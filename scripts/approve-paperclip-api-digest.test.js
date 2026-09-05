@@ -1721,7 +1721,12 @@ release_in_flight_lock`;
   const sleeps = existsSync(sleepLog)
     ? readFileSync(sleepLog, "utf8").split("\n").filter(Boolean)
     : [];
-  return { status: r.status, stderr: r.stderr, writes, sleeps };
+  // stdout as well as stderr: the two loops' MESSAGING asymmetry -- this one
+  // silent on success, retire-only mode chatty -- is the other half of what
+  // `:755-759` defends at length against a parity fix, and until both harnesses
+  // captured stdout it was asserted by nothing. Both directions of that fix are
+  // now failures: adding a success `echo` here, or deleting retire-only's.
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr, writes, sleeps };
 }
 
 test("a non-retriable retirement write bails once and reports the cause", () => {
@@ -1773,7 +1778,7 @@ test("a conflicting retirement write is still retried to exhaustion", () => {
   );
 });
 
-test("a retirement write that succeeds returns at the first attempt without sleeping", () => {
+test("a retirement write that succeeds returns at the first attempt, silently and without sleeping", () => {
   // The control for the two pacing assertions: they pin what an EXHAUSTED loop
   // spends, and would still pass if the sleep had migrated above the success
   // check and started charging every caller. A succeeding retirement is the
@@ -1782,6 +1787,20 @@ test("a retirement write that succeeds returns at the first attempt without slee
   assert.equal(r.writes, 1, "a succeeding write must not be repeated");
   assert.equal(r.status, 0, "a retired lock must report success");
   assert.deepEqual(r.sleeps, [], "the success path must not sleep");
+  // The SILENT half of the messaging asymmetry, and the more surprising one --
+  // a parity fix reading retire-only mode's three chatty success lines would
+  // "correct" this loop by ADDING output, which is the direction the retire-only
+  // assertion below cannot catch. `:755-759` argues this silence is required,
+  // not merely tolerated: the caller (`cleanup_on_exit`) prints the operator
+  // guidance itself, and this loop only ever runs after a deploy has already
+  // failed, so a success line here would bury the failure the cleanup exists to
+  // report. Asserted as exact emptiness rather than a `doesNotMatch` on today's
+  // wording, so any new success line fails regardless of how it is phrased.
+  assert.equal(
+    r.stdout,
+    "",
+    "this loop must stay silent on success -- its caller prints the guidance, and a success line here would bury the failure the cleanup is running after",
+  );
 });
 
 test("a retirement write with no stderr still explains itself", () => {
@@ -1895,7 +1914,10 @@ ${retireRegion}`;
   const sleeps = existsSync(sleepLog)
     ? readFileSync(sleepLog, "utf8").split("\n").filter(Boolean)
     : [];
-  return { status: r.status, stderr: r.stderr, writes, sleeps };
+  // stdout captured for the reason spelled out in `runReleaseWrite`: this is the
+  // chatty half of that messaging asymmetry, and the success lines asserted
+  // below are what the release harness's empty-stdout assertion is the mirror of.
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr, writes, sleeps };
 }
 
 test("retire-only mode's non-retriable write bails once and reports the cause", () => {
@@ -1948,7 +1970,7 @@ test("retire-only mode's conflicting write is still retried to exhaustion", () =
   );
 });
 
-test("retire-only mode's succeeding write exits 0 at the first attempt without sleeping", () => {
+test("retire-only mode's succeeding write exits 0 at the first attempt, telling the operator what it retired", () => {
   // Same control as the release path's. Retire-only mode `exit 0`s where the
   // release loop `return 0`s, so this also pins that the success exit survives
   // the slice -- a mode that retired the lock and then exited non-zero would
@@ -1957,6 +1979,24 @@ test("retire-only mode's succeeding write exits 0 at the first attempt without s
   assert.equal(r.writes, 1, "a succeeding write must not be repeated");
   assert.equal(r.status, 0, "a retired lock must exit 0");
   assert.deepEqual(r.sleeps, [], "the success path must not spend the backoff");
+  // The CHATTY half, and the output this mode exists to produce: an operator
+  // ran it by hand and the three lines at `:342-344` are the only report they
+  // get. Until the harness captured stdout, silencing all three "for parity
+  // with `release_in_flight_lock`" left the suite green.
+  assert.match(
+    r.stdout,
+    /Retired the in-flight approval lock on sha256:cafe \(owner owner-9\)/,
+    "the operator must be told WHICH lock was retired, by digest and owner",
+  );
+  // The consequence, not just the act: this is what tells the operator they can
+  // re-run a corrected plan without editing the ring by hand. Matched across the
+  // line wrap so a rewrap stays green and a deletion does not -- the two lines
+  // are one sentence and neither is separately meaningful.
+  assert.match(
+    r.stdout,
+    /The ring still lists that digest, so a corrected plan or a rollback is\s+admitted without an out-of-band edit\./,
+    "the operator must be told the retirement left the digest admissible, or they will assume they have to re-approve it",
+  );
 });
 
 test("retire-only mode's write with no stderr still explains itself", () => {
