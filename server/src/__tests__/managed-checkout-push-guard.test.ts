@@ -321,11 +321,87 @@ describe("ensureManagedCheckoutRejectsPushes", () => {
     expect(output).toContain("does not accept pushes");
     expect(await refExists(base, "refs/heads/probe-tracked")).toBe(false);
 
+    // The base must stay CLEAN. The hook is an untracked file inside a directory
+    // the repo tracks, so without an info/exclude entry the checkout is
+    // permanently dirty -- and `execution-workspaces.ts` throws
+    // "requires a clean worktree" on branch reconciliation, whose target for a
+    // `project_primary` workspace is this very base. Asserting `hookPath` alone
+    // passes against a guard that breaks reconciliation for every repo it
+    // installs in place for.
+    const status = await git(["status", "--porcelain", "--untracked-files=all"], base);
+    expect(status.stdout.trim()).toBe("");
+    expect(result.excludedHookPath).toBe(path.join(trackedHooks, "pre-receive"));
+
+    // The other half of the same entry: an untracked hook is something
+    // `git clean -fd` deletes, which would silently disarm the guard until the
+    // next provisioning pass. Run a real clean rather than trusting `-n`.
+    await git(["clean", "-fd"], base);
+    expect(await fs.readFile(path.join(trackedHooks, "pre-receive"), "utf8")).toContain(
+      PUSH_GUARD_HOOK_MARKER,
+    );
+    const afterClean = await gitExpectFailure(["push", base, "HEAD:refs/heads/probe-after-clean"], run);
+    expect(afterClean).toContain("does not accept pushes");
+    expect(await refExists(base, "refs/heads/probe-after-clean")).toBe(false);
+
     // Converges: the value is absolute now, so there is nothing left to rewrite.
     const second = await ensureManagedCheckoutRejectsPushes({ cwd: base });
     expect(second.state).toBe("already_installed");
     expect(second.normalizedHooksPath).toBeNull();
     expect(second.warning).toBeNull();
+
+    // The exclude entry converges too -- a second pass must not append a
+    // duplicate, or the file grows by two lines on every heartbeat.
+    const excludeFile = path.join(base, ".git", "info", "exclude");
+    const excludeBody = await fs.readFile(excludeFile, "utf8");
+    const hits = excludeBody.split(/\r?\n/).filter((line) => line.trim() === "/.githooks/pre-receive");
+    expect(hits).toHaveLength(1);
+  });
+
+  it("declines rather than displace a TRACKED pre-receive, leaving the repo untouched", async () => {
+    // The one shape this module cannot serve. Displacing a tracked file renames
+    // version-controlled content: `git status` shows a modification, and any
+    // `git checkout -- .` silently restores the operator's hook over the guard.
+    // Because the backup keeps its name, the next provision sees a foreign hook
+    // again and reserves the next number, so a revert/re-provision cycle walks
+    // the backup budget to exhaustion and lands on a permanent decline anyway --
+    // having dirtied the checkout on every pass. info/exclude cannot help: the
+    // file is tracked. So the guard declines up front and changes nothing.
+    const base = await createUnguardedBase();
+    const trackedHooks = path.join(base, ".githooks");
+    await fs.mkdir(trackedHooks, { recursive: true });
+    const operatorHook = path.join(trackedHooks, "pre-receive");
+    const operatorBody = "#!/bin/sh\n# operator's own, committed deliberately\nexit 0\n";
+    await fs.writeFile(operatorHook, operatorBody, { encoding: "utf8", mode: 0o755 });
+    await git(["add", ".githooks/pre-receive"], base);
+    await git(["commit", "-m", "track a pre-receive"], base);
+    await git(["config", "core.hooksPath", trackedHooks], base);
+
+    const result = await ensureManagedCheckoutRejectsPushes({ cwd: base });
+
+    expect(result.state).toBe("install_failed");
+    expect(result.hookPath).toBeNull();
+    expect(result.excludedHookPath).toBeNull();
+    expect(result.warning).toContain("is tracked in this repository");
+
+    // "Changes nothing" is the whole claim, so assert it rather than implying it
+    // from the state: content intact, no backup beside it, worktree still clean.
+    expect(await fs.readFile(operatorHook, "utf8")).toBe(operatorBody);
+    expect(await fs.readdir(trackedHooks)).toEqual(["pre-receive"]);
+    const status = await git(["status", "--porcelain", "--untracked-files=all"], base);
+    expect(status.stdout.trim()).toBe("");
+
+    // Idempotent: a second provision must not start accumulating backups or
+    // dirtying the tree either. This is the pass that would have walked the
+    // budget under the displacement behaviour.
+    const second = await ensureManagedCheckoutRejectsPushes({ cwd: base });
+    expect(second.state).toBe("install_failed");
+    expect(await fs.readdir(trackedHooks)).toEqual(["pre-receive"]);
+
+    // The honest cost of declining, stated as a test so it cannot be forgotten:
+    // this checkout still accepts pushes. #1616 is what stops runs reaching it.
+    const run = await createRunWorkspace(base);
+    await git(["push", base, "HEAD:refs/heads/probe-tracked-decline"], run); // paperclip:allow-git-push: asserting the documented residual gap
+    expect(await refExists(base, "refs/heads/probe-tracked-decline")).toBe(true);
   });
 
   it("writes into an ABSOLUTE in-tree hooks dir with no config write at all", async () => {
