@@ -1385,6 +1385,20 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   // instead of the `default` single-attempt/instant-escalate path, so a lone
   // control-plane blip no longer strands the issue as `blocked`.
   "process_lost",
+  // BLO-32055: a declared skill's runtime tree was mid-refresh when the adapter
+  // walked it to build the prompt-bundle key — the rolling materialization sweep
+  // rm's and rewrites `__runtime__/<slug>/` non-atomically, so `SKILL.md` is
+  // briefly absent. The condition self-heals (measured: the live instance's file
+  // appeared 43m36s later), and the run died before the CLI was spawned, so it is
+  // idempotent to re-dispatch.
+  //
+  // Listed HERE rather than alongside `skill_not_found` in
+  // NON_RETRYABLE_CONTINUATION_ERROR_CODES on purpose. It replaces
+  // `adapter_failed`, which is already a member of this set, so naming a skill
+  // fault preserves retryability exactly instead of widening or narrowing it.
+  // Routing it to `skill_not_found` would suppress retries permanently on a
+  // transient condition — the over-suppression hazard BLO-31794 tracks.
+  "skill_materialization_pending",
 ]);
 
 // BLO-19124: emitted by the dispatcher's dependency gate (see heartbeat.ts

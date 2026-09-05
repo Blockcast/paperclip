@@ -130,6 +130,48 @@ describe("recovery classifier boundary", () => {
     });
   });
 
+  // BLO-32055. A run killed while a declared skill's `__runtime__` tree was
+  // mid-refresh is the OPPOSITE of a missing-skill config fault: the sweep
+  // completes on its own (measured live at 43m36s), so the next attempt succeeds.
+  // This pair is the whole point of giving it a separate code — the two must not
+  // converge on one classification.
+  it("keeps a mid-materialization skill fault retryable, unlike a missing skill", () => {
+    const materializationPending = classifyContinuationFailure({
+      status: "failed",
+      errorCode: "skill_materialization_pending",
+      error: 'Skill "garrytan/gstack/investigate" source is incomplete',
+      resultJson: null,
+    } as never);
+    expect(materializationPending).toMatchObject({
+      kind: "transient_infra",
+      errorCode: "skill_materialization_pending",
+    });
+    expect(materializationPending.maxAttempts).toBeGreaterThan(0);
+
+    // It replaced `adapter_failed`, which is already transient_infra, so naming
+    // the fault must preserve retryability exactly rather than widen it.
+    expect(materializationPending.maxAttempts).toBe(
+      classifyContinuationFailure({
+        status: "failed",
+        errorCode: "adapter_failed",
+        error: "ENOENT: no such file or directory",
+        resultJson: null,
+      } as never).maxAttempts,
+    );
+  });
+
+  // The AC's second half: it must also stay eligible for the zero-token session
+  // reset, which `skill_not_found` is deliberately excluded from.
+  it("does not exclude a mid-materialization skill fault from the session reset", () => {
+    expect("skill_materialization_pending").not.toBe(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE);
+    expect(ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has("skill_materialization_pending")).toBe(false);
+    expect(isZeroTokenStartupFailureRun({
+      status: "failed",
+      errorCode: "skill_materialization_pending",
+      usageJson: { inputTokens: 0, outputTokens: 0 },
+    })).toBe(false);
+  });
+
   it("treats a scheduled monitor as an explicit review action path", () => {
     const findings = classifyIssueGraphLiveness({
       now: "2026-04-30T18:00:00.000Z",
