@@ -1722,10 +1722,11 @@ release_in_flight_lock`;
     ? readFileSync(sleepLog, "utf8").split("\n").filter(Boolean)
     : [];
   // stdout as well as stderr: the two loops' MESSAGING asymmetry -- this one
-  // silent on success, retire-only mode chatty -- is the other half of what
-  // `:755-759` defends at length against a parity fix, and until both harnesses
-  // captured stdout it was asserted by nothing. Both directions of that fix are
-  // now failures: adding a success `echo` here, or deleting retire-only's.
+  // silent on both success and exhaustion, retire-only mode chatty -- is the
+  // other half of what `:755-759` defends at length against a parity fix, and
+  // until both harnesses captured stdout it was asserted by nothing. Every
+  // direction of that fix is now a failure: adding an `echo` here on either
+  // path, or deleting retire-only's.
   return { status: r.status, stdout: r.stdout, stderr: r.stderr, writes, sleeps };
 }
 
@@ -1775,6 +1776,17 @@ test("a conflicting retirement write is still retried to exhaustion", () => {
     r.stderr,
     /cannot retire the in-flight lock on/,
     "the non-retriable message must not fire on a retriable conflict",
+  );
+  // The EXHAUSTION half of the silence `:757-758` requires, which the success
+  // test's assertion cannot reach: that comment forbids a chatty success *or
+  // exhaustion*, and exhaustion is where the temptation is stronger, because
+  // the loop has just given up and so has something to report. It reports it on
+  // stderr or not at all -- the operator guidance belongs to `cleanup_on_exit`,
+  // and a stdout line here would bury the deploy failure that ran the cleanup.
+  assert.equal(
+    r.stdout,
+    "",
+    "an exhausted retirement must stay silent on stdout too -- its caller prints the guidance, and a line here would bury the failure the cleanup is running after",
   );
 });
 
