@@ -83,6 +83,14 @@ export const PRECREATE_REQUIRED_INDEXES: readonly PrecreateRequiredIndex[] = [
       "AND (context_snapshot ->> 'recoveryActionId') IS NOT NULL",
   },
   {
+    migration: "0217_heartbeat_runs_queued_age_idx.sql",
+    name: "heartbeat_runs_queued_age_idx",
+    table: "heartbeat_runs",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_queued_age_idx " +
+      "ON heartbeat_runs USING btree (agent_id, (coalesce(queued_at, created_at))) WHERE status = 'queued'",
+  },
+  {
     migration: "0224_heartbeat_runs_overdue_scheduled_retry_index.sql",
     name: "heartbeat_runs_overdue_scheduled_retry_idx",
     table: "heartbeat_runs",
