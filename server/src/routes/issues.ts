@@ -6894,6 +6894,68 @@ export function issueRoutes(
     if (statusOnly && writesStatusAdjudication) return true;
     if (!statusOnly && (!planningOnly || mutationKind === "document")) return true;
 
+    // BLO-23197: record the refusal on the run row so the successful-run-handoff
+    // detector can escalate the corrective wake off this lane. `details` below
+    // already names the remedy (`resumeRequiresNormalModel: true`), but it lives
+    // only in an HTTP response nobody re-reads, so `decideSuccessfulRunHandoff`
+    // was left inferring the lane from `issues.workMode` — a proxy that reads
+    // `standard` in exactly the deadlocking case and queues another status-only
+    // wake into the identical 403.
+    //
+    // Documents only: the escalation target is `planning_only`, which permits
+    // document updates but still bars deliverables and annotations, so a refused
+    // deliverable write would be escalated onto a lane that still cannot perform
+    // it. Deliberately NOT routed through `recordDeniedIssueWrite` like the
+    // sibling guards — that log's aggregate cap and repeat dedupe both drop
+    // records silently, so a signal read from it would go quiet under repeated
+    // denials, which is the very load that produces the deadlock.
+    //
+    // Best-effort by design: the 403 is the contract of this function and must
+    // be delivered even if the stamp fails, so a failure is logged and
+    // swallowed rather than surfacing as a 500. Unlike the activity-log cap this
+    // replaces, the drop is uncorrelated with denial volume — re-refusals
+    // re-stamp the same row by primary key — so it degrades on genuine database
+    // failure only, and says so in the log.
+    //
+    // On the co-written `updatedAt`: deliberately NOT justified by enumerating
+    // today's readers, because such a list is wrong the moment one is added.
+    //
+    // What carries the weight is that a mid-run bump is not a new class of event
+    // on this row. The column has no `$onUpdate`, and ~50 sites in
+    // `heartbeat.ts` bump it explicitly across a run's life, so every reader of
+    // it already has to tolerate one landing at an arbitrary mid-run instant —
+    // this stamp included.
+    //
+    // Supporting only, and deliberately not the load-bearing half: the row's
+    // eventual state is unaffected, because every terminal path writes a
+    // strictly later `updatedAt` through `setRunStatus` — normal completion and
+    // the reaper's `process_lost` finalize alike, so this holds even for a run
+    // that dies immediately after stamping. That argument is about the eventual
+    // state ONLY. Inside the live window between the stamp and the finalize the
+    // row is genuinely fresher than it would otherwise have been, so a reader
+    // shaped as "`updatedAt` older than N ⇒ abandoned" that samples in that
+    // window has its verdict postponed by exactly that interval, and the later
+    // finalize cannot retroactively correct a read already taken. Only the
+    // bump-tolerance argument above covers that reader; do not lean on this one.
+    if (statusOnly && mutationKind === "document") {
+      try {
+        await db
+          .update(heartbeatRuns)
+          .set({ statusOnlyDocumentWriteRefusedAt: new Date(), updatedAt: new Date() })
+          .where(eq(heartbeatRuns.id, run.id));
+      } catch (err) {
+        // `documentKey` is absent on the revision-restore route, which passes
+        // `"document"` with no key so it gets the strict gate (see this
+        // function's doc comment). Log the request line too, or a restore
+        // refusal and an upsert refusal are indistinguishable in production —
+        // both would read `documentKey: undefined`.
+        logger.warn(
+          { err, runId: run.id, issueId: issue.id, documentKey, method: req.method, url: req.originalUrl },
+          "status_only_document_write_refusal_stamp_failed",
+        );
+      }
+    }
+
     res.status(403).json({
       error: planningOnly
         ? "Planning-only recovery runs can update issue documents but cannot create or modify annotations or deliverable artifacts"
