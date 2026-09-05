@@ -9587,7 +9587,16 @@ const COPULA_FILLER_WORDS = Math.floor(CLAUSE_SCOPE_CHARS / 5);
 // demonstrative, not a complementizer ("yet THAT HEAD was" vs "yet that THIS
 // head was"), so it must not flip the connective into its filler role and let
 // the negation cross (Ally pass 16 suggestion: 20/20 connectives false-vetoed).
-const COPULA_FILLER = `(?:(?!(?:${CONNECTIVES})\\b(?!\\s+(?:[^\\s.\\n:;,\u2014\u2013]+\\s+){0,2}(?:that|whether)\\b(?!\\s+(?:head|commit|sha|branch|pr)\\b)))[^\\s.\\n:;,\u2014\u2013]+\\s+){0,${COPULA_FILLER_WORDS}}`;
+// One filler WORD that may not be a connective in its connective role. The
+// negative lookahead lets a connective through only when a complementizer
+// follows within two words (filler role: "No evidence YET THAT this head was"),
+// and not when that complementizer is a demonstrative before an anchor noun.
+const NON_CONNECTIVE_WORD = `(?!(?:${CONNECTIVES})\\b(?!\\s+(?:[^\\s.\\n:;,\u2014\u2013]+\\s+){0,2}(?:that|whether)\\b(?!\\s+(?:head|commit|sha|branch|pr)\\b)))[^\\s.\\n:;,\u2014\u2013]+\\s+`;
+const COPULA_FILLER = `(?:${NON_CONNECTIVE_WORD}){0,${COPULA_FILLER_WORDS}}`;
+// The same unit at the negation cue's own bound. Pass 23: the `negation` stem
+// used a bare `(?:\\w+\\s+){0,3}`, so a negation governing the PREVIOUS clause
+// crossed a consequence connective and false-vetoed correct skips.
+const NEGATION_FILLER = `(?:${NON_CONNECTIVE_WORD}){0,3}`;
 // A relative pronoun abutting the copula is NOT a complementizer, and the
 // distinction is syntactic rather than lexical: a complementizer is always
 // followed by a SUBJECT before the copula ("confirm that this head was"), so
@@ -9647,7 +9656,7 @@ const EPISTEMIC_NOUN_HEAD =
 // pass-21 one did: every control carried a connective. The family alone in a
 // bare adjunct is inert ("Despite the obvious drift this head was …" stays a
 // skip, since these words bind only after a negation), but a bare NEGATED
-// adjunct does false-veto, and two of those are new here: "Given no certain
+// adjunct does false-veto, and two were opened by earlier passes of this PR: "Given no certain
 // match this head was …" (pass 20) and "Aside from no obvious drift this head
 // was …" (pass 21) both flip true -> false, while "Despite no evidence of a
 // force-push this head was …" false-vetoes at every head. Same CLAUSE_REACH
@@ -9660,6 +9669,16 @@ const EPISTEMIC_NOUN_HEAD =
 // state of the world rather than the speaker's confidence, so they are likelier
 // to appear in a correct skip than in a hedge. They remain known residuals, not
 // asserted-correct behaviour, on the same reasoning the `\w+ly` rejection gives.
+//
+// `ideas?` (pass 22) replaces `hedge`'s complementizer-bound `no\s+idea`. An
+// audit of all seven cues found `hedge` the last stem hardcoding a trailing
+// token, and `no idea` the one word unique to it: "I have no idea this head was
+// already reviewed at <sha>" was accepted. As a noun head under `negation` it
+// binds through CLAUSE_REACH like the rest — 5/5 hedge frames veto, 6/6
+// connective- or comma-bearing controls stay skips. It is inert without a
+// preceding negation, and it widens the bare-adjunct residual by one more word
+// ("No new idea landed for this head was …"), pinned in the characterization
+// table with its pass label like the pass-20 and pass-21 widenings.
 //
 // `positive` is INCLUDED, against the pass-20 review's recommendation to drop
 // it, because mutation-testing that recommendation refuted its premise. The
@@ -9869,7 +9888,7 @@ const GOVERNING_CUE_STEMS: ReadonlyArray<{ name: string; stem: string }> = [
   },
   {
     name: "negation",
-    stem: `${NEGATION_PREFIX_WORD}\\s+(?:\\w+\\s+){0,3}${EPISTEMIC_HEAD}`,
+    stem: `${NEGATION_PREFIX_WORD}\\s+${NEGATION_FILLER}${EPISTEMIC_HEAD}`,
   },
 ];
 
