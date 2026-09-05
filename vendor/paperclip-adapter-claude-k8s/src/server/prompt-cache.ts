@@ -6,7 +6,9 @@ import { createHash } from "node:crypto";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
   type PaperclipSkillEntry,
+  asString,
   ensurePaperclipSkillSymlink,
+  parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
 
 export interface ClaudePromptBundle {
@@ -102,19 +104,36 @@ function isMissingEntryError(err: unknown): boolean {
  * rewrites them non-atomically, so only the former can produce the transient
  * race. Bundled skills sit in a read-only image path: a file missing there is a
  * packaging fault that no amount of retrying will fix.
+ *
+ * The body below is a literal transcription of the key-deriving half of
+ * `normalizeConfiguredPaperclipRuntimeSkills` (server-utils) — same primitives,
+ * same fallbacks, same drop rule — rather than an approximation of it. That
+ * matters in both directions, and an earlier hand-rolled version got both wrong:
+ *
+ *   - `asString` falls back on an EMPTY string, not merely on a non-string, so
+ *     `{key: "", name: "x"}` normalizes to key `x` upstream. A `typeof key ===
+ *     "string"` test resolves it to `""` and drops the entry, marking a
+ *     catalog-backed skill as un-backed — permanent retry suppression on a
+ *     self-healing condition, which is the one direction this whole change
+ *     exists to avoid.
+ *   - Upstream also DISCARDS any entry missing `runtimeName` or `source`.
+ *     Contributing those keys anyway would mark a bundled-skill packaging fault
+ *     as retryable.
+ *
+ * Deriving both from the same predicate closes both at once. Do not re-hand-roll
+ * this; if the upstream normalizer changes, change it here in the same commit.
  */
 export function readCatalogBackedSkillKeys(config: Record<string, unknown>): ReadonlySet<string> {
   const raw = config.paperclipRuntimeSkills;
   if (!Array.isArray(raw)) return new Set<string>();
   const keys = new Set<string>();
-  for (const entry of raw) {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-    const key = (entry as Record<string, unknown>).key;
-    // Mirrors normalizeConfiguredPaperclipRuntimeSkills' key fallback in
-    // server-utils, so the two cannot disagree about which entry is which.
-    const name = (entry as Record<string, unknown>).name;
-    const resolved = (typeof key === "string" ? key : typeof name === "string" ? name : "").trim();
-    if (resolved) keys.add(resolved);
+  for (const rawEntry of raw) {
+    const entry = parseObject(rawEntry);
+    const key = asString(entry.key, asString(entry.name, "")).trim();
+    const runtimeName = asString(entry.runtimeName, asString(entry.name, "")).trim();
+    const source = asString(entry.source, "").trim();
+    if (!key || !runtimeName || !source) continue;
+    keys.add(key);
   }
   return keys;
 }
@@ -256,7 +275,9 @@ export async function prepareClaudePromptBundle(input: {
    * Omitting it defaults every entry to catalog-backed, i.e. RETRYABLE. That is
    * the deliberate direction to fail in: an over-retry costs bounded attempts
    * against a condition that may clear, whereas an over-suppression is permanent
-   * (the BLO-31794 hazard). Production always passes the set explicitly.
+   * (the BLO-31794 hazard). The only call site is `execute.ts`, which passes it
+   * — so a second caller appearing here is a contradiction to resolve, not
+   * prose that has quietly gone stale.
    */
   catalogBackedSkillKeys?: ReadonlySet<string>;
   onLog: AdapterExecutionContext["onLog"];
