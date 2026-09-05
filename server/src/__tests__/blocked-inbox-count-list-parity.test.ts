@@ -413,6 +413,12 @@ describeEmbeddedPostgres("blocked-inbox count/list parity (BLO-31839)", () => {
     // that keeps it scoped: a row that never asserted `externalDetailsRedacted` must come back
     // byte-identical, including a string that merely looks like an owner. Without this, a fix
     // that redacted every row would pass every assertion above.
+    //
+    // Pin `blockedInboxAttention` to null as well, so the control states *which* branch it
+    // guards. `externalDetailsRedacted ?? false === false` is satisfied both by "no entry" and by
+    // "entry present with the flag off", and those two return `description` from different
+    // expressions — this asserts it is the no-entry branch under test.
+    expect(row.blockedInboxAttention).toBeNull();
     expect(row.blockedInboxAttention?.redaction?.externalDetailsRedacted ?? false).toBe(false);
     expect(row.description).toBe(description);
   });
