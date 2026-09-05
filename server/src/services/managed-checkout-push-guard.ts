@@ -43,19 +43,43 @@
  *
  * Resolve where hooks *actually* come from, then choose the least invasive site:
  *
- * - **Effective hooks dir is inside this repo's git common dir** -> install
- *   `pre-receive` there and write no config at all. This covers the unset case
- *   (`<commondir>/hooks`, measured as 40 of 40 managed checkouts on 2026-09-03)
- *   and the repo-private-override case (`.git/no-hooks`, what the two test
- *   fixtures above create). Every pre-existing hook of a *different* name keeps
- *   working untouched; a pre-existing `pre-receive` is the one file this module
- *   must own, so it is moved aside to `pre-receive.paperclip-displaced` and
- *   reported rather than overwritten in place. Nothing is ever destroyed.
- * - **Effective hooks dir is outside the repo** (a shared or global directory)
+ * - **Effective hooks dir belongs to this repo** -- i.e. it is inside the git
+ *   common dir *or* inside the working tree -> install `pre-receive` there and
+ *   write no config at all. This covers the unset case (`<commondir>/hooks`,
+ *   measured as 40 of 40 managed checkouts on 2026-09-03), the
+ *   repo-private-override case (`.git/no-hooks`, what the two test fixtures
+ *   above create), and the tracked-hooks convention (`.githooks/`, `.husky/`),
+ *   which git resolves against the top of the working tree and which is
+ *   therefore in the repo but not in `.git`. Every pre-existing hook of a
+ *   *different* name keeps working untouched; a pre-existing `pre-receive` is
+ *   the one file this module must own, so it is moved aside to
+ *   `pre-receive.paperclip-displaced` and reported rather than overwritten in
+ *   place. Nothing is ever destroyed.
+ * - **Effective hooks dir is outside the repo entirely** (a shared or global
+ *   directory, outside both the common dir and the working tree)
  *   -> do NOT write into it; a file dropped in a global hooks dir would apply to
  *   every repository on the host. Instead set a *local* `core.hooksPath` to a
  *   private dir and install there. Local config beats global, so this is
  *   deterministic rather than dependent on discovery defaults.
+ *
+ * The distinction matters because the second branch is much more invasive than
+ * it looks: it repoints hook resolution for the base *and* for every run
+ * workspace worktree, so any other hook the repo relied on stops running. It is
+ * reserved for the case where the alternative is worse (writing into a directory
+ * shared with other repositories), and a repo-tracked hooks dir is not that
+ * case -- writing one untracked `pre-receive` beside the repo's own hooks leaves
+ * them all working.
+ *
+ * One wrinkle sits underneath both branches: a **relative** `core.hooksPath` does
+ * not name a single directory. Git resolves it against the running process's cwd,
+ * and that differs by command -- the working tree for `git worktree add`, but the
+ * *git dir* for `receive-pack`. Measured on git 2.47.3 with
+ * `core.hooksPath = .githooks`, a guard installed at `<worktree>/.githooks` is
+ * never consulted by an inbound push and the push is ACCEPTED, while the guard
+ * reports success. So for an in-repo relative value the local config is rewritten
+ * to the absolute directory it already pointed at. That is a normalization, not a
+ * displacement: the same hooks keep running, and it is reported in
+ * `normalizedHooksPath` rather than `displacedHooksPath`.
  *
  * Both displacing branches record what they displaced -- the hooks dir in
  * `paperclip.pushGuard.displacedHooksPath`, an operator hook by leaving the file
@@ -65,14 +89,23 @@
  * Note the second branch's blast radius: git stores `--local` config in the git
  * *common* dir, which every linked worktree shares. This project provisions run
  * workspaces as worktrees, so taking `core.hooksPath` over repoints hook
- * resolution for those run workspaces too, not only for the base. That is
- * checked rather than assumed: as of 2026-09-04 no non-test source path in this
- * repository reads `core.hooksPath` or installs/depends on any git hook, so
- * nothing in the run-workspace flow relies on an inherited `post-checkout` /
- * `pre-commit` / `commit-msg`. Per-worktree scoping (`extensions.worktreeConfig`
- * plus `--worktree`) is therefore deliberately not used -- it carries its own
- * consequences and buys nothing here. The warning names the wider scope so an
- * operator with such hooks is not surprised.
+ * resolution for those run workspaces too, not only for the base.
+ *
+ * Two different things bound that risk, and only the first is measured. Paperclip's
+ * own orchestration does not depend on hooks: as of 2026-09-04 no non-test source
+ * path in *this* repository reads `core.hooksPath` or installs/depends on any git
+ * hook, so nothing in the run-workspace flow relies on an inherited
+ * `post-checkout` / `pre-commit` / `commit-msg`. That grep does NOT cover the
+ * repos the code actually runs against -- `ensureManagedProjectWorkspace`
+ * provisions managed checkouts of arbitrary project repos, any of which may ship
+ * hooks of its own, and no grep here can see them. What protects those is the
+ * placement rule rather than a measurement: a repo that tracks its hooks now
+ * takes the in-place branch, so the displacement branch is reached only for a
+ * directory outside the repo altogether, which by construction is not the repo's
+ * own hooks. Per-worktree scoping (`extensions.worktreeConfig` plus `--worktree`)
+ * is therefore deliberately not used -- it carries its own consequences and buys
+ * little once the misclassification is gone. The warning names the wider scope so
+ * an operator with genuinely shared hooks is not surprised.
  *
  * ## What this must not break
  *
@@ -218,6 +251,12 @@ export type ManagedCheckoutPushGuardResult = {
   displacedHooksPath: string | null;
   /** Set when an operator's own `pre-receive` was moved aside to this path. */
   displacedHookPath: string | null;
+  /**
+   * Set when a *relative* `core.hooksPath` was rewritten to the absolute
+   * directory it already pointed at. Not a displacement -- the same hooks keep
+   * running -- but it is a config write, so it is reported separately.
+   */
+  normalizedHooksPath: string | null;
   warning: string | null;
 };
 
@@ -323,6 +362,7 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
     hookPath: null,
     displacedHooksPath: null,
     displacedHookPath: null,
+    normalizedHooksPath: null,
     warning: null,
   };
   if (!cwd) return base;
@@ -379,8 +419,10 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
     };
   }
 
-  // `core.hooksPath` may be relative, in which case git resolves it against the
-  // top of the working tree.
+  // `core.hooksPath` may be relative. Resolve it against the top of the working
+  // tree -- that is where a repo's own tracked hooks live, and it is how every
+  // worktree-side command resolves it. See `relativeHooksPath` below for why
+  // that is NOT how `receive-pack` resolves it.
   const effectiveHooksDir = configured.value
     ? path.resolve(cwd, configured.value)
     : path.join(commonDir, "hooks");
@@ -389,9 +431,57 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
   // this repo, and only take core.hooksPath over when it does not. Writing a
   // `pre-receive` into a shared or global hooks dir would apply it to every
   // repository on the host, which is far worse than the hazard being closed.
-  const insideRepo = isInside(commonDir, effectiveHooksDir);
+  //
+  // "Belongs to this repo" is BOTH the git dir and the working tree, and the
+  // second half is not redundant: the commonest non-default convention is a repo
+  // that TRACKS its hooks (`.githooks/`, `.husky/`) and points `core.hooksPath`
+  // at them, which lands inside the repo but outside `.git`. Testing only
+  // `commonDir` sent exactly that case down the displacement path, which
+  // repoints `core.hooksPath` for the base AND every worktree derived from it,
+  // so the repo's own committed `post-checkout`/`pre-commit`/`commit-msg`
+  // silently stop running (measured on git 2.47.3: a tracked post-checkout fired
+  // on `git worktree add` before the takeover and not after). `cwd` is safe as
+  // the working-tree root because the structural `.git` probe above only
+  // proceeds when `.git` sits directly in it.
+  const insideRepo = isInside(commonDir, effectiveHooksDir) || isInside(cwd, effectiveHooksDir);
+
+  // A relative `core.hooksPath` does not name one directory -- git resolves it
+  // against the *current process's* cwd, and that differs by command. Measured
+  // on git 2.47.3 with `core.hooksPath = .githooks`:
+  //
+  //   git worktree add  (cwd = working tree) -> <cwd>/.githooks       -- hooks run
+  //   receive-pack      (cwd = the git dir)  -> <commondir>/.githooks -- guard sought HERE
+  //
+  // So installing into the resolved-against-the-worktree directory is silently
+  // ineffective for the one hook this module exists to install: the guard
+  // reports success and the push is still accepted (verified end-to-end -- this
+  // is why the test pushes rather than only asserting `hookPath`). Rewriting the
+  // value to the absolute directory it already points at collapses the two
+  // resolutions onto the same place, so the guard works AND the repo's own hooks
+  // keep running. That is a config write but not a displacement, and it is
+  // strictly less invasive than pointing `core.hooksPath` at a private dir.
+  const relativeHooksPath = Boolean(configured.value) && !path.isAbsolute(configured.value!);
+  const normalizedHooksPath = insideRepo && relativeHooksPath ? effectiveHooksDir : null;
+
   const hooksDir = insideRepo ? effectiveHooksDir : path.join(commonDir, PUSH_GUARD_PRIVATE_HOOKS_DIRNAME);
-  const displacedHooksPath = insideRepo ? null : effectiveHooksDir;
+  const privateHooksDir = path.join(commonDir, PUSH_GUARD_PRIVATE_HOOKS_DIRNAME);
+
+  // A takeover erases its own evidence from this computation: afterwards
+  // `core.hooksPath` is an absolute path under the common dir, so `insideRepo` is
+  // true and the line above yields null -- the result would report no
+  // displacement while the checkout is still displaced, and the single warning at
+  // takeover time would be the only notice an operator ever gets. Recover it from
+  // the key we wrote. Read only when the effective dir IS our private dir, which
+  // is the signature of a prior takeover, so the common case (an unset
+  // `core.hooksPath`) adds no subprocess.
+  const priorDisplacement =
+    insideRepo && effectiveHooksDir === privateHooksDir
+      ? (await readConfigValue(runGit, cwd, PUSH_GUARD_DISPLACED_HOOKS_PATH_KEY, "local")).value
+      : null;
+  const displacedHooksPath = insideRepo ? priorDisplacement : effectiveHooksDir;
+  // Only a displacement performed by THIS call writes config and warns; a prior
+  // one is already recorded on disk and merely needs reporting.
+  const displacingNow = !insideRepo;
   const hookPath = path.join(hooksDir, "pre-receive");
 
   const existing = await fs.readFile(hookPath, "utf8").catch(() => null);
@@ -440,9 +530,12 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
       hookInstalled = true;
     }
 
-    if (displacedHooksPath) {
+    if (displacingNow) {
       await runGit(["config", "--local", "core.hooksPath", hooksDir], cwd);
-      await runGit(["config", "--local", PUSH_GUARD_DISPLACED_HOOKS_PATH_KEY, displacedHooksPath], cwd);
+      await runGit(["config", "--local", PUSH_GUARD_DISPLACED_HOOKS_PATH_KEY, effectiveHooksDir], cwd);
+    } else if (normalizedHooksPath) {
+      // Same directory, spelled absolutely -- see `relativeHooksPath` above.
+      await runGit(["config", "--local", "core.hooksPath", normalizedHooksPath], cwd);
     }
 
     // Set last and best-effort: the hook above is what refuses ref *creation*,
@@ -470,16 +563,32 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
           `hook name, or move "${path.basename(foreignBackupPath)}" back over the guard to disable it.`,
       );
     }
-    if (displacedHooksPath) {
+    if (displacingNow) {
       notes.push(
-        `Managed checkout "${cwd}" loaded hooks from "${displacedHooksPath}", which is outside the ` +
-          `repository. Paperclip set a local core.hooksPath to "${hooksDir}" instead of writing into a ` +
-          `shared hooks directory. The previous value is recorded in ` +
+        `Managed checkout "${cwd}" loaded hooks from "${displacedHooksPath}", which is outside this ` +
+          `repository entirely -- neither in its git directory nor in its working tree, so it is a shared ` +
+          `or global directory rather than hooks the repo ships. Paperclip set a local core.hooksPath to ` +
+          `"${hooksDir}" instead of writing into it, which would have applied the guard to every repository ` +
+          `using that directory. The previous value is recorded in ` +
           `${PUSH_GUARD_DISPLACED_HOOKS_PATH_KEY}. Note the scope: git stores --local config in the git ` +
           `*common* dir, which every linked worktree shares, so hooks that lived in "${displacedHooksPath}" ` +
           `no longer run for this checkout OR for any run workspace provisioned as a worktree from it ` +
-          `(post-checkout, pre-commit, commit-msg and the rest). Paperclip installs only \`pre-receive\`, ` +
-          `which run worktrees inherit harmlessly -- nothing pushes into one either.`,
+          `(post-checkout, pre-commit, commit-msg and the rest). To restore them, move your hooks into the ` +
+          `repository (a tracked ".githooks/" is written into in place, not displaced) or unset the local ` +
+          `core.hooksPath. Paperclip installs only \`pre-receive\`, which run worktrees inherit ` +
+          `harmlessly -- nothing pushes into one either.`,
+      );
+    }
+    if (normalizedHooksPath) {
+      notes.push(
+        `Managed checkout "${cwd}": core.hooksPath was the relative value ` +
+          `"${configured.value}", which git resolves against each command's working directory -- the working ` +
+          `tree for worktree commands, but the git directory for \`receive-pack\`, so a \`pre-receive\` ` +
+          `placed at "${normalizedHooksPath}" would never have been found by an inbound push. Paperclip ` +
+          `rewrote the local value to that same directory spelled absolutely. The same hooks run as before; ` +
+          `only the spelling changed. One consequence worth knowing: a linked worktree now resolves hooks to ` +
+          `the base's copy rather than its own checked-out one, so a branch that changes a hook no longer ` +
+          `changes it for that worktree.`,
       );
     }
     if (configFailures.length > 0) {
@@ -491,11 +600,18 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
     }
 
     return {
+      // Convergence is about what THIS call changed, so a displacement carried
+      // over from an earlier provision must not keep re-reporting "installed"
+      // forever. `displacedHooksPath` stays populated in the payload either way
+      // -- the state says what happened, the field says what is true.
       state:
-        hookCurrent && !displacedHooksPath && configFailures.length === 0 ? "already_installed" : "installed",
+        hookCurrent && !displacingNow && !normalizedHooksPath && configFailures.length === 0
+          ? "already_installed"
+          : "installed",
       hookPath,
       displacedHooksPath,
       displacedHookPath: foreignBackupPath,
+      normalizedHooksPath,
       warning: notes.length > 0 ? notes.join(" ") : null,
     };
   } catch (error) {
@@ -507,7 +623,7 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
     const consequence = hookInstalled
       ? `The \`pre-receive\` guard itself IS installed at "${hookPath}" and inbound pushes are refused, but ` +
         `the follow-up configuration did not complete` +
-        (displacedHooksPath
+        (displacingNow
           ? `, so core.hooksPath may still point at "${displacedHooksPath}" and the guard may therefore not ` +
             `be the hook git loads. Re-provisioning will retry.`
           : `, so the receive.* keys that protect existing refs if the hook file is removed may be unset. ` +
@@ -520,6 +636,7 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
       hookPath: hookInstalled ? hookPath : null,
       displacedHooksPath,
       displacedHookPath: foreignBackupPath,
+      normalizedHooksPath,
       warning: `Managed checkout "${cwd}": could not fully install the inbound-push guard at "${hookPath}" (${reason}). ${consequence}`,
     };
   }

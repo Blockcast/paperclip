@@ -183,10 +183,18 @@ describe("ensureManagedCheckoutRejectsPushes", () => {
     const base = await createUnguardedBase();
     const run = await createRunWorkspace(base);
 
-    // An unrelated, empty hooks directory -- the shape a Git LFS install or an
-    // org-wide policy leaves behind.
+    // An unrelated hooks directory -- the shape a Git LFS install or an org-wide
+    // policy leaves behind. The sentinel `post-checkout` is what makes the
+    // worktree assertion at the end of this test capable of failing.
     const globalHooks = path.join(root, `global-hooks-${counter++}`);
     await fs.mkdir(globalHooks, { recursive: true });
+    const sentinel = path.join(root, `global-hook-firings-${counter++}.txt`);
+    await fs.writeFile(
+      path.join(globalHooks, "post-checkout"),
+      `#!/bin/sh\necho fired >> ${JSON.stringify(sentinel)}\n`,
+      { encoding: "utf8", mode: 0o755 },
+    );
+    await fs.chmod(path.join(globalHooks, "post-checkout"), 0o755);
     const globalConfig = path.join(root, `gitconfig-hookspath-${counter++}`);
     await fs.writeFile(globalConfig, `[core]\n\thooksPath = ${globalHooks}\n`, "utf8");
     process.env.GIT_CONFIG_GLOBAL = globalConfig;
@@ -202,14 +210,23 @@ describe("ensureManagedCheckoutRejectsPushes", () => {
     expect(await refExists(base, "refs/heads/probe-naive")).toBe(true);
     await fs.rm(naiveHook);
 
+    // Second control, and the baseline for the worktree assertion below: while
+    // the global dir is still in force its hooks genuinely run. Without this the
+    // "did not fire" check afterwards could pass because the sentinel never
+    // worked at all.
+    const worktreeBefore = path.join(root, `worktree-before-takeover-${counter++}`);
+    await git(["worktree", "add", "-b", "wt-before-takeover", worktreeBefore], base);
+    expect(await fs.readFile(sentinel, "utf8")).toContain("fired");
+    await fs.rm(sentinel);
+
     const result = await ensureManagedCheckoutRejectsPushes({ cwd: base });
     expect(result.state).toBe("installed");
     // The global dir is shared across every repo on the host, so the guard must
-    // not have written into it.
+    // not have written into it -- only the sentinel hook we put there.
     expect(result.displacedHooksPath).toBe(globalHooks);
-    expect(await fs.readdir(globalHooks)).toEqual([]);
+    expect(await fs.readdir(globalHooks)).toEqual(["post-checkout"]);
     expect(result.hookPath).toBe(path.join(base, ".git", PUSH_GUARD_PRIVATE_HOOKS_DIRNAME, "pre-receive"));
-    expect(result.warning).toContain("outside the repository");
+    expect(result.warning).toContain("outside this repository entirely");
 
     const output = await gitExpectFailure(["push", base, "HEAD:refs/heads/probe-global-hookspath"], run);
     expect(output).toContain("does not accept pushes");
@@ -219,12 +236,18 @@ describe("ensureManagedCheckoutRejectsPushes", () => {
     const recorded = await git(["config", "--local", "--get", PUSH_GUARD_DISPLACED_HOOKS_PATH_KEY], base);
     expect(recorded.stdout.trim()).toBe(globalHooks);
 
-    // The warning claims run worktrees inherit the takeover harmlessly. Worktrees
-    // share the git common dir, so the local core.hooksPath written above applies
-    // to them too -- exercise that rather than asserting it in prose. This is the
-    // displaced case specifically; test 6 covers worktrees without a takeover.
+    // The takeover's blast radius, measured rather than asserted in prose.
+    // Worktrees share the git common dir, so the local core.hooksPath written
+    // above applies to them too. Asserting only that `worktree add` succeeds
+    // could not fail -- git skips a missing hook silently and post-checkout's
+    // exit code does not fail a checkout -- so read the resolved value back AND
+    // show the displaced dir's hook stops firing, which is the actual cost.
     const worktree = path.join(root, `worktree-displaced-${counter++}`);
     await git(["worktree", "add", "-b", "wt-displaced-probe", worktree], base);
+    expect((await git(["config", "--get", "core.hooksPath"], worktree)).stdout.trim()).toBe(
+      path.join(base, ".git", PUSH_GUARD_PRIVATE_HOOKS_DIRNAME),
+    );
+    expect(await fs.readFile(sentinel, "utf8").catch(() => "")).not.toContain("fired");
     expect((await git(["rev-parse", "HEAD"], worktree)).stdout.trim()).toMatch(/^[0-9a-f]{40}$/);
   });
 
@@ -245,6 +268,111 @@ describe("ensureManagedCheckoutRejectsPushes", () => {
 
     await gitExpectFailure(["push", base, "HEAD:refs/heads/probe-private"], run);
     expect(await refExists(base, "refs/heads/probe-private")).toBe(false);
+  });
+
+  it("writes into a repo's own TRACKED hooks dir rather than displacing it", async () => {
+    // The commonest non-default convention: the repo ships its hooks in
+    // `.githooks/` and points core.hooksPath at them. Git resolves a relative
+    // value against the top of the WORKING TREE, so this lands inside the repo
+    // but outside `.git` -- and a placement rule that asks only "is it under
+    // .git?" sends it down the takeover path meant for global directories. That
+    // is the more invasive branch: it repoints core.hooksPath for the base and
+    // every worktree derived from it, so the repo's own committed hooks stop
+    // running. Writing one untracked `pre-receive` beside them leaves them alive.
+    const base = await createUnguardedBase();
+    const trackedHooks = path.join(base, ".githooks");
+    await fs.mkdir(trackedHooks, { recursive: true });
+    const sentinel = path.join(root, `tracked-hook-firings-${counter++}.txt`);
+    await fs.writeFile(
+      path.join(trackedHooks, "post-checkout"),
+      `#!/bin/sh\necho fired >> ${JSON.stringify(sentinel)}\n`,
+      { encoding: "utf8", mode: 0o755 },
+    );
+    await fs.chmod(path.join(trackedHooks, "post-checkout"), 0o755);
+    await git(["add", ".githooks/post-checkout"], base);
+    await git(["commit", "-m", "track hooks"], base);
+    await git(["config", "core.hooksPath", ".githooks"], base);
+    const run = await createRunWorkspace(base);
+
+    const result = await ensureManagedCheckoutRejectsPushes({ cwd: base });
+
+    // Least invasive: installed in place, nothing displaced.
+    expect(result.state).toBe("installed");
+    expect(result.displacedHooksPath).toBeNull();
+    expect(result.hookPath).toBe(path.join(trackedHooks, "pre-receive"));
+
+    // ...but the relative value had to be spelled absolutely. Git resolves a
+    // relative core.hooksPath against each command's cwd, and receive-pack's cwd
+    // is the git dir -- so before this the guard sat where an inbound push would
+    // never look. The push probe below is what makes that visible; asserting
+    // `hookPath` alone passes against a guard that does not guard.
+    expect(result.normalizedHooksPath).toBe(trackedHooks);
+    expect((await git(["config", "--get", "core.hooksPath"], base)).stdout.trim()).toBe(trackedHooks);
+    expect(result.warning).toContain("resolves against each command's working directory");
+
+    // The property that the takeover branch destroys: the repo's committed hooks
+    // keep running, for the base and for worktrees provisioned from it.
+    const worktree = path.join(root, `worktree-tracked-${counter++}`);
+    await git(["worktree", "add", "-b", "wt-tracked-probe", worktree], base);
+    expect(await fs.readFile(sentinel, "utf8")).toContain("fired");
+
+    // ...and the guard actually guards.
+    const output = await gitExpectFailure(["push", base, "HEAD:refs/heads/probe-tracked"], run);
+    expect(output).toContain("does not accept pushes");
+    expect(await refExists(base, "refs/heads/probe-tracked")).toBe(false);
+
+    // Converges: the value is absolute now, so there is nothing left to rewrite.
+    const second = await ensureManagedCheckoutRejectsPushes({ cwd: base });
+    expect(second.state).toBe("already_installed");
+    expect(second.normalizedHooksPath).toBeNull();
+    expect(second.warning).toBeNull();
+  });
+
+  it("writes into an ABSOLUTE in-tree hooks dir with no config write at all", async () => {
+    // Same convention, already spelled absolutely: nothing is ambiguous, so the
+    // guard installs in place and touches no configuration.
+    const base = await createUnguardedBase();
+    const trackedHooks = path.join(base, ".githooks");
+    await fs.mkdir(trackedHooks, { recursive: true });
+    await git(["config", "core.hooksPath", trackedHooks], base);
+    const run = await createRunWorkspace(base);
+
+    const result = await ensureManagedCheckoutRejectsPushes({ cwd: base });
+    expect(result.state).toBe("installed");
+    expect(result.displacedHooksPath).toBeNull();
+    expect(result.normalizedHooksPath).toBeNull();
+    expect(result.warning).toBeNull();
+    expect(result.hookPath).toBe(path.join(trackedHooks, "pre-receive"));
+    expect((await git(["config", "--get", "core.hooksPath"], base)).stdout.trim()).toBe(trackedHooks);
+
+    await gitExpectFailure(["push", base, "HEAD:refs/heads/probe-abs-tracked"], run);
+    expect(await refExists(base, "refs/heads/probe-abs-tracked")).toBe(false);
+  });
+
+  it("keeps reporting an EARLIER displacement once core.hooksPath points at us", async () => {
+    // A takeover erases its own evidence from the placement computation: on the
+    // next pass core.hooksPath is an absolute path under the common dir, so the
+    // dir reads as repo-owned and the result would say nothing was displaced --
+    // while the checkout is still displaced. The single warning at takeover time
+    // would then be an operator's only notice, ever.
+    const base = await createUnguardedBase();
+    const globalHooks = path.join(root, `global-hooks-carry-${counter++}`);
+    await fs.mkdir(globalHooks, { recursive: true });
+    const globalConfig = path.join(root, `gitconfig-carry-${counter++}`);
+    await fs.writeFile(globalConfig, `[core]\n\thooksPath = ${globalHooks}\n`, "utf8");
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+
+    const first = await ensureManagedCheckoutRejectsPushes({ cwd: base });
+    expect(first.state).toBe("installed");
+    expect(first.displacedHooksPath).toBe(globalHooks);
+
+    const second = await ensureManagedCheckoutRejectsPushes({ cwd: base });
+    // Converged -- the state describes what THIS call changed, which is nothing.
+    expect(second.state).toBe("already_installed");
+    // ...but the payload stays truthful about what is still displaced.
+    expect(second.displacedHooksPath).toBe(globalHooks);
+    // Converged means quiet: the warning is not repeated on every heartbeat.
+    expect(second.warning).toBeNull();
   });
 
   it("keeps the base able to serve clones (BLO-31351 is not regressed)", async () => {
