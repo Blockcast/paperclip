@@ -706,16 +706,30 @@ release_in_flight_lock() {
     if clear_in_flight_lock "$json"; then
       return 0
     fi
+    # Same non-retriable test as retire-only mode's write bail, for the same
+    # reason and with the same argument as the read failure above: a conflict
+    # means this write lost a race and a fresh read may win the next one, while
+    # an approver Role missing `update` or a deleted ConfigMap fails identically
+    # on every attempt. Retrying those spends the very TERM grace period the flat
+    # pacing below exists to conserve, and still reports nothing -- the caller
+    # prints only the bare "could not retire the in-flight lock", with no
+    # operator present to re-run with more logging.
+    if ! grep -qiE 'conflict|modified|latest version' <<<"$CLEAR_IN_FLIGHT_LOCK_ERR"; then
+      echo "cannot retire the in-flight lock on ${DIGEST} (owner ${LOCK_OWNER_ID}):" >&2
+      printf '%s\n' "$CLEAR_IN_FLIGHT_LOCK_ERR" >&2
+      return 1
+    fi
     # Guarded rather than unconditional: the last attempt has nothing left to
     # wait for. Spelled as an `if` and not `(( ... )) && sleep` because it is the
     # final command in the loop body, where a false `(( ... ))` under `set -e`
     # would abort the retirement it is meant to pace.
     #
-    # Flat, where retire-only mode backs off linearly (`sleep "$attempt"`). That
-    # asymmetry is deliberate, not an unfinished parity fix: this loop runs
-    # inside a trap reached from `trap 'exit 143' TERM`, so the runner's grace
-    # period is the whole budget and 2s of total sleep beats 3s. Retire-only
-    # mode has an operator at a terminal and no such deadline.
+    # Flat, where retire-only mode backs off linearly (`sleep "$attempt"`). With
+    # the bail above shared, the sleep is now the ONLY asymmetry between the two
+    # loops, and it is deliberate rather than an unfinished parity fix: this loop
+    # runs inside a trap reached from `trap 'exit 143' TERM`, so the runner's
+    # grace period is the whole budget and 2s of total sleep beats 3s.
+    # Retire-only mode has an operator at a terminal and no such deadline.
     if (( attempt < RETIRE_ATTEMPTS )); then
       sleep 1
     fi
