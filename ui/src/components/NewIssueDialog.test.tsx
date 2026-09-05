@@ -52,16 +52,18 @@ const mockIssuesApi = vi.hoisted(() => ({
 }));
 
 // `list` is deliberately absent. The real `executionWorkspacesApi` has it, but
-// NewIssueDialog must only ever reach for the cheaper `listSummaries`. Omitting
-// it is what let the vacuous `expect(list).not.toHaveBeenCalled()` assertion go
-// away — it is not itself a tripwire, so do not read it as one. A regression to
-// `list` throws inside a react-query `queryFn`; React Query catches that into
-// `isError` (the client below sets `retry: false` with no `throwOnError`, and
-// there is no ErrorBoundary), so the dialog renders its error branch instead of
-// crashing the test. Measured by forcing the regression: it reddens 2 of 26
-// tests — the `toHaveBeenCalledWith` in "submits parent and goal context for
-// sub-issues" and the "Reusing PAP-100" assertion in "applies project and
-// execution workspace defaults for normal new issues". The other 24 swallow it.
+// NewIssueDialog must only ever reach for the cheaper `listSummaries`. Removing
+// the vacuous `expect(list).not.toHaveBeenCalled()` assertion is what let `list`
+// come off the double, not the reverse — that assertion was its only consumer
+// here. The omission is not itself a tripwire, so do not read it as one. A
+// regression to `list` throws inside a react-query `queryFn`; React Query
+// catches that into `isError` (the client below sets `retry: false` with no
+// `throwOnError`, and there is no ErrorBoundary), so the dialog renders its
+// error branch instead of crashing the test. Measured by forcing the
+// regression: it reddens 2 of 26 tests — the `toHaveBeenCalledWith` in "submits
+// parent and goal context for sub-issues" and the "Reusing PAP-100" assertion
+// in "applies project and execution workspace defaults for normal new issues".
+// The other 24 swallow it.
 const mockExecutionWorkspacesApi = vi.hoisted(() => ({
   listSummaries: vi.fn(),
 }));
