@@ -228,6 +228,16 @@ DEFERRED_REASON_PREFIX = "skip: deferred"
 # being able to grep for if sweeps ever start overlapping routinely.
 REREAD_SKIP_REASON_PREFIX = "skip: marker posted between scan and write"
 
+# Prefix for the reason recorded when the pre-write re-read (BLO-32044) found
+# that Ally produced a consolidated report for this exact head after the scan
+# had already decided the PR was unreviewed. Held distinct from the cooldown
+# prefix above because the two mean opposite things to an operator: that one
+# says "somebody re-asked too recently", this one says "the review we were
+# about to ask for has ALREADY LANDED" -- i.e. the sweep was about to spam a
+# PR that is no longer stranded at all. Collapsing them would make the
+# healthier outcome indistinguishable from evidence of a concurrent writer.
+REVIEWED_SKIP_REASON_PREFIX = "skip: Ally reviewed this head between scan and write"
+
 # Rate-limit exhaustion is recorded under SWEEP_ERROR_REASON_PREFIX (it IS a
 # failure to evaluate, and must count as one for the degraded-run exit below),
 # but carries this distinguishing token so main() can name the actual cause
@@ -402,10 +412,25 @@ def cooldown_blocks_refire(marker_epochs, now):
 
     Returns (bool, str|None) -- whether the write is blocked, and the reason
     when it is.
+
+    The reason is worded for the sign of `since_last`, which is NEGATIVE in
+    exactly the case the pre-write guard exists for. `now` is sampled once at
+    the top of the run and shared with should_refire, so a marker posted by a
+    concurrent sweep mid-run is genuinely newer than this run's clock. The
+    decision is right either way -- a negative `since_last` is still less than
+    the cooldown, so the write is still blocked -- but rendering it as
+    "re-asked -3s ago" reads as an arithmetic bug to anyone scanning the log,
+    and that log line is the only evidence operators get that sweeps are
+    overlapping. Name the skew instead of hiding it behind max(0, ...): the
+    fact that the marker POSTDATES this run is the informative part.
     """
     if not marker_epochs:
         return False, None
     since_last = now - max(marker_epochs)
+    if since_last < 0:
+        return True, "re-asked %ds AFTER this run's scan clock (concurrent writer), cooldown %ds" % (
+            int(-since_last), REFIRE_COOLDOWN_SECONDS,
+        )
     if since_last < REFIRE_COOLDOWN_SECONDS:
         return True, "re-asked %ds ago < cooldown %ds" % (int(since_last), REFIRE_COOLDOWN_SECONDS)
     return False, None
@@ -616,10 +641,11 @@ def reviewer_is_already_requested(pr_payload, login=ALLY_REQUEST_REVIEWER_LOGIN)
     return any((entry or {}).get("login", "").lower() == target for entry in requested)
 
 
-def refire_still_permitted(owner, repo, number, token, api_base_url, now):
-    """Re-read this PR's marker comments and re-apply the cooldown, as late as
-    possible before the write. Returns (bool, str|None) -- permitted, and the
-    reason when it is not.
+def refire_still_permitted(owner, repo, number, head_sha, token, api_base_url, now):
+    """Re-read this PR's state and re-apply BOTH scan-time preconditions, as
+    late as possible before the write. Returns (bool, str|None, str|None) --
+    permitted, the reason when it is not, and the reason-prefix naming which
+    precondition declined so main() can report the two separately.
 
     WHY (BLO-31908). The cooldown is derived from GitHub state
     (`existing_marker_epochs`) rather than run-local state, which is the right
@@ -640,13 +666,48 @@ def refire_still_permitted(owner, repo, number, token, api_base_url, now):
     could only ever discard a starved backlog rather than serialise it. So a
     starvation window released all at once does run sweeps together.
 
+    ALSO (BLO-32044). The cooldown is not the scan's only precondition, and it
+    was originally the only one re-applied here. _consider_pr also skips a PR
+    when ally_has_reviewed_head() is true, and that read is just as stale by
+    the time we reach the write. The uncovered interleaving needs no concurrent
+    sweep at all -- one run whose scan and write straddle Ally answering is
+    enough:
+
+      1. scan reads the surfaces; Ally has not reviewed head -> candidate
+      2. Ally posts its consolidated report (comment, or a formal review)
+      3. the guard re-reads -- the fresh report IS in the list
+      4. without this check, the sweep re-asks for a review that just landed
+
+    That is the stacked-marker-request pathology this script exists to avoid,
+    arriving through the front door. Measured request->response latency is
+    5m-74m, so a ~2min run straddling it is small but not exotic.
+
+    Both surfaces are consulted, because either alone yields false negatives:
+    verified live 2026-08-04, `#952` carried 4 comment-shaped reviews with an
+    EMPTY `pulls/952/reviews`, while `#937` carried 4 formal review objects and
+    no comment-shaped one.
+
+    Order is by cost, and every branch that declines is a branch that will not
+    write -- so the paid read is reached only when the two free checks have
+    both passed. The cooldown and the comment surface are free (the comments
+    are already in hand); only the reviews surface costs a request, bounded at
+    MAX_REFIRES_PER_RUN per run against a 1,000/hour budget.
+
+    The check is deliberately head-exact, not "has Ally reviewed at all".
+    ally_has_reviewed_head demands a consolidated report attesting THIS head,
+    so a report against a superseded head does not block -- reconciling that
+    case is precisely what the sweep exists for, and a coarser test here would
+    silently disable the reconciler while still passing the two tests above.
+
     RESIDUAL, stated rather than claimed away: this NARROWS the window from the
     whole scan (minutes -- one request per open PR) to the gap between this
     re-read and the POST (~a second). It does NOT close it. There is no
     compare-and-set on the GitHub comment API, so a second run entering after
     this re-read and before the write still fires, and the DELETE/POST
     interleaving above is still reachable. The exposure is small, not absent;
-    do not read this guard as making overlapping writes safe.
+    do not read this guard as making overlapping writes safe. BLO-32044 narrows
+    a DIFFERENT window with the same mechanism and inherits the same residual;
+    it does not close the concurrent-sweep race either.
 
     `now` is the run's single scan-time clock, shared with should_refire rather
     than re-sampled here. It lags real time by at most the run duration (~2min
@@ -662,7 +723,19 @@ def refire_still_permitted(owner, repo, number, token, api_base_url, now):
         api_base_url, "/repos/%s/%s/issues/%d/comments" % (owner, repo, number), token
     )
     blocked, reason = cooldown_blocks_refire(marker_epochs_from_comments(comments), now)
-    return (not blocked), reason
+    if blocked:
+        return False, reason, REREAD_SKIP_REASON_PREFIX
+    # Comment surface first: free, since the cooldown re-read already paid for
+    # these. Passing [] for reviews is a genuine single-surface test --
+    # ally_has_reviewed_head scans the two lists independently.
+    if ally_has_reviewed_head([], comments, head_sha, ALLY_REVIEWER_LOGINS):
+        return False, "consolidated report on the comment surface", REVIEWED_SKIP_REASON_PREFIX
+    reviews = _fetch_paginated(
+        api_base_url, "/repos/%s/%s/pulls/%d/reviews" % (owner, repo, number), token
+    )
+    if ally_has_reviewed_head(reviews, [], head_sha, ALLY_REVIEWER_LOGINS):
+        return False, "consolidated report on the reviews surface", REVIEWED_SKIP_REASON_PREFIX
+    return True, None, None
 
 
 def request_review(owner, repo, number, token, api_base_url, login=ALLY_REQUEST_REVIEWER_LOGIN):
@@ -825,11 +898,12 @@ def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry
     re-fire flag stays True so the caller's accounting and budget match a live
     run exactly; only the side effects are withheld.
 
-    A re-fire decision is re-checked against freshly-read markers immediately
-    before the write (refire_still_permitted, BLO-31908) -- the scan's read is
-    minutes stale by then and a concurrent sweep may have re-asked in between.
-    Neither `may_refire=False` nor `dry_run` pays for that extra read, since
-    neither is going to write.
+    A re-fire decision is re-checked against freshly-read state immediately
+    before the write (refire_still_permitted) -- the scan's reads are minutes
+    stale by then. Both of the scan's preconditions are re-applied: a
+    concurrent sweep may have re-asked (BLO-31908) and Ally may have answered
+    (BLO-32044). Neither `may_refire=False` nor `dry_run` pays for that extra
+    read, since neither is going to write.
     """
     number = pr["number"]
     is_draft = bool(pr.get("draft"))
@@ -906,18 +980,22 @@ def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry
     if refire and dry_run:
         return (pr, head_sha, pending_since, True, "DRY-RUN would re-fire -- %s" % reason)
     if refire:
-        # Re-read the markers and re-apply the cooldown immediately before the
-        # write (BLO-31908). The scan's read is minutes stale by now; a sweep
+        # Re-read the surfaces and re-apply BOTH scan-time preconditions
+        # immediately before the write (BLO-31908 cooldown, BLO-32044
+        # already-reviewed). The scan's reads are minutes stale by now: a sweep
         # running concurrently -- or an operator re-asking by hand -- may have
-        # posted a marker in between, and firing again on top of it is the
-        # stacked-request pathology this repo has hit before.
-        permitted, cooled = refire_still_permitted(owner, repo, number, token, api_base_url, now)
+        # posted a marker in between, and Ally may simply have answered. Firing
+        # on top of either is the stacked-request pathology this repo has hit
+        # before.
+        permitted, withheld, prefix = refire_still_permitted(
+            owner, repo, number, head_sha, token, api_base_url, now
+        )
         if not permitted:
             # BOTH writes are withheld, not just the reviewer re-request.
             # Posting the marker comment alone would still double the re-ask
             # trail and push the cooldown out for the next run, so gating only
             # request_review would leave half the defect in place.
-            return (pr, head_sha, pending_since, False, "%s -- %s" % (REREAD_SKIP_REASON_PREFIX, cooled))
+            return (pr, head_sha, pending_since, False, "%s -- %s" % (prefix, withheld))
         requested = request_review(owner, repo, number, token, api_base_url)
         body = build_comment_body(
             number, head_sha, now - pending_since,
@@ -1050,6 +1128,14 @@ def main(argv=None):
     failed = [r for r in results if str(r[4]).startswith(SWEEP_ERROR_REASON_PREFIX)]
     rate_limited = [r for r in failed if RATE_LIMIT_TOKEN in str(r[4])]
     deferred = [r for r in results if str(r[4]).startswith(DEFERRED_REASON_PREFIX)]
+    # The two pre-write guard outcomes. `failed`, `deferred` and `alarming`
+    # each already get a summary section; these reached an operator only
+    # through the per-PR stdout line, which is the wrong way round -- the
+    # cooldown one is the ONLY direct evidence that dropping the concurrency
+    # group (BLO-31818) has a live cost, i.e. that sweeps genuinely overlap.
+    # Reported separately because they mean opposite things: see below.
+    contended = [r for r in results if str(r[4]).startswith(REREAD_SKIP_REASON_PREFIX)]
+    answered = [r for r in results if str(r[4]).startswith(REVIEWED_SKIP_REASON_PREFIX)]
     degraded = sweep_is_degraded(len(failed), len(results))
     for pr, head_sha, pending_since, refire, reason in results:
         marker = "RE-FIRED" if refire else "skip"
@@ -1100,6 +1186,36 @@ def main(argv=None):
                 )
                 handle.write("| PR | head | reason |\n|---|---|---|\n")
                 for pr, head_sha, _pending_since, _refire, reason in deferred:
+                    handle.write("| #%d | `%s` | %s |\n" % (pr["number"], head_sha[:7], reason))
+            if contended or answered:
+                handle.write(
+                    "\n### %d re-fire(s) withheld by the pre-write guard\n\n"
+                    % (len(contended) + len(answered))
+                )
+                if contended:
+                    # The signal worth escalating on. Rare by design -- hourly
+                    # cadence, ~2min run, 2h cooldown -- so a routinely
+                    # non-zero count means sweeps really are overlapping and
+                    # the residual documented on refire_still_permitted is
+                    # live rather than theoretical.
+                    handle.write(
+                        "- **%d contended**: a marker was posted between this run's scan and "
+                        "its write, so a CONCURRENT SWEEP re-asked first (BLO-31908). This is "
+                        "the measurable cost of carrying no `concurrency` group (BLO-31818). "
+                        "Expected to be 0 or 1; if it is routinely higher, sweeps are "
+                        "overlapping and the guard's stated residual is live.\n"
+                        % len(contended)
+                    )
+                if answered:
+                    handle.write(
+                        "- **%d answered**: Ally reviewed the head between this run's scan and "
+                        "its write (BLO-32044), so the PR is no longer stranded. This one is "
+                        "healthy -- the guard suppressed a redundant re-ask; it implies nothing "
+                        "about contention.\n"
+                        % len(answered)
+                    )
+                handle.write("\n| PR | head | reason |\n|---|---|---|\n")
+                for pr, head_sha, _pending_since, _refire, reason in contended + answered:
                     handle.write("| #%d | `%s` | %s |\n" % (pr["number"], head_sha[:7], reason))
             if alarming:
                 handle.write(
