@@ -1252,3 +1252,102 @@ test("a signal is routed into the cleanup rather than killing the script outrigh
     assert.equal(result.status, status, "the cleanup must not swallow the signal's status");
   }
 });
+
+// Exercises release_in_flight_lock's WRITE failure with the REAL
+// clear_in_flight_lock in the loop and only kubectl stubbed, so the bail runs as
+// written and CLEAR_IN_FLIGHT_LOCK_ERR is proven to be populated by the script's
+// own capture rather than by the harness. Ally's suggestion at 4b80791e: without
+// this branch a non-retriable write burns every attempt and returns 1 with no
+// cause, on the path with the LEAST operator visibility -- the caller prints
+// only the bare "could not retire the in-flight lock" and nobody is at a
+// terminal to re-run it with more logging.
+function runReleaseWrite({ stderrText, attempts = 3 }) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-release-write-"));
+  const countFile = path.join(dir, "replace_count");
+  // Sliced out of the shipping script, not restated: this carries the annotation
+  // constants, the shared jq program, and the `2>&1 >/dev/null` capture. Losing
+  // that redirection order fails this test instead of silently blinding the bail.
+  const clearRegion = script.slice(
+    script.indexOf('LOCK_DIGEST_ANNOTATION="'),
+    script.indexOf("\n# Must stay in lockstep with the `maxApprovedApiDigests`"),
+  );
+  const fn = script.slice(
+    script.indexOf("release_in_flight_lock() {"),
+    script.indexOf("\nemit_lock_owner() {"),
+  );
+  // Heredoc body and terminator sit at column 0 deliberately; indenting them
+  // here would make the generated bash unparseable rather than failing loudly.
+  const harness = `set -uo pipefail
+NAMESPACE=paperclip-release-approvals
+CONFIGMAP=paperclip-api-approved-images
+RETIRE_ATTEMPTS=${attempts}
+DIGEST=sha256:deadbeef
+PLAN_SHA256=plan-abc
+PLAN_MARKER=marker-xyz
+LOCK_OWNER_ID=owner-nonce-1
+${clearRegion}
+# get returns a lock whose digest+plan+marker+owner all match this invocation,
+# so the loop gets past the ownership guard and actually attempts the write.
+# replace fails with the text under test, counting its attempts on the way.
+kubectl() {
+  if [[ "\${1:-}" == "-n" ]]; then shift 2; fi
+  case "\${1:-}" in
+    get)
+cat <<'JSON'
+{"metadata":{"annotations":{
+"paperclip.blockcast.net/approval-in-flight-digest":"sha256:deadbeef",
+"paperclip.blockcast.net/approval-in-flight-plan-sha256":"plan-abc",
+"paperclip.blockcast.net/approval-in-flight-rollout-marker":"marker-xyz",
+"paperclip.blockcast.net/approval-in-flight-owner":"owner-nonce-1"
+}}}
+JSON
+      ;;
+    replace)
+      echo x >>${JSON.stringify(countFile)}
+      printf '%s\\n' ${JSON.stringify(stderrText)} >&2
+      return 1
+      ;;
+  esac
+}
+# Stubbed so the retriable case does not actually spend the loop's pacing.
+sleep() { :; }
+${fn}
+release_in_flight_lock`;
+  const r = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  const writes = existsSync(countFile)
+    ? readFileSync(countFile, "utf8").split("\n").filter(Boolean).length
+    : 0;
+  return { status: r.status, stderr: r.stderr, writes };
+}
+
+test("a non-retriable retirement write bails once and reports the cause", () => {
+  // An approver Role missing `update` fails identically on all three attempts.
+  const r = runReleaseWrite({ stderrText: 'Error from server (Forbidden): configmaps "x" is forbidden' });
+  assert.equal(r.writes, 1, "a non-retriable write must not be retried -- it fails the same way every time");
+  assert.equal(r.status, 1, "the retirement must report failure");
+  assert.match(
+    r.stderr,
+    /cannot retire the in-flight lock on sha256:deadbeef \(owner owner-nonce-1\)/,
+    "the operator must be told WHICH lock could not be retired, by digest and owner",
+  );
+  assert.match(
+    r.stderr,
+    /Forbidden/,
+    "kubectl's actual cause must reach stderr -- this is the whole point of the capture",
+  );
+});
+
+test("a conflicting retirement write is still retried to exhaustion", () => {
+  // The safety half: a 409 means this write lost a race, so a fresh read may win
+  // the next one. Inverting the bail's polarity would make this case bail at 1.
+  const r = runReleaseWrite({
+    stderrText: "Operation cannot be fulfilled on configmaps: the object has been modified",
+  });
+  assert.equal(r.writes, 3, "a conflict must consume every attempt, not bail on the first");
+  assert.equal(r.status, 1, "exhausting the attempts still reports failure");
+  assert.doesNotMatch(
+    r.stderr,
+    /cannot retire the in-flight lock on/,
+    "the non-retriable message must not fire on a retriable conflict",
+  );
+});
