@@ -9602,17 +9602,26 @@ const COPULA_FILLER = `(?:${NON_CONNECTIVE_WORD}){0,${COPULA_FILLER_WORDS}}`;
 // inherits NON_CONNECTIVE_WORD's non-boundary token class in place of `\\w+`,
 // which cuts both ways:
 //   - It closes on `negation` the citation-masking hole that the token-class
-//     note above records closing on COPULA_FILLER: "I have no `direct` evidence
-//     this head was …", "No (verified) proof that …", "No force-push evidence
-//     that …" were ACCEPTED at the parent because `\\w+` could not cross the
-//     backtick, parenthesis or hyphen, so the cue never fired. 4/4 now veto.
+//     note above records closing on COPULA_FILLER: "I have no `direct`
+//     evidence this head was …", "No (verified) proof that …", "No
+//     force-push evidence that …" were ACCEPTED at the parent because `\\w+`
+//     could not cross the backtick, parenthesis or hyphen, so the cue never
+//     fired. 4/4 now veto.
 //   - It widens the CLAUSE_REACH bare-adjunct residual by one more shape —
-//     punctuated filler tokens with no connective ("No force-push evidence this
-//     head was …", 4/4 true -> false) — pinned in the characterization table
-//     under its own pass label. Fails toward `missing`, like the rest of it.
-// Only CONSEQUENCE connectives are affected by the exclusion; the adversative
-// family (`yet`/`however`/`still`/…) is deliberately untouched — "No evidence
-// yet this head was …" is a hedge, not a skip — and measured 0 frames changed.
+//     punctuated filler tokens with no connective ("No force-push evidence
+//     this head was …", 4/4 true -> false) — pinned in the characterization
+//     table under its own pass label. Fails toward `missing`, like the rest
+//     of it.
+// The exclusion covers BOTH connective families (CONNECTIVES, above) — it is
+// family-agnostic, not consequence-only. Only consequence connectives are
+// affected IN PRACTICE: a grammatical adversative sits after the epistemic
+// head, inside COPULA_FILLER's span rather than NEGATION_FILLER's, so the
+// exclusion never reaches it — "No evidence yet this head was …" stays a
+// hedge. Measured 0 grammatical frames changed; the flips are confined to
+// ungrammatical strings with the adversative IN the filler slot ("No yet
+// evidence …"), which is why the measurement looks clean without being a
+// property anyone chose. Do not add a same-family guard here — there is
+// nothing to guard against, and the effect is positional.
 //
 // `{0,3}` is a KNOWN SECOND CAP, inherited verbatim from the old stem and not
 // derived from CLAUSE_SCOPE_CHARS the way COPULA_FILLER_WORDS is. It binds:
@@ -9683,10 +9692,10 @@ const EPISTEMIC_NOUN_HEAD =
 // skip, since these words bind only after a negation), but a bare NEGATED
 // adjunct does false-veto, and two were opened by earlier passes of this PR:
 // "Given no certain match this head was …" (pass 20) and "Aside from no
-// obvious drift this head
-// was …" (pass 21) both flip true -> false, while "Despite no evidence of a
-// force-push this head was …" false-vetoes at every head. Same CLAUSE_REACH
-// residual as the fused stem's; see the characterization rows.
+// obvious drift this head was …" (pass 21) both flip true -> false, while
+// "Despite no evidence of a force-push this head was …" false-vetoes at every
+// head. Same CLAUSE_REACH residual as the fused stem's; see the
+// characterization rows.
 //
 // `obvious` joined the family in pass 21 as an exact synonym of `apparent` and
 // `evident`, which were already in it. Probing the same frame across 24
