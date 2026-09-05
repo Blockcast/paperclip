@@ -1071,7 +1071,12 @@ test("the retirement loop and its trailing-sleep guard cannot drift apart", () =
   const loop = fn.match(/for attempt in \$\(seq 1 "\$(\w+)"\); do/);
   assert.ok(loop, "the retirement loop must take its bound from a named constant, not `1 2 3`");
   const guard = fn.match(/if \(\( attempt < (\w+) \)\); then/);
-  assert.ok(guard, "the trailing sleep must be guarded by an explicit `if`, not `(( … )) && sleep`");
+  // "not a bare `(( … ))`" rather than "not `(( … )) && sleep`": the `&&`
+  // spelling does NOT abort under `set -e` (bash exempts the left side of an
+  // `&&` list), as the guarded comment now says. A BARE `(( … ))` as the loop
+  // body's last command is the rewrite that actually breaks, so that is the
+  // form this assertion exists to exclude -- the `if` resists both.
+  assert.ok(guard, "the trailing sleep must be guarded by an explicit `if`, not a bare `(( … ))`");
   assert.equal(
     guard[1],
     loop[1],
@@ -1336,10 +1341,13 @@ test("a non-retriable retirement write bails once and reports the cause", () => 
     /cannot retire the in-flight lock on sha256:deadbeef \(owner owner-nonce-1\)/,
     "the operator must be told WHICH lock could not be retired, by digest and owner",
   );
+  // Indented under its header, matching the read guard's convention. The bare
+  // /Forbidden/ this replaces passed with `sed 's/^/    /'` deleted (Ally,
+  // sugg 2); the anchored form is what makes the indentation load-bearing.
   assert.match(
     r.stderr,
-    /Forbidden/,
-    "kubectl's actual cause must reach stderr -- this is the whole point of the capture",
+    /^ {4}Error from server \(Forbidden\)/m,
+    "kubectl's actual cause must reach stderr indented -- this is the whole point of the capture",
   );
 });
 
@@ -1377,6 +1385,140 @@ test("a retirement write with no stderr still explains itself", () => {
   assert.doesNotMatch(
     r.stderr,
     /\(owner owner-nonce-1\):\s*$/,
+    "the message must not end at the colon it promises to expand on",
+  );
+});
+
+// Exercises RETIRE-ONLY mode's write bail the same way `runReleaseWrite` does
+// the release path's: the real loop, the real `clear_in_flight_lock`, only
+// kubectl stubbed. Ally's finding at 31219d45: the release half of this change
+// is mutation-covered and this half was not, so deleting retire-only's empty
+// guard -- or inverting its non-retriable test -- left the suite fully green.
+// That mattered more than a normal coverage gap because the change's own thesis
+// is that the two bails now fail IDENTICALLY, and that claim lived only in a
+// comment; the first divergence would have been silent.
+//
+// Driven rather than string-asserted, and driven through the real function
+// rather than by presetting CLEAR_IN_FLIGHT_LOCK_ERR, so the variable is proven
+// populated by the script's own `2>&1 >/dev/null` capture -- the same standard
+// the release harness sets, for the same reason.
+function runRetireOnlyWrite({ stderrText, attempts = 3 }) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-retire-write-"));
+  const countFile = path.join(dir, "replace_count");
+  // Retire-only mode is top-level script, not a function, so there is nothing
+  // to source: the loop is sliced out between two anchors that bracket it.
+  // The start anchor is the read-error tempfile's trap, which is unique to this
+  // mode -- anchoring on `for attempt in` would silently slice the release
+  // function's identically-spelled loop if the two ever swap order. The end
+  // anchor stops BEFORE the `fi` closing `if [[ -n "$RETIRE_IN_FLIGHT_ONLY" ]]`,
+  // whose opening half is not in the slice.
+  const retireStart = script.indexOf(`trap 'rm -f "$retire_err"' EXIT`);
+  assert.notEqual(retireStart, -1, "retire-only mode's read-error trap must exist to anchor this slice");
+  const retireEnd = script.indexOf("\nfi\n\n# Admissibility-probe pacing.");
+  assert.notEqual(retireEnd, -1, "the retire-only block must still end before the probe-pacing constants");
+  const retireRegion = script.slice(script.indexOf("\n", retireStart), retireEnd);
+  // Carries the annotation constants and the real clear_in_flight_lock, exactly
+  // as runReleaseWrite slices them.
+  const clearRegion = script.slice(
+    script.indexOf('LOCK_DIGEST_ANNOTATION="'),
+    script.indexOf("\n# Must stay in lockstep with the `maxApprovedApiDigests`"),
+  );
+  // `retire_err` is normally the mktemp above the slice; the loop only ever
+  // reads it on the READ failure path, which this harness never takes.
+  const harness = `set -euo pipefail
+NAMESPACE=paperclip-release-approvals
+CONFIGMAP=paperclip-api-approved-images
+RETIRE_ATTEMPTS=${attempts}
+ABANDON_IN_FLIGHT=sha256:cafe
+ABANDON_IN_FLIGHT_OWNER=owner-9
+retire_err=${JSON.stringify(path.join(dir, "retire_err"))}
+: >"$retire_err"
+${clearRegion}
+# get returns a lock whose digest and owner both match, so the loop clears the
+# ownership guard and actually attempts the write; replace fails with the text
+# under test, counting its attempts.
+kubectl() {
+  if [[ "\${1:-}" == "-n" ]]; then shift 2; fi
+  case "\${1:-}" in
+    get)
+cat <<'JSON'
+{"metadata":{"annotations":{
+"paperclip.blockcast.net/approval-in-flight-digest":"sha256:cafe",
+"paperclip.blockcast.net/approval-in-flight-owner":"owner-9"
+}}}
+JSON
+      ;;
+    replace)
+      echo x >>${JSON.stringify(countFile)}
+      printf '%s\\n' ${JSON.stringify(stderrText)} >&2
+      return 1
+      ;;
+  esac
+}
+# Stubbed so the retriable case does not spend the loop's linear backoff.
+sleep() { :; }
+${retireRegion}`;
+  const r = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  const writes = existsSync(countFile)
+    ? readFileSync(countFile, "utf8").split("\n").filter(Boolean).length
+    : 0;
+  return { status: r.status, stderr: r.stderr, writes };
+}
+
+test("retire-only mode's non-retriable write bails once and reports the cause", () => {
+  const r = runRetireOnlyWrite({ stderrText: 'Error from server (Forbidden): configmaps "x" is forbidden' });
+  assert.equal(r.writes, 1, "a non-retriable write must not be retried -- it fails the same way every time");
+  assert.equal(r.status, 1, "the retirement must report failure");
+  assert.match(
+    r.stderr,
+    /cannot retire the in-flight approval lock on sha256:cafe \(owner owner-9\)/,
+    "the operator must be told WHICH lock could not be retired, by digest and owner",
+  );
+  // Indented, matching the read guard directly above it in the same block. Both
+  // write paths gained `sed 's/^/    /'` in this pass and neither was asserted,
+  // so either could have been dropped with the suite green (Ally, sugg 2).
+  assert.match(
+    r.stderr,
+    /^ {4}Error from server \(Forbidden\)/m,
+    "kubectl's cause must reach stderr indented under its header, as the read guard does",
+  );
+});
+
+test("retire-only mode's conflicting write is still retried to exhaustion", () => {
+  // The polarity half: inverting the bail's `!` makes this bail at one attempt.
+  const r = runRetireOnlyWrite({
+    stderrText: "Operation cannot be fulfilled on configmaps: the object has been modified",
+  });
+  assert.equal(r.writes, 3, "a conflict must consume every attempt, not bail on the first");
+  assert.equal(r.status, 1, "exhausting the attempts still reports failure");
+  assert.doesNotMatch(
+    r.stderr,
+    /cannot retire the in-flight approval lock on/,
+    "the non-retriable message must not fire on a retriable conflict",
+  );
+  assert.match(
+    r.stderr,
+    /could not retire the in-flight approval lock on sha256:cafe/,
+    "exhaustion must still print this mode's own operator guidance",
+  );
+});
+
+test("retire-only mode's write with no stderr still explains itself", () => {
+  // Same guard, same reason, as the release path's: an empty capture matches
+  // none of the conflict vocabulary, so it lands on the non-retriable bail --
+  // correctly -- and must not print a header promising a cause and then a blank
+  // line. This is the case Ally measured as deletable with 59/59 still green.
+  const r = runRetireOnlyWrite({ stderrText: "" });
+  assert.equal(r.writes, 1, "an empty stderr proves no race, so it must not be retried");
+  assert.equal(r.status, 1, "the retirement must still report failure");
+  assert.match(
+    r.stderr,
+    /\(kubectl produced no error output\)/,
+    "an empty stderr must say so rather than leaving a dangling colon",
+  );
+  assert.doesNotMatch(
+    r.stderr,
+    /\(owner owner-9\):\s*$/,
     "the message must not end at the colon it promises to expand on",
   );
 });
