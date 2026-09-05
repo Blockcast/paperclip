@@ -282,6 +282,28 @@ describeEmbeddedPostgres("blocked-inbox count/list parity (BLO-31839)", () => {
     expect(count).toBe(0);
   });
 
+  it("stops matching q on a redacted external owner, on both count and list", async () => {
+    const { companyId } = await seedExternallyParkedRowWithCoveredBlocker(
+      "PKS",
+      parkDeclaredLateWithOwnerNamedEarly(),
+    );
+
+    const filters = { attention: "blocked" as const, status: "blocked", q: EXTERNAL_OWNER };
+    const [count, rows] = await Promise.all([
+      svc.count(companyId, filters),
+      svc.list(companyId, filters),
+    ]);
+
+    // `blockedInboxSearchText` searches the *redacted* description, and the external-wait payload
+    // sets `owner.label`/`action.detail` to null, so the owner exists nowhere in the searchable
+    // surface. Both sides must therefore return nothing. This is the count half of the redaction
+    // change — otherwise inferred rather than tested — and it is the assertion that fails if the
+    // search path is ever "optimised" back onto the raw column, which would make the owner
+    // findable by `q` while the response claims it was removed.
+    expect(count).toBe(rows.length);
+    expect(count).toBe(0);
+  });
+
   it("keeps count and list in parity for a q term inside the description cutoff", async () => {
     const { companyId } = await seedExternallyParkedRowWithCoveredBlocker("PKI", parkDeclaredEarly());
 
@@ -295,5 +317,103 @@ describeEmbeddedPostgres("blocked-inbox count/list parity (BLO-31839)", () => {
     // assertion there is not passing merely because both sides return zero.
     expect(count).toBe(rows.length);
     expect(count).toBe(1);
+  });
+
+  /**
+   * BLO-32045. The three tests below cover the *other* endpoint that serves
+   * `blockedInboxAttention`: `list({ includeBlockedInboxAttention: true })`, which is reached
+   * without `attention: "blocked"` and so never touched `listBlockedInboxIssues`' redaction.
+   */
+  function blockedInboxRow(rows: unknown[], issueId: string) {
+    const row = (rows as { id: string }[]).find((candidate) => candidate.id === issueId);
+    expect(row, `expected issue ${issueId} in the response`).toBeDefined();
+    return row as {
+      id: string;
+      description?: string | null;
+      blockedInboxAttention?: { redaction?: { externalDetailsRedacted?: boolean } } | null;
+    };
+  }
+
+  it("redacts on the general path too, not just when attention=blocked", async () => {
+    const { companyId, parkedId } = await seedExternallyParkedRowWithCoveredBlocker(
+      "PKG",
+      parkDeclaredLateWithOwnerNamedEarly(),
+    );
+
+    const rows = await svc.list(companyId, { includeBlockedInboxAttention: true });
+    const row = blockedInboxRow(rows, parkedId);
+
+    // Same contract as the `attention=blocked` path: the flag is a claim about *this* response's
+    // description, so setting it while spreading the raw row is a claim the caller cannot check.
+    // The general path spread `...row` verbatim, so it returned the owner in full.
+    expect(row.blockedInboxAttention?.redaction?.externalDetailsRedacted).toBe(true);
+    expect(row.description ?? "").not.toContain(EXTERNAL_OWNER);
+    expect(row.description ?? "").toContain("[redacted external wait detail]");
+  });
+
+  it("redacts on the general path for a user-context request", async () => {
+    const { companyId, parkedId } = await seedExternallyParkedRowWithCoveredBlocker(
+      "PKU",
+      parkDeclaredLateWithOwnerNamedEarly(),
+    );
+
+    // `list` builds its response in two separate literals — one for anonymous callers and one
+    // for callers with a user context (`unreadForUserId`/`touchedByUserId`/
+    // `inboxArchivedByUserId`). Both attached the verdict and neither redacted, so a fix applied
+    // to one would pass a test that only exercises the other. `inboxArchivedByUserId` is the
+    // context filter that selects rows rather than narrowing them: it is a `NOT EXISTS` over
+    // archive rows, and nothing here is archived.
+    const rows = await svc.list(companyId, {
+      includeBlockedInboxAttention: true,
+      inboxArchivedByUserId: randomUUID(),
+    });
+    const row = blockedInboxRow(rows, parkedId);
+
+    expect(row.blockedInboxAttention?.redaction?.externalDetailsRedacted).toBe(true);
+    expect(row.description ?? "").not.toContain(EXTERNAL_OWNER);
+    expect(row.description ?? "").toContain("[redacted external wait detail]");
+  });
+
+  it("returns the same description from both endpoints for the same issue", async () => {
+    const { companyId, parkedId } = await seedExternallyParkedRowWithCoveredBlocker(
+      "PKP",
+      parkDeclaredLateWithOwnerNamedEarly(),
+    );
+
+    const [blockedRows, generalRows] = await Promise.all([
+      svc.list(companyId, { attention: "blocked" as const, status: "blocked" }),
+      svc.list(companyId, { includeBlockedInboxAttention: true }),
+    ]);
+
+    // The per-endpoint assertions above would both still pass if the two paths redacted
+    // *differently* — e.g. if one re-parsed its own preview for needles and the other used the
+    // classifier's. Pin them to the same string so the paths cannot drift apart silently.
+    const blocked = blockedInboxRow(blockedRows, parkedId);
+    const general = blockedInboxRow(generalRows, parkedId);
+    expect(general.description).toBe(blocked.description);
+    expect(general.description ?? "").not.toContain(EXTERNAL_OWNER);
+  });
+
+  it("leaves the description untouched for a row with no external-wait redaction", async () => {
+    const { companyId, agentId } = await createCompany("PKN");
+    const description = `Ordinary work item mentioning ${EXTERNAL_OWNER} in passing.`;
+    const openId = await insertIssue({
+      companyId,
+      identifier: "PKN-1",
+      title: "Not externally parked",
+      status: "todo",
+      assigneeAgentId: agentId,
+      description,
+    });
+
+    const rows = await svc.list(companyId, { includeBlockedInboxAttention: true });
+    const row = blockedInboxRow(rows, openId);
+
+    // The redaction override is now unconditional on the general path, so this is the control
+    // that keeps it scoped: a row that never asserted `externalDetailsRedacted` must come back
+    // byte-identical, including a string that merely looks like an owner. Without this, a fix
+    // that redacted every row would pass every assertion above.
+    expect(row.blockedInboxAttention?.redaction?.externalDetailsRedacted ?? false).toBe(false);
+    expect(row.description).toBe(description);
   });
 });

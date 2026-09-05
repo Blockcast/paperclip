@@ -4582,6 +4582,31 @@ function blockedInboxResponseDescription(entry: BlockedInboxAttentionEntry, row:
   return redactExternalWaitDescription(row.description, entry.externalWait);
 }
 
+/**
+ * The two response fields that have to move together whenever a caller asks for blocked-inbox
+ * attention.
+ *
+ * BLO-32045: `blockedInboxAttention.redaction.externalDetailsRedacted` is not a property of the
+ * issue, it is a claim about *this response's* `description`. Attaching the verdict without also
+ * overriding the description publishes a claim the caller has no way to check. Two paths serve
+ * this shape — `listBlockedInboxIssues` and `list({ includeBlockedInboxAttention })` — and only
+ * the first redacted, so the flag was false on the general path for every externally-parked row
+ * (a strictly wider population than the late-declared case BLO-31839 fixed, which additionally
+ * needed the declaration to sit past `ISSUE_LIST_DESCRIPTION_MAX_CHARS`). Emitting both fields
+ * from one place is what makes "asserted redacted" and "actually redacted" hard to separate
+ * again. `entry.externalWait` stays internal: it holds the very strings being removed.
+ */
+function blockedInboxAttentionResponseFields(
+  entry: BlockedInboxAttentionEntry | undefined,
+  row: BlockedInboxIssueRow,
+) {
+  if (!entry) return { description: row.description, blockedInboxAttention: null };
+  return {
+    description: blockedInboxResponseDescription(entry, row),
+    blockedInboxAttention: entry.attention,
+  };
+}
+
 function blockedInboxSearchText(entry: BlockedInboxAttentionEntry, row: BlockedInboxIssueRow) {
   const attention = entry.attention;
   return [
@@ -7715,7 +7740,9 @@ export function issueService(db: Db) {
             ...(includeBlockedBy ? { blockedBy: blockedByMap.get(row.id) ?? [] } : {}),
             lastActivityAt,
             ...(blockerAttentionByIssueId.has(row.id) ? { blockerAttention: blockerAttentionByIssueId.get(row.id) } : {}),
-            ...(includeBlockedInboxAttention ? { blockedInboxAttention: blockedInboxAttentionByIssueId.get(row.id)?.attention ?? null } : {}),
+            ...(includeBlockedInboxAttention
+              ? blockedInboxAttentionResponseFields(blockedInboxAttentionByIssueId.get(row.id), row)
+              : {}),
             ...(includeLiveDescendantSummary ? { liveDescendantCount: liveDescendantCountByIssueId.get(row.id) ?? 0 } : {}),
             ...(productivityReviewByIssueId.has(row.id)
               ? { productivityReview: productivityReviewByIssueId.get(row.id) }
@@ -7739,7 +7766,9 @@ export function issueService(db: Db) {
           ...(includeBlockedBy ? { blockedBy: blockedByMap.get(row.id) ?? [] } : {}),
           lastActivityAt,
           ...(blockerAttentionByIssueId.has(row.id) ? { blockerAttention: blockerAttentionByIssueId.get(row.id) } : {}),
-          ...(includeBlockedInboxAttention ? { blockedInboxAttention: blockedInboxAttentionByIssueId.get(row.id)?.attention ?? null } : {}),
+          ...(includeBlockedInboxAttention
+            ? blockedInboxAttentionResponseFields(blockedInboxAttentionByIssueId.get(row.id), row)
+            : {}),
           ...(includeLiveDescendantSummary ? { liveDescendantCount: liveDescendantCountByIssueId.get(row.id) ?? 0 } : {}),
           ...(productivityReviewByIssueId.has(row.id)
             ? { productivityReview: productivityReviewByIssueId.get(row.id) }
