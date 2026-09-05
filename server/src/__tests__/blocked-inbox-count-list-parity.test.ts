@@ -54,6 +54,22 @@ function parkDeclaredEarly() {
   return `${EXTERNAL_WAIT_DECLARATION}\n\nContext follows.\n${"filler ".repeat(400)}`;
 }
 
+const EXTERNAL_OWNER = "Staging Traffic Ops operator";
+
+/**
+ * A late-declared park that also names the owner in prose *inside* the cutoff.
+ *
+ * This is the shape that makes the redaction contract observable. The `External owner:` /
+ * `External action:` lines are past the projection cutoff either way, so line-stripping alone
+ * cannot be caught — only a needle set carried from the classifier removes the owner from the
+ * preview the response actually returns.
+ */
+function parkDeclaredLateWithOwnerNamedEarly() {
+  const lede = `Waiting on the ${EXTERNAL_OWNER} to run the repair.`;
+  const body = `${lede}\n${"context ".repeat(200)}`.slice(0, ISSUE_LIST_DESCRIPTION_MAX_CHARS + 200);
+  return `${body}\n\n${EXTERNAL_WAIT_DECLARATION}\n`;
+}
+
 describeEmbeddedPostgres("blocked-inbox count/list parity (BLO-31839)", () => {
   let db!: ReturnType<typeof createDb>;
   let svc!: ReturnType<typeof issueService>;
@@ -218,6 +234,29 @@ describeEmbeddedPostgres("blocked-inbox count/list parity (BLO-31839)", () => {
     expect(state(earlyRows)).toBe(state(lateRows));
   });
 
+  it("actually redacts the external owner it reports as redacted, on a late-declared park", async () => {
+    const { companyId, parkedId } = await seedExternallyParkedRowWithCoveredBlocker(
+      "PKR",
+      parkDeclaredLateWithOwnerNamedEarly(),
+    );
+
+    const rows = await svc.list(companyId, { attention: "blocked" as const, status: "blocked" });
+    expect(rows.map((row) => row.id)).toEqual([parkedId]);
+    const row = rows[0] as {
+      description?: string | null;
+      blockedInboxAttention?: { redaction?: { externalDetailsRedacted?: boolean } };
+    };
+
+    // The response asserts the owner/action details were stripped...
+    expect(row.blockedInboxAttention?.redaction?.externalDetailsRedacted).toBe(true);
+    // ...so they have to actually be gone. Redaction used to re-derive its needles by re-parsing
+    // the truncated preview, which returns `null` for a park declared past the cutoff — so for
+    // exactly the population the parity fix surfaces, the flag was set and no value substitution
+    // ran, returning the owner verbatim. The needles now come from the classifier's own parse.
+    expect(row.description ?? "").not.toContain(EXTERNAL_OWNER);
+    expect(row.description ?? "").toContain("[redacted external wait detail]");
+  });
+
   it("keeps count and list in parity for a q term past the description cutoff", async () => {
     const marker = "zqxjlate";
     const { companyId } = await seedExternallyParkedRowWithCoveredBlocker("PKQ", parkDeclaredEarly());
@@ -237,6 +276,10 @@ describeEmbeddedPostgres("blocked-inbox count/list parity (BLO-31839)", () => {
     // count previously searched the untruncated column, so a term past the cutoff was countable
     // but not enumerable — the mirror image of the external-wait divergence.
     expect(count).toBe(rows.length);
+    // Pin the value, not just the parity: both sides are legitimately 0 here, so `count ===
+    // rows.length` alone would also pass if a regression made this fixture return 1 on both
+    // sides. The zero-zero control below runs on a different fixture and cannot catch that.
+    expect(count).toBe(0);
   });
 
   it("keeps count and list in parity for a q term inside the description cutoff", async () => {
