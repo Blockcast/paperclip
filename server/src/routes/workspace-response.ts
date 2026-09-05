@@ -1,6 +1,7 @@
 import type { Request } from "express";
-import type { ExecutionWorkspace, ProjectWorkspace } from "@paperclipai/shared";
+import type { AgentEnvConfig, ExecutionWorkspace, ProjectWorkspace } from "@paperclipai/shared";
 import type { accessService } from "../services/index.js";
+import { maskProjectEnv } from "./project-env-response.js";
 
 /**
  * PEN-2852 — withholding boundary for workspace runtime configuration on response bodies.
@@ -119,13 +120,19 @@ export function publicProjectWorkspaces(
 export function publicProject<T extends {
   workspaces: ProjectWorkspace[];
   primaryWorkspace: ProjectWorkspace | null;
+  env?: AgentEnvConfig | null;
 }>(project: T, viewer: WorkspaceRuntimeViewer): T {
-  if (viewer.revealRuntimeConfig) return project;
+  // PEN-3033: the `env` mask is applied FIRST and is not gated on `viewer`. The runtime-config
+  // withholding below is an entitlement decision; a plain env value is disclosed to nobody, so it
+  // must not sit behind the `revealRuntimeConfig` early return — an entitled viewer would
+  // otherwise take the raw row on the very next line.
+  const masked = maskProjectEnv(project);
+  if (viewer.revealRuntimeConfig) return masked;
   return {
-    ...project,
-    workspaces: publicProjectWorkspaces(project.workspaces, viewer),
-    primaryWorkspace: project.primaryWorkspace
-      ? publicProjectWorkspace(project.primaryWorkspace, viewer)
+    ...masked,
+    workspaces: publicProjectWorkspaces(masked.workspaces, viewer),
+    primaryWorkspace: masked.primaryWorkspace
+      ? publicProjectWorkspace(masked.primaryWorkspace, viewer)
       : null,
   };
 }
@@ -133,6 +140,7 @@ export function publicProject<T extends {
 export function publicProjects<T extends {
   workspaces: ProjectWorkspace[];
   primaryWorkspace: ProjectWorkspace | null;
+  env?: AgentEnvConfig | null;
 }>(projects: T[], viewer: WorkspaceRuntimeViewer): T[] {
   return projects.map((project) => publicProject(project, viewer));
 }

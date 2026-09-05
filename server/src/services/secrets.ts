@@ -63,9 +63,13 @@ import type {
 import { isSecretProviderClientError } from "../secrets/types.js";
 import { authorizationDeniedDetails, authorizationService } from "./authorization.js";
 import { findActiveServerAdapter } from "../adapters/index.js";
+import { REDACTED_SENTINEL } from "./secret-sentinel.js";
+
+// Re-exported for existing importers of this module; `./secret-sentinel.js` is the single source of
+// truth. See that file for why the constant does not live here.
+export { REDACTED_SENTINEL };
 
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const REDACTED_SENTINEL = "***REDACTED***";
 const COMING_SOON_SECRET_PROVIDERS: ReadonlySet<SecretProvider> = new Set([
   "gcp_secret_manager",
   "vault",

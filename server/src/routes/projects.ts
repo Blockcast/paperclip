@@ -38,6 +38,7 @@ import {
   publicProjectWorkspaces,
   resolveWorkspaceRuntimeViewer,
 } from "./workspace-response.js";
+import { maskProjectEnv, restoreMaskedEnvBindings } from "./project-env-response.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { appendWithCap } from "../adapters/utils.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
@@ -247,10 +248,15 @@ export function projectRoutes(db: Db) {
       body.archivedAt = new Date(body.archivedAt);
     }
     if (body.env !== undefined) {
-      body.env = await secretsSvc.normalizeEnvBindingsForPersistence(existing.companyId, body.env, {
-        strictMode: strictSecretsMode,
-        fieldPath: "env",
-      });
+      // PEN-3033: the read side masks plain values, and the editor re-emits every row on save, so
+      // an incoming masked value means "keep the stored binding" rather than a literal to persist.
+      // Merged BEFORE normalization so `normalizeEnvBindingsForPersistence` still sees — and still
+      // refuses — any placeholder that has no stored binding behind it.
+      body.env = await secretsSvc.normalizeEnvBindingsForPersistence(
+        existing.companyId,
+        restoreMaskedEnvBindings(body.env, existing.env),
+        { strictMode: strictSecretsMode, fieldPath: "env" },
+      );
     }
     const project = await svc.update(id, body);
     if (!project) {
@@ -688,8 +694,13 @@ export function projectRoutes(db: Db) {
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
     if (!existing) return;
     // `svc.remove` returns the bare deleted row — no `workspaces` / `primaryWorkspace` — so there is
-    // no withheld material on this response. Named `deletedProjectRow` rather than `project` so that
-    // is legible at the response site instead of being an unexplained exemption in the CI guard.
+    // no withheld WORKSPACE RUNTIME material on this response. Named `deletedProjectRow` rather than
+    // `project` so that is legible at the response site instead of being an unexplained exemption in
+    // the CI guard.
+    //
+    // PEN-3033: that exemption is axis-specific and does NOT extend to `env`. Runtime config lives
+    // under `workspaces[]`, which this row lacks; `env` lives on the project row itself, which this
+    // row still carries. So this exit skips `publicProject` and masks directly.
     const deletedProjectRow = await svc.remove(id);
     if (!deletedProjectRow) {
       res.status(404).json({ error: "Project not found" });
@@ -707,7 +718,7 @@ export function projectRoutes(db: Db) {
       entityId: deletedProjectRow.id,
     });
 
-    res.json(deletedProjectRow);
+    res.json(maskProjectEnv(deletedProjectRow));
   });
 
   return router;
