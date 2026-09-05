@@ -227,6 +227,7 @@ import {
   type CommentEffectIntent,
   type CommentEffectRow,
 } from "../services/issue-comment-effects.js";
+import { maskProjectEnv } from "./project-env-response.js";
 
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
@@ -8469,8 +8470,12 @@ export function issueRoutes(
       actor: getActorInfo(req),
       activeRecoveryAction,
     });
+    // PEN-3033: `listByIds` is a full-row select, so these carry `env` with plain values in the
+    // clear. The primary project on this very response is already stripped (`compactIssueProject`
+    // sets `env: null`) — the class was closed in one direction only, and the mentioned projects
+    // handed the same material out one key over.
     const mentionedProjects = mentionedProjectIds.length > 0
-      ? await projectsSvc.listByIds(issue.companyId, mentionedProjectIds)
+      ? (await projectsSvc.listByIds(issue.companyId, mentionedProjectIds)).map(maskProjectEnv)
       : [];
     const currentExecutionWorkspace = issue.executionWorkspaceId
       ? await executionWorkspacesSvc.getById(issue.executionWorkspaceId)
