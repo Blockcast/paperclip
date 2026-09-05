@@ -84,9 +84,13 @@ the plugin's recover-aggregate-firing route.
 
 The failure is per-alert, but one held aggregate fails the whole delivery batch
 so Alertmanager retries it — which is why a single wedged key can stall all
-webhook alert delivery. A fence abandoned by a dead process now self-clears via
-its slot's next worker (BLO-31036), so a *sustained* failure means the holder is
-live or in another slot.
+webhook alert delivery. The wait budget is spent at most once per aggregate key
+per delivery, not once per alert: the first alert to exhaust it marks that key,
+and the rest of the batch fails fast rather than each waiting in turn. So a
+wedged fence delays a delivery by roughly one budget, not by one per alert — a
+batch of 10 costs seconds, not tens of seconds. A fence abandoned by a dead
+process now self-clears via its slot's next worker (BLO-31036), so a *sustained*
+failure means the holder is live or in another slot.
 
 **Do not diagnose this from
 `alertmanager_notifications_failed_total{integration="webhook"}`.** It undercounts

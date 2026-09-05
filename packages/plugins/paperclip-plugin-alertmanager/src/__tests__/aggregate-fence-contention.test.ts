@@ -117,6 +117,35 @@ const firingPayloadFor = (
   ],
 });
 
+/**
+ * A batch of alerts about distinct objects that all share the alertname — so
+ * they all map to ONE aggregate key, which is exactly the shape Alertmanager
+ * delivers when it groups by alertname.
+ */
+const firingBatchOf = (size: number): AlertmanagerWebhookPayload => ({
+  version: "4",
+  status: "firing",
+  receiver: "paperclip",
+  groupLabels: { alertname: ALERTNAME },
+  commonLabels: { alertname: ALERTNAME, severity: "critical" },
+  commonAnnotations: {},
+  externalURL: "http://alertmanager.monitoring.svc:9093",
+  alerts: Array.from({ length: size }, (_, i) => ({
+    status: "firing" as const,
+    fingerprint: `fp-batch-${i}`,
+    labels: {
+      alertname: ALERTNAME,
+      severity: "critical",
+      namespace: `ns-${i}`,
+      cronjob: `cronjob-${i}`,
+    },
+    annotations: { summary: `cronjob-${i} has not succeeded recently` },
+    startsAt: "2026-09-01T00:00:00Z",
+    endsAt: "0001-01-01T00:00:00Z",
+    generatorURL: "http://prometheus/graph",
+  })),
+});
+
 function mkCtx(overrides: { onIssueCreate?: () => Promise<void> } = {}) {
   const logger = {
     info: vi.fn(),
@@ -166,7 +195,7 @@ const deliver = (
   ctx: PluginContext,
   payload: AlertmanagerWebhookPayload,
   requestId: string,
-  policy?: AggregateFenceWaitPolicy,
+  policy?: Partial<AggregateFenceWaitPolicy>,
 ) =>
   handleWebhook(
     ctx,
@@ -237,8 +266,20 @@ describe("PEN-3013 — two distinct objects under one alertname both deliver", (
     );
 
     // Wait until A genuinely holds the fence before B attempts, so B's first
-    // claim is guaranteed to be refused.
-    while (!firstIsHoldingFence) await new Promise((r) => setTimeout(r, 1));
+    // claim is guaranteed to be refused. Bounded: if A never reaches
+    // issues.create (it threw earlier, or a future change stops routing
+    // through it) this must report *that*, not hang to the vitest timeout and
+    // surface as a timeout with the real defect invisible.
+    const barrierDeadline = Date.now() + 5_000;
+    while (!firstIsHoldingFence) {
+      if (Date.now() > barrierDeadline) {
+        throw new Error(
+          "delivery A never reached issues.create, so it never held the fence; " +
+            "the contention this test asserts was never set up",
+        );
+      }
+      await new Promise((r) => setTimeout(r, 1));
+    }
 
     const b = deliver(
       ctxB,
@@ -381,7 +422,78 @@ describe("PEN-3013 — a genuinely wedged fence still fails the delivery", () =>
     expect(slept.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(1_000);
     // Backs off rather than hot-looping, and clamps at maxDelayMs.
     expect(Math.max(...slept)).toBeLessThanOrEqual(100);
-    expect(slept[0]).toBeLessThan(slept[slept.length - 1]);
+    // Growth is asserted on the *unclamped prefix*, which is the only part that
+    // expresses the backoff. With random() pinned to 1 the schedule is
+    // deterministic: ceiling = min(maxDelayMs, initialDelayMs * 2**attempt).
+    // Comparing first-to-last instead would pass on the size of the trailing
+    // budget remainder — an assertion that holds even with the growth removed.
+    expect(slept.slice(0, 4)).toEqual([10, 20, 40, 80]);
+  });
+
+  it("spends one budget per aggregate key for a whole batch, not one per alert", async () => {
+    // The budget is taken per call, so without a per-delivery memo a batch of N
+    // alerts costs N budgets against a fence nothing in this delivery can
+    // clear. That lands on precisely the wrong population: Alertmanager groups
+    // by alertname and the aggregate key is [alertname, dedupe-domain], so one
+    // batch is exactly the set that maps to one fence.
+    await db.query(
+      `INSERT INTO ${FENCES}
+         (company_id, aggregate_key, phase, firing_token, owner_instance_id, owner_slot)
+       VALUES ($1, $2, 'firing', $3, $4, $5)`,
+      [
+        COMPANY_ID,
+        `alert-aggregate:v1:["${ALERTNAME}",null]`,
+        "token-held-by-live-sibling",
+        SELF.instanceId,
+        SELF.slot,
+      ],
+    );
+    const { ctx } = mkCtx();
+
+    let clock = 0;
+    const slept: number[] = [];
+    const policy = fastPolicy({
+      budgetMs: 1_000,
+      initialDelayMs: 10,
+      maxDelayMs: 100,
+      now: () => clock,
+      sleep: async (ms) => {
+        slept.push(ms);
+        clock += ms;
+      },
+      random: () => 1,
+    });
+
+    const BATCH_SIZE = 10;
+    const rejection = await deliver(
+      ctx,
+      firingBatchOf(BATCH_SIZE),
+      "req-batch",
+      policy,
+    ).catch((err: unknown) => err);
+
+    expect(rejection).toBeInstanceOf(AlertDeliveryIncompleteError);
+
+    // The headline property: total waiting is bounded by ONE budget for the
+    // whole batch. Without the memo this is ~10x over.
+    expect(slept.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(1_000);
+
+    // ...and the saving comes from alerts 2..N not waiting, not from the first
+    // one being cut short: the first alert still spends a real budget.
+    expect(slept.length).toBeGreaterThan(1);
+
+    // Every alert is still reported failed, so the cheaper failure path costs
+    // no coverage — nothing is silently dropped (BLO-20467).
+    expect(
+      (rejection as AlertDeliveryIncompleteError).fingerprints,
+    ).toHaveLength(BATCH_SIZE);
+
+    // The holder's generation is untouched throughout — waiting claims nothing.
+    const rows = await db.query<{ firing_token: string | null }>(
+      `SELECT firing_token FROM ${FENCES} WHERE company_id = $1`,
+      [COMPANY_ID],
+    );
+    expect(rows.rows[0]?.firing_token).toBe("token-held-by-live-sibling");
   });
 
   it("jitters its delays so a restart fan-out does not re-collide in lockstep", async () => {

@@ -465,10 +465,12 @@ async function beginAggregateFiring(
  * The fence is only ever held for one delivery's issue RPCs, so the holder
  * clears in the sub-second range and waiting nearly always beats failing. The
  * budget is wall-clock and deliberately modest, because it is also paid on the
- * path it cannot help: against a genuinely wedged fence every delivery now
- * occupies a request slot for the full budget before failing, and Alertmanager
- * keeps retrying throughout. It does not need to cover the worst-case fan-out —
- * only to collapse the common case. A delivery that loses the race anyway still
+ * path it cannot help: against a genuinely wedged fence a delivery now occupies
+ * a request slot for the full budget before failing, and Alertmanager keeps
+ * retrying throughout. That cost is per aggregate key per delivery, not per
+ * alert — see {@link AggregateFenceWedgedMemo}, without which it would scale
+ * with batch size. It does not need to cover the worst-case fan-out — only to
+ * collapse the common case. A delivery that loses the race anyway still
  * throws exactly as it did before, so it is retried, not lost; the
  * transient/permanent taxonomy is untouched.
  *
@@ -500,6 +502,26 @@ const DEFAULT_AGGREGATE_FENCE_WAIT: AggregateFenceWaitPolicy = {
 };
 
 /**
+ * Aggregate keys this delivery has already spent a full wait budget on without
+ * winning the claim. Scoped to one webhook delivery, like {@link FallbackOwnerMemo}
+ * and for the same reason: a storm is the case that matters.
+ *
+ * The budget is per *call*, so without this a batch of N alerts costs N budgets
+ * against a fence nothing in this delivery can clear — and that lands on
+ * precisely the wrong population, because Alertmanager groups by alertname and
+ * the aggregate key is `[alertname, dedupe-domain]`, so one batch is exactly the
+ * set that maps to one fence. A 10-alert `CronJobSuccessStale` batch would hold a
+ * request slot for ~30s where it previously failed in milliseconds, worst under
+ * the restart fan-out this change exists to fix.
+ *
+ * Alerts 2..N gain nothing by waiting: the first already established that this
+ * key is not becoming claimable on this delivery's timescale, and none of them
+ * can release it. So they get one attempt and no wait — cheaper, and more
+ * honest about the information available.
+ */
+type AggregateFenceWedgedMemo = Set<string>;
+
+/**
  * `beginAggregateFiring`, but waits out a fence held by a live holder instead of
  * failing the delivery on first refusal (PEN-3013).
  *
@@ -513,13 +535,29 @@ const DEFAULT_AGGREGATE_FENCE_WAIT: AggregateFenceWaitPolicy = {
  * finishing a terminal transition, which is exactly the case the original
  * comment says should "retry after the terminal transition" — previously that
  * retry had to arrive as a whole new HTTP delivery.
+ *
+ * The budget is spent at most once per aggregate key per delivery — see
+ * {@link AggregateFenceWedgedMemo}. Distinct keys still each get their own
+ * budget, because a claim refused on one fence says nothing about another.
  */
 async function claimAggregateFiringWaiting(
   ctx: PluginContext,
   companyId: string,
   aggregateKey: string,
-  policy: AggregateFenceWaitPolicy = DEFAULT_AGGREGATE_FENCE_WAIT,
+  policyOverrides?: Partial<AggregateFenceWaitPolicy>,
+  wedgedKeys?: AggregateFenceWedgedMemo,
 ): Promise<AggregateFiringClaim> {
+  const policy: AggregateFenceWaitPolicy = policyOverrides
+    ? { ...DEFAULT_AGGREGATE_FENCE_WAIT, ...policyOverrides }
+    : DEFAULT_AGGREGATE_FENCE_WAIT;
+
+  // Still attempt once: the holder may have released since the alert that gave
+  // up, and skipping the attempt entirely would fail an alert that could have
+  // been served. Only the *waiting* is skipped.
+  if (wedgedKeys?.has(aggregateKey)) {
+    return beginAggregateFiring(ctx, companyId, aggregateKey);
+  }
+
   const startedAt = policy.now();
   let attempt = 0;
   let claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
@@ -527,7 +565,10 @@ async function claimAggregateFiringWaiting(
   while (!claim.ok) {
     const elapsedMs = policy.now() - startedAt;
     const remainingMs = policy.budgetMs - elapsedMs;
-    if (remainingMs <= 0) return claim;
+    if (remainingMs <= 0) {
+      wedgedKeys?.add(aggregateKey);
+      return claim;
+    }
 
     // Exponential with full jitter, clamped to whatever budget is left so the
     // total wait cannot overrun even on the final attempt.
@@ -1211,7 +1252,8 @@ export async function handleFiring(
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
   fallbackOwnerMemo?: FallbackOwnerMemo,
-  fenceWaitPolicy?: AggregateFenceWaitPolicy,
+  fenceWaitPolicy?: Partial<AggregateFenceWaitPolicy>,
+  fenceWedgedMemo?: AggregateFenceWedgedMemo,
 ): Promise<void> {
   // Resolved up front because it now scopes the state read, not just issue
   // creation. Without it there is no namespace to look in, so a delivery that
@@ -1276,6 +1318,7 @@ export async function handleFiring(
     companyId,
     aggregateKey,
     fenceWaitPolicy,
+    fenceWedgedMemo,
   );
   if (!firingClaim.ok) {
     throw new Error(
@@ -2190,7 +2233,7 @@ export async function handleWebhook(
   config: AlertmanagerPluginConfig,
   authenticated: boolean,
   input: PluginWebhookInput,
-  fenceWaitPolicy?: AggregateFenceWaitPolicy,
+  fenceWaitPolicy?: Partial<AggregateFenceWaitPolicy>,
 ): Promise<void> {
   if (input.endpointKey !== WEBHOOK_KEYS.alertmanager) {
     ctx.logger.warn(
@@ -2231,6 +2274,10 @@ export async function handleWebhook(
   // matters: without it, every ownerless alert in the batch repeats the same
   // company-wide agent lookup.
   const fallbackOwnerMemo: FallbackOwnerMemo = new Map();
+  // Same scope, same reason — see AggregateFenceWedgedMemo. Bounds the fence
+  // wait at one budget per aggregate key per delivery instead of one per alert,
+  // so a wedged fence stays O(1) in batch size on the failure path.
+  const fenceWedgedMemo: AggregateFenceWedgedMemo = new Set();
 
   for (const alert of body.alerts) {
     if (!alertMatchesLabelFilter(alert, config.acceptOnlyLabels)) {
@@ -2293,7 +2340,14 @@ export async function handleWebhook(
           }
           continue;
         }
-        await handleFiring(ctx, config, alert, fallbackOwnerMemo, fenceWaitPolicy);
+        await handleFiring(
+          ctx,
+          config,
+          alert,
+          fallbackOwnerMemo,
+          fenceWaitPolicy,
+          fenceWedgedMemo,
+        );
       } else if (status === "resolved") {
         // Reached with BOTH policy gates above deliberately bypassed — this
         // path is creation-only, exactly like the severity floor in

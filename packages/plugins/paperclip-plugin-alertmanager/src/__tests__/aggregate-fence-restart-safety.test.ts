@@ -220,16 +220,13 @@ function mkCtx() {
  * how long a loser waits, so they run on a compressed budget — the wait itself
  * is covered in `aggregate-fence-contention.test.ts`.
  */
-const REFUSAL_FAST_WAIT: AggregateFenceWaitPolicy = {
+const REFUSAL_FAST_WAIT: Partial<AggregateFenceWaitPolicy> = {
   budgetMs: 30,
   initialDelayMs: 2,
   maxDelayMs: 10,
-  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-  now: () => Date.now(),
-  random: () => Math.random(),
 };
 
-const deliver = (ctx: PluginContext, fenceWait?: AggregateFenceWaitPolicy) =>
+const deliver = (ctx: PluginContext, fenceWait?: Partial<AggregateFenceWaitPolicy>) =>
   handleWebhook(
     ctx,
     baseConfig(),
