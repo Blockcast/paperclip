@@ -38,7 +38,11 @@
 # "Currently running" means a rollout that has actually landed and is serving,
 # not merely one that was written to the pod template — a digest applied by a
 # failed deploy stays in spec.template forever, and pinning that would burn the
-# reserved slot on an image which never carried traffic.
+# reserved slot on an image which never carried traffic. Once that has happened
+# the Deployment no longer names the last healthy digest at all, so the previous
+# ReplicaSet is consulted instead (BLO-31842); that read needs get+list on
+# apps/replicasets for the deploy identity, and says so in the log when it does
+# not have them, rather than degrading in silence.
 #
 # An approval holds an in-flight lock until its rollout actually lands, so two
 # releases cannot rotate the ring underneath each other. Retiring that lock —
@@ -837,20 +841,156 @@ live_deployment_completed_digest() {
 # the previous age-ordered behaviour, never fail an otherwise valid release.
 # Tightening the evidence therefore costs no availability -- a rollout in flight,
 # or one that never landed, simply goes unpinned.
+#
+# Declining to believe the spec is correct but not sufficient on its own, because
+# nothing then names the last healthy digest either and the ring is back to pure
+# age ordering -- the same wedge, one failure later (BLO-31842). The previous
+# ReplicaSet is the object that still names it, so a spec that fails the serving
+# gate falls back to serving_replicaset_image below.
 live_running_digest() {
   local live_json image
   live_json="$("${deploy_kubectl[@]}" -n "$DEPLOY_NAMESPACE" \
     get deployment "$DEPLOYMENT" -o json 2>/dev/null)" || return 0
-  jq -e "$ROLLOUT_SERVING_JQ" <<<"$live_json" >/dev/null 2>&1 || return 0
-  image="$(jq -r '
-    [ .spec.template.spec.containers[]?.image // empty ] as $images
-    | if ($images | length) > 0 and (($images | unique | length) == 1)
-      then $images[0]
-      else ""
-      end
-  ' <<<"$live_json" 2>/dev/null)" || return 0
+  if jq -e "$ROLLOUT_SERVING_JQ" <<<"$live_json" >/dev/null 2>&1; then
+    image="$(jq -r '
+      [ .spec.template.spec.containers[]?.image // empty ] as $images
+      | if ($images | length) > 0 and (($images | unique | length) == 1)
+        then $images[0]
+        else ""
+        end
+    ' <<<"$live_json" 2>/dev/null)" || return 0
+  else
+    image="$(serving_replicaset_image "$live_json")" || return 0
+  fi
   [[ "$image" == "${IMAGE_REPOSITORY}@sha256:"* ]] || return 0
   printf '%s\n' "${image#*@}"
+}
+
+# The image carried by the one ReplicaSet of this Deployment that still has ready
+# pods, or empty. Reached only when the Deployment's own template has failed the
+# serving gate -- typically because a rollout was applied and never became ready,
+# which leaves spec.template naming a digest that never carried traffic while the
+# previous ReplicaSet keeps serving the one that did.
+#
+# EXACTLY ONE serving ReplicaSet is required, which is deliberately stricter than
+# "the newest one that has ready pods". Two ReplicaSets with ready pods means both
+# digests are serving and neither is "the running one"; naming the newer would pin
+# a half-rolled digest that is quite possibly the one about to fail. The two rules
+# only ever disagree in that case, and there the strict one is never worse -- for
+# either of the two ways to reach it:
+#
+#   - A roll still moving. The newer digest is usually the one being approved right
+#     now, which build_approval_ring already holds in slot 0 and discards as not
+#     distinct, so pinning it would be a no-op anyway.
+#   - A roll stalled part-way, which is reachable here rather than hypothetical.
+#     With maxSurge: 1 / maxUnavailable: 0 (values.yaml api.maxSurge) the old
+#     ReplicaSet scales 2->1 as soon as the first new pod goes ready, so a second
+#     new pod that never schedules parks the Deployment at old=1 ready / new=1
+#     ready indefinitely -- and deployment-api.yaml hard-enforces DoNotSchedule
+#     spread across nodes for pods of the SAME ReplicaSet (BLO-20901), so losing a
+#     node to capacity holds that surge pod Pending. Here the newer digest is the
+#     BROKEN one rather than the one being approved, so pinning it would be
+#     actively worse than pinning nothing.
+#
+# So do not "fix" the ambiguous case by taking the newest: in the first case that
+# buys nothing, and in the second it pins the digest that is currently failing.
+#
+# ReplicaSets are matched by the Deployment's own selector AND by an ownerReference
+# to its uid. The selector alone is server-side narrowing; the uid is what makes it
+# exact, so an overlapping selector elsewhere in the namespace cannot contribute a
+# rollback target for a different workload.
+#
+# A failed list is REPORTED rather than swallowed. This reader needs `get`/`list`
+# on apps/replicasets for the deploy identity, and as of 2026-09-04 the deploy SA
+# (system:serviceaccount:paperclip:paperclip-ci-deploy) holds them only through
+# RoleBinding/paperclip-ci-deploy-admin -> ClusterRole/admin, which carries a
+# deprecation annotation and whose removal is tracked at BLO-21598. The scoped
+# replacement Role/paperclip-ci-deploy grants apps/{deployments,statefulsets} and
+# no replicasets rule at all. So the day that cutover lands, this reader starts
+# returning empty on every release -- silently, with every stubbed unit test in
+# scripts/approve-paperclip-api-digest.test.js still green, because they stub
+# kubectl. The warning below is what makes that visible in the deploy log instead.
+# It stays a warning: this is still an availability safeguard, not a gate.
+serving_replicaset_image() {
+  local live_json="$1"
+  local selector uid rs_json rs_err rs_status state_dir state_dir_owned="" image=""
+
+  selector="$(jq -r '
+    [ (.spec.selector.matchLabels // {}) | to_entries[] | "\(.key)=\(.value)" ]
+    | join(",")
+  ' <<<"$live_json" 2>/dev/null)" || return 0
+  uid="$(jq -r '.metadata.uid // ""' <<<"$live_json" 2>/dev/null)" || return 0
+
+  # Warn-once markers and the stderr capture live in a directory the CALLER owns.
+  # Both properties matter and neither is available any other way: this function
+  # runs inside $( ), so a shell variable set here cannot survive back to the
+  # rotate loop that re-reads the digest on every 409, and a `local` path cannot
+  # be seen by the EXIT trap that clears the script's other temp files. A file in
+  # a directory the caller minted is visible to both. When no caller directory
+  # exists -- the extracted-function unit tests, which source this on its own --
+  # an ephemeral one is minted and removed before returning, so the markers are
+  # per-invocation there and nothing is left behind either way.
+  state_dir="${rs_state_dir:-}"
+  if [[ -z "$state_dir" || ! -d "$state_dir" ]]; then
+    state_dir="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-approve-rs.XXXXXX")" || return 0
+    state_dir_owned=1
+  fi
+
+  if [[ -z "$selector" || -z "$uid" ]]; then
+    # Not reachable against the Helm-rendered paperclip-api Deployment, which uses
+    # matchLabels. It is reachable for a selector written with matchExpressions
+    # only, and returning quietly there would be the same silent hollowing-out
+    # this reader's list-failure branch exists to prevent -- so it is stated too.
+    if [[ ! -e "${state_dir}/warned-selector" ]]; then
+      : >"${state_dir}/warned-selector"
+      echo "warning: Deployment/${DEPLOYMENT} exposes no matchLabels selector and uid pair, so the" >&2
+      echo "         ReplicaSet that last actually served traffic cannot be identified. The" >&2
+      echo "         approval ring falls back to pure age ordering and the rollback target can" >&2
+      echo "         age out (BLO-28483, BLO-31842)." >&2
+    fi
+  else
+    rs_err="${state_dir}/list-err"
+    : >"$rs_err"
+    rs_json="$("${deploy_kubectl[@]}" -n "$DEPLOY_NAMESPACE" \
+      get replicasets --selector "$selector" -o json 2>"$rs_err")" && rs_status=0 || rs_status=$?
+    if (( rs_status != 0 )); then
+      # Warned once per script run, not once per rotation: this reader is called
+      # again on every 409 retry, so an unwarned branch would print the same five
+      # lines up to MAX_ROTATE_ATTEMPTS times and bury the signal in its own noise.
+      if [[ ! -e "${state_dir}/warned-list" ]]; then
+        : >"${state_dir}/warned-list"
+        echo "warning: cannot list ReplicaSets in namespace ${DEPLOY_NAMESPACE}, so the digest that" >&2
+        echo "         last actually served traffic cannot be named. Deployment/${DEPLOYMENT} names a" >&2
+        echo "         digest whose rollout has not landed, so the approval ring falls back to pure" >&2
+        echo "         age ordering and the rollback target can age out (BLO-28483, BLO-31842)." >&2
+        echo "         The deploy identity needs get+list on apps/replicasets in this namespace." >&2
+        sed 's/^/         /' <"$rs_err" >&2
+      fi
+    else
+      image="$(jq -r --arg uid "$uid" '
+        [ .items[]?
+          | select(
+              [ (.metadata.ownerReferences // [])[]
+                | select(.kind == "Deployment" and .uid == $uid)
+              ] | length == 1
+            )
+          | select((.status.readyReplicas // 0) > 0)
+          | [ .spec.template.spec.containers[]?.image // empty ] as $images
+          | if ($images | length) > 0 and (($images | unique | length) == 1)
+            then $images[0]
+            else ""
+            end
+        ] as $serving
+        | if ($serving | length) == 1 then $serving[0] else "" end
+      ' <<<"$rs_json" 2>/dev/null)" || image=""
+    fi
+    rm -f "$rs_err"
+  fi
+
+  if [[ -n "$state_dir_owned" ]]; then
+    rm -rf "$state_dir"
+  fi
+  printf '%s\n' "$image"
 }
 
 # Build the approval window, newest-first, from the digest being released, the
@@ -929,6 +1069,11 @@ nonce_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-nonce.XXXXXX")"
 server_plan_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-server-plan.XXXXXX")"
 probe_attempts_log="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-probe-log.XXXXXX")"
 release_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-release-err.XXXXXX")"
+# Owned here rather than inside serving_replicaset_image so the EXIT trap can
+# clear it: that reader runs inside $( ), so a path it mints itself is invisible
+# to this shell. Holding it here also makes its warn-once markers span the whole
+# rotate loop instead of resetting on every 409 retry.
+rs_state_dir="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-approve-rs.XXXXXX")"
 lock_cleanup_armed=""
 lock_preserve_on_failure=""
 lock_owner_is_ours=""
@@ -963,6 +1108,7 @@ cleanup_on_exit() {
     fi
   fi
   rm -f "$replace_err" "$nonce_err" "$server_plan_err" "$probe_attempts_log" "$release_err"
+  rm -rf "$rs_state_dir"
   exit "$status"
 }
 trap cleanup_on_exit EXIT
