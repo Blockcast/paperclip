@@ -412,10 +412,25 @@ def cooldown_blocks_refire(marker_epochs, now):
 
     Returns (bool, str|None) -- whether the write is blocked, and the reason
     when it is.
+
+    The reason is worded for the sign of `since_last`, which is NEGATIVE in
+    exactly the case the pre-write guard exists for. `now` is sampled once at
+    the top of the run and shared with should_refire, so a marker posted by a
+    concurrent sweep mid-run is genuinely newer than this run's clock. The
+    decision is right either way -- a negative `since_last` is still less than
+    the cooldown, so the write is still blocked -- but rendering it as
+    "re-asked -3s ago" reads as an arithmetic bug to anyone scanning the log,
+    and that log line is the only evidence operators get that sweeps are
+    overlapping. Name the skew instead of hiding it behind max(0, ...): the
+    fact that the marker POSTDATES this run is the informative part.
     """
     if not marker_epochs:
         return False, None
     since_last = now - max(marker_epochs)
+    if since_last < 0:
+        return True, "re-asked %ds AFTER this run's scan clock (concurrent writer), cooldown %ds" % (
+            int(-since_last), REFIRE_COOLDOWN_SECONDS,
+        )
     if since_last < REFIRE_COOLDOWN_SECONDS:
         return True, "re-asked %ds ago < cooldown %ds" % (int(since_last), REFIRE_COOLDOWN_SECONDS)
     return False, None
@@ -1113,6 +1128,14 @@ def main(argv=None):
     failed = [r for r in results if str(r[4]).startswith(SWEEP_ERROR_REASON_PREFIX)]
     rate_limited = [r for r in failed if RATE_LIMIT_TOKEN in str(r[4])]
     deferred = [r for r in results if str(r[4]).startswith(DEFERRED_REASON_PREFIX)]
+    # The two pre-write guard outcomes. `failed`, `deferred` and `alarming`
+    # each already get a summary section; these reached an operator only
+    # through the per-PR stdout line, which is the wrong way round -- the
+    # cooldown one is the ONLY direct evidence that dropping the concurrency
+    # group (BLO-31818) has a live cost, i.e. that sweeps genuinely overlap.
+    # Reported separately because they mean opposite things: see below.
+    contended = [r for r in results if str(r[4]).startswith(REREAD_SKIP_REASON_PREFIX)]
+    answered = [r for r in results if str(r[4]).startswith(REVIEWED_SKIP_REASON_PREFIX)]
     degraded = sweep_is_degraded(len(failed), len(results))
     for pr, head_sha, pending_since, refire, reason in results:
         marker = "RE-FIRED" if refire else "skip"
@@ -1163,6 +1186,36 @@ def main(argv=None):
                 )
                 handle.write("| PR | head | reason |\n|---|---|---|\n")
                 for pr, head_sha, _pending_since, _refire, reason in deferred:
+                    handle.write("| #%d | `%s` | %s |\n" % (pr["number"], head_sha[:7], reason))
+            if contended or answered:
+                handle.write(
+                    "\n### %d re-fire(s) withheld by the pre-write guard\n\n"
+                    % (len(contended) + len(answered))
+                )
+                if contended:
+                    # The signal worth escalating on. Rare by design -- hourly
+                    # cadence, ~2min run, 2h cooldown -- so a routinely
+                    # non-zero count means sweeps really are overlapping and
+                    # the residual documented on refire_still_permitted is
+                    # live rather than theoretical.
+                    handle.write(
+                        "- **%d contended**: a marker was posted between this run's scan and "
+                        "its write, so a CONCURRENT SWEEP re-asked first (BLO-31908). This is "
+                        "the measurable cost of carrying no `concurrency` group (BLO-31818). "
+                        "Expected to be 0 or 1; if it is routinely higher, sweeps are "
+                        "overlapping and the guard's stated residual is live.\n"
+                        % len(contended)
+                    )
+                if answered:
+                    handle.write(
+                        "- **%d answered**: Ally reviewed the head between this run's scan and "
+                        "its write (BLO-32044), so the PR is no longer stranded. This one is "
+                        "healthy -- the guard suppressed a redundant re-ask; it implies nothing "
+                        "about contention.\n"
+                        % len(answered)
+                    )
+                handle.write("\n| PR | head | reason |\n|---|---|---|\n")
+                for pr, head_sha, _pending_since, _refire, reason in contended + answered:
                     handle.write("| #%d | `%s` | %s |\n" % (pr["number"], head_sha[:7], reason))
             if alarming:
                 handle.write(
