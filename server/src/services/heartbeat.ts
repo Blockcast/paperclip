@@ -9614,14 +9614,23 @@ const COPULA_FILLER = `(?:${NON_CONNECTIVE_WORD}){0,${COPULA_FILLER_WORDS}}`;
 //     of it.
 // The exclusion covers BOTH connective families (CONNECTIVES, above) — it is
 // family-agnostic, not consequence-only. Only consequence connectives are
-// affected IN PRACTICE: a grammatical adversative sits after the epistemic
-// head, inside COPULA_FILLER's span rather than NEGATION_FILLER's, so the
-// exclusion never reaches it — "No evidence yet this head was …" stays a
-// hedge. Measured 0 grammatical frames changed; the flips are confined to
-// ungrammatical strings with the adversative IN the filler slot ("No yet
-// evidence …"), which is why the measurement looks clean without being a
-// property anyone chose. Do not add a same-family guard here — there is
-// nothing to guard against, and the effect is positional.
+// affected IN PRACTICE, but NOT for a positional reason — pass 25 tried that
+// explanation here and it is wrong, disprovable in this same file: consequence
+// and adversative connectives in the IDENTICAL slot (after the epistemic head,
+// before the copula) verdict oppositely ("No evidence yet this head was …" is
+// a hedge, "No evidence so this head was …" is a skip), so position cannot be
+// the cause. The actual cause is `negatedHeadConnective` (below), whose stem
+// names ADVERSATIVE_CONNECTIVES explicitly — a deliberate, hand-written
+// adversative-only guard, load-bearing since pass 16 (35/35 elided-
+// complementizer phrasings). Ablated against this head: deleting that entry
+// drops grammatical adversatives vetoed from 6/6 to 0/6; widening its stem to
+// CONNECTIVES raises grammatical consequence frames vetoed from 0/6 to 6/6.
+// See the attribution pin at heartbeat-context-summary.test.ts:1420, which
+// already names this cue for this exact frame. Measured 0 grammatical frames
+// changed BY THIS EXCLUSION; the flips are confined to ungrammatical strings
+// with the adversative IN the filler slot ("No yet evidence …"). Do NOT
+// generalise `negatedHeadConnective`'s ADVERSATIVE_CONNECTIVES to
+// CONNECTIVES — it is load-bearing for pass 16's 35/35, not redundant here.
 //
 // `{0,3}` is a KNOWN SECOND CAP, inherited verbatim from the old stem and not
 // derived from CLAUSE_SCOPE_CHARS the way COPULA_FILLER_WORDS is. It binds:

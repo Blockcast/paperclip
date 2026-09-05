@@ -1391,6 +1391,10 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       // the negation govern this clause — the pass-15 balance, unchanged.
       [`No sign but that this head was already reviewed at \`${sha}\`.`, false],
       [`No evidence so far that this head was already reviewed at \`${sha}\`.`, false],
+      // negatedHeadConnective's adversative-only guard, not position: same
+      // slot, opposite verdict for the two families (pass 26).
+      [`No evidence yet this head was already reviewed at \`${sha}\`.`, false],
+      [`No evidence so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
       // pass 23/24: the negation filler's token class can cross a citation or
       // punctuation; with `\\w+` these four were accepted (masking).
       [`I have no \`direct\` evidence this head was already reviewed at \`${sha}\`.`, false],
@@ -1474,10 +1478,6 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`No new idea landed for this head was already reviewed at \`${sha}\`.`, false],
       // widened by the pass-23 NON_CONNECTIVE_WORD token class
       [`No force-push evidence this head was already reviewed at \`${sha}\`.`, false],
-      // adversative control: the exclusion is family-agnostic, but a
-      // grammatical adversative sits in COPULA_FILLER's span, not
-      // NEGATION_FILLER's, so it stays a hedge rather than a skip.
-      [`No evidence yet this head was already reviewed at \`${sha}\`.`, false],
     ])("known residual: %s -> %s", (text, want) => {
       expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
     });
