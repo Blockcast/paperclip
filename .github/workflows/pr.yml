@@ -50,33 +50,73 @@ jobs:
     #                                                 own p100. The 8.9m
     #                                                 sum-of-maxima has never
     #                                                 occurred and over-budgets)
-    #   every other step in the job            3.9m   (p100; the MEDIAN is
-    #                                                 2.0m. Sizing a bound to
+    #   every other step in the job            4.8m   (p100 over 159 runs /
+    #                                                 148 successes,
+    #                                                 2026-09-04; the MEDIAN is
+    #                                                 1.9m. Sizing a bound to
     #                                                 the median is what
     #                                                 produced BLO-31405, and
     #                                                 the 9.9m near-miss above
     #                                                 had only median setup --
     #                                                 gate work alone nearly
-    #                                                 killed it)
+    #                                                 killed it. Unlike the two
+    #                                                 setup legs this term has
+    #                                                 no structural ceiling, so
+    #                                                 its p100 is a function of
+    #                                                 sample size: it read 3.9m
+    #                                                 over 120 runs, 4.8m over
+    #                                                 159 a day later, and 4.8m
+    #                                                 again on an independent
+    #                                                 200-run / 176-success
+    #                                                 re-measure 2026-09-05 --
+    #                                                 same record run,
+    #                                                 33922988027. Two
+    #                                                 samples agreeing is why
+    #                                                 4.8m is used rather than
+    #                                                 padded, but treat it as
+    #                                                 the term most likely to
+    #                                                 have moved since this was
+    #                                                 written)
     #   one 1-minute step bound                1.0m   (headroom for a single
     #                                                 hung gate step to fail as
     #                                                 THAT step instead of as
     #                                                 the job cap -- BLO-29182)
     #                                         -------
-    #                                         13.0m   -> 15m = 2.0m (13%)
+    #                                         13.9m   -> 15m = 1.1m (7%)
     #
-    # That is the worst OBSERVED case. With the 6m checkout bound below, the
-    # worst case is also bounded from above rather than merely unobserved --
-    # and note the instrument deliberately changes here, because an upper bound
-    # may not assume the two legs keep declining to co-peak the way the
-    # observed 8.1m above records that they did:
-    # 6.0m checkout bound + 4.3m pnpm p100 + 3.9m gate work = 14.2m, inside 15m
-    # so long as the 1.0m step reserve is unconsumed -- if a gate step also
-    # hangs for its full bound the same arithmetic is 15.2m and the cap is
-    # reachable again. A checkout slower than 6m now fails as the checkout step
-    # instead of as the cap. `Setup pnpm` is the one leg still unbounded (see
-    # the residuals below), so with that reserve unconsumed it is the only
-    # remaining way to reach the cap without an attributable step failure.
+    # That total sums maxima drawn from DIFFERENT runs, so it over-budgets on
+    # purpose. The directly measured quantity the cap actually bounds is total
+    # job step-time, whose p100 over the same 148 successes is 9.73m -- 5.3m
+    # (35%) under the cap, and 9.73m again over the independent 176 successes
+    # re-measured 2026-09-05. 1.1m is the margin against the conservative
+    # model; 5.3m is the margin against the worst run anyone has observed.
+    #
+    # That is the worst OBSERVED case, and observed is all it is. An earlier
+    # revision of this comment claimed the 6m checkout bound below ALSO bounds
+    # the worst case from above; that was wrong, and the correction is worth
+    # keeping. Substituting one real bound into a sum whose other two terms are
+    # unbounded does not yield an upper bound: `Setup pnpm` carries no step
+    # bound at all (see the residuals below) and gate work has no structural
+    # ceiling, so either can still grow past any p100 recorded here. Run
+    # honestly, with gate work at the 4.8m above:
+    #
+    #   6.0m checkout bound + 4.3m pnpm p100 + 4.8m gate p100 = 15.1m
+    #
+    # -- already past the cap before the 1.0m step reserve is touched, and
+    # 16.1m with it. The earlier revision ran that same line with gate work at
+    # its then-p100 of 3.9m, got 14.2m, and read the difference as headroom;
+    # the term moved to 4.8m within a day and the sign flipped. That is an
+    # argument about the INSTRUMENT, not about the cap.
+    #
+    # The cap is sized against the directly measured quantity instead: total
+    # job step-time, p100 9.73m against 15m. The three maxima above are drawn
+    # from different runs and have never co-occurred -- worst combined setup
+    # ever seen is 8.05m against an 8.9m sum-of-maxima, and the run that set
+    # the 4.8m gate record (33922988027) carried only 3.1m of setup, finishing
+    # at 7.9m. What the 6m checkout bound buys is therefore not headroom but
+    # ATTRIBUTION: a checkout slower than 6m now fails as the checkout step
+    # rather than as the cap, which leaves `Setup pnpm` as the only remaining
+    # way to reach the cap without an attributable step failure.
     #
     # This supersedes an earlier 5 -> 10 raise whose arithmetic was "2 x
     # (bootstrap + 120s fetch) + backoff ~= 5m", covering a second
@@ -85,25 +125,36 @@ jobs:
     # registry converted a fast red into a job timeout, which ejects a
     # merge-queue candidate just the same but burns a runner for the full
     # budget first -- but its model mis-attributes the cost, which is why 10
-    # looked sufficient and was not. Read off the wrapper's own action markers:
-    # the retry fired in 0 of the 75 runs -- both `Back off before retrying
-    # pnpm setup` and `Setup pnpm (retry)` log `conclusion=skipped`, and no
-    # run's step even reaches the retry path's floor -- while a SUCCESSFUL
-    # first attempt still took 254.5s (`outcome=success;duration_ms=254504`,
+    # looked sufficient and was not. Read off the wrapper's own action markers
+    # IN THE LOGS: the retry fired in 0 of the 75 runs -- both `Back off before
+    # retrying pnpm setup` and `Setup pnpm (retry)` log `conclusion=skipped`,
+    # and no run's step even reaches the retry path's floor -- while a
+    # SUCCESSFUL first attempt still took 254.5s
+    # (`outcome=success;duration_ms=254504`,
     # 259s for the step as a whole). 243s of that is the bootstrap `npm ci`
     # ("added 1 package in 4m") and only ~7s the self-update the old model
     # blamed. So pnpm's ~4.3m is one slow success whose cost sits in the
     # bootstrap, not two attempts against a stalled registry.
+    #
+    # "In the logs" is load-bearing and this window is deliberately NOT widened
+    # to match the timing sample above: both retry steps live inside the
+    # `./.github/actions/setup-pnpm` composite, and composite inner steps are
+    # not surfaced by the jobs API at all. `policy`'s only pnpm-named entries
+    # there are `Setup pnpm` and `Post Setup pnpm` (the latter 0-2s, immaterial
+    # to the split above). So counting "non-skipped retry steps" over the jobs
+    # API returns zero for every window, whether or not a retry ever fired --
+    # a vacuous confirmation that reads exactly like a real one. Widening this
+    # count means re-reading logs, not re-running the timing query.
     #
     # Both historical blowouts died with seconds of work left (reconstructed at
     # ~10.4m and ~10.7m needed) and now fit with over 4m to spare. Two
     # residuals deliberately NOT covered here, both bounded by the same
     # structural fix -- baking the pinned pnpm into the ARC runner image, an
     # onprem-k8s change tracked separately, see the wrapper's own header:
-    #   - the retry firing on a p100-checkout run would be 10.8m pnpm + 4.4m
-    #     checkout + 3.9m work = ~19m, unobserved in this sample (0 retries in
-    #     75 runs). Raising the cap to cover it would budget every run for a
-    #     path none of them took;
+    #   - the retry firing on a p100-checkout run would be 10.8m pnpm + 4.6m
+    #     checkout + 4.8m work = ~20m, unobserved in this sample (0 retries in
+    #     the 75 log-read runs). Raising the cap to cover it would budget every
+    #     run for a path none of them took;
     #   - `Setup pnpm` still carries no step bound, so a wedged bootstrap
     #     surfaces as an unattributable job-cap cancellation the way a wedged
     #     checkout did before the bound below. Bounding it means picking a
@@ -123,19 +174,23 @@ jobs:
         # ever surface as an unattributable job-cap cancellation.
         #
         # 6m, not 8m: a bound only helps if it is the thing that fires first.
-        # With pnpm at its 4.3m p100, gate work at its 3.9m p100 and the 1.0m
-        # step reserve, the 15m cap leaves checkout 5.8m -- so an 8m bound left
-        # a 5.8-8.0m band in which a checkout passes its own bound and then
+        # With pnpm at its 4.3m p100, gate work at its 4.8m p100 and the 1.0m
+        # step reserve, the 15m cap leaves checkout 4.9m -- so an 8m bound left
+        # a 4.9-8.0m band in which a checkout passes its own bound and then
         # dies at the cap anyway, unattributed, which is precisely the mode
         # this bound exists to remove. 6m narrows that band rather than closing
-        # it: 5.8-6.0m remains, a 0.2m residual, and only bites while a gate
-        # step is simultaneously burning its full 1m reserve. Closing it
-        # outright means a 5m bound -- 1.09x the measured 4.57m p100, tight
-        # enough to fire on a slow-but-working fetch, which trades a rare
-        # unattributable death for a routine false one. 6m is ~1.3x that p100.
-        # Treat the ratio as drifting rather than fixed: `fetch-depth: 0` cost
-        # grows monotonically with history, so it tightens on its own and is
-        # worth re-measuring rather than trusting.
+        # it: 4.9-6.0m remains, a 1.1m residual, and bites only when pnpm AND
+        # gate work are BOTH at their p100 and a gate step is burning its full
+        # 1m reserve -- a conjunction of maxima drawn from different runs that
+        # the sample never shows co-occurring. Note this residual widened from
+        # 0.2m when the gate-work term was corrected 3.9m -> 4.8m: it is a
+        # function of that drifting term, not a fixed property of 6m. Closing
+        # it outright means a 4.9m bound -- 1.07x the measured 4.57m checkout
+        # p100, tight enough to fire on a slow-but-working fetch, which trades
+        # a rare unattributable death for a routine false one. 6m is ~1.3x that
+        # p100. Treat the ratio as drifting rather than fixed: `fetch-depth: 0`
+        # cost grows monotonically with history, so it tightens on its own and
+        # is worth re-measuring rather than trusting.
         #
         # Adding this bound raises no existing bound -- it bounds a step that
         # had none -- but that is a property of this diff, not an invariant,

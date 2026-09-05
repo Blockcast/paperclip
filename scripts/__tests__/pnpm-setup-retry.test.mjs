@@ -38,8 +38,8 @@ const wrapperRef = "./.github/actions/setup-pnpm";
 // within half of it.
 //
 // So 15 does NOT buy full retry-path coverage, and this constant should not be
-// read as claiming it does: for `policy` that would be 10.8m pnpm + 4.4m p100
-// checkout + 3.9m gate work = ~19m. What 15 does buy is the observed
+// read as claiming it does: for `policy` that would be 10.8m pnpm + 4.6m p100
+// checkout + 4.8m gate work = ~20m. What 15 does buy is the observed
 // worst case -- a slow-but-successful setup plus the job's own work, which is
 // what both historical blowouts actually were -- with margin, and it is a
 // floor every other budgeted wrapper job in this repo already clears. Counted
@@ -173,8 +173,9 @@ test("every job that sets up pnpm clears the measured setup floor", async () => 
         Number(declared[1]) >= MIN_TIMEOUT_MINUTES_FOR_RETRY,
         `${name} job "${job.name}" sets up pnpm with timeout-minutes: ${declared[1]}, ` +
           `below the ${MIN_TIMEOUT_MINUTES_FOR_RETRY}m floor. A slow-but-successful setup ` +
-          `alone measured 8.1m (checkout + pnpm p100), and the job's own work adds up to ` +
-          `3.9m on top, so a budget under the floor is spent before the work starts — the ` +
+          `alone measured 8.1m (worst observed checkout + pnpm combined, NOT the sum of ` +
+          `the two p100s), and the job's own work adds up to ` +
+          `4.8m on top, so a budget under the floor is spent before the work starts — the ` +
           `job dies at its cap as an unattributable \`cancelled\` (BLO-31690)`,
       );
     }
