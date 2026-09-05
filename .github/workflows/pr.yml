@@ -504,6 +504,16 @@ jobs:
         # in its own PR with its own green `Helm chart` rather than riding
         # along here. Re-run that comparison when you touch this line: if the
         # gap has grown, that is the signal to bump.
+        #
+        # Prose rather than a soft assertion in the suite, chosen not defaulted:
+        # asserting "the pin is within N releases of the tip" means querying the
+        # helm/helm releases API from a policy test, and that trades a decaying
+        # comment for a gate that goes red on GitHub rate limits and offline
+        # runners. BLO-29182 was exactly that failure — network I/O inside this
+        # job with no bound below the job cap. A stale date misleads a reader
+        # who is already editing this line; a flaky assertion fails PRs that
+        # never touched it. So the decay is accepted deliberately, and bounded
+        # by pinning it to a date a reader can re-run in one API call.
         uses: azure/setup-helm@v4
         with:
           version: v3.16.3

@@ -297,13 +297,31 @@ test("only helm_chart runs the chart suite from inside the chart directory (BLO-
 //
 // Node's own value-taking flags, so a flag's VALUE is never mistaken for the
 // positional path argument. Only space-separated forms are a hazard --
-// `--flag=value` is one token and already reads as a flag. Listed explicitly
-// rather than inferred from a shape: a value-taking flag added to node in a
-// later release reopens the same hole, but that costs a missed row, not a false
-// red, which is the direction this file prefers to fail in. Worth re-checking
-// against `node --help` whenever the pinned major moves.
+// `--flag=value` is one token and already reads as a flag. Short aliases are
+// listed alongside their long spellings (`-r`/`--require`, `-C`/`--conditions`)
+// because they are the same flag; `--import` and `--loader` have none.
+//
+// Listed explicitly rather than inferred from a shape, and the cost of a flag
+// missing from the list runs in BOTH directions -- an earlier draft of this
+// comment claimed it was only ever a missed row, which is wrong. An unconsumed
+// value stays an operand, so:
+//   - value has no glob -> it satisfies the rooted-path check itself, and the
+//     step escapes. A missed row, the direction this file tolerates.
+//   - value HAS a glob -> it also reaches the wildcard-directory scan below and
+//     reports there, reddening a step that names a perfectly good rooted path.
+//     A FALSE RED, the direction this file does not tolerate: a missed row is a
+//     hole this gate is allowed to have, a false red fails an unrelated PR and
+//     gets the assertion deleted.
+// `--test-coverage-exclude`/`--test-coverage-include` are exactly that case --
+// glob-valued by design, shipping since node 22, and the natural companions of
+// `--experimental-test-coverage`, so wiring coverage into a `node --test` step
+// is the ordinary edit that hits it rather than an exotic one. Both are listed
+// for that reason; `--test-isolation` takes `process`/`none` and so only ever
+// costs a missed row, and is listed for consistency. Worth re-checking against
+// `node --help` whenever the pinned major moves -- and weighing any new
+// value-taking flag by whether its value can hold a glob.
 const VALUE_FLAGS =
-  /^--(?:test-(?:reporter|reporter-destination|name-pattern|skip-pattern|timeout|concurrency|shard)|import|require|loader|conditions)$/;
+  /^(?:--(?:test-(?:reporter|reporter-destination|name-pattern|skip-pattern|timeout|concurrency|shard|isolation|coverage-exclude|coverage-include)|import|require|loader|conditions)|-[rC])$/;
 test("every node --test names explicit paths, so the text match above is sound (BLO-31516)", () => {
   const marker = "\n      - name: ";
   const offenders = [];
@@ -334,7 +352,12 @@ test("every node --test names explicit paths, so the text match above is sound (
       const tokens = invocation[1].split(/[\s\\]+/).filter(Boolean);
       const operands = tokens
         .filter((arg, i) => !(tokens[i - 1] && VALUE_FLAGS.test(tokens[i - 1])))
-        .filter((arg) => !arg.startsWith("--"));
+        // `-` rather than `--`: a path never starts with a dash, and now that
+        // short aliases are in VALUE_FLAGS a leftover `-r` would otherwise
+        // count as an operand and report "no ROOTED path argument" on a step
+        // that has no path argument at all -- the same misleading-message
+        // defect the operands/args split above exists to fix.
+        .filter((arg) => !arg.startsWith("-"));
       // Rooted, not merely non-flag. This is the house-style claim the rest of
       // this gate rests on -- all 40 invocations name a rooted path -- and it
       // is what keeps the exactly-once TEXT match sound. It is reported apart
