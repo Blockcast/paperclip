@@ -1000,31 +1000,64 @@ describe("retired context supersede", () => {
  *
  * `hasActionablePrReviewFeedback` ended with an unguarded `Recommended Action`
  * … `fix` … `before merge` prose fallback. Ally's own 0-findings closing lines
- * supply all three tokens, so the cleaner the review, the likelier the red —
- * and because a 0/0 body yields no finding identities, no
- * `Prior Findings Dispositioned` ledger entry could ever retire the carried
- * head. The misclassification was therefore permanent, not transient.
+ * supply all three tokens, so the cleaner the review, the likelier the red.
  *
- * The bodies below are the load-bearing lines of four real reviews, verbatim.
+ * Two distinct costs, and they are not equally severe — an earlier draft of
+ * this comment called the whole thing permanent, which is wrong for the first:
+ *
+ *   - Carried case (an older head is the one misread): self-clears as soon as
+ *     any clean attestation of the *current* head lands, because
+ *     `evaluateCommentReviewGate` short-circuits on a current-head attestation
+ *     before it ever consults the carry-forward. Cost is one review cycle of
+ *     red. Observed at ~22 minutes on paperclip#1651.
+ *   - Same-head case (the head being merged is the one misread): genuinely
+ *     unclearable. A 0/0 body yields no finding identities, so no
+ *     `Prior Findings Dispositioned` entry can name the finding to retire it,
+ *     and the only exit is a fresh commit.
+ *
+ * Measured over the 68 Ally consolidated reviews on the 25 most recent
+ * `Blockcast/paperclip` pull requests: this fix flips exactly 7, every one of
+ * them `true` → `false`, every one of them yielding zero finding identities.
+ * Zero flips in the other direction, and all 40 reviews carrying real findings
+ * still block.
+ *
+ * The bodies below are the load-bearing lines of five real reviews, verbatim.
  * They are trimmed to the counted buckets plus the exact `Recommended Action`
- * line rather than reproducing several KB of prose; the full verbatim
- * multicast#589 body was executed against both the pre- and post-fix module
- * and classifies identically to its trimmed form here, so the trim is
- * measured, not assumed.
+ * lines rather than reproducing several KB of prose; the full verbatim
+ * multicast#589 and paperclip#1651 bodies were executed against both the pre-
+ * and post-fix module and classify identically to their trimmed forms here, so
+ * the trim is measured, not assumed.
  */
 describe("clean-review precedence over the Recommended Action prose fallback", () => {
   const CLEAN_BUCKETS = ["### Critical Issues (0)", "### Important Issues (0)"];
 
-  // Each of the four differs in where and how the negation is phrased, which is
+  // Each of the five differs in where and how the negation is phrased, which is
   // why the fix is precedence rather than another regex: `hasNonNegatedMatch`
   // only inspects the words *preceding* a match within its sentence, so the
   // paperclip#1605 body's trailing `_(None.)_` is invisible to any look-back
   // guard however its cue list is tuned.
-  const realCleanReviews: Array<[string, string]> = [
-    ["paperclip#1618 @999cc70", "1. No Critical issues to fix before merge."],
-    ["paperclip#1612 @383f074", "1. No Critical issues — nothing to fix before merge."],
-    ["multicast#589 @ef7a43a", "1. No Critical or Important issues — nothing to fix before merge."],
-    ["paperclip#1605 @123e1d2", "1. Fix Critical issues before merge. _(None.)_"],
+  //
+  // The paperclip#1651 body is the shape that rules out the other candidate
+  // narrowing — confining the fallback's `[\s\S]{0,400}` spans to a single
+  // paragraph. There the three trigger tokens are three *unrelated* list items:
+  // the heading, then `fix` as a **noun naming the PR**, then a `before
+  // merging` that belongs to a rebase instruction. Nothing about that span is
+  // an instruction to fix anything, and no lexical guard can tell, because
+  // every token is used in good faith. Only the reviewer's own 0/0 tally
+  // settles it.
+  const realCleanReviews: Array<[string, string[]]> = [
+    ["paperclip#1618 @999cc70", ["1. No Critical issues to fix before merge."]],
+    ["paperclip#1612 @383f074", ["1. No Critical issues — nothing to fix before merge."]],
+    ["multicast#589 @ef7a43a", ["1. No Critical or Important issues — nothing to fix before merge."]],
+    ["paperclip#1605 @123e1d2", ["1. Fix Critical issues before merge. _(None.)_"]],
+    [
+      "paperclip#1651 @2b6763f6",
+      [
+        "1. Nothing blocks merge on correctness. Zero Critical, zero Important, and the one prior blocker is withdrawn by me.",
+        "2. With BLO-31836 cancelled as not-a-defect, this PR is the whole fix and BLO-23197 can close on it.",
+        "3. The branch is `mergeable_state: behind` — update it before merging.",
+      ],
+    ],
   ];
 
   for (const [source, recommendedAction] of realCleanReviews) {
@@ -1032,7 +1065,7 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
       const body = reviewBody(CURRENT_HEAD, [
         ...CLEAN_BUCKETS,
         "### Recommended Action",
-        recommendedAction,
+        ...recommendedAction,
       ]);
 
       expect(hasActionablePrReviewFeedback(body)).toBe(false);

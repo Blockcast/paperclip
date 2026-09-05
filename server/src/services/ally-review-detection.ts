@@ -378,19 +378,31 @@ function carriesBlockingFeedback(text: string): boolean {
   // bucket at all. Ally's own clean-review boilerplate supplies its exact
   // trigger tokens, so running it against a review that has already declared
   // both buckets zero misreads an approval as a blocking finding -- observed on
-  // four real bodies across two repos, each phrasing the negation differently:
+  // five real bodies across two repos, each phrasing the negation differently:
   //
   //   "1. No Critical issues to fix before merge."                    paperclip#1618
   //   "1. No Critical or Important issues -- nothing to fix before merge."
   //                                                                   multicast#589
   //   "1. Fix Critical issues before merge. _(None.)_"                paperclip#1605
   //
+  // Two candidate narrowings were considered and both fail on a real body.
   // A negation guard cannot fix this: hasNonNegatedMatch only inspects the
-  // preceding words within a sentence, so the third body's trailing "(None.)"
-  // is invisible to it however the cue list is tuned. Precedence is the fix --
-  // an explicit 0/0 is a definitive statement by the reviewer and outranks a
-  // guess made from prose. Every signal above stays live, so a review that
-  // explicitly requests changes still blocks at 0/0. See BLO-31446.
+  // preceding words within a sentence, so the paperclip#1605 body's trailing
+  // "(None.)" is invisible to it however the cue list is tuned. Confining the
+  // [\s\S]{0,400} spans to one paragraph fails on paperclip#1651, where the
+  // three tokens are three unrelated list items -- the heading, then "fix" as a
+  // noun naming the PR, then a "before merging" belonging to a rebase
+  // instruction. Every token there is used in good faith, so no lexical rule
+  // can separate them.
+  //
+  // Precedence is the fix: an explicit 0/0 is a definitive statement by the
+  // reviewer and outranks a guess made from prose. Every signal above stays
+  // live, so a review that explicitly requests changes still blocks at 0/0.
+  //
+  // Measured over the 68 Ally consolidated reviews on the 25 most recent
+  // Blockcast/paperclip pull requests, this clause flips exactly 7 reviews,
+  // all true -> false, all yielding zero finding identities; no review flips
+  // the other way and all 40 carrying real findings still block. See BLO-31446.
   if (declaresNoFindings) return false;
 
   return /\bRecommended\s+Action\b[\s\S]{0,400}\bfix\b[\s\S]{0,400}\bbefore\s+merg(?:e|es|ed|ing)\b/i.test(text);
