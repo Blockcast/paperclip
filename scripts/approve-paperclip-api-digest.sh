@@ -353,15 +353,23 @@ if [[ -n "$RETIRE_IN_FLIGHT_ONLY" ]]; then
     # same reasoning, as the rotation write's non-retriable bail.
     if ! grep -qiE 'conflict|modified|latest version' <<<"$CLEAR_IN_FLIGHT_LOCK_ERR"; then
       echo "cannot retire the in-flight approval lock on ${ABANDON_IN_FLIGHT} (owner ${ABANDON_IN_FLIGHT_OWNER}):" >&2
-      printf '%s\n' "$CLEAR_IN_FLIGHT_LOCK_ERR" >&2
+      if [[ -n "$CLEAR_IN_FLIGHT_LOCK_ERR" ]]; then
+        printf '%s\n' "$CLEAR_IN_FLIGHT_LOCK_ERR" | sed 's/^/    /' >&2
+      else
+        # Empty is not a special case to skip: it matches none of the conflict
+        # vocabulary, so it arrives HERE, and printing the header alone would
+        # leave the dangling colon the read guard above exists to prevent.
+        echo "    (kubectl produced no error output)" >&2
+      fi
       exit 1
     fi
     # No sleep after the final attempt: the loop is about to end, so it buys
     # nothing and delays the exhaustion message below by a whole ceiling while
-    # a release is wedged. Spelled as an `if` rather than `(( … )) && sleep` for
-    # the same reason as the admissibility probe's backoff: a false `(( … ))`
-    # yields a non-zero status, and this is the last command in the loop body,
-    # so under `set -e` that would abort mid-retirement.
+    # a release is wedged. Spelled as an `if` because a BARE `(( … ))` as the
+    # loop body's last command is false on the final attempt, and `set -e`
+    # aborts the retirement there. Note the `(( … )) && sleep` spelling would
+    # NOT abort -- bash exempts the left side of an `&&` list from `set -e` --
+    # so the `if` is what makes the intent survive either rewrite.
     if (( attempt < RETIRE_ATTEMPTS )); then
       sleep "$attempt"
     fi
@@ -716,20 +724,39 @@ release_in_flight_lock() {
     # operator present to re-run with more logging.
     if ! grep -qiE 'conflict|modified|latest version' <<<"$CLEAR_IN_FLIGHT_LOCK_ERR"; then
       echo "cannot retire the in-flight lock on ${DIGEST} (owner ${LOCK_OWNER_ID}):" >&2
-      printf '%s\n' "$CLEAR_IN_FLIGHT_LOCK_ERR" >&2
+      if [[ -n "$CLEAR_IN_FLIGHT_LOCK_ERR" ]]; then
+        printf '%s\n' "$CLEAR_IN_FLIGHT_LOCK_ERR" | sed 's/^/    /' >&2
+      else
+        # Not an exotic case here: this loop runs inside a trap reached from
+        # `trap 'exit 143' TERM`, so kubectl signal-killed mid-`replace` is the
+        # EXPECTED teardown, and it writes nothing. An empty capture matches
+        # none of the conflict vocabulary, so it lands on this bail -- correctly,
+        # since nothing suggests a retry would win -- and without this branch the
+        # header would promise a cause and deliver a blank line, on the one path
+        # where the caller prints no cause of its own.
+        echo "    (kubectl produced no error output)" >&2
+      fi
       return 1
     fi
     # Guarded rather than unconditional: the last attempt has nothing left to
-    # wait for. Spelled as an `if` and not `(( ... )) && sleep` because it is the
-    # final command in the loop body, where a false `(( ... ))` under `set -e`
-    # would abort the retirement it is meant to pace.
+    # wait for. Spelled as an `if` because a BARE `(( ... ))` as the loop body's
+    # last command is false on the final attempt and `set -e` aborts there; the
+    # `(( ... )) && sleep` spelling would not abort (bash exempts the left side
+    # of an `&&` list), so the `if` is what survives either rewrite intact.
     #
     # Flat, where retire-only mode backs off linearly (`sleep "$attempt"`). With
-    # the bail above shared, the sleep is now the ONLY asymmetry between the two
-    # loops, and it is deliberate rather than an unfinished parity fix: this loop
-    # runs inside a trap reached from `trap 'exit 143' TERM`, so the runner's
-    # grace period is the whole budget and 2s of total sleep beats 3s.
-    # Retire-only mode has an operator at a terminal and no such deadline.
+    # the bail above shared, the sleep is the only remaining asymmetry in the
+    # two loops' RETRY-CONTROL structure, and it is deliberate rather than an
+    # unfinished parity fix: this loop runs inside a trap reached from
+    # `trap 'exit 143' TERM`, so the runner's grace period is the whole budget
+    # and 2s of total sleep beats 3s. Retire-only mode has an operator at a
+    # terminal and no such deadline.
+    #
+    # Their MESSAGING differences are deliberate too, and are not a parity gap
+    # to close: this loop's caller (`cleanup_on_exit`) prints the operator
+    # guidance that retire-only mode prints itself, so a chatty success or
+    # exhaustion here would bury the real failure the cleanup is running after.
+    # `return` vs `exit` is structurally required for the same reason.
     if (( attempt < RETIRE_ATTEMPTS )); then
       sleep 1
     fi
