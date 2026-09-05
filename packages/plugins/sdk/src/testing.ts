@@ -1106,6 +1106,18 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           // rejects UUID- or path-shaped names. Any realistic seeded path and
           // name pass both, so nothing diverges today — but do not read this
           // block as a full reimplementation of the host's sanitizers.
+          //
+          // The host's PROJECT-LEVEL fallbacks are not mirrored either. It
+          // resolves `repoUrl: workspace.repoUrl ?? project.codebase.repoUrl`,
+          // `repoRef: … ?? project.codebase.repoRef` and `defaultRef: … ??
+          // project.codebase.defaultRef`; the double takes all three straight
+          // off the execution workspace, because the harness seeds projects
+          // with no `codebase` to fall back to. A worktree row commonly
+          // inherits the project's repo rather than restating it, so a
+          // workspace seeded with `repoUrl: null` yields `null` here where the
+          // host would yield the project URL — a plugin gated on
+          // `if (!ws.repoUrl)` takes opposite limbs in test and production.
+          // Seed those three fields explicitly if your plugin branches on them.
           if (
             isInCompany(executionWorkspace, companyId) &&
             !executionWorkspace?.closed &&
@@ -1133,7 +1145,21 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
               // callers to read a falsy `mode` as project-scoped — so a plugin
               // following that advice, against a workspace seeded without the
               // optional `mode`, would see a result claiming both at once.
-              mode: executionWorkspace.mode ?? "isolated_workspace",
+              //
+              // The substitute FAILS CLOSED. `isolated_workspace` and
+              // `cloud_sandbox` are the two modes that promise the path is
+              // private to one issue, so inventing either for a field the
+              // author never set would hand an unseeded fixture the strongest
+              // privacy claim available: a plugin doing
+              // `if (ws.mode === "isolated_workspace") destructiveWrite()`
+              // would take the confined limb in the harness while production
+              // took whichever real mode the row carries. `shared_workspace` is
+              // equally non-null and equally host-reachable, and drives that
+              // check false. Note `??` also substitutes for an explicitly
+              // seeded `null`, which the type permits — same reasoning: "the
+              // author said nothing about isolation" must not read as "the
+              // author claimed isolation".
+              mode: executionWorkspace.mode ?? "shared_workspace",
               createdAt: now,
               updatedAt: now,
             };
