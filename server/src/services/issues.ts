@@ -4570,16 +4570,24 @@ function redactExternalWaitDescription(
   return redacted.length > 0 ? redacted : null;
 }
 
-function blockedInboxResponseDescription(attention: IssueBlockedInboxAttention, row: BlockedInboxIssueRow) {
-  if (!attention.redaction.externalDetailsRedacted) return row.description;
-  return redactExternalWaitDescription(row.description, externalWaitFromDescription(row.description));
+function blockedInboxResponseDescription(entry: BlockedInboxAttentionEntry, row: BlockedInboxIssueRow) {
+  if (!entry.attention.redaction.externalDetailsRedacted) return row.description;
+  // BLO-31839: redact with the needles the classifier actually parsed, never by re-parsing
+  // `row.description`. The classifier reads the full graph description; `row.description` is
+  // the `ISSUE_LIST_DESCRIPTION_MAX_CHARS` preview. For a park declared past that cutoff —
+  // exactly the population the parity fix newly surfaces — re-parsing returns `null` by
+  // construction, so the needle set was empty and this returned an unredacted preview while
+  // `externalDetailsRedacted: true` asserted otherwise. Carrying the parsed pair makes "what
+  // decided redaction" and "what performed it" the same string.
+  return redactExternalWaitDescription(row.description, entry.externalWait);
 }
 
-function blockedInboxSearchText(attention: IssueBlockedInboxAttention, row: BlockedInboxIssueRow) {
+function blockedInboxSearchText(entry: BlockedInboxAttentionEntry, row: BlockedInboxIssueRow) {
+  const attention = entry.attention;
   return [
     row.identifier,
     row.title,
-    blockedInboxResponseDescription(attention, row),
+    blockedInboxResponseDescription(entry, row),
     attention.sourceIssue?.identifier,
     attention.sourceIssue?.title,
     attention.leafIssue?.identifier,
@@ -4650,13 +4658,34 @@ function compareBlockedInboxRows(
   return right.id.localeCompare(left.id);
 }
 
+/**
+ * The attention verdict plus the external-wait pair the classifier parsed to reach it.
+ *
+ * BLO-31839: these travel together deliberately. `redaction.externalDetailsRedacted` is a
+ * promise that the owner/action strings were removed from the response, and the only way to
+ * keep that promise is to redact with the same values that set the flag. Re-deriving them
+ * from the response projection silently breaks for any park declared past
+ * `ISSUE_LIST_DESCRIPTION_MAX_CHARS`, which is precisely the population the parity fix
+ * surfaces. `externalWait` is non-null iff the entry took the `external_wait` branch, and it
+ * is internal — it must never be serialized, since it holds the values being redacted.
+ */
+type BlockedInboxAttentionEntry = {
+  attention: IssueBlockedInboxAttention;
+  externalWait: { owner: string; action: string } | null;
+};
+
 async function listIssueBlockedInboxAttentionMap(
   dbOrTx: any,
   companyId: string,
   issueRows: BlockedInboxIssueRow[],
-): Promise<Map<string, IssueBlockedInboxAttention>> {
+): Promise<Map<string, BlockedInboxAttentionEntry>> {
   const rowIssueIds = [...new Set(issueRows.map((row) => row.id))];
-  const result = new Map<string, IssueBlockedInboxAttention>();
+  const result = new Map<string, BlockedInboxAttentionEntry>();
+  const setAttention = (
+    issueId: string,
+    attention: IssueBlockedInboxAttention,
+    externalWait: { owner: string; action: string } | null = null,
+  ) => result.set(issueId, { attention, externalWait });
   if (rowIssueIds.length === 0) return result;
 
   const [graphIssueRows, graphRelationRows, companyAgentRows] = await Promise.all([
@@ -4927,7 +4956,7 @@ async function listIssueBlockedInboxAttentionMap(
       && (liveHandoffRunIssueIds.has(row.id) || liveHandoffWakeIssueIds.has(row.id))
     );
     if (handoff && !hasLiveHandoffContinuation && (handoff.required || handoff.state === "escalated")) {
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "missing_disposition",
         reason: "missing_successful_run_disposition",
         severity: "high",
@@ -4962,7 +4991,7 @@ async function listIssueBlockedInboxAttentionMap(
       ) {
         sourceIssue = issueRef(issuesById.get(row.originId));
       }
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "recovery_open",
         reason: "open_recovery_issue",
         severity: "high",
@@ -4987,7 +5016,7 @@ async function listIssueBlockedInboxAttentionMap(
     const interaction = interactionByIssueId.get(row.id);
     if (interaction) {
       const isUserQuestion = interaction.kind === "ask_user_questions" && Boolean(row.assigneeUserId);
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "awaiting_decision",
         reason: isUserQuestion ? "pending_user_decision" : "pending_board_decision",
         severity: "medium",
@@ -5007,7 +5036,7 @@ async function listIssueBlockedInboxAttentionMap(
 
     const approval = approvalByIssueId.get(row.id);
     if (approval) {
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "awaiting_decision",
         reason: "pending_board_decision",
         severity: "medium",
@@ -5031,7 +5060,7 @@ async function listIssueBlockedInboxAttentionMap(
       const ownerAgentId = finding.state === "blocked_by_unassigned_issue"
         ? null
         : finding.recommendedOwnerAgentId ?? row.assigneeAgentId ?? leaf?.assigneeAgentId ?? null;
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "needs_attention",
         reason: finding.state as IssueBlockedInboxAttention["reason"],
         severity: finding.state === "blocked_by_assigned_backlog_issue"
@@ -5091,7 +5120,7 @@ async function listIssueBlockedInboxAttentionMap(
       ? externalWaitFromDescription(externalWaitDescription)
       : null;
     if (external) {
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "external_wait",
         reason: "external_owner_action",
         severity: "medium",
@@ -5103,13 +5132,13 @@ async function listIssueBlockedInboxAttentionMap(
         },
         sourceIssue: source,
         externalDetailsRedacted: true,
-      }));
+      }), external);
       continue;
     }
 
     const blockerState = blockerAttentionByIssueId.get(row.id);
     if (row.status === "blocked" && (blockerState?.state === "needs_attention" || blockerState?.state === "stalled")) {
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "needs_attention",
         reason: "blocked_chain_stalled",
         severity: "high",
@@ -5312,11 +5341,11 @@ async function listBlockedInboxIssues(
   const lastActivityByIssueId = new Map(lastActivityRows.map((row) => [row.issueId, row]));
 
   const enriched = withRuns.flatMap((row) => {
-    const blockedInboxAttention = blockedInboxAttentionByIssueId.get(row.id);
-    if (!blockedInboxAttention) return [];
+    const blockedInboxEntry = blockedInboxAttentionByIssueId.get(row.id);
+    if (!blockedInboxEntry) return [];
     if (
       rawSearch
-      && !blockedInboxSearchText(blockedInboxAttention, row).includes(rawSearch)
+      && !blockedInboxSearchText(blockedInboxEntry, row).includes(rawSearch)
       && !commentSearchMatchIssueIds.has(row.id)
     ) return [];
 
@@ -5328,11 +5357,13 @@ async function listBlockedInboxIssues(
     ) ?? row.updatedAt;
     return [{
       ...row,
-      description: blockedInboxResponseDescription(blockedInboxAttention, row),
+      description: blockedInboxResponseDescription(blockedInboxEntry, row),
       blockedBy: blockedByMap.get(row.id) ?? [],
       lastActivityAt,
       ...(blockerAttentionByIssueId.has(row.id) ? { blockerAttention: blockerAttentionByIssueId.get(row.id) } : {}),
-      blockedInboxAttention,
+      // Only the verdict is serialized; `blockedInboxEntry.externalWait` stays internal because
+      // it holds the very owner/action strings the redaction above removes (BLO-31839).
+      blockedInboxAttention: blockedInboxEntry.attention,
       ...(productivityReviewByIssueId.has(row.id)
         ? { productivityReview: productivityReviewByIssueId.get(row.id) }
         : {}),
@@ -5358,16 +5389,23 @@ async function listBlockedInboxIssues(
 
 async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?: IssueFilters): Promise<number> {
   const { conditions } = await blockedInboxIssueConditions(dbOrTx, companyId, filters);
-  // BLO-31839: project exactly what `listBlockedInboxIssues` projects. This count is the oracle
-  // for that list, so it has to see the same row shape: `blockedInboxSearchText` reads
-  // `row.description`, and selecting the full column here made a `q` term past
-  // ISSUE_LIST_DESCRIPTION_MAX_CHARS countable but not enumerable — the mirror image of the
-  // external-wait divergence fixed above. Sharing the projection also stops this path force-
-  // detoasting every blocked row's description.
+  // BLO-31839: project exactly what `listBlockedInboxIssues` projects, including its
+  // `decodeDatabaseTextPreview` post-step. This count is the oracle for that list, so it has to
+  // see the same row shape: `blockedInboxSearchText` reads `row.description`, and selecting the
+  // full column here made a `q` term past ISSUE_LIST_DESCRIPTION_MAX_CHARS countable but not
+  // enumerable — the mirror image of the external-wait divergence fixed above. The post-step is
+  // a no-op on this input today (PG `substring(text, 1, n)` already counts code points, so the
+  // truncation is the identity even for astral characters, and the column is never `undefined`),
+  // but it is mirrored rather than argued away: leaving the one unmirrored step in a projection
+  // whose whole contract is "same shape as the list" is how this divergence happens again.
   const rows = (await dbOrTx
     .select(issueListSelect)
     .from(issues)
-    .where(and(...conditions))) as IssueRow[];
+    .where(and(...conditions)))
+    .map((row: any) => ({
+      ...row,
+      description: decodeDatabaseTextPreview(row.description, ISSUE_LIST_DESCRIPTION_MAX_CHARS),
+    })) as IssueRow[];
   if (rows.length === 0) return 0;
 
   const blockedInboxAttentionByIssueId = await listIssueBlockedInboxAttentionMap(dbOrTx, companyId, rows);
@@ -5392,11 +5430,11 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
   }
 
   return rows.reduce((count: number, row: IssueRow) => {
-    const attention = blockedInboxAttentionByIssueId.get(row.id);
-    if (!attention) return count;
+    const entry = blockedInboxAttentionByIssueId.get(row.id);
+    if (!entry) return count;
     if (
       rawSearch
-      && !blockedInboxSearchText(attention, row).includes(rawSearch)
+      && !blockedInboxSearchText(entry, row).includes(rawSearch)
       && !commentSearchMatchIssueIds.has(row.id)
     ) return count;
     return count + 1;
@@ -7661,7 +7699,7 @@ export function issueService(db: Db) {
         listIssueProductivityReviewMap(db, companyId, issueIds),
         includeBlockedInboxAttention
           ? listIssueBlockedInboxAttentionMap(db, companyId, withRuns)
-          : Promise.resolve(new Map<string, IssueBlockedInboxAttention>()),
+          : Promise.resolve(new Map<string, BlockedInboxAttentionEntry>()),
       ]);
 
       if (!contextUserId) {
@@ -7677,7 +7715,7 @@ export function issueService(db: Db) {
             ...(includeBlockedBy ? { blockedBy: blockedByMap.get(row.id) ?? [] } : {}),
             lastActivityAt,
             ...(blockerAttentionByIssueId.has(row.id) ? { blockerAttention: blockerAttentionByIssueId.get(row.id) } : {}),
-            ...(includeBlockedInboxAttention ? { blockedInboxAttention: blockedInboxAttentionByIssueId.get(row.id) ?? null } : {}),
+            ...(includeBlockedInboxAttention ? { blockedInboxAttention: blockedInboxAttentionByIssueId.get(row.id)?.attention ?? null } : {}),
             ...(includeLiveDescendantSummary ? { liveDescendantCount: liveDescendantCountByIssueId.get(row.id) ?? 0 } : {}),
             ...(productivityReviewByIssueId.has(row.id)
               ? { productivityReview: productivityReviewByIssueId.get(row.id) }
@@ -7701,7 +7739,7 @@ export function issueService(db: Db) {
           ...(includeBlockedBy ? { blockedBy: blockedByMap.get(row.id) ?? [] } : {}),
           lastActivityAt,
           ...(blockerAttentionByIssueId.has(row.id) ? { blockerAttention: blockerAttentionByIssueId.get(row.id) } : {}),
-          ...(includeBlockedInboxAttention ? { blockedInboxAttention: blockedInboxAttentionByIssueId.get(row.id) ?? null } : {}),
+          ...(includeBlockedInboxAttention ? { blockedInboxAttention: blockedInboxAttentionByIssueId.get(row.id)?.attention ?? null } : {}),
           ...(includeLiveDescendantSummary ? { liveDescendantCount: liveDescendantCountByIssueId.get(row.id) ?? 0 } : {}),
           ...(productivityReviewByIssueId.has(row.id)
             ? { productivityReview: productivityReviewByIssueId.get(row.id) }
