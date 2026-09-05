@@ -9,7 +9,11 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { prepareClaudePromptBundle } from "./prompt-cache.js";
+import {
+  ClaudeSkillSourceUnavailableError,
+  prepareClaudePromptBundle,
+  readCatalogBackedSkillKeys,
+} from "./prompt-cache.js";
 import {
   parseClaudeStreamJson,
   describeClaudeFailure,
@@ -1408,6 +1412,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const skillEntries = await readPaperclipRuntimeSkillEntries(config, import.meta.dirname ?? __dirname);
   const desiredSkillNames = new Set(resolvePaperclipDesiredSkillNames(config, skillEntries));
   const desiredSkills = skillEntries.filter((e) => desiredSkillNames.has(e.key));
+  // BLO-32055: which of these came from a company-skill catalog row, which is
+  // the discriminator between a transient materialization race and a permanent
+  // config fault. `readPaperclipRuntimeSkillEntries` returns EITHER the
+  // server-injected `paperclipRuntimeSkills` (resolved by `listRuntimeSkillEntries`
+  // from catalog rows, and the only ones the rolling sweep rewrites) OR, when that
+  // is empty, the adapter's own bundled on-disk skills. A missing file under the
+  // latter is a packaging fault in a read-only image path — permanent, and it must
+  // not be retried as though a sweep were about to finish writing it.
+  const catalogBackedSkillKeys = readCatalogBackedSkillKeys(config);
   const skillSummary = desiredSkills.length > 0 ? desiredSkills.map((s) => s.runtimeName ?? s.key).join(", ") : "none";
   await onLog("stdout", `[paperclip] Skills bundled (${desiredSkills.length}): ${skillSummary}\n`);
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
@@ -1429,13 +1442,50 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
     }
   }
-  const promptBundle = await prepareClaudePromptBundle({
-    companyId: ctx.agent.companyId,
-    skills: desiredSkills,
-    instructionsContents,
-    rootDir: resolvePromptCacheRoot(config, effectiveCtx, jobIsolation),
-    onLog,
-  });
+  let promptBundle: Awaited<ReturnType<typeof prepareClaudePromptBundle>>;
+  try {
+    promptBundle = await prepareClaudePromptBundle({
+      companyId: ctx.agent.companyId,
+      skills: desiredSkills,
+      instructionsContents,
+      rootDir: resolvePromptCacheRoot(config, effectiveCtx, jobIsolation),
+      catalogBackedSkillKeys,
+      onLog,
+    });
+  } catch (err) {
+    // BLO-32055. This throw happens before the Claude CLI is spawned, so there is
+    // no stdout, no result event and no `parsed` — every BLO-7991 AC3 classifier
+    // in parse.ts reads a Claude-CLI-authored surface and is structurally unable
+    // to see it. Untyped, it fell through to the anonymous `adapter_failed`,
+    // which reports an agent-pool/adapter fault for what is actually a skill
+    // configuration fault and hides it from skill-health sweeps.
+    //
+    // Classified on the source of truth (which skill owns the path), never on
+    // the message text: nothing here scans transcript or model output, so the
+    // BLO-31794 false-positive hazard — a run that merely *discusses* a missing
+    // skill — cannot reach this branch.
+    if (!(err instanceof ClaudeSkillSourceUnavailableError)) throw err;
+    await onLog(
+      "stderr",
+      `[paperclip] ${err.message} (source: ${err.skillSource})\n`,
+    );
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorMessage: err.message,
+      // A catalog row exists => the sweep is mid-refresh and the tree completes
+      // on its own, so this must stay retryable: `skill_materialization_pending`
+      // is a member of TRANSIENT_INFRA_CONTINUATION_ERROR_CODES (the set that
+      // already held `adapter_failed`, so retryability is preserved exactly, not
+      // widened) and is not the DETERMINISTIC_SKILL_FAILURE_ERROR_CODE excluded
+      // from the zero-token session reset.
+      //
+      // No catalog row => a genuine, permanent configuration fault, which keeps
+      // the existing non-retryable `skill_not_found`.
+      errorCode: err.catalogBacked ? "skill_materialization_pending" : "skill_not_found",
+    };
+  }
 
   // Build Job manifest
     const built = buildJobManifest({ ctx: effectiveCtx, selfPod, promptBundle });

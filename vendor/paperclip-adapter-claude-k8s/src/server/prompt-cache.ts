@@ -21,6 +21,104 @@ export interface ClaudePromptBundle {
 
 const DEFAULT_PAPERCLIP_INSTANCE_ID = "default";
 
+/**
+ * A declared skill's source tree lost a file out from under the bundle-key walk.
+ *
+ * BLO-32055: `company-skills.ts materializeRuntimeSkillFiles` refreshes a runtime
+ * skill by `fs.rm(skillDir, {recursive:true})` -> `mkdir` -> per-file `writeFile`.
+ * That is not atomic, so the rolling materialization sweep publishes a window in
+ * which the directory exists and `SKILL.md` does not. `hashPathContents` below
+ * walks that tree to derive the prompt-bundle cache key, and its `readFile` used
+ * to be unguarded — so a sweep landing between the `readdir` and the `readFile`
+ * threw a bare Node `ENOENT ... open '<...>/__runtime__/<slug>/SKILL.md'` out of
+ * `prepareClaudePromptBundle`, i.e. before the Claude CLI was ever spawned.
+ *
+ * That is why the live instance carried `errorCode: adapter_failed` with both
+ * `stdoutExcerpt` and `stderrExcerpt` null: there was no transcript, no result
+ * event, and no `parsed` for `isClaudeSkillNotFoundError` to read. The BLO-7991
+ * AC3 classifier is correct for the surface it targets (Claude-CLI-authored
+ * text); this is a second path into the same user-visible failure on a layer it
+ * never inspects.
+ *
+ * Carrying the owning skill lets `execute.ts` name the fault and — decisively —
+ * separate the transient class from the permanent one. Only skills the server
+ * resolved from a company-skill catalog row live under the sweep-rewritten
+ * `__runtime__/`, so an ENOENT attributed to one of those means *materialization
+ * pending*, which self-heals (the live instance's file appeared 43m36s later).
+ * Routing that to `skill_not_found` would be wrong in the expensive direction:
+ * that code is in `NON_RETRYABLE_CONTINUATION_ERROR_CODES` and would permanently
+ * suppress retries on a self-healing condition.
+ *
+ * The set is NOT every desired skill — see `readCatalogBackedSkillKeys` below for
+ * why `readPaperclipRuntimeSkillEntries` can also hand back bundled on-disk
+ * skills, for which the same ENOENT is permanent.
+ */
+export class ClaudeSkillSourceUnavailableError extends Error {
+  readonly skillKey: string;
+  readonly skillSource: string;
+  readonly missingPath: string;
+  /**
+   * True when the failing path belongs to a skill the caller resolved from the
+   * company-skill catalog. False is the defensive branch: a source that is not
+   * attributable to a catalog-backed entry is a real configuration fault, not a
+   * sweep race, and must stay non-retryable.
+   */
+  readonly catalogBacked: boolean;
+
+  constructor(input: {
+    skillKey: string;
+    skillSource: string;
+    missingPath: string;
+    catalogBacked: boolean;
+    cause: unknown;
+  }) {
+    super(
+      `Skill "${input.skillKey}" source is incomplete: ${input.missingPath} disappeared while building the Claude prompt bundle.`,
+    );
+    this.name = "ClaudeSkillSourceUnavailableError";
+    this.skillKey = input.skillKey;
+    this.skillSource = input.skillSource;
+    this.missingPath = input.missingPath;
+    this.catalogBacked = input.catalogBacked;
+    this.cause = input.cause;
+  }
+}
+
+/**
+ * ENOENT only. A permissions fault, an I/O error or a symlink loop is NOT a
+ * materialization race and must keep its existing behaviour rather than being
+ * laundered into a retryable skill code.
+ */
+function isMissingEntryError(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | null)?.code === "ENOENT";
+}
+
+/**
+ * The skill keys the server resolved from company-skill catalog rows.
+ *
+ * `readPaperclipRuntimeSkillEntries` returns EITHER these injected entries OR,
+ * when the config carries none, the adapter's own bundled on-disk skills. Only
+ * the former live under `__runtime__/` where the rolling materialization sweep
+ * rewrites them non-atomically, so only the former can produce the transient
+ * race. Bundled skills sit in a read-only image path: a file missing there is a
+ * packaging fault that no amount of retrying will fix.
+ */
+export function readCatalogBackedSkillKeys(config: Record<string, unknown>): ReadonlySet<string> {
+  const raw = config.paperclipRuntimeSkills;
+  if (!Array.isArray(raw)) return new Set<string>();
+  const keys = new Set<string>();
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const key = (entry as Record<string, unknown>).key;
+    // Mirrors normalizeConfiguredPaperclipRuntimeSkills' key fallback in
+    // server-utils, so the two cannot disagree about which entry is which.
+    const name = (entry as Record<string, unknown>).name;
+    const resolved = (typeof key === "string" ? key : typeof name === "string" ? name : "").trim();
+    if (resolved) keys.add(resolved);
+  }
+  return keys;
+}
+
 function validatePathComponent(value: string, fieldName: string): void {
   if (value.trim().length === 0) throw new Error(`Invalid ${fieldName}: must not be empty`);
   if (value.includes("/") || value.includes("\\")) throw new Error(`Invalid ${fieldName}: must not contain path separators`);
@@ -88,6 +186,7 @@ async function hashPathContents(
 async function buildClaudePromptBundleKey(input: {
   skills: PaperclipSkillEntry[];
   instructionsContents: string | null;
+  catalogBackedSkillKeys?: ReadonlySet<string>;
 }): Promise<string> {
   const hash = createHash("sha256");
   hash.update("paperclip-claude-prompt-bundle:v1\n");
@@ -101,7 +200,23 @@ async function buildClaudePromptBundleKey(input: {
   const sortedSkills = [...input.skills].sort((a, b) => a.runtimeName.localeCompare(b.runtimeName));
   for (const entry of sortedSkills) {
     hash.update(`skill:${entry.key}:${entry.runtimeName}\n`);
-    await hashPathContents(entry.source, hash, entry.runtimeName, new Set());
+    try {
+      await hashPathContents(entry.source, hash, entry.runtimeName, new Set());
+    } catch (err) {
+      // Deliberately still fatal, and re-thrown rather than swallowed. Hashing a
+      // half-written tree into a key would mint a bundle whose skills are silently
+      // incomplete — which is BLO-7991's original harm (an agent that behaves as
+      // though a declared skill does not exist), traded for a failure nobody sees.
+      // A typed, correctly-classified death costs one bounded retry and self-heals.
+      if (!isMissingEntryError(err)) throw err;
+      throw new ClaudeSkillSourceUnavailableError({
+        skillKey: entry.key,
+        skillSource: entry.source,
+        missingPath: (err as NodeJS.ErrnoException).path ?? entry.source,
+        catalogBacked: input.catalogBackedSkillKeys?.has(entry.key) ?? true,
+        cause: err,
+      });
+    }
   }
   return hash.digest("hex");
 }
@@ -131,10 +246,27 @@ export async function prepareClaudePromptBundle(input: {
   skills: PaperclipSkillEntry[];
   instructionsContents: string | null;
   rootDir?: string | null;
+  /**
+   * Skill keys the caller resolved from the company-skill catalog — the
+   * discriminator between a transient materialization race and a permanent
+   * configuration fault. `execute.ts` derives it from the server-injected
+   * `paperclipRuntimeSkills`, so the adapter's own bundled on-disk skills (a
+   * read-only image path the sweep never rewrites) are correctly excluded.
+   *
+   * Omitting it defaults every entry to catalog-backed, i.e. RETRYABLE. That is
+   * the deliberate direction to fail in: an over-retry costs bounded attempts
+   * against a condition that may clear, whereas an over-suppression is permanent
+   * (the BLO-31794 hazard). Production always passes the set explicitly.
+   */
+  catalogBackedSkillKeys?: ReadonlySet<string>;
   onLog: AdapterExecutionContext["onLog"];
 }): Promise<ClaudePromptBundle> {
   const { companyId, skills, instructionsContents, onLog } = input;
-  const bundleKey = await buildClaudePromptBundleKey({ skills, instructionsContents });
+  const bundleKey = await buildClaudePromptBundleKey({
+    skills,
+    instructionsContents,
+    catalogBackedSkillKeys: input.catalogBackedSkillKeys,
+  });
   const rootDir = path.join(input.rootDir?.trim() || resolveManagedClaudePromptCacheRoot(companyId), bundleKey);
   const skillsHome = path.join(rootDir, ".claude", "skills");
   await fs.mkdir(skillsHome, { recursive: true });
