@@ -60,21 +60,44 @@ never block a firing claim, so neither ever needs recovery.
 
 ### Recognising the wedge
 
-Every delivery that touches a held aggregate fails with:
+A firing claim refused by a live holder is **not** a wedge, and is no longer
+reported as a failure. Contention is routine: the fence is keyed on the creation
+identity, so every alert sharing an alertname contends for one fence by design.
+A refused claim is retried in-process with jittered backoff for a few seconds
+(PEN-3013), and the common case is absorbed silently. A delivery that had to
+wait says so, at info:
 
 ```
-Alertmanager aggregate <key> is held in phase '<firing|cancelling>' by an
-interrupted delivery; retrying firing delivery. This does not self-clear: an
-operator must release the fence via the plugin's recover-aggregate-firing route.
+Alertmanager aggregate <key> was held by a concurrent delivery; claimed it
+after <n> attempt(s) over <ms>ms instead of failing the delivery.
+```
+
+Only once that budget is spent does the delivery fail, with:
+
+```
+Alertmanager aggregate <key> is held in phase '<firing|cancelling>' by a
+delivery in progress; retrying firing delivery. A fence abandoned by a dead
+process is released automatically by its slot's next worker; if this persists,
+the holder is either live or in another slot, and an operator can release it via
+the plugin's recover-aggregate-firing route.
 ```
 
 The failure is per-alert, but one held aggregate fails the whole delivery batch
 so Alertmanager retries it — which is why a single wedged key can stall all
-webhook alert delivery until an operator intervenes. Watch for a sustained
-`alertmanager_notifications_failed_total{integration="webhook",reason="serverError"}`
-with `alertmanager_notifications_total` still advancing. Note that
-`paperclip_plugin_error` stays `0` throughout: the plugin is running and healthy
-at the lifecycle level, and is failing per alert.
+webhook alert delivery. A fence abandoned by a dead process now self-clears via
+its slot's next worker (BLO-31036), so a *sustained* failure means the holder is
+live or in another slot.
+
+**Do not diagnose this from
+`alertmanager_notifications_failed_total{integration="webhook"}`.** It undercounts
+and cannot witness the fault: Alertmanager increments it only when a
+notification's retry budget is *exhausted*, not per failed request, so a request
+that fails and is later retried successfully leaves no trace at all. Measured on
+PEN-2988, 14 HTTP 502s inside 40 seconds produced **zero** counter movement — a
+flat counter is fully compatible with a continuously-failing handler. Diagnose at
+the HTTP layer (502s at the webhook route) and from the handler logs above. Note
+that `paperclip_plugin_error` also stays `0` throughout: the plugin is running and
+healthy at the lifecycle level, and is failing per alert.
 
 The recovery API is board-authenticated and company-scoped. The examples below
 use a Paperclip board token in `PAPERCLIP_BOARD_TOKEN` (a browser session cookie

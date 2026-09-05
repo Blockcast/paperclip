@@ -448,6 +448,110 @@ async function beginAggregateFiring(
 }
 
 /**
+ * How long a firing delivery waits for a live sibling to release the aggregate
+ * fence before giving up and failing the delivery (PEN-3013).
+ *
+ * The fence is keyed on the *creation identity*
+ * (`alert-aggregate:v1:[alertname, dedupe-domain]`), so by design every alert
+ * sharing an alertname contends for one fence — that convergence is the whole
+ * point of the aggregate, and widening the key here would change which alerts
+ * share an issue, not merely who waits. So contention is expected, routine, and
+ * scales with the number of distinct firing instances per alertname; it is not
+ * a fault. Treating it as one is what produced the measured failure mode:
+ * unrelated objects under a shared alertname each returned 502, and
+ * Alertmanager's retry then collided with the delivery still holding the fence,
+ * sustaining the episode until the fan-out settled.
+ *
+ * The fence is only ever held for one delivery's issue RPCs, so the holder
+ * clears in the sub-second range and waiting nearly always beats failing. The
+ * budget is wall-clock and deliberately modest, because it is also paid on the
+ * path it cannot help: against a genuinely wedged fence every delivery now
+ * occupies a request slot for the full budget before failing, and Alertmanager
+ * keeps retrying throughout. It does not need to cover the worst-case fan-out —
+ * only to collapse the common case. A delivery that loses the race anyway still
+ * throws exactly as it did before, so it is retried, not lost; the
+ * transient/permanent taxonomy is untouched.
+ *
+ * Delays are jittered because the alerts that contend here re-fire *together*
+ * after a worker restart. Retrying on a fixed schedule would re-collide the same
+ * set in lockstep on every attempt, converting one queue into repeated
+ * thundering herds.
+ */
+const AGGREGATE_FENCE_WAIT_BUDGET_MS = 3_000;
+const AGGREGATE_FENCE_WAIT_INITIAL_DELAY_MS = 25;
+const AGGREGATE_FENCE_WAIT_MAX_DELAY_MS = 500;
+
+export type AggregateFenceWaitPolicy = {
+  budgetMs: number;
+  initialDelayMs: number;
+  maxDelayMs: number;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  random: () => number;
+};
+
+const DEFAULT_AGGREGATE_FENCE_WAIT: AggregateFenceWaitPolicy = {
+  budgetMs: AGGREGATE_FENCE_WAIT_BUDGET_MS,
+  initialDelayMs: AGGREGATE_FENCE_WAIT_INITIAL_DELAY_MS,
+  maxDelayMs: AGGREGATE_FENCE_WAIT_MAX_DELAY_MS,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now: () => Date.now(),
+  random: () => Math.random(),
+};
+
+/**
+ * `beginAggregateFiring`, but waits out a fence held by a live holder instead of
+ * failing the delivery on first refusal (PEN-3013).
+ *
+ * This waits for a *claim*; it holds nothing while it sleeps, so it cannot
+ * itself wedge an aggregate or delay a holder's release. Ownership safety is
+ * unchanged — it still rests entirely on the `firing_token` generation checked
+ * at each mutation site, and a claim won on the second attempt is
+ * indistinguishable from one won on the first.
+ *
+ * Deliberately retries on BOTH blocking phases. 'cancelling' is the resolver
+ * finishing a terminal transition, which is exactly the case the original
+ * comment says should "retry after the terminal transition" — previously that
+ * retry had to arrive as a whole new HTTP delivery.
+ */
+async function claimAggregateFiringWaiting(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+  policy: AggregateFenceWaitPolicy = DEFAULT_AGGREGATE_FENCE_WAIT,
+): Promise<AggregateFiringClaim> {
+  const startedAt = policy.now();
+  let attempt = 0;
+  let claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+
+  while (!claim.ok) {
+    const elapsedMs = policy.now() - startedAt;
+    const remainingMs = policy.budgetMs - elapsedMs;
+    if (remainingMs <= 0) return claim;
+
+    // Exponential with full jitter, clamped to whatever budget is left so the
+    // total wait cannot overrun even on the final attempt.
+    const ceiling = Math.min(
+      policy.maxDelayMs,
+      policy.initialDelayMs * 2 ** attempt,
+    );
+    const delayMs = Math.min(remainingMs, Math.ceil(policy.random() * ceiling));
+    await policy.sleep(delayMs);
+    attempt += 1;
+    claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+  }
+
+  if (attempt > 0) {
+    ctx.logger.info(
+      `Alertmanager aggregate ${aggregateKey} was held by a concurrent ` +
+        `delivery; claimed it after ${attempt} attempt(s) over ` +
+        `${policy.now() - startedAt}ms instead of failing the delivery.`,
+    );
+  }
+  return claim;
+}
+
+/**
  * Release fences abandoned by a previous occupant of this slot (BLO-31036).
  *
  * Runs once per worker process, from `setup()`. The per-claim steal in
@@ -1107,6 +1211,7 @@ export async function handleFiring(
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
   fallbackOwnerMemo?: FallbackOwnerMemo,
+  fenceWaitPolicy?: AggregateFenceWaitPolicy,
 ): Promise<void> {
   // Resolved up front because it now scopes the state read, not just issue
   // creation. Without it there is no namespace to look in, so a delivery that
@@ -1166,7 +1271,12 @@ export async function handleFiring(
     return;
   }
 
-  const firingClaim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+  const firingClaim = await claimAggregateFiringWaiting(
+    ctx,
+    companyId,
+    aggregateKey,
+    fenceWaitPolicy,
+  );
   if (!firingClaim.ok) {
     throw new Error(
       `Alertmanager aggregate ${aggregateKey} is held in phase ` +
@@ -2080,6 +2190,7 @@ export async function handleWebhook(
   config: AlertmanagerPluginConfig,
   authenticated: boolean,
   input: PluginWebhookInput,
+  fenceWaitPolicy?: AggregateFenceWaitPolicy,
 ): Promise<void> {
   if (input.endpointKey !== WEBHOOK_KEYS.alertmanager) {
     ctx.logger.warn(
@@ -2182,7 +2293,7 @@ export async function handleWebhook(
           }
           continue;
         }
-        await handleFiring(ctx, config, alert, fallbackOwnerMemo);
+        await handleFiring(ctx, config, alert, fallbackOwnerMemo, fenceWaitPolicy);
       } else if (status === "resolved") {
         // Reached with BOTH policy gates above deliberately bypassed — this
         // path is creation-only, exactly like the severity floor in
