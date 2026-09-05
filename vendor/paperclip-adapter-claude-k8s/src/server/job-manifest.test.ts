@@ -890,16 +890,24 @@ describe("buildJobManifest", () => {
     // not security, so unlike the remove/add pair it is guarded — an offline pod
     // must degrade to "fetch first", never to a failed run.
     it("refetches remote-tracking refs and origin/HEAD after repointing origin, without letting a fetch failure fail the run", () => {
+      // Each path is read twice — once to build the fixture, once to spell the
+      // `git -C` prefixes the assertions match on — so bind them rather than
+      // re-typing the literals. The desync fails closed but points the wrong
+      // way: editing a fixture literal alone leaves both calls unrecognised, so
+      // the suite reports "unclassified git call" and sends the reader to the
+      // run-workspace git block they did not touch instead of the path they did.
+      const sourceCheckout = "/paperclip/instances/default/projects/co1/proj-1/paperclip";
+      const workspaceRoot = "/runtime-cache/paperclip-runs/run-abc12345/workspace";
       ctx.context = {
         paperclipWorkspace: {
-          cwd: "/paperclip/instances/default/projects/co1/proj-1/paperclip",
+          cwd: sourceCheckout,
           repoUrl: "https://github.com/Blockcast/paperclip.git",
         },
       };
       setRuntimeIsolation(ctx, {
         isolationMode: "run",
         isolationKey: "run:run-abc12345",
-        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        workspaceRoot,
         homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
         sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
         cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
@@ -909,7 +917,6 @@ describe("buildJobManifest", () => {
 
       const { job } = buildJobManifest({ ctx, selfPod });
       const command = job.spec?.template?.spec?.containers[0]?.command?.join(" ") ?? "";
-      const workspaceRoot = "/runtime-cache/paperclip-runs/run-abc12345/workspace";
       const boundedGit = `git -C '${workspaceRoot}' -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15`;
 
       expect(command).toContain(`fetch --no-tags --quiet origin`);
@@ -984,19 +991,60 @@ describe("buildJobManifest", () => {
         });
 
       const networkCalls = invocations.filter((i) => reachesNetwork(i.args));
+      // Scope, closed rather than described. The parser above only sees calls
+      // spelled exactly `git -C '<workspaceRoot>'`. Enumerating the forms that
+      // evade it would read as exhaustive without being so: `git -c k=v -C
+      // '<root>'` and `git --git-dir '<root>/.git'` both slip the prefix match,
+      // and this block ENDS with a literal `cd '<workspaceRoot>'`, so a call
+      // appended after that needs no path argument at all to act on this repo
+      // and would mention neither `-C` nor the root. Classify every git call
+      // instead and let anything unrecognised fail here — that is what makes
+      // the boundedness assertions below load-bearing rather than merely
+      // well-labelled.
+      //
+      // Command position excludes three non-calls: the `.git` suffix inside a
+      // repo URL, the `git ...` spelled inside the breadcrumb prose (always
+      // preceded by a backtick), and the tail of a flag such as `--git-dir`,
+      // which is reported by the flag's own call rather than twice.
+      //
+      // Scope is deliberately the WHOLE container command, not just this block:
+      // the command also carries buildEnvGuardSetupShell(), ccrotateRefresh,
+      // DIND_WAIT_PREAMBLE, claudeArgsEscaped and failFastFilter. That is the
+      // fail-closed choice — a git call added to any of them still lands here —
+      // but the coupling runs the other way too, so an unrelated file can redden
+      // this assertion. If that happens the fix is to classify the new call, not
+      // to narrow this match back to the block.
+      const unclassifiedGitCalls = [...command.matchAll(/(?<![-.`\w])git\b/g)]
+        .map((m) => command.slice(m.index))
+        .filter(
+          (call) =>
+            // The three shapes this block is allowed to use.
+            !call.startsWith(`git -C '${workspaceRoot}'`) &&
+            !call.startsWith(`git -C '${sourceCheckout}'`) &&
+            !call.startsWith("git clone "),
+        )
+        .map((call) => call.slice(0, 60));
+      expect(unclassifiedGitCalls).toEqual([]);
       // The real guard: no unbounded network call, however this block grows.
-      // Needs no edit when a third bounded call is legitimately added. Scope is
-      // every `git -C '<workspaceRoot>'`-prefixed call — a call written against
-      // a different `-C`, or as `cd "$root" && git ...`, is not seen here.
+      // Needs no edit when a third bounded call is legitimately added, and the
+      // scope check above is what guarantees "every call" really means every
+      // call rather than every call written in one particular style.
       expect(networkCalls.filter((i) => !i.bounded).map((i) => i.args.trim())).toEqual([]);
       // ...and nothing that stays local pays the bound, so the bound tracks the
       // set of network calls in both directions.
       expect(invocations.filter((i) => i.bounded && !reachesNetwork(i.args)).map((i) => i.args.trim())).toEqual([]);
       // Deliberate change-tripwire, NOT a boundedness check: the two calls above
       // are the whole network surface of run-workspace setup today. A third one
-      // is a decision worth a human reading this block, so bumping this literal
-      // is the correct response to a legitimate addition — the invariant above
-      // is what keeps that addition honest.
+      // is a decision worth a human reading this block. Which edit is correct
+      // depends on what was added, and the count alone will not tell you:
+      //   - a genuinely NEW network call — bump this literal, and the
+      //     boundedness invariant above keeps the addition honest.
+      //   - a new LOCAL call whose verb `staysLocal` does not yet name — the
+      //     deny-list classifies it as network-reaching (that is the fail-closed
+      //     design, not a bug), so it inflates this count too. Add its verb to
+      //     `staysLocal`; bumping the literal here would paper over the
+      //     misclassification and leave a local call asserted to carry a bound
+      //     it has no reason to carry.
       expect(networkCalls).toHaveLength(2);
 
       const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });

@@ -805,6 +805,12 @@ jobs:
             fi
             # Surfaced in the run summary so retiring a lock is never a silent
             # side effect of a deploy someone skim-approved.
+            #
+            # Keep this AFTER both shape checks above. It interpolates
+            # operator-supplied input into the run log, so emitting it before
+            # validation would let `::stop-commands::` or `::add-mask::` inside
+            # `abandon_in_flight` take effect as workflow commands. The position
+            # is the protection; nothing about the echo itself enforces it.
             echo "::warning::retiring stranded in-flight approval ${ABANDON_IN_FLIGHT} (owner ${ABANDON_IN_FLIGHT_OWNER}) before approving ${DIGEST}"
           fi
 
