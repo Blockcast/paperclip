@@ -32,6 +32,20 @@ const tsx = path.resolve(here, "..", "..", "node_modules", ".bin", "tsx");
 const PIPE_PRESSURE_BYTES = 200_000;
 /** Child startup is outside the measured crash deadline and can lag on loaded CI runners. */
 const FIXTURE_STARTUP_TIMEOUT_MS = 10_000;
+/**
+ * The behaviour under test: with stderr stalled, the guard must still exit this fast.
+ * This is the contract — tighten or loosen it only when the guard's own deadline moves.
+ */
+const STALLED_EXIT_DEADLINE_MS = 1_500;
+/**
+ * Harness backstop, never the thing under test. It must stay well clear of
+ * STALLED_EXIT_DEADLINE_MS: a slow-but-working exit has to fail the assertion with a
+ * measured elapsed time, not get SIGKILLed into "did not exit" — a claim this harness
+ * cannot support, because it killed the child rather than watching it fail to die.
+ * The startup watchdog next door needed 5x headroom for loaded runners; a deadline
+ * measured on the same runners needs the same, and at 2s it had 500ms.
+ */
+const STALLED_EXIT_WATCHDOG_MS = STALLED_EXIT_DEADLINE_MS * 5;
 
 interface CrashResult {
   code: number | null;
@@ -97,8 +111,13 @@ function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
       startedAt = Date.now();
       watchdog = setTimeout(() => {
         child.kill("SIGKILL");
-        reject(new Error("crash guard did not exit while stderr was stalled"));
-      }, 2_000);
+        reject(
+          new Error(
+            `crash guard had not exited ${STALLED_EXIT_WATCHDOG_MS}ms after the stall ` +
+              `(harness backstop; the asserted deadline is ${STALLED_EXIT_DEADLINE_MS}ms)`,
+          ),
+        );
+      }, STALLED_EXIT_WATCHDOG_MS);
       child.stdin.end("CRASH\n");
     });
 
@@ -152,7 +171,7 @@ describe("process crash guard — real process exit", () => {
     const { code, elapsedMs } = await runFixtureWithStalledStderr();
 
     expect(code).toBe(1);
-    expect(elapsedMs).toBeLessThan(1_500);
+    expect(elapsedMs).toBeLessThan(STALLED_EXIT_DEADLINE_MS);
   });
 
   it("flushes one complete crash record for a strict unhandled rejection", async () => {
