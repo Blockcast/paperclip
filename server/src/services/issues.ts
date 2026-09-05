@@ -5075,7 +5075,21 @@ async function listIssueBlockedInboxAttentionMap(
     }
 
     const hasMonitor = Boolean(row.monitorNextCheckAt && row.monitorNextCheckAt.getTime() > Date.now());
-    const external = row.status === "blocked" && !hasMonitor ? externalWaitFromDescription(row.description) : null;
+    // BLO-31839: read the description from the graph projection, never from `row`. Callers hand
+    // this function two different row shapes — `listBlockedInboxIssues` projects
+    // `substring(description, 1, ISSUE_LIST_DESCRIPTION_MAX_CHARS)` to bound payload size, while
+    // `countBlockedInboxIssues` selected the full column — so reading `row.description` made the
+    // external-wait gate depend on the caller's projection. A park declared past the 1200-char
+    // cutoff was counted and not enumerable, which is what made the blocked-inbox oracle sit
+    // stably +1 against its own list. `graphIssues` is already fetched in full above, so this is
+    // the same string the liveness classifier's `hasExternalWaitOwner` reads — the two disagreeing
+    // is what let a genuinely parked row fall through to no attention at all and vanish from the
+    // inbox. Fall back to `row` only when the row is absent from the graph projection.
+    const graphRow = issuesById.get(row.id);
+    const externalWaitDescription = graphRow ? graphRow.description : row.description;
+    const external = row.status === "blocked" && !hasMonitor
+      ? externalWaitFromDescription(externalWaitDescription)
+      : null;
     if (external) {
       result.set(row.id, attentionBase({
         state: "external_wait",
@@ -5344,8 +5358,14 @@ async function listBlockedInboxIssues(
 
 async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?: IssueFilters): Promise<number> {
   const { conditions } = await blockedInboxIssueConditions(dbOrTx, companyId, filters);
+  // BLO-31839: project exactly what `listBlockedInboxIssues` projects. This count is the oracle
+  // for that list, so it has to see the same row shape: `blockedInboxSearchText` reads
+  // `row.description`, and selecting the full column here made a `q` term past
+  // ISSUE_LIST_DESCRIPTION_MAX_CHARS countable but not enumerable — the mirror image of the
+  // external-wait divergence fixed above. Sharing the projection also stops this path force-
+  // detoasting every blocked row's description.
   const rows = (await dbOrTx
-    .select()
+    .select(issueListSelect)
     .from(issues)
     .where(and(...conditions))) as IssueRow[];
   if (rows.length === 0) return 0;
