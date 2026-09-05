@@ -5,6 +5,13 @@ import { describe, expect, it } from "vitest";
 import { admitsNothingEvaluated } from "../../../scripts/check-comment-review-gate-census.mjs";
 
 import {
+  extractAllyPriorFindingDispositions,
+  extractAllyReportedFindingRefs,
+  extractAllyReviewedHeadSha,
+  hasActionablePrReviewFeedback,
+  hasAllyConsolidatedReviewHeading,
+} from "../services/ally-review-detection.js";
+import {
   commentReviewGateRetirementDescription,
   commentReviewGateRetirementStatus,
   commentReviewGateVerdictIsMisreadable,
@@ -629,6 +636,267 @@ describe("evaluateCommentReviewGate", () => {
     });
 
     expect(verdict).toMatchObject({ state: "failure" });
+  });
+});
+
+/**
+ * Quoting a review must never be mistaken for emitting one.
+ *
+ * The gate's only identity check is the author login, and every agent in the
+ * fleet comments as that same App. So before this suite existed, an agent
+ * pasting the review it was replying to published a merge-visible verdict
+ * about a head nothing had examined — in both directions.
+ */
+describe("evaluateCommentReviewGate — quoted review bodies", () => {
+  const fenced = (body: string, info = ""): string =>
+    ["Quoting the review I am replying to:", "", `\`\`\`${info}`, body, "```", "", "Nothing addressed yet."].join("\n");
+
+  it("does not let a fenced paste of a clean review attest the head", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [allyComment(fenced(cleanReview(CURRENT_HEAD)), "2026-09-05T00:00:00Z")],
+    });
+
+    // Not merely "not clean": `clean` is the one outcome that asserts positive
+    // evidence of review, which is exactly what a quote is not.
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  it("does not let a fenced paste of a finding redden a head Ally never reviewed", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [allyComment(fenced(blockingReview(CURRENT_HEAD), "markdown"), "2026-09-05T00:00:00Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  it("does not let a quoted ledger entry retire a live finding", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-09-05T00:00:00Z"),
+        allyComment(fenced(dispositioningReview(CURRENT_HEAD, OLD_HEAD, "fixed")), "2026-09-05T01:00:00Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
+  it("still reads a genuine review that itself contains a fenced code block", () => {
+    const withSuggestion = reviewBody(CURRENT_HEAD, [
+      "### Critical Issues (0)",
+      "### Important Issues (1)",
+      "- Prefer the guarded form:",
+      "```ts",
+      "if (!ok) return;",
+      "```",
+      "### Recommended Action",
+      "Fix the guard before merge.",
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [allyComment(withSuggestion, "2026-09-05T00:00:00Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "blocking_finding" });
+  });
+
+  it("keeps a finding visible when an unbalanced fence would blank the rest of the body", () => {
+    // Fail-closed guard: hasActionablePrReviewFeedback reads the raw body too,
+    // so a malformed fence cannot silently clear a PR.
+    const unbalanced = reviewBody(CURRENT_HEAD, [
+      "### Critical Issues (0)",
+      "```ts",
+      "const oops = true;",
+      "### Important Issues (1)",
+      "- The unterminated fence above swallows this line when rendered.",
+    ]);
+
+    expect(hasActionablePrReviewFeedback(unbalanced)).toBe(true);
+  });
+
+  /**
+   * The unit assertion above passes while the gate still goes green, because
+   * detecting a finding and enumerating which findings exist are separate
+   * predicates. Enumerating from fence-stripped text alone dropped the bucket
+   * that followed an unbalanced fence, so retiring the surviving one retired
+   * the whole head — a silent green with a live finding on it.
+   */
+  it("does not drop a finding bucket that an unbalanced fence swallows", () => {
+    const swallowed = reviewBody(OLD_HEAD, [
+      "### Critical Issues (1)",
+      "- **[code]** the terminator is missing.",
+      "```ts",
+      "const unterminated = true;",
+      "### Important Issues (1)",
+      "- **[code]** this bucket follows the unbalanced fence.",
+    ]);
+
+    // Both buckets are enumerated, so a ledger must name both to retire the head.
+    expect(extractAllyReportedFindingRefs(swallowed)).toEqual([
+      { severity: "critical", index: 1 },
+      { severity: "important", index: 1 },
+    ]);
+
+    const retiresOnlyTheFirst = reviewBody(INTERMEDIATE_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} critical 1** — fixed — the terminator is back.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(swallowed, "2026-09-05T00:00:00Z"),
+        allyComment(retiresOnlyTheFirst, "2026-09-05T01:00:00Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
+  it("does not let a 4-space-indented ledger entry retire a live finding", () => {
+    // Indentation is the other way to quote a ledger, and stripping fenced
+    // spans alone left it readable as emitted structure.
+    const quotesLedgerByIndent = reviewBody(CURRENT_HEAD, [
+      "The earlier review's ledger read:",
+      "",
+      `    - **prior:${OLD_HEAD.slice(0, 7)} important 1** — fixed — re-checked.`,
+      "",
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    expect(extractAllyPriorFindingDispositions(quotesLedgerByIndent)).toEqual([]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: INTERMEDIATE_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-09-05T00:00:00Z"),
+        allyComment(quotesLedgerByIndent, "2026-09-05T01:00:00Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
+  it("still reads the unindented ledger entry Ally actually emits", () => {
+    // The guard above must not cost a real retirement: every ledger entry in
+    // the sampled corpus is unindented.
+    expect(
+      extractAllyPriorFindingDispositions(dispositioningReview(CURRENT_HEAD, OLD_HEAD, "fixed")),
+    ).toMatchObject([{ shortSha: OLD_HEAD.slice(0, 7), disposition: "fixed", kind: "retires" }]);
+  });
+
+  it("ignores a 4-space-indented paste, which the heading and attestation once disagreed about", () => {
+    const indented = [
+      "For reference, the earlier review said:",
+      "",
+      "    ## Ally — Consolidated PR Review",
+      `    Reviewed head: ${CURRENT_HEAD}`,
+      "    ### Critical Issues (0)",
+      "    ### Important Issues (0)",
+    ].join("\n");
+
+    expect(extractAllyReviewedHeadSha(indented)).toBeNull();
+    expect(
+      evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        comments: [allyComment(indented, "2026-09-05T00:00:00Z")],
+      }),
+    ).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+});
+
+/**
+ * Ally wraps the attested SHA in whatever emphasis it happens to choose. The
+ * suite previously built every fixture with a bare SHA, so it asserted the
+ * parser correct only on the one shape it already handled (BLO-31730).
+ */
+describe("extractAllyReviewedHeadSha — attestation delimiters", () => {
+  // Verbatim from paperclip#1637's `cce8d6b0` review, the review whose
+  // invisibility carried a resolved finding forward against a dead head.
+  it("parses the backticked form that made a real review invisible", () => {
+    expect(
+      extractAllyReviewedHeadSha(
+        ["## Ally — Consolidated PR Review", `Reviewed head: \`${CURRENT_HEAD}\``, ""].join("\n"),
+      ),
+    ).toBe(CURRENT_HEAD);
+  });
+
+  it.each([
+    ["bare", `Reviewed head: ${CURRENT_HEAD}`],
+    ["backticked sha", `Reviewed head: \`${CURRENT_HEAD}\``],
+    ["bold sha", `Reviewed head: **${CURRENT_HEAD}**`],
+    ["bold and backticked", `Reviewed head: **\`${CURRENT_HEAD}\`**`],
+    ["italicized line", `_Reviewed head: ${CURRENT_HEAD}_`],
+  ])("accepts the %s attestation", (_label, line) => {
+    expect(extractAllyReviewedHeadSha(`## Ally — Consolidated PR Review\n${line}\n`)).toBe(CURRENT_HEAD);
+  });
+
+  it("preserves the ambiguity guard that keeps a check from being set on a guess", () => {
+    expect(
+      extractAllyReviewedHeadSha(
+        [`Reviewed head: \`${CURRENT_HEAD}\``, `Reviewed head: **${OLD_HEAD}**`].join("\n"),
+      ),
+    ).toBeNull();
+    expect(extractAllyReviewedHeadSha("## Ally — Consolidated PR Review\nno attestation\n")).toBeNull();
+  });
+
+  it("does not treat a mid-line prose mention as an attestation", () => {
+    expect(extractAllyReviewedHeadSha(`The status says Reviewed head: ${CURRENT_HEAD} which is stale.`)).toBeNull();
+  });
+
+  it("does not treat a fenced SHA as an attestation", () => {
+    expect(
+      extractAllyReviewedHeadSha(["```", `Reviewed head: ${CURRENT_HEAD}`, "```"].join("\n")),
+    ).toBeNull();
+  });
+
+  /**
+   * A tab advances to the next four-column stop, so it starts an indented code
+   * block however few spaces precede it. The heading pattern already rejected
+   * this shape; the attestation accepted it, which is the same two-parsers
+   * disagreement in miniature.
+   */
+  it.each([
+    ["four spaces", "    "],
+    ["a tab", "\t"],
+    ["spaces then a tab", "   \t"],
+  ])("rejects an attestation indented by %s", (_label, indent) => {
+    expect(extractAllyReviewedHeadSha(`context\n${indent}Reviewed head: ${CURRENT_HEAD}\n`)).toBeNull();
+  });
+
+  it("still accepts the up-to-three-space indentation Markdown treats as a paragraph", () => {
+    expect(extractAllyReviewedHeadSha(`context\n   Reviewed head: ${CURRENT_HEAD}\n`)).toBe(CURRENT_HEAD);
+  });
+
+  /**
+   * The converse of the quoting tests above, and the one direction that fails
+   * open: blanking can also remove a *genuine* attestation. A review whose
+   * attestation is swallowed attests no head, so it is never an attesting
+   * comment and its findings go untracked.
+   *
+   * This is the residual the module header accepts rather than closes — Ally's
+   * template leaves nothing fenceable above these lines, so reaching it needs a
+   * malformed body. Pinning it keeps the residual executable instead of merely
+   * described, and fails loudly if the attestation is ever moved below a
+   * fenceable region.
+   */
+  it.each([
+    ["an unbalanced backtick fence", "```ts"],
+    ["a stray tilde fence", "~~~ts"],
+  ])("loses a genuine attestation to %s above it", (_label, fence) => {
+    const body = ["## Ally — Consolidated PR Review", fence, "", `Reviewed head: ${CURRENT_HEAD}`].join(
+      "\n",
+    );
+    expect(extractAllyReviewedHeadSha(body)).toBeNull();
+    // The body still reads as an actionable Ally review — only the attestation
+    // is lost, which is precisely what makes this direction fail open.
+    expect(hasAllyConsolidatedReviewHeading(body)).toBe(true);
   });
 });
 
