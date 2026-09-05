@@ -9625,8 +9625,10 @@ const COPULA_FILLER = `(?:${NON_CONNECTIVE_WORD}){0,${COPULA_FILLER_WORDS}}`;
 // complementizer phrasings). Ablated against this head: deleting that entry
 // drops grammatical adversatives vetoed from 6/6 to 0/6; widening its stem to
 // CONNECTIVES raises grammatical consequence frames vetoed from 0/6 to 6/6.
-// See the attribution pin at heartbeat-context-summary.test.ts:1420, which
-// already names this cue for this exact frame. Measured 0 grammatical frames
+// See the attribution pin for "No evidence yet this head was " in
+// heartbeat-context-summary.test.ts, which already names this cue for this
+// exact frame — cited by frame, not line number, since this file grows by
+// several lines per pass. Measured 0 grammatical frames
 // changed BY THIS EXCLUSION; the flips are confined to ungrammatical strings
 // with the adversative IN the filler slot ("No yet evidence …"). Do NOT
 // generalise `negatedHeadConnective`'s ADVERSATIVE_CONNECTIVES to
