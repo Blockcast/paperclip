@@ -408,9 +408,13 @@ tolerations:
 # pve2 saturates the same way whenever CI runner bursts land on
 # paperclip-5/-10/-11 (load 135/80 seen 2026-09-05 17:30Z, 20-24% steal), but
 # it cannot be excluded outright: the API's hard two-host spread
-# (api.spreadAcrossNodes) needs a second eligible node and pve4 hosts only
-# paperclip-3. The preferred rule below steers one replica (and the worker) to
-# pve4 and lets the spread rule place the other replica on a pve2 node.
+# (api.spreadAcrossNodes) needs a second eligible node, pve4 hosts only
+# paperclip-3, and the pve1 nodes (paperclip-1/-4/-8) carry reserved taints
+# (arc-dind-reserved, arc-multicast-integ-reserved) that production does not
+# tolerate. A NotIn [pve2, pve3] rule therefore wedged the rollout with a
+# replica Pending (2026-09-05 17:45Z). Instead: prefer pve4 outright, fall
+# back to any host that is not pve2, and let the spread rule place the second
+# replica on a pve2 node. This is a scheduler bias, not a pin.
 affinity:
   nodeAffinity:
     requiredDuringSchedulingIgnoredDuringExecution:
@@ -422,6 +426,13 @@ affinity:
                 - pve3
     preferredDuringSchedulingIgnoredDuringExecution:
       - weight: 100
+        preference:
+          matchExpressions:
+            - key: blockcast.net/pve-storage-domain
+              operator: In
+              values:
+                - pve4
+      - weight: 50
         preference:
           matchExpressions:
             - key: blockcast.net/pve-storage-domain

@@ -56,25 +56,37 @@ test("worker StatefulSet requires a node whose PVE host is not pve3", () => {
 
 // pve2 saturates whenever CI runner bursts land on paperclip-5/-10/-11, but it
 // cannot be excluded outright: the API's hard two-host spread needs a second
-// eligible node and pve4 only hosts paperclip-3. A preferred rule steers one
-// replica to pve4 and lets the spread rule place the other on pve2.
-const PREFER_NOT_PVE2 =
-  /preferredDuringSchedulingIgnoredDuringExecution:\s*\n\s*- preference:\s*\n\s*matchExpressions:\s*\n\s*- key: blockcast\.net\/pve-storage-domain\s*\n\s*operator: NotIn\s*\n\s*values:\s*\n\s*- pve2\s*\n\s*weight: 100/;
+// eligible node, pve4 hosts only paperclip-3, and the pve1 nodes carry reserved
+// taints production does not tolerate. So pve4 is preferred outright and any
+// non-pve2 host is the fallback, leaving the spread rule to place the second
+// replica on pve2.
+const PREFER_PVE4_THEN_NOT_PVE2 =
+  /preferredDuringSchedulingIgnoredDuringExecution:\s*\n\s*- preference:\s*\n\s*matchExpressions:\s*\n\s*- key: blockcast\.net\/pve-storage-domain\s*\n\s*operator: In\s*\n\s*values:\s*\n\s*- pve4\s*\n\s*weight: 100\s*\n\s*- preference:\s*\n\s*matchExpressions:\s*\n\s*- key: blockcast\.net\/pve-storage-domain\s*\n\s*operator: NotIn\s*\n\s*values:\s*\n\s*- pve2\s*\n\s*weight: 50/;
 
-test("API deployment prefers a node whose PVE host is not pve2", () => {
+test("API deployment prefers pve4, then any host that is not pve2", () => {
   const rendered = renderTemplate("templates/deployment-api.yaml", [
     "--set",
     "api.enabled=true",
   ]);
 
-  assert.match(rendered, PREFER_NOT_PVE2);
+  assert.match(rendered, PREFER_PVE4_THEN_NOT_PVE2);
 });
 
-test("worker StatefulSet prefers a node whose PVE host is not pve2", () => {
+test("worker StatefulSet prefers pve4, then any host that is not pve2", () => {
   const rendered = renderTemplate("templates/statefulset.yaml");
 
-  assert.match(rendered, PREFER_NOT_PVE2);
+  assert.match(rendered, PREFER_PVE4_THEN_NOT_PVE2);
 });
+
+// Slice one probe block out of the rendered container spec so assertions
+// cannot drift onto a neighbouring probe or a future sidecar.
+function probeBlock(rendered, name) {
+  const match = rendered.match(
+    new RegExp(`\\n(\\s+)${name}:\\n([\\s\\S]*?)\\n\\1[a-zA-Z]`),
+  );
+  assert.ok(match, `${name} block not found`);
+  return match[2];
+}
 
 // A stalled vCPU can hold /healthz past 5 s for a couple of periods without
 // the process being wedged; the worker already tolerates 10 s x 6. Killing
@@ -85,8 +97,11 @@ test("API liveness tolerates 10 s x 6 like the worker", () => {
     "api.enabled=true",
   ]);
 
-  assert.match(
-    rendered,
-    /livenessProbe:[\s\S]*?failureThreshold: 6[\s\S]*?timeoutSeconds: 10/,
-  );
+  const liveness = probeBlock(rendered, "livenessProbe");
+  assert.match(liveness, /failureThreshold: 6\b/);
+  assert.match(liveness, /timeoutSeconds: 10\b/);
+  // Readiness keeps the chart default so a slow replica still leaves rotation.
+  const readiness = probeBlock(rendered, "readinessProbe");
+  assert.match(readiness, /failureThreshold: 3\b/);
+  assert.match(readiness, /timeoutSeconds: 5\b/);
 });
