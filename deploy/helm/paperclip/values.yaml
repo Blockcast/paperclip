@@ -396,10 +396,56 @@ workerProbes:
     timeoutSeconds: 10
     failureThreshold: 6
   # -- Worker readiness probe.
-  # Readiness gates the API-to-worker Service endpoint. Keep it tighter than
-  # liveness so API callers stop routing to a worker whose event loop is not
-  # answering promptly; during a long-but-recoverable stall the pod may stay
-  # alive while temporarily leaving the Service endpoints.
+  #
+  # BLO-31945 — why this is no longer tuned "tighter than liveness".
+  #
+  # The rationale here used to read: "Keep it tighter than liveness so API
+  # callers stop routing to a worker whose event loop is not answering
+  # promptly." That holds for a horizontally-scaled tier, where readiness
+  # sheds traffic to healthy peers. This StatefulSet runs `replicas: 1`, so
+  # there is no peer to shed to: removing the only endpoint does not redirect
+  # plugin traffic, it 502s it. Every API-to-worker call then fails in the
+  # `catch` at `server/src/routes/worker-tier-proxy.ts` with "Worker tier
+  # unreachable", which is how a `/healthz` latency blip became a total
+  # plugin-tier outage — Alertmanager webhook delivery included. Alertmanager
+  # then retries each delivery 4x into the worker that just failed its probe.
+  #
+  # Measured on `paperclip-0` over the 24h to 2026-09-05T20:30Z from the
+  # kubelet `prober_probe_*` metrics. Same endpoint, same pod, same window:
+  #
+  #   probe      timeout   failed / total   failure rate
+  #   Readiness     5s     100.2 / 8559        1.171%
+  #   Liveness     10s      13.1 / 2838        0.462%
+  #
+  # Readiness failed at 2.53x the liveness rate against the identical
+  # `/healthz`, and the per-probe timeout is the only material difference
+  # between them. The tail latency confirms the cause: p99.9 of *successful*
+  # liveness probes is 8.59s, i.e. `/healthz` legitimately takes longer than
+  # the old 5s readiness timeout. A timeout set below the endpoint's own tail
+  # is a false-positive generator, not a sensitivity knob.
+  #
+  # Trap when re-deriving this: `prober_probe_duration_seconds` is a
+  # SUCCESS-ONLY histogram — its `_count` matches
+  # `prober_probe_total{result="successful"}`, not the total. Timed-out probes
+  # are censored out of it, so the bucket distribution on its own reads as
+  # "almost nothing exceeds 5s" and will invert this diagnosis if used without
+  # the failure counter.
+  #
+  # timeoutSeconds now matches liveness (10s), above the measured tail, and
+  # periodSeconds moves to 15 so a probe cannot outlast its own period.
+  # Worst-case endpoint removal becomes 3 x 15s = 45s rather than 30s; that
+  # slower detection costs nothing real at `replicas: 1`, because endpoint
+  # removal has no upside here in the first place.
+  #
+  # Decision, recorded explicitly rather than left implicit: readiness is
+  # KEPT, not retired. It still gates the endpoint during rollout, and
+  # deleting it would make a genuine wedge hang API callers until TCP timeout
+  # instead of failing fast. What is retired is tuning it as though it could
+  # shed load. This is mitigation, not a cure: at the liveness failure rate
+  # the probe still drops the endpoint occasionally, and the durable fix is a
+  # second replica (BLO-29307 / BLO-29004) or a `/healthz` that cannot be
+  # blocked by the event loop. Until one of those lands, this probe must be
+  # tolerant rather than tight.
   readiness:
     httpGet:
       path: /healthz
@@ -408,8 +454,8 @@ workerProbes:
         - name: Host
           value: 127.0.0.1:3100
     initialDelaySeconds: 5
-    periodSeconds: 10
-    timeoutSeconds: 5
+    periodSeconds: 15
+    timeoutSeconds: 10
     failureThreshold: 3
   # -- Worker startup probe.
   startup:
