@@ -70,6 +70,40 @@
  * case -- writing one untracked `pre-receive` beside the repo's own hooks leaves
  * them all working.
  *
+ * ## The in-tree placement has a working-tree cost, and it is paid explicitly
+ *
+ * "One untracked `pre-receive`" is untracked *content* in a directory the repo
+ * tracks, which means `git status` reports it and `git clean -fd` deletes it.
+ * Neither is cosmetic. `execution-workspaces.ts` refuses branch reconciliation
+ * on a non-clean worktree, and for a `project_primary` workspace the path it
+ * inspects is the managed base itself -- so an unexcluded guard would break
+ * reconciliation for precisely the repos it installs in place for, on every
+ * pass. And a routine `git clean -fd` would silently disarm the guard until the
+ * next provision. Both are closed by adding the hook's path to the repository's
+ * `info/exclude` (measured on git 2.47.3: status clean, and the hook survives
+ * `git clean -fd`). `info/exclude` rather than `.gitignore` because the latter is
+ * tracked -- writing there would turn a dirty worktree into a committable diff.
+ * Only our own file is excluded; a displaced operator hook keeps its `??` line,
+ * because that content is theirs and was already untracked before Paperclip
+ * touched anything.
+ *
+ * ## The one shape this module refuses to serve: a TRACKED `pre-receive`
+ *
+ * If the repo commits `pre-receive` itself, every available move is destructive
+ * and the guard declines instead. Displacement renames version-controlled
+ * content: `git status` shows a modification, any `git checkout -- .` silently
+ * restores the operator's hook over the guard, and because the backup keeps its
+ * name the next provision sees a foreign hook again and reserves the next
+ * number -- so a revert/re-provision cycle walks the backup budget to exhaustion
+ * and reaches a permanent decline anyway, having dirtied the checkout every pass
+ * on the way. `info/exclude` cannot help, because the file is tracked. Taking
+ * `core.hooksPath` over was the considered alternative and was rejected: it
+ * stops the repo's own committed hooks running for the base and every worktree
+ * derived from it, to install defence-in-depth that #1616 has already made
+ * redundant. A `pre-receive` in version control is deliberate operator intent,
+ * and hardening does not outrank it -- the same principle as the backup-budget
+ * decline. The warning says plainly that such a checkout still accepts pushes.
+ *
  * One wrinkle sits underneath both branches: a **relative** `core.hooksPath` does
  * not name a single directory. Git resolves it against the running process's cwd,
  * and that differs by command -- the working tree for `git worktree add`, but the
@@ -168,6 +202,13 @@ export const PUSH_GUARD_HOOK_MARKER = "paperclip-push-guard";
 export const PUSH_GUARD_DISPLACED_HOOK_SUFFIX = ".paperclip-displaced";
 
 /**
+ * Header written above our entry in `info/exclude`, so the line is legible to an
+ * operator who finds it and can be removed deliberately rather than guessed at.
+ */
+export const PUSH_GUARD_EXCLUDE_COMMENT =
+  "# paperclip-push-guard (BLO-31555): keeps the inbound-push hook from dirtying this worktree.";
+
+/**
  * Cap on displaced-hook backups before we refuse rather than overwrite one.
  *
  * Reaching this means an operator has re-installed their own `pre-receive`
@@ -257,6 +298,12 @@ export type ManagedCheckoutPushGuardResult = {
    * running -- but it is a config write, so it is reported separately.
    */
   normalizedHooksPath: string | null;
+  /**
+   * Set when the hook landed in the working tree and its path was added to
+   * `info/exclude` so the checkout stays clean. Null when the hook landed inside
+   * the git dir, where it is invisible to `git status` already.
+   */
+  excludedHookPath: string | null;
   warning: string | null;
 };
 
@@ -343,6 +390,67 @@ async function reserveDisplacedHookPath(hookPath: string): Promise<string | null
 }
 
 /**
+ * Translate an absolute in-tree path into an anchored `info/exclude` pattern.
+ *
+ * Anchored with a leading `/` so it matches only the hook we installed at the
+ * top of this working tree, never a same-named file elsewhere in the repo. The
+ * escaping is not decorative: a repository whose hooks dir contains a gitignore
+ * metacharacter (`*?[]`) would otherwise get a pattern matching a *wider* set of
+ * files than the one we wrote, silently hiding an operator's real changes from
+ * `git status`. Leading `#`/`!` need no escape because the anchor precedes them.
+ */
+function toExcludePattern(worktreeRoot: string, absolutePath: string): string {
+  const relative = path.relative(worktreeRoot, absolutePath).split(path.sep).join("/");
+  const escaped = relative.replace(/[\\*?[\]]/g, (character) => `\\${character}`);
+  // A trailing space is stripped by git unless escaped, which would leave the
+  // pattern pointing at a different name than the file we created.
+  return `/${escaped.replace(/ $/, "\\ ")}`;
+}
+
+/**
+ * Add `pattern` to `<commonDir>/info/exclude`, idempotently.
+ *
+ * `info/exclude` rather than `.gitignore`: the latter is tracked content, so
+ * writing to it would be a *committable* change to the operator's repository --
+ * exactly the dirtiness being fixed, one level worse. `info/exclude` is
+ * untracked, repo-local, and shared by every linked worktree, which matches the
+ * scope of the hook it covers.
+ *
+ * Returns whether a write happened, so a converged checkout can still report
+ * `already_installed`.
+ */
+async function ensureExcluded(commonDir: string, pattern: string): Promise<boolean> {
+  const excludeFile = path.join(commonDir, "info", "exclude");
+  const existing = await fs.readFile(excludeFile, "utf8").catch(() => null);
+  if (existing !== null && existing.split(/\r?\n/).some((line) => line.trim() === pattern)) return false;
+  await fs.mkdir(path.dirname(excludeFile), { recursive: true });
+  // Never rewrite the file: an operator's own patterns live here too. Append,
+  // and open a fresh line first if the last one was unterminated -- otherwise
+  // our pattern would graft onto the tail of theirs and change its meaning.
+  const separator = existing === null || existing.length === 0 || existing.endsWith("\n") ? "" : "\n";
+  await fs.appendFile(excludeFile, `${separator}${PUSH_GUARD_EXCLUDE_COMMENT}\n${pattern}\n`, "utf8");
+  return true;
+}
+
+/**
+ * Is `absolutePath` tracked in this checkout's index?
+ *
+ * `git ls-files` rather than `--error-unmatch`: the latter signals "untracked"
+ * by exit code 1, which is indistinguishable here from a genuine fault, and this
+ * question decides whether the guard installs at all. `ls-files` exits 0 either
+ * way and answers by printing the path, so a thrown error means a real failure.
+ *
+ * Deliberately true for a tracked file that has been *deleted* from the working
+ * tree: writing our hook over that path shows up as a staged-able modification
+ * just the same, which is the condition being avoided.
+ */
+async function isTracked(runGit: PushGuardGitRunner, cwd: string, absolutePath: string): Promise<boolean> {
+  const relative = path.relative(cwd, absolutePath).split(path.sep).join("/");
+  const output = await runGit(["ls-files", "--", relative], cwd);
+  return typeof output === "string" && output.trim().length > 0;
+}
+
+/**
  * Install the guard on the managed checkout at `cwd`.
  *
  * Safe to call unconditionally on any managed-workspace path. A repo-less
@@ -363,6 +471,7 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
     displacedHooksPath: null,
     displacedHookPath: null,
     normalizedHooksPath: null,
+    excludedHookPath: null,
     warning: null,
   };
   if (!cwd) return base;
@@ -484,6 +593,54 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
   const displacingNow = !insideRepo;
   const hookPath = path.join(hooksDir, "pre-receive");
 
+  // Does the hook land in the WORKING TREE rather than the git dir? Only the
+  // tracked-hooks convention (`.githooks/`, `.husky/`) does, and only there can
+  // the guard show up in `git status` or be swept by `git clean`. A bare/mirror
+  // checkout has no working tree, so the question does not arise.
+  const hookInWorkTree = hasGitMetadata && insideRepo && !isInside(commonDir, hookPath);
+
+  // A TRACKED `pre-receive` is the one shape this module cannot serve, and the
+  // honest answer is to decline rather than to half-handle it. Displacement
+  // renames a tracked file, which (measured, git 2.47.3) leaves `M .githooks/
+  // pre-receive` plus an untracked backup, and any `git checkout -- .` silently
+  // restores the operator's hook over the guard. Because the backup still holds
+  // its name, the next provision sees a foreign hook again and reserves the next
+  // number, so a revert/re-provision cycle walks the backup budget to exhaustion
+  // and lands on the permanent decline below anyway -- having dirtied the
+  // checkout every pass on the way. `info/exclude` cannot help: the file is
+  // tracked. Declining up front reaches the same terminal state immediately,
+  // without touching the repository at all.
+  //
+  // Taking `core.hooksPath` over instead was the alternative considered. It was
+  // rejected because it stops the repo's OWN committed hooks from running for
+  // the base and every worktree derived from it -- the exact regression this
+  // module's placement rule exists to avoid -- to install defence-in-depth that
+  // BLO-31359's primary fix has already made redundant. Operator intent
+  // committed to version control outranks hardening.
+  const trackedTarget = hookInWorkTree
+    ? await isTracked(runGit, cwd, hookPath).catch(() => null)
+    : false;
+  if (trackedTarget !== false) {
+    const cause =
+      trackedTarget === null
+        ? `Paperclip could not determine whether "${hookPath}" is tracked`
+        : `"${hookPath}" is tracked in this repository`;
+    return {
+      ...base,
+      state: "install_failed",
+      displacedHooksPath,
+      warning:
+        `Managed checkout "${cwd}": ${cause}, so Paperclip did not install the inbound-push guard. A ` +
+        `version-controlled \`pre-receive\` is deliberate operator intent, and Paperclip will not move a ` +
+        `tracked file aside: the rename would show as a local modification and any \`git checkout\` would ` +
+        `silently restore the original over the guard. This checkout may therefore still accept ` +
+        `\`git push <path>\` from run workspaces (BLO-31359); note #1616 already stopped runs from ` + // paperclip:allow-git-push: operator-facing warning text, not an invocation
+        `carrying this base as their \`origin\`, so this is defence-in-depth rather than the live hazard. ` +
+        `To enable the guard, stop tracking "${path.basename(hookPath)}" in "${path.dirname(hookPath)}" ` +
+        `(move your logic to a differently-named hook, which Paperclip never touches).`,
+    };
+  }
+
   const existing = await fs.readFile(hookPath, "utf8").catch(() => null);
   // Two distinct questions -- see PUSH_GUARD_HOOK_MARKER. "Current" is verbatim
   // so a bumped version or a hand-edit is refreshed; "ours" is by marker so an
@@ -551,6 +708,34 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
       if (failure) configFailures.push(failure);
     }
 
+    // A hook in the working tree is an untracked file in a directory the repo
+    // tracks, so without this the base checkout is permanently dirty. That is
+    // not cosmetic: `execution-workspaces.ts` refuses branch reconciliation on a
+    // non-clean worktree, and a `project_primary` workspace inspects the managed
+    // base itself -- so the guard would break reconciliation for exactly the
+    // repos it installs in place for. `git clean -fd` would also delete the
+    // guard, silently disarming it until the next provisioning pass. Excluding
+    // the path closes both (measured, git 2.47.3: status clean, and the hook
+    // survives `git clean -fd`).
+    //
+    // Only our own file. A displaced operator hook keeps its `??` line
+    // deliberately: that content is theirs, it was already untracked before
+    // Paperclip touched anything, and hiding someone's hook from `git status` to
+    // tidy our own output would be the wrong trade.
+    let excludedHookPath: string | null = null;
+    let excludeWritten = false;
+    let excludeFailure: string | null = null;
+    if (hookInWorkTree) {
+      const pattern = toExcludePattern(cwd, hookPath);
+      const outcome = await ensureExcluded(commonDir, pattern).then(
+        (written) => ({ written, error: null }),
+        (error: unknown) => ({ written: false, error: error instanceof Error ? error.message : String(error) }),
+      );
+      excludeFailure = outcome.error;
+      excludeWritten = outcome.written;
+      if (!outcome.error) excludedHookPath = hookPath;
+    }
+
     const notes: string[] = [];
     if (foreignBackupPath) {
       notes.push(
@@ -591,6 +776,14 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
           `changes it for that worktree.`,
       );
     }
+    if (excludeFailure) {
+      notes.push(
+        `Managed checkout "${cwd}": the inbound-push guard is installed at "${hookPath}", but its path could ` +
+          `not be added to the repository's info/exclude (${excludeFailure}). The guard works; the checkout ` +
+          `will read as dirty (an untracked "${path.basename(hookPath)}"), which blocks execution-workspace ` +
+          `branch reconciliation, and \`git clean -fd\` will remove the guard until the next provision.`,
+      );
+    }
     if (configFailures.length > 0) {
       notes.push(
         `Managed checkout "${cwd}": the inbound-push hook is installed, but these ref-protection keys ` +
@@ -605,13 +798,19 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
       // forever. `displacedHooksPath` stays populated in the payload either way
       // -- the state says what happened, the field says what is true.
       state:
-        hookCurrent && !displacingNow && !normalizedHooksPath && configFailures.length === 0
+        hookCurrent &&
+        !displacingNow &&
+        !normalizedHooksPath &&
+        !excludeWritten &&
+        configFailures.length === 0 &&
+        !excludeFailure
           ? "already_installed"
           : "installed",
       hookPath,
       displacedHooksPath,
       displacedHookPath: foreignBackupPath,
       normalizedHooksPath,
+      excludedHookPath,
       warning: notes.length > 0 ? notes.join(" ") : null,
     };
   } catch (error) {
@@ -637,6 +836,9 @@ export async function ensureManagedCheckoutRejectsPushes(input: {
       displacedHooksPath,
       displacedHookPath: foreignBackupPath,
       normalizedHooksPath,
+      // The exclude write happens after every statement that can reach this
+      // catch, so nothing was excluded on this path.
+      excludedHookPath: null,
       warning: `Managed checkout "${cwd}": could not fully install the inbound-push guard at "${hookPath}" (${reason}). ${consequence}`,
     };
   }
