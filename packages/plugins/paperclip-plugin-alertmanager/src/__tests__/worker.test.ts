@@ -690,7 +690,7 @@ describe("handleWebhook — firing first time", () => {
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.alert.permanent_error",
       1,
-      { alertname: "CiliumPolicyDropsHigh" },
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
     );
   });
 
@@ -787,7 +787,75 @@ describe("handleWebhook — firing first time", () => {
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.alert.permanent_error",
       1,
-      { alertname: "CephOsdNearFull" },
+      { alertname: "CephOsdNearFull", severity: "critical" },
+    );
+  });
+
+  // The permanent drop above is driven by *unset config*, which returns before
+  // `agents.list` is ever called. This one is driven by roster contents: the
+  // name is configured and correct-looking, and the refusal is decided by what
+  // the list came back with. That is the branch every roster-derived permanent
+  // refusal actually takes in production — `agents.list` filters terminated
+  // agents out, so a terminated fallback owner never reaches the eligibility
+  // ladder and lands here as an unmatched name instead.
+  it("permanently drops when the configured name is absent from the roster", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {} });
+    // A non-empty roster that simply does not contain the configured name —
+    // indistinguishable from a typo, and correctly permanent.
+    mocks.agents.list.mockResolvedValue([
+      { id: "agent-other", name: "Someone Else", status: "idle" },
+    ]);
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput()),
+    ).resolves.toBeUndefined();
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.fallback_failed",
+      1,
+      {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "critical",
+        refusal: "permanent",
+      },
+    );
+  });
+
+  // The guard that separates a degraded host from a wrong name. Same "no
+  // match" outcome as the test directly above, opposite refusal class, and the
+  // only difference in the input is that the roster is empty rather than merely
+  // lacking the name. An `agents.list` that fails by *returning* `[]` instead
+  // of throwing would otherwise be dropped at 200 and never retried, while the
+  // throwing variant of the identical fault keeps its retry window.
+  it("keeps the retry window when the roster comes back empty", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {} });
+    mocks.agents.list.mockResolvedValue([]);
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput()),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+
+    // Fail-closed is intact either way — the class change is about the
+    // reporting channel, never about creating an ownerless issue.
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.fallback_failed",
+      1,
+      {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "critical",
+        refusal: "transient",
+      },
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      expect.anything(),
     );
   });
 
@@ -816,7 +884,7 @@ describe("handleWebhook — firing first time", () => {
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.alert.error",
       1,
-      { alertname: "CiliumPolicyDropsHigh" },
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
     );
     expect(mocks.metrics.write).not.toHaveBeenCalledWith(
       "alertmanager.alert.permanent_error",
@@ -869,7 +937,7 @@ describe("handleWebhook — firing first time", () => {
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.alert.permanent_error",
       1,
-      { alertname: "CiliumPolicyDropsHigh" },
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
     );
     // And the swallowed metrics failure is still audible in the log.
     expect(mocks.logger.error).toHaveBeenCalledWith(
@@ -892,7 +960,7 @@ describe("handleWebhook — firing first time", () => {
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.alert.error",
       1,
-      { alertname: "CiliumPolicyDropsHigh" },
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
     );
     expect(mocks.metrics.write).not.toHaveBeenCalledWith(
       "alertmanager.alert.permanent_error",

@@ -2306,6 +2306,12 @@ export async function handleWebhook(
         failedFingerprints.push(alert.fingerprint);
       }
       try {
+        // `severity` is carried on both branches for the same reason the
+        // `refusal` label exists on `alertmanager.owner.fallback_failed`:
+        // without it, "did we drop a critical?" needs a join against another
+        // series. It matters most on the permanent branch — that drop returns
+        // 200, so it is by design invisible in Alertmanager's own failure
+        // metrics and this series is the entire detection surface for it.
         await ctx.metrics.write(
           permanent
             ? "alertmanager.alert.permanent_error"
@@ -2313,6 +2319,7 @@ export async function handleWebhook(
           1,
           {
             alertname: alert.labels.alertname ?? "unknown",
+            severity: alert.labels.severity ?? "unknown",
           },
         );
       } catch (metricErr) {

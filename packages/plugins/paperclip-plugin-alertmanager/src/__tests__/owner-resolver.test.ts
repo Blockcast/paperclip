@@ -551,6 +551,27 @@ describe("resolveFallbackAgentId", () => {
     );
   });
 
+  // An empty roster is the shape a degraded-but-non-throwing `agents.list`
+  // takes, and it is the one input the unmatched-name branch cannot tell from
+  // a genuine typo. A throwing list already retries (the caller's memo evicts
+  // and a plain Error propagates); this pins that the silent-failure variant of
+  // the *same* host fault gets the same survivable treatment rather than a
+  // permanent 200 drop.
+  //
+  // Paired deliberately with the wrong-name case directly above: same call,
+  // same "no match" outcome, opposite refusal class. Asserting only the empty
+  // case would not catch a change that made *both* transient and reinstated
+  // the retry burst on genuinely wrong config.
+  it("refuses transiently when the roster itself comes back empty", async () => {
+    const { ctx, logger } = mkAgentCtx([]);
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
+    ).resolves.toEqual({ refusal: "transient" });
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("roster came back empty"),
+    );
+  });
+
   it("refuses permanently and warns when the name is ambiguous", async () => {
     const { ctx, logger } = mkAgentCtx([
       { id: "agent-1", name: "Ops Triage" },
@@ -583,6 +604,15 @@ describe("resolveFallbackAgentId", () => {
   // paused owner becomes invokable on its own and must keep Alertmanager's
   // retry window, while a terminated one needs a roster edit and must not.
   // Bundling them would assert only "refuses" and lose the distinction.
+  //
+  // ⚠️ The `terminated` row pins the map entry in isolation, not the
+  // production route. It injects a terminated agent into the mocked list, but
+  // the real `agents.list` filters those out (see the comment above), so in
+  // production a terminated owner is absent from the roster entirely and is
+  // refused by the unmatched-name branch instead — same `permanent` outcome,
+  // different code path. Keep the row as a guard on the map; do not read it as
+  // evidence that the classification ladder handles `terminated` live. The
+  // empty-roster case below covers the branch that does the real deciding.
   it.each([
     ["paused", "transient"],
     ["pending_approval", "transient"],
