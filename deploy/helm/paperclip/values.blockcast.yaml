@@ -404,6 +404,13 @@ tolerations:
 # carry blockcast.net/pve-storage-domain=<pve host>, so the rule keys on that.
 # The API template merges this beside its own podAntiAffinity; the StatefulSet
 # takes it verbatim. Drop the entry once pve3 is rebalanced.
+#
+# pve2 saturates the same way whenever CI runner bursts land on
+# paperclip-5/-10/-11 (load 135/80 seen 2026-09-05 17:30Z, 20-24% steal), but
+# it cannot be excluded outright: the API's hard two-host spread
+# (api.spreadAcrossNodes) needs a second eligible node and pve4 hosts only
+# paperclip-3. The preferred rule below steers one replica (and the worker) to
+# pve4 and lets the spread rule place the other replica on a pve2 node.
 affinity:
   nodeAffinity:
     requiredDuringSchedulingIgnoredDuringExecution:
@@ -413,6 +420,24 @@ affinity:
               operator: NotIn
               values:
                 - pve3
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+            - key: blockcast.net/pve-storage-domain
+              operator: NotIn
+              values:
+                - pve2
+
+# A vCPU stalled by hypervisor steal can hold /healthz past 5 s for a couple of
+# probe periods without the process being wedged; the worker already tolerates
+# 10 s x 6. Killing the API on 3 x 5 s is how the 2026-09-05 outage happened
+# (BLO-32054). Readiness keeps the chart default so a slow replica still leaves
+# rotation quickly.
+probes:
+  liveness:
+    timeoutSeconds: 10
+    failureThreshold: 6
 
 secret:
   existingSecret: paperclip-credentials
