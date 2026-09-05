@@ -77,12 +77,49 @@ const CANONICAL_REVIEW_HEADING_RE = /^## Ally — Consolidated PR Review[ \t]*$/
 const BLOCKING_SECTION_RE =
   /^#+[ \t]*(critical|important)[^\n]*\((?!0\))\d+\)/im;
 
+/**
+ * Leading whitespace that CommonMark would render as an indented code block,
+ * i.e. quoted text rather than emitted structure. Four spaces reach column
+ * four, and so does a tab however few spaces precede it.
+ *
+ * Must stay equivalent to NOT_INDENTED_CODE in
+ * server/src/services/ally-review-detection.ts. BLO-31730 is a bug about two
+ * parsers disagreeing on this exact line, so the auditor and the merge gate
+ * must not disagree about which indentation counts.
+ *
+ * The two constants are deliberately not byte-identical, so compare the
+ * *composed* forms rather than these lines. The module's is the bare pair of
+ * lookaheads and each of its three use sites appends its own ` {0,3}`; this
+ * one folds that quantifier in, because both of its use sites want it. What
+ * must match is the composition — `(?! *\t)(?! {4}) {0,3}` on either side. A
+ * future edit that reads this as a literal-identity claim and "restores" it
+ * by deleting the ` {0,3}` here would silently stop allowing the up-to-three
+ * spaces CommonMark still treats as a paragraph, which is the divergence this
+ * comment exists to prevent.
+ *
+ * Residual, stated rather than implied: the gate additionally blanks fenced
+ * spans before matching, and this script does not, so a *fenced* paste is
+ * still read here as an attestation while the gate ignores it. The extra
+ * attestation is not quietly absorbed — canonicalReviewHead requires exactly
+ * one, so it returns null and the review is reported as an I3 "not canonical"
+ * violation. (I3, not I1: I1 caps operative reviews per lane, not attestations
+ * within a body.) The direction is still the safe one for an auditor, because
+ * the consequence is a false red against an otherwise-valid review rather than
+ * a missed one, but it is a real remaining divergence, not parity.
+ */
+const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4}) {0,3}`;
+
 /** A prior-finding disposition that says the blocker is still present. */
-const STILL_PRESENT_DISPOSITION_RE =
-  /^[ \t]*-[ \t]*\*\*prior:[^\n]*\*\*[ \t]*(?:—|-)[ \t]*still-present[ \t]*(?:—|-)/im;
+const STILL_PRESENT_DISPOSITION_RE = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*prior:[^\n]*\*\*[ \t]*(?:—|-)[ \t]*still-present[ \t]*(?:—|-)`,
+  "im",
+);
 
 /** The single standalone attestation line Ally is required to emit. */
-const ATTESTED_HEAD_RE = /^[ \t]*(?:[_*]+)?[ \t]*reviewed head:[ \t]*`?([0-9a-f]{40})`?[ \t]*(?:[_*]+)?[ \t]*$/im;
+const ATTESTED_HEAD_RE = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}(?:[_*]+)?[ \t]*reviewed head:[ \t]*\`?([0-9a-f]{40})\`?[ \t]*(?:[_*]+)?[ \t]*$`,
+  "im",
+);
 const ATTESTED_HEAD_GLOBAL_RE = new RegExp(ATTESTED_HEAD_RE.source, "gim");
 
 const ALLY_REVIEW_LANES = ["app", "seat"];
