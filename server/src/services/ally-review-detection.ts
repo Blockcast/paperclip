@@ -367,7 +367,18 @@ function carriesBlockingFeedback(text: string): boolean {
     if (Number(count) > 0) return true;
     zeroedSeverities.add(severity!.toLowerCase());
   }
-  const declaresNoFindings = zeroedSeverities.has("critical") && zeroedSeverities.has("important");
+  // A `still-present` ledger entry is an explicit statement that a prior finding
+  // still stands, so it outranks the 0/0 for exactly the reason the 0/0 outranks
+  // the prose below. The contract says such a finding is mirrored into the
+  // current buckets, which would make a count non-zero and block here anyway;
+  // this clause is the defence for when that mirroring is omitted. It matters
+  // because evaluateCommentReviewGate short-circuits on a current-head
+  // attestation before consulting the carry-forward, so without it a 0/0 body
+  // asserting an unresolved prior finding would deterministically read clean.
+  const declaresNoFindings =
+    zeroedSeverities.has("critical") &&
+    zeroedSeverities.has("important") &&
+    !extractAllyPriorFindingDispositions(text).some((entry) => entry.kind === "blocks");
 
   if (UNCOUNTED_FINDINGS_HEADING_REGEX.test(text)) return true;
   if (/^[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*$/im.test(text)) return true;
