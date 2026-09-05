@@ -397,6 +397,23 @@ tolerations:
     value: paperclip
     effect: NoSchedule
 
+# Keep production off nodes whose Proxmox host is pve3 (BLO-32054). pve3 runs
+# ~172 vCPUs on 80 cores and steals 20-40% of CPU time from every guest; a 5 s
+# liveness probe on a stalled vCPU misses its deadline and the kubelet kills a
+# healthy container (paperclip-api + paperclip-0 on 2026-09-05). Nodes already
+# carry blockcast.net/pve-storage-domain=<pve host>, so the rule keys on that.
+# The API template merges this beside its own podAntiAffinity; the StatefulSet
+# takes it verbatim. Drop the entry once pve3 is rebalanced.
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: blockcast.net/pve-storage-domain
+              operator: NotIn
+              values:
+                - pve3
+
 secret:
   existingSecret: paperclip-credentials
 
