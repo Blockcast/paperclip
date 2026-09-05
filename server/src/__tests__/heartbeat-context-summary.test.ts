@@ -1391,6 +1391,12 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       // the negation govern this clause — the pass-15 balance, unchanged.
       [`No sign but that this head was already reviewed at \`${sha}\`.`, false],
       [`No evidence so far that this head was already reviewed at \`${sha}\`.`, false],
+      // pass 23/24: the negation filler's token class can cross a citation or
+      // punctuation; with `\\w+` these four were accepted (masking).
+      [`I have no \`direct\` evidence this head was already reviewed at \`${sha}\`.`, false],
+      [`No (verified) proof that this head was already reviewed at \`${sha}\`.`, false],
+      [`No force-push evidence that this head was already reviewed at \`${sha}\`.`, false],
+      [`There is no up-to-date confirmation that this head was already reviewed at \`${sha}\`.`, false],
       [`Already reviewed at head${sha}.`, false],
     ])("%s → %s", (text, want) => {
       expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
@@ -1425,6 +1431,7 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       ["No evidence of a force-push, so ", null],
       ["I did not check whether a newer head exists so ", null],
       ["No newer commits were found so this head was ", null],
+      ["No force-push evidence that this head was ", "negation"],
       ["Nothing changed so I see this head was ", null],
       ["Beyond reasonable doubt this head was ", null],
       ["The wake was probably a duplicate dispatch so ", null],
@@ -1444,9 +1451,10 @@ describe("evaluatePrReviewCompletionEvidence", () => {
   // the review clause. It has never been survivable for any epistemic cue —
   // the `negation` row here false-vetoes at every head in this PR's history —
   // and it fails toward `missing`, a re-review rather than a masked
-  // non-review. Passes 20-22 each widened it to more words; none opened it. The
-  // pass-23 connective-role exclusion on `negation`'s filler does not touch
-  // it either: these frames carry no connective for the exclusion to act on.
+  // non-review. Passes 20-23 each widened it to more words or shapes; none
+  // opened it. Pass 23's connective-role exclusion does not touch these frames
+  // (they carry no connective for it to act on), but the token class it
+  // shares with COPULA_FILLER does, by one shape: punctuated filler tokens.
   //
   // If a later pass fixes CLAUSE_REACH so an adjunct no longer swallows the
   // clause, these expectations flip to `true` and SHOULD be updated to `true`.
@@ -1464,6 +1472,8 @@ describe("evaluatePrReviewCompletionEvidence", () => {
       [`Aside from no obvious drift this head was already reviewed at \`${sha}\`.`, false],
       // widened by the pass-22 `ideas?` lemma
       [`No new idea landed for this head was already reviewed at \`${sha}\`.`, false],
+      // widened by the pass-23 NON_CONNECTIVE_WORD token class
+      [`No force-push evidence this head was already reviewed at \`${sha}\`.`, false],
     ])("known residual: %s -> %s", (text, want) => {
       expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
     });

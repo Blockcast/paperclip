@@ -9596,6 +9596,31 @@ const COPULA_FILLER = `(?:${NON_CONNECTIVE_WORD}){0,${COPULA_FILLER_WORDS}}`;
 // The same unit at the negation cue's own bound. Pass 23: the `negation` stem
 // used a bare `(?:\\w+\\s+){0,3}`, so a negation governing the PREVIOUS clause
 // crossed a consequence connective and false-vetoed correct skips.
+//
+// Sharing the unit changes TWO things, and pass 24 caught that only one was
+// written down. Besides the connective-role exclusion, NEGATION_FILLER now
+// inherits NON_CONNECTIVE_WORD's non-boundary token class in place of `\\w+`,
+// which cuts both ways:
+//   - It closes on `negation` the citation-masking hole that the token-class
+//     note above records closing on COPULA_FILLER: "I have no `direct` evidence
+//     this head was …", "No (verified) proof that …", "No force-push evidence
+//     that …" were ACCEPTED at the parent because `\\w+` could not cross the
+//     backtick, parenthesis or hyphen, so the cue never fired. 4/4 now veto.
+//   - It widens the CLAUSE_REACH bare-adjunct residual by one more shape —
+//     punctuated filler tokens with no connective ("No force-push evidence this
+//     head was …", 4/4 true -> false) — pinned in the characterization table
+//     under its own pass label. Fails toward `missing`, like the rest of it.
+// Only CONSEQUENCE connectives are affected by the exclusion; the adversative
+// family (`yet`/`however`/`still`/…) is deliberately untouched — "No evidence
+// yet this head was …" is a hedge, not a skip — and measured 0 frames changed.
+//
+// `{0,3}` is a KNOWN SECOND CAP, inherited verbatim from the old stem and not
+// derived from CLAUSE_SCOPE_CHARS the way COPULA_FILLER_WORDS is. It binds:
+// "I found no really very quite fully clear evidence that this head was …"
+// (five filler words) escapes the veto — masking — while four filler words
+// veto. Left as-is because raising it interacts with the filler-role balance
+// and deserves its own measurement; recorded so it is not mistaken for a
+// derived bound.
 const NEGATION_FILLER = `(?:${NON_CONNECTIVE_WORD}){0,3}`;
 // A relative pronoun abutting the copula is NOT a complementizer, and the
 // distinction is syntactic rather than lexical: a complementizer is always
@@ -9656,8 +9681,9 @@ const EPISTEMIC_NOUN_HEAD =
 // pass-21 one did: every control carried a connective. The family alone in a
 // bare adjunct is inert ("Despite the obvious drift this head was …" stays a
 // skip, since these words bind only after a negation), but a bare NEGATED
-// adjunct does false-veto, and two were opened by earlier passes of this PR: "Given no certain
-// match this head was …" (pass 20) and "Aside from no obvious drift this head
+// adjunct does false-veto, and two were opened by earlier passes of this PR:
+// "Given no certain match this head was …" (pass 20) and "Aside from no
+// obvious drift this head
 // was …" (pass 21) both flip true -> false, while "Despite no evidence of a
 // force-push this head was …" false-vetoes at every head. Same CLAUSE_REACH
 // residual as the fused stem's; see the characterization rows.
