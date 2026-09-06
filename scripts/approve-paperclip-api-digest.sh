@@ -967,9 +967,15 @@ live_running_digest() {
 # scripts/approve-paperclip-api-digest.test.js still green, because they stub
 # kubectl. The warning below is what makes that visible in the deploy log instead.
 # It stays a warning: this is still an availability safeguard, not a gate.
+#
+# A jq ABORT is reported the same way, and for the same reason (BLO-32267). Every
+# decline above is expressed by the program succeeding and emitting "", so a
+# non-zero jq exit can only mean the program itself is broken -- and swallowing
+# its stderr made that indistinguishable from "no rollback target". See the
+# branch itself for why that conflation is not hypothetical.
 serving_replicaset_image() {
   local live_json="$1"
-  local selector uid rs_json rs_err rs_status state_dir state_dir_owned="" image=""
+  local selector uid rs_json rs_err rs_status jq_err jq_status state_dir state_dir_owned="" image=""
 
   selector="$(jq -r '
     [ (.spec.selector.matchLabels // {}) | to_entries[] | "\(.key)=\(.value)" ]
@@ -1023,6 +1029,8 @@ serving_replicaset_image() {
         sed 's/^/         /' <"$rs_err" >&2
       fi
     else
+      jq_err="${state_dir}/jq-err"
+      : >"$jq_err"
       image="$(jq -r --arg uid "$uid" '
         def rs_image:
           [ .spec.template.spec.containers[]?.image // empty ] as $images
@@ -1058,7 +1066,39 @@ serving_replicaset_image() {
           elif (($revisions | sort) | .[0] == .[1]) then ""
           else ($serving | sort_by(rs_revision) | .[0] | rs_image)
           end
-      ' <<<"$rs_json" 2>/dev/null)" || image=""
+      ' <<<"$rs_json" 2>"$jq_err")" && jq_status=0 || jq_status=$?
+      if (( jq_status != 0 )); then
+        # A non-zero jq exit is a BROKEN PROGRAM, not a decline (BLO-32267).
+        # Every decline above -- no serving ReplicaSet, a missing or non-integer
+        # revision, tied revisions, containers that disagree -- is expressed by
+        # the program SUCCEEDING and emitting "". So the only way to arrive here
+        # is a jq that could not run: a syntax error, a type error, an unguarded
+        # coercion. The empty string is then a symptom rather than an answer, and
+        # `2>/dev/null` used to throw away the one line that said which.
+        #
+        # That conflation is not hypothetical. BLO-32101's first attempt at the
+        # malformed-revision case passed WITH and WITHOUT the guard it was written
+        # to prove, because an abort and a clean decline are indistinguishable
+        # from outside; it had to be rewritten to become discriminating. Left
+        # alone, a future edit that breaks this program surfaces as a silently
+        # missing recovery digest -- in the very reader whose purpose is to
+        # preserve the last-healthy one.
+        #
+        # Reported the same way the list failure two branches up is: warned once
+        # per script run (the reader is re-entered on every 409 retry), degrading
+        # to empty rather than failing the release. This is still an availability
+        # safeguard, not a gate.
+        image=""
+        if [[ ! -e "${state_dir}/warned-jq" ]]; then
+          : >"${state_dir}/warned-jq"
+          echo "warning: the ReplicaSet reader's jq program failed (exit ${jq_status}), so the digest that" >&2
+          echo "         last actually served traffic cannot be named. This is a broken program rather" >&2
+          echo "         than a decline: the approval ring falls back to pure age ordering and the" >&2
+          echo "         rollback target can age out (BLO-28483, BLO-31842)." >&2
+          sed 's/^/         /' <"$jq_err" >&2
+        fi
+      fi
+      rm -f "$jq_err"
     fi
     rm -f "$rs_err"
   fi

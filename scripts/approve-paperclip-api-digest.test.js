@@ -433,6 +433,25 @@ function extractJqBlock(name) {
 
 const SERVING_JQ = extractJqBlock("ROLLOUT_SERVING_JQ");
 
+// A jq program that cannot RUN is categorically different from one that runs and
+// declines, and until BLO-32267 both reached the caller as the same empty string.
+// Proving the difference is now visible needs a program that genuinely aborts, so
+// the guard is stripped out of the SHIPPING source rather than out of a restated
+// copy — the same neutering as BLO-32101's negative control D, which is the exact
+// regression a future edit here would reintroduce.
+//
+// Anchored on the guard's own text so a rewrite of it cannot silently turn this
+// into a no-op mutation that tests nothing; the cases below assert the anchor
+// still matched.
+const UNGUARDED_COERCION_ANCHOR = `| if ($r | type) == "string" and ($r | test("^[0-9]+$"))
+            then ($r | tonumber)
+            else null
+            end;`;
+const unguardedCoercionReaderSource = replicaSetReaderSource.replace(
+  UNGUARDED_COERCION_ANCHOR,
+  "| ($r | tonumber);",
+);
+
 // `deployment` of null makes the stub exit non-zero, standing in for "no such
 // Deployment" or an unreachable apiserver.
 //
@@ -452,7 +471,12 @@ const SERVING_JQ = extractJqBlock("ROLLOUT_SERVING_JQ");
 // leaves behind can be counted rather than assumed.
 function readerRunFor(
   deployment,
-  { replicaSets = [], repeat = 1, callerOwnedStateDir = false } = {},
+  {
+    replicaSets = [],
+    repeat = 1,
+    callerOwnedStateDir = false,
+    unguardedCoercion = false,
+  } = {},
 ) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-live-digest-"));
   const tmpRoot = path.join(dir, "tmp");
@@ -494,7 +518,7 @@ function readerRunFor(
     `  esac`,
     `}`,
     "deploy_kubectl=(fake_kubectl)",
-    replicaSetReaderSource,
+    unguardedCoercion ? unguardedCoercionReaderSource : replicaSetReaderSource,
     readerSource,
     // Mints and clears the state directory exactly as the script's own top level
     // and EXIT trap do, so leftover-file accounting measures the reader rather
@@ -1184,6 +1208,146 @@ test("a failed ReplicaSet list warns, naming the grant and carrying kubectl's re
 test("the happy path stays quiet — no warning when nothing is wrong", () => {
   const run = readerRunFor(deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`] }));
   assert.equal(run.stderr.trim(), "");
+});
+
+// BLO-32267. `image="$(jq …)" || image=""` used to route jq's stderr to /dev/null,
+// which collapsed two categorically different outcomes onto the same empty string:
+// a program that ran and DECLINED (no serving ReplicaSet, a missing or non-integer
+// revision, tied revisions, a disqualified winner), and a program that could not
+// RUN at all. Downstream both read as "no rollback target", so a future edit that
+// breaks this jq would surface as a silently missing recovery digest rather than a
+// diagnosable error — in the very reader whose purpose is to preserve the digest a
+// rollback needs.
+//
+// This is not a hypothetical failure mode: BLO-32101's first attempt at the
+// malformed-revision case passed WITH and WITHOUT the guard it was written to
+// prove, precisely because an abort and a clean decline are indistinguishable from
+// outside. That case had to be reshaped to work around the conflation; this one
+// asserts the conflation is gone.
+//
+// The neutering is the same one as that issue's negative control D — drop the
+// string/type guard so a malformed annotation reaches `tonumber` — because
+// `$revisions` is bound eagerly, before the single-candidate branch is taken, so
+// even a lone ReplicaSet aborts the whole program.
+test("a jq abort is reported as an error, not returned as a silent empty", () => {
+  assert.notEqual(
+    unguardedCoercionReaderSource,
+    replicaSetReaderSource,
+    "the unguarded-coercion anchor no longer matches the shipping source — this case would prove nothing",
+  );
+  const run = readerRunFor(neverReadyDeployment(digest(0xbb)), {
+    unguardedCoercion: true,
+    replicaSets: [
+      replicaSetWith({
+        name: "paperclip-api-malformed",
+        images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+        ready: 2,
+        created: OLDER,
+        revision: "not-a-number",
+      }),
+    ],
+  });
+  // Still degrades rather than failing the release — this stays a safeguard.
+  assert.equal(run.digest, "");
+  assert.match(run.stderr, /jq program failed/);
+  // The warning is hard-wrapped across lines, so match across the wrap rather
+  // than pinning the exact column it breaks at.
+  assert.match(run.stderr, /broken program rather\s+than a decline/);
+  assert.match(run.stderr, /BLO-31842/);
+  // jq's own message is carried through, which is the whole point: without it the
+  // operator has an empty digest and nothing that says why.
+  assert.match(run.stderr, /Invalid numeric literal/);
+});
+
+// The other half of the contract. A decline is a NORMAL outcome — most releases
+// have no second serving ReplicaSet at all — so making aborts visible must not
+// start narrating the ordinary path. Every shape that declines by design is swept
+// here rather than trusting the happy-path case above to cover them.
+test("every deliberate decline stays silent and still returns empty", () => {
+  const declines = {
+    "no serving ReplicaSet": [
+      replicaSetWith({ name: "paperclip-api-idle", images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`], ready: 0 }),
+    ],
+    "missing revision annotation": [
+      replicaSetWith({ name: "paperclip-api-a", images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`], ready: 2, revision: null }),
+      replicaSetWith({ name: "paperclip-api-b", images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`], ready: 1, revision: "7" }),
+    ],
+    "tied revisions": [
+      replicaSetWith({ name: "paperclip-api-a", images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`], ready: 2, revision: "7" }),
+      replicaSetWith({ name: "paperclip-api-b", images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`], ready: 1, revision: "7" }),
+    ],
+    "containers disagree": [
+      replicaSetWith({
+        name: "paperclip-api-mixed",
+        images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`, `${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+        ready: 2,
+        revision: "7",
+      }),
+    ],
+    "another repository": [
+      replicaSetWith({ name: "paperclip-api-foreign", images: [`ghcr.io/elsewhere/api@${digest(0xaa)}`], ready: 2, revision: "7" }),
+    ],
+  };
+  for (const [shape, replicaSets] of Object.entries(declines)) {
+    const run = readerRunFor(neverReadyDeployment(digest(0xbb)), { replicaSets });
+    assert.equal(run.digest, "", `${shape}: must decline`);
+    assert.equal(run.stderr.trim(), "", `${shape}: declining must not warn`);
+  }
+});
+
+// Same guard as the list-failure branch, for the same reason: the rotate loop
+// re-enters this reader on every 409, so an unguarded warning prints its four
+// lines up to MAX_ROTATE_ATTEMPTS times and buries itself.
+test("a repeated jq abort warns once, not once per rotation", () => {
+  const run = readerRunFor(neverReadyDeployment(digest(0xbb)), {
+    unguardedCoercion: true,
+    repeat: 5,
+    callerOwnedStateDir: true,
+    replicaSets: [
+      replicaSetWith({
+        name: "paperclip-api-malformed",
+        images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+        ready: 2,
+        revision: "not-a-number",
+      }),
+    ],
+  });
+  // Name which side of 1 it landed on. `undefined` (warned NOT AT ALL, the
+  // pre-BLO-32267 behaviour this case exists to catch) and 3 (warned per
+  // rotation) are opposite defects, and a message that reads "more than once"
+  // for both repeats in miniature the conflation this whole change is about.
+  const warnings = run.stderr.match(/jq program failed/g)?.length ?? 0;
+  assert.equal(
+    warnings,
+    1,
+    `expected exactly one jq-abort warning across 5 rotations, got ${warnings}:\n${run.stderr}`,
+  );
+});
+
+// The stderr capture is a temp file like every other one this reader mints, and
+// the abort path is the one that writes to it. It has to be reclaimed on that
+// path too, caller-owned directory or not.
+test("the jq stderr capture leaves no temp file behind", () => {
+  for (const callerOwnedStateDir of [true, false]) {
+    const run = readerRunFor(neverReadyDeployment(digest(0xbb)), {
+      unguardedCoercion: true,
+      repeat: 2,
+      callerOwnedStateDir,
+      replicaSets: [
+        replicaSetWith({
+          name: "paperclip-api-malformed",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+          ready: 2,
+          revision: "not-a-number",
+        }),
+      ],
+    });
+    assert.deepEqual(
+      run.leftoverTempFiles,
+      [],
+      `leftover temp files after a jq abort (callerOwned=${callerOwnedStateDir})`,
+    );
+  }
 });
 
 // A selector the reader cannot turn into a label query is the OTHER way this
