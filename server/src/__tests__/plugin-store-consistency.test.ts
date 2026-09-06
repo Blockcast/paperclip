@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -10,12 +10,14 @@ import {
   checkSharedDependencyConsistency,
   checkSharedDependencyConsistencyAfterRecheck,
   pluginLoader,
+  SDK_NOT_INSTALLED_ERROR_MARKER,
   type PluginRuntimeServices,
 } from "../services/plugin-loader.js";
 import {
   ISOLATED_SDK_PLUGIN_PACKAGES,
   resolveDefaultInstallDir,
 } from "../bootstrap/isolated-sdk-plugins.js";
+import { BUNDLED_PLUGIN_PACKAGES } from "../bootstrap/bundled-plugin-packages.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -235,6 +237,266 @@ describe("checkSharedDependencyConsistency", () => {
     expect(result.diagnostic).toContain("Unable to read valid JSON");
     expect(result.diagnostic).toContain("package-lock.json");
   });
+
+  it("fails closed when the SDK is neither recorded nor installed — an empty tree, not a version disagreement", async () => {
+    // The one absence that is NOT congruent (BLO-31857). Nothing recorded and
+    // nothing installed means there is no tree for a worker to import the SDK
+    // from, and — unlike the two single-sided absences pinned above — no other
+    // mechanism covers it. A guard that called this congruent would let a boot
+    // fixture that sets up nothing at all pass while asserting nothing.
+    const installDir = await tempInstallDir();
+
+    const result = await checkSharedDependencyConsistency(installDir, SDK_PACKAGE);
+
+    expect(result).toEqual({
+      packageName: SDK_PACKAGE,
+      lockfileVersion: null,
+      installedVersion: null,
+      lockfileState: "missing",
+      installedState: "missing",
+      consistent: false,
+      problem: "not_installed",
+      diagnostic: null,
+    });
+  });
+
+  it("reports not_installed distinctly from the two pre-existing problem classes", async () => {
+    // The AC asks for a *distinct* problem value: a caller (or an operator
+    // reading lastError) must be able to tell "nothing is installed" apart
+    // from "two versions disagree", because the remedies differ — install vs
+    // reconcile. Assert all three in one place so a future collapse of the
+    // union into a single value fails here.
+    const emptyDir = await tempInstallDir();
+
+    const tornDir = await tempInstallDir();
+    await writeLockfileVersion(tornDir, SDK_PACKAGE, "2026.513.0");
+    await writeInstalledPackageVersion(tornDir, SDK_PACKAGE, "1.0.0");
+
+    const invalidDir = await tempInstallDir();
+    await writeFile(path.join(invalidDir, "package-lock.json"), "{", "utf8");
+    await writeInstalledPackageVersion(invalidDir, SDK_PACKAGE, "1.0.0");
+
+    const problems = await Promise.all(
+      [emptyDir, tornDir, invalidDir].map(async (dir) =>
+        (await checkSharedDependencyConsistency(dir, SDK_PACKAGE)).problem,
+      ),
+    );
+
+    expect(problems).toEqual(["not_installed", "version_mismatch", "metadata_invalid"]);
+    expect(new Set(problems).size).toBe(3);
+  });
+});
+
+describe("BLO-31857: the healthy isolated-tree shape must stay congruent (outage guard)", () => {
+  // Every test here pins `(lock absent)/(installed ok)` as CONGRUENT. That is
+  // not a tolerance for sloppiness — it is the measured, healthy steady state
+  // of all three isolated install dirs on the live PVC (2026-09-04):
+  //
+  //   plugins-isolated/lucitra__paperclip-plugin-secrets/package-lock.json
+  //       -> 0 entries matching plugin-sdk           (lockfileState "missing")
+  //   plugins-isolated/lucitra__paperclip-plugin-secrets/node_modules/
+  //     @paperclipai/plugin-sdk -> 2026.817.0        (installedState "ok")
+  //
+  // A peer-dependency-only plugin declares no direct dependency, so npm has
+  // nothing to record in the lockfile while still installing the peer. Because
+  // `activatePlugin` throws on `!sdkConsistency.consistent` *before* spawning a
+  // worker, a tightening that required both metadata sources to be present
+  // would fail activation for `@lucitra/paperclip-plugin-secrets`,
+  // `@lucitra/paperclip-plugin-chat` and `@penstock/paperclip-plugin`
+  // simultaneously. A working tree that did exactly that is preserved unmerged
+  // at `cto/blo-28656-isolated-sdk-proposed`. If a future change makes these
+  // tests fail, the change is the outage — not the tests.
+  const cleanupPaths = new Set<string>();
+
+  afterEach(async () => {
+    for (const cleanupPath of cleanupPaths) {
+      await rm(cleanupPath, { recursive: true, force: true });
+    }
+    cleanupPaths.clear();
+  });
+
+  async function tempInstallDir(): Promise<string> {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-isolated-tree-"));
+    cleanupPaths.add(dir);
+    return dir;
+  }
+
+  /**
+   * A package-lock.json that genuinely exists and resolves other packages but
+   * carries no entry for `omittedPackage`. This is the live shape, and it is
+   * NOT the same input as "no lockfile at all" (covered separately above) even
+   * though both yield `lockfileState: "missing"` — production has a lockfile.
+   */
+  async function writeLockfileOmitting(installDir: string, omittedPackage: string): Promise<void> {
+    await writeFile(
+      path.join(installDir, "package-lock.json"),
+      JSON.stringify(
+        {
+          name: "paperclip-plugins",
+          lockfileVersion: 3,
+          requires: true,
+          packages: {
+            "": { name: "paperclip-plugins" },
+            "node_modules/zod": { version: "3.23.8" },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const raw = await readFile(path.join(installDir, "package-lock.json"), "utf8");
+    // Guard the fixture itself: if a future edit accidentally reintroduces the
+    // package, these tests would silently stop covering the absent-lock shape.
+    expect(raw).not.toContain(omittedPackage);
+  }
+
+  /**
+   * The `@lucitra/paperclip-plugin-secrets` manifest shape: the SDK is a peer
+   * dependency with no direct `dependencies` entry, which is *why* npm records
+   * nothing for it in the install dir's lockfile.
+   */
+  async function writePeerDependencyOnlyPlugin(installDir: string, packageName: string): Promise<void> {
+    const packageDir = path.join(installDir, "node_modules", ...packageName.split("/"));
+    await mkdir(packageDir, { recursive: true });
+    await writeFile(
+      path.join(packageDir, "package.json"),
+      JSON.stringify(
+        {
+          name: packageName,
+          version: "0.4.2",
+          type: "module",
+          peerDependencies: { [SDK_PACKAGE]: ">=1.0.0" },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+  }
+
+  it("accepts a PEER-DEPENDENCY-ONLY plugin whose lockfile records no SDK while the SDK is installed (the lucitra.plugin-secrets shape)", async () => {
+    const installDir = await tempInstallDir();
+    const packageName = "@lucitra/paperclip-plugin-secrets";
+    expect(ISOLATED_SDK_PLUGIN_PACKAGES).toContain(packageName);
+
+    await writePeerDependencyOnlyPlugin(installDir, packageName);
+    await writeLockfileOmitting(installDir, "plugin-sdk");
+    await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "2026.817.0");
+
+    const result = await checkSharedDependencyConsistency(installDir, SDK_PACKAGE);
+
+    expect(result).toEqual({
+      packageName: SDK_PACKAGE,
+      lockfileVersion: null,
+      installedVersion: "2026.817.0",
+      lockfileState: "missing",
+      installedState: "ok",
+      consistent: true,
+      problem: null,
+      diagnostic: null,
+    });
+  });
+
+  it("accepts an OPERATOR-INSTALLED, NON-BUNDLED plugin in the same shape (the paperclip-plugin-hindsight shape)", async () => {
+    const installDir = await tempInstallDir();
+    const packageName = "paperclip-plugin-hindsight";
+    // hindsight opts into the isolation *mechanism* but is deliberately absent
+    // from BUNDLED_PLUGIN_PACKAGES — it is installed by an operator, never
+    // auto-installed on boot. It must be covered explicitly: a fixture built
+    // only from bundled rows would not exercise this row at all.
+    expect(ISOLATED_SDK_PLUGIN_PACKAGES).toContain(packageName);
+    expect(BUNDLED_PLUGIN_PACKAGES).not.toContain(packageName);
+
+    await writePeerDependencyOnlyPlugin(installDir, packageName);
+    await writeLockfileOmitting(installDir, "plugin-sdk");
+    await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "2026.817.0");
+
+    const result = await checkSharedDependencyConsistency(installDir, SDK_PACKAGE);
+
+    expect(result.consistent).toBe(true);
+    expect(result.problem).toBeNull();
+    expect(result.lockfileState).toBe("missing");
+    expect(result.installedState).toBe("ok");
+  });
+
+  it("stays congruent for every ISOLATED_SDK_PLUGIN_PACKAGES entry in its real install dir, so no single plugin regresses alone", async () => {
+    // The proposed-but-unmerged tightening broke all three isolated plugins at
+    // once. Sweep the whole list rather than one representative, so a partial
+    // regression cannot hide behind a passing single-package test.
+    const sharedDir = await tempInstallDir();
+
+    for (const packageName of ISOLATED_SDK_PLUGIN_PACKAGES) {
+      const isolatedDir = resolveDefaultInstallDir(packageName, sharedDir);
+      cleanupPaths.add(isolatedDir);
+      await mkdir(isolatedDir, { recursive: true });
+      await writePeerDependencyOnlyPlugin(isolatedDir, packageName);
+      await writeLockfileOmitting(isolatedDir, "plugin-sdk");
+      await writeInstalledPackageVersion(isolatedDir, SDK_PACKAGE, "2026.817.0");
+
+      const result = await checkSharedDependencyConsistency(isolatedDir, SDK_PACKAGE);
+      expect(result.consistent, `${packageName} must remain congruent`).toBe(true);
+      expect(result.problem, `${packageName} must report no problem`).toBeNull();
+    }
+  });
+
+  it("still rejects that same tree once the installed SDK is removed, so the acceptance above is not blanket permissiveness", async () => {
+    // The discriminating case: identical peer-dependency-only manifest and
+    // identical SDK-less lockfile, differing only in whether the SDK is
+    // physically installed. Congruent with it, rejected without it.
+    const installDir = await tempInstallDir();
+    const packageName = "@lucitra/paperclip-plugin-secrets";
+    await writePeerDependencyOnlyPlugin(installDir, packageName);
+    await writeLockfileOmitting(installDir, "plugin-sdk");
+
+    const withoutSdk = await checkSharedDependencyConsistency(installDir, SDK_PACKAGE);
+    expect(withoutSdk.consistent).toBe(false);
+    expect(withoutSdk.problem).toBe("not_installed");
+
+    await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "2026.817.0");
+    const withSdk = await checkSharedDependencyConsistency(installDir, SDK_PACKAGE);
+    expect(withSdk.consistent).toBe(true);
+    expect(withSdk.problem).toBeNull();
+  });
+
+  it("does not stall the recheck path on the healthy shape — a congruent first read returns without sleeping", async () => {
+    // `checkSharedDependencyConsistencyAfterRecheck` only sleeps on a problem.
+    // If the healthy shape were ever classified as a problem, activation for
+    // all three isolated plugins would pay the full ~28s recheck budget on
+    // every boot before failing. Assert the fast path directly, since a
+    // wall-clock regression here is the cheap early warning for that.
+    const installDir = await tempInstallDir();
+    await writeLockfileOmitting(installDir, "plugin-sdk");
+    await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "2026.817.0");
+
+    const startedAt = Date.now();
+    const result = await checkSharedDependencyConsistencyAfterRecheck(installDir, SDK_PACKAGE);
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(result.consistent).toBe(true);
+    expect(elapsedMs).toBeLessThan(1_000);
+  });
+
+  it("lets a transient boot-install (absent)/(absent) settle instead of failing closed immediately", async () => {
+    // `(absent)/(absent)` is a real transient state during the concurrent boot
+    // npm install that SDK_INSTALL_RACE_RETRY_DELAYS_MS was built for. Making
+    // it a hard problem is only safe because the recheck path returns as soon
+    // as the SDK lands. Without this, rejecting the shape would convert a
+    // self-healing boot race into a latched plugin error.
+    const installDir = await tempInstallDir();
+
+    const settleStore = (async () => {
+      await sleep(800);
+      await writeInstalledPackageVersion(installDir, SDK_PACKAGE, "2026.817.0");
+    })();
+
+    const result = await checkSharedDependencyConsistencyAfterRecheck(installDir, SDK_PACKAGE);
+    await settleStore;
+
+    expect(result.consistent).toBe(true);
+    expect(result.installedVersion).toBe("2026.817.0");
+    expect(result.problem).toBeNull();
+  }, 15_000);
 });
 
 describe("BLO-20961: installDir isolation survives a re-torn shared store across boots", () => {
@@ -628,4 +890,89 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
     expect(startWorker).toHaveBeenCalledTimes(1);
     expect(markError).not.toHaveBeenCalled();
   }, 20_000);
+
+  it("BLO-31857: ACTIVATES a peer-dependency-only isolated plugin whose lockfile records no SDK — the live production shape", async () => {
+    // This is the end-to-end form of the outage guard. The unit tests above
+    // pin the predicate; this pins the thing that actually breaks, because
+    // `activatePlugin` throws on `!consistent` before spawning a worker. If a
+    // future tightening requires both metadata sources to be present, THIS is
+    // the test that fails, and its failure means the three isolated plugins in
+    // production stop activating.
+    const fixture = await createFixturePluginPackage();
+    const sharedDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-plugin-store-"));
+    cleanupPaths.add(sharedDir);
+    const isolatedDir = resolveDefaultInstallDir(ISOLATED_SDK_PLUGIN_PACKAGES[0], sharedDir);
+    cleanupPaths.add(isolatedDir);
+    await mkdir(isolatedDir, { recursive: true });
+
+    // A real lockfile that resolves other packages but records nothing for the
+    // SDK, because it is a peer dependency — plus the SDK physically installed.
+    await writeFile(
+      path.join(isolatedDir, "package-lock.json"),
+      JSON.stringify({
+        name: "paperclip-plugins",
+        lockfileVersion: 3,
+        packages: { "": { name: "paperclip-plugins" }, "node_modules/zod": { version: "3.23.8" } },
+      }),
+      "utf8",
+    );
+    await writeInstalledPackageVersion(isolatedDir, SDK_PACKAGE, "2026.817.0");
+
+    const [plugin] = await db
+      .insert(plugins)
+      .values({
+        pluginKey: fixture.manifest.id,
+        packageName: ISOLATED_SDK_PLUGIN_PACKAGES[0],
+        version: fixture.manifest.version,
+        apiVersion: fixture.manifest.apiVersion,
+        categories: fixture.manifest.categories as never,
+        manifestJson: fixture.manifest as never,
+        status: "ready",
+        packagePath: fixture.packageRoot,
+        installDir: isolatedDir,
+      })
+      .returning();
+    if (!plugin) throw new Error("fixture plugin row not inserted");
+
+    const { runtimeServices, startWorker, markError } = createRuntimeServices();
+    const loader = pluginLoader(db, { localPluginDir: sharedDir }, runtimeServices);
+    const result = await loader.loadSingle(plugin.id);
+
+    expect(result.success).toBe(true);
+    expect(startWorker).toHaveBeenCalledTimes(1);
+    expect(markError).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("BLO-31857: refuses to spawn a worker when the install dir holds no SDK at all, with a message distinct from the torn-store one", async () => {
+    const fixture = await createFixturePluginPackage();
+    // Empty install dir: no lockfile, no node_modules. Nothing settles it, so
+    // the recheck window elapses and the guard fails closed.
+    const installDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-plugin-store-"));
+    cleanupPaths.add(installDir);
+
+    const { runtimeServices, startWorker, markError } = createRuntimeServices(
+      vi.fn().mockImplementation(async () => {
+        throw new Error("startWorker should not have been called for an empty plugin store");
+      }),
+    );
+    const plugin = await insertReadyFixturePlugin(fixture);
+
+    const loader = pluginLoader(db, { localPluginDir: installDir }, runtimeServices);
+    const startedAt = Date.now();
+    const result = await loader.loadSingle(plugin.id);
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain(SDK_NOT_INSTALLED_ERROR_MARKER);
+    // Must NOT borrow the torn-store marker: the startup isolation migration
+    // un-latches rows carrying that marker, which would revive this row into
+    // the same failure on the next boot instead of waiting for an install.
+    expect(result.error).not.toContain("Torn plugin store detected");
+    expect(startWorker).not.toHaveBeenCalled();
+    expect(markError).toHaveBeenCalledTimes(1);
+    // Still well under the 60s worker initialize timeout this guard exists to
+    // pre-empt, while leaving the boot-install race room to settle.
+    expect(elapsedMs).toBeGreaterThanOrEqual(10_000);
+    expect(elapsedMs).toBeLessThan(35_000);
+  }, 45_000);
 });
