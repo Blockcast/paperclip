@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
+import { ApiException } from "@kubernetes/client-node";
 import type { Writable } from "node:stream";
 import { readFile } from "node:fs/promises";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
@@ -25,6 +26,8 @@ const mockBatchPatchJob = vi.fn();
 const mockCoreListPods = vi.fn();
 const mockCoreReadPodLog = vi.fn();
 const mockCoreCreateSecret = vi.fn();
+const mockCoreReadSecret = vi.fn();
+const mockCoreReplaceSecret = vi.fn();
 const mockCorePatchSecret = vi.fn();
 const mockCoreDeleteSecret = vi.fn();
 // vi.hoisted ensures a single vi.fn() instance shared between the mock factory
@@ -49,6 +52,8 @@ vi.mock("./k8s-client.js", () => ({
     listNamespacedPod: mockCoreListPods,
     readNamespacedPodLog: mockCoreReadPodLog,
     createNamespacedSecret: mockCoreCreateSecret,
+    readNamespacedSecret: mockCoreReadSecret,
+    replaceNamespacedSecret: mockCoreReplaceSecret,
     patchNamespacedSecret: mockCorePatchSecret,
     deleteNamespacedSecret: mockCoreDeleteSecret,
   }),
@@ -1132,6 +1137,12 @@ describe("execute: job creation", () => {
     // cleanup throws a TypeError instead of doing what it says (BLO-21858).
     mockCoreCreateSecret.mockResolvedValue({});
     mockCoreDeleteSecret.mockResolvedValue({});
+    // Same reasoning as the two above, for the 409 adopt path (BLO-31665).
+    // Left unstubbed, a future test that trips a 409 gets `existing ===
+    // undefined` from the read and a TypeError masked into a secret-create
+    // failure — the exact trap the comment above was written about.
+    mockCoreReadSecret.mockResolvedValue({ metadata: { resourceVersion: "1" } });
+    mockCoreReplaceSecret.mockResolvedValue({});
   });
 
   it("returns k8s_job_create_failed when createNamespacedJob throws", async () => {
@@ -1139,6 +1150,115 @@ describe("execute: job creation", () => {
     const result = await execute(makeCtx());
     expect(result.errorCode).toBe("k8s_job_create_failed");
     expect(result.errorMessage).toContain("quota exceeded");
+  });
+
+  // ── BLO-31665: an AlreadyExists 409 must not kill the run ────────────────
+  //
+  // Secret names are `${jobName}-{prompt,env,mcp}` where jobName embeds
+  // shortHash(agentId:runId), so a name collision is a collision with this
+  // same run — a leftover from an earlier attempt. Before this guard every
+  // throw from the create was fatal, and three agents sat in `status: error`
+  // holding a stale k8s_*_secret_create_failed for a Secret that no longer
+  // existed. These drive the real execute() path, not the helper directly.
+  //
+  // The 409 is the genuine `ApiException` the client throws (it sets `code`
+  // and leaves `statusCode`/`response` undefined), so these fixtures match the
+  // production shape and the unit-test ones. An earlier revision built a plain
+  // Error and described it as "status only in the message" — that account of
+  // the incident was retracted; see the isK8s409 comment in execute.ts.
+  const alreadyExists409 = () =>
+    new ApiException(
+      409,
+      "Conflict",
+      { kind: "Status", status: "Failure", reason: "AlreadyExists", code: 409 },
+      {},
+    ) as unknown as Error;
+
+  // A prompt over the 256 KiB threshold forces the prompt Secret path.
+  const largePromptCtx = () =>
+    makeCtx({ context: { paperclipTaskMarkdown: "x".repeat(300 * 1024) } } as Partial<AdapterExecutionContext>);
+
+  // A sensitive-named adapterConfig env var forces the *env* Secret path
+  // (isSensitiveEnvName routes it to a secretKeyRef — BLO-17980).
+  const envSecretCtx = () =>
+    makeCtx({
+      agent: {
+        id: "agent-abc",
+        companyId: "co1",
+        name: "Test Agent",
+        adapterType: "claude_k8s",
+        adapterConfig: { env: { MY_API_TOKEN: "s3cret" } },
+      },
+    } as unknown as Partial<AdapterExecutionContext>);
+
+  it("adopts a same-run leftover Secret and still creates the Job", async () => {
+    mockCoreCreateSecret.mockRejectedValueOnce(alreadyExists409());
+    mockCoreReadSecret.mockResolvedValue({
+      metadata: {
+        resourceVersion: "42",
+        labels: { "app.kubernetes.io/managed-by": "paperclip", "paperclip.io/run-id": "run-test-001" },
+      },
+    });
+    mockCoreReplaceSecret.mockResolvedValue({});
+
+    const result = await execute(largePromptCtx());
+
+    expect(result.errorCode).not.toBe("k8s_prompt_secret_create_failed");
+    expect(mockCoreReplaceSecret).toHaveBeenCalledTimes(1);
+    expect(mockBatchCreateJob).toHaveBeenCalled();
+  });
+
+  it("re-creates when the leftover Secret is deleted between create and read", async () => {
+    mockCoreCreateSecret.mockRejectedValueOnce(alreadyExists409()).mockResolvedValue({});
+    mockCoreReadSecret.mockRejectedValue(
+      new ApiException(404, "Not Found", { kind: "Status", reason: "NotFound", code: 404 }, {}),
+    );
+
+    const result = await execute(largePromptCtx());
+
+    expect(result.errorCode).not.toBe("k8s_prompt_secret_create_failed");
+    expect(mockCoreReplaceSecret).not.toHaveBeenCalled();
+    expect(mockBatchCreateJob).toHaveBeenCalled();
+  });
+
+  it("still fails the run when the colliding Secret belongs to another run", async () => {
+    // Fail-closed half: adopting must never mean overwriting someone else's
+    // credentials just because a name collided.
+    mockCoreCreateSecret.mockRejectedValueOnce(alreadyExists409());
+    mockCoreReadSecret.mockResolvedValue({
+      metadata: { resourceVersion: "42", labels: { "paperclip.io/run-id": "some-other-run" } },
+    });
+
+    const result = await execute(largePromptCtx());
+
+    expect(result.errorCode).toBe("k8s_prompt_secret_create_failed");
+    expect(result.errorMessage).toContain("belongs to run some-other-run");
+    expect(mockCoreReplaceSecret).not.toHaveBeenCalled();
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
+  });
+
+  it("adopts a same-run leftover on the ENV Secret, the path that actually broke", async () => {
+    // The other three e2e cases drive the prompt Secret. The reported incident
+    // was k8s_env_secret_create_failed, so prove that exact path end to end
+    // rather than inferring it from the shared helper.
+    mockCoreCreateSecret.mockRejectedValueOnce(alreadyExists409());
+    mockCoreReadSecret.mockResolvedValue({
+      metadata: {
+        resourceVersion: "42",
+        labels: { "app.kubernetes.io/managed-by": "paperclip", "paperclip.io/run-id": "run-test-001" },
+      },
+    });
+    mockCoreReplaceSecret.mockResolvedValue({});
+
+    const result = await execute(envSecretCtx());
+
+    expect(result.errorCode).not.toBe("k8s_env_secret_create_failed");
+    // The Secret that 409'd must be the env one, or this test is silently
+    // re-testing the prompt path with different scaffolding.
+    expect(mockCoreCreateSecret.mock.calls[0][0].body.metadata.name).toMatch(/-env$/);
+    expect(mockCoreReplaceSecret).toHaveBeenCalledTimes(1);
+    expect(mockCoreReplaceSecret.mock.calls[0][0].name).toMatch(/-env$/);
+    expect(mockBatchCreateJob).toHaveBeenCalled();
   });
 
   it("acknowledges the created Job identity before continuing", async () => {
