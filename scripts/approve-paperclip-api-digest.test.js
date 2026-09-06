@@ -1639,7 +1639,7 @@ test("a signal is routed into the cleanup rather than killing the script outrigh
 // cause, on the path with the LEAST operator visibility -- the caller prints
 // only the bare "could not retire the in-flight lock" and nobody is at a
 // terminal to re-run it with more logging.
-function runReleaseWrite({ stderrText, attempts = 3, writeSucceeds = false }) {
+function runReleaseWrite({ stderrText = "", attempts = 3, writeSucceeds = false } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-release-write-"));
   const countFile = path.join(dir, "replace_count");
   const sleepLog = path.join(dir, "sleeps");
@@ -1851,7 +1851,7 @@ test("a retirement write with no stderr still explains itself", () => {
 // rather than by presetting CLEAR_IN_FLIGHT_LOCK_ERR, so the variable is proven
 // populated by the script's own `2>&1 >/dev/null` capture -- the same standard
 // the release harness sets, for the same reason.
-function runRetireOnlyWrite({ stderrText, attempts = 3, writeSucceeds = false }) {
+function runRetireOnlyWrite({ stderrText = "", attempts = 3, writeSucceeds = false } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-retire-write-"));
   const countFile = path.join(dir, "replace_count");
   const sleepLog = path.join(dir, "sleeps");
@@ -2154,4 +2154,66 @@ test("no line citation can be added to this file without being pinned", () => {
     [],
     "a LINE_CITATIONS entry no longer matches any citation in the file -- remove it rather than leaving it pinning nothing",
   );
+});
+
+// Both write harnesses default `stderrText` to "" rather than destructuring it
+// bare, and this pins that default. Ally's suggestion 1 on #1671:
+// `JSON.stringify(undefined)` returns the VALUE undefined, not a string, so a
+// bare destructure interpolated the six-character token `undefined` into the
+// stub and shipped it as kubectl's stderr -- the release path's message read
+// `cannot retire the in-flight lock on sha256:deadbeef (owner owner-nonce-1):`
+// followed by an indented `undefined`, a cause no kubectl ever produced.
+//
+// No call site reached it: every failing-path caller passes the text
+// explicitly, and the callers that omit it pass writeSucceeds, which takes the
+// `return 0` arm and never reads the value. So the whole cost was in front of
+// us rather than behind -- this harness has taken new cases from four issues in
+// two days, and the next failing case that forgets the argument would have
+// asserted against that fabricated value, passing or failing on the harness
+// rather than on the script. That is the quiet-wrong-answer mode, which is why
+// it is worth a test despite being unreachable on the day it was written.
+//
+// Asserted as EQUIVALENCE to an explicit "", not merely as the absence of
+// /undefined/. The negative alone would still pass if the default were later
+// changed to some other invented string -- measured, not supposed: defaulting
+// to "(none)" instead leaves the negative green and trips only this deepEqual.
+// The equivalence pins it to the one value that already carries a tested
+// meaning on this path -- kubectl produced no output -- so a forgotten argument
+// lands on the empty-capture branch both harnesses defend directly above,
+// instead of on a new and unexamined one.
+//
+// Both harnesses in one test because it is one shared invariant, and because
+// the pair is the point: the defect was identical in both, so a per-harness
+// split would let a future divergence read as an unrelated single failure.
+//
+// The third assertion pins the `= {}` on the parameter object itself, which is
+// the same omission family one level out: with a bare `{ ... }` destructure the
+// defaults above are unreachable for a caller who passes nothing at all, and
+// `run()` dies with `TypeError: Cannot read properties of undefined (reading
+// 'stderrText')`. That is a loud failure rather than the quiet one this test
+// exists for, so it is pinned here as an extension of the same chain --
+// `run()` === `run({})` === `run({ stderrText: "" })` -- rather than given a
+// test of its own. Ally's suggestion 1 on #1682.
+test("omitting stderrText on a failing write is exactly an empty capture, never the token `undefined`", () => {
+  for (const [mode, run] of [
+    ["release", runReleaseWrite],
+    ["retire-only", runRetireOnlyWrite],
+  ]) {
+    const omitted = run({});
+    assert.doesNotMatch(
+      omitted.stderr,
+      /undefined/,
+      `${mode} mode fabricated a cause: the stub emitted the bare token \`undefined\` as kubectl's stderr, so any assertion about the cause would be measuring the harness rather than the script`,
+    );
+    assert.deepEqual(
+      omitted,
+      run({ stderrText: "" }),
+      `${mode} mode: omitting stderrText must be indistinguishable from passing "", so a failing case that forgets it lands on the tested empty-capture path`,
+    );
+    assert.deepEqual(
+      run(),
+      omitted,
+      `${mode} mode: omitting the argument object entirely must reach the same defaults as passing {}, not throw past them`,
+    );
+  }
 });
