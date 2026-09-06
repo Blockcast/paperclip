@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { REDACTED_EVENT_VALUE, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, isPlainObject, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
 import { diffAgentAdapterSecretBindings } from "../services/agent-secret-bindings.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
@@ -2105,6 +2105,35 @@ export function agentRoutes(
   }
 
   /**
+   * The one admission gate for anything agent-config-shaped on its way out.
+   *
+   * `redactAgentConfigPayload` — and `sanitizeValue` beneath it — sanitize only
+   * `isPlainObject` values and return anything else *by reference*. A caller
+   * that admits on a weaker "is it an object" test, or hands the value straight
+   * in with no gate, therefore has a fail-open the redactor cannot see: it gets
+   * the raw value back and serializes it.
+   *
+   * The obvious repair — swap the caller's predicate to `isPlainObject` — does
+   * not work where the assignment sits inside the gate, as in
+   * `redactAgentSecrets`: a failing gate just leaves the raw value on the
+   * `{ ...agent }` spread, so the same bytes reach the wire by a different
+   * route. Containment has to be *written back*, which is why this returns a
+   * value rather than answering a question.
+   *
+   *   `undefined` — not object-like (`null`, `undefined`, a primitive). No
+   *                 config to contain; each caller keeps its own absence
+   *                 contract for these.
+   *   `{}`        — an object this file cannot sanitize (array or foreign
+   *                 prototype). Withheld rather than emitted uncontained.
+   *   otherwise   — the redacted record.
+   */
+  function containAgentConfig(value: unknown): Record<string, unknown> | undefined {
+    if (typeof value !== "object" || value === null) return undefined;
+    if (!isPlainObject(value)) return {};
+    return redactAgentConfigPayload(value) ?? {};
+  }
+
+  /**
    * Strip credential material out of an agent row before it goes on the wire.
    *
    * `adapterConfig` holds live secrets — `{type:"plain",value}` env bindings and
@@ -2128,10 +2157,15 @@ export function agentRoutes(
    */
   function redactAgentSecrets<T extends { adapterConfig?: unknown; runtimeConfig?: unknown }>(agent: T): T {
     let result = { ...agent };
-    const config = asRecord(agent.adapterConfig);
-    if (config) {
-      const redactedConfig = redactAgentConfigPayload(config) ?? {};
-      const env = asRecord(config.env);
+    // `containAgentConfig`, not the local `asRecord`: `asRecord` admits any
+    // non-array object, and for a foreign-prototype config the redactor handed
+    // the argument straight back, so `result.adapterConfig` was assigned the
+    // raw record. See the helper for why swapping the predicate alone would
+    // have moved the leak rather than closed it.
+    const rawConfig = agent.adapterConfig;
+    const containedConfig = containAgentConfig(rawConfig);
+    if (containedConfig) {
+      const env = isPlainObject(rawConfig) ? asRecord(rawConfig.env) : null;
       if (env) {
         // The top-level env keeps the shorter `***` sentinel the UI and
         // `stripRedactedEnvBindingsFromAdapterConfig` have always round-tripped.
@@ -2139,14 +2173,14 @@ export function agentRoutes(
         for (const key of Object.keys(env)) {
           redactedEnv[key] = REDACTED_ENV_SENTINEL;
         }
-        result.adapterConfig = { ...redactedConfig, env: redactedEnv } as T["adapterConfig"];
+        result.adapterConfig = { ...containedConfig, env: redactedEnv } as T["adapterConfig"];
       } else {
-        result.adapterConfig = redactedConfig as T["adapterConfig"];
+        result.adapterConfig = containedConfig as T["adapterConfig"];
       }
     }
-    const rtConfig = asRecord(agent.runtimeConfig);
-    if (rtConfig) {
-      result.runtimeConfig = redactAgentConfigPayload(rtConfig) as T["runtimeConfig"];
+    const containedRuntime = containAgentConfig(agent.runtimeConfig);
+    if (containedRuntime) {
+      result.runtimeConfig = containedRuntime as T["runtimeConfig"];
     }
     return result;
   }
@@ -2163,32 +2197,85 @@ export function agentRoutes(
       status: agent.status,
       reportsTo: agent.reportsTo,
       adapterType: agent.adapterType,
-      adapterConfig: redactAgentConfigPayload(agent.adapterConfig),
-      runtimeConfig: redactAgentConfigPayload(agent.runtimeConfig),
+      adapterConfig: containAgentConfig(agent.adapterConfig) ?? null,
+      runtimeConfig: containAgentConfig(agent.runtimeConfig) ?? null,
       permissions: agent.permissions,
       updatedAt: agent.updatedAt,
     };
   }
 
+  /**
+   * Contain the WHOLE snapshot, not three named fields.
+   *
+   * This used to spread the stored row and override `adapterConfig`,
+   * `runtimeConfig` and `metadata`. That list is complete for the shape
+   * `buildConfigSnapshot` emits today, so it did not leak — but it fails open
+   * the moment a config-bearing field is added to the snapshot and this line is
+   * not revisited in the same commit. It is the same drift that produced doors
+   * #12 and #13 on PEN-2370, where a projection's withholding list was correct
+   * when written and silently stopped covering what it projected.
+   *
+   * The stakes here are higher than for a live-agent read, because the row this
+   * projects is stored *pre-redaction* by `buildConfigSnapshot`, which uses the
+   * name-based `sanitizeRecord` rather than the structural one — so an
+   * ordinary-keyed value like `env.FOO` is genuinely at rest in the clear and
+   * this projection is the only thing masking it on the way out.
+   *
+   * `redactAgentConfigPayload` recurses, so an `env`/`headers` map or a
+   * `{type:"plain",value}` binding is masked at any depth under any parent key,
+   * including one added after this comment was written. That also closes an
+   * array-shaped hole in the old `metadata` branch: `typeof x === "object"` is
+   * true for an array, and `redactAgentConfigPayload` returns a non-plain-object
+   * argument unchanged, so an array-valued `metadata` was passed through
+   * verbatim. `sanitizeValue` maps arrays element-wise.
+   *
+   * Note the polarity of `redactAgentConfiguration` directly above: it
+   * enumerates its output, so a new agent column cannot ship by accident. Same
+   * material, same file — these two should share a default, and now do.
+   */
   function redactRevisionSnapshot(snapshot: unknown): Record<string, unknown> {
-    if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return {};
-    const record = snapshot as Record<string, unknown>;
+    // Gate on `isPlainObject`, NOT the local `asRecord`. `asRecord` admits any
+    // non-null non-array object, while `redactAgentConfigPayload` sanitizes only
+    // plain objects and otherwise returns its argument *by reference*
+    // (`redaction.ts`). Admitting on the wider test would let a foreign-prototype
+    // snapshot through uncontained: `contained` would BE `record`, the spread
+    // would emit it verbatim, and the three lines below would only be reshaping.
+    // Not reachable from today's callers — both snapshots come from `jsonb` via
+    // `JSON.parse`, which always yields `Object.prototype` objects — but a
+    // containment function resting on an unstated assumption about the shape it
+    // is handed is the exact defect class this function exists to close, so the
+    // admit gate and the sanitize gate share one predicate instead.
+    if (!isPlainObject(snapshot)) return {};
+    // `?? {}` is a type narrowing, not a live branch: `containAgentConfig`
+    // returns `undefined` only for a non-object, which the gate above has
+    // already excluded.
+    const contained = containAgentConfig(snapshot) ?? {};
+    const meta = contained.metadata;
     return {
-      ...record,
-      adapterConfig: redactAgentConfigPayload(
-        typeof record.adapterConfig === "object" && record.adapterConfig !== null
-          ? (record.adapterConfig as Record<string, unknown>)
-          : {},
-      ),
-      runtimeConfig: redactAgentConfigPayload(
-        typeof record.runtimeConfig === "object" && record.runtimeConfig !== null
-          ? (record.runtimeConfig as Record<string, unknown>)
-          : {},
-      ),
+      // Shape contract preserved exactly: absent or non-object config still
+      // normalizes to `{}`, and absent metadata still to `null`. These sub-field
+      // gates are `isPlainObject` for the same reason as above — `sanitizeValue`
+      // also passes a nested non-plain object through unchanged, so the mismatch
+      // recurs one level down.
+      ...contained,
+      adapterConfig: isPlainObject(contained.adapterConfig) ? contained.adapterConfig : {},
+      runtimeConfig: isPlainObject(contained.runtimeConfig) ? contained.runtimeConfig : {},
+      // `metadata` is NOT coerced to a record: an array-valued `metadata` must
+      // survive as the element-wise-sanitized array `sanitizeValue` produced,
+      // not be flattened to `null`. But it must still fail closed the same way
+      // the two lines above do. `metadata` matches no tier and no special case
+      // in `sanitizeRecord`, so it reaches `sanitizeValue`, which returns a
+      // non-plain non-array object BY REFERENCE — a foreign-prototype
+      // `metadata` arrived in `contained` unsanitized and `?? null` emitted it
+      // verbatim. Arrays and plain objects have been sanitized and pass; a
+      // primitive carries no binding for `sanitizeValue` to have missed and any
+      // string has already been through `redactUriCredentialsInValue`;
+      // everything else is withheld.
       metadata:
-        typeof record.metadata === "object" && record.metadata !== null
-          ? redactAgentConfigPayload(record.metadata as Record<string, unknown>)
-          : record.metadata ?? null,
+        meta === null || meta === undefined ? null
+        : typeof meta !== "object" ? meta
+        : isPlainObject(meta) || Array.isArray(meta) ? meta
+        : null,
     };
   }
 
@@ -3087,7 +3174,7 @@ export function agentRoutes(
     res.status(201).json({
       agent: redactAgentSecrets(agent),
       approval: approval
-        ? { ...approval, payload: redactAgentConfigPayload(asRecord(approval.payload) ?? null) }
+        ? { ...approval, payload: containAgentConfig(approval.payload) ?? null }
         : approval,
     });
   });
