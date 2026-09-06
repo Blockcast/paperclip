@@ -2837,11 +2837,24 @@ export function buildUnmaterializedSkillNoticeMarkdown(
     const hiddenPending = hidden.filter(
       (entry) => entry.reason === "runtime_files_unpublished",
     ).length;
-    const hiddenConfigFault = hidden.length - hiddenPending;
+    // Counted per reason off the same allowlist that scopes the verdict, rather
+    // than as `hidden.length - hiddenPending`. That subtraction was the negative
+    // derivation the allowlist above exists to replace, reintroduced one
+    // paragraph lower: a fourth reason would have been silently counted here as
+    // "a configuration fault" while `configFaultReasons` correctly refused to
+    // cover it — the two sites disagreeing about the same question. Counting per
+    // reason also lets the disclosure name the same labels the verdict quotes,
+    // so the reader matches "N <label>" against a label they can see on a bullet
+    // instead of bridging a class word to a label by inference.
+    const hiddenConfigFault = UNMATERIALIZED_SKILL_CONFIG_FAULT_REASONS
+      .map((reason) => ({ reason, count: hidden.filter((e) => e.reason === reason).length }))
+      .filter((bucket) => bucket.count > 0);
     const disclosures = isMixed
       ? [
           ...(hiddenPending > 0 ? [`${hiddenPending} with runtime files unpublished`] : []),
-          ...(hiddenConfigFault > 0 ? [`${hiddenConfigFault} a configuration fault`] : []),
+          ...hiddenConfigFault.map(
+            ({ reason, count }) => `${count} ${UNMATERIALIZED_SKILL_REASON_SUMMARY[reason]}`,
+          ),
         ]
       : [];
     lines.push(

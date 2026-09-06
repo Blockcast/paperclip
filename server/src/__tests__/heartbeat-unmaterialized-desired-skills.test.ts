@@ -22,6 +22,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildUnmaterializedSkillNoticeMarkdown,
   computeUnmaterializedDesiredSkills,
+  type UnmaterializedDesiredSkill,
 } from "../services/heartbeat.ts";
 
 describe("computeUnmaterializedDesiredSkills", () => {
@@ -363,9 +364,67 @@ describe("buildUnmaterializedSkillNoticeMarkdown", () => {
     expect(notice).not.toContain("a/b/gone-one");
     expect(notice).not.toContain("a/b/gone-two");
     // The config-fault verdict is rendered, so the reader must be told which
-    // keys it is about — none of them are visible.
-    expect(notice).toContain("- …and 2 more (2 a configuration fault)");
+    // keys it is about — none of them are visible. The disclosure quotes the
+    // same label the verdict does, so matching the two costs no inference.
+    expect(notice).toContain("- …and 2 more (2 not in the company skill library)");
+    expect(notice).toContain("*not in the company skill library* are a configuration fault");
     expect(notice).toContain("retrying will not fix them");
+  });
+
+  // The disclosure and the verdict answer the same question — "which class are
+  // the keys I cannot see?" — so they must be derived from one list, not two.
+  // Deriving the count by subtracting the pending ones re-created the negative
+  // predicate `UNMATERIALIZED_SKILL_CONFIG_FAULT_REASONS` exists to remove: a
+  // reason added to the union later would be counted as a configuration fault
+  // here while the verdict, correctly, declined to cover it.
+  it("does not enrol an unknown reason in the hidden config-fault count", () => {
+    const notice = buildUnmaterializedSkillNoticeMarkdown(
+      [
+        ...Array.from({ length: 20 }, (_unused, index) => ({
+          key: `a/b/pending-${index}`,
+          reason: "runtime_files_unpublished" as const,
+          detail: null,
+        })),
+        { key: "a/b/gone", reason: "absent" as const, detail: null },
+        // Stands in for a fourth reason added to the union later. The cast is
+        // the point: `tsc` cannot catch the enrolment, so the guard has to be
+        // in the shape of the derivation and pinned by a test.
+        { key: "a/b/future", reason: "some_future_reason", detail: null } as unknown as
+          UnmaterializedDesiredSkill,
+      ],
+      30,
+    );
+    // Only the one genuinely-absent key is claimed as a configuration fault.
+    expect(notice).toContain("- …and 2 more (1 not in the company skill library)");
+    // The unknown reason is disclosed in the honest total but never described
+    // by a verdict that does not cover it.
+    expect(notice).not.toContain("2 not in the company skill library");
+    expect(notice).not.toContain("a configuration fault, not a transient error — retrying will not fix them.\n");
+  });
+
+  // Ally raised the reverse of the mirror case above: 20 visible `absent` keys
+  // and hidden `unresolved_source` ones, with nothing pending. It renders
+  // correctly and needs no disclosure, because the label-scoped verdict is
+  // gated on `hasPending` — with no pending key the flat sentence renders
+  // instead, and it covers both config-fault labels. Pinned so a later widening
+  // of that gate has to argue with a test rather than a comment.
+  it("needs no disclosure when every reported key is a configuration fault", () => {
+    const notice = buildUnmaterializedSkillNoticeMarkdown(
+      [
+        ...Array.from({ length: 20 }, (_unused, index) => ({
+          key: `a/b/gone-${index}`,
+          reason: "absent" as const,
+          detail: null,
+        })),
+        { key: "a/b/unresolved", reason: "unresolved_source" as const, detail: null },
+      ],
+      30,
+    );
+    // The flat verdict renders, so no label is named that has no visible bullet.
+    expect(notice).toContain("This is a configuration fault");
+    expect(notice).not.toContain("The keys marked");
+    expect(notice).toContain("- …and 1 more");
+    expect(notice).not.toContain("- …and 1 more (");
   });
 
   it("does not annotate the overflow line when nothing hidden is pending", () => {
