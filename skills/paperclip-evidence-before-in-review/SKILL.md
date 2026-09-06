@@ -230,6 +230,39 @@ paperclipUpdateIssue(issueId, { status: "in_review" })
 
 The gate runs synchronously and writes its verdict to `issues.last_evidence_verdict`. Operator + QA Engineer see the verdict via the UI badge. If your evidence shape was complete, verdict is `pass`. If it wasn't, verdict is `block` (Phase 1: telemetry only; Phase 2: 422).
 
+### Requesting privileged access
+
+Agents cannot read or grant elevation. Elevation is decided in magma tenants (`ApprovalsService`) by two distinct human approvers and enforced by the `bc-protected-secret-write` ValidatingAdmissionPolicy, which reads the `bc-elevation/bc-active-elevations` ConfigMap. Your Kubernetes subject is `system:serviceaccount:paperclip:<sa-name>`. When a task needs a write that the policy denies: do not retry, do not hand the issue to a human assignee, and do not ask for a permanent RBAC change. File a `request_board_approval` approval with the payload below, add the approval as a first-class blocker, and keep the issue `in_progress`.
+
+`POST /api/companies/{companyId}/approvals`
+
+```json
+{
+  "type": "request_board_approval",
+  "payload": {
+    "title": "Elevation: <BLO-id> <one-line why>",
+    "subject": "system:serviceaccount:paperclip:<sa-name>",
+    "systemPrincipal": "sp_<uuid>",
+    "verb": "<create|update|patch|delete>",
+    "resource": "<group/version/kind>",
+    "namespace": "<namespace>",
+    "durationMinutes": 60,
+    "reason": "<BLO-id>: <why this write is needed and what it changes>",
+    "approverCommand": "break_glass_cli grant --kind admin_elevation --subject sp_<uuid> --reason \"<BLO-id>: <why>\" --addr tenants.controller.magma.local:9079 --cert-file <operator cert> --key-file <key> --ca-file <ca>"
+  }
+}
+```
+
+Rules:
+
+- Check first that you actually lack the capability, and say which call proved it. A `403` naming a missing grant is a capability gap, not a policy denial, and the two have different owners: a missing Paperclip grant is a board/CEO decision, while a Kubernetes admission denial is what this section is for.
+- `durationMinutes` is at most 60. `ElevationGrant.spec.expiresAt` is capped at one hour. Ask for less when less is enough.
+- `systemPrincipal` (`sp_<uuid>`) is the system-principal registration in magma tenants for `system:serviceaccount:paperclip:<sa-name>`. Two approvers must each run `approverCommand` with their own operator `mb_<uuid>` certificate. One approver is not a grant.
+- If you cannot find an `sp_<uuid>` for your subject, the registration may not exist. Say so in the request in plain words and ask for registration first. Whether Paperclip agent SAs are registered at all is unverified as of 2026-09-04; see the bc-elevation bridge notes in onprem-k8s `security/bc-elevation/source-of-truth.md`.
+- Give the card one ask and a branch it can satisfy inside Paperclip, and state what you do on silence. A card whose only satisfying action is a click somewhere else is a work item with no owner.
+- The approval record plus the audit of the write you performed are the evidence for `in_review`. The grant itself is not evidence.
+
+
 ## Anti-patterns
 
 These have all happened on real issues and the gate exists to catch them:
