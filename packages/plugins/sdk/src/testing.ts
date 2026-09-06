@@ -1926,23 +1926,60 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         if (!isInCompany(parentIssue, companyId)) {
           throw new Error(`Issue not found: ${issueId}`);
         }
+        // Mirror the host's idempotent-create contract (`issues.addComment` +
+        // the three partial unique indexes in `0206_issue_comment_idempotency`):
+        // a second create carrying a key already written to this issue returns
+        // the existing comment with `deduplicated: true` rather than inserting.
+        //
+        // Two details are load-bearing for plugins that rely on the key instead
+        // of their own dedup layer, so they are reproduced rather than
+        // approximated:
+        //  - The scope is (issue, author, key), not (issue, key). The real
+        //    indexes are partial and author-scoped, so an agent-authored and a
+        //    system-authored comment can hold the same key on one issue.
+        //  - Empty and whitespace-only keys count as omitted, matching the
+        //    host's `readNonEmptyParam`. Otherwise `""` would dedup every
+        //    keyless-looking create against the first one.
+        // One detail is deliberately *not* reproduced: this stores the raw
+        // caller key, where the host stores `plugin:${pluginId}:${key}`. Tests
+        // asserting the key should assert the call argument, which is the level
+        // a plugin controls. Do not read this fake as evidence that the host's
+        // namespacing is unnecessary — it cannot model the cross-plugin
+        // collision that namespacing exists to prevent, where two plugins
+        // sharing a natural key on one issue would hand the second caller the
+        // first's body with `deduplicated: true` and no error.
+        // Everything up to the push below is synchronous, so concurrent callers
+        // cannot interleave here — the same atomicity the unique index gives us
+        // in Postgres, which is what makes the concurrency tests meaningful.
+        const idempotencyKey = options?.idempotencyKey?.trim() || null;
+        const authorAgentId = options?.authorAgentId ?? null;
+        const existingForIssue = issueComments.get(issueId) ?? [];
+        if (idempotencyKey) {
+          const duplicate = existingForIssue.find(
+            (candidate) =>
+              candidate.idempotencyKey === idempotencyKey &&
+              candidate.authorAgentId === authorAgentId &&
+              !candidate.deletedAt,
+          );
+          if (duplicate) return { ...duplicate, deduplicated: true };
+        }
         const now = new Date();
         const comment: IssueComment = {
           id: randomUUID(),
           companyId: parentIssue.companyId,
           issueId,
-          authorType: options?.authorAgentId ? "agent" : "system",
-          authorAgentId: options?.authorAgentId ?? null,
+          authorType: authorAgentId ? "agent" : "system",
+          authorAgentId,
           authorUserId: null,
           body,
           presentation: null,
           metadata: null,
           createdAt: now,
           updatedAt: now,
+          ...(idempotencyKey ? { idempotencyKey } : {}),
         };
-        const current = issueComments.get(issueId) ?? [];
-        current.push(comment);
-        issueComments.set(issueId, current);
+        existingForIssue.push(comment);
+        issueComments.set(issueId, existingForIssue);
         return comment;
       },
       async createInteraction(issueId, interaction, companyId, options) {
