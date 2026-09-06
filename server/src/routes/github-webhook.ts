@@ -69,6 +69,10 @@ import {
   githubPostIssueComment,
 } from "../services/github-app-auth.js";
 import {
+  allyReviewAlreadyAttestsHead,
+  type ListPrReviewsForAttestation,
+} from "../services/pr-review-head-attestation.js";
+import {
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
 } from "../services/ally-review-detection.js";
@@ -167,6 +171,12 @@ export interface GithubWebhookConfig {
    * uses the GitHub App lookup; route tests can provide a deterministic seam.
    */
   resolvePrReviewHeadSha?: typeof githubFetchPrHeadSha;
+  /**
+   * Optional seam for the head-attestation idempotency check (BLO-32198).
+   * Production lists reviews through the GitHub App; route tests supply a
+   * deterministic list so the suppression path is verified without network.
+   */
+  listPrReviewsForAttestation?: ListPrReviewsForAttestation;
   /**
    * Optional seam for the comment-review status gate. Production uses the
    * service implementation; route tests supply a local recorder so webhook
@@ -4402,6 +4412,71 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           "github webhook reviewer wake skipped: self-echo of the reviewer's own posted review",
         );
         return false;
+      }
+      // BLO-32198: don't wake the reviewer for a head it has already reviewed.
+      //
+      // Until this check existed the only thing enforcing "at most one
+      // operative Ally App review per (PR, head)" — invariant I1 of
+      // scripts/check-ally-review-consistency.mjs — was a prose instruction to
+      // the agent (.planning/ally-agent/AGENTS.md "Step 2"), which is not the
+      // agent's live instruction source and so was advisory. Four open PRs were
+      // measured carrying duplicate operative reviews at one head, with gaps
+      // from 53 s to 6h35m; a spread that wide is a step being skipped, not a
+      // delivery race, and the delivery/comment-scoped idempotency keys above
+      // cannot catch it because two DIFFERENT wake sources at one head
+      // legitimately produce two different keys.
+      //
+      // This suppresses unconditionally across wake reasons, matching what the
+      // agent instructions already state ("there is no wake reason that exempts
+      // it ... if a re-review is genuinely wanted, the PR needs a new commit").
+      // The asymmetry that justifies including the explicit-request reason: a
+      // duplicate COMMENTED review can never be retracted — GitHub's dismiss
+      // endpoint rejects COMMENTED (422) and there is no delete-review API — so
+      // the violation is permanent, whereas a re-review someone still wants is
+      // one commit away. On `github_pr_synchronized` the head is new by
+      // definition, so this costs one API call and always falls through.
+      //
+      // Fail-open by construction: only an `attested` outcome suppresses. An
+      // unreachable GitHub, an unparseable body, or a missing head all yield
+      // `unknown` and let the wake proceed, because an unreviewed PR is a worse
+      // failure than a redundant review and nothing else retries this.
+      if (context.headSha && context.repoFullName) {
+        const attestation = await allyReviewAlreadyAttestsHead({
+          repoFullName: context.repoFullName,
+          prNumber: context.prNumber,
+          headSha: context.headSha,
+          botLogin: config.prReviewerBotLogin,
+          ...(config.listPrReviewsForAttestation
+            ? { listPrReviews: config.listPrReviewsForAttestation }
+            : {}),
+        });
+        if (attestation.outcome === "attested") {
+          logger.info(
+            {
+              deliveryId,
+              repoFullName: context.repoFullName,
+              prNumber: context.prNumber,
+              wakeReason: context.wakeReason,
+              headSha: context.headSha,
+              attestingReviewCount: attestation.attestingReviewCount,
+            },
+            "github webhook reviewer wake skipped: this head is already attested by an operative Ally review",
+          );
+          return false;
+        }
+        if (attestation.outcome === "unknown") {
+          logger.warn(
+            {
+              deliveryId,
+              repoFullName: context.repoFullName,
+              prNumber: context.prNumber,
+              wakeReason: context.wakeReason,
+              headSha: context.headSha,
+              reason: attestation.reason,
+            },
+            "github webhook could not establish whether this head was already reviewed; dispatching the reviewer wake anyway",
+          );
+        }
       }
       try {
         const outcome = await attemptPrReviewerWake({
