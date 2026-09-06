@@ -24,7 +24,14 @@ import { describe, expect, it } from "vitest";
  *    against deliberate evasion.
  *  - A site clears the check if ANY withholding helper appears anywhere in its argument. In a large
  *    object literal with several nouns, one wrapped noun therefore vouches for the rest. Tightening
- *    that is worthwhile and is not done here.
+ *    that is worthwhile and is not done here. Since `issues.ts` joined the scan, the site where
+ *    this bites is the `GET /issues/:id` detail response (`issues.ts:8540` at time of writing):
+ *    ONE `res.json` argument carries all four exits, so `project: compactIssueProject(…)` alone
+ *    clears it — deleting the `publicProjects(…)` wrapper from `mentionedProjects` would leave the
+ *    scan green. What holds that line instead is route-driven, not textual: the three withholding
+ *    tests in `issue-detail-workspace-runtime-withholding.test.ts` assert on the serialized body
+ *    and each fails alone under its own mutation. Anyone tightening this bullet should test
+ *    against that site, because it is the one the limit is load-bearing for.
  *  - The first cases below are POSITIVE CONTROLS: they prove the detector actually fires on an
  *    unwrapped response, under both nouns the material travels under. Without them, a green run
  *    could mean "no violations" or "the detector matches nothing", and those are different claims.
@@ -259,14 +266,24 @@ export function stripLiterals(expression: string): string {
  * noise that the guard gets switched off, which is not safe at all.
  */
 export function escapesAsWholeValue(code: string, noun: string): boolean {
-  const occurrences = new RegExp(`\\b${noun}\\b\\s*(.?)`, "g");
+  // Two characters of lookahead, not one: `?` opens three different constructs and only two of
+  // them keep the row out of the response. The trailing characters are matched ZERO-WIDTH so the
+  // walk's `lastIndex` still advances by the noun alone — consuming them would step past a second
+  // occurrence lying within two characters of the first, and the first is precisely the kind that
+  // says `continue` below.
+  const occurrences = new RegExp(`\\b${noun}\\b\\s*(?=(.{0,2}))`, "g");
   let match: RegExpExecArray | null;
   while ((match = occurrences.exec(code)) !== null) {
     const next = match[1] ?? "";
+    // Nullish coalescing hands over the WHOLE row (`workspace ?? null`) and merely happens to
+    // start with the same character as the two shapes below. It is the dominant idiom in
+    // `issues.ts`, so reading it as a field access switches the guard off in the module it was
+    // widened to cover.
+    if (next.startsWith("??")) return true;
     // `.` is a field read; `?` is either optional chaining (`project?.id`) or a ternary TEST
     // (`project ? { … } : null`) — in both cases what reaches the response is decided elsewhere in
     // the expression, and that elsewhere is itself a site this scan sees.
-    if (next === "." || next === "?") continue;
+    if (next[0] === "." || next[0] === "?") continue;
     return true;
   }
   return false;
@@ -387,6 +404,44 @@ describe("workspace response withholding guard (PEN-2852, PEN-2370 (b2))", () =>
     expect(
       findUnwithheldWorkspaceResponses(collectResponseSites("synthetic.ts", spread)),
     ).toHaveLength(1);
+  });
+
+  it("reads `?? null` after a workspace row as a whole-value escape, not as a field access", () => {
+    // `?` after the noun is `continue`-worthy in two shapes — optional chaining (`workspace?.id`)
+    // and the ternary TEST (`workspace ? … : null`) — but nullish coalescing opens with the same
+    // character while handing the ROW over. One character of lookahead cannot tell them apart, so
+    // the guard has to look at two. This matters more than its size suggests: `?? null` is the
+    // dominant idiom in `issues.ts`, so it is what an accidental new handler in the module this
+    // guard was widened to cover is most likely to write.
+    const coalesced = "  res.json({ executionWorkspace: workspace ?? null });";
+    expect(
+      findUnwithheldWorkspaceResponses(collectResponseSites("synthetic.ts", coalesced)),
+    ).toHaveLength(1);
+
+    // The key is deliberately `executionWorkspace`: it does NOT match `\bworkspace\b`, so the bare
+    // value is the only occurrence and the verdict rests entirely on what follows it. Spelling the
+    // key `workspace` would pass for the wrong reason — the key would match first and return early.
+    expect(escapesAsWholeValue("{ executionWorkspace: workspace ?? null }", "workspace")).toBe(true);
+
+    // The two `?` shapes this must NOT swallow, kept adjacent to the case above so the distinction
+    // is visible rather than inferred.
+    expect(escapesAsWholeValue("{ id: workspace?.id }", "workspace")).toBe(false);
+    expect(
+      findUnwithheldWorkspaceResponses(
+        collectResponseSites("synthetic.ts", "  res.json({ id: workspace?.id, at: project?.updatedAt });"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("still sees a whole-value escape that follows a field read of the same noun", () => {
+    // Guards the lookahead's implementation, not its policy. The scan walks occurrences with a
+    // sticky `lastIndex`, so widening the capture from one character to two would step PAST a
+    // second occurrence sitting within two characters of the first — and the first is exactly the
+    // kind that says `continue`. Matching the trailing characters in a zero-width lookahead keeps
+    // every occurrence reachable; consuming them does not. Anyone simplifying the lookahead away
+    // fails here rather than silently narrowing the guard.
+    expect(escapesAsWholeValue("{ x: project.project }", "project")).toBe(true);
+    expect(escapesAsWholeValue("{ x: workspace?.workspace }", "workspace")).toBe(true);
   });
 
   it("qualifies producers by receiver so a same-named method on another service is not tracked", () => {
