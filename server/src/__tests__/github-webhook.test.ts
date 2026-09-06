@@ -30,6 +30,8 @@ import {
   __test_buildPrReviewerWakeIdempotencyKey,
   __test_buildPrReviewFeedbackComment,
   __test_classifyWorkflowRunSupersession,
+  __test_classifyPrReviewActionability,
+  __test_resolveReviewFeedbackSuppression,
   __test_commentsContainBackLinkMarker,
   __test_extractPaperclipIdentifiers,
   __test_hasActionablePrReviewFeedback,
@@ -43,6 +45,7 @@ import {
   __test_idempotentWakeStatuses,
   __test_prReviewerWakeIdempotencyScope,
   __test_recordWorkflowRunSighting,
+  __test_REVIEW_BODY_MAX_BYTES,
   __test_resolvePrCommentReviewGateWebhookTrigger,
   __test_resolveDependabotAlertContext,
   __test_resolveEventContext,
@@ -6991,6 +6994,270 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect((feedbackComments[0]!.metadata as Record<string, unknown>).kind).toBe(
       "github_pr_review_feedback",
     );
+    // BLO-30420: the companion assertion to the suppression tests below. An
+    // ACTIONABLE review must carry no suppression reason at all, so the
+    // field's presence is unambiguous evidence that the classifier declined --
+    // never an artifact of the issue's `blocked` status.
+    expect(response.body.reviewFeedbackSuppressed).toBeUndefined();
+  });
+
+  // BLO-30420. The frr#61 specimen (Blockcast/frr#61, review submitted
+  // 2026-08-19T02:55:21Z against f78f3dcd) produced no wake, and for weeks the
+  // only evidence was the ABSENCE of a `github_pr_review_feedback` comment --
+  // which is equally consistent with a status suppression, a dropped delivery,
+  // or a review that never arrived. These tests pin the named reason so the
+  // same shape is diagnosable on sight.
+  //
+  // Measured against the live specimen: the body is 9856 bytes, and its
+  // `### Critical Issues (0)` / `### Important Issues (1)` headings begin at
+  // bytes 4248 and 4273 -- both past the old 4096-byte clamp. So the truncated
+  // body the classifier saw carried NO counted bucket at all, while still
+  // carrying the Ally heading and four dispositioned prior findings. A
+  // complete Ally review never has that shape, which is what makes
+  // `ally_review_findings_unenumerable` a truncation signal rather than a
+  // "clean review" signal.
+  describe("declined review-feedback diagnostics (BLO-30420)", () => {
+    // Reproduces the specimen's decisive structure: Ally heading, a
+    // Reviewed-head attestation, four prior-finding dispositions, and counted
+    // buckets pushed past the clamp boundary by the intervening prose. The
+    // padding width is chosen so the first bucket starts at byte ~5006, past
+    // the 4096 clamp, mirroring the live specimen's 4248.
+    function frr61ShapedBody(): string {
+      const detail = "detail ".repeat(160);
+      return [
+        "## Ally — Consolidated PR Review",
+        "",
+        "Reviewed head: f78f3dcd8818ed2bf9b7550965c96c614f433987",
+        "",
+        "Three of the four outstanding blockers are fixed at this head.",
+        "",
+        "### Prior Findings Dispositioned (4)",
+        "",
+        `- **prior:f58559a important 4** — still-present — \`pimd/pim_mroute.c:1828\` — ${detail}`,
+        `- **prior:b889084 important 2** — fixed — \`pimd/pim_dimt.c:1115\` — ${detail}`,
+        `- **prior:b889084 important 3** — fixed — \`pimd/pim_iface.c:2218\` — ${detail}`,
+        `- **prior:b889084 important 4** — fixed — \`tests/topotests/lib/test_kernel_state.py:73\` — ${detail}`,
+        "",
+        "### Critical Issues (0)",
+        "",
+        "### Important Issues (1)",
+        "",
+        "- **prior:f58559a important 4** — Kernel MFC admission is still unguarded.",
+      ].join("\n");
+    }
+
+    it("names ally_review_findings_unenumerable when the classifier sees the frr#61 body truncated before its findings buckets", async () => {
+      const fullBody = frr61ShapedBody();
+      // Pin the property that made frr#61 undiagnosable: the buckets sit
+      // beyond the clamp, exactly as in the live specimen (4248/4273 > 4096).
+      // Read against the real clamp, not a copy of it — if the clamp is
+      // retuned, this fixture must fail rather than quietly stop reproducing
+      // the past-the-clamp shape the comment above claims.
+      const bucketOffset = Buffer.byteLength(
+        fullBody.slice(0, fullBody.indexOf("### Critical Issues")),
+        "utf8",
+      );
+      expect(bucketOffset).toBeGreaterThan(__test_REVIEW_BODY_MAX_BYTES);
+
+      // The body as the classifier historically received it: clamped first,
+      // classified second. Sent as the raw review body so this test exercises
+      // the declined path even though PR #1517 now classifies pre-clamp.
+      const truncatedBody = Buffer.from(fullBody, "utf8")
+        .subarray(0, __test_REVIEW_BODY_MAX_BYTES)
+        .toString("utf8");
+      expect(truncatedBody).toContain("## Ally — Consolidated PR Review");
+      expect(truncatedBody).not.toContain("Important Issues (1)");
+
+      const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
+      const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+
+      const response = await sendReviewSubmitted(
+        app,
+        reviewSubmittedFeedbackPayload({
+          prNumber: 61,
+          reviewId: 4968003838,
+          state: "commented",
+          headSha: "f78f3dcd8818ed2bf9b7550965c96c614f433987",
+          identifier: "PEN-1126",
+          body: truncatedBody,
+        }),
+        "delivery-blo-30420-frr61-truncated",
+      );
+
+      expect(response.status).toBe(200);
+      // The named reason, and the exact predicate that selected it.
+      expect(response.body.reviewFeedbackSuppressed).toEqual({
+        reason: "ally_review_findings_unenumerable",
+        predicate: "hasAllyConsolidatedReviewHeading && extractAllyReportedFindingRefs === null",
+      });
+
+      // The declined classification is what it says it is: no feedback comment
+      // and no reopen. Without the reason above, this state is exactly the
+      // silence that made frr#61 undiagnosable.
+      expect(response.body.reopened).toEqual([]);
+      const comments = await db
+        .select({ metadata: issueComments.metadata })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(
+        comments.filter(
+          (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback",
+        ),
+      ).toHaveLength(0);
+
+      // Wake behavior is unchanged: a review event still reaches the author,
+      // now carrying the reason so the run can tell "reviewer found nothing"
+      // from "the findings were lost".
+      expect(response.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+      const wakes = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakes).toHaveLength(1);
+
+      // Persisted, not merely returned: the reason survives on the queued
+      // run's context so a later reader can diagnose the no-op without the
+      // original webhook response or log line.
+      const runs = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]!.contextSnapshot).toMatchObject({
+        githubReviewFeedbackSuppressionReason: "ally_review_findings_unenumerable",
+        githubReviewFeedbackSuppressionPredicate:
+          "hasAllyConsolidatedReviewHeading && extractAllyReportedFindingRefs === null",
+      });
+      // And the actionable marker is absent, so the two cannot both be read
+      // as true by a consumer.
+      expect(
+        (runs[0]!.contextSnapshot as Record<string, unknown>).githubReviewFeedbackActionable,
+      ).toBeUndefined();
+    });
+
+    it("distinguishes a classifier disposition from blocked-status suppression on the same body", async () => {
+      // The discriminator BLO-30304 could not make. Same review body, same PR,
+      // same reviewer -- the ONLY difference is the issue status. If `blocked`
+      // status suppressed feedback delivery (the hypothesis #1517 ruled out),
+      // this blocked issue would produce no comment; it must produce one, and
+      // must report no suppression reason.
+      const fullBody = frr61ShapedBody();
+      const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "blocked" });
+      const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+
+      const response = await sendReviewSubmitted(
+        app,
+        reviewSubmittedFeedbackPayload({
+          prNumber: 61,
+          reviewId: 4968003839,
+          state: "commented",
+          headSha: "f78f3dcd8818ed2bf9b7550965c96c614f433987",
+          identifier: "PEN-1126",
+          body: fullBody,
+        }),
+        "delivery-blo-30420-frr61-full",
+      );
+
+      expect(response.status).toBe(200);
+      // Blocked status does NOT suppress: the classifier accepted the review,
+      // so there is no suppression reason and the feedback comment is written.
+      expect(response.body.reviewFeedbackSuppressed).toBeUndefined();
+      expect(response.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+      const comments = await db
+        .select({ metadata: issueComments.metadata })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(
+        comments.filter(
+          (c) => (c.metadata as Record<string, unknown> | null)?.kind === "github_pr_review_feedback",
+        ),
+      ).toHaveLength(1);
+    });
+
+    it("separates a genuinely clean Ally review from a truncated one", () => {
+      // Both decline, and collapsing them into one reason would re-create the
+      // ambiguity this issue exists to remove: all-zero buckets are a healthy
+      // no-op, no buckets at all is a body that lost its findings.
+      const clean = [
+        "## Ally — Consolidated PR Review",
+        "",
+        "Reviewed head: f78f3dcd8818ed2bf9b7550965c96c614f433987",
+        "",
+        "### Critical Issues (0)",
+        "",
+        "### Important Issues (0)",
+      ].join("\n");
+      expect(__test_classifyPrReviewActionability(clean, "commented")).toEqual({
+        actionable: false,
+        reason: "ally_review_findings_all_zero",
+        predicate: "hasAllyConsolidatedReviewHeading && every counted findings bucket === 0",
+      });
+
+      const truncated = Buffer.from(frr61ShapedBody(), "utf8")
+        .subarray(0, __test_REVIEW_BODY_MAX_BYTES)
+        .toString("utf8");
+      expect(__test_classifyPrReviewActionability(truncated, "commented")).toMatchObject({
+        actionable: false,
+        reason: "ally_review_findings_unenumerable",
+      });
+
+      // Non-Ally chatter is neither, and must not borrow an Ally-specific name.
+      expect(__test_classifyPrReviewActionability("lgtm, nice work", "commented")).toMatchObject({
+        actionable: false,
+        reason: "review_no_blocking_feedback",
+      });
+    });
+
+    it("keeps the actionability boolean and the named reason from drifting apart", () => {
+      // hasActionablePrReviewFeedback delegates to the classifier, so this
+      // pins the delegation rather than re-testing the branches: a future edit
+      // that reintroduces a second copy of the predicate fails here.
+      const bodies: Array<[string | null, string]> = [
+        [frr61ShapedBody(), "commented"],
+        [
+          Buffer.from(frr61ShapedBody(), "utf8")
+            .subarray(0, __test_REVIEW_BODY_MAX_BYTES)
+            .toString("utf8"),
+          "commented",
+        ],
+        ["### Important Issues (2)", "commented"],
+        ["nothing to see", "commented"],
+        ["anything at all", "changes_requested"],
+        [null, "commented"],
+        ["   ", "commented"],
+      ];
+      for (const [body, state] of bodies) {
+        expect(__test_hasActionablePrReviewFeedback(body, state)).toBe(
+          __test_classifyPrReviewActionability(body, state).actionable,
+        );
+      }
+    });
+
+    it("reports no suppression reason for PR wake reasons that are not review submissions", () => {
+      // opened/synchronize/review_requested are non-actionable by
+      // construction, not by a classifier decision. Naming a suppression
+      // reason for them would bury the one case worth reading.
+      expect(
+        __test_resolveReviewFeedbackSuppression({
+          identifiers: ["PEN-1126"],
+          wakeReason: "github_pr_synchronized",
+          prNumber: 61,
+          repoFullName: "Blockcast/frr",
+        }),
+      ).toBeNull();
+
+      // ...but a review submission with no body at all still gets one.
+      expect(
+        __test_resolveReviewFeedbackSuppression({
+          identifiers: ["PEN-1126"],
+          wakeReason: "github_pr_review_submitted",
+          prNumber: 61,
+          repoFullName: "Blockcast/frr",
+          reviewBody: null,
+          reviewState: "commented",
+        }),
+      ).toEqual({ reason: "review_body_absent", predicate: "typeof body !== 'string'" });
+    });
   });
 
   // BLO-23267: real-world reproduction of the same defect via the

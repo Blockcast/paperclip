@@ -369,13 +369,75 @@ function carriesBlockingFeedback(text: string): boolean {
   return /\bRecommended\s+Action\b[\s\S]{0,400}\bfix\b[\s\S]{0,400}\bbefore\s+merg(?:e|es|ed|ing)\b/i.test(text);
 }
 
-/** Return whether a formal or comment-shaped review contains blocking feedback. */
-export function hasActionablePrReviewFeedback(body: string | null | undefined, state?: string | null): boolean {
+/**
+ * Why a review was NOT routed as actionable feedback.
+ *
+ * These names are a diagnostic contract, not free text: they are logged and
+ * returned on the webhook's review-delivery path so a no-wake can be read off
+ * a named reason instead of inferred from the ABSENCE of a
+ * `github_pr_review_feedback` comment (BLO-30420). Inference-by-absence is
+ * what made frr#61 undiagnosable for weeks — silence looks identical whether
+ * the classifier declined the review, the issue was in a suppressing status,
+ * or the delivery never arrived.
+ *
+ * The Ally-specific reasons exist because the two of them fail in opposite
+ * directions and must not be collapsed:
+ *
+ *   - `ally_review_findings_all_zero` is the HEALTHY no-op. Ally emitted its
+ *     buckets and every one of them is zero, so there is genuinely nothing to
+ *     route. Named for the predicate and not for a history: the commonest
+ *     emission is a first-ever clean review that never raised a finding at
+ *     all, so a name like `all_retired` would imply a disposition that did not
+ *     happen on the majority of the lines it labels.
+ *   - `ally_review_findings_unenumerable` is a SUSPECT no-op. Ally's heading
+ *     was recognised but the body carries no counted bucket at all, which a
+ *     complete Ally review never does. It is the signature of a body that was
+ *     truncated before classification — exactly frr#61, whose
+ *     `Critical Issues (0)`/`Important Issues (1)` headings sit at bytes
+ *     4248/4273, past the old 4096-byte clamp. Seeing this reason on a review
+ *     that also dispositions prior findings means the classifier read a
+ *     fragment, not that the review was clean.
+ */
+export type PrReviewNonActionableReason =
+  | "review_body_absent"
+  | "review_body_empty"
+  | "ally_review_findings_unenumerable"
+  | "ally_review_findings_all_zero"
+  | "review_no_blocking_feedback";
+
+/**
+ * The actionability verdict plus the exact predicate that selected it.
+ *
+ * `predicate` names the code that decided, so a log line answers "why" without
+ * a reader re-deriving the classifier by hand.
+ */
+export type PrReviewActionabilityDecision =
+  | { actionable: true; predicate: string }
+  | { actionable: false; reason: PrReviewNonActionableReason; predicate: string };
+
+/**
+ * Classify a formal or comment-shaped review, naming the deciding predicate.
+ *
+ * `hasActionablePrReviewFeedback` delegates here so the boolean the wake path
+ * routes on and the reason the diagnostic reports are computed once, from the
+ * same branches. Duplicating the predicate to "just add logging" is how the
+ * two drift into disagreeing about the same body.
+ */
+export function classifyPrReviewActionability(
+  body: string | null | undefined,
+  state?: string | null,
+): PrReviewActionabilityDecision {
   const normalizedState = state?.trim().toLowerCase();
-  if (normalizedState === "changes_requested" || normalizedState === "changes-requested") return true;
-  if (typeof body !== "string") return false;
+  if (normalizedState === "changes_requested" || normalizedState === "changes-requested") {
+    return { actionable: true, predicate: "reviewState=changes_requested" };
+  }
+  if (typeof body !== "string") {
+    return { actionable: false, reason: "review_body_absent", predicate: "typeof body !== 'string'" };
+  }
   const text = body.trim();
-  if (!text) return false;
+  if (!text) {
+    return { actionable: false, reason: "review_body_empty", predicate: "body.trim() === ''" };
+  }
 
   // Deliberately the one predicate that reads the raw body as well as the
   // fence-stripped one, and blocks if *either* says so. Everywhere else,
@@ -384,5 +446,40 @@ export function hasActionablePrReviewFeedback(body: string | null | undefined, s
   // PR. A quoted finding costs a false red, which is visible and recoverable;
   // a missed one is neither. Same asymmetry that keeps an unrecognized ledger
   // verb from retiring a finding.
-  return carriesBlockingFeedback(text) || carriesBlockingFeedback(withoutFencedCodeBlocks(text));
+  if (carriesBlockingFeedback(text)) {
+    return { actionable: true, predicate: "carriesBlockingFeedback(rawBody)" };
+  }
+  if (carriesBlockingFeedback(withoutFencedCodeBlocks(text))) {
+    return { actionable: true, predicate: "carriesBlockingFeedback(withoutFencedCodeBlocks(body))" };
+  }
+
+  // Not actionable. Name which shape of not-actionable it is. Only reachable
+  // when no bucket exceeded zero, so extractAllyReportedFindingRefs is either
+  // null (no bucket parsed at all) or empty (every bucket was zero) — it reads
+  // the same two texts and the same pattern as carriesBlockingFeedback.
+  if (hasAllyConsolidatedReviewHeading(text)) {
+    const refs = extractAllyReportedFindingRefs(text);
+    if (refs === null) {
+      return {
+        actionable: false,
+        reason: "ally_review_findings_unenumerable",
+        predicate: "hasAllyConsolidatedReviewHeading && extractAllyReportedFindingRefs === null",
+      };
+    }
+    return {
+      actionable: false,
+      reason: "ally_review_findings_all_zero",
+      predicate: "hasAllyConsolidatedReviewHeading && every counted findings bucket === 0",
+    };
+  }
+  return {
+    actionable: false,
+    reason: "review_no_blocking_feedback",
+    predicate: "!carriesBlockingFeedback(rawBody | strippedBody)",
+  };
+}
+
+/** Return whether a formal or comment-shaped review contains blocking feedback. */
+export function hasActionablePrReviewFeedback(body: string | null | undefined, state?: string | null): boolean {
+  return classifyPrReviewActionability(body, state).actionable;
 }
