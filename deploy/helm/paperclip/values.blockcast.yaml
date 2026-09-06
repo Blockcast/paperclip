@@ -396,6 +396,34 @@ tolerations:
     operator: Equal
     value: paperclip
     effect: NoSchedule
+  # With pve3 excluded (below), the API's hard two-host spread left pve2 as the
+  # only host for the second replica, and pve2 saturates under CI bursts
+  # (34-49% steal on paperclip-10, 2026-09-06 03:00Z; pod-local /api/health up
+  # to 9.9 s against a 10 s liveness timeout). paperclip-8 (pve1, 32 cores)
+  # idles at ~87% carrying only the multicast-integ runners, so production
+  # tolerates that node's reserved taint and the pve4-then-not-pve2 preference
+  # places the second replica there instead (BLO-32054). One API pod (1.5 CPU
+  # request, 4 limit) alongside those runners is the accepted trade. Budget on
+  # that 32-CPU node: the three multicast-integ runners request 3 x 9 = 27
+  # (8 for the runner container plus 1 for the dind native sidecar, which
+  # counts toward the pod's scheduling request) and DaemonSets ~1.2, so
+  # everything else must fit in ~4 CPU or the third runner sits Pending. With
+  # the API pod placed (1.5), ~2.3 CPU is free; the worker StatefulSet shares
+  # this tolerations list and also requests 1.5, so both landing here leaves
+  # ~0.8. The runners are priority 500000 with preemptionPolicy Never and the
+  # API is priority 0, so a runner that no longer fits here does not preempt.
+  # It is not stranded either: the runners are not pinned to this node (they
+  # prefer paperclip-8 at weight 100 but may run on any arc-runner-host node,
+  # and paperclip-1 and -5 carried runners on 2026-09-06), so the displaced
+  # runner schedules elsewhere and the reserved floor degrades to a preference
+  # while an API pod sits here. If no node fits at all, onprem-k8s's
+  # PodPendingTooLong alert (monitoring/pod-init-stuck-prometheus-rule.yaml,
+  # arc-runners namespace, 15 m) fires. Drop this once pve2 is rebalanced
+  # (tracked in BLO-32054).
+  - key: blockcast.net/arc-multicast-integ-reserved
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
 
 # Keep production off nodes whose Proxmox host is pve3 (BLO-32054). pve3 runs
 # ~172 vCPUs on 80 cores and steals 20-40% of CPU time from every guest; a 5 s
@@ -403,18 +431,21 @@ tolerations:
 # healthy container (paperclip-api + paperclip-0 on 2026-09-05). Nodes already
 # carry blockcast.net/pve-storage-domain=<pve host>, so the rule keys on that.
 # The API template merges this beside its own podAntiAffinity; the StatefulSet
-# takes it verbatim. Drop the entry once pve3 is rebalanced.
+# takes it verbatim. Drop the entry once pve3 is rebalanced (tracked in
+# BLO-32054).
 #
 # pve2 saturates the same way whenever CI runner bursts land on
-# paperclip-5/-10/-11 (load 135/80 seen 2026-09-05 17:30Z, 20-24% steal), but
-# it cannot be excluded outright: the API's hard two-host spread
-# (api.spreadAcrossNodes) needs a second eligible node, pve4 hosts only
-# paperclip-3, and the pve1 nodes (paperclip-1/-4/-8) carry reserved taints
-# (arc-dind-reserved, arc-multicast-integ-reserved) that production does not
-# tolerate. A NotIn [pve2, pve3] rule therefore wedged the rollout with a
-# replica Pending (2026-09-05 17:45Z). Instead: prefer pve4 outright, fall
-# back to any host that is not pve2, and let the spread rule place the second
-# replica on a pve2 node. This is a scheduler bias, not a pin.
+# paperclip-5/-10/-11 (load 135/80 seen 2026-09-05 17:30Z, 20-24% steal;
+# 148/80 and 49% steal on 2026-09-06 03:00Z), but it is still not excluded
+# outright: the API's hard two-host spread (api.spreadAcrossNodes) needs a
+# second eligible node, pve4 hosts only paperclip-3, and the pve1 nodes
+# paperclip-1/-4 carry arc-dind-reserved, which production does not tolerate.
+# A NotIn [pve2, pve3] rule therefore wedged the rollout with a replica
+# Pending (2026-09-05 17:45Z). Instead: prefer pve4 outright, fall back to any
+# host that is not pve2, and let the spread rule place the second replica on
+# the best remaining host. Since the arc-multicast-integ-reserved toleration
+# above, that host is paperclip-8 (pve1); pve2 stays reachable only as the
+# fallback if paperclip-8 is full. This is a scheduler bias, not a pin.
 affinity:
   nodeAffinity:
     requiredDuringSchedulingIgnoredDuringExecution:
