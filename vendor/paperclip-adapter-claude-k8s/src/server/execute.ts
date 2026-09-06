@@ -585,6 +585,13 @@ export function isK8s409(err: unknown): boolean {
  * are re-derived from the same config, so replacing is idempotent.  Before
  * BLO-31665 every throw here was fatal, so a benign leftover killed the run.
  *
+ * The obvious worry about replace-on-collision is yanking a Secret out from
+ * under a pod that is still mounting it.  That cannot happen from here: the
+ * concurrency guard above (`k8s_concurrent_run_blocked`) lists this agent's
+ * Jobs and returns *before* buildJobManifest, so by the time any of these
+ * creates runs there is no live Job for this agent.  A colliding Secret is
+ * therefore a leftover of a *dead* attempt by construction, not one in use.
+ *
  * The identity check fails closed only on *positive contradiction*: a Secret
  * whose labels actively disagree with this run is never overwritten.  Missing
  * labels are tolerated, because a Secret written by an older adapter build is
