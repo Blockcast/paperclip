@@ -24,6 +24,7 @@ import {
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   WATCHDOG_DEFAULT_MANDATE,
+  type ProcessLifecycleEvent,
 } from "./server-utils.js";
 
 function isPidAlive(pid: number) {
@@ -414,6 +415,59 @@ describe("runChildProcess", () => {
     expect(result.stdout).toBe("done");
   });
 
+  it("reports value-safe spawn, first-byte, exit, and close lifecycle events", async () => {
+    const lifecycle: ProcessLifecycleEvent[] = [];
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      ["-e", "process.stdout.write('out');process.stderr.write('err');"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        onLifecycle: async (event) => {
+          lifecycle.push(event);
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(lifecycle.map((event) => event.stage)).toEqual([
+      "spawn_attempted",
+      "spawned",
+      "first_output",
+      "first_output",
+      "exit",
+      "close",
+    ]);
+    expect(lifecycle.filter((event) => event.stage === "first_output").map((event) => event.stream).sort()).toEqual([
+      "stderr",
+      "stdout",
+    ]);
+    expect(lifecycle).not.toEqual(expect.arrayContaining([expect.objectContaining({ output: expect.anything() })]));
+  });
+
+  it("does not report a failed spawn as spawned", async () => {
+    const lifecycle: ProcessLifecycleEvent[] = [];
+
+    await expect(
+      runChildProcess(randomUUID(), path.join(os.tmpdir(), `missing-${randomUUID()}`), [], {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        onLifecycle: async (event) => {
+          lifecycle.push(event);
+        },
+      }),
+    ).rejects.toThrow("Failed to start command");
+
+    expect(lifecycle.map((event) => event.stage)).toEqual(["spawn_attempted", "error"]);
+  });
+
   it("waits for onSpawn before sending stdin to the child", async () => {
     const spawnDelayMs = 150;
     const startedAt = Date.now();
@@ -504,6 +558,39 @@ describe("runChildProcess", () => {
 
     expect(await waitForPidExit(descendantPid!, 2_000)).toBe(true);
   }, PROCESS_TREE_TEST_BUDGET_MS);
+
+  it.skipIf(process.platform === "win32")(
+    "keeps timeout escalation armed after the direct child exits",
+    async () => {
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        [
+          "-e",
+          [
+            "const { spawn } = require('node:child_process');",
+            "const child = spawn(process.execPath, ['-e', `process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)`], { stdio: 'ignore' });",
+            "process.stdout.write(String(child.pid));",
+            "setInterval(() => {}, 1000);",
+          ].join(" "),
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 1,
+          graceSec: 1,
+          onLog: async () => {},
+          onSpawn: async () => {},
+        },
+      );
+
+      const descendantPid = Number.parseInt(result.stdout.trim(), 10);
+      expect(result.timedOut).toBe(true);
+      expect(result.signal).toBe("SIGTERM");
+      expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+      expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
+    },
+  );
 
   it.skipIf(process.platform === "win32")(
     "force-kills a child that ignores SIGTERM once the grace window elapses",
