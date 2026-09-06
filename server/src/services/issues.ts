@@ -4570,16 +4570,64 @@ function redactExternalWaitDescription(
   return redacted.length > 0 ? redacted : null;
 }
 
-function blockedInboxResponseDescription(attention: IssueBlockedInboxAttention, row: BlockedInboxIssueRow) {
-  if (!attention.redaction.externalDetailsRedacted) return row.description;
-  return redactExternalWaitDescription(row.description, externalWaitFromDescription(row.description));
+function blockedInboxResponseDescription(entry: BlockedInboxAttentionEntry, row: BlockedInboxIssueRow) {
+  if (!entry.attention.redaction.externalDetailsRedacted) return row.description;
+  // BLO-31839: redact with the needles the classifier actually parsed, never by re-parsing
+  // `row.description`. The classifier reads the full graph description; `row.description` is
+  // the `ISSUE_LIST_DESCRIPTION_MAX_CHARS` preview. For a park declared past that cutoff —
+  // exactly the population the parity fix newly surfaces — re-parsing returns `null` by
+  // construction, so the needle set was empty and this returned an unredacted preview while
+  // `externalDetailsRedacted: true` asserted otherwise. Carrying the parsed pair makes "what
+  // decided redaction" and "what performed it" the same string.
+  return redactExternalWaitDescription(row.description, entry.externalWait);
 }
 
-function blockedInboxSearchText(attention: IssueBlockedInboxAttention, row: BlockedInboxIssueRow) {
+/**
+ * The two response fields that have to move together whenever a caller asks for blocked-inbox
+ * attention.
+ *
+ * BLO-32045: `blockedInboxAttention.redaction.externalDetailsRedacted` is not a property of the
+ * issue, it is a claim about *this response's* `description`. Attaching the verdict without also
+ * overriding the description publishes a claim the caller has no way to check. Two paths serve
+ * this shape — `listBlockedInboxIssues` and `list({ includeBlockedInboxAttention })` — and only
+ * the first redacted, so the flag was false on the general path for every externally-parked row
+ * (a strictly wider population than the late-declared case BLO-31839 fixed, which additionally
+ * needed the declaration to sit past `ISSUE_LIST_DESCRIPTION_MAX_CHARS`). Emitting both fields
+ * from one place is what makes "asserted redacted" and "actually redacted" hard to separate
+ * again. `entry.externalWait` stays internal: it holds the very strings being removed.
+ *
+ * Two limits of this flag, recorded so a later reader does not over-read it:
+ *
+ * 1. It is a **response-consistency invariant, not a disclosure boundary.** Do not build an
+ *    access-control decision on it. `list()` matches `q` with `${issues.description} ILIKE …`
+ *    against the *full* column, so `?includeBlockedInboxAttention=true&q=<owner>` still returns
+ *    the row — body redacted, presence confirming the guess. The same string is also available
+ *    by simply omitting the flag. The blocked-inbox path does not have this property: its `q`
+ *    filters in JS over `blockedInboxSearchText`, which reads the redacted description.
+ * 2. The two paths agree on the returned description **only because `decodeDatabaseTextPreview`
+ *    is provably the identity here** — PG `substring(text, 1, n)` already counts code points, so
+ *    `truncateByCodePoint` is a no-op even for astral characters. `listBlockedInboxIssues`
+ *    applies it before redacting and `list()` does not. The cross-endpoint equality test couples
+ *    them, so if that step ever stops being an identity, `list()` becomes the wrong one and that
+ *    test fails some distance from the cause — mirror the decode into this helper at that point.
+ */
+function blockedInboxAttentionResponseFields(
+  entry: BlockedInboxAttentionEntry | undefined,
+  row: BlockedInboxIssueRow,
+) {
+  if (!entry) return { description: row.description, blockedInboxAttention: null };
+  return {
+    description: blockedInboxResponseDescription(entry, row),
+    blockedInboxAttention: entry.attention,
+  };
+}
+
+function blockedInboxSearchText(entry: BlockedInboxAttentionEntry, row: BlockedInboxIssueRow) {
+  const attention = entry.attention;
   return [
     row.identifier,
     row.title,
-    blockedInboxResponseDescription(attention, row),
+    blockedInboxResponseDescription(entry, row),
     attention.sourceIssue?.identifier,
     attention.sourceIssue?.title,
     attention.leafIssue?.identifier,
@@ -4650,13 +4698,34 @@ function compareBlockedInboxRows(
   return right.id.localeCompare(left.id);
 }
 
+/**
+ * The attention verdict plus the external-wait pair the classifier parsed to reach it.
+ *
+ * BLO-31839: these travel together deliberately. `redaction.externalDetailsRedacted` is a
+ * promise that the owner/action strings were removed from the response, and the only way to
+ * keep that promise is to redact with the same values that set the flag. Re-deriving them
+ * from the response projection silently breaks for any park declared past
+ * `ISSUE_LIST_DESCRIPTION_MAX_CHARS`, which is precisely the population the parity fix
+ * surfaces. `externalWait` is non-null iff the entry took the `external_wait` branch, and it
+ * is internal — it must never be serialized, since it holds the values being redacted.
+ */
+type BlockedInboxAttentionEntry = {
+  attention: IssueBlockedInboxAttention;
+  externalWait: { owner: string; action: string } | null;
+};
+
 async function listIssueBlockedInboxAttentionMap(
   dbOrTx: any,
   companyId: string,
   issueRows: BlockedInboxIssueRow[],
-): Promise<Map<string, IssueBlockedInboxAttention>> {
+): Promise<Map<string, BlockedInboxAttentionEntry>> {
   const rowIssueIds = [...new Set(issueRows.map((row) => row.id))];
-  const result = new Map<string, IssueBlockedInboxAttention>();
+  const result = new Map<string, BlockedInboxAttentionEntry>();
+  const setAttention = (
+    issueId: string,
+    attention: IssueBlockedInboxAttention,
+    externalWait: { owner: string; action: string } | null = null,
+  ) => result.set(issueId, { attention, externalWait });
   if (rowIssueIds.length === 0) return result;
 
   const [graphIssueRows, graphRelationRows, companyAgentRows] = await Promise.all([
@@ -4927,7 +4996,7 @@ async function listIssueBlockedInboxAttentionMap(
       && (liveHandoffRunIssueIds.has(row.id) || liveHandoffWakeIssueIds.has(row.id))
     );
     if (handoff && !hasLiveHandoffContinuation && (handoff.required || handoff.state === "escalated")) {
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "missing_disposition",
         reason: "missing_successful_run_disposition",
         severity: "high",
@@ -4962,7 +5031,7 @@ async function listIssueBlockedInboxAttentionMap(
       ) {
         sourceIssue = issueRef(issuesById.get(row.originId));
       }
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "recovery_open",
         reason: "open_recovery_issue",
         severity: "high",
@@ -4987,7 +5056,7 @@ async function listIssueBlockedInboxAttentionMap(
     const interaction = interactionByIssueId.get(row.id);
     if (interaction) {
       const isUserQuestion = interaction.kind === "ask_user_questions" && Boolean(row.assigneeUserId);
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "awaiting_decision",
         reason: isUserQuestion ? "pending_user_decision" : "pending_board_decision",
         severity: "medium",
@@ -5007,7 +5076,7 @@ async function listIssueBlockedInboxAttentionMap(
 
     const approval = approvalByIssueId.get(row.id);
     if (approval) {
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "awaiting_decision",
         reason: "pending_board_decision",
         severity: "medium",
@@ -5031,7 +5100,7 @@ async function listIssueBlockedInboxAttentionMap(
       const ownerAgentId = finding.state === "blocked_by_unassigned_issue"
         ? null
         : finding.recommendedOwnerAgentId ?? row.assigneeAgentId ?? leaf?.assigneeAgentId ?? null;
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "needs_attention",
         reason: finding.state as IssueBlockedInboxAttention["reason"],
         severity: finding.state === "blocked_by_assigned_backlog_issue"
@@ -5075,9 +5144,23 @@ async function listIssueBlockedInboxAttentionMap(
     }
 
     const hasMonitor = Boolean(row.monitorNextCheckAt && row.monitorNextCheckAt.getTime() > Date.now());
-    const external = row.status === "blocked" && !hasMonitor ? externalWaitFromDescription(row.description) : null;
+    // BLO-31839: read the description from the graph projection, never from `row`. Callers hand
+    // this function two different row shapes — `listBlockedInboxIssues` projects
+    // `substring(description, 1, ISSUE_LIST_DESCRIPTION_MAX_CHARS)` to bound payload size, while
+    // `countBlockedInboxIssues` selected the full column — so reading `row.description` made the
+    // external-wait gate depend on the caller's projection. A park declared past the 1200-char
+    // cutoff was counted and not enumerable, which is what made the blocked-inbox oracle sit
+    // stably +1 against its own list. `graphIssues` is already fetched in full above, so this is
+    // the same string the liveness classifier's `hasExternalWaitOwner` reads — the two disagreeing
+    // is what let a genuinely parked row fall through to no attention at all and vanish from the
+    // inbox. Fall back to `row` only when the row is absent from the graph projection.
+    const graphRow = issuesById.get(row.id);
+    const externalWaitDescription = graphRow ? graphRow.description : row.description;
+    const external = row.status === "blocked" && !hasMonitor
+      ? externalWaitFromDescription(externalWaitDescription)
+      : null;
     if (external) {
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "external_wait",
         reason: "external_owner_action",
         severity: "medium",
@@ -5089,13 +5172,13 @@ async function listIssueBlockedInboxAttentionMap(
         },
         sourceIssue: source,
         externalDetailsRedacted: true,
-      }));
+      }), external);
       continue;
     }
 
     const blockerState = blockerAttentionByIssueId.get(row.id);
     if (row.status === "blocked" && (blockerState?.state === "needs_attention" || blockerState?.state === "stalled")) {
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "needs_attention",
         reason: "blocked_chain_stalled",
         severity: "high",
@@ -5298,11 +5381,11 @@ async function listBlockedInboxIssues(
   const lastActivityByIssueId = new Map(lastActivityRows.map((row) => [row.issueId, row]));
 
   const enriched = withRuns.flatMap((row) => {
-    const blockedInboxAttention = blockedInboxAttentionByIssueId.get(row.id);
-    if (!blockedInboxAttention) return [];
+    const blockedInboxEntry = blockedInboxAttentionByIssueId.get(row.id);
+    if (!blockedInboxEntry) return [];
     if (
       rawSearch
-      && !blockedInboxSearchText(blockedInboxAttention, row).includes(rawSearch)
+      && !blockedInboxSearchText(blockedInboxEntry, row).includes(rawSearch)
       && !commentSearchMatchIssueIds.has(row.id)
     ) return [];
 
@@ -5314,11 +5397,13 @@ async function listBlockedInboxIssues(
     ) ?? row.updatedAt;
     return [{
       ...row,
-      description: blockedInboxResponseDescription(blockedInboxAttention, row),
+      description: blockedInboxResponseDescription(blockedInboxEntry, row),
       blockedBy: blockedByMap.get(row.id) ?? [],
       lastActivityAt,
       ...(blockerAttentionByIssueId.has(row.id) ? { blockerAttention: blockerAttentionByIssueId.get(row.id) } : {}),
-      blockedInboxAttention,
+      // Only the verdict is serialized; `blockedInboxEntry.externalWait` stays internal because
+      // it holds the very owner/action strings the redaction above removes (BLO-31839).
+      blockedInboxAttention: blockedInboxEntry.attention,
       ...(productivityReviewByIssueId.has(row.id)
         ? { productivityReview: productivityReviewByIssueId.get(row.id) }
         : {}),
@@ -5344,10 +5429,23 @@ async function listBlockedInboxIssues(
 
 async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?: IssueFilters): Promise<number> {
   const { conditions } = await blockedInboxIssueConditions(dbOrTx, companyId, filters);
+  // BLO-31839: project exactly what `listBlockedInboxIssues` projects, including its
+  // `decodeDatabaseTextPreview` post-step. This count is the oracle for that list, so it has to
+  // see the same row shape: `blockedInboxSearchText` reads `row.description`, and selecting the
+  // full column here made a `q` term past ISSUE_LIST_DESCRIPTION_MAX_CHARS countable but not
+  // enumerable — the mirror image of the external-wait divergence fixed above. The post-step is
+  // a no-op on this input today (PG `substring(text, 1, n)` already counts code points, so the
+  // truncation is the identity even for astral characters, and the column is never `undefined`),
+  // but it is mirrored rather than argued away: leaving the one unmirrored step in a projection
+  // whose whole contract is "same shape as the list" is how this divergence happens again.
   const rows = (await dbOrTx
-    .select()
+    .select(issueListSelect)
     .from(issues)
-    .where(and(...conditions))) as IssueRow[];
+    .where(and(...conditions)))
+    .map((row: any) => ({
+      ...row,
+      description: decodeDatabaseTextPreview(row.description, ISSUE_LIST_DESCRIPTION_MAX_CHARS),
+    })) as IssueRow[];
   if (rows.length === 0) return 0;
 
   const blockedInboxAttentionByIssueId = await listIssueBlockedInboxAttentionMap(dbOrTx, companyId, rows);
@@ -5372,11 +5470,11 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
   }
 
   return rows.reduce((count: number, row: IssueRow) => {
-    const attention = blockedInboxAttentionByIssueId.get(row.id);
-    if (!attention) return count;
+    const entry = blockedInboxAttentionByIssueId.get(row.id);
+    if (!entry) return count;
     if (
       rawSearch
-      && !blockedInboxSearchText(attention, row).includes(rawSearch)
+      && !blockedInboxSearchText(entry, row).includes(rawSearch)
       && !commentSearchMatchIssueIds.has(row.id)
     ) return count;
     return count + 1;
@@ -7641,7 +7739,7 @@ export function issueService(db: Db) {
         listIssueProductivityReviewMap(db, companyId, issueIds),
         includeBlockedInboxAttention
           ? listIssueBlockedInboxAttentionMap(db, companyId, withRuns)
-          : Promise.resolve(new Map<string, IssueBlockedInboxAttention>()),
+          : Promise.resolve(new Map<string, BlockedInboxAttentionEntry>()),
       ]);
 
       if (!contextUserId) {
@@ -7657,7 +7755,9 @@ export function issueService(db: Db) {
             ...(includeBlockedBy ? { blockedBy: blockedByMap.get(row.id) ?? [] } : {}),
             lastActivityAt,
             ...(blockerAttentionByIssueId.has(row.id) ? { blockerAttention: blockerAttentionByIssueId.get(row.id) } : {}),
-            ...(includeBlockedInboxAttention ? { blockedInboxAttention: blockedInboxAttentionByIssueId.get(row.id) ?? null } : {}),
+            ...(includeBlockedInboxAttention
+              ? blockedInboxAttentionResponseFields(blockedInboxAttentionByIssueId.get(row.id), row)
+              : {}),
             ...(includeLiveDescendantSummary ? { liveDescendantCount: liveDescendantCountByIssueId.get(row.id) ?? 0 } : {}),
             ...(productivityReviewByIssueId.has(row.id)
               ? { productivityReview: productivityReviewByIssueId.get(row.id) }
@@ -7681,7 +7781,9 @@ export function issueService(db: Db) {
           ...(includeBlockedBy ? { blockedBy: blockedByMap.get(row.id) ?? [] } : {}),
           lastActivityAt,
           ...(blockerAttentionByIssueId.has(row.id) ? { blockerAttention: blockerAttentionByIssueId.get(row.id) } : {}),
-          ...(includeBlockedInboxAttention ? { blockedInboxAttention: blockedInboxAttentionByIssueId.get(row.id) ?? null } : {}),
+          ...(includeBlockedInboxAttention
+            ? blockedInboxAttentionResponseFields(blockedInboxAttentionByIssueId.get(row.id), row)
+            : {}),
           ...(includeLiveDescendantSummary ? { liveDescendantCount: liveDescendantCountByIssueId.get(row.id) ?? 0 } : {}),
           ...(productivityReviewByIssueId.has(row.id)
             ? { productivityReview: productivityReviewByIssueId.get(row.id) }
