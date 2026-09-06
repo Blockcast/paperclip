@@ -407,12 +407,12 @@ tolerations:
   # that 32-CPU node: the three multicast-integ runners request 3 x 9 = 27
   # (8 for the runner container plus 1 for the dind native sidecar, which
   # counts toward the pod's scheduling request) and DaemonSets ~1.2, so
-  # everything else (this API pod included) must fit in ~4 CPU or the third
-  # runner sits Pending; with the API placed, ~2.3 CPU is free. The runners
-  # are priority 500000
-  # with preemptionPolicy Never and the API is priority 0, so a runner that no
-  # longer fits waits silently rather than preempting. Drop this once pve2 is
-  # rebalanced.
+  # everything else must fit in ~4 CPU or the third runner sits Pending. With
+  # the API pod placed (1.5), ~2.3 CPU is free; the worker StatefulSet shares
+  # this tolerations list and also requests 1.5, so both landing here leaves
+  # ~0.8. The runners are priority 500000 with preemptionPolicy Never and the
+  # API is priority 0, so a runner that no longer fits waits silently rather
+  # than preempting. Drop this once pve2 is rebalanced.
   - key: blockcast.net/arc-multicast-integ-reserved
     operator: Equal
     value: "true"
