@@ -53,8 +53,14 @@ import { inspectMigrations } from "./client.js";
  * engineered around: the table can gain its first row between this check and
  * the migration. The migration re-checks under `LOCK TABLE ... IN SHARE MODE`
  * and fails loudly if it happens, exactly as it does today. Racing to a false
- * *negative* leaves behaviour no worse than before this module existed;
- * today's false *positive* blocks every new environment unconditionally.
+ * *negative* leaves behaviour no worse than before this module existed.
+ *
+ * Against this module's *current* behaviour it is a trade rather than a strict
+ * improvement, and worth naming as one: today an empty table reports a blocker
+ * — wrongly, but that happens to cover the race. The trade is still clearly
+ * right. It swaps a guaranteed false block on every fresh bootstrap for a
+ * false negative that needs the table to gain its *first* row mid-deploy, and
+ * whose failure mode is loud and already handled.
  */
 export type PrecreateRequiredIndex = {
   /** Migration filename, exactly as it appears in `migrations/`. */
