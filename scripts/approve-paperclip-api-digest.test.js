@@ -2002,8 +2002,13 @@ test("retire-only mode's succeeding write exits 0 at the first attempt, telling 
   );
   // The consequence, not just the act: this is what tells the operator they can
   // re-run a corrected plan without editing the ring by hand. Matched across the
-  // line wrap so a rewrap stays green and a deletion does not -- the two lines
-  // are one sentence and neither is separately meaningful.
+  // line wrap so THIS assertion survives a rewrap and a deletion does not -- the
+  // two lines are one sentence and neither is separately meaningful.
+  //
+  // The SUITE is a different question, and it does NOT tolerate a rewrap: pulling
+  // these two lines into one deletes a line, so every citation below shifts by -1
+  // and the citation test below goes red naming each one. That is the pin doing
+  // its job, not a false alarm -- the failure message says where each moved to.
   assert.match(
     r.stdout,
     /The ring still lists that digest, so a corrected plan or a rollback is\s+admitted without an out-of-band edit\./,
@@ -2035,10 +2040,12 @@ test("retire-only mode's write with no stderr still explains itself", () => {
 // shipping script, and until now nothing checked them. That is not hypothetical
 // drift: when the BLO-31842 ReplicaSet work inserted four lines into the
 // script's header comment, all seven citations in this file went stale by
-// exactly +4 in one commit, silently. The worst of them then pointed a reader
-// at the "nothing to retire" branch's `exit 0` instead of the three success
-// lines the assertion beside it is actually about -- so the comment read as if
-// it were pinning a completely different code path.
+// exactly +4 in one commit, silently. (Seven occurrences, six distinct ranges --
+// the messaging-asymmetry one is cited twice, which is why the table below has
+// six rows and not seven.) The worst of them then pointed a reader at the
+// "nothing to retire" branch's `exit 0` instead of the three success lines the
+// assertion beside it is actually about -- so the comment read as if it were
+// pinning a completely different code path.
 //
 // Every OTHER cross-file reference here is already mechanical -- the function
 // body by name via extractShellFunction(), the numeric defaults and limits by
@@ -2054,7 +2061,11 @@ test("retire-only mode's write with no stderr still explains itself", () => {
 // an earlier occurrence elsewhere in the script and then reports a confidently
 // wrong line number -- the very defect being fixed. An exact first-line match
 // admits neither. `contains` additionally holds the rest of the range to the
-// content the citing comment claims is there.
+// content the citing comment claims is there, and EVERY multi-line entry below
+// carries one: first-line anchoring alone catches wholesale drift but leaves a
+// range's interior free to be gutted in place, which is the widest ranges'
+// problem precisely because they have the most interior to lose. A single-line
+// citation needs no `contains` -- its first line is the whole range.
 const LINE_CITATIONS = [
   {
     cite: "86",
@@ -2070,6 +2081,7 @@ const LINE_CITATIONS = [
   {
     cite: "751-760",
     startsWith: /^\s*# Flat, where retire-only mode backs off linearly/,
+    contains: /only remaining asymmetry[\s\S]*unfinished parity fix[\s\S]*no such deadline/,
     claim: "the ten lines defending the release loop's flat backoff",
   },
   {
@@ -2081,6 +2093,7 @@ const LINE_CITATIONS = [
   {
     cite: "759-763",
     startsWith: /^\s*# Their MESSAGING differences are deliberate too/,
+    contains: /not a parity gap[\s\S]*`return` vs `exit` is structurally required/,
     claim: "the messaging-asymmetry defence against a parity fix",
   },
   {
@@ -2153,5 +2166,19 @@ test("no line citation can be added to this file without being pinned", () => {
     [...pinned].filter((c) => !found.has(c)).sort(),
     [],
     "a LINE_CITATIONS entry no longer matches any citation in the file -- remove it rather than leaving it pinning nothing",
+  );
+  // Pinned AT ALL is not the same as pinned THROUGHOUT. A multi-line entry with
+  // no `contains` holds only its first line, so its interior can be rewritten
+  // wholesale while this suite stays green -- measured, not supposed: gutting
+  // the interior of the ten-line range and the last line of the five-line one
+  // each left 81/81 passing until those two got a guard. Asserted here rather
+  // than left to care, because the next wide citation is unguarded by default
+  // and this gap would reopen exactly as quietly as it opened.
+  assert.deepEqual(
+    LINE_CITATIONS.filter((c) => c.cite.includes("-") && !c.contains).map(
+      (c) => c.cite,
+    ),
+    [],
+    "a multi-line citation has no `contains` guard -- only its first line is pinned, so the rest of the range can be gutted without failing anything",
   );
 });
