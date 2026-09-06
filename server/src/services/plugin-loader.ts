@@ -182,6 +182,68 @@ export function isTransientActivationRetryError(err: unknown): boolean {
 export const TRANSIENT_ACTIVATION_RETRY_DELAYS_MS = [2_000, 8_000];
 
 /**
+ * Written into `lastError` when activation latched *after* spending the
+ * transient retry budget above. `reviveTransientlyLatchedPluginsAtStartup()`
+ * keys its "safe to re-attempt this row" decision off this exact string, so the
+ * two must stay coupled — hence a shared constant rather than a repeated
+ * literal (same arrangement as `TORN_STORE_ERROR_MARKER`).
+ *
+ * Its absence is load-bearing in the other direction: a plugin that failed
+ * closed on the first attempt never carries this marker and is therefore never
+ * revived, which is what keeps a genuinely broken plugin terminal.
+ */
+export const TRANSIENT_RETRY_EXHAUSTED_MARKER = "transient activation retries exhausted";
+
+/**
+ * `loadAll()` selects `status='ready'`, so a row latched at `error` is invisible
+ * to every subsequent boot — the in-activation retry above only ever covers the
+ * attempt that is already running. That is why the original four plugins were
+ * still dead 9 hours and one restart later, and why a human `/enable` was the
+ * only way back (BLO-20410).
+ *
+ * A boot therefore re-attempts rows whose latch provenance says contention, and
+ * counts those re-attempts in `lastError` so the budget survives the restart it
+ * is measured in. After the limit the row stays latched: three consecutive
+ * boots of transient failure is no longer evidence of contention, and silently
+ * re-attempting forever would bury exactly that signal.
+ *
+ * Set `PAPERCLIP_PLUGIN_BOOT_ACTIVATION_RETRY_LIMIT=0` to disable the pass and
+ * restore the pre-fix latch-forever behaviour.
+ */
+const DEFAULT_BOOT_ACTIVATION_RETRY_LIMIT = 3;
+
+export function resolveBootActivationRetryLimit(): number {
+  const raw = process.env.PAPERCLIP_PLUGIN_BOOT_ACTIVATION_RETRY_LIMIT;
+  if (!raw) return DEFAULT_BOOT_ACTIVATION_RETRY_LIMIT;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_BOOT_ACTIVATION_RETRY_LIMIT;
+  }
+  return parsed;
+}
+
+const BOOT_ACTIVATION_RETRY_TAG = "boot-activation-retry";
+const BOOT_ACTIVATION_RETRY_PATTERN = new RegExp(
+  ` \\[${BOOT_ACTIVATION_RETRY_TAG} (\\d+)/\\d+\\]`,
+);
+
+/** How many boots have already re-attempted this row, per its `lastError`. */
+export function readBootActivationRetryCount(lastError: string | null | undefined): number {
+  const match = BOOT_ACTIVATION_RETRY_PATTERN.exec(lastError ?? "");
+  if (!match) return 0;
+  const parsed = Number.parseInt(match[1]!, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function stripBootActivationRetryTag(lastError: string): string {
+  return lastError.replace(BOOT_ACTIVATION_RETRY_PATTERN, "");
+}
+
+function formatBootActivationRetryTag(count: number, limit: number): string {
+  return ` [${BOOT_ACTIVATION_RETRY_TAG} ${count}/${limit}]`;
+}
+
+/**
  * Boot-time activation was an unbounded `Promise.allSettled` over every ready
  * plugin, so all eleven raced for the same 60s initialize window and the losers
  * latched `error`. Enabling them one at a time afterwards succeeded every time,
@@ -2022,6 +2084,72 @@ export function pluginLoader(
   }
 
   /**
+   * Re-attempt rows a previous boot latched after spending the transient
+   * activation retry budget, before `loadAll()` selects by status.
+   *
+   * This is the automatic form of the manual `/enable` that recovered all four
+   * plugins in BLO-20410 with no other change: flip the row back to `ready` and
+   * let the normal activation path try again. It is deliberately the same two
+   * writes `lifecycle.enable()` performs, so a revived row is indistinguishable
+   * from an operator-enabled one by the time `activatePlugin` sees it.
+   *
+   * Two things keep it from becoming an unbounded retry:
+   *
+   * - Only rows carrying `TRANSIENT_RETRY_EXHAUSTED_MARKER` are eligible. A
+   *   plugin that failed closed — bad credentials, missing config, any explicit
+   *   RPC rejection — never wrote that marker and stays latched.
+   * - The re-attempt count rides in `lastError` (cleared on the next successful
+   *   activation), so the budget is spent across boots rather than reset by
+   *   each one.
+   *
+   * Best-effort per row: one row that cannot be updated must not abort boot for
+   * the rest.
+   */
+  async function reviveTransientlyLatchedPluginsAtStartup(): Promise<void> {
+    const limit = resolveBootActivationRetryLimit();
+    if (limit <= 0) return;
+
+    const installed = (await registry.listInstalled()) as PluginRecord[];
+
+    for (const plugin of installed) {
+      if (plugin.status !== "error") continue;
+      const lastError = plugin.lastError ?? "";
+      if (!lastError.includes(TRANSIENT_RETRY_EXHAUSTED_MARKER)) continue;
+
+      const spent = readBootActivationRetryCount(lastError);
+      if (spent >= limit) {
+        log.warn(
+          { pluginId: plugin.id, pluginKey: plugin.pluginKey, attempts: spent, limit },
+          "plugin-loader: transient activation retry budget exhausted across boots; " +
+            "leaving plugin latched (this is no longer contention)",
+        );
+        continue;
+      }
+
+      const attempt = spent + 1;
+      try {
+        await registry.updateStatus(plugin.id, {
+          status: "ready",
+          lastError: `${stripBootActivationRetryTag(lastError)}${formatBootActivationRetryTag(attempt, limit)}`,
+        });
+        log.info(
+          { pluginId: plugin.id, pluginKey: plugin.pluginKey, attempt, limit },
+          "plugin-loader: re-attempting plugin latched by a transient activation failure",
+        );
+      } catch (err) {
+        log.warn(
+          {
+            pluginId: plugin.id,
+            pluginKey: plugin.pluginKey,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          "plugin-loader: failed to revive transiently-latched plugin; leaving row unchanged",
+        );
+      }
+    }
+  }
+
+  /**
    * Attempt to load and validate a plugin manifest from a resolved path.
    * Returns the manifest on success or throws with a descriptive error.
    */
@@ -2688,6 +2816,13 @@ export function pluginLoader(
       // status — a revived row must be visible to the query below.
       await reconcileLegacyIsolatedInstallsAtStartup();
 
+      // Give rows a previous boot latched on a transient failure one more
+      // activation before selecting by status. Without this the in-activation
+      // retry only ever covers the attempt already running, so a plugin that
+      // loses the initialize race stays invisible to every later boot and only
+      // a human `/enable` brings it back (BLO-20410).
+      await reviveTransientlyLatchedPluginsAtStartup();
+
       // Fetch all plugins in ready status, ordered by installOrder
       const readyPlugins = (await registry.listByStatus("ready")) as PluginRecord[];
 
@@ -2926,6 +3061,11 @@ export function pluginLoader(
     // immediately).
     let sdkRaceAttempt = 0;
     let transientAttempt = 0;
+
+    // Read before activation can rewrite the row: `activePlugin` is replaced by
+    // the isolation migration mid-flight, and the boot re-attempt count lives
+    // in the `lastError` of the record as it was handed to us.
+    const inboundLastError = plugin.lastError;
 
     // Guard: runtime services must exist (callers already checked)
     if (!runtimeServices) {
@@ -3265,6 +3405,31 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       // Done — plugin fully activated
       // ------------------------------------------------------------------
+
+      // A row revived by the boot re-attempt pass arrives `ready` still
+      // carrying the latch text that made it eligible. Clearing it here is what
+      // makes a recovered plugin indistinguishable from one that never failed —
+      // otherwise the UI shows a healthy plugin with a stale error, and the
+      // cross-boot retry count never resets after a good boot.
+      if (activePlugin.lastError) {
+        try {
+          const cleared = (await registry.updateStatus(pluginId, {
+            status: "ready",
+            lastError: null,
+          })) as PluginRecord | null;
+          if (cleared) activePlugin = cleared;
+        } catch (clearErr) {
+          log.warn(
+            {
+              pluginId,
+              pluginKey,
+              err: clearErr instanceof Error ? clearErr.message : String(clearErr),
+            },
+            "plugin-loader: activated plugin but failed to clear its stale lastError",
+          );
+        }
+      }
+
       log.info(
         {
           pluginId,
@@ -3309,10 +3474,27 @@ export function pluginLoader(
       // `lastError` outlives log retention, so it carries the one fact the logs
       // cannot: whether retries were spent (contention) or the failure was
       // terminal on the first attempt (a real fault). See BLO-20410.
+      //
+      // The transient branch is also the machine-readable half: the marker is
+      // what makes this row eligible for a re-attempt on the next boot, and the
+      // failed-closed branch is what keeps a real fault out of that pass.
       const retrySuffix =
-        sdkRaceAttempt > 0 || transientAttempt > 0
-          ? ` (after ${transientAttempt} transient and ${sdkRaceAttempt} sdk-install-race retries)`
-          : " (failed closed on first attempt; not classified as transient)";
+        transientAttempt > 0
+          ? ` (${TRANSIENT_RETRY_EXHAUSTED_MARKER}: ${transientAttempt} transient and ` +
+            `${sdkRaceAttempt} sdk-install-race retries spent)`
+          : sdkRaceAttempt > 0
+            ? ` (after 0 transient and ${sdkRaceAttempt} sdk-install-race retries)`
+            : " (failed closed on first attempt; not classified as transient)";
+
+      // Carry the cross-boot re-attempt count from the row we were handed, so
+      // the budget is spent over consecutive boots instead of being reset by
+      // each latch. Only meaningful when this latch is itself transient — a row
+      // that fails closed leaves the pass regardless of its count.
+      const carriedBootRetries = readBootActivationRetryCount(inboundLastError);
+      const bootRetryTag =
+        transientAttempt > 0 && carriedBootRetries > 0
+          ? formatBootActivationRetryTag(carriedBootRetries, resolveBootActivationRetryLimit())
+          : "";
 
       // Mark the plugin as errored in the database. Transient failures are
       // retried above before reaching this point (BLO-20410); anything that
@@ -3321,7 +3503,7 @@ export function pluginLoader(
       try {
         await lifecycleManager.markError(
           pluginId,
-          `Activation failed: ${errorMessage}${retrySuffix}`,
+          `Activation failed: ${errorMessage}${retrySuffix}${bootRetryTag}`,
         );
       } catch (markErr) {
         log.error(
