@@ -21,6 +21,8 @@ function createProjectWorkspace(overrides: Partial<ProjectWorkspace>): ProjectWo
     sharedWorkspaceKey: overrides.sharedWorkspaceKey ?? null,
     metadata: overrides.metadata ?? null,
     runtimeConfig: overrides.runtimeConfig ?? null,
+    hasWorkspaceRuntimeConfig:
+      overrides.hasWorkspaceRuntimeConfig ?? Boolean(overrides.runtimeConfig?.workspaceRuntime),
     isPrimary: overrides.isPrimary ?? false,
     runtimeServices: overrides.runtimeServices ?? [],
     createdAt: overrides.createdAt ?? new Date("2026-03-20T00:00:00Z"),
@@ -90,6 +92,8 @@ function createExecutionWorkspace(overrides: Partial<ExecutionWorkspace>): Execu
     cleanupEligibleAt: overrides.cleanupEligibleAt ?? null,
     cleanupReason: overrides.cleanupReason ?? null,
     config: overrides.config ?? null,
+    hasWorkspaceRuntimeConfig:
+      overrides.hasWorkspaceRuntimeConfig ?? Boolean(overrides.config?.workspaceRuntime),
     metadata: overrides.metadata ?? null,
     runtimeServices: overrides.runtimeServices ?? [],
     createdAt: overrides.createdAt ?? new Date("2026-03-26T09:00:00Z"),
