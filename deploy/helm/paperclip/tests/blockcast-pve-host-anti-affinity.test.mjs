@@ -122,6 +122,8 @@ function podTolerations(rendered) {
   return match[1];
 }
 
+// Helm marshals map keys alphabetically, so the rendered entry order is
+// effect/key/operator/value regardless of how the values file lists them.
 const MULTICAST_INTEG_TOLERATION =
   / {8}- effect: NoSchedule\n {10}key: blockcast\.net\/arc-multicast-integ-reserved\n {10}operator: Equal\n {10}value: "true"\n/;
 const DEDICATED_TOLERATION =
