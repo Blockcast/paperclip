@@ -280,12 +280,15 @@ re-derive it or re-file it as a fresh misattribution report:
   repair: verified 2026-09-05 on a fresh `git init` with no identity in any
   config file, and again with a conflicting local `user.email` set, both of
   which committed as the acting agent. If you genuinely need a *different*
-  author for one commit, only a per-invocation environment override reaches it
-  (`GIT_AUTHOR_EMAIL=… GIT_COMMITTER_EMAIL=… git commit …`); `-c user.email=…`
-  will not. Earlier revisions of this file called this "a known, unfixed
-  provisioning gap (BLO-23894)" and told you to run `git config` by hand — that
-  was true of the 2026-08-10 sweep (71 checkouts: 11 App-stamped, 18 with no
-  identity) and was fixed by BLO-29050.
+  author for one commit, two per-invocation overrides reach it and no config
+  file does: `GIT_AUTHOR_EMAIL=… GIT_COMMITTER_EMAIL=… git commit …` moves both
+  the author and the committer, and `git commit --author="Name <addr>"` moves
+  **only** the author, leaving you as committer — which is usually what you
+  want, since it records who wrote the change without disclaiming who ran it.
+  `-c user.email=…` reaches neither. Earlier revisions of this file called
+  this "a known, unfixed provisioning gap (BLO-23894)" and told you to run
+  `git config` by hand — that was true of the 2026-08-10 sweep (71 checkouts:
+  11 App-stamped, 18 with no identity) and was fixed by BLO-29050.
 - If you must create a commit via the raw API (no local checkout available),
   use `gh api` directly and pass an explicit author, e.g.:
   ```bash
