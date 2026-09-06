@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
+import { ApiException } from "@kubernetes/client-node";
 
 // execute.ts reaches for the cluster at import time only through these three
 // factories, so a minimal stub is enough to load the module. The unit under
@@ -24,9 +25,22 @@ const ADAPTER_TYPE = "paperclip.io/adapter-type";
 const RUN_ID_LABEL = "paperclip.io/run-id";
 
 /**
- * The error shape observed in the BLO-31665 incident: @kubernetes/client-node
- * surfaced the status only inside the message string.
+ * A real `ApiException` from the installed client, not a hand-rolled stand-in.
+ * Constructing the genuine class is what makes these tests evidence about the
+ * error shape the adapter actually sees at runtime: it sets `code` and leaves
+ * `statusCode`/`response` undefined, which a hand-written fake would get wrong
+ * in whichever direction the author happened to assume.
  */
+function apiException(code: number, reason: string): Error {
+  return new ApiException(
+    code,
+    reason,
+    { kind: "Status", status: "Failure", message: `secrets "${NAME}" already exists`, reason, code },
+    {},
+  ) as unknown as Error;
+}
+
+/** Legacy/plain-Error shape: the status survives only in the message text. */
 function k8sErr(code: number, reason: string): Error {
   return new Error(
     `HTTP-Code: ${code}\nMessage: ${reason}\nBody: {"kind":"Status","status":"Failure",` +
@@ -54,11 +68,22 @@ function makeCoreApi(overrides: Partial<Record<string, ReturnType<typeof vi.fn>>
 const INPUT = { name: NAME, namespace: NS, runId: RUN_ID, data: { FOO: "bar" } };
 
 describe("isK8s409", () => {
-  it("detects the production shape, where the status is only in the message", () => {
-    // This is the regression that matters: the sibling implementation in
-    // packages/plugins/sandbox-providers/kubernetes/src/secret-manager.ts
-    // inspects code/statusCode only and returns false for exactly this error.
-    expect(isK8s409(k8sErr(409, "AlreadyExists"))).toBe(true);
+  it("detects a real ApiException, which carries `code` but not `statusCode`", () => {
+    // Measured against the installed @kubernetes/client-node (1.4.0):
+    // ApiException sets ONLY `this.code`; `statusCode` and `response` are
+    // both undefined. So `code` is the load-bearing branch here — note the
+    // pre-existing isK8s404 does not check it at all and works purely on its
+    // message regex.
+    const err = apiException(409, "AlreadyExists");
+    expect((err as unknown as Record<string, unknown>).code).toBe(409);
+    expect((err as unknown as Record<string, unknown>).statusCode).toBeUndefined();
+    expect(isK8s409(err)).toBe(true);
+  });
+
+  it("also detects an error carrying the status only in the message text", () => {
+    // Redundant for a genuine ApiException, kept for symmetry with isK8s404
+    // and to cover an error re-thrown as a plain Error.
+    expect(isK8s409(new Error(apiException(409, "AlreadyExists").message))).toBe(true);
   });
 
   it("detects structurally-carried statuses", () => {
@@ -103,7 +128,7 @@ describe("createOrAdoptRunSecret", () => {
     // The BLO-31665 incident: a benign leftover from an earlier attempt of
     // this same run used to return k8s_env_secret_create_failed and kill it.
     const coreApi = makeCoreApi({
-      createNamespacedSecret: vi.fn().mockRejectedValue(k8sErr(409, "AlreadyExists")),
+      createNamespacedSecret: vi.fn().mockRejectedValue(apiException(409, "AlreadyExists")),
       readNamespacedSecret: vi.fn().mockResolvedValue({
         metadata: {
           name: NAME,
@@ -129,7 +154,7 @@ describe("createOrAdoptRunSecret", () => {
     // adopt precisely the objects that need adopting, leaving the fix inert
     // on first contact. The name already encodes (agentId, runId).
     const coreApi = makeCoreApi({
-      createNamespacedSecret: vi.fn().mockRejectedValue(k8sErr(409, "AlreadyExists")),
+      createNamespacedSecret: vi.fn().mockRejectedValue(apiException(409, "AlreadyExists")),
       readNamespacedSecret: vi.fn().mockResolvedValue({ metadata: { name: NAME, resourceVersion: "7" } }),
     });
 
@@ -139,7 +164,7 @@ describe("createOrAdoptRunSecret", () => {
 
   it("fails closed when the existing Secret belongs to a different run", async () => {
     const coreApi = makeCoreApi({
-      createNamespacedSecret: vi.fn().mockRejectedValue(k8sErr(409, "AlreadyExists")),
+      createNamespacedSecret: vi.fn().mockRejectedValue(apiException(409, "AlreadyExists")),
       readNamespacedSecret: vi.fn().mockResolvedValue({
         metadata: { name: NAME, resourceVersion: "9", labels: { [RUN_ID_LABEL]: "some-other-run" } },
       }),
@@ -151,7 +176,7 @@ describe("createOrAdoptRunSecret", () => {
 
   it("fails closed when the existing Secret is managed by something else", async () => {
     const coreApi = makeCoreApi({
-      createNamespacedSecret: vi.fn().mockRejectedValue(k8sErr(409, "AlreadyExists")),
+      createNamespacedSecret: vi.fn().mockRejectedValue(apiException(409, "AlreadyExists")),
       readNamespacedSecret: vi.fn().mockResolvedValue({
         metadata: { name: NAME, resourceVersion: "9", labels: { [MANAGED_BY]: "helm" } },
       }),
@@ -167,11 +192,11 @@ describe("createOrAdoptRunSecret", () => {
     // sandbox-provider sibling does) fails a run that had nothing wrong.
     const create = vi
       .fn()
-      .mockRejectedValueOnce(k8sErr(409, "AlreadyExists"))
+      .mockRejectedValueOnce(apiException(409, "AlreadyExists"))
       .mockResolvedValueOnce({});
     const coreApi = makeCoreApi({
       createNamespacedSecret: create,
-      readNamespacedSecret: vi.fn().mockRejectedValue(k8sErr(404, "NotFound")),
+      readNamespacedSecret: vi.fn().mockRejectedValue(apiException(404, "NotFound")),
     });
 
     await expect(createOrAdoptRunSecret(coreApi, INPUT)).resolves.toBe("recreated");
@@ -189,7 +214,7 @@ describe("createOrAdoptRunSecret", () => {
 
   it("reports an unreadable existing Secret rather than masking it", async () => {
     const coreApi = makeCoreApi({
-      createNamespacedSecret: vi.fn().mockRejectedValue(k8sErr(409, "AlreadyExists")),
+      createNamespacedSecret: vi.fn().mockRejectedValue(apiException(409, "AlreadyExists")),
       readNamespacedSecret: vi.fn().mockRejectedValue(new Error("HTTP-Code: 500")),
     });
 
