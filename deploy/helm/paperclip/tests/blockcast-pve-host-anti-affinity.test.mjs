@@ -105,3 +105,29 @@ test("API liveness tolerates 10 s x 6 like the worker", () => {
   assert.match(readiness, /failureThreshold: 3\b/);
   assert.match(readiness, /timeoutSeconds: 5\b/);
 });
+
+// With pve3 excluded, the hard two-host spread left pve2 as the only host for
+// the second API replica, and pve2 saturates under CI bursts (34-49% steal on
+// paperclip-10, 2026-09-06 03:00Z, pod-local /api/health up to 9.9 s against a
+// 10 s liveness timeout). paperclip-8 (pve1) idles at 87% with two
+// multicast-integ runners, so production tolerates that node's reserved taint
+// and the pve4-then-not-pve2 preference lands the second replica there.
+const MULTICAST_INTEG_TOLERATION =
+  /tolerations:[\s\S]*?- effect: NoSchedule\s*\n\s*key: blockcast\.net\/arc-multicast-integ-reserved\s*\n\s*operator: Equal\s*\n\s*value: "true"/;
+
+test("API deployment tolerates the paperclip-8 multicast-integ reserved taint", () => {
+  const rendered = renderTemplate("templates/deployment-api.yaml", [
+    "--set",
+    "api.enabled=true",
+  ]);
+
+  assert.match(rendered, MULTICAST_INTEG_TOLERATION);
+  // The dedicated=paperclip toleration must survive alongside it.
+  assert.match(rendered, /key: dedicated\s*\n\s*operator: Equal\s*\n\s*value: paperclip/);
+});
+
+test("worker StatefulSet tolerates the paperclip-8 multicast-integ reserved taint", () => {
+  const rendered = renderTemplate("templates/statefulset.yaml");
+
+  assert.match(rendered, MULTICAST_INTEG_TOLERATION);
+});
