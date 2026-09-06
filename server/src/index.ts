@@ -1768,6 +1768,31 @@ export async function startServer(): Promise<StartedServer> {
     );
   }
 
+  // Approval-enforcement reconciler (BLO-24631). Worker-tier singleton, same
+  // rationale as the reconcilers above: an approved decision that never
+  // reaches the object enforcing it is invisible — the board reads it as
+  // approved and the requester reads it as resolved, indefinitely. Read-only
+  // with respect to approvals and budget policies; it raises a deduped issue
+  // rather than silently re-applying a stale decided figure. Kicks off once on
+  // startup, then on interval.
+  if (config.approvalEnforcementReconcilerEnabled && config.paperclipNodeRole !== "api") {
+    const { startApprovalEnforcementReconciler } = await import(
+      "./services/approval-enforcement-reconciler.js"
+    );
+    logger.info(
+      {
+        intervalMinutes: config.approvalEnforcementReconcilerIntervalMinutes,
+        graceHours: config.approvalEnforcementReconcilerGraceHours,
+      },
+      "Approval-enforcement reconciler enabled (BLO-24631)",
+    );
+    startApprovalEnforcementReconciler(
+      db,
+      config.approvalEnforcementReconcilerIntervalMinutes * 60 * 1000,
+      { graceHours: config.approvalEnforcementReconcilerGraceHours },
+    );
+  }
+
   // Isolation-workspace reaper (BLO-31222). Worker-tier singleton, opt-IN.
   //
   // `buildK8sRunIsolationDescriptor` mounts every workspace-isolated run under

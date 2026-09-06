@@ -66,7 +66,18 @@ const approvalPayloadSchema = z.object({
     invalid_type_error: approvalTitleMessage,
   }).refine((title) => title.trim().length > 0, approvalTitleMessage),
   gate: approvalGateSchema.optional(),
-}).catchall(z.unknown());
+}).catchall(z.unknown()).describe(
+  "Free-form beyond `title`. When the decision can be stated as a concrete target value on a " +
+    "specific object, ALSO include a machine-checkable `enforcement_assertions` array so the " +
+    "approval-enforcement reconciler (BLO-24631) can verify the decision actually reached the " +
+    "object that enforces it. Approved decisions have silently never been applied — three " +
+    "confirmed instances, one of which left every one of 8 budget changes unapplied for 5 days " +
+    "while the affected agent approached an auto-pause. Prose alone cannot be checked. Shape: " +
+    '`enforcement_assertions: [{ kind: "budget_policy_amount", policyId: "<uuid>", ' +
+    'expected_usd: 32000, label: "CTO" }]` (or `expected_amount_cents`). Today only ' +
+    "`budget_policy_amount` is checked; unknown kinds are ignored, so declaring one is never " +
+    "harmful and becomes useful when its resolver lands.",
+);
 
 export const createApprovalSchema = z.object({
   type: z.enum(APPROVAL_TYPES),
