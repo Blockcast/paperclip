@@ -5539,6 +5539,95 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_escalated")).toBe(true);
   });
 
+  // BLO-31913: the same exhausted handoff, but on an issue checkout-restore has
+  // already put back to `todo`. That restore is what makes this a distinct case
+  // rather than a duplicate of the test above -- it clears `checkoutRunId` and
+  // `executionRunId` and moves the issue out of the `in_progress` arm where the
+  // escalation lives, so before the fix the `todo` arm's bare `succeeded` skip
+  // swallowed it and nothing ever re-evaluated the issue again. Measured on
+  // Ally: BLO-30577, BLO-31052 and BLO-31216 sat `todo` for 3-8 days this way.
+  it("escalates an exhausted successful-run handoff after checkout-restore returns the issue to todo", async () => {
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "succeeded",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.successfulRunHandoffEscalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "todo",
+      retryReason: null,
+      cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+      kind: "missing_disposition",
+    });
+    expect(recoveryAction.evidence).toMatchObject({
+      sourceRunId,
+      missingDisposition: "clear_next_step",
+      latestRunStatus: "succeeded",
+      recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+    });
+
+    // The escalation must leave a live owner behind, not the BLO-27553
+    // `blocked`-with-no-blockers signature that has no wake path at all --
+    // trading a silent strand for a permanent one would be a worse outcome
+    // than the bug. `resolveStrandedEscalationStatus` owns that choice; this
+    // asserts the recovery action carries an owner whichever status it picks.
+    expect(recoveryAction.wakePolicy).toMatchObject({ ownerAgentId: agentId });
+  });
+
+  // BLO-31913 regression guard, and the more important half of the pair: a
+  // succeeded run on a `todo` issue is normally a DELIBERATE park -- the run
+  // chose `todo` and recorded why, which is the disposition this fleet's own
+  // guidance prescribes for a human-gated issue. Re-dispatching those would
+  // turn every parked issue into a hot loop. The discriminator is the handoff
+  // evidence, never the status, so with no handoff markers on the run this
+  // must skip byte-for-byte as it did before the fix.
+  it("leaves a deliberately parked todo issue untouched when its succeeded run recorded a disposition", async () => {
+    const { issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "succeeded",
+    });
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.assignmentDispatched).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("todo");
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
+      .toHaveLength(0);
+  });
+
   it("escalates an exhausted successful handoff run that still leaves no disposition", async () => {
     const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",

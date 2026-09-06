@@ -8439,7 +8439,44 @@ export function recoveryService(
         }
 
         if (latestRun.status === "succeeded") {
-          result.skipped += 1;
+          // BLO-31913: a succeeded run on a `todo` issue is usually a deliberate
+          // park — the run chose `todo` and recorded why — so the default here
+          // stays "skip". The exception is a run that succeeded WITHOUT
+          // recording a disposition: checkout-restore puts the issue back to
+          // `todo` and clears `checkoutRunId`/`executionRunId`, which moves it
+          // out of the `in_progress` arm where the successful-run-handoff
+          // escalation below lives. The bare skip this replaces therefore made
+          // that state a permanent, silent strand — nothing else re-evaluates a
+          // `todo` issue, and the two cases are indistinguishable from status
+          // alone. Measured on Ally: BLO-30577, BLO-31052 and BLO-31216 sat
+          // `todo` for 3-8 days, each carrying handoff evidence no arm read.
+          //
+          // Discriminate on the evidence the platform already recorded rather
+          // than on status: `successfulRunHandoffRecoveryEvidence` is non-null
+          // only when the disposition was missing, so a deliberate park is
+          // still skipped byte-for-byte as before. Escalation is terminal and
+          // the handoff attempt budget is already spent when `exhausted` is
+          // true, so this cannot re-dispatch in a loop.
+          const todoHandoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
+          if (!todoHandoffEvidence || !todoHandoffEvidence.exhausted) {
+            result.skipped += 1;
+            continue;
+          }
+
+          const updated = await escalateStrandedAssignedIssue({
+            expectedLockOwnerState: adoptionHandoverLockGuard,
+            issue,
+            previousStatus: "todo",
+            latestRun,
+            recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+            successfulRunHandoffEvidence: todoHandoffEvidence,
+          });
+          if (updated) {
+            result.successfulRunHandoffEscalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
           continue;
         }
 
