@@ -416,6 +416,23 @@ test("PaperclipRuntimeResourceReconciliationStuck pins both backlog gauges and t
     /max\(paperclip_environment_leases_orphaned_active\) > 0/,
     "must page on an orphaned-active environment lease",
   );
+  // The two count arms above read a healthy 0 when the sweep that publishes
+  // them throws, because prom-client gauges retain their last value and the
+  // process stays up. Without this arm the alert is silent during exactly the
+  // kube-API outage its own description tells the operator to check for.
+  assert.match(
+    expr,
+    /max\(paperclip_orphaned_runtime_resource_metrics_refresh_success\)\s*==\s*0/,
+    "must page when the reconciliation sweep stops refreshing the backlog gauges, so a stale 0 cannot read as healthy",
+  );
+  // max(), not a bare comparison: every control-plane pod exports the gauge
+  // but only the worker runs the sweep, so a bare `== 0` would fire forever on
+  // the api pods' untouched initial 0.
+  assert.doesNotMatch(
+    expr,
+    /(?<!max\()paperclip_orphaned_runtime_resource_metrics_refresh_success\s*==\s*0/,
+    "freshness arm must aggregate with max() so non-sweeping pods cannot hold it firing",
+  );
   assert.match(
     expr,
     /max\(up\{job="paperclip-control-plane", service="paperclip-workers"\}\)\s*==\s*0/,

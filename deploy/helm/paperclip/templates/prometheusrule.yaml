@@ -392,10 +392,25 @@ spec:
           # do not add absent(metric) branches before the companion metrics are
           # deployed, because they would fire on a healthy pre-deployment
           # cluster.
+          # The refresh_success arm closes the remaining blind spot (Ally
+          # review on #1304): reapOrphanedRuns' sweep reaches the kube API, and
+          # if it throws, the four backlog gauges retain their last prom-client
+          # value — normally the healthy 0 — while the process stays up, so
+          # neither up-based arm compensates and the count arms read clean
+          # during exactly the kube-API outage this alert tells the operator to
+          # check for. `max()` rather than a bare `== 0` on purpose: every
+          # control-plane pod exports its own copy of the gauge but only the
+          # worker runs the sweep, so a bare comparison would fire forever on
+          # the api pods' untouched initial 0 (the same duplicate-series defect
+          # documented on PaperclipAgentHeartbeatStale above). max() fires only
+          # when NO pod has completed a sweep. Like the arms above it is inert
+          # pre-deployment: max() over an absent series yields an empty vector,
+          # which never matches.
           # See runbooks/cancellation-reservation-lease-leak-and-migration-0209-rollout.md.
           expr: >
             max(paperclip_external_runtime_reservations_release_pending) > 0
             or max(paperclip_environment_leases_orphaned_active) > 0
+            or max(paperclip_orphaned_runtime_resource_metrics_refresh_success) == 0
             or (max(up{job="paperclip-control-plane", service="paperclip-workers"}) == 0)
             or absent(up{job="paperclip-control-plane", service="paperclip-workers"})
           for: 10m
@@ -403,7 +418,7 @@ spec:
             severity: warning
           annotations:
             summary: "Paperclip cancellation cleanup is not keeping up"
-            description: "A confirmed-releasable external-runtime reservation (paperclip_external_runtime_reservations_release_pending) or ephemeral environment lease (paperclip_environment_leases_orphaned_active) has not been released for 10+ minutes, OR that telemetry / the paperclip-control-plane scrape target has gone missing for 10+ minutes (BLO-21460). A missing-telemetry firing usually means the scheduler itself is down (e.g. crash-looping on a migration) — check up{job=\"paperclip-control-plane\"} and control-plane pod status first. Otherwise check whether the kube API is reachable so a reservation's Job status can be confirmed. See the runbook for manual recovery steps if the automated reconciler itself is down."
+            description: "A confirmed-releasable external-runtime reservation (paperclip_external_runtime_reservations_release_pending) or ephemeral environment lease (paperclip_environment_leases_orphaned_active) has not been released for 10+ minutes, OR the reconciliation sweep that publishes those gauges has been failing for 10+ minutes (paperclip_orphaned_runtime_resource_metrics_refresh_success == 0, meaning the backlog numbers are stale and a 0 must NOT be read as healthy), OR that telemetry / the paperclip-control-plane scrape target has gone missing for 10+ minutes (BLO-21460). A missing-telemetry firing usually means the scheduler itself is down (e.g. crash-looping on a migration) — check up{job=\"paperclip-control-plane\"} and control-plane pod status first. Otherwise check whether the kube API is reachable so a reservation's Job status can be confirmed. See the runbook for manual recovery steps if the automated reconciler itself is down."
     - name: paperclip-queued-run-stranded
       rules:
         - alert: PaperclipQueuedRunStranded

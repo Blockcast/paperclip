@@ -419,6 +419,7 @@ import {
   setAgentLivenessMetrics,
   setReleasePendingExternalRuntimeReservationMetrics,
   setOrphanedEnvironmentLeaseMetrics,
+  setOrphanedRuntimeResourceMetricsRefreshSuccess,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
@@ -22442,9 +22443,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const cleanedTerminalJobRunIds = await cleanupTerminalExternalLifecycleJobs(jobRunStatuses, now);
     reaped.push(...cleanedTerminalJobRunIds);
-    await reconcileReleasePendingExternalRuntimeReservations(jobRunStatuses, ambiguousExternalRunIds);
-    await reconcileOrphanedEnvironmentLeases();
-    await refreshOrphanedRuntimeResourceMetrics(now);
+    // BLO-21460: the two reconcilers below can throw (both reach the kube API
+    // via confirmStaleKilledJobQuiesced). The backlog refresh must still run,
+    // because prom-client gauges retain their last value: skipping it leaves
+    // all four series frozen at their previous — normally healthy `0` —
+    // reading while the process stays up, so `up`-based arms of
+    // PaperclipRuntimeResourceReconciliationStuck cannot compensate and the
+    // alert goes blind during exactly the outage it exists to catch. Refresh
+    // in `finally`, and publish the freshness gauge so a stale 0 is
+    // distinguishable from a measured 0. The original error still propagates.
+    //
+    // The freshness gauge reports the whole pass, not just the refresh: a
+    // sweep that threw early can leave a genuinely-empty backlog measuring 0
+    // while reconciliation is broken, which reads healthy on the count arms.
+    let reconciliationSweepSucceeded = false;
+    try {
+      await reconcileReleasePendingExternalRuntimeReservations(jobRunStatuses, ambiguousExternalRunIds);
+      await reconcileOrphanedEnvironmentLeases();
+      reconciliationSweepSucceeded = true;
+    } finally {
+      try {
+        await refreshOrphanedRuntimeResourceMetrics(now);
+        setOrphanedRuntimeResourceMetricsRefreshSuccess(reconciliationSweepSucceeded);
+      } catch (error) {
+        setOrphanedRuntimeResourceMetricsRefreshSuccess(false);
+        logger.warn(
+          { error: error instanceof Error ? error.message : String(error) },
+          "reapOrphanedRuns: orphaned runtime-resource backlog refresh failed; gauges are stale",
+        );
+      }
+    }
     const liveJobRunIds =
       jobRunStatuses !== null
         ? new Set(
@@ -34864,7 +34892,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         message: options.eventMessage ?? "run cancelled",
         ...(options.eventPayload ? { payload: options.eventPayload } : {}),
       });
-      await releaseIssueExecutionAndPromote(cancelled);
       if (agent && hasExternalLifecycle(agent.adapterType)) {
         // BLO-20815: additive-only telemetry (see finalizeExternalLifecycleTerminalRun).
         recordExternalLifecycleRunSilenceGap({
@@ -34909,6 +34936,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     } else {
       await releaseCancelledRunRuntimeResources(cancelled ?? run, agent, "cancelled", reason);
+    }
+
+    if (cancelled) {
+      // BLO-21460: release this run's issue execution lock even while the
+      // runtime drains, but do NOT promote a successor into an environment the
+      // cancelled Job still occupies. `releaseIssueExecutionAndPromote` ends in
+      // `startNextQueuedRunForAgent`, so it dispatches rather than merely
+      // unlocking — running it before the quiescence probe raced a successor
+      // against the surviving Job, and the gate below could not retract it.
+      // On non-quiescence the reconciler retries cleanup and a later
+      // scheduling tick promotes the deferred wake.
+      await releaseIssueExecutionAndPromote(cancelled, {
+        suppressPromotion: !externalRuntimeQuiesced,
+      });
     }
 
     await finalizeAgentStatus(run.agentId, "cancelled");
@@ -34972,8 +35013,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           processGroupId: run.processGroupId,
         });
       }
-      await releaseIssueExecutionAndPromote(run);
-
       // Mirrors the cascade in cancelRunInternal — bulk agent cancel must
       // also release the k8s Job slot for external-lifecycle runs.
       if (agent && hasExternalLifecycle(agent.adapterType)) {
@@ -34996,10 +35035,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let externalRuntimeQuiesced = true;
       if (agent && hasExternalLifecycle(agent.adapterType)) {
         externalRuntimeQuiesced = false;
-        externalRuntimeQuiesced = await confirmStaleKilledJobQuiesced(run);
+        try {
+          externalRuntimeQuiesced = await confirmStaleKilledJobQuiesced(run);
+        } catch (error) {
+          // Fail closed for THIS run and keep cancelling the rest. The probe
+          // does a DB read plus two kube reads, any of which can reject; an
+          // unhandled rejection here aborted the whole loop after earlier runs
+          // were already marked `cancelled`, leaving every later run with
+          // neither Job deletion nor lease/reservation release.
+          logger.warn(
+            { runId: run.id, error: error instanceof Error ? error.message : String(error) },
+            "cancelActiveForAgent: runtime quiescence probe failed; retaining resources and continuing bulk cancellation",
+          );
+        }
       }
       await releaseCancelledRunRuntimeResources(run, agent, "cancelled", reason, {
         externalRuntimeQuiesced,
+      });
+      // BLO-21460: same ordering as cancelRunInternal — unlock the issue, but
+      // only dispatch a successor once the cancelled Job is confirmed gone.
+      await releaseIssueExecutionAndPromote(run, {
+        suppressPromotion: !externalRuntimeQuiesced,
       });
     }
 

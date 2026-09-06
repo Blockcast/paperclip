@@ -228,6 +228,30 @@ export const EXTERNAL_RUNTIME_RESERVATION_RELEASE_PENDING_OLDEST_AGE_METRIC = "p
 export const ENVIRONMENT_LEASES_ORPHANED_ACTIVE_METRIC = "paperclip_environment_leases_orphaned_active";
 export const ENVIRONMENT_LEASES_ORPHANED_OLDEST_AGE_METRIC = "paperclip_environment_leases_orphaned_oldest_age_seconds";
 /**
+ * Freshness companion for the four BLO-21460 backlog gauges above (Ally
+ * review on #1304). Same role the sibling `*_refresh_success` gauges play,
+ * and load-bearing for the same reason — but the failure mode it covers is
+ * specifically the one the alert was written for.
+ *
+ * `refreshOrphanedRuntimeResourceMetrics` runs *after*
+ * `reconcileOrphanedEnvironmentLeases` in `reapOrphanedRuns`, and that sweep
+ * calls `confirmStaleKilledJobQuiesced` unguarded. A kube-API failure
+ * therefore throws past the refresh, and because `prom-client` gauges retain
+ * their last value, all four series hold their previous reading — normally
+ * `0`, the *healthy* value. Meanwhile the process is alive, so `up` stays `1`
+ * and the scrape target is present: neither the `max(up{...}) == 0` nor the
+ * `absent(up{...})` arm of PaperclipRuntimeResourceReconciliationStuck
+ * compensates. The alert would stay silent during exactly the kube-API
+ * outage its own description tells the operator to check for.
+ *
+ * One gauge for all four series rather than one each: unlike the
+ * queued-run/overdue-retry pair, these four are refreshed by a single
+ * function in one pass, so there is no partial-failure mode for a per-gauge
+ * signal to distinguish — either the pass completed or none of them updated.
+ */
+export const ORPHANED_RUNTIME_RESOURCE_METRICS_REFRESH_SUCCESS_METRIC =
+  "paperclip_orphaned_runtime_resource_metrics_refresh_success";
+/**
  * process_lost reap counter (BLO-16184, parent BLO-12292). Incremented once at
  * the reaper's `process_lost` mint, labeled by bounded `adapter`
  * (claude_k8s/opencode_k8s/other), `error_bucket` (the fixed reaper failure
@@ -1308,6 +1332,7 @@ let externalRuntimeReservationsReleasePending: Gauge | null = null;
 let externalRuntimeReservationReleasePendingOldestAge: Gauge | null = null;
 let environmentLeasesOrphanedActive: Gauge | null = null;
 let environmentLeasesOrphanedOldestAge: Gauge | null = null;
+let orphanedRuntimeResourceMetricsRefreshSuccess: Gauge | null = null;
 let externalRuntimeReservationStrandedOldestAge: Gauge<"agent_id"> | null = null;
 let externalRuntimeReservationStrandMetricsRefreshSuccess: Gauge | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
@@ -1355,6 +1380,7 @@ function ensureRegistry(): {
   externalRuntimeReservationReleasePendingOldestAgeGauge: Gauge;
   environmentLeasesOrphanedActiveGauge: Gauge;
   environmentLeasesOrphanedOldestAgeGauge: Gauge;
+  orphanedRuntimeResourceMetricsRefreshSuccessGauge: Gauge;
   processLostTotalCounter: Counter<"adapter" | "error_bucket" | "classification">;
   externalLifecycleRunningRunsGauge: Gauge<"adapter">;
   externalLifecycleRunSilenceGapHistogram: Histogram<"adapter" | "status">;
@@ -1404,6 +1430,7 @@ function ensureRegistry(): {
     || !externalRuntimeReservationReleasePendingOldestAge
     || !environmentLeasesOrphanedActive
     || !environmentLeasesOrphanedOldestAge
+    || !orphanedRuntimeResourceMetricsRefreshSuccess
     || !externalRuntimeReservationStrandedOldestAge
     || !externalRuntimeReservationStrandMetricsRefreshSuccess
     || !processLostTotal
@@ -1558,6 +1585,15 @@ function ensureRegistry(): {
       help: "Age in seconds of the oldest lease counted by " + ENVIRONMENT_LEASES_ORPHANED_ACTIVE_METRIC + ".",
       registers: [registry],
     });
+    orphanedRuntimeResourceMetricsRefreshSuccess = new Gauge({
+      name: ORPHANED_RUNTIME_RESOURCE_METRICS_REFRESH_SUCCESS_METRIC,
+      help:
+        "1 when the orphaned runtime-resource backlog refresh (release-pending reservations "
+        + "and orphaned environment leases) completed, otherwise 0. Guards against the four "
+        + "backlog gauges holding a stale healthy 0 when the preceding sweep threw (BLO-21460).",
+      registers: [registry],
+    });
+    orphanedRuntimeResourceMetricsRefreshSuccess.set(0);
     externalRuntimeReservationStrandedOldestAge = new Gauge({
       name: EXTERNAL_RUNTIME_RESERVATION_STRANDED_OLDEST_AGE_METRIC,
       help:
@@ -2032,6 +2068,7 @@ function ensureRegistry(): {
     externalRuntimeReservationReleasePendingOldestAgeGauge: externalRuntimeReservationReleasePendingOldestAge,
     environmentLeasesOrphanedActiveGauge: environmentLeasesOrphanedActive,
     environmentLeasesOrphanedOldestAgeGauge: environmentLeasesOrphanedOldestAge,
+    orphanedRuntimeResourceMetricsRefreshSuccessGauge: orphanedRuntimeResourceMetricsRefreshSuccess,
     externalRuntimeReservationStrandedOldestAgeGauge: externalRuntimeReservationStrandedOldestAge,
     externalRuntimeReservationStrandMetricsRefreshSuccessGauge:
       externalRuntimeReservationStrandMetricsRefreshSuccess,
@@ -2359,6 +2396,15 @@ export function setOrphanedEnvironmentLeaseMetrics(input: {
   const metrics = ensureRegistry();
   metrics.environmentLeasesOrphanedActiveGauge.set(Math.max(0, input.active));
   metrics.environmentLeasesOrphanedOldestAgeGauge.set(Math.max(0, input.oldestAgeSeconds));
+}
+
+/**
+ * BLO-21460. Freshness gate for the four backlog gauges above. Set `false`
+ * when the reconciliation pass threw before the refresh could run, so the
+ * alert can distinguish "measured 0" from "held a stale 0".
+ */
+export function setOrphanedRuntimeResourceMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().orphanedRuntimeResourceMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
 /**
@@ -2922,6 +2968,7 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationReleasePendingOldestAge = null;
   environmentLeasesOrphanedActive = null;
   environmentLeasesOrphanedOldestAge = null;
+  orphanedRuntimeResourceMetricsRefreshSuccess = null;
   externalRuntimeReservationStrandedOldestAge = null;
   externalRuntimeReservationStrandMetricsRefreshSuccess = null;
   processLostTotal = null;
