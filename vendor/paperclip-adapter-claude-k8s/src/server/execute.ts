@@ -572,39 +572,6 @@ export function isK8s409(err: unknown): boolean {
   return /HTTP-Code:\s*409\b/.test(err.message);
 }
 
-/**
- * Create one of the run-scoped Secrets (prompt / env / mcp-config), adopting
- * an existing object instead of failing when the name is already taken.
- *
- * Why adopting is safe here.  Every one of these names is
- * `${jobName}-{prompt,env,mcp}` where
- * `jobName = ac-<agentSlug>-<runSlug>-<shortHash(agentId:runId)>`
- * (job-manifest.ts).  The name therefore *encodes* the run identity, so a
- * collision on the full name is a collision with this same (agentId, runId) —
- * i.e. a leftover from an earlier attempt of this very run — and the contents
- * are re-derived from the same config, so replacing is idempotent.  Before
- * BLO-31665 every throw here was fatal, so a benign leftover killed the run.
- *
- * The obvious worry about replace-on-collision is yanking a Secret out from
- * under a pod that is still mounting it.  That cannot happen from here: the
- * concurrency guard above (`k8s_concurrent_run_blocked`) lists this agent's
- * Jobs and returns *before* buildJobManifest, so by the time any of these
- * creates runs there is no live Job for this agent.  A colliding Secret is
- * therefore a leftover of a *dead* attempt by construction, not one in use.
- *
- * The identity check fails closed only on *positive contradiction*: a Secret
- * whose labels actively disagree with this run is never overwritten.  Missing
- * labels are tolerated, because a Secret written by an older adapter build is
- * still one this run must be able to reclaim — a gate that requires labels to
- * be present would refuse to adopt precisely the objects that need adopting.
- *
- * Note the label vocabulary differs from the sandbox-provider sibling
- * (`app.kubernetes.io/managed-by: paperclip` here vs
- * `paperclip.io/managed-by: paperclip-k8s-plugin` there); a verbatim copy of
- * that gate would reject every Secret this adapter writes.
- *
- * @returns how the Secret came to exist, for logging.
- */
 type SecretDisposition = "created" | "adopted" | "recreated";
 
 /**
@@ -620,6 +587,44 @@ const SECRET_DISPOSITION_VERB = {
   recreated: "Recreated",
 } as const satisfies Record<SecretDisposition, string>;
 
+/**
+ * Create one of the run-scoped Secrets (prompt / env / mcp-config), adopting
+ * an existing object instead of failing when the name is already taken.
+ *
+ * Why adopting is safe here.  Every one of these names is
+ * `${jobName}-{prompt,env,mcp}` where
+ * `jobName = ac-<agentSlug>-<runSlug>-<shortHash(agentId:runId)>`
+ * (job-manifest.ts).  The name therefore *encodes* the run identity, so a
+ * collision on the full name is a collision with this same (agentId, runId) —
+ * i.e. a leftover from an earlier attempt of this very run — and the contents
+ * are re-derived from the same config, so replacing is idempotent.  Before
+ * BLO-31665 every throw here was fatal, so a benign leftover killed the run.
+ *
+ * The obvious worry about replace-on-collision is yanking a Secret out from
+ * under a pod that is still mounting it.  The concurrency guard above
+ * (`k8s_concurrent_run_blocked`) removes most of that: it lists this agent's
+ * Jobs and returns *before* buildJobManifest.  It does not remove all of it —
+ * that filter counts a Job as running only when it carries no
+ * `deletionTimestamp` and no Complete/Failed condition, so a Job mid-deletion
+ * whose pod is still terminating passes the guard.  What closes the residual
+ * window is the consumption model, not the guard: the env Secret is read via
+ * `secretKeyRef` at container start, so a later replace cannot reach an
+ * already-running container, and the prompt/mcp Secrets are volume-mounted but
+ * re-derived byte-identically for the same (agentId, runId).
+ *
+ * The identity check fails closed only on *positive contradiction*: a Secret
+ * whose labels actively disagree with this run is never overwritten.  Missing
+ * labels are tolerated, because a Secret written by an older adapter build is
+ * still one this run must be able to reclaim — a gate that requires labels to
+ * be present would refuse to adopt precisely the objects that need adopting.
+ *
+ * Note the label vocabulary differs from the sandbox-provider sibling
+ * (`app.kubernetes.io/managed-by: paperclip` here vs
+ * `paperclip.io/managed-by: paperclip-k8s-plugin` there); a verbatim copy of
+ * that gate would reject every Secret this adapter writes.
+ *
+ * @returns how the Secret came to exist, for logging.
+ */
 export async function createOrAdoptRunSecret(
   coreApi: k8s.CoreV1Api,
   input: { name: string; namespace: string; runId: string; data: Record<string, string> },
