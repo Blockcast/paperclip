@@ -569,10 +569,35 @@ function deploymentWith({
 // above. `readyReplicas` of 0 is written as an ABSENT field by default, matching
 // what a never-ready ReplicaSet actually looks like on the live cluster —
 // observed 2026-09-04 across the 7 scaled-down paperclip-api ReplicaSets.
-function replicaSetWith({ name, images = [], ready = 0, uid = DEPLOYMENT_UID } = {}) {
+//
+// `revision` is the deployment.kubernetes.io/revision annotation, and it is the
+// tie-break the reader uses once two ReplicaSets are serving (BLO-32101). The
+// default is SHARED, so two fixtures that do not both override it tie and the
+// reader declines — the conservative direction, pinned by its own case below
+// rather than left as an accident. Pass `revision: null` to omit the annotation
+// entirely, the other shape that leaves no winner to pick.
+//
+// `created` is carried alongside because every real ReplicaSet has one and
+// because the reader deliberately does NOT read it — the inversion case below
+// sets stamp order opposite to revision order to prove that.
+const RS_CREATED_DEFAULT = "2026-09-04T00:00:00Z";
+const RS_REVISION_DEFAULT = "7";
+
+function replicaSetWith({
+  name,
+  images = [],
+  ready = 0,
+  uid = DEPLOYMENT_UID,
+  created = RS_CREATED_DEFAULT,
+  revision = RS_REVISION_DEFAULT,
+} = {}) {
   return {
     metadata: {
       name,
+      ...(created === null ? {} : { creationTimestamp: created }),
+      ...(revision === null
+        ? {}
+        : { annotations: { "deployment.kubernetes.io/revision": revision } }),
       ownerReferences: [{ kind: "Deployment", name: "paperclip-api", uid }],
     },
     spec: { template: { spec: { containers: images.map((image) => ({ image })) } } },
@@ -738,28 +763,323 @@ test("a landed rollout is answered from the Deployment and never consults Replic
   assert.equal(run.argv.filter((line) => line.includes("replicasets")).length, 0);
 });
 
-test("two ReplicaSets with ready pods are ambiguous and yield no digest", () => {
-  // A rollout genuinely in flight: both digests are serving and neither is "the
-  // running one". Naming the newer would pin a half-rolled digest.
+// Two ReplicaSets with ready pods used to be refused outright, on the reasoning
+// that neither digest is unambiguously "the running one". True, and it threw away
+// the answer: the PREVIOUS of two serving ReplicaSets is the one carrying the
+// last-healthy digest this reader exists to recover, and in the stalled-roll case
+// it is the only object that still names it. Revision breaks the tie only among
+// ReplicaSets that already passed ownership and readiness, and the winner still
+// faces the container and repository checks with no fallthrough to the runner-up
+// (BLO-32101).
+//
+// The ordering key is deployment.kubernetes.io/revision, NOT creationTimestamp,
+// because the Deployment controller reuses a ReplicaSet whose pod template repeats
+// — preserving its stamp while bumping its revision. `PREVIOUS_REVISION` names the
+// ReplicaSet being scaled DOWN (the last-healthy digest) and `CURRENT_REVISION` the
+// one being rolled out.
+const OLDER = "2026-09-04T10:00:00Z";
+const NEWER = "2026-09-04T11:00:00Z";
+const PREVIOUS_REVISION = "41";
+const CURRENT_REVISION = "42";
+
+function twoServingReplicaSets({ olderImages, newerImages, olderUid = DEPLOYMENT_UID }) {
+  return {
+    replicaSets: [
+      replicaSetWith({
+        name: "paperclip-api-new",
+        images: newerImages,
+        ready: 1,
+        created: NEWER,
+        revision: CURRENT_REVISION,
+      }),
+      replicaSetWith({
+        name: "paperclip-api-old",
+        images: olderImages,
+        ready: 1,
+        created: OLDER,
+        revision: PREVIOUS_REVISION,
+        uid: olderUid,
+      }),
+    ],
+  };
+}
+
+// The Deployment fixture every case below shares: a rollout applied and never made
+// ready, which is what sends the reader to the ReplicaSets in the first place.
+function neverReadyDeployment(applied = digest(0xcc)) {
+  return deploymentWith({ images: [`${IMAGE_REPOSITORY}@${applied}`], status: NEVER_READY });
+}
+
+test("two ReplicaSets with ready pods resolve to the previous revision's digest", () => {
+  // The stalled roll the reader exists for: maxSurge parks the Deployment at
+  // old=1 ready / new=1 ready, and the previous revision carries the last healthy
+  // digest.
+  const lastHealthy = digest(0xaa);
   assert.equal(
     runningDigestFor(
-      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`], status: NEVER_READY }),
-      {
-        replicaSets: [
-          replicaSetWith({
-            name: "paperclip-api-new",
-            images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
-            ready: 1,
-          }),
-          replicaSetWith({
-            name: "paperclip-api-old",
-            images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
-            ready: 1,
-          }),
-        ],
-      },
+      neverReadyDeployment(),
+      twoServingReplicaSets({
+        olderImages: [`${IMAGE_REPOSITORY}@${lastHealthy}`],
+        newerImages: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+      }),
+    ),
+    lastHealthy,
+  );
+});
+
+test("a reused ReplicaSet is ranked by revision, not by its older creationTimestamp", () => {
+  // The case creationTimestamp gets WRONG, and the reason the key is revision.
+  // When a pod template repeats byte-for-byte — which `helm rollback` produces,
+  // since it re-applies the stored manifest verbatim — the Deployment controller
+  // scales the EXISTING ReplicaSet back up instead of minting a new one. It keeps
+  // its original creationTimestamp and has its revision bumped to the new highest,
+  // so it is simultaneously the OLDEST by stamp and the NEWEST by rollout.
+  //
+  // Stamp order is therefore set INVERTED against revision order here: the reused
+  // RS is the one being rolled out and must NOT be pinned, even though it is the
+  // oldest object in the list. Ordering by creationTimestamp elects `rolledOut`;
+  // this asserts the reader elects `stillServing` instead.
+  const rolledOut = digest(0xbb);
+  const stillServing = digest(0xaa);
+  assert.equal(
+    runningDigestFor(neverReadyDeployment(), {
+      replicaSets: [
+        replicaSetWith({
+          name: "paperclip-api-reused",
+          images: [`${IMAGE_REPOSITORY}@${rolledOut}`],
+          ready: 1,
+          created: OLDER,
+          revision: "43",
+        }),
+        replicaSetWith({
+          name: "paperclip-api-serving",
+          images: [`${IMAGE_REPOSITORY}@${stillServing}`],
+          ready: 1,
+          created: NEWER,
+          revision: "42",
+        }),
+      ],
+    }),
+    stillServing,
+  );
+});
+
+test("revisions are ordered numerically, so revision 9 outranks revision 10", () => {
+  // A string compare would sort "10" before "9" and elect the wrong ReplicaSet.
+  const lastHealthy = digest(0xaa);
+  assert.equal(
+    runningDigestFor(neverReadyDeployment(), {
+      replicaSets: [
+        replicaSetWith({
+          name: "paperclip-api-new",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+          ready: 1,
+          revision: "10",
+        }),
+        replicaSetWith({
+          name: "paperclip-api-old",
+          images: [`${IMAGE_REPOSITORY}@${lastHealthy}`],
+          ready: 1,
+          revision: "9",
+        }),
+      ],
+    }),
+    lastHealthy,
+  );
+});
+
+test("three ReplicaSets with ready pods resolve to the lowest revision, not merely a previous one", () => {
+  const oldest = digest(0xaa);
+  assert.equal(
+    runningDigestFor(neverReadyDeployment(), {
+      replicaSets: [
+        replicaSetWith({
+          name: "paperclip-api-mid",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`],
+          ready: 1,
+          created: "2026-09-04T10:30:00Z",
+          revision: "41",
+        }),
+        replicaSetWith({
+          name: "paperclip-api-new",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+          ready: 1,
+          created: NEWER,
+          revision: "42",
+        }),
+        replicaSetWith({
+          name: "paperclip-api-old",
+          images: [`${IMAGE_REPOSITORY}@${oldest}`],
+          ready: 1,
+          created: OLDER,
+          revision: "40",
+        }),
+      ],
+    }),
+    oldest,
+  );
+});
+
+test("two serving ReplicaSets sharing a revision stay ambiguous and yield no digest", () => {
+  // Two ReplicaSets of one Deployment should never share a revision, so this is a
+  // shape outside the controller's model rather than a near-miss. There is no
+  // lowest, and jq's sort would resolve it on apiserver list order — an arbitrary
+  // answer dressed as a decision.
+  assert.equal(
+    runningDigestFor(neverReadyDeployment(), {
+      replicaSets: [
+        replicaSetWith({
+          name: "paperclip-api-new",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+          ready: 1,
+          created: NEWER,
+          revision: PREVIOUS_REVISION,
+        }),
+        replicaSetWith({
+          name: "paperclip-api-old",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+          ready: 1,
+          created: OLDER,
+          revision: PREVIOUS_REVISION,
+        }),
+      ],
+    }),
+    "",
+  );
+});
+
+test("a serving ReplicaSet with no revision annotation is never ranked as the lowest", () => {
+  // The missing annotation must not be read as revision 0, which would win the
+  // election on the strength of the field being absent.
+  assert.equal(
+    runningDigestFor(neverReadyDeployment(), {
+      replicaSets: [
+        replicaSetWith({
+          name: "paperclip-api-unannotated",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+          ready: 1,
+          created: OLDER,
+          revision: null,
+        }),
+        replicaSetWith({
+          name: "paperclip-api-new",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+          ready: 1,
+          created: NEWER,
+          revision: CURRENT_REVISION,
+        }),
+      ],
+    }),
+    "",
+  );
+});
+
+test("a lone serving ReplicaSet is pinned even when its revision annotation is malformed", () => {
+  // Revision is irrelevant when there is only one candidate, so a malformed
+  // annotation must not cost the recovery. This is also the case that proves the
+  // string test earns its place: the $revisions array is built BEFORE the
+  // single-candidate branch is taken, so an unguarded tonumber aborts the whole jq
+  // program here and the caller maps that to no digest at all.
+  //
+  // Deliberately a LONE ReplicaSet. With two candidates the guard is invisible from
+  // outside — a jq abort and a clean decline both surface as "" — so a two-serving
+  // version of this case would pass with or without the guard and prove nothing.
+  const serving = digest(0xaa);
+  assert.equal(
+    runningDigestFor(neverReadyDeployment(digest(0xbb)), {
+      replicaSets: [
+        replicaSetWith({
+          name: "paperclip-api-malformed",
+          images: [`${IMAGE_REPOSITORY}@${serving}`],
+          ready: 2,
+          created: OLDER,
+          revision: "not-a-number",
+        }),
+      ],
+    }),
+    serving,
+  );
+});
+
+test("serving ReplicaSets stamped the same second still resolve when revisions differ", () => {
+  // The converse of the retired stamp-tie guard: creationTimestamp is
+  // second-granular, so two ReplicaSets minted inside one second tie for real —
+  // and under the old key that tie forfeited the recovery. Revision is unique per
+  // ReplicaSet, so the election still has an answer.
+  const lastHealthy = digest(0xaa);
+  assert.equal(
+    runningDigestFor(neverReadyDeployment(), {
+      replicaSets: [
+        replicaSetWith({
+          name: "paperclip-api-new",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+          ready: 1,
+          created: OLDER,
+          revision: CURRENT_REVISION,
+        }),
+        replicaSetWith({
+          name: "paperclip-api-old",
+          images: [`${IMAGE_REPOSITORY}@${lastHealthy}`],
+          ready: 1,
+          created: OLDER,
+          revision: PREVIOUS_REVISION,
+        }),
+      ],
+    }),
+    lastHealthy,
+  );
+});
+
+// Revision is the LAST filter applied, and the ReplicaSet it elects is then held to
+// the same standard a lone serving ReplicaSet is. These three cases are the teeth of
+// that: in each, the elected ReplicaSet is disqualified and a naive "skip it and
+// take the next one" would happily pin the newer digest instead.
+
+test("a lowest-revision serving ReplicaSet from another repository yields no digest, not the runner-up", () => {
+  assert.equal(
+    runningDigestFor(
+      neverReadyDeployment(),
+      twoServingReplicaSets({
+        olderImages: [`ghcr.io/someone/else@${digest(0xaa)}`],
+        newerImages: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+      }),
     ),
     "",
+  );
+});
+
+test("a lowest-revision serving ReplicaSet whose containers disagree yields no digest, not the runner-up", () => {
+  assert.equal(
+    runningDigestFor(
+      neverReadyDeployment(),
+      twoServingReplicaSets({
+        olderImages: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`, `${IMAGE_REPOSITORY}@${digest(0xdd)}`],
+        newerImages: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+      }),
+    ),
+    "",
+  );
+});
+
+test("a lower-revision ReplicaSet owned by a different Deployment does not outrank ours", () => {
+  // Ownership filters BEFORE revision, so a foreign ReplicaSet is not a candidate
+  // at all — it neither wins the election nor makes ours ambiguous. Ours is then
+  // the only serving ReplicaSet, and is pinned exactly as it would be alone.
+  //
+  // `ours` deliberately differs from the Deployment's own applied digest. If both
+  // were 0xcc the assertion would still pass when the reader wrongly answered from
+  // spec.template, so the two must stay distinct for this case to discriminate.
+  const ours = digest(0xcc);
+  assert.equal(
+    runningDigestFor(
+      neverReadyDeployment(digest(0xbb)),
+      twoServingReplicaSets({
+        olderImages: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+        newerImages: [`${IMAGE_REPOSITORY}@${ours}`],
+        olderUid: "99999999-9999-4999-8999-999999999999",
+      }),
+    ),
+    ours,
   );
 });
 
@@ -1409,6 +1729,17 @@ test("nothing disarms the cleanup between the ring write and the probe", () => {
 // rather than mocked away, so the branch runs as written. Without this the
 // empty-stderr guard could be deleted and every other test here stays green --
 // which is exactly how the dangling-colon regression it fixes got shipped.
+//
+// `stderrText` is bare here on purpose, and giving it a `= ""` default would be
+// inert: the kubectl stub interpolates it behind a truthiness ternary, so
+// `JSON.stringify` is never reached when it is omitted and both spellings
+// render the byte-identical `kubectl() { return 1; }`. The cost of adding one
+// anyway is not the dead code, it is that the next reader finds a default
+// standing where nothing required it and concludes it was load-bearing.
+// The write harnesses further down interpolate `JSON.stringify(stderrText)`
+// with no such ternary, so an omitted value there really does reach the stub as
+// the bare word `undefined` -- that asymmetry is in the template shape, not in
+// the destructure. When adding a harness, copy the guarded form from here.
 function runRelease({ stderrText }) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-release-"));
   const errFile = path.join(dir, "release_err");

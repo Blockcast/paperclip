@@ -866,18 +866,15 @@ live_running_digest() {
   printf '%s\n' "${image#*@}"
 }
 
-# The image carried by the one ReplicaSet of this Deployment that still has ready
-# pods, or empty. Reached only when the Deployment's own template has failed the
-# serving gate -- typically because a rollout was applied and never became ready,
-# which leaves spec.template naming a digest that never carried traffic while the
-# previous ReplicaSet keeps serving the one that did.
+# The image carried by the LOWEST-REVISION ReplicaSet of this Deployment that still
+# has ready pods, or empty. Reached only when the Deployment's own template has
+# failed the serving gate -- typically because a rollout was applied and never became
+# ready, which leaves spec.template naming a digest that never carried traffic
+# while the previous ReplicaSet keeps serving the one that did.
 #
-# EXACTLY ONE serving ReplicaSet is required, which is deliberately stricter than
-# "the newest one that has ready pods". Two ReplicaSets with ready pods means both
-# digests are serving and neither is "the running one"; naming the newer would pin
-# a half-rolled digest that is quite possibly the one about to fail. The two rules
-# only ever disagree in that case, and there the strict one is never worse -- for
-# either of the two ways to reach it:
+# LOWEST REVISION rather than newest, and rather than "exactly one" (BLO-32101).
+# Taking the NEWEST is wrong, for either of the two ways to reach the two-serving
+# case:
 #
 #   - A roll still moving. The newer digest is usually the one being approved right
 #     now, which build_approval_ring already holds in slot 0 and discards as not
@@ -892,8 +889,67 @@ live_running_digest() {
 #     BROKEN one rather than the one being approved, so pinning it would be
 #     actively worse than pinning nothing.
 #
-# So do not "fix" the ambiguous case by taking the newest: in the first case that
-# buys nothing, and in the second it pins the digest that is currently failing.
+# This function originally required EXACTLY ONE serving ReplicaSet and declined
+# otherwise, on the reasoning that neither of two serving digests is "the running
+# one". That is true and still not a reason to decline: in BOTH cases above the
+# PREVIOUS ReplicaSet is the one carrying the last-healthy digest this reader
+# exists to recover -- in the stalled case it is the only object that still names
+# it -- and declining threw it away. An RS with ready pods is serving traffic by
+# definition, so ordering the serving set breaks the tie in exactly the direction
+# this reader wants. Ordered-wins therefore dominates: the two rules agree whenever
+# one serving RS exists, and where they differ the strict rule pinned nothing while
+# this one pins the last-healthy digest.
+#
+# The order is `deployment.kubernetes.io/revision` ASCENDING, NOT creationTimestamp.
+# This distinction is load-bearing rather than stylistic, and creationTimestamp is
+# outright wrong (raised on #1676, native-codex lens):
+#
+#   - The Deployment controller REUSES a ReplicaSet whose pod template is
+#     byte-identical to one it has seen before. FindNewReplicaSet matches it and
+#     getNewReplicaSet scales that existing object back up instead of minting a new
+#     one -- preserving its original creationTimestamp while bumping its revision
+#     annotation to the new highest revision.
+#   - So a reused RS is simultaneously the OLDEST by stamp and the NEWEST by
+#     rollout. "Older" then stops meaning "has been serving longer": a reused RS may
+#     have sat at zero replicas for days and only just scaled back up. Ordering by
+#     stamp would elect the digest being rolled OUT -- already admissible by
+#     construction, so pinning it wastes the slot that should have held the digest
+#     still serving, which then ages out and leaves nothing to fall back to. That is
+#     the BLO-28483 wedge this reader exists to prevent, reached by a new route.
+#   - This is not hypothetical here. `helm rollback paperclip <REVISION>` is the
+#     documented rollback path (deploy/helm/paperclip/README.md), it re-applies the
+#     stored manifest verbatim rather than re-rendering it, and the paperclip-api pod
+#     template carries only two variable annotations (deployed-commit and
+#     approval-plan-sha256) which that stored manifest restores unchanged. So a
+#     rollback reproduces a previously-seen template exactly and triggers the reuse.
+#     The approval ring has no purpose unless that path is exercised.
+#
+# Revision strictly dominates the stamp: revisions are unique per ReplicaSet and
+# monotonic per rollout, so the two agree whenever no reuse has occurred, and
+# revision is the correct answer when it has.
+#
+# Revision is consulted ONLY to break a tie among ReplicaSets that already passed
+# ownership and readiness, and the winner is then subjected to the same container
+# and repository checks as before, with no fallthrough to the runner-up. So an
+# elected ReplicaSet whose containers disagree, or one carrying another
+# repository's image, still yields no digest rather than promoting the next one
+# -- the elected RS being disqualified is evidence about the rollback target, not an
+# invitation to pick a different one.
+#
+# Two shapes leave no winner to pick and are declined rather than guessed at, both
+# of which the plain sort would otherwise answer arbitrarily:
+#
+#   - Equal revisions. Two ReplicaSets of one Deployment should never share a
+#     revision, so this is a shape outside the controller's model rather than a
+#     near-miss; jq's sort would resolve it on apiserver list order.
+#   - A missing or non-numeric revision annotation. The controller sets it on every
+#     ReplicaSet it creates (verified on the live paperclip-api set, 2026-09-06),
+#     so its absence likewise means something outside the model. Declining is the
+#     conservative direction: it costs a recovery opportunity, where guessing costs
+#     the rollback target.
+#
+# Revisions are compared NUMERICALLY after an explicit integer test, so revision 9
+# does not outrank revision 10 the way a string compare would.
 #
 # ReplicaSets are matched by the Deployment's own selector AND by an ownerReference
 # to its uid. The selector alone is server-side narrowing; the uid is what makes it
@@ -968,6 +1024,25 @@ serving_replicaset_image() {
       fi
     else
       image="$(jq -r --arg uid "$uid" '
+        def rs_image:
+          [ .spec.template.spec.containers[]?.image // empty ] as $images
+          | if ($images | length) > 0 and (($images | unique | length) == 1)
+            then $images[0]
+            else ""
+            end;
+
+        # null for a ReplicaSet whose revision annotation is absent or not an
+        # integer, which the caller below turns into a decline. The string test
+        # runs before tonumber so a malformed value declines rather than aborting
+        # the whole program, and the type guard runs before the string test so a
+        # non-string annotation cannot error inside test() either.
+        def rs_revision:
+          ((.metadata.annotations // {})["deployment.kubernetes.io/revision"]) as $r
+          | if ($r | type) == "string" and ($r | test("^[0-9]+$"))
+            then ($r | tonumber)
+            else null
+            end;
+
         [ .items[]?
           | select(
               [ (.metadata.ownerReferences // [])[]
@@ -975,13 +1050,14 @@ serving_replicaset_image() {
               ] | length == 1
             )
           | select((.status.readyReplicas // 0) > 0)
-          | [ .spec.template.spec.containers[]?.image // empty ] as $images
-          | if ($images | length) > 0 and (($images | unique | length) == 1)
-            then $images[0]
-            else ""
-            end
         ] as $serving
-        | if ($serving | length) == 1 then $serving[0] else "" end
+        | [ $serving[] | rs_revision ] as $revisions
+        | if   ($serving | length) == 0 then ""
+          elif ($serving | length) == 1 then ($serving[0] | rs_image)
+          elif ($revisions | map(select(. == null)) | length) > 0 then ""
+          elif (($revisions | sort) | .[0] == .[1]) then ""
+          else ($serving | sort_by(rs_revision) | .[0] | rs_image)
+          end
       ' <<<"$rs_json" 2>/dev/null)" || image=""
     fi
     rm -f "$rs_err"
