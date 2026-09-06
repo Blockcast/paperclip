@@ -109,8 +109,9 @@ test("API liveness tolerates 10 s x 6 like the worker", () => {
 // With pve3 excluded, the hard two-host spread left pve2 as the only host for
 // the second API replica, and pve2 saturates under CI bursts (34-49% steal on
 // paperclip-10, 2026-09-06 03:00Z, pod-local /api/health up to 9.9 s against a
-// 10 s liveness timeout). paperclip-8 (pve1) idles at 87% with two
-// multicast-integ runners, so production tolerates that node's reserved taint
+// 10 s liveness timeout). paperclip-8 (pve1) idles at 87% with three
+// multicast-integ runners (a reserved floor), so production tolerates that
+// node's reserved taint
 // and the pve4-then-not-pve2 preference lands the second replica there.
 // Slice the pod-spec tolerations list (key at six spaces, entries at eight, in
 // both templates) so the assertion cannot be satisfied by a tolerations key
