@@ -150,6 +150,15 @@ import {
 } from "./workspace-command-authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import {
+  executionWorkspaceIdentity,
+  publicExecutionWorkspace,
+  publicProjects,
+  publicProjectWorkspace,
+  resolveWorkspaceRuntimeViewer,
+  type ExecutionWorkspaceIdentity,
+  type WorkspaceRuntimeViewer,
+} from "./workspace-response.js";
+import {
   isInlineAttachmentContentType,
   normalizeIssueAttachmentMaxBytes,
   normalizeContentType,
@@ -227,7 +236,6 @@ import {
   type CommentEffectIntent,
   type CommentEffectRow,
 } from "../services/issue-comment-effects.js";
-import { maskProjectEnv } from "./project-env-response.js";
 
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
@@ -7294,11 +7302,17 @@ export function issueRoutes(
 
   function respondClosedIssueExecutionWorkspace(
     res: Response,
-    workspace: Pick<ExecutionWorkspace, "closedAt" | "id" | "mode" | "name" | "status">,
+    workspace: ExecutionWorkspaceIdentity,
   ) {
     res.status(409).json({
       error: getClosedIsolatedExecutionWorkspaceMessage(workspace),
-      executionWorkspace: workspace,
+      // The parameter type promises five fields, but every caller passes the full row returned by
+      // `executionWorkspacesSvc.getById` (a bare `db.select()` fed through `toExecutionWorkspace`,
+      // which sets `workspaceRuntime`). TypeScript does not strip excess properties at runtime, so
+      // `executionWorkspace: workspace` served the operator-authored `workspaceRuntime` on this 409
+      // — the same material `publicExecutionWorkspace` exists to withhold. The narrow declared type
+      // is what hid it; perform the narrowing instead of declaring it.
+      executionWorkspace: executionWorkspaceIdentity(workspace),
     });
   }
 
@@ -7361,8 +7375,27 @@ export function issueRoutes(
     return { project, goal: null };
   }
 
-  function compactIssueProjectWorkspace(workspace: ProjectWorkspace | null | undefined) {
-    if (!workspace) return null;
+  /**
+   * PEN-2852 / PEN-2370 — `GET /issues/:id` is a THIRD exit for workspace runtime config, and the
+   * one an agent reads most. The withholding boundary in `routes/workspace-response.ts` was wired
+   * into `routes/execution-workspaces.ts` and `routes/projects.ts`; this module answers with the
+   * same rows under different nouns (`project.workspaces[]`, `project.primaryWorkspace`,
+   * `currentExecutionWorkspace`, `mentionedProjects[]`), so the entitlement has to be applied here
+   * too or it is enforced on two of four doors.
+   *
+   * Applied by delegating to the same `public*` helpers rather than re-deriving the mask, so the
+   * two exits cannot drift: `runtimeConfig` and `config` are derived views over `metadata`, and a
+   * second implementation is how one of them ends up masked while the other is not.
+   *
+   * The compaction below already drops `metadata`, so the derived view is the only exit here — but
+   * the helper is still the right place to ask, because it owns which keys count as derived.
+   */
+  function compactIssueProjectWorkspace(
+    rawWorkspace: ProjectWorkspace | null | undefined,
+    viewer: WorkspaceRuntimeViewer,
+  ) {
+    if (!rawWorkspace) return null;
+    const workspace = publicProjectWorkspace(rawWorkspace, viewer);
     return {
       id: workspace.id,
       companyId: workspace.companyId,
@@ -7380,13 +7413,23 @@ export function issueRoutes(
       remoteWorkspaceRef: workspace.remoteWorkspaceRef,
       sharedWorkspaceKey: workspace.sharedWorkspaceKey,
       runtimeConfig: workspace.runtimeConfig,
+      // The compensating field the boundary promises: `workspace-response.ts` states that callers
+      // keep `hasWorkspaceRuntimeConfig` regardless of entitlement, so a UI needing only existence
+      // never needs the contents. This projection selects fields explicitly, so omitting it left a
+      // withheld caller unable to tell "no runtime config" from "withheld" — a distinction that
+      // WAS available before withholding, because the config was disclosed outright. The service
+      // mapper computes it from the raw row, so it survives the mask.
+      hasWorkspaceRuntimeConfig: workspace.hasWorkspaceRuntimeConfig,
       isPrimary: workspace.isPrimary,
       createdAt: workspace.createdAt,
       updatedAt: workspace.updatedAt,
     };
   }
 
-  function compactIssueProject(project: Awaited<ReturnType<typeof resolveIssueProjectAndGoal>>["project"]) {
+  function compactIssueProject(
+    project: Awaited<ReturnType<typeof resolveIssueProjectAndGoal>>["project"],
+    viewer: WorkspaceRuntimeViewer,
+  ) {
     if (!project) return null;
     return {
       id: project.id,
@@ -7407,8 +7450,10 @@ export function issueRoutes(
       pausedAt: project.pausedAt,
       executionWorkspacePolicy: project.executionWorkspacePolicy,
       codebase: project.codebase,
-      workspaces: (project.workspaces ?? []).map(compactIssueProjectWorkspace),
-      primaryWorkspace: compactIssueProjectWorkspace(project.primaryWorkspace),
+      workspaces: (project.workspaces ?? []).map((workspace) =>
+        compactIssueProjectWorkspace(workspace, viewer),
+      ),
+      primaryWorkspace: compactIssueProjectWorkspace(project.primaryWorkspace, viewer),
       managedByPlugin: project.managedByPlugin ?? null,
       taskCount: project.taskCount,
       budget: project.budget,
@@ -7448,8 +7493,12 @@ export function issueRoutes(
     };
   }
 
-  function compactIssueExecutionWorkspace(workspace: ExecutionWorkspace | null) {
-    if (!workspace) return null;
+  function compactIssueExecutionWorkspace(
+    rawWorkspace: ExecutionWorkspace | null,
+    viewer: WorkspaceRuntimeViewer,
+  ) {
+    if (!rawWorkspace) return null;
+    const workspace = publicExecutionWorkspace(rawWorkspace, viewer);
     return {
       id: workspace.id,
       companyId: workspace.companyId,
@@ -8181,6 +8230,7 @@ export function issueRoutes(
       activeRecoveryAction,
     });
     const redactLowTrust = await shouldRedactLowTrustForHeartbeatContext(issue, getActorInfo(req));
+    const runtimeViewer = await resolveWorkspaceRuntimeViewer(access, req, issue.companyId);
     const safeWakeComment =
       wakeComment && wakeComment.issueId === issue.id
         ? redactLowTrust
@@ -8280,7 +8330,7 @@ export function issueRoutes(
           }
         : null,
       planReviewContext,
-      currentExecutionWorkspace: compactIssueExecutionWorkspace(currentExecutionWorkspace),
+      currentExecutionWorkspace: compactIssueExecutionWorkspace(currentExecutionWorkspace, runtimeViewer),
     });
   });
 
@@ -8474,13 +8524,19 @@ export function issueRoutes(
     // clear. The primary project on this very response is already stripped (`compactIssueProject`
     // sets `env: null`) — the class was closed in one direction only, and the mentioned projects
     // handed the same material out one key over.
+    //
+    // The `env` mask is applied by `publicProjects` at the response boundary below, NOT here: it
+    // runs inside `publicProject` ahead of the `revealRuntimeConfig` early return, so it covers the
+    // entitled viewer too. A second `.map(maskProjectEnv)` at construction was idempotent but left
+    // two masks where one is load-bearing, which invites a later reader to delete the wrong one.
     const mentionedProjects = mentionedProjectIds.length > 0
-      ? (await projectsSvc.listByIds(issue.companyId, mentionedProjectIds)).map(maskProjectEnv)
+      ? await projectsSvc.listByIds(issue.companyId, mentionedProjectIds)
       : [];
     const currentExecutionWorkspace = issue.executionWorkspaceId
       ? await executionWorkspacesSvc.getById(issue.executionWorkspaceId)
       : null;
     const workProducts = await workProductsSvc.listForIssue(issue.id);
+    const runtimeViewer = await resolveWorkspaceRuntimeViewer(access, req, issue.companyId);
     res.json({
       ...issue,
       ...inboxArchiveFields,
@@ -8497,10 +8553,14 @@ export function issueRoutes(
       relatedWork: referenceSummary,
       referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
       ...documentPayload,
-      project: compactIssueProject(project),
+      project: compactIssueProject(project, runtimeViewer),
       goal: goal ?? null,
-      mentionedProjects,
-      currentExecutionWorkspace: compactIssueExecutionWorkspace(currentExecutionWorkspace),
+      // `listByIds` runs `attachWorkspaces`, so these rows are FULL project workspaces —
+      // uncompacted, carrying `metadata` as well as the derived `runtimeConfig`. The widest of the
+      // four exits in this response, and the only one where withholding the derived view alone
+      // would leave the same bytes one key over.
+      mentionedProjects: publicProjects(mentionedProjects, runtimeViewer),
+      currentExecutionWorkspace: compactIssueExecutionWorkspace(currentExecutionWorkspace, runtimeViewer),
       workProducts,
       linkedCases,
     });

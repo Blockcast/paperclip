@@ -84,6 +84,36 @@ export function publicExecutionWorkspace(
   };
 }
 
+/** The identity fields of an execution workspace — which workspace, and nothing about its runtime. */
+export type ExecutionWorkspaceIdentity = Pick<
+  ExecutionWorkspace,
+  "closedAt" | "id" | "mode" | "name" | "status"
+>;
+
+/**
+ * Narrows an execution-workspace row to its identity fields, for responses that must say WHICH
+ * workspace a caller hit without disclosing anything about it — error bodies, chiefly.
+ *
+ * This is a narrowing, not a mask, so unlike `publicExecutionWorkspace` it takes no viewer: none of
+ * the five fields is withheld from anyone. It exists as a function rather than a declared parameter
+ * type because a declared type does not narrow at runtime. A handler typed
+ * `Pick<ExecutionWorkspace, …>` still serializes every property of the full row it is handed —
+ * TypeScript checks excess properties at literal-assignment sites and nowhere else. That is exactly
+ * how the closed-workspace 409 in `routes/issues.ts` came to serve `workspaceRuntime`: the narrow
+ * type made it read as already-projected, so nobody looked.
+ */
+export function executionWorkspaceIdentity(
+  workspace: ExecutionWorkspaceIdentity,
+): ExecutionWorkspaceIdentity {
+  return {
+    closedAt: workspace.closedAt,
+    id: workspace.id,
+    mode: workspace.mode,
+    name: workspace.name,
+    status: workspace.status,
+  };
+}
+
 export function publicExecutionWorkspaces(
   workspaces: ExecutionWorkspace[],
   viewer: WorkspaceRuntimeViewer,
