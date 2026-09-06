@@ -187,7 +187,7 @@ import {
 import { findWakeIdempotencyReceipt } from "../services/wake-idempotency.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
-import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import { maskWorkspaceRuntimeForRead, redactEventPayload, redactSensitiveText } from "../redaction.js";
 import {
   createCompanySearchRateLimiter,
   type CompanySearchRateLimiter,
@@ -7539,7 +7539,14 @@ export function issueRoutes(
             provisionCommand: workspace.config.provisionCommand,
             teardownCommand: workspace.config.teardownCommand,
             cleanupCommand: workspace.config.cleanupCommand,
-            workspaceRuntime: workspace.config.workspaceRuntime,
+            // PEN-2846 (door #12): `workspaceRuntime` is an open
+            // `Record<string, unknown>` an operator authors by hand, and this
+            // function is a withholding boundary — it enumerates its fields and
+            // sets `metadata: null` rather than spreading the row. Passing the
+            // runtime config through verbatim handed every operator-authored key
+            // in a service definition to three MCP tools any same-company agent
+            // holds. Names and structure still cross; values do not.
+            workspaceRuntime: maskWorkspaceRuntimeForRead(workspace.config.workspaceRuntime),
             desiredState: workspace.config.desiredState,
             serviceStates: workspace.config.serviceStates,
           }
