@@ -30,16 +30,23 @@ interface RunResult {
 
 interface HookState {
   lastRunStartedAt: number;
+  /** Whether the most recent completed hook run exited 0. The time-based
+   *  debounce branch below has no other way to know: it fires after
+   *  `inFlight` has already been cleared, so without this it cannot tell a
+   *  recovered account from a hook that crashed. */
+  lastResultOk: boolean;
   inFlight: Promise<RunResult> | null;
 }
 
 const state: HookState = {
   lastRunStartedAt: 0,
+  lastResultOk: false,
   inFlight: null,
 };
 
 export function __resetQuotaExhaustedHookStateForTesting() {
   state.lastRunStartedAt = 0;
+  state.lastResultOk = false;
   state.inFlight = null;
 }
 
@@ -126,6 +133,20 @@ export interface RunQuotaExhaustedHookInput {
    *  recovery action per adapter without an extra DB lookup. */
   adapterType: string;
   errorCode: string;
+  /** Invoked once recovery succeeds.
+   *
+   *  LOAD-BEARING CONTRACT (BLO-28992): this must be invoked **per caller**, on
+   *  every branch — the in-flight join, the time-debounced return, and the
+   *  branch that actually ran the recovery. Each parked run passes its own
+   *  closure carrying its own task scope, so collapsing this into a single
+   *  shared callback would silently re-deliver one run's scope to all N (or
+   *  none at all), which is exactly the fan-in that made N runs of one agent
+   *  converge on one issue and interleave writes into a shared checkout.
+   *
+   *  The degradation is silent — N scoped wakes quietly become 1 — and the test
+   *  that pins this behaviour lives on the heartbeat side
+   *  (`heartbeat-quota-recovery-wake-scope.test.ts`), so someone refactoring
+   *  this file would not see it. Keep the per-caller invocation. */
   onSuccess?: (() => void | Promise<void>) | null;
 }
 
@@ -162,10 +183,19 @@ export async function runQuotaExhaustedHook(
         companyId: input.companyId,
         msSinceLast: sinceLast,
         debounceMs: DEBOUNCE_MS,
+        lastResultOk: state.lastResultOk,
       },
       "quota-exhausted hook debounced",
     );
-    if (input.onSuccess) {
+    // Only re-wake if the recent hook actually recovered the account. Waking
+    // on a failed hook is a load multiplier, not a recovery: the agent runs
+    // again against the same exhausted credential, exhausts it, fires the
+    // hook, fails, and debounces into another wake. That loop is what a
+    // stale/broken quotaExhaustedCmd produces in production — the agent
+    // leases a k8s environment per lap while making no progress. When the
+    // hook has failed we fall through to the lease-level transient retry,
+    // which has its own backoff.
+    if (state.lastResultOk && input.onSuccess) {
       await Promise.resolve(input.onSuccess()).catch((err) => {
         logger.warn(
           { err, agentId: input.agentId },
@@ -177,6 +207,9 @@ export async function runQuotaExhaustedHook(
   }
 
   state.lastRunStartedAt = now;
+  // Fail closed: if the hook crashes outright (below), the debounce branch
+  // must not treat the previous, older success as still valid.
+  state.lastResultOk = false;
   const runPromise = runCommand(command, {
     PAPERCLIP_HOOK_KIND: "quotaExhausted",
     PAPERCLIP_AGENT_ID: input.agentId,
@@ -193,6 +226,7 @@ export async function runQuotaExhaustedHook(
   } finally {
     state.inFlight = null;
   }
+  state.lastResultOk = result.ok;
 
   logger.info(
     {

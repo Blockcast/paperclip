@@ -188,16 +188,35 @@ export const AGENT_ENV_ALLOWED_PREFIXES: readonly string[] = [
  *
  * This propagation is intentional and documented in
  * deploy/helm/paperclip/values.blockcast.yaml ("The adapter auto-propagates
- * this main-container secret volume into agent Job pods"). Agents genuinely
- * need all three — they are agent-scoped credentials, not control-plane ones.
+ * this main-container secret volume into agent Job pods"). Both entries are
+ * agent-scoped credentials, not control-plane ones.
+ *
+ * The @allyblockcast USER-seat token (`paperclip-github-merge-token`) was
+ * removed from this list (BLO-24056). It was unreachable from an agent Job by
+ * construction and therefore pure exposure:
+ *
+ *   - the `gh` wrapper resolves its credential from
+ *     PAPERCLIP_GITHUB_TOKEN_FILE, which values.blockcast.yaml pins to the App
+ *     token at /paperclip/.secrets/github-token/token — never the seat path;
+ *   - `GH_TOKEN=` / `gh auth` / `--with-token` overrides silently do nothing in
+ *     these pods, because that wrapper re-reads the token file per invocation;
+ *   - shipped skills are forbidden from naming the seat path at all — see
+ *     CREDENTIAL_SELECTOR_PATTERNS ("literal seat-token path") in
+ *     packages/skills-catalog/src/shipped-catalog.test.ts.
+ *
+ * Measured over 240 PRs across onprem-k8s, penstock-llm-proxy-core, paperclip
+ * and multicast, the seat authored 0 and pushed 0 — authorship is 100% the App.
+ * Meanwhile the mount put a review-clearing credential on 108 agent Job pods,
+ * which is what made the two-hat self-approval path a fleet-wide capability
+ * rather than one service's. The control plane keeps the mount via
+ * values.blockcast.yaml (paperclip-api + the StatefulSet), which is where the
+ * dedicated reviewer service that legitimately uses this identity runs.
  */
 export const AGENT_SECRET_VOLUME_ALLOWLIST: ReadonlySet<string> = new Set([
   // gbrain plugin's managed service key (read via PAPERCLIP_GBRAIN_*_FILE).
   "authbot-mcp-consumer-service-keys",
   // GitHub App installation token — the identity `gh` uses for PR/API work.
   "paperclip-github-mcp-token",
-  // @allyblockcast user-seat token used for PR authoring + merge (BLO-11994).
-  "paperclip-github-merge-token",
 ]);
 
 /**

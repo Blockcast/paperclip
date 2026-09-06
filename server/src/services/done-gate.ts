@@ -161,6 +161,8 @@ export interface DoneGateInput {
    * you have not looked.
    */
   hasDurableArtifactEvidence: boolean;
+  /** True only after a cited GitHub commit URL was resolved remotely. */
+  hasVerifiedCommitEvidence?: boolean;
 }
 
 function hasPrLinkEvidence(verdict: unknown): boolean {
@@ -191,6 +193,7 @@ export function shouldBlockNarratedDone(input: DoneGateInput): boolean {
   if (!input.isAgentActor) return false;
   if (input.existingCheckoutRunId != null) return false;
   if (hasPrLinkEvidence(input.lastEvidenceVerdict)) return false;
+  if (input.hasVerifiedCommitEvidence) return false;
   if (input.hasDurableArtifactEvidence) return false;
   return true;
 }

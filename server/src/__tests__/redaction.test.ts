@@ -7,6 +7,8 @@ import {
   redactEventPayload,
   redactSensitiveText,
   sanitizeRecord,
+  withholdAgentConfigFromApprovalPayload,
+  withholdAgentConfigKeys,
 } from "../redaction.js";
 
 describe("redaction", () => {
@@ -742,6 +744,134 @@ describe("redactAgentConfigPayload", () => {
       title: "Pick deployment target",
       env: { target: REDACTED_EVENT_VALUE },
       colorChoice: { type: "plain", value: REDACTED_EVENT_VALUE },
+    });
+  });
+
+  it("withholds every agent-config subtree from a hire payload, at any depth (PEN-2777)", () => {
+    // The redactors above decide what is secret; this decides what an
+    // ungranted caller is entitled to. The masked-but-diagnosable upstream is
+    // exactly what survives them, so it is what has to be withheld here.
+    const upstream = "https://svc-account@k8s-mcp-admin.internal:8443/mcp";
+    const payload = {
+      name: "Worker",
+      adapterType: "claude_k8s",
+      adapterConfig: { mcpServers: { k8s: { url: upstream } } },
+      runtimeConfig: { modelProfiles: { cheap: { adapterConfig: { mcpServers: {} } } } },
+      requestedConfigurationSnapshot: {
+        adapterType: "claude_k8s",
+        adapterConfig: { mcpServers: { k8s: { url: upstream } } },
+      },
+    };
+
+    const { payload: withheld, withheldFields } = withholdAgentConfigFromApprovalPayload(
+      "hire_agent",
+      structuredClone(payload),
+    );
+
+    expect(JSON.stringify(withheld)).not.toContain("k8s-mcp-admin.internal");
+    expect(withheld).toEqual({
+      name: "Worker",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      requestedConfigurationSnapshot: { adapterType: "claude_k8s", adapterConfig: {} },
+    });
+    expect(withheldFields).toEqual([
+      "adapterConfig",
+      "runtimeConfig",
+      "requestedConfigurationSnapshot.adapterConfig",
+    ]);
+  });
+
+  it("withholds non-object agent-config values, which the payload schema permits (PEN-2777)", () => {
+    // `approvalPayloadSchema` is a `.catchall(z.unknown())` and
+    // `normalizeHireApprovalPayloadForPersistence` only normalizes a record, so
+    // `POST /companies/:companyId/approvals` can persist any shape under these
+    // keys. An array of configs and a JSON-encoded string both carry the
+    // upstream topology, so letting the shape decide entitlement would reopen
+    // the hole through the generic create route.
+    const upstream = "https://svc-account@k8s-mcp-admin.internal:8443/mcp";
+    const { payload: withheld, withheldFields } = withholdAgentConfigFromApprovalPayload("hire_agent", {
+      name: "Worker",
+      adapterConfig: [{ mcpServers: { k8s: { url: upstream } } }],
+      runtimeConfig: JSON.stringify({ mcpServers: { k8s: { url: upstream } } }),
+      requestedConfigurationSnapshot: { adapterConfig: [{ mcpServers: { k8s: { url: upstream } } }] },
+    });
+
+    expect(JSON.stringify(withheld)).not.toContain("k8s-mcp-admin.internal");
+    expect(withheld).toEqual({
+      name: "Worker",
+      adapterConfig: {},
+      runtimeConfig: {},
+      requestedConfigurationSnapshot: { adapterConfig: {} },
+    });
+    expect(withheldFields).toEqual([
+      "adapterConfig",
+      "runtimeConfig",
+      "requestedConfigurationSnapshot.adapterConfig",
+    ]);
+  });
+
+  it("keeps an absent agent config readable rather than reporting it withheld (PEN-2777)", () => {
+    // `null` carries no topology, and blanking it would make the board queue
+    // unable to tell "you may not see this" from "no config was requested".
+    const { payload: withheld, withheldFields } = withholdAgentConfigFromApprovalPayload("hire_agent", {
+      name: "Worker",
+      adapterConfig: null,
+      runtimeConfig: undefined,
+    });
+
+    expect(withheld).toEqual({ name: "Worker", adapterConfig: null, runtimeConfig: undefined });
+    expect(withheldFields).toEqual([]);
+  });
+
+  it("leaves non-hire approval payloads untouched when withholding agent config", () => {
+    const payload = { title: "Ship it", adapterConfig: { note: "not a hire card" } };
+    const { payload: untouched, withheldFields } = withholdAgentConfigFromApprovalPayload(
+      "request_board_approval",
+      structuredClone(payload),
+    );
+
+    expect(untouched).toEqual(payload);
+    expect(withheldFields).toEqual([]);
+  });
+
+  it("withholds the agent config pair from any read projection, not only hire cards (PEN-2839)", () => {
+    // Door #10: the skill test-run `agentConfigSnapshot` reaches the same pair
+    // under `company_scope:read`, the same weaker entitlement PEN-2777 closed
+    // on the approval card. It shares this walk rather than copying it, so the
+    // array/JSON-string bypass Ally caught in #1574 cannot be re-derived and
+    // re-missed on the second path.
+    const upstream = "https://svc-account@k8s-mcp-admin.internal:8443/mcp";
+    const { payload: withheld, withheldFields } = withholdAgentConfigKeys({
+      agentId: "agent-1",
+      name: "Worker",
+      adapterConfig: { env: { OPENAI_API_KEY: SECRET }, mcpServers: { k8s: { url: upstream } } },
+      runtimeConfig: [{ mcpServers: { k8s: { url: upstream } } }],
+    });
+
+    expect(JSON.stringify(withheld)).not.toContain(SECRET);
+    expect(JSON.stringify(withheld)).not.toContain("k8s-mcp-admin.internal");
+    expect(withheld).toEqual({
+      agentId: "agent-1",
+      name: "Worker",
+      adapterConfig: {},
+      runtimeConfig: {},
+    });
+    expect(withheldFields).toEqual(["adapterConfig", "runtimeConfig"]);
+  });
+
+  it("keeps withholdAgentConfigFromApprovalPayload's hire-only precondition after the extraction (PEN-2839)", () => {
+    // The extraction must not widen the approval filter. `withholdAgentConfigKeys`
+    // has no type precondition by design; the approval wrapper must still refuse
+    // to touch a non-hire card, or PEN-2777's scoping silently becomes global.
+    const payload = { title: "Ship it", adapterConfig: { note: "not a hire card" } };
+
+    expect(withholdAgentConfigFromApprovalPayload("request_board_approval", structuredClone(payload)))
+      .toEqual({ payload, withheldFields: [] });
+    expect(withholdAgentConfigKeys(structuredClone(payload))).toEqual({
+      payload: { title: "Ship it", adapterConfig: {} },
+      withheldFields: ["adapterConfig"],
     });
   });
 

@@ -4,6 +4,7 @@ import { agents, approvalComments, approvals, issueApprovals } from "@paperclipa
 import { APPROVAL_UNDECIDED_STATUSES } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
+import { logger } from "../middleware/logger.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { REDACTED_EVENT_VALUE, redactApprovalPayloadByType } from "../redaction.js";
 import { agentService } from "./agents.js";
@@ -32,6 +33,17 @@ export function approvalService(db: Db) {
   type ResolutionResult = { approval: ApprovalRecord; applied: boolean };
   type CreateWithIdempotencyOptions = {
     afterCreate?: (txDb: Db, approval: ApprovalRecord) => Promise<void>;
+    /**
+     * Who the key collides against. Default `"requester"` — two agents filing similar asks never
+     * collide, one agent retrying always does.
+     *
+     * `"company"` is for SERVER-DERIVED keys only (BLO-24744). A liveness incident can hand the
+     * same root-cause key to escalation runs owned by different agents, and the question on the
+     * card is the incident's, not the filer's — so requester scoping would mint one card per owner
+     * for one human decision. Never widen a caller-supplied key this way: the requester scoping is
+     * what stops one agent's key from swallowing another's unrelated ask.
+     */
+    dedupeScope?: "requester" | "company";
   };
 
   function redactApprovalComment<T extends { body: string }>(comment: T, censorUsernameInLogs: boolean): T {
@@ -61,6 +73,14 @@ export function approvalService(db: Db) {
       );
     }
     return conditions;
+  }
+
+  // A board note worth protecting from a requester-initiated transition. Blank or
+  // absent is treated as "the board wrote nothing", so an ordinary withdrawal of a
+  // never-decided card keeps recording its reason in the note field as before.
+  function readBoardDecisionNote(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    return value.trim() === "" ? null : value;
   }
 
   function readSafeLabel(value: unknown) {
@@ -349,8 +369,15 @@ export function approvalService(db: Db) {
         throw unprocessable("Approval idempotency key requires an authenticated requester");
       }
 
+      // A company-scoped key is one incident's, not one filer's, so both the read and the advisory
+      // lock must drop the requester — leaving it in the lock would let two owners of the same
+      // incident run the read concurrently and both insert.
+      const companyScoped = options.dedupeScope === "company";
+
       return db.transaction(async (tx) => {
-        const guardKey = `approval-create:idempotency:${companyId}:${requesterValue ?? "anonymous"}:${idempotencyKey}`;
+        const guardKey = companyScoped
+          ? `approval-create:idempotency:${companyId}:${idempotencyKey}`
+          : `approval-create:idempotency:${companyId}:${requesterValue ?? "anonymous"}:${idempotencyKey}`;
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${guardKey}, 0))`);
 
         const existing = await tx
@@ -360,7 +387,7 @@ export function approvalService(db: Db) {
             and(
               eq(approvals.companyId, companyId),
               eq(approvals.idempotencyKey, idempotencyKey),
-              eq(requesterColumn, requesterValue),
+              ...(companyScoped ? [] : [eq(requesterColumn, requesterValue)]),
               inArray(approvals.status, resolvableStatuses),
             ),
           )
@@ -546,25 +573,69 @@ export function approvalService(db: Db) {
     },
 
     resubmit: async (id: string, payload?: Record<string, unknown>) => {
-      const existing = await getExistingApproval(id);
-      if (existing.status !== "revision_requested") {
-        throw unprocessable("Only revision requested approvals can be resubmitted");
-      }
+      return db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const existing = await getExistingApproval(id, txDb);
+        if (existing.status !== "revision_requested") {
+          throw unprocessable("Only revision requested approvals can be resubmitted");
+        }
 
-      const now = new Date();
-      return db
-        .update(approvals)
-        .set({
-          status: "pending",
-          payload: payload ?? existing.payload,
-          decisionNote: null,
-          decidedByUserId: null,
-          decidedAt: null,
-          updatedAt: now,
-        })
-        .where(eq(approvals.id, id))
-        .returning()
-        .then((rows) => rows[0]);
+        // Clearing the decision fields is right for a card going back to `pending`
+        // -- it is genuinely undecided again, and leaving `decidedAt` populated
+        // would make it read as decided. But the note itself is the board's only
+        // record of *why* revision was asked for, and there is no history on the
+        // column, so archive it as a comment first. Without this the single
+        // operation the workflow tells agents to use is silent, permanent data
+        // loss (BLO-27036, reproduced on approval f946c9b3).
+        const boardDecisionNote = readBoardDecisionNote(existing.decisionNote);
+        if (boardDecisionNote !== null) {
+          await txDb.insert(approvalComments).values({
+            companyId: existing.companyId,
+            approvalId: existing.id,
+            authorAgentId: null,
+            authorUserId: existing.decidedByUserId,
+            body: `Board decision note archived on resubmit (was \`revision_requested\`${
+              existing.decidedAt ? ` at ${existing.decidedAt.toISOString()}` : ""
+            }):\n\n${boardDecisionNote}`,
+          });
+        }
+
+        const now = new Date();
+        // Status-guarded for the same reason `requestRevision` and `withdraw` are,
+        // and this one closes the loss class above rather than merely avoiding a
+        // resurrection. The status check is a separate statement over an unlocked
+        // read, and `resolveApproval` accepts `revision_requested`, so a board
+        // approve/reject committing in between would otherwise be reverted to
+        // `pending` with its *fresh* decision note nulled -- while the comment
+        // archived just above records the older revision note, leaving the card
+        // reading as though its reasoning had been preserved. Losing the race must
+        // be a no-op, not a silent overwrite of the newer decision (BLO-27036).
+        const updated = await txDb
+          .update(approvals)
+          .set({
+            status: "pending",
+            payload: payload ?? existing.payload,
+            decisionNote: null,
+            decidedByUserId: null,
+            decidedAt: null,
+            updatedAt: now,
+          })
+          .where(and(eq(approvals.id, id), eq(approvals.status, "revision_requested")))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+
+        // Throwing rolls the transaction back, so the archive comment written above
+        // goes with it -- a lost race leaves no trace of a resubmit that never was.
+        if (!updated) {
+          const latest = await getExistingApproval(id, txDb);
+          throw unprocessable("Only revision requested approvals can be resubmitted", {
+            approvalId: id,
+            status: latest.status,
+          });
+        }
+
+        return updated;
+      });
     },
 
     withdraw: async (
@@ -575,16 +646,30 @@ export function approvalService(db: Db) {
         activity: Pick<LogActivityInput, "actorType" | "actorId" | "agentId">;
       },
     ) => {
-      return db.transaction(async (tx) => {
+      const { updated, publishWithdrawn } = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         const existing = await getExistingApproval(id, txDb);
-        if (existing.status !== "pending") {
-          throw conflict("Only pending approvals can be withdrawn", {
+        // Undecided, not merely `pending`. A `revision_requested` card used to have
+        // exactly one agent-reachable exit -- `resubmit` then `withdraw` -- and
+        // `resubmit` nulls `decisionNote`, so retiring a moot card destroyed the
+        // board's reasoning. Accepting the whole undecided set gives that card a
+        // one-hop terminal exit that touches no decision field (BLO-27036).
+        if (!canResolveStatuses.has(existing.status)) {
+          throw conflict("Only undecided approvals can be withdrawn", {
             approvalId: id,
             status: existing.status,
+            allowedStatuses: resolvableStatuses,
           });
         }
 
+        // The note is the board's, not the withdrawer's. Overwriting it with the
+        // withdrawal reason is unrecoverable -- there is no revision history on
+        // this column -- so a note that already exists is preserved byte-identical,
+        // along with the attribution that makes it readable. The reason is recorded
+        // separately, in the activity log and as an approval comment. Only a card
+        // the board never wrote on takes the reason into the note field, which is
+        // the pre-existing behaviour for an ordinary `pending` withdrawal.
+        const preservesDecision = readBoardDecisionNote(existing.decisionNote) !== null;
         const now = new Date();
         // Status-guarded so a concurrent board decision wins rather than being
         // silently overwritten by a withdrawal racing it.
@@ -592,20 +677,25 @@ export function approvalService(db: Db) {
           .update(approvals)
           .set({
             status: "withdrawn",
-            decisionNote: reason,
-            decidedByUserId: actor.userId ?? null,
-            decidedAt: now,
+            ...(preservesDecision
+              ? {}
+              : {
+                  decisionNote: reason,
+                  decidedByUserId: actor.userId ?? null,
+                  decidedAt: now,
+                }),
             updatedAt: now,
           })
-          .where(and(eq(approvals.id, id), eq(approvals.status, "pending")))
+          .where(and(eq(approvals.id, id), inArray(approvals.status, resolvableStatuses)))
           .returning()
           .then((rows) => rows[0] ?? null);
 
         if (!updated) {
           const latest = await getExistingApproval(id, txDb);
-          throw conflict("Only pending approvals can be withdrawn", {
+          throw conflict("Only undecided approvals can be withdrawn", {
             approvalId: id,
             status: latest.status,
+            allowedStatuses: resolvableStatuses,
           });
         }
 
@@ -617,23 +707,62 @@ export function approvalService(db: Db) {
           if (boundPendingAgent) await agentService(txDb).terminate(boundPendingAgent.id);
         }
 
-        await logActivity(txDb, {
+        // Where the note was preserved, this comment is the only place the reason
+        // is legible on the card itself. Written inside the transaction so a card
+        // can never end up `withdrawn` with no recorded reason.
+        if (preservesDecision) {
+          await txDb.insert(approvalComments).values({
+            companyId: updated.companyId,
+            approvalId: updated.id,
+            authorAgentId: actor.activity.agentId ?? null,
+            authorUserId: actor.userId ?? null,
+            body: `Withdrawn from \`${existing.status}\`: ${reason}\n\nThe board's decision note above is preserved unchanged.`,
+          });
+        }
+
+        const publishWithdrawn = await logActivity(txDb, {
           companyId: updated.companyId,
           ...actor.activity,
           action: "approval.withdrawn",
           entityType: "approval",
           entityId: updated.id,
-          details: { type: updated.type, reason },
+          details: {
+            type: updated.type,
+            reason,
+            withdrawnFromStatus: existing.status,
+            decisionNotePreserved: preservesDecision,
+          },
           // This transaction has already terminated the linked agent by the time
           // we get here. If the commit then fails, the default fire-and-forget
           // outbox write would still have told every plugin the approval was
           // decided -- a durable phantom for an approval that is in fact still
           // pending. Bind the event to this transaction so it retracts too.
           atomicPluginEvent: true,
+        }, {
+          // ...and defer the in-memory live event past commit, which
+          // `atomicPluginEvent` alone does not cover: it binds the outbox row,
+          // but `publishLiveEvent` is not transactional and would announce a
+          // withdrawal that a failed commit then un-did.
+          deferPublish: true,
         });
 
-        return updated;
+        return { updated, publishWithdrawn };
       });
+
+      // Reached only on commit; a rollback throws straight past this.
+      try {
+        await publishWithdrawn();
+      } catch (err) {
+        // The withdrawal itself is committed and durable -- only its live
+        // refresh hint failed. The outbox row committed with the transaction,
+        // so plugins are still told.
+        logger.warn(
+          { err, approvalId: updated.id },
+          "withdrew approval but failed to publish its live activity event",
+        );
+      }
+
+      return updated;
     },
 
     listComments: async (approvalId: string) => {

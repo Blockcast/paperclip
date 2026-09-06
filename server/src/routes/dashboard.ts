@@ -7,6 +7,9 @@ import {
   recoveryObservabilityService,
 } from "../services/recovery-observability.js";
 import { assertCompanyAccess } from "./authz.js";
+import { badRequest } from "../errors.js";
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function parsePositiveNumber(
   value: unknown,
@@ -57,6 +60,25 @@ export function dashboardRoutes(db: Db) {
       thresholdPercent,
     });
     res.json(report);
+  });
+
+  router.get("/companies/:companyId/recovery-actions", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const ownerAgentId = typeof req.query.ownerAgentId === "string" ? req.query.ownerAgentId : undefined;
+    if (ownerAgentId !== undefined && !UUID_REGEX.test(ownerAgentId)) {
+      throw badRequest("Query parameter ownerAgentId must be a valid UUID");
+    }
+    const kind = typeof req.query.kind === "string" ? req.query.kind : undefined;
+    const status = typeof req.query.status === "string" ? req.query.status : undefined;
+    const limit = parsePositiveNumber(req.query.limit, 100, 500);
+    const actions = await recoveryObservability.listActions(companyId, {
+      ownerAgentId,
+      kind,
+      status,
+      limit,
+    });
+    res.json({ companyId, ownerAgentId: ownerAgentId ?? null, kind: kind ?? null, status: status ?? null, actions });
   });
 
   return router;

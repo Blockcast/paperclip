@@ -29,11 +29,14 @@ import {
   bindExternalRuntimeReservationIsolation,
   claimRunWithExternalRuntimeSlot,
   ExternalRuntimeIsolationConflictError,
+  ExternalRuntimeJobNameMismatchError,
   markExternalRuntimeReservationLaunching,
   recordExpectedExternalRuntimeJobName,
   recordExternalRuntimeJobIdentity,
   releaseExternalRuntimeReservation,
 } from "../services/external-runtime-reservations.js";
+import { refreshExternalRuntimeReservationStrandMetrics } from "../services/external-runtime-reservation-strand-metrics.js";
+import { renderMetrics } from "../services/metrics.js";
 
 const mockAdapterExecute = vi.hoisted(() => vi.fn());
 const mockListAgentJobRunStatuses = vi.hoisted(() => vi.fn(async () => null));
@@ -156,6 +159,36 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
   afterAll(async () => {
     await tempDb?.cleanup();
   });
+
+  /**
+   * Read a single sample out of the rendered exposition rather than reaching
+   * into prom-client internals. This is deliberately the same surface
+   * Prometheus scrapes, so a gauge that is registered but never exported --
+   * the failure mode that would make the alert permanently silent -- fails
+   * these tests instead of passing them.
+   */
+  async function readStrandedGaugeForAgent(agentId: string): Promise<number | null> {
+    const { body } = await renderMetrics();
+    const line = body
+      .split("\n")
+      .find((row) =>
+        row.startsWith("paperclip_external_runtime_reservation_stranded_oldest_age_seconds{")
+        && row.includes(`agent_id="${agentId}"`));
+    if (!line) return null;
+    const value = Number(line.trim().split(/\s+/).at(-1));
+    return Number.isFinite(value) ? value : null;
+  }
+
+  async function readStrandRefreshSuccess(): Promise<number | null> {
+    const { body } = await renderMetrics();
+    const line = body
+      .split("\n")
+      .find((row) =>
+        row.startsWith("paperclip_external_runtime_reservation_strand_metrics_refresh_success "));
+    if (!line) return null;
+    const value = Number(line.trim().split(/\s+/).at(-1));
+    return Number.isFinite(value) ? value : null;
+  }
 
   it("re-arms ownership and persists metadata for a replacement Job after ccrotate throttle", async () => {
     const companyId = randomUUID();
@@ -1496,5 +1529,419 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(refusals[0][0]).toMatchObject({ runId, reservationId });
 
     expect(mockDeleteAgentJobExact).not.toHaveBeenCalled();
+  }, 120_000);
+
+  /**
+   * BLO-28865 (parent BLO-27700). An agent whose adapterType changes while it
+   * holds an in-flight external-lifecycle run used to strand its reservation
+   * forever: `recordExpectedExternalRuntimeJobName` matches a `launched` row by
+   * exact `expectedJobName` equality, the new adapter presents a
+   * differently-prefixed Job name (`agent-opencode-*` -> `ac-*`), zero rows
+   * match, and the throw repeats on EVERY launch. The unreleased row keeps
+   * holding the agent's slot via
+   * `external_runtime_reservations_active_slot_idx`, so all launches stall.
+   * Recovery was incidental, arriving only at the 45-minute hard-stale kill.
+   *
+   * The fix cancels the in-flight run (routes/agents.ts, on adapter-type
+   * change) instead of touching the reservation, which is what makes the
+   * old-named Job teardown possible at all -- see the AC#2 assertion below.
+   */
+  async function seedMigratingAgentWithLaunchedReservation() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const reservationId = randomUUID();
+    // Deliberately the PRE-migration prefix: this is the identity the
+    // reservation holds and the only handle anything has on the live Job.
+    const oldJobName = `agent-opencode-${runId.slice(0, 8)}`;
+    const oldJobUid = `uid-opencode-${runId.slice(0, 8)}`;
+    const issuePrefix = `M${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "AdapterMigrationCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "AdapterMigrationAgent",
+      role: "engineer",
+      status: "running",
+      adapterType: "opencode_k8s",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 5, concurrencyEnabled: true } },
+      permissions: {},
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      // In flight, and in CANCELLABLE_HEARTBEAT_RUN_STATUSES.
+      status: "running",
+      startedAt: new Date(Date.now() - 5 * 60 * 1000),
+      contextSnapshot: {},
+    });
+
+    await db.insert(externalRuntimeReservations).values({
+      id: reservationId,
+      companyId,
+      agentId,
+      runId,
+      slotId: 0,
+      state: "launched",
+      expectedJobName: oldJobName,
+      jobName: oldJobName,
+      jobUid: oldJobUid,
+      reservedAt: new Date(Date.now() - 5 * 60 * 1000),
+      launchedAt: new Date(Date.now() - 5 * 60 * 1000),
+      releasedAt: null,
+      isolationMode: "run",
+      isolationKey: `run:${runId}`,
+      isolationBoundAt: new Date(Date.now() - 5 * 60 * 1000),
+    });
+
+    return { companyId, agentId, runId, reservationId, oldJobName, oldJobUid };
+  }
+
+  it("tears down the old-named Job and frees the slot when an agent's adapter type changes mid-run (BLO-28865)", async () => {
+    const { agentId, runId, oldJobName, oldJobUid } =
+      await seedMigratingAgentWithLaunchedReservation();
+
+    // The committed half of the PATCH: the agent is now codex_local while its
+    // reservation still describes the opencode_k8s Job. This is exactly the
+    // divergence that wedged production.
+    await db
+      .update(agents)
+      .set({ adapterType: "codex_local", updatedAt: new Date() })
+      .where(eq(agents.id, agentId));
+
+    // What routes/agents.ts now invokes from its adapter-type-change block.
+    const cancelled = await heartbeat.cancelExternalRuntimeReservationHoldersForAgent(
+      agentId,
+      "Cancelled because the agent's adapter type changed from opencode_k8s to codex_local",
+    );
+    expect(cancelled).toBe(1);
+
+    // AC#2 -- the load-bearing one. The orphaned pre-change Job must be torn
+    // down, and it can only be targeted by the OLD name/UID. A fix that
+    // re-armed the reservation (nulling jobName/jobUid) would have nothing to
+    // pass here, which is precisely why re-arming leaks a live pod that can
+    // still burn node CPU and make model calls.
+    expect(mockDeleteAgentJobExact).toHaveBeenCalledWith(
+      expect.objectContaining({ runId, agentId, name: oldJobName, uid: oldJobUid }),
+    );
+    // Pinned as a negative too: deleting under the post-migration prefix would
+    // silently miss the real Job while looking like a successful teardown.
+    expect(mockDeleteAgentJobExact).not.toHaveBeenCalledWith(
+      expect.objectContaining({ name: expect.stringMatching(/^ac-/) }),
+    );
+
+    const runAfter = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(runAfter?.status).toBe("cancelled");
+
+    // AC#1 -- one reaper cycle, not the 45-minute hard-stale boundary. The Job
+    // is gone because the cascade above deleted it.
+    mockReadAgentJobRunStatusByName.mockImplementation(async (name: string) => ({
+      phase: "missing" as const,
+      reason: "NotFound",
+      message: `Kubernetes Job ${name} was not found`,
+      name,
+    }));
+    await heartbeat.reapOrphanedRuns();
+
+    const reservationAfter = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, runId))
+      .then((rows) => rows[0]);
+    expect(reservationAfter.releasedAt).not.toBeNull();
+    expect(reservationAfter.state).toBe("released");
+
+    // AC#3 -- the agent can launch again. This is the assertion that actually
+    // proves the wedge is gone: slot 0 is the one the stranded row held via
+    // external_runtime_reservations_active_slot_idx, so a successful claim on
+    // that exact slot is only possible once the strand is released.
+    const nextRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: nextRunId,
+      companyId: reservationAfter.companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: {},
+    });
+    const nextClaim = await claimRunWithExternalRuntimeSlot(db, nextRunId, new Date(), 0);
+    expect(nextClaim).not.toBeNull();
+    expect(nextClaim!.reservation.agentId).toBe(agentId);
+  }, 120_000);
+
+  it("leaves a queued run alone -- only reservation holders are cancelled (BLO-28865)", async () => {
+    const { companyId, agentId, runId } = await seedMigratingAgentWithLaunchedReservation();
+
+    // A second run that was never dispatched: no reservation, no Job. It would
+    // launch perfectly well under the new adapter, so the migration must not
+    // kill it. This is the difference between this narrow helper and the
+    // pause path's cancelActiveForAgent, which cancels every queued/running/
+    // scheduled_retry run for the agent.
+    const queuedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: {},
+    });
+
+    await db
+      .update(agents)
+      .set({ adapterType: "claude_k8s", updatedAt: new Date() })
+      .where(eq(agents.id, agentId));
+
+    const cancelled = await heartbeat.cancelExternalRuntimeReservationHoldersForAgent(
+      agentId,
+      "Cancelled because the agent's adapter type changed from opencode_k8s to claude_k8s",
+    );
+
+    // Exactly one: the reservation holder. Not the queued run.
+    expect(cancelled).toBe(1);
+
+    const statuses = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const byId = new Map(statuses.map((row) => [row.id, row.status]));
+    expect(byId.get(runId)).toBe("cancelled");
+    expect(byId.get(queuedRunId)).not.toBe("cancelled");
+  }, 120_000);
+
+  it("names a Job-name mismatch distinctly instead of folding it into the generic non-launchable error (BLO-28865)", async () => {
+    const { runId, reservationId, oldJobName } =
+      await seedMigratingAgentWithLaunchedReservation();
+
+    // Exactly what the post-migration adapter presents on its next launch.
+    const newJobName = `ac-${runId.slice(0, 8)}`;
+
+    let caught: unknown;
+    try {
+      await recordExpectedExternalRuntimeJobName(db, { runId, jobName: newJobName });
+    } catch (error) {
+      caught = error;
+    }
+
+    // AC#4: the mismatch is *named*, not swallowed into one error string. The
+    // distinction matters operationally -- a generic non-launchable
+    // reservation means the run lost a race and retrying is the answer, while
+    // this means the caller's identity changed underneath an intact
+    // reservation and retrying can never clear it.
+    expect(caught).toBeInstanceOf(ExternalRuntimeJobNameMismatchError);
+    const mismatch = caught as ExternalRuntimeJobNameMismatchError;
+    expect(mismatch.code).toBe("external_runtime_job_name_mismatch");
+    // Structured fields, not just interpolation: this is what lets the
+    // condition be counted and correlated rather than grepped out of prose.
+    expect(mismatch.runId).toBe(runId);
+    expect(mismatch.reservationId).toBe(reservationId);
+    expect(mismatch.expectedJobName).toBe(oldJobName);
+    expect(mismatch.receivedJobName).toBe(newJobName);
+
+    // The reservation is untouched by the failed launch -- still holding the
+    // old identity, so the teardown path above remains available.
+    const reservationAfter = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, runId))
+      .then((rows) => rows[0]);
+    expect(reservationAfter.jobName).toBe(oldJobName);
+    expect(reservationAfter.releasedAt).toBeNull();
+  }, 120_000);
+
+  it("leaves an unchanged-adapter launch path alone (BLO-28865 AC#6)", async () => {
+    const { runId, oldJobName } = await seedMigratingAgentWithLaunchedReservation();
+
+    // No adapter-type change: the same Job name arrives that the reservation
+    // was launched with. The normal reserved -> launching -> launched ->
+    // released lifecycle must be completely unaffected by the mismatch branch
+    // added above.
+    const reservation = await recordExpectedExternalRuntimeJobName(db, {
+      runId,
+      jobName: oldJobName,
+    });
+    expect(reservation).not.toBeNull();
+    expect(reservation!.state).toBe("launched");
+    expect(reservation!.expectedJobName).toBe(oldJobName);
+
+    const released = await releaseExternalRuntimeReservation(db, {
+      runId,
+      reason: "test_normal_lifecycle",
+    });
+    expect(released).not.toBeNull();
+    expect(released!.releasedAt).not.toBeNull();
+  }, 120_000);
+  /**
+   * BLO-28865 Defect 2. The alert rule is only as good as this predicate: the
+   * whole reason the rule is not a threshold over
+   * `paperclip_external_runtime_reservation_oldest_age_seconds` is that the
+   * strand-versus-long-run distinction is made HERE, in SQL. Both directions
+   * are pinned, because a predicate that only ever counts is exactly as
+   * useless as one that never does.
+   */
+  async function seedReservationForStrandMetrics(input: {
+    runStatus: string;
+    lastUsefulActionAt: Date | null;
+    reservedAt: Date;
+  }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const jobName = `agent-claude-strand-${runId.slice(0, 8)}`;
+    const issuePrefix = `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "StrandMetricsCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "StrandMetricsAgent",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 5, concurrencyEnabled: true } },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: input.runStatus,
+      startedAt: input.reservedAt,
+      lastUsefulActionAt: input.lastUsefulActionAt,
+      contextSnapshot: {},
+      createdAt: input.reservedAt,
+    });
+    await db.insert(externalRuntimeReservations).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      runId,
+      slotId: 0,
+      state: "launched",
+      expectedJobName: jobName,
+      jobName,
+      jobUid: `uid-${runId.slice(0, 8)}`,
+      reservedAt: input.reservedAt,
+      launchedAt: input.reservedAt,
+      releasedAt: null,
+      isolationMode: "run",
+      isolationKey: `run:${runId}`,
+      isolationBoundAt: input.reservedAt,
+    });
+    return { agentId, runId };
+  }
+
+  it("counts a terminal run's unreleased reservation as stranded (BLO-28865 AC#5)", async () => {
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    const { agentId } = await seedReservationForStrandMetrics({
+      runStatus: "cancelled",
+      lastUsefulActionAt: threeHoursAgo,
+      reservedAt: threeHoursAgo,
+    });
+
+    await refreshExternalRuntimeReservationStrandMetrics(db);
+
+    const value = await readStrandedGaugeForAgent(agentId);
+    // The run is over; the reservation outliving it is the definition of a
+    // strand, regardless of how recently the run was noisy.
+    expect(value).toBeGreaterThan(0);
+    expect(await readStrandRefreshSuccess()).toBe(1);
+  }, 120_000);
+
+  it("counts a silent non-terminal run's reservation as stranded (BLO-28865 AC#5)", async () => {
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    const { agentId } = await seedReservationForStrandMetrics({
+      runStatus: "running",
+      // Silent well past EXTERNAL_LIFECYCLE_HARD_STALE_MS -- the pre-fix wedge
+      // shape: the run still looks alive, but nothing is coming out of it and
+      // the row is holding the agent's only slot.
+      lastUsefulActionAt: threeHoursAgo,
+      reservedAt: threeHoursAgo,
+    });
+
+    await refreshExternalRuntimeReservationStrandMetrics(db);
+
+    expect(await readStrandedGaugeForAgent(agentId)).toBeGreaterThan(0);
+  }, 120_000);
+
+  it("counts an interrupted run's recently active reservation as stranded (BLO-28865 AC#5)", async () => {
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    const { agentId } = await seedReservationForStrandMetrics({
+      runStatus: "interrupted",
+      // Recent liveness is intentional: the terminal-status branch must win
+      // without waiting for the silence cutoff.
+      lastUsefulActionAt: new Date(Date.now() - 30 * 1000),
+      reservedAt: threeHoursAgo,
+    });
+
+    await refreshExternalRuntimeReservationStrandMetrics(db);
+
+    expect(await readStrandedGaugeForAgent(agentId)).toBeGreaterThan(0);
+  }, 120_000);
+
+  it("does NOT count a legitimately long-running, still-active run (BLO-28865 AC#5)", async () => {
+    const { agentId } = await seedReservationForStrandMetrics({
+      runStatus: "running",
+      // Nine hours old -- longer than any threshold a naive rule over the raw
+      // age gauge could pick, and the actual measured 7d maximum on healthy
+      // replicas. But it emitted a useful action seconds ago, so it is
+      // working, not wedged.
+      reservedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+      lastUsefulActionAt: new Date(Date.now() - 30 * 1000),
+    });
+
+    await refreshExternalRuntimeReservationStrandMetrics(db);
+
+    // This is AC#5's load-bearing half. A rule over
+    // paperclip_external_runtime_reservation_oldest_age_seconds would read
+    // 9 hours here and page. This gauge reads 0 -- the agent appears because
+    // every known agent is published (an absent series and "nothing stuck"
+    // render identically), but with no age.
+    expect(await readStrandedGaugeForAgent(agentId)).toBe(0);
+  }, 120_000);
+
+  it("does NOT count a reservation that has already been released (BLO-28865 AC#5)", async () => {
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    const { agentId, runId } = await seedReservationForStrandMetrics({
+      runStatus: "cancelled",
+      lastUsefulActionAt: threeHoursAgo,
+      reservedAt: threeHoursAgo,
+    });
+    await releaseExternalRuntimeReservation(db, { runId, reason: "test_released" });
+
+    await refreshExternalRuntimeReservationStrandMetrics(db);
+
+    // The reset-then-set contract: once the slot is reclaimed the agent must
+    // read an explicit 0, or the alert would stay open forever after a
+    // successful recovery.
+    expect(await readStrandedGaugeForAgent(agentId)).toBe(0);
   }, 120_000);
 });

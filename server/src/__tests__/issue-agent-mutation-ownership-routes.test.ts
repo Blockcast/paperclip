@@ -2,6 +2,7 @@ import { Readable } from "node:stream";
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { extractAgentMentionIds } from "@paperclipai/shared";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
@@ -445,10 +446,27 @@ function createRunContextDb(
     select,
     insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
   };
+  // BLO-23197: the status-only guard stamps
+  // `heartbeat_runs.status_only_document_write_refused_at` before returning its
+  // 403, so the successful-run-handoff detector can escalate the corrective wake
+  // off a lane that provably cannot land the refused write. Every `.set()`
+  // payload is captured so a test can assert the stamp was written — and, just
+  // as importantly, that repeated refusals keep re-stamping, since the whole
+  // point of using a run column over the denied-write activity log is that a run
+  // column has no aggregate cap to silently drop the signal under burst.
+  const runUpdates: Array<Record<string, unknown>> = [];
+  const update = vi.fn(() => ({
+    set: vi.fn((values: Record<string, unknown>) => {
+      runUpdates.push(values);
+      return { where: vi.fn(async () => undefined) };
+    }),
+  }));
   return {
     transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(tx),
     execute: tx.execute,
     select,
+    update,
+    runUpdates,
   };
 }
 
@@ -1591,10 +1609,182 @@ describe("agent issue mutation checkout ownership", () => {
       issueId,
       expect.objectContaining({
         executionPolicy: expect.objectContaining({
-          monitor: expect.objectContaining({ notes: "manager restored lapsed monitor" }),
+          monitor: expect.objectContaining({
+            notes: "manager restored lapsed monitor",
+            scheduledBy: "manager",
+          }),
         }),
       }),
     );
+  });
+
+  // BLO-27912. `hasExplicitWaitingPath` accepted six satisfiers for "somebody owns the
+  // next action here" and every one was assignee-reachable only, so a deliberately-parked
+  // row — one whose assignee is by construction NOT working on it — had no attainable way
+  // to say so. Measured on the live instance (BLO-24266): an actor holding BOTH the
+  // `createdByAgentId` and manager-chain grants got 403 `deny_missing_grant` on every
+  // mechanism that would have silenced the false incident. These tests pin the 403 -> 2xx
+  // transition for the one narrow shape, and the 403 everywhere around it.
+  describe("deliberate-park disposition PATCH (BLO-27912)", () => {
+    const parkedBody = {
+      parkedDisposition: {
+        reason: "Gated on upstream fMP4 contract scheduling; no timer owns the event.",
+        until: "2026-09-30T00:00:00.000Z",
+      },
+    };
+    // Grants `issue:comment` (the action the creator / manager-chain allow-paths are
+    // defined over) and denies the general mutation boundary, which is exactly the
+    // position the CTO was measured in on BLO-24266.
+    const commentOnlyDecide = (reason: string) => async (input: { action: string }) => {
+      if (input.action === "issue:comment") {
+        return { allowed: true, action: input.action, reason, explanation: "Comment grant." };
+      }
+      if (input.action === "issue:read") {
+        return {
+          allowed: true,
+          action: input.action,
+          reason: "allow_explicit_grant",
+          explanation: "Allowed by test grant.",
+        };
+      }
+      return {
+        allowed: false,
+        action: input.action,
+        reason: "deny_missing_grant",
+        explanation: "No general issue mutation grant.",
+      };
+    };
+
+    beforeEach(() => {
+      // A backlog row assigned to somebody else: the shape that produced the loop.
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "backlog",
+        assigneeAgentId: peerAgentId,
+        executionPolicy: null,
+        executionState: null,
+        monitorNextCheckAt: null,
+      }));
+    });
+
+    for (const reason of ["allow_manager_chain", "allow_issue_creator"]) {
+      it(`lets a non-assignee holding only ${reason} record a park, and forwards it as the nested input`, async () => {
+        mockAccessService.decide.mockImplementation(commentOnlyDecide(reason));
+
+        const res = await request(await createApp(ownerActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send(parkedBody);
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        // Forwarded as the nested disposition and nothing else. The four `parked_*`
+        // columns are derived server-side from this, so `parkedByAgentId` / `parkedAt`
+        // cannot be forged by the caller.
+        expect(mockIssueService.update).toHaveBeenCalledWith(
+          issueId,
+          expect.objectContaining({ parkedDisposition: parkedBody.parkedDisposition }),
+        );
+        // The AC that a park changes none of the row's own fields, asserted rather than
+        // assumed: nothing else may ride along on this grant.
+        const forwarded = mockIssueService.update.mock.calls.at(-1)?.[1] ?? {};
+        for (const field of ["status", "priority", "assigneeAgentId", "blockedByIssueIds"]) {
+          expect(forwarded).not.toHaveProperty(field);
+        }
+      });
+    }
+
+    it("lets the same actor un-park, so suppression cannot be made one-way", async () => {
+      mockAccessService.decide.mockImplementation(commentOnlyDecide("allow_manager_chain"));
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parkedDisposition: null });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ parkedDisposition: null }),
+      );
+    });
+
+    it("refuses a park bundled with any other field, so the grant cannot be widened", async () => {
+      // The shape gate. `parkedDisposition` alongside `status` would reach a status
+      // transition through a path that deliberately skips the mutation boundary.
+      mockAccessService.decide.mockImplementation(commentOnlyDecide("allow_manager_chain"));
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ ...parkedBody, status: "todo" });
+
+      expect(res.status).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses a park from an actor holding neither grant", async () => {
+      // Fails closed: the widening is keyed on the two named allow-paths, not on the
+      // request merely being park-shaped.
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+        if (input.action === "issue:read") {
+          return {
+            allowed: true,
+            action: input.action,
+            reason: "allow_explicit_grant",
+            explanation: "Allowed by test grant.",
+          };
+        }
+        return {
+          allowed: false,
+          action: input.action,
+          reason: "deny_missing_grant",
+          explanation: "No grant at all.",
+        };
+      });
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send(parkedBody);
+
+      expect(res.status).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects the flat parked_* keys instead of silently discarding them", async () => {
+      // Same trap the misplaced monitor keys guard against: a caller who guesses the flat
+      // shape would otherwise be stripped by zod, get a 200, and believe the row is parked.
+      mockAccessService.decide.mockImplementation(commentOnlyDecide("allow_manager_chain"));
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parkedUntil: "2026-09-30T00:00:00.000Z" });
+
+      expect(res.status).toBe(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects a deadline that is in the past or beyond the horizon", async () => {
+      // The anti-silence bound, enforced at the edge. A lapsed deadline suppresses
+      // nothing, and an unbounded one is permanent silence.
+      mockAccessService.decide.mockImplementation(commentOnlyDecide("allow_manager_chain"));
+      const app = await createApp(ownerActor());
+
+      for (const until of ["2020-01-01T00:00:00.000Z", "2099-01-01T00:00:00.000Z"]) {
+        const res = await request(app)
+          .patch(`/api/issues/${issueId}`)
+          .send({ parkedDisposition: { reason: "still waiting upstream", until } });
+        expect(res.status, `until=${until} body=${JSON.stringify(res.body)}`).toBe(400);
+      }
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("requires a stated reason", async () => {
+      // A park whose reason is unstated is indistinguishable from the stall it suppresses.
+      mockAccessService.decide.mockImplementation(commentOnlyDecide("allow_manager_chain"));
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ parkedDisposition: { until: "2026-09-30T00:00:00.000Z" } });
+
+      expect(res.status).toBe(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
   });
 
   // BLO-21947. The BLO-18294 convergence guard stops re-arming after N
@@ -2706,6 +2896,19 @@ describe("agent issue mutation checkout ownership", () => {
       expect(remediation).toContain(`agent://${ownerAgentId}`);
       // ...and the exact token they must write to do it.
       expect(remediation).toContain(`agent://${peerAgentId}`);
+      // PEN-2394: naming the token is not enough — the parser only accepts the
+      // markdown link form, so the message has to show it. Prescribing "a comment
+      // containing agent://<id>" sent an assignee to post a bare string that
+      // grants nothing, and the retry returned this same text.
+      expect(remediation).toContain("[@name](agent://<agent-id>)");
+      expect(remediation).toMatch(/bare agent:\/\/[^\s]+ in the comment body is not a mention/i);
+      // ...but the form is shown with a placeholder id, never the actor's real
+      // one, so the body cannot grant anything if it is pasted into a comment.
+      // The assignee who hit this 403 is precisely the actor who *can* grant, and
+      // quoting an error to ask about it is not consent to hand out write. This
+      // is the invariant, not the wording: whatever the text says, no substring
+      // of it may parse as a live mention.
+      expect(extractAgentMentionIds(remediation)).toEqual([]);
       // Corrects the specific false inference that caused the loop.
       expect(remediation).toMatch(/does not grant you comment access/i);
       // Names somewhere to respond instead, so the wake is not a dead end.
@@ -3370,6 +3573,130 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.removeAttachment).not.toHaveBeenCalled();
     expect(mockIssueApprovalService.link).not.toHaveBeenCalled();
     expect(mockIssueApprovalService.unlink).not.toHaveBeenCalled();
+  });
+
+  // BLO-23197: the refusal has to leave a durable mark, or the
+  // successful-run-handoff detector has nothing to escalate on and queues
+  // another status-only wake into the identical 403.
+  it("stamps the run when a status-only recovery run is refused an issue-document write", async () => {
+    const routeDb = createRunContextDb({
+      modelProfile: "cheap",
+      recoveryIntent: "status_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    });
+    const app = await createApp(ownerActor(), routeDb);
+
+    const res = await request(app)
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# refused" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Cheap status-only recovery runs cannot update issue documents");
+    expect(res.body.details).toMatchObject({ resumeRequiresNormalModel: true });
+    expect(mockDocumentService.upsertIssueDocument).not.toHaveBeenCalled();
+
+    const stamps = routeDb.runUpdates.filter((values) => "statusOnlyDocumentWriteRefusedAt" in values);
+    expect(stamps).toHaveLength(1);
+    expect(stamps[0]!.statusOnlyDocumentWriteRefusedAt).toBeInstanceOf(Date);
+  });
+
+  // The reason this signal lives on the run row rather than in the denied-write
+  // activity log the sibling guards use: that log is capped at
+  // DENIED_ISSUE_WRITE_AGGREGATE_MAX_RECORDS = 5 per (company, actor, issue) and
+  // also repeat-deduped, and both bounds drop the record SILENTLY. An escalation
+  // keyed on it would go quiet exactly when an issue is churning through repeated
+  // denials — the load that produces the deadlock — while still passing the
+  // single-refusal test above. This asserts the replacement has no such bound.
+  it("keeps stamping the run across repeated document refusals, past the denied-write aggregate cap", async () => {
+    const routeDb = createRunContextDb({
+      modelProfile: "cheap",
+      recoveryIntent: "status_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    });
+    const app = await createApp(ownerActor(), routeDb);
+
+    const attempts = 8;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      await request(app)
+        .put(`/api/issues/${issueId}/documents/plan`)
+        .send({ format: "markdown", body: `# refused ${attempt}` })
+        .expect(403);
+    }
+
+    const stamps = routeDb.runUpdates.filter((values) => "statusOnlyDocumentWriteRefusedAt" in values);
+    expect(stamps).toHaveLength(attempts);
+  });
+
+  // Scoped to documents on purpose. `planning_only` — the lane the detector
+  // escalates to — permits document updates but still bars deliverables and
+  // annotations, so stamping a refused deliverable write would escalate onto a
+  // lane that still cannot perform it. Those need a full normal-model run.
+  it.each([
+    [
+      "work product create",
+      (app: express.Express) =>
+        request(app).post(`/api/issues/${issueId}/work-products`).send({
+          type: "artifact",
+          provider: "test",
+          title: "Artifact",
+        }),
+    ],
+    [
+      "annotation thread creation",
+      (app: express.Express) => request(app)
+        .post(`/api/issues/${issueId}/documents/plan/annotations`)
+        .send({
+          baseRevisionId: "88888888-8888-4888-8888-888888888888",
+          baseRevisionNumber: 1,
+          selector: {
+            quote: { exact: "selected", prefix: "", suffix: "" },
+            position: { normalizedStart: 0, normalizedEnd: 8, markdownStart: 0, markdownEnd: 8 },
+          },
+          body: "Review this",
+        }),
+    ],
+  ])("does not stamp a document refusal when the refused write was %s", async (_name, sendRequest) => {
+    const routeDb = createRunContextDb({
+      modelProfile: "cheap",
+      recoveryIntent: "status_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    });
+    const app = await createApp(ownerActor(), routeDb);
+
+    await sendRequest(app).expect(403);
+
+    expect(routeDb.runUpdates.filter((values) => "statusOnlyDocumentWriteRefusedAt" in values)).toEqual([]);
+  });
+
+  // The 403 is this guard's contract and must survive a failing stamp: losing
+  // the refusal to a 500 would be a strictly worse outcome than losing the
+  // escalation signal.
+  it("still refuses the write when stamping the run fails", async () => {
+    const routeDb = createRunContextDb({
+      modelProfile: "cheap",
+      recoveryIntent: "status_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    });
+    routeDb.update = vi.fn(() => {
+      throw new Error("heartbeat_runs update failed");
+    }) as unknown as typeof routeDb.update;
+    const app = await createApp(ownerActor(), routeDb);
+
+    const res = await request(app)
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# refused" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Cheap status-only recovery runs cannot update issue documents");
+    expect(mockDocumentService.upsertIssueDocument).not.toHaveBeenCalled();
   });
 
   it("allows planning-only recovery to update its issue document but blocks implementation artifacts", async () => {
@@ -4331,6 +4658,189 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
     expect(mockIssueService.remove).not.toHaveBeenCalled();
+  });
+
+  // BLO-29150: `isCurrentIssueExecutionRun` is assignee-agnostic, so before the
+  // route-local opt-in a run holding a lock left stale by a reassignment could
+  // hard-delete a row that had since been assigned to another agent — the row
+  // and its attachment objects, irreversibly.
+  //
+  // Asserted as a MATRIX on purpose. The single fixed cell is the cheap
+  // assertion and the useless one: the short-circuit is shared by ~25 routes, so
+  // a later change there can flip a *different* cell, and a test that pins only
+  // the non-assignee case would stay green while the legitimate owner lost the
+  // ability to delete its own issue.
+  describe("BLO-29150: DELETE /issues/:id does not take a bare run lock as delete authority", () => {
+    const staleLockRunId = "99999999-9999-4999-8999-999999999911";
+
+    function expectRowSurvived() {
+      expect(mockIssueService.remove).not.toHaveBeenCalled();
+      // The route deletes attachment objects from storage after `remove`, so a
+      // surviving row must also mean surviving objects.
+      expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+    }
+
+    it("refuses the lock holder once the row is assigned to another agent", async () => {
+      useProductionIssueAuthorization([makeAgent(peerAgentId), makeAgent(ownerAgentId)]);
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          assigneeAgentId: ownerAgentId,
+          checkoutRunId: staleLockRunId,
+          executionRunId: staleLockRunId,
+        }),
+      );
+
+      const res = await request(await createApp(peerActor({ runId: staleLockRunId })))
+        .delete(`/api/issues/${issueId}`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+      expectRowSurvived();
+    });
+
+    it("gives the lock holder exactly the same answer as the no-lock control", async () => {
+      useProductionIssueAuthorization([makeAgent(peerAgentId), makeAgent(ownerAgentId)]);
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ assigneeAgentId: ownerAgentId, checkoutRunId: null, executionRunId: null }),
+      );
+
+      const res = await request(await createApp(peerActor())).delete(`/api/issues/${issueId}`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ reason: "deny_missing_grant", boundary: "grant" });
+      expectRowSurvived();
+    });
+
+    // The sharper case: an actor that DOES clear the issue:mutate boundary
+    // (company-wide grant, the permissive default in this suite) still must not
+    // delete a row assigned elsewhere on the strength of the lock. Without this
+    // cell, "fix it by leaning on the boundary" would look sufficient.
+    it("refuses a boundary-clearing lock holder that is not the assignee", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          assigneeAgentId: ownerAgentId,
+          checkoutRunId: staleLockRunId,
+          executionRunId: staleLockRunId,
+        }),
+      );
+
+      const res = await request(await createApp(peerActor({ runId: staleLockRunId })))
+        .delete(`/api/issues/${issueId}`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.error).toBe("Issue is checked out by another agent");
+      expectRowSurvived();
+    });
+
+    it("still lets the assignee holding the lock delete its own issue", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          assigneeAgentId: ownerAgentId,
+          checkoutRunId: ownerRunId,
+          executionRunId: ownerRunId,
+        }),
+      );
+
+      const res = await request(await createApp(ownerActor())).delete(`/api/issues/${issueId}`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.remove).toHaveBeenCalledWith(issueId);
+    });
+
+    it("keeps the assignee's other run fenced off by the checkout assertion", async () => {
+      const { HttpError } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      mockIssueService.assertCheckoutOwner.mockRejectedValue(new HttpError(409, "Issue run ownership conflict"));
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          assigneeAgentId: ownerAgentId,
+          checkoutRunId: staleLockRunId,
+          executionRunId: staleLockRunId,
+        }),
+      );
+
+      const res = await request(await createApp(ownerActorFromSweepRun())).delete(`/api/issues/${issueId}`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.error).toBe("Issue run ownership conflict");
+      expectRowSurvived();
+    });
+
+    // Pins the deliberate carve-out rather than leaving it implicit: an
+    // unassigned row has no assignee to diverge from, so the lock holder is
+    // still authorized and behaviour is unchanged from before the fix.
+    it("leaves the unassigned-row lock holder able to delete", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          assigneeAgentId: null,
+          checkoutRunId: staleLockRunId,
+          executionRunId: staleLockRunId,
+        }),
+      );
+
+      const res = await request(await createApp(peerActor({ runId: staleLockRunId })))
+        .delete(`/api/issues/${issueId}`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.remove).toHaveBeenCalledWith(issueId);
+    });
+
+    // The sweep the issue asked for. Of the destructive routes sharing this
+    // helper, these two are the ones whose effect is irreversible and whose
+    // only gate was the lock: attachment delete calls
+    // `storage.deleteObject` before the row, and `workProductsSvc.remove` is a
+    // hard `db.delete`. Neither is protected by its neighbouring
+    // `assertDeliverableMutationAllowedByRunContext` call, which filters cheap
+    // status-only/planning-only recovery runs by context snapshot and returns
+    // true for an ordinary run.
+    describe("the same rule covers the other irreversible routes on this helper", () => {
+      const lockedIssue = () =>
+        makeIssue({
+          assigneeAgentId: ownerAgentId,
+          checkoutRunId: staleLockRunId,
+          executionRunId: staleLockRunId,
+        });
+
+      it("refuses attachment delete from a lock holder that is not the assignee", async () => {
+        mockIssueService.getById.mockResolvedValue(lockedIssue());
+        mockIssueService.getAttachmentById.mockResolvedValue({
+          id: "attachment-1",
+          companyId,
+          issueId,
+          objectKey: "issues/attachment-1/report.txt",
+        });
+
+        const res = await request(await createApp(peerActor({ runId: staleLockRunId })))
+          .delete("/api/attachments/attachment-1");
+
+        expect(res.status, JSON.stringify(res.body)).toBe(409);
+        expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+        expect(mockIssueService.removeAttachment).not.toHaveBeenCalled();
+      });
+
+      it("refuses work-product delete from a lock holder that is not the assignee", async () => {
+        mockIssueService.getById.mockResolvedValue(lockedIssue());
+
+        const res = await request(await createApp(peerActor({ runId: staleLockRunId })))
+          .delete("/api/work-products/product-1");
+
+        expect(res.status, JSON.stringify(res.body)).toBe(409);
+        expect(mockWorkProductService.remove).not.toHaveBeenCalled();
+      });
+
+      // The reversible routes on this helper are deliberately NOT opted in, so
+      // a lock holder can still wind down its own in-flight work. Asserted so
+      // that a later blanket application of the option trips a test instead of
+      // silently narrowing them.
+      it("leaves the reversible routes on this helper untouched", async () => {
+        mockIssueService.getById.mockResolvedValue(lockedIssue());
+
+        const res = await request(await createApp(peerActor({ runId: staleLockRunId })))
+          .delete(`/api/issues/${issueId}/watchdog`);
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(mockTaskWatchdogService.disableForIssue).toHaveBeenCalled();
+      });
+    });
   });
 
   // BLO-22876 review: the reroute is route-scoped by construction — only

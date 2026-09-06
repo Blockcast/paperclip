@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -16,6 +16,9 @@ import {
   issueRelations,
   issues,
   projects,
+  routineRuns,
+  routineTriggers,
+  routines,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -42,7 +45,33 @@ import {
 import {
   MAX_TRANSIENT_RETRY_HORIZON_MS,
   TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
+  TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS,
 } from "../services/ccrotate-capacity-retry.js";
+
+/**
+ * PEN-2509: a retry floor is no longer adopted verbatim as `dueAt`.
+ *
+ * Every run that saw the same denial holds the same absolute floor, so adopting
+ * it verbatim resumed whole cohorts on one millisecond (measured: 25 runs at 0ms
+ * spread). The floor is now dispersed forward by a bounded jitter, so the
+ * contract these assertions encode changed from "equals the floor" to "at or
+ * after the floor, by no more than the jitter cap".
+ *
+ * Asserted as a window rather than an exact value on purpose: pinning the exact
+ * jittered instant would just re-encode whichever `random` the test happens to
+ * seed, and would pass again if the jitter were silently removed. The lower
+ * bound is the load-bearing half — it is the "never probe before the advertised
+ * reset" invariant.
+ */
+function expectFlooredRetryAt(actualMs: number | undefined, floorMs: number, label: string) {
+  expect(actualMs, `${label}: no retry instant recorded`).toBeDefined();
+  expect(actualMs!, `${label}: retry probes before the advertised floor`).toBeGreaterThanOrEqual(
+    floorMs,
+  );
+  expect(actualMs!, `${label}: retry pushed beyond the jitter cap`).toBeLessThanOrEqual(
+    floorMs + TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS,
+  );
+}
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -337,7 +366,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .then((rows) => rows[0] ?? null);
     expect(retryRun?.status).toBe("scheduled_retry");
     expect(retryRun?.scheduledRetryReason).toBe("transient_failure");
-    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe("2030-04-22T21:00:00.000Z");
+    expectFlooredRetryAt(
+      retryRun?.scheduledRetryAt?.getTime(),
+      new Date("2030-04-22T21:00:00.000Z").getTime(),
+      "provider_quota reset-time retry",
+    );
     expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.errorFamily).toBe("provider_quota");
     expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.providerQuotaRetryNotBefore).toBe(
       "2030-04-22T21:00:00.000Z",
@@ -355,6 +388,62 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         { timeout: 5_000, interval: 50 },
       )
       .toEqual({ status: "idle", errorReason: null });
+  });
+
+  it("coalesces bounded retries by agent, work identity, and reason", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2030-04-22T20:00:00.000Z");
+    const firstRunId = randomUUID();
+    const secondRunId = randomUUID();
+
+    await seedRetryFixture({
+      companyId,
+      agentId,
+      runId: firstRunId,
+      now,
+      errorCode: "adapter_failed",
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: secondRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: "upstream overload",
+      errorCode: "adapter_failed",
+      finishedAt: new Date(now.getTime() + 1_000),
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      updatedAt: new Date(now.getTime() + 1_000),
+      createdAt: new Date(now.getTime() + 1_000),
+    });
+
+    const first = await heartbeat.scheduleBoundedRetry(firstRunId, { now, delayMs: 60_000 });
+    const second = await heartbeat.scheduleBoundedRetry(secondRunId, {
+      now: new Date(now.getTime() + 30_000),
+      delayMs: 120_000,
+    });
+
+    expect(first.outcome).toBe("scheduled");
+    expect(second.outcome).toBe("scheduled");
+    if (first.outcome !== "scheduled" || second.outcome !== "scheduled") return;
+    expect(second.run.id).toBe(first.run.id);
+    expect(second.run.retryOfRunId).toBe(firstRunId);
+
+    const retryRows = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry")));
+    expect(retryRows).toEqual([{ id: first.run.id }]);
+
+    const wakeup = await db
+      .select({ coalescedCount: agentWakeupRequests.coalescedCount })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, first.run.wakeupRequestId!))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.coalescedCount).toBe(1);
   });
 
   async function seedQueuedRunFixture(input: {
@@ -454,6 +543,10 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         scheduledRetryReason: "ccrotate_capacity",
       })
       .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agents)
+      .set({ status: "error", errorReason: "stale failure from the previous run" })
+      .where(eq(agents.id, agentId));
 
     let observedClaim = false;
     mockAdapterExecute.mockImplementationOnce(async () => {
@@ -477,6 +570,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         scheduledRetryAttempt: 2,
         scheduledRetryReason: "ccrotate_capacity",
       });
+      const [runningAgent] = await db
+        .select({ status: agents.status, errorReason: agents.errorReason })
+        .from(agents)
+        .where(eq(agents.id, agentId));
+      expect(runningAgent).toEqual({ status: "running", errorReason: null });
       observedClaim = true;
 
       return {
@@ -818,6 +916,133 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     // the latter at insert time -- an artifact of the test harness, not of
     // the promotion logic under test.)
     expect(promotedRun?.queuedAt?.toISOString()).toBe(expectedDueAt.toISOString());
+  });
+
+  it("bounds a retry owned by a periodic routine and persists the pre-clamp instant", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const routineId = randomUUID();
+    const routineRunId = randomUUID();
+    const triggerId = randomUUID();
+    const failedAt = new Date("2026-08-19T00:19:17.166Z");
+    const windowClosesAt = new Date("2026-08-19T06:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Routine Retry Test",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "Six-hour routine",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(routineTriggers).values({
+      id: triggerId,
+      companyId,
+      routineId,
+      kind: "schedule",
+      enabled: true,
+      cronExpression: "0 */6 * * *",
+      timezone: "UTC",
+      nextRunAt: windowClosesAt,
+    });
+    await db.insert(routineRuns).values({
+      id: routineRunId,
+      companyId,
+      routineId,
+      triggerId,
+      source: "schedule",
+      status: "issue_created",
+      triggeredAt: new Date("2026-08-19T00:00:00.000Z"),
+      triggerPayload: {
+        __paperclipRoutineWindowClosesAt: windowClosesAt.toISOString(),
+      },
+      linkedIssueId: null,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Routine retry fixture",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-1`,
+      originKind: "routine_execution",
+      originId: routineId,
+      originRunId: routineRunId,
+    });
+    await db
+      .update(routineRuns)
+      .set({ linkedIssueId: issueId })
+      .where(eq(routineRuns.id, routineRunId));
+    // The trigger has already advanced by the time a delayed execution fails.
+    // Retry resolution must continue using the origin run's saved boundary.
+    await db
+      .update(routineTriggers)
+      .set({ nextRunAt: new Date("2026-08-19T12:00:00.000Z") })
+      .where(eq(routineTriggers.id, triggerId));
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: "upstream overload",
+      errorCode: "adapter_failed",
+      finishedAt: failedAt,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_assigned",
+        errorFamily: "transient_upstream",
+        retryNotBefore: "2026-08-20T00:19:17.166Z",
+      },
+      resultJson: {
+        errorFamily: "transient_upstream",
+        retryNotBefore: "2026-08-20T00:19:17.166Z",
+      },
+      updatedAt: failedAt,
+      createdAt: failedAt,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+      now: failedAt,
+      random: () => 0,
+    });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    expect(scheduled.dueAt.toISOString()).toBe("2026-08-19T04:41:19.000Z");
+    expect(scheduled.dueAt.getTime() - failedAt.getTime()).toBeLessThanOrEqual(6 * 60 * 60 * 1000);
+
+    const retryRun = await db
+      .select({ scheduledRetryAt: heartbeatRuns.scheduledRetryAt, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe("2026-08-19T04:41:19.000Z");
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      routineRetryDecision: "clamp",
+      routineRetryPreClampAt: "2026-08-20T00:19:17.166Z",
+      routineRetryClampedFrom: "2026-08-20T00:19:17.166Z",
+    });
   });
 
   // BLO-24166 (split from BLO-23699 AC3): a provider blip on 2026-08-08 burned
@@ -1293,6 +1518,88 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       coalescedCount: 1,
     });
     expect(wakeups[0]?.idempotencyKey).toContain(`:${issueId}:${runId}:1`);
+  });
+
+  it("does not coalesce distinct interaction continuation attempts", async () => {
+    const { companyId, agentId, issueId, runId, now } = await seedMaxTurnFixture({ issueStatus: "in_review" });
+    const firstInteractionId = randomUUID();
+    const secondSourceRunId = randomUUID();
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        error: "workspace validation failed before dispatch",
+        errorCode: "workspace_validation_failed",
+        resultJson: {},
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_commented",
+          mutation: "interaction",
+          interactionId: firstInteractionId,
+          interactionKind: "request_confirmation",
+          interactionStatus: "accepted",
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const retryOptions = {
+      retryReason: INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
+      wakeReason: INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
+      maxAttempts: 3,
+      random: () => 0.5,
+    };
+    const first = await heartbeat.scheduleBoundedRetry(runId, { now, ...retryOptions });
+    expect(first.outcome).toBe("scheduled");
+    if (first.outcome !== "scheduled") return;
+
+    await db.insert(heartbeatRuns).values({
+      id: secondSourceRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "failed",
+      error: "workspace validation failed before dispatch",
+      errorCode: "workspace_validation_failed",
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_commented",
+        mutation: "interaction",
+        interactionId: randomUUID(),
+        interactionKind: "request_confirmation",
+        interactionStatus: "accepted",
+      },
+      finishedAt: new Date(now.getTime() + 1_000),
+      updatedAt: new Date(now.getTime() + 1_000),
+      createdAt: new Date(now.getTime() + 1_000),
+    });
+
+    const second = await heartbeat.scheduleBoundedRetry(secondSourceRunId, {
+      now: new Date(now.getTime() + 1_000),
+      ...retryOptions,
+    });
+    expect(second.outcome).toBe("scheduled");
+    if (second.outcome !== "scheduled") return;
+    expect(second.run.id).not.toBe(first.run.id);
+    expect(second.run.retryOfRunId).toBe(secondSourceRunId);
+    expect(second.run.scheduledRetryAttempt).toBe(2);
+
+    const retries = await db
+      .select({ id: heartbeatRuns.id, retryOfRunId: heartbeatRuns.retryOfRunId, attempt: heartbeatRuns.scheduledRetryAttempt })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.scheduledRetryReason, INTERACTION_CONTINUATION_INFRA_RETRY_REASON),
+        inArray(heartbeatRuns.retryOfRunId, [runId, secondSourceRunId]),
+      ))
+      .orderBy(asc(heartbeatRuns.scheduledRetryAttempt));
+    expect(retries).toHaveLength(2);
+    expect(retries.map((retry) => retry.attempt).sort()).toEqual([1, 2]);
+    expect(retries.map((retry) => retry.retryOfRunId)).toEqual([runId, secondSourceRunId]);
   });
 
   it.each([
@@ -3954,7 +4261,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
     expect(scheduled.outcome).toBe("scheduled");
     if (scheduled.outcome !== "scheduled") return;
-    expect(scheduled.dueAt.getTime()).toBe(retryNotBefore.getTime());
+    expectFlooredRetryAt(scheduled.dueAt.getTime(), retryNotBefore.getTime(), "advertised retry-not-before floor");
 
     const retryRun = await db
       .select({
@@ -3966,7 +4273,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
 
-    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(retryNotBefore.getTime());
+    expectFlooredRetryAt(
+      retryRun?.scheduledRetryAt?.getTime(),
+      retryNotBefore.getTime(),
+      "advertised retry-not-before floor (persisted)",
+    );
     expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
       retryNotBefore.toISOString(),
     );
@@ -4007,7 +4318,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
     expect(scheduled.outcome).toBe("scheduled");
     if (scheduled.outcome !== "scheduled") return;
-    expect(scheduled.dueAt.getTime()).toBe(retryNotBefore.getTime());
+    expectFlooredRetryAt(scheduled.dueAt.getTime(), retryNotBefore.getTime(), "advertised retry-not-before floor");
 
     const retryRun = await db
       .select({
@@ -4019,7 +4330,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
 
-    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(retryNotBefore.getTime());
+    expectFlooredRetryAt(
+      retryRun?.scheduledRetryAt?.getTime(),
+      retryNotBefore.getTime(),
+      "advertised retry-not-before floor (persisted)",
+    );
     const contextSnapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
     expect(contextSnapshot.transientRetryNotBefore).toBe(retryNotBefore.toISOString());
     // Claude does not participate in the Codex fallback-mode ladder.
@@ -4069,7 +4384,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(scheduled.outcome).toBe("scheduled");
     if (scheduled.outcome !== "scheduled") return;
     // Clamped to the ceiling, not the (later) advertised horizon.
-    expect(scheduled.dueAt.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+    expectFlooredRetryAt(
+      scheduled.dueAt.getTime(),
+      now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS,
+      "clamped horizon ceiling",
+    );
     expect(scheduled.attempt).toBe(1);
     // The family's ceiling was raised so 24h-per-attempt re-probing has
     // enough attempts left to reach BLO-22844's 124.8h worst case.
@@ -4082,7 +4401,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
 
-    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+    expectFlooredRetryAt(
+      retryRun?.scheduledRetryAt?.getTime(),
+      now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS,
+      "clamped horizon ceiling (persisted)",
+    );
     const contextSnapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
     // The clamped instant is what downstream retry logic acts on...
     expect(contextSnapshot.transientRetryNotBefore).toBe(advertisedRetryNotBefore.toISOString());
@@ -4119,7 +4442,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(lastAllowedAttempt.outcome).toBe("scheduled");
     if (lastAllowedAttempt.outcome !== "scheduled") return;
     expect(lastAllowedAttempt.attempt).toBe(TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS);
-    expect(lastAllowedAttempt.dueAt.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+    expectFlooredRetryAt(
+      lastAllowedAttempt.dueAt.getTime(),
+      now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS,
+      "clamped horizon ceiling (last allowed attempt)",
+    );
 
     await cleanupRetryFixture();
 

@@ -7,6 +7,54 @@ import type {
   ListPluginState,
 } from "@paperclipai/shared";
 import { notFound } from "../errors.js";
+import {
+  assertPluginFencingGeneration,
+  type ResolvedPluginFencingPrecondition,
+} from "./plugin-fencing.js";
+import { recordGbrainRecallOutcome } from "./metrics.js";
+
+/**
+ * gbrain-context recall outcomes are counted here rather than in the gbrain
+ * plugin worker (BLO-25892): the worker runs out-of-process with no access to
+ * the server's Prometheus registry, but every prefetch result already
+ * round-trips through this exact write path to persist to `plugin_state`, so
+ * hooking it is free of a second RPC. See metrics.ts's GBRAIN_RECALL_METRIC
+ * doc comment for the 2026-08-08 outage this detection path closes.
+ *
+ * Deliberately selects on (scopeKind, stateKey) and NOT on pluginId, matching
+ * the RAG-health route at routes/plugins.ts:626 one-for-one. Two reasons, in
+ * order of weight:
+ *
+ *   1. The counter exists to corroborate that route. If it filtered on plugin
+ *      identity and the route did not, the two would silently disagree — and
+ *      the counter is the half that gets alerted on.
+ *   2. Filtering would mean hardcoding the plugin's identity ("kkroo.gbrain",
+ *      a personal-scope vendor id) here as a fourth cross-package literal with
+ *      no brake: a re-vendoring would zero the detector silently, which is the
+ *      exact failure mode this metric was written to close.
+ *
+ * The residual risk it accepts is inflation, not blindness: a second plugin
+ * would have to adopt the literal key `gbrain-context` under run scope, and
+ * its payload would land in the "other" bucket unless it also emitted a
+ * matching status string. A false zero is catastrophic for a detector; a
+ * visible over-count is not. Revisit if a second writer of this key appears.
+ */
+const GBRAIN_CONTEXT_STATE_KEY = "gbrain-context";
+
+function maybeRecordGbrainRecallOutcome(input: SetPluginState): void {
+  if (input.scopeKind !== "run" || input.stateKey !== GBRAIN_CONTEXT_STATE_KEY) return;
+  const value = input.value as { status?: unknown } | null | undefined;
+  const status = typeof value?.status === "string" ? value.status : undefined;
+  try {
+    recordGbrainRecallOutcome(status);
+  } catch {
+    // Never fail a committed write on instrumentation. Both call sites are
+    // post-commit, so throwing from here would report a prefetch failure for a
+    // write that actually landed — and the plugin's retry would then
+    // double-count. Losing one sample is strictly cheaper than corrupting the
+    // caller's view of a durable write.
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -132,39 +180,70 @@ export function pluginStateStore(db: Db) {
      *
      * Requires `plugin.state.write` capability (enforced by the caller).
      *
+     * When `fencingPrecondition` is supplied the upsert runs inside a
+     * transaction that first takes a share lock on the plugin's own generation
+     * row and holds it to commit. That is what makes this a fence rather than a
+     * barrier: a plugin that has been displaced since it read its own generation
+     * cannot land a stale value, because a concurrent steal either commits first
+     * (this write is rejected) or blocks on the lock until this write is done.
+     * Without it the write is unconditional, exactly as before.
+     *
      * @param pluginId - UUID of the owning plugin
      * @param input - Scope key and value to store
+     * @param fencingPrecondition - Optional generation the caller must still hold
      */
-    set: async (pluginId: string, input: SetPluginState): Promise<void> => {
+    set: async (
+      pluginId: string,
+      input: SetPluginState,
+      fencingPrecondition?: ResolvedPluginFencingPrecondition | null,
+    ): Promise<void> => {
       await assertPluginExists(pluginId);
 
       const namespace = input.namespace ?? DEFAULT_NAMESPACE;
       const scopeId = input.scopeId ?? null;
 
-      await db
-        .insert(pluginState)
-        .values({
-          pluginId,
-          scopeKind: input.scopeKind,
-          scopeId,
-          namespace,
-          stateKey: input.stateKey,
+      const values = {
+        pluginId,
+        scopeKind: input.scopeKind,
+        scopeId,
+        namespace,
+        stateKey: input.stateKey,
+        valueJson: input.value,
+        updatedAt: new Date(),
+      };
+      const onConflict = {
+        target: [
+          pluginState.pluginId,
+          pluginState.scopeKind,
+          pluginState.scopeId,
+          pluginState.namespace,
+          pluginState.stateKey,
+        ],
+        set: {
           valueJson: input.value,
           updatedAt: new Date(),
-        })
-        .onConflictDoUpdate({
-          target: [
-            pluginState.pluginId,
-            pluginState.scopeKind,
-            pluginState.scopeId,
-            pluginState.namespace,
-            pluginState.stateKey,
-          ],
-          set: {
-            valueJson: input.value,
-            updatedAt: new Date(),
-          },
-        });
+        },
+      };
+
+      if (!fencingPrecondition) {
+        await db.insert(pluginState).values(values).onConflictDoUpdate(onConflict);
+        maybeRecordGbrainRecallOutcome(input);
+        return;
+      }
+
+      await db.transaction(async (tx) => {
+        // First statement in the transaction, deliberately: a displaced caller
+        // is rejected before the upsert, and the share lock taken here is held
+        // to commit so a steal cannot interleave with the write below.
+        await assertPluginFencingGeneration(tx, fencingPrecondition);
+        await tx.insert(pluginState).values(values).onConflictDoUpdate(onConflict);
+      });
+      // Both write paths are counted, and both only after the write has
+      // committed: a fencing rejection or a failed upsert throws above, so a
+      // displaced caller never inflates the recall counter. The reverse
+      // direction is guarded inside maybeRecordGbrainRecallOutcome, so the
+      // ordering guarantee holds in both directions rather than just one.
+      maybeRecordGbrainRecallOutcome(input);
     },
 
     /**

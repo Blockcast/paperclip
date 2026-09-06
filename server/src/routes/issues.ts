@@ -143,7 +143,7 @@ import {
 import type { TaskWatchdogServiceDeps, taskWatchdogService } from "../services/task-watchdogs.js";
 import { logger } from "../middleware/logger.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
-import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
+import { actorCanReadAgentConfig, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
@@ -167,6 +167,7 @@ import { executionWorkspaceService as executionWorkspaceServiceDirect } from "..
 import { decisionTrainingService } from "../services/decision-training.js";
 import { feedbackService } from "../services/feedback.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { parseUnsupportedPaginationParams } from "../lib/issue-list-query.js";
 import { readAcceptedPlanConfirmationTarget } from "../services/issues.js";
 import { issueEfficiencyService } from "../services/issue-efficiency.js";
 import {
@@ -174,6 +175,8 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  listBlockedDependentIssueIds,
+  recomputeBlockedIssuesStatusIfReady,
 } from "../services/issues.js";
 import {
   authorizationBoundaryLabel,
@@ -181,6 +184,7 @@ import {
   commentAuthorCanGrantIssueMention,
   getActiveCompanyMembership,
 } from "../services/authorization.js";
+import { findWakeIdempotencyReceipt } from "../services/wake-idempotency.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
@@ -190,6 +194,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  isMonitorNextCheckAtLive,
   mergeIssueExecutionPolicyMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -215,6 +220,14 @@ import {
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
 import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
+import {
+  enqueueCommentEffects,
+  getEffectResult,
+  hasCommentEffects,
+  processCommentEffects,
+  type CommentEffectIntent,
+  type CommentEffectRow,
+} from "../services/issue-comment-effects.js";
 
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
@@ -556,6 +569,8 @@ async function listIssueLinkedCases(db: Db, companyId: string, issueId: string) 
     .where(and(
       eq(pipelineCaseIssueLinks.companyId, companyId),
       eq(pipelineCaseIssueLinks.issueId, issueId),
+      isNull(pipelineCaseIssueLinks.retiredAt),
+      eq(pipelineCaseIssueLinks.attachmentState, "attached"),
       eq(pipelineCases.companyId, companyId),
       eq(pipelines.companyId, companyId),
     ));
@@ -999,15 +1014,34 @@ function hasExecutionParticipant(value: unknown) {
   return false;
 }
 
+/**
+ * Is there a monitor that will actually wake this issue after the write lands?
+ *
+ * PEN-2853: this used to accept any non-null check instant, including one already in
+ * the past, while the stranded-assigned sweep counted only a future one. Both
+ * readings are now `isMonitorNextCheckAtLive`, so the validator cannot admit an
+ * `in_review` the sweep would treat as unattended off the same column.
+ *
+ * The clause order is the write's own precedence and is unchanged: an explicit
+ * `monitorNextCheckAt` in the patch is what this write is arming, so it decides;
+ * otherwise a monitor the row already carries stands; otherwise the policy being
+ * written is consulted. Only the acceptance test moved.
+ */
 function hasScheduledMonitor(input: {
   existingMonitorNextCheckAt?: Date | null;
   patchMonitorNextCheckAt?: unknown;
   executionPolicy?: unknown;
+  nowMs: number;
 }) {
-  if (input.patchMonitorNextCheckAt instanceof Date && !Number.isNaN(input.patchMonitorNextCheckAt.getTime())) return true;
-  if (input.patchMonitorNextCheckAt === undefined && input.existingMonitorNextCheckAt) return true;
+  if (input.patchMonitorNextCheckAt instanceof Date && !Number.isNaN(input.patchMonitorNextCheckAt.getTime())) {
+    return isMonitorNextCheckAtLive(input.patchMonitorNextCheckAt, input.nowMs);
+  }
+  if (
+    input.patchMonitorNextCheckAt === undefined &&
+    isMonitorNextCheckAtLive(input.existingMonitorNextCheckAt, input.nowMs)
+  ) return true;
   const policy = normalizeIssueExecutionPolicy(input.executionPolicy ?? null);
-  return Boolean(policy?.monitor?.nextCheckAt);
+  return isMonitorNextCheckAtLive(policy?.monitor?.nextCheckAt, input.nowMs);
 }
 
 function successfulRunHandoffStateFromActivity(row: {
@@ -1875,7 +1909,8 @@ const INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE =
   "This request would leave the issue in_review without anyone or anything owning the next action. " +
   "Keep working instead of moving to review, create a request_confirmation or ask_user_questions interaction, " +
   "link or request a pending approval, assign a human reviewer with assigneeUserId, set a typed executionState.currentParticipant through an execution policy, " +
-  "or schedule an issue monitor for an external review/check. After creating one of those review paths, retry the status update.";
+  "or schedule an issue monitor for an external review/check with a nextCheckAt in the future — a lapsed or past-dated monitor is not a review path, " +
+  "because the strandedness sweep has already stopped counting it. After creating one of those review paths, retry the status update.";
 
 function isPendingIssueThreadInteractionReviewPath(interaction: { kind: string; status: string }) {
   return interaction.status === "pending" && REVIEW_PATH_INTERACTION_KINDS.has(interaction.kind);
@@ -1997,8 +2032,12 @@ function monitorPoliciesEqual(left: NormalizedExecutionPolicy | null, right: Nor
 function applyActorMonitorScheduledBy(
   policy: NormalizedExecutionPolicy | null,
   actorType: "agent" | "user",
+  managerMonitorRearmAuthorized = false,
 ) {
-  return setIssueExecutionPolicyMonitorScheduledBy(policy, actorType === "user" ? "board" : "assignee");
+  return setIssueExecutionPolicyMonitorScheduledBy(
+    policy,
+    actorType === "user" ? "board" : managerMonitorRearmAuthorized ? "manager" : "assignee",
+  );
 }
 
 async function assertCanManageIssueMonitor(
@@ -2488,6 +2527,7 @@ function diffExecutionParticipants(
 
 function buildExecutionStageWakeup(input: {
   issueId: string;
+  issueStatus: string;
   previousState: ParsedExecutionState | null;
   nextState: ParsedExecutionState | null;
   interruptedRunId: string | null;
@@ -2496,6 +2536,10 @@ function buildExecutionStageWakeup(input: {
 }) {
   const { issueId, previousState, nextState, interruptedRunId } = input;
   if (!nextState) return null;
+
+  // A terminal issue cannot have an actionable execution-stage participant.
+  // Reopened issues carry a non-terminal post-update status at this call site.
+  if (isClosedIssueStatus(input.issueStatus)) return null;
 
   if (nextState.status === "pending") {
     const agentId =
@@ -3047,6 +3091,7 @@ export function issueRoutes(
     createIssueDuplicateCandidateActivityTimeoutMs?: number;
     createIssueDuplicateCandidateCorpusFilter?: CreateIssueDuplicateCandidateCorpusFilter;
     createIssueBeforeResponseHook?: () => Promise<void>;
+    registerCommentEffectProcessor?: (processor: (commentId: string) => Promise<unknown>) => void;
   } = {},
 ) {
   const router = Router();
@@ -3884,6 +3929,7 @@ export function issueRoutes(
       existingMonitorNextCheckAt: input.existing.monitorNextCheckAt ?? null,
       patchMonitorNextCheckAt: input.updateFields.monitorNextCheckAt,
       executionPolicy: nextExecutionPolicy,
+      nowMs: Date.now(),
     })) return;
 
     const interactions = await issueThreadInteractionService(db).listForIssue(input.existing.id);
@@ -3933,6 +3979,245 @@ export function issueRoutes(
       });
     }
   }
+
+  type PersistedCommentActor = {
+    actorType: "agent" | "user";
+    actorId: string;
+    agentId: string | null;
+    runId: string | null;
+    agentApiKeyId: string | null;
+  };
+
+  function persistedCommentActor(actor: ReturnType<typeof getActorInfo>): PersistedCommentActor {
+    return {
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId ?? null,
+      runId: actor.runId ?? null,
+      agentApiKeyId: actor.agentApiKeyId ?? null,
+    };
+  }
+
+  async function buildKeyedCommentEffectIntents(input: {
+    issue: IssueRouteSnapshot;
+    comment: typeof issueComments.$inferSelect;
+    actor: ReturnType<typeof getActorInfo>;
+    referenceSummaryBefore: Awaited<ReturnType<typeof issueReferencesSvc.listIssueReferenceSummary>>;
+  }): Promise<CommentEffectIntent[]> {
+    const actor = persistedCommentActor(input.actor);
+    const effects: CommentEffectIntent[] = [
+      {
+        effectKind: "references_sync",
+        effectKey: "references_sync",
+        payload: { referenceSummaryBefore: input.referenceSummaryBefore },
+      },
+      { effectKind: "comment_activity", effectKey: "comment_activity", payload: { actor } },
+      { effectKind: "interaction_expiry", effectKey: "interaction_expiry", payload: { actor } },
+      { effectKind: "recovery_revalidation", effectKey: "recovery_revalidation", payload: { actor } },
+    ];
+
+    const wakeups = new Map<string, { agentId: string; wakeup: IssueWakeupRequest }>();
+    const assigneeId = input.issue.assigneeAgentId;
+    const selfComment = actor.actorType === "agent" && actor.actorId === assigneeId;
+    if (assigneeId && !selfComment && !isClosedIssueStatus(input.issue.status)) {
+      wakeups.set(`${assigneeId}:${input.issue.id}`, {
+        agentId: assigneeId,
+        wakeup: {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_commented",
+          payload: { issueId: input.issue.id, commentId: input.comment.id, mutation: "comment" },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          idempotencyKey: `issue_comment:${input.comment.id}:assignee:${assigneeId}`,
+          contextSnapshot: {
+            issueId: input.issue.id,
+            taskId: input.issue.id,
+            commentId: input.comment.id,
+            wakeCommentId: input.comment.id,
+            source: "issue.comment",
+            wakeReason: "issue_commented",
+          },
+        },
+      });
+    }
+
+    const mentionedIds = await svc.findMentionedAgents(input.issue.companyId, input.comment.body);
+    let authorUserIsActiveMember = false;
+    if (mentionedIds.length > 0 && actor.actorType === "user") {
+      try {
+        authorUserIsActiveMember = Boolean(
+          await getActiveCompanyMembership(db, input.issue.companyId, "user", actor.actorId),
+        );
+      } catch (err) {
+        logger.warn({ err, issueId: input.issue.id }, "failed to resolve keyed comment author membership for @-mentions");
+      }
+    }
+    for (const mentionedId of mentionedIds) {
+      if (!commentAuthorCanGrantIssueMention({
+        mentionedAgentId: mentionedId,
+        issueAssigneeAgentId: input.issue.assigneeAgentId,
+        authorAgentId: actor.actorType === "agent" ? actor.actorId : null,
+        authorUserIsActiveMember,
+      })) continue;
+      const key = `${mentionedId}:${input.issue.id}`;
+      if (wakeups.has(key)) continue;
+      wakeups.set(key, {
+        agentId: mentionedId,
+        wakeup: {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_comment_mentioned",
+          payload: { issueId: input.issue.id, commentId: input.comment.id },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          idempotencyKey: `issue_comment:${input.comment.id}:mention:${mentionedId}`,
+          contextSnapshot: {
+            issueId: input.issue.id,
+            taskId: input.issue.id,
+            commentId: input.comment.id,
+            wakeCommentId: input.comment.id,
+            wakeReason: "issue_comment_mentioned",
+            source: "comment.mention",
+          },
+        },
+      });
+    }
+    for (const { agentId, wakeup } of wakeups.values()) {
+      effects.push({
+        effectKind: "wake",
+        effectKey: `wake:${agentId}:${input.issue.id}`,
+        payload: { agentId, wakeup },
+      });
+    }
+    effects.push({ effectKind: "watchdog_evaluation", effectKey: "watchdog_evaluation", payload: { runId: actor.runId } });
+    if (actor.runId) {
+      effects.push({ effectKind: "run_activity", effectKey: "run_activity", payload: { runId: actor.runId } });
+    }
+    return effects;
+  }
+
+  async function executeKeyedCommentEffect(effect: CommentEffectRow) {
+    const [comment] = await db.select().from(issueComments).where(eq(issueComments.id, effect.commentId)).limit(1);
+    const issue = await svc.getById(effect.issueId);
+    if (!comment || !issue) throw new Error(`Comment effect target is missing: ${effect.id}`);
+    const payload = effect.payload as Record<string, any>;
+    const actor = payload.actor as PersistedCommentActor | undefined;
+
+    switch (effect.effectKind) {
+      case "references_sync": {
+        await issueReferencesSvc.syncComment(comment.id);
+        const after = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
+        return issueReferencesSvc.diffIssueReferenceSummary(payload.referenceSummaryBefore, after) as unknown as Record<string, unknown>;
+      }
+      case "comment_activity": {
+        if (await hasIssueCommentAddedActivity({ issueId: issue.id, commentId: comment.id })) return;
+        if (!actor) throw new Error("Comment activity effect is missing actor context");
+        const referenceEffect = await getEffectResult(db, comment.id, "references_sync");
+        const diff = referenceEffect?.result as any;
+        // The activity row and its plugin event must land together. The guard above
+        // treats the activity row as proof the event was emitted, so if the event
+        // were enqueued fire-and-forget and failed, the retry would skip this
+        // branch and the `issue.comment.created` event would be lost permanently.
+        // Committing both in one transaction makes the guard's premise true.
+        const publish = await db.transaction(async (tx) =>
+          logActivity(tx as unknown as typeof db, {
+            companyId: issue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "issue.comment_added",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              commentId: comment.id,
+              bodySnippet: comment.body.slice(0, 120),
+              identifier: issue.identifier,
+              issueTitle: issue.title,
+              ...summarizeIssueReferenceActivityDetails({
+                addedReferencedIssues: (diff?.addedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+                removedReferencedIssues: (diff?.removedReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+                currentReferencedIssues: (diff?.currentReferencedIssues ?? []).map(summarizeIssueRelationForActivity),
+              }),
+            },
+            pluginEventPayloadExtra: {
+              issueId: issue.id,
+              body: comment.body,
+              authorName: await resolveCommentAuthorName(actor as ReturnType<typeof getActorInfo>),
+            },
+          }, { deferPublish: true, enlistPluginOutbox: true }),
+        );
+        // Live fan-out only, after commit: durable delivery is already enqueued.
+        publish();
+        return;
+      }
+      case "interaction_expiry": {
+        if (!actor) throw new Error("Interaction expiry effect is missing actor context");
+        const expired = await issueThreadInteractionsSvc.expireRequestConfirmationsSupersededByComment(
+          issue,
+          comment,
+          { agentId: actor.agentId, userId: actor.actorType === "user" ? actor.actorId : null },
+        );
+        await logExpiredRequestConfirmations({
+          issue,
+          interactions: expired,
+          actor: actor as ReturnType<typeof getActorInfo>,
+          source: "issue.comment",
+        });
+        return { expiredInteractionIds: expired.map((interaction) => interaction.id) };
+      }
+      case "recovery_revalidation":
+        if (!actor) throw new Error("Recovery effect is missing actor context");
+        await revalidateActiveSourceRecovery({
+          issue,
+          trigger: "comment",
+          actor: actor as ReturnType<typeof getActorInfo>,
+        });
+        return;
+      case "wake": {
+        const agentId = payload.agentId;
+        if (typeof agentId !== "string" || !payload.wakeup) throw new Error("Wake effect payload is invalid");
+        const wakeup = payload.wakeup as IssueWakeupRequest;
+        // `heartbeat.wakeup` is the one sink here that is not naturally
+        // idempotent across "executed, then died before the ledger recorded it".
+        // Its own coalescing only merges a wake into a still-queued/running run,
+        // so once the first run finishes, a reclaim after lease expiry would
+        // create a SECOND run for one comment. The wake carries a deterministic
+        // idempotency key (`issue_comment:<commentId>:assignee|mention:<target>`),
+        // and an accepted wake request keeps that key on a row that outlives the
+        // run — so the key doubles as a durable receipt we can check first.
+        //
+        // Safe against the check-then-act race because effect claims serialize
+        // execution of this effect: only the claim holder reaches this line.
+        const idempotencyKey = wakeup.idempotencyKey;
+        if (typeof idempotencyKey === "string" && idempotencyKey.length > 0) {
+          const receipt = await findWakeIdempotencyReceipt(db, {
+            companyId: issue.companyId,
+            idempotencyKey,
+          });
+          if (receipt) return { wakeSkipped: "already_accepted", wakeupRequestId: receipt.id };
+        }
+        await heartbeat.wakeup(agentId, wakeup);
+        return;
+      }
+      case "watchdog_evaluation":
+        await taskWatchdogsSvc.reconcileForIssueAndAncestors(issue.companyId, issue.id, {
+          runId: typeof payload.runId === "string" ? payload.runId : null,
+        });
+        return;
+      case "run_activity":
+        if (typeof payload.runId === "string") await heartbeat.reportRunActivity(payload.runId);
+        return;
+      default:
+        throw new Error(`Unknown comment effect kind: ${effect.effectKind}`);
+    }
+  }
+
+  const processKeyedCommentEffects = (commentId: string) =>
+    processCommentEffects(db, commentId, executeKeyedCommentEffect);
+  opts.registerCommentEffectProcessor?.(processKeyedCommentEffects);
 
   function parseDateQuery(value: unknown, field: string) {
     if (typeof value !== "string" || value.trim().length === 0) return undefined;
@@ -4129,6 +4414,31 @@ export function issueRoutes(
   // far as labelling the boundary "grant" and its own note suggests "retry with
   // a mention", which is a trap: the mention has to come from a *specific*
   // author, and a mention from anyone else leaves the agent looping.
+  // PEN-2394: the text below used to say "a comment containing agent://<id>",
+  // and that form grants nothing. `agentHasMentionGrantOnIssue` prefilters with
+  // a LIKE on the raw substring but then gates on `extractAgentMentionIds`,
+  // whose regex only matches the markdown link `[label](agent://<id>)`. So an
+  // assignee who followed this message to the letter got the same 403 back,
+  // still telling them to do what they had already done — and, because the
+  // remediation was plausible, they kept retrying it instead of escalating.
+  // Tested with a control arm: the grant string was posted verbatim by the named
+  // assignee and the denial was byte-identical to an issue where nothing was
+  // ever posted.
+  //
+  // The fix is the message, not the check. Widening the parser to accept a bare
+  // `agent://<id>` would make quoting this very error body inside a comment hand
+  // out comment access by accident, and a bare string does not wake the agent
+  // either — the mention link is the one form that both wakes and authorizes.
+  //
+  // Which is exactly why the form below keeps the literal `<agent-id>`
+  // placeholder instead of interpolating the actor's real id into the link:
+  // `[@name](agent://<agent-id>)` fails `parseAgentMentionHref` (`new URL` throws
+  // on the angle brackets), so the whole body stays inert when someone pastes it
+  // into a comment to ask about it rather than to grant. Substituting the real id
+  // into the link — the obvious "helpful" edit — turns this error text into a
+  // live grant that fires on quotation, which is the hazard the paragraph above
+  // refuses to accept from the parser side. The id is given separately, bare, on
+  // the next clause; bare tokens grant nothing, which is the whole point.
   function issueCommentGrantRemediation(input: {
     actorAgentId: string;
     assigneeAgentId: string | null;
@@ -4140,9 +4450,11 @@ export function issueRoutes(
     return (
       `Being @-mentioned here does not grant you comment access. Only this issue's assignee ` +
       `(agent://${input.assigneeAgentId}) or a board user can grant it, by posting a comment on ` +
-      `this issue containing agent://${input.actorAgentId}. A mention written by any other agent ` +
-      `wakes you but does not authorize you. Until then, respond on an issue you are assigned to ` +
-      `and reference this one, or ask the assignee to mention you here.`
+      `this issue that @-mentions you as a markdown link of the form [@name](agent://<agent-id>), ` +
+      `where <agent-id> is ${input.actorAgentId}. A bare agent://${input.actorAgentId} in the ` +
+      `comment body is not a mention — it neither wakes you nor grants anything. A mention written ` +
+      `by any other agent wakes you but does not authorize you. Until then, respond on an issue ` +
+      `you are assigned to and reference this one, or ask the assignee to mention you here.`
     );
   }
 
@@ -4754,7 +5066,7 @@ export function issueRoutes(
         });
         // Reached only on commit; a rollback throws straight past this.
         try {
-          publishRecorded?.();
+          await publishRecorded?.();
         } catch (err) {
           // Distinct from the catch below: the record itself is committed and
           // recoverable, only its notification failed.
@@ -5557,6 +5869,70 @@ export function issueRoutes(
     );
   }
 
+  /**
+   * BLO-27912: is this PATCH exclusively a deliberate-park disposition write?
+   *
+   * Shape-gated to a single key for the same reason `isLapsedMonitorRearmPatch` is: the
+   * capability this unlocks is "state that a row is deliberately not being worked", and
+   * nothing else. A body carrying `parkedDisposition` *alongside* anything else would let a
+   * creator or manager reach `status`, `assigneeAgentId`, `description` or the dependency
+   * edges through a path that deliberately skips the ordinary mutation boundary. The row's
+   * own ACs require the park to change none of those, so admitting them here would break
+   * the acceptance criteria and the authorization boundary in one move.
+   *
+   * Key presence is a sound test here, unlike the monitor case: `parkedDisposition` has no
+   * nested defaults that zod would materialize, so a key is present only if the caller sent
+   * it. `null` (un-park) is as admissible as an object — an actor who can park must be able
+   * to un-park, or the disposition becomes one-way and the AC that un-parking restores
+   * detection would have no reachable executor.
+   */
+  function isParkedDispositionPatch(body: unknown) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+    const patch = body as Record<string, unknown>;
+    const keys = Object.keys(patch);
+    return keys.length === 1 && keys[0] === "parkedDisposition";
+  }
+
+  /**
+   * BLO-27912: admit a park write from an actor that is NOT the assignee.
+   *
+   * This is the whole point of the row. `hasExplicitWaitingPath` accepted six satisfiers and
+   * every one of them was assignee-reachable only, so a deliberately-parked row — one whose
+   * assignee is by construction not working on it — had no attainable way to say so and the
+   * liveness invariant re-fired against it forever. Measured on BLO-24266: three escalations
+   * with a byte-identical `originFingerprint`, and `POST /issues/:id/interactions` returning
+   * 403 `deny_missing_grant` to an actor holding BOTH creator and manager-chain grants.
+   *
+   * Both of those grants are admitted, which is exactly the set the row's AC names
+   * (`createdByAgentId` or manager-chain). Resolved through the `issue:comment` action
+   * because that is the action those two allow-paths are defined over — BLO-18797 made them
+   * a comment grant deliberately, and this widens it by one narrowly-shaped field rather
+   * than by promoting the grant itself. Everything else the comment grant withholds
+   * (`reopen`, `resume`, status transitions) stays withheld, because the shape gate above
+   * rejects any body that carries them.
+   *
+   * Fails closed: a non-agent actor, a cross-company actor, a differently-shaped body, or
+   * any other decision reason all return null and leave the pre-existing boundary intact.
+   */
+  async function decideParkedDispositionPatch(
+    req: Request,
+    issue: Parameters<typeof decideIssueAccess>[1],
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return null;
+    if (req.actor.companyId !== issue.companyId) return null;
+    if (!isParkedDispositionPatch(req.body)) return null;
+
+    const commentDecision = await decideIssueAccess(req, issue, "issue:comment");
+    if (!commentDecision.allowed) return null;
+    if (
+      commentDecision.reason !== "allow_manager_chain" &&
+      commentDecision.reason !== "allow_issue_creator"
+    ) {
+      return null;
+    }
+    return commentDecision;
+  }
+
   function isManagerChainNonInvokableAssigneeReroutePatch(body: unknown) {
     if (!body || typeof body !== "object" || Array.isArray(body)) return false;
     const patch = body as Record<string, unknown>;
@@ -5674,6 +6050,15 @@ export function issueRoutes(
       onManagerChainNonInvokableRerouteAllowed?: () => void;
       allowManagerMonitorRearm?: boolean;
       /**
+       * BLO-27912: PATCH /issues/:id only. Set by the caller after
+       * `decideParkedDispositionPatch` has confirmed BOTH that the body is exclusively a
+       * `parkedDisposition` write AND that the actor holds the creator or manager-chain
+       * grant over this issue. Off by default, and deliberately so — this helper backs ~25
+       * mutation routes including DELETE /issues/:id, so a `return true` reached from any
+       * of them would be a far wider grant than the one narrow field this unlocks.
+       */
+      allowParkedDisposition?: boolean;
+      /**
        * PATCH /issues/:id only: when an execution-stage currentParticipant and
        * issue assignee diverge, the participant must still be able to submit a
        * decision-shaped stage patch. Keep this opt-in and shape-gated because
@@ -5691,6 +6076,17 @@ export function issueRoutes(
        * route whose blast radius you have actually checked.
        */
       allowCreatorOrManagerChainOwnership?: boolean;
+      /**
+       * BLO-29150: DELETE /issues/:id only. A bare run lock proves "this run is
+       * executing this row" — the right predicate for mutating in-flight work,
+       * and the wrong one for destroying the row and its attachment objects.
+       * `isCurrentIssueExecutionRun` is assignee-agnostic, so a lock left stale
+       * by a reassignment authorized an irreversible hard delete of a row that
+       * now belongs to another agent. Opt in from routes whose effect outlives
+       * the run holding the lock; leave it off where the lock holder is only
+       * concluding its own in-flight work.
+       */
+      requireAssignmentForRunLockAuthority?: boolean;
     } = {},
   ) {
     if (req.actor.type !== "agent") return true;
@@ -5720,8 +6116,33 @@ export function issueRoutes(
     if (options.allowManagerMonitorRearm) {
       return true;
     }
-    if (isCurrentIssueExecutionRun(req, issue)) {
+    // BLO-27912: same placement rationale as the two flags above — the gate that knows what
+    // is being written lives at the caller, and this only honours its decision.
+    if (options.allowParkedDisposition) {
       return true;
+    }
+    if (isCurrentIssueExecutionRun(req, issue)) {
+      // BLO-29150: the lock alone is authority for every route that has not
+      // opted in. Where it has, the holder must ALSO still be the assignee.
+      // The stale pair "A holds the lock, B is the assignee" is produced by
+      // ordinary operation, not by abuse: the heartbeat's reassignment
+      // lock-release (services/heartbeat.ts) deliberately leaves a `running`
+      // holder's lock in place, and escalateStaleRunRefire
+      // (services/recovery/service.ts) plus agents.remove (services/agents.ts)
+      // strand it outright.
+      //
+      // Falling through instead of returning false is deliberate: the actor may
+      // still hold real authority over this row — a checkout-management
+      // override, or an unassigned row — and the checks below are what decide
+      // that. Returning false here would deny a manager that legitimately
+      // clears the boundary.
+      if (
+        !options.requireAssignmentForRunLockAuthority ||
+        issue.assigneeAgentId === null ||
+        issue.assigneeAgentId === actorAgentId
+      ) {
+        return true;
+      }
     }
     const isActiveRecoveryActionOwner = async () => {
       if (!options.allowRecoveryActionOwner || req.actor.companyId !== issue.companyId) return false;
@@ -6495,6 +6916,68 @@ export function issueRoutes(
     if (statusOnly && writesStatusAdjudication) return true;
     if (!statusOnly && (!planningOnly || mutationKind === "document")) return true;
 
+    // BLO-23197: record the refusal on the run row so the successful-run-handoff
+    // detector can escalate the corrective wake off this lane. `details` below
+    // already names the remedy (`resumeRequiresNormalModel: true`), but it lives
+    // only in an HTTP response nobody re-reads, so `decideSuccessfulRunHandoff`
+    // was left inferring the lane from `issues.workMode` — a proxy that reads
+    // `standard` in exactly the deadlocking case and queues another status-only
+    // wake into the identical 403.
+    //
+    // Documents only: the escalation target is `planning_only`, which permits
+    // document updates but still bars deliverables and annotations, so a refused
+    // deliverable write would be escalated onto a lane that still cannot perform
+    // it. Deliberately NOT routed through `recordDeniedIssueWrite` like the
+    // sibling guards — that log's aggregate cap and repeat dedupe both drop
+    // records silently, so a signal read from it would go quiet under repeated
+    // denials, which is the very load that produces the deadlock.
+    //
+    // Best-effort by design: the 403 is the contract of this function and must
+    // be delivered even if the stamp fails, so a failure is logged and
+    // swallowed rather than surfacing as a 500. Unlike the activity-log cap this
+    // replaces, the drop is uncorrelated with denial volume — re-refusals
+    // re-stamp the same row by primary key — so it degrades on genuine database
+    // failure only, and says so in the log.
+    //
+    // On the co-written `updatedAt`: deliberately NOT justified by enumerating
+    // today's readers, because such a list is wrong the moment one is added.
+    //
+    // What carries the weight is that a mid-run bump is not a new class of event
+    // on this row. The column has no `$onUpdate`, and ~50 sites in
+    // `heartbeat.ts` bump it explicitly across a run's life, so every reader of
+    // it already has to tolerate one landing at an arbitrary mid-run instant —
+    // this stamp included.
+    //
+    // Supporting only, and deliberately not the load-bearing half: the row's
+    // eventual state is unaffected, because every terminal path writes a
+    // strictly later `updatedAt` through `setRunStatus` — normal completion and
+    // the reaper's `process_lost` finalize alike, so this holds even for a run
+    // that dies immediately after stamping. That argument is about the eventual
+    // state ONLY. Inside the live window between the stamp and the finalize the
+    // row is genuinely fresher than it would otherwise have been, so a reader
+    // shaped as "`updatedAt` older than N ⇒ abandoned" that samples in that
+    // window has its verdict postponed by exactly that interval, and the later
+    // finalize cannot retroactively correct a read already taken. Only the
+    // bump-tolerance argument above covers that reader; do not lean on this one.
+    if (statusOnly && mutationKind === "document") {
+      try {
+        await db
+          .update(heartbeatRuns)
+          .set({ statusOnlyDocumentWriteRefusedAt: new Date(), updatedAt: new Date() })
+          .where(eq(heartbeatRuns.id, run.id));
+      } catch (err) {
+        // `documentKey` is absent on the revision-restore route, which passes
+        // `"document"` with no key so it gets the strict gate (see this
+        // function's doc comment). Log the request line too, or a restore
+        // refusal and an upsert refusal are indistinguishable in production —
+        // both would read `documentKey: undefined`.
+        logger.warn(
+          { err, runId: run.id, issueId: issue.id, documentKey, method: req.method, url: req.originalUrl },
+          "status_only_document_write_refusal_stamp_failed",
+        );
+      }
+    }
+
     res.status(403).json({
       error: planningOnly
         ? "Planning-only recovery runs can update issue documents but cannot create or modify annotations or deliverable artifacts"
@@ -7232,6 +7715,18 @@ export function issueRoutes(
     const parsedOffset = rawOffset !== undefined && /^\d+$/.test(rawOffset)
       ? Number.parseInt(rawOffset, 10)
       : null;
+    // BLO-24495: this endpoint only ever implemented limit/offset. `page`/`perPage`
+    // were silently dropped (never read from req.query), so every page number
+    // replayed the same limit/offset-default window with no error. Reject
+    // explicitly instead of returning a confident, wrong result set.
+    const unsupportedPaginationParams = parseUnsupportedPaginationParams(req.query);
+    if (unsupportedPaginationParams.length > 0) {
+      res.status(400).json({
+        error: "page/perPage pagination is not supported on this endpoint; use limit and offset instead",
+        unsupportedParams: unsupportedPaginationParams,
+      });
+      return;
+    }
     const attention = req.query.attention as string | undefined;
     const sortField = req.query.sortField as string | undefined;
     const sortDir = req.query.sortDir as string | undefined;
@@ -8246,9 +8741,42 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
-    const handBackAgentId = outcome === "restored" && sourceIssueStatus === "todo"
-      ? activeRecoveryAction?.returnOwnerAgentId ?? null
-      : null;
+    // Ownership returns to the original assignee on two distinct paths, and the
+    // difference is the source issue's status, not the ownership question:
+    //
+    //   restored + todo    — the strand cleared and the issue is dispatchable again.
+    //   blocked  + blocked — the strand cleared but the issue is genuinely waiting
+    //                        on a first-class blocker (enforced below), so it stays
+    //                        `blocked` while ownership goes home. This is an
+    //                        ownership-only restore.
+    //
+    // The second path exists because a dependency-blocked issue is not a strand
+    // needing a manager's judgment — it is an issue waiting for its blocker. Parking
+    // it on the manager makes `reconcileResolvedBlockerDependents` wake
+    // `assigneeAgentId` (the manager) when the blocker resolves, so the agent that
+    // was actually doing the work is never woken. Returning ownership while the row
+    // stays `blocked` re-points that wake at the right agent without falsifying the
+    // status — which is why this must NOT be done by moving the issue to `todo`.
+    const handBackAgentId =
+      ((outcome === "restored" && sourceIssueStatus === "todo") ||
+        (outcome === "blocked" && sourceIssueStatus === "blocked")) &&
+      // A human holding the issue outranks a recorded return owner. The sibling
+      // PATCH path refuses this case too (it requires the action owner to be the
+      // current assignee, which a user-assigned issue can never satisfy). Here the
+      // stakes are higher: this path sets `assigneeAgentId` without clearing
+      // `assigneeUserId`, so handing back would leave BOTH set rather than merely
+      // reassigning.
+      !existing.assigneeUserId
+        ? activeRecoveryAction?.returnOwnerAgentId ?? null
+        : null;
+    // A hand-back only converges if the return owner can actually run. The PATCH
+    // blocked->todo path already routes the return owner through this guard, which
+    // is what makes it reject a terminated owner with 409; this endpoint wrote the
+    // id straight through, so a hand-back here could park work on a terminated or
+    // invalid-org-chain agent and strand it silently. Validate on both paths.
+    if (handBackAgentId) {
+      await normalizeIssueAssigneeAgentReference(existing.companyId, handBackAgentId);
+    }
     const recordedOutcome = handBackAgentId
       ? "handed_back"
       : outcome === "restored" && sourceIssueStatus === "done"
@@ -9396,7 +9924,16 @@ export function issueRoutes(
       res.status(404).json({ error: "Issue not found" });
       return;
     }
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    // BLO-29150: `workProductsSvc.remove` is a hard `db.delete`, so the same
+    // rule as DELETE /issues/:id applies — a run lock left stale by a
+    // reassignment is not authority to destroy the row.
+    if (
+      !(await assertAgentIssueMutationAllowed(req, res, issue, {
+        requireAssignmentForRunLockAuthority: true,
+      }))
+    ) {
+      return;
+    }
     if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
     const removed = await workProductsSvc.remove(id);
     if (!removed) {
@@ -9593,7 +10130,9 @@ export function issueRoutes(
     if (!issue) return;
     if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
-    const approvals = await issueApprovalsSvc.listApprovalsForIssue(id);
+    const approvals = await issueApprovalsSvc.listApprovalsForIssue(id, {
+      includeAgentConfig: await actorCanReadAgentConfig(req, access, issue.companyId),
+    });
     res.json(approvals);
   });
 
@@ -9624,7 +10163,9 @@ export function issueRoutes(
       details: { approvalId: req.body.approvalId },
     });
 
-    const approvals = await issueApprovalsSvc.listApprovalsForIssue(id);
+    const approvals = await issueApprovalsSvc.listApprovalsForIssue(id, {
+      includeAgentConfig: await actorCanReadAgentConfig(req, access, issue.companyId),
+    });
     res.status(201).json(approvals);
   });
 
@@ -9783,7 +10324,7 @@ export function issueRoutes(
       projectId: createBody.projectId ?? null,
       executionPolicy,
     }, actor);
-    let deduplicationReason: "idempotency_key" | "recent_open_title" | null = null;
+    let deduplicationReason: "idempotency_key" | "recent_open_title" | "pr_review_target" | null = null;
     const issue = await svc.create(companyId, {
       ...createBody,
       ...(taskBridgeOriginForActor(req) ?? {}),
@@ -9802,6 +10343,19 @@ export function issueRoutes(
       },
     });
     if (deduplicationReason) {
+      if (deduplicationReason === "pr_review_target") {
+        await issueReferencesSvc.syncIssue(issue.id);
+        await externalObjectsSvc.syncIssueSafely(issue.id);
+        void queueIssueAssignmentWakeup({
+          heartbeat,
+          issue,
+          reason: "issue_assigned",
+          mutation: "create_deduplicated",
+          contextSource: "issue.create",
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+        });
+      }
       const referenceSummary = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
       res.status(200).json({
         ...issue,
@@ -10470,6 +11024,13 @@ export function issueRoutes(
       managerMonitorRearmDecision &&
       managerMonitorRearmDecision.reason === "allow_manager_chain",
     );
+    // BLO-27912: the park write is the one satisfier on `hasExplicitWaitingPath` that a
+    // non-assignee can set. Resolved here, before the boundary check, for the same reason
+    // the coordination-metadata allowlist is: the boundary returns early on denial, and a
+    // parked-disposition PATCH from a creator or manager is exactly the request the boundary
+    // would otherwise refuse. Null-shaped bodies leave the boundary untouched.
+    const parkedDispositionDecision = await decideParkedDispositionPatch(req, existing);
+    const parkedDispositionAuthorized = parkedDispositionDecision !== null;
     const coordinationMetadataDecision = coordinationMetadataOutcome?.kind === "allowed"
       ? coordinationMetadataOutcome.decision
       : null;
@@ -10505,6 +11066,7 @@ export function issueRoutes(
           managerChainNonInvokableRerouteAllowed = true;
         },
         allowManagerMonitorRearm: managerMonitorRearmAuthorized,
+        allowParkedDisposition: parkedDispositionAuthorized,
         // BLO-18797: the delegate-recovery path. The helper additionally
         // requires a blocked -> todo patch containing only status and
         // blockedByIssueIds.
@@ -10533,7 +11095,7 @@ export function issueRoutes(
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);
     const isBlocked = existing.status === "blocked";
-    const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+    let normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
       existing.companyId,
       req.body.assigneeAgentId as string | null | undefined,
     );
@@ -10552,6 +11114,24 @@ export function issueRoutes(
     } = req.body;
     const shouldCancelActiveRunForCancelledStatus =
       existing.status !== "cancelled" && updateFields.status === "cancelled";
+    // BLO-23206: the predicate above ends at most ONE run — the running one, via
+    // resolveActiveIssueRun, which returns null for anything not `running`.
+    // Queued and scheduled_retry rows for the same issue survived the close and
+    // were claimed against it on the next 30s scheduler tick. Drain those too,
+    // on either terminal status: `done` closes work just as dead as `cancelled`,
+    // and the drain only targets never-started runs so it cannot kill the run
+    // that is marking the issue done.
+    //
+    // Captured here rather than re-read at the drain site below, because
+    // `updateFields.status` is mutated further down (the move-to-todo branch).
+    // That branch only fires when the status was undefined, so it cannot
+    // currently collide with a terminal write — but relying on that is a
+    // temporal coupling a later edit would silently break.
+    const terminalStatusForDrain =
+      (updateFields.status === "cancelled" || updateFields.status === "done") &&
+      existing.status !== updateFields.status
+        ? (updateFields.status as "cancelled" | "done")
+        : null;
     if (resumeRequested === true && !commentBody) {
       res.status(400).json({ error: "Follow-up intent requires a comment" });
       await recordDeniedIssueWrite(req, existing, "issue:mutate", {
@@ -10810,6 +11390,7 @@ export function issueRoutes(
       const requestedExecutionPolicy = applyActorMonitorScheduledBy(
         normalizeIssueExecutionPolicy(req.body.executionPolicy),
         actor.actorType,
+        managerMonitorRearmAuthorized,
       );
       // A manager-chain re-arm is authorized to restore a *timer*, not to
       // rewrite the policy. `isLapsedMonitorRearmPatch` already rejects a
@@ -10830,6 +11411,22 @@ export function issueRoutes(
         : previousExecutionPolicy;
     if (normalizedAssigneeAgentId !== undefined) {
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
+    }
+    const automaticRecoveryHandBack =
+      existing.status === "blocked" &&
+      updateFields.status === "todo" &&
+      req.body.assigneeAgentId === undefined &&
+      req.body.assigneeUserId === undefined &&
+      activeRecoveryActionBeforeUpdate?.ownerAgentId != null &&
+      activeRecoveryActionBeforeUpdate?.ownerAgentId === existing.assigneeAgentId &&
+      Boolean(activeRecoveryActionBeforeUpdate.returnOwnerAgentId);
+    if (automaticRecoveryHandBack) {
+      normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+        existing.companyId,
+        activeRecoveryActionBeforeUpdate!.returnOwnerAgentId,
+      );
+      updateFields.assigneeAgentId = normalizedAssigneeAgentId;
+      updateFields.assigneeUserId = null;
     }
     const monitorChanged = monitorPoliciesEqual(previousExecutionPolicy, nextExecutionPolicy) === false;
     await assertCanManageIssueMonitor(
@@ -10940,7 +11537,7 @@ export function issueRoutes(
     const isScopedRecoveryOwnerReturnAssignment =
       allowScopedRecoveryOwnerSourceMutation &&
       req.actor.type === "agent" &&
-      req.body.assigneeAgentId !== undefined;
+      (req.body.assigneeAgentId !== undefined || automaticRecoveryHandBack);
     const isCurrentRunMonitorAssigneeRestore =
       req.actor.type === "agent" &&
       isCurrentIssueExecutionRun(req, existing) &&
@@ -11220,6 +11817,71 @@ export function issueRoutes(
           issueId: existing.id,
           details: { source: "issue_status_cancelled", issueId: existing.id },
         });
+      }
+    }
+
+    // BLO-23206: drain the never-started runs the block above cannot reach.
+    //
+    // Deliberately AFTER svc.update has committed the terminal status. Running
+    // it inside that transaction would be worse, not better: the drain would be
+    // invisible to a concurrent scheduler tick until commit, while the issue
+    // that tick reads is still NON-terminal, so it would claim a row we had
+    // just drained and we would have cancelled nothing.
+    //
+    // This ordering leaves a residual window — between the commit and the drain
+    // a tick can still claim a row — and that window is ACCEPTED here, not
+    // closed. It is not closed because the claim-time guard in
+    // `evaluateQueuedRunStaleness` deliberately spares any row carrying a
+    // wakeCommentId (see the comment there: the self-directed/handoff
+    // distinction is undecidable at that layer), so for exactly the rows this
+    // issue is about, the guard is not a backstop. What closes the promoted-row
+    // case is `suppressSelfDirectedTerminalWake` at the promotion source; a run
+    // enqueued directly by the closing comment on this PATCH is still out of
+    // reach of both and is tracked separately.
+    //
+    // Best-effort: a failure here leaves the pre-existing behaviour rather than
+    // failing the PATCH the caller asked for.
+    let drainedQueuedRunCount = 0;
+    if (terminalStatusForDrain) {
+      try {
+        drainedQueuedRunCount = await svc.cancelStaleIssueContextRuns({
+          companyId: existing.companyId,
+          issueId: existing.id,
+          keepRunId: actor.runId ?? null,
+          reason: `Cancelled because the issue reached terminal status (${terminalStatusForDrain}) before this queued run could start`,
+          errorCode: "issue_terminal_status",
+        });
+        // A drained row may have been holding the issue's pre-claim execution
+        // lock (BLO-20321), which would otherwise outlive it and read as a live
+        // owner. This only clears a pointer that names a terminal or missing
+        // run, and its restore-promotion step is guarded on `in_progress`, so
+        // it cannot resurrect the status we just wrote.
+        await svc.clearExecutionRunIfTerminal(existing.id);
+        if (drainedQueuedRunCount > 0) {
+          await logActivity(db, {
+            companyId: existing.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "heartbeat.cancelled",
+            entityType: "issue",
+            entityId: existing.id,
+            issueId: existing.id,
+            details: {
+              source: "issue_terminal_status_drain",
+              issueId: existing.id,
+              terminalStatus: terminalStatusForDrain,
+              drainedRunCount: drainedQueuedRunCount,
+            },
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          { err, issueId: existing.id, terminalStatus: terminalStatusForDrain },
+          "failed to drain queued runs for terminal issue",
+        );
       }
     }
 
@@ -11696,6 +12358,7 @@ export function issueRoutes(
     const nextExecutionState = parseIssueExecutionState(issue.executionState);
     const executionStageWakeup = buildExecutionStageWakeup({
       issueId: issue.id,
+      issueStatus: issue.status,
       previousState: previousExecutionState,
       nextState: nextExecutionState,
       interruptedRunId,
@@ -11768,7 +12431,12 @@ export function issueRoutes(
 
       if (executionStageWakeup) {
         addWakeup(executionStageWakeup.agentId, executionStageWakeup.wakeup);
-      } else if (assigneeChanged && issue.assigneeAgentId && issue.status !== "backlog") {
+      } else if (
+        assigneeChanged &&
+        issue.assigneeAgentId &&
+        issue.status !== "backlog" &&
+        !isClosedIssueStatus(issue.status)
+      ) {
         addWakeup(issue.assigneeAgentId, {
           source: "assignment",
           triggerDetail: "system",
@@ -11828,7 +12496,16 @@ export function issueRoutes(
         const assigneeId = issue.assigneeAgentId;
         const actorIsAgent = actor.actorType === "agent";
         const selfComment = actorIsAgent && actor.actorId === assigneeId;
-        const skipAssigneeCommentWake = selfComment || isClosed;
+        // BLO-29821: this must read the POST-update status, not `isClosed` — which is
+        // `existing.status`, i.e. one write behind. A single PATCH that both closes the
+        // issue and posts the closing comment (`{status:"cancelled", comment:"..."}`)
+        // would otherwise slip past this guard and wake the assignee on an issue that is
+        // already terminal by the time the wake is claimed. `isClosed` itself stays
+        // pre-update on purpose: `reopened` above is defined in terms of it.
+        //
+        // Terminal issues are closed work for every agent, including explicitly mentioned
+        // peers. Only an explicit reopen makes the thread actionable again.
+        const skipAssigneeCommentWake = selfComment || isClosedIssueStatus(issue.status);
 
         if (assigneeId && !assigneeChanged && (reopened || !skipAssigneeCommentWake)) {
           addWakeup(assigneeId, {
@@ -11878,6 +12555,7 @@ export function issueRoutes(
         }
 
         for (const mentionedId of mentionedIds) {
+          if (isClosedIssueStatus(issue.status) && !reopened) continue;
           if (!commentAuthorCanGrantIssueMention({
             mentionedAgentId: mentionedId,
             issueAssigneeAgentId: issue.assigneeAgentId,
@@ -11916,16 +12594,59 @@ export function issueRoutes(
             mutation: "blocker_done",
           });
         }
+        // BLO-21523 phase 2: the wake above only reaches assigned, wakeable
+        // dependents. Flip `status` for every `blocked` dependent this
+        // blocker's `done` transition may have freed — including unassigned
+        // ones no wake ever targets — so the fix isn't just "the agent got
+        // told," it's "the row is dispatchable."
+        try {
+          const blockedDependentIds = await listBlockedDependentIssueIds(db, issue.companyId, issue.id);
+          if (blockedDependentIds.length > 0) {
+            await recomputeBlockedIssuesStatusIfReady(db, issue.companyId, blockedDependentIds, {
+              triggerPath: "eager_status_recompute",
+            });
+          }
+        } catch (err) {
+          logger.warn(
+            { err, issueId: issue.id },
+            "failed to recompute blocked dependents' status after blocker resolved",
+          );
+        }
+      }
+
+      // BLO-21523 phase 2: clearing this issue's own last blocker (via
+      // `blockedByIssueIds`) must recompute its `status` even when it has no
+      // assignee yet to wake.
+      //
+      // Gated on an actual blocker-edge write, NOT on the broader wake
+      // condition below. The wake's other two disjuncts are not blocker
+      // transitions: `existing.status !== "blocked"` fires on a transition
+      // *into* blocked, and the assignee comparison fires on reassignment.
+      // Since an issue with no blocker edges is always dependency-ready,
+      // reusing them here would flip a bare `PATCH {status: "blocked"}` — the
+      // common "blocked on a human/external gate" escalation, which carries no
+      // edges by construction — straight back to `todo`, contradicting the
+      // 200 the caller just received and making `blocked` unsettable.
+      const statusRecomputeCandidate =
+        issue.status === "blocked" && Array.isArray(req.body.blockedByIssueIds);
+      if (statusRecomputeCandidate) {
+        try {
+          await recomputeBlockedIssuesStatusIfReady(db, issue.companyId, [issue.id], {
+            triggerPath: "eager_status_recompute",
+          });
+        } catch (err) {
+          logger.warn({ err, issueId: issue.id }, "failed to recompute blocked status after blocker-transition");
+        }
       }
 
       const restoredBlockedReadyDependency =
         issue.status === "blocked" &&
-        issue.assigneeAgentId &&
         (
           existing.status !== "blocked" ||
           Array.isArray(req.body.blockedByIssueIds) ||
           existing.assigneeAgentId !== issue.assigneeAgentId
-        );
+        ) &&
+        issue.assigneeAgentId;
       if (restoredBlockedReadyDependency && typeof dependencyReadinessSvc.getDependencyReadiness === "function") {
         const readiness = await dependencyReadinessSvc.getDependencyReadiness(issue.id);
         const resolvedBlockerIssueId = readiness.blockerIssueIds[0] ?? null;
@@ -11991,7 +12712,16 @@ export function issueRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    // BLO-29150: `svc.remove` is a hard delete and the attachment objects go
+    // with it, so this route does not accept a bare checkout/execution run lock
+    // as delete authority — see requireAssignmentForRunLockAuthority.
+    if (
+      !(await assertAgentIssueMutationAllowed(req, res, existing, {
+        requireAssignmentForRunLockAuthority: true,
+      }))
+    ) {
+      return;
+    }
     const attachments = await svc.listAttachments(id);
 
     const issue = await svc.remove(id);
@@ -13716,6 +14446,7 @@ export function issueRoutes(
         }
         commentDecisionStageWakeup = buildExecutionStageWakeup({
           issueId: currentIssue.id,
+          issueStatus: currentIssue.status,
           previousState: currentExecutionState,
           nextState: parseIssueExecutionState(currentIssue.executionState),
           interruptedRunId,
@@ -13723,17 +14454,38 @@ export function issueRoutes(
           requestedByActorId: actor.actorId,
         });
       } else {
-        comment = await svc.addComment(id, req.body.body, {
+        const commentActor = {
           agentId: actor.agentId ?? undefined,
           userId: actor.actorType === "user" ? actor.actorId : undefined,
           runId: actor.runId,
-        }, {
+        };
+        const commentOptions = {
           authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
           presentation: req.body.presentation ?? null,
           metadata: req.body.metadata ?? null,
           idempotencyKey: req.body.idempotencyKey ?? null,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
-        });
+        };
+        if (req.body.idempotencyKey) {
+          comment = await db.transaction(async (tx) => {
+            const accepted = await svc.addComment(id, req.body.body, commentActor, commentOptions, tx);
+            const effects = await buildKeyedCommentEffectIntents({
+              issue: currentIssue,
+              comment: accepted,
+              actor,
+              referenceSummaryBefore: commentReferenceSummaryBefore,
+            });
+            await enqueueCommentEffects(tx as unknown as Db, {
+              companyId: currentIssue.companyId,
+              issueId: currentIssue.id,
+              commentId: accepted.id,
+              effects,
+            });
+            return accepted;
+          });
+        } else {
+          comment = await svc.addComment(id, req.body.body, commentActor, commentOptions);
+        }
       }
     }
 
@@ -13747,6 +14499,28 @@ export function issueRoutes(
         res.status(200).json(comment);
         return;
       }
+    }
+
+    if (req.body.idempotencyKey) {
+      if (idempotentReplay) {
+        if (!(await hasCommentEffects(db, comment.id))) {
+          const effects = await buildKeyedCommentEffectIntents({
+            issue: currentIssue,
+            comment,
+            actor,
+            referenceSummaryBefore: commentReferenceSummaryBefore,
+          });
+          await enqueueCommentEffects(db, {
+            companyId: currentIssue.companyId,
+            issueId: currentIssue.id,
+            commentId: comment.id,
+            effects,
+          });
+        }
+      }
+      await processKeyedCommentEffects(comment.id);
+      res.status(idempotentReplay ? 200 : 201).json(comment);
+      return;
     }
 
     if (commentReferenceDiff === null) {
@@ -13982,6 +14756,7 @@ export function issueRoutes(
       }
 
       for (const mentionedId of mentionedIds) {
+        if (isClosedIssueStatus(currentIssue.status) && !reopened) continue;
         if (!commentAuthorCanGrantIssueMention({
           mentionedAgentId: mentionedId,
           issueAssigneeAgentId: currentIssue.assigneeAgentId,
@@ -14017,6 +14792,29 @@ export function issueRoutes(
             resolvedBlockerIssueId: currentIssue.id,
             blockerIssueIds: dependent.blockerIssueIds,
           });
+        }
+        // BLO-21523 phase 2: see the matching comment on the PATCH /issues/:id
+        // becameDone block — flip status for every blocked dependent this
+        // transition may have freed, not just the ones with a wake target.
+        // This whole block is `await`-ed before the comment response is sent
+        // (unlike the PATCH route's fire-and-forget wake dispatch), so a
+        // recompute failure must not fail the comment-post request itself.
+        try {
+          const blockedDependentIds = await listBlockedDependentIssueIds(
+            db,
+            currentIssue.companyId,
+            currentIssue.id,
+          );
+          if (blockedDependentIds.length > 0) {
+            await recomputeBlockedIssuesStatusIfReady(db, currentIssue.companyId, blockedDependentIds, {
+              triggerPath: "eager_status_recompute",
+            });
+          }
+        } catch (err) {
+          logger.warn(
+            { err, issueId: currentIssue.id },
+            "failed to recompute blocked dependents' status after blocker resolved",
+          );
         }
       }
 
@@ -14061,9 +14859,6 @@ export function issueRoutes(
     })();
 
     await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
-    if (req.body.idempotencyKey) {
-      await svc.markCommentIdempotencyProcessed(comment.id);
-    }
     res.status(idempotentReplay ? 200 : 201).json(comment);
   });
 
@@ -14337,7 +15132,19 @@ export function issueRoutes(
       res.status(404).json({ error: "Issue not found" });
       return;
     }
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    // BLO-29150: this route deletes the storage object before the row, so it is
+    // the same irreversible class as DELETE /issues/:id. The
+    // `assertDeliverableMutationAllowedByRunContext` call below is NOT an
+    // ownership gate — it only filters cheap status-only / planning-only
+    // recovery runs by their context snapshot, and returns true for an ordinary
+    // run — so it does not close this hole on its own.
+    if (
+      !(await assertAgentIssueMutationAllowed(req, res, issue, {
+        requireAssignmentForRunLockAuthority: true,
+      }))
+    ) {
+      return;
+    }
     if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
 
     try {

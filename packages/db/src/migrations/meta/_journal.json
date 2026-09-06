@@ -1496,8 +1496,141 @@
     {
       "idx": 221,
       "version": "7",
-      "when": 1786700947582,
-      "tag": "0221_approval_enforcement_drift_index",
+      "when": 1787054772668,
+      "tag": "0221_repair_cross_company_issue_projects",
+      "breakpoints": true
+    },
+    {
+      "idx": 222,
+      "version": "7",
+      "when": 1787054773668,
+      "tag": "0222_issues_parked_disposition",
+      "breakpoints": true
+    },
+    {
+      "idx": 223,
+      "version": "7",
+      "when": 1787356572975,
+      "tag": "0223_pipeline_stage_exit_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 224,
+      "version": "7",
+      "when": 1787356573975,
+      "tag": "0224_heartbeat_runs_overdue_scheduled_retry_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 225,
+      "version": "7",
+      "when": 1787356574975,
+      "tag": "0225_heartbeat_runs_crash_recovery_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 226,
+      "version": "7",
+      "when": 1787356575975,
+      "tag": "0226_heartbeat_runs_crash_recovery_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 227,
+      "version": "7",
+      "when": 1787356576975,
+      "tag": "0227_heartbeat_runs_crash_recovery_validate",
+      "breakpoints": true
+    },
+    {
+      "idx": 228,
+      "version": "7",
+      "when": 1786492207000,
+      "tag": "0228_github_review_gate_deliveries",
+      "breakpoints": true
+    },
+    {
+      "idx": 229,
+      "version": "7",
+      "when": 1787743476000,
+      "tag": "0229_human_gated_digest_touch_locks",
+      "breakpoints": true
+    },
+    {
+      "idx": 230,
+      "version": "7",
+      "when": 1787743477000,
+      "tag": "0230_heartbeat_runs_retry_successor_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 231,
+      "version": "7",
+      "when": 1787874021213,
+      "tag": "0231_issue_comment_effects",
+      "breakpoints": true
+    },
+    {
+      "idx": 232,
+      "version": "7",
+      "when": 1787877823391,
+      "tag": "0232_issue_comment_effects_retry_schedule",
+      "breakpoints": true
+    },
+    {
+      "idx": 233,
+      "version": "7",
+      "when": 1787883888000,
+      "tag": "0233_alertmanager_aggregate_creation_dedupe",
+      "breakpoints": true
+    },
+    {
+      "idx": 234,
+      "version": "7",
+      "when": 1787980000000,
+      "tag": "0234_pull_request_review_state",
+      "breakpoints": true
+    },
+    {
+      "idx": 235,
+      "version": "7",
+      "when": 1788040000000,
+      "tag": "0235_issue_recovery_hand_back_residual",
+      "breakpoints": true
+    },
+    {
+      "idx": 236,
+      "version": "7",
+      "when": 1788100000000,
+      "tag": "0236_active_pr_review_dedup",
+      "breakpoints": true
+    },
+    {
+      "idx": 237,
+      "version": "7",
+      "when": 1788480000000,
+      "tag": "0237_heartbeat_runs_agent_queued_dispatch_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 238,
+      "version": "7",
+      "when": 1788560000000,
+      "tag": "0238_heartbeat_runs_status_only_document_write_refused",
+      "breakpoints": true
+    },
+    {
+      "idx": 239,
+      "version": "7",
+      "when": 1788560060000,
+      "tag": "0239_github_status_webhook_outbox_provenance",
+      "breakpoints": true
+    },
+    {
+      "idx": 240,
+      "version": "7",
+      "when": 1788560120000,
+      "tag": "0240_approval_enforcement_drift_index",
       "breakpoints": true
     }
   ]

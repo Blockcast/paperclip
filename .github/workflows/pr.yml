@@ -25,7 +25,14 @@ jobs:
     # A merge-group is the sole landing candidate and must not wait behind the
     # pull-request review backlog that saturates arc-light.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
-    timeout-minutes: 5
+    # 10, not 5, because this is the tightest-budgeted job that sets up pnpm and
+    # `./.github/actions/setup-pnpm` may spend a second attempt on a stalled
+    # npm registry (BLO-28813). At 5 a degraded registry converted a fast red
+    # into a job timeout, which ejects a merge-queue candidate just the same but
+    # burns a runner for the full budget first. Worst case here is roughly
+    # 2 x (bootstrap + 120s fetch) + backoff ~= 5m, so the real work needs the
+    # headroom above it.
+    timeout-minutes: 10
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
 
@@ -61,43 +68,169 @@ jobs:
           fi
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
-          run_install: false
+        uses: ./.github/actions/setup-pnpm
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 24
 
+      - name: Setup actionlint
+        uses: ./.github/actions/setup-actionlint
+
+      - name: Validate workflow files parse (BLO-23511)
+        # Runs before the runner-label check on purpose: that checker scans
+        # these same files line by line, which a structurally broken file
+        # passes happily. An unparseable workflow emits zero jobs, so it
+        # fails nothing and every required check stays green — this is the
+        # step that turns that silence into a red.
+        run: node ./scripts/check-workflows-parse.mjs
+
+      - name: Test workflow-parse gate (BLO-23511)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-workflows-parse.test.mjs
+        timeout-minutes: 1
+
       - name: Validate ARC runner labels
+        if: ${{ !cancelled() }}
         run: node ./scripts/check-github-runner-labels.mjs
 
       - name: Validate Dockerfile deps stage
+        if: ${{ !cancelled() }}
         run: |
           node ./scripts/check-docker-deps-stage.mjs
           node --test ./scripts/__tests__/docker-deps-stage.test.mjs
+        timeout-minutes: 1
 
       - name: Validate Docker deploy timeout margin
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
+        timeout-minutes: 1
+
+      # BLO-31598: pins the abandon-in-flight escape hatch's wiring. The
+      # approval holds a lock until its rollout lands, so a deploy dying between
+      # the approval step and `helm upgrade` strands a lock nothing can clear
+      # and every later deploy is refused at admission. The remedy existed in
+      # `approve-paperclip-api-digest.sh` but was unreachable from this
+      # workflow, so recovery required a human holding the approver credential.
+      # Render-level, like its neighbours: it asserts the inputs exist, that
+      # both reach the script, and that a half-supplied pair is refused before
+      # the approver credential is written to disk.
+      - name: Validate abandon-in-flight approval inputs (BLO-31598)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-docker-abandon-in-flight-inputs.test.js
+        timeout-minutes: 1
+
+      # BLO-31666: the automatic half of the above. The escape hatch pinned by
+      # its neighbour is recovery and needs a human who knows it exists; this is
+      # prevention — the deploy job retires the lock it took when `helm upgrade`
+      # never ran. The safety condition is the whole design, since retiring a
+      # lock whose rollout IS in flight lets a competing release rotate the ring
+      # underneath a landing one.
+      #
+      # Deliberately NOT render-level, unlike its neighbours. #1636's review
+      # showed two presence-only assertions passing against mutated code — an
+      # inverted-polarity guard and a condition gutted to `if false; then` — so
+      # this extracts the step's real shell and runs the full conclusion matrix,
+      # and runs the retirement itself against a stubbed cluster to prove it
+      # clears every constituent annotation, leaves the approval ring alone, and
+      # never touches a lock whose digest+owner pair it did not write.
+      - name: Validate in-flight lock retirement on a skipped helm upgrade (BLO-31666)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-docker-retire-in-flight-lock.test.js
+        timeout-minutes: 1
+
+      # Asserts the pre-flight runs BEFORE helm upgrade and fails closed. Both
+      # are load-bearing: running it after the rollout starts reports the
+      # problem only once the 30-minute timeout has already burned, and an
+      # inconclusive check that exits 0 hands back the blind rollout it exists
+      # to prevent.
+      - name: Validate pending-migration deploy pre-flight
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-pending-migration-preflight.test.js
+        timeout-minutes: 1
+
+      # BLO-31254: executes the pre-flight's two-phase wait against a stub
+      # kubectl. The defect it guards was pure control flow — a single budget
+      # charged image transfer against the migration allowance, so a cold pull
+      # of the 1.7 GB image (measured 3m3s) failed a good build at 180s — and
+      # the render-level test above cannot tell a fix apart from a rewording.
+      # Slower than its neighbours because it must let real budgets expire.
+      #
+      # The 1-minute bound is measured, not guessed: 21.5s locally and 23s on a
+      # runner (run 33714085042, policy job), a 7% spread, so ~2.5x margin. It
+      # does not need the 3x that BLO-31405 asks of the Helm render suite,
+      # because the two have different variance profiles: this file's cost is
+      # almost entirely fixed `sleep`, which does not dilate under runner
+      # contention, whereas that suite forks `helm template` 18 times and ranges
+      # 21.8s local to 32-73s on CI. Keep this bound honest by re-measuring
+      # rather than by analogy -- but if you add a test here that waits on a new
+      # budget, it lands on the bound directly, so check the total.
+      - name: Test pending-migration pre-flight phase budgets (BLO-31254)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-pending-migration-preflight-phases.test.js
+        timeout-minutes: 1
+
+      # BLO-29008: executes the two-tier convergence gate's shell against
+      # recorded cluster states. The gate fails OPEN if its string accumulation
+      # breaks, so a render-level test cannot cover it — the negative cases here
+      # are the whole point.
+      - name: Test two-tier deploy convergence gate (BLO-29008)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-docker-two-tier-convergence.test.js
+        timeout-minutes: 1
+
+      - name: Test approval admissibility-probe backoff (BLO-28471)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/approve-paperclip-api-digest.test.js
+        timeout-minutes: 1
+
+      - name: Test pnpm setup retry wrapper (BLO-28813)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/pnpm-setup-retry.test.mjs
+        timeout-minutes: 1
 
       - name: Test CI cache and Docker runner routing
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/ci-cache-routing.test.mjs
+        timeout-minutes: 1
 
       - name: Validate opencode_k8s adapter pin
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/opencode-k8s-runtime-cache-pin.test.js
+        timeout-minutes: 1
 
       - name: Test merge-group concurrency key
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/merge-group-concurrency.test.mjs
+        timeout-minutes: 1
+
+      - name: Test policy node-test timeouts
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/policy-node-test-timeouts.test.mjs
+        timeout-minutes: 1
+
+      - name: Test @penstock publish-drift comparison
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/penstock-publish-drift.test.mjs
+        timeout-minutes: 1
+
+      - name: Test Ally agent instruction contract
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/ally-agent-idempotency-contract.test.mjs
+        timeout-minutes: 1
 
       - name: Reject git push in adapter/runtime code
+        if: ${{ !cancelled() }}
         run: node ./scripts/check-no-git-push.mjs
 
       - name: Test no-git-push check
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/check-no-git-push.test.mjs
+        timeout-minutes: 1
 
       - name: Reject App-attributed commits on the PR (BLO-21416)
+        if: ${{ !cancelled() }}
         # Non-merge commits stamped with the shared allyblockcast[bot] App
         # identity mean either the commit was created via the GitHub
         # REST/MCP write path (contents API, merge API,
@@ -124,74 +257,204 @@ jobs:
         run: node ./scripts/check-commit-author-attribution.mjs --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
 
       - name: Test commit-author-attribution check
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/check-commit-author-attribution.test.mjs
+        timeout-minutes: 1
 
       - name: Test gh token wrapper
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/gh-token-wrapper.test.mjs
+        timeout-minutes: 1
 
       - name: Test PR test-coverage gate
+        if: ${{ !cancelled() }}
         run: node --test ./.github/scripts/tests/check-pr-test-coverage.test.mjs
+        timeout-minutes: 1
+
+      # Guards the one property of the BLO-28888 soak workflow that cannot be
+      # re-checked after the fact: that it stays dispatch-only. Adding its
+      # ~50-90 minutes to a per-PR trigger would be invisible until it was
+      # already on every PR's critical path.
+      - name: Test soak workflow stays dispatch-only
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/soak-workflow-triggers.test.mjs
+        timeout-minutes: 1
 
       - name: Test ffmpeg muxer detection (BLO-23128)
+        if: ${{ !cancelled() }}
         run: node --test ./.github/scripts/tests/check-ffmpeg-muxer.test.mjs
+        timeout-minutes: 1
 
       - name: Test production environment protection guard (BLO-22329)
+        if: ${{ !cancelled() }}
         run: |
           node --test \
             ./.github/scripts/tests/check-production-environment-protection.test.mjs \
             ./.github/scripts/tests/post-environment-protection-alert.test.mjs
+        timeout-minutes: 1
+
+      # The stuck-approval escalation only ever runs inside the scheduled
+      # dispatcher, and only on the branch where a deploy is already pending —
+      # so without this it could regress for weeks unnoticed, and the first
+      # signal would be another silent no-op. The suite pins the two properties
+      # that cannot be re-checked after the fact: that severity stays `critical`
+      # (anything else routes to the paperclip webhook only, which is not a
+      # human), and that queued/building runs never page the reviewers.
+      - name: Test stuck production-approval escalation (PEN-2848)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/post-pending-deploy-alert.test.mjs
+        timeout-minutes: 1
+
+      # BLO-28203. The stalled-Ally-review sweep's decision suite otherwise runs
+      # ONLY inside the scheduled `review-gate-sweep` job, where a non-zero exit
+      # is the deliberate stranded-PR alarm (EXIT_ALARM=1). That conflates two
+      # unrelated signals -- a test regression would read as "a PR is stranded"
+      # -- and lets a change to the reconciler merge without its 1013-line suite
+      # ever running at PR time. Running it here separates "the code under
+      # review is broken" from "a PR needs a human".
+      #
+      # `setup-python` explicitly rather than a bare `python3`: this job runs on
+      # `arc-merge-queue` for merge_group events, that scale set is currently
+      # at zero replicas, and its image's python is therefore unverifiable --
+      # on a job every PR and every merge-queue candidate depends on, an
+      # unproven `command not found` would be worse than the gap it closes.
+      # setup-python is image-independent and is this repo's own pattern for
+      # python (docker-figma-bot.yml / docker-webflow-bot.yml), verified green
+      # on the ARC fleet. 3.10 matches those two; the suite uses no 3.11+
+      # constructs.
+      - name: Set up Python for the review-gate sweep suite
+        if: ${{ !cancelled() }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Test stalled-Ally-review sweep decision logic (BLO-28203)
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s .github/scripts -p 'test_sweep_*.py' -v
 
       - name: Validate Designer fast-uri security floor
+        if: ${{ !cancelled() }}
         run: node ./scripts/designer-fast-uri-security.test.js
 
-      - name: Setup Helm
-        uses: azure/setup-helm@v4
-        with:
-          version: v3.16.3
+      - name: Test bounded PR-check polling skills
+        # BLO-31075. .agents/skills/{check-pr,prcheckloop}/SKILL.md are executed
+        # by agents, so they are code. Their first version passed `bash -n` and
+        # still (a) polled a red PR for the full deadline before reporting a
+        # timeout and (b) had no success exit at all. This suite runs the fenced
+        # blocks against a stubbed `gh` and asserts the exit codes.
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/skill-bounded-pr-check-polling.test.mjs
+        timeout-minutes: 1
 
-      - name: Test Helm chart render suite (deploy/helm/paperclip)
-        # These render tests (topology-spread, probes, role-rbac, prometheus-rule,
-        # service-monitor, blockcast-auth, runtime-cache) previously ran nowhere in
-        # CI — a chart edit could silently break or regress any of them and every
-        # required check would stay green. BLO-20901's whole premise is that
-        # paperclip-api node spread is "enforced by scheduler policy, not left to
-        # chance"; that claim only holds if the test asserting it actually runs.
-        run: node --test deploy/helm/paperclip/tests/*.test.mjs
+      # BLO-31405: the chart render suite deliberately does NOT run here. It has
+      # its own `helm_chart` job below; see the comment there before adding it
+      # back.
 
       - name: Test Ally review-consistency guard
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/check-ally-review-consistency.test.mjs
+        timeout-minutes: 1
+
+      - name: Test comment-review-gate census
+        if: ${{ !cancelled() }}
+        # The census itself is not run here: it fails on 100% of sampled merges
+        # today across paperclip, penstock, frr and NOP, so gating PRs on it
+        # would block every merge. It becomes a runnable regression gate once
+        # the gate context moves out of the review/ namespace (BLO-29711).
+        run: node --test ./scripts/check-comment-review-gate-census.test.mjs
+        timeout-minutes: 1
 
       - name: Test CODEOWNERS guard
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/check-codeowners.test.mjs
+        timeout-minutes: 1
 
       - name: Test general-server shard partition
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
+        timeout-minutes: 1
+
+      # BLO-24241: unlike the step above (a hard-required, generous-floor
+      # sanity check), this one asserts strict 100% manifest coverage and is
+      # allowed to fail. A missing suite shows up as a real red X on this
+      # step, naming the exact suites and the one-line fix, without failing
+      # `policy` and skipping build/typecheck/e2e for the whole PR the way
+      # the old bare >=90% assertion did.
+      - name: Check shard duration manifest freshness (non-blocking)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: node --test ./scripts/check-shard-manifest-freshness.test.mjs
+        timeout-minutes: 1
+
+      # BLO-24241: the weekly refresh path. These are required (not
+      # continue-on-error) because a break here only surfaces on a Monday
+      # schedule that nobody is watching -- the merge step used to clobber the
+      # manifest's durable "$notes" prose, and the measurement runner used to
+      # buffer vitest's stdout into an ENOBUFS kill.
+      - name: Test shard duration measurement runner
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/measure-general-server-shard-durations.test.mjs
+        timeout-minutes: 1
+
+      - name: Test shard duration manifest merge
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/merge-shard-duration-manifest.test.mjs
+        timeout-minutes: 1
+
+      - name: Test shard duration refresh workflow
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/refresh-shard-manifest-workflow.test.mjs
+        timeout-minutes: 1
 
       - name: Test vitest project coverage
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/vitest-project-coverage.test.mjs
+        timeout-minutes: 1
 
       - name: Test release verify workflow wiring
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/release-verify-workflow.test.mjs
+        timeout-minutes: 1
 
       - name: Test standalone package build concurrency
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/build-standalone-concurrency.test.mjs
+        timeout-minutes: 1
 
       - name: Test devDependency install guard (NODE_ENV=production)
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/npmrc-devdeps-guard.test.mjs
+        timeout-minutes: 1
 
       - name: Test verify job cancelled/skipped-vs-failed lane outcome
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/pr-verify-lane-outcome.test.mjs
+        timeout-minutes: 1
+
+      - name: Test Playwright install-deps retry/backoff
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/playwright-install-deps-retry.test.mjs
+        timeout-minutes: 1
 
       - name: Test PR server-shard folding
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/pr-ci-shard-folding.test.mjs
+        timeout-minutes: 1
 
       - name: Validate release package manifest
+        if: ${{ !cancelled() }}
         run: node ./scripts/release-package-map.mjs check
 
       - name: Test ip-address security override
+        if: ${{ !cancelled() }}
         run: pnpm run test:ip-address-security-override
 
+      - name: Test browserslist security override
+        if: ${{ !cancelled() }}
+        run: pnpm run test:browserslist-security-override
+
       - name: Verify release package bootstrap for changed manifests
+        if: ${{ !cancelled() }}
         run: |
           mapfile -t changed_paths < <(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")
           PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="$PR_BASE_SHA" \
@@ -206,13 +469,17 @@ jobs:
       # asserts the committed lockfile itself is consistent, which is exactly
       # the gap that let 08b6f4491 take the whole queue down.
       - name: Check pnpm-lock.yaml overrides/patchedDependencies consistency
+        if: ${{ !cancelled() }}
         run: node ./scripts/check-lockfile-overrides-consistency.mjs
 
       - name: Test lockfile overrides consistency guard
+        if: ${{ !cancelled() }}
         run: node --test ./scripts/check-lockfile-overrides-consistency.test.mjs
+        timeout-minutes: 1
 
       - name: Validate dependency resolution when manifests change
         id: regen_lockfile
+        if: ${{ !cancelled() }}
         run: |
           changed="$(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")"
           manifest_pattern='(^|/)package\.json$|^pnpm-workspace\.yaml$|^\.npmrc$|^pnpmfile\.(cjs|js|mjs)$'
@@ -228,7 +495,7 @@ jobs:
       # downstream `pnpm install --frozen-lockfile` steps. Upload it here so
       # every job consumes the same hash without recomputing.
       - name: Upload regenerated lockfile for downstream jobs
-        if: steps.regen_lockfile.outputs.regenerated == '1'
+        if: ${{ !cancelled() && steps.regen_lockfile.outputs.regenerated == '1' }}
         uses: actions/upload-artifact@v4
         with:
           name: pr-lockfile
@@ -246,6 +513,15 @@ jobs:
   # Deliberately its own job rather than a step in `policy`: it needs helm and
   # the runner image's pinned yq, and a tooling regression in provisioning those
   # should not take down the gate that every unrelated PR depends on.
+  #
+  # BLO-31405: a second copy of this suite had landed in parallel as a `policy`
+  # step (#965 and #995 crossed, each believing the tests ran nowhere), which is
+  # exactly the coupling the paragraph above rejects. It shelled out to `helm
+  # template` once per test file, so under `policy`'s 60s step bound its p100 of
+  # 73s failed 3 of 25 sampled runs on duration alone — each one skipping every
+  # lane that `needs: policy`, on PRs that never touched the chart. Removed. Do
+  # not re-add it here: this job is a `verify` lane (see its `needs:`), so a red
+  # chart already fails the required check without any `policy` coupling.
   helm_chart:
     name: Helm chart
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
@@ -265,6 +541,16 @@ jobs:
 
       - name: Test Helm chart renders
         run: node --test ./deploy/helm/paperclip/tests/*.test.mjs
+        # BLO-29182 observed THIS invocation hang: `node --test` has no default
+        # per-test timeout and these tests shell out to `helm`, which does
+        # network I/O, so a stalled fetch has no upper bound below the job cap.
+        # That was fixed by bounding the `policy` copy, and BLO-31405 has now
+        # removed that copy as a duplicate — so the bound has to live here, or
+        # deleting the duplicate would leave the one invocation known to hang
+        # unbounded again. 4 min is 3.3x the suite's measured p100 of 73s (25
+        # sampled pr.yml runs) and well inside the 10-minute job cap, so a hang
+        # fails this step attributably instead of burning the whole budget.
+        timeout-minutes: 4
 
   typecheck_release_registry:
     name: Typecheck + Release Registry
@@ -286,9 +572,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -342,9 +626,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -465,9 +747,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -551,9 +831,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -672,9 +950,146 @@ jobs:
         vendor_claude_k8s,
       ]
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
-    timeout-minutes: 5
+    # BLO-28999: the failure path below adds checkout + Node setup + up to N+1
+    # API round trips, and it runs precisely when the pool is saturated. At the
+    # previous 5 minutes a slow classify step could time `verify` out and lose
+    # the annotation entirely — the one thing this job exists to emit. The
+    # classify step carries its own tighter bound, so this ceiling only has to
+    # cover the setup around it. Same headroom reasoning as `policy` above.
+    timeout-minutes: 10
+    # BLO-28999: the classify step below is this workflow's first GITHUB_TOKEN
+    # consumer, and `pr.yml` declares no workflow-level `permissions:`. Under a
+    # restricted default-permissions preset every scope is `none`, the API calls
+    # 403, and the classifier degrades silently to the pre-existing wording —
+    # indistinguishable from "nothing was killed", which is the exact bug this
+    # job now exists to fix. Declared explicitly, as `master-health.yml` and
+    # `refresh-lockfile.yml` already do for the same reason.
+    permissions:
+      # A job-level block REPLACES the workflow-level one rather than merging
+      # into it (see the same note in `docker.yml`), so `contents: read` is
+      # listed deliberately — without it `actions/checkout` below loses repo
+      # access and the classify step cannot even find the script.
+      contents: read
+      # `/actions/runs/{id}/jobs` — the per-job detail and step conclusions.
+      actions: read
+      # `/check-runs/{id}/annotations` — a DIFFERENT scope from `actions: read`,
+      # and the source of the runner-loss annotation that is signal 1.
+      checks: read
 
     steps:
+      # BLO-28999: `needs.<lane>.result` cannot distinguish an ARC mid-job
+      # runner kill from a real lane failure — GitHub records both as
+      # `failure`. Go back to the Actions API for the per-job detail the
+      # aggregation step below cannot see, and hand it the subset of failed
+      # lanes that were actually killed.
+      #
+      # All three steps are gated on there being a failure at all, so the
+      # overwhelmingly common all-green run pays nothing: no checkout, no
+      # toolchain setup, no API calls. That also keeps `verify` light enough
+      # not to become a victim of the same pool saturation it now reports on.
+      - name: Checkout repository
+        if: ${{ contains(needs.*.result, 'failure') }}
+        uses: actions/checkout@v6
+
+      # `arc-light` does not ship a usable Node by default — the `policy` job
+      # on the same pool sets one up explicitly before its `node --test` steps.
+      - name: Setup Node
+        if: ${{ contains(needs.*.result, 'failure') }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Classify failed lanes as infrastructure kills or real failures
+        id: classify_lanes
+        if: ${{ contains(needs.*.result, 'failure') }}
+        # This step decides only which WORDING explains the failure, never
+        # whether `verify` passes. If it errors, the aggregation step below
+        # still runs (`if: always()`) and falls back to the pre-existing
+        # failure wording.
+        continue-on-error: true
+        # Bounded well inside the job ceiling: this step makes N+1 API calls on
+        # a saturated pool, and if it hangs the job timeout would kill `verify`
+        # before the aggregation step could emit any annotation at all.
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HELM_CHART_RESULT: ${{ needs.helm_chart.result }}
+          TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
+          GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
+          WORKTREE_INSTALL_RESULT: ${{ needs.worktree_install.result }}
+          OPENCODE_RESPONSES_REPLAY_RESULT: ${{ needs.opencode_responses_replay.result }}
+          OPENCODE_K8S_SEED_COLD_START_RESULT: ${{ needs.opencode_k8s_seed_cold_start.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          VENDOR_CLAUDE_K8S_RESULT: ${{ needs.vendor_claude_k8s.result }}
+        run: |
+          # Keep these three arrays in the same order — scripts/__tests__/
+          # pr-verify-lane-outcome.test.mjs asserts the pairing, and also
+          # asserts each lane_job_names entry matches that job's `name:`.
+          lane_names=(
+            helm_chart
+            typecheck_release_registry
+            general_tests
+            worktree_install
+            opencode_responses_replay
+            opencode_k8s_seed_cold_start
+            build
+            vendor_claude_k8s
+          )
+          lane_results=(
+            "$HELM_CHART_RESULT"
+            "$TYPECHECK_RELEASE_REGISTRY_RESULT"
+            "$GENERAL_TESTS_RESULT"
+            "$WORKTREE_INSTALL_RESULT"
+            "$OPENCODE_RESPONSES_REPLAY_RESULT"
+            "$OPENCODE_K8S_SEED_COLD_START_RESULT"
+            "$BUILD_RESULT"
+            "$VENDOR_CLAUDE_K8S_RESULT"
+          )
+          lane_job_names=(
+            "Helm chart"
+            "Typecheck + Release Registry"
+            "General tests"
+            "Worktree install (NODE_ENV=production)"
+            "OpenCode Responses replay"
+            "k8s-ro seed transport cold start"
+            "Build"
+            "Vendored claude_k8s adapter"
+          )
+
+          # `failed` and `job_names` are built in lockstep so the Nth failed
+          # lane's job name is the Nth entry — the script pairs them by index.
+          # Appending to `job_names` outside this branch would map every lane
+          # onto the wrong job and silently disable the classifier.
+          failed=()
+          job_names=()
+          for i in "${!lane_names[@]}"; do
+            case "${lane_results[$i]}" in
+              success | cancelled | skipped) ;;
+              *)
+                failed+=("${lane_names[$i]}")
+                job_names+=("${lane_job_names[$i]}")
+                ;;
+            esac
+          done
+
+          infra=""
+          if [ "${#failed[@]}" -gt 0 ]; then
+            # The script degrades to an empty set on any error, so a
+            # classification problem can never change the gate — only the
+            # wording the aggregation step picks. That degradation is silent by
+            # design on stdout (which carries the lane list), so surface the
+            # script's stderr as a warning annotation: a 403 from a missing
+            # token scope would otherwise be indistinguishable from a clean
+            # "nothing was killed", and could rot back to silence unnoticed.
+            classify_err="$(mktemp)"
+            infra="$(LANE_JOB_NAMES="$(printf '%s\n' "${job_names[@]}")" \
+              node scripts/classify-lane-failures.mjs "${failed[@]}" 2>"$classify_err" | tail -n 1)"
+            if [ -s "$classify_err" ]; then
+              echo "::warning title=verify: lane classifier degraded::Runner-kill detection did not produce a verdict, so any killed lane below is reported with the ordinary failure wording. Cause: $(tr '\n' ' ' <"$classify_err")"
+            fi
+          fi
+          echo "infra_lanes=$infra" >>"$GITHUB_OUTPUT"
+
       # BLO-20867: an upstream lane can end up `cancelled` or `skipped` rather
       # than `failure`. A plain `test "$X" = "success"` makes every one of
       # these look like an identical failing required check, so authors
@@ -695,8 +1110,19 @@ jobs:
       #   - skipped:   the lane never ran because a dependency it needs
       #     (typically `policy`) did not succeed. The defect, if any, is in
       #     that dependency, not in this lane.
+      #   - infrastructure (BLO-28999): the lane's job was killed mid-run by
+      #     the runner pool. GitHub reports this as `failure`, so without the
+      #     classify step above it is indistinguishable from the first case
+      #     and reads as a defect in the diff. Split out here so the killed
+      #     lane gets the "not your diff, re-run it" wording that already
+      #     existed for `cancelled` but could never fire for a kill.
       - name: Fail if any split verify lane failed
+        # Must run even when the classify step above was skipped or errored —
+        # this step IS the gate, and its verdict may never depend on the
+        # classifier being available.
+        if: always()
         env:
+          INFRA_LANES: ${{ steps.classify_lanes.outputs.infra_lanes }}
           HELM_CHART_RESULT: ${{ needs.helm_chart.result }}
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
@@ -730,13 +1156,33 @@ jobs:
           cancelled_lanes=()
           skipped_lanes=()
           failed_lanes=()
+          infra_lanes=()
           for i in "${!lane_names[@]}"; do
             lane="${lane_names[$i]}"
             case "${lane_results[$i]}" in
               success) ;;
               cancelled) cancelled_lanes+=("$lane") ;;
               skipped) skipped_lanes+=("$lane") ;;
-              *) failed_lanes+=("$lane") ;;
+              *)
+                # BLO-28999: a lane the classifier proved was killed mid-job
+                # by the runner pool is reported as infrastructure, not as a
+                # failure. Anything it could not prove stays a failure — the
+                # fallback is the pre-existing wording, so an unavailable or
+                # erroring classifier degrades to today's behaviour rather
+                # than excusing a real defect.
+                is_infra=0
+                for infra_lane in $INFRA_LANES; do
+                  if [ "$infra_lane" = "$lane" ]; then
+                    is_infra=1
+                    break
+                  fi
+                done
+                if [ "$is_infra" -eq 1 ]; then
+                  infra_lanes+=("$lane")
+                else
+                  failed_lanes+=("$lane")
+                fi
+                ;;
             esac
           done
 
@@ -754,6 +1200,11 @@ jobs:
 
           if [ "${#cancelled_lanes[@]}" -gt 0 ]; then
             echo "::error title=verify: lane cancelled::Upstream lane(s) were CANCELLED, not failed: ${cancelled_lanes[*]}. This is not a report of a defect in this PR's diff — the lane was interrupted before it could produce a result (possible causes include a CI infrastructure interruption, see BLO-20867, or a manual cancellation). Re-run the job to get a real result."
+            any_non_success=1
+          fi
+
+          if [ "${#infra_lanes[@]}" -gt 0 ]; then
+            echo "::error title=verify: lane infrastructure kill::Upstream lane(s) were KILLED MID-JOB by the CI runner pool, not failed: ${infra_lanes[*]}. This is not a report of a defect in this PR's diff — the runner hosting the lane was terminated before it could produce a result (see BLO-28999). Re-run the job to get a real result."
             any_non_success=1
           fi
 
@@ -775,9 +1226,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -815,9 +1264,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -874,9 +1321,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
@@ -908,8 +1353,29 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.playwright_version.outputs.version }}
 
+      # BLO-27699 (BLO-22675 residue): apt's upstream mirrors (e.g.
+      # security.ubuntu.com) fail with a transient "Mirror sync in progress?"
+      # size mismatch often enough to take out a merge_group run on their own —
+      # run 31107120860 died here and forced PR #1038 to be admin-merged.
+      # Retry with backoff before failing the job.
       - name: Install Playwright system dependencies
-        run: pnpm exec playwright install-deps chromium
+        run: |
+          attempts=3
+          delay="${PLAYWRIGHT_INSTALL_DEPS_RETRY_DELAY_SECONDS:-15}"
+          attempt=1
+          while [ "$attempt" -le "$attempts" ]; do
+            if pnpm exec playwright install-deps chromium; then
+              exit 0
+            fi
+            if [ "$attempt" -lt "$attempts" ]; then
+              echo "Playwright system dependency install failed (attempt $attempt/$attempts); retrying in ${delay}s..." >&2
+              sleep "$delay"
+              delay=$((delay * 2))
+            fi
+            attempt=$((attempt + 1))
+          done
+          echo "Playwright system dependency install failed after $attempts attempts" >&2
+          exit 1
 
       - name: Install Playwright browser
         if: steps.playwright_cache.outputs.cache-hit != 'true'
@@ -935,9 +1401,18 @@ jobs:
           PAPERCLIP_E2E_SKIP_LLM: "true"
         run: pnpm run test:e2e
 
+      # Diagnostic-only artifact (retention-days: 1). `if: always()` controls
+      # whether this step RUNS, not whether its failure counts -- so a flaky
+      # upload fails the step, fails the job, fails the merge-group run, and
+      # ejects the PR. That is not hypothetical: it ejected #1512 and #1516 on
+      # 2026-08-27 with every e2e test green (41 passed / 0 failed on #1512).
+      # Nothing downstream consumes this report, so its failure must not gate a
+      # merge. The lockfile upload in `policy` is deliberately left blocking --
+      # downstream jobs install from it. BLO-29023.
       - name: Upload Playwright report
         uses: actions/upload-artifact@v7
         if: always()
+        continue-on-error: true
         with:
           name: playwright-report
           path: |

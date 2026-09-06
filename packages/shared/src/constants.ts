@@ -466,7 +466,7 @@ export type IssueExecutionPolicyMode = (typeof ISSUE_EXECUTION_POLICY_MODES)[num
 export const ISSUE_EXECUTION_STAGE_TYPES = ["review", "approval"] as const;
 export type IssueExecutionStageType = (typeof ISSUE_EXECUTION_STAGE_TYPES)[number];
 
-export const ISSUE_MONITOR_SCHEDULED_BY = ["assignee", "board"] as const;
+export const ISSUE_MONITOR_SCHEDULED_BY = ["assignee", "board", "manager"] as const;
 export type IssueMonitorScheduledBy = (typeof ISSUE_MONITOR_SCHEDULED_BY)[number];
 
 export const ISSUE_EXECUTION_MONITOR_KINDS = ["external_service"] as const;
@@ -495,10 +495,16 @@ export const ISSUE_EXECUTION_MONITOR_CLEAR_REASONS = [
   "cancelled",
   "invalid_status",
   "invalid_assignee",
+  "suppressed_by_status",
   "dispatch_skipped",
   "timeout_exceeded",
   "max_attempts_exhausted",
   "convergence_stalled",
+  // BLO-29606: a monitor that fired and whose woken run never called back, on a
+  // policy that carries no `timeoutAt` to expire against. Distinct from
+  // `timeout_exceeded` on purpose — nothing timed out, the trigger stalled — so
+  // the two stranding shapes stay separable in activity logs and dashboards.
+  "trigger_stalled",
 ] as const;
 export type IssueExecutionMonitorClearReason = (typeof ISSUE_EXECUTION_MONITOR_CLEAR_REASONS)[number];
 
@@ -1337,6 +1343,7 @@ export const PLUGIN_CAPABILITIES = [
   "agent.sessions.send",
   "agent.sessions.close",
   "activity.log.write",
+  "costs.write",
   "metrics.write",
   "telemetry.track",
   "database.namespace.migrate",

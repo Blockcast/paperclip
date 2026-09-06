@@ -11,7 +11,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { activityLog, agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import {
@@ -30,7 +30,15 @@ import {
   buildPrReviewTaskKey,
   parsePullRequestRefs,
   taskKeysMatch,
+  NOT_A_REVIEW_REQUEST_MARKER,
 } from "../services/pr-review-duplicate-issue-guard.js";
+
+// This suite exercises duplicate-review admission, not assignment wake
+// delivery. Keep the route's fire-and-forget assignment side effect out of the
+// embedded database so teardown cannot race its activity/issue lock triggers.
+vi.mock("../services/issue-assignment-wakeup.js", () => ({
+  queueIssueAssignmentWakeup: vi.fn(),
+}));
 
 const REPO = "Blockcast/pim-multicast-gateway";
 const NORMALIZED_REPO = REPO.toLowerCase();
@@ -40,6 +48,28 @@ const NORMALIZED_PR_URL = `https://github.com/${NORMALIZED_REPO}/pull/${PR_NUMBE
 const TASK_KEY = `pr_review:${NORMALIZED_REPO}:${PR_NUMBER}`;
 
 describe("pr review duplicate issue guard (pure helpers)", () => {
+  it("does NOT case-fold task keys outside the pr_review scope", () => {
+    // taskKeysMatch must stay behaviourally identical to the SQL predicate,
+    // which only adds its lower() leg for pr_review keys. Without a negative,
+    // a regression dropping the isPrReviewTaskKey guard would widen equality
+    // for EVERY task scope in the system and still ship green.
+    expect(taskKeysMatch("issue:ABC-1", "issue:abc-1")).toBe(false);
+    expect(taskKeysMatch(`pr_review:${REPO}:${PR_NUMBER}`, TASK_KEY)).toBe(true);
+  });
+
+  it("bounds how many PR refs one issue body can force the guard to scan", () => {
+    // Each parsed ref becomes a lock namespace and a SQL predicate leg, so an
+    // unbounded scan lets one issue body (or a PR description echoed into one)
+    // decide how much work admission does. Assert the cap holds and that it
+    // keeps the FIRST refs, so the bound is deterministic rather than
+    // whichever refs a hash happened to order first.
+    const refs = Array.from({ length: 30 }, (_, i) => `https://github.com/${REPO}/pull/${1000 + i}`);
+    const parsed = parsePullRequestRefs(refs.join("\n"));
+    expect(parsed).toHaveLength(20);
+    expect(parsed[0]).toEqual({ repoFullName: NORMALIZED_REPO, prNumber: 1000 });
+    expect(parsed.at(-1)).toEqual({ repoFullName: NORMALIZED_REPO, prNumber: 1019 });
+  });
+
   it("resolves the same scope as the legacy key the webhook writes during phase one", () => {
     const webhookKey = __test_buildPrReviewerTaskKey({
       repoFullName: REPO,
@@ -372,6 +402,109 @@ describeEmbeddedPostgres("issue create PR-review duplicate guard routes", () => 
       .expect(409);
   });
 
+  /**
+   * The structured request path: `prReviewTarget` names the PR directly and is
+   * what stamps `origin_fingerprint`. The text is deliberately free of anything
+   * resolvable — no URL, no repo, no number — so these cases fail unless the
+   * guard consumes the target itself rather than re-parsing title/description.
+   */
+  function structuredTargetIssueBody(reviewerId: string, overrides: Record<string, unknown> = {}) {
+    return {
+      title: "Take a look at the gateway branch",
+      description: "Head is 8ee6f12d60.",
+      assigneeAgentId: reviewerId,
+      prReviewTarget: { repoFullName: REPO, prNumber: PR_NUMBER },
+      ...overrides,
+    };
+  }
+
+  it("rejects a structured prReviewTarget whose title and description never name the PR", async () => {
+    // Durable fingerprint dedupe cannot cover this: it matches unresolved
+    // *issues*, and a webhook-sourced review in flight has a run but no issue
+    // row. Without the target reaching the guard, this create is admitted and
+    // launches a second reviewer run on a PR already under review.
+    const { companyId, reviewer, app } = await setup();
+    const run = await seedReviewRun(companyId, reviewer.id, { status: "running" });
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send(structuredTargetIssueBody(reviewer.id))
+      .expect(409);
+
+    expect(res.body.code).toBe(DUPLICATE_PR_REVIEW_ISSUE_ERROR_CODE);
+    expect(res.body.details).toMatchObject({
+      taskKey: TASK_KEY,
+      repoFullName: NORMALIZED_REPO,
+      prNumber: PR_NUMBER,
+      existingRunId: run.id,
+      existingRunStatus: "running",
+    });
+    expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(0);
+  });
+
+  for (const [lockSpelling, webhookTaskKey] of [
+    ["normalized", TASK_KEY],
+    ["pre-compatibility mixed-case", `pr_review:${REPO}:${PR_NUMBER}`],
+  ] as const) {
+    it(`waits for a racing ${lockSpelling} webhook wake when only the structured target names the PR`, async () => {
+      // The lock namespace is the key's spelling, so the target has to feed both
+      // the normalized and source-casing lock sets exactly as a parsed URL does.
+      const { companyId, reviewer, app } = await setup();
+      let releaseWebhook!: () => void;
+      let reportLockAcquired!: () => void;
+      const lockAcquired = new Promise<void>((resolve) => {
+        reportLockAcquired = resolve;
+      });
+      const release = new Promise<void>((resolve) => {
+        releaseWebhook = resolve;
+      });
+
+      const webhookTransaction = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${webhookTaskKey}, 0))`);
+        reportLockAcquired();
+        await release;
+        await tx.insert(heartbeatRuns).values({
+          companyId,
+          agentId: reviewer.id,
+          status: "queued",
+          contextSnapshot: { taskKey: webhookTaskKey },
+        });
+      });
+      await lockAcquired;
+
+      const createRequest = request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send(structuredTargetIssueBody(reviewer.id))
+        .then((response) => response);
+      await expect(
+        Promise.race([
+          createRequest.then(() => "settled"),
+          new Promise<string>((resolve) => setTimeout(() => resolve("waiting"), 100)),
+        ]),
+      ).resolves.toBe("waiting");
+
+      releaseWebhook();
+      await webhookTransaction;
+      const response = await createRequest;
+      expect(response.status).toBe(409);
+      expect(response.body.code).toBe(DUPLICATE_PR_REVIEW_ISSUE_ERROR_CODE);
+    });
+  }
+
+  it("accepts a structured target for a different PR than the live run", async () => {
+    // The target must narrow the guard to one PR, not become a blanket
+    // rejection of every structured request while any review is in flight.
+    const { companyId, reviewer, app } = await setup();
+    await seedReviewRun(companyId, reviewer.id);
+
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send(structuredTargetIssueBody(reviewer.id, {
+        prReviewTarget: { repoFullName: REPO, prNumber: PR_NUMBER + 1 },
+      }))
+      .expect(201);
+  });
+
   for (const status of ["queued", "running", "scheduled_retry"]) {
     it(`rejects while the existing review run is ${status}`, async () => {
       const { companyId, reviewer, app } = await setup();
@@ -411,6 +544,47 @@ describeEmbeddedPostgres("issue create PR-review duplicate guard routes", () => 
       .send({
         title: "Improve the reviewer's own verdict-formatting tooling",
         description: "No pull request reference here.",
+        assigneeAgentId: reviewer.id,
+      })
+      .expect(201);
+  });
+
+  it("admits an issue about the SAME PR only when it declares it is not a review request", async () => {
+    // The guard fires on any canonical PR permalink and cannot tell a review
+    // REQUEST from an issue that is merely ABOUT the review. Without an escape
+    // hatch a legitimate meta-issue like this one is hard-rejected, and the
+    // 409's remediation ("post a review-request marker comment on the PR") is
+    // actively wrong advice here: following it queues a SECOND review of a PR
+    // whose review is already broken. The only prior way past it was the
+    // global kill switch.
+    //
+    // Both halves share one fixture so the ONLY difference between the admitted
+    // and rejected creates is the marker itself.
+    const { companyId, reviewer, app } = await setup();
+    await seedReviewRun(companyId, reviewer.id);
+    const title = `Ally's review of ${PR_URL} exited with pr_review_output_missing`;
+    const body = "The adapter produced no verdict.";
+
+    // Rejected FIRST, deliberately. A 409 persists no issue, whereas a 201
+    // would then let the UNRELATED generic issue-deduplicator (a 30-day
+    // title-similarity window) answer the second create with
+    // `200 {deduplicated:true}` before this guard ever runs — which is what an
+    // earlier revision of this test actually hit.
+    const rejected = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title, description: body, assigneeAgentId: reviewer.id })
+      .expect(409);
+    expect(rejected.body.code).toBe(DUPLICATE_PR_REVIEW_ISSUE_ERROR_CODE);
+    // The rejection must advertise the escape hatch or a blocked filer cannot
+    // discover it.
+    expect(rejected.body.remediation).toContain(NOT_A_REVIEW_REQUEST_MARKER);
+
+    // Same title, same fixture, same live review run — only the marker differs.
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title,
+        description: `${NOT_A_REVIEW_REQUEST_MARKER}\n${body}`,
         assigneeAgentId: reviewer.id,
       })
       .expect(201);

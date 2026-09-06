@@ -31,6 +31,7 @@ import {
   REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT,
   REQUEST_ITEM_VERDICTS_ITEM_LIMIT,
 } from "../constants.js";
+import { executionWorkspaceStrategySchema } from "./execution-workspace.js";
 import { multilineTextSchema } from "./text.js";
 import { lowTrustReviewPresetPolicySchema, trustAuthorizationPolicySchema } from "./trust-policy.js";
 
@@ -106,20 +107,6 @@ export const ISSUE_EXECUTION_WORKSPACE_PREFERENCES = [
   "reuse_existing",
   "agent_default",
 ] as const;
-
-const executionWorkspaceStrategySchema = z
-  .object({
-    type: z.enum(["project_primary", "git_worktree", "adapter_managed", "cloud_sandbox"]).optional(),
-    baseRef: z.string().optional().nullable(),
-    branchTemplate: z.string().optional().nullable(),
-    worktreeParentDir: z.string().optional().nullable(),
-    provisionCommand: z.string().optional().nullable(),
-    teardownCommand: z.string().optional().nullable(),
-    // BLO-19063: opt into a per-run working tree. Omitted => "per_issue", the
-    // historical behaviour.
-    runScope: z.enum(["per_issue", "per_run"]).optional().nullable(),
-  })
-  .strict();
 
 export const issueExecutionWorkspaceSettingsSchema = z
   .object({
@@ -306,13 +293,39 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "cancelled",
 ] as const;
 
+/**
+ * `sourceIssueStatus` is the status the resolver ASSERTS about the source issue.
+ *
+ * PEN-2756: the enum omits `in_progress` and `backlog`, and those are exactly the
+ * two states beacons most often sit on. No invariant enforces that omission —
+ * `in_progress` is NOT reserved for the execution lock (issues.ts sets it lock-free
+ * on any assigned row, and a deliberate `in_progress` write is explicitly protected
+ * from the checkout-restore sweep). So the exclusion is not load-bearing; it is
+ * simply a vocabulary that never grew a way to say "nothing".
+ *
+ * The fix is to allow asserting NOTHING rather than to widen the enum. Widening it
+ * would make the resolver claim execution state it cannot verify, and would route a
+ * status write through `issues.update` side effects (`startedAt`, checkout-restore
+ * marker clearing) purely to clear an unrelated beacon. Omitting the field asserts
+ * nothing, touches nothing, and leaves a live `in_progress` run or a board-approved
+ * `backlog` park exactly as it was.
+ *
+ * Omission is confined to `restored` on purpose. `blocked` must land the row on
+ * `blocked` (the route additionally requires a real first-class blocker), and the
+ * board-only `false_positive`/`cancelled` outcomes retire the recovery premise
+ * entirely, so they must say where the row lands rather than leave it mid-flight.
+ */
 export const resolveIssueRecoveryActionSchema = z.object({
   actionId: z.string().uuid().optional(),
   outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
-  sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
+  sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]).optional(),
   resolutionNote: multilineTextSchema.optional().nullable(),
 }).strict().superRefine((value, ctx) => {
   if (value.outcome === "restored") {
+    // Omitted => leave the source issue's status untouched. The route already
+    // guards every status-dependent step on this field being present, so an
+    // absent value resolves the action and writes no status.
+    if (value.sourceIssueStatus === undefined) return;
     if (
       value.sourceIssueStatus !== "todo" &&
       value.sourceIssueStatus !== "done" &&
@@ -320,7 +333,8 @@ export const resolveIssueRecoveryActionSchema = z.object({
     ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "Restored recovery actions must move the source issue to todo, done, or in_review",
+        message:
+          "Restored recovery actions must move the source issue to todo, done, or in_review, or omit sourceIssueStatus to leave it unchanged",
         path: ["sourceIssueStatus"],
       });
     }
@@ -448,8 +462,111 @@ const misplacedIssueMonitorInputShape = {
   monitorWakeRequestedAt: misplacedIssueMonitorInputSchema("monitorWakeRequestedAt"),
 };
 
+/**
+ * BLO-27912: the same silent-strip trap the monitor keys above guard against, for the
+ * deliberate-park disposition. The four `parked_*` columns are server-owned and derived
+ * from the nested `parkedDisposition` input; a caller who guesses the flat shape would
+ * otherwise have it stripped by zod, get a 200, and believe the row was parked.
+ */
+export const MISPLACED_ISSUE_PARKED_INPUT_KEYS = [
+  "parkedUntil",
+  "parkedReason",
+  "parkedByAgentId",
+  "parkedAt",
+] as const;
+
+export function misplacedIssueParkedInputMessage(key: string) {
+  return `\`${key}\` is not a writable issue field, so it would be silently discarded. Record or clear a deliberate park with the nested shape \`parkedDisposition\`: {"parkedDisposition":{"reason":"<why this row is deliberately not being worked, and what event ends the park>","until":"<ISO-8601, in the future and at most ${PARKED_DISPOSITION_MAX_HORIZON_DAYS} days out>"}}, or {"parkedDisposition":null} to un-park. The \`parked_*\` columns are server-owned: \`parkedByAgentId\` is stamped from the calling actor and \`parkedAt\` from the server clock, so neither can be supplied. Note the park is DELIBERATELY time-bounded — it suppresses the liveness invariants only until \`until\`, after which the row is detectable again.`;
+}
+
+function misplacedIssueParkedInputSchema(key: (typeof MISPLACED_ISSUE_PARKED_INPUT_KEYS)[number]) {
+  return z
+    .undefined({ errorMap: () => ({ message: misplacedIssueParkedInputMessage(key) }) })
+    .optional();
+}
+
+const misplacedIssueParkedInputShape = {
+  parkedUntil: misplacedIssueParkedInputSchema("parkedUntil"),
+  parkedReason: misplacedIssueParkedInputSchema("parkedReason"),
+  parkedByAgentId: misplacedIssueParkedInputSchema("parkedByAgentId"),
+  parkedAt: misplacedIssueParkedInputSchema("parkedAt"),
+};
+
+/**
+ * BLO-27912: `parkedDisposition` is PATCH-only, and this states that rather than leaving it
+ * to be inferred from an omission.
+ *
+ * The four flat keys above are guarded because zod would strip them into a misleading 200.
+ * The nested key had exactly the same hole on the create path: `createIssueBaseSchema` is
+ * not `.strict()`, so `POST /issues` with a `parkedDisposition` returned `201 Created` and
+ * an UNPARKED row, with no signal — and the caller only finds out when the liveness
+ * invariant fires against a row they believe is parked. Guarding the flat shape while
+ * leaving the real shape silently stripped is the worse of the two failures, because the
+ * caller who guessed right is the one who gets no error.
+ *
+ * Scoped to create by construction: `updateIssueSchema` `.extend()`s the real schema over
+ * this key, so the rejection cannot leak onto the PATCH path that is supposed to accept it.
+ */
+export function parkedDispositionCreateRejectionMessage() {
+  return `\`parkedDisposition\` cannot be set when creating an issue, so it would be silently discarded — record the park with a follow-up PATCH /issues/:id instead: {"parkedDisposition":{"reason":"<why this row is deliberately not being worked, and what event ends the park>","until":"<ISO-8601, in the future and at most ${PARKED_DISPOSITION_MAX_HORIZON_DAYS} days out>"}}. A park is a statement about work already scoped and assigned — that it is correctly NOT being done, pending a named upstream event — so there is nothing to park at creation time, and admitting it here would let a row be born pre-suppressed: created and already invisible to the liveness invariants, having never once been looked at.`;
+}
+
+const parkedDispositionCreateGuardShape = {
+  parkedDisposition: z
+    .undefined({ errorMap: () => ({ message: parkedDispositionCreateRejectionMessage() }) })
+    .optional(),
+};
+
+/**
+ * BLO-27912: how far into the future a park may reach.
+ *
+ * A park exists to say "this row is correctly not being worked, pending an upstream event
+ * no timer owns" — which is a legitimate indefinite state, but recording it as *actually*
+ * indefinite would trade a noisy failure for a silent one. The horizon forces the park to
+ * be re-stated periodically by someone willing to state a reason, which is the
+ * re-examination condition the invariant is entitled to.
+ */
+export const PARKED_DISPOSITION_MAX_HORIZON_DAYS = 90;
+export const PARKED_DISPOSITION_MAX_HORIZON_MS = PARKED_DISPOSITION_MAX_HORIZON_DAYS * 24 * 60 * 60 * 1000;
+
+export const issueParkedDispositionSchema = z.object({
+  /**
+   * Why the row is parked and what ends the park. Required: a park whose reason is
+   * unstated is indistinguishable from the stall it is suppressing.
+   */
+  reason: z.string().trim().min(1).max(500),
+  /** The re-examination deadline. Must be in the future, and within the horizon. */
+  until: z.string().datetime(),
+}).strict().superRefine((value, ctx) => {
+  const untilMs = Date.parse(value.until);
+  if (Number.isNaN(untilMs)) return;
+  const nowMs = Date.now();
+  if (untilMs <= nowMs) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["until"],
+      message:
+        "`until` must be in the future. A park whose deadline has already passed suppresses nothing — the liveness invariants resume the moment it lapses.",
+    });
+    return;
+  }
+  if (untilMs - nowMs > PARKED_DISPOSITION_MAX_HORIZON_MS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["until"],
+      message:
+        `\`until\` may be at most ${PARKED_DISPOSITION_MAX_HORIZON_DAYS} days out. A park is deliberately bounded so that suppressing the liveness invariants cannot become permanent silence; re-park with a restated reason if the upstream event is still pending.`,
+    });
+  }
+});
+
+export type IssueParkedDispositionInput = z.infer<typeof issueParkedDispositionSchema>;
+
+
 const createIssueBaseSchema = z.object({
   ...misplacedIssueMonitorInputShape,
+  ...misplacedIssueParkedInputShape,
+  ...parkedDispositionCreateGuardShape,
   projectId: z.string().uuid().optional().nullable(),
   projectWorkspaceId: z.string().uuid().optional().nullable(),
   goalId: z.string().uuid().optional().nullable(),
@@ -488,6 +605,10 @@ const createIssueBaseSchema = z.object({
   watchdog: z.object({
     agentId: z.string().uuid(),
     instructions: multilineTextSchema.optional().nullable(),
+  }).strict().optional().nullable(),
+  prReviewTarget: z.object({
+    repoFullName: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
+    prNumber: z.number().int().positive(),
   }).strict().optional().nullable(),
 });
 
@@ -546,6 +667,7 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   createdByUserId: true,
   responsibleUserId: true,
   watchdog: true,
+  prReviewTarget: true,
 }).partial().extend({
   requestDepth: issueRequestDepthInputSchema.optional(),
   assigneeAgentId: z.string().trim().min(1).optional().nullable(),
@@ -555,6 +677,12 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
   hiddenAt: z.string().datetime().nullable().optional(),
+  // BLO-27912: PATCH-only, like `reviewRequest`. A park is a statement about work already
+  // scoped and assigned — there is nothing to park at creation time, and admitting it on
+  // create would let a row be born pre-suppressed. Enforced rather than conventional: the
+  // create path carries `parkedDispositionCreateGuardShape`, and this `.extend()` is what
+  // overrides that rejection back to the real schema on update.
+  parkedDisposition: issueParkedDispositionSchema.nullable().optional(),
 });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;

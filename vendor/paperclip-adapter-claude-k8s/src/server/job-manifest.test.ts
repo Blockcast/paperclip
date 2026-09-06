@@ -3,12 +3,15 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
   buildJobManifest,
   buildPodLogPath,
   sanitizeLabelValue,
   isSensitiveEnvName,
+  classifyEnvName,
+  ENV_NAME_CLASSIFICATION,
   findLiteralSensitiveEnvVars,
   findLiteralSensitiveEnvVarsInPodSpec,
   findServerOnlyEnvVarsInPodSpec,
@@ -71,6 +74,19 @@ function createClaudeConfigDirWithSession(sessionId: string, workingDir = "/pape
   writeFileSync(join(projectDir, `${sessionId}.jsonl`), "{}\n");
   return configDir;
 }
+
+// serviceAccountName is now required (BLO-21812): buildJobManifest throws
+// when neither the per-agent config nor this fleet-wide env fallback
+// resolves. File-scoped so every describe block below gets a working
+// default; the "serviceAccountName" describe block overrides/clears it
+// per case to exercise the actual resolution and refusal behavior.
+beforeEach(() => {
+  process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "test-default-sa";
+});
+
+afterEach(() => {
+  delete process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME;
+});
 
 describe("buildJobManifest", () => {
   let ctx: AdapterExecutionContext;
@@ -800,14 +816,192 @@ describe("buildJobManifest", () => {
       expect(env.get("TEMP")).toBe("/runtime-cache/paperclip-runs/run-abc12345/tmp");
       expect(env.get("PAPERCLIP_WORKSPACE_CWD")).toBe("/runtime-cache/paperclip-runs/run-abc12345/workspace");
       expect(command).toContain("if git -C '/paperclip/source-worktree' rev-parse --verify HEAD");
-      expect(command).toContain("git clone --shared --no-checkout -- '/paperclip/source-worktree' '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
+      expect(command).toContain("git clone --shared --no-checkout --origin origin -- '/paperclip/source-worktree' '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
       expect(command).toContain("checkout --detach \"$source_head\"");
+      // BLO-31359: no recorded upstream, so the clone is left with no remote at
+      // all rather than one aimed back at the clone source — plus a breadcrumb,
+      // so the resulting "'origin' does not appear to be a git repository" is
+      // self-explaining.
+      expect(command).toContain("git -C '/runtime-cache/paperclip-runs/run-abc12345/workspace' remote remove origin");
+      expect(command).not.toContain("remote add origin");
+      expect(command).not.toContain("fetch --no-tags");
+      // Nothing that presumes a remote may leak onto the no-upstream path.
+      expect(command).not.toContain("remote set-head");
+      expect(command).toContain("config paperclip.originRemoved");
       expect(command).toContain("else rm -rf '/runtime-cache/paperclip-runs/run-abc12345/workspace' && mkdir -p '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
       expect(command).toContain("fi && cd '/runtime-cache/paperclip-runs/run-abc12345/workspace' || exit $?");
       const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
       expect(syntaxCheck.stderr).toBe("");
       expect(syntaxCheck.status).toBe(0);
       expect(command).not.toContain("/paperclip/config-workspace");
+    });
+
+    // BLO-31359: `git clone` aims the clone's `origin` at its source, so cloning
+    // the project base checkout makes that shared base a push target — git only
+    // refuses a push to the base's *currently checked out* branch, so any other
+    // refname lands inside it. Repointing `origin` at the real upstream is what
+    // keeps an ephemeral run's push traffic leaving the cluster.
+    it("repoints the ephemeral clone's origin at the real upstream, never the clone source", () => {
+      ctx.context = {
+        paperclipWorkspace: {
+          cwd: "/paperclip/instances/default/projects/co1/proj-1/paperclip",
+          repoUrl: "https://github.com/Blockcast/paperclip.git",
+        },
+      };
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
+        storage: isolatedStorage("ephemeral"),
+      });
+
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers[0]?.command?.join(" ") ?? "";
+      const workspaceRoot = "/runtime-cache/paperclip-runs/run-abc12345/workspace";
+
+      // The clone still comes off local disk — that is what makes provisioning
+      // cheap — but the base must not survive as a remote.
+      expect(command).toContain(
+        `git clone --shared --no-checkout --origin origin -- '/paperclip/instances/default/projects/co1/proj-1/paperclip' '${workspaceRoot}'`,
+      );
+      expect(command).toContain(`git -C '${workspaceRoot}' remote remove origin`);
+      expect(command).toContain(
+        `git -C '${workspaceRoot}' remote add origin -- 'https://github.com/Blockcast/paperclip.git'`,
+      );
+      // Remove must precede add, or the add fails and the base stays wired up.
+      expect(command.indexOf("remote remove origin")).toBeLessThan(command.indexOf("remote add origin"));
+      // Fail-closed: the two commands that establish the security property sit
+      // in the `&&` chain unguarded, so a failure aborts the run rather than
+      // handing back a base-writable workspace.
+      expect(command).not.toMatch(/remote (remove|add) origin[^&|]*\|\|/);
+
+      const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
+      expect(syntaxCheck.stderr).toBe("");
+      expect(syntaxCheck.status).toBe(0);
+    });
+
+    // `git remote remove` also deletes every refs/remotes/origin/*, so without
+    // this the workspace has no remote-tracking refs and `git rebase
+    // origin/master` fails with `unknown revision`. The refetch is ergonomics,
+    // not security, so unlike the remove/add pair it is guarded — an offline pod
+    // must degrade to "fetch first", never to a failed run.
+    it("refetches remote-tracking refs and origin/HEAD after repointing origin, without letting a fetch failure fail the run", () => {
+      ctx.context = {
+        paperclipWorkspace: {
+          cwd: "/paperclip/instances/default/projects/co1/proj-1/paperclip",
+          repoUrl: "https://github.com/Blockcast/paperclip.git",
+        },
+      };
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
+        storage: isolatedStorage("ephemeral"),
+      });
+
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers[0]?.command?.join(" ") ?? "";
+      const workspaceRoot = "/runtime-cache/paperclip-runs/run-abc12345/workspace";
+      const boundedGit = `git -C '${workspaceRoot}' -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15`;
+
+      expect(command).toContain(`fetch --no-tags --quiet origin`);
+      // Fetch only after origin points at upstream — fetching earlier would pull
+      // the base's refs back in under the name `origin`.
+      expect(command.indexOf("remote add origin")).toBeLessThan(command.indexOf("fetch --no-tags"));
+      // Guarded, and in a subshell: `a && b || true` would parse as
+      // `(a && b) || true` and swallow failures of the unguarded security
+      // commands earlier in the chain.
+      expect(command).toContain(`(git -C '${workspaceRoot}' -c http.lowSpeedLimit=1000`);
+      expect(command).toContain("config paperclip.originFetchFailed");
+
+      // `fetch` restores refs/remotes/origin/<branch> but not the symbolic
+      // refs/remotes/origin/HEAD, so `set-head` is paired with it — otherwise
+      // `git symbolic-ref refs/remotes/origin/HEAD` stays broken in every
+      // run-isolated workspace.
+      expect(command).toContain("remote set-head origin -a");
+      expect(command.indexOf("fetch --no-tags")).toBeLessThan(command.indexOf("remote set-head"));
+      // set-head carries its own nested guard, so a set-head failure after a
+      // successful fetch cannot fall through to the "fetch failed" breadcrumb.
+      // It records its own breadcrumb instead of failing silently, so every
+      // failure path in this block explains itself on the workspace.
+      expect(command).toContain(
+        `(${boundedGit} remote set-head origin -a >/dev/null 2>&1 || git -C '${workspaceRoot}' config paperclip.originHeadUnset`,
+      );
+
+      // Both calls in this block reach the network — `set-head -a` queries the
+      // remote for its default branch even when the tracking refs are already
+      // local — so the bound must be on both, not just the fetch.
+      expect(command).toContain(`${boundedGit} fetch --no-tags --quiet origin`);
+      expect(command).toContain(`${boundedGit} remote set-head origin -a`);
+
+      // The guard against future drift is the *invariant* "every network-reaching
+      // git call carries the bound", not a count of how often the bound appears.
+      // Counting the bound asserts the inverse of what it looks like it asserts:
+      // a third call added WITHOUT the bound leaves the count at 2 and passes
+      // silently — exactly the regression worth catching — while a correctly
+      // bounded one pushes it to 3 and fails, training the next reader to bump
+      // the literal instead of reading the block.
+      const boundFlags = ["-c http.lowSpeedLimit=1000", "-c http.lowSpeedTime=15"];
+      const gitPrefix = `git -C '${workspaceRoot}'`;
+      // Deny-list, deliberately, because the two sets are not symmetric: the
+      // verbs this block uses that stay local are enumerable, the ones that can
+      // reach a remote are not. An allowlist of network verbs fails OPEN — an
+      // unnamed verb is classified local, so an unbounded call using it passes
+      // every assertion below. `remote prune` and `remote show` are two that
+      // exist today: both block on an unreachable remote exactly as
+      // `set-head -a` does. Treating anything unrecognised as network-reaching
+      // fails CLOSED instead, so a new verb reddens this suite until a human
+      // classifies it — which is the whole point of a drift guard.
+      const staysLocal = (args: string) =>
+        /^\s*(config|checkout|rev-parse|symbolic-ref)\b/.test(args) ||
+        /^\s*remote\s+(add|remove|rename|set-url)\b/.test(args);
+      const reachesNetwork = (args: string) => !staysLocal(args);
+
+      const invocations = command
+        .split(gitPrefix)
+        .slice(1)
+        .map((tail) => {
+          // One invocation ends at the next shell separator.
+          const raw = tail.split(/&&|\|\||[;|)]/, 1)[0] ?? "";
+          // Peel every leading `-c <key>=<value>` so boundedness is a question
+          // of which flags are present, not of them being adjacent and in this
+          // exact order — and so the verb match sees the subcommand either way.
+          let rest = raw.trimStart();
+          const flags: string[] = [];
+          for (let m = rest.match(/^-c\s+(\S+)\s+/); m; m = rest.match(/^-c\s+(\S+)\s+/)) {
+            flags.push(`-c ${m[1]}`);
+            rest = rest.slice(m[0].length);
+          }
+          return { args: rest, bounded: boundFlags.every((flag) => flags.includes(flag)) };
+        });
+
+      const networkCalls = invocations.filter((i) => reachesNetwork(i.args));
+      // The real guard: no unbounded network call, however this block grows.
+      // Needs no edit when a third bounded call is legitimately added. Scope is
+      // every `git -C '<workspaceRoot>'`-prefixed call — a call written against
+      // a different `-C`, or as `cd "$root" && git ...`, is not seen here.
+      expect(networkCalls.filter((i) => !i.bounded).map((i) => i.args.trim())).toEqual([]);
+      // ...and nothing that stays local pays the bound, so the bound tracks the
+      // set of network calls in both directions.
+      expect(invocations.filter((i) => i.bounded && !reachesNetwork(i.args)).map((i) => i.args.trim())).toEqual([]);
+      // Deliberate change-tripwire, NOT a boundedness check: the two calls above
+      // are the whole network surface of run-workspace setup today. A third one
+      // is a decision worth a human reading this block, so bumping this literal
+      // is the correct response to a legitimate addition — the invariant above
+      // is what keeps that addition honest.
+      expect(networkCalls).toHaveLength(2);
+
+      const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
+      expect(syntaxCheck.stderr).toBe("");
+      expect(syntaxCheck.status).toBe(0);
     });
 
     it("gives two concurrent stateless runs distinct, non-colliding TMPDIR/TMP/TEMP values", () => {
@@ -979,11 +1173,15 @@ describe("buildJobManifest", () => {
       expect(apiKeyEntry?.value).toBeUndefined();
     });
 
-    it("stamps x-penstock-session: agent:<name> into ANTHROPIC_CUSTOM_HEADERS", () => {
-      const { job } = buildJobManifest({ ctx, selfPod });
+    it("stamps x-penstock-session: agent:<name> into ANTHROPIC_CUSTOM_HEADERS, via the Secret (BLO-21858)", () => {
+      const { job, envSecret } = buildJobManifest({ ctx, selfPod });
       const envList = job.spec?.template?.spec?.containers[0]?.env ?? [];
       const headers = envList.find((e) => e.name === "ANTHROPIC_CUSTOM_HEADERS");
-      expect(headers?.value).toContain("x-penstock-session: agent:");
+      // AC1: never a literal. AC4: the value still reaches the container.
+      expect(headers?.value).toBeUndefined();
+      expect(headers?.valueFrom?.secretKeyRef?.name).toBe(envSecret?.name);
+      expect(headers?.valueFrom?.secretKeyRef?.key).toBe("ANTHROPIC_CUSTOM_HEADERS");
+      expect(envSecret?.data.ANTHROPIC_CUSTOM_HEADERS).toContain("x-penstock-session: agent:");
     });
 
     it("appends the session header to an existing ANTHROPIC_CUSTOM_HEADERS and respects a manual override", () => {
@@ -995,8 +1193,9 @@ describe("buildJobManifest", () => {
       const h1 = (r1.job.spec?.template?.spec?.containers[0]?.env ?? []).find(
         (e) => e.name === "ANTHROPIC_CUSTOM_HEADERS",
       );
-      expect(h1?.value).toContain("X-Custom: 1");
-      expect(h1?.value).toContain("x-penstock-session: agent:");
+      expect(h1?.value).toBeUndefined();
+      expect(r1.envSecret?.data.ANTHROPIC_CUSTOM_HEADERS).toContain("X-Custom: 1");
+      expect(r1.envSecret?.data.ANTHROPIC_CUSTOM_HEADERS).toContain("x-penstock-session: agent:");
 
       const withOverride = {
         ...ctx,
@@ -1009,7 +1208,8 @@ describe("buildJobManifest", () => {
       const h2 = (r2.job.spec?.template?.spec?.containers[0]?.env ?? []).find(
         (e) => e.name === "ANTHROPIC_CUSTOM_HEADERS",
       );
-      expect(h2?.value).toBe("x-penstock-session: manual-pin");
+      expect(h2?.value).toBeUndefined();
+      expect(r2.envSecret?.data.ANTHROPIC_CUSTOM_HEADERS).toBe("x-penstock-session: manual-pin");
     });
 
     it("literal env overrides valueFrom with the same name", () => {
@@ -1341,9 +1541,47 @@ describe("buildJobManifest", () => {
       expect(job.spec?.template?.spec?.serviceAccountName).toBe("paperclip-agent");
     });
 
-    it("omits serviceAccountName when not configured", () => {
+    it("echoes the resolved serviceAccountName on the result for log/manifest discoverability", () => {
+      ctx.config = { serviceAccountName: "paperclip-agent" };
+      const { serviceAccountName } = buildJobManifest({ ctx, selfPod });
+      expect(serviceAccountName).toBe("paperclip-agent");
+    });
+
+    it("falls back to PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME when the per-agent value is unset", () => {
+      process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "paperclip";
+      const { job, serviceAccountName } = buildJobManifest({ ctx, selfPod });
+      expect(job.spec?.template?.spec?.serviceAccountName).toBe("paperclip");
+      expect(serviceAccountName).toBe("paperclip");
+    });
+
+    it("prefers the per-agent serviceAccountName over the fleet default", () => {
+      process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "paperclip";
+      ctx.config = { serviceAccountName: "paperclip-agent" };
       const { job } = buildJobManifest({ ctx, selfPod });
-      expect(job.spec?.template?.spec?.serviceAccountName).toBeUndefined();
+      expect(job.spec?.template?.spec?.serviceAccountName).toBe("paperclip-agent");
+    });
+
+    // Both `.trim()` calls in resolveServiceAccountName are load-bearing:
+    // serviceAccountName is a `type: "text"` field, so a whitespace-only value
+    // is reachable from the UI form, and a bare `||` would pass it straight
+    // through as a Job SA name the API server rejects.
+    it("treats a whitespace-only per-agent serviceAccountName as unset and falls back to the fleet default", () => {
+      process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "paperclip";
+      ctx.config = { serviceAccountName: "   " };
+      const { job, serviceAccountName } = buildJobManifest({ ctx, selfPod });
+      expect(job.spec?.template?.spec?.serviceAccountName).toBe("paperclip");
+      expect(serviceAccountName).toBe("paperclip");
+    });
+
+    it("refuses to build the manifest when both the per-agent value and the fleet default are whitespace-only", () => {
+      process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "  ";
+      ctx.config = { serviceAccountName: "  " };
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/serviceAccountName/);
+    });
+
+    it("refuses to build the manifest — never silently lands on the namespace `default` ServiceAccount — when neither serviceAccountName nor the fleet default is set", () => {
+      delete process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME;
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/serviceAccountName/);
     });
   });
 
@@ -2046,6 +2284,73 @@ describe("fail-closed sensitive-env guard covers every container on the pod", ()
 });
 
 /**
+ * BLO-21858 (from the BLO-21593 review of adapter PR #31, probe 6).
+ *
+ * ANTHROPIC_CUSTOM_HEADERS carries arbitrary "Name: value" header lines that
+ * Claude Code forwards on every Anthropic API call, so it can hold a literal
+ * `Authorization:` header — but its name matches none of the six patterns in
+ * SENSITIVE_ENV_NAME_RE, so before this fix it shipped as a literal
+ * env[].value readable through a plain read-only `GET Pod` (BLO-17973).
+ */
+describe("ANTHROPIC_CUSTOM_HEADERS is always Secret-backed (BLO-21858)", () => {
+  const HEADER = "Authorization: Bearer sk-leaked-via-a-header-line";
+
+  it("never ships ANTHROPIC_CUSTOM_HEADERS as a literal env value on any container, even when set via adapterConfig.env", () => {
+    const ctx = makeCtx({ config: { env: { ANTHROPIC_CUSTOM_HEADERS: HEADER } } });
+    const { job, envSecret } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const podSpec = job.spec!.template.spec!;
+    const allContainers = [
+      ...(podSpec.initContainers ?? []),
+      ...(podSpec.containers ?? []),
+      ...((podSpec.ephemeralContainers ?? []) as unknown as typeof podSpec.containers),
+    ];
+
+    // (a) the header text appears in no literal env value on any container.
+    for (const c of allContainers) {
+      for (const e of c.env ?? []) {
+        expect(e.value ?? "").not.toContain("Authorization:");
+        expect(e.value ?? "").not.toContain("sk-leaked-via-a-header-line");
+      }
+    }
+
+    // (b) it is present as a secretKeyRef, and the value still reaches the
+    //     container through the per-Job EnvSecret (AC4 — runs keep working).
+    const entry = podSpec.containers![0].env!.find((e) => e.name === "ANTHROPIC_CUSTOM_HEADERS");
+    expect(entry).toBeDefined();
+    expect(entry!.value).toBeUndefined();
+    expect(entry!.valueFrom?.secretKeyRef?.name).toBe(envSecret?.name);
+    expect(entry!.valueFrom?.secretKeyRef?.key).toBe("ANTHROPIC_CUSTOM_HEADERS");
+    expect(envSecret?.data.ANTHROPIC_CUSTOM_HEADERS).toContain(HEADER);
+  });
+
+  it("is treated as sensitive by name, case-insensitively, despite matching none of the six patterns", () => {
+    // The negative control: it genuinely does not match the regex, so this is
+    // the pinned-name path doing the work, not an accidental substring hit.
+    expect(/(TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL|AUTH)/i.test("ANTHROPIC_CUSTOM_HEADERS")).toBe(false);
+    expect(isSensitiveEnvName("ANTHROPIC_CUSTOM_HEADERS")).toBe(true);
+    expect(isSensitiveEnvName("anthropic_custom_headers")).toBe(true);
+    // Unrelated non-sensitive names stay literal (AC4 — no collateral).
+    expect(isSensitiveEnvName("ANTHROPIC_BASE_URL")).toBe(false);
+    expect(isSensitiveEnvName("ANTHROPIC_MODEL")).toBe(false);
+  });
+
+  it("the fail-closed guard flags a literal ANTHROPIC_CUSTOM_HEADERS if a future code path reintroduces one", () => {
+    // buildJobManifest throws on any non-empty result from this function (see
+    // the "refusing to build Job manifest" throw), so flagging here is the
+    // rejection. Driven off a synthetic spec because the routing above makes
+    // the literal unreachable through buildJobManifest today — which is the
+    // point of a backstop.
+    const podSpec = {
+      initContainers: [{ name: "write-prompt", env: [{ name: "PROMPT_FILE", value: "/tmp/p" }] }],
+      containers: [{ name: "claude", env: [{ name: "ANTHROPIC_CUSTOM_HEADERS", value: HEADER }] }],
+    } as unknown as Parameters<typeof findLiteralSensitiveEnvVarsInPodSpec>[0];
+
+    expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual(["claude/ANTHROPIC_CUSTOM_HEADERS"]);
+    expect(findLiteralSensitiveEnvVars(podSpec.containers![0].env ?? [])).toEqual(["ANTHROPIC_CUSTOM_HEADERS"]);
+  });
+});
+
+/**
  * BLO-22514: agent Job pods used to inherit the paperclip server's entire secret
  * env, so any single agent could mint tokens as any other agent. The primary
  * control is the allowlist in getSelfPodInfo() (see inherit-allowlist.test.ts
@@ -2172,5 +2477,228 @@ describe("buildJobManifest — server credential propagation (BLO-22514)", () =>
     expect(findServerOnlyEnvVarsInPodSpec(podSpec)).toEqual([]);
     expect(findLiteralSensitiveEnvVarsInPodSpec(podSpec)).toEqual([]);
     expect(podSpec.volumes!.map((v) => v.name)).toContain("github-merge-token");
+  });
+});
+
+/**
+ * BLO-29804 — the declare-or-fail gate on env classification.
+ *
+ * SENSITIVE_ENV_NAME_RE is fail-open against a credential-carrying variable
+ * whose name doesn't match one of its six patterns; BLO-21858
+ * (ANTHROPIC_CUSTOM_HEADERS) is the proof. Pinning names one at a time only
+ * fixes the instances someone notices. These tests are the forcing function:
+ * a new env var introduced in job-manifest.ts reddens CI in the pull request
+ * that introduces it, naming the variable, and the author has to declare it
+ * SECRET or SAFE_LITERAL rather than inheriting a default.
+ */
+describe("env name classification gate (BLO-29804)", () => {
+  /**
+   * Names the test itself injects through the three operator-supplied
+   * channels. Their names are data, not code, so they cannot be pre-declared
+   * in ENV_NAME_CLASSIFICATION; subtracting exactly what we supplied leaves
+   * only code-originated names, which is what the table must cover.
+   *
+   * `inheritedEnv` is separately governed by AGENT_ENV_ALLOWLIST in
+   * inherit-allowlist.ts — the same declare-or-refuse shape at that boundary.
+   */
+  const OPERATOR_CONFIG_ENV = {
+    OPERATOR_TUNABLE: "some-value",
+    OPERATOR_API_TOKEN: "should-be-secret-backed",
+  };
+  const OPERATOR_INHERITED_ENV = {
+    PAPERCLIP_API_URL: "http://paperclip.paperclip.svc.cluster.local:3100",
+    GH_TOKEN: "inherited-and-secret-backed",
+  };
+  const OPERATOR_VALUE_FROM = [
+    { name: "INHERITED_VALUE_FROM_DEPLOYMENT", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } },
+  ];
+
+  const OPERATOR_SUPPLIED_NAMES = new Set([
+    ...Object.keys(OPERATOR_CONFIG_ENV),
+    ...Object.keys(OPERATOR_INHERITED_ENV),
+    ...OPERATOR_VALUE_FROM.map((e) => e.name),
+  ]);
+
+  /**
+   * A context populated on every optional field, so the conditional
+   * setIfPresent branches in buildEnvVars all fire. A var that only appears
+   * when, say, an approval wake supplies approvalId is still a var the table
+   * has to classify.
+   */
+  function maximalCtx(config: Record<string, unknown>): AdapterExecutionContext {
+    const ctx = makeCtx({
+      authToken: "pk_test_token",
+      context: {
+        taskId: "task-1",
+        issueId: "issue-1",
+        wakeReason: "issue_assigned",
+        wakeCommentId: "comment-1",
+        commentId: "comment-1",
+        approvalId: "approval-1",
+        approvalStatus: "approved",
+        issueIds: ["issue-1", "issue-2"],
+        paperclipWake: { issue: { identifier: "BLO-1" }, comments: [] },
+        paperclipWorkspace: {
+          cwd: "/paperclip/workspace",
+          source: "git_repo",
+          strategy: "project_primary",
+          workspaceId: "ws-1",
+          repoUrl: "https://github.com/Blockcast/paperclip.git",
+          repoRef: "master",
+          branchName: "feature",
+          worktreePath: "/paperclip/wt",
+          agentHome: "/paperclip/home",
+        },
+        paperclipWorkspaces: [{ id: "ws-1", name: "paperclip" }],
+        paperclipRuntimeServiceIntents: [{ name: "web", port: 3000 }],
+        paperclipRuntimeServices: [{ name: "web", url: "http://web:3000" }],
+        paperclipRuntimePrimaryUrl: "http://web:3000",
+      } as AdapterExecutionContext["context"],
+    });
+    ctx.config = config;
+    return ctx;
+  }
+
+  /** The four AC permutations, as a full 2x2x2x2 cross product. */
+  function permutations(): { label: string; ctx: AdapterExecutionContext }[] {
+    const out: { label: string; ctx: AdapterExecutionContext }[] = [];
+    for (const isolation of [false, true]) {
+      for (const dind of [false, true]) {
+        for (const operatorEnv of [false, true]) {
+          for (const mcp of [false, true]) {
+            const config: Record<string, unknown> = { enableDocker: dind };
+            if (isolation) {
+              config.isolationMode = "isolated";
+              config.isolationKey = "pr-review-123";
+            }
+            if (operatorEnv) config.env = { ...OPERATOR_CONFIG_ENV };
+            if (mcp) config.mcpServers = { extra: { command: "node", args: ["server.js"] } };
+            out.push({
+              label: `isolation=${isolation} dind=${dind} adapterConfigEnv=${operatorEnv} mcpServers=${mcp}`,
+              ctx: maximalCtx(config),
+            });
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  const selfPodWithInherited = () =>
+    makeSelfPod({
+      inheritedEnv: { ...OPERATOR_INHERITED_ENV },
+      inheritedEnvValueFrom: OPERATOR_VALUE_FROM,
+    });
+
+  /** Every env name on every container of the assembled pod spec. */
+  function allEnvNames(podSpec: k8s.V1PodSpec): string[] {
+    const containers: k8s.V1Container[] = [
+      ...(podSpec.initContainers ?? []),
+      ...(podSpec.containers ?? []),
+      ...((podSpec.ephemeralContainers ?? []) as unknown as k8s.V1Container[]),
+    ];
+    return containers.flatMap((c) => (c.env ?? []).map((e) => e.name).filter((n): n is string => !!n));
+  }
+
+  it("classifies every code-originated env name across all 16 config permutations", () => {
+    const undeclared = new Map<string, string[]>();
+
+    for (const { label, ctx } of permutations()) {
+      const { job } = buildJobManifest({ ctx, selfPod: selfPodWithInherited() });
+      for (const name of allEnvNames(job.spec!.template.spec!)) {
+        if (OPERATOR_SUPPLIED_NAMES.has(name)) continue;
+        if (classifyEnvName(name) !== null) continue;
+        undeclared.set(name, [...(undeclared.get(name) ?? []), label]);
+      }
+    }
+
+    // Name the variable, not just the failure — that is the whole point of the
+    // gate. A PR adding an env var reads its own name out of this message.
+    expect(
+      [...undeclared.entries()].map(
+        ([name, labels]) =>
+          `${name} (emitted under: ${labels[0]}) — declare it SECRET or SAFE_LITERAL in ENV_NAME_CLASSIFICATION in job-manifest.ts`,
+      ),
+    ).toEqual([]);
+  });
+
+  it("agrees with isSensitiveEnvName on every name it declares", () => {
+    // The table must describe what the code actually does. A SECRET entry the
+    // routing does not treat as sensitive, or a SAFE_LITERAL entry it does,
+    // means the classification has drifted from behaviour.
+    const disagreements = ENV_NAME_CLASSIFICATION.filter((e) => !e.prefix).filter(
+      (e) => isSensitiveEnvName(e.name) !== (e.classification === "SECRET"),
+    );
+    expect(disagreements.map((e) => `${e.name} declared ${e.classification}`)).toEqual([]);
+  });
+
+  it("does not let a prefix entry silently absolve a credential-shaped name", () => {
+    // The check above only covers exact entries, so a prefix family is the one
+    // way a new credential-shaped name could enter classified without anyone
+    // deciding: `PAPERCLIP_WORKSPACE_AUTH_TOKEN` inherits SAFE_LITERAL from
+    // the `PAPERCLIP_WORKSPACE_` family while isSensitiveEnvName routes it to
+    // a secretKeyRef. Runtime would be right and the table would be lying.
+    // Assert the two agree on every name actually emitted, which is what
+    // closes the prefix escape hatch without banning prefixes.
+    const drifted = new Set<string>();
+
+    for (const { ctx } of permutations()) {
+      const { job } = buildJobManifest({ ctx, selfPod: selfPodWithInherited() });
+      for (const name of allEnvNames(job.spec!.template.spec!)) {
+        if (OPERATOR_SUPPLIED_NAMES.has(name)) continue;
+        const declared = classifyEnvName(name);
+        if (declared === null) continue; // the coverage test above owns this case
+        if (isSensitiveEnvName(name) !== (declared === "SECRET")) {
+          drifted.add(
+            `${name} classifies as ${declared} but isSensitiveEnvName says ${isSensitiveEnvName(name) ? "sensitive" : "not sensitive"} — declare it explicitly in ENV_NAME_CLASSIFICATION instead of inheriting a prefix`,
+          );
+        }
+      }
+    }
+
+    expect([...drifted]).toEqual([]);
+  });
+
+  it("requires a stated reason on every entry", () => {
+    // Non-empty is the whole machine-checkable invariant, deliberately. A
+    // character-count floor looks stricter but measures nothing a reviewer
+    // cares about — it is satisfied by padding and it reddens on a reason
+    // that is short because the variable is simple ("pip cache path."). The
+    // useful reason is the one a reviewer reads instead of re-deriving
+    // whether the value can carry a credential, and that is a review
+    // judgement, not a length.
+    expect(ENV_NAME_CLASSIFICATION.filter((e) => e.reason.trim().length === 0).map((e) => e.name)).toEqual([]);
+  });
+
+  it("keeps the Secret-backed name set identical to the pre-change set (no behaviour change)", () => {
+    // The no-behaviour-change proof required by BLO-29804. This is the set as
+    // it stood before the classification table existed: regex matches plus the
+    // one name BLO-21858 pinned. If introducing the table ever moves a var
+    // between literal and secretKeyRef, this reddens.
+    const EXPECTED_SECRET_BACKED = [
+      "ANTHROPIC_CUSTOM_HEADERS",
+      "GH_TOKEN",
+      "OPERATOR_API_TOKEN",
+      "PAPERCLIP_API_KEY",
+      "PAPERCLIP_K8S_ISOLATION_KEY",
+    ];
+
+    const ctx = maximalCtx({
+      isolationMode: "isolated",
+      isolationKey: "pr-review-123",
+      enableDocker: true,
+      env: { ...OPERATOR_CONFIG_ENV },
+      mcpServers: { extra: { command: "node", args: ["server.js"] } },
+    });
+    const { job, envSecret } = buildJobManifest({ ctx, selfPod: selfPodWithInherited() });
+
+    const mainEnv = job.spec!.template.spec!.containers[0]?.env ?? [];
+    const secretBacked = mainEnv
+      .filter((e) => e.valueFrom?.secretKeyRef?.name === envSecret?.name)
+      .map((e) => e.name!)
+      .sort();
+
+    expect(secretBacked).toEqual(EXPECTED_SECRET_BACKED);
+    expect(Object.keys(envSecret?.data ?? {}).sort()).toEqual(EXPECTED_SECRET_BACKED);
   });
 });

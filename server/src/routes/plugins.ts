@@ -235,6 +235,51 @@ const UUID_REGEX =
 const PLUGIN_API_BODY_LIMIT_BYTES = 1_000_000;
 const PLUGIN_ACTION_RPC_TIMEOUT_MS = 15 * 60 * 1_000;
 const DEFAULT_RAG_HEALTH_WINDOW_DAYS = 7;
+/**
+ * `Retry-After` advertised when webhook ingestion rejects a delivery because the
+ * plugin is not ready. Long enough that a stuck plugin is not hot-looped by its
+ * senders, short enough that a normal restart re-delivers promptly.
+ */
+const WEBHOOK_NOT_READY_RETRY_AFTER_SECONDS = 30;
+/**
+ * Non-`ready` plugin statuses webhook ingestion answers as *terminal* (410).
+ * Everything else that is not `ready` is treated as recoverable and answers
+ * 503 + `Retry-After`.
+ *
+ * This is a denylist on purpose, and the direction matters more than the
+ * contents. `plugins.status` is `text().$type<PluginStatus>()`
+ * (`packages/db/src/schema/plugins.ts`) — a compile-time brand over an
+ * unconstrained column, with no PG enum and no CHECK behind it. So the set of
+ * values that can actually arrive here is open, not closed: a rolling deploy
+ * where a newer pod writes a status an older image has never heard of is
+ * enough. An allowlist of retryable statuses would send every such unknown
+ * down the 410 path and destroy the payload — reintroducing exactly the
+ * BLO-28659 failure mode behind a narrower door. With a denylist, an
+ * unrecognised status *delays* alerts instead of dropping them, and staying
+ * safe requires no maintenance.
+ *
+ * `uninstalled` is terminal because soft delete keeps the row for 30 days
+ * (`DELETE /plugins/:pluginId` without `purge`) and the resolution path does
+ * not filter by status, so a catch-all `!== "ready"` would answer
+ * `503 + Retry-After` for a deliberately removed plugin until the purge.
+ * Senders would requeue forever with no action able to clear it. Getting back
+ * to `ready` from `uninstalled` requires a *reinstall* — a new lifecycle, not
+ * a retry — so the endpoint is genuinely gone and says so.
+ *
+ * `disabled` is deliberately *not* terminal: an operator disabling a plugin
+ * for maintenance is exactly the person who wants the deliveries made during
+ * the window to land once they re-enable it, and `enable` restores the same
+ * row. The cost is honest — a plugin left disabled for a long time keeps
+ * `AlertmanagerWebhookNotificationsFailing` lit — but that alarm has a real
+ * operator action that clears it, which is the line this partition draws.
+ *
+ * Adding a status here converts delayed alerts into destroyed ones for that
+ * status. Exported so the regression suite can pin the membership rather than
+ * assert the enum against itself.
+ *
+ * @see BLO-28659 — why readiness is retryable at all
+ */
+export const WEBHOOK_TERMINAL_PLUGIN_STATUSES = new Set<PluginStatus>(["uninstalled"]);
 const MEMORY_PLUGIN_KEYWORDS = ["gbrain", "hindsight", "memory", "plugin-secrets"] as const;
 
 type RagHealthBucketCacheEntry = {
@@ -3143,8 +3188,32 @@ export function pluginRoutes(
    * Response: `{ deliveryId: string, status: string }`
    * Errors:
    * - 404 if plugin not found or endpointKey not declared
-   * - 400 if plugin is not in ready state or lacks webhooks.receive capability
+   * - 400 if the manifest is missing, lacks the webhooks.receive capability,
+   *   or an explicit companyId is required for a multi-company plugin
+   * - 404 if an explicit companyId is not configured
+   * - 503 (with `Retry-After`) if no company is configured yet
+   * - 410 if the plugin has been uninstalled (the endpoint is gone for good)
+   * - 503 (with `Retry-After`) if the plugin is not ready but can recover
    * - 502 if the worker is unavailable or the RPC call fails
+   *
+   * Readiness is a *transient, server-side* condition, so it answers 503 and
+   * not 4xx: a conforming sender treats 4xx as permanent and discards the
+   * payload outright. Alertmanager did exactly that during the 2026-08-18
+   * outage ("notify retry canceled due to unrecoverable error ... status code
+   * 400"), destroying every alert that fired across a 5.8h window. Keep this
+   * retryable; delayed alerts are recoverable, dropped ones are not.
+   *
+   * "Not ready" is a *partition*, not a negation — see
+   * {@link WEBHOOK_TERMINAL_PLUGIN_STATUSES}. Only statuses named terminal
+   * answer 410 (`uninstalled`: telling a sender to retry a plugin that no
+   * longer exists trades dropped payloads for an unclearable alarm and an
+   * unbounded retry loop); everything else non-ready retries.
+   *
+   * The sibling readiness guard on the plugin-scoped API route above is still
+   * a plain `!== "ready"` catch-all, so it answers 503 for `uninstalled` where
+   * this route answers 410. That drift is known and deliberate for now: its
+   * callers are plugin-authored clients rather than Alertmanager, so the
+   * payload-loss stakes differ. It is the next guard to partition.
    */
   router.post("/plugins/:pluginId/webhooks/:endpointKey", async (req, res) => {
     if (!webhookDeps) {
@@ -3161,9 +3230,21 @@ export function pluginRoutes(
       return;
     }
 
-    // Step 2: Validate the plugin is in 'ready' state
+    // Step 2: Validate the plugin is in 'ready' state.
+    //
+    // Partition, not negation — and the unknown case falls to the safe side.
+    // Only statuses named terminal answer 410; every other non-ready status,
+    // including one this build has never heard of, answers 503 + Retry-After.
+    // The request is well-formed and the fault is ours.
     if (plugin.status !== "ready") {
-      res.status(400).json({
+      if (WEBHOOK_TERMINAL_PLUGIN_STATUSES.has(plugin.status as PluginStatus)) {
+        res.status(410).json({
+          error: `Plugin has been uninstalled (current status: ${plugin.status})`,
+        });
+        return;
+      }
+      res.setHeader("Retry-After", String(WEBHOOK_NOT_READY_RETRY_AFTER_SECONDS));
+      res.status(503).json({
         error: `Plugin is not ready (current status: ${plugin.status})`,
       });
       return;
@@ -3232,11 +3313,18 @@ export function pluginRoutes(
       companyId = requestedCompanyId;
     } else if (configuredCompanyIds.length === 1) {
       companyId = configuredCompanyIds[0]!;
+    } else if (configuredCompanyIds.length === 0) {
+      // Company configuration is operator-controlled and may be written after
+      // the plugin reaches ready. Treat that transient state like readiness so
+      // senders retain the payload instead of classifying it as permanent.
+      res.setHeader("Retry-After", String(WEBHOOK_NOT_READY_RETRY_AFTER_SECONDS));
+      res.status(503).json({
+        error: "Plugin must be configured for a company before receiving webhooks",
+      });
+      return;
     } else {
       res.status(400).json({
-        error: configuredCompanyIds.length === 0
-          ? "Plugin must be configured for a company before receiving webhooks"
-          : '"companyId" query parameter is required for a multi-company plugin',
+        error: '"companyId" query parameter is required for a multi-company plugin',
       });
       return;
     }

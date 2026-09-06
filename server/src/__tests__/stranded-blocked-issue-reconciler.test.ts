@@ -8,6 +8,7 @@ import {
   companies,
   createDb,
   executionWorkspaces,
+  heartbeatRuns,
   issueApprovals,
   issueComments,
   issueRecoveryActions,
@@ -28,6 +29,7 @@ import {
   type StrandedBlockedIssueReconcilerScheduler,
 } from "../services/stranded-blocked-issue-reconciler.js";
 import { listBlockedIssueAutoResumeSuppressions } from "../services/issues.js";
+import { resolveStrandedEscalationStatus } from "../services/recovery/stranded-escalation-status.js";
 import {
   WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
   WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION,
@@ -62,6 +64,7 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     await db.delete(issueThreadInteractions);
     await db.delete(issueComments);
     await db.delete(activityLog);
+    await db.delete(heartbeatRuns);
     await db.delete(workspaceOperations);
     await db.delete(issueRecoveryActions);
     await db.delete(issueRelations);
@@ -184,6 +187,93 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
 
     expect(result.reconciled).toBe(1);
     expect(await statusOf(stranded)).toBe("todo");
+    const activity = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, stranded));
+    expect(activity).toEqual([{
+      action: "issue.stranded_blocked_reconciled",
+      details: expect.objectContaining({
+        statusBefore: "blocked",
+        statusAfter: "todo",
+        disposition: "unclassified_external_wait_made_visible",
+      }),
+    }]);
+  });
+
+  it.each(["queued", "running", "scheduled_retry"] as const)(
+    "does not reconcile an issue with a %s active run",
+    async (runStatus) => {
+      const { companyId, agentId } = await createCompany(`SBA-${runStatus}`);
+      const stranded = await insertIssue({
+        companyId,
+        identifier: `SBA-${runStatus}`,
+        status: "blocked",
+        assigneeAgentId: agentId,
+      });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        status: runStatus,
+        contextSnapshot: { issueId: stranded },
+        ...(runStatus === "running" ? { startedAt: new Date() } : {}),
+        ...(runStatus === "scheduled_retry" ? {
+          scheduledRetryAt: new Date(Date.now() + 60_000),
+          scheduledRetryReason: "transient_failure",
+        } : {}),
+      });
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, stranded));
+
+      const result = await reconcileStrandedBlockedIssues(db);
+
+      expect(result.reconciled).toBe(0);
+      expect(await statusOf(stranded)).toBe("blocked");
+      expect(await db.select().from(activityLog)).toHaveLength(0);
+    },
+  );
+
+  it("does not reconcile an issue held only by a checkout lock", async () => {
+    const { companyId, agentId } = await createCompany("SBC");
+    const stranded = await insertIssue({
+      companyId,
+      identifier: "SBC-1",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    const checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "queued",
+      contextSnapshot: { issueId: stranded },
+    });
+    await db.update(issues)
+      .set({ checkoutRunId })
+      .where(eq(issues.id, stranded));
+
+    const result = await reconcileStrandedBlockedIssues(db);
+
+    expect(result.reconciled).toBe(0);
+    expect(await statusOf(stranded)).toBe("blocked");
+    expect(await db.select().from(activityLog)).toHaveLength(0);
+  });
+
+  it("does not reconcile an issue with a live monitor", async () => {
+    const { companyId } = await createCompany("SBM");
+    const stranded = await insertIssue({ companyId, identifier: "SBM-1", status: "blocked" });
+    await db.update(issues)
+      .set({ monitorNextCheckAt: new Date(Date.now() + 60_000) })
+      .where(eq(issues.id, stranded));
+
+    const result = await reconcileStrandedBlockedIssues(db);
+
+    expect(result.reconciled).toBe(0);
+    expect(await statusOf(stranded)).toBe("blocked");
   });
 
   it("drains an issue whose sole blocker closed done but the edge was never cleared", async () => {
@@ -325,6 +415,90 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
 
     expect(result.reconciled).toBe(0);
     expect(await statusOf(stranded)).toBe("blocked");
+  });
+
+  it("sweeps an issue whose stranded-run recovery action has ESCALATED (wake-exhausted, so it pins nothing)", async () => {
+    // BLO-21523: `escalated` stays inside ACTIVE_RECOVERY_ACTION_STATUSES so it keeps holding
+    // the active-source uniqueness slot, but it is definitionally wake-exhausted — every wake
+    // path drops it at `strandedRecoveryWakeAttemptsExhausted`. Suppressing the sweep on it
+    // preserved no repair path and left the row permanently unreachable.
+    const { companyId, agentId } = await createCompany("SB7E");
+    const stranded = await insertIssue({ companyId, identifier: "SB7E-1", status: "blocked" });
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: stranded,
+      kind: "stranded_assigned_issue",
+      status: "escalated",
+      ownerAgentId: agentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `source_scoped_recovery:${companyId}:${stranded}:stranded_assigned_issue:${agentId}`,
+      nextAction: "Restore a live execution path.",
+    });
+
+    const result = await reconcileStrandedBlockedIssues(db);
+
+    expect(result.reconciled).toBe(1);
+    expect(await statusOf(stranded)).toBe("todo");
+  });
+
+  it("leaves the escalated recovery action itself untouched when it sweeps the issue", async () => {
+    // The sweep decides dispatchability only. Resolving the action would free
+    // `issue_recovery_actions_active_source_uq` and let a fresh action be minted with a new
+    // budget and horizon — the unbounded re-fire loop BLO-18996 closed.
+    const { companyId, agentId } = await createCompany("SB7F");
+    const stranded = await insertIssue({ companyId, identifier: "SB7F-1", status: "blocked" });
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: stranded,
+      kind: "stranded_assigned_issue",
+      status: "escalated",
+      ownerAgentId: agentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `source_scoped_recovery:${companyId}:${stranded}:stranded_assigned_issue:${agentId}`,
+      nextAction: "Restore a live execution path.",
+    });
+
+    await reconcileStrandedBlockedIssues(db);
+
+    const actions = await db
+      .select({ status: issueRecoveryActions.status, resolvedAt: issueRecoveryActions.resolvedAt })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, stranded));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]?.status).toBe("escalated");
+    expect(actions[0]?.resolvedAt).toBeNull();
+  });
+
+  it("cannot have an active action masked by an escalated one: the partial unique index forbids coexistence", async () => {
+    // This pins the invariant the narrowing above depends on. `issue_recovery_actions_active_source_uq`
+    // is unique on (company_id, source_issue_id) WHERE status IN ('active','escalated'), so an issue
+    // has AT MOST ONE action in either state. That is what makes "suppress on active only" safe:
+    // there is no case where dropping `escalated` from the predicate hides a live `active` action on
+    // the same issue. If this index is ever narrowed to 'active' alone, coexistence becomes possible
+    // and the suppression predicate must be revisited — this test is the tripwire.
+    const { companyId, agentId } = await createCompany("SB7G");
+    const stranded = await insertIssue({ companyId, identifier: "SB7G-1", status: "blocked" });
+    const base = {
+      companyId,
+      sourceIssueId: stranded,
+      kind: "stranded_assigned_issue" as const,
+      ownerAgentId: agentId,
+      cause: "stranded_assigned_issue",
+      nextAction: "Restore a live execution path.",
+    };
+    await db.insert(issueRecoveryActions).values({
+      ...base,
+      status: "escalated",
+      fingerprint: `source_scoped_recovery:${companyId}:${stranded}:stranded_assigned_issue:escalated`,
+    });
+
+    await expect(
+      db.insert(issueRecoveryActions).values({
+        ...base,
+        status: "active",
+        fingerprint: `source_scoped_recovery:${companyId}:${stranded}:stranded_assigned_issue:active`,
+      }),
+    ).rejects.toThrow();
   });
 
   it("does not sweep edge-less blocked issues with explicit pending interactions or approvals", async () => {
@@ -611,6 +785,163 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     expect(result.reconciled).toBe(0);
     expect(await statusOf(issueId)).toBe("in_progress");
   });
+
+  it("does not reconcile when a checkout lock appears after candidate selection", async () => {
+    const { companyId, agentId } = await createCompany("SBRACE");
+    const issueId = await insertIssue({ companyId, identifier: "SBRACE-1", status: "blocked" });
+    const checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "queued",
+      contextSnapshot: { issueId },
+    });
+
+    const candidatesSelected = defer();
+    const releaseSelection = defer();
+    const reconcile = reconcileStrandedBlockedIssues(db, {
+      batchSize: 1,
+      afterCandidatesSelected: async (candidateIds) => {
+        expect(candidateIds).toContain(issueId);
+        candidatesSelected.resolve();
+        await releaseSelection.promise;
+      },
+    });
+    await candidatesSelected.promise;
+
+    await db.update(issues).set({ checkoutRunId }).where(eq(issues.id, issueId));
+    releaseSelection.resolve();
+
+    const result = await reconcile;
+
+    expect(result.reconciled).toBe(0);
+    expect(await statusOf(issueId)).toBe("blocked");
+  });
+
+  /**
+   * BLO-30743: the two drains must reach a FIXED POINT on a row, not trade it.
+   *
+   * Production shape: a `stranded_assigned_issue` recovery action that has burned its wake
+   * horizon and gone `escalated`, on an issue with an empty blocker set. The reconciler
+   * sweeps it (its suppression set is `["active"]`, so `escalated` pins nothing — asserted
+   * directly by the SB7E case above). The producer, `resolveStrandedEscalationStatus`, is
+   * the other half: it used to test only whether an owner was NAMED, and an escalated
+   * action keeps `ownerAgentId` populated, so it wrote `blocked` straight back onto the row
+   * the reconciler had just drained.
+   *
+   * Measured on BLO-27999 before the fix: 458 activity events in 10.3h — 208
+   * `issue.escalation.needs_human_decision` (each one a Slack forward), 208 `issue.updated`,
+   * 42 `issue.stranded_blocked_reconciled` — and the same entity in 20 of 20 consecutive
+   * reconciler ticks.
+   */
+  describe("two-drain fixed point with a wake-exhausted escalation (BLO-30743)", () => {
+    async function seedOscillationCandidate(prefix: string) {
+      const { companyId, agentId } = await createCompany(prefix);
+      const stranded = await insertIssue({
+        companyId,
+        identifier: `${prefix}-1`,
+        status: "blocked",
+        assigneeAgentId: agentId,
+      });
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: stranded,
+        kind: "stranded_assigned_issue",
+        status: "escalated",
+        ownerAgentId: agentId,
+        cause: "stranded_assigned_issue",
+        fingerprint: `source_scoped_recovery:${companyId}:${stranded}:stranded_assigned_issue:${agentId}`,
+        nextAction: "Restore a live execution path.",
+        attemptCount: 748,
+        maxAttempts: 5,
+      });
+      return { companyId, agentId, stranded };
+    }
+
+    // The producer's decision for the row as the reconciler leaves it. Mirrors the call in
+    // `escalateStrandedAssignedIssue`, which passes `action.status === "escalated"`.
+    function producerDecisionFor(input: { currentStatus: string; ownerAgentId: string }) {
+      return resolveStrandedEscalationStatus({
+        currentStatus: input.currentStatus,
+        recoveryOwnerAgentId: input.ownerAgentId,
+        isWakeExhaustedEscalation: true,
+        isProviderQuotaWait: false,
+        blockerIssueIds: [],
+        recoveryCause: "stranded_assigned_issue",
+      });
+    }
+
+    it("converges after one flip and holds across three consecutive ticks", async () => {
+      const { agentId, stranded } = await seedOscillationCandidate("SBFP");
+
+      // Tick 1 — the reconciler drains the strand, exactly as it does in production.
+      const first = await reconcileStrandedBlockedIssues(db);
+      expect(first.reconciled).toBe(1);
+      expect(await statusOf(stranded)).toBe("todo");
+
+      // The producer now re-picks the row (`todo` is inside
+      // STRANDED_ASSIGNED_ISSUE_STATUSES) and decides what to write back. Before the fix
+      // this returned `blocked`, restarting the cycle; it must agree with the reconciler.
+      const decision = producerDecisionFor({ currentStatus: "todo", ownerAgentId: agentId });
+      expect(decision).toEqual({ status: "todo", hasNoRecoveryPath: true });
+      await db.update(issues).set({ status: decision.status }).where(eq(issues.id, stranded));
+
+      // Ticks 2 and 3 — nothing left to reconcile, and the row never returns to `blocked`.
+      for (const _tick of [2, 3]) {
+        const sweep = await reconcileStrandedBlockedIssues(db);
+        expect(sweep.reconciled).toBe(0);
+        const status = await statusOf(stranded);
+        expect(status).toBe("todo");
+        const again = producerDecisionFor({ currentStatus: status!, ownerAgentId: agentId });
+        expect(again.status).toBe("todo");
+        await db.update(issues).set({ status: again.status }).where(eq(issues.id, stranded));
+      }
+
+      expect(await statusOf(stranded)).toBe("todo");
+    });
+
+    it("logs exactly one reconciliation for the row across the three ticks", async () => {
+      // The measured signal in the issue's verifying section: today the same entityId
+      // repeats in 20 of 20 consecutive ticks. One flip total is the target.
+      const { stranded, agentId } = await seedOscillationCandidate("SBFPA");
+
+      await reconcileStrandedBlockedIssues(db);
+      const decision = producerDecisionFor({ currentStatus: "todo", ownerAgentId: agentId });
+      await db.update(issues).set({ status: decision.status }).where(eq(issues.id, stranded));
+      await reconcileStrandedBlockedIssues(db);
+      await reconcileStrandedBlockedIssues(db);
+
+      const reconciliations = await db
+        .select({ action: activityLog.action })
+        .from(activityLog)
+        .where(eq(activityLog.entityId, stranded));
+      expect(reconciliations).toEqual([{ action: "issue.stranded_blocked_reconciled" }]);
+    });
+
+    it("still parks — and stays parked — when the same row has a real blocker edge", async () => {
+      // The fixed point must not be reached by making every row dispatchable. With an
+      // unresolved dependency the reconciler declines and the producer writes `blocked`;
+      // both agree on the opposite answer, which is equally a fixed point.
+      const { companyId, agentId, stranded } = await seedOscillationCandidate("SBFPB");
+      const blocker = await insertIssue({ companyId, identifier: "SBFPB-2", status: "todo" });
+      await block({ companyId, blockerIssueId: blocker, blockedIssueId: stranded });
+
+      const sweep = await reconcileStrandedBlockedIssues(db);
+
+      expect(sweep.reconciled).toBe(0);
+      expect(await statusOf(stranded)).toBe("blocked");
+      expect(resolveStrandedEscalationStatus({
+        currentStatus: "blocked",
+        recoveryOwnerAgentId: agentId,
+        isWakeExhaustedEscalation: true,
+        isProviderQuotaWait: false,
+        blockerIssueIds: [blocker],
+        recoveryCause: "stranded_assigned_issue",
+      })).toEqual({ status: "blocked", hasNoRecoveryPath: false });
+    });
+  });
 });
 
 describe("startStrandedBlockedIssueReconciler", () => {
@@ -657,4 +988,5 @@ describe("startStrandedBlockedIssueReconciler", () => {
     expect(transactionCount).toBe(2);
     stop();
   });
+
 });

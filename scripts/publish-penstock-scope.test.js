@@ -68,8 +68,13 @@ function createPublishFixture() {
   };
 }
 
-function runPublishScript(fakeNpm, fixture, extraEnv = {}) {
-  return spawnSync(process.execPath, ["scripts/publish-penstock-scope.mjs", "--version", "2026.614.0"], {
+function runPublishScript(fakeNpm, fixture, extraEnv = {}, extraArgs = []) {
+  return spawnSync(process.execPath, [
+    "scripts/publish-penstock-scope.mjs",
+    "--version",
+    "2026.614.0",
+    ...extraArgs,
+  ], {
     cwd: fixture.dir,
     encoding: "utf8",
     env: {
@@ -133,4 +138,44 @@ test("publish-penstock-scope restores manifests when npm publish fails", () => {
     rmSync(fixture.dir, { recursive: true, force: true });
     rmSync(fakeNpm.dir, { recursive: true, force: true });
   }
+});
+
+test("bootstrap publishes without dry-run or provenance flags", () => {
+  const fakeNpm = createFakeNpm();
+  const fixture = createPublishFixture();
+
+  try {
+    const result = runPublishScript(fakeNpm, fixture, {}, ["--bootstrap", "--provenance"]);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /Bootstrap mode: local 2FA publish, no provenance/);
+
+    const calls = readJsonLines(fakeNpm.logPath);
+    assert.equal(calls.length, 2);
+    for (const call of calls) {
+      assert.deepEqual(call.argv, ["publish", "--access", "public"]);
+    }
+  } finally {
+    assert.equal(readFileSync(fixture.sharedManifestPath, "utf8"), fixture.originalShared);
+    assert.equal(readFileSync(fixture.sdkManifestPath, "utf8"), fixture.originalSdk);
+    rmSync(fixture.dir, { recursive: true, force: true });
+    rmSync(fakeNpm.dir, { recursive: true, force: true });
+  }
+});
+
+test("release workflow never grants id-token: write", () => {
+  const wf = readFileSync(
+    new URL("../.github/workflows/release-penstock-scope.yml", import.meta.url),
+    "utf8",
+  );
+  // Granting id-token: write lets npm reach an OIDC token, which silently
+  // re-enables trusted publishing and its UNCONDITIONAL provenance attestation.
+  // npm then 422s that attestation because these are self-hosted runners, so the
+  // permission is what breaks CI publishing — not the --provenance flag.
+  // Comments mentioning it are fine; an actual grant is not.
+  const uncommented = wf
+    .split("\n")
+    .filter((l) => !l.trimStart().startsWith("#"))
+    .join("\n");
+  assert.doesNotMatch(uncommented, /id-token\s*:\s*write/);
+  assert.match(uncommented, /NODE_AUTH_TOKEN:\s*\$\{\{\s*secrets\.NPM_TOKEN\s*\}\}/);
 });

@@ -45,10 +45,32 @@ export interface EvidenceVerdictRecord {
   overridden?: boolean;
   overrideReason?: string;
   evaluatedAt: string;
+  commitEvidence?: Array<{ repoFullName: string; sha: string }>;
 }
 
 const OPERATOR_OVERRIDE_PATTERN = /^evidence-gate: override (.+)$/;
 const OPERATOR_OVERRIDE_MAX_AGE_MS = 60 * 60 * 1000;
+
+export function extractGithubCommitEvidence(
+  comments: EvidenceCommentLite[],
+): Array<{ repoFullName: string; sha: string }> {
+  const seen = new Set<string>();
+  const refs: Array<{ repoFullName: string; sha: string }> = [];
+  for (const comment of comments) {
+    if (comment.authorAgentId === null) continue;
+    for (const match of comment.body.matchAll(
+      /https?:\/\/github\.com\/([\w-]+\/[\w.-]+)\/commit\/([0-9a-f]{7,40})\b/gi,
+    )) {
+      const repoFullName = match[1]!;
+      const sha = match[2]!.toLowerCase();
+      const key = `${repoFullName.toLowerCase()}@${sha}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      refs.push({ repoFullName, sha });
+    }
+  }
+  return refs;
+}
 
 /**
  * Run the gate for one issue. Returns the verdict record the caller should
@@ -97,6 +119,7 @@ export async function runEvidenceGate(
       overridden: true,
       overrideReason: override.match[1]!.trim(),
       evaluatedAt: now.toISOString(),
+      commitEvidence: [],
     };
   }
   const evaluation = evaluateEvidence({
@@ -122,5 +145,6 @@ export async function runEvidenceGate(
     unlabeledFallback: evaluation.unlabeledFallback,
     diagnostics: evaluation.diagnostics,
     evaluatedAt: now.toISOString(),
+    commitEvidence: extractGithubCommitEvidence(data.comments),
   };
 }

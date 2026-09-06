@@ -2629,6 +2629,8 @@ async function derivePipelineCaseLiveness(
       eq(pipelineCaseIssueLinks.companyId, companyId),
       eq(pipelineCaseIssueLinks.caseId, row.case.id),
       inArray(pipelineCaseIssueLinks.role, ["automation", "work"]),
+      isNull(pipelineCaseIssueLinks.retiredAt),
+      eq(pipelineCaseIssueLinks.attachmentState, "attached"),
       eq(issueRows.companyId, companyId),
       isNull(issueRows.hiddenAt),
     ))

@@ -2091,6 +2091,136 @@ describe("comment-review gate webhook trigger", () => {
       ),
     ).toBeNull();
   });
+
+  // BLO-29853. The event carrying 33 of 33 real consolidated reviews in this
+  // repo was absent from this matrix entirely — neither asserted to trigger nor
+  // asserted not to — while the block around it read as exhaustive. That
+  // omission is why the gate shipped able to publish only "not evaluated".
+  function reviewPayload(
+    overrides: {
+      action?: string;
+      author?: string;
+      body?: string;
+      commitId?: string;
+    } = {},
+  ) {
+    return {
+      action: overrides.action ?? "submitted",
+      repository: { full_name: repo },
+      pull_request: { number: 1049, html_url: `https://github.com/${repo}/pull/1049`, head: { sha: head } },
+      review: {
+        state: "commented",
+        commit_id: overrides.commitId ?? head,
+        user: { login: overrides.author ?? reviewer },
+        body: overrides.body ?? `## Ally — Consolidated PR Review\nReviewed head: ${head}`,
+      },
+    };
+  }
+
+  // `submitted` is the live repro from BLO-29853: Ally submitted a COMMENTED
+  // review carrying an open Important at the then-current head of #1471 and the
+  // gate never re-ran, leaving its push-time green standing for 6h+ on a
+  // mergeable PR. `edited` because the verdict is a pure function of the review
+  // bodies, so editing one changes it.
+  it.each(["submitted", "edited"])("re-evaluates the gate on pull_request_review.%s", (action) => {
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger("pull_request_review", reviewPayload({ action }), reviewer),
+    ).toEqual({
+      repoFullName: repo,
+      prNumber: 1049,
+      prUrl: `https://github.com/${repo}/pull/1049`,
+    });
+  });
+
+  // Asserted as its own case because it is a design decision, not an omission:
+  // resolving the live head lets the carried-finding path see an unattested new
+  // head when a review lands against one the branch has moved past. Trusting
+  // `review.commit_id` (or this payload's snapshot) would instead write a status
+  // to a non-head commit, where branch protection cannot see it.
+  it("leaves the head unresolved so the gate reads the live head, not the reviewed one", () => {
+    const trigger = __test_resolvePrCommentReviewGateWebhookTrigger(
+      "pull_request_review",
+      reviewPayload({ commitId: "feedfacefeedfacefeedfacefeedfacefeedface" }),
+      reviewer,
+    );
+    expect(trigger).not.toBeNull();
+    expect(trigger).not.toHaveProperty("headSha");
+  });
+
+  it("rejects a review from any author but the configured reviewer", () => {
+    // Same near-miss login the issue_comment path guards: the bot suffix matters.
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "pull_request_review",
+        reviewPayload({ author: "allyblockcast" }),
+        reviewer,
+      ),
+    ).toBeNull();
+  });
+
+  // Regression for the two Important findings Ally raised on #1478 @ c13ec58a.
+  // Both earlier revisions of this block asserted the *bug* was correct, which
+  // is why the suite stayed green across them.
+  it("re-evaluates on a reviewer review that is not a consolidated review", () => {
+    // The evaluator never reads this payload — it re-lists both surfaces and
+    // recomputes. So a body without the heading is not evidence that nothing
+    // changed: this may be an `edited` event that just removed the heading from
+    // a previously blocking review, and dropping it here would leave that
+    // review's `failure` published forever.
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "pull_request_review",
+        reviewPayload({ action: "edited", body: "Looks good, shipping." }),
+        reviewer,
+      ),
+    ).toEqual({
+      repoFullName: repo,
+      prNumber: 1049,
+      prUrl: `https://github.com/${repo}/pull/1049`,
+    });
+  });
+
+  it("re-evaluates on pull_request_review.dismissed", () => {
+    // `githubListPrReviewsWithTimestamps` (github-app-auth.ts) skips DISMISSED
+    // reviews before the evaluator sees them, so dismissing a blocking review
+    // *does* change the verdict. Excluding this action stranded the stale
+    // `failure` on the PR with no event able to clear it.
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger(
+        "pull_request_review",
+        reviewPayload({ action: "dismissed" }),
+        reviewer,
+      ),
+    ).toEqual({
+      repoFullName: repo,
+      prNumber: 1049,
+      prUrl: `https://github.com/${repo}/pull/1049`,
+    });
+  });
+
+  it("still ignores review actions that cannot change the review set", () => {
+    // The predicate is not "any pull_request_review": these carry no change to
+    // what the evaluator would read, so triggering would burn three API calls
+    // to republish an identical verdict.
+    for (const action of ["dismissed_stale_unknown_action", "labeled"]) {
+      expect(
+        __test_resolvePrCommentReviewGateWebhookTrigger(
+          "pull_request_review",
+          reviewPayload({ action }),
+          reviewer,
+        ),
+      ).toBeNull();
+    }
+  });
+
+  it("rejects a review payload carrying no resolvable PR number", () => {
+    // The gate keys every read and the status write on the PR number, so a
+    // payload without one has to drop rather than reach the API with a guess.
+    const { pull_request: _omitted, ...withoutPr } = reviewPayload();
+    expect(
+      __test_resolvePrCommentReviewGateWebhookTrigger("pull_request_review", withoutPr, reviewer),
+    ).toBeNull();
+  });
 });
 
 describeEmbeddedPostgres("github-webhook route", () => {
@@ -2127,7 +2257,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     await tempDb?.cleanup();
   }, 60_000);
 
-  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions"> = {}) {
+  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "resolvePrReviewHeadSha" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions"> = {}) {
     const app = express();
     app.use(express.json({
       verify: (req, _res, buf) => {
@@ -2137,6 +2267,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     app.use("/api/webhooks/github", githubWebhookRoutes(db, {
       webhookSecret,
       ...config,
+      resolvePrReviewHeadSha: config.resolvePrReviewHeadSha ?? (async () => null),
       runPrCommentReviewGateCheck: config.runPrCommentReviewGateCheck ?? (async () => ({
         posted: false as const,
         reason: "not_configured" as const,
@@ -2315,6 +2446,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       prNumber: number;
       headSha?: string | null;
       prUrl?: string | null;
+      db?: unknown;
     }> = [];
     let markCalled!: () => void;
     const called = new Promise<void>((resolve) => {
@@ -2353,11 +2485,18 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
     expect(response.status).toBe(200);
     expect(response.body).toMatchObject({ ignored: "no_paperclip_identifier" });
-    expect(calls).toEqual([{
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
       repoFullName: "Blockcast/paperclip",
       prNumber: 1049,
       prUrl: "https://github.com/Blockcast/paperclip/pull/1049",
-    }]);
+    });
+    // The db handle is the gate's only cross-process serialization boundary,
+    // and production supplying it is a property of THIS call site. Assert it
+    // on the argument the seam actually received: while the seam was invoked
+    // with the bare trigger, the real handle was unobservable from here and a
+    // caller could drop it without any test noticing.
+    expect(calls[0]!.db).toBeDefined();
   });
 
   it("leaves reviewer wakes queued when the webhook runs on the API tier", async () => {
@@ -3190,7 +3329,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     }));
   });
 
-  it("counts scheduled retries when assigning to the least-loaded active reviewer", async () => {
+  it("counts scheduled retries when assigning to the least-loaded invokable reviewer", async () => {
     const { companyId, agentId: busyReviewerId } = await seedCompanyAndAgent({
       agentName: "Ally",
     });
@@ -3250,7 +3389,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     });
   });
 
-  it("uses a task-scoped tie-break when active reviewers have equal load", async () => {
+  it("uses a task-scoped tie-break when invokable reviewers have equal load", async () => {
     const { companyId, agentId: firstReviewerId } = await seedCompanyAndAgent({
       agentName: "Ally",
     });
@@ -3362,6 +3501,39 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, terminatedReviewerId));
     expect(terminatedRuns).toHaveLength(0);
+  });
+
+  it("assigns a PR review wake to an error-status reviewer with a healthy org chain", async () => {
+    const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+    await db.update(agents).set({ status: "error" }).where(eq(agents.id, reviewerId));
+
+    const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 978,
+        title: "Wake the reviewer after a recoverable adapter error",
+        body: null,
+        head: { ref: "reviewer-error-status" },
+      },
+      repository: { full_name: "Blockcast/magma" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "pull_request")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-reviewer-error-status")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.reviewerWakeFired).toBe(true);
+    const runs = await db
+      .select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, reviewerId));
+    expect(runs).toEqual([{ agentId: reviewerId, status: "queued" }]);
   });
 
   it("dedupes a replayed reviewer delivery across the whole reviewer pool", async () => {
@@ -3605,6 +3777,148 @@ describeEmbeddedPostgres("github-webhook route", () => {
         repository: { full_name: REPO },
       };
     }
+
+    it("durably retries an initially paused reviewer and recovers when it returns", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+      const prNumber = 22003;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+
+      const { body, signature } = signedRequest(openedPayload(prNumber));
+      const res = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-21995-initially-paused")
+        .set("content-type", "application/json")
+        .send(body);
+
+      expect(res.status).toBe(200);
+      expect(res.body.reviewerWakeFired).toBe(false);
+      expect(await runsForTask(taskKey)).toHaveLength(0);
+
+      const retryRows = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(retryRows).toHaveLength(1);
+      const retry = (retryRows[0]!.payload as Record<string, any>).prReviewerContendedRetry;
+      expect(retry.availabilityAttempts).toBe(1);
+      expect(typeof retry.unavailableSince).toBe("string");
+      expect(new Date(retry.nextAttemptAt).getTime()).toBeGreaterThan(Date.now());
+
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, reviewerId));
+      const recovered = await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(Date.now() + 60_000),
+      );
+      expect(recovered).toMatchObject({ recovered: 1, exhausted: 0, superseded: 0 });
+      expect(await runsForTask(taskKey)).toHaveLength(1);
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+    }, 30_000);
+
+    it("does not retry a paused reviewer whose reporting chain is invalid", async () => {
+      const { companyId, agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const terminatedManagerId = randomUUID();
+      await db.insert(agents).values({
+        id: terminatedManagerId,
+        companyId,
+        name: "Terminated manager",
+        role: "manager",
+        status: "terminated",
+        adapterType: "claude_k8s",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db
+        .update(agents)
+        .set({ status: "paused", reportsTo: terminatedManagerId })
+        .where(eq(agents.id, reviewerId));
+      const app = buildApp({ prReviewerAgentIds: [reviewerId] });
+
+      const { body, signature } = signedRequest(openedPayload(22005));
+      const res = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-invalid-paused-reviewer")
+        .set("content-type", "application/json")
+        .send(body);
+
+      expect(res.status).toBe(200);
+      expect(res.body.reviewerWakeFired).toBe(false);
+      const retryRows = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(retryRows).toHaveLength(0);
+    });
+
+    it("coalesces duplicate marker requests while the reviewer is paused", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+      const app = buildApp({
+        prReviewerAgentIds: [reviewerId],
+        prReviewerBotLogin: "allyblockcast[bot]",
+      });
+      const prNumber = 22004;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+      const payload = {
+        action: "created",
+        issue: {
+          number: prNumber,
+          title: "Durable marker request while reviewer is paused",
+          html_url: `https://github.com/${REPO}/pull/${prNumber}`,
+          pull_request: { url: `https://api.github.com/repos/${REPO}/pulls/${prNumber}` },
+          user: { login: "codex" },
+        },
+        comment: {
+          id: 49000022004,
+          body: "<!-- paperclip:review-request -->\n@ally please re-review",
+          html_url: `https://github.com/${REPO}/pull/${prNumber}#issuecomment-49000022004`,
+          user: { login: "allyblockcast[bot]" },
+        },
+        repository: { full_name: REPO },
+      };
+      const { body, signature } = signedRequest(payload);
+      const send = (deliveryId: string) =>
+        request(app)
+          .post("/api/webhooks/github")
+          .set("x-github-event", "issue_comment")
+          .set("x-hub-signature-256", signature)
+          .set("x-github-delivery", deliveryId)
+          .set("content-type", "application/json")
+          .send(body);
+
+      const [first, replay] = await Promise.all([
+        send("delivery-blo-21995-marker-paused-1"),
+        send("delivery-blo-21995-marker-paused-2"),
+      ]);
+      expect(first.status).toBe(200);
+      expect(replay.status).toBe(200);
+      expect(first.body.reviewerWakeFired).toBe(false);
+      expect(replay.body.reviewerWakeFired).toBe(false);
+
+      const retryRows = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(retryRows).toHaveLength(1);
+
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, reviewerId));
+      await reconcileContendedPrReviewerWakes(
+        db,
+        reviewerConfig(reviewerId),
+        new Date(Date.now() + 60_000),
+      );
+      expect(await runsForTask(taskKey)).toHaveLength(1);
+      expect(await deliveryCount("queued")).toBe(1);
+    }, 40_000);
 
     it("persists a durable record when the PR scope is contended, then dispatches exactly one wake", async () => {
       __resetMetricsForTest();
@@ -5239,6 +5553,76 @@ describeEmbeddedPostgres("github-webhook route", () => {
     });
   });
 
+  it("resolves and persists the exact PR head for issue-comment review wakes", async () => {
+    const { companyId, agentId: authorAgentId } = await seedIssueWithIdentifier("BLO-31415");
+    const reviewerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const fetchedHeadSha = "0123456789abcdef0123456789abcdef01234567";
+    const quotedHeadSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const lookups: Array<{ repoFullName: string; prNumber: number }> = [];
+    const app = buildApp({
+      prReviewerAgentId: reviewerAgentId,
+      resolvePrReviewHeadSha: async (input) => {
+        lookups.push(input);
+        return fetchedHeadSha;
+      },
+    });
+    const payload = {
+      action: "created",
+      issue: {
+        number: 1435,
+        title: "Fix BLO-31415 reviewer evidence",
+        body: null,
+        html_url: "https://github.com/Blockcast/paperclip/pull/1435",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/1435" },
+        user: { login: "codex" },
+      },
+      comment: {
+        id: 5003000001,
+        body: `@ally please review head ${quotedHeadSha}`,
+        html_url: "https://github.com/Blockcast/paperclip/pull/1435#issuecomment-5003000001",
+        user: { login: "kkroo" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-comment-head-context")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(lookups).toEqual([{ repoFullName: "Blockcast/paperclip", prNumber: 1435 }]);
+
+    const runs = await db
+      .select({ agentId: heartbeatRuns.agentId, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.agentId, [authorAgentId, reviewerAgentId]));
+    expect(runs).toHaveLength(2);
+    for (const run of runs) {
+      expect(run.contextSnapshot).toMatchObject({
+        githubHeadSha: fetchedHeadSha,
+        githubPrNumber: 1435,
+        githubRepoFullName: "Blockcast/paperclip",
+      });
+      expect(run.contextSnapshot).not.toMatchObject({ githubHeadSha: quotedHeadSha });
+    }
+  });
+
   it("skips the reviewer wake for the reviewer's own review self-echo but still wakes for human and other-bot reviews (BLO-15799)", async () => {
     const { agentId } = await seedCompanyAndAgent({ agentName: "Ally" });
     const app = buildApp({ prReviewerAgentId: agentId, prReviewerBotLogin: "allyblockcast[bot]" });
@@ -6564,6 +6948,51 @@ describeEmbeddedPostgres("github-webhook route", () => {
     ).toHaveLength(2);
   });
 
+  it("classifies findings after the context clamp and writes feedback for a blocked issue", async () => {
+    const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "blocked" });
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const longReviewBody = [
+      "## Ally — Consolidated PR Review",
+      "",
+      "Reviewed head: f78f3dcd8818ed2bf9b7550965c96c614f433987",
+      "",
+      "Prior review context:",
+      "x".repeat(4100),
+      "",
+      "### Critical Issues (0)",
+      "",
+      "### Important Issues (1)",
+      "- The remaining issue is actionable.",
+    ].join("\n");
+    expect(Buffer.byteLength(longReviewBody, "utf8")).toBeGreaterThan(4096);
+
+    const response = await sendReviewSubmitted(
+      app,
+      reviewSubmittedFeedbackPayload({
+        prNumber: 850,
+        reviewId: 333,
+        state: "commented",
+        headSha: "f78f3dcd8818ed2bf9b7550965c96c614f433987",
+        identifier: "PEN-1126",
+        body: longReviewBody,
+      }),
+      "delivery-blocked-long-review",
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body.reopened).toEqual([]);
+    expect(response.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+
+    const feedbackComments = await db
+      .select({ metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(feedbackComments).toHaveLength(1);
+    expect((feedbackComments[0]!.metadata as Record<string, unknown>).kind).toBe(
+      "github_pr_review_feedback",
+    );
+  });
+
   // BLO-23267: real-world reproduction of the same defect via the
   // COMMENT-shaped path (issue_comment, not pull_request_review.submitted) --
   // the shape Ally's consolidated review actually takes. Payload bodies and
@@ -7340,7 +7769,52 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(description).toContain("## Note on the Dependabot Alerts REST API (operational, not evidentiary)");
     expect(description).toContain("403 Dependabot alerts are disabled for this repository");
     expect(description).toContain("It is NOT an evidentiary standard");
-    expect(description).toContain("does not forbid the repository contents API or GraphQL");
+    expect(description).toContain("does not forbid the repository contents API");
+
+    // BLO-28884: the note used to end "...contents API or GraphQL", which
+    // affirmatively licensed `vulnerabilityAlerts` as an evidence source. That
+    // query returns an unerrored `totalCount: 0` when the credential lacks the
+    // Dependabot alerts permission, so the old wording pointed agents at a
+    // silent false-green: read 0, conclude "no open alert", close as done.
+    expect(description).not.toContain("does not forbid the repository contents API or GraphQL");
+    expect(description).toContain("## Alert state may be unreadable, and the unreadable case LOOKS LIKE ZERO");
+    expect(description).toContain("`totalCount: 0` with no `errors` block");
+    expect(description).toContain("An absence-shaped answer from a permission-gated source means UNKNOWN, never NONE");
+    // Both 403 shapes, so a missing permission is not mis-diagnosed as the
+    // repo having the feature switched off.
+    expect(description).toContain("Resource not accessible by integration");
+    expect(description).toContain("You are not authorized to perform this operation.");
+
+    // BLO-28884 (Ally, Important): the section above must not claim the whole
+    // of branches 2 and 3 needs the permission. Branch 3's receipt disjunct is
+    // pushed to us by the verified delivery, so it needs no credential -- an
+    // agent holding a receipt that reads "you lack the permission" concludes
+    // its own valid evidence is inadmissible and escalates instead of closing.
+    // That is a false-NEGATIVE, the mirror of the false-zero this PR fixes.
+    expect(description).not.toContain("Branches 2 and 3 both require observing terminal alert state");
+    expect(description).toContain(
+      "**A terminal dismissal webhook receipt already on this issue is sufficient evidence on its own.**",
+    );
+    expect(description).toContain("needs no permission, no token and no API call");
+    expect(description).toContain("you must NOT escalate on the grounds that you lack a permission");
+
+    // AC2: the non-agent escalation path is named, with the SBOM read that
+    // still works when the alerts API does not.
+    expect(description).toContain("## When branch 1 is unsatisfiable (phantom alerts)");
+    expect(description).toContain("dependency-graph/sbom");
+    expect(description).toContain("Escalate to a repository admin");
+
+    // BLO-28884: the SBOM is built from the same dependency graph as the
+    // alerts, so it cannot rule a phantom in. Two ways to misread it, both
+    // measured on Blockcast/magma 2026-08-21: summarising 2,366 packages hid a
+    // single grpc entry inside the vulnerable range, and no SBOM metadata field
+    // distinguishes it (`filesAnalyzed` is false for all 2,366).
+    expect(description).toContain("same GitHub dependency graph that generates these alerts");
+    expect(description).toContain(
+      "Use it to establish that a patched version is present; never to establish that a vulnerable one is real.",
+    );
+    expect(description).toContain("Compare the **minimum** resolved version across every entry");
+    expect(description).toContain("neither field discriminates");
 
     // Preserve the operational prohibition verbatim while changing closure criteria.
     expect(description).toContain(
@@ -7496,6 +7970,478 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(receipts[0]!.body).toContain("Action: `fixed`");
     expect(receipts[0]!.body).toContain("GitHub delivery: `delivery-fixed`");
     expect(receipts[0]!.body).toContain("no Dependabot REST or GraphQL query was used");
+  });
+
+  // BLO-28981: `issues_active_dependabot_alert_uq` only constrains non-terminal
+  // rows, so once a cycle's issue closed, the next re-fire matched nothing in
+  // findOpenDependabotAlertIssue and the intake minted a brand-new full-weight
+  // row. On `Blockcast/magma` that produced 8 alerts x 3 cycles = 24 rows under
+  // 8 identical originIds, each one context-free -- the adjudication that closed
+  // the previous cycle never travelled with the alert, so the same conclusion
+  // was re-derived every cycle at ~8 agent runs a time.
+  it("reopens the adjudicated issue instead of refiling when a closed alert re-fires", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    const [originalIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(originalIssue!.status).toBe("todo");
+
+    // The cycle is adjudicated and closed.
+    await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed");
+    const [closed] = await db.select().from(issues).where(eq(issues.id, originalIssue!.id));
+    expect(closed!.status).toBe("done");
+
+    // GitHub re-fires the same alert.
+    const refire = await postDependabot(
+      app,
+      dependabotPayload("critical", "reintroduced"),
+      "delivery-refire-1",
+    );
+    expect(refire.status).toBe(200);
+    expect(refire.body).toMatchObject({ dependabotWakeFired: true });
+
+    // The row count does not grow: this is the fourth-row check the production
+    // verifying signal watches for.
+    const alertIssues = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(alertIssues).toHaveLength(1);
+    expect(alertIssues[0]!.id).toBe(originalIssue!.id);
+
+    // ...and it is reopened, assigned, and no longer carrying the closed row's
+    // completion timestamp or a stale execution lock.
+    const reopened = alertIssues[0]!;
+    expect(reopened.status).toBe("todo");
+    expect(reopened.assigneeAgentId).toBe(agentId);
+    expect(reopened.completedAt).toBeNull();
+    expect(reopened.checkoutRunId).toBeNull();
+    expect(reopened.executionRunId).toBeNull();
+
+    // The re-fire is recorded on the row, so the next agent to pick it up reads
+    // that this is a repeat rather than starting cold.
+    const refireComments = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, reopened.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_refire'`,
+        ),
+      );
+    expect(refireComments).toHaveLength(1);
+    expect(refireComments[0]!.body).toContain("reopened in place");
+    expect(refireComments[0]!.body).toContain("Action: `reintroduced`");
+    expect(refireComments[0]!.body).toContain("GitHub delivery: `delivery-refire-1`");
+    // The prior adjudication is the terminal receipt already on this row.
+    const receipts = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, reopened.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        ),
+      );
+    expect(receipts).toHaveLength(1);
+  });
+
+  // The regression signal must survive the dedupe: reopening changes WHICH row
+  // the alert lands on, never whether it reaches someone. A dependency that was
+  // genuinely fixed and then reintroduced by a later commit still has to wake an
+  // assignee.
+  it("still wakes an assignee when a closed alert is genuinely reintroduced", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed");
+
+    const refire = await postDependabot(
+      app,
+      dependabotPayload("critical", "reintroduced"),
+      "delivery-refire-2",
+    );
+    expect(refire.body).toMatchObject({ dependabotWakeFired: true });
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(issue!.status).toBe("todo");
+    expect(issue!.assigneeAgentId).toBe(agentId);
+
+    // The re-fire enqueued its own wake, keyed on this delivery. Do NOT assert a
+    // run-count delta here: the re-fire shares the alert's taskKey with the
+    // "created" run, so if that run is still queued, enqueueWakeup's generic
+    // coalescing (coalescePendingTaskScopeWake) merges the re-fire into it
+    // instead of queuing a second -- see the sibling "reuses the open issue"
+    // test. Whether it coalesces depends on how far the earlier run has
+    // progressed, which is not deterministic across suite orderings. The wake
+    // request is the durable evidence that the regression reached the assignee.
+    const wakes = await db
+      .select({ idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(
+      wakes.some((wake) =>
+        wake.idempotencyKey === "github-dependabot:Blockcast/paperclip#58:reintroduced:delivery-refire-2",
+      ),
+    ).toBe(true);
+
+    // ...and whichever run(s) exist all point at the one surviving issue.
+    const runs = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.length).toBeGreaterThanOrEqual(1);
+    for (const run of runs) {
+      expect((run.contextSnapshot as Record<string, unknown>).issueId).toBe(issue!.id);
+    }
+  });
+
+  // The normal path must not regress: an alert nobody has seen before still gets
+  // a full-weight issue, with no reopen machinery involved.
+  it("still files a fresh issue for a first-ever alert with no prior adjudication", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    const res = await postDependabot(app, dependabotPayload("critical", "created", 4242), "delivery-first");
+    expect(res.body).toMatchObject({ dependabotWakeFired: true });
+
+    const alertIssues = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originId, "github-dependabot:Blockcast/paperclip#4242"),
+        ),
+      );
+    expect(alertIssues).toHaveLength(1);
+    const issue = alertIssues[0]!;
+    expect(issue.status).toBe("todo");
+    expect(issue.assigneeAgentId).toBe(agentId);
+    // Full alert body, not a reopen notice.
+    expect(issue.description).toContain("## Acceptance criteria");
+    expect(issue.description).toContain("security/dependabot/4242");
+
+    const refireComments = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issue.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_refire'`,
+        ),
+      );
+    expect(refireComments).toHaveLength(0);
+  });
+
+  // Pre-fix history: the 24 rows already in production sit under the same
+  // originId as terminal siblings. The reopened row must name them so the whole
+  // adjudication chain stays reachable from the one row that survives.
+  it("carries prior adjudication rows into the reopened issue", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed");
+
+    // An older, already-closed duplicate from before this fix shipped. Terminal
+    // rows are outside the partial unique index, which is exactly why the old
+    // behaviour could stack them.
+    const [legacyDuplicate] = await db
+      .insert(issues)
+      .values({
+        companyId,
+        title: "Dependabot critical alert: vitest in Blockcast/paperclip#58",
+        description: "Adjudicated in an earlier cycle.",
+        status: "done",
+        priority: "critical",
+        originKind: "github_dependabot_alert",
+        originId: "github-dependabot:Blockcast/paperclip#58",
+        originFingerprint: "github-dependabot:Blockcast/paperclip#58",
+        // Real rows carry an identifier from issueService.create; a raw insert
+        // does not, and the identifier is what the reopen notice links to.
+        issueNumber: 22652,
+        identifier: "BLO-22652",
+        completedAt: new Date("2026-08-06T00:00:00.000Z"),
+        createdAt: new Date("2026-08-06T00:00:00.000Z"),
+      })
+      .returning({ id: issues.id, identifier: issues.identifier });
+
+    await postDependabot(app, dependabotPayload("critical", "reintroduced"), "delivery-refire-3");
+
+    // Still no new row: two terminal rows existed, and the newest was reopened.
+    const alertIssues = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(alertIssues).toHaveLength(2);
+    const open = alertIssues.filter((row) => row.status === "todo");
+    expect(open).toHaveLength(1);
+    expect(open[0]!.id).not.toBe(legacyDuplicate!.id);
+
+    const [refireComment] = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, open[0]!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_refire'`,
+        ),
+      );
+    expect(refireComment!.body).toContain("Earlier rows for this same alert (1)");
+    expect(refireComment!.body).toContain(legacyDuplicate!.identifier!);
+    expect(refireComment!.body).toContain("adjudicated before");
+  });
+
+  // A replayed delivery never reaches the reopen path at all: the wake
+  // pre-check in the dependabot handler keys on
+  // `${taskKey}:${action}:${deliveryId}` and short-circuits before
+  // resolveDependabotAlertIssue runs. That is the outermost of the two dedupe
+  // layers, and this pins it: the replay is dropped whole, so the row is left
+  // exactly as the *previous* delivery left it -- still closed. The
+  // comment-level guard is a separate layer, exercised by the next test.
+  it("short-circuits a replayed re-fire delivery at the wake pre-check", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed");
+    await postDependabot(app, dependabotPayload("critical", "reintroduced"), "delivery-refire-4");
+
+    // Close it again, then replay the exact same re-fire delivery id.
+    await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed-2");
+    const replay = await postDependabot(
+      app,
+      dependabotPayload("critical", "reintroduced"),
+      "delivery-refire-4",
+    );
+
+    // The replay was dropped at the wake gate, so no wake fired...
+    expect(replay.body).toMatchObject({ dependabotWakeFired: false });
+
+    const alertIssues = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(alertIssues).toHaveLength(1);
+    // ...and the reopen never ran, so the row is still where delivery-fixed-2
+    // left it. Asserting the status is what separates "deduped" from "silently
+    // processed twice"; the row count alone cannot tell those apart.
+    expect(alertIssues[0]!.status).toBe("done");
+
+    const refireComments = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, alertIssues[0]!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_refire'`,
+        ),
+      );
+    // Exactly the one written by the first (non-replayed) re-fire.
+    expect(refireComments).toHaveLength(1);
+  });
+
+  // The inner layer: a delivery that gets PAST the wake pre-check but carries a
+  // delivery id already seen by the reopen path. `reintroduced` and `reopened`
+  // produce distinct wake idempotency keys for the same delivery id, so the
+  // second one runs the reopen for real -- and the refire comment's externalKey
+  // (`${originId}:refire:${deliveryId}`) collides, so onConflictDoNothing is the
+  // only thing preventing a duplicate notice. Unlike the test above, the row IS
+  // re-queued here, which is what proves the guard suppressed the comment
+  // rather than the whole delivery.
+  it("dedupes a re-fire comment on delivery id when the reopen path runs twice", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed");
+
+    const first = await postDependabot(
+      app,
+      dependabotPayload("critical", "reintroduced"),
+      "delivery-refire-shared",
+    );
+    expect(first.body).toMatchObject({ dependabotWakeFired: true });
+
+    // Close it, then re-fire under a DIFFERENT action with the SAME delivery
+    // id: distinct wake key, identical comment externalKey.
+    await postDependabot(app, dependabotPayload("critical", "fixed"), "delivery-fixed-3");
+    const second = await postDependabot(
+      app,
+      dependabotPayload("critical", "reopened"),
+      "delivery-refire-shared",
+    );
+    expect(second.body).toMatchObject({ dependabotWakeFired: true });
+
+    const alertIssues = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(alertIssues).toHaveLength(1);
+    // The reopen DID run this time -- the row came back out of `done`.
+    expect(alertIssues[0]!.status).toBe("todo");
+    expect(alertIssues[0]!.assigneeAgentId).toBe(agentId);
+
+    // ...but the notice was not stacked.
+    const refireComments = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, alertIssues[0]!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_refire'`,
+        ),
+      );
+    expect(refireComments).toHaveLength(1);
+    // The surviving comment is the first delivery's, not the second's.
+    expect(refireComments[0]!.body).toContain("Action: `reintroduced`");
+  });
+
+  // BLO-28981 / BLO-28864: cancelling an alert issue is a deliberate "stop
+  // re-adjudicating this" decision, and it is the only suppression lever the
+  // intake has. Reopening a cancelled row would null out `cancelledAt` and
+  // re-queue the alert on every subsequent re-fire forever, leaving no way to
+  // silence a phantom alert at all.
+  it("suppresses a re-fire against a cancelled alert issue instead of reopening it", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    const [originalIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+
+    // A human cancels it: this alert is not worth re-adjudicating.
+    const cancelledAt = new Date("2026-08-19T00:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ status: "cancelled", cancelledAt })
+      .where(eq(issues.id, originalIssue!.id));
+
+    const refire = await postDependabot(
+      app,
+      dependabotPayload("critical", "reintroduced"),
+      "delivery-refire-cancelled",
+    );
+    expect(refire.status).toBe(200);
+    // No agent was woken -- that cost is exactly what cancelling stops.
+    expect(refire.body).toMatchObject({ dependabotWakeFired: false });
+
+    const alertIssues = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    // Still no new row, AND the cancellation survived intact.
+    expect(alertIssues).toHaveLength(1);
+    expect(alertIssues[0]!.status).toBe("cancelled");
+    expect(alertIssues[0]!.cancelledAt).toEqual(cancelledAt);
+
+    // The suppressed delivery is auditable rather than silently dropped.
+    const suppressed = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, originalIssue!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_refire_suppressed'`,
+        ),
+      );
+    expect(suppressed).toHaveLength(1);
+    expect(suppressed[0]!.body).toContain("not** re-queued");
+    expect(suppressed[0]!.body).toContain("GitHub delivery: `delivery-refire-cancelled`");
+    expect(suppressed[0]!.body).toContain(cancelledAt.toISOString());
+
+    // And it was not reopened by the other path.
+    const refireComments = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, originalIssue!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_refire'`,
+        ),
+      );
+    expect(refireComments).toHaveLength(0);
+  });
+
+  // The suppression lever above has to survive the alert's OWN lifecycle, not
+  // just a re-fire. `recordDependabotTerminalReceipt` resolves its target with a
+  // fallback query that has no status filter, so a later terminal delivery
+  // (`fixed`, or any dismissal) lands on the cancelled row -- and moving it to
+  // `done` would null `cancelledAt` and hand every subsequent re-fire back to
+  // the reopen path, defeating the suppression through a different door.
+  it("does not un-cancel an alert issue when a later terminal delivery arrives", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
+    const app = buildApp({ dependabotAgentId: agentId });
+
+    await postDependabot(app, dependabotPayload("critical", "created"), "delivery-created");
+    const [originalIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+
+    const cancelledAt = new Date("2026-08-19T00:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ status: "cancelled", cancelledAt })
+      .where(eq(issues.id, originalIssue!.id));
+
+    // `fixed` sets hasCompleteTerminalEvidence unconditionally -- the ordinary
+    // way this arrives, not a contrived payload.
+    const terminal = await postDependabot(
+      app,
+      dependabotPayload("critical", "fixed"),
+      "delivery-terminal-after-cancel",
+    );
+    expect(terminal.status).toBe(200);
+
+    const afterTerminal = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(afterTerminal).toHaveLength(1);
+    expect(afterTerminal[0]!.status).toBe("cancelled");
+    expect(afterTerminal[0]!.cancelledAt).toEqual(cancelledAt);
+
+    // The terminal delivery is still recorded, so nothing is silently dropped.
+    const receipts = await db
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, originalIssue!.id),
+          sql`${issueComments.metadata}->>'kind' = 'github_dependabot_terminal_receipt'`,
+        ),
+      );
+    expect(receipts).toHaveLength(1);
+
+    // The proof that matters: the lever still works afterwards. A re-fire is
+    // still suppressed rather than reopening a now-`done` row.
+    const refire = await postDependabot(
+      app,
+      dependabotPayload("critical", "reintroduced"),
+      "delivery-refire-after-terminal",
+    );
+    expect(refire.status).toBe(200);
+    expect(refire.body).toMatchObject({ dependabotWakeFired: false });
+
+    const afterRefire = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, "github-dependabot:Blockcast/paperclip#58"));
+    expect(afterRefire).toHaveLength(1);
+    expect(afterRefire[0]!.status).toBe("cancelled");
+    expect(afterRefire[0]!.cancelledAt).toEqual(cancelledAt);
   });
 
   it("dedupes terminal delivery replays against legacy metadata-key receipts", async () => {

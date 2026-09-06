@@ -63,6 +63,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     skills: PaperclipSkillEntry[];
     mcpServers: AdapterRuntimeMcpServer[];
     config: Record<string, unknown>;
+    context: Record<string, unknown>;
     serializedRuntimeInput: string;
   }> = [];
   const cleanupDirs = new Set<string>();
@@ -93,6 +94,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
           skills: (ctx.config.paperclipRuntimeSkills ?? []) as PaperclipSkillEntry[],
           mcpServers: ctx.runtimeMcp?.getServers() ?? [],
           config: ctx.config,
+          context: (ctx.context ?? {}) as Record<string, unknown>,
           serializedRuntimeInput,
         });
         return {
@@ -266,6 +268,174 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
       sourceStatus: "available",
     });
     expect((await fs.stat(firstSkillFile)).mtime.toISOString()).toBe(oldMtime.toISOString());
+  });
+
+  // BLO-7991 AC2 — a declared skill that never materializes must be visible to
+  // the agent INSIDE the pod, not merely to the API/UI snapshot.
+  //
+  // This asserts against `ctx.context`, which is what the adapter injects into
+  // the run's opening prompt, rather than against `ctx.onLog`. That distinction
+  // is the whole point: `onLog` and `commandNotes` reach the run log and the UI
+  // only, so a test asserting "the warning was emitted" would pass against a
+  // log line while the model still saw nothing — exactly the failure mode AC2's
+  // own verifying signal warns about.
+  it("surfaces declared-but-unmaterialized skills to the run prompt", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const presentKey = `company/${companyId}/present-skill`;
+    const missingSourceKey = `company/${companyId}/missing-source-skill`;
+    const missingVersionId = randomUUID();
+    // Never imported into `companySkills`, so `listRuntimeSkillEntries` cannot
+    // even enter its loop for this key. This is the design-shotgun shape.
+    const danglingKey = `company/${companyId}/never-imported-skill`;
+    const skillDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ac2-skill-"));
+    cleanupDirs.add(skillDir);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Skill Delta",
+      issuePrefix: `D${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await fs.writeFile(path.join(skillDir, "SKILL.md"), "# Present\n\nBody.\n", "utf8");
+    await db.insert(companySkills).values({
+      id: randomUUID(),
+      companyId,
+      key: presentKey,
+      slug: "present-skill",
+      name: "Present Skill",
+      description: null,
+      markdown: "# Present\n\nBody.\n",
+      sourceType: "local_path",
+      sourceLocator: skillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { sourceKind: "local_path" },
+    });
+    await db.insert(companySkills).values({
+      id: randomUUID(),
+      companyId,
+      key: missingSourceKey,
+      slug: "missing-source-skill",
+      name: "Missing Source Skill",
+      description: null,
+      markdown: "# Missing Source\n\nBody.\n",
+      sourceType: "local_path",
+      sourceLocator: path.join(skillDir, "does-not-exist"),
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { sourceKind: "local_path" },
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Skill Delta Capture",
+      role: "engineer",
+      status: "idle",
+      adapterType: TEST_ADAPTER_TYPE,
+      adapterConfig: {
+        // A stale version pin is deterministic here: ordinary missing local
+        // sources are intentionally recovered from their stored SKILL.md by
+        // the heartbeat runtime path.
+        paperclipSkillSync: {
+          desiredSkills: [presentKey, { key: missingSourceKey, versionId: missingVersionId }, danglingKey],
+        },
+      },
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+    expect((await waitForRunToFinish(heartbeat, run!.id))?.status).toBe("succeeded");
+
+    const captured = capturedRuns.find((entry) => entry.agentId === agentId);
+    expect(captured).toBeDefined();
+
+    // The delta is real: the dangling key is genuinely absent from what the pod
+    // receives, while the resolvable sibling came through. Without this the
+    // assertion below could pass on a warning about nothing.
+    // Runtime entries are sorted by key before they reach the adapter.
+    expect(captured!.skills.map((entry) => entry.key)).toEqual([missingSourceKey, presentKey]);
+    expect(captured!.skills.find((entry) => entry.key === missingSourceKey)).toMatchObject({
+      sourceStatus: "missing",
+    });
+
+    const taskMarkdown = String(captured!.context.paperclipTaskMarkdown ?? "");
+    expect(taskMarkdown).toContain(danglingKey);
+    expect(taskMarkdown).toContain("3 skills configured, 1 available");
+    expect(taskMarkdown).toContain("not in the company skill library");
+    expect(taskMarkdown).toContain("library entry exists but its files are not on the runtime volume");
+    // Resolvable skills must not be named as missing.
+    expect(taskMarkdown).not.toContain(`\`${presentKey}\``);
+
+    // Structured mirror, persisted to the run row via `contextSnapshot`, so a
+    // health sweep can key off it without parsing prose.
+    expect(captured!.context.paperclipUnmaterializedSkills).toMatchObject({
+      declaredCount: 3,
+      materializedCount: 1,
+      missing: [
+        { key: missingSourceKey, reason: "unresolved_source" },
+        { key: danglingKey, reason: "absent" },
+      ],
+    });
+  });
+
+  it("adds no skill notice when every declared skill materializes", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const skillKey = `company/${companyId}/clean-skill`;
+    const skillDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ac2-clean-"));
+    cleanupDirs.add(skillDir);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Skill Delta Clean",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await fs.writeFile(path.join(skillDir, "SKILL.md"), "# Clean\n\nBody.\n", "utf8");
+    await db.insert(companySkills).values({
+      id: randomUUID(),
+      companyId,
+      key: skillKey,
+      slug: "clean-skill",
+      name: "Clean Skill",
+      description: null,
+      markdown: "# Clean\n\nBody.\n",
+      sourceType: "local_path",
+      sourceLocator: skillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { sourceKind: "local_path" },
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Skill Delta Clean Capture",
+      role: "engineer",
+      status: "idle",
+      adapterType: TEST_ADAPTER_TYPE,
+      adapterConfig: { paperclipSkillSync: { desiredSkills: [skillKey] } },
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+    expect((await waitForRunToFinish(heartbeat, run!.id))?.status).toBe("succeeded");
+
+    const captured = capturedRuns.find((entry) => entry.agentId === agentId);
+    expect(captured).toBeDefined();
+    expect(captured!.skills.map((entry) => entry.key)).toEqual([skillKey]);
+    expect(captured!.context.paperclipUnmaterializedSkills).toBeUndefined();
+    expect(String(captured!.context.paperclipTaskMarkdown ?? ""))
+      .not.toContain("configured skills are unavailable");
   });
 
   it("delivers installed connections without exposing gateway bearers in adapter config or logs", async () => {

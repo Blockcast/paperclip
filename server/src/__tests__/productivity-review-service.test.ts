@@ -110,7 +110,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     status?: "todo" | "in_progress" | "done" | "cancelled";
     startedAt?: Date;
     monitorNextCheckAt?: Date | null;
-    monitorScheduledBy?: "assignee" | "board" | null;
+    monitorScheduledBy?: "assignee" | "board" | "manager" | null;
     monitorLastTriggeredAt?: Date | null;
     monitorWakeRequestedAt?: Date | null;
     parentId?: string | null;
@@ -232,13 +232,23 @@ describeEmbeddedPostgres("productivity review service", () => {
     livenessState?: string | null;
     usageJson?: Record<string, unknown> | null;
     logBytes?: number | null;
-    // BLO-26165: defaults to a value distinct from the DB's own default of
-    // `"not_applicable"` so existing fixtures — which model a run that
-    // genuinely executed and simply produced no comment — are not silently
-    // excluded from the no-comment-streak walk by the new
-    // `NEVER_INVOKED_ISSUE_COMMENT_STATUS` filter. Pass `"not_applicable"`
-    // explicitly to model a never-invoked run (BLO-23096).
+    logStore?: string | null;
+    // BLO-26165 (narrowing): the DB default, matching production
+    // (`heartbeat_runs.issue_comment_status` defaults to `"not_applicable"`).
+    // The original BLO-26165 fix defaulted this to `"retry_exhausted"` instead,
+    // deliberately off the production default, so that fixtures would not be
+    // swept up by the `issueCommentStatus` exclusion. That made the whole suite
+    // model a run population production never produces — and hid the false
+    // negative that exclusion introduced. The exclusion now keys on
+    // `isNeverInvokedRun` (run telemetry) rather than this column, so fixtures
+    // can carry the honest default again.
     issueCommentStatus?: string;
+    // Wake reason written into `contextSnapshot`. Production stamps
+    // `issueCommentStatus: "not_applicable"` for every reason outside the
+    // four-item `shouldRequireIssueCommentForWake` whitelist — and also
+    // whenever `contextSnapshot.skipIssueComment === true`, a fifth early exit
+    // that makes the required set narrower than the wake list alone.
+    wakeReason?: string;
     errorCode?: string | null;
     spacingMs?: number;
   }) {
@@ -255,14 +265,36 @@ describeEmbeddedPostgres("productivity review service", () => {
         triggerDetail: "system",
         startedAt: input.startedAt === undefined ? createdAt : input.startedAt,
         finishedAt: (input.status ?? "succeeded") === "succeeded" ? new Date(createdAt.getTime() + 30_000) : null,
-        contextSnapshot: input.contextSource
-          ? { issueId: input.issueId, taskId: input.issueId, source: input.contextSource }
-          : { issueId: input.issueId, taskId: input.issueId },
+        contextSnapshot: {
+          issueId: input.issueId,
+          taskId: input.issueId,
+          ...(input.contextSource ? { source: input.contextSource } : {}),
+          ...(input.wakeReason ? { wakeReason: input.wakeReason } : {}),
+        },
         livenessState: input.livenessState !== undefined ? input.livenessState : "advanced",
         usageJson: input.usageJson !== undefined ? input.usageJson : undefined,
         errorCode: input.errorCode !== undefined ? input.errorCode : undefined,
         logBytes: input.logBytes !== undefined ? input.logBytes : undefined,
-        issueCommentStatus: input.issueCommentStatus ?? "retry_exhausted",
+        // BLO-26165: default to a run that HAS a log store, because production
+        // only produces the null shape for a pre-adapter failure. `logStore`
+        // and `logRef` are written immediately after `runLogStore.begin`, the
+        // first thing `executeRun`'s inner `try` does — so every run that got
+        // as far as the adapter has them set, and only a setup failure that
+        // threw earlier leaves them null.
+        //
+        // This default is load-bearing for `isNeverInvokedRun`, which reads
+        // `logStore`/`logRef` as its invocation signal. Leaving it null made
+        // the baseline fixture — a `succeeded` run with `livenessState:
+        // "advanced"` — indistinguishable from a run whose adapter never
+        // existed, so every ordinary silent-streak test would have been
+        // silently excluded from the numerator. Fixtures that mean "never
+        // invoked" pass `logStore: null` explicitly.
+        //
+        // No other predicate reads `logStore`: `isInfraFailureRun` keys on
+        // `livenessState`/`usageJson`/`logBytes`, so this default does not
+        // disturb the never-executed or runtime-failure populations.
+        logStore: input.logStore !== undefined ? input.logStore : "s3",
+        issueCommentStatus: input.issueCommentStatus ?? "not_applicable",
         nextAction: input.nextAction === undefined ? "Continue processing the next batch." : input.nextAction,
         createdAt,
         updatedAt: createdAt,
@@ -874,26 +906,32 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
   });
 
-  // BLO-26165: a run stamped `issueCommentStatus: "not_applicable"` never
-  // had an adapter container created for it (BLO-23096: `preferred_workspace_
-  // unrealizable` / `adapter_failed` setup failures — the same shape as this
-  // fixture's runs, but with `livenessState: null` because classification
-  // never ran, which is exactly the case `isNeverExecutedRun`'s
-  // `livenessState !== "failed"` check cannot catch). There was nothing
-  // capable of writing a comment, so it must not count toward
-  // `no_comment_streak`.
-  it("excludes never-invoked runs (issueCommentStatus: not_applicable) from the no-comment streak, even when the never-executed liveness heuristic misses them (BLO-26165)", async () => {
+  // BLO-26165 / BLO-23096: the 25-run `preferred_workspace_unrealizable`
+  // streak that produced the false-positive review this issue was opened for.
+  // Nothing capable of writing a comment ever existed, so the assignee-facing
+  // `no_comment_streak` must not fire.
+  //
+  // What DOES fire — correctly — is `runtime_failure_streak`. These rows are
+  // terminal, `livenessState: "failed"`, zero-token infra failures, which is
+  // exactly that trigger's population. It is the platform-owner-facing signal,
+  // and its own body says "infrastructure signal, not an agent-performance
+  // verdict; do not decompose, block, or cancel the underlying work on the
+  // strength of this alone." Asserting `created === 0` here would only be
+  // reachable with a `livenessState: null` fixture that production never
+  // writes for a terminal setup failure. The acceptance criterion is that no
+  // *`no_comment_streak`* review is created, not that the window goes unreported.
+  it("attributes the BLO-23096 never-invoked streak to runtime_failure_streak, never to no_comment_streak (BLO-26165)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
-    // Mirrors the BLO-23096 fixture: 25 consecutive terminal runs whose
-    // adapter never started. `livenessState: null` means `isNeverExecutedRun`
-    // alone would NOT exclude these (it requires `livenessState === "failed"`)
-    // — only the new `issueCommentStatus` predicate does. Anchored 2h before
-    // `now` (outside the 1h/6h high_churn windows) so that once no_comment_streak
-    // and runtime_failure_streak are both correctly suppressed, the fixture
-    // doesn't accidentally trip `high_churn` instead — this test is only about
-    // proving no review fires at all.
+    // Anchored 2h before `now` (outside the 1h/6h high_churn windows) so the
+    // fixture cannot trip `high_churn` and muddy which trigger won.
     const insertNow = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+    // Production shape for a `preferred_workspace_unrealizable` pre-adapter
+    // throw. `livenessState` is "failed", NOT null: the setup-failure branch of
+    // `executeRun`'s outer catch calls `classifyAndPersistRunLiveness`, and
+    // `classifyRunLiveness` returns "failed" for any non-succeeded run.
+    // `usageJson`/`logStore`/`logRef` stay null because the throw precedes
+    // `runLogStore.begin`.
     await insertRuns({
       companyId: seeded.companyId,
       agentId: seeded.coderId,
@@ -901,18 +939,86 @@ describeEmbeddedPostgres("productivity review service", () => {
       count: 25,
       now: insertNow,
       status: "failed",
-      livenessState: null,
+      errorCode: "preferred_workspace_unrealizable",
+      livenessState: "failed",
       usageJson: null,
       logBytes: null,
+      logStore: null,
       issueCommentStatus: "not_applicable",
     });
 
     const service = productivityReviewService(db);
     const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
 
-    expect(result.created).toBe(0);
+    expect(result.created).toBe(1);
     const reviews = await listProductivityReviews(seeded.companyId);
-    expect(reviews).toHaveLength(0);
+    expect(reviews).toHaveLength(1);
+    // The assignee-facing trigger must not be the one that fired.
+    expect(reviews[0]?.description).toContain("Primary trigger: `runtime_failure_streak`");
+    expect(reviews[0]?.description).not.toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 0");
+    // Proves the invocation predicate is live against the production row shape:
+    // a predicate that short-circuits on non-null `livenessState` reports 0.
+    expect(reviews[0]?.description).toContain(
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` null or 0, BLO-26165): 25",
+    );
+  });
+
+  // BLO-26165 NEGATIVE CONTROL (required). This is the test that fails against
+  // the first BLO-26165 fix (#1342) and must keep passing after it.
+  //
+  // #1342 excluded on `issueCommentStatus === "not_applicable"`, treating it as
+  // proof no adapter ran. It is not: `finalizeIssueCommentPolicy` stamps that
+  // status on runs that provably executed, whenever
+  // `shouldRequireIssueCommentForWake` returns false. That helper is a
+  // four-item wake-reason whitelist (`issue_assigned`,
+  // `execution_review_requested`, `execution_approval_requested`,
+  // `execution_changes_requested`) behind a fifth early exit for
+  // `contextSnapshot.skipIssueComment === true`, so an
+  // `issue_monitor_due` run — like every `heartbeat_timer`,
+  // `issue_comment_mentioned`, `issue_continuation_needed` and recovery-lane
+  // run — gets `not_applicable` no matter how much work it did. Under #1342 the
+  // streak below reads 0 and the detector is silent while an agent burns
+  // 10 consecutive wakes without a word. That is the inverse of the false
+  // positive BLO-26165 was opened for, and it disables the detector on the
+  // overwhelming majority of wake reasons.
+  //
+  // These runs carry positive proof of invocation: a real usage blob, a log
+  // store, and non-zero log bytes.
+  it("counts executed runs stamped issueCommentStatus: not_applicable toward the streak — comment policy is not an invocation signal (BLO-26165 negative control)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      wakeReason: "issue_monitor_due",
+      issueCommentStatus: "not_applicable",
+      livenessState: "advanced",
+      usageJson: { inputTokens: 4200, outputTokens: 1350 },
+      logBytes: 512_000,
+      logStore: "s3",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain(
+      `No-comment streak (terminal, turn-executing runs): ${DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS}`,
+    );
+    // The label must not claim these were never invoked — they were.
+    expect(reviews[0]?.description).toContain(
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` null or 0, BLO-26165): 0",
+    );
+    expect(reviews[0]?.description).toContain(
+      `Comment-policy-exempt runs that DID execute (terminal, \`issueCommentStatus: not_applicable\`, not excluded from the streak walk — BLO-26165): ${DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS}`,
+    );
   });
 
   it("still fires no_comment_streak on a streak of executed, comment-required-but-missed runs (BLO-26165 control)", async () => {
@@ -936,14 +1042,17 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain(
-      "Never-invoked runs excluded (terminal, `issueCommentStatus: not_applicable`, BLO-26165): 0",
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` null or 0, BLO-26165): 0",
     );
   });
 
   it("distinguishes never-invoked runs from executed-but-silent runs in the same sampled window (BLO-26165)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
-    // Most recent 5 runs never invoked (adapter never started, not_applicable).
+    // Most recent 5 runs never invoked (adapter never started). Production
+    // shape: `livenessState: "failed"` — see the BLO-23096 fixture above. This
+    // is what makes the assertion below a real regression test: a predicate
+    // that short-circuits on non-null `livenessState` reports 0 here, not 5.
     await insertRuns({
       companyId: seeded.companyId,
       agentId: seeded.coderId,
@@ -951,9 +1060,11 @@ describeEmbeddedPostgres("productivity review service", () => {
       count: 5,
       now,
       status: "failed",
-      livenessState: null,
+      errorCode: "preferred_workspace_unrealizable",
+      livenessState: "failed",
       usageJson: null,
       logBytes: null,
+      logStore: null,
       issueCommentStatus: "not_applicable",
     });
     // Older 10 runs genuinely executed and stayed silent.
@@ -976,8 +1087,46 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain(
-      "Never-invoked runs excluded (terminal, `issueCommentStatus: not_applicable`, BLO-26165): 5",
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` null or 0, BLO-26165): 5",
     );
+  });
+
+  // BLO-26165: the branch where `isNeverInvokedRun` is load-bearing rather than
+  // a subset of `isNeverExecutedRun`. Liveness classification is not guaranteed
+  // to land on a setup failure — the write in the outer catch is gated on the
+  // run still being `running`, and `backfillMissingRunLivenessForIssue` is
+  // scheduled asynchronously — so `livenessState: null` is reachable on a
+  // terminal never-invoked run. `isInfraFailureRun` requires
+  // `livenessState === "failed"` and therefore returns false for these rows;
+  // without the invocation predicate they would walk straight into the streak
+  // and fire a review against an assignee that was never invoked.
+  it("excludes never-invoked runs whose liveness classification never landed, which isInfraFailureRun cannot catch (BLO-26165)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Anchored outside the 1h/6h high_churn windows so a suppressed
+    // no_comment_streak doesn't simply trip a different trigger.
+    const insertNow = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: insertNow,
+      status: "failed",
+      errorCode: "preferred_workspace_unrealizable",
+      livenessState: null,
+      usageJson: null,
+      logBytes: null,
+      logStore: null,
+      issueCommentStatus: "not_applicable",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(0);
   });
 
   // BLO-22097: a post-model failure whose result event never arrives leaves
@@ -1223,6 +1372,11 @@ describeEmbeddedPostgres("productivity review service", () => {
       status: "cancelled",
       livenessState: null,
       usageJson: null,
+      // The gate cancels a still-`queued` run, so `executeRun` never opened a
+      // log store for it — `logStore`/`logRef` are null in production, same as
+      // a pre-adapter setup failure. Stated explicitly because the helper now
+      // defaults `logStore` to a run that executed (BLO-26165).
+      logStore: null,
       errorCode: "issue_dependencies_blocked",
       // BLO-22436 (Ally follow-up): model the gate's actual write.
       // `cancelQueuedRunForBlockedDependencies` never calls
@@ -1380,6 +1534,11 @@ describeEmbeddedPostgres("productivity review service", () => {
       status: "cancelled",
       livenessState: null,
       usageJson: null,
+      // The gate cancels a still-`queued` run, so `executeRun` never opened a
+      // log store for it — `logStore`/`logRef` are null in production, same as
+      // a pre-adapter setup failure. Stated explicitly because the helper now
+      // defaults `logStore` to a run that executed (BLO-26165).
+      logStore: null,
       errorCode: "issue_dependencies_blocked",
       // BLO-22436 (Ally follow-up): model the gate's actual write (see note above).
       issueCommentStatus: "not_applicable",
@@ -1404,7 +1563,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
     expect(reviews[0]?.description).toContain(
-      "Never-invoked runs excluded (terminal, `issueCommentStatus: not_applicable`, BLO-26165): 3",
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` null or 0, BLO-26165): 3",
     );
     // BLO-22436 (Ally follow-up): all 3 non-executing runs are also counted
     // above as never-invoked — the evidence block must say so rather than
@@ -1435,6 +1594,11 @@ describeEmbeddedPostgres("productivity review service", () => {
       status: "cancelled",
       livenessState: null,
       usageJson: null,
+      // The gate cancels a still-`queued` run, so `executeRun` never opened a
+      // log store for it — `logStore`/`logRef` are null in production, same as
+      // a pre-adapter setup failure. Stated explicitly because the helper now
+      // defaults `logStore` to a run that executed (BLO-26165).
+      logStore: null,
       errorCode: "issue_dependencies_blocked",
       // BLO-22436 (Ally follow-up): model the gate's actual write (see note above).
       issueCommentStatus: "not_applicable",
@@ -1484,6 +1648,11 @@ describeEmbeddedPostgres("productivity review service", () => {
       status: "cancelled",
       livenessState: null,
       usageJson: null,
+      // The gate cancels a still-`queued` run, so `executeRun` never opened a
+      // log store for it — `logStore`/`logRef` are null in production, same as
+      // a pre-adapter setup failure. Stated explicitly because the helper now
+      // defaults `logStore` to a run that executed (BLO-26165).
+      logStore: null,
       errorCode: "issue_dependencies_blocked",
       // BLO-22436 (Ally follow-up): model the gate's actual write (see note above).
       issueCommentStatus: "not_applicable",
@@ -2774,6 +2943,280 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(0);
   });
 
+
+  // BLO-25722: both BLO-19848 helpers read a single row — the issue's current
+  // `executionRunId` holder — so an episode made of a *chain* of runs kept
+  // silently re-absorbing every earlier row's queue wait. Once the last row
+  // reached `running` the tail clamp released, elapsed ran uncapped from
+  // issues.started_at, and `monitorGatingBreakdown` reported the lot as
+  // unattended. BLO-23547's review claimed "13h 23m unattended" for BLO-21395
+  // when 710 of those 802 minutes (88.5%) were queue->start latency across three
+  // sequential runs, each waiting hours for a slot while its agent sat pinned at
+  // maxConcurrentRuns (BLO-23699). Timings below are that episode's real chain.
+  async function insertRunChain(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    runs: Array<{
+      createdAt: Date;
+      startedAt: Date | null;
+      finishedAt?: Date | null;
+      status: string;
+      lastOutputAt?: Date | null;
+    }>;
+    lockedAt: Date;
+  }) {
+    const rows = input.runs.map((run) => ({
+      id: randomUUID(),
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: run.status,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt: run.startedAt,
+      finishedAt: run.finishedAt ?? null,
+      lastOutputAt: run.lastOutputAt ?? null,
+      contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+      // Every run in this chain executed model turns; only their *queue* time is
+      // at issue, so none of them may be filtered as never-executed (BLO-21769).
+      livenessState: "advanced",
+      usageJson: { input_tokens: 1000, output_tokens: 500 },
+      logBytes: 4096,
+      createdAt: run.createdAt,
+      updatedAt: run.createdAt,
+    }));
+    await db.insert(heartbeatRuns).values(rows);
+    // The live run holds the lock; a merely-queued sibling never does. Callers
+    // therefore pass the holder last, whatever the createdAt ordering.
+    const holder = rows[rows.length - 1]!;
+    await db
+      .update(issues)
+      .set({ executionRunId: holder.id, checkoutRunId: holder.id, executionLockedAt: input.lockedAt })
+      .where(eq(issues.id, input.issueId));
+    return rows;
+  }
+
+  it("does not fire on a retry chain whose flagged time was queue wait (BLO-25722)", async () => {
+    // BLO-23547's chain, replayed: 232m + 301m + 178m queued across three
+    // sequential runs, the third live right now.
+    //
+    // Passes with and without the BLO-25722 union (measured 2026-08-15): the
+    // episode anchors on `max(startedAt)` = 09:44, so it spans 3h 16m and never
+    // sees the earlier queue wait at all. Kept as an end-to-end guard on that
+    // anchor — a regression to checkout-anchoring reads 15h 18m and fires.
+    const now = new Date("2026-08-09T13:00:00.000Z");
+    const episodeStart = new Date("2026-08-08T21:42:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await insertRunChain({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      lockedAt: episodeStart,
+      runs: [
+        {
+          createdAt: episodeStart,
+          startedAt: new Date("2026-08-09T01:34:00.000Z"), // 232m queued
+          finishedAt: new Date("2026-08-09T01:36:00.000Z"),
+          status: "failed",
+        },
+        {
+          createdAt: new Date("2026-08-09T01:36:00.000Z"),
+          startedAt: new Date("2026-08-09T06:37:00.000Z"), // 301m queued
+          finishedAt: new Date("2026-08-09T06:45:00.000Z"),
+          status: "failed",
+        },
+        {
+          createdAt: new Date("2026-08-09T06:46:00.000Z"),
+          startedAt: new Date("2026-08-09T09:44:00.000Z"), // 178m queued
+          status: "running",
+          lastOutputAt: new Date(now.getTime() - 60 * 1000),
+        },
+      ],
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    // 3h 16m attributable from the last dispatch, under the 6h threshold.
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("does not charge a retry chain's queue wait to the assignee once the trigger does fire (BLO-25722)", async () => {
+    // Same chain, but the live segment is long enough that the trigger still
+    // fires, so the evidence block is generated and the elapsed figure is
+    // readable.
+    //
+    // This test originally asserted `Excluded as non-live execution hold:
+    // 11h 51m` (232+301+178) on the theory that the chain's queue wait reaches
+    // the numerator and has to be subtracted back out by the BLO-25722 union.
+    // Measured 2026-08-15, that theory is wrong: the episode anchors on
+    // `mostRecentDispatchAt` = `max(startedAt)` (BLO-19604), so it opens at the
+    // *last* dispatch (09:44) and every earlier queue wait is outside the
+    // window before any exclusion runs. Elapsed is 9h 16m — 11m *stricter* than
+    // the 9h 27m the union model predicted, because the anchor also drops the
+    // two earlier runs' live minutes. Control: this file's four BLO-25722 cases
+    // behave identically with and without the union (2 pass / 2 fail either
+    // way), which is what proved the pre-dispatch half of the fix is inert.
+    //
+    // So the property worth pinning here is the outcome, not the mechanism: the
+    // 21h 18m pre-BLO-19604 reading must never come back. The union's live
+    // surface is post-dispatch queue wait only — pinned by the population-3
+    // replay below, which does fail without it.
+    const now = new Date("2026-08-09T19:00:00.000Z");
+    const episodeStart = new Date("2026-08-08T21:42:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await insertRunChain({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      lockedAt: episodeStart,
+      runs: [
+        {
+          createdAt: episodeStart,
+          startedAt: new Date("2026-08-09T01:34:00.000Z"),
+          finishedAt: new Date("2026-08-09T01:36:00.000Z"),
+          status: "failed",
+        },
+        {
+          createdAt: new Date("2026-08-09T01:36:00.000Z"),
+          startedAt: new Date("2026-08-09T06:37:00.000Z"),
+          finishedAt: new Date("2026-08-09T06:45:00.000Z"),
+          status: "failed",
+        },
+        {
+          createdAt: new Date("2026-08-09T06:46:00.000Z"),
+          startedAt: new Date("2026-08-09T09:44:00.000Z"),
+          status: "running",
+          lastOutputAt: new Date(now.getTime() - 60 * 1000),
+        },
+      ],
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    // Anchored at the last dispatch (09:44), not at checkout (21:42).
+    expect(review?.description).toContain("9h 16m unattended");
+    // The regression this exists to catch: charging the whole 21h 18m
+    // checkout-to-now span, queue wait included, to the assignee.
+    expect(review?.description).not.toContain("21h 18m unattended");
+  });
+
+  it("does not exclude a queue wait that overlapped another run's live work (BLO-25722)", async () => {
+    // The over-correction guard, and the one BLO-25722 case that still binds. A
+    // run sitting `queued` while a *different* run works the same issue is not
+    // idle time; unioning its wait unguarded would withhold real working time.
+    // The queued row here waits 6h 50m of a 7h episode, so dropping the overlap
+    // guard collapses elapsed to 10m and `created` falls to 0.
+    //
+    // It previously also asserted `Excluded as non-live execution hold: 10m` for
+    // the live run's own 11:50→12:00 wait. That is unreachable: the episode
+    // anchors on `max(startedAt)` = 12:00, so those 10m sit outside the window
+    // and are never in the numerator to exclude. Asserting the absence of the
+    // line instead — an exclusion appearing here would mean the anchor moved.
+    const now = new Date("2026-08-09T19:00:00.000Z");
+    const episodeStart = new Date("2026-08-09T11:50:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await insertRunChain({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      lockedAt: episodeStart,
+      runs: [
+        {
+          // Enqueued while the run below is live, and still waiting for a slot.
+          createdAt: new Date("2026-08-09T12:10:00.000Z"),
+          startedAt: null,
+          status: "queued",
+        },
+        {
+          createdAt: new Date("2026-08-09T11:50:00.000Z"),
+          startedAt: new Date("2026-08-09T12:00:00.000Z"), // 10m queued
+          status: "running",
+          lastOutputAt: new Date(now.getTime() - 60 * 1000),
+        },
+      ],
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    // 430m episode, anchored at 12:00. The 6h 50m overlapping queue wait stays
+    // in: a live run was working the issue throughout.
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("7h 0m unattended");
+    expect(review?.description).not.toContain("Excluded as non-live execution hold");
+  });
+
+  it("excludes queue wait from a retry chain longer than the streak sample cap (BLO-25722)", async () => {
+    // Review follow-up: duration accounting originally reused `latestRuns`,
+    // which is capped at MAX_RUNS_FOR_STREAK (100) for streak walking. A chain
+    // longer than the cap silently dropped its OLDEST queue-wait intervals —
+    // reviving the false positive first on the worst-wedged issues, the ones
+    // with the most runs. Duration accounting is now scoped by the episode
+    // window instead of by run count.
+    //
+    // 140 runs x (20m queued + 2m live). Correct attributable time is the 280m
+    // of live work, well under the 6h threshold. Capped at the newest 100, the
+    // 40 oldest runs' 800m of queue wait reverts to "elapsed" and the episode
+    // reads 18h — firing the exact review this change exists to prevent.
+    const episodeStart = new Date("2026-08-01T00:00:00.000Z");
+    const runCount = 140;
+    const cycleMs = 22 * 60 * 1000;
+    const now = new Date(episodeStart.getTime() + runCount * cycleMs);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    const runs = Array.from({ length: runCount }, (_, i) => {
+      const createdAt = new Date(episodeStart.getTime() + i * cycleMs);
+      const startedAt = new Date(createdAt.getTime() + 20 * 60 * 1000);
+      const isLast = i === runCount - 1;
+      return isLast
+        ? {
+            createdAt,
+            startedAt,
+            status: "running",
+            lastOutputAt: new Date(now.getTime() - 60 * 1000),
+          }
+        : {
+            createdAt,
+            startedAt,
+            finishedAt: new Date(startedAt.getTime() + 2 * 60 * 1000),
+            status: "failed",
+          };
+    });
+    const inserted = await insertRunChain({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      lockedAt: episodeStart,
+      runs,
+    });
+    // Every run comments, so `no_comment_streak` cannot fire on a chain this
+    // long and confound what is under test here: `long_active_duration`'s
+    // duration accounting alone.
+    await db.insert(issueComments).values(
+      inserted.map((run, index) => ({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        authorAgentId: seeded.coderId,
+        createdByRunId: run.id,
+        body: `Progress update ${index}`,
+        createdAt: run.createdAt as Date,
+        updatedAt: run.createdAt as Date,
+      })),
+    );
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
   it("keeps long_active_duration monotonic just past the running silence boundary (BLO-19848)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
@@ -3245,6 +3688,58 @@ describeEmbeddedPostgres("productivity review service", () => {
     });
   });
 
+  it("records one suppression per monitor wait instead of one per reconcile tick", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    const svc = productivityReviewService(db);
+    const suppressionRows = () =>
+      db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+
+    const first = await svc.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    expect(first.monitorScheduledSuppressed).toBe(1);
+    expect(await suppressionRows()).toHaveLength(1);
+
+    // Three further ticks 30s apart — the scheduler cadence. `elapsedMs` grows on each one, but
+    // the monitor wait is unchanged, so none of them is a state change worth an audit row.
+    for (const offsetMs of [30_000, 60_000, 90_000]) {
+      const tick = await svc.reconcileProductivityReviews({
+        now: new Date(now.getTime() + offsetMs),
+        companyId: seeded.companyId,
+      });
+      // Still a suppression decision every tick — only the audit write is deduped.
+      expect(tick.monitorScheduledSuppressed).toBe(1);
+    }
+    expect(await suppressionRows()).toHaveLength(1);
+
+    // Re-arming to a different check time is a new wait and must be recorded.
+    const rearmedNextCheckAt = new Date(monitorNextCheckAt.getTime() + 60 * 60 * 1000);
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: rearmedNextCheckAt })
+      .where(eq(issues.id, seeded.issueId));
+
+    const afterRearm = await svc.reconcileProductivityReviews({
+      now: new Date(now.getTime() + 120_000),
+      companyId: seeded.companyId,
+    });
+    expect(afterRearm.monitorScheduledSuppressed).toBe(1);
+    const rows = await suppressionRows();
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => (row.details as Record<string, unknown>).monitorNextCheckAt).sort()).toEqual(
+      [monitorNextCheckAt.toISOString(), rearmedNextCheckAt.toISOString()].sort(),
+    );
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
   it("creates long-active productivity reviews when the scheduled monitor has expired", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
@@ -3332,6 +3827,116 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
+  // BLO-22436 population 3, live reproduction (BLO-23179 / run `e646fcdb`): a run enqueued
+  // 3s after its PR merged sat `queued` for 6h05m against `maxConcurrentRuns: 5` with every
+  // slot occupied, and mid-gap the detector filed BLO-27289 reporting a "6h 0m active
+  // episode". Every minute of it was queue latency.
+  //
+  // Deliberately does NOT pin the queued run via `pinExecutionRun`, unlike the BLO-22016
+  // test above, and that is the whole point of keeping this case separate: `issues
+  // .executionRunId` is written only once the claim transaction observes the run already
+  // `running` (heartbeat.ts, the `lockedRun?.status !== "running"` guard), so an ordinary
+  // never-dispatched run is *not* the execution holder. Both single-row helpers therefore
+  // see nothing — `currentHolderNeverDispatched` cannot fire and `nonLiveExecutionHoldSince`
+  // has no hold to clamp — and before BLO-25722 the episode kept accruing against the
+  // *previous* run's `startedAt` for the entire queue wait. Verified against master
+  // (`dc466350e`): this seeding files a review, `expected 1 to be +0`.
+  it("does not raise long_active_duration while the assignee's next run sits queued and undispatched (BLO-22436 population 3 / BLO-23179)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const checkoutAt = new Date(now.getTime() - 12 * 60 * 60 * 1000);
+    const dispatchedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const enqueuedAt = new Date(now.getTime() - 6 * 60 * 60 * 1000 - 50 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: checkoutAt,
+    });
+
+    // The previous run: dispatched, executed, commented, finished. It anchors the episode
+    // at 7h ago — past the 6h threshold on raw wall-clock.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: dispatchedAt,
+      startedAt: dispatchedAt,
+      withRunComments: true,
+    });
+
+    // The successor, enqueued 10 minutes later and never given a pod. Carries no
+    // `errorCode` and is not terminal, so neither never-executed filter (BLO-21769's
+    // zero-token test, BLO-22436's `issue_dependencies_blocked` test) can reach it —
+    // this population is caught on the queued-and-undispatched signature or not at all.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: enqueuedAt,
+      status: "queued",
+      startedAt: null,
+      livenessState: null,
+      errorCode: null,
+      nextAction: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // Scope control for the above. The queue-wait exclusion is confined to the
+  // elapsed-duration path: `no_comment_streak` counts terminal, turn-executing runs, so a
+  // dispatch enqueued *after* those runs was never pending for the flagged interval and
+  // does not excuse them. Suppressing the streak on any pending dispatch would blind the
+  // detector on every actively-woken issue, since a fresh `queued` run is the normal
+  // post-wake state.
+  it("still raises no_comment_streak when a genuinely silent executed streak is followed by a queued run (BLO-22436 population 3 scope)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const streakAt = new Date(now.getTime() - 90 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress" });
+
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now: streakAt,
+      spacingMs: 10 * 60 * 1000,
+    });
+
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: new Date(now.getTime() - 30 * 60 * 1000),
+      status: "queued",
+      startedAt: null,
+      livenessState: null,
+      nextAction: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+  });
+
+  // Contrast case: no run row exists at all since checkout — nothing was even attempted,
+  // as distinct from "a run was queued but never started" above. This is the existing,
+  // deliberately-tested "unattended episode" scenario (see the monitor-gating tests
+  // below, e.g. "reports the whole episode as unattended when no monitor was ever
+  // armed") and must keep firing on raw wall-clock time; the BLO-22016 fix must not
+  // desensitize this case just because it also involves zero dispatched runs.
   it("still raises long_active_duration when a checked-out issue has no run at all, unlike a queued-never-started run", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const twelveHoursAgo = new Date(now.getTime() - 12 * 60 * 60 * 1000);
@@ -5456,6 +6061,23 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.monitorScheduledSuppressed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+  });
+
+  it("suppresses long-active reviews for manager-scheduled future monitor waits", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000),
+      monitorScheduledBy: "manager",
+    });
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.monitorScheduledSuppressed).toBe(1);
   });
 
   it("closes open long-active productivity reviews when the source has a deliberate future monitor", async () => {

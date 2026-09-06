@@ -58,9 +58,16 @@ vi.mock("./k8s-client.js", () => ({
 }));
 
 const mockPrepareBundle = vi.fn();
-vi.mock("./prompt-cache.js", () => ({
-  prepareClaudePromptBundle: mockPrepareBundle,
-}));
+// Partial mock via importOriginal, matching the server-utils mock below: only
+// prepareClaudePromptBundle needs replacing, and a whole-module replacement
+// silently drops every other export the module gains later (BLO-32055 added
+// readCatalogBackedSkillKeys and broke 23 tests here that way).
+vi.mock("./prompt-cache.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./prompt-cache.js")>();
+  return Object.assign(Object.create(null), original, {
+    prepareClaudePromptBundle: mockPrepareBundle,
+  });
+});
 
 vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
   const original = await importOriginal<typeof import("@paperclipai/adapter-utils/server-utils")>();
@@ -82,6 +89,11 @@ const {
   shouldAbortForCancellation,
   execute,
 } = await import("./execute.js");
+
+// Real class, not a stub: the prompt-cache mock above is a partial that passes
+// `original` through, so this is the exact constructor execute.ts imports and
+// the `instanceof` guard under test compares against.
+const { ClaudeSkillSourceUnavailableError } = await import("./prompt-cache.js");
 
 function makeJob(opts: {
   runId?: string;
@@ -111,6 +123,20 @@ function makeJob(opts: {
       : { conditions: [] },
   } as k8s.V1Job;
 }
+
+// serviceAccountName is now required (BLO-21812): buildJobManifest throws
+// when neither the per-agent config nor this fleet-wide env fallback
+// resolves. Tests in this file exercise unrelated execute() behavior and
+// don't set serviceAccountName per-ctx, so give them a working default here;
+// tests that specifically cover the resolution/refusal behavior live in
+// job-manifest.test.ts and manage this env var themselves.
+beforeEach(() => {
+  process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "test-default-sa";
+});
+
+afterEach(() => {
+  delete process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME;
+});
 
 describe("isK8s404", () => {
   it("returns false for non-Error values", () => {
@@ -1030,6 +1056,66 @@ describe("execute: concurrency guard", () => {
   });
 });
 
+// ─── execute: skill-source classification (BLO-32055) ────────────────────────
+
+// The seam this PR exists to produce. Both halves were already covered and the
+// JOIN was not: prompt-cache.test.ts proves the error carries the right
+// `catalogBacked` flag, recovery-classifiers.test.ts proves the classifier
+// treats `skill_materialization_pending` as transient — but nothing asserted
+// that execute() maps one to the other. Invert the ternary or drop the
+// `instanceof` guard and every other test in this PR still passes while the
+// stated acceptance criterion silently regresses to `adapter_failed`.
+describe("execute: skill source unavailable", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockReadSkillEntries.mockResolvedValue([]);
+    mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+  });
+
+  function makeSkillError(catalogBacked: boolean) {
+    return new ClaudeSkillSourceUnavailableError({
+      skillKey: "garrytan/gstack/investigate",
+      skillSource: "/paperclip/instances/default/skills/co/__runtime__/investigate--9debdeaf08",
+      missingPath:
+        "/paperclip/instances/default/skills/co/__runtime__/investigate--9debdeaf08/SKILL.md",
+      catalogBacked,
+      cause: Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" }),
+    });
+  }
+
+  it("classifies a catalog-backed skill as retryable skill_materialization_pending", async () => {
+    // A catalog row exists => the sweep is mid-refresh and the tree completes on
+    // its own. Measured live at 43m36s to self-heal, so this MUST stay retryable.
+    mockPrepareBundle.mockRejectedValueOnce(makeSkillError(true));
+    const result = await execute(makeCtx());
+    expect(result.errorCode).toBe("skill_materialization_pending");
+    expect(result.errorCode).not.toBe("adapter_failed");
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
+  });
+
+  it("classifies a non-catalog-backed skill as non-retryable skill_not_found", async () => {
+    // No catalog row => the path is a bundled skill in a read-only image path,
+    // i.e. a packaging fault no retry can fix. Keeps the existing permanent code.
+    mockPrepareBundle.mockRejectedValueOnce(makeSkillError(false));
+    const result = await execute(makeCtx());
+    expect(result.errorCode).toBe("skill_not_found");
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
+  });
+
+  it("rethrows a non-skill bundle failure rather than laundering it", async () => {
+    // Pins the `instanceof` guard. Without it, any prepareClaudePromptBundle
+    // failure would be reported as a skill fault. The rethrow propagates out of
+    // execute() entirely — it does NOT become a typed result — so the caller
+    // keeps classifying it as the anonymous adapter fault it has always been.
+    // That is the pre-existing behaviour for every non-skill bundle failure and
+    // this change must not alter it.
+    mockPrepareBundle.mockRejectedValueOnce(new Error("disk full"));
+    await expect(execute(makeCtx())).rejects.toThrow("disk full");
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
+  });
+});
+
 // ─── execute: job creation paths ─────────────────────────────────────────────
 
 describe("execute: job creation", () => {
@@ -1041,6 +1127,11 @@ describe("execute: job creation", () => {
     mockPrepareBundle.mockResolvedValue(makeBundle());
     mockBatchCreateJob.mockResolvedValue({ metadata: { uid: "job-uid-1" } });
     mockBatchDeleteJob.mockResolvedValue({});
+    // The real client always returns a Promise, and the secret-cleanup paths
+    // chain .catch() onto it. Left unstubbed these return undefined, so the
+    // cleanup throws a TypeError instead of doing what it says (BLO-21858).
+    mockCoreCreateSecret.mockResolvedValue({});
+    mockCoreDeleteSecret.mockResolvedValue({});
   });
 
   it("returns k8s_job_create_failed when createNamespacedJob throws", async () => {

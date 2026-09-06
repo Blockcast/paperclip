@@ -7,6 +7,27 @@ import { DEFAULT_ISSUE_ROUTE_MAP } from "../constants.js";
 import { ORIGIN_KIND } from "../types.js";
 import type { AlertmanagerAlert, AlertmanagerPluginConfig, AlertStateRecord } from "../types.js";
 
+/**
+ * BLO-31036 — the firing tail is fenced, so `ctx.state.set` and
+ * `ctx.events.emit` take one more argument on that path: the generation the
+ * host enforces inside the write's own transaction.
+ *
+ * Pinned, not ignored. Relaxing these to `expect.anything()` — or dropping the
+ * trailing argument so vitest only checks a prefix — would leave them green
+ * with the fence removed, which is the exact regression they now guard. The
+ * token itself is a per-claim UUID, so its presence and the phase holding it
+ * are the strongest things assertable without reaching into the fence table.
+ */
+const FIRING_FENCE_ARG = {
+  fencing: {
+    table: "alertmanager_aggregate_lifecycle_fences",
+    match: expect.objectContaining({
+      phase: "firing",
+      firing_token: expect.any(String),
+    }),
+  },
+};
+
 const alert = (severity = "critical"): AlertmanagerAlert => ({
   status: "firing",
   labels: { alertname: "SyntheticAlert", severity },
@@ -75,6 +96,15 @@ function buildFakeAlertmanagerStore() {
     namespace: "ns",
     async execute(sql: string, params: unknown[] = []) {
       const text = sql.replace(/\s+/g, " ").trim();
+      if (text.includes("alertmanager_aggregate_lifecycle_fences")) {
+        return { rowCount: 1 };
+      }
+      if (
+        text.includes("alertmanager_aggregate_creation_claims") ||
+        text.includes("alertmanager_aggregate_members")
+      ) {
+        return { rowCount: text.startsWith("INSERT") || text.startsWith("DELETE") ? 1 : 0 };
+      }
       if (text.includes("ON CONFLICT (cover_issue_id, alert_issue_id)")) {
         const [id, coverIssueId, alertIssueId] = params as [string, string, string];
         const key = `${coverIssueId}:${alertIssueId}`;
@@ -144,6 +174,15 @@ function buildFakeAlertmanagerStore() {
     },
     async query<T>(sql: string, params: unknown[] = []): Promise<T[]> {
       const text = sql.replace(/\s+/g, " ").trim();
+      // The firing-generation barrier (BLO-31036) checks that the delivery still
+      // holds the fence it claimed. These are uncontended single deliveries, so
+      // it does — matching `execute`'s existing rowCount-1 answer for the same
+      // table. Contention is covered against real SQL in
+      // aggregate-fence-restart-safety.test.ts.
+      if (text.includes("alertmanager_aggregate_lifecycle_fences")) {
+        return [{ "?column?": 1 }] as T[];
+      }
+      if (text.includes("alertmanager_aggregate_members")) return [];
       if (text.startsWith("SELECT DISTINCT cover_issue_id")) {
         const [alertIssueId] = params as [string];
         const ids = new Set<string>();
@@ -359,9 +398,9 @@ describe("alert escalation", () => {
 
   it("does not reset the ladder on repeat firing deliveries", async () => {
     const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T01:00:00Z", escalationAttempt: 2 };
-    const mocks = { state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) }, issues: { get: vi.fn(async () => ({ id: "issue-1", status: "todo" })), update: vi.fn(async () => ({})) }, events: { emit: vi.fn() }, metrics: { write: vi.fn() }, logger: { warn: vi.fn() } };
+    const mocks = { state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) }, issues: { get: vi.fn(async () => ({ id: "issue-1", status: "todo" })), update: vi.fn(async () => ({})) }, events: { emit: vi.fn() }, metrics: { write: vi.fn() }, logger: { warn: vi.fn() }, db: buildFakeAlertmanagerStore().db };
     await handleFiring(mocks as unknown as PluginContext, config(), alert());
-    expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 2, nextEscalationAt: "2026-07-11T01:00:00Z" }));
+    expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 2, nextEscalationAt: "2026-07-11T01:00:00Z" }), FIRING_FENCE_ARG);
   });
 });
 
@@ -618,6 +657,7 @@ describe("BLO-15982 pod_pending route: 240-minute escalation deadline end-to-end
       activity: { log: vi.fn() },
       metrics: { write: vi.fn() },
       logger: { debug: vi.fn(), warn: vi.fn() },
+      db: buildFakeAlertmanagerStore().db,
     };
     const beforeFiring = Date.now();
     await handleFiring(firingMocks as unknown as PluginContext, config({ issueRouteMap: DEFAULT_ISSUE_ROUTE_MAP }), podPendingAlert);
@@ -627,6 +667,7 @@ describe("BLO-15982 pod_pending route: 240-minute escalation deadline end-to-end
     expect(firingMocks.state.set).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ escalationIntervalMs: 240 * 60_000 }),
+      FIRING_FENCE_ARG,
     );
     const storedState = (firingMocks.state.set as ReturnType<typeof vi.fn>).mock.calls[0][1] as AlertStateRecord;
     const nextEscalationAtMs = Date.parse(storedState.nextEscalationAt!);

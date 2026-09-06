@@ -6,7 +6,7 @@
  * merges `executionTarget.config` over `ctx.config` with environment fields
  * winning, and that the resulting fields flow through to the V1Job manifest.
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 
 // Reuse the same K8s mock shape as execute.test.ts so we can drive a happy
@@ -47,9 +47,16 @@ vi.mock("./k8s-client.js", () => ({
 }));
 
 const mockPrepareBundle = vi.fn();
-vi.mock("./prompt-cache.js", () => ({
-  prepareClaudePromptBundle: mockPrepareBundle,
-}));
+// Partial mock via importOriginal, matching the server-utils mock below: only
+// prepareClaudePromptBundle needs replacing, and a whole-module replacement
+// silently drops every other export the module gains later (BLO-32055 added
+// readCatalogBackedSkillKeys and broke 23 tests here that way).
+vi.mock("./prompt-cache.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./prompt-cache.js")>();
+  return Object.assign(Object.create(null), original, {
+    prepareClaudePromptBundle: mockPrepareBundle,
+  });
+});
 
 vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
   const original = await importOriginal<typeof import("@paperclipai/adapter-utils/server-utils")>();
@@ -103,6 +110,18 @@ function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecu
     ...overrides,
   } as unknown as AdapterExecutionContext;
 }
+
+// serviceAccountName is now required (BLO-21812): buildJobManifest throws
+// when neither the per-agent config nor this fleet-wide env fallback
+// resolves. These tests exercise environment.config merging, not
+// serviceAccountName resolution itself, so give them a working default.
+beforeEach(() => {
+  process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "test-default-sa";
+});
+
+afterEach(() => {
+  delete process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME;
+});
 
 describe("mergeEnvironmentConfig", () => {
   it("returns adapterConfig unchanged when environmentConfig is undefined", () => {

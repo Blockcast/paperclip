@@ -52,6 +52,10 @@ import {
   restoreCheckoutPromotedStatus,
 } from "../services/issue-checkout-status.ts";
 import {
+  buildInitialIssueMonitorFields,
+  normalizeIssueExecutionPolicy,
+} from "../services/issue-execution-policy.ts";
+import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
@@ -383,7 +387,7 @@ describeEmbeddedPostgres("issueService.addComment idempotency", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-comment-idempotency-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(issueComments);
@@ -602,6 +606,32 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     });
   });
 
+  it("returns the active aggregate winner for sequential alertmanager creates", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const originFingerprint =
+      'alert-aggregate:v1:["HindsightConsolidationStalled",null]';
+    const first = await svc.create(companyId, {
+      title: "First alert series",
+      status: "todo",
+      priority: "high",
+      originKind: "plugin:paperclip-plugin-alertmanager",
+      originId: "series-1",
+      originFingerprint,
+    });
+
+    const second = await svc.create(companyId, {
+      title: "Concurrent alert series",
+      status: "todo",
+      priority: "high",
+      originKind: "plugin:paperclip-plugin-alertmanager",
+      originId: "series-2",
+      originFingerprint,
+    });
+
+    expect(second.id).toBe(first.id);
+    expect(second.identifier).toBe(first.identifier);
+  });
+
   function agentRow(companyId: string, input: {
     id: string;
     name: string;
@@ -658,6 +688,202 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
         .where(eq(issues.id, id))
         .then((rows) => rows[0]!);
     }
+
+    // BLO-28900: `tickDueIssueMonitors` only selects `in_progress`/`in_review`,
+    // agent-assigned rows. A demotion that leaves `monitor_next_check_at`
+    // populated produces a monitor that reads `scheduled` forever and can never
+    // fire — silent, and indistinguishable from an idle assignee.
+    function readMonitor(id: string) {
+      return db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRestoreStatus: issues.checkoutRestoreStatus,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
+          executionPolicy: issues.executionPolicy,
+          executionState: issues.executionState,
+        })
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0]!);
+    }
+
+    const MONITOR_CHECK_AT = "2026-09-01T12:00:00.000Z";
+
+    /**
+     * Arming goes through the route layer (`routes/issues.ts` computes the
+     * policy transition), so a service-level test writes the armed shape
+     * directly — built with the production builders rather than hand-rolled
+     * JSON, so the fixture cannot drift from what a real arm persists.
+     */
+    async function armMonitor(issueId: string, agentId: string) {
+      const policy = normalizeIssueExecutionPolicy({
+        monitor: { nextCheckAt: MONITOR_CHECK_AT, notes: "watch deploy", scheduledBy: "assignee" },
+      });
+      const fields = buildInitialIssueMonitorFields({
+        policy,
+        status: "in_progress",
+        assigneeAgentId: agentId,
+        assigneeUserId: null,
+      });
+      await db
+        .update(issues)
+        .set({ ...fields, executionPolicy: policy as unknown as Record<string, unknown> })
+        .where(eq(issues.id, issueId));
+
+      const armed = await readMonitor(issueId);
+      // Guard the guard: if the arm silently no-ops the assertions below pass
+      // vacuously and the test proves nothing.
+      expect(armed.monitorNextCheckAt).not.toBeNull();
+      expect((armed.executionState as { monitor?: { status?: string } } | null)?.monitor?.status)
+        .toBe("scheduled");
+    }
+
+    // BLO-29554: BLO-28900 cleared the monitor a restore stranded, which stopped
+    // the row lying about being scheduled but still threw the scheduled work
+    // away. The restore now declines instead, so the wake survives.
+    it("keeps the checkout promotion while a dispatchable monitor is armed", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      const held = await readMonitor(issue.id);
+      // `in_progress` plus an agent assignee is exactly what
+      // `tickDueIssueMonitors` selects on, so this row can still be dispatched.
+      expect(held.status).toBe("in_progress");
+      expect(held.assigneeAgentId).toBe(agentId);
+      expect(held.monitorNextCheckAt).toEqual(new Date(MONITOR_CHECK_AT));
+      expect(held.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+      // Deferred, not cancelled: the marker is what lets the demotion still
+      // happen at the end of the run this monitor wakes.
+      expect(held.checkoutRestoreStatus).toBe("todo");
+    });
+
+    // BLO-29554 review follow-up: `holdsDispatchableMonitor` deliberately omits
+    // the `companies.status = 'active'` condition that `tickDueIssueMonitors`
+    // also joins on. Both non-active statuses are reversible, so folding it in
+    // would let a pause restore the row and clear the monitor as
+    // `invalid_status` — destroying an armed wake that reactivation would
+    // otherwise have fired. This pins the divergence as intended, not an
+    // oversight to be tidied away.
+    it("holds the promotion for a paused company so reactivation can still fire", async () => {
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+      await db
+        .update(companies)
+        .set({ status: "paused" })
+        .where(eq(companies.id, companyId));
+
+      await finishRun(runId);
+      expect(
+        await restoreCheckoutPromotedStatus(db, { issueId: issue.id, companyId }),
+      ).toBe(false);
+
+      const held = await readMonitor(issue.id);
+      expect(held.status).toBe("in_progress");
+      expect(held.monitorNextCheckAt).toEqual(new Date(MONITOR_CHECK_AT));
+      // The wake survives the pause intact — this is the assertion that fails if
+      // company status is ever added to the guard.
+      expect(held.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+      expect(held.checkoutRestoreStatus).toBe("todo");
+    });
+
+    it("restores the deferred demotion once the monitor is no longer armed", async () => {
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+      expect(await readMonitor(issue.id)).toMatchObject({ status: "in_progress" });
+
+      // Stand in for the woken run finishing without re-arming. Without this the
+      // test above only proves the demotion was skipped, not that it was merely
+      // postponed — a skip that never resolves is the BLO-20649 high-water mark.
+      await db
+        .update(issues)
+        .set({ monitorNextCheckAt: null })
+        .where(eq(issues.id, issue.id));
+
+      expect(
+        await restoreCheckoutPromotedStatus(db, { issueId: issue.id, companyId }),
+      ).toBe(true);
+      expect(await readMonitor(issue.id)).toMatchObject({
+        status: "todo",
+        checkoutRestoreStatus: null,
+      });
+    });
+
+    it("clears a monitor the restore strands when the agent assignee is gone", async () => {
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+      // An unassigned monitor is undeliverable at every status, so there is no
+      // promotion worth holding and the reconciler still has to run here.
+      await db
+        .update(issues)
+        .set({ assigneeAgentId: null })
+        .where(eq(issues.id, issue.id));
+      await finishRun(runId);
+
+      expect(
+        await restoreCheckoutPromotedStatus(db, { issueId: issue.id, companyId }),
+      ).toBe(true);
+
+      const restored = await readMonitor(issue.id);
+      expect(restored.status).toBe("todo");
+      expect(restored.monitorNextCheckAt).toBeNull();
+      expect(restored.executionState).toMatchObject({
+        monitor: { status: "cleared", clearReason: "invalid_assignee" },
+      });
+      expect((restored.executionPolicy as { monitor?: unknown } | null)?.monitor).toBeUndefined();
+    });
+
+    it("clears a monitor when release strips both eligibility conditions", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+
+      await svc.release(issue.id, agentId, runId);
+
+      const released = await readMonitor(issue.id);
+      expect(released.status).toBe("todo");
+      expect(released.assigneeAgentId).toBeNull();
+      expect(released.monitorNextCheckAt).toBeNull();
+      // Release drops the agent assignee too, so the assignee condition is the
+      // one reported — release is the worst instance of this class, not a
+      // milder one.
+      expect(released.executionState).toMatchObject({
+        monitor: { status: "cleared", clearReason: "invalid_assignee" },
+      });
+    });
+
+    it("leaves a monitor armed when the run advances the issue to in_review", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+      await svc.update(issue.id, { status: "in_review" });
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      // The safety property runs the other way too: reconciliation must not
+      // disarm a monitor that is still deliverable, or the fix trades a silent
+      // stall for a silent cancellation.
+      const kept = await readMonitor(issue.id);
+      expect(kept.status).toBe("in_review");
+      expect(kept.monitorNextCheckAt?.toISOString()).toBe(MONITOR_CHECK_AT);
+      expect(kept.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+    });
 
     it("returns a todo issue to todo when the run releases without advancing it", async () => {
       const { agentId, issue, runId } = await seedCheckoutFixture("todo");
@@ -4929,6 +5155,126 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     expect(child.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
   });
+
+  // BLO-27706: a reused execution workspace is shared, so patching issue B's
+  // settings must not clear config issue A depends on. The builder used to emit
+  // `null` for every absent key, which defeated mergeExecutionWorkspaceConfig's
+  // leave-unchanged semantics and silently wiped runtime services.
+  it("BLO-27706: a sibling issue update that omits workspaceRuntime leaves shared workspace config intact", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const issueAId = randomUUID();
+    const issueBId = randomUUID();
+
+    const workspaceRuntime = {
+      services: [{ name: "portal", command: "pnpm dev", port: 5173 }],
+    };
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+    });
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+    });
+
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Shared workspace",
+      status: "active",
+      providerType: "local_fs",
+      metadata: {
+        source: "project_primary",
+        config: {
+          provisionCommand: "bash ./scripts/provision.sh",
+          teardownCommand: "bash ./scripts/teardown.sh",
+          workspaceRuntime,
+        },
+      },
+    });
+
+    // Two issues share the one execution workspace.
+    await db.insert(issues).values([
+      {
+        id: issueAId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Issue A depends on the runtime services",
+        status: "in_progress",
+        priority: "medium",
+        executionWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: { mode: "shared_workspace", workspaceRuntime },
+      },
+      {
+        id: issueBId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Issue B knows nothing about runtime services",
+        status: "todo",
+        priority: "medium",
+        executionWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: { mode: "shared_workspace" },
+      },
+    ]);
+
+    const readConfig = async () => {
+      const row = await db
+        .select({ metadata: executionWorkspaces.metadata })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, executionWorkspaceId))
+        .then((rows) => rows[0] ?? null);
+      return (row?.metadata as { config?: Record<string, unknown> } | null)?.config ?? null;
+    };
+
+    expect((await readConfig())?.workspaceRuntime).toEqual(workspaceRuntime);
+
+    // Issue B supplies settings without workspaceRuntime. Absent must mean
+    // "leave unchanged", not "clear".
+    await svc.update(issueBId, {
+      executionWorkspaceSettings: { mode: "shared_workspace" },
+    });
+
+    const afterSiblingUpdate = await readConfig();
+    expect(afterSiblingUpdate?.workspaceRuntime).toEqual(workspaceRuntime);
+    expect(afterSiblingUpdate?.provisionCommand).toBe("bash ./scripts/provision.sh");
+    expect(afterSiblingUpdate?.teardownCommand).toBe("bash ./scripts/teardown.sh");
+
+    // Control: an issue that DOES supply workspaceRuntime still writes it through,
+    // so the fix suppresses only the absent-key clear, not the feature.
+    const replacementRuntime = {
+      services: [{ name: "portal", command: "pnpm dev --host", port: 5173 }],
+    };
+    await svc.update(issueAId, {
+      executionWorkspaceSettings: { mode: "shared_workspace", workspaceRuntime: replacementRuntime },
+    });
+
+    expect((await readConfig())?.workspaceRuntime).toEqual(replacementRuntime);
+  });
 });
 
 describeEmbeddedPostgres("issueService blockers and dependency wake readiness", () => {
@@ -8738,7 +9084,14 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     expect(workspace?.metadata).toEqual({
       config: {
-        environmentId: null,
+        // BLO-27706: issue settings deliberately do not carry environmentId --
+        // parseIssueExecutionWorkspaceSettings is called here without
+        // includeEnvironmentId, so "env-new" above never reaches this patch (see
+        // the "operator overrides env then reassigns" case). This previously
+        // asserted `null`, i.e. every such update silently discarded the
+        // workspace's own environment selection. Absent now means leave
+        // unchanged, so the persisted "env-old" survives.
+        environmentId: "env-old",
         provisionCommand: "bash ./scripts/provision-new.sh",
         teardownCommand: "bash ./scripts/teardown-new.sh",
         cleanupCommand: null,

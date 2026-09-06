@@ -6,6 +6,32 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { pluginStateStore } from "../services/plugin-state-store.js";
+import { GBRAIN_RECALL_METRIC, __resetMetricsForTest, renderMetrics } from "../services/metrics.js";
+// Imported from the gbrain plugin's real producer on purpose (BLO-25892). The
+// server-side extractor in plugin-state-store.ts duck-types `value.status` out
+// of a payload owned by packCacheEntry, and matches on a private literal copy
+// of the state key; nothing in server/ imports StoredRecall or
+// RECALL_STATE_KEY, so there is no type-level link between the two packages.
+// Both halves of that contract are bound here rather than hand-written:
+//
+//   - payload shape: if the producer moved `status` under an envelope key,
+//     normalizeGbrainRecallStatus would send every real prefetch to "other".
+//   - state key: if RECALL_STATE_KEY's value changed, the plugin would keep
+//     working (its write and read move together) while the server's matcher
+//     silently stopped matching.
+//
+// Either drift zeroes status="error" and the alert never fires —
+// indistinguishable from a healthy fleet, with both tests still green. The
+// state-key leg is the more silent of the two: `status` has an independent
+// brake in the value_json->>'status' partial indexes and the RAG-health route,
+// whereas nothing on the server notices a state-key rename except this counter.
+// Same relative cross-package import pattern as
+// linear-webhook-fixture-replay.test.ts.
+import {
+  RECALL_STATE_KEY,
+  buildCacheEntry,
+  packCacheEntry,
+} from "../../../packages/plugins/paperclip-plugin-gbrain/src/recall.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -77,5 +103,58 @@ describeEmbeddedPostgres("plugin state store", () => {
       expect(result.rows.map((row) => row.stateKey)).toEqual(expected);
       expect(result.hasMore).toBe(false);
     }
+  });
+
+  it("increments the gbrain recall metric on a run-scoped gbrain-context write, and not on other writes (BLO-25892)", async () => {
+    __resetMetricsForTest();
+    const store = pluginStateStore(db);
+
+    // Built by the real producer, not hand-written: this is the cross-package
+    // shape contract the metric depends on. ok:false + a non-null
+    // issuePageSlug + no "no-oauth-client" reasonKind is the branch that
+    // yields status "error" — the 2026-08-08 outage's classification.
+    const erroredRecall = packCacheEntry(
+      buildCacheEntry({
+        result: {
+          ok: false,
+          issuePageSlug: "issues/blo-25892",
+          graph: null,
+          reason: "traverse_graph failed: fetch failed",
+        },
+        depth: 2,
+        nowIso: "2026-08-08T11:00:00.000Z",
+      }),
+    );
+    // Guard the guard: if the producer stops emitting a top-level "error"
+    // status, fail here with a clear message rather than further down as a
+    // confusing zero counter.
+    expect(erroredRecall.status).toBe("error");
+
+    await store.set(pluginId, {
+      scopeKind: "run",
+      scopeId: randomUUID(),
+      stateKey: RECALL_STATE_KEY,
+      value: erroredRecall,
+    });
+    // Scope-filter negative: the *real* recall key under the wrong scope. Bound
+    // to the constant so a rename keeps this case exercising the scope filter
+    // against the live key instead of degrading into a second stale-key case.
+    await store.set(pluginId, {
+      scopeKind: "instance",
+      stateKey: RECALL_STATE_KEY,
+      value: erroredRecall,
+    });
+    // Key-filter negative: deliberately a literal, since it must stay a
+    // non-matching key no matter what RECALL_STATE_KEY becomes.
+    await store.set(pluginId, {
+      scopeKind: "run",
+      scopeId: randomUUID(),
+      stateKey: "some-other-state-key",
+      value: erroredRecall,
+    });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${GBRAIN_RECALL_METRIC}{status="error"} 1`);
+    expect(body).not.toMatch(new RegExp(`${GBRAIN_RECALL_METRIC}\\{status="other"\\} [1-9]`));
   });
 });

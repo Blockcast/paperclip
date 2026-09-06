@@ -66,6 +66,15 @@ const goalIdSchema = z.string().uuid();
 const approvalIdSchema = z.string().uuid();
 const documentKeySchema = z.string().trim().min(1).max(64);
 
+// BLO-27561: `q` is a literal contiguous ILIKE '%…%' over four columns — it is NOT
+// tokenized (server/src/services/issues.ts, `list`). Agent instructions fleet-wide
+// mandate this call as the pre-filing duplicate gate, and its failure direction is the
+// harmful one: a descriptive multi-word query returns `[]`, which is indistinguishable
+// from "no such issue exists". Both tools share this string so the alias cannot drift
+// out of sync with the primary.
+const ISSUE_SEARCH_Q_DESCRIPTION =
+  "Literal contiguous substring match (case-insensitive), NOT tokenized: no AND-of-terms, no stemming, no fuzzy matching. Matched against title, identifier, description, and comment bodies; results are bucketed title > identifier > comment > description, which is a coarse field precedence and not a relevance score.\n\nMULTI-WORD INPUT IS UNRELIABLE — the whole string must appear verbatim and contiguously, so word order and every interior word matter. `dependency-waits provider` does NOT match a title reading `dependency-waits and provider-capacity`; deleting one interior word turns a hit into a miss.\n\nThis matters most when you are using this call as a duplicate check before filing. An empty result for a multi-word phrase is NOT evidence that no such issue exists, and the more precisely you describe your finding the more certain the false clear. Query ONE distinctive token (an error code, a ticket identifier, a rare noun, a symbol name) and read the results yourself; run several single-token queries rather than one descriptive phrase. `%` and `_` are matched literally, not as wildcards.";
+
 const listIssuesSchema = z.object({
   companyId: companyIdOptional,
   status: z.string().optional(),
@@ -100,11 +109,11 @@ const listIssuesSchema = z.object({
     .describe(
       "Hydrate `blockedBy` on every row. Default false, in which case the key is ABSENT (not `[]`) — do not read a missing key as 'no blockers'. `blocks` is never hydrated on list at any setting; use paperclipGetIssue for that.",
     ),
-  q: z.string().optional(),
+  q: z.string().optional().describe(ISSUE_SEARCH_Q_DESCRIPTION),
 });
 
 const searchIssuesSchema = listIssuesSchema.omit({ q: true }).extend({
-  query: z.string().trim().min(1),
+  query: z.string().trim().min(1).describe(ISSUE_SEARCH_Q_DESCRIPTION),
 });
 
 const listCommentsSchema = z.object({
@@ -194,8 +203,15 @@ const createRequestCheckboxConfirmationToolSchema = z.object({
 
 const approvalDecisionSchema = z.object({
   approvalId: approvalIdSchema,
-  action: z.enum(["approve", "reject", "requestRevision", "resubmit"]),
+  action: z.enum(["approve", "reject", "requestRevision", "resubmit", "withdraw"]),
   decisionNote: z.string().optional(),
+  // `withdraw` and `resubmit` are both requester-scoped; only approve/reject/
+  // requestRevision call assertBoard. The withdraw route additionally requires a
+  // non-empty reason, so accept a dedicated `reason` rather than making callers
+  // learn that `decisionNote` is overloaded. `decisionNote` is still read as a
+  // fallback, and on the non-withdraw path `reason` folds back into
+  // `decisionNote` so a note can never be silently dropped either way.
+  reason: z.string().optional(),
   payloadJson: z.string().optional(),
 });
 
@@ -357,13 +373,13 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipListIssues",
-      "List issues for a company with optional filters (status, projectId, assigneeAgentId, labelId, q, ...). Omitting a filter does not scope it — pass status explicitly if you only want open work; unfiltered can return the full company backlog.\n\nRELATIONAL FIELDS ARE NOT HYDRATED HERE. `blockedBy` is absent unless you pass includeBlockedBy=true; `blocks` and `children` are NEVER present at any setting. An absent key is not an empty relation — never conclude 'this issue has no blockers' or 'this epic has no children' from a list row. To enumerate children pass parentId (direct) or descendantOf (subtree); to read `blocks`, call paperclipGetIssue.\n\n`blockerAttention` is a coarse triage signal, NOT a summary of `blockedBy`, and reading it as one is wrong in three ways: (1) it is computed for non-terminal rows whose status is `blocked` or whose dependency readiness has unresolved explicit blockers; all-zeros means the row is not an attention root, but open child issues do NOT make a row a root, so all-zeros still tells you nothing about children — enumerate them with parentId; (2) `unresolvedBlockerCount` counts explicit blockers UNION open child issues, so it legitimately exceeds `blockedBy.length`; (3) `sampleBlockerIdentifier` is drawn from the transitive closure and often names an issue absent from `blockedBy`. Use it to rank attention, never to decide a specific issue is unblocked.",
+      "List issues for a company with optional filters (status, projectId, assigneeAgentId, labelId, q, ...). Omitting a filter does not scope it — pass status explicitly if you only want open work; unfiltered can return the full company backlog.\n\nRELATIONAL FIELDS ARE NOT HYDRATED HERE. `blockedBy` is absent unless you pass includeBlockedBy=true; `blocks` and `children` are NEVER present at any setting. An absent key is not an empty relation — never conclude 'this issue has no blockers' or 'this epic has no children' from a list row. To enumerate children pass parentId (direct) or descendantOf (subtree); to read `blocks`, call paperclipGetIssue.\n\nLIVENESS IS THREE PATHS, AND EVERY ROW CARRIES ALL THREE. An issue is *attended* by a live run (`activeRun`), an armed monitor (`monitorNextCheckAt` + peers), or a scheduled retry (`scheduledRetryAt`, `scheduledRetryReason`, `scheduledRetryAttempt`). The retry scalars are always **present**, explicitly `null` when the issue has no parked run — so `scheduledRetryAt === null` genuinely means 'no retry', and a row is unattended only when all three paths are empty. Auditing on `activeRun` alone systematically over-reports unattended, because a run parked on a concrete `scheduledRetryAt` is not abandoned; that is the defect BLO-28843 fixed, after it produced a >20× lane-capacity error. The scalars mirror `paperclipGetIssue`'s `scheduledRetry` object and agree with `paperclipListParkedAgents` for the same run.\n\n`blockerAttention` is a coarse triage signal, NOT a summary of `blockedBy`, and reading it as one is wrong in three ways: (1) it is computed for non-terminal rows whose status is `blocked` or whose dependency readiness has unresolved explicit blockers; all-zeros means the row is not an attention root, but open child issues do NOT make a row a root, so all-zeros still tells you nothing about children — enumerate them with parentId; (2) `unresolvedBlockerCount` counts explicit blockers UNION open child issues, so it legitimately exceeds `blockedBy.length`; (3) `sampleBlockerIdentifier` is drawn from the transitive closure and often names an issue absent from `blockedBy`. Use it to rank attention, never to decide a specific issue is unblocked.",
       listIssuesSchema,
       async (input) => listIssues(client, input),
     ),
     makeTool(
       "paperclip_search_issues",
-      "Search Paperclip issues by text. Compatibility alias for clients that ask for paperclip_search_issues; prefer paperclipListIssues with q when choosing tools directly.",
+      "Find Paperclip issues whose title, identifier, description, or comments CONTAIN a literal substring. Compatibility alias for clients that ask for paperclip_search_issues; prefer paperclipListIssues with q when choosing tools directly.\n\nDespite the name this is substring matching, not search: the query is not tokenized, so a multi-word phrase must appear verbatim and contiguously. Pass a single distinctive token — see the `query` parameter description before using this as a duplicate check.",
       searchIssuesSchema,
       async ({ query, ...input }) => listIssues(client, { ...input, q: query }),
     ),
@@ -554,7 +570,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipCreateApproval",
-      "Create a board approval request, optionally linked to one or more issues. Pass idempotencyKey (a stable token derived from the ask itself, e.g. \"rotate-creds:BLO-18969\") so a retry replays the original instead of filing a duplicate: the response then carries deduplicated:true and a statusReadback line telling you the original is still pending. A pending approval emits nothing on its own, so use that readback — or paperclipListApprovals with view=count — instead of re-filing to find out.",
+      "Create a board approval request, optionally linked to one or more issues. Pass idempotencyKey (a stable token derived from the ask itself, e.g. \"rotate-creds:BLO-18969\") so a retry replays the original instead of filing a duplicate: the response then carries deduplicated:true and a statusReadback line telling you the original is still pending. A pending approval emits nothing on its own, so use that readback — or paperclipListApprovals with view=count — instead of re-filing to find out. When the ask is \"a human must click a GitHub Actions gate\", ALSO set payload.gate = {kind:\"github_actions_run\", repoFullName, runId} (url optional) — naming the run in prose alone leaves nothing able to tell whether that gate is still alive, and the card then outlives its run and sends approvers to a dead gate. With payload.gate set, the card is closed automatically and the death announced on every linked issue once the run terminates (BLO-29359).",
       createApprovalToolSchema,
       async ({ companyId, ...body }) => {
         const resolved = await client.resolveCompany({ override: companyId });
@@ -729,9 +745,26 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipApprovalDecision",
-      "Approve, reject, request revision, or resubmit an approval",
+      "Approve, reject, request revision, resubmit, or withdraw an approval. `approve`, `reject`, and `requestRevision` are board-only — an agent calling them gets `403 Board access required`. `withdraw` and `resubmit` are **both requester-scoped**: the requesting agent may rescind its own ask or resubmit it, so a card that went moot is yours to clear rather than something to ask a human to close, and a card the board sent back as `revision_requested` is yours to resubmit. You can only act on cards you filed, and only while they are still pending; acting on another agent's card is refused (403), as is acting on one already decided (409). `withdraw` requires a non-empty `reason` (or `decisionNote`) — the audit trail relies on it to tell a moot request apart from an abandoned one. Note one destructive side effect: withdrawing a `hire_agent` approval also terminates the pending agent it would have created (it would otherwise be stranded frozen with no approval left to decide it).",
       approvalDecisionSchema,
-      async ({ approvalId, action, decisionNote, payloadJson }) => {
+      async ({ approvalId, action, decisionNote, reason, payloadJson }) => {
+        if (action === "withdraw") {
+          // Refuse here rather than letting an empty reason reach the server as a
+          // bare 400: the caller learns which field to fill, and a withdrawal can
+          // never silently lose the note the audit trail depends on.
+          const withdrawReason = (reason ?? decisionNote ?? "").trim();
+          if (!withdrawReason) {
+            throw new Error(
+              "withdraw requires a non-empty reason: pass `reason` (or `decisionNote`) saying why the request became moot",
+            );
+          }
+          return client.requestJson(
+            "POST",
+            `/approvals/${encodeURIComponent(approvalId)}/withdraw`,
+            { body: { reason: withdrawReason } },
+          );
+        }
+
         const path =
           action === "approve"
             ? `/approvals/${encodeURIComponent(approvalId)}/approve`
@@ -747,7 +780,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
             ? replacementPayload === undefined
               ? {}
               : { payload: replacementPayload }
-            : { decisionNote };
+            : { decisionNote: decisionNote ?? reason };
 
         return client.requestJson("POST", path, { body });
       },

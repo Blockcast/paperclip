@@ -16,6 +16,10 @@ import {
 
 type DeliveryRow = typeof githubCommitStatusDeliveries.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+// Either handle works for the delivery bookkeeping below. Code reached from
+// inside withGithubStatusDeliveryLock must use the transaction handle so the
+// critical section does not take a second pool connection.
+type DbHandle = Db | DbTransaction;
 type DeliveryTerminalStatus = "delivered" | "skipped" | "failed" | "failed_permanent";
 
 const POLL_INTERVAL_MS = 5_000;
@@ -30,22 +34,56 @@ const RETRY_DELAYS_MS = [
   2 * 60 * 60_000,
 ];
 
+// How long a waiter may queue for the delivery advisory lock before giving up,
+// and how long a holder may sit idle-in-transaction (i.e. inside its external
+// GitHub calls) before Postgres terminates it and releases the lock. Both are
+// far above the normal critical-section cost — they exist to make pool
+// exhaustion recoverable, not to bound healthy work.
+const DELIVERY_LOCK_WAIT_TIMEOUT_MS = 30_000;
+const DELIVERY_LOCK_HOLD_TIMEOUT_MS = 120_000;
+
+/** Serialize the final read and external write for one GitHub status key. */
+export async function withGithubStatusDeliveryLock<T>(
+  db: Db,
+  key: string,
+  operation: (tx: DbTransaction) => Promise<T>,
+): Promise<T> {
+  return db.transaction(async (tx) => {
+    // Bound both sides of the lock. The critical section performs external
+    // GitHub I/O (paginated list calls and status POSTs with retries), so the
+    // holder sits idle-in-transaction pinning a pool connection, and every
+    // waiter queued on an untimed pg_advisory_xact_lock pins one too. Without
+    // these bounds a hung GitHub call can exhaust the pool, and once exhausted
+    // the holder cannot finish, so the lock is never released.
+    //
+    // set_config(..., true) is transaction-local; SET LOCAL cannot be
+    // parameterized, so it is spelled this way deliberately.
+    await tx.execute(
+      sql`select set_config('lock_timeout', ${`${DELIVERY_LOCK_WAIT_TIMEOUT_MS}ms`}, true)`,
+    );
+    await tx.execute(
+      sql`select set_config('idle_in_transaction_session_timeout', ${`${DELIVERY_LOCK_HOLD_TIMEOUT_MS}ms`}, true)`,
+    );
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
+    // Hand the transaction handle to the caller: taking a second pool
+    // connection here is what makes the exhaustion above reachable.
+    return operation(tx);
+  });
+}
+
 export type EnqueueGithubCommitStatusDeliveryInput = {
-  companyId: string;
-  sourceRunId: string;
+  companyId?: string | null;
+  sourceRunId?: string | null;
   repoFullName: string;
   sha: string;
   context: string;
   state: GitHubCommitStatusState;
+  forceWrite?: boolean;
   description: string;
   targetUrl?: string | null;
   prNumber: number;
   prUrl?: string | null;
 };
-
-function isRetryableGithubHttpStatus(status: number): boolean {
-  return status === 408 || status === 409 || status === 429 || status >= 500;
-}
 
 function normalizeCommitStatusState(value: string): GitHubCommitStatusState {
   return value === "error" || value === "failure" || value === "pending" || value === "success"
@@ -58,6 +96,29 @@ function nextAttemptAt(attempt: number, now: Date): Date {
   return new Date(now.getTime() + delayMs);
 }
 
+/**
+ * An evidence-fetch failure is never evidence about the PR — on ANY surface.
+ *
+ * Only the two enumerated *configuration* faults below are permanent. Every
+ * transport error and every HTTP status, on every present or future evidence
+ * surface, is retryable. Stating the rule once as the default (rather than as a
+ * per-surface carve-out) is deliberate: a surface added later cannot inherit a
+ * permanent-failure default by omission.
+ *
+ * BLO-28920 established this for `comments_*` but left `reviews_*` classified by
+ * HTTP status, so a bare 403/404/401 there reached failPermanentDelivery and
+ * permanently dropped the gate-status delivery. That asymmetry was exactly
+ * backwards: a `reviews_*` failure means the predicate read NOTHING — strictly
+ * less information than a `comments_*` failure, which by construction only
+ * happens after the reviews surface has already been read conclusively. So the
+ * surface we knew least about was the one that failed permanently.
+ *
+ * The cost of that is a stall, not a dropped log line. Dropping the delivery
+ * means the required context is never posted, and a required context with no
+ * status reads "Expected — waiting for status" and blocks the PR indefinitely
+ * until a human intervenes (BLO-28968). Retrying is bounded by MAX_ATTEMPTS, so
+ * the fail-safe direction costs at most a few extra reads.
+ */
 function classifyReviewerEvidenceError(error: string): { retryable: boolean; reason: string } {
   if (error === "no_bot_login") return { retryable: false, reason: "missing_pr_reviewer_bot_login" };
   if (error === "no_token") {
@@ -65,15 +126,11 @@ function classifyReviewerEvidenceError(error: string): { retryable: boolean; rea
       ? { retryable: true, reason: "github_app_token_unavailable" }
       : { retryable: false, reason: "missing_github_app_credentials" };
   }
-  const status = Number(error.match(/_(\d{3})$/)?.[1]);
-  if (Number.isInteger(status)) {
-    return {
-      retryable: isRetryableGithubHttpStatus(status),
-      reason: `reviewer_evidence_${error}`,
-    };
-  }
   return { retryable: true, reason: `reviewer_evidence_${error}` };
 }
+
+/** Test-only: assert the classification rule directly (BLO-28968). */
+export { classifyReviewerEvidenceError as _classifyReviewerEvidenceError };
 
 function deliveryClaimWhere(row: DeliveryRow) {
   return and(
@@ -83,7 +140,7 @@ function deliveryClaimWhere(row: DeliveryRow) {
   );
 }
 
-async function refreshDeliveryClaimBeforeExternalWrite(db: Db, row: DeliveryRow): Promise<DeliveryRow | null> {
+async function refreshDeliveryClaimBeforeExternalWrite(db: DbHandle, row: DeliveryRow): Promise<DeliveryRow | null> {
   const [updated] = await db
     .update(githubCommitStatusDeliveries)
     .set({ updatedAt: new Date() })
@@ -98,7 +155,7 @@ function statusCreatedAtOrAfterQueueSecond(statusCreatedAt: number, queuedAt: Da
   return statusCreatedAt >= queuedAtSecond;
 }
 
-async function handleFreshCommitStatusIfPresent(db: Db, row: DeliveryRow): Promise<boolean> {
+async function handleFreshCommitStatusIfPresent(db: DbHandle, row: DeliveryRow): Promise<boolean> {
   const latestStatus = await githubGetLatestCommitStatusForContext({
     repoFullName: row.repoFullName,
     sha: row.sha,
@@ -134,13 +191,52 @@ async function handleFreshCommitStatusIfPresent(db: Db, row: DeliveryRow): Promi
   return false;
 }
 
+// A forced retirement retry may supersede the status that existed when it was
+// queued, but it must not overwrite any later evaluation of the same head.
+async function handleFreshSuccessForForcedDelivery(db: DbHandle, row: DeliveryRow): Promise<boolean> {
+  if (!row.forceWrite) return false;
+  const latestStatus = await githubGetLatestCommitStatusForContext({
+    repoFullName: row.repoFullName,
+    sha: row.sha,
+    context: row.context,
+  });
+  if (!latestStatus.ok) {
+    if (latestStatus.retryable) {
+      await retryOrFailDelivery(db, row, latestStatus.reason, latestStatus);
+    } else {
+      await failPermanentDelivery(db, row, latestStatus.reason, latestStatus);
+    }
+    return true;
+  }
+
+  const latest = latestStatus.status;
+  const createdAt = latest?.createdAt ? Date.parse(latest.createdAt) : NaN;
+  if (statusCreatedAtOrAfterQueueSecond(createdAt, row.createdAt)) {
+    await markTerminal(
+      db,
+      row,
+      "skipped",
+      "info",
+      `Skipped forced retired-context retry for ${row.context} on ${row.repoFullName}@${row.sha.slice(0, 7)} because a newer status already exists`,
+      {
+        reason: latest?.state === "success" ? "fresh_success_status_exists" : "newer_status_exists",
+        latestStatus: latest,
+      },
+    );
+    return true;
+  }
+  return false;
+}
+
 async function appendDeliveryRunEvent(
-  db: Db,
+  db: DbHandle,
   row: DeliveryRow,
   level: "info" | "warn",
   message: string,
   payload: Record<string, unknown>,
 ): Promise<void> {
+  if (!row.sourceRunId) return;
+
   const run = await db
     .select({
       id: heartbeatRuns.id,
@@ -171,7 +267,7 @@ async function appendDeliveryRunEvent(
 }
 
 async function markTerminal(
-  db: Db,
+  db: DbHandle,
   row: DeliveryRow,
   status: DeliveryTerminalStatus,
   level: "info" | "warn",
@@ -211,7 +307,7 @@ async function markTerminal(
 }
 
 async function retryOrFailDelivery(
-  db: Db,
+  db: DbHandle,
   row: DeliveryRow,
   reason: string,
   result: Record<string, unknown>,
@@ -265,7 +361,7 @@ async function retryOrFailDelivery(
 }
 
 async function failPermanentDelivery(
-  db: Db,
+  db: DbHandle,
   row: DeliveryRow,
   reason: string,
   result: Record<string, unknown>,
@@ -281,31 +377,35 @@ async function failPermanentDelivery(
 }
 
 async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
-  if (await handleFreshCommitStatusIfPresent(db, row)) return;
+  if (!row.forceWrite) {
+    if (await handleFreshCommitStatusIfPresent(db, row)) return;
 
-  const evidence = await githubHasReviewerEvidenceForPr({
-    repoFullName: row.repoFullName,
-    prNumber: row.prNumber,
-    headSha: row.sha,
-  });
-  if ("found" in evidence && evidence.found) {
-    await markTerminal(
-      db,
-      row,
-      "skipped",
-      "info",
-      `Skipped PR-review gate status failure for ${row.context} on ${row.repoFullName}#${row.prNumber}; reviewer evidence exists`,
-      { reason: "reviewer_evidence_found", via: evidence.via },
-    );
-    return;
-  }
-  if ("error" in evidence) {
-    const classified = classifyReviewerEvidenceError(evidence.error);
-    if (classified.retryable) {
-      await retryOrFailDelivery(db, row, classified.reason, { evidence });
-    } else {
-      await failPermanentDelivery(db, row, classified.reason, { evidence });
+    const evidence = await githubHasReviewerEvidenceForPr({
+      repoFullName: row.repoFullName,
+      prNumber: row.prNumber,
+      headSha: row.sha,
+    });
+    if ("found" in evidence && evidence.found) {
+      await markTerminal(
+        db,
+        row,
+        "skipped",
+        "info",
+        `Skipped PR-review gate status failure for ${row.context} on ${row.repoFullName}#${row.prNumber}; reviewer evidence exists`,
+        { reason: "reviewer_evidence_found", via: evidence.via },
+      );
+      return;
     }
+    if ("error" in evidence) {
+      const classified = classifyReviewerEvidenceError(evidence.error);
+      if (classified.retryable) {
+        await retryOrFailDelivery(db, row, classified.reason, { evidence });
+      } else {
+        await failPermanentDelivery(db, row, classified.reason, { evidence });
+      }
+      return;
+    }
+  } else if (await handleFreshSuccessForForcedDelivery(db, row)) {
     return;
   }
 
@@ -317,7 +417,8 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
     );
     return;
   }
-  if (await handleFreshCommitStatusIfPresent(db, fencedRow)) return;
+  if (await handleFreshSuccessForForcedDelivery(db, fencedRow)) return;
+  if (!fencedRow.forceWrite && (await handleFreshCommitStatusIfPresent(db, fencedRow))) return;
 
   const postingRow = await refreshDeliveryClaimBeforeExternalWrite(db, fencedRow);
   if (!postingRow) {
@@ -329,7 +430,7 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
   }
   fencedRow = postingRow;
 
-  const posted = await githubPostCommitStatusDetailed({
+  const post = async () => githubPostCommitStatusDetailed({
     repoFullName: fencedRow.repoFullName,
     sha: fencedRow.sha,
     context: fencedRow.context,
@@ -337,6 +438,23 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
     description: fencedRow.description,
     targetUrl: fencedRow.targetUrl,
   });
+  const posted = fencedRow.forceWrite
+    ? await withGithubStatusDeliveryLock(
+        db,
+        `${fencedRow.repoFullName}#${fencedRow.sha}`,
+        async (tx) => {
+          // The lock is shared with the live gate evaluation. Re-check inside
+          // it so a clean evaluation that won the lock cannot be overwritten.
+          // Use `tx`, not `db`: a second pool connection taken here is what
+          // lets a saturated pool wedge the lock holder.
+          if (await handleFreshSuccessForForcedDelivery(tx, fencedRow)) {
+            return { ok: true as const, skipped: true as const };
+          }
+          return { ...(await post()), skipped: false as const };
+        },
+      )
+    : { ...(await post()), skipped: false as const };
+  if (posted.skipped) return;
   if (posted.ok) {
     await markTerminal(
       db,
@@ -361,20 +479,42 @@ export async function enqueueGithubCommitStatusDelivery(
 ): Promise<DeliveryRow> {
   const now = new Date();
   const nowSql = sql`${now.toISOString()}::timestamptz`;
+  // Normalize the two optional provenance fields ONCE, before anything below
+  // reads them. `undefined` and `null` are different inputs to drizzle and only
+  // the second is safe here: an `undefined` chunk renders as the empty string
+  // with no bound parameter, so `source_run_id = ${undefined}` becomes
+  // `source_run_id = ` and a CASE ELSE arm becomes `else  end` — both Postgres
+  // 42601 at parse time. Webhook-originated retirements omit these keys
+  // entirely (`github-webhook.ts`), so that is the shape production actually
+  // sends. Deriving the insert values and both CASE arms from these two
+  // constants is what keeps them from drifting apart again.
+  const companyId = input.companyId ?? null;
+  const sourceRunId = input.sourceRunId ?? null;
+  // NOTE the NULL semantics, which are load-bearing. Migration 0238 made
+  // source_run_id nullable, so for webhook-originated rows both sides of the
+  // comparison are NULL and `source_run_id = NULL` evaluates to NULL, not
+  // true. preserveExistingDelivery is therefore NULL, every CASE below takes
+  // its ELSE branch, and a `delivered`/`skipped` row is reset to `queued`.
+  // That is the wanted behavior: a retirement write that already delivered
+  // must be redone when a fresh failure re-enqueues the same key. Do NOT
+  // "correct" this to `is not distinct from` — that would make the comparison
+  // true for two NULLs, preserve the terminal row, and silently drop the
+  // re-delivery. Pinned by test: "re-queues a delivered webhook-originated row".
   const preserveExistingDelivery = sql`${
     githubCommitStatusDeliveries.status
   } = 'processing' or (${
     githubCommitStatusDeliveries.status
   } in ('delivered', 'skipped') and ${
     githubCommitStatusDeliveries.sourceRunId
-  } = ${input.sourceRunId})`;
+  } = ${sourceRunId})`;
   const values = {
-    companyId: input.companyId,
-    sourceRunId: input.sourceRunId,
+    companyId,
+    sourceRunId,
     repoFullName: input.repoFullName,
     sha: input.sha,
     context: input.context,
     state: input.state,
+    forceWrite: input.forceWrite ?? false,
     description: input.description.slice(0, 140),
     targetUrl: input.targetUrl ?? null,
     prNumber: input.prNumber,
@@ -399,11 +539,12 @@ export async function enqueueGithubCommitStatusDelivery(
         githubCommitStatusDeliveries.context,
       ],
       set: {
-        companyId: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.companyId} else ${input.companyId} end`,
-        sourceRunId: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.sourceRunId} else ${input.sourceRunId} end`,
+        companyId: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.companyId} else ${companyId} end`,
+        sourceRunId: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.sourceRunId} else ${sourceRunId} end`,
         prNumber: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.prNumber} else ${input.prNumber} end`,
         prUrl: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.prUrl} else ${input.prUrl ?? null} end`,
         state: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.state} else ${input.state} end`,
+        forceWrite: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.forceWrite} else ${input.forceWrite ?? false} end`,
         description: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.description} else ${input.description.slice(0, 140)} end`,
         targetUrl: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.targetUrl} else ${input.targetUrl ?? null} end`,
         status: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.status} else 'queued' end`,

@@ -1533,6 +1533,7 @@ export function IssueDetail() {
   const { isMobile } = useSidebar();
   const [moreOpen, setMoreOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  const copiedResetTimeoutRef = useRef<number | null>(null);
   const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
   const [fileViewerPromptOpen, setFileViewerPromptOpen] = useState(false);
   const [detailTab, setDetailTab] = useState("chat");
@@ -3500,6 +3501,19 @@ export function IssueDetail() {
     [mediaGalleryItems],
   );
 
+  const clearCopiedResetTimeout = useCallback(() => {
+    if (copiedResetTimeoutRef.current !== null) {
+      window.clearTimeout(copiedResetTimeoutRef.current);
+      copiedResetTimeoutRef.current = null;
+    }
+  }, []);
+
+  // The 2s "Copied" reset outlives a fast unmount (navigate away, or a test that
+  // finishes in milliseconds), so the timer must be owned and cleared. Without
+  // this, setCopied fires after teardown and React reaches for a window that is
+  // already gone.
+  useEffect(() => clearCopiedResetTimeout, [clearCopiedResetTimeout]);
+
   const copyIssueToClipboard = async () => {
     if (!issue) return;
     const decodeEntities = (text: string) => {
@@ -3514,7 +3528,11 @@ export function IssueDetail() {
       await copyTextToClipboard(md);
       setCopied(true);
       pushToast({ title: "Copied to clipboard", tone: "success" });
-      setTimeout(() => setCopied(false), 2000);
+      clearCopiedResetTimeout();
+      copiedResetTimeoutRef.current = window.setTimeout(() => {
+        copiedResetTimeoutRef.current = null;
+        setCopied(false);
+      }, 2000);
     } catch (error) {
       pushToast({
         title: "Copy failed",

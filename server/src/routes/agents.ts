@@ -3,12 +3,14 @@ import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
+import { diffAgentAdapterSecretBindings } from "../services/agent-secret-bindings.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   agentSkillSyncSchema,
   agentMineInboxQuerySchema,
+  agentMeRecoveryActionsQuerySchema,
   ADAPTER_AGNOSTIC_KEYS,
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   createAgentKeySchema,
@@ -99,6 +101,7 @@ import {
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
 import { loadAgentInboxLite } from "../services/agent-inbox-lite.js";
+import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { logger } from "../middleware/logger.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
@@ -148,14 +151,21 @@ export function isRedactedEnvBinding(binding: unknown): boolean {
 const OMIT_REDACTED_ADAPTER_VALUE = Symbol("omit-redacted-adapter-value");
 
 function containsRedactedAdapterValue(value: unknown): boolean {
-  if (value === REDACTED_EVENT_VALUE) return true;
+  if (typeof value === "string") return value.includes(REDACTED_EVENT_VALUE);
   if (Array.isArray(value)) return value.some(containsRedactedAdapterValue);
   if (!value || typeof value !== "object") return false;
   return Object.values(value as Record<string, unknown>).some(containsRedactedAdapterValue);
 }
 
 function restoreRedactedAdapterValue(incoming: unknown, existing: unknown): unknown {
-  if (incoming === REDACTED_EVENT_VALUE) {
+  // PEN-2747: the URI-credential rule masks only the credential *component* of
+  // a URL, so the round-tripped value is `https://user:***REDACTED***@host/mcp`
+  // — a string that merely CONTAINS the sentinel rather than equalling it. An
+  // equality test misses it and persists a broken upstream URL, which is the
+  // BLO-5xxx failure mode described above (a sentinel written back into live
+  // config killed every run) with a different shape. Substring-test instead:
+  // no legitimate configured value contains this sentinel.
+  if (typeof incoming === "string" && incoming.includes(REDACTED_EVENT_VALUE)) {
     return existing === undefined ? OMIT_REDACTED_ADAPTER_VALUE : existing;
   }
   if (
@@ -1416,9 +1426,29 @@ export function agentRoutes(
     return entries;
   }
 
-  function assertNoAgentRuntimeConfigAdapterConfigMutation(req: Request, runtimeConfig: unknown) {
+  /**
+   * A model profile's adapterConfig is not synced to `company_secret_bindings`
+   * — only the agent's top-level `adapterConfig` is (`syncAgentSecretBindings`)
+   * — so a binding declared here creates no row and fails closed at runtime on
+   * `binding_missing`. The guard runs anyway as defence in depth against a
+   * future sync, and pairs each profile with its stored counterpart so an
+   * unchanged round-trip is not refused. Removal is deliberately not checked:
+   * there is no row for it to delete.
+   */
+  function assertNoAgentRuntimeConfigAdapterConfigMutation(
+    req: Request,
+    runtimeConfig: unknown,
+    existingRuntimeConfig?: unknown,
+  ) {
+    const existingByProfileKey = new Map(
+      listRuntimeModelProfileAdapterConfigs(existingRuntimeConfig).map((entry) =>
+        [entry.profileKey, entry.adapterConfig] as const,
+      ),
+    );
     for (const entry of listRuntimeModelProfileAdapterConfigs(runtimeConfig)) {
-      assertNoAgentAdapterConfigMutation(req, entry.adapterConfig, entry.path);
+      assertNoAgentAdapterConfigMutation(req, entry.adapterConfig, entry.path, {
+        existingAdapterConfig: existingByProfileKey.get(entry.profileKey) ?? null,
+      });
     }
   }
 
@@ -1427,6 +1457,7 @@ export function agentRoutes(
     adapterType: string | null | undefined;
     adapterConfig: Record<string, unknown>;
     constraintAdapterConfig?: Record<string, unknown>;
+    actor?: { userId?: string | null; agentId?: string | null };
   }): Promise<Record<string, unknown>> {
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
       input.companyId,
@@ -1434,6 +1465,7 @@ export function agentRoutes(
       {
         strictMode: strictSecretsMode,
         adapterType: input.adapterType ?? null,
+        actor: input.actor,
       },
     );
     await assertAdapterConfigConstraints(
@@ -1450,6 +1482,7 @@ export function agentRoutes(
     adapterType: string,
     runtimeConfig: Record<string, unknown>,
     baseAdapterConfig: Record<string, unknown>,
+    actor?: { userId?: string | null; agentId?: string | null },
   ): Promise<Record<string, unknown>> {
     const entries = listRuntimeModelProfileAdapterConfigs(runtimeConfig);
     if (entries.length === 0) return runtimeConfig;
@@ -1467,6 +1500,7 @@ export function agentRoutes(
         companyId,
         adapterType,
         adapterConfig: entry.adapterConfig,
+        actor,
         constraintAdapterConfig: {
           ...baseAdapterConfig,
           ...adapterDefaultConfig,
@@ -1752,12 +1786,116 @@ export function agentRoutes(
     return KNOWN_INSTRUCTIONS_BUNDLE_KEYS.some((key) => adapterConfig[key] !== undefined);
   }
 
+  /**
+   * An agent must not be able to create, modify, or remove its own secret
+   * bindings (BLO-27991).
+   *
+   * `PATCH /agents/:id` carrying only `adapterConfig` takes the weak
+   * authorization branch (`allow_self`, no change grant), and the sync path it
+   * feeds — `syncAgentAdapterEnvBindings` -> `syncSecretRefsForTarget` — only
+   * checks that the referenced secret is in the same company. Without this
+   * guard any agent can mint a `company_secret_bindings` row pointing at any
+   * company secret and have it projected into its own pod, because the runtime
+   * re-check (`assertBindingContext`) validates against that very row.
+   *
+   * This compares the bindings the write would persist against the bindings
+   * already stored, and refuses only a difference. A blanket refusal of any
+   * request *carrying* a binding is wrong in both directions:
+   *
+   *  - It 403s the honest round-trip. An agent-facing GET masks only the
+   *    top-level `env` map to `***`; a `secret_ref` outside `env`, and every
+   *    binding from `redactAgentConfiguration`, comes back as a readable
+   *    pointer by design (`redaction.ts`). So read-modify-write does echo
+   *    literal bindings, and `stripRedactedEnvBindingsFromAdapterConfig`
+   *    restores sentinels only — never a literal pointer.
+   *  - It misses removal. `syncSecretRefsForTarget` runs `replaceAll: true`,
+   *    so dropping a key deletes its row; the only way past a blanket refusal
+   *    is to drop the key, which is itself an unauthorized mutation.
+   *
+   * `existingAdapterConfig` is omitted on create and hire, where there is no
+   * prior state and every binding is therefore a creation. Board and system
+   * actors are unaffected, as are the service-internal callers (company-package
+   * import, built-in agent reconciler) that bypass this route.
+   */
+  function assertNoAgentSecretBindingMutation(
+    req: Request,
+    adapterConfig: Record<string, unknown> | null | undefined,
+    path = "adapterConfig",
+    existingAdapterConfig?: Record<string, unknown> | null,
+  ) {
+    if (req.actor.type !== "agent") return;
+    const changedPaths = diffAgentAdapterSecretBindings(
+      existingAdapterConfig ?? null,
+      adapterConfig ?? null,
+    );
+    if (changedPaths.length === 0) return;
+    throw forbidden(
+      "Agent-authenticated callers cannot create, modify, or remove secret bindings "
+        + `(${changedPaths.map((bindingPath) => `${path}.${bindingPath}`).join(", ")}). `
+        + "Secret bindings must be configured by a board actor.",
+    );
+  }
+
+  /**
+   * The adapterConfig a `PATCH /agents/:id` would persist, before server-side
+   * normalization: sentinel env values already restored from stored state by
+   * the caller, shallow-merged onto the stored config unless the request asked
+   * to replace it, then adapter-agnostic and instructions-bundle keys carried
+   * over when the adapter type changes.
+   *
+   * Shared by the agent secret-binding guard and the persistence path so the
+   * two cannot drift. A guard that models the merge differently from the writer
+   * either refuses honest requests — every omitted key reads as a removal — or
+   * misses real ones.
+   */
+  function resolveRawEffectiveAdapterConfigForPatch(input: {
+    existingAdapterConfig: Record<string, unknown>;
+    requestedAdapterConfig: Record<string, unknown> | null;
+    replaceAdapterConfig: boolean;
+    changingAdapterType: boolean;
+  }): Record<string, unknown> {
+    const { existingAdapterConfig, requestedAdapterConfig } = input;
+    let effective = requestedAdapterConfig ?? existingAdapterConfig;
+    if (requestedAdapterConfig && !input.changingAdapterType && !input.replaceAdapterConfig) {
+      effective = { ...existingAdapterConfig, ...requestedAdapterConfig };
+    }
+    if (input.changingAdapterType) {
+      // Preserve adapter-agnostic keys (env, cwd, etc.) from the existing config
+      // when the adapter type changes. Without this, a PATCH that includes
+      // adapterConfig but omits these keys would silently drop them.
+      for (const key of ADAPTER_AGNOSTIC_KEYS) {
+        if (KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET.has(key)) continue;
+        if (effective[key] === undefined && existingAdapterConfig[key] !== undefined) {
+          effective = { ...effective, [key]: existingAdapterConfig[key] };
+        }
+      }
+      effective = preserveInstructionsBundleConfig(existingAdapterConfig, effective);
+    }
+    return effective;
+  }
+
   function assertNoAgentAdapterConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown>,
     path = "adapterConfig",
+    options?: {
+      /** Stored config the binding diff is taken against. Omit on create/hire. */
+      existingAdapterConfig?: Record<string, unknown> | null;
+      /**
+       * Config that will actually be persisted, when it differs from the raw
+       * request body — a PATCH shallow-merges onto the stored config, so the
+       * request alone understates what survives and overstates what is removed.
+       */
+      effectiveAdapterConfig?: Record<string, unknown> | null;
+    },
   ) {
     assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
+    assertNoAgentSecretBindingMutation(
+      req,
+      options?.effectiveAdapterConfig ?? adapterConfig,
+      path,
+      options?.existingAdapterConfig ?? null,
+    );
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectAgentAdapterWorkspaceCommandPaths(adapterConfig, path),
@@ -1849,12 +1987,68 @@ export function agentRoutes(
     };
   }
 
+  /**
+   * The desired-skill keys an agent already carries in its persisted config.
+   *
+   * An unresolvable key cannot be canonicalized — it matches no library row, so
+   * there is nothing to canonicalize it against. A trimmed exact compare against
+   * the stored keys is therefore both the only comparison available and the
+   * correct one: it answers "did *this* write introduce the key?", which is the
+   * distinction the reject-vs-tolerate rule turns on. `readPaperclipSkillSyncPreference`
+   * already trims, so both sides of the compare are normalized identically.
+   */
+  function storedDesiredSkillKeys(adapterConfig: unknown): Set<string> {
+    const config = asRecord(adapterConfig);
+    if (!config) return new Set<string>();
+    return new Set(readPaperclipSkillSyncPreference(config).desiredSkills);
+  }
+
+  /**
+   * Reject desired-skill keys that this write *introduces* and that resolve to
+   * no company-skill row, while continuing to tolerate keys the agent already
+   * carried (BLO-7991).
+   *
+   * Both halves matter. Tolerating everything is how `garrytan/gstack/design-shotgun`
+   * — a key that named a catalog entry which never existed, because the skill was
+   * published upstream five days after the catalog's pinned import ref — was
+   * accepted in silence and then simply failed to materialize at pod start, with
+   * no error on any surface. Tolerating *nothing* is worse: a key whose library
+   * row was deleted after the fact would 422 every subsequent save, so the agent
+   * could neither run nor have the offending key removed, since removing it takes
+   * a successful write. Splitting on "introduced by this write" keeps stale keys
+   * visible and removable and still fails the never-resolvable case at the point
+   * where the caller is present to fix it.
+   */
+  function assertNoUnresolvableNewDesiredSkills(
+    unresolvedKeys: readonly string[],
+    previouslyDesiredKeys: ReadonlySet<string>,
+  ) {
+    const introduced = unresolvedKeys
+      .filter((key) => !previouslyDesiredKeys.has(key))
+      .sort();
+    if (introduced.length === 0) return;
+    throw unprocessable(
+      `Unknown desired skill${introduced.length > 1 ? "s" : ""}: ${introduced.join(", ")}. `
+      + "No matching skill exists in this company's library — import the skill first "
+      + "(POST /api/companies/:companyId/skills/import), then set it as desired.",
+    );
+  }
+
   async function resolveDesiredSkillAssignment(
     companyId: string,
     adapterType: string,
     adapterConfig: Record<string, unknown>,
     requestedDesiredSkills: AgentDesiredSkillEntry[] | undefined,
-    options: { tolerateUnknownDesiredSkills?: boolean } = {},
+    options: {
+      tolerateUnknownDesiredSkills?: boolean;
+      /**
+       * Keys the agent already carries. When supplied alongside
+       * `tolerateUnknownDesiredSkills`, tolerance narrows to exactly these —
+       * anything else unresolvable is a newly-introduced dangling key and is
+       * rejected instead of silently persisted.
+       */
+      previouslyDesiredKeys?: ReadonlySet<string>;
+    } = {},
   ) {
     if (!requestedDesiredSkills) {
       return {
@@ -1869,6 +2063,12 @@ export function agentRoutes(
       await companySkills.resolveRequestedSkillEntries(companyId, requestedDesiredSkills, {
         tolerateUnknownReferences: options.tolerateUnknownDesiredSkills,
       });
+    if (options.previouslyDesiredKeys) {
+      assertNoUnresolvableNewDesiredSkills(
+        unresolvedDesiredSkillKeys,
+        options.previouslyDesiredKeys,
+      );
+    }
     // Runtime materialization + version selection only ever consider skills that
     // actually resolve to the company library; stale keys can't be materialized.
     const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
@@ -2214,8 +2414,13 @@ export function agentRoutes(
         requestedSkills,
         // Toggling a resolvable skill must not fail just because the agent
         // already carries stale desired keys (e.g. a skill removed from the
-        // library). Preserve those keys so they remain visible/removable.
-        { tolerateUnknownDesiredSkills: true },
+        // library). Preserve those keys so they remain visible/removable —
+        // but scope that tolerance to the keys already stored, so this write
+        // cannot introduce a brand-new dangling key (BLO-7991).
+        {
+          tolerateUnknownDesiredSkills: true,
+          previouslyDesiredKeys: storedDesiredSkillKeys(agent.adapterConfig),
+        },
       );
       if (!desiredSkills || !desiredSkillEntries || !runtimeSkillEntries) {
         throw unprocessable("Skill sync requires desiredSkills.");
@@ -2479,6 +2684,37 @@ export function agentRoutes(
     }));
   });
 
+  // PEN-2756: a recovery action names an OWNER agent and a `nextAction` addressed
+  // to that owner, so it is a real assigned obligation — but every agent-facing
+  // surface for it is keyed by ISSUE, not by owner. `inbox-lite` does carry
+  // `activeRecoveryAction`, yet only for rows the agent is the ASSIGNEE of, and a
+  // beacon routinely lands on a row assigned to someone else (escalation reassigns
+  // away from the stranded agent). The owner's sweep therefore reads clean while
+  // the obligation is live, and the only way to find it was to scan every issue in
+  // the company.
+  //
+  // The owner-filtered query already existed (`recoveryObservability.listActions`)
+  // but only behind the company-wide dashboard route, which has no self-scoping and
+  // requires the caller to already know its own agent id. This is that same query,
+  // self-scoped from the authenticated actor — deliberately a SIBLING of
+  // `inbox-lite` rather than extra rows inside it, because inbox-lite rows are
+  // offered work that consumers check out, and these rows are someone else's issue.
+  router.get("/agents/me/recovery-actions", async (req, res) => {
+    if (req.actor.type !== "agent" || !req.actor.agentId || !req.actor.companyId) {
+      res.status(401).json({ error: "Agent authentication required" });
+      return;
+    }
+
+    const query = agentMeRecoveryActionsQuerySchema.parse(req.query);
+    const actions = await recoveryObservabilityService(db).listActions(req.actor.companyId, {
+      ownerAgentId: req.actor.agentId,
+      status: query.status,
+      kind: query.kind,
+      limit: query.limit,
+    });
+    res.json(actions);
+  });
+
   router.get("/agents/me/inbox/mine", async (req, res) => {
     if (req.actor.type !== "agent" || !req.actor.agentId || !req.actor.companyId) {
       res.status(401).json({ error: "Agent authentication required" });
@@ -2655,6 +2891,7 @@ export function agentRoutes(
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
     const sourceIssueIds = parseSourceIssueIds(req.body);
+    const actor = getActorInfo(req);
     const {
       desiredSkills: requestedDesiredSkills,
       instructionsBundle,
@@ -2693,7 +2930,9 @@ export function agentRoutes(
       companyId,
       adapterType: hireInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
+      actor: req.actor,
     });
+    assertNoAgentAdapterConfigMutation(req, normalizedAdapterConfig);
     const requestedRuntimeConfig = normalizeNewAgentRuntimeConfig(hireInput.runtimeConfig, hireInput.adapterType);
     assertExternalLifecycleConcurrencyPolicy(hireInput.adapterType, requestedRuntimeConfig);
     const normalizedRuntimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
@@ -2701,6 +2940,7 @@ export function agentRoutes(
       hireInput.adapterType,
       requestedRuntimeConfig,
       normalizedAdapterConfig,
+      req.actor,
     );
     const normalizedHireInput = {
       ...hireInput,
@@ -2730,8 +2970,6 @@ export function agentRoutes(
     const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent, instructionsBundle);
 
     let approval: Awaited<ReturnType<typeof approvalsSvc.getById>> | null = null;
-    const actor = getActorInfo(req);
-
     if (requiresApproval) {
       const requestedAdapterType = normalizedHireInput.adapterType ?? agent.adapterType;
       // Deliberately the generic redactor, matching what is already stored:
@@ -2857,6 +3095,7 @@ export function agentRoutes(
   router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
+    const actor = getActorInfo(req);
 
     const company = await db
       .select()
@@ -2909,7 +3148,9 @@ export function agentRoutes(
       companyId,
       adapterType: createInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
+      actor: req.actor,
     });
+    assertNoAgentAdapterConfigMutation(req, normalizedAdapterConfig);
     const requestedRuntimeConfig = normalizeNewAgentRuntimeConfig(createInput.runtimeConfig, createInput.adapterType);
     assertExternalLifecycleConcurrencyPolicy(createInput.adapterType, requestedRuntimeConfig);
     const normalizedRuntimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
@@ -2917,6 +3158,7 @@ export function agentRoutes(
       createInput.adapterType,
       requestedRuntimeConfig,
       normalizedAdapterConfig,
+      req.actor,
     );
     await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
     await assertAgentDefaultEnvironmentSelection(companyId, createInput.defaultEnvironmentId, {
@@ -2935,7 +3177,6 @@ export function agentRoutes(
     });
     const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent, instructionsBundle);
 
-    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId,
       actorType: actor.actorType,
@@ -3277,6 +3518,28 @@ export function agentRoutes(
       return;
     }
 
+    // This route wrote `agents.budget_monthly_cents` — the display mirror — and
+    // never the budget policy that actually enforces the cap
+    // (`pauseScopeForBudget` reads the policy, not the column). It returned 200,
+    // echoed the new value and recorded a config revision, so a cap raise made
+    // here was indistinguishable from one that took effect while binding
+    // nothing. It is also the only agent-reachable budget write, so the failure
+    // absorbed real allocation decisions: two separate raises landed here and
+    // silently did not apply.
+    //
+    // Rejecting rather than writing through on purpose. Write-through would
+    // hand every agent the ability to raise its own enforcing cap, which is the
+    // boundary `assertBoard` on the budgets route exists to hold — the fix has
+    // to narrow what agents can write, never widen it. BLO-27626.
+    if (hasOwn(req.body as object, "budgetMonthlyCents")) {
+      res.status(422).json({
+        error:
+          "Use PATCH /api/agents/:agentId/budgets to change a monthly budget cap. "
+          + "This route writes only the display mirror and would not change enforcement.",
+      });
+      return;
+    }
+
     const patchData = { ...(req.body as Record<string, unknown>) };
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;
@@ -3292,7 +3555,28 @@ export function agentRoutes(
         res.status(422).json({ error: "adapterConfig must be an object" });
         return;
       }
-      assertNoAgentAdapterConfigMutation(req, adapterConfig);
+      const existingAdapterConfigForGuard = asRecord(existing.adapterConfig) ?? {};
+      assertNoAgentAdapterConfigMutation(req, adapterConfig, "adapterConfig", {
+        existingAdapterConfig: existingAdapterConfigForGuard,
+        // The binding diff has to be taken against what will actually be
+        // persisted, via the same helper the writer uses below: read from the
+        // request body alone, every key this PATCH merely omits would read as a
+        // binding removal.
+        //
+        // Deliberately pre-normalization: `normalizeAdapterConfigForPersistence`
+        // can itself mint a `secret_ref` from a plain value (mediated secrets),
+        // and that is the server's own write, not the caller's.
+        effectiveAdapterConfig: resolveRawEffectiveAdapterConfigForPatch({
+          existingAdapterConfig: existingAdapterConfigForGuard,
+          requestedAdapterConfig: stripRedactedEnvBindingsFromAdapterConfig(
+            adapterConfig,
+            existingAdapterConfigForGuard,
+          ),
+          replaceAdapterConfig,
+          changingAdapterType:
+            typeof patchData.adapterType === "string" && patchData.adapterType !== existing.adapterType,
+        }),
+      });
       const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(adapterConfig);
       if (changingInstructionsConfig) {
         await assertCanManageInstructionsPath(req, existing);
@@ -3314,7 +3598,7 @@ export function agentRoutes(
         existing.runtimeConfig,
         runtimeConfig,
       );
-      assertNoAgentRuntimeConfigAdapterConfigMutation(req, requestedRuntimeConfig);
+      assertNoAgentRuntimeConfigAdapterConfigMutation(req, requestedRuntimeConfig, existing.runtimeConfig);
     }
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||
@@ -3338,25 +3622,12 @@ export function agentRoutes(
       ) {
         await assertCanManageInstructionsPath(req, existing);
       }
-      let rawEffectiveAdapterConfig = requestedAdapterConfig ?? existingAdapterConfig;
-      if (requestedAdapterConfig && !changingAdapterType && !replaceAdapterConfig) {
-        rawEffectiveAdapterConfig = { ...existingAdapterConfig, ...requestedAdapterConfig };
-      }
-      if (changingAdapterType) {
-        // Preserve adapter-agnostic keys (env, cwd, etc.) from the existing config
-        // when the adapter type changes. Without this, a PATCH that includes
-        // adapterConfig but omits these keys would silently drop them.
-        for (const key of ADAPTER_AGNOSTIC_KEYS) {
-          if (KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET.has(key)) continue;
-          if (rawEffectiveAdapterConfig[key] === undefined && existingAdapterConfig[key] !== undefined) {
-            rawEffectiveAdapterConfig = { ...rawEffectiveAdapterConfig, [key]: existingAdapterConfig[key] };
-          }
-        }
-        rawEffectiveAdapterConfig = preserveInstructionsBundleConfig(
-          existingAdapterConfig,
-          rawEffectiveAdapterConfig,
-        );
-      }
+      let rawEffectiveAdapterConfig = resolveRawEffectiveAdapterConfigForPatch({
+        existingAdapterConfig,
+        requestedAdapterConfig,
+        replaceAdapterConfig,
+        changingAdapterType,
+      });
       const effectiveAdapterConfig = applyCodexLocalKeyIsolation(
         existing.companyId,
         existing.id,
@@ -3370,8 +3641,36 @@ export function agentRoutes(
         companyId: existing.companyId,
         adapterType: requestedAdapterType,
         adapterConfig: effectiveAdapterConfig,
+        actor: req.actor,
+      });
+      // Normalization can turn a plain schema-secret value into a managed
+      // secret_ref. Check the result as well as the raw request so that a
+      // mediated binding cannot bypass the agent mutation guard.
+      assertNoAgentAdapterConfigMutation(req, normalizedEffectiveAdapterConfig, "adapterConfig", {
+        existingAdapterConfig,
       });
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
+      // PATCH writes `adapterConfig` straight through to the service, so it was
+      // the one skill-writing route with no skill validation at all — hire and
+      // create already resolve strictly, and skills/sync at least resolves. That
+      // gap is the path the BLO-7991 incident actually took: a `desiredSkills`
+      // key naming a skill with no library row persisted with a 200 and then
+      // simply failed to materialize at pod start, silently.
+      //
+      // Only the keys this write introduces are validated; keys already stored
+      // stay tolerated so a since-deleted library row can't wedge the agent.
+      const previouslyDesiredKeys = storedDesiredSkillKeys(existing.adapterConfig);
+      const introducedDesiredSkillKeys = readPaperclipSkillSyncPreference(
+        asRecord(patchData.adapterConfig) ?? {},
+      ).desiredSkills.filter((key) => !previouslyDesiredKeys.has(key));
+      if (introducedDesiredSkillKeys.length > 0) {
+        const { unresolved } = await companySkills.resolveRequestedSkillEntries(
+          existing.companyId,
+          introducedDesiredSkillKeys.map((key) => ({ key, versionId: null })),
+          { tolerateUnknownReferences: true },
+        );
+        assertNoUnresolvableNewDesiredSkills(unresolved, previouslyDesiredKeys);
+      }
     }
     if (requestedRuntimeConfig) {
       const baseAdapterConfig = asRecord(patchData.adapterConfig) ?? asRecord(existing.adapterConfig) ?? {};
@@ -3380,6 +3679,7 @@ export function agentRoutes(
         requestedAdapterType,
         requestedRuntimeConfig,
         baseAdapterConfig,
+        req.actor,
       );
     }
     if (touchesAdapterConfiguration || Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")) {
@@ -3394,12 +3694,23 @@ export function agentRoutes(
         },
       );
     }
+    // Fail CLOSED on mixing: any patch that *touches* a consent-gated profile
+    // field takes the protected branch, regardless of which other keys ride
+    // along.  The previous `profileOnlyChange` form required *every* key to be
+    // a profile field, so `{role, <any non-profile key>}` fell through to
+    // `assertCanUpdateAgent`, which reaches `allow_self` for a self-PATCH and
+    // let an agent write its own `role`/`name`/`title`/`capabilities` with no
+    // change grant and no consent (BLO-27751).  This mirrors the
+    // coordination-metadata path, which also fails closed on mixing.
     const touchesProfileFields = touchesAgentProfileChangeConsentFields(patchData);
-    const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) =>
-      (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
-    );
-    if (profileOnlyChange) {
+    if (touchesProfileFields) {
       await assertCanApplyAgentProfileChange(req, existing);
+      const mixesNonProfileKeys = Object.keys(patchData).some((key) =>
+        !(AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
+      );
+      // Consent for the profile diff must not authorize unrelated keys in a
+      // mixed patch; require the ordinary update grant as well.
+      if (mixesNonProfileKeys) await assertCanUpdateAgent(req, existing);
     } else {
       await assertCanUpdateAgent(req, existing);
     }
@@ -3435,6 +3746,63 @@ export function agentRoutes(
           updatedAt: new Date(),
         })
         .where(eq(agentRuntimeState.agentId, agent.id));
+
+      // BLO-28865: the in-flight run's external-runtime reservation is not
+      // portable across adapters either, and unlike the session id it is
+      // load-bearing. `recordExpectedExternalRuntimeJobName` matches a
+      // `launched` reservation by exact `expectedJobName` equality; the new
+      // adapter presents a differently-prefixed Job name, so zero rows match
+      // and every subsequent launch throws. The row stays unreleased, so it
+      // keeps holding the agent's slot
+      // (`external_runtime_reservations_active_slot_idx`) and ALL launches for
+      // that agent stall -- not just the migrated one. Before this, recovery
+      // was incidental: it arrived only when the orphaned Job exited on its
+      // own or was force-killed at EXTERNAL_LIFECYCLE_HARD_STALE_MS (45 min).
+      //
+      // Cancel the in-flight runs instead of touching the reservation. This is
+      // deliberate, and the ordering is the whole point: the reservation still
+      // holds the OLD Job's name/UID, which is the only handle the cancel
+      // cascade's exact-name delete has on it. `cancelRunInternal` finalizes
+      // the run terminal, deletes that exact old-named Job, then promotes the
+      // next queued run. The reaper releases the now-terminal run's
+      // reservation on its next pass.
+      //
+      // Scoped to reservation HOLDERS specifically, not every active run for
+      // the agent (which is what the pause path's `cancelActiveForAgent`
+      // does). A `queued` run has never been dispatched, holds no reservation
+      // and no Job, and would launch perfectly well under the new adapter --
+      // killing it would be collateral damage from a config edit.
+      //
+      // Do NOT "fix" this by re-arming the reservation instead
+      // (`rearmExternalRuntimeReservationForRetry`): it nulls jobName/jobUid,
+      // which unwedges launches while abandoning a live pre-migration Job that
+      // still holds node CPU and can still make model calls.
+      //
+      // Gate on the PREVIOUS adapter type: the stranded reservation and the
+      // orphaned Job both belong to the substrate being migrated away from. A
+      // process -> claude_k8s change has no external-lifecycle run to cancel.
+      if (EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(existing.adapterType)) {
+        try {
+          await heartbeat.cancelExternalRuntimeReservationHoldersForAgent(
+            id,
+            `Cancelled because the agent's adapter type changed from ${existing.adapterType} to ${agent.adapterType}`,
+          );
+        } catch (error) {
+          // Non-fatal, and deliberately so: the adapter-type change itself has
+          // already committed, and refusing to return it would leave the
+          // caller believing the migration failed when it did not. The reaper
+          // and alert still expose the stranded state if teardown fails.
+          logger.warn(
+            {
+              err: error,
+              agentId: id,
+              from: existing.adapterType,
+              to: agent.adapterType,
+            },
+            "adapter-type change: reservation-holder teardown failed",
+          );
+        }
+      }
     }
 
     // Auto-wakeup when heartbeat.enabled flips false → true (BLO-13048).
@@ -4381,10 +4749,20 @@ export function agentRoutes(
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
+    // BLO-29312: the run's own scheduledRetry* columns describe the park that
+    // PRODUCED it, so they cannot answer "was this run retried?". Resolve the
+    // outbound edge here so that question costs one read of this endpoint
+    // rather than a reverse scan of the company run list.
+    const retrySuccessor = await heartbeat.getRetrySuccessor(run);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
     res.json(
       redactCurrentUserValue(
-        { ...decoratedRun, retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
+        {
+          ...decoratedRun,
+          retryExhaustedReason,
+          retrySuccessor,
+          outputSilence: await heartbeat.buildRunOutputSilence(run),
+        },
         await getCurrentUserRedactionOptions(),
       ),
     );

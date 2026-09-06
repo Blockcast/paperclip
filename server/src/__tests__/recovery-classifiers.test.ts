@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import { classifyIssueGraphLiveness as classifyIssueGraphLivenessCompat } from "../services/issue-liveness.js";
 import { decideRunLivenessContinuation as decideRunLivenessContinuationCompat } from "../services/run-continuations.js";
 import {
+  DETERMINISTIC_SKILL_FAILURE_ERROR_CODE,
   RECOVERY_KEY_PREFIXES,
   RECOVERY_ORIGIN_KINDS,
   RECOVERY_REASON_KINDS,
+  ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES,
   buildIssueGraphLivenessIncidentKey,
   buildIssueGraphLivenessLeafKey,
   buildRunLivenessContinuationIdempotencyKey,
@@ -79,6 +81,107 @@ describe("recovery classifier boundary", () => {
     };
 
     expect(classifyIssueGraphLiveness(input)).toEqual(classifyIssueGraphLivenessCompat(input));
+  });
+
+  // Ally flagged the original version of this test as non-discriminating, and
+  // that was correct: with errorCode "skill_not_found",
+  // isLegacySessionUnavailableAdapterFailure hard-requires "adapter_failed", so
+  // the explicit early return in isZeroTokenStartupFailureRun is unreachable and
+  // deleting it changes nothing. The exclusion holds in production by *set
+  // non-membership*, so that is what this asserts — it fails loudly if anyone
+  // adds the code to the set.
+  it("excludes a missing skill from the zero-token startup family by set non-membership", () => {
+    expect(ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE)).toBe(false);
+    expect(isZeroTokenStartupFailureRun({
+      status: "failed",
+      errorCode: DETERMINISTIC_SKILL_FAILURE_ERROR_CODE,
+      usageJson: { inputTokens: 0, outputTokens: 0 },
+    })).toBe(false);
+  });
+
+  // The early return is kept as a backstop for exactly the case the assertion
+  // above forbids. This is the only test in which it is load-bearing: with the
+  // code temporarily in the set, removing the guard flips this to true.
+  it("keeps excluding a missing skill even if it joins the zero-token set", () => {
+    ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.add(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE);
+    try {
+      expect(isZeroTokenStartupFailureRun({
+        status: "failed",
+        errorCode: DETERMINISTIC_SKILL_FAILURE_ERROR_CODE,
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      })).toBe(false);
+    } finally {
+      ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.delete(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE);
+    }
+    // Restored, so the production invariant above still holds for other tests.
+    expect(ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE)).toBe(false);
+  });
+
+  it("routes a missing skill to blocked escalation instead of retry", () => {
+    expect(classifyContinuationFailure({
+      status: "failed",
+      errorCode: "skill_not_found",
+      error: 'Skill "verification-before-completion" not found',
+      resultJson: null,
+    } as never)).toMatchObject({
+      kind: "non_retryable",
+      maxAttempts: 0,
+      errorCode: "skill_not_found",
+    });
+  });
+
+  // BLO-32055. A run killed while a declared skill's `__runtime__` tree was
+  // mid-refresh is the OPPOSITE of a missing-skill config fault: the sweep
+  // completes on its own (measured live at 43m36s), so the next attempt succeeds.
+  // This pair is the whole point of giving it a separate code — the two must not
+  // converge on one classification.
+  it("keeps a mid-materialization skill fault retryable, unlike a missing skill", () => {
+    const materializationPending = classifyContinuationFailure({
+      status: "failed",
+      errorCode: "skill_materialization_pending",
+      error: 'Skill "garrytan/gstack/investigate" source is incomplete',
+      resultJson: null,
+    } as never);
+    expect(materializationPending).toMatchObject({
+      kind: "transient_infra",
+      errorCode: "skill_materialization_pending",
+    });
+    expect(materializationPending.maxAttempts).toBeGreaterThan(0);
+
+    // It replaced `adapter_failed`, which is already transient_infra, so naming
+    // the fault must preserve retryability exactly rather than widen it.
+    expect(materializationPending.maxAttempts).toBe(
+      classifyContinuationFailure({
+        status: "failed",
+        errorCode: "adapter_failed",
+        error: "ENOENT: no such file or directory",
+        resultJson: null,
+      } as never).maxAttempts,
+    );
+  });
+
+  // The AC's second half. Stated precisely, because the intuitive reading is
+  // backwards and acting on it would undo this whole change: like the
+  // `adapter_failed` it replaces, this code is ABSENT from
+  // ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES, so `isZeroTokenStartupFailureRun`
+  // stays false and the run is NOT escalated as a structural startup wedge — it
+  // takes ordinary transient recovery instead. That set marks wedges the sweep
+  // escalates straight to `blocked` (service.ts, the `isZeroTokenStartupFailureRun`
+  // branch), and a self-healing materialization race is the opposite of one.
+  // It is separately not the DETERMINISTIC_SKILL_FAILURE_ERROR_CODE, so nothing
+  // else excludes it either — but that non-membership does NOT imply zero-token
+  // eligibility; the two tests are independent.
+  it("is not treated as a structural zero-token wedge", () => {
+    expect("skill_materialization_pending").not.toBe(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE);
+    expect(ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has("skill_materialization_pending")).toBe(false);
+    // Parity with the code being replaced is the actual invariant: neither is a
+    // zero-token startup failure, so this change moves nothing.
+    expect(ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has("adapter_failed")).toBe(false);
+    expect(isZeroTokenStartupFailureRun({
+      status: "failed",
+      errorCode: "skill_materialization_pending",
+      usageJson: { inputTokens: 0, outputTokens: 0 },
+    })).toBe(false);
   });
 
   it("treats a scheduled monitor as an explicit review action path", () => {

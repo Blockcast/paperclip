@@ -972,6 +972,8 @@ export type {
   GitWorktreeBranchIncoherenceEvidence,
   GitWorktreeInProgressOperation,
   HeartbeatRun,
+  HeartbeatRunRetrySuccessor,
+  HeartbeatRunRetrySuccessorState,
   HeartbeatRunEvent,
   HeartbeatRunStatusPhase,
   AgentRuntimeState,
@@ -1344,7 +1346,12 @@ export {
   type ResourceMembershipUpdateResult,
 } from "./types/resource-memberships.js";
 
-export { workspaceRuntimeControlTargetSchema } from "./validators/execution-workspace.js";
+export {
+  collectBranchTemplateProblems,
+  EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS,
+  executionWorkspaceStrategySchema,
+  workspaceRuntimeControlTargetSchema,
+} from "./validators/execution-workspace.js";
 export {
   findWorkspaceCommandDefinition,
   listWorkspaceCommandDefinitions,
@@ -1409,6 +1416,7 @@ export type { ServerGitInfo, ServerGitLocalChanges, ServerInfoSnapshot } from ".
 
 export {
   getClosedIsolatedExecutionWorkspaceMessage,
+  isClosedExecutionWorkspace,
   isClosedIsolatedExecutionWorkspace,
 } from "./execution-workspace-guards.js";
 
@@ -1509,6 +1517,7 @@ export {
   skillTestAgentKeyScopeSchema,
   createAgentKeySchema,
   agentMineInboxQuerySchema,
+  agentMeRecoveryActionsQuerySchema,
   wakeAgentSchema,
   resetAgentSessionSchema,
   testAdapterEnvironmentSchema,
@@ -1581,6 +1590,12 @@ export {
   updateIssueSchema,
   MISPLACED_ISSUE_MONITOR_INPUT_KEYS,
   misplacedIssueMonitorInputMessage,
+  MISPLACED_ISSUE_PARKED_INPUT_KEYS,
+  misplacedIssueParkedInputMessage,
+  parkedDispositionCreateRejectionMessage,
+  issueParkedDispositionSchema,
+  PARKED_DISPOSITION_MAX_HORIZON_DAYS,
+  PARKED_DISPOSITION_MAX_HORIZON_MS,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
   resolveIssueRecoveryActionSchema,
@@ -1678,6 +1693,7 @@ export {
   type CreateAcceptedPlanDecomposition,
   type CreateIssueLabel,
   type UpdateIssue,
+  type IssueParkedDispositionInput,
   type ResolveIssueRecoveryAction,
   type CheckoutIssue,
   type AddIssueComment,
@@ -1715,8 +1731,10 @@ export {
 } from "./validators/index.js";
 export type { Milestone, CreateMilestoneInput, UpdateMilestoneInput } from "./types/milestone.js";
 export {
+  approvalGateSchema,
   createApprovalSchema,
   listApprovalsQuerySchema,
+  parseApprovalGate,
   upsertBudgetPolicySchema,
   resolveBudgetIncidentSchema,
   resolveApprovalSchema,
@@ -1724,6 +1742,7 @@ export {
   resubmitApprovalSchema,
   withdrawApprovalSchema,
   addApprovalCommentSchema,
+  type ApprovalGate,
   type CreateApproval,
   type ListApprovalsQuery,
   type UpsertBudgetPolicy,

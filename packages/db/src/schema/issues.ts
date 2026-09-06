@@ -76,6 +76,15 @@ export const issues = pgTable(
     monitorAttemptCount: integer("monitor_attempt_count").notNull().default(0),
     monitorNotes: text("monitor_notes"),
     monitorScheduledBy: text("monitor_scheduled_by"),
+    // BLO-27912: the deliberate-park disposition. Set together or all NULL. Derived from
+    // the nested `parkedDisposition` PATCH input — never written from flat request keys —
+    // and readable by the liveness sweep as a seventh explicit waiting path. `parkedUntil`
+    // is the whole anti-silence mechanism: suppression is keyed on it being in the future,
+    // so the park expires rather than persisting by default.
+    parkedUntil: timestamp("parked_until", { withTimezone: true }),
+    parkedReason: text("parked_reason"),
+    parkedByAgentId: uuid("parked_by_agent_id").references((): AnyPgColumn => agents.id),
+    parkedAt: timestamp("parked_at", { withTimezone: true }),
     executionWorkspaceId: uuid("execution_workspace_id")
       .references((): AnyPgColumn => executionWorkspaces.id, { onDelete: "set null" }),
     executionWorkspacePreference: text("execution_workspace_preference"),
@@ -244,6 +253,28 @@ export const issues = pgTable(
       .on(table.companyId, table.originKind, table.originFingerprint)
       .where(
         sql`${table.originKind} = 'plugin:paperclip-plugin-alertmanager:escalation'
+          and ${table.originFingerprint} <> 'default'
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
+    // BLO-20074: one unresolved review-request issue per (repo, PR).
+    // originFingerprint carries the `pr_review:<repoFullName>:<prNumber>` key,
+    // so N concurrent requests as a branch advances collapse onto one row —
+    // the losers catch 23505 and reuse the winner instead of each launching an
+    // independent reviewer run. Scoped to unresolved rows so a genuinely new
+    // review is still creatable once the prior one reaches a terminal status.
+    activePrReviewIdx: uniqueIndex("issues_active_pr_review_uq")
+      .on(table.companyId, table.originKind, table.originFingerprint)
+      .where(
+        sql`${table.originKind} = 'pr_review'
+          and ${table.originFingerprint} <> 'default'
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
+    activeAlertmanagerAggregateCreationIdx: uniqueIndex("issues_active_alertmanager_aggregate_creation_uq")
+      .on(table.companyId, table.originKind, table.originFingerprint)
+      .where(
+        sql`${table.originKind} = 'plugin:paperclip-plugin-alertmanager'
           and ${table.originFingerprint} <> 'default'
           and ${table.hiddenAt} is null
           and ${table.status} not in ('done', 'cancelled')`,
