@@ -1729,6 +1729,17 @@ test("nothing disarms the cleanup between the ring write and the probe", () => {
 // rather than mocked away, so the branch runs as written. Without this the
 // empty-stderr guard could be deleted and every other test here stays green --
 // which is exactly how the dangling-colon regression it fixes got shipped.
+//
+// `stderrText` is bare here on purpose, and giving it a `= ""` default would be
+// inert: the kubectl stub interpolates it behind a truthiness ternary, so
+// `JSON.stringify` is never reached when it is omitted and both spellings
+// render the byte-identical `kubectl() { return 1; }`. The cost of adding one
+// anyway is not the dead code, it is that the next reader finds a default
+// standing where nothing required it and concludes it was load-bearing.
+// The write harnesses further down interpolate `JSON.stringify(stderrText)`
+// with no such ternary, so an omitted value there really does reach the stub as
+// the bare word `undefined` -- that asymmetry is in the template shape, not in
+// the destructure. When adding a harness, copy the guarded form from here.
 function runRelease({ stderrText }) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-release-"));
   const errFile = path.join(dir, "release_err");
