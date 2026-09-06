@@ -549,14 +549,19 @@ export function isK8s404(err: unknown): boolean {
 /**
  * Returns true for a Kubernetes 409 (`AlreadyExists` on a create).
  *
- * Mirrors isK8s404's shape deliberately, including the `HTTP-Code:` message
- * probe.  That last clause is load-bearing rather than defensive: the
- * production failures this guards against (BLO-31665) surfaced as
- * `Failed to create env Secret: HTTP-Code: 409 ... "reason":"AlreadyExists"`,
- * i.e. the status reached us only in the message text.  A predicate that
- * inspects `code`/`statusCode` alone — as the sandbox-provider sibling in
- * packages/plugins/sandbox-providers/kubernetes/src/secret-manager.ts does —
- * would return false for exactly the errors observed in the incident.
+ * Mirrors isK8s404's shape, with one addition and one caveat, both measured
+ * against the installed @kubernetes/client-node (1.4.0) rather than assumed.
+ *
+ * `ApiException` is constructed as `super("HTTP-Code: " + code + ...)` and
+ * then sets **only** `this.code` — `statusCode` and `response` are both
+ * `undefined`.  So:
+ *
+ *   - `err.code` is the reliable structured signal, and isK8s404 does not
+ *     check it; that predicate works today purely on its message regex.
+ *     Checking `code` here is the more robust half, not the fallback.
+ *   - The `HTTP-Code:` probe is kept for symmetry with isK8s404 and to cover
+ *     an error re-thrown as a plain Error carrying only the message text.
+ *     It is redundant for a genuine ApiException, deliberately.
  */
 export function isK8s409(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
