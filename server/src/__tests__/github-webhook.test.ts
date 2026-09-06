@@ -45,6 +45,7 @@ import {
   __test_idempotentWakeStatuses,
   __test_prReviewerWakeIdempotencyScope,
   __test_recordWorkflowRunSighting,
+  __test_REVIEW_BODY_MAX_BYTES,
   __test_resolvePrCommentReviewGateWebhookTrigger,
   __test_resolveDependabotAlertContext,
   __test_resolveEventContext,
@@ -7049,16 +7050,21 @@ describeEmbeddedPostgres("github-webhook route", () => {
       const fullBody = frr61ShapedBody();
       // Pin the property that made frr#61 undiagnosable: the buckets sit
       // beyond the clamp, exactly as in the live specimen (4248/4273 > 4096).
+      // Read against the real clamp, not a copy of it — if the clamp is
+      // retuned, this fixture must fail rather than quietly stop reproducing
+      // the past-the-clamp shape the comment above claims.
       const bucketOffset = Buffer.byteLength(
         fullBody.slice(0, fullBody.indexOf("### Critical Issues")),
         "utf8",
       );
-      expect(bucketOffset).toBeGreaterThan(4096);
+      expect(bucketOffset).toBeGreaterThan(__test_REVIEW_BODY_MAX_BYTES);
 
       // The body as the classifier historically received it: clamped first,
       // classified second. Sent as the raw review body so this test exercises
       // the declined path even though PR #1517 now classifies pre-clamp.
-      const truncatedBody = Buffer.from(fullBody, "utf8").subarray(0, 4096).toString("utf8");
+      const truncatedBody = Buffer.from(fullBody, "utf8")
+        .subarray(0, __test_REVIEW_BODY_MAX_BYTES)
+        .toString("utf8");
       expect(truncatedBody).toContain("## Ally — Consolidated PR Review");
       expect(truncatedBody).not.toContain("Important Issues (1)");
 
@@ -7183,11 +7189,13 @@ describeEmbeddedPostgres("github-webhook route", () => {
       ].join("\n");
       expect(__test_classifyPrReviewActionability(clean, "commented")).toEqual({
         actionable: false,
-        reason: "ally_review_findings_all_retired",
+        reason: "ally_review_findings_all_zero",
         predicate: "hasAllyConsolidatedReviewHeading && every counted findings bucket === 0",
       });
 
-      const truncated = Buffer.from(frr61ShapedBody(), "utf8").subarray(0, 4096).toString("utf8");
+      const truncated = Buffer.from(frr61ShapedBody(), "utf8")
+        .subarray(0, __test_REVIEW_BODY_MAX_BYTES)
+        .toString("utf8");
       expect(__test_classifyPrReviewActionability(truncated, "commented")).toMatchObject({
         actionable: false,
         reason: "ally_review_findings_unenumerable",
@@ -7206,7 +7214,12 @@ describeEmbeddedPostgres("github-webhook route", () => {
       // that reintroduces a second copy of the predicate fails here.
       const bodies: Array<[string | null, string]> = [
         [frr61ShapedBody(), "commented"],
-        [Buffer.from(frr61ShapedBody(), "utf8").subarray(0, 4096).toString("utf8"), "commented"],
+        [
+          Buffer.from(frr61ShapedBody(), "utf8")
+            .subarray(0, __test_REVIEW_BODY_MAX_BYTES)
+            .toString("utf8"),
+          "commented",
+        ],
         ["### Important Issues (2)", "commented"],
         ["nothing to see", "commented"],
         ["anything at all", "changes_requested"],

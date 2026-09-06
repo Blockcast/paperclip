@@ -383,9 +383,12 @@ function carriesBlockingFeedback(text: string): boolean {
  * The Ally-specific reasons exist because the two of them fail in opposite
  * directions and must not be collapsed:
  *
- *   - `ally_review_findings_all_retired` is the HEALTHY no-op. Ally emitted
- *     its buckets and every one of them is zero, so there is genuinely nothing
- *     to route.
+ *   - `ally_review_findings_all_zero` is the HEALTHY no-op. Ally emitted its
+ *     buckets and every one of them is zero, so there is genuinely nothing to
+ *     route. Named for the predicate and not for a history: the commonest
+ *     emission is a first-ever clean review that never raised a finding at
+ *     all, so a name like `all_retired` would imply a disposition that did not
+ *     happen on the majority of the lines it labels.
  *   - `ally_review_findings_unenumerable` is a SUSPECT no-op. Ally's heading
  *     was recognised but the body carries no counted bucket at all, which a
  *     complete Ally review never does. It is the signature of a body that was
@@ -399,7 +402,7 @@ export type PrReviewNonActionableReason =
   | "review_body_absent"
   | "review_body_empty"
   | "ally_review_findings_unenumerable"
-  | "ally_review_findings_all_retired"
+  | "ally_review_findings_all_zero"
   | "review_no_blocking_feedback";
 
 /**
@@ -465,7 +468,7 @@ export function classifyPrReviewActionability(
     }
     return {
       actionable: false,
-      reason: "ally_review_findings_all_retired",
+      reason: "ally_review_findings_all_zero",
       predicate: "hasAllyConsolidatedReviewHeading && every counted findings bucket === 0",
     };
   }
