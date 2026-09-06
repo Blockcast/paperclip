@@ -79,6 +79,7 @@ export interface IssueLivenessWaitingPathInput {
   companyId: string;
   issueId: string;
   status: string;
+  createdAt?: Date | string | null;
 }
 
 export interface IssueLivenessDependencyPathEntry {
@@ -165,12 +166,40 @@ function hasActiveExecutionPath(
   );
 }
 
+const PENDING_INTERACTION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
 function hasWaitingPath(
   companyId: string,
   issueId: string,
   waitingPaths: IssueLivenessWaitingPathInput[],
 ) {
   return waitingPaths.some((entry) => entry.companyId === companyId && entry.issueId === issueId);
+}
+
+function hasLivePendingInteraction(
+  companyId: string,
+  issueId: string,
+  pendingInteractions: IssueLivenessWaitingPathInput[],
+  nowMs: number,
+) {
+  return pendingInteractions.some((entry) => {
+    if (entry.companyId !== companyId || entry.issueId !== issueId) return false;
+    const createdAtMs = readDateMs(entry.createdAt);
+    return createdAtMs === null || nowMs - createdAtMs < PENDING_INTERACTION_MAX_AGE_MS;
+  });
+}
+
+function hasStalePendingInteraction(
+  companyId: string,
+  issueId: string,
+  pendingInteractions: IssueLivenessWaitingPathInput[],
+  nowMs: number,
+) {
+  return pendingInteractions.some((entry) => {
+    if (entry.companyId !== companyId || entry.issueId !== issueId) return false;
+    const createdAtMs = readDateMs(entry.createdAt);
+    return createdAtMs !== null && nowMs - createdAtMs >= PENDING_INTERACTION_MAX_AGE_MS;
+  });
 }
 
 function readRecord(value: unknown): Record<string, unknown> | null {
@@ -504,7 +533,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       hasScheduledMonitor(issue, nowMs) ||
       hasActiveParkedDisposition(issue, nowMs) ||
       hasActiveExecutionPath(issue.companyId, issue.id, activeRuns, queuedWakeRequests) ||
-      hasWaitingPath(issue.companyId, issue.id, pendingInteractions) ||
+      hasLivePendingInteraction(issue.companyId, issue.id, pendingInteractions, nowMs) ||
       hasWaitingPath(issue.companyId, issue.id, pendingApprovals) ||
       hasWaitingPath(issue.companyId, issue.id, openRecoveryIssues);
   }
@@ -656,10 +685,20 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     // ownerCandidates so unassigned issues don't sit silently forever.
     if (reviewIssue.assigneeUserId) return null;
 
-    const reason = reviewIssue.assigneeAgentId
+    const staleInteraction = hasStalePendingInteraction(
+      reviewIssue.companyId,
+      reviewIssue.id,
+      pendingInteractions,
+      nowMs,
+    );
+    const reason = staleInteraction
+      ? `${issueLabel(reviewIssue)} has a pending issue-thread interaction older than 24h; it is not a live action path.`
+      : reviewIssue.assigneeAgentId
       ? `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, or recovery issue owning the next action.`
       : `${issueLabel(reviewIssue)} is in review with no assignee and no participant, interaction, approval, user owner, wake, active run, or recovery issue owning the next action.`;
-    const recommendedAction = reviewIssue.assigneeAgentId
+    const recommendedAction = staleInteraction
+      ? `Review ${issueLabel(reviewIssue)}'s stale interaction: resolve or withdraw it, then establish the current owner and next action.`
+      : reviewIssue.assigneeAgentId
       ? `Review ${issueLabel(reviewIssue)} and make the next action explicit: add a reviewer/interaction, return it to active work with a change request, mark it done if accepted, or open a bounded recovery issue.`
       : `Assign ${issueLabel(reviewIssue)} to a clear owner from the project / chain-of-command, or move it back to an active status with a change request.`;
 
