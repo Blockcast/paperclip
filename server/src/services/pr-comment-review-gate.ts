@@ -279,9 +279,18 @@ function headsWithUndispositionedFinding(
     return [...verbs];
   };
 
+  // `countInheritedLedgerAssertion: false` keeps this enumeration answering
+  // "which findings did *this head* raise?". A `still-present` entry names an
+  // earlier head's finding, and that head is enumerated in its own right, so
+  // counting it here would name a review whose own buckets are empty — and
+  // permanently, since a 0/0 body reports no identities for any later ledger
+  // entry to retire. The current-head branch below deliberately does count it.
   return [...newestPerHead.values()]
     .filter(
-      (entry) => hasActionablePrReviewFeedback(entry.attesting.comment.body) && !isFullyDispositioned(entry),
+      (entry) =>
+        hasActionablePrReviewFeedback(entry.attesting.comment.body, undefined, {
+          countInheritedLedgerAssertion: false,
+        }) && !isFullyDispositioned(entry),
     )
     .sort((a, b) => b.timeMs - a.timeMs)
     .map((entry) => ({ ...entry.attesting, unrecognizedVerbs: unrecognizedVerbsBlocking(entry) }));
