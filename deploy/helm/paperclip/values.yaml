@@ -411,15 +411,13 @@ workerProbes:
   # then retries each delivery 4x into the worker that just failed its probe.
   #
   # Measured on `paperclip-0` over the 24h to 2026-09-05T20:30Z from the
-  # kubelet `prober_probe_*` metrics. Same endpoint, same pod, same window:
-  #
-  #   probe      timeout   failed / total   failure rate
-  #   Readiness     5s     100.2 / 8559        1.171%
-  #   Liveness     10s      13.1 / 2838        0.462%
+  # kubelet `prober_probe_*` metrics — same endpoint, same pod, same window,
+  # with the per-probe timeout as the only material difference: readiness at a
+  # 5s timeout failed 100.2 of 8559 probes (1.171%), while liveness at a 10s
+  # timeout failed 13.1 of 2838 (0.462%).
   #
   # Readiness failed at 2.53x the liveness rate against the identical
-  # `/healthz`, and the per-probe timeout is the only material difference
-  # between them. The tail latency confirms the cause: p99.9 of *successful*
+  # `/healthz`. The tail latency confirms the cause: p99.9 of *successful*
   # liveness probes is 8.59s, i.e. `/healthz` legitimately takes longer than
   # the old 5s readiness timeout. A timeout set below the endpoint's own tail
   # is a false-positive generator, not a sensitivity knob.
@@ -433,9 +431,12 @@ workerProbes:
   #
   # timeoutSeconds now matches liveness (10s), above the measured tail, and
   # periodSeconds moves to 15 so a probe cannot outlast its own period.
-  # Worst-case endpoint removal becomes 3 x 15s = 45s rather than 30s; that
-  # slower detection costs nothing real at `replicas: 1`, because endpoint
-  # removal has no upside here in the first place.
+  # Worst-case endpoint removal, stated derivably rather than as `3 x period`:
+  # probes start at t=0/15/30 and each times out 10s in, so the third
+  # consecutive failure is only observed at t=40s, and endpoint propagation
+  # adds more on top. That is ~40s+ versus ~20s+ under the old 10s/5s
+  # settings. The slower detection costs nothing real at `replicas: 1`,
+  # because endpoint removal has no upside here in the first place.
   #
   # Decision, recorded explicitly rather than left implicit: readiness is
   # KEPT, not retired. It still gates the endpoint during rollout, and
@@ -446,6 +447,15 @@ workerProbes:
   # second replica (BLO-29307 / BLO-29004) or a `/healthz` that cannot be
   # blocked by the event loop. Until one of those lands, this probe must be
   # tolerant rather than tight.
+  #
+  # `failureThreshold: 3` is load-bearing, not incidental, and it is the knob
+  # a future reader will reach for once told not to touch the timeout. At the
+  # 0.462% per-probe failure rate this endpoint actually exhibits, requiring
+  # three *consecutive* failures puts an endpoint drop at roughly one per
+  # several years; `failureThreshold: 1` would drop the only endpoint on any
+  # single tail-latency blip, i.e. tens of times a day, reopening exactly the
+  # outage this change closes. `tests/probes.test.mjs` enforces both this
+  # floor and the timeout relationship while the tier is single-replica.
   readiness:
     httpGet:
       path: /healthz
@@ -458,6 +468,15 @@ workerProbes:
     timeoutSeconds: 10
     failureThreshold: 3
   # -- Worker startup probe.
+  #
+  # Deliberately left at `timeoutSeconds: 5`, below the 8.59s `/healthz` tail
+  # measured above, and that exemption is intentional rather than an
+  # oversight: `failureThreshold: 30` at a 10s period gives a ~300s budget, so
+  # an individual timed-out probe is absorbed instead of being fatal. The
+  # readiness defect was that three false timeouts were *sufficient* to remove
+  # the endpoint; here they are not close to sufficient, so tail sensitivity
+  # carries no cost. Re-tighten `failureThreshold` here and that stops being
+  # true.
   startup:
     httpGet:
       path: /healthz
