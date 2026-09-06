@@ -505,6 +505,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
     mockTerminateLocalService.mockImplementation(localServiceSupervisor.terminateLocalService);
     mockHasActiveJobForAgent.mockImplementation(async () => false);
+    // vi.clearAllMocks() only clears call history, not implementations, and
+    // this suite sets no `clearMocks`/`mockReset` in vitest config. A test that
+    // uses the persistent `mockResolvedValue` (rather than ...Once) on these two
+    // would otherwise leak its k8s snapshot into every later test in the file —
+    // and a stale Map reads as "job missing" where the default null reads as
+    // "kube unavailable", which are different branches in reapOrphanedRuns.
+    mockListAgentJobRunStatuses.mockImplementation(async () => null);
+    mockListLiveAgentJobRunIds.mockImplementation(async () => null);
     mockGithubHasReviewerEvidenceForPr.mockResolvedValue({ found: false });
     mockGithubGetPullRequestGate.mockResolvedValue({ state: "open", merged: false });
     mockAdapterExecute.mockImplementation(async () => ({
@@ -7716,6 +7724,193 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(queuedRun?.status).not.toBe("queued");
     expect(queuedRun?.errorCode).not.toBe("duplicate_dispatch_suppressed");
+    await heartbeat.cancelRun(queuedRunId);
+  });
+
+  // BLO-19461 characterization. These two pin the CURRENT behaviour of the
+  // window between EXTERNAL_LIFECYCLE_STALE_MS (15 min) and
+  // EXTERNAL_LIFECYCLE_HARD_STALE_MS (45 min) for an agent whose every run has
+  // gone silent while its k8s Job is still `phase: active`.
+  //
+  // The stall is NOT slot exhaustion: BLO-12990 Fix #1 already drops silent runs
+  // from `runningCount` (heartbeat.ts:17529-17541), so slots are free. It is the
+  // all-or-nothing orphan-Job guard at heartbeat.ts:17555 —
+  // `runningCount === 0 && hasActiveExternalJob` returns [] — which defers to a
+  // reaper that will not force-kill until the 45-minute hard floor. The agent is
+  // therefore totally undispatchable for 30 minutes with nothing working to end
+  // it, and because the trigger is `runningCount === 0` this is independent of
+  // how many slots the agent has: one hung run on a 1-slot agent behaves the same.
+  //
+  // The first test is the defect and is expected to FLIP once the guard's window
+  // is bounded. The second guards the 2026-05-23 RCA (heartbeat.ts:1047-1059):
+  // whatever bound is introduced, a hard-stale run must still be force-killed
+  // with a reason naming adapter silence, not `job_missing`.
+  //
+  // Shared fixture for the blocked/control pair. Both cases MUST differ in
+  // exactly one input — `hasActiveJobForAgent` — or the pair proves nothing.
+  // Any other difference (a missing reservation, an absent per-run Job snapshot,
+  // an empty live-run set) gives `reapOrphanedRuns` grounds to terminalize the
+  // silent run in one case but not the other; the silent row then disappears
+  // from the control and a dispatch difference could be explained by slot
+  // capacity rather than by the guard at heartbeat.ts:17555. Keeping the seed in
+  // one function is what makes "only the guard input varies" checkable.
+  const seedSilentExternalLifecycleAgent = async () => {
+    // Past the 15-min soft floor, comfortably below the 45-min hard floor.
+    const silentSince = new Date(Date.now() - 20 * 60 * 1000);
+    const { companyId, agentId, issueId, runId: silentRunId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      agentStatus: "running",
+      includeIssue: true,
+      lastOutputAt: silentSince,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId: silentRunId });
+    const reservation = await seedLaunchedReservation({ companyId, agentId, runId: silentRunId });
+    // The Job is alive and still `active` — this is a hung adapter, not a lost
+    // Job. Held identical across the pair so the reaper leaves the silent run
+    // `running` in both.
+    mockListAgentJobRunStatuses.mockResolvedValue(
+      new Map([
+        [silentRunId, {
+          phase: "active",
+          reason: null,
+          message: null,
+          name: reservation.jobName,
+          uid: reservation.jobUid,
+        }],
+      ]),
+    );
+
+    const queuedWakeupId = randomUUID();
+    const queuedRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: queuedWakeupId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_continuation_needed",
+      payload: { issueId },
+      status: "queued",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: queuedWakeupId,
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_continuation_needed" },
+      createdAt: new Date("2026-03-19T00:10:00.000Z"),
+      updatedAt: new Date("2026-03-19T00:10:00.000Z"),
+    });
+
+    return { companyId, agentId, issueId, silentRunId, queuedRunId };
+  };
+
+  it("leaves a fully-silent external-lifecycle agent undispatchable below the hard-stale floor (BLO-19461)", async () => {
+    const { silentRunId, queuedRunId } = await seedSilentExternalLifecycleAgent();
+    // The single variable under test. The control flips exactly this and nothing else.
+    mockHasActiveJobForAgent.mockResolvedValue(true);
+
+    await heartbeat.resumeQueuedRuns();
+
+    // Precondition shared with the control: the reaper declines to touch the
+    // hung run (silent, but under 45 min), so a `running` row survives in BOTH
+    // cases and slot accounting is identical across the pair.
+    const silentRun = await heartbeat.getRun(silentRunId);
+    expect(silentRun?.status).toBe("running");
+    // ...and the guard blocks the whole agent, so queued work does not dispatch.
+    const queuedRun = await heartbeat.getRun(queuedRunId);
+    expect(queuedRun?.status).toBe("queued");
+    expect(mockAdapterExecute.mock.calls.some(([ctx]) => ctx.runId === queuedRunId)).toBe(false);
+  });
+
+  it("force-kills a hard-stale live Job with a silence reason and releases the agent (BLO-19461)", async () => {
+    // Past the 45-min hard floor.
+    const silentSince = new Date(Date.now() - 46 * 60 * 1000);
+    const { companyId, agentId, runId: silentRunId } = await seedRunFixture({
+      adapterType: "claude_k8s",
+      agentStatus: "running",
+      // No issue: this case is only about the reaper, and an attached issue
+      // drags in the release-and-promote tail, which is not what we assert here.
+      includeIssue: false,
+      lastOutputAt: silentSince,
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId: silentRunId });
+    const reservation = await seedLaunchedReservation({ companyId, agentId, runId: silentRunId });
+    mockListAgentJobRunStatuses.mockResolvedValue(
+      new Map([
+        [silentRunId, {
+          phase: "active",
+          reason: null,
+          message: null,
+          name: reservation.jobName,
+          uid: reservation.jobUid,
+        }],
+      ]),
+    );
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(silentRunId);
+    const silentRun = await heartbeat.getRun(silentRunId);
+    expect(silentRun?.status).toBe("failed");
+    // The reason must name adapter silence, never `job_missing` — the Job was
+    // present and active; it was us who killed it.
+    expect(silentRun?.errorCode).toBe("external_lifecycle_stale_killed");
+    // Pin the deletion target, not just that a deletion was attempted: the
+    // reclaim must name this run's Job, and the delete swallows its own
+    // failures, so a bare `toHaveBeenCalled()` would pass even if we reclaimed
+    // the wrong run. NB `mockDeleteAgentJobsForRun` is wired to
+    // `deleteAgentJobExact` (see the vi.mock map above), which takes the
+    // {name, runId, uid} triple.
+    //
+    // Assert all three, not just `runId`. `deleteExactExternalRuntimeJob`
+    // (heartbeat.ts:15463-15477) re-reads the reservation itself and refuses
+    // with "mismatch" when either `jobName` or `jobUid` is absent, so a
+    // runId-only assertion would still pass if the reclaim silently resolved
+    // the wrong Job identity — precisely the exactly-once hazard this case
+    // exists to pin (BLO-19461 AC 3). The name/uid pair is what makes the
+    // k8s delete exact rather than agent-scoped.
+    expect(mockDeleteAgentJobsForRun).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: silentRunId,
+        name: reservation.jobName,
+        uid: reservation.jobUid,
+      }),
+    );
+  });
+
+  // Control for the pair above: the SAME fixture, differing only in whether the
+  // agent-level probe reports a live Job. Because the seed is shared, the silent
+  // run is still `running` here too — slots are accounted identically — so if
+  // this dispatches and the other does not, the blocker is provably the
+  // `hasActiveExternalJob` guard at heartbeat.ts:17555 and NOT slot exhaustion.
+  // This is the evidence that the "N hung runs occupy N slots" model of
+  // BLO-19461 was wrong.
+  it("dispatches queued work for an equally-silent agent once no live Job remains (BLO-19461 control)", async () => {
+    const { silentRunId, queuedRunId } = await seedSilentExternalLifecycleAgent();
+    // Deliberately synthetic: the per-run snapshot still reports `active` while
+    // the agent-level probe reports no live Job. That combination is not what
+    // k8s would produce, and it is the point — clearing the snapshot to make the
+    // fixture "realistic" would let the reaper terminalize the silent run here
+    // but not in the blocked case, which is exactly the confound this control
+    // exists to exclude. Isolating one input beats fixture realism.
+    mockHasActiveJobForAgent.mockResolvedValue(false);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForValue(async () => {
+      const run = await heartbeat.getRun(queuedRunId);
+      return run && run.status !== "queued" ? run : null;
+    });
+
+    // Same precondition as the blocked case: the silent run survives untouched,
+    // so the guard input is the only thing that differs between the two.
+    const silentRun = await heartbeat.getRun(silentRunId);
+    expect(silentRun?.status).toBe("running");
+    const queuedRun = await heartbeat.getRun(queuedRunId);
+    expect(queuedRun?.status).not.toBe("queued");
     await heartbeat.cancelRun(queuedRunId);
   });
 
