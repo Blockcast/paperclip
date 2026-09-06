@@ -1465,9 +1465,15 @@ function carriesBlockingFeedback(text: string, options?: ActionableFeedbackOptio
  * The Ally-specific reasons exist because the two of them fail in opposite
  * directions and must not be collapsed:
  *
- *   - `ally_review_findings_all_retired` is the HEALTHY no-op. Ally emitted
- *     its buckets and every one of them is zero, so there is genuinely nothing
- *     to route.
+ *   - `ally_review_findings_all_zero` is the HEALTHY no-op. Ally emitted its
+ *     buckets and every one of them is zero, so there is genuinely nothing to
+ *     route. Named for the predicate and not for a history: the commonest
+ *     emission is a first-ever clean review that never raised a finding at
+ *     all, so a name like `all_retired` would imply a disposition that did not
+ *     happen on the majority of the lines it labels. Both the structured
+ *     verdict block and the prose headings report it, distinguished by
+ *     `predicate` rather than by a second reason — the reason is the taxonomy,
+ *     the predicate is the deciding code.
  *   - `ally_review_findings_unenumerable` is a SUSPECT no-op. Ally's heading
  *     was recognised but the body carries no counted bucket at all, which a
  *     complete Ally review never does. It is the signature of a body that was
@@ -1481,7 +1487,7 @@ export type PrReviewNonActionableReason =
   | "review_body_absent"
   | "review_body_empty"
   | "ally_review_findings_unenumerable"
-  | "ally_review_findings_all_retired"
+  | "ally_review_findings_all_zero"
   | "review_no_blocking_feedback";
 
 /**
@@ -1525,7 +1531,7 @@ export function classifyPrReviewActionability(
   if (block.kind === "ok") {
     for (const [severity, count] of block.verdict.findings) {
       if (BLOCKING_SEVERITIES.has(severity) && count > 0) {
-        return { actionable: true, predicate: "allyVerdictBlock.findings[blockingSeverity] > 0" };
+        return { actionable: true, predicate: `allyVerdictBlock.findings.${severity} > 0` };
       }
     }
     // The structured twin of the prose ledger clause at :1102, and it is load
@@ -1547,23 +1553,22 @@ export function classifyPrReviewActionability(
       options?.countInheritedLedgerAssertion !== false &&
       block.verdict.dispositions.some((entry) => classifyPriorDisposition(entry.verb) === "blocks")
     ) {
-      return {
-        actionable: true,
-        predicate: "allyVerdictBlock.dispositions[classifyPriorDisposition=blocks]",
-      };
+      return { actionable: true, predicate: "allyVerdictBlock.dispositions has a verb classifying as blocks" };
     }
-    // A readable block that counts no blocking finding and carries no blocking
-    // ledger entry IS Ally's enumeration, and every bucket in it came back zero
-    // or retired — the healthy no-op the taxonomy names. It cannot be
-    // `unenumerable`: that reason exists for a body whose buckets could not be
-    // read at all, and a parsed block rules exactly that out. Naming it here
-    // rather than falling through to `review_no_blocking_feedback` keeps the
-    // Ally/non-Ally split the taxonomy's JSDoc promises, which is what lets a
-    // reader tell a complete zero review from a body that lost its findings.
+    // The structured surface's healthy no-op. It reports the same reason as the
+    // prose surface below rather than a block-specific name, because the reason
+    // is the taxonomy ("Ally counted its findings and none of them block") and
+    // `predicate` is where the deciding code is named — that split is why the
+    // reason set does not have to grow every time a new surface learns to
+    // answer the same question. It cannot be `unenumerable`: that reason exists
+    // for a body whose buckets could not be read at all, which a parsed block
+    // rules out. Reached without consulting prose by design: the block
+    // short-circuits, so the `hasAllyConsolidatedReviewHeading` naming below is
+    // for block-less bodies only.
     return {
       actionable: false,
-      reason: "ally_review_findings_all_retired",
-      predicate: "allyVerdictBlock ok && no blocking findings count && no blocking ledger disposition",
+      reason: "ally_review_findings_all_zero",
+      predicate: "allyVerdictBlock parsed && every blocking-severity count === 0 && no blocking ledger entry",
     };
   }
   // An unreadable block falls through to prose rather than answering "no
@@ -1632,7 +1637,7 @@ export function classifyPrReviewActionability(
     }
     return {
       actionable: false,
-      reason: "ally_review_findings_all_retired",
+      reason: "ally_review_findings_all_zero",
       predicate: "hasAllyConsolidatedReviewHeading && every counted findings bucket === 0",
     };
   }
