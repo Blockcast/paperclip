@@ -605,10 +605,25 @@ export function isK8s409(err: unknown): boolean {
  *
  * @returns how the Secret came to exist, for logging.
  */
+type SecretDisposition = "created" | "adopted" | "recreated";
+
+/**
+ * Log verb per disposition.  Deliberately three distinct words: "Replaced" and
+ * "Recreated" are operationally different events — a leftover that was still
+ * there and got overwritten, versus one that vanished under us so the name had
+ * to be retaken — and which of the two occurred is exactly what you want to
+ * know when triaging the next occurrence.
+ */
+const SECRET_DISPOSITION_VERB = {
+  created: "Created",
+  adopted: "Replaced",
+  recreated: "Recreated",
+} as const satisfies Record<SecretDisposition, string>;
+
 export async function createOrAdoptRunSecret(
   coreApi: k8s.CoreV1Api,
   input: { name: string; namespace: string; runId: string; data: Record<string, string> },
-): Promise<"created" | "adopted" | "recreated"> {
+): Promise<SecretDisposition> {
   const body: k8s.V1Secret = {
     apiVersion: "v1",
     kind: "Secret",
@@ -624,51 +639,59 @@ export async function createOrAdoptRunSecret(
     stringData: input.data,
   };
 
-  try {
-    await coreApi.createNamespacedSecret({ namespace: input.namespace, body });
-    return "created";
-  } catch (err) {
-    if (!isK8s409(err)) throw err;
-
-    let existing: k8s.V1Secret;
+  // At most two passes.  The second exists only for the read-404 case below,
+  // where the name was freed under us and the create is worth exactly one
+  // retry; bounding it here rather than recursing keeps the "give up" path
+  // explicit and makes an infinite create/delete duel impossible.
+  for (let attempt = 0; ; attempt++) {
     try {
-      existing = await coreApi.readNamespacedSecret({ namespace: input.namespace, name: input.name });
-    } catch (readErr) {
-      if (isK8s404(readErr)) {
+      await coreApi.createNamespacedSecret({ namespace: input.namespace, body });
+      return attempt === 0 ? "created" : "recreated";
+    } catch (err) {
+      if (!isK8s409(err)) throw err;
+
+      let existing: k8s.V1Secret;
+      try {
+        existing = await coreApi.readNamespacedSecret({ namespace: input.namespace, name: input.name });
+      } catch (readErr) {
+        if (!isK8s404(readErr)) {
+          throw new Error(
+            `Secret ${input.namespace}/${input.name} already exists and could not be read`,
+            { cause: readErr },
+          );
+        }
         // Create said "exists", read said "gone": a cleanup delete landed in
         // between (the adapter's own finally-block reaper races a retry).  The
         // name is free again, so the correct move is to take it — not to
         // resurface the stale 409, which is what the sandbox-provider sibling
         // does and is a live way to fail a run that had nothing wrong with it.
-        await coreApi.createNamespacedSecret({ namespace: input.namespace, body });
-        return "recreated";
+        if (attempt === 0) continue;
+        // Twice in a row means something is actively churning this name.
+        // Surface the original 409 rather than spinning.
+        throw err;
       }
-      throw new Error(
-        `Secret ${input.namespace}/${input.name} already exists and could not be read`,
-        { cause: readErr },
-      );
-    }
 
-    const labels = existing.metadata?.labels ?? {};
-    const existingRunId = labels[RUN_ID_LABEL];
-    if (existingRunId !== undefined && existingRunId !== input.runId) {
-      throw new Error(
-        `Secret ${input.namespace}/${input.name} already exists and belongs to run ${existingRunId}, not ${input.runId}`,
-      );
-    }
-    const existingManagedBy = labels[MANAGED_BY_LABEL];
-    if (existingManagedBy !== undefined && existingManagedBy !== MANAGED_BY_VALUE) {
-      throw new Error(
-        `Secret ${input.namespace}/${input.name} already exists and is managed by ${existingManagedBy}, not ${MANAGED_BY_VALUE}`,
-      );
-    }
+      const labels = existing.metadata?.labels ?? {};
+      const existingRunId = labels[RUN_ID_LABEL];
+      if (existingRunId !== undefined && existingRunId !== input.runId) {
+        throw new Error(
+          `Secret ${input.namespace}/${input.name} already exists and belongs to run ${existingRunId}, not ${input.runId}`,
+        );
+      }
+      const existingManagedBy = labels[MANAGED_BY_LABEL];
+      if (existingManagedBy !== undefined && existingManagedBy !== MANAGED_BY_VALUE) {
+        throw new Error(
+          `Secret ${input.namespace}/${input.name} already exists and is managed by ${existingManagedBy}, not ${MANAGED_BY_VALUE}`,
+        );
+      }
 
-    await coreApi.replaceNamespacedSecret({
-      namespace: input.namespace,
-      name: input.name,
-      body: { ...body, metadata: { ...body.metadata, resourceVersion: existing.metadata?.resourceVersion } },
-    });
-    return "adopted";
+      await coreApi.replaceNamespacedSecret({
+        namespace: input.namespace,
+        name: input.name,
+        body: { ...body, metadata: { ...body.metadata, resourceVersion: existing.metadata?.resourceVersion } },
+      });
+      return "adopted";
+    }
   }
 }
 
@@ -1668,7 +1691,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           runId,
           data: promptSecret.data,
         });
-        await onLog("stdout", `[paperclip] ${disposition === "created" ? "Created" : "Reclaimed"} prompt Secret: ${promptSecret.name} (${Math.round(Buffer.byteLength(prompt, "utf-8") / 1024)} KiB)\n`);
+        await onLog("stdout", `[paperclip] ${SECRET_DISPOSITION_VERB[disposition]} prompt Secret: ${promptSecret.name} (${Math.round(Buffer.byteLength(prompt, "utf-8") / 1024)} KiB)\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Failed to create prompt Secret: ${msg}\n`);
@@ -1694,7 +1717,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           runId,
           data: envSecret.data,
         });
-        await onLog("stdout", `[paperclip] ${disposition === "created" ? "Created" : "Reclaimed"} env Secret: ${envSecret.name} (keys: ${Object.keys(envSecret.data).join(", ")})\n`);
+        await onLog("stdout", `[paperclip] ${SECRET_DISPOSITION_VERB[disposition]} env Secret: ${envSecret.name} (keys: ${Object.keys(envSecret.data).join(", ")})\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Failed to create env Secret: ${msg}\n`);
@@ -1723,7 +1746,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           runId,
           data: mcpConfigSecret.data,
         });
-        await onLog("stdout", `[paperclip] ${disposition === "created" ? "Created" : "Reclaimed"} mcp-config Secret: ${mcpConfigSecret.name}\n`);
+        await onLog("stdout", `[paperclip] ${SECRET_DISPOSITION_VERB[disposition]} mcp-config Secret: ${mcpConfigSecret.name}\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Failed to create mcp-config Secret: ${msg}\n`);

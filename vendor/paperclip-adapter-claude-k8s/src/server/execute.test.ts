@@ -1136,6 +1136,12 @@ describe("execute: job creation", () => {
     // cleanup throws a TypeError instead of doing what it says (BLO-21858).
     mockCoreCreateSecret.mockResolvedValue({});
     mockCoreDeleteSecret.mockResolvedValue({});
+    // Same reasoning as the two above, for the 409 adopt path (BLO-31665).
+    // Left unstubbed, a future test that trips a 409 gets `existing ===
+    // undefined` from the read and a TypeError masked into a secret-create
+    // failure — the exact trap the comment above was written about.
+    mockCoreReadSecret.mockResolvedValue({ metadata: { resourceVersion: "1" } });
+    mockCoreReplaceSecret.mockResolvedValue({});
   });
 
   it("returns k8s_job_create_failed when createNamespacedJob throws", async () => {
@@ -1163,6 +1169,19 @@ describe("execute: job creation", () => {
   // A prompt over the 256 KiB threshold forces the prompt Secret path.
   const largePromptCtx = () =>
     makeCtx({ context: { paperclipTaskMarkdown: "x".repeat(300 * 1024) } } as Partial<AdapterExecutionContext>);
+
+  // A sensitive-named adapterConfig env var forces the *env* Secret path
+  // (isSensitiveEnvName routes it to a secretKeyRef — BLO-17980).
+  const envSecretCtx = () =>
+    makeCtx({
+      agent: {
+        id: "agent-abc",
+        companyId: "co1",
+        name: "Test Agent",
+        adapterType: "claude_k8s",
+        adapterConfig: { env: { MY_API_TOKEN: "s3cret" } },
+      },
+    } as unknown as Partial<AdapterExecutionContext>);
 
   it("adopts a same-run leftover Secret and still creates the Job", async () => {
     mockCoreCreateSecret.mockRejectedValueOnce(alreadyExists409());
@@ -1206,6 +1225,30 @@ describe("execute: job creation", () => {
     expect(result.errorMessage).toContain("belongs to run some-other-run");
     expect(mockCoreReplaceSecret).not.toHaveBeenCalled();
     expect(mockBatchCreateJob).not.toHaveBeenCalled();
+  });
+
+  it("adopts a same-run leftover on the ENV Secret, the path that actually broke", async () => {
+    // The other three e2e cases drive the prompt Secret. The reported incident
+    // was k8s_env_secret_create_failed, so prove that exact path end to end
+    // rather than inferring it from the shared helper.
+    mockCoreCreateSecret.mockRejectedValueOnce(alreadyExists409());
+    mockCoreReadSecret.mockResolvedValue({
+      metadata: {
+        resourceVersion: "42",
+        labels: { "app.kubernetes.io/managed-by": "paperclip", "paperclip.io/run-id": "run-test-001" },
+      },
+    });
+    mockCoreReplaceSecret.mockResolvedValue({});
+
+    const result = await execute(envSecretCtx());
+
+    expect(result.errorCode).not.toBe("k8s_env_secret_create_failed");
+    // The Secret that 409'd must be the env one, or this test is silently
+    // re-testing the prompt path with different scaffolding.
+    expect(mockCoreCreateSecret.mock.calls[0][0].body.metadata.name).toMatch(/-env$/);
+    expect(mockCoreReplaceSecret).toHaveBeenCalledTimes(1);
+    expect(mockCoreReplaceSecret.mock.calls[0][0].name).toMatch(/-env$/);
+    expect(mockBatchCreateJob).toHaveBeenCalled();
   });
 
   it("acknowledges the created Job identity before continuing", async () => {
