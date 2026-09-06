@@ -384,6 +384,103 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     });
   });
 
+  // BLO-31993 — the classification the unit test cannot prove is wired up.
+  //
+  // `computeUnmaterializedDesiredSkills` being correct is not enough: the call
+  // site has to actually consult the catalog, and the AC2 hot path is the one
+  // place that could quietly skip it. So this drives a real run against a real
+  // `companySkills` row and asserts on the prompt the pod receives.
+  //
+  // The state under test is "catalog row present, runtime files absent". In
+  // production that is a rolling materialization sweep caught mid-flight — its
+  // rm -rf → mkdir → per-file write is not atomic. Reproducing a race in a test
+  // would be flaky, so it is induced deterministically instead: a row whose
+  // source directory does not exist AND whose fileInventory carries no
+  // SKILL.md, which makes `materializeRuntimeSkillFiles` throw and the caller
+  // drop the key with its bare `continue`. Different trigger, byte-identical
+  // state at the classification seam — which is what is being tested.
+  it("distinguishes a catalog row awaiting materialization from a key with no row", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const pendingKey = `company/${companyId}/pending-materialization-skill`;
+    // No `companySkills` row at all — the genuinely-absent control. Without it
+    // this test could pass by relabelling everything `materialization_pending`.
+    const danglingKey = `company/${companyId}/never-imported-skill`;
+    const skillDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-blo31993-"));
+    cleanupDirs.add(skillDir);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Skill Materialization Pending",
+      issuePrefix: `M${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(companySkills).values({
+      id: randomUUID(),
+      companyId,
+      key: pendingKey,
+      slug: "pending-materialization-skill",
+      name: "Pending Materialization Skill",
+      description: null,
+      markdown: "# Pending\n\nBody.\n",
+      sourceType: "local_path",
+      // Not on disk, so the direct-source branch misses and materialization runs.
+      sourceLocator: path.join(skillDir, "does-not-exist"),
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      // No SKILL.md entry, so materialization cannot satisfy `wroteSkillFile`
+      // and throws — the key is dropped and produces no runtime entry.
+      fileInventory: [{ path: "reference.md", kind: "reference" }],
+      metadata: { sourceKind: "local_path" },
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Materialization Pending Capture",
+      role: "engineer",
+      status: "idle",
+      adapterType: TEST_ADAPTER_TYPE,
+      adapterConfig: {
+        paperclipSkillSync: { desiredSkills: [pendingKey, danglingKey] },
+      },
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+    expect((await waitForRunToFinish(heartbeat, run!.id))?.status).toBe("succeeded");
+
+    const captured = capturedRuns.find((entry) => entry.agentId === agentId);
+    expect(captured).toBeDefined();
+    // Both keys really did fail to reach the pod, so the notice below is about
+    // something rather than passing vacuously.
+    expect(captured!.skills.map((entry) => entry.key)).toEqual([]);
+
+    const taskMarkdown = String(captured!.context.paperclipTaskMarkdown ?? "");
+    expect(taskMarkdown).toContain(pendingKey);
+    expect(taskMarkdown).toContain(danglingKey);
+    // The defect: the imported skill was told it was not in the library, and
+    // the reader was sent to re-import it.
+    expect(taskMarkdown).toContain(
+      `\`${pendingKey}\` — in the company skill library, but its runtime files are not published yet`,
+    );
+    expect(taskMarkdown).toContain(`\`${danglingKey}\` — not in the company skill library`);
+    expect(taskMarkdown).toContain("do not import them again");
+    // Counts are unchanged by the reclassification (AC).
+    expect(taskMarkdown).toContain("2 skills configured, 0 available");
+
+    expect(captured!.context.paperclipUnmaterializedSkills).toMatchObject({
+      declaredCount: 2,
+      materializedCount: 0,
+      missing: [
+        { key: pendingKey, reason: "materialization_pending" },
+        { key: danglingKey, reason: "absent" },
+      ],
+    });
+  });
+
   it("adds no skill notice when every declared skill materializes", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
