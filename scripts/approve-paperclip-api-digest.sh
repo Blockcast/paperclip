@@ -866,13 +866,13 @@ live_running_digest() {
   printf '%s\n' "${image#*@}"
 }
 
-# The image carried by the OLDEST ReplicaSet of this Deployment that still has
-# ready pods, or empty. Reached only when the Deployment's own template has failed
-# the serving gate -- typically because a rollout was applied and never became
+# The image carried by the LOWEST-REVISION ReplicaSet of this Deployment that still
+# has ready pods, or empty. Reached only when the Deployment's own template has
+# failed the serving gate -- typically because a rollout was applied and never became
 # ready, which leaves spec.template naming a digest that never carried traffic
 # while the previous ReplicaSet keeps serving the one that did.
 #
-# OLDEST rather than newest, and oldest rather than "exactly one" (BLO-32101).
+# LOWEST REVISION rather than newest, and rather than "exactly one" (BLO-32101).
 # Taking the NEWEST is wrong, for either of the two ways to reach the two-serving
 # case:
 #
@@ -892,36 +892,64 @@ live_running_digest() {
 # This function originally required EXACTLY ONE serving ReplicaSet and declined
 # otherwise, on the reasoning that neither of two serving digests is "the running
 # one". That is true and still not a reason to decline: in BOTH cases above the
-# OLDER ReplicaSet is the one carrying the last-healthy digest this reader exists
-# to recover -- in the stalled case it is the only object that still names it --
-# and declining threw it away. An RS with ready pods is serving traffic by
-# definition, and between two of them the older has been serving longer, so age
-# breaks the tie in exactly the direction this reader wants. Oldest-wins therefore
-# dominates: the two rules agree whenever one serving RS exists, and where they
-# differ the strict rule pinned nothing while oldest-wins pins the last-healthy
-# digest.
+# PREVIOUS ReplicaSet is the one carrying the last-healthy digest this reader
+# exists to recover -- in the stalled case it is the only object that still names
+# it -- and declining threw it away. An RS with ready pods is serving traffic by
+# definition, so ordering the serving set breaks the tie in exactly the direction
+# this reader wants. Ordered-wins therefore dominates: the two rules agree whenever
+# one serving RS exists, and where they differ the strict rule pinned nothing while
+# this one pins the last-healthy digest.
 #
-# Age is consulted ONLY to break a tie among ReplicaSets that already passed
+# The order is `deployment.kubernetes.io/revision` ASCENDING, NOT creationTimestamp.
+# This distinction is load-bearing rather than stylistic, and creationTimestamp is
+# outright wrong (raised on #1676, native-codex lens):
+#
+#   - The Deployment controller REUSES a ReplicaSet whose pod template is
+#     byte-identical to one it has seen before. FindNewReplicaSet matches it and
+#     getNewReplicaSet scales that existing object back up instead of minting a new
+#     one -- preserving its original creationTimestamp while bumping its revision
+#     annotation to the new highest revision.
+#   - So a reused RS is simultaneously the OLDEST by stamp and the NEWEST by
+#     rollout. "Older" then stops meaning "has been serving longer": a reused RS may
+#     have sat at zero replicas for days and only just scaled back up. Ordering by
+#     stamp would elect the digest being rolled OUT -- already admissible by
+#     construction, so pinning it wastes the slot that should have held the digest
+#     still serving, which then ages out and leaves nothing to fall back to. That is
+#     the BLO-28483 wedge this reader exists to prevent, reached by a new route.
+#   - This is not hypothetical here. `helm rollback paperclip <REVISION>` is the
+#     documented rollback path (deploy/helm/paperclip/README.md), it re-applies the
+#     stored manifest verbatim rather than re-rendering it, and the paperclip-api pod
+#     template carries only two variable annotations (deployed-commit and
+#     approval-plan-sha256) which that stored manifest restores unchanged. So a
+#     rollback reproduces a previously-seen template exactly and triggers the reuse.
+#     The approval ring has no purpose unless that path is exercised.
+#
+# Revision strictly dominates the stamp: revisions are unique per ReplicaSet and
+# monotonic per rollout, so the two agree whenever no reuse has occurred, and
+# revision is the correct answer when it has.
+#
+# Revision is consulted ONLY to break a tie among ReplicaSets that already passed
 # ownership and readiness, and the winner is then subjected to the same container
 # and repository checks as before, with no fallthrough to the runner-up. So an
-# oldest ReplicaSet whose containers disagree, or one carrying another
-# repository's image, still yields no digest rather than promoting the newer one
-# -- the older RS being disqualified is evidence about the rollback target, not an
+# elected ReplicaSet whose containers disagree, or one carrying another
+# repository's image, still yields no digest rather than promoting the next one
+# -- the elected RS being disqualified is evidence about the rollback target, not an
 # invitation to pick a different one.
 #
-# Two shapes leave no oldest to pick and are declined rather than guessed at, both
+# Two shapes leave no winner to pick and are declined rather than guessed at, both
 # of which the plain sort would otherwise answer arbitrarily:
 #
-#   - Equal creationTimestamps. Kubernetes stamps these at one-second granularity,
-#     so two ReplicaSets minted inside the same second tie for real. jq's sort
-#     would then resolve on input order, i.e. on apiserver list order.
-#   - A missing creationTimestamp. It defaults to the empty string, which sorts
-#     BEFORE every real timestamp, so a ReplicaSet with no stamp would win as
-#     "oldest" on the strength of the field being absent.
+#   - Equal revisions. Two ReplicaSets of one Deployment should never share a
+#     revision, so this is a shape outside the controller's model rather than a
+#     near-miss; jq's sort would resolve it on apiserver list order.
+#   - A missing or non-numeric revision annotation. The controller sets it on every
+#     ReplicaSet it creates (verified on the live paperclip-api set, 2026-09-06),
+#     so its absence likewise means something outside the model. Declining is the
+#     conservative direction: it costs a recovery opportunity, where guessing costs
+#     the rollback target.
 #
-# Timestamps are compared as strings, which is exact rather than approximate:
-# metav1.Time marshals as RFC3339 in UTC with a fixed layout, so lexicographic and
-# chronological order coincide.
+# Revisions are compared NUMERICALLY after an explicit integer test, so revision 9
+# does not outrank revision 10 the way a string compare would.
 #
 # ReplicaSets are matched by the Deployment's own selector AND by an ownerReference
 # to its uid. The selector alone is server-side narrowing; the uid is what makes it
@@ -1003,6 +1031,18 @@ serving_replicaset_image() {
             else ""
             end;
 
+        # null for a ReplicaSet whose revision annotation is absent or not an
+        # integer, which the caller below turns into a decline. The string test
+        # runs before tonumber so a malformed value declines rather than aborting
+        # the whole program, and the type guard runs before the string test so a
+        # non-string annotation cannot error inside test() either.
+        def rs_revision:
+          ((.metadata.annotations // {})["deployment.kubernetes.io/revision"]) as $r
+          | if ($r | type) == "string" and ($r | test("^[0-9]+$"))
+            then ($r | tonumber)
+            else null
+            end;
+
         [ .items[]?
           | select(
               [ (.metadata.ownerReferences // [])[]
@@ -1011,12 +1051,12 @@ serving_replicaset_image() {
             )
           | select((.status.readyReplicas // 0) > 0)
         ] as $serving
-        | [ $serving[] | .metadata.creationTimestamp // "" ] as $stamps
+        | [ $serving[] | rs_revision ] as $revisions
         | if   ($serving | length) == 0 then ""
           elif ($serving | length) == 1 then ($serving[0] | rs_image)
-          elif ($stamps | map(select(. == "")) | length) > 0 then ""
-          elif (($stamps | sort) | .[0] == .[1]) then ""
-          else ($serving | sort_by(.metadata.creationTimestamp) | .[0] | rs_image)
+          elif ($revisions | map(select(. == null)) | length) > 0 then ""
+          elif (($revisions | sort) | .[0] == .[1]) then ""
+          else ($serving | sort_by(rs_revision) | .[0] | rs_image)
           end
       ' <<<"$rs_json" 2>/dev/null)" || image=""
     fi
