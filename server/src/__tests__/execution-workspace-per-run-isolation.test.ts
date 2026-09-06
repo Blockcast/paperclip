@@ -238,6 +238,76 @@ describe("applyRunScopeToBranchName", () => {
     // two runs back onto one tree, which is the whole bug.
     expect(scoped).toMatch(/-r[0-9a-f]{8}$/);
   });
+
+  // BLO-23144 (2). The case above has the identifier at the FRONT, so
+  // end-truncation cannot reach it and it passes with or without the fix. These
+  // put the identifier where a custom branchTemplate that renders it last would
+  // put it: past the cut.
+  describe("BLO-23144: the length clamp preserves the issue identifier", () => {
+    // Long enough that the clamp fires, positioned so the identifier straddles
+    // the cut (budget is 120 - "-r"+8 = 110). Pre-fix this yielded a branch
+    // ending "...aaa-BLO-2", i.e. no extractable identifier at all.
+    const identifierLast = `${"a".repeat(104)}-BLO-23144`;
+
+    it("keeps an identifier rendered at the END of an over-long branch", () => {
+      const scoped = applyRunScopeToBranchName(identifierLast, "per_run", runId, "BLO-23144");
+
+      expect(scoped.length).toBeLessThanOrEqual(120);
+      expect(scoped).toContain("BLO-23144");
+      // Uppercase and intact: the github-webhook forward-capture extractor is
+      // uppercase-only, so a surviving-but-lowercased identifier would not
+      // ref-link either (BLO-9117).
+      expect(scoped).toMatch(/BLO-23144/);
+      // And the run token still survives alongside it — preserving the
+      // identifier must not be paid for with the isolation guarantee.
+      expect(scoped).toMatch(/-r[0-9a-f]{8}$/);
+    });
+
+    it("still clamps, and still round-trips the same run to the same branch", () => {
+      const a = applyRunScopeToBranchName(identifierLast, "per_run", runId, "BLO-23144");
+      const b = applyRunScopeToBranchName(identifierLast, "per_run", runId, "BLO-23144");
+      expect(a).toBe(b);
+      expect(a.length).toBeLessThanOrEqual(120);
+    });
+
+    it("does not disturb a branch that already fits", () => {
+      // The re-anchor only triggers on the truncating path; a short name must be
+      // left exactly as the pre-fix code produced it.
+      const short = applyRunScopeToBranchName("agent-slug-BLO-23144", "per_run", runId, "BLO-23144");
+      expect(short).toMatch(/^agent-slug-BLO-23144-r[0-9a-f]{8}$/);
+    });
+  });
+
+  // BLO-23144 (3). Two distinct run ids that share their first 8 alphanumerics.
+  // The old token was `id.replace(/[^A-Za-z0-9]+/g,"").slice(0,8)` — for a UUID
+  // that is `time_low` alone — so both of these produced the token "11111111",
+  // hence one branch, hence one worktree for two concurrent runs: precisely the
+  // isolation failure BLO-19063 exists to prevent.
+  it("BLO-23144: derives the token from the whole run id, not its first 8 characters", () => {
+    const shared = "11111111-2222-4333-8444-555555555555";
+    const sharedPrefix = "11111111-9999-4333-8444-555555555555";
+    expect(shared.replace(/[^A-Za-z0-9]+/g, "").slice(0, 8)).toBe(
+      sharedPrefix.replace(/[^A-Za-z0-9]+/g, "").slice(0, 8),
+    );
+
+    const a = applyRunScopeToBranchName("BLO-1-x", "per_run", shared);
+    const b = applyRunScopeToBranchName("BLO-1-x", "per_run", sharedPrefix);
+
+    expect(a).not.toBe(b);
+    // Neither may be a prefix of the other: worktree paths are join(parent,
+    // branch), so a prefix relationship is still a nesting hazard.
+    expect(a.startsWith(b)).toBe(false);
+    expect(b.startsWith(a)).toBe(false);
+  });
+
+  it("BLO-23144: hashing does not invent a token for an id with no usable characters", () => {
+    // A digest maps every input to a plausible token, including "" and "---", so
+    // the "no run id degrades loudly" guarantee has to be decided on the raw id.
+    // Deciding it on the digest would put every id-less run on one shared branch
+    // while the name still read as per-run.
+    expect(applyRunScopeToBranchName("BLO-1-x", "per_run", "---")).toBe("BLO-1-x");
+    expect(applyRunScopeToBranchName("BLO-1-x", "per_run", "   ")).toBe("BLO-1-x");
+  });
 });
 
 describe("runScope is reachable by configuration (AC3)", () => {

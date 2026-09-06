@@ -658,6 +658,45 @@ const RUN_SCOPE_TOKEN_LENGTH = 8;
 const BRANCH_NAME_MAX_LENGTH = 120;
 
 /**
+ * BLO-23144 (2): clamp `branchName` into `budget` characters without losing the
+ * issue identifier.
+ *
+ * The clamp truncates from the END, so it only preserves the identifier when the
+ * identifier happens to sit at the FRONT of the rendered name. That is true for
+ * the default branchTemplate and for anything `applyIssueIdentifierToBranchName`
+ * had to prepend, which is why the original code could assert "applied after the
+ * identifier step so the identifier survives" and be right in practice. It is
+ * not true in general: a custom `branchTemplate` that renders the identifier
+ * last (`{{agent.slug}}-{{issue.identifier}}`) puts it exactly where the cut
+ * lands, and losing it breaks the BLO-9117 guarantee that a merged PR ref-links
+ * at merge time — silently, because the branch still looks well-formed.
+ *
+ * When the cut would eat the identifier, re-anchor it at the front, where
+ * end-truncation can never reach it, and spend whatever budget is left on the
+ * original name.
+ */
+function clampBranchBasePreservingIdentifier(
+  branchName: string,
+  issueIdentifier: string | null | undefined,
+  budget: number,
+): string {
+  if (branchName.length <= budget) return branchName;
+  const clamped = branchName.slice(0, budget);
+  const identifier = issueIdentifier ? sanitizeBranchName(issueIdentifier) : "";
+  // Nothing to protect, it already survived the cut, or it was never in the name
+  // to begin with (applyIssueIdentifierToBranchName's job, not this one's).
+  if (!identifier || clamped.includes(identifier) || !branchName.includes(identifier)) {
+    return clamped;
+  }
+  const prefix = `${identifier}-`;
+  // Degenerate budget: an identifier that cannot fit alongside the run token has
+  // nothing to re-anchor into. Prefer the plain clamp over emitting a branch that
+  // is nothing but an identifier.
+  if (prefix.length >= budget) return clamped;
+  return `${prefix}${branchName.slice(0, budget - prefix.length)}`;
+}
+
+/**
  * BLO-19063: derive a run-scoped branch name so that two concurrent runs never
  * share a working tree.
  *
@@ -667,34 +706,41 @@ const BRANCH_NAME_MAX_LENGTH = 120;
  * twice, so a per-run tree genuinely requires a per-run branch, not just a
  * per-run directory.
  *
- * The issue identifier is preserved verbatim in the result, so the BLO-9117
- * ref-linking guarantee (see applyIssueIdentifierToBranchName) still holds — the
- * token is appended, never substituted. Returns `branchName` unchanged for
- * `per_issue` scope or when no run id is available, which is what keeps this
- * opt-in rather than a fleet-wide migration.
+ * The issue identifier is preserved in the result, so the BLO-9117 ref-linking
+ * guarantee (see applyIssueIdentifierToBranchName) still holds — the token is
+ * appended, never substituted, and the clamp re-anchors the identifier rather
+ * than cutting it (see clampBranchBasePreservingIdentifier). Returns
+ * `branchName` unchanged for `per_issue` scope or when no run id is available,
+ * which is what keeps this opt-in rather than a fleet-wide migration.
  */
 export function applyRunScopeToBranchName(
   branchName: string,
   runScope: ExecutionWorkspaceRunScope | null | undefined,
   heartbeatRunId: string | null | undefined,
+  issueIdentifier?: string | null,
 ): string {
   if (runScope !== "per_run") return branchName;
-  // Derive the token from the raw run id rather than via sanitizeBranchName:
-  // that helper substitutes a literal "paperclip-work" for empty input, which
-  // would turn every run *without* a run id into the same token ("papercli")
-  // and silently collapse them back onto one shared tree while still looking
-  // per-run. A missing id must degrade to the issue-scoped name loudly, not to
-  // a colliding one quietly.
-  const token = (heartbeatRunId ?? "")
-    .replace(/[^A-Za-z0-9]+/g, "")
-    .slice(0, RUN_SCOPE_TOKEN_LENGTH)
-    .toLowerCase();
-  // No usable run id (e.g. a non-heartbeat realize path): fall back to the
-  // issue-scoped name rather than inventing a token, which would strand a tree
-  // nothing can find again.
-  if (!token) return branchName;
+  // Decide "is there a usable run id?" on the RAW id, before hashing. A hash maps
+  // every input to a plausible-looking token, including "" and "-----", so
+  // deciding on the digest would resurrect the exact failure the original code
+  // avoided: runs without an id silently colliding on one token while still
+  // looking per-run. A missing id must degrade to the issue-scoped name loudly.
+  if (!/[A-Za-z0-9]/.test(heartbeatRunId ?? "")) return branchName;
+  // BLO-23144 (3): hash the WHOLE run id rather than slicing its first 8
+  // alphanumerics. For a UUID those 8 are just `time_low` — one field, ~32 bits —
+  // so uniqueness rested on a fraction of the id and on the id happening to be a
+  // UUID at all. A digest depends on every character and is stable across calls,
+  // which is what the worktree lookup needs.
+  const token = createHash("sha256")
+    .update(heartbeatRunId ?? "")
+    .digest("hex")
+    .slice(0, RUN_SCOPE_TOKEN_LENGTH);
   const suffix = `-r${token}`;
-  const base = branchName.slice(0, BRANCH_NAME_MAX_LENGTH - suffix.length);
+  const base = clampBranchBasePreservingIdentifier(
+    branchName,
+    issueIdentifier,
+    BRANCH_NAME_MAX_LENGTH - suffix.length,
+  );
   return sanitizeBranchName(`${base}${suffix}`);
 }
 
@@ -3918,11 +3964,14 @@ export async function realizeExecutionWorkspace(input: {
   //
   // BLO-19063: then, under `runScope: "per_run"`, append a run token so two
   // concurrent runs of this issue land in different trees instead of sharing
-  // one. Applied after the identifier step so the identifier survives.
+  // one. Applied after the identifier step, and handed the identifier so its
+  // length clamp can re-anchor rather than truncate it (BLO-23144) — ordering
+  // alone only protects an identifier that sits at the front.
   let branchName = applyRunScopeToBranchName(
     applyIssueIdentifierToBranchName(renderedBranch, input.issue?.identifier ?? null),
     resolveExecutionWorkspaceRunScope(rawStrategy.runScope),
     input.heartbeatRunId ?? null,
+    input.issue?.identifier ?? null,
   );
   const configuredParentDir = asString(rawStrategy.worktreeParentDir, "");
   const worktreeParentDir = configuredParentDir
