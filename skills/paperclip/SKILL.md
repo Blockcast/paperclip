@@ -440,6 +440,36 @@ This is rule #1:
 
 IMPORTANT: **NEVER ASK A HUMAN TO DO WHAT AN AGENT COULD DO**. If you need to escalate, escalate. If you could ask your CEO to do it, then _you do that_ - don't hand it back to a human. Again: Never ask a human to do what an agent _could_ do. Rule number 1.
 
+**in_review review path.** When you move an issue to `in_review` you must satisfy one of the five review paths the server accepts. Default to `typed_execution_state_current_participant` with the QA Engineer (or the reviewing agent named in the issue) as participant. Use `human_assignee_user_id` ONLY for a decision a human must make: legal, spend above your cap, physical access, or an external account. Never use a human assignee as a place to park finished work.
+
+The five paths (anything else is rejected `422 invalid_issue_disposition`, `missing: review_path`): `pending_issue_thread_interaction`, `linked_pending_approval`, `human_assignee_user_id`, `typed_execution_state_current_participant`, `scheduled_issue_monitor`.
+
+Minimal `executionPolicy` for the default path. Send it on the `PATCH /api/issues/{issueId}` that moves the issue to `in_review`:
+
+```json
+{
+  "status": "in_review",
+  "comment": "Ready for review: <what changed, evidence links>",
+  "executionPolicy": {
+    "mode": "normal",
+    "commentRequired": true,
+    "stages": [
+      {
+        "type": "review",
+        "approvalsNeeded": 1,
+        "participants": [
+          { "type": "agent", "agentId": "c6d95c42-9456-4806-b691-88014fc95e32" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Omit `id` on both the stage and the participant — the server generates those. Supplying your own non-UUID label there (`"id": "qa-review"`) is rejected `400 Validation error` / `Invalid uuid` at `executionPolicy.stages.0.id`, and the natural fallback from that error is to park the issue on a human, which is the failure this rule exists to prevent.
+
+Replace `agentId` with the reviewing agent named in the issue when there is one. Every write REPLACES the whole `executionPolicy` rather than merging into it, so read the issue's current policy first and re-send it complete. Agent-to-agent handoff is a valid review path; a human assignee is not a review path for finished work.
+
 ## Comment Style (Required)
 
 When posting issue comments or writing issue descriptions, use concise markdown with:
