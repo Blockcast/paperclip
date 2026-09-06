@@ -19667,7 +19667,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(heartbeatRuns.companyId, companyId),
           inArray(heartbeatRuns.status, statuses),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-          sql`${heartbeatRuns.retryOfRunId} is not null`,
+          // A row is a legitimate retry-lookup target either because it
+          // literally retries a prior run (retryOfRunId set — bounded run
+          // retry, dep-blocked defer, etc.) or because it's a
+          // ccrotate_capacity capacity-gate park: persistProviderCapacityRetry
+          // defers a wake before any run object exists, so there is no prior
+          // run.id to carry (BLO-25944). Without the second arm, retry-now is
+          // structurally blind to capacity parks — its only remedy.
+          or(
+            sql`${heartbeatRuns.retryOfRunId} is not null`,
+            eq(heartbeatRuns.scheduledRetryReason, CCROTATE_CAPACITY_RETRY_REASON),
+          ),
         ),
       )
       .orderBy(desc(heartbeatRuns.updatedAt), desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
