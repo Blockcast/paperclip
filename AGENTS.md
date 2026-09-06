@@ -281,11 +281,16 @@ re-derive it or re-file it as a fresh misattribution report:
   config file, and again with a conflicting local `user.email` set, both of
   which committed as the acting agent. If you genuinely need a *different*
   author for one commit, two per-invocation overrides reach it and no config
-  file does: `GIT_AUTHOR_EMAIL=… GIT_COMMITTER_EMAIL=… git commit …` moves both
-  the author and the committer, and `git commit --author="Name <addr>"` moves
-  **only** the author, leaving you as committer — which is usually what you
-  want, since it records who wrote the change without disclaiming who ran it.
-  `-c user.email=…` reaches neither. Earlier revisions of this file called
+  file does. `git commit --author="Name <addr>"` moves **only** the author,
+  leaving you as committer — usually what you want, since it records who wrote
+  the change without disclaiming who ran it. The environment form moves both,
+  but you must override the **names as well as the addresses**:
+  `GIT_AUTHOR_NAME=… GIT_AUTHOR_EMAIL=… GIT_COMMITTER_NAME=… GIT_COMMITTER_EMAIL=… git commit …`.
+  Setting only the two `*_EMAIL` variables leaves `GIT_AUTHOR_NAME` in the
+  environment still winning, which silently yields the mismatched pair
+  `CTO <someone@example.com>` — your name against their address, which is worse
+  than either endpoint (verified 2026-09-06). `-c user.email=…` reaches
+  neither. Earlier revisions of this file called
   this "a known, unfixed provisioning gap (BLO-23894)" and told you to run
   `git config` by hand — that was true of the 2026-08-10 sweep (71 checkouts:
   11 App-stamped, 18 with no identity) and was fixed by BLO-29050.
@@ -312,10 +317,12 @@ re-derive it or re-file it as a fresh misattribution report:
   the bare `allyblockcast[bot]@users.noreply.github.com`.** That bare form is
   the `graphify-reindex` bot's own legitimate `git push` identity, verified
   against real PRs (#789, #944) — widening the match would flag its
-  commits. If your checkout's local `user.email` shows the bare form, that
-  is still a misconfigured checkout (see above): fix the local config; do
-  not ask the gate to catch it, it cannot distinguish the two cases by email
-  alone.
+  commits. If a *commit* shows the bare form, that is the `graphify-reindex`
+  bot's own identity, not a misconfigured checkout — diagnose it with
+  `git log -1 --pretty='%an <%ae>'`, not with `git config user.email`, which
+  no longer decides authorship (see above) and so cannot tell you anything
+  about what the gate saw. Do not ask the gate to catch it; it cannot
+  distinguish the two cases by email alone.
 - CI enforces this going forward on every `paperclip` PR
   (`scripts/check-commit-author-attribution.mjs`, wired into `pr.yml`); an
   on-demand cross-repo audit mode (`--audit-merged`) covers
