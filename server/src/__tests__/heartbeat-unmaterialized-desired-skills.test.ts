@@ -72,7 +72,7 @@ describe("computeUnmaterializedDesiredSkills", () => {
   // itself mean "absent from the library" — which is exactly the false claim
   // the live notice printed. The catalog is the discriminator, so it is passed
   // in as a separate axis rather than inferred from the entries array.
-  it("reports a declared key with a catalog row but no runtime entry as `materialization_pending`", () => {
+  it("reports a declared key with a catalog row but no runtime entry as `runtime_files_unpublished`", () => {
     expect(computeUnmaterializedDesiredSkills({
       desiredSkillKeys: [
         "blockcast/hindsight/hindsight-self-hosted",
@@ -88,12 +88,12 @@ describe("computeUnmaterializedDesiredSkills", () => {
     })).toEqual([
       {
         key: "blockcast/hindsight/hindsight-self-hosted",
-        reason: "materialization_pending",
+        reason: "runtime_files_unpublished",
         detail: null,
       },
       {
         key: "obra/superpowers/dispatching-parallel-agents",
-        reason: "materialization_pending",
+        reason: "runtime_files_unpublished",
         detail: null,
       },
     ]);
@@ -106,7 +106,7 @@ describe("computeUnmaterializedDesiredSkills", () => {
       runtimeSkillEntries: [],
       catalogSkillKeys: ["a/b/pending"],
     })).toEqual([
-      { key: "a/b/pending", reason: "materialization_pending", detail: null },
+      { key: "a/b/pending", reason: "runtime_files_unpublished", detail: null },
       { key: "garrytan/gstack/design-shotgun", reason: "absent", detail: null },
     ]);
   });
@@ -122,7 +122,7 @@ describe("computeUnmaterializedDesiredSkills", () => {
 
   it("keeps `unresolved_source` for a surviving entry even when the catalog row exists", () => {
     // A catalog row is always present for an entry that survived resolution,
-    // so `materialization_pending` must not shadow the sourceStatus branch.
+    // so `runtime_files_unpublished` must not shadow the sourceStatus branch.
     expect(computeUnmaterializedDesiredSkills({
       desiredSkillKeys: ["a/b/one"],
       runtimeSkillEntries: [{ key: "a/b/one", sourceStatus: "missing", missingDetail: "gone" }],
@@ -150,7 +150,7 @@ describe("computeUnmaterializedDesiredSkills", () => {
     expect(withoutCatalog.map((entry) => entry.reason))
       .toEqual(["absent", "absent", "unresolved_source"]);
     expect(withCatalog.map((entry) => entry.reason))
-      .toEqual(["materialization_pending", "absent", "unresolved_source"]);
+      .toEqual(["runtime_files_unpublished", "absent", "unresolved_source"]);
   });
 
   it("trims catalog keys before comparing them", () => {
@@ -158,7 +158,7 @@ describe("computeUnmaterializedDesiredSkills", () => {
       desiredSkillKeys: [" a/b/pending "],
       runtimeSkillEntries: [],
       catalogSkillKeys: [" a/b/pending ", "", "   "],
-    })).toEqual([{ key: "a/b/pending", reason: "materialization_pending", detail: null }]);
+    })).toEqual([{ key: "a/b/pending", reason: "runtime_files_unpublished", detail: null }]);
   });
 
   it("treats an entry with no sourceStatus as materialized", () => {
@@ -170,7 +170,8 @@ describe("computeUnmaterializedDesiredSkills", () => {
     })).toEqual([]);
   });
 
-  it("normalizes whitespace and de-duplicates declared keys", () => {    expect(computeUnmaterializedDesiredSkills({
+  it("normalizes whitespace and de-duplicates declared keys", () => {
+    expect(computeUnmaterializedDesiredSkills({
       desiredSkillKeys: [" a/b/gone ", "a/b/gone", "", "   "],
       runtimeSkillEntries: [],
     })).toEqual([{ key: "a/b/gone", reason: "absent", detail: null }]);
@@ -209,11 +210,11 @@ describe("buildUnmaterializedSkillNoticeMarkdown", () => {
   // BLO-31993: the actionable half. A skill that is already in the library must
   // not be described as missing from it, and the reader must not be told to
   // import it again.
-  it("does not claim a `materialization_pending` key is missing from the library", () => {
+  it("does not claim a `runtime_files_unpublished` key is missing from the library", () => {
     const notice = buildUnmaterializedSkillNoticeMarkdown(
       [{
         key: "blockcast/hindsight/hindsight-self-hosted",
-        reason: "materialization_pending",
+        reason: "runtime_files_unpublished",
         detail: null,
       }],
       13,
@@ -222,12 +223,18 @@ describe("buildUnmaterializedSkillNoticeMarkdown", () => {
     expect(notice).toContain("in the company skill library, but its runtime files are not published yet");
     // The exact false claim from the live repro.
     expect(notice).not.toContain("— not in the company skill library");
-    expect(notice).toContain("already imported");
+    expect(notice).toContain("already in the company skill library");
     expect(notice).toContain("do not import them again");
     // Nothing here is a permanent configuration fault, so the flat
     // "retrying will not fix it" verdict must not be asserted over it.
     expect(notice).not.toContain("retrying will not fix it");
     expect(notice).not.toContain("This is a configuration fault");
+    // ...but the opposite claim is equally unsupported. This state is reached
+    // both by a sweep mid-flight and by a deterministic materialization throw
+    // (no `SKILL.md` producible), and `.catch(() => null)` discards which. So
+    // the notice must not promise it clears by itself either.
+    expect(notice).not.toContain("so a later run will pick them up");
+    expect(notice).toContain("Report it if it persists across runs");
     // Counts are unchanged by the reclassification.
     expect(notice).toContain("13 skills configured, 12 available");
   });
@@ -250,7 +257,7 @@ describe("buildUnmaterializedSkillNoticeMarkdown", () => {
   it("gives both remediations, scoped, when the two classes are mixed", () => {
     const notice = buildUnmaterializedSkillNoticeMarkdown(
       [
-        { key: "a/b/pending", reason: "materialization_pending", detail: null },
+        { key: "a/b/pending", reason: "runtime_files_unpublished", detail: null },
         { key: "a/b/gone", reason: "absent", detail: null },
       ],
       4,
@@ -261,6 +268,46 @@ describe("buildUnmaterializedSkillNoticeMarkdown", () => {
     expect(notice).not.toContain("This is a configuration fault");
     expect(notice).toContain("do not import them again");
     expect(notice).toContain("4 skills configured, 2 available");
+  });
+
+  // Review follow-up on #1679: the remediation flags are derived from every
+  // reported key, but only the first 20 are rendered. A pending key past the
+  // cap would otherwise produce a paragraph with no visible referent.
+  it("says what a truncated list is hiding so every remediation has a referent", () => {
+    const notice = buildUnmaterializedSkillNoticeMarkdown(
+      [
+        ...Array.from({ length: 20 }, (_unused, index) => ({
+          key: `a/b/gone-${index}`,
+          reason: "absent" as const,
+          detail: null,
+        })),
+        { key: "a/b/pending-one", reason: "runtime_files_unpublished" as const, detail: null },
+        { key: "a/b/pending-two", reason: "runtime_files_unpublished" as const, detail: null },
+      ],
+      30,
+    );
+    // Both pending keys are past the cap, so neither is rendered as a bullet...
+    expect(notice).not.toContain("a/b/pending-one");
+    // ...but the reader is still told they are there, and still gets the
+    // "do not re-import" advice that applies to them. Deriving the flags from
+    // the visible slice instead would drop that advice AND assert the flat
+    // "retrying will not fix it" verdict over them — the bug this PR removes.
+    expect(notice).toContain("- …and 2 more (2 with runtime files unpublished)");
+    expect(notice).toContain("do not import them again");
+    expect(notice).toContain("retrying will not fix them");
+  });
+
+  it("does not annotate the overflow line when nothing hidden is pending", () => {
+    const notice = buildUnmaterializedSkillNoticeMarkdown(
+      Array.from({ length: 22 }, (_unused, index) => ({
+        key: `a/b/gone-${index}`,
+        reason: "absent" as const,
+        detail: null,
+      })),
+      30,
+    );
+    expect(notice).toContain("- …and 2 more");
+    expect(notice).not.toContain("with runtime files unpublished");
   });
 
   it("does not go negative when the delta exceeds the declared count", () => {
