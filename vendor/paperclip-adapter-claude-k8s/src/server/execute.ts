@@ -38,6 +38,10 @@ const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
 const K8S_CONCURRENCY_GUARD_TIMEOUT_MS = 15_000;
 const RUN_ID_LABEL = "paperclip.io/run-id";
+const MANAGED_BY_LABEL = "app.kubernetes.io/managed-by";
+const MANAGED_BY_VALUE = "paperclip";
+const ADAPTER_TYPE_LABEL = "paperclip.io/adapter-type";
+const ADAPTER_TYPE_VALUE = "claude_k8s";
 const ISOLATION_MODE_LABEL = "paperclip.io/isolation-mode";
 const ISOLATION_KEY_LABEL = "paperclip.io/isolation-key";
 const TASK_KEY_LABEL = "paperclip.io/task-key";
@@ -540,6 +544,120 @@ export function isK8s404(err: unknown): boolean {
   if (resp?.statusCode === 404 || resp?.status === 404) return true;
   if (e.statusCode === 404) return true;
   return /HTTP-Code:\s*404\b/.test(err.message);
+}
+
+/**
+ * Returns true for a Kubernetes 409 (`AlreadyExists` on a create).
+ *
+ * Mirrors isK8s404's shape deliberately, including the `HTTP-Code:` message
+ * probe.  That last clause is load-bearing rather than defensive: the
+ * production failures this guards against (BLO-31665) surfaced as
+ * `Failed to create env Secret: HTTP-Code: 409 ... "reason":"AlreadyExists"`,
+ * i.e. the status reached us only in the message text.  A predicate that
+ * inspects `code`/`statusCode` alone — as the sandbox-provider sibling in
+ * packages/plugins/sandbox-providers/kubernetes/src/secret-manager.ts does —
+ * would return false for exactly the errors observed in the incident.
+ */
+export function isK8s409(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const e = err as unknown as Record<string, unknown>;
+  const resp = e.response as Record<string, unknown> | undefined;
+  if (resp?.statusCode === 409 || resp?.status === 409) return true;
+  if (e.statusCode === 409 || e.code === 409) return true;
+  return /HTTP-Code:\s*409\b/.test(err.message);
+}
+
+/**
+ * Create one of the run-scoped Secrets (prompt / env / mcp-config), adopting
+ * an existing object instead of failing when the name is already taken.
+ *
+ * Why adopting is safe here.  Every one of these names is
+ * `${jobName}-{prompt,env,mcp}` where
+ * `jobName = ac-<agentSlug>-<runSlug>-<shortHash(agentId:runId)>`
+ * (job-manifest.ts).  The name therefore *encodes* the run identity, so a
+ * collision on the full name is a collision with this same (agentId, runId) —
+ * i.e. a leftover from an earlier attempt of this very run — and the contents
+ * are re-derived from the same config, so replacing is idempotent.  Before
+ * BLO-31665 every throw here was fatal, so a benign leftover killed the run.
+ *
+ * The identity check fails closed only on *positive contradiction*: a Secret
+ * whose labels actively disagree with this run is never overwritten.  Missing
+ * labels are tolerated, because a Secret written by an older adapter build is
+ * still one this run must be able to reclaim — a gate that requires labels to
+ * be present would refuse to adopt precisely the objects that need adopting.
+ *
+ * Note the label vocabulary differs from the sandbox-provider sibling
+ * (`app.kubernetes.io/managed-by: paperclip` here vs
+ * `paperclip.io/managed-by: paperclip-k8s-plugin` there); a verbatim copy of
+ * that gate would reject every Secret this adapter writes.
+ *
+ * @returns how the Secret came to exist, for logging.
+ */
+export async function createOrAdoptRunSecret(
+  coreApi: k8s.CoreV1Api,
+  input: { name: string; namespace: string; runId: string; data: Record<string, string> },
+): Promise<"created" | "adopted" | "recreated"> {
+  const body: k8s.V1Secret = {
+    apiVersion: "v1",
+    kind: "Secret",
+    metadata: {
+      name: input.name,
+      namespace: input.namespace,
+      labels: {
+        [MANAGED_BY_LABEL]: MANAGED_BY_VALUE,
+        [ADAPTER_TYPE_LABEL]: ADAPTER_TYPE_VALUE,
+        [RUN_ID_LABEL]: input.runId,
+      },
+    },
+    stringData: input.data,
+  };
+
+  try {
+    await coreApi.createNamespacedSecret({ namespace: input.namespace, body });
+    return "created";
+  } catch (err) {
+    if (!isK8s409(err)) throw err;
+
+    let existing: k8s.V1Secret;
+    try {
+      existing = await coreApi.readNamespacedSecret({ namespace: input.namespace, name: input.name });
+    } catch (readErr) {
+      if (isK8s404(readErr)) {
+        // Create said "exists", read said "gone": a cleanup delete landed in
+        // between (the adapter's own finally-block reaper races a retry).  The
+        // name is free again, so the correct move is to take it — not to
+        // resurface the stale 409, which is what the sandbox-provider sibling
+        // does and is a live way to fail a run that had nothing wrong with it.
+        await coreApi.createNamespacedSecret({ namespace: input.namespace, body });
+        return "recreated";
+      }
+      throw new Error(
+        `Secret ${input.namespace}/${input.name} already exists and could not be read`,
+        { cause: readErr },
+      );
+    }
+
+    const labels = existing.metadata?.labels ?? {};
+    const existingRunId = labels[RUN_ID_LABEL];
+    if (existingRunId !== undefined && existingRunId !== input.runId) {
+      throw new Error(
+        `Secret ${input.namespace}/${input.name} already exists and belongs to run ${existingRunId}, not ${input.runId}`,
+      );
+    }
+    const existingManagedBy = labels[MANAGED_BY_LABEL];
+    if (existingManagedBy !== undefined && existingManagedBy !== MANAGED_BY_VALUE) {
+      throw new Error(
+        `Secret ${input.namespace}/${input.name} already exists and is managed by ${existingManagedBy}, not ${MANAGED_BY_VALUE}`,
+      );
+    }
+
+    await coreApi.replaceNamespacedSecret({
+      namespace: input.namespace,
+      name: input.name,
+      body: { ...body, metadata: { ...body.metadata, resourceVersion: existing.metadata?.resourceVersion } },
+    });
+    return "adopted";
+  }
 }
 
 /**
@@ -1532,24 +1650,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // PodSpec limit).  The Secret is cleaned up in the finally block.
     if (promptSecret) {
       try {
-        await coreApi.createNamespacedSecret({
+        const disposition = await createOrAdoptRunSecret(coreApi, {
+          name: promptSecret.name,
           namespace: promptSecret.namespace,
-          body: {
-            apiVersion: "v1",
-            kind: "Secret",
-            metadata: {
-              name: promptSecret.name,
-              namespace: promptSecret.namespace,
-              labels: {
-                "app.kubernetes.io/managed-by": "paperclip",
-                "paperclip.io/adapter-type": "claude_k8s",
-                "paperclip.io/run-id": runId,
-              },
-            },
-            stringData: promptSecret.data,
-          },
+          runId,
+          data: promptSecret.data,
         });
-        await onLog("stdout", `[paperclip] Created prompt Secret: ${promptSecret.name} (${Math.round(Buffer.byteLength(prompt, "utf-8") / 1024)} KiB)\n`);
+        await onLog("stdout", `[paperclip] ${disposition === "created" ? "Created" : "Reclaimed"} prompt Secret: ${promptSecret.name} (${Math.round(Buffer.byteLength(prompt, "utf-8") / 1024)} KiB)\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Failed to create prompt Secret: ${msg}\n`);
@@ -1569,24 +1676,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // clean it up in the finally block. Never log envSecret.data (values).
     if (envSecret) {
       try {
-        await coreApi.createNamespacedSecret({
+        const disposition = await createOrAdoptRunSecret(coreApi, {
+          name: envSecret.name,
           namespace: envSecret.namespace,
-          body: {
-            apiVersion: "v1",
-            kind: "Secret",
-            metadata: {
-              name: envSecret.name,
-              namespace: envSecret.namespace,
-              labels: {
-                "app.kubernetes.io/managed-by": "paperclip",
-                "paperclip.io/adapter-type": "claude_k8s",
-                "paperclip.io/run-id": runId,
-              },
-            },
-            stringData: envSecret.data,
-          },
+          runId,
+          data: envSecret.data,
         });
-        await onLog("stdout", `[paperclip] Created env Secret: ${envSecret.name} (keys: ${Object.keys(envSecret.data).join(", ")})\n`);
+        await onLog("stdout", `[paperclip] ${disposition === "created" ? "Created" : "Reclaimed"} env Secret: ${envSecret.name} (keys: ${Object.keys(envSecret.data).join(", ")})\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Failed to create env Secret: ${msg}\n`);
@@ -1609,24 +1705,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // — never a literal env var. Never log mcpConfigSecret.data (values).
     if (mcpConfigSecret) {
       try {
-        await coreApi.createNamespacedSecret({
+        const disposition = await createOrAdoptRunSecret(coreApi, {
+          name: mcpConfigSecret.name,
           namespace: mcpConfigSecret.namespace,
-          body: {
-            apiVersion: "v1",
-            kind: "Secret",
-            metadata: {
-              name: mcpConfigSecret.name,
-              namespace: mcpConfigSecret.namespace,
-              labels: {
-                "app.kubernetes.io/managed-by": "paperclip",
-                "paperclip.io/adapter-type": "claude_k8s",
-                "paperclip.io/run-id": runId,
-              },
-            },
-            stringData: mcpConfigSecret.data,
-          },
+          runId,
+          data: mcpConfigSecret.data,
         });
-        await onLog("stdout", `[paperclip] Created mcp-config Secret: ${mcpConfigSecret.name}\n`);
+        await onLog("stdout", `[paperclip] ${disposition === "created" ? "Created" : "Reclaimed"} mcp-config Secret: ${mcpConfigSecret.name}\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Failed to create mcp-config Secret: ${msg}\n`);
