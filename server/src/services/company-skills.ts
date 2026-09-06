@@ -5397,6 +5397,47 @@ export function companySkillService(db: Db) {
     return materializedSource ? { status: "available", source: materializedSource } : null;
   }
 
+  /**
+   * BLO-31993 — the catalog half of the AC2 delta, and *only* the catalog half.
+   *
+   * "Which declared keys are materialized on the runtime volume" and "which
+   * declared keys exist in this company's library" are different questions, and
+   * `listRuntimeSkillEntries` only answers the first. Conflating them is the
+   * defect this exists to fix: a skill whose `companySkills` row is present but
+   * whose files a rolling materialization sweep has not yet republished is
+   * dropped by that function's bare `continue`, so it looked identical to a key
+   * with no row at all and was reported to the agent as "not in the company
+   * skill library" — advising it to import a skill that was already imported.
+   *
+   * Deliberately a bare key projection: no `resolveRuntimeSkillSource`, no
+   * `ensureSkillInventoryCurrent`, no filesystem access of any kind. The AC2
+   * hot path must stay `reconcileInventory: false`, so classification may read
+   * the catalog table but may never trigger a reconcile.
+   */
+  async function listCatalogSkillKeys(
+    companyId: string,
+    skillKeys?: readonly string[],
+  ): Promise<string[]> {
+    const requestedKeys = skillKeys
+      ? Array.from(new Set(skillKeys.map((key) => key.trim()).filter(Boolean)))
+      : null;
+    // An explicit empty request means "no keys asked about", not "all keys" —
+    // without this an `inArray(..., [])` would widen to the whole company.
+    if (requestedKeys && requestedKeys.length === 0) return [];
+    const rows = await db
+      .select({ key: companySkills.key })
+      .from(companySkills)
+      .where(
+        requestedKeys
+          ? and(
+              eq(companySkills.companyId, companyId),
+              inArray(companySkills.key, requestedKeys),
+            )
+          : eq(companySkills.companyId, companyId),
+      );
+    return rows.map((row) => row.key);
+  }
+
   async function listRuntimeSkillEntries(
     companyId: string,
     options: RuntimeSkillEntryOptions = {},
@@ -6567,5 +6608,6 @@ export function companySkillService(db: Db) {
     installUpdate,
     resetSkill,
     listRuntimeSkillEntries,
+    listCatalogSkillKeys,
   };
 }
