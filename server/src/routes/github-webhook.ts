@@ -342,6 +342,18 @@ function hasPrReviewerAgentRequestMarker(body: string | null | undefined): boole
   return typeof body === "string" && PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN.test(body);
 }
 
+// BLO-23395: posted by .github/workflows/merge-queue-eviction-detector.yml
+// (scripts/merge-queue-eviction-detector.mjs) via the default GITHUB_TOKEN
+// whenever a PR is removed from the merge queue without being merged. Gated
+// on the exact github-actions[bot] login below (not just the marker) so an
+// arbitrary commenter cannot spoof a merge-queue-eviction wake.
+const MERGE_QUEUE_EVICTION_MARKER = "<!-- paperclip:merge-queue-eviction -->";
+const MERGE_QUEUE_EVICTION_BOT_LOGIN = "github-actions[bot]";
+
+function hasMergeQueueEvictionMarker(body: string | null | undefined): boolean {
+  return typeof body === "string" && body.trimStart().startsWith(MERGE_QUEUE_EVICTION_MARKER);
+}
+
 // BLO-23059: Claude Code Review posts its "this integration is paused/disabled"
 // org-settings notice as a FORMAL pull_request_review (state COMMENTED, commit_id
 // = current head), not as a plain comment. Measured 2026-08-07:
@@ -1213,7 +1225,12 @@ function resolveEventContextRaw(
           });
         }
       }
-      if (!reviewerRequest && !reviewFeedback) return null;
+      // BLO-23395: a merge-queue eviction notice is its own actionable
+      // signal, independent of the reviewer-request/feedback detection above
+      // (it is not authored by the reviewer bot at all).
+      const mergeQueueEvictionNotice =
+        commentAuthorLogin === MERGE_QUEUE_EVICTION_BOT_LOGIN && hasMergeQueueEvictionMarker(commentBody);
+      if (!reviewerRequest && !reviewFeedback && !mergeQueueEvictionNotice) return null;
       // BLO-9293: on a PR's issue_comment payload, `issue.user.login` is the PR
       // author (the comment author is `comment.user.login`, captured separately).
       const issueUser = issue.user as Record<string, unknown> | undefined;
@@ -1250,7 +1267,11 @@ function resolveEventContextRaw(
           issue.body as string | undefined,
         ),
         owningIdentifiers: owning.owning,
-        wakeReason: reviewerRequest ? "github_pr_review_requested" : "github_pr_review_feedback",
+        wakeReason: mergeQueueEvictionNotice
+          ? "github_pr_merge_queue_evicted"
+          : reviewerRequest
+            ? "github_pr_review_requested"
+            : "github_pr_review_feedback",
         prNumber,
         repoFullName,
         prTitle: issueTitle ?? null,
@@ -5313,6 +5334,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               : {}),
             ...(context.wakeReason === "github_pr_review_requested" && context.commentAuthorLogin
               ? { githubPrReviewRequestAuthorLogin: context.commentAuthorLogin }
+              : {}),
+            // BLO-23395: inline the eviction-cause comment so the woken agent
+            // doesn't have to fetch githubEventUrl just to learn why.
+            ...(context.wakeReason === "github_pr_merge_queue_evicted" && context.commentBody
+              ? { githubMergeQueueEvictionBody: context.commentBody }
               : {}),
           },
           // Coalesce rapid bursts on the same PR/event so a single review

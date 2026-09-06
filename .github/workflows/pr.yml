@@ -411,6 +411,11 @@ jobs:
         run: node --test ./scripts/__tests__/vitest-project-coverage.test.mjs
         timeout-minutes: 1
 
+      - name: Test merge-queue eviction detector (BLO-23395)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/merge-queue-eviction-detector.test.mjs
+        timeout-minutes: 1
+
       - name: Test release verify workflow wiring
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/release-verify-workflow.test.mjs
