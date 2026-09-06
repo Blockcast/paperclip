@@ -2921,10 +2921,16 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
     expect(reassignedAction).toMatchObject({
-      status: "escalated",
+      // BLO-19124: the owner change LIFTS the `attempt_budget` retirement, so the row comes
+      // back as `active` with no bound. It must not stay `escalated` carrying that bound —
+      // `shouldReuseStrandedRecoveryAction` reads `escalated` + an unchanged owner as a
+      // standing escalation and returns before the upsert on every later sweep, so the
+      // replacement owner would be woken exactly once and then starve on a budget it can
+      // never spend. Step 4 is what proves it can spend it; this pins the shape that lets it.
+      status: "active",
       ownerAgentId: secondManagerId,
       attemptCount: 1,
-      retiringBound: "attempt_budget",
+      retiringBound: null,
     });
     expect(wakesTo(secondManagerId)).toBe(1);
 
@@ -2966,6 +2972,166 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(exhaustionComments).toHaveLength(2);
     expect(exhaustionComments.some((body) => body.includes(`(owner \`${managerId}\`)`))).toBe(true);
     expect(exhaustionComments.some((body) => body.includes(`(owner \`${secondManagerId}\`)`))).toBe(true);
+  });
+
+  it("freezes the attempt counter across post-retirement sweeps that change the fingerprint", async () => {
+    // BLO-19124, Ally's review of #1542. The exhaustion test above and the budget test
+    // before it BOTH sweep an unchanged assignee, so `shouldReuseStrandedRecoveryAction`
+    // sees an unchanged fingerprint plus a standing escalation and returns BEFORE
+    // `upsertSourceScoped` reserves anything. Their freeze assertions therefore hold no
+    // matter what the retire/refund CAS does — they are blind to it, which is why the
+    // self-disarming predicate shipped green.
+    //
+    // This drives the one shape that clears that gate: a fingerprint that changes while the
+    // ROUTED OWNER stays put. The stranded fingerprint ends in `issue.assigneeAgentId`, so
+    // alternating the issue between two engineers who report to the SAME manager changes it
+    // every sweep while routing keeps resolving that one manager. The reuse gate declines,
+    // the reserve lands on an already-retired row, and the refund is the only thing standing
+    // between this and `attemptCount` climbing +1 per sweep forever (a live row reached 30).
+    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    const siblingCoderId = randomUUID();
+    await db.insert(agents).values({
+      id: siblingCoderId,
+      companyId,
+      name: "Sibling Coder",
+      role: "engineer",
+      status: "idle",
+      reportsTo: managerId,
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const baseRun = {
+      agentId: coderId,
+      status: "failed",
+      error: "agent is not invokable",
+      errorCode: "agent_not_invokable",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+    const wakesTo = (agentId: string) =>
+      enqueueWakeup.mock.calls.filter((call) => call[0] === agentId).length;
+
+    // Escalation reassigns the issue to the recovery owner, so the assignee is put back on
+    // one of the two engineers before every sweep. Alternating which one is what moves the
+    // fingerprint without moving the owner.
+    const sweepAs = async (assigneeAgentId: string) => {
+      await db
+        .update(issues)
+        .set({ assigneeAgentId, status: "in_progress" })
+        .where(eq(issues.id, sourceIssue.id));
+      const [current] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+      await recovery.escalateStrandedAssignedIssue({
+        issue: current!,
+        previousStatus: "in_progress",
+        latestRun: { ...baseRun, id: randomUUID() },
+        comment: "Automatic continuation recovery failed.",
+      });
+    };
+    const readAction = async () => {
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+      return row!;
+    };
+
+    // Burn the budget, then retire. One extra sweep past `maxAttempts` trips the exhaustion
+    // gate, which retires the row and refunds the reserve it did not spend.
+    for (let attempt = 0; attempt <= defaultRecoveryActionMaxAttempts; attempt += 1) {
+      await sweepAs(attempt % 2 === 0 ? coderId : siblingCoderId);
+    }
+    const retired = await readAction();
+    expect(retired).toMatchObject({
+      status: "escalated",
+      ownerAgentId: managerId,
+      retiringBound: "attempt_budget",
+      attemptCount: defaultRecoveryActionMaxAttempts,
+    });
+    expect(wakesTo(managerId)).toBe(defaultRecoveryActionMaxAttempts);
+
+    // Now the assertion the suite was missing. Every one of these sweeps reserves an attempt
+    // on a row that is already `escalated` with a bound set, which is precisely where the
+    // old CAS matched zero rows and stopped refunding. The counter must not move, the
+    // retirement must not be rewritten, and nobody must be woken again.
+    const retiredAt = retired.updatedAt;
+    for (let extra = 0; extra < 4; extra += 1) {
+      await sweepAs(extra % 2 === 0 ? siblingCoderId : coderId);
+      const frozen = await readAction();
+      expect(frozen.attemptCount).toBe(defaultRecoveryActionMaxAttempts);
+      expect(frozen.status).toBe("escalated");
+      expect(frozen.retiringBound).toBe("attempt_budget");
+      expect(wakesTo(managerId)).toBe(defaultRecoveryActionMaxAttempts);
+    }
+    // The non-delivery dimension is the one that MUST keep moving: these sweeps really did
+    // touch the row and really did wake nobody, and AC2 requires those be counted apart from
+    // delivered wakes. A frozen `attemptCount` with a frozen sweep count would mean the
+    // refund was never reached at all, which is the failure this test exists to tell apart.
+    const settled = await readAction();
+    expect(settled.nonDeliverySweepCount).toBeGreaterThan(retired.nonDeliverySweepCount);
+    expect(settled.updatedAt.getTime()).toBeGreaterThan(retiredAt.getTime());
+  });
+
+  it("retires a legacy escalated row that predates the retiring-bound column exactly once", async () => {
+    // BLO-19124, Ally's review of #1542. `0240` adds `retiring_bound` and backfills the rows
+    // already `escalated` when it runs. This covers the shape from the other side: the CAS
+    // must be able to retire an `escalated` row that reaches the sweep without a bound, so a
+    // row arriving in that state by any route other than the backfill can still acquire one.
+    //
+    // Before the widening both retire predicates required `status = 'active'`, so a legacy
+    // row matched zero rows and the return value was discarded at the call site. It stayed a
+    // backstop candidate — `isNull(retiringBound)` keeps admitting it — on every future
+    // sweep, incrementing `exhaustedSkipped` forever without ever being retired.
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      status: "escalated",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "agent_not_invokable",
+      fingerprint: `legacy:${actionId}`,
+      evidence: {},
+      nextAction: "Wake the recovery owner.",
+      attemptCount: 0,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
+      timeoutAt: new Date(Date.now() - 60 * 60 * 1000),
+      retiringBound: null,
+    });
+
+    const first = await svc.retireWakeAction({
+      companyId,
+      actionId,
+      retiringBound: "timeout_horizon",
+    });
+    expect(first).toMatchObject({ status: "escalated", retiringBound: "timeout_horizon" });
+
+    // Idempotent: `retiring_bound IS NULL` is what carries that, and a second pass must not
+    // relabel a row with a bound some other path already wrote.
+    const second = await svc.retireWakeAction({
+      companyId,
+      actionId,
+      retiringBound: "attempt_budget",
+    });
+    expect(second).toBeNull();
+    const [settled] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(settled).toMatchObject({ status: "escalated", retiringBound: "timeout_horizon" });
   });
 
   it("does not refresh the handoff grant when recovery sweeps through its own owner churn", async () => {

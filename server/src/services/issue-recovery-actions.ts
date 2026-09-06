@@ -421,6 +421,21 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       // Computed in the same UPDATE as the owner write, so no sweep can observe a new owner
       // carrying an old counter.
       const isNewOwnerSequence = (input.ownerAgentId ?? null) !== existing.ownerAgentId;
+      // BLO-19124: an `attempt_budget` retirement belongs to the owner whose budget it was,
+      // so it has to be lifted by the same event that restarts `attemptCount` at 1 below.
+      // Leaving the row `escalated` with that bound hands the replacement owner a budget it
+      // can never spend: `shouldReuseStrandedRecoveryAction` reads `escalated` + an unchanged
+      // owner as a standing escalation and returns BEFORE this upsert on every later sweep,
+      // so the new owner is woken exactly once and then starves. That is the BLO-18996
+      // deadlock reintroduced — the "too broad" half that predicate's own doc warns about.
+      //
+      // Only this bound is lifted. `timeout_horizon` is anchored to creation and owner churn
+      // must not restore it (BLO-24662), and `discharged`/`cancelled` are explicit disposals.
+      // Un-retiring is still bounded: the new owner gets a fresh attempt budget, while the
+      // preserved creation-anchored `timeoutAt` keeps bounding wall-clock and re-retires the
+      // row as `timeout_horizon` the moment that horizon passes.
+      const liftsAttemptBudgetRetirement = isNewOwnerSequence &&
+        existing.retiringBound === "attempt_budget";
       const existingTimeoutAt = toValidDate(existing.timeoutAt);
       const inputMaxAttempts = input.maxAttempts ?? null;
       const existingWakeHorizonAt = readSourceScopedWakeHorizonAt(existing.evidence);
@@ -526,8 +541,12 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           // action — no owner change restores it (see the `timeoutAt` preservation note
           // below). Re-setting `active` here would silently un-retire an action on the very
           // next sweep and put it straight back into the invisible state the transition
-          // exists to end.
-          status: existing.status === "escalated" ? "escalated" : "active",
+          // exists to end. The one exception is an `attempt_budget` retirement lifted by a
+          // genuine owner change — see `liftsAttemptBudgetRetirement`.
+          status: existing.status === "escalated" && !liftsAttemptBudgetRetirement
+            ? "escalated"
+            : "active",
+          retiringBound: liftsAttemptBudgetRetirement ? null : existing.retiringBound,
           ownerType,
           ownerAgentId: input.ownerAgentId ?? null,
           ownerUserId: input.ownerUserId ?? null,
@@ -688,13 +707,27 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     expectedAttemptCount: number;
     retiringBound: IssueRecoveryActionRetiringBound;
   }): Promise<void> {
-    // Retiring and refunding must share the reservation CAS. Otherwise changing the
-    // status first makes the refund match `escalated`, reopening the exhausted action.
+    // Retiring and refunding must share one statement. Splitting them lets a sweep observe a
+    // row whose status advanced without its reserved attempt coming back, which reopens the
+    // exhausted action.
+    //
+    // BLO-19124 (Ally review of #1542): the retirement half is what must be idempotent, NOT
+    // the refund. Gating the whole UPDATE on `status = 'active' AND retiring_bound IS NULL`
+    // made this self-disarming — a successful call sets exactly the opposite on the same row,
+    // so every later call matched zero rows and the refund silently stopped while the reserve
+    // in `upsertSourceScoped` kept incrementing. `shouldReuseStrandedRecoveryAction` hides
+    // that for an unchanged owner by returning before the reserve, but a sweep that changes
+    // the fingerprint without changing the routed owner (two assignees under one manager)
+    // still reaches it, and there the counter climbs +1 per sweep with no ceiling.
+    //
+    // So the predicate keeps only the reservation CAS — owner plus attempt count, scoped to
+    // active statuses — and the retirement writes are made idempotent in SQL instead. A
+    // re-run refunds its own reserve and rewrites neither `status` nor `retiring_bound`.
     await db
       .update(issueRecoveryActions)
       .set({
-        status: "escalated",
-        retiringBound: input.retiringBound,
+        status: sql`case when ${issueRecoveryActions.retiringBound} is null and ${issueRecoveryActions.status} = 'active' then 'escalated' else ${issueRecoveryActions.status} end`,
+        retiringBound: sql`coalesce(${issueRecoveryActions.retiringBound}, ${input.retiringBound})`,
         attemptCount: sql`greatest(${issueRecoveryActions.attemptCount} - 1, 0)`,
         nonDeliverySweepCount: sql`${issueRecoveryActions.nonDeliverySweepCount} + 1`,
         updatedAt: new Date(),
@@ -704,8 +737,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         eq(issueRecoveryActions.companyId, input.companyId),
         eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
         eq(issueRecoveryActions.attemptCount, input.expectedAttemptCount),
-        eq(issueRecoveryActions.status, "active"),
-        isNull(issueRecoveryActions.retiringBound),
+        inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
       ));
   }
 
@@ -720,7 +752,13 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       .where(and(
         eq(issueRecoveryActions.id, input.actionId),
         eq(issueRecoveryActions.companyId, input.companyId),
-        eq(issueRecoveryActions.status, "active"),
+        // BLO-19124 (Ally review of #1542): `active` alone cannot retire a row that is
+        // already `escalated` with no bound — the legacy shape `0240` backfills. The
+        // backfill closes the known population; this closes the door behind it, so a row
+        // that reaches that shape by any other route can still acquire its bound instead of
+        // staying a backstop candidate forever. `retiring_bound IS NULL` is what keeps the
+        // write idempotent, and it is the predicate that actually carries that job.
+        inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
         isNull(issueRecoveryActions.retiringBound),
       ))
       .returning();
