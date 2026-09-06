@@ -396,6 +396,18 @@ tolerations:
     operator: Equal
     value: paperclip
     effect: NoSchedule
+  # With pve3 excluded (below), the API's hard two-host spread left pve2 as the
+  # only host for the second replica, and pve2 saturates under CI bursts
+  # (34-49% steal on paperclip-10, 2026-09-06 03:00Z; pod-local /api/health up
+  # to 9.9 s against a 10 s liveness timeout). paperclip-8 (pve1, 32 cores)
+  # idles at ~87% carrying only the multicast-integ runners, so production
+  # tolerates that node's reserved taint and the pve4-then-not-pve2 preference
+  # places the second replica there instead (BLO-32054). One API pod alongside
+  # those runners is the accepted trade; drop this once pve2 is rebalanced.
+  - key: blockcast.net/arc-multicast-integ-reserved
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
 
 # Keep production off nodes whose Proxmox host is pve3 (BLO-32054). pve3 runs
 # ~172 vCPUs on 80 cores and steals 20-40% of CPU time from every guest; a 5 s
