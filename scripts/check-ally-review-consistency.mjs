@@ -121,6 +121,7 @@ const ATTESTED_HEAD_RE = new RegExp(
   "im",
 );
 const ATTESTED_HEAD_GLOBAL_RE = new RegExp(ATTESTED_HEAD_RE.source, "gim");
+const PRIOR_FINDINGS_SECTION_RE = /^#+[ \t]*prior findings dispositioned\b/im;
 
 const ALLY_REVIEW_LANES = ["app", "seat"];
 
@@ -163,6 +164,14 @@ function canonicalReviewHead(body) {
   const attestations = Array.from(text.matchAll(ATTESTED_HEAD_GLOBAL_RE));
   if (headings.length !== 1 || attestations.length !== 1) return null;
   return attestations[0][1].toLowerCase();
+}
+
+function isCanonicalAppVerdict(review) {
+  return canonicalReviewHead(review?.body) !== null;
+}
+
+function isSupersedingAppVerdict(review) {
+  return PRIOR_FINDINGS_SECTION_RE.test(String(review?.body ?? ""));
 }
 
 // The two distinct GitHub principals required by the protected-merge policy.
@@ -232,7 +241,7 @@ export function attestedHead(body) {
 
 export function operativeAllyReviews(reviews, headSha, lane = null) {
   const normalizedHead = String(headSha ?? "").toLowerCase();
-  return (reviews ?? []).filter(
+  const operative = (reviews ?? []).filter(
     (review) => {
       const reviewLane = allyReviewLane(review?.user);
       return (
@@ -243,6 +252,26 @@ export function operativeAllyReviews(reviews, headSha, lane = null) {
       );
     },
   );
+
+  const appReviews = operative.filter(
+    (review) =>
+      allyReviewLane(review?.user) === "app" &&
+      (isCanonicalAppVerdict(review) || isApproved(review)),
+  );
+  const supersedingAppReview = [...appReviews]
+    .filter(isSupersedingAppVerdict)
+    .sort((a, b) => String(b?.submitted_at ?? "").localeCompare(String(a?.submitted_at ?? "")))[0];
+  const supersededAt = supersedingAppReview?.submitted_at;
+
+  return operative.filter((review) => {
+    if (allyReviewLane(review?.user) !== "app") return true;
+    if (!isCanonicalAppVerdict(review)) return isApproved(review);
+    return !(
+      supersededAt &&
+      review !== supersedingAppReview &&
+      String(review?.submitted_at ?? "") < String(supersededAt)
+    );
+  });
 }
 
 function isCleanAppSelfReview(pr, review) {
@@ -349,7 +378,7 @@ export function findPrViolations(pr) {
       continue;
     }
     const identity = allyReviewIdentityShape(review?.user);
-    if (identity && review?.user?.id !== identity.expectedId) {
+    if (identity && review?.user?.id !== identity.expectedId && (identity.lane !== "app" || isCanonicalAppVerdict(review))) {
       violations.push(
         `I5 PR #${pr.number} @${short}: ${laneLabel(identity.lane)} review ${review.id} uses the canonical login/type but REST id ${String(review?.user?.id ?? "<missing>")} (expected ${identity.expectedId}) — identity mismatch cannot satisfy the review lane`,
       );

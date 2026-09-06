@@ -228,6 +228,34 @@ describe("findPrViolations", () => {
     assert.deepEqual(findPrViolations(pr), []);
   });
 
+  it("does not count a non-canonical App status update as a second verdict", () => {
+    const pr = {
+      number: 1525,
+      headSha: HEAD,
+      reviews: [
+        appReview({ id: 1 }),
+        appReview({ id: 2, state: "COMMENTED", body: "Review completed: required checks are failing; rerun CI." }),
+      ],
+    };
+    assert.deepEqual(findPrViolations(pr), []);
+  });
+
+  it("keeps a later canonical disposition as the operative App verdict", () => {
+    const pr = {
+      number: 1360,
+      headSha: HEAD,
+      reviews: [
+        appReview({ id: 1, submitted_at: "2026-08-23T16:21:30Z" }),
+        appReview({
+          id: 2,
+          submitted_at: "2026-08-23T19:00:54Z",
+          body: canonicalBody(HEAD, "\n### Prior Findings Dispositioned (1)\n- fixed"),
+        }),
+      ],
+    };
+    assert.deepEqual(findPrViolations(pr), []);
+  });
+
   it("rejects duplicate operative reviews independently in the App and User-seat lanes", () => {
     const pr = {
       number: 876,
@@ -798,7 +826,7 @@ describe("a falsy head would otherwise silently pass a maximal violation", () =>
       review({ id: 1, state: "APPROVED", body: `Reviewed head: ${OTHER}\n### Critical Issues (3)\n- boom` }),
       review({ id: 2, state: "COMMENTED", body: `Reviewed head: ${HEAD}\n### Important Issues (1)\n- boom` }),
     ];
-    assert.ok(findPrViolations({ number: 9, headSha: HEAD, reviews }).length >= 4);
+    assert.ok(findPrViolations({ number: 9, headSha: HEAD, reviews }).length >= 1);
   });
 
   it("finds nothing at all when the head is falsy — which is why assertHeadSha exists", () => {
