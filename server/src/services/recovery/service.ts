@@ -5541,7 +5541,7 @@ export function recoveryService(
     const reservedOwnerAgentId = input.action.ownerAgentId;
     const reservedAttemptCount = input.action.attemptCount;
     const refundUnspentWakeAttempt = async (
-      cause: "enqueue_threw" | "enqueue_not_delivered" | "attempts_exhausted",
+      cause: "enqueue_threw" | "enqueue_not_delivered",
       error?: unknown,
     ) => {
       const release = () =>
@@ -5597,7 +5597,33 @@ export function recoveryService(
     // re-trips this same gate before any enqueue — so the delivered-wake ceiling is unchanged
     // at exactly `maxAttempts`, and `timeoutAt` still bounds wall-clock independently.
     if (strandedRecoveryWakeAttemptsExhausted(input.action)) {
-      await refundUnspentWakeAttempt("attempts_exhausted");
+      const retireAndRefund = () => recoveryActionsSvc.retireAndReleaseWakeAttempt({
+        companyId: input.issue.companyId,
+        actionId: input.action.id,
+        expectedOwnerAgentId: reservedOwnerAgentId,
+        expectedAttemptCount: reservedAttemptCount,
+        retiringBound: "attempt_budget",
+      });
+      try {
+        await retireAndRefund();
+      } catch (firstError) {
+        try {
+          await retireAndRefund();
+        } catch (secondError) {
+          logger.warn(
+            {
+              err: secondError,
+              firstErr: firstError,
+              companyId: input.issue.companyId,
+              issueId: input.issue.id,
+              recoveryActionId: input.action.id,
+              attemptCount: input.action.attemptCount,
+              maxAttempts: input.action.maxAttempts,
+            },
+            "recovery wake retirement/refund failed after retry",
+          );
+        }
+      }
       return;
     }
     const enqueueOrRefundAttempt: typeof deps.enqueueWakeup = async (agentId, opts) => {
@@ -12016,6 +12042,7 @@ export function recoveryService(
     const queryCandidates = (afterActionId: string | null) => {
       const filters = [
         inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        isNull(issueRecoveryActions.retiringBound),
         inArray(issues.status, STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES),
         visibleIssueCondition(),
         sql`${issues.assigneeAgentId} is not null`,
@@ -12144,6 +12171,13 @@ export function recoveryService(
         maxAttempts: candidate.actionMaxAttempts,
         timeoutAt: candidate.actionTimeoutAt,
       }, now, false)) {
+        const attemptBudgetReached = candidate.actionMaxAttempts !== null &&
+          candidate.actionAttemptCount >= candidate.actionMaxAttempts;
+        await recoveryActionsSvc.retireWakeAction({
+          companyId: candidate.companyId,
+          actionId: candidate.actionId,
+          retiringBound: attemptBudgetReached ? "attempt_budget" : "timeout_horizon",
+        });
         result.exhaustedSkipped += 1;
         continue;
       }
@@ -12176,14 +12210,18 @@ export function recoveryService(
       // cooldown expires and the same durable action is eligible on the next pass.
       const claimed = await db
         .update(issueRecoveryActions)
-        .set({ lastAttemptAt: now, updatedAt: now })
+        .set({
+          lastAttemptAt: now,
+          updatedAt: now,
+        })
         .where(and(
           eq(issueRecoveryActions.id, candidate.actionId),
-          eq(issueRecoveryActions.companyId, candidate.companyId),
-          eq(issueRecoveryActions.ownerAgentId, ownerAgentId),
-          inArray(issueRecoveryActions.status, ["active", "escalated"]),
-          or(isNull(issueRecoveryActions.lastAttemptAt), lt(issueRecoveryActions.lastAttemptAt, cooldownBefore)),
-        ))
+           eq(issueRecoveryActions.companyId, candidate.companyId),
+           eq(issueRecoveryActions.ownerAgentId, ownerAgentId),
+           inArray(issueRecoveryActions.status, ["active", "escalated"]),
+           isNull(issueRecoveryActions.retiringBound),
+           or(isNull(issueRecoveryActions.lastAttemptAt), lt(issueRecoveryActions.lastAttemptAt, cooldownBefore)),
+         ))
         .returning({ lastAttemptAt: issueRecoveryActions.lastAttemptAt })
         .then((rows) => rows[0] ?? null);
       if (!claimed) {
@@ -12227,6 +12265,12 @@ export function recoveryService(
           },
         });
         if (!wake) {
+          await recoveryActionsSvc.recordNonDeliverySweep({
+            companyId: candidate.companyId,
+            actionId: candidate.actionId,
+            expectedOwnerAgentId: ownerAgentId,
+            expectedLastAttemptAt: deliveryAttemptAt,
+          });
           result.deferredOrFailed += 1;
           continue;
         }
@@ -12254,6 +12298,12 @@ export function recoveryService(
           },
         });
       } catch (err) {
+        await recoveryActionsSvc.recordNonDeliverySweep({
+          companyId: candidate.companyId,
+          actionId: candidate.actionId,
+          expectedOwnerAgentId: ownerAgentId,
+          expectedLastAttemptAt: deliveryAttemptAt,
+        });
         result.deferredOrFailed += 1;
         result.enqueueFailed += 1;
         logger.warn(

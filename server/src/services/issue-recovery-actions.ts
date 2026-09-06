@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNotNull, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, lte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueRecoveryActions } from "@paperclipai/db";
 import type {
@@ -7,6 +7,7 @@ import type {
   IssueRecoveryActionOwnerType,
   IssueRecoveryActionOutcome,
   IssueRecoveryActionStatus,
+  IssueRecoveryActionRetiringBound,
 } from "@paperclipai/shared";
 
 export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
@@ -286,8 +287,10 @@ function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
     wakePolicy: row.wakePolicy,
     monitorPolicy: row.monitorPolicy,
     attemptCount: row.attemptCount,
+    nonDeliverySweepCount: row.nonDeliverySweepCount,
     maxAttempts: row.maxAttempts,
     timeoutAt: row.timeoutAt,
+    retiringBound: row.retiringBound as IssueRecoveryActionRetiringBound | null,
     lastAttemptAt: row.lastAttemptAt,
     outcome: row.outcome as IssueRecoveryAction["outcome"],
     resolutionNote: row.resolutionNote,
@@ -664,6 +667,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       .update(issueRecoveryActions)
       .set({
         attemptCount: sql`greatest(${issueRecoveryActions.attemptCount} - 1, 0)`,
+        nonDeliverySweepCount: sql`${issueRecoveryActions.nonDeliverySweepCount} + 1`,
         updatedAt: new Date(),
       })
       .where(
@@ -675,6 +679,73 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
         ),
       );
+  }
+
+  async function retireAndReleaseWakeAttempt(input: {
+    companyId: string;
+    actionId: string;
+    expectedOwnerAgentId: string;
+    expectedAttemptCount: number;
+    retiringBound: IssueRecoveryActionRetiringBound;
+  }): Promise<void> {
+    // Retiring and refunding must share the reservation CAS. Otherwise changing the
+    // status first makes the refund match `escalated`, reopening the exhausted action.
+    await db
+      .update(issueRecoveryActions)
+      .set({
+        status: "escalated",
+        retiringBound: input.retiringBound,
+        attemptCount: sql`greatest(${issueRecoveryActions.attemptCount} - 1, 0)`,
+        nonDeliverySweepCount: sql`${issueRecoveryActions.nonDeliverySweepCount} + 1`,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(issueRecoveryActions.id, input.actionId),
+        eq(issueRecoveryActions.companyId, input.companyId),
+        eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
+        eq(issueRecoveryActions.attemptCount, input.expectedAttemptCount),
+        eq(issueRecoveryActions.status, "active"),
+        isNull(issueRecoveryActions.retiringBound),
+      ));
+  }
+
+  async function retireWakeAction(input: {
+    companyId: string;
+    actionId: string;
+    retiringBound: IssueRecoveryActionRetiringBound;
+  }) {
+    const [updated] = await db
+      .update(issueRecoveryActions)
+      .set({ status: "escalated", retiringBound: input.retiringBound, updatedAt: new Date() })
+      .where(and(
+        eq(issueRecoveryActions.id, input.actionId),
+        eq(issueRecoveryActions.companyId, input.companyId),
+        eq(issueRecoveryActions.status, "active"),
+        isNull(issueRecoveryActions.retiringBound),
+      ))
+      .returning();
+    return updated ? toReadModel(updated) : null;
+  }
+
+  async function recordNonDeliverySweep(input: {
+    companyId: string;
+    actionId: string;
+    expectedOwnerAgentId: string;
+    expectedLastAttemptAt: Date;
+  }): Promise<void> {
+    await db
+      .update(issueRecoveryActions)
+      .set({
+        nonDeliverySweepCount: sql`${issueRecoveryActions.nonDeliverySweepCount} + 1`,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(issueRecoveryActions.id, input.actionId),
+        eq(issueRecoveryActions.companyId, input.companyId),
+        eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
+        eq(issueRecoveryActions.lastAttemptAt, input.expectedLastAttemptAt),
+        inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+      ));
   }
 
   /**
@@ -732,7 +803,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
 
     const updated = await db
       .update(issueRecoveryActions)
-      .set({ status: "escalated", updatedAt: now })
+      .set({ status: "escalated", retiringBound: "timeout_horizon", updatedAt: now })
       .where(and(
         inArray(issueRecoveryActions.id, candidateIds),
         eq(issueRecoveryActions.status, "active"),
@@ -770,6 +841,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       .set({
         status: input.status,
         outcome: input.outcome,
+        retiringBound: input.status === "cancelled" ? "cancelled" : "discharged",
         resolutionNote: input.resolutionNote ?? null,
         resolvedAt: now,
         updatedAt: now,
@@ -787,5 +859,8 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     escalateExpiredWakeHorizons,
     upsertSourceScoped,
     releaseWakeAttempt,
+    retireAndReleaseWakeAttempt,
+    retireWakeAction,
+    recordNonDeliverySweep,
   };
 }
