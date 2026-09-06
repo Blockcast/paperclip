@@ -117,6 +117,25 @@ describe("allyReviewAlreadyAttestsHead", () => {
     expect(result).toEqual({ outcome: "not_attested" });
   });
 
+  it("returns unknown when no reviewer bot login is configured", async () => {
+    // No hardcoded default identity: the other suppression path in the webhook
+    // (isReviewerSelfEchoReview) is inert when prReviewerBotLogin is unset, and
+    // suppressing here on a guessed login would disagree with it.
+    let called = 0;
+    const result = await allyReviewAlreadyAttestsHead({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 1316,
+      headSha: HEAD,
+      botLogin: "  ",
+      listPrReviews: async () => {
+        called += 1;
+        return [{ login: APP, body: reviewBody(HEAD), createdAt: "2026-09-05T00:00:00Z" }];
+      },
+    });
+    expect(result).toMatchObject({ outcome: "unknown" });
+    expect(called).toBe(0);
+  });
+
   it("returns unknown — not not_attested — when GitHub cannot be listed", async () => {
     const result = await check(async () => null);
     expect(result.outcome).toBe("unknown");

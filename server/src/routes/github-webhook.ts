@@ -3227,6 +3227,55 @@ export async function reconcileContendedPrReviewerWakes(
       result.superseded += 1;
       continue;
     }
+    // BLO-32198: re-check attestation before replaying. The route-level gate
+    // ran when this row was written and correctly let the wake through — no
+    // review existed yet. But this row is replayed here, NOT through the route,
+    // so nothing re-evaluates that. A wake deferred for reviewer-unavailability
+    // waits up to PR_REVIEWER_UNAVAILABLE_MAX_WAIT_MS, and in that window
+    // another delivery's run can post a review at this same head; replaying
+    // then produces exactly the duplicate the route gate exists to prevent, in
+    // exactly the multi-hour shape that motivated it. Deferral for
+    // unavailability is also the single likeliest way to open a gap that wide,
+    // so the deferred path needs the check more than the live one does.
+    //
+    // Retired as `superseded` rather than `recovered`: the work this row
+    // represents has been done, by whichever delivery won. That is the same
+    // meaning the `duplicate` outcome already carries below. Checked before the
+    // attempt counter and the `retried` metric, because this is not an attempt
+    // that happened — counting it would overstate retries and hide the
+    // supersession.
+    if (replay.context.headSha && replay.context.repoFullName) {
+      const replayAttestation = await allyReviewAlreadyAttestsHead({
+        repoFullName: replay.context.repoFullName,
+        prNumber: replay.context.prNumber,
+        headSha: replay.context.headSha,
+        botLogin: config.prReviewerBotLogin,
+        ...(config.listPrReviewsForAttestation
+          ? { listPrReviews: config.listPrReviewsForAttestation }
+          : {}),
+      });
+      if (replayAttestation.outcome === "attested") {
+        await retireContendedRow(
+          db,
+          row.id,
+          PR_REVIEWER_CONTENDED_SUPERSEDED_STATUS,
+          "head already attested by an operative Ally review",
+        );
+        result.superseded += 1;
+        logger.info(
+          {
+            taskKey: replay.taskKey,
+            deliveryId: replay.deliveryId,
+            repoFullName: replay.context.repoFullName,
+            prNumber: replay.context.prNumber,
+            headSha: replay.context.headSha,
+            attestingReviewCount: replayAttestation.attestingReviewCount,
+          },
+          "contended PR-reviewer wake superseded: this head was reviewed while the retry was deferred (BLO-32198)",
+        );
+        continue;
+      }
+    }
     const attempts = replay.attempts + 1;
     // Counted up-front so a pass that throws somewhere unexpected still shows
     // as an attempt rather than looking like it never ran.
@@ -4440,6 +4489,20 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       // unreachable GitHub, an unparseable body, or a missing head all yield
       // `unknown` and let the wake proceed, because an unreviewed PR is a worse
       // failure than a redundant review and nothing else retries this.
+      //
+      // One asymmetry to know about. On `github_pr_review_submitted`,
+      // `context.headSha` is `review.commit_id ?? head.sha` (see
+      // resolveEventContext), i.e. the commit the INCOMING review was left
+      // against — which for a review on an outdated diff is not the live head.
+      // So this can answer "already attested" about a superseded head and skip
+      // the counter-review pass for the current one. The attesting side of the
+      // comparison deliberately never reads `commit_id`; this is the querying
+      // side, and the value arrives that way from GitHub's own payload.
+      // Deliberately not "fixed" by re-resolving the live head here: that
+      // would spend an extra API call on every wake to change behaviour only
+      // for reviews left on stale diffs, and the failure is a missed
+      // counter-review — recoverable by a push or a fresh request — not a
+      // permanent duplicate.
       if (context.headSha && context.repoFullName) {
         const attestation = await allyReviewAlreadyAttestsHead({
           repoFullName: context.repoFullName,

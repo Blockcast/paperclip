@@ -13,8 +13,21 @@
  *
  * Measured on 2026-09-05, four open PRs each carried two operative App reviews
  * at one head, with gaps from 53 s (#1304, byte-identical bodies) to 6h35m
- * (#1316). A spread that wide is not a delivery race — it is an agent
- * sometimes not performing a step it was merely asked to perform.
+ * (#1316).
+ *
+ * WHAT THIS CLOSES, AND WHAT IT DOES NOT. This is a check-then-act guard at
+ * *dispatch* time, but the duplicate is created minutes later at *post* time,
+ * so it can only close gaps wider than a review run. It closes the wide ones:
+ * a wake that arrives after a review is already visible. It does NOT close
+ * concurrent dispatch at one head — for #1304's 53 s byte-identical pair the
+ * second run must already have been running when the first review landed (a
+ * review run does not finish inside 53 s), so its dispatch preceded any
+ * attestation and this predicate would have answered `not_attested` truthfully.
+ * That window is also missed by the delivery-scoped wake idempotency keys, and
+ * closing it needs a lock or a post-time check, not this.
+ *
+ * Stated explicitly because the next I1 red on `master` will otherwise read as
+ * a regression here rather than as the known residual it is.
  *
  * Why this must be enforced BEFORE the run rather than cleaned up after: a
  * COMMENTED review cannot be retracted. GitHub's dismiss endpoint rejects it
@@ -35,8 +48,6 @@ import {
   githubReviewerIdentityMatches,
 } from "./github-app-auth.js";
 import { extractAllyReviewedHeadSha } from "./ally-review-detection.js";
-
-export const DEFAULT_PR_REVIEWER_BOT_LOGIN = "allyblockcast[bot]";
 
 /**
  * `unknown` is a distinct outcome, not a flavour of `false`.
@@ -74,14 +85,23 @@ export async function allyReviewAlreadyAttestsHead(input: {
   botLogin?: string | null;
   listPrReviews?: ListPrReviewsForAttestation;
 }): Promise<PrReviewHeadAttestation> {
-  const headSha = input.headSha?.trim().toLowerCase() ?? "";
+  const headSha = input.headSha.trim().toLowerCase();
   // Anything short of a full commit id cannot be compared to an attestation
   // without guessing, and guessing here suppresses a real review.
   if (!/^[0-9a-f]{40}$/.test(headSha)) {
     return { outcome: "unknown", reason: "head sha is absent or not a full commit id" };
   }
 
-  const botLogin = (input.botLogin ?? "").trim() || DEFAULT_PR_REVIEWER_BOT_LOGIN;
+  // No hardcoded default identity. `isReviewerSelfEchoReview` — the other
+  // suppression path in the webhook — is simply inert when
+  // `prReviewerBotLogin` is unconfigured, and the two must agree about what
+  // "unconfigured" means. Defaulting here would let this path suppress on a
+  // deployment-specific login the rest of the system was not configured to
+  // recognise, which is suppression on a guess.
+  const botLogin = (input.botLogin ?? "").trim();
+  if (!botLogin) {
+    return { outcome: "unknown", reason: "no reviewer bot login is configured" };
+  }
   const list = input.listPrReviews ?? githubListPrReviewsWithTimestamps;
 
   let reviews: Awaited<ReturnType<ListPrReviewsForAttestation>>;
