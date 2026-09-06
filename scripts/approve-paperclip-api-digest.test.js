@@ -1639,7 +1639,7 @@ test("a signal is routed into the cleanup rather than killing the script outrigh
 // cause, on the path with the LEAST operator visibility -- the caller prints
 // only the bare "could not retire the in-flight lock" and nobody is at a
 // terminal to re-run it with more logging.
-function runReleaseWrite({ stderrText = "", attempts = 3, writeSucceeds = false }) {
+function runReleaseWrite({ stderrText = "", attempts = 3, writeSucceeds = false } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-release-write-"));
   const countFile = path.join(dir, "replace_count");
   const sleepLog = path.join(dir, "sleeps");
@@ -1851,7 +1851,7 @@ test("a retirement write with no stderr still explains itself", () => {
 // rather than by presetting CLEAR_IN_FLIGHT_LOCK_ERR, so the variable is proven
 // populated by the script's own `2>&1 >/dev/null` capture -- the same standard
 // the release harness sets, for the same reason.
-function runRetireOnlyWrite({ stderrText = "", attempts = 3, writeSucceeds = false }) {
+function runRetireOnlyWrite({ stderrText = "", attempts = 3, writeSucceeds = false } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-retire-write-"));
   const countFile = path.join(dir, "replace_count");
   const sleepLog = path.join(dir, "sleeps");
@@ -2185,6 +2185,15 @@ test("no line citation can be added to this file without being pinned", () => {
 // Both harnesses in one test because it is one shared invariant, and because
 // the pair is the point: the defect was identical in both, so a per-harness
 // split would let a future divergence read as an unrelated single failure.
+//
+// The third assertion pins the `= {}` on the parameter object itself, which is
+// the same omission family one level out: with a bare `{ ... }` destructure the
+// defaults above are unreachable for a caller who passes nothing at all, and
+// `run()` dies with `TypeError: Cannot read properties of undefined (reading
+// 'stderrText')`. That is a loud failure rather than the quiet one this test
+// exists for, so it is pinned here as an extension of the same chain --
+// `run()` === `run({})` === `run({ stderrText: "" })` -- rather than given a
+// test of its own. Ally's suggestion 1 on #1682.
 test("omitting stderrText on a failing write is exactly an empty capture, never the token `undefined`", () => {
   for (const [mode, run] of [
     ["release", runReleaseWrite],
@@ -2200,6 +2209,11 @@ test("omitting stderrText on a failing write is exactly an empty capture, never 
       omitted,
       run({ stderrText: "" }),
       `${mode} mode: omitting stderrText must be indistinguishable from passing "", so a failing case that forgets it lands on the tested empty-capture path`,
+    );
+    assert.deepEqual(
+      run(),
+      omitted,
+      `${mode} mode: omitting the argument object entirely must reach the same defaults as passing {}, not throw past them`,
     );
   }
 });
