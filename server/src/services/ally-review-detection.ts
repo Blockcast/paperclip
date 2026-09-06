@@ -203,12 +203,23 @@ const PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp(
   "gim",
 );
 
+// The severities Ally tallies in a counted bucket. Single source for both the
+// pattern below and the "declared clean" test in
+// hasActionablePrReviewFeedback, which are 140 lines apart and were otherwise
+// silently coupled: adding a third bucket to the alternation without widening
+// that test would keep precedence applying on a two-of-three declaration.
+// Lowercase because the test compares lowercased captures; the pattern is
+// case-insensitive, so the alternation is unaffected.
+const COUNTED_SEVERITIES = ["critical", "important"] as const;
+
 // The counted finding buckets a review reports, e.g. `### Important Issues (2)`.
 // Ally numbers findings within a bucket from 1, and its ledger entries name
 // that same (severity, index) pair, so these counts enumerate exactly which
 // finding identities a head raised.
-const COUNTED_FINDINGS_BUCKET_PATTERN =
-  /\b(Critical|Important)\s+Issues\b[*_]*\s*\((\d+)\)/gi;
+const COUNTED_FINDINGS_BUCKET_PATTERN = new RegExp(
+  String.raw`\b(${COUNTED_SEVERITIES.join("|")})\s+Issues\b[*_]*\s*\((\d+)\)`,
+  "gi",
+);
 
 // Ally's disposition vocabulary is three words: `fixed` and
 // `no-longer-applicable` retire a prior finding, `still-present` asserts it
@@ -358,7 +369,27 @@ export function extractAllyReportedFindingRefs(
   return refs;
 }
 
-function carriesBlockingFeedback(text: string): boolean {
+export interface ActionableFeedbackOptions {
+  /**
+   * Whether a `still-present` ledger entry counts as blocking feedback.
+   *
+   * Defaults to true, which is the question every live caller asks: "does this
+   * review say a finding is unresolved right now?" — and an assertion that a
+   * prior finding still stands says exactly that.
+   *
+   * The carry-forward enumeration asks a narrower question, "which findings did
+   * *this head* raise?", and passes false. A ledger entry names a finding from
+   * an earlier head, and that head is enumerated on its own account, so
+   * counting it here would attribute the block to a review whose own buckets
+   * are empty. That misattribution is not merely cosmetic: a 0/0 body yields no
+   * finding identities, so `isFullyDispositioned` is permanently false for it
+   * and no later ledger entry could ever retire the head this named — the
+   * unretirable carry-forward BLO-31446 exists to remove.
+   */
+  readonly countInheritedLedgerAssertion?: boolean;
+}
+
+function carriesBlockingFeedback(text: string, options?: ActionableFeedbackOptions): boolean {
   // Shares COUNTED_FINDINGS_BUCKET_PATTERN with extractAllyReportedFindingRefs
   // so the two cannot drift: a body this function reads as "no findings" is
   // exactly one that yields no finding identities there.
@@ -367,23 +398,37 @@ function carriesBlockingFeedback(text: string): boolean {
     if (Number(count) > 0) return true;
     zeroedSeverities.add(severity!.toLowerCase());
   }
-  // A `still-present` ledger entry is an explicit statement that a prior finding
-  // still stands, so it outranks the 0/0 for exactly the reason the 0/0 outranks
-  // the prose below. The contract says such a finding is mirrored into the
-  // current buckets, which would make a count non-zero and block here anyway;
-  // this clause is the defence for when that mirroring is omitted. It matters
-  // because evaluateCommentReviewGate short-circuits on a current-head
-  // attestation before consulting the carry-forward, so without it a 0/0 body
-  // asserting an unresolved prior finding would deterministically read clean.
-  const declaresNoFindings =
-    zeroedSeverities.has("critical") &&
-    zeroedSeverities.has("important") &&
-    !extractAllyPriorFindingDispositions(text).some((entry) => entry.kind === "blocks");
+  const declaresNoFindings = COUNTED_SEVERITIES.every((severity) => zeroedSeverities.has(severity));
 
   if (UNCOUNTED_FINDINGS_HEADING_REGEX.test(text)) return true;
   if (/^[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*$/im.test(text)) return true;
   if (hasNonNegatedMatch(text, /\bchanges\s+requested\b/i)) return true;
   if (hasNonNegatedMatch(text, /\brequest(?:ed|s)?\s+changes\b/i)) return true;
+  // A `still-present` ledger entry positively asserts that a prior finding
+  // stands, which is a statement about this head exactly as a non-zero bucket
+  // is — so it belongs here among the hard signals rather than as a carve-out
+  // in `declaresNoFindings`. As a carve-out it only ever suppressed the
+  // `return false` below, leaving the prose fallback to decide; on any body
+  // whose prose lacks the fallback's trigger tokens the assertion was silently
+  // ignored. Measured against the three shapes: `still-present` alongside the
+  // usual "No Critical issues to fix before merge." boilerplate blocked, but
+  // the same entry under a `Recommended Action` reading "Nothing to address."
+  // — or under no `Recommended Action` at all, or in a body declaring no
+  // counted bucket — read clean. Only `blocks` is consulted, so an
+  // unrecognized verb still clears here (see RESOLVED_PRIOR_DISPOSITIONS for
+  // why that asymmetry with the carry-forward path is deliberate).
+  //
+  // The contract says a still-standing finding is mirrored into the current
+  // buckets, which would make a count non-zero and return true above; this is
+  // the defence for when that mirroring is omitted. It matters because
+  // evaluateCommentReviewGate short-circuits on a current-head attestation
+  // before consulting the carry-forward, so nothing else re-examines the entry.
+  if (
+    options?.countInheritedLedgerAssertion !== false &&
+    extractAllyPriorFindingDispositions(text).some((entry) => entry.kind === "blocks")
+  ) {
+    return true;
+  }
 
   // The prose fallback below is a heuristic for reviews that carry no counted
   // bucket at all. Ally's own clean-review boilerplate supplies its exact
@@ -410,17 +455,28 @@ function carriesBlockingFeedback(text: string): boolean {
   // reviewer and outranks a guess made from prose. Every signal above stays
   // live, so a review that explicitly requests changes still blocks at 0/0.
   //
-  // Measured over the 68 Ally consolidated reviews on the 25 most recent
-  // Blockcast/paperclip pull requests, this clause flips exactly 7 reviews,
-  // all true -> false, all yielding zero finding identities; no review flips
-  // the other way and all 40 carrying real findings still block. See BLO-31446.
+  // Measured twice against the Ally consolidated reviews on the 25 most recent
+  // Blockcast/paperclip pull requests. The window slides, so the counts are
+  // dated rather than fixed: 7 of 68 flipped when the clause was written, 5 of
+  // 62 on re-measurement. Every flip in both runs was true -> false and yielded
+  // zero finding identities; none flipped the other way, and every review
+  // carrying a counted finding still blocked.
+  //
+  // The durable form of that result, which does not slide: over the whole
+  // corpus this function's verdict is exactly "the body declares at least one
+  // counted finding" -- no review is actionable without one, and none carrying
+  // one clears. See BLO-31446.
   if (declaresNoFindings) return false;
 
   return /\bRecommended\s+Action\b[\s\S]{0,400}\bfix\b[\s\S]{0,400}\bbefore\s+merg(?:e|es|ed|ing)\b/i.test(text);
 }
 
 /** Return whether a formal or comment-shaped review contains blocking feedback. */
-export function hasActionablePrReviewFeedback(body: string | null | undefined, state?: string | null): boolean {
+export function hasActionablePrReviewFeedback(
+  body: string | null | undefined,
+  state?: string | null,
+  options?: ActionableFeedbackOptions,
+): boolean {
   const normalizedState = state?.trim().toLowerCase();
   if (normalizedState === "changes_requested" || normalizedState === "changes-requested") return true;
   if (typeof body !== "string") return false;
@@ -434,5 +490,8 @@ export function hasActionablePrReviewFeedback(body: string | null | undefined, s
   // PR. A quoted finding costs a false red, which is visible and recoverable;
   // a missed one is neither. Same asymmetry that keeps an unrecognized ledger
   // verb from retiring a finding.
-  return carriesBlockingFeedback(text) || carriesBlockingFeedback(withoutFencedCodeBlocks(text));
+  return (
+    carriesBlockingFeedback(text, options) ||
+    carriesBlockingFeedback(withoutFencedCodeBlocks(text), options)
+  );
 }
