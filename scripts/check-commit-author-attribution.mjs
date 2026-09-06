@@ -7,16 +7,18 @@
  * authenticated identity when none is supplied. Every agent pod shares one
  * credential — the `allyblockcast[bot]` GitHub App installation (id
  * 290875700) — so any agent writing via that path gets stamped with the App,
- * not the acting agent. `git push` reads `user.name`/`user.email` from the
- * checkout's local git config instead, so it is NOT subject to this
- * server-side default — but that only produces a correctly-attributed commit
- * if the checkout's local config actually holds a per-agent identity. A
- * 2026-08-10 sweep of 71 checkouts (BLO-23894) found 11 with local config
- * stamped to the shared App identity and 18 with no local identity set at
- * all, so `git push` failing this gate is a live, not just historical,
- * failure mode — check `git config user.email` in the checkout before
- * assuming the write path is the cause. See AGENTS.md §9 and the BLO-21416
- * issue for the full writeup.
+ * not the acting agent. `git push` is NOT subject to that server-side
+ * default: it takes its identity from the per-run `GIT_AUTHOR_*` /
+ * `GIT_COMMITTER_*` environment overlay applied to every adapter process
+ * (`applyAgentGitIdentityToRuntimeConfig`, BLO-29050), which outranks the
+ * local, global and system config files. So a `git push` commit is
+ * correctly attributed regardless of what the checkout's config holds, and
+ * `git config user.email` is NOT a useful diagnostic for a failure here —
+ * read the commit itself (`git log -1 --pretty='%an <%ae>'`). The
+ * 2026-08-10 sweep of 71 checkouts (BLO-23894) that found 11 App-stamped
+ * and 18 identity-less local configs predates that overlay and is now
+ * historical. See AGENTS.md §9 and the BLO-21416 issue for the full
+ * writeup.
  *
  * Two independent modes, one shared assertion (`findAttributionOffenses`):
  *
@@ -459,7 +461,7 @@ async function main() {
       console.error(`  ${offense.sha.slice(0, 7)} "${offense.message}" — ${offense.authorEmail}`);
     }
     console.error(
-      "\nThis means either the commit was created via the GitHub REST/MCP write path (contents API, merge API, or `create_or_update_file`/`push_files`, which always stamps the shared App credential), OR it was made with `git push` from a checkout whose local git config itself holds the App identity — run `git config user.email` in this checkout to tell which. The first case: use `git push` instead. The second case: `git push` will not fix it until the checkout's local `user.email`/`user.name` is set to your own per-agent identity (BLO-23894 found this local-config gap on 11 of 71 sampled checkouts). See AGENTS.md §9 (BLO-21416).\n\nIf this commit genuinely predates the gate (authored before ATTRIBUTION_GATE_CUTOFF, e.g. it was already open and reviewed before the rule existed, or it's a grandfathered PR that got rebased and changed SHA) it is unfixable in place — file against BLO-23894's owner to add its SHA to GRANDFATHERED_OFFENSE_SHAS rather than rewriting history.",
+      "\nThis almost certainly means the commit was created via the GitHub REST/MCP write path (contents API, merge API, or `create_or_update_file`/`push_files`, which always stamps the shared App credential). Fix: recreate it with `git push`, which carries your per-agent identity from the run environment.\n\nDo NOT try to fix this by setting `git config user.email`/`user.name` in the checkout. Since BLO-29050 every adapter process runs with a `GIT_AUTHOR_*`/`GIT_COMMITTER_*` overlay that outranks the local, global and system config files, so a config write changes nothing about what gets committed — and `git config user.email` correspondingly tells you nothing about what the gate saw. Diagnose from the commit instead: `git log -1 --pretty='%an <%ae>'`. (Earlier revisions of this message named a misconfigured local config as the second cause; that was true of the 2026-08-10 sweep and is not a live failure mode now.) See AGENTS.md §9 (BLO-21416).\n\nIf this commit genuinely predates the gate (authored before ATTRIBUTION_GATE_CUTOFF, e.g. it was already open and reviewed before the rule existed, or it's a grandfathered PR that got rebased and changed SHA) it is unfixable in place — file against BLO-23894's owner to add its SHA to GRANDFATHERED_OFFENSE_SHAS rather than rewriting history.",
     );
     process.exit(1);
   }
