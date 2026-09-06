@@ -141,7 +141,7 @@ type AggregateMemberResolution = {
  */
 type AggregateFiringClaim =
   | { ok: true; token: string }
-  | { ok: false; blockingPhase: string | null };
+  | { ok: false; blockingPhase: string | null; heldMs?: number | null };
 
 function q(ns: string, table: string): string {
   return `${ns}.${table}`;
@@ -373,6 +373,28 @@ async function upsertAggregateMember(
 }
 
 /**
+ * How long a `firing`/`cancelling` fence may be held before the next claim for
+ * that aggregate reclaims it regardless of who owns it (BLO-32113).
+ *
+ * This is a backstop against an unreclaimable fence, not a lease: nothing
+ * renews it, and the identity rules in `beginAggregateFiring` are tried first
+ * and handle every ordinary case. It exists because identity-based reclaim has
+ * one blind spot it cannot close by construction — a fence leaked by a process
+ * that is still running — and in that state no automatic path can ever recover
+ * the aggregate.
+ *
+ * 15 minutes is not a new number: it is the horizon this file already calls
+ * wedged (see `assertFiringGeneration`, which is a SELECT specifically so it
+ * cannot bump `updated_at` and hide a fence from the
+ * `updated_at < now() - interval '15 minutes'` detector). A legitimate hold
+ * covers one delivery's issue RPCs and clears in the sub-second range; the
+ * contention wait budget above is 3s. So this is ~300x the wait budget and
+ * orders of magnitude beyond any healthy hold — a delivery still holding at 15
+ * minutes is pathological whether or not its process is alive.
+ */
+const AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS = 15 * 60_000;
+
+/**
  * Firing claims the aggregate fence before it mutates member state or touches
  * the issue. A resolver may only begin finalization while the fence is active;
  * once it is cancelling, a new firing fails its delivery and retries after the
@@ -411,6 +433,37 @@ async function beginAggregateFiring(
   //
   // A live sibling delivery in *this* process shares WORKER_INSTANCE_ID and is
   // therefore excluded, as is any owner in another slot.
+  //
+  // Those two exclusions are also the identity steal's blind spot, and BLO-32113
+  // measured it in production: a fence leaked by a process that is still alive
+  // — same instance id, or an owner in a slot that never restarts — matches
+  // NEITHER this steal NOR `reconcileAbandonedAggregateFences`, because both
+  // require `owner_instance_id IS DISTINCT FROM` the running process. It is then
+  // unreclaimable by any automatic path, and the only drain is the board-user
+  // recovery route. Four aggregates sat that way while every delivery for them
+  // 502'd (`ArgoAppOutOfSyncTooLong`, `HeartbeatRunQueueAgentOldestQueuedHigh`,
+  // `BlockcastdImageDriftDetected`, `LLMProxyProviderAuthenticationFailed`:
+  // 25 distinct fingerprints retried ~50x each, none ever succeeding).
+  //
+  // The third disjunct is the backstop for that. It is NOT a lease, and it does
+  // not weaken the rule above it: identity remains the ordinary reclaim path and
+  // is tried first. This only admits a fence whose hold has already exceeded
+  // AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS — a duration this file already treats
+  // as pathological, since `assertFiringGeneration` is deliberately a SELECT so
+  // that it cannot bump `updated_at` and hide a fence from the wedged-fence
+  // detector's `updated_at < now() - interval '15 minutes'`. That detector
+  // defines the condition; nothing acted on it. This is the actor.
+  //
+  // Stealing from a possibly-live owner is already this design's accepted
+  // posture, not a new one: the comment above admits same-slot/different-instance
+  // on "strong evidence of death, NOT proof of it", and rests correctness on the
+  // generation instead. A backstop steal is safe by exactly that argument. A
+  // holder that resumes after losing the race cannot attach a member
+  // (`upsertAggregateMember`), cannot complete (`finishAggregateFiring`), and
+  // cannot mutate the issue (the `firingFence(...)` share lock, BLO-31049); it
+  // fails loudly and Alertmanager retries. So an over-eager backstop costs one
+  // retry, while the current behaviour costs every alert in the aggregate
+  // indefinitely.
   const result = await ctx.db.execute(
     `INSERT INTO ${fences}
        (company_id, aggregate_key, phase, firing_token, owner_instance_id, owner_slot)
@@ -427,8 +480,20 @@ async function beginAggregateFiring(
           ${fences}.phase IN ('firing', 'cancelling')
           AND ${fences}.owner_slot = $5
           AND ${fences}.owner_instance_id IS DISTINCT FROM $4
+        )
+        OR (
+          ${fences}.phase IN ('firing', 'cancelling')
+          AND ${fences}.updated_at
+              < now() - ($6::bigint * interval '1 millisecond')
         )`,
-    [companyId, aggregateKey, token, WORKER_INSTANCE_ID, WORKER_SLOT],
+    [
+      companyId,
+      aggregateKey,
+      token,
+      WORKER_INSTANCE_ID,
+      WORKER_SLOT,
+      AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS,
+    ],
   );
   if (result.rowCount > 0) return { ok: true, token };
   // Read back the phase that actually refused the claim. The upsert admits
@@ -437,14 +502,23 @@ async function beginAggregateFiring(
   // what makes the wedge diagnosable from the delivery error alone; reporting a
   // fixed phase here sent a six-day production investigation (PEN-2581) after
   // `finalizing`, which is the one phase that cannot produce this failure.
-  const rows = await ctx.db.query<{ phase: string }>(
-    `SELECT phase
+  const rows = await ctx.db.query<{ phase: string; held_ms: number | string | null }>(
+    `SELECT phase,
+            EXTRACT(EPOCH FROM (now() - updated_at)) * 1000 AS held_ms
        FROM ${fences}
       WHERE company_id = $1
         AND aggregate_key = $2`,
     [companyId, aggregateKey],
   );
-  return { ok: false, blockingPhase: rows[0]?.phase ?? null };
+  const heldMsRaw = rows[0]?.held_ms;
+  const heldMs = heldMsRaw === null || heldMsRaw === undefined
+    ? null
+    : Math.round(Number(heldMsRaw));
+  return {
+    ok: false,
+    blockingPhase: rows[0]?.phase ?? null,
+    heldMs: heldMs !== null && Number.isFinite(heldMs) ? heldMs : null,
+  };
 }
 
 /**
@@ -1321,13 +1395,36 @@ export async function handleFiring(
     fenceWedgedMemo,
   );
   if (!firingClaim.ok) {
+    // Surface the hold age as a metric so a wedge is detectable as a *cause*
+    // rather than inferred hours later from the webhook delivery ratio
+    // (BLO-32113). Past the backstop this should be self-clearing, so a
+    // sustained non-zero here means the reclaim itself is not working.
+    const heldMs = firingClaim.heldMs ?? null;
+    try {
+      await ctx.metrics.write(
+        "alertmanager.aggregate.fence_blocked",
+        heldMs === null ? 0 : Math.round(heldMs / 1000),
+        {
+          alertname,
+          aggregate_key: aggregateKey,
+          phase: firingClaim.blockingPhase ?? "unknown",
+        },
+      );
+    } catch (metricErr) {
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record blocked-fence metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
     throw new Error(
       `Alertmanager aggregate ${aggregateKey} is held in phase ` +
         `'${firingClaim.blockingPhase ?? "unknown"}' by a delivery in progress; ` +
+        (heldMs === null ? "" : `held for ${Math.round(heldMs / 1000)}s; `) +
         `retrying firing delivery. A fence abandoned by a dead process is released ` +
-        `automatically by its slot's next worker; if this persists, the holder is ` +
-        `either live or in another slot, and an operator can release it via the ` +
-        `plugin's recover-aggregate-firing route.`,
+        `automatically by its slot's next worker, and any fence held past the ` +
+        `abandonment backstop is reclaimed by the next claim regardless of owner. ` +
+        `So this should clear on its own; if it persists past that backstop the ` +
+        `reclaim itself is failing, and an operator can force it via the plugin's ` +
+        `recover-aggregate-firing route.`,
     );
   }
   const firingToken = firingClaim.token;
