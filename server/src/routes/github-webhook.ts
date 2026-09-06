@@ -3869,9 +3869,16 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           // The disabled default must be silent; otherwise every PR webhook in
           // a deployment that has not opted in would emit a warning.
           if (!result.posted && result.reason === "not_configured") return;
-          logger[result.posted ? "info" : "warn"](
+          // A published blocking verdict whose retired-context row could not be
+          // overwritten is not an `info`: the stale green may still be the
+          // required check, so the block is not necessarily operative
+          // (BLO-29711).
+          const unsafeMigration = result.posted && (result.unsupersededBlockingContexts?.length ?? 0) > 0;
+          logger[result.posted && !unsafeMigration ? "info" : "warn"](
             { deliveryId, event: eventName, ...commentReviewGateTrigger, result },
-            "github webhook comment-review gate check completed",
+            unsafeMigration
+              ? "github webhook comment-review gate published a blocking verdict but left a retired context stale"
+              : "github webhook comment-review gate check completed",
           );
         })
         .catch((err) => {

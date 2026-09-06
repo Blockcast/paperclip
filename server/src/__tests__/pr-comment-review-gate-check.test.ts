@@ -274,8 +274,54 @@ describe("retired status contexts", () => {
         : { ok: true, statusCode: 201 },
     );
 
-    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
+    const result = await runPrCommentReviewGateCheck(TARGET);
+
+    expect(result).toMatchObject({ posted: true });
     expect(postFor("gate/ally-comment-findings")).toBeDefined();
+    // The live verdict here is clean (both surfaces empty), so the stale green
+    // row agrees with it and nothing is bypassed. Reporting it would train
+    // operators to ignore the signal that matters in the blocking case below.
+    expect(result).not.toHaveProperty("unsupersededBlockingContexts");
+  });
+
+  // The dangerous half of the same code path, and the one the sibling test
+  // above does NOT cover: a *blocking* live verdict whose retired-context write
+  // failed. The retired context may still be in required checks while the live
+  // one is not (BLO-26602 is that migration), so the stale green is then the
+  // operative row and the PR merges with the finding unresolved. Before the
+  // BLO-29711 fix this returned a bare `posted: true` — indistinguishable from
+  // a fully-published block — and the failure was only `console.warn`ed.
+  it("reports the unsafe migration state when a blocking verdict leaves a retired context stale", async () => {
+    mockListReviews.mockResolvedValue([blockingCommentFor(TARGET.headSha)]);
+    mockPostStatus.mockImplementation(async ({ context }: { context: string }) =>
+      context === "review/ally-comment"
+        ? { ok: false, retryable: false, reason: "commit_status_write_http_403" }
+        : { ok: true, statusCode: 201 },
+    );
+
+    const result = await runPrCommentReviewGateCheck(TARGET);
+
+    // The live verdict is still published — cleanup never breaks the live signal.
+    expect(result).toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "blocking_finding" },
+      unsupersededBlockingContexts: ["review/ally-comment"],
+    });
+    expect(postFor("gate/ally-comment-findings")).toMatchObject({ state: "failure" });
+    // The attempted retirement row mirrored the block; it simply did not land.
+    expect(postFor("review/ally-comment")).toMatchObject({ state: "failure" });
+  });
+
+  it("does not report an unsafe migration state when the blocking mirror lands", async () => {
+    // Same blocking verdict, working write: the retired row now carries the
+    // block too, so there is nothing stale and nothing to escalate.
+    mockListReviews.mockResolvedValue([blockingCommentFor(TARGET.headSha)]);
+
+    const result = await runPrCommentReviewGateCheck(TARGET);
+
+    expect(result).toMatchObject({ posted: true, verdict: { state: "failure" } });
+    expect(postFor("review/ally-comment")).toMatchObject({ state: "failure" });
+    expect(result).not.toHaveProperty("unsupersededBlockingContexts");
   });
 
   it("writes nothing extra when no context is retired", async () => {

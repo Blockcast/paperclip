@@ -74,6 +74,7 @@ import {
   refreshOverdueScheduledRetryAgeMetrics,
   refreshQueuedRunAgeMetrics,
 } from "./services/queued-run-age-metrics.js";
+import { refreshGbrainContextCoverageMetrics } from "./services/gbrain-context-coverage-metrics.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -318,6 +319,9 @@ export async function createApp(
       });
       await refreshOverdueScheduledRetryAgeMetrics(db).catch((err) => {
         logger.warn({ err }, "failed to refresh overdue-scheduled-retry-age metrics before scrape");
+      });
+      await refreshGbrainContextCoverageMetrics(db).catch((err) => {
+        logger.warn({ err }, "failed to refresh gbrain-context coverage metrics before scrape");
       });
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);

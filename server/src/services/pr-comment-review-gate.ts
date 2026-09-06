@@ -339,7 +339,30 @@ export function commentReviewGateRetirementStatus(
 }
 
 export type PrCommentReviewGateCheckResult =
-  | { posted: true; verdict: CommentReviewGateVerdict }
+  | {
+      posted: true;
+      verdict: CommentReviewGateVerdict;
+      /**
+       * Retired contexts still carrying their pre-retirement row because the
+       * supersede write failed *while the live verdict was blocking*.
+       *
+       * Present only in that combination, because only that combination is
+       * unsafe. A failed supersede under a clean live verdict leaves a stale
+       * green next to a live green — the two agree, and nothing is bypassed. A
+       * failed supersede under a *blocking* verdict leaves a stale green that
+       * an operator may still have in required checks (this code cannot read
+       * branch protection to find out: the App gets 403), while the live
+       * context that reports the finding is not required yet. The stale row is
+       * then the operative one and the PR merges with the finding unresolved —
+       * BLO-29711's fail-open, reintroduced through the cleanup path.
+       *
+       * Surfaced rather than thrown: the live verdict *was* published, so the
+       * check did its job, and failing it outright would let cleanup of a
+       * superseded row break the live signal. Callers must not read a bare
+       * `posted: true` as "the block is operative" when this is set.
+       */
+      unsupersededBlockingContexts?: string[];
+    }
   | { posted: false; reason: "not_configured" | "fetch_failed" | "post_failed"; postFailure?: string };
 
 export interface PrCommentReviewGateCheckInput {
@@ -474,7 +497,14 @@ async function executeCommentReviewGateCheck(
   );
   if (!posted.ok) return { posted: false, reason: "post_failed", postFailure: posted.reason };
 
-  await supersedeRetiredContexts(input, headSha, context, config, verdict);
+  const unsuperseded = await supersedeRetiredContexts(input, headSha, context, config, verdict);
+
+  // Only a blocking verdict makes a failed supersede unsafe — see
+  // `unsupersededBlockingContexts`. Under a clean verdict the stale row agrees
+  // with the live one, so reporting it would train operators to ignore it.
+  if (verdict.state === "failure" && unsuperseded.length > 0) {
+    return { posted: true, verdict, unsupersededBlockingContexts: unsuperseded };
+  }
 
   return { posted: true, verdict };
 }
@@ -505,9 +535,20 @@ async function executeCommentReviewGateCheck(
  * where it is not. It also never paints a PR red that the live context is not
  * already painting red, which was the original argument for a fixed `success`.
  *
- * Best-effort by construction: the live verdict is already published, and
- * failing the check over cleanup of a superseded row would let a retired
- * context break the live one.
+ * Best-effort against the *live* signal by construction: the live verdict is
+ * already published, and failing the check over cleanup of a superseded row
+ * would let a retired context break the live one. That is not the same as
+ * silent. A failure here is benign under a clean verdict and unsafe under a
+ * blocking one, so the two are logged at different severities and the unsafe
+ * set is returned to the caller rather than only logged (BLO-29711).
+ *
+ * Self-healing where it can be: the gate re-evaluates on every subsequent
+ * webhook delivery for the PR, and each evaluation retries the supersede. A
+ * transient write failure therefore clears on the next push or review. A
+ * persistent one (403 on the retired context) does not, which is exactly the
+ * case the returned set exists to surface.
+ *
+ * @returns retired contexts whose row could not be overwritten.
  */
 async function supersedeRetiredContexts(
   input: PrCommentReviewGateCheckInput,
@@ -515,15 +556,15 @@ async function supersedeRetiredContexts(
   liveContext: string,
   config: ReturnType<typeof loadConfig>,
   verdict: CommentReviewGateVerdict,
-): Promise<void> {
+): Promise<string[]> {
   const retiredContexts = retiredCommentReviewGateContexts(
     config.prCommentReviewGateRetiredStatusContexts,
     liveContext,
   );
-  if (retiredContexts.length === 0) return;
+  if (retiredContexts.length === 0) return [];
 
   const retirement = commentReviewGateRetirementStatus(liveContext, verdict);
-  await Promise.all(
+  const settled = await Promise.all(
     retiredContexts.map(async (retiredContext) => {
       const result = await withBoundedRetry<GitHubCommitStatusPostResult>(
         () =>
@@ -537,13 +578,27 @@ async function supersedeRetiredContexts(
           }),
         (attempt) => !attempt.ok && attempt.retryable,
       );
-      if (!result.ok) {
+      if (result.ok) return null;
+
+      const where = `"${retiredContext}" on ${input.repoFullName}@${headSha.slice(0, 7)}`;
+      if (verdict.state === "failure") {
+        // The live verdict blocks but the stale row does not. If the retired
+        // context is still required anywhere, that row is the operative one.
+        console.error(
+          `[pr-comment-review-gate] UNSAFE MIGRATION STATE: could not supersede retired context ${where}: ` +
+            `${result.reason}. The live context "${liveContext}" reports "${verdict.outcome}", but the stale ` +
+            "row stands and still reads green. If the retired context is a required check, this PR can merge " +
+            "with the finding unresolved. Remove it from required checks or restore write access (BLO-26602).",
+        );
+      } else {
         console.warn(
-          `[pr-comment-review-gate] Could not supersede retired context "${retiredContext}" on ` +
-            `${input.repoFullName}@${headSha.slice(0, 7)}: ${result.reason}. The stale row stands; ` +
-            "the live verdict was published and is unaffected.",
+          `[pr-comment-review-gate] Could not supersede retired context ${where}: ${result.reason}. ` +
+            "The stale row stands; the live verdict is clean, so nothing is bypassed.",
         );
       }
+      return retiredContext;
     }),
   );
+
+  return settled.filter((context): context is string => context !== null);
 }

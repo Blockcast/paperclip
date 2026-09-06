@@ -39,6 +39,27 @@ test("Blockcast values do not render a PrometheusRule (paperclip-ci-deploy has n
     "values.blockcast.yaml must keep prometheusRule.enabled=false until paperclip-ci-deploy is granted RBAC on prometheusrules.monitoring.coreos.com",
   );
 });
+
+test("PaperclipGbrainContextCoverageMissing uses activity as the denominator (BLO-30067)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipGbrainContextCoverageMissing/);
+  assert.match(
+    rendered,
+    /paperclip_gbrain_context_coverage_refresh_success == 1 and paperclip_gbrain_context_runs_last_hour > 0 and paperclip_gbrain_context_state_rows_last_hour == 0/,
+    "coverage alert must require activity and zero state rows, not an error-rate denominator",
+  );
+  assert.match(
+    rendered,
+    /PaperclipGbrainContextCoverageMissing[\s\S]*?for: 10m/,
+    "coverage alert must tolerate a short scrape gap but fire within the one-hour target",
+  );
+});
 test("prometheusRule.enabled=true still renders the PrometheusRule (flag remains usable once RBAC exists)", () => {
   const rendered = execFileSync(
     "helm",
@@ -658,4 +679,3 @@ test("PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed exposes a stale snap
     "the overdue alert must gate on its own freshness gauge, not the sibling's",
   );
 });
-

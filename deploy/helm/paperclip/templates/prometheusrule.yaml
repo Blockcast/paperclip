@@ -77,6 +77,16 @@ spec:
   groups:
     - name: paperclip-runtime
       rules:
+        - alert: PaperclipGbrainContextCoverageMissing
+          # BLO-30067: activity is the denominator. A plugin_state-only GROUP
+          # BY cannot see an hour in which the plugin wrote no row at all.
+          expr: paperclip_gbrain_context_coverage_refresh_success == 1 and paperclip_gbrain_context_runs_last_hour > 0 and paperclip_gbrain_context_state_rows_last_hour == 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "gbrain-context has no state rows while heartbeat activity is present"
+            description: "The gbrain-context write path has produced zero run-scoped plugin_state rows in the last hour while {{`{{ $value }}`}} activity remains. This is an activity-side coverage alert for zero-row outages (BLO-30067), not an error-rate alert; inspect paperclip-0/plugin workers and the torn plugin-store runbook."
         - alert: PaperclipAgentZeroTokenRunStreak
           expr: max by (agent_id, adapter) (paperclip_agent_zero_token_completed_run_streak) >= {{ .Values.prometheusRule.zeroTokenStreakThreshold }}
           for: {{ .Values.prometheusRule.zeroTokenFor }}

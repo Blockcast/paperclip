@@ -140,6 +140,13 @@ export const OVERDUE_SCHEDULED_RETRY_OLDEST_AGE_METRIC = "paperclip_overdue_sche
  */
 export const OVERDUE_SCHEDULED_RETRY_AGE_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_overdue_scheduled_retry_age_metrics_refresh_success";
+// BLO-30067: activity-side denominator and gbrain-context write-path coverage.
+// These are fleet-wide gauges so Prometheus can distinguish zero plugin rows
+// from zero heartbeat activity, including when the plugin emitted no row.
+export const GBRAIN_CONTEXT_RUNS_LAST_HOUR_METRIC = "paperclip_gbrain_context_runs_last_hour";
+export const GBRAIN_CONTEXT_STATE_ROWS_LAST_HOUR_METRIC = "paperclip_gbrain_context_state_rows_last_hour";
+export const GBRAIN_CONTEXT_COVERAGE_RATIO_LAST_HOUR_METRIC = "paperclip_gbrain_context_coverage_ratio_last_hour";
+export const GBRAIN_CONTEXT_COVERAGE_REFRESH_SUCCESS_METRIC = "paperclip_gbrain_context_coverage_refresh_success";
 /**
  * process_lost reap counter (BLO-16184, parent BLO-12292). Incremented once at
  * the reaper's `process_lost` mint, labeled by bounded `adapter`
@@ -1030,6 +1037,10 @@ let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null =
 let queuedRunOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryAgeMetricsRefreshSuccess: Gauge | null = null;
+let gbrainContextRunsLastHour: Gauge | null = null;
+let gbrainContextStateRowsLastHour: Gauge | null = null;
+let gbrainContextCoverageRatioLastHour: Gauge | null = null;
+let gbrainContextCoverageRefreshSuccess: Gauge | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
 let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
@@ -1062,6 +1073,10 @@ function ensureRegistry(): {
   queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
   overdueScheduledRetryOldestAgeGauge: Gauge<"agent_id">;
   overdueScheduledRetryAgeMetricsRefreshSuccessGauge: Gauge;
+  gbrainContextRunsLastHourGauge: Gauge;
+  gbrainContextStateRowsLastHourGauge: Gauge;
+  gbrainContextCoverageRatioLastHourGauge: Gauge;
+  gbrainContextCoverageRefreshSuccessGauge: Gauge;
   authRequestCounter: Counter<"operation" | "outcome">;
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
@@ -1094,6 +1109,10 @@ function ensureRegistry(): {
     || !queuedRunOldestAge
     || !overdueScheduledRetryOldestAge
     || !overdueScheduledRetryAgeMetricsRefreshSuccess
+    || !gbrainContextRunsLastHour
+    || !gbrainContextStateRowsLastHour
+    || !gbrainContextCoverageRatioLastHour
+    || !gbrainContextCoverageRefreshSuccess
     || !authRequest
     || !agentHeartbeatAge
     || !agentHeartbeatInterval
@@ -1437,6 +1456,27 @@ function ensureRegistry(): {
         + "and can fail independently.",
       registers: [registry],
     });
+    gbrainContextRunsLastHour = new Gauge({
+      name: GBRAIN_CONTEXT_RUNS_LAST_HOUR_METRIC,
+      help: "Heartbeat runs started in the last hour, used as the activity denominator for gbrain-context coverage.",
+      registers: [registry],
+    });
+    gbrainContextStateRowsLastHour = new Gauge({
+      name: GBRAIN_CONTEXT_STATE_ROWS_LAST_HOUR_METRIC,
+      help: "gbrain-context run-scoped plugin_state rows updated in the last hour.",
+      registers: [registry],
+    });
+    gbrainContextCoverageRatioLastHour = new Gauge({
+      name: GBRAIN_CONTEXT_COVERAGE_RATIO_LAST_HOUR_METRIC,
+      help: "gbrain-context state rows divided by heartbeat runs in the last hour; zero rows are represented as zero.",
+      registers: [registry],
+    });
+    gbrainContextCoverageRefreshSuccess = new Gauge({
+      name: GBRAIN_CONTEXT_COVERAGE_REFRESH_SUCCESS_METRIC,
+      help: "1 when the gbrain-context coverage query succeeded before metrics exposition, 0 otherwise.",
+      registers: [registry],
+    });
+    gbrainContextCoverageRefreshSuccess.set(0);
     overdueScheduledRetryAgeMetricsRefreshSuccess.set(0);
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
@@ -1527,6 +1567,10 @@ function ensureRegistry(): {
     queuedRunOldestAgeGauge: queuedRunOldestAge,
     overdueScheduledRetryOldestAgeGauge: overdueScheduledRetryOldestAge,
     overdueScheduledRetryAgeMetricsRefreshSuccessGauge: overdueScheduledRetryAgeMetricsRefreshSuccess,
+    gbrainContextRunsLastHourGauge: gbrainContextRunsLastHour,
+    gbrainContextStateRowsLastHourGauge: gbrainContextStateRowsLastHour,
+    gbrainContextCoverageRatioLastHourGauge: gbrainContextCoverageRatioLastHour,
+    gbrainContextCoverageRefreshSuccessGauge: gbrainContextCoverageRefreshSuccess,
     authRequestCounter: authRequest,
     agentHeartbeatAgeGauge: agentHeartbeatAge,
     agentHeartbeatIntervalGauge: agentHeartbeatInterval,
@@ -2095,6 +2139,25 @@ export function setAgentLivenessMetrics(
   }
 }
 
+/** Publish the activity-side gbrain-context coverage snapshot (BLO-30067). */
+export function setGbrainContextCoverageMetrics(input: {
+  runsLastHour: number;
+  stateRowsLastHour: number;
+  refreshSucceeded: boolean;
+}): void {
+  const metrics = ensureRegistry();
+  const runs = Math.max(0, input.runsLastHour);
+  const stateRows = Math.max(0, input.stateRowsLastHour);
+  metrics.gbrainContextRunsLastHourGauge.set(runs);
+  metrics.gbrainContextStateRowsLastHourGauge.set(stateRows);
+  metrics.gbrainContextCoverageRatioLastHourGauge.set(runs > 0 ? stateRows / runs : 0);
+  metrics.gbrainContextCoverageRefreshSuccessGauge.set(input.refreshSucceeded ? 1 : 0);
+}
+
+export function setGbrainContextCoverageRefreshSuccess(success: boolean): void {
+  ensureRegistry().gbrainContextCoverageRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
 /**
  * Record a project primary-workspace resolution that fell through to the
  * earliest-created row (BLO-26184). Callers should invoke this only when the
@@ -2169,6 +2232,10 @@ export function __resetMetricsForTest(): void {
   queuedRunOldestAge = null;
   overdueScheduledRetryOldestAge = null;
   overdueScheduledRetryAgeMetricsRefreshSuccess = null;
+  gbrainContextRunsLastHour = null;
+  gbrainContextStateRowsLastHour = null;
+  gbrainContextCoverageRatioLastHour = null;
+  gbrainContextCoverageRefreshSuccess = null;
   authRequest = null;
   agentHeartbeatAge = null;
   agentHeartbeatInterval = null;
