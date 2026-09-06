@@ -65,6 +65,41 @@ export const BACKSTOP_SKIP_REASONS = [
   "deferred_or_failed", "enqueue_failed",
 ] as const;
 export type BackstopSkipReason = (typeof BACKSTOP_SKIP_REASONS)[number];
+/**
+ * Webhook deliveries turned away at the ingestion readiness guard (BLO-28803).
+ *
+ * `POST /api/plugins/:pluginId/webhooks/:endpointKey` returns from that guard
+ * long before the `plugin_webhook_deliveries` insert, so a rejected delivery
+ * used to leave no row, no counter and no log. During the 2026-08-18 alert
+ * blackout ([BLO-20813]) the only surviving evidence that ~15h of alert
+ * batches had been turned away lived in *Alertmanager's* logs — Paperclip, the
+ * system of record for alerting, could not answer "how many did we bounce, and
+ * for which plugins?".
+ *
+ * This is the counter that answers it. It matters more since [BLO-28659]
+ * converted rejection from destruction into deferral: deliveries now pile up
+ * at the sender instead of failing loudly, so a plugin quietly bouncing every
+ * delivery for hours is otherwise indistinguishable from one receiving none.
+ * Silence is not health.
+ *
+ * `response_class` separates the two outcomes that must never aggregate:
+ * `retryable` (503 — the sender will come back, payloads are merely delayed)
+ * from `terminal` (410 — the plugin is gone and the payloads are being
+ * dropped on purpose). `plugin_status` carries the underlying cause.
+ *
+ * Cardinality guardrail — this route is public and unauthenticated, so the
+ * bound is load-bearing rather than decorative. Labels are read from the
+ * *resolved database row*, never from the caller-supplied `:pluginId` path
+ * parameter: a POST naming a plugin that does not exist is rejected 404 one
+ * step earlier and mints no series at all. On top of that,
+ * {@link boundWebhookRejectionPluginKey} admits at most
+ * {@link MAX_TRACKED_WEBHOOK_REJECTION_PLUGIN_KEYS} distinct keys per process
+ * and collapses the rest to {@link OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY}, so
+ * the hard ceiling is `(64 + 1) * 5` series — five because `ready` never
+ * reaches the guard — independent of the plugins table and of request volume.
+ * Abuse costs a counter increment on an existing series, never storage.
+ */
+export const PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC = "paperclip_plugin_webhook_delivery_rejected_total";
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
 /**
@@ -1221,6 +1256,117 @@ export function normalizeAuthOutcome(outcome: string | null | undefined): AuthOu
     : "server_error";
 }
 
+/**
+ * How a webhook delivery rejected at the readiness guard looked to the sender
+ * (BLO-28803). These must stay separate in the exposition: `retryable` means
+ * the sender will bring the payload back, `terminal` means it will not and the
+ * data is being discarded deliberately. Summing them would hide exactly the
+ * distinction an incident reconstruction needs.
+ */
+export const KNOWN_WEBHOOK_REJECTION_RESPONSE_CLASSES = ["retryable", "terminal"] as const;
+export type WebhookRejectionResponseClass =
+  (typeof KNOWN_WEBHOOK_REJECTION_RESPONSE_CLASSES)[number];
+
+/**
+ * Hard ceiling on distinct `plugin_key` label values admitted by
+ * {@link PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC}.
+ *
+ * The resolved-row rule already bounds this by the plugins table, which is
+ * operator-controlled — an unknown plugin never reaches the guard. This cap is
+ * the second line: it holds the series count flat even if a future change lets
+ * an unresolved identifier through, so a public unauthenticated route can
+ * never turn into unbounded registry growth. Comfortably above any realistic
+ * install count (the fleet runs well under 20).
+ */
+export const MAX_TRACKED_WEBHOOK_REJECTION_PLUGIN_KEYS = 64;
+/** Label value standing in for keys beyond the cap, and for a missing key. */
+export const OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY = "other";
+
+const trackedWebhookRejectionPluginKeys = new Set<string>();
+
+/** Keep reject-path logs useful without making sender volume a log-volume DoS. */
+const WEBHOOK_REJECTION_LOG_INTERVAL_MS = 60_000;
+type WebhookRejectionLogState = {
+  lastLoggedAt: number;
+  suppressed: number;
+  latest: {
+    pluginId: string;
+    endpointKey: string;
+    pluginStatus: string;
+    httpStatus: number;
+  };
+};
+const webhookRejectionLogState = new Map<string, WebhookRejectionLogState>();
+
+/**
+ * Admit `pluginKey` as a label value, or collapse it to
+ * {@link OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY}. First-come-first-served up to
+ * the cap: real installs are few and long-lived, so they claim their slots on
+ * first rejection and keep them for the life of the process.
+ */
+export function boundWebhookRejectionPluginKey(pluginKey: string | null | undefined): string {
+  const key = typeof pluginKey === "string" ? pluginKey.trim() : "";
+  if (key.length === 0) return OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY;
+  if (trackedWebhookRejectionPluginKeys.has(key)) return key;
+  if (trackedWebhookRejectionPluginKeys.size >= MAX_TRACKED_WEBHOOK_REJECTION_PLUGIN_KEYS) {
+    return OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY;
+  }
+  trackedWebhookRejectionPluginKeys.add(key);
+  return key;
+}
+
+function logPluginWebhookDeliveryRejection(input: {
+  pluginKey: string;
+  pluginId: string;
+  endpointKey: string;
+  pluginStatus: string;
+  responseClass: WebhookRejectionResponseClass;
+  httpStatus: number;
+}): void {
+  const key = `${input.pluginKey}:${input.responseClass}`;
+  const now = Date.now();
+  const previous = webhookRejectionLogState.get(key);
+  const latest = {
+    pluginId: input.pluginId,
+    endpointKey: input.endpointKey,
+    pluginStatus: input.pluginStatus,
+    httpStatus: input.httpStatus,
+  };
+
+  if (previous && now - previous.lastLoggedAt < WEBHOOK_REJECTION_LOG_INTERVAL_MS) {
+    previous.suppressed += 1;
+    previous.latest = latest;
+    return;
+  }
+
+  if (previous?.suppressed) {
+    logger.warn(
+      {
+        pluginKey: input.pluginKey,
+        responseClass: input.responseClass,
+        suppressedCount: previous.suppressed,
+        ...previous.latest,
+      },
+      "plugin webhook rejection log summary",
+    );
+  }
+
+  webhookRejectionLogState.set(key, { lastLoggedAt: now, suppressed: 0, latest });
+  logger.warn(
+    {
+      pluginKey: input.pluginKey,
+      pluginId: input.pluginId,
+      endpointKey: input.endpointKey,
+      pluginStatus: input.pluginStatus,
+      responseClass: input.responseClass,
+      httpStatus: input.httpStatus,
+    },
+    input.responseClass === "retryable"
+      ? "plugin webhook delivery deferred: plugin is not ready, sender told to retry"
+      : "plugin webhook delivery dropped: plugin is gone, sender told not to retry",
+  );
+}
+
 export function classifyAuthOperation(requestUrl: string): AuthOperation {
   const pathname = requestUrl.split("?", 1)[0]?.replace(/\/+$/, "") ?? "";
   if (pathname.endsWith("/sign-in/oauth2")) return "oidc_start";
@@ -1672,6 +1818,9 @@ let projectPrimaryWorkspaceFallback: Counter | null = null;
 let backstopDeferredCandidates: Gauge<"source"> | null = null;
 let backstopSweepCompleted: Counter<"source"> | null = null;
 let backstopCandidatesSkipped: Counter<"source" | "reason"> | null = null;
+let pluginWebhookDeliveryRejected:
+  | Counter<"plugin_key" | "response_class" | "plugin_status">
+  | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -1722,6 +1871,7 @@ function ensureRegistry(): {
   backstopDeferredCandidatesGauge: Gauge<"source">;
   backstopSweepCompletedCounter: Counter<"source">;
   backstopCandidatesSkippedCounter: Counter<"source" | "reason">;
+  pluginWebhookDeliveryRejectedCounter: Counter<"plugin_key" | "response_class" | "plugin_status">;
 } {
   if (
     !registry
@@ -1770,6 +1920,7 @@ function ensureRegistry(): {
     || !backstopDeferredCandidates
     || !backstopSweepCompleted
     || !backstopCandidatesSkipped
+    || !pluginWebhookDeliveryRejected
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -2416,6 +2567,20 @@ function ensureRegistry(): {
     for (const source of BACKSTOP_SOURCES) {
       backstopDeferredCandidates.set({ source }, 0);
     }
+    pluginWebhookDeliveryRejected = new Counter({
+      name: PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC,
+      help:
+        "Count of inbound plugin webhook deliveries turned away at the ingestion "
+        + "readiness guard (BLO-28803), labeled by bounded plugin_key, response_class "
+        + "(retryable = 503, the sender will re-deliver; terminal = 410, the payload is "
+        + "dropped on purpose) and plugin_status. Before this counter a rejected delivery "
+        + "left no row, no counter and no log, so the 2026-08-18 alert blackout "
+        + "(BLO-20813) could only be reconstructed from Alertmanager's own logs. "
+        + "A sustained retryable rate means a plugin is bouncing every delivery; any "
+        + "terminal rate means payloads are being discarded.",
+      labelNames: ["plugin_key", "response_class", "plugin_status"],
+      registers: [registry],
+    });
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -2468,6 +2633,7 @@ function ensureRegistry(): {
     backstopDeferredCandidatesGauge: backstopDeferredCandidates,
     backstopSweepCompletedCounter: backstopSweepCompleted,
     backstopCandidatesSkippedCounter: backstopCandidatesSkipped,
+    pluginWebhookDeliveryRejectedCounter: pluginWebhookDeliveryRejected,
   };
 }
 
@@ -3510,6 +3676,46 @@ export function recordBackstopCandidateSkipped(source: BackstopSource, reason: B
   ensureRegistry().backstopCandidatesSkippedCounter.inc({ source, reason });
 }
 
+/**
+ * Record a webhook delivery turned away at the ingestion readiness guard
+ * (BLO-28803).
+ *
+ * Two surfaces, deliberately: the counter answers "how many, for which plugin,
+ * over what window" from the scraped registry — alertable, and readable long
+ * after the fact without sender-side logs — while the paired log line carries
+ * the per-request detail (`pluginId` as the caller supplied it, `endpointKey`,
+ * the HTTP status actually sent) that must never become a label.
+ *
+ * Called on the reject path of a public unauthenticated route, so it must not
+ * throw: a metrics fault has no business converting a considered 503 into a
+ * 500 that the sender reads as something else entirely.
+ */
+export function recordPluginWebhookDeliveryRejected(input: {
+  /** Canonical key from the resolved plugins row — NOT the URL parameter. */
+  pluginKey: string | null | undefined;
+  /** Identifier as supplied by the caller; logged, never labeled. */
+  pluginId: string;
+  endpointKey: string;
+  pluginStatus: string;
+  responseClass: WebhookRejectionResponseClass;
+  httpStatus: number;
+}): void {
+  const pluginKey = boundWebhookRejectionPluginKey(input.pluginKey);
+  try {
+    ensureRegistry().pluginWebhookDeliveryRejectedCounter.inc({
+      plugin_key: pluginKey,
+      response_class: input.responseClass,
+      plugin_status: input.pluginStatus,
+    });
+  } catch (error) {
+    logger.error(
+      { err: error, pluginKey },
+      "failed to record plugin webhook delivery rejection metric",
+    );
+  }
+  logPluginWebhookDeliveryRejection({ ...input, pluginKey });
+}
+
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
@@ -3591,6 +3797,9 @@ export function __resetMetricsForTest(): void {
   backstopSweepCompleted = null;
   backstopCandidatesSkipped = null;
   gbrainRecallTotal = null;
+  pluginWebhookDeliveryRejected = null;
+  trackedWebhookRejectionPluginKeys.clear();
+  webhookRejectionLogState.clear();
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
   resetRoutineDispatchMetrics();
