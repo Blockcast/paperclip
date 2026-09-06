@@ -866,18 +866,15 @@ live_running_digest() {
   printf '%s\n' "${image#*@}"
 }
 
-# The image carried by the one ReplicaSet of this Deployment that still has ready
-# pods, or empty. Reached only when the Deployment's own template has failed the
-# serving gate -- typically because a rollout was applied and never became ready,
-# which leaves spec.template naming a digest that never carried traffic while the
-# previous ReplicaSet keeps serving the one that did.
+# The image carried by the OLDEST ReplicaSet of this Deployment that still has
+# ready pods, or empty. Reached only when the Deployment's own template has failed
+# the serving gate -- typically because a rollout was applied and never became
+# ready, which leaves spec.template naming a digest that never carried traffic
+# while the previous ReplicaSet keeps serving the one that did.
 #
-# EXACTLY ONE serving ReplicaSet is required, which is deliberately stricter than
-# "the newest one that has ready pods". Two ReplicaSets with ready pods means both
-# digests are serving and neither is "the running one"; naming the newer would pin
-# a half-rolled digest that is quite possibly the one about to fail. The two rules
-# only ever disagree in that case, and there the strict one is never worse -- for
-# either of the two ways to reach it:
+# OLDEST rather than newest, and oldest rather than "exactly one" (BLO-32101).
+# Taking the NEWEST is wrong, for either of the two ways to reach the two-serving
+# case:
 #
 #   - A roll still moving. The newer digest is usually the one being approved right
 #     now, which build_approval_ring already holds in slot 0 and discards as not
@@ -892,8 +889,39 @@ live_running_digest() {
 #     BROKEN one rather than the one being approved, so pinning it would be
 #     actively worse than pinning nothing.
 #
-# So do not "fix" the ambiguous case by taking the newest: in the first case that
-# buys nothing, and in the second it pins the digest that is currently failing.
+# This function originally required EXACTLY ONE serving ReplicaSet and declined
+# otherwise, on the reasoning that neither of two serving digests is "the running
+# one". That is true and still not a reason to decline: in BOTH cases above the
+# OLDER ReplicaSet is the one carrying the last-healthy digest this reader exists
+# to recover -- in the stalled case it is the only object that still names it --
+# and declining threw it away. An RS with ready pods is serving traffic by
+# definition, and between two of them the older has been serving longer, so age
+# breaks the tie in exactly the direction this reader wants. Oldest-wins therefore
+# dominates: the two rules agree whenever one serving RS exists, and where they
+# differ the strict rule pinned nothing while oldest-wins pins the last-healthy
+# digest.
+#
+# Age is consulted ONLY to break a tie among ReplicaSets that already passed
+# ownership and readiness, and the winner is then subjected to the same container
+# and repository checks as before, with no fallthrough to the runner-up. So an
+# oldest ReplicaSet whose containers disagree, or one carrying another
+# repository's image, still yields no digest rather than promoting the newer one
+# -- the older RS being disqualified is evidence about the rollback target, not an
+# invitation to pick a different one.
+#
+# Two shapes leave no oldest to pick and are declined rather than guessed at, both
+# of which the plain sort would otherwise answer arbitrarily:
+#
+#   - Equal creationTimestamps. Kubernetes stamps these at one-second granularity,
+#     so two ReplicaSets minted inside the same second tie for real. jq's sort
+#     would then resolve on input order, i.e. on apiserver list order.
+#   - A missing creationTimestamp. It defaults to the empty string, which sorts
+#     BEFORE every real timestamp, so a ReplicaSet with no stamp would win as
+#     "oldest" on the strength of the field being absent.
+#
+# Timestamps are compared as strings, which is exact rather than approximate:
+# metav1.Time marshals as RFC3339 in UTC with a fixed layout, so lexicographic and
+# chronological order coincide.
 #
 # ReplicaSets are matched by the Deployment's own selector AND by an ownerReference
 # to its uid. The selector alone is server-side narrowing; the uid is what makes it
@@ -968,6 +996,13 @@ serving_replicaset_image() {
       fi
     else
       image="$(jq -r --arg uid "$uid" '
+        def rs_image:
+          [ .spec.template.spec.containers[]?.image // empty ] as $images
+          | if ($images | length) > 0 and (($images | unique | length) == 1)
+            then $images[0]
+            else ""
+            end;
+
         [ .items[]?
           | select(
               [ (.metadata.ownerReferences // [])[]
@@ -975,13 +1010,14 @@ serving_replicaset_image() {
               ] | length == 1
             )
           | select((.status.readyReplicas // 0) > 0)
-          | [ .spec.template.spec.containers[]?.image // empty ] as $images
-          | if ($images | length) > 0 and (($images | unique | length) == 1)
-            then $images[0]
-            else ""
-            end
         ] as $serving
-        | if ($serving | length) == 1 then $serving[0] else "" end
+        | [ $serving[] | .metadata.creationTimestamp // "" ] as $stamps
+        | if   ($serving | length) == 0 then ""
+          elif ($serving | length) == 1 then ($serving[0] | rs_image)
+          elif ($stamps | map(select(. == "")) | length) > 0 then ""
+          elif (($stamps | sort) | .[0] == .[1]) then ""
+          else ($serving | sort_by(.metadata.creationTimestamp) | .[0] | rs_image)
+          end
       ' <<<"$rs_json" 2>/dev/null)" || image=""
     fi
     rm -f "$rs_err"
