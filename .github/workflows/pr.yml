@@ -332,6 +332,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s .github/scripts -p 'test_sweep_*.py' -v
 
+      # BLO-23128: an unparseable workflow is invisible to every other gate —
+      # GitHub emits an instant 0-job failure instead of a parse error, so there
+      # is no failing job for a required check to catch. Validate structure here.
+      - name: Validate workflow block-scalar structure (BLO-23128)
+        run: |
+          node ./.github/scripts/check-workflow-structure.mjs
+          node --test ./.github/scripts/tests/check-workflow-structure.test.mjs
+
       - name: Validate Designer fast-uri security floor
         if: ${{ !cancelled() }}
         run: node ./scripts/designer-fast-uri-security.test.js
