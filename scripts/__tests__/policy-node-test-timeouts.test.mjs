@@ -105,3 +105,49 @@ test("the chart render step is bounded, and inside its job's budget (BLO-29182)"
   assert.ok(stepBound > 0, "the chart render step must declare a step-level timeout-minutes");
   assert.ok(stepBound < jobCap, `step bound ${stepBound}m must sit below the ${jobCap}m job cap`);
 });
+
+// BLO-31690. `policy`'s cap is sized against measured setup cost, and the larger,
+// more variable half of that cost is its `fetch-depth: 0` checkout (0.5-4.6m over
+// 120 runs). Until that bound was added the step carried none, so a wedged fetch
+// could only ever surface as an unattributable job-cap `cancelled` — the exact
+// mode the cap raise exists to remove, which makes the bound load-bearing rather
+// than decorative. By this file's own convention that means gating it: the
+// mutation case above exists because a bound nothing asserts is a bound that can
+// be quietly deleted, and this one is the only step bound in `policy` that had no
+// test behind it. The sizing argument (6m ≈ 1.3× the p100, why not 8m, and the
+// residual band it leaves) lives in the workflow comment — deliberately without
+// the figure here, since that band is a function of the drifting gate-work term
+// and a copy of it in this file went stale within one commit (0.2m → 1.1m); the
+// invariants worth gating are that the bound exists and that it stays under the
+// cap, since a step bound at or above the job cap can never fire and silently
+// stops being attribution.
+function assertCheckoutBounded(region) {
+  const jobCap = Number(region.match(/\n    timeout-minutes: (\d+)\n/)?.[1]);
+  assert.ok(jobCap > 0, "policy must declare a job-level timeout-minutes");
+  const step = region
+    .split("\n      - name: ")
+    .slice(1)
+    .find((candidate) => candidate.includes("uses: actions/checkout@"));
+  assert.ok(step, "policy must contain an actions/checkout step");
+  const stepBound = Number(step.match(/\n        timeout-minutes: (\d+)\n/)?.[1]);
+  assert.ok(stepBound > 0, "policy's checkout step must declare a step-level timeout-minutes");
+  assert.ok(
+    stepBound < jobCap,
+    `checkout bound ${stepBound}m must sit below the ${jobCap}m job cap`,
+  );
+}
+
+test("policy's checkout step is bounded, and inside the job's budget (BLO-31690)", () => {
+  assertCheckoutBounded(jobRegion("policy"));
+});
+
+test("the checkout guard fails when the bound is removed", () => {
+  const region = jobRegion("policy");
+  const at = region.indexOf("uses: actions/checkout@");
+  assert.notEqual(at, -1, "policy must contain an actions/checkout step");
+  // Strip only the bound belonging to the checkout step: the first 8-space
+  // `timeout-minutes` at or after its `uses:` line.
+  const mutated =
+    region.slice(0, at) + region.slice(at).replace(/\n {8}timeout-minutes: \d+\n/, "\n");
+  assert.throws(() => assertCheckoutBounded(mutated), /step-level timeout-minutes/);
+});
