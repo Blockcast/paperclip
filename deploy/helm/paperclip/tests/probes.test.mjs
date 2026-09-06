@@ -51,6 +51,10 @@ test("API deployment keeps HTTP health probes", () => {
   assert.doesNotMatch(rendered, /grep -qa 'server\/dist\/index\.js'/);
 });
 
+// Smallest readiness failureThreshold that still requires *consecutive*
+// failures before the only Service endpoint is removed. See BLO-31945.
+const MIN_READINESS_FAILURE_THRESHOLD = 3;
+
 function probeSettings(rendered, probeName) {
   const match = rendered.match(
     new RegExp(`^(\\s*)${probeName}:\\n((?:\\1\\s+.*\\n)+)`, "m"),
@@ -78,7 +82,13 @@ function probeSettings(rendered, probeName) {
 // 10s liveness timeout against the identical /healthz (1.171% vs 0.462%),
 // while p99.9 of successful liveness probes was 8.59s — i.e. the readiness
 // timeout had been set below the endpoint's own tail latency.
-test("worker readiness probe is no tighter than liveness while the tier is single-replica", () => {
+//
+// Three separate knobs can each reopen that outage, so all three are asserted:
+// the timeout (how easily one probe reports failure), failureThreshold (how
+// many failures are needed to act on it), and the timeout/period relationship.
+// Guarding only the timeout leaves failureThreshold as the next lever a reader
+// reaches for once told the timeout is off limits.
+test("worker readiness probe cannot be re-tightened into the BLO-31945 outage", () => {
   const rendered = renderTemplate("templates/statefulset.yaml");
 
   const replicas = Number(rendered.match(/^\s*replicas:\s*(\d+)/m)?.[1]);
@@ -98,6 +108,23 @@ test("worker readiness probe is no tighter than liveness while the tier is singl
         `liveness (${liveness.timeoutSeconds}s) on a single-replica worker: with no peer to ` +
         `shed to, a readiness failure removes the only endpoint and 502s all plugin traffic. ` +
         `See BLO-31945.`,
+    );
+
+    // The floor is 3, not `>= liveness.failureThreshold`. Liveness is 6 and
+    // readiness is 3, so keying off liveness would fail against the very
+    // configuration this guard is meant to protect. 3 is the smallest value
+    // that still requires *consecutive* failures, which is the property that
+    // matters: at the 0.462% per-probe failure rate this endpoint exhibits,
+    // needing three in a row makes an endpoint drop rare, while
+    // failureThreshold: 1 drops the only endpoint on any single tail-latency
+    // blip and reopens the outage — with every other assertion here still
+    // green.
+    assert.ok(
+      readiness.failureThreshold >= MIN_READINESS_FAILURE_THRESHOLD,
+      `readiness failureThreshold (${readiness.failureThreshold}) must be at least ` +
+        `${MIN_READINESS_FAILURE_THRESHOLD} on a single-replica worker: a lower threshold lets ` +
+        `an isolated slow /healthz remove the only Service endpoint, which 502s all plugin ` +
+        `traffic rather than shedding it. See BLO-31945.`,
     );
   }
 
