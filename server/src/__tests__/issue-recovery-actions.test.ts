@@ -15,6 +15,7 @@ import {
   issueComments,
   issueRecoveryActions,
   issueRelations,
+  issueWorkProducts,
   issues,
   routines,
   routineRuns,
@@ -33,6 +34,7 @@ import { issueRecoveryActionService, recoveryHandoffGrantIsWithinTtl } from "../
 import { issueService } from "../services/issues.js";
 import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { buildPullRequestWorkProductFields } from "../services/pull-request-work-products.js";
 import { loadConfig } from "../config.js";
 import {
   RECOVERY_SWEEP_COVERED_ISSUE_STATUSES,
@@ -392,6 +394,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     pauseHoldSeam.onNextCheck = null;
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
+    await db.delete(issueWorkProducts);
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
@@ -1971,6 +1974,185 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(updatedRun?.errorCode).toBe("adapter_failed");
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
     expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  // PEN-2791. The sweep counted five attendance paths -- live run, deferred execution
+  // wake, pending wake interaction, active monitor, unresolved blocker -- and none of
+  // them was an external event wake. That put two platform controls in contradiction:
+  // the convergence guard's whole job, against a gate it cannot move, is to stop
+  // re-arming and clear `monitorNextCheckAt`, and on an issue with no blockers that
+  // column WAS the only durable path. The guard behaving correctly is exactly what made
+  // the row seizable, so an assignee reasoning correctly about when not to poll was the
+  // assignee most likely to lose its issue.
+  //
+  // Reproduced from PEN-2370 (2026-09-01): a `stranded_assigned_issue` action moved a
+  // `critical` security row from `in_progress` to `blocked` and took it from its owner,
+  // on an evidence block naming no fault -- `latestRunStatus: succeeded`,
+  // `latestRunErrorCode: null`, `infraClassCause: false` -- so it fired on the absence of
+  // a counted path, not on a failure. (Those action-record fields are quoted from the
+  // issue; the recovery-action API is not readable from an agent seat.) Directly
+  // re-measured on the row itself: its monitor was cleared with `monitorAttemptCount: 8`
+  // and it carried two `ready_for_review` PR work products written by the same webhook
+  // that had already woken that owner from those PRs earlier the same day.
+  describe("PEN-2791 open pull request as an attendance path", () => {
+    // The PEN-2370 shape: productive succeeded run, no monitor, no blockers. Without an
+    // open PR this escalates -- which the first test below asserts, so the rest are
+    // known to be measuring the exemption rather than a row that was never at risk.
+    async function seedSeizableProductiveRow() {
+      const seeded = await seedCompany();
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "succeeded",
+        livenessState: "advanced",
+        startedAt: new Date(Date.now() - 45 * 60_000),
+        finishedAt: new Date(Date.now() - 40 * 60_000),
+        contextSnapshot: {
+          issueId: seeded.sourceIssueId,
+          retryReason: "issue_continuation_needed",
+          source: "issue.productive_terminal_continuation_recovery",
+        },
+      });
+      return seeded;
+    }
+
+    // Built through the real producer, not hand-written literals: the predicate filters
+    // on the webhook's metadata source and system source-trust, so if either constant
+    // moves, this seeding moves with it and a stale filter fails loudly instead of
+    // silently matching nothing.
+    async function insertPullRequestWorkProduct(input: {
+      companyId: string;
+      issueId: string;
+      prNumber: number;
+      merged?: boolean;
+      updatedAt?: Date;
+      /** Simulates a hand-created row: no webhook metadata, no system source-trust. */
+      handCreated?: boolean;
+    }) {
+      const fields = buildPullRequestWorkProductFields({
+        repoFullName: "Blockcast/paperclip",
+        prNumber: input.prNumber,
+        prTitle: "Scrub secret material from k8s MCP responses",
+        prUrl: `https://github.com/Blockcast/paperclip/pull/${input.prNumber}`,
+        headSha: "0b11256d0a5dccad3d26bb9756d02294c231988f",
+        prBranch: "security/scrub-k8s-mcp-env",
+        prDraft: false,
+        prMerged: input.merged === true,
+        prUpdatedAt: new Date().toISOString(),
+        action: input.merged === true ? "closed" : "synchronize",
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId: input.companyId,
+        issueId: input.issueId,
+        provider: "github",
+        type: "pull_request",
+        externalId: fields.externalId,
+        title: fields.title,
+        url: fields.url,
+        status: fields.status,
+        metadata: input.handCreated ? null : fields.metadata,
+        sourceTrust: input.handCreated ? null : fields.sourceTrust,
+        ...(input.updatedAt ? { updatedAt: input.updatedAt } : {}),
+      });
+      return fields;
+    }
+
+    async function sweep() {
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+      return recovery.reconcileStrandedAssignedIssues();
+    }
+
+    it("escalates the PEN-2370 shape when no pull request is recorded (control)", async () => {
+      const { sourceIssueId } = await seedSeizableProductiveRow();
+
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("does not escalate while an open pull request is recorded against the issue", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      const fields = await insertPullRequestWorkProduct({
+        companyId,
+        issueId: sourceIssueId,
+        prNumber: 1583,
+      });
+      // Guard the guard: if the producer ever stops emitting an open status here, this
+      // test would pass for the wrong reason -- the row would be terminal and the
+      // exemption untested.
+      expect(fields.status).toBe("ready_for_review");
+
+      const result = await sweep();
+
+      expect(result.escalated).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("in_progress");
+      expect(updated?.assigneeAgentId).toBe(coderId);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    });
+
+    it("still escalates when the only recorded pull request has merged", async () => {
+      const { companyId, sourceIssueId } = await seedSeizableProductiveRow();
+      const fields = await insertPullRequestWorkProduct({
+        companyId,
+        issueId: sourceIssueId,
+        prNumber: 1574,
+        merged: true,
+      });
+      expect(fields.status).toBe("merged");
+
+      const result = await sweep();
+
+      // A merged PR emits no further webhook, so it is not evidence of a future wake.
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("still escalates for a hand-created pull request row the webhook did not write", async () => {
+      const { companyId, sourceIssueId } = await seedSeizableProductiveRow();
+      await insertPullRequestWorkProduct({
+        companyId,
+        issueId: sourceIssueId,
+        prNumber: 1581,
+        handCreated: true,
+      });
+
+      // Only a row the webhook itself wrote predicts that the webhook will fire again.
+      // Someone pasting a PR URL onto an issue creates no wake path at all.
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("stops believing an open pull request that has not moved within the grace", async () => {
+      const { companyId, sourceIssueId } = await seedSeizableProductiveRow();
+      const graceMs = loadConfig().openPullRequestAttendanceGraceMs;
+      await insertPullRequestWorkProduct({
+        companyId,
+        issueId: sourceIssueId,
+        prNumber: 1449,
+        updatedAt: new Date(Date.now() - (graceMs + 60 * 60_000)),
+      });
+
+      // An open PR proves a wake arrives when the PR next MOVES, not that one arrives on
+      // a schedule. Unbounded, this disjunct would hold an abandoned PR's issue
+      // `in_progress` and unattended forever -- PEN-2791's own failure, entered from the
+      // other side.
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
   });
 
   it("does not create takeover recovery when a quota monitor cannot be scheduled", async () => {

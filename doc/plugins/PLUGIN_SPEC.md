@@ -325,6 +325,12 @@ export interface PaperclipPluginManifestV1 {
   /** @deprecated Use `minimumHostVersion` instead. Retained for backwards compatibility. */
   minimumPaperclipVersion?: string;
   capabilities: string[];
+  /**
+   * Tag keys this plugin may promote to Prometheus labels on
+   * `paperclip_plugin_metric_total`. Max 5, `snake_case`. Promotion also
+   * requires the key to be in the host's allow-list — see §26.4.
+   */
+  metricLabels?: string[];
   entrypoints: {
     worker: string;
     ui?: string;
@@ -1643,6 +1649,74 @@ The host should emit internal events when plugin health degrades. These use the 
 - `plugin.worker.restarted` — worker restarted after crash
 
 These events can be consumed by other plugins (e.g. a notification plugin) or surfaced in the dashboard.
+
+### 26.4 Metric Exposition
+
+`ctx.metrics.write(name, value, tags)` does two independent things:
+
+1. writes a `plugin_logs` row at `level='metric'` (queryable per-tenant detail), and
+2. increments the Prometheus counter `paperclip_plugin_metric_total`, which is what an alert rule can actually fire on.
+
+Both happen on every call; (2) runs first, so a `plugin_logs` write or flush failure cannot cost you the alertable signal.
+
+**The metric name is a label, not a series name.** The series is always `paperclip_plugin_metric_total`, labelled `plugin_id`, `plugin_key`, `metric` (your name), plus any promoted tags. Plugin metric names are frequently built by interpolation, so mapping them into series names would let an installed plugin mint arbitrary `paperclip_*` series in the host's namespace — and rule authors cannot enumerate plugin metric names in advance.
+
+**`write` is a counter increment.** The value must be finite and `>= 0`. Anything else is rejected, not clamped. There is no gauge form; if one is added it will be a separate method with its own series family, so that recompiling a plugin can never silently change what an existing series means.
+
+**Tag promotion is a two-sided gate.** A tag key becomes a Prometheus label only when it appears in *both*:
+
+- your manifest's `metricLabels` (max 5, `snake_case`), and
+- the host's `PLUGIN_METRIC_PROMOTABLE_TAG_KEYS` allow-list.
+
+Your manifest chooses what *you* promote; the host list bounds what *any* plugin may ever promote, so installing a third-party plugin cannot introduce an unbounded label. Both are required because Prometheus client libraries fix a counter's label names when the counter is constructed, while a manifest is read per write.
+
+**A promoted tag is published under a `tag_` prefix.** You declare and write `alertname`; the series carries `tag_alertname`. The prefix exists because Prometheus assigns some label names itself, and a plugin tag sharing one of those names breaks the rules this metric exists to feed:
+
+- An alerting rule **overwrites `alertname` with the rule's own name** before checking for duplicate label sets. Two series differing only in `alertname` therefore become identical, and the rule dies at evaluation with `vector contains metrics with the same labelset after applying alert labels` — measured with promtool, not inferred.
+- A rule's `labels:` block conventionally sets `severity`, which would **silently** overwrite a promoted `severity` and route the alert on a value neither side chose.
+- From the scrape side `job` and `instance` are the same hazard: under the default `honor_labels: false` they are quietly renamed to `exported_*`.
+
+Writing your queries against `tag_alertname` rather than `alertname` is the whole cost, and it buys the ability to write the obvious unaggregated rule — `paperclip_plugin_metric_total{metric="your.metric.name"} > 0` — without it hard-failing.
+
+Keys outside the gate are **not** dropped from the metric — only from its labels. The increment still lands, and the full tag set is still on the `plugin_logs` row. Declaring nothing is safe and is the default: you get aggregate-only series.
+
+`company_id` is never a label (unbounded per tenant). It stays on the `plugin_logs` row.
+
+**Cardinality is bounded in two tiers, and the tiers degrade on different axes on purpose.** Per worker process a plugin may occupy at most **50 distinct metric names** and **100 distinct `(metric, promoted-label-values)` combinations**. Independently of both, a single promoted label **value** is cut to **128 code points**, and has **control characters stripped** — the exposition format cannot carry them, so a value containing them would otherwise emit raw bytes into `/metrics`.
+
+- Exceed the **combination** budget and a write **keeps its `metric` label and drops its promoted labels**. The increment still lands on that metric's own series, so an alert rule matching `metric="your.metric.name"` keeps working and `sum by (metric)` stays *exactly* correct — only the per-tag breakdown is lost.
+- Exceed the far tighter **name** budget and the write collapses to `metric="_overflow"`. This is the only case where `metric` collapses, and it means the plugin is minting names faster than any rule author could enumerate them.
+
+That asymmetry is load-bearing. `metric` is the label rule authors filter on, while promoted tag values (`alertname`, say) are the genuinely unbounded axis — so collapsing `metric` to protect against tag churn would silently break the rule the metric exists to feed, which is the failure mode this whole feature was built to end. Nothing is ever discarded; every rejection or degradation increments `paperclip_plugin_metric_dropped_total{reason}`:
+
+| `reason` | meaning |
+|---|---|
+| `bad_name` | name failed shape (`^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*$`) or exceeded 64 chars |
+| `bad_value` | value was non-finite or negative |
+| `label_budget` | tag-value budget exhausted; promoted labels dropped, increment still on the metric's series |
+| `name_budget` | metric-name budget exhausted; folded into the `_overflow` series |
+| `value_truncated` | a promoted label value exceeded 128 code points and was cut to fit; the increment landed with the shortened value, and two values sharing that prefix collapse into one series |
+| `value_sanitized` | a promoted label value carried control characters, which were stripped before publishing; the increment landed with the stripped value, and two values differing only in stripped characters collapse into one series |
+
+The `metric` label is populated only where its cardinality is already bounded: `label_budget`, `value_truncated` and `value_sanitized` carry the real metric name, `name_budget` carries `_overflow` (never the rejected name, which is the unbounded input that tier exists to refuse), and `bad_name`/`bad_value` leave it empty for that same reason. So `sum by (metric) (paperclip_plugin_metric_dropped_total)` buckets the two shape rejections under `metric=""` by design.
+
+If a metric you expect is missing, or its per-tag breakdown looks wrong, query that series first — it is the answer, and it exists so the answer never requires reading host source.
+
+Example manifest fragment:
+
+```ts
+capabilities: ["metrics.write"],
+metricLabels: ["alertname", "severity", "version"],
+```
+
+and a rule written against it:
+
+```promql
+sum by (plugin_key, metric) (
+  rate(paperclip_plugin_metric_total{plugin_key="paperclip-plugin-alertmanager",
+                                     metric="alertmanager.owner.fallback_failed"}[10m])
+) > 0
+```
 
 ## 27. Plugin Development And Testing
 

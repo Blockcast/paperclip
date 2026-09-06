@@ -523,6 +523,22 @@ describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
     expect(summary).toContain("BackoffLimitExceeded");
   });
 
+  it("keeps the causal tail of a long plain failure", () => {
+    const cause = "error: could not lock config file /workspace/.git/config.lock: File exists";
+    const summary = summarizeRunFailureForIssueComment(
+      run({
+        errorCode: "workspace_git_submodule_unavailable",
+        error: `${"/very/long/workspace/path/".repeat(30)}${cause}`,
+      }),
+    );
+
+    expect(summary).toContain("could not lock config file");
+    expect(summary).toContain("workspace_git_submodule_unavailable");
+    expect(summary).toHaveLength(
+      240 + " Latest retry failure: `workspace_git_submodule_unavailable` — .".length,
+    );
+  });
+
   it("returns null when there is no run", () => {
     expect(summarizeRunFailureForIssueComment(null)).toBeNull();
   });
