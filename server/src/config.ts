@@ -132,6 +132,11 @@ export interface Config {
   // run. Worker-tier only, same rationale as the PR reconciler.
   approvalGateReconcilerEnabled: boolean;
   approvalGateReconcilerIntervalMinutes: number;
+  // Terminal-gate reconciler (BLO-27515): re-reads the PR gates a terminated
+  // monitor declared, so a gate that resolves after the last poll is observed
+  // without dispatching an assignee run. Worker-tier only.
+  terminalGateReconcilerEnabled: boolean;
+  terminalGateReconcilerIntervalMinutes: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -416,6 +421,11 @@ export const NUMERIC_SETTING_BOUNDS = {
     min: 1,
     max: TIMER_PERIOD_MINUTES_MAX,
   },
+  terminalGateReconcilerIntervalMinutes: {
+    fallback: 10,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
   heartbeatSchedulerIntervalMs: { fallback: 30_000, min: 10_000, max: 24 * 60 * 60_000 },
   recoveryActionMaxAttempts: { fallback: 5, min: 1, max: 1_000 },
   recoveryActionTimeoutMs: {
@@ -456,6 +466,7 @@ export const TIMER_SETTING_MS_FACTOR = {
   humanGatedDigestIntervalMinutes: 60_000,
   prReviewStateReconcilerIntervalMinutes: 60_000,
   approvalGateReconcilerIntervalMinutes: 60_000,
+  terminalGateReconcilerIntervalMinutes: 60_000,
   heartbeatSchedulerIntervalMs: 1,
 } as const satisfies Partial<Record<keyof typeof NUMERIC_SETTING_BOUNDS, number>>;
 
@@ -858,6 +869,20 @@ export function loadConfig(): Config {
     NUMERIC_SETTING_BOUNDS.approvalGateReconcilerIntervalMinutes,
     "approvalGateReconcilerIntervalMinutes",
   );
+  // Terminal-gate reconciler (BLO-27515). Enabled by default for the same
+  // reason: a monitor gate that resolves while nothing is polling it is a
+  // silent reliability defect, not an opt-in feature. 10m default — each pass
+  // costs at most one GitHub read per distinct still-unresolved PR, and reads
+  // stop entirely once a resolution is recorded.
+  const terminalGateReconcilerEnabled =
+    process.env.PAPERCLIP_TERMINAL_GATE_RECONCILER_ENABLED !== undefined
+      ? process.env.PAPERCLIP_TERMINAL_GATE_RECONCILER_ENABLED === "true"
+      : true;
+  const terminalGateReconcilerIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_TERMINAL_GATE_RECONCILER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.terminalGateReconcilerIntervalMinutes,
+    "terminalGateReconcilerIntervalMinutes",
+  );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -974,6 +999,8 @@ export function loadConfig(): Config {
     prReviewStateMaxPullRequestsPerRepo,
     approvalGateReconcilerEnabled,
     approvalGateReconcilerIntervalMinutes,
+    terminalGateReconcilerEnabled,
+    terminalGateReconcilerIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
     serveUi:
