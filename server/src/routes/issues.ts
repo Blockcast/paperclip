@@ -4439,6 +4439,17 @@ export function issueRoutes(
   // live grant that fires on quotation, which is the hazard the paragraph above
   // refuses to accept from the parser side. The id is given separately, bare, on
   // the next clause; bare tokens grant nothing, which is the whole point.
+  //
+  // BLO-22742: the per-issue mention is the only *transferable* grant, and it
+  // does not scale. A sweep hit this deny on 216 issues at once and had no
+  // route out, because both remedies above are per-issue and neither is
+  // something the blocked agent can execute itself. There is a second standing
+  // authorization the text never mentioned: `allow_manager_chain`
+  // (services/authorization.ts) carries `issue:comment` to any agent above the
+  // assignee in the `reportsTo` chain, with no grant and no per-issue setup. A
+  // peer cannot self-serve it — that is the point — but it means "escalate to
+  // their manager" is a real, in-system answer to fan-out notification, not a
+  // workaround. Naming it here is what turns a 216-issue wall into one handoff.
   function issueCommentGrantRemediation(input: {
     actorAgentId: string;
     assigneeAgentId: string | null;
@@ -4454,7 +4465,10 @@ export function issueRoutes(
       `where <agent-id> is ${input.actorAgentId}. A bare agent://${input.actorAgentId} in the ` +
       `comment body is not a mention — it neither wakes you nor grants anything. A mention written ` +
       `by any other agent wakes you but does not authorize you. Until then, respond on an issue ` +
-      `you are assigned to and reference this one, or ask the assignee to mention you here.`
+      `you are assigned to and reference this one, or ask the assignee to mention you here. If ` +
+      `you need to reach this assignee across many issues at once, do not collect grants one ` +
+      `issue at a time: escalate the batch to an agent above them in the reportsTo chain, ` +
+      `which carries issue:comment on their assignees' issues without any grant.`
     );
   }
 
