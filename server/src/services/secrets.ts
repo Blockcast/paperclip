@@ -38,6 +38,7 @@ import {
   createSecretProviderConfigSchema,
   deriveProjectUrlKey,
   envBindingSchema,
+  isSensitiveEnv,
   isUuidLike,
   normalizeAgentUrlKey,
   secretProviderConfigPayloadSchema,
@@ -64,8 +65,6 @@ import { authorizationDeniedDetails, authorizationService } from "./authorizatio
 import { findActiveServerAdapter } from "../adapters/index.js";
 
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const SENSITIVE_ENV_KEY_RE =
-  /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 const REDACTED_SENTINEL = "***REDACTED***";
 const COMING_SOON_SECRET_PROVIDERS: ReadonlySet<SecretProvider> = new Set([
   "gcp_secret_manager",
@@ -482,10 +481,6 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
-function isSensitiveEnvKey(key: string) {
-  return SENSITIVE_ENV_KEY_RE.test(key);
-}
-
 function normalizeSecretKey(input: string) {
   return input
     .trim()
@@ -555,6 +550,61 @@ function assertClass3StaticLeaseAllowed(input: {
       configPath: input.configPath,
     });
   }
+}
+
+/**
+ * Decide a binding's projection classification from inputs the server owns
+ * (BLO-27991).
+ *
+ * `assertClass3StaticLeaseAllowed` returns early for anything not labelled
+ * `class_3_static_lease`, so when the label was taken from the caller a caller
+ * could simply omit it and skip the restriction that slot is meant to carry.
+ * `targetType` comes from the sync target and `configPath` from the binding's
+ * own location, so the allowlist slot is derivable without trusting the caller.
+ *
+ * A caller that declares class-3 at a slot that is not allowlisted is still
+ * rejected rather than silently downgraded, so an honest-but-wrong declaration
+ * stays loud.
+ *
+ * Note the allowlist's `key` is a capability key (`slack.bot_token`), not the
+ * secret's own `companySecrets.key` — those are unrelated, so classification
+ * cannot be derived by matching the secret record.
+ *
+ * This is the single classification point for all three binding write paths
+ * (`createBinding`, `syncSecretRefsForTarget`, `syncEnvBindingsForTarget`);
+ * classifying at only one of them would leave the omit-the-label bypass open on
+ * the others. `assertClass3StaticLeaseAllowed` survives as the runtime check in
+ * `assertBindingContext`, where it reads the *stored* row rather than a caller's
+ * declaration and so is no longer self-satisfying.
+ *
+ * Migration note: a row already stored `unclassified` at an allowlisted slot is
+ * upgraded to `class_3_static_lease` the next time anything re-syncs that
+ * target, without a backfill. That is the intended direction — the allowlist is
+ * what the slot is *meant* to carry, and the previous value only recorded what
+ * the caller happened to declare.
+ */
+function resolveProjectionClassification(input: {
+  targetType: SecretBindingTargetType;
+  configPath: string;
+  declaredProjectionClass?: SecretProjectionClass | null;
+}): { projectionClass: SecretProjectionClass; projectionAllowlistKey: string | null } {
+  const allowlistEntry = CLASS3_STATIC_LEASE_ALLOWLIST.find((entry) =>
+    entry.targetType === input.targetType && entry.configPath === input.configPath
+  );
+  if (allowlistEntry) {
+    return {
+      projectionClass: "class_3_static_lease",
+      projectionAllowlistKey: allowlistEntry.key,
+    };
+  }
+  if ((input.declaredProjectionClass ?? "unclassified") === "class_3_static_lease") {
+    throw unprocessable("Class-3 static lease binding is outside the approved allowlist", {
+      code: "class_3_static_lease_not_allowed",
+      targetType: input.targetType,
+      configPath: input.configPath,
+    });
+  }
+  return { projectionClass: "unclassified", projectionAllowlistKey: null };
 }
 
 function defaultProviderConfigStatus(provider: SecretProvider): SecretProviderConfigStatus {
@@ -1230,7 +1280,11 @@ export function secretService(db: Db) {
 
       const binding = canonicalizeBinding(parsed.data as EnvBinding);
       if (binding.type === "plain") {
-        if (opts?.strictMode && isSensitiveEnvKey(key) && binding.value.trim().length > 0) {
+        if (
+          opts?.strictMode &&
+          binding.value.trim().length > 0 &&
+          isSensitiveEnv(key, binding.value)
+        ) {
           throw unprocessable(
             `Strict secret mode requires secret references for sensitive key: ${key}`,
           );
@@ -1336,6 +1390,11 @@ export function secretService(db: Db) {
     if (!value) return undefined;
     if (value === REDACTED_SENTINEL) {
       throw unprocessable(`Refusing to persist redacted placeholder for key: ${input.key}`);
+    }
+    if (input.actor?.agentId) {
+      throw forbidden(
+        `Agent-authenticated callers cannot introduce a plain secret schema field: ${input.key}`,
+      );
     }
     const id = randomUUID();
     const adapterPart = normalizeSecretKey(input.adapterType ?? "adapter");
@@ -3519,11 +3578,10 @@ export function secretService(db: Db) {
       projectionAllowlistKey?: string | null;
     }) => {
       await assertSecretInCompany(input.companyId, input.secretId);
-      assertClass3StaticLeaseAllowed({
+      const { projectionClass, projectionAllowlistKey } = resolveProjectionClassification({
         targetType: input.targetType,
         configPath: input.configPath,
-        projectionClass: input.projectionClass,
-        projectionAllowlistKey: input.projectionAllowlistKey,
+        declaredProjectionClass: input.projectionClass,
       });
       const existing = await db
         .select()
@@ -3549,8 +3607,8 @@ export function secretService(db: Db) {
           versionSelector: String(input.versionSelector ?? "latest"),
           required: input.required ?? true,
           label: input.label ?? null,
-          projectionClass: input.projectionClass ?? "unclassified",
-          projectionAllowlistKey: input.projectionAllowlistKey ?? null,
+          projectionClass,
+          projectionAllowlistKey,
         })
         .returning()
         .then((rows) => rows[0]);
@@ -3581,13 +3639,10 @@ export function secretService(db: Db) {
       }> = [];
       for (const ref of refs) {
         await assertSecretInCompany(companyId, ref.secretId);
-        const projectionClass = ref.projectionClass ?? "unclassified";
-        const projectionAllowlistKey = ref.projectionAllowlistKey ?? null;
-        assertClass3StaticLeaseAllowed({
+        const { projectionClass, projectionAllowlistKey } = resolveProjectionClassification({
           targetType: target.targetType,
           configPath: ref.configPath,
-          projectionClass,
-          projectionAllowlistKey,
+          declaredProjectionClass: ref.projectionClass,
         });
         normalizedRefs.push({
           secretId: ref.secretId,
@@ -3716,18 +3771,17 @@ export function secretService(db: Db) {
         if (binding.type !== "secret_ref") continue;
         await assertSecretInCompany(companyId, binding.secretId, bindingDb);
         const configPath = `${pathPrefix}.${key}`;
-        assertClass3StaticLeaseAllowed({
+        const { projectionClass, projectionAllowlistKey } = resolveProjectionClassification({
           targetType: target.targetType,
           configPath,
-          projectionClass: binding.projectionClass,
-          projectionAllowlistKey: binding.projectionAllowlistKey,
+          declaredProjectionClass: binding.projectionClass,
         });
         refs.push({
           secretId: binding.secretId,
           configPath,
           versionSelector: binding.version,
-          projectionClass: binding.projectionClass,
-          projectionAllowlistKey: binding.projectionAllowlistKey,
+          projectionClass,
+          projectionAllowlistKey,
         });
       }
 

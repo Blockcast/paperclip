@@ -620,6 +620,187 @@ describeEmbeddedPostgres("heartbeat reconcileDetachedQueuedRuns", () => {
     });
   });
 
+  it("terminalizes an assignee-less recovery intent instead of retrying it forever (BLO-30320)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const intentId = randomUUID();
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Detached recovery with no assignee",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: null,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId,
+      status: "cancelled",
+      invocationSource: "on_demand",
+      contextSnapshot: { issueId },
+      createdAt: new Date(Date.now() - SEVEN_HOURS_MS),
+    });
+    await db.insert(detachedQueuedRunRecoveries).values({
+      id: intentId,
+      companyId,
+      issueId,
+      sourceRunId,
+      status: "pending",
+      pendingAt: new Date(),
+    });
+
+    const first = await heartbeat.reconcileDetachedQueuedRuns({ companyId });
+
+    expect(first).toMatchObject({ scanned: 0, terminalized: 0, recovered: 0, skipped: 1, failed: 0 });
+    const cancelled = await db
+      .select({
+        status: detachedQueuedRunRecoveries.status,
+        attemptCount: detachedQueuedRunRecoveries.attemptCount,
+        lastError: detachedQueuedRunRecoveries.lastError,
+      })
+      .from(detachedQueuedRunRecoveries)
+      .where(eq(detachedQueuedRunRecoveries.id, intentId))
+      .then((rows) => rows[0]);
+    expect(cancelled).toMatchObject({
+      status: "cancelled",
+      attemptCount: 1,
+      lastError: "Detached queued-run recovery issue has no assignee agent",
+    });
+
+    const second = await heartbeat.reconcileDetachedQueuedRuns({ companyId });
+    expect(second).toMatchObject({ scanned: 0, terminalized: 0, recovered: 0, skipped: 0, failed: 0 });
+  });
+
+  it("rechecks assignment under the issue lock before cancelling recovery (BLO-30320)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const intentId = randomUUID();
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Assignment races assignee-less recovery",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: null,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId,
+      status: "cancelled",
+      invocationSource: "on_demand",
+      contextSnapshot: { issueId },
+      createdAt: new Date(Date.now() - SEVEN_HOURS_MS),
+    });
+    await db.insert(detachedQueuedRunRecoveries).values({
+      id: intentId,
+      companyId,
+      issueId,
+      sourceRunId,
+      status: "pending",
+      pendingAt: new Date(),
+    });
+
+    let assignment!: ReturnType<typeof heartbeat.wakeup>;
+    const reconcilingHeartbeat = heartbeatService(db, {
+      skipQueuedRunDispatch: true,
+      beforeDetachedQueuedRunAssigneeCheckForTest: async () => {
+        await db
+          .update(issues)
+          .set({ assigneeAgentId: agentId })
+          .where(eq(issues.id, issueId));
+        assignment = heartbeat.wakeup(agentId, {
+          source: "manual",
+          triggerDetail: "user",
+          reason: "assignment_race_regression",
+          contextSnapshot: { issueId, taskId: issueId },
+        });
+        await assignment;
+      },
+    });
+
+    const result = await reconcilingHeartbeat.reconcileDetachedQueuedRuns({ companyId });
+
+    expect(result).toMatchObject({ scanned: 0, terminalized: 0, recovered: 1, skipped: 0, failed: 0 });
+    const intent = await db
+      .select({ status: detachedQueuedRunRecoveries.status })
+      .from(detachedQueuedRunRecoveries)
+      .where(eq(detachedQueuedRunRecoveries.id, intentId))
+      .then((rows) => rows[0]);
+    expect(intent?.status).toBe("completed");
+  });
+
+  it("cancels recovery when the locked re-read sees a terminal issue (BLO-30320)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const intentId = randomUUID();
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Terminal transition races assignee-less recovery",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: null,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId,
+      status: "cancelled",
+      invocationSource: "on_demand",
+      contextSnapshot: { issueId },
+      createdAt: new Date(Date.now() - SEVEN_HOURS_MS),
+    });
+    await db.insert(detachedQueuedRunRecoveries).values({
+      id: intentId,
+      companyId,
+      issueId,
+      sourceRunId,
+      status: "pending",
+      pendingAt: new Date(),
+    });
+
+    const reconcilingHeartbeat = heartbeatService(db, {
+      skipQueuedRunDispatch: true,
+      beforeDetachedQueuedRunAssigneeCheckForTest: async () => {
+        await db
+          .update(issues)
+          .set({ status: "cancelled" })
+          .where(eq(issues.id, issueId));
+      },
+    });
+
+    const first = await reconcilingHeartbeat.reconcileDetachedQueuedRuns({ companyId });
+
+    expect(first).toMatchObject({ scanned: 0, terminalized: 0, recovered: 0, skipped: 1, failed: 0 });
+    const cancelled = await db
+      .select({
+        status: detachedQueuedRunRecoveries.status,
+        attemptCount: detachedQueuedRunRecoveries.attemptCount,
+        lastError: detachedQueuedRunRecoveries.lastError,
+      })
+      .from(detachedQueuedRunRecoveries)
+      .where(eq(detachedQueuedRunRecoveries.id, intentId))
+      .then((rows) => rows[0]);
+    expect(cancelled).toMatchObject({ status: "cancelled", attemptCount: 1, lastError: null });
+
+    const second = await reconcilingHeartbeat.reconcileDetachedQueuedRuns({ companyId });
+    expect(second).toMatchObject({ scanned: 0, terminalized: 0, recovered: 0, skipped: 0, failed: 0 });
+  });
+
   it("coalesces concurrent dispatches of the same pending recovery intent (BLO-21621 Ally suggestion)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();

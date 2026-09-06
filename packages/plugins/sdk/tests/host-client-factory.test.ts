@@ -12,19 +12,27 @@ describe("createHostClientHandlers invocation company scope", () => {
   it("rejects worker-selected config and secret company ids without a host invocation scope", async () => {
     const configGet = vi.fn(async () => ({ apiKeyRef: "unreachable" }));
     const secretsResolve = vi.fn(async () => "unreachable");
+    const secretsVerify = vi.fn(async () => false);
     const services = {
       config: { get: configGet },
-      secrets: { resolve: secretsResolve },
+      secrets: { resolve: secretsResolve, verify: secretsVerify },
     } as unknown as HostServices;
 
     const handlers = createHostClientHandlers({
       pluginId: "paperclip.test",
-      capabilities: ["secrets.read-ref"],
+      capabilities: ["secrets.read-ref", "secrets.verify-ref"],
       services,
     });
 
     await expect(
       handlers["config.get"]({ companyId: "company-a" }),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    await expect(
+      handlers["secrets.verify"]({
+        companyId: "company-a",
+        secretRef: { type: "secret_ref", secretId: "secret-a" },
+        presented: "guess",
+      }),
     ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
     await expect(
       handlers["secrets.resolve"]({
@@ -34,19 +42,21 @@ describe("createHostClientHandlers invocation company scope", () => {
     ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
     expect(configGet).not.toHaveBeenCalled();
     expect(secretsResolve).not.toHaveBeenCalled();
+    expect(secretsVerify).not.toHaveBeenCalled();
   });
 
   it("allows explicit config and secret company ids only when they match the host invocation scope", async () => {
     const configGet = vi.fn(async () => ({ apiKeyRef: "ref" }));
     const secretsResolve = vi.fn(async () => "resolved");
+    const secretsVerify = vi.fn(async () => true);
     const services = {
       config: { get: configGet },
-      secrets: { resolve: secretsResolve },
+      secrets: { resolve: secretsResolve, verify: secretsVerify },
     } as unknown as HostServices;
 
     const handlers = createHostClientHandlers({
       pluginId: "paperclip.test",
-      capabilities: ["secrets.read-ref"],
+      capabilities: ["secrets.read-ref", "secrets.verify-ref"],
       services,
     });
     const context = { invocationScope: { companyId: "company-a" } };
@@ -60,12 +70,49 @@ describe("createHostClientHandlers invocation company scope", () => {
         secretRef: { type: "secret_ref", secretId: "secret-a" },
       }, context),
     ).resolves.toBe("resolved");
+    await expect(
+      handlers["secrets.verify"]({
+        companyId: "company-a",
+        secretRef: { type: "secret_ref", secretId: "secret-a" },
+        presented: "candidate",
+      }, context),
+    ).resolves.toBe(true);
 
     expect(configGet).toHaveBeenCalledWith({ companyId: "company-a" }, context);
     expect(secretsResolve).toHaveBeenCalledWith({
       companyId: "company-a",
       secretRef: { type: "secret_ref", secretId: "secret-a" },
     }, context);
+    expect(secretsVerify).toHaveBeenCalledWith({
+      companyId: "company-a",
+      secretRef: { type: "secret_ref", secretId: "secret-a" },
+      presented: "candidate",
+    }, context);
+  });
+
+  it("allows verification without granting plaintext secret resolution", async () => {
+    const secretsResolve = vi.fn(async () => "plaintext");
+    const secretsVerify = vi.fn(async () => true);
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.verify-ref"],
+      services: {
+        secrets: { resolve: secretsResolve, verify: secretsVerify },
+      } as unknown as HostServices,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+    const secretRef = { type: "secret_ref" as const, secretId: "secret-a" };
+
+    await expect(handlers["secrets.verify"]({
+      companyId: "company-a",
+      secretRef,
+      presented: "candidate",
+    }, context)).resolves.toBe(true);
+    await expect(handlers["secrets.resolve"]({
+      companyId: "company-a",
+      secretRef,
+    }, context)).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(secretsResolve).not.toHaveBeenCalled();
   });
 
   it("rejects company-scoped host calls outside the current invocation company", async () => {

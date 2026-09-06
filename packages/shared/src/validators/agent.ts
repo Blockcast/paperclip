@@ -315,6 +315,20 @@ export const agentMineInboxQuerySchema = z.object({
 
 export type AgentMineInboxQuery = z.infer<typeof agentMineInboxQuerySchema>;
 
+/**
+ * PEN-2756: query for `GET /agents/me/recovery-actions`, the owner-scoped view of
+ * recovery beacons. Defaults to the two live statuses, because the question this
+ * surface answers is "what obligations do I currently hold" — resolved and
+ * cancelled rows are history and have to be asked for explicitly.
+ */
+export const agentMeRecoveryActionsQuerySchema = z.object({
+  status: z.string().trim().min(1).optional().default("active,escalated"),
+  kind: z.string().trim().min(1).optional(),
+  limit: z.coerce.number().int().positive().max(500).optional().default(100),
+});
+
+export type AgentMeRecoveryActionsQuery = z.infer<typeof agentMeRecoveryActionsQuerySchema>;
+
 export const wakeAgentSchema = z.object({
   source: z.enum(["timer", "assignment", "on_demand", "automation"]).optional().default("on_demand"),
   triggerDetail: z.enum(["manual", "ping", "callback", "system"]).optional(),

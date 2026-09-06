@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { companies, createDb, pluginEventOutbox } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { activityLog, companies, createDb, pluginEventOutbox, type Db } from "@paperclipai/db";
+import { asc, eq } from "drizzle-orm";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import {
   getEmbeddedPostgresTestSupport,
@@ -9,6 +9,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { createPluginEventBus } from "../services/plugin-event-bus.js";
 import { pollOnce, resetStaleProcessing } from "../services/plugin-event-outbox.js";
+import { logActivity, setPluginEventOutboxDb } from "../services/activity-log.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -40,6 +41,8 @@ describeEmbeddedPostgres("plugin event outbox", () => {
   });
 
   beforeEach(async () => {
+    setPluginEventOutboxDb(db);
+    await db.delete(activityLog);
     await db.delete(pluginEventOutbox);
   });
 
@@ -101,6 +104,60 @@ describeEmbeddedPostgres("plugin event outbox", () => {
     await pollOnce(db, bus);
 
     expect(order).toEqual(["approval.created", "approval.decided"]);
+  });
+
+  it("preserves sequential logActivity order when an outbox insert is delayed", async () => {
+    const pendingInserts: Promise<unknown>[] = [];
+    let resolveSecondInsertScheduled!: () => void;
+    const secondInsertScheduled = new Promise<void>((resolve) => {
+      resolveSecondInsertScheduled = resolve;
+    });
+    let insertCount = 0;
+    let delayFirstInsert = true;
+    const delayedOutboxDb = {
+      insert: (table: typeof pluginEventOutbox) => {
+        const builder = db.insert(table);
+        return {
+          values: (values: typeof pluginEventOutbox.$inferInsert) => {
+            const query = builder.values(values);
+            const completion = delayFirstInsert
+              ? new Promise<void>((resolve) => setImmediate(resolve)).then(() => query)
+              : Promise.resolve(query);
+            insertCount += 1;
+            if (insertCount === 2) resolveSecondInsertScheduled();
+            delayFirstInsert = false;
+            pendingInserts.push(completion);
+            return completion;
+          },
+        };
+      },
+    } as unknown as Db;
+    setPluginEventOutboxDb(delayedOutboxDb);
+
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId: "test",
+      action: "issue.created",
+      entityType: "issue",
+      entityId: randomUUID(),
+    });
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId: "test",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: randomUUID(),
+    });
+    await secondInsertScheduled;
+    await Promise.all(pendingInserts);
+
+    const rows = await db
+      .select({ eventType: pluginEventOutbox.eventType })
+      .from(pluginEventOutbox)
+      .orderBy(asc(pluginEventOutbox.seq));
+    expect(rows.map((row) => row.eventType)).toEqual(["issue.created", "issue.updated"]);
   });
 
   it("marks processed even when a handler throws (no poison loop)", async () => {

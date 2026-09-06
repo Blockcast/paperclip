@@ -370,6 +370,25 @@ export const SYSTEM_ISSUE_DOCUMENT_KEYS = [
 ] as const;
 export type SystemIssueDocumentKey = (typeof SYSTEM_ISSUE_DOCUMENT_KEYS)[number];
 
+/**
+ * The one issue-document key a cheap status-only recovery run may write (BLO-25868).
+ *
+ * Such a run is barred from authoring deliverables — it must not invent work
+ * product — but it IS authorized to reach a status conclusion. Those two facts
+ * used to deadlock: the done gate refuses a close that has no execution run and
+ * no PR link unless a run-attributed durable artifact exists
+ * (`no_execution_run_and_no_pr_evidence`), while the artifact route refused this
+ * actor outright. A non-code deliverable with no PR therefore could not be
+ * closed by the run that owned it, and re-waking never helped.
+ *
+ * This key is the narrow escape: a verdict recording WHY the run concluded the
+ * issue is resolved, citing evidence that already existed. It is deliberately
+ * NOT a system key and NOT `plan`, so it qualifies for the done gate; and it is
+ * the ONLY key the status-only bar exempts, so plans and deliverable documents
+ * stay barred. See `done-gate.ts` and `assertDeliverableMutationAllowedByRunContext`.
+ */
+export const ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY = "status-adjudication" as const;
+
 const SYSTEM_ISSUE_DOCUMENT_KEY_SET = new Set<string>(SYSTEM_ISSUE_DOCUMENT_KEYS);
 
 export function isSystemIssueDocumentKey(key: string): key is SystemIssueDocumentKey {
@@ -447,7 +466,7 @@ export type IssueExecutionPolicyMode = (typeof ISSUE_EXECUTION_POLICY_MODES)[num
 export const ISSUE_EXECUTION_STAGE_TYPES = ["review", "approval"] as const;
 export type IssueExecutionStageType = (typeof ISSUE_EXECUTION_STAGE_TYPES)[number];
 
-export const ISSUE_MONITOR_SCHEDULED_BY = ["assignee", "board"] as const;
+export const ISSUE_MONITOR_SCHEDULED_BY = ["assignee", "board", "manager"] as const;
 export type IssueMonitorScheduledBy = (typeof ISSUE_MONITOR_SCHEDULED_BY)[number];
 
 export const ISSUE_EXECUTION_MONITOR_KINDS = ["external_service"] as const;
@@ -476,10 +495,16 @@ export const ISSUE_EXECUTION_MONITOR_CLEAR_REASONS = [
   "cancelled",
   "invalid_status",
   "invalid_assignee",
+  "suppressed_by_status",
   "dispatch_skipped",
   "timeout_exceeded",
   "max_attempts_exhausted",
   "convergence_stalled",
+  // BLO-29606: a monitor that fired and whose woken run never called back, on a
+  // policy that carries no `timeoutAt` to expire against. Distinct from
+  // `timeout_exceeded` on purpose — nothing timed out, the trigger stalled — so
+  // the two stranding shapes stay separable in activity logs and dashboards.
+  "trigger_stalled",
 ] as const;
 export type IssueExecutionMonitorClearReason = (typeof ISSUE_EXECUTION_MONITOR_CLEAR_REASONS)[number];
 
@@ -1318,6 +1343,7 @@ export const PLUGIN_CAPABILITIES = [
   "agent.sessions.send",
   "agent.sessions.close",
   "activity.log.write",
+  "costs.write",
   "metrics.write",
   "telemetry.track",
   "database.namespace.migrate",
@@ -1345,6 +1371,7 @@ export const PLUGIN_CAPABILITIES = [
   "api.routes.register",
   "http.outbound",
   "secrets.read-ref",
+  "secrets.verify-ref",
   "secrets.list",
   "secrets.manage",
   "environment.drivers.register",

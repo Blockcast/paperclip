@@ -26,6 +26,7 @@ import {
   type ProjectManagedByPlugin,
   type ProjectWorkspaceRuntimeConfig,
   type ProjectWorkspace,
+  type PrimaryWorkspaceSource,
   type WorkspaceRuntimeService,
   type PluginManagedProjectDeclaration,
   type PluginManagedProjectResolution,
@@ -34,6 +35,8 @@ import { listCurrentRuntimeServicesForProjectWorkspaces } from "./workspace-runt
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import { mergeProjectWorkspaceRuntimeConfig, readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import { recordProjectPrimaryWorkspaceFallback } from "./metrics.js";
+import { logger } from "../middleware/logger.js";
 
 type ProjectRow = typeof projects.$inferSelect;
 type ProjectWorkspaceRow = typeof projectWorkspaces.$inferSelect;
@@ -66,6 +69,7 @@ interface ProjectWithGoals extends Omit<ProjectRow, "executionWorkspacePolicy"> 
   codebase: ProjectCodebase;
   workspaces: ProjectWorkspace[];
   primaryWorkspace: ProjectWorkspace | null;
+  primaryWorkspaceSource: PrimaryWorkspaceSource;
   managedByPlugin: ProjectManagedByPlugin | null;
   linearProjectLink: LinearProjectLink | null;
   taskCount?: number;
@@ -223,14 +227,28 @@ function deriveProjectCodebase(input: {
   };
 }
 
+/**
+ * Resolve a project's primary workspace, and report whether it was
+ * explicitly flagged or guessed (BLO-26184). Never throws and never refuses
+ * to resolve — 0 workspaces resolves `null`/"none", and a multi-workspace
+ * project with no explicit primary still resolves the earliest-created row
+ * (fail-open contract affirmed by the CTO on BLO-23599's follow-up). What
+ * changed is that the guess is no longer indistinguishable from a choice: the
+ * caller gets `source: "inferred"` and a fallback counter/log fires, so drift
+ * like CDN+ Supply Side Rewards's 3-workspaces/0-primary state is observable
+ * instead of silently presented as `primaryWorkspace: <name>`.
+ */
 function pickPrimaryWorkspace(
   rows: ProjectWorkspaceRow[],
   runtimeServicesByWorkspaceId?: Map<string, WorkspaceRuntimeService[]>,
-): ProjectWorkspace | null {
-  if (rows.length === 0) return null;
+): { workspace: ProjectWorkspace | null; source: PrimaryWorkspaceSource } {
+  if (rows.length === 0) return { workspace: null, source: "none" };
   const explicitPrimary = rows.find((row) => row.isPrimary);
   const primary = explicitPrimary ?? rows[0];
-  return toWorkspace(primary, runtimeServicesByWorkspaceId?.get(primary.id) ?? []);
+  const workspace = toWorkspace(primary, runtimeServicesByWorkspaceId?.get(primary.id) ?? []);
+  if (explicitPrimary) return { workspace, source: "explicit" };
+  recordProjectPrimaryWorkspaceFallback(primary.projectId);
+  return { workspace, source: "inferred" };
 }
 
 /** Batch-load workspace refs for a set of projects. */
@@ -342,7 +360,8 @@ async function attachWorkspaces(db: Db, rows: ProjectWithGoals[]): Promise<Proje
         sharedRuntimeServicesByWorkspaceId.get(workspace.id) ?? [],
       ),
     );
-    const primaryWorkspace = pickPrimaryWorkspace(projectWorkspaceRows, sharedRuntimeServicesByWorkspaceId);
+    const primaryWorkspaceResolution = pickPrimaryWorkspace(projectWorkspaceRows, sharedRuntimeServicesByWorkspaceId);
+    const { workspace: primaryWorkspace, source: primaryWorkspaceSource } = primaryWorkspaceResolution;
     return {
       ...row,
       codebase: deriveProjectCodebase({
@@ -353,6 +372,7 @@ async function attachWorkspaces(db: Db, rows: ProjectWithGoals[]): Promise<Proje
       }),
       workspaces,
       primaryWorkspace,
+      primaryWorkspaceSource,
       managedByPlugin: managedByProjectId.get(row.id) ?? null,
       linearProjectLink: linearProjectLinkByProjectId.get(row.id) ?? null,
     };
@@ -549,6 +569,85 @@ export function resolveProjectNameForUniqueShortname(
   return `${requestedName} ${Date.now()}`;
 }
 
+/**
+ * Walk candidate workspaces in creation order and promote the first one that
+ * still exists, retrying past rows that were concurrently removed.
+ *
+ * Termination (BLO-26184): every pass marks exactly one id as tried, and the
+ * next candidate is always drawn from the *untried* remainder, so a project
+ * holding N workspaces can burn at most N passes. `maxAttempts` is therefore
+ * not the real bound — it is a safety valve against an unbounded stream of
+ * concurrent INSERTs, deliberately set far above any plausible workspace count
+ * so that genuine candidate exhaustion always wins the race to terminate.
+ *
+ * The previous implementation capped this at 5. That cap was low enough to be
+ * reached by real candidates: a project with >5 workspaces whose promotions
+ * kept losing the race would exit the loop with `candidateId` still pointing at
+ * an untried row, having already demoted everything — and the caller's warning
+ * only covered the exhausted case, so it exited silently. Hence the split
+ * `result` below: callers must be able to tell "nothing left to promote" from
+ * "gave up with work remaining".
+ */
+export async function promoteFirstSurvivingWorkspace(input: {
+  initialCandidateId: string;
+  tryPromote: (workspaceId: string) => Promise<boolean>;
+  listCandidateIds: () => Promise<string[]>;
+  maxAttempts?: number;
+}): Promise<{
+  result: "promoted" | "candidates_exhausted" | "attempt_cap_reached";
+  promotedId: string | null;
+  triedIds: string[];
+}> {
+  const maxAttempts = input.maxAttempts ?? 1_000;
+  const triedIds = new Set<string>();
+  let candidateId: string | null = input.initialCandidateId;
+  let attempts = 0;
+
+  while (candidateId && attempts < maxAttempts) {
+    attempts += 1;
+    triedIds.add(candidateId);
+
+    if (await input.tryPromote(candidateId)) {
+      return { result: "promoted", promotedId: candidateId, triedIds: Array.from(triedIds) };
+    }
+
+    const remaining = await input.listCandidateIds();
+    candidateId = remaining.find((id) => !triedIds.has(id)) ?? null;
+  }
+
+  return {
+    result: candidateId === null ? "candidates_exhausted" : "attempt_cap_reached",
+    promotedId: null,
+    triedIds: Array.from(triedIds),
+  };
+}
+
+/**
+ * Demote every workspace on a project and promote exactly `keepWorkspaceId`
+ * (BLO-26184). Callers hold `keepWorkspaceId` from a SELECT that ran before
+ * this function's own statements, so it is not guaranteed to still exist by
+ * the time the promote UPDATE runs: a concurrent transaction touching the
+ * SAME project (a second removeWorkspace racing this one, for example) can
+ * delete that exact row in between. Previously the promote UPDATE would then
+ * match zero rows, and — because the demote-all UPDATE just above it always
+ * runs unconditionally — the project would be left with N workspaces and 0
+ * primaries. That is precisely the drift shape seen on CDN+ Supply Side
+ * Rewards (BLO-23599): this is the write-path hole scope item 3 asks to
+ * close, identified by code inspection (a logical TOCTOU proof), not by
+ * reproducing the historical incident against its actual audit trail, which
+ * is not accessible from here.
+ *
+ * Fix: verify the promote UPDATE actually affected a row; if the target was
+ * concurrently removed, re-pick a surviving candidate and retry rather than
+ * leaving the project premoted-to-nobody. The walk itself lives in
+ * `promoteFirstSurvivingWorkspace` below, which owns the termination argument.
+ *
+ * Whichever way the walk ends without promoting, a structured warning fires
+ * rather than an assertion: 0 remaining workspaces is a legitimate
+ * empty-project state, not a bug in this function. What must never happen is
+ * returning *quietly* after the demote-all — the whole point of this function
+ * is that a project is never silently left at 0 primaries.
+ */
 async function ensureSinglePrimaryWorkspace(
   dbOrTx: any,
   input: {
@@ -567,16 +666,57 @@ async function ensureSinglePrimaryWorkspace(
       ),
     );
 
-  await dbOrTx
-    .update(projectWorkspaces)
-    .set({ isPrimary: true, updatedAt: new Date() })
-    .where(
-      and(
-        eq(projectWorkspaces.companyId, input.companyId),
-        eq(projectWorkspaces.projectId, input.projectId),
-        eq(projectWorkspaces.id, input.keepWorkspaceId),
-      ),
-    );
+  const outcome = await promoteFirstSurvivingWorkspace({
+    initialCandidateId: input.keepWorkspaceId,
+    tryPromote: async (workspaceId) => {
+      const promoted = await dbOrTx
+        .update(projectWorkspaces)
+        .set({ isPrimary: true, updatedAt: new Date() })
+        .where(
+          and(
+            eq(projectWorkspaces.companyId, input.companyId),
+            eq(projectWorkspaces.projectId, input.projectId),
+            eq(projectWorkspaces.id, workspaceId),
+          ),
+        )
+        .returning({ id: projectWorkspaces.id });
+      return promoted.length > 0;
+    },
+    listCandidateIds: async () => {
+      const remaining: Array<{ id: string }> = await dbOrTx
+        .select({ id: projectWorkspaces.id })
+        .from(projectWorkspaces)
+        .where(
+          and(
+            eq(projectWorkspaces.companyId, input.companyId),
+            eq(projectWorkspaces.projectId, input.projectId),
+          ),
+        )
+        .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id));
+      return remaining.map((row) => row.id);
+    },
+  });
+
+  if (outcome.result === "promoted") return;
+
+  // Every row is demoted by this point, so both remaining outcomes leave the
+  // project at 0 primaries and both must be loud. Previously only the
+  // exhausted branch warned, so hitting the attempt cap returned silently —
+  // the exact "guess indistinguishable from a choice" failure this issue is
+  // about, re-created inside its own fix.
+  logger.warn(
+    {
+      companyId: input.companyId,
+      projectId: input.projectId,
+      triedWorkspaceIds: outcome.triedIds,
+      result: outcome.result,
+    },
+    outcome.result === "candidates_exhausted"
+      ? "ensureSinglePrimaryWorkspace: every candidate workspace was concurrently removed; "
+        + "project has 0 remaining workspaces or all were deleted mid-promotion"
+      : "ensureSinglePrimaryWorkspace: hit the concurrent-insert safety cap with candidates still "
+        + "untried; project is left with 0 primaries and needs manual inspection",
+  );
 }
 
 export function projectService(db: Db) {

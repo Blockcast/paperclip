@@ -9,6 +9,28 @@ on:
         description: Full approved commit SHA, reachable from master
         required: true
         type: string
+      # BLO-31598. The approval below holds an in-flight lock until its rollout
+      # lands. A deploy that dies after approving but before `helm upgrade`
+      # therefore strands a lock no rollout can clear, and every later deploy is
+      # refused at admission. `approve-paperclip-api-digest.sh` documents the
+      # remedy, but until these inputs existed the workflow could not reach it —
+      # the only way out was a human holding the approver credential running the
+      # script by hand. Both values are echoed in the refusal message, so a
+      # wedged deploy hands the operator exactly what to paste here.
+      abandon_in_flight:
+        description: >-
+          Optional. Digest (sha256:<64 hex>) of a stranded in-flight approval to
+          retire. Only for a release that failed, was rolled back, or can never
+          complete — confirm the rollout is not merely still landing first.
+        required: false
+        type: string
+      abandon_in_flight_owner:
+        description: >-
+          Optional. Owner (64 hex) of that stranded approval. Required whenever
+          abandon_in_flight is given: a configuration-only release can reuse a
+          digest, so the owner is what identifies which approval is retired.
+        required: false
+        type: string
   push:
     branches:
       - "master"
@@ -144,11 +166,43 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # BuildKit cache is local to each StatefulSet ordinal. Ephemeral ARC
+      # client IPs make Service session affinity ineffective between runs, so
+      # route each build class to a stable cache owner. The ClusterIP remains a
+      # bounded availability fallback when the preferred ordinal is unhealthy.
+      - name: Select BuildKit endpoint
+        id: buildkit-endpoint
+        env:
+          PREFERRED_ORDINAL: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${PREFERRED_ORDINAL}" =~ ^[01]$ ]]; then
+            echo "Invalid BuildKit ordinal: ${PREFERRED_ORDINAL}" >&2
+            exit 1
+          fi
+
+          probe_buildkit() {
+            local host="$1"
+            local timeout_seconds="$2"
+            timeout "${timeout_seconds}" nc -z -w "${timeout_seconds}" "${host}" 1234
+          }
+
+          preferred="buildkit-amd64-${PREFERRED_ORDINAL}.buildkit-amd64-headless.ci.svc.cluster.local"
+          fallback="buildkit-amd64.ci.svc.cluster.local"
+          host="${preferred}"
+          if ! probe_buildkit "${preferred}" 5; then
+            echo "::warning::Preferred BuildKit ${preferred} is unavailable; using the healthy service endpoint"
+            host="${fallback}"
+            probe_buildkit "${fallback}" 10
+          fi
+          echo "endpoint=tcp://${host}:1234" >> "$GITHUB_OUTPUT"
+          echo "Using BuildKit endpoint tcp://${host}:1234"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
         with:
           driver: remote
-          endpoint: tcp://buildkit-amd64.ci.svc.cluster.local:1234
+          endpoint: ${{ steps.buildkit-endpoint.outputs.endpoint }}
 
       # Runtime packages and global CLIs change far less often than /app.
       # Address the base by its inputs and only build it when that exact image
@@ -273,15 +327,113 @@ jobs:
             echo "- Image: \`harbor.blockcast.net/paperclip/paperclip:${{ steps.image_tag.outputs.value }}@${{ steps.build.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  deploy:
-    needs: build-and-push
+  # BLO-26972: GitHub allows only ONE run to sit *pending* per concurrency
+  # group. `deploy`'s group is keyed on the release/namespace, not on this
+  # run, so a second workflow_dispatch that reaches the group while an
+  # earlier one is still parked on the paperclip-production reviewer gate
+  # does not queue behind it — GitHub cancels the earlier, already-waiting
+  # approval outright. `cancel-in-progress: false` does not prevent this: it
+  # only stops a later run from cancelling an earlier run's *in-progress*
+  # job, and a run stuck on environment-approval review is not in progress.
+  # Three consecutive production deploys died this way, unapproved, each
+  # evicted within minutes of the next dispatch.
+  #
+  # This fast pre-check catches the common case in seconds, without waiting
+  # on build-and-push. It is NOT sufficient on its own: it runs ~5 minutes
+  # before `deploy` would enter the concurrency group, so two dispatches
+  # launched inside that build window can both see blocked=false here and
+  # then race at the group gate. guard-pending-deploy-final below is the
+  # authoritative re-check that closes that window.
+  guard-pending-deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' }}
     runs-on: arc-deploy
-    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' }}
+    timeout-minutes: 5
+    permissions:
+      # A job-level `permissions:` block REPLACES the workflow-level one
+      # outright rather than merging into it, so the `contents: read` at the
+      # top of this file does not reach here. Without it `actions/checkout`
+      # below cannot read the repo, the job fails before the guard script
+      # runs, and `deploy` — which requires both guards to succeed — is
+      # skipped on every dispatch. `actions: read` is what the script itself
+      # needs to list runs via the API.
+      contents: read
+      actions: read
+    outputs:
+      blocked: ${{ steps.check.outputs.blocked }}
+    steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Check for an existing pending production approval
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: .github/scripts/guard-pending-deploy.sh
+
+  # Re-runs the same check immediately before `deploy` enters the
+  # paperclip-production concurrency group, closing the race window the fast
+  # guard above cannot: a sibling dispatch that started its own pending
+  # approval sometime during this run's build-and-push. Costs no extra wall
+  # time — `deploy` already waits out build-and-push, so this rides the same
+  # ~5 minutes rather than adding to it. Skipped (not run) once the fast
+  # guard has already found blocked=true, since re-checking can't change
+  # that outcome.
+  guard-pending-deploy-final:
+    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' && needs.guard-pending-deploy.result == 'success' && needs.guard-pending-deploy.outputs.blocked != 'true' }}
+    needs: [build-and-push, guard-pending-deploy]
+    runs-on: arc-deploy
+    timeout-minutes: 5
+    permissions:
+      # A job-level `permissions:` block REPLACES the workflow-level one
+      # outright rather than merging into it, so the `contents: read` at the
+      # top of this file does not reach here. Without it `actions/checkout`
+      # below cannot read the repo, the job fails before the guard script
+      # runs, and `deploy` — which requires both guards to succeed — is
+      # skipped on every dispatch. `actions: read` is what the script itself
+      # needs to list runs via the API.
+      contents: read
+      actions: read
+    outputs:
+      blocked: ${{ steps.check.outputs.blocked }}
+    steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Re-check for a pending production approval right before deploy
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: .github/scripts/guard-pending-deploy.sh
+
+  deploy:
+    # Both guard results are required (not just their `blocked` outputs) so
+    # a failed/errored guard check — e.g. a GitHub API hiccup — fails closed
+    # into skipping this deploy, rather than silently proceeding with an
+    # unknown pending-approval state. guard-pending-deploy-final is the one
+    # that actually closes the eviction window; guard-pending-deploy alone
+    # only short-circuits the common case fast.
+    needs: [build-and-push, guard-pending-deploy, guard-pending-deploy-final]
+    runs-on: arc-deploy
+    if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' && needs.guard-pending-deploy.result == 'success' && needs.guard-pending-deploy.outputs.blocked != 'true' && needs.guard-pending-deploy-final.result == 'success' && needs.guard-pending-deploy-final.outputs.blocked != 'true' }}
     environment:
       name: paperclip-production
-    # Covers the sequential 30m Helm wait and 30m post-reconcile rollout wait,
-    # plus checkout, approval, final verification, and cleanup margin.
-    timeout-minutes: 70
+    # Covers the sequential 30m Helm wait, 30m api rollout wait and 15m worker
+    # rollout wait (BLO-29008), plus the pending-migration pre-flight's 600s
+    # startup + 180s run budgets (BLO-31254), plus checkout, approval, final
+    # verification, and cleanup margin. scripts/check-docker-deploy-timeout.test.js
+    # sums EVERY `rollout status --timeout=` in this job AND reads both
+    # PREFLIGHT_*_SECONDS defaults out of .github/scripts/check-pending-migrations.sh,
+    # so raising any of them without raising this fails CI rather than silently
+    # overrunning the job. Overrunning is not a clean failure: GitHub cancels the
+    # job mid-`helm upgrade --atomic`, killing the process whose job is to roll
+    # back, which is the half-applied release BLO-21492 added --atomic to prevent.
+    timeout-minutes: 98
     concurrency:
       # Serialize deploys to the same target so a fast-followup push doesn't
       # race with an in-flight upgrade.
@@ -435,6 +587,7 @@ jobs:
           sparse-checkout: |
             scripts/approve-paperclip-api-digest.sh
             scripts/stamp-paperclip-api-approval-plan.sh
+            scripts/verify-review-gate-capture-promotion.mjs
           sparse-checkout-cone-mode: false
 
       - name: Verify release tooling revision
@@ -459,12 +612,14 @@ jobs:
           fi
           script="$(pwd)/.release-tooling/scripts/approve-paperclip-api-digest.sh"
           stamper="$(pwd)/.release-tooling/scripts/stamp-paperclip-api-approval-plan.sh"
-          if [ ! -x "${script}" ] || [ ! -x "${stamper}" ]; then
+          promotion_verifier="$(pwd)/.release-tooling/scripts/verify-review-gate-capture-promotion.mjs"
+          if [ ! -x "${script}" ] || [ ! -x "${stamper}" ] || [ ! -r "${promotion_verifier}" ]; then
             echo "Approval release tooling missing or non-executable at trusted revision ${expected}" >&2
             exit 1
           fi
           echo "approve_script=${script}" >> "$GITHUB_OUTPUT"
           echo "stamp_script=${stamper}" >> "$GITHUB_OUTPUT"
+          echo "promotion_verify_script=${promotion_verifier}" >> "$GITHUB_OUTPUT"
 
       - name: Render, stamp, and validate deploy plan
         id: plan
@@ -475,6 +630,7 @@ jobs:
           TAG: ${{ needs.build-and-push.outputs.image_tag }}
           COMMIT: ${{ steps.target.outputs.full }}
           STAMP_SCRIPT: ${{ steps.tooling.outputs.stamp_script }}
+          PROMOTION_VERIFY_SCRIPT: ${{ steps.tooling.outputs.promotion_verify_script }}
         run: |
           set -euo pipefail
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -514,6 +670,26 @@ jobs:
                     ((.spec.template.metadata.annotations // {}) + {($key): $commit})
                 end
               ' > "${unstamped}"
+          api_deployment="$(jq -er '.metadata.name | select(type == "string" and length > 0)' "${unstamped}")"
+
+          # A single rolling update cannot safely introduce capture and authority:
+          # old API replicas would still acknowledge without persisting. Trusted
+          # release tooling compares the full capture contract and rollout state
+          # before promotion. GitHub does not auto-redeliver failed webhooks, so
+          # an outage-based Recreate fallback is also unsafe.
+          authority_enabled="$(node "${PROMOTION_VERIFY_SCRIPT}" \
+            --target "${unstamped}" --print-authority)"
+          if [ "${authority_enabled}" = "true" ]; then
+            live_capture="${RUNNER_TEMP}/paperclip-api-live-capture.json"
+            if ! kubectl -n "${NS}" get deployment "${api_deployment}" -o json > "${live_capture}"; then
+              echo "Review-gate authority requires an earlier completed capture-only API rollout" >&2
+              exit 1
+            fi
+            node "${PROMOTION_VERIFY_SCRIPT}" --target "${unstamped}" --live "${live_capture}"
+          elif [ "${authority_enabled}" != "false" ]; then
+            echo "Promotion verifier returned invalid authority state: ${authority_enabled}" >&2
+            exit 1
+          fi
 
           canonical_unstamped=$(jq -cS --arg key "${marker_key}" '
             del(.spec.template.metadata.annotations[$key])
@@ -536,7 +712,8 @@ jobs:
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
             --set-string api.deployedCommit="${COMMIT}" \
-            | PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
+            | PAPERCLIP_API_DEPLOYMENT="${api_deployment}" \
+              PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
               PAPERCLIP_DEPLOYED_COMMIT="${COMMIT}" \
               PAPERCLIP_APPROVAL_PLAN_SHA256="${marker}" "${STAMP_SCRIPT}" \
             | kubectl create --dry-run=client -n "${NS}" -o json -f - > "${plan}"
@@ -547,11 +724,12 @@ jobs:
             --arg marker "${marker}" \
             --arg commit "${COMMIT}" \
             --arg image "${expected_image}" \
-            --arg namespace "${NS}" '
+            --arg namespace "${NS}" \
+            --arg name "${api_deployment}" '
             .apiVersion == "apps/v1" and
             .kind == "Deployment" and
             .metadata.namespace == $namespace and
-            .metadata.name == "paperclip-api" and
+            .metadata.name == $name and
             .spec.template.metadata.annotations[$key] == $marker and
             .spec.template.metadata.annotations[$deployedCommitKey] == $commit and
             (.spec.template.spec.containers | all(.image == $image))
@@ -585,6 +763,12 @@ jobs:
           COMMIT: ${{ steps.target.outputs.full }}
           DEPLOY_PLAN: ${{ steps.plan.outputs.path }}
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
+          # BLO-31598: passed through `env:` and never interpolated into the
+          # script body below. Both render empty on `push`, which the approval
+          # script treats as "no abandon requested" via its own `:-` defaults,
+          # so the ordinary deploy path is unchanged.
+          ABANDON_IN_FLIGHT: ${{ inputs.abandon_in_flight }}
+          ABANDON_IN_FLIGHT_OWNER: ${{ inputs.abandon_in_flight_owner }}
           # The approval window size is deliberately NOT set here. It is a
           # readonly constant inside the approval script, kept in lockstep with
           # maxApprovedApiDigests in the admission policy; a workflow-side value
@@ -599,6 +783,31 @@ jobs:
             exit 1
           fi
 
+          # BLO-31598: validate the abandon pair BEFORE the approver credential
+          # reaches disk. A malformed value should never get as far as the
+          # higher-privilege credential, and the operator gets a message naming
+          # the input they mistyped rather than the script's internal variable.
+          if [ -n "${ABANDON_IN_FLIGHT}${ABANDON_IN_FLIGHT_OWNER}" ]; then
+            if [ -z "${ABANDON_IN_FLIGHT}" ] || [ -z "${ABANDON_IN_FLIGHT_OWNER}" ]; then
+              echo "abandon_in_flight and abandon_in_flight_owner must be supplied together." >&2
+              echo "The digest alone is ambiguous: a configuration-only release can reuse a digest," >&2
+              echo "so the owner is what identifies which in-flight approval is being retired." >&2
+              echo "Both values appear verbatim in the admission refusal that sent you here." >&2
+              exit 1
+            fi
+            if [[ ! "${ABANDON_IN_FLIGHT}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "abandon_in_flight must be a full digest of the form sha256:<64 hex>" >&2
+              exit 1
+            fi
+            if [[ ! "${ABANDON_IN_FLIGHT_OWNER}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "abandon_in_flight_owner must be 64 hexadecimal characters" >&2
+              exit 1
+            fi
+            # Surfaced in the run summary so retiring a lock is never a silent
+            # side effect of a deploy someone skim-approved.
+            echo "::warning::retiring stranded in-flight approval ${ABANDON_IN_FLIGHT} (owner ${ABANDON_IN_FLIGHT_OWNER}) before approving ${DIGEST}"
+          fi
+
           # mktemp -d, not a fixed path: `> "$RUNNER_TEMP/.kube/approver"`
           # follows a pre-existing symlink at that name, and arc-deploy is a
           # self-hosted pool, so residue from an earlier workload could redirect
@@ -610,6 +819,17 @@ jobs:
           approval_log="${approver_dir}/approval.log"
           deploy_kubeconfig="${KUBECONFIG}"
           approved_server_plan="$(mktemp "${RUNNER_TEMP}/paperclip-api-approved.XXXXXXXX.json")"
+          # BLO-31666: where the approval records the owner of the lock it mints,
+          # so the cleanup step at the end of this job can name that exact lock.
+          # Deliberately NOT created: the approval writes this file only for a
+          # lock it minted itself and is therefore entitled to retire, so ABSENT
+          # is the meaningful "nothing to retire" signal. An adopted lock belongs
+          # to a rollout that may still be running and is left unnamed. Inside
+          # approver_dir because mktemp -d just created it empty at 0700, which
+          # is exactly the guarantee this needs — a stale file at a fixed path
+          # would hand the cleanup step an owner from an earlier workload.
+          lock_owner_file="${approver_dir}/lock-owner.txt"
+          api_deployment="$(jq -er '.metadata.name | select(type == "string" and length > 0)' "${DEPLOY_PLAN}")"
 
           # Arm the cleanup BEFORE the credential reaches disk, so a kubectl/jq
           # failure exiting under `set -e` cannot leave it behind. umask instead
@@ -619,16 +839,48 @@ jobs:
           unset APPROVER_KUBECONFIG
 
           KUBECONFIG="${approver_kubeconfig}" \
+            PAPERCLIP_API_DEPLOYMENT="${api_deployment}" \
             PAPERCLIP_DEPLOY_KUBECONFIG="${deploy_kubeconfig}" \
             PAPERCLIP_DEPLOY_NAMESPACE="${NS}" \
             PAPERCLIP_APPROVED_SERVER_PLAN_OUT="${approved_server_plan}" \
+            PAPERCLIP_APPROVAL_LOCK_OWNER_OUT="${lock_owner_file}" \
+            PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT="${ABANDON_IN_FLIGHT}" \
+            PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER="${ABANDON_IN_FLIGHT_OWNER}" \
             "${APPROVE_SCRIPT}" "${DIGEST}" "${DEPLOY_PLAN}" | tee "${approval_log}"
 
-          jq -e --arg namespace "${NS}" --arg digest "${DIGEST}" --arg commit "${COMMIT}" '
+          # BLO-31666: publish the lock BEFORE the plan verification below, not
+          # after. The stranding window is "a lock exists and helm never ran",
+          # and it opens the instant the script above exits 0 — which includes
+          # the rest of THIS step. Writing the outputs after the jq check would
+          # leave a jq failure here stranding a lock the cleanup step cannot
+          # name, reproducing the exact BLO-31598 wedge one step earlier than
+          # the one this fix is about.
+          if [ -s "${lock_owner_file}" ]; then
+            lock_owner="$(tr -d '[:space:]' < "${lock_owner_file}")"
+            if [[ "${lock_owner}" =~ ^[0-9a-f]{64}$ ]]; then
+              {
+                echo "lock_digest=${DIGEST}"
+                echo "lock_owner=${lock_owner}"
+              } >> "$GITHUB_OUTPUT"
+              echo "::notice::holding in-flight approval lock ${DIGEST} (owner ${lock_owner})"
+            else
+              # Unnameable, so unretireable — the approval script mints this from
+              # SecureRandom.hex(32) and validates the same shape on the way back
+              # in, so a malformed value here means something is badly wrong.
+              # Deliberately NOT fatal: the approval itself succeeded, and failing
+              # the step now would strand this very lock while ALSO cancelling a
+              # deploy that would otherwise consume it legitimately at helm
+              # upgrade. Publishing nothing makes the cleanup step no-op, which
+              # is the honest reading of an owner nobody can name.
+              echo "::warning::approval wrote a malformed in-flight lock owner; the automatic cleanup cannot name this lock. Retire it by hand if this deploy fails before helm upgrade."
+            fi
+          fi
+
+          jq -e --arg namespace "${NS}" --arg digest "${DIGEST}" --arg commit "${COMMIT}" --arg name "${api_deployment}" '
             .apiVersion == "apps/v1" and
             .kind == "Deployment" and
             .metadata.namespace == $namespace and
-            .metadata.name == "paperclip-api" and
+            .metadata.name == $name and
             ((.metadata.resourceVersion == null) or
               (.metadata.resourceVersion | type == "string" and length > 0)) and
             .spec.template.metadata.annotations["paperclip.blockcast.net/deployed-commit"] == $commit and
@@ -643,10 +895,29 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Refuse to start a rollout whose pending migrations need an index built
+      # online first. Those migrations raise from inside worker startup, so
+      # without this the only symptom is `helm upgrade --wait` timing out 30
+      # minutes later with `context deadline exceeded` and `--atomic` spending
+      # a second timeout failing to evict the crashlooping pod. Read-only, runs
+      # the candidate image so the pending set is the one about to be applied.
+      - name: pending-migration pre-flight
+        env:
+          DIGEST: ${{ steps.artifact.outputs.digest }}
+          NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
+        run: .github/scripts/check-pending-migrations.sh
+
       # Pin the manifest digest resolved above so the image inspected for the
       # approved commit is exactly the image Kubernetes pulls. The committed
       # tag remains the readable source reference for non-CI deploys.
       - name: helm upgrade
+        # BLO-31666: the cleanup step at the end of this job reads this step's
+        # conclusion to decide whether the cluster was ever touched. `skipped`
+        # (an earlier step failed, so this never ran) is the ONLY value that
+        # licenses retiring the lock. Renaming or removing this id silently
+        # turns that condition into "" and disables the cleanup, which is why
+        # scripts/check-docker-retire-in-flight-lock.test.js asserts on it.
+        id: helm
         env:
           DIGEST: ${{ steps.artifact.outputs.digest }}
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
@@ -662,14 +933,25 @@ jobs:
           PAPERCLIP_DEPLOY_NAMESPACE: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
         run: |
           set -euo pipefail
+          # BLO-31666: positive evidence that this step began executing, written
+          # before anything that can fail. The cleanup step at the end of the job
+          # refuses to retire the approval lock while this is set, because from
+          # here on a rollout may have been started. Deliberately independent of
+          # steps.helm.conclusion: this marker survives a step that failed on its
+          # very first assertion, and the conclusion covers the case where the
+          # runner is killed mid-`helm upgrade` before outputs are collected.
+          # Either signal alone means "helm ran"; only their joint absence means
+          # the cluster was never touched.
+          echo "started=true" >> "$GITHUB_OUTPUT"
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "rolling out ${TAG}@${DIGEST} to ${NS}/${RELEASE}"
+          api_deployment="$(jq -er '.metadata.name | select(type == "string" and length > 0)' "${APPROVED_SERVER_PLAN}")"
           reconcile_approved_api_plan() {
             local attempt live_json reconciled replace_err
             reconciled="$(mktemp "${RUNNER_TEMP}/paperclip-api-reconciled.XXXXXXXX.json")"
             replace_err="$(mktemp "${RUNNER_TEMP}/paperclip-api-replace.XXXXXXXX.err")"
             for attempt in $(seq 1 5); do
-              live_json="$(kubectl -n "${NS}" get deployment paperclip-api -o json)"
+              live_json="$(kubectl -n "${NS}" get deployment "${api_deployment}" -o json)"
               jq --slurpfile approved "${APPROVED_SERVER_PLAN}" '
                 def release_controlled_metadata_key:
                   startswith("app.kubernetes.io/") or
@@ -758,12 +1040,14 @@ jobs:
           }
           trap stop_background_helm EXIT
 
-          helm upgrade "${RELEASE}" ./deploy/helm/paperclip \
+          PAPERCLIP_API_DEPLOYMENT="${api_deployment}" \
+            helm upgrade "${RELEASE}" ./deploy/helm/paperclip \
             -n "${NS}" \
             -f deploy/helm/paperclip/values.blockcast.yaml \
             --set image.tag="${TAG}" \
             --set-string image.digest="${DIGEST}" \
             --set-string api.deployedCommit="${COMMIT}" \
+            --set-string worker.deployedCommit="${COMMIT}" \
             --post-renderer "${STAMP_SCRIPT}" \
             --atomic --wait --timeout 30m &
           helm_pid=$!
@@ -775,7 +1059,7 @@ jobs:
           # marker-bearing intermediate Deployment is left live.
           api_plan_reconciled=""
           while kill -0 "${helm_pid}" 2>/dev/null; do
-            live_marker="$(kubectl -n "${NS}" get deployment paperclip-api \
+            live_marker="$(kubectl -n "${NS}" get deployment "${api_deployment}" \
               -o jsonpath='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/approval-plan-sha256}' \
               2>/dev/null || true)"
             if [ "${live_marker}" = "${PLAN_MARKER}" ]; then
@@ -795,7 +1079,7 @@ jobs:
           # invocation; only this unconditional post-wait pass guarantees a later
           # three-way merge or failure cannot strand live-only template drift.
           api_plan_reconciled=""
-          live_marker="$(kubectl -n "${NS}" get deployment paperclip-api \
+          live_marker="$(kubectl -n "${NS}" get deployment "${api_deployment}" \
             -o jsonpath='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/approval-plan-sha256}' \
             2>/dev/null || true)"
           if [ "${live_marker}" = "${PLAN_MARKER}" ]; then
@@ -811,7 +1095,28 @@ jobs:
             exit "${helm_status}"
           fi
 
-          kubectl -n "${NS}" rollout status deployment/paperclip-api --timeout=30m
+          kubectl -n "${NS}" rollout status "deployment/${api_deployment}" --timeout=30m
+
+          # BLO-29008: the api Deployment is only ONE of the two tiers this
+          # release rolls. statefulset/paperclip runs PAPERCLIP_NODE_ROLE=worker
+          # -- the singleton that drives heartbeat dispatch and hosts the plugin
+          # workers -- so a release that settles the api and leaves the worker
+          # behind has shipped nothing for every heartbeat-path fix. Waiting on
+          # it here is what makes the job's `success` mean "both tiers are on
+          # this build" instead of "the HTTP tier is".
+          #
+          # 15m, not the api's 30m, and the tighter bound is deliberate: this
+          # wait is serial with the two above it, and
+          # .github/scripts/guard-pending-deploy.sh blocks on ANY non-terminal
+          # docker.yml run -- so a worker that will never converge would hold a
+          # fleet-wide deploy freeze for the whole window. 15m is still clear of
+          # the worst-case cold start: the seed init container runs up to 13
+          # `timeout 45s` plugin-seed calls (~9m45s) and the startup probe budget
+          # is failureThreshold 30 x periodSeconds 10 (5m). Raise this only
+          # alongside that arithmetic, and keep the deploy job's timeout-minutes
+          # covering helm + api + worker + pre-flight + 10m (pinned by
+          # scripts/check-docker-deploy-timeout.test.js).
+          kubectl -n "${NS}" rollout status statefulset/paperclip --timeout=15m
 
           # Use the approver's canonical projection verbatim. Comparing the live
           # object with the handed-off server plan proves the lock can be retired
@@ -825,7 +1130,7 @@ jobs:
           fi
           approved_server_plan_sha256="$(jq -cS "${canonical_jq}" "${APPROVED_SERVER_PLAN}" \
             | sha256sum | awk '{print $1}')"
-          live_json="$(kubectl -n "${NS}" get deployment paperclip-api -o json)"
+          live_json="$(kubectl -n "${NS}" get deployment "${api_deployment}" -o json)"
           live_server_plan_sha256="$(jq -cS "${canonical_jq}" <<<"${live_json}" \
             | sha256sum | awk '{print $1}')"
           if [ "${live_server_plan_sha256}" != "${approved_server_plan_sha256}" ]; then
@@ -841,6 +1146,233 @@ jobs:
               (.spec.template.spec.containers | all(.image == $image))
             ' <<<"${live_json}" >/dev/null
 
+          # BLO-29008: two-tier convergence gate. Everything above this point
+          # verifies the api tier only -- against the approved plan, its marker,
+          # its commit and its digest. All of it passed during BLO-28920 while
+          # statefulset/paperclip sat on a 32h-old image, because nothing ever
+          # asked the worker what it was running.
+          #
+          # This block is the assertion that makes a partial roll a FAILURE
+          # rather than a green run. It reads the live objects (not the render),
+          # so it also catches a tier left behind by an out-of-band change --
+          # which is exactly how the BLO-28920 split arose, with no docker.yml
+          # deploy job involved at all.
+          #
+          # It verifies CONVERGENCE, not provenance: a tier that someone
+          # hand-rolled to the correct digest outside Helm passes this gate,
+          # leaving live state right and the Helm release state stale. A green
+          # gate is therefore not proof the release is Helm-consistent.
+          expected_image="harbor.blockcast.net/paperclip/paperclip@${DIGEST}"
+          commit_path='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/deployed-commit}'
+          api_image="$(kubectl -n "${NS}" get deployment paperclip-api \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          worker_image="$(kubectl -n "${NS}" get statefulset paperclip \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          api_commit="$(kubectl -n "${NS}" get deployment paperclip-api -o jsonpath="${commit_path}")"
+          worker_commit="$(kubectl -n "${NS}" get statefulset paperclip -o jsonpath="${commit_path}")"
+          sts_current_revision="$(kubectl -n "${NS}" get statefulset paperclip \
+            -o jsonpath='{.status.currentRevision}')"
+          sts_update_revision="$(kubectl -n "${NS}" get statefulset paperclip \
+            -o jsonpath='{.status.updateRevision}')"
+
+          tier_failures=""
+          if [ "${api_image}" != "${expected_image}" ]; then
+            tier_failures="${tier_failures}  api image     ${api_image:-<empty>} != ${expected_image}"$'\n'
+          fi
+          if [ "${worker_image}" != "${expected_image}" ]; then
+            tier_failures="${tier_failures}  worker image  ${worker_image:-<empty>} != ${expected_image}"$'\n'
+          fi
+          if [ "${api_commit}" != "${COMMIT}" ]; then
+            tier_failures="${tier_failures}  api commit    ${api_commit:-<unstamped>} != ${COMMIT}"$'\n'
+          fi
+          if [ "${worker_commit}" != "${COMMIT}" ]; then
+            tier_failures="${tier_failures}  worker commit ${worker_commit:-<unstamped>} != ${COMMIT}"$'\n'
+          fi
+          if [ "${sts_current_revision}" != "${sts_update_revision}" ]; then
+            tier_failures="${tier_failures}  worker revision unsettled: current ${sts_current_revision:-<empty>} != update ${sts_update_revision:-<empty>}"$'\n'
+          fi
+
+          if [ -n "${tier_failures}" ]; then
+            echo "Two-tier convergence check FAILED (BLO-29008)." >&2
+            echo "A partial roll must not report success: the worker tier drives" >&2
+            echo "heartbeat dispatch, so an api-only deploy ships nothing for it." >&2
+            echo "" >&2
+            printf '%s' "${tier_failures}" >&2
+            echo "" >&2
+            echo "  deployment/paperclip-api image:  ${api_image:-<empty>}" >&2
+            echo "  statefulset/paperclip   image:  ${worker_image:-<empty>}" >&2
+            echo "  expected image:                  ${expected_image}" >&2
+            exit 1
+          fi
+          echo "Two-tier convergence OK: api and worker both on ${expected_image} at ${COMMIT}"
+
           helm -n "${NS}" list | head -3
           kubectl -n "${NS}" get pod -l app.kubernetes.io/name=paperclip \
             -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount
+
+      # BLO-31666. The approval above holds an in-flight lock from the moment it
+      # rotates the ring until that digest's rollout actually lands, and only a
+      # landing rollout releases it. So a deploy that dies between the approval
+      # and `helm upgrade` strands a lock for a digest that was never applied,
+      # and every subsequent production deploy is then refused at admission with
+      # `refusing to approve <new>: <stranded> is still locked`. That is not
+      # hypothetical: run 33763503004 died in the pending-migration pre-flight,
+      # and run 33810092507 was refused against the lock it left behind
+      # (BLO-31598). The pre-flight budget that triggered it has been widened,
+      # but that removed the trigger, not the class — ANY failure between those
+      # two steps does the same thing.
+      #
+      # `if: always()` rather than `failure()` on purpose: this must also run
+      # when the job is CANCELLED, which is exactly how a job timeout during the
+      # pre-flight looks, and which strands a lock identically.
+      #
+      # The safety condition deliberately lives in the shell below rather than in
+      # this `if:`. It is the whole design, and a condition expressed as a GitHub
+      # expression cannot be executed by a test — #1636's review demonstrated two
+      # presence-only assertions passing against mutated code, so the condition
+      # this one guards is exercised for real by
+      # scripts/check-docker-retire-in-flight-lock.test.js instead.
+      - name: Retire the in-flight approval lock if helm never ran
+        if: ${{ always() }}
+        env:
+          # Empty unless the approval minted a lock of its own. It stays empty
+          # for a lock ADOPTED from an earlier attempt, whose rollout may still
+          # be running — see PAPERCLIP_APPROVAL_LOCK_OWNER_OUT in the approval
+          # script. So "empty" already means "no lock this job may retire".
+          LOCK_OWNER: ${{ steps.approval.outputs.lock_owner }}
+          LOCK_DIGEST: ${{ steps.approval.outputs.lock_digest }}
+          HELM_CONCLUSION: ${{ steps.helm.conclusion }}
+          # Set by the helm step's own first line. Two independent signals
+          # because neither is sufficient alone — see the guard below.
+          HELM_STARTED: ${{ steps.helm.outputs.started }}
+          APPROVER_KUBECONFIG: ${{ secrets.KUBECONFIG_PAPERCLIP_RELEASE_APPROVER }}
+          APPROVE_SCRIPT: ${{ steps.tooling.outputs.approve_script }}
+        run: |
+          set -euo pipefail
+          # BEGIN RETIRE_IN_FLIGHT_LOCK_GUARD
+          # "The job failed" is NOT sufficient grounds to retire the lock. A
+          # failure during or after `helm upgrade` may leave a rollout genuinely
+          # in flight, and retiring that lock would let a competing release
+          # rotate the ring underneath a landing one — precisely what the lock
+          # exists to prevent. The condition is "this job took a lock AND helm
+          # upgrade never executed", and nothing weaker.
+          if [ -z "${LOCK_OWNER}" ] || [ -z "${LOCK_DIGEST}" ]; then
+            # Three ways to reach here, and the message must not claim more than
+            # it knows. Two are ordinary: the approval minted no lock, or it
+            # ADOPTED one, whose owner is deliberately never published because
+            # its rollout may still be running. The third is that the approval
+            # step died before publishing — and that one is NOT a wedge, because
+            # the script arms its own cleanup before the ring write and keeps it
+            # armed through the admissibility probe, then traps INT and TERM into
+            # a non-zero exit that runs `release_in_flight_lock`. So an operator
+            # cancelling the deploy has its lock retired inside that script,
+            # before this step ever runs. Only a SIGKILL runs no trap at all.
+            # Recover THAT one from the cluster, not from this run's log. The
+            # log carries the digest but never the owner: LOCK_OWNER_ID reaches
+            # stdout at exactly one site, the script's success epilogue, which is
+            # past this entire window -- and the `holding in-flight approval
+            # lock ... (owner ...)` notice below reads a file the script only
+            # writes on return, so it is unreachable here too. The annotation is
+            # the one place the owner provably still exists at that moment:
+            #   kubectl -n paperclip-release-approvals get configmap \
+            #     paperclip-api-approved-images -o jsonpath=\
+            #     '{.metadata.annotations.paperclip\.blockcast\.net/approval-in-flight-owner}'
+            # Both halves are required: PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY
+            # validates the pair and matches on digest AND owner, so the digest
+            # alone cannot retire anything. Pinned by the two cancellation tests
+            # in approve-paperclip-api-digest.test.js.
+            echo "this job's approval published no in-flight lock for this step to retire (none minted, adopted, or already retired by the approval's own cleanup)"
+            exit 0
+          fi
+
+          # Signal 1: the helm step's own marker, written as its first line.
+          # Positive evidence that it began, so it is conclusive on its own and
+          # is checked first. It also covers a helm step that died on its very
+          # first assertion, which has no rollout but is still not something to
+          # infer from a conclusion alone.
+          if [ -n "${HELM_STARTED}" ]; then
+            echo "helm upgrade started (marker '${HELM_STARTED}'), so a rollout may exist; leaving the lock on ${LOCK_DIGEST} intact"
+            exit 0
+          fi
+
+          # Signal 2: the step conclusion. Only two values are consistent with a
+          # step that never began — `skipped` (an earlier step failed, so this
+          # one never started) and empty (a never-started step may be absent
+          # from the steps context entirely). This is deliberately an ALLOW-list
+          # of "did not run" rather than a deny-list of {success, failure,
+          # cancelled}: an unrecognised value then preserves the lock instead of
+          # retiring it, which is the direction that fails safely. `cancelled`
+          # matters most — a runner killed mid-`helm upgrade` may lose the marker
+          # above while --atomic is still rolling the release back, so the
+          # conclusion is the signal that catches it.
+          case "${HELM_CONCLUSION}" in
+            "" | skipped) ;;
+            *)
+              echo "helm upgrade concluded '${HELM_CONCLUSION}', so a rollout may have started; leaving the lock on ${LOCK_DIGEST} intact"
+              exit 0
+              ;;
+          esac
+          # END RETIRE_IN_FLIGHT_LOCK_GUARD
+
+          if [ -z "${APPROVER_KUBECONFIG}" ] || [ ! -x "${APPROVE_SCRIPT:-}" ]; then
+            echo "::error::cannot retire stranded in-flight approval lock ${LOCK_DIGEST} (owner ${LOCK_OWNER}): approver credential or release tooling unavailable. Retire it with PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY=1 before the next deploy."
+            exit 1
+          fi
+
+          # Same mktemp -d discipline as the approval step: arc-deploy is a
+          # self-hosted pool, so a fixed path could be a symlink left by an
+          # earlier workload redirecting this credential somewhere it survives.
+          approver_dir="$(mktemp -d "${RUNNER_TEMP}/retire.XXXXXXXX")"
+          trap 'rm -rf "${approver_dir}"' EXIT
+          approver_kubeconfig="${approver_dir}/kubeconfig"
+          (umask 077; printf '%s' "${APPROVER_KUBECONFIG}" > "${approver_kubeconfig}")
+          unset APPROVER_KUBECONFIG
+
+          echo "::warning::retiring the in-flight approval lock on ${LOCK_DIGEST} (owner ${LOCK_OWNER}): this deploy failed before helm upgrade ran, so the cluster was never touched"
+
+          # Retire-only mode approves nothing and matches on digest AND owner
+          # together, so it cannot touch a lock another run took — a
+          # configuration-only release can legitimately reuse a digest, which is
+          # why the owner is the identifying half. It exits 0 without writing
+          # when no such lock is present, so a lock already retired (by the
+          # script's own abort path, or by an operator) is a silent no-op here.
+          # `2>&1` because the give-up guidance is printed to stderr, and that is
+          # the one path where a human has to act: a bare `| tee` captures only
+          # stdout, so the recovery instructions would be missing from exactly
+          # the log an operator opens. Run under `if !` rather than bare, so
+          # `set -e` cannot abort the step before the summary and the annotation
+          # below are written; `pipefail` keeps the pipeline status the script's
+          # own rather than tee's.
+          # BEGIN RETIRE_IN_FLIGHT_LOCK_HANDBACK
+          retire_status=0
+          if ! KUBECONFIG="${approver_kubeconfig}" \
+              PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY=1 \
+              PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT="${LOCK_DIGEST}" \
+              PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER="${LOCK_OWNER}" \
+              "${APPROVE_SCRIPT}" 2>&1 | tee "${approver_dir}/retire.log"; then
+            retire_status=1
+          fi
+
+          # Written on both outcomes. A failed retirement is the case most in
+          # need of a summary, since the ring stays wedged and the next deploy
+          # fails at admission on someone else's unrelated release.
+          {
+            if [ "${retire_status}" -eq 0 ]; then
+              echo "### Retired unused in-flight approval lock"
+            else
+              echo "### FAILED to retire unused in-flight approval lock"
+            fi
+            echo '```'
+            cat "${approver_dir}/retire.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Annotation parity with the missing-credential branch above: both are
+          # paths where the automation is handing the lock back to a human, and
+          # an unannotated red step inside a job that already failed for another
+          # reason is easy to read past.
+          if [ "${retire_status}" -ne 0 ]; then
+            echo "::error::could not retire the in-flight approval lock on ${LOCK_DIGEST} (owner ${LOCK_OWNER}). Every production deploy is refused at admission until it is retired — see this step's log for the recovery command."
+            exit 1
+          fi
+          # END RETIRE_IN_FLIGHT_LOCK_HANDBACK

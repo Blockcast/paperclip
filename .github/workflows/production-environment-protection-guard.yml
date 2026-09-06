@@ -1,0 +1,74 @@
+name: Production Environment Protection Guard
+
+# Re-reads the live `paperclip-production` GitHub environment and asserts the
+# board-ratified protection shape (approval b75f8156). Exists because a closed
+# approval card was being treated as evidence the control existed: the
+# protection has now silently drifted three times (2026-07-31 never applied,
+# 2026-08-04 lapsed, 2026-08-08 widened under an incident override that was
+# never restored) and each time nobody noticed for 2-6 days. See BLO-22329.
+#
+# A red workflow run is deliberately NOT the alerting path — it only emails the
+# last committer, which is the exact failure mode being fixed. Drift is pushed
+# to Alertmanager with severity=critical, which routes to the slack-relay
+# receiver and reaches a human. The run also fails, as a backstop.
+
+on:
+  schedule:
+    # Twice daily, off the hour: the AC asks for at least daily.
+    - cron: "43 6,18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: default
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      # The default Actions GITHUB_TOKEN does not carry environments read; the
+      # allyblockcast App installation token does (verified 2026-08-14 against
+      # GET /repos/Blockcast/paperclip/environments/paperclip-production).
+      - name: Generate app token
+        id: token
+        run: |
+          TOKEN=$(node .github/scripts/get-bot-token.mjs)
+          echo "::add-mask::$TOKEN"
+          echo "value=$TOKEN" >> "$GITHUB_OUTPUT"
+        env:
+          COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+          COMMITPERCLIP_APP_ID: ${{ vars.COMMITPERCLIP_APP_ID }}
+
+      - name: Check environment protection
+        id: check
+        continue-on-error: true
+        run: |
+          set +e
+          node .github/scripts/check-production-environment-protection.mjs
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.value }}
+          GH_REPO: ${{ github.repository }}
+          GH_ENVIRONMENT_NAME: ${{ vars.PRODUCTION_ENVIRONMENT_NAME || 'paperclip-production' }}
+          ENV_CHECK_JSON_OUT: ${{ runner.temp }}/env-check.json
+
+      # Exit code 2 (could not read) must never be reported as compliant, so it
+      # alerts under its own alertname rather than being folded into drift.
+      - name: Push drift alert to Alertmanager
+        if: steps.check.outputs.exit_code != '0'
+        env:
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          EXIT_CODE: ${{ steps.check.outputs.exit_code }}
+          SUMMARY_PATH: ${{ runner.temp }}/env-check.json
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ENVIRONMENT_NAME: ${{ vars.PRODUCTION_ENVIRONMENT_NAME || 'paperclip-production' }}
+        run: node .github/scripts/post-environment-protection-alert.mjs
+
+      - name: Fail the run when the environment is drifted or unreadable
+        if: steps.check.outputs.exit_code != '0'
+        run: |
+          echo "::error::paperclip-production protection check exited ${{ steps.check.outputs.exit_code }} (1=drift, 2=unreadable). See the step log and the Alertmanager alert."
+          exit 1

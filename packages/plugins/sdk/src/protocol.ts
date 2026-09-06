@@ -394,6 +394,76 @@ export interface GetDataParams {
 }
 
 /**
+ * A fencing generation the caller must still hold for a mutating host call —
+ * `issues.*` or `state.set` — to be applied.
+ *
+ * A plugin can enforce its own fence on its own database writes, but not on a
+ * host RPC — leaving a check-before-act window between "am I still the owner?"
+ * and the call. Supplying this closes it: the host takes a share lock on the
+ * named row inside the very transaction that performs the mutation and holds it
+ * to commit, so a concurrent steal either loses (and the mutation proceeds) or
+ * wins (and the mutation is rejected). There is no interleaving.
+ *
+ * This type is only accepted where that guarantee is actually available, which
+ * means a database mutation the host can wrap in one transaction. Event
+ * delivery is not one: see {@link PluginEventOwnershipCheck}, which is a
+ * deliberately separate, weaker type so that a caller cannot mistake a
+ * best-effort pre-dispatch check for this fence.
+ *
+ * `table` and the keys of `match` are resolved inside *this plugin's own*
+ * database namespace, which the host derives from the authenticated plugin — a
+ * plugin cannot name another schema, so this grants no additional SQL reach.
+ *
+ * Omit it and the call behaves exactly as it always has; this is opt-in.
+ *
+ * Rejection surfaces as an error carrying `code: "fencing_generation_lost"`, so
+ * a caller can distinguish "I was displaced" from "the RPC failed".
+ */
+export type PluginFencingPrecondition = {
+  /** Table in the calling plugin's namespace that holds the generation. */
+  table: string;
+  /** Column -> required value. One row must match all of them. */
+  match: Record<string, string | number | null>;
+};
+
+/** Error code returned when a supplied {@link PluginFencingPrecondition} no longer holds. */
+export const PLUGIN_FENCING_GENERATION_LOST_CODE = "fencing_generation_lost";
+
+/**
+ * A best-effort ownership check for `events.emit`. **This is not a fence, and
+ * it is a separate type from {@link PluginFencingPrecondition} for exactly that
+ * reason.**
+ *
+ * What it does guarantee: the host re-reads this generation immediately before
+ * fan-out and refuses to dispatch if it is already gone. That downgrades "a
+ * displaced worker announces an event it does not own" from *likely* (the
+ * displacement usually happened long before the emit) to *a race it has to
+ * win*.
+ *
+ * What it does NOT guarantee, and callers must not assume: that a delivered
+ * event was owned at the moment a subscriber acted on it. Event delivery is an
+ * in-memory fan-out with no transaction to join, so there is no lock to hold
+ * from the check through the dispatch. A steal committing in that window still
+ * results in delivery. Holding the share lock across the handlers *would* close
+ * it and is rejected on purpose: handlers run arbitrary plugin code, so a slow
+ * or wedged handler would block the steal path — reintroducing the
+ * unstealable-fence failure this whole mechanism exists to prevent (BLO-31036).
+ *
+ * Therefore: **treat a plugin event as a notification, not as an authorization
+ * to act on the named aggregate.** A subscriber that performs a durable or
+ * side-effecting action must re-establish ownership itself at the point of that
+ * action. Making delivery authoritative needs a transactional outbox in the
+ * host event subsystem and is tracked in BLO-31113 — it cannot be fixed from
+ * the emitting side.
+ */
+export type PluginEventOwnershipCheck = {
+  /** Table in the calling plugin's namespace that holds the generation. */
+  table: string;
+  /** Column -> required value. One row must match all of them. */
+  match: Record<string, string | number | null>;
+};
+
+/**
  * Input for the `performAction` RPC method.
  *
  * @see PLUGIN_SPEC.md §13.9 — `performAction`
@@ -1008,7 +1078,14 @@ export interface WorkerToHostMethods {
     },
   ];
   "state.set": [
-    params: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string; value: unknown },
+    params: {
+      scopeKind: string;
+      scopeId?: string;
+      namespace?: string;
+      stateKey: string;
+      value: unknown;
+      fencing?: PluginFencingPrecondition;
+    },
     result: void,
   ];
   "state.delete": [
@@ -1079,7 +1156,16 @@ export interface WorkerToHostMethods {
 
   // Events
   "events.emit": [
-    params: { name: string; companyId: string; payload: unknown },
+    params: {
+      name: string;
+      companyId: string;
+      payload: unknown;
+      /**
+       * Best-effort pre-dispatch ownership check. NOT a fence — see
+       * {@link PluginEventOwnershipCheck}. Deliberately not `fencing`.
+       */
+      ownershipCheck?: PluginEventOwnershipCheck;
+    },
     result: void,
   ];
   "events.subscribe": [
@@ -1122,6 +1208,15 @@ export interface WorkerToHostMethods {
   "secrets.resolve": [
     params: { secretRef: string | EnvSecretRefBinding; companyId?: string; configPath?: string },
     result: string,
+  ];
+  "secrets.verify": [
+    params: {
+      secretRef: string | EnvSecretRefBinding;
+      presented: string;
+      companyId?: string;
+      configPath?: string;
+    },
+    result: boolean,
   ];
   "secrets.list": [
     params: { companyId: string },
@@ -1181,6 +1276,39 @@ export interface WorkerToHostMethods {
       metadata?: Record<string, unknown>;
     },
     result: void,
+  ];
+
+  // Costs / finance
+  /**
+   * Record a settlement-side finance event (`finance_events`), NOT a `cost_events`
+   * row. Adapters already emit `cost_events` for agent traffic; writing there from a
+   * plugin would double-count. This surface exists so an external biller (a proxy, a
+   * provider invoice export) can be reconciled against that self-reported estimate.
+   *
+   * Idempotent on `(companyId, externalInvoiceId)` — a repeat call returns the
+   * existing row with `created: false` instead of inserting a duplicate.
+   */
+  "costs.finance.create": [
+    params: {
+      companyId: string;
+      eventKind: string;
+      biller: string;
+      provider?: string;
+      model?: string;
+      amountCents: number;
+      currency?: string;
+      /** `true` when the amount is derived from an estimate rather than a settled invoice. */
+      estimated?: boolean;
+      quantity?: number;
+      unit?: string;
+      /** Stable external key; the idempotency key for this write. */
+      externalInvoiceId?: string;
+      description?: string;
+      /** ISO 8601. */
+      occurredAt: string;
+      metadata?: Record<string, unknown>;
+    },
+    result: { id: string; created: boolean },
   ];
 
   // Metrics
@@ -1422,6 +1550,7 @@ export interface WorkerToHostMethods {
        * import an existing Linear issue rather than create one.
        */
       linkedLinearIssue?: { id: string; identifier: string };
+      fencing?: PluginFencingPrecondition;
     },
     result: Issue,
   ];
@@ -1430,6 +1559,7 @@ export interface WorkerToHostMethods {
       issueId: string;
       patch: Record<string, unknown>;
       companyId: string;
+      fencing?: PluginFencingPrecondition;
     },
     result: Issue,
   ];
@@ -1531,8 +1661,37 @@ export interface WorkerToHostMethods {
     result: IssueComment[],
   ];
   "issues.createComment": [
-    params: { issueId: string; body: string; companyId: string; authorAgentId?: string },
-    result: IssueComment,
+    params: {
+      issueId: string;
+      body: string;
+      companyId: string;
+      authorAgentId?: string;
+      fencing?: PluginFencingPrecondition;
+      /**
+       * Dedup key, scoped to this plugin *installation*: the host namespaces it
+       * as `plugin:<pluginId>:<key>`, so a natural key cannot collide with
+       * another plugin's or with a server-internal one. `pluginId` is the
+       * install row's id, not the manifest `pluginKey`, but that row and its id
+       * are retained by the default (soft) uninstall and reused on reinstall, so
+       * keys keep matching across an uninstall/reinstall cycle. They are
+       * orphaned only by a purge (`DELETE /api/plugins/:pluginId?purge=true`) or
+       * a table reseed, and that boundary fails in the safe direction (an extra
+       * comment, never a wrong body handed back).
+       * A second create carrying a key already written to this issue returns
+       * the existing comment —
+       * `deduplicated: true` — instead of inserting, atomically in the database,
+       * so it holds across replicas and across concurrent deliveries. Empty and
+       * whitespace-only strings are treated as omitted. Omit for today's
+       * behaviour: no key means no dedup.
+       *
+       * Caveat when combined with `fencing`: the generation is asserted *before*
+       * the dedup lookup, so a duplicate delivery arriving after the generation
+       * has advanced throws a fencing error rather than returning the existing
+       * comment. Treat that error as "may already be applied".
+       */
+      idempotencyKey?: string | null;
+    },
+    result: IssueComment & { deduplicated?: boolean },
   ];
   "issues.createInteraction": [
     params: {

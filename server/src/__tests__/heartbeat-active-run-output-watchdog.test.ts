@@ -149,6 +149,12 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     lastOutputAgeMs?: number;
     lastUsefulActionAgeMs?: number;
     logChunk?: string;
+    // PEN-2106: reproduce production. `logBytes` is only written back on
+    // finalize, so a still-`running` row has logStore/logRef set and logBytes
+    // 0. The default path here writes the real byte count, which is why no
+    // test ever caught the evidence reader being gated on it.
+    staleLogBytes?: boolean;
+    agentAdapterType?: string;
     recentRunEventAgeMs?: number;
     sourceStatus?: "in_progress" | "done" | "cancelled";
     sourceOriginKind?: string;
@@ -196,7 +202,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
         role: "engineer",
         status: "running",
         reportsTo: managerId,
-        adapterType: "codex_local",
+        adapterType: opts.agentAdapterType ?? "codex_local",
         adapterConfig: {},
         runtimeConfig: {},
         permissions: {},
@@ -247,7 +253,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
         .set({
           logStore: handle.store,
           logRef: handle.logRef,
-          logBytes,
+          logBytes: opts.staleLogBytes ? 0 : logBytes,
         })
         .where(eq(heartbeatRuns.id, runId));
     }
@@ -519,6 +525,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       sourceStatus: "done",
       sameRunTerminalEvidence: "activity",
     });
+    await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
 
     const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
 
@@ -545,6 +552,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     });
 
     const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(source?.checkoutRunId).toBeNull();
     expect(source?.executionRunId).toBeNull();
     const [agent] = await db.select().from(agents).where(eq(agents.id, coderId));
     expect(agent?.status).toBe("idle");
@@ -1347,5 +1355,133 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(followup.existing).toBe(1);
     expect(followup.reopened).toBe(0);
     expect(followup.created).toBe(0);
+  });
+
+  // PEN-2106: the BLO-4467 wedge is an EXTERNAL-LIFECYCLE story. These four
+  // tests pin the adapter boundary in both directions, plus the evidence read
+  // that was blind for this detector's entire population.
+  const POD_LIFECYCLE_LANGUAGE = /\bpod\b|\bJob\b|concurrency lock/i;
+
+  async function driveToReopen(companyId: string, wrapperId: string, t0: Date) {
+    const closedAt = new Date(t0.getTime() + 60_000);
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: closedAt, updatedAt: closedAt })
+      .where(eq(issues.id, wrapperId));
+    for (let i = 1; i <= STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD; i += 1) {
+      await heartbeat.scanSilentActiveRuns({
+        now: new Date(closedAt.getTime() + i * 10 * 60_000),
+        companyId,
+      });
+    }
+    const escalation = await heartbeat.scanSilentActiveRuns({
+      now: new Date(closedAt.getTime() + (STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD + 1) * 10 * 60_000),
+      companyId,
+    });
+    expect(escalation.reopened).toBe(1);
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, wrapperId));
+    const reopen = comments.find((c) => c.body.includes("Re-fire escalation"));
+    expect(reopen).toBeTruthy();
+    return reopen!.body;
+  }
+
+  it("reopen remedy drops pod/Job/lock language on a sessioned-local adapter (PEN-2106)", async () => {
+    const t0 = new Date("2026-05-24T12:00:00.000Z");
+    const { companyId } = await seedRunningRun({
+      now: t0,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      agentAdapterType: "claude_local",
+    });
+    await heartbeat.scanSilentActiveRuns({ now: t0, companyId });
+    const [wrapper] = await getStaleRunWrappers(companyId);
+
+    const body = await driveToReopen(companyId, wrapper!.id, t0);
+
+    // The whole point: no pod, no Job, no lock — none of it exists here.
+    expect(body).not.toMatch(POD_LIFECYCLE_LANGUAGE);
+    // And it must say what IS true, including the grant boundary that makes
+    // "force-finish it yourself" impossible for an agent assignee.
+    expect(body).toContain("no external runtime lifecycle");
+    expect(body).toContain("board-gated");
+  });
+
+  it("reopen remedy KEEPS the pod/Job reaper remedy on an external-lifecycle adapter (PEN-2106)", async () => {
+    const t0 = new Date("2026-05-24T12:00:00.000Z");
+    const { companyId } = await seedRunningRun({
+      now: t0,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      agentAdapterType: "claude_k8s",
+    });
+    await heartbeat.scanSilentActiveRuns({ now: t0, companyId });
+    const [wrapper] = await getStaleRunWrappers(companyId);
+
+    const body = await driveToReopen(companyId, wrapper!.id, t0);
+
+    // Positive control: the branch must not blank BOTH sides. Where the k8s
+    // mechanism is real, the original remedy survives verbatim.
+    expect(body).toContain("the run row is `running` but the pod/Job is gone");
+    expect(body).toContain("concurrency lock releases");
+  });
+
+  it("suppression note branches its mechanism phrase on adapter lifecycle (PEN-2106)", async () => {
+    const t0 = new Date("2026-05-24T12:00:00.000Z");
+    async function tallyBodyFor(adapterType: string) {
+      const { companyId } = await seedRunningRun({
+        now: t0,
+        ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+        agentAdapterType: adapterType,
+      });
+      await heartbeat.scanSilentActiveRuns({ now: t0, companyId });
+      const [wrapper] = await getStaleRunWrappers(companyId);
+      const closedAt = new Date(t0.getTime() + 60_000);
+      await db
+        .update(issues)
+        .set({ status: "done", completedAt: closedAt, updatedAt: closedAt })
+        .where(eq(issues.id, wrapper!.id));
+      const refire = await heartbeat.scanSilentActiveRuns({
+        now: new Date(closedAt.getTime() + 10 * 60_000),
+        companyId,
+      });
+      expect(refire.suppressed).toBe(1);
+      const comments = await db
+        .select()
+        .from(issueComments)
+        .where(eq(issueComments.issueId, wrapper!.id));
+      const tally = comments.find((c) =>
+        c.body.startsWith(STALE_ACTIVE_RUN_EVALUATION_REFIRE_COMMENT_MARKER),
+      );
+      expect(tally).toBeTruthy();
+      return tally!.body;
+    }
+
+    const local = await tallyBodyFor("claude_local");
+    expect(local).not.toMatch(POD_LIFECYCLE_LANGUAGE);
+    expect(local).toContain("no external runtime lifecycle");
+
+    const external = await tallyBodyFor("claude_k8s");
+    expect(external).toContain("pod already reaped");
+  });
+
+  it("collects the run-log tail when logBytes is unwritten, as it always is here (PEN-2106)", async () => {
+    const t0 = new Date("2026-05-24T12:00:00.000Z");
+    // The production symptom: the most diagnostic line is the LAST one, and it
+    // is invisible on the run row itself (lastOutputSeq stays 1).
+    const marker = "Adapter execution timeout: timeoutSec=900";
+    const { companyId } = await seedRunningRun({
+      now: t0,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      logChunk: `booting agent runtime\nloading instructions\n${marker}`,
+      staleLogBytes: true,
+    });
+
+    const scan = await heartbeat.scanSilentActiveRuns({ now: t0, companyId });
+    expect(scan.created).toBe(1);
+
+    const [wrapper] = await getStaleRunWrappers(companyId);
+    expect(wrapper?.description).toContain(marker);
+    expect(wrapper?.description).not.toContain("_No run-log tail was available._");
   });
 });

@@ -550,6 +550,7 @@ function existingProject(): Project {
     },
     workspaces: [],
     primaryWorkspace: null,
+    primaryWorkspaceSource: "none" as const,
     managedByPlugin: null,
     archivedAt: null,
     createdAt: now,

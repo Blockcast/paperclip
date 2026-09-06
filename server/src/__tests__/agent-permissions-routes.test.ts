@@ -854,7 +854,14 @@ describe.sequential("agent permission routes", () => {
         model: "gpt-5.3-codex-spark",
         env: expect.any(Object),
       }),
-      { strictMode: false, adapterType: "codex_local" },
+      {
+        strictMode: false,
+        adapterType: "codex_local",
+        actor: expect.objectContaining({
+          userId: "board-user",
+          type: "board",
+        }),
+      },
     );
     expect(mockAgentService.update).toHaveBeenCalledWith(
       agentId,
@@ -989,6 +996,86 @@ describe.sequential("agent permission routes", () => {
     expect(res.body.error).toContain("instructions path or bundle configuration");
     expect(mockAgentService.create).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("blocks agent-authenticated hires when normalization creates a secret binding", async () => {
+    mockAccessService.hasPermission.mockResolvedValue(true);
+    mockSecretService.normalizeAdapterConfigForPersistence.mockResolvedValue({
+      env: {
+        API_TOKEN: {
+          type: "secret_ref",
+          secretId: "33333333-3333-4333-8333-333333333333",
+          version: "latest",
+        },
+      },
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/companies/${companyId}/agent-hires`)
+      .send({
+        name: "Injected",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: { env: { API_TOKEN: "plain-secret" } },
+      }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("secret bindings");
+    expect(mockAgentService.create).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(mockSecretService.normalizeAdapterConfigForPersistence).toHaveBeenCalledWith(
+      companyId,
+      expect.any(Object),
+      expect.objectContaining({ actor: expect.objectContaining({ type: "agent", agentId }) }),
+    );
+  });
+
+  it("blocks agent-authenticated direct creation when normalization creates a secret binding", async () => {
+    mockAccessService.hasPermission.mockResolvedValue(true);
+    mockSecretService.normalizeAdapterConfigForPersistence.mockResolvedValue({
+      env: {
+        API_TOKEN: {
+          type: "secret_ref",
+          secretId: "33333333-3333-4333-8333-333333333333",
+          version: "latest",
+        },
+      },
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/companies/${companyId}/agents`)
+      .send({
+        name: "Injected",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: { env: { API_TOKEN: "plain-secret" } },
+      }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("secret bindings");
+    expect(mockAgentService.create).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(mockSecretService.normalizeAdapterConfigForPersistence).toHaveBeenCalledWith(
+      companyId,
+      expect.any(Object),
+      expect.objectContaining({ actor: expect.objectContaining({ type: "agent", agentId }) }),
+    );
   });
 
   it("blocks direct agent creation for authenticated company members without agent create permission", async () => {
@@ -1916,5 +2003,133 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(404);
     expect(res.body.error).toBe("Heartbeat run not found");
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
+  // BLO-21947: an agent may cancel a run it does not own, but only when it
+  // manages the run's agent AND the run demonstrably never dispatched. Before
+  // this the route was `assertBoard` outright, which left a stranded run
+  // repairable only by its own assignee — whose wake path is what is broken in
+  // this failure class — or by a human board user.
+  describe("stranded-run recovery by a managing agent", () => {
+    const strandedRun = {
+      id: "run-1",
+      companyId,
+      agentId: "44444444-4444-4444-8444-444444444444",
+      status: "queued",
+      startedAt: null,
+      processPid: null,
+      processGroupId: null,
+      createdAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+    };
+
+    function agentActor() {
+      return { type: "agent", agentId, companyId, source: "agent_jwt", isInstanceAdmin: false };
+    }
+
+    function allowRecovery() {
+      mockAccessService.decide.mockResolvedValue({
+        allowed: true,
+        action: "run:recover_stranded",
+        reason: "allow_explicit_grant",
+        explanation: "ok",
+      });
+    }
+
+    it("cancels an undispatched run for an authorized managing agent", async () => {
+      mockHeartbeatService.getRun.mockResolvedValue(strandedRun);
+      mockHeartbeatService.cancelRun.mockResolvedValue({ ...strandedRun, status: "cancelled" });
+      allowRecovery();
+
+      const app = await createApp(agentActor());
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl).post("/api/heartbeat-runs/run-1/cancel").send({}));
+
+      expect(res.status).toBe(200);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalled();
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "run:recover_stranded",
+        resource: { type: "agent", companyId, agentId: strandedRun.agentId },
+      }));
+    });
+
+    it("refuses when the authorization decision denies", async () => {
+      mockHeartbeatService.getRun.mockResolvedValue(strandedRun);
+      mockAccessService.decide.mockResolvedValue({
+        allowed: false,
+        action: "run:recover_stranded",
+        reason: "deny_scope",
+        explanation: "Actor does not manage the run's owning agent in the reporting chain.",
+      });
+
+      const app = await createApp(agentActor());
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl).post("/api/heartbeat-runs/run-1/cancel").send({}));
+
+      expect(res.status).toBe(403);
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    // The safety property: authorization alone must never be enough to kill a
+    // run that has in-flight work. A running run stays board-only at any age.
+    it("refuses a running run even for an authorized managing agent", async () => {
+      mockHeartbeatService.getRun.mockResolvedValue({
+        ...strandedRun,
+        status: "running",
+        startedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+        processPid: 4242,
+      });
+      allowRecovery();
+
+      const app = await createApp(agentActor());
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl).post("/api/heartbeat-runs/run-1/cancel").send({}));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("not eligible");
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    it("refuses a freshly queued run so a manager cannot race the dispatcher", async () => {
+      mockHeartbeatService.getRun.mockResolvedValue({ ...strandedRun, createdAt: new Date() });
+      allowRecovery();
+
+      const app = await createApp(agentActor());
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl).post("/api/heartbeat-runs/run-1/cancel").send({}));
+
+      expect(res.status).toBe(403);
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    // Board authority is unchanged: no manager-chain decision, and no age or
+    // dispatch precondition.
+    it("leaves board cancellation of a running run unconditional", async () => {
+      mockHeartbeatService.getRun.mockResolvedValue({
+        ...strandedRun,
+        status: "running",
+        startedAt: new Date(),
+        processPid: 4242,
+      });
+      mockHeartbeatService.cancelRun.mockResolvedValue({ ...strandedRun, status: "cancelled" });
+      mockAccessService.decide.mockResolvedValue({
+        allowed: false,
+        action: "run:recover_stranded",
+        reason: "deny_scope",
+        explanation: "should not be consulted for board actors",
+      });
+
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      });
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl).post("/api/heartbeat-runs/run-1/cancel").send({}));
+
+      expect(res.status).toBe(200);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalled();
+    });
   });
 });

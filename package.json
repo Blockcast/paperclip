@@ -16,6 +16,7 @@
     "build": "pnpm run preflight:workspace-links && pnpm -r build",
     "typecheck": "pnpm run preflight:workspace-links && pnpm -r typecheck",
     "typecheck:build-gaps": "pnpm run preflight:workspace-links && pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && pnpm --filter @paperclipai/server build && node scripts/run-typecheck-build-gaps.mjs",
+    "check:test-undefined-symbols": "node scripts/check-test-undefined-symbols.mjs",
     "test": "pnpm run test:run",
     "test:watch": "pnpm run preflight:workspace-links && vitest",
     "test:run": "pnpm run preflight:workspace-links && node scripts/run-vitest-stable.mjs",
@@ -44,6 +45,7 @@
     "test:check-no-git-push": "node --test scripts/check-no-git-push.test.mjs",
     "test:security-audit-overrides": "node scripts/security-audit-overrides.test.js",
     "test:ip-address-security-override": "node --test scripts/ip-address-security-override.test.js",
+    "test:browserslist-security-override": "node --test scripts/browserslist-security-override.test.js",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
     "docs:dev": "cd docs && npx mintlify dev",
     "smoke:hermes-gateway-join": "./scripts/smoke/hermes-gateway-join.sh",
@@ -71,9 +73,13 @@
     "postinstall": "node scripts/link-plugin-dev-sdk.mjs"
   },
   "devDependencies": {
+    "@paperclipai/db": "workspace:^",
+    "@paperclipai/shared": "workspace:^",
     "@playwright/test": "^1.58.2",
     "cross-env": "^10.1.0",
+    "drizzle-orm": "0.45.2",
     "esbuild": "^0.28.1",
+    "tsx": "^4.23.1",
     "typescript": "^5.7.3",
     "vitest": "^4.1.8"
   },
@@ -140,7 +146,7 @@
     "overrides": {
       "rollup": ">=4.59.0",
       "kysely": "^0.28.17",
-      "fast-uri": "^3.1.5",
+      "fast-uri": "^3.1.6",
       "vite@6": "^6.4.2",
       "defu": "^6.1.5",
       "lodash-es": "^4.18.0",
@@ -165,6 +171,7 @@
       "@connectrpc/connect-node>undici": ">=6.27.0 <7",
       "jsdom>undici": ">=7.29.0 <8",
       "multer": ">=2.2.0 <3",
+      "browserslist": ">=4.28.7 <5",
       "react": "^19.2.7",
       "react-dom": "^19.2.7",
       "lexical": "0.46.0",

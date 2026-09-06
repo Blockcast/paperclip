@@ -13,7 +13,8 @@ import {
   type SkillPolicySourceType,
 } from "@paperclipai/shared";
 import { conflict, forbidden, notFound } from "../errors.js";
-import { logActivity, type LogActivityInput } from "./activity-log.js";
+import { logger } from "../middleware/logger.js";
+import { logActivity, type ActivityPublish, type LogActivityInput } from "./activity-log.js";
 
 export type SkillPolicyPrincipal = {
   type: "agent" | "board";
@@ -192,7 +193,14 @@ export function companySkillPolicyService(db: Db) {
     policy: SkillPolicyDocument;
     activity: Omit<LogActivityInput, "companyId" | "action" | "entityType" | "entityId" | "details">;
   }) {
-    return db.transaction(async (tx) => {
+    // logActivity's publisher escapes the transaction (in-process emitter +
+    // plugin outbox insert on its own handle), so it is returned from the
+    // transaction rather than fired inline: firing inside lets a consumer
+    // read `activity.logged` before the row commits, and turns a rollback
+    // into a phantom event. Capturing it as the transaction's return value
+    // (not a callback-captured variable) means a rollback throws past the
+    // `publish()` call below rather than falling through to it.
+    const { result, publish } = await db.transaction(async (tx) => {
       const transactionDb = tx as unknown as Db;
       const policy = skillPolicyDocumentSchema.parse(input.policy);
       const existing = await tx
@@ -246,7 +254,7 @@ export function companySkillPolicyService(db: Db) {
           });
         }
       }
-      await logActivity(transactionDb, {
+      const activityPublish = await logActivity(transactionDb, {
         ...input.activity,
         companyId: input.companyId,
         action: "company.skill_policy_replaced",
@@ -258,34 +266,58 @@ export function companySkillPolicyService(db: Db) {
           defaultEffect: policy.defaultEffect,
           ruleCount: policy.rules.length,
         },
+      }, {
+        enlistPluginOutbox: true,
+        deferPublish: true,
       });
-      return { ...policy, revision: nextRevision, materialized: true } satisfies EffectiveSkillPolicy;
+      return {
+        result: { ...policy, revision: nextRevision, materialized: true } satisfies EffectiveSkillPolicy,
+        publish: activityPublish,
+      };
     });
+    // Reached only on commit; a rollback throws straight past this.
+    try {
+      await publish();
+    } catch (err) {
+      logger.warn({ err, companyId: input.companyId }, "failed to publish company.skill_policy_replaced activity event");
+    }
+    return result;
   }
 
   async function reset(input: {
     companyId: string;
     activity: Omit<LogActivityInput, "companyId" | "action" | "entityType" | "entityId" | "details">;
   }) {
-    return db.transaction(async (tx) => {
+    const { result, publish } = await db.transaction(async (tx) => {
       const transactionDb = tx as unknown as Db;
       const existing = await tx
         .delete(companySkillPolicies)
         .where(eq(companySkillPolicies.companyId, input.companyId))
         .returning({ revision: companySkillPolicies.revision })
         .then((rows) => rows[0] ?? null);
+      let activityPublish: ActivityPublish = async () => {};
       if (existing) {
-        await logActivity(transactionDb, {
+        activityPublish = await logActivity(transactionDb, {
           ...input.activity,
           companyId: input.companyId,
           action: "company.skill_policy_reset",
           entityType: "company_skill_policy",
           entityId: input.companyId,
           details: { previousRevision: existing.revision, newRevision: 0 },
+        }, {
+          enlistPluginOutbox: true,
+          deferPublish: true,
         });
       }
-      return { ...OPEN_DEFAULT_POLICY, rules: [] };
+      return { result: { ...OPEN_DEFAULT_POLICY, rules: [] }, publish: activityPublish };
     });
+    // Reached only on commit; a rollback throws straight past this.
+    try {
+      await publish();
+    } catch (err) {
+      logger.warn({ err, companyId: input.companyId }, "failed to publish company.skill_policy_reset activity event");
+    }
+    return result;
   }
 
   return { get, resolveAgentPrincipal, evaluate, replace, reset };

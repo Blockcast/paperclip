@@ -1189,7 +1189,7 @@ Terminal states: `done`, `cancelled`
 
 | Method | Path                               | Description                                                                              |
 | ------ | ---------------------------------- | ---------------------------------------------------------------------------------------- |
-| GET    | `/api/companies/:companyId/issues` | List issues, sorted by priority. Filters: `?status=`, `?assigneeAgentId=`, `?assigneeUserId=`, `?projectId=`, `?labelId=`, `?q=` (full-text search across title, identifier, description, comments) |
+| GET    | `/api/companies/:companyId/issues` | List issues, sorted by priority. Filters: `?status=`, `?assigneeAgentId=`, `?assigneeUserId=`, `?projectId=`, `?labelId=`, `?q=` (literal contiguous substring match over title, identifier, description, comments — NOT full-text search and NOT tokenized; multi-word input is unreliable, query one distinctive token. See "Searching Issues" in SKILL.md) |
 | GET    | `/api/issues/:issueId`             | Issue details + ancestors                                                                |
 | GET    | `/api/issues/:issueId/heartbeat-context` | Compact context for heartbeat: issue state, ancestor summaries, comment cursor  |
 | GET    | `/api/issues/:issueId/diagnostics/blockers` | Read-only blocker diagnostic with `diagnosis`, readiness, and bounded anomaly flags |

@@ -19,6 +19,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { scrubResponseBody, stripLeadingBom } from "./response-scrub.js";
 import {
   CredentialCustodyError,
   applyCustodiedAuthorization,
@@ -32,6 +33,7 @@ import {
 } from "./credential-custody.js";
 import {
   buildCredentialHeaders,
+  isToolAllowed,
   loadUpstreams,
   matchUpstream,
   upstreamsPrincipalHash,
@@ -276,12 +278,57 @@ function isSuccess(status: number): boolean {
 
 function parseJsonRpcRequest(bodyText: string): JsonRpcRequest | null {
   try {
-    const parsed = JSON.parse(bodyText) as unknown;
+    // `stripLeadingBom` for the reason it documents: `JSON.parse` rejects a
+    // leading BOM, so without this a BOM-prefixed body reads as unparseable.
+    // That is not only an audit gap (the request logs as its HTTP verb rather
+    // than its JSON-RPC method) — it is a fail-open, because a body we cannot
+    // classify is a body the PEN-2735 tool guard cannot examine.
+    const parsed = JSON.parse(stripLeadingBom(bodyText)) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
     return parsed as JsonRpcRequest;
   } catch {
     return null;
   }
+}
+
+/**
+ * The tool named by an inbound `tools/call` that this upstream may not expose,
+ * or `null` if there is nothing to refuse (PEN-2735).
+ *
+ * Enforced on the REQUEST, before the forward, because the response filter can
+ * only remove a tool from a listing — it cannot un-execute a call. Filtering
+ * `tools/list` alone would leave every denied tool advertised-but-absent and
+ * still perfectly callable by name, which is a partial fix that reads as a whole
+ * one.
+ *
+ * Two shapes are checked, not one. `parseJsonRpcRequest` rejects arrays, so a
+ * JSON-RPC *batch* reaches `serveMatched` with `inboundMessage === null` and is
+ * forwarded unexamined — a guard written against the single-object shape alone
+ * would be bypassed by wrapping the same call in `[ ]`. A batch containing any
+ * denied call is refused whole rather than split: partial execution of a batch
+ * is a worse contract than refusing it, and refusing is the fail-closed side.
+ */
+function deniedToolCall(bodyText: string, upstream: UpstreamConfig): string | null {
+  if (!Array.isArray(upstream.tools)) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stripLeadingBom(bodyText));
+  } catch {
+    // Not JSON, so not a JSON-RPC tools/call. The upstream will reject it on its
+    // own terms; there is no tool name here to authorize.
+    return null;
+  }
+  for (const message of Array.isArray(parsed) ? parsed : [parsed]) {
+    if (!message || typeof message !== "object" || Array.isArray(message)) continue;
+    const record = message as { method?: unknown; params?: unknown };
+    if (record.method !== "tools/call") continue;
+    const params = record.params;
+    const name = params && typeof params === "object" && !Array.isArray(params)
+      ? (params as { name?: unknown }).name
+      : undefined;
+    if (!isToolAllowed(upstream, name)) return typeof name === "string" ? name : "";
+  }
+  return null;
 }
 
 function buildJsonRpcResponse(id: JsonRpcRequest["id"], result: unknown): Buffer {
@@ -539,23 +586,108 @@ function copyHeader(
   }
 }
 
+/**
+ * Per-request audit line: who (source IP) called what (matched prefix +
+ * JSON-RPC method, and tool name for tools/call) through the gateway. This
+ * is the only record of gateway callers — the upstream MCP servers log only
+ * an opaque session id, and `upstreamCallCounts`/session counts are fan-out
+ * artifacts of the aggregate endpoint (one aggregate initialize/tools/list
+ * touches every upstream), not a per-caller count. Emitted exactly once per
+ * inbound HTTP request regardless of outcome; never includes the request
+ * body, `authorization` header value, or tool-call arguments.
+ */
+function logMcpRequest(
+  req: http.IncomingMessage,
+  requestId: string,
+  prefix: string,
+  method: string,
+  tool?: string,
+): void {
+  // eslint-disable-next-line no-console
+  console.log(JSON.stringify({
+    event: "mcp_gateway_request",
+    requestId,
+    sourceIp: req.socket.remoteAddress ?? "unknown",
+    prefix,
+    method,
+    ...(tool ? { tool } : {}),
+  }));
+}
+
+function jsonRpcMethodLabel(req: http.IncomingMessage, message: JsonRpcRequest | null): string {
+  return message?.method ?? req.method ?? "unknown";
+}
+
+/**
+ * Wrap a body the gateway itself constructed (health, JSON-RPC errors, the
+ * aggregate replies) in the same shape a proxied result has, so it can leave
+ * through the one chokepoint below.
+ *
+ * PEN-2370: routing gateway-built bodies through the scrubber too is not
+ * defence against our own string literals — it is so that no author ever has
+ * to decide whether a given body is "upstream-derived enough" to need
+ * scrubbing. That judgement is what failed on `tools/list`, where a reply
+ * assembled from upstream records was written directly. The scrub is inert on
+ * a body carrying nothing it redacts, so the safe rule is also the cheap one.
+ */
+function gatewayResult(
+  status: number,
+  body: Buffer | string,
+  extraHeaders: Record<string, string> = {},
+): ForwardResult {
+  return {
+    status,
+    headers: new Headers({ "content-type": "application/json", ...extraHeaders }),
+    body: typeof body === "string" ? Buffer.from(body) : body,
+  };
+}
+
+/**
+ * The single place a response body reaches the client.
+ *
+ * PEN-2370: this is enforced, not merely intended — `server.test.ts` asserts
+ * that `res.end` is called with a body exactly once in this file. An earlier
+ * version of this comment claimed every proxied response left through here
+ * while the aggregate `tools/list` reply, built by spreading upstream tool
+ * records, was written directly and reached agents unscrubbed. A second
+ * response path is the recurring failure in this module; the test makes
+ * adding one fail CI instead of relying on the next author reading this.
+ *
+ * PEN-2735: `upstream` is REQUIRED rather than optional, and that is the whole
+ * design. It carries the tool allowlist to apply to this body, and a required
+ * parameter means a new call site that forgets it is a compile error instead of
+ * a route where filtering silently stops. Pass `null` only where the body is
+ * gateway-built and belongs to no upstream (health, 404, circuit-open, the
+ * error path) — an explicit `null` is a statement a reviewer can check, which an
+ * omitted argument is not.
+ */
 function writeResponse(
   res: http.ServerResponse,
   result: ForwardResult,
   exposedClientSessionId: string | null,
+  upstream: UpstreamConfig | null,
 ): void {
+  const body = scrubResponseBody(result.body, result.headers.get("content-type"), {
+    toolFilter: (toolName) => (upstream ? isToolAllowed(upstream, toolName) : true),
+  });
+
   res.statusCode = result.status;
   for (const [k, v] of result.headers.entries()) {
     // Replace upstream's session header with the stable client one.
     if (k.toLowerCase() === MCP_SESSION_HEADER) continue;
     // Skip hop-by-hop headers.
     if (k.toLowerCase() === "transfer-encoding" || k.toLowerCase() === "content-encoding") continue;
+    // Scrubbing changes the body length, so the upstream's content-length no
+    // longer describes what we are about to send. Forwarding it would either
+    // truncate the response or hang the client waiting for bytes that never
+    // arrive; Node recomputes it from the buffer we pass to end().
+    if (k.toLowerCase() === "content-length") continue;
     res.setHeader(k, v);
   }
   if (exposedClientSessionId) {
     res.setHeader(MCP_SESSION_HEADER, exposedClientSessionId);
   }
-  res.end(result.body);
+  res.end(body);
 }
 
 async function handleRequest(
@@ -563,6 +695,7 @@ async function handleRequest(
   res: http.ServerResponse,
   state: GatewayState,
 ): Promise<void> {
+  const requestId = randomUUID();
   const url = req.url ?? "/";
   const pathName = url.split("?", 1)[0] ?? "/";
 
@@ -570,9 +703,7 @@ async function handleRequest(
 
   // Health endpoint.
   if (pathName === "/" || pathName === "/healthz") {
-    res.statusCode = 200;
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({
+    writeResponse(res, gatewayResult(200, JSON.stringify({
       ok: true,
       upstreams: Object.keys(state.upstreams),
       breakers: state.breaker.snapshot(),
@@ -580,24 +711,22 @@ async function handleRequest(
       sessions: Object.fromEntries(
         Array.from(state.sessions.entries()).map(([prefix, store]) => [prefix, store.size()]),
       ),
-    }));
+    })), null, null);
     return;
   }
 
   if (pathName === "/mcp" || pathName.startsWith("/mcp/")) {
-    await handleAggregateRequest(req, res, state);
+    await handleAggregateRequest(req, res, state, requestId);
     return;
   }
 
   const matched = matchUpstream(pathName, state.upstreams);
   if (!matched) {
-    res.statusCode = 404;
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({
+    writeResponse(res, gatewayResult(404, JSON.stringify({
       error: "no upstream matched",
       path: pathName,
       knownPrefixes: Object.keys(state.upstreams),
-    }));
+    })), null, null);
     return;
   }
   const prefix = (() => {
@@ -605,25 +734,60 @@ async function handleRequest(
     const slashIdx = trimmed.indexOf("/");
     return slashIdx === -1 ? trimmed : trimmed.slice(0, slashIdx);
   })();
-  await ensurePersistedSessionsLoaded(state);
+  // Body consumption and session-store setup can throw (aborted connection,
+  // stream error, disk error loading persisted sessions) before we've parsed
+  // enough of the request to log it — that would leave exactly the failing
+  // calls unaccounted for in the audit trail. Emit a fallback line (matched
+  // prefix + HTTP method) if anything in here throws, so every request that
+  // reaches this function logs exactly once either way.
+  let body: Buffer;
+  let bodyText: string;
+  let inboundMessage: JsonRpcRequest | null;
+  try {
+    await ensurePersistedSessionsLoaded(state);
+    body = await readBody(req);
+    bodyText = body.toString("utf8");
+    inboundMessage = parseJsonRpcRequest(bodyText);
+  } catch (e) {
+    logMcpRequest(req, requestId, prefix, jsonRpcMethodLabel(req, null));
+    throw e;
+  }
   const store = getOrCreateStore(state, prefix);
   state.upstreamCallCounts.set(prefix, (state.upstreamCallCounts.get(prefix) ?? 0) + 1);
-
-  const body = await readBody(req);
-  const bodyText = body.toString("utf8");
   const clientSessionId = (() => {
     const v = req.headers[MCP_SESSION_HEADER];
     return Array.isArray(v) ? v[0] : (v as string | undefined);
   })();
 
+  const logMethod = jsonRpcMethodLabel(req, inboundMessage);
+  const logTool = logMethod === "tools/call" && typeof inboundMessage?.params?.name === "string"
+    ? inboundMessage.params.name
+    : undefined;
+  logMcpRequest(req, requestId, prefix, logMethod, logTool);
+
+  // PEN-2735: refuse a call to a tool this upstream is not permitted to expose,
+  // before it reaches the upstream. Placed after the audit line on purpose — a
+  // refused attempt is exactly the event an audit trail should carry — and
+  // before the breaker, since a call we never forwarded is not evidence about
+  // upstream health either way.
+  const denied = deniedToolCall(bodyText, matched.config);
+  if (denied !== null) {
+    writeResponse(
+      res,
+      gatewayResult(200, buildJsonRpcError(inboundMessage?.id ?? null, -32602, `unknown tool "${denied}"`)),
+      clientSessionId ?? null,
+      null,
+    );
+    return;
+  }
+
   // Circuit breaker: if this upstream has been failing (hung / OOMing /
   // unreachable), fail fast with 503 instead of forwarding into it and
   // accumulating buffered in-flight requests until the gateway OOMs.
   if (!state.breaker.tryAcquire(prefix)) {
-    res.statusCode = 503;
-    res.setHeader("content-type", "application/json");
-    res.setHeader("retry-after", String(Math.ceil(state.upstreamTimeoutMs / 1000)));
-    res.end(JSON.stringify({ error: "upstream circuit open", prefix }));
+    writeResponse(res, gatewayResult(503, JSON.stringify({ error: "upstream circuit open", prefix }), {
+      "retry-after": String(Math.ceil(state.upstreamTimeoutMs / 1000)),
+    }), null, null);
     return;
   }
 
@@ -657,11 +821,22 @@ async function handleAggregateRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   state: GatewayState,
+  requestId: string,
 ): Promise<void> {
-  await ensurePersistedSessionsLoaded(state);
-  const body = await readBody(req);
-  const bodyText = body.toString("utf8");
-  const message = parseJsonRpcRequest(bodyText);
+  // See the matching comment in handleRequest: log a fallback line if setup
+  // or body consumption throws, so a failure here isn't left unaccounted for.
+  let body: Buffer;
+  let bodyText: string;
+  let message: JsonRpcRequest | null;
+  try {
+    await ensurePersistedSessionsLoaded(state);
+    body = await readBody(req);
+    bodyText = body.toString("utf8");
+    message = parseJsonRpcRequest(bodyText);
+  } catch (e) {
+    logMcpRequest(req, requestId, "*", jsonRpcMethodLabel(req, null));
+    throw e;
+  }
   const inboundSessionId = (() => {
     const v = req.headers[MCP_SESSION_HEADER];
     return Array.isArray(v) ? v[0] : (v as string | undefined);
@@ -669,10 +844,20 @@ async function handleAggregateRequest(
   const clientSessionId = inboundSessionId || randomUUID();
   const initializePayload = looksLikeInitializeRequest(bodyText) ? body : buildDefaultInitializePayload();
 
+  // Exactly one line per inbound request, even for `initialize`/`tools/list`,
+  // which fan out to every upstream below — the requestId (and, for
+  // `tools/call`, the resolved prefix) is what makes that fan-out
+  // attributable to a single caller rather than ten indistinguishable lines.
+  const logMethod = jsonRpcMethodLabel(req, message);
+  const logTool = logMethod === "tools/call" && typeof message?.params?.name === "string"
+    ? message.params.name
+    : undefined;
+  const logToolSeparatorIndex = logTool ? logTool.indexOf("__") : -1;
+  const logPrefix = logToolSeparatorIndex > 0 ? logTool!.slice(0, logToolSeparatorIndex) : "*";
+  logMcpRequest(req, requestId, logPrefix, logMethod, logTool);
+
   if (!message?.method) {
-    res.statusCode = 400;
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ error: "invalid JSON-RPC request" }));
+    writeResponse(res, gatewayResult(400, JSON.stringify({ error: "invalid JSON-RPC request" })), null, null);
     return;
   }
 
@@ -698,14 +883,11 @@ async function handleAggregateRequest(
         console.warn(`[mcp-gateway] aggregate initialize skipped prefix=${prefix}: ${(e as Error).message}`);
       }
     }));
-    res.statusCode = 200;
-    res.setHeader("content-type", "application/json");
-    res.setHeader(MCP_SESSION_HEADER, clientSessionId);
-    res.end(buildJsonRpcResponse(message.id, {
+    writeResponse(res, gatewayResult(200, buildJsonRpcResponse(message.id, {
       protocolVersion: "2024-11-05",
       capabilities: { tools: {} },
       serverInfo: { name: "paperclip-mcp-gateway", version: "0.1.0" },
-    }));
+    })), clientSessionId, null);
     return;
   }
 
@@ -745,6 +927,10 @@ async function handleAggregateRequest(
           if (!tool || typeof tool !== "object" || Array.isArray(tool)) continue;
           const record = tool as Record<string, unknown>;
           if (typeof record.name !== "string" || record.name.length === 0) continue;
+          // PEN-2735: authorize on the UPSTREAM name, before the `prefix__` is
+          // added — the same question the prefixed route asks of the same
+          // predicate, so the two routes cannot disagree about what is exposed.
+          if (!isToolAllowed(upstream, record.name)) continue;
           tools.push({ ...record, name: `${prefix}__${record.name}` });
         }
       } catch (e) {
@@ -753,10 +939,7 @@ async function handleAggregateRequest(
         console.warn(`[mcp-gateway] aggregate tools/list skipped prefix=${prefix}: ${(e as Error).message}`);
       }
     }
-    res.statusCode = 200;
-    res.setHeader("content-type", "application/json");
-    res.setHeader(MCP_SESSION_HEADER, clientSessionId);
-    res.end(buildJsonRpcResponse(message.id, { tools }));
+    writeResponse(res, gatewayResult(200, buildJsonRpcResponse(message.id, { tools })), clientSessionId, null);
     return;
   }
 
@@ -766,18 +949,20 @@ async function handleAggregateRequest(
     const prefix = separatorIndex > 0 ? toolName.slice(0, separatorIndex) : "";
     const upstreamToolName = separatorIndex > 0 ? toolName.slice(separatorIndex + 2) : "";
     const upstream = prefix ? state.upstreams[prefix] : undefined;
-    if (!upstream || upstreamToolName.length === 0) {
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json");
-      res.setHeader(MCP_SESSION_HEADER, clientSessionId);
-      res.end(buildJsonRpcError(message.id, -32602, `unknown aggregated tool name "${toolName}"`));
+    // A tool the allowlist denies is reported exactly as a tool that does not
+    // exist. That is not obfuscation for its own sake — it is the truthful
+    // answer, because the same allowlist kept it out of `tools/list`, so from
+    // this client's view it genuinely is not an aggregated tool. Splitting this
+    // into a distinct "forbidden" branch would make the gateway advertise the
+    // existence of what it just refused to expose.
+    if (!upstream || upstreamToolName.length === 0 || !isToolAllowed(upstream, upstreamToolName)) {
+      writeResponse(res, gatewayResult(200, buildJsonRpcError(message.id, -32602, `unknown aggregated tool name "${toolName}"`)), clientSessionId, null);
       return;
     }
     if (!state.breaker.tryAcquire(prefix)) {
-      res.statusCode = 503;
-      res.setHeader("content-type", "application/json");
-      res.setHeader("retry-after", String(Math.ceil(state.upstreamTimeoutMs / 1000)));
-      res.end(JSON.stringify({ error: "upstream circuit open", prefix }));
+      writeResponse(res, gatewayResult(503, JSON.stringify({ error: "upstream circuit open", prefix }), {
+        "retry-after": String(Math.ceil(state.upstreamTimeoutMs / 1000)),
+      }), null, null);
       return;
     }
     state.upstreamCallCounts.set(prefix, (state.upstreamCallCounts.get(prefix) ?? 0) + 1);
@@ -798,21 +983,16 @@ async function handleAggregateRequest(
     );
     if (!result) {
       state.breaker.recordFailure(prefix);
-      res.statusCode = 502;
-      res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ error: "failed to initialize upstream session", prefix }));
+      writeResponse(res, gatewayResult(502, JSON.stringify({ error: "failed to initialize upstream session", prefix })), null, null);
       return;
     }
     if (result.status >= 500) state.breaker.recordFailure(prefix);
     else state.breaker.recordSuccess(prefix);
-    writeResponse(res, result, clientSessionId);
+    writeResponse(res, result, clientSessionId, upstream);
     return;
   }
 
-  res.statusCode = 200;
-  res.setHeader("content-type", "application/json");
-  res.setHeader(MCP_SESSION_HEADER, clientSessionId);
-  res.end(buildJsonRpcError(message.id, -32601, `method "${message.method}" is not supported by aggregate endpoint`));
+  writeResponse(res, gatewayResult(200, buildJsonRpcError(message.id, -32601, `method "${message.method}" is not supported by aggregate endpoint`)), clientSessionId, null);
 }
 
 /**
@@ -859,7 +1039,7 @@ async function serveMatched(
         // Replay path: re-issue the cached initialize, get a fresh upstream id, retry.
         if (!record.initializePayload) {
           // No cached initialize — can't recover. Pass the failure through.
-          writeResponse(res, result, clientSessionId);
+          writeResponse(res, result, clientSessionId, matched.config);
           return result.status;
         }
         const retryResult = await store.runLifecycleExclusive(async () => {
@@ -895,14 +1075,14 @@ async function serveMatched(
           );
         });
         if (retryResult) {
-          writeResponse(res, retryResult, clientSessionId);
+          writeResponse(res, retryResult, clientSessionId, matched.config);
           return retryResult.status;
         }
         // Re-init failed; pass the original 404 through so the client can recover its own way.
-        writeResponse(res, result, clientSessionId);
+        writeResponse(res, result, clientSessionId, matched.config);
         return result.status;
       }
-      writeResponse(res, result, clientSessionId);
+      writeResponse(res, result, clientSessionId, matched.config);
       return result.status;
     }
     // Client supplied a sessionId we don't know — treat as new init below.
@@ -960,7 +1140,7 @@ async function serveMatched(
       return { result, clientSessionId: record.clientSessionId };
     });
     if (bootstrapResult) {
-      writeResponse(res, bootstrapResult.result, bootstrapResult.clientSessionId);
+      writeResponse(res, bootstrapResult.result, bootstrapResult.clientSessionId, matched.config);
       if (bootstrapResult.result.status === 401 && custodyConfig) {
         invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, bootstrapResult.clientSessionId);
       }
@@ -983,7 +1163,7 @@ async function serveMatched(
         upstreamSessionId: upstreamId,
         initializePayload: body,
       });
-      writeResponse(res, result, record.clientSessionId);
+      writeResponse(res, result, record.clientSessionId, matched.config);
       await persistSessionStore?.();
       if (result.status === 401 && custodyConfig) {
         invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, record.clientSessionId);
@@ -991,7 +1171,7 @@ async function serveMatched(
       return result.status;
     }
   }
-  writeResponse(res, result, clientSessionId ?? null);
+  writeResponse(res, result, clientSessionId ?? null, matched.config);
   if (result.status === 401 && custodyConfig) {
     invalidateCustodiedToken(custodyConfig.state, custodyConfig.config, req.headers, nextClientSessionId);
   }
@@ -1020,13 +1200,11 @@ function serveOAuthDiscovery(
 ): boolean {
   if (!config) return false;
   if (pathName === "/.well-known/oauth-protected-resource" || pathName === "/.well-known/oauth-protected-resource/mcp") {
-    res.statusCode = 200;
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({
+    writeResponse(res, gatewayResult(200, JSON.stringify({
       resource: config.resource,
       authorization_servers: [config.authorizationServer],
       bearer_methods_supported: ["header"],
-    }));
+    })), null, null);
     return true;
   }
   if (pathName === "/.well-known/oauth-authorization-server" || pathName === "/.well-known/openid-configuration") {
@@ -1081,12 +1259,14 @@ function safeOnError(e: unknown, req: http.IncomingMessage, res: http.ServerResp
     `[mcp-gateway] request handler error: method=${req.method} url=${req.url} cause=${causeCode ?? (e as Error).name}: ${causeMessage ?? (e as Error).message}`,
   );
   if (!res.headersSent) {
-    res.statusCode = e instanceof CredentialCustodyError ? e.statusCode : isTimeout ? 504 : 502;
-    res.setHeader("content-type", "application/json");
-    if (e instanceof CredentialCustodyError && e.retryAfter) {
-      res.setHeader("retry-after", e.retryAfter);
-    }
-    res.end(JSON.stringify({ error: isTimeout ? "gateway timeout" : "gateway error", detail: (e as Error).message }));
+    // `detail` is an error message, and an upstream failure can quote the body
+    // that caused it — so this path carries upstream text too, which is why it
+    // goes through the chokepoint rather than straight out.
+    writeResponse(res, gatewayResult(
+      e instanceof CredentialCustodyError ? e.statusCode : isTimeout ? 504 : 502,
+      JSON.stringify({ error: isTimeout ? "gateway timeout" : "gateway error", detail: (e as Error).message }),
+      e instanceof CredentialCustodyError && e.retryAfter ? { "retry-after": e.retryAfter } : {},
+    ), null, null);
   } else {
     res.end();
   }

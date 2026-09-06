@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   ADAPTER_TYPE_LABEL,
+  classifyAgentJobFailureErrorCode,
   classifyAgentJobRunStatus,
   classifyManagedAgentPod,
   indexUniqueAgentJobRunStatuses,
@@ -316,6 +317,56 @@ describe("readContainerDiagnostic", () => {
     } as unknown as V1ContainerStatus;
 
     expect(readContainerDiagnostic(status, "app")).toBeNull();
+  });
+});
+
+describe("classifyAgentJobFailureErrorCode", () => {
+  const container = (container: string, exitCode: number, reason: string | null) => ({
+    container,
+    kind: "app" as const,
+    exitCode,
+    reason,
+    signal: 9,
+    terminationMessage: null,
+    startedAt: null,
+    finishedAt: null,
+  });
+  const diagnostics = (...containers: ReturnType<typeof container>[]) => ({
+    jobName: "job-1",
+    podName: "pod-1",
+    podPhase: "Failed",
+    containers,
+    logTail: null,
+    logTailTruncated: false,
+  });
+
+  it("classifies an OOMKilled app container independently of the generic Job failure", () => {
+    expect(classifyAgentJobFailureErrorCode(diagnostics(container("claude", 137, "OOMKilled"))))
+      .toBe("oom_killed");
+  });
+
+  it("keeps exit 137 visible when Kubernetes omits the OOM reason", () => {
+    expect(classifyAgentJobFailureErrorCode(diagnostics(container("claude", 137, "Error"))))
+      .toBe("exit_137");
+  });
+
+  it("leaves unrelated app-container failures on the generic Job code", () => {
+    expect(classifyAgentJobFailureErrorCode(diagnostics(container("claude", 128, "Error"))))
+      .toBeNull();
+  });
+
+  it.each([
+    [container("sidecar", 1, "Error"), container("claude", 137, "OOMKilled")],
+    [container("claude", 137, "OOMKilled"), container("sidecar", 1, "Error")],
+  ])("prefers OOMKilled regardless of regular-container ordering", (first, second) => {
+    expect(classifyAgentJobFailureErrorCode(diagnostics(first, second))).toBe("oom_killed");
+  });
+
+  it("prefers OOMKilled over another regular container's exit 137", () => {
+    expect(classifyAgentJobFailureErrorCode(diagnostics(
+      container("sidecar", 137, "Error"),
+      container("claude", 137, "OOMKilled"),
+    ))).toBe("oom_killed");
   });
 });
 

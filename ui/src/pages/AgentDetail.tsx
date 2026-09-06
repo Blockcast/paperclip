@@ -105,6 +105,7 @@ import {
   type LiveEvent,
   type WorkspaceOperation,
   isResponsibleUserDenialCode,
+  isSensitiveEnv,
   responsibleUserLabel,
 } from "@paperclipai/shared";
 import { ResponsibleUserDenialNotice } from "../components/ResponsibleUserDenialNotice";
@@ -133,8 +134,6 @@ const runStatusIcons: Record<string, { icon: typeof CheckCircle2; color: string 
 const RUN_LOG_PAGE_BYTES = 256_000;
 
 const REDACTED_ENV_VALUE = "***REDACTED***";
-const SECRET_ENV_KEY_RE =
-  /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 const COMMAND_ENV_KEY_RE = /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
 
@@ -157,12 +156,11 @@ function redactCommandText(value: string, censorUsernameInLogs: boolean): string
 }
 
 function shouldRedactSecretValue(key: string, value: unknown): boolean {
-  if (SECRET_ENV_KEY_RE.test(key)) return true;
   if (typeof value !== "string") return false;
-  return JWT_VALUE_RE.test(value);
+  return isSensitiveEnv(key, value) || JWT_VALUE_RE.test(value);
 }
 
-function redactEnvValue(key: string, value: unknown, censorUsernameInLogs: boolean): string {
+export function redactEnvValue(key: string, value: unknown, censorUsernameInLogs: boolean): string {
   if (
     typeof value === "object" &&
     value !== null &&
@@ -848,7 +846,14 @@ export function AgentDetail() {
       (policy) => policy.scopeType === "agent" && policy.scopeId === (agent?.id ?? routeAgentRef),
     );
     if (matched) return matched;
-    const budgetMonthlyCents = agent?.budgetMonthlyCents ?? 0;
+    // No policy row in the overview — either the agent has no enforcing policy,
+    // or `budgets/overview` is still loading or forbidden for this viewer. Fall
+    // back to the enforcing amount carried on the agent read model, NOT to
+    // `agent.budgetMonthlyCents`: that column is a display mirror and can be
+    // stale, and rendering it here is what let a drifted cap read as the real
+    // one. `null`/absent means no active policy, i.e. uncapped — which is the
+    // safe thing to show when we do not know the cap. BLO-27626.
+    const budgetMonthlyCents = agent?.enforcedBudgetMonthlyCents ?? 0;
     const spentMonthlyCents = agent?.spentMonthlyCents ?? 0;
     return {
       policyId: "",

@@ -1,0 +1,32 @@
+name: Lockfile Drift Monitor
+
+on:
+  schedule:
+    - cron: "9 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# BLO-24150: the pull_request/merge_group guard added in #1273
+# (scripts/check-lockfile-overrides-consistency.mjs, wired into pr.yml's
+# `policy` job) stops new package.json/pnpm-lock.yaml drift from landing,
+# but that is a pre-merge gate — it does not verify that master itself
+# stays consistent afterward (an admin merge, a branch-protection bypass,
+# or a bug in the guard could still let drift through undetected). This
+# job re-runs the same dependency-free checker directly against master on
+# a schedule, independent of any PR, so drift on master itself fails a
+# job and alerts via Actions notifications instead of surfacing only when
+# the next PR's `pnpm install --frozen-lockfile` dies.
+jobs:
+  check-master-lockfile-overrides:
+    runs-on: default
+    timeout-minutes: 5
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v5
+        with:
+          ref: master
+
+      - name: Check pnpm-lock.yaml overrides/patchedDependencies consistency
+        run: node ./scripts/check-lockfile-overrides-consistency.mjs

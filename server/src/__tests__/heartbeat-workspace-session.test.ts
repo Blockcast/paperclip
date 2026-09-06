@@ -28,6 +28,8 @@ import {
   isNonPrimaryWorkspaceTarget,
   isWorkspaceLessFallbackCwdForOtherIsolationMode,
   isK8sIsolationRetryDeferred,
+  isBranchClaimRetryDeferred,
+  isQueuedRunAdmissionDeferred,
   logK8sGuardDecision,
   resolveProjectPrimaryWorkspaceId,
   extractWakeCommentIds,
@@ -58,8 +60,16 @@ import {
   stripPaperclipSessionMetadataFromSessionParams,
   normalizeSessionParams,
   shouldResetTaskSessionForWake,
+  mergeModelProfileAdapterConfig,
+  resolveContainedWorkspaceSubpath,
+  resolveRepoRelativeWorkspaceCwd,
   type ResolvedWorkspaceForRunSuccess,
 } from "../services/heartbeat.js";
+import { applyRunScopeToBranchName } from "../services/workspace-runtime.js";
+import {
+  buildExecutionWorkspaceAdapterConfig,
+  executionWorkspaceUsesPerRunScope,
+} from "../services/execution-workspace-policy.js";
 import type { TrustPresetResolution } from "../services/trust-preset-resolver.js";
 
 const execFile = promisify(execFileCallback);
@@ -2857,6 +2867,55 @@ describe("K8s session isolation metadata", () => {
     expect(isK8sIsolationRetryDeferred({
       paperclipK8sIsolationRetryAt: "invalid",
     }, now)).toBe(false);
+
+    expect(isBranchClaimRetryDeferred({
+      paperclipBranchClaimRetryAt: "2026-07-14T12:00:01.000Z",
+    }, now)).toBe(true);
+    expect(isBranchClaimRetryDeferred({
+      paperclipBranchClaimRetryAt: "2026-07-14T11:59:59.000Z",
+    }, now)).toBe(false);
+    expect(isBranchClaimRetryDeferred({
+      paperclipBranchClaimRetryAt: "invalid",
+    }, now)).toBe(false);
+  });
+
+  // BLO-21602: deferRunForBranchClaimConflict stamps paperclipBranchClaimRetryAt
+  // on the run's contextSnapshot, mirroring the K8s isolation backoff stamp
+  // above. Queued-run admission must honor it via isQueuedRunAdmissionDeferred
+  // everywhere it previously only checked isK8sIsolationRetryDeferred, or a
+  // branch-conflict-deferred run is immediately eligible again and repeatedly
+  // performs setup, conflict, and requeue instead of honoring the backoff.
+  it("backs off branch-claim contention without creating a terminal run", () => {
+    const now = new Date("2026-07-14T12:00:00.000Z");
+    expect(isBranchClaimRetryDeferred({
+      paperclipBranchClaimRetryAt: "2026-07-14T12:00:01.000Z",
+    }, now)).toBe(true);
+    expect(isBranchClaimRetryDeferred({
+      paperclipBranchClaimRetryAt: "2026-07-14T11:59:59.000Z",
+    }, now)).toBe(false);
+    expect(isBranchClaimRetryDeferred({
+      paperclipBranchClaimRetryAt: "invalid",
+    }, now)).toBe(false);
+  });
+
+  it("isQueuedRunAdmissionDeferred combines the K8s isolation and branch-claim backoff stamps", () => {
+    const now = new Date("2026-07-14T12:00:00.000Z");
+    // Neither stamp present.
+    expect(isQueuedRunAdmissionDeferred({}, now)).toBe(false);
+    // Only the K8s isolation stamp is still in the future.
+    expect(isQueuedRunAdmissionDeferred({
+      paperclipK8sIsolationRetryAt: "2026-07-14T12:00:01.000Z",
+    }, now)).toBe(true);
+    // Only the branch-claim stamp is still in the future -- this is the case
+    // the queued-run admission bug missed before this fix.
+    expect(isQueuedRunAdmissionDeferred({
+      paperclipBranchClaimRetryAt: "2026-07-14T12:00:01.000Z",
+    }, now)).toBe(true);
+    // Both stamps present but expired.
+    expect(isQueuedRunAdmissionDeferred({
+      paperclipK8sIsolationRetryAt: "2026-07-14T11:59:59.000Z",
+      paperclipBranchClaimRetryAt: "2026-07-14T11:59:59.000Z",
+    }, now)).toBe(false);
   });
 
   it("returns null for non-K8s adapters", () => {
@@ -3004,6 +3063,159 @@ describe("K8s session isolation metadata", () => {
       isolationMode: "run",
       isolationKey: "run:run-1",
     });
+  });
+
+  // BLO-31282: the `run:<runId>` isolation *key* is correct for a concurrent
+  // agent with no persisted workspace id, but it must not also discard the
+  // worktree that was actually cut for the run. Dropping the agent into an empty
+  // ephemeral scratch dir is what pushed agents back into the project BASE
+  // checkout, which accumulated 32 uncommitted files across three days.
+  it("keeps the provisioned worktree as the workspace root under per-run isolation", () => {
+    const isolation = buildK8sRunIsolationDescriptor({
+      adapterType: "claude_k8s",
+      runId: "run-1",
+      companyId: "company-1",
+      agentId: "agent-1",
+      taskKey: "issue-1",
+      statelessPrReview: false,
+      executionWorkspace: {
+        cwd: "/paperclip/projects/project-1/repo/.paperclip/worktrees/BLO-31282",
+        source: "task_session",
+        strategy: "git_worktree",
+      },
+      persistedExecutionWorkspaceId: null,
+      effectiveMaxConcurrentRuns: 12,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+    });
+
+    // The isolation key stays per-run so concurrent siblings keep independent
+    // writer reservations (BLO-16842) -- only the workspace path changes.
+    expect(isolation).toMatchObject({
+      isolationMode: "run",
+      isolationKey: "run:run-1",
+      workspaceRoot: "/paperclip/projects/project-1/repo/.paperclip/worktrees/BLO-31282",
+      homeRoot: "/runtime-cache/paperclip-runs/run-1/home",
+      sessionRoot: "/runtime-cache/paperclip-runs/run-1/session",
+      cacheRoot: "/runtime-cache/paperclip-runs/run-1/cache",
+    });
+    // storage.workspace must track workspaceRoot, or the volume wiring backs a
+    // persistent-disk path with ephemeral storage.
+    expect(isolation?.storage).toEqual({
+      workspace: "persistent",
+      home: "ephemeral",
+      session: "ephemeral",
+      cache: "ephemeral",
+    });
+  });
+
+  // BLO-31282 review follow-up: the tests above let the descriptor resolve its
+  // own identity, but production NEVER does -- `dispatchHeartbeatRun` always
+  // passes a precomputed `isolationIdentity`, built with the narrower
+  // `isWorkspaceIsolated: workspaceIsolationRequested` (mode only) rather than
+  // the broader in-function definition (mode OR task_session OR git_worktree).
+  // Pin the shipping path explicitly so a future change to either definition
+  // cannot silently stop covering it.
+  const buildPrecomputedIdentityDescriptor = () =>
+    buildK8sRunIsolationDescriptor({
+      adapterType: "claude_k8s",
+      runId: "run-1",
+      companyId: "company-1",
+      agentId: "agent-1",
+      taskKey: "issue-1",
+      statelessPrReview: false,
+      executionWorkspace: {
+        cwd: "/paperclip/projects/project-1/repo/.paperclip/worktrees/BLO-31282",
+        source: "task_session",
+        strategy: "git_worktree",
+      },
+      persistedExecutionWorkspaceId: null,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+      // Exactly what dispatch hands in when it planned no workspace id.
+      isolationIdentity: { isolationMode: "run", isolationKey: "run:run-1" },
+    });
+
+  it("keeps the provisioned worktree when the isolation identity is precomputed by dispatch", () => {
+    const isolation = buildPrecomputedIdentityDescriptor();
+    expect(isolation).toMatchObject({
+      isolationMode: "run",
+      isolationKey: "run:run-1",
+      workspaceRoot: "/paperclip/projects/project-1/repo/.paperclip/worktrees/BLO-31282",
+    });
+    expect(isolation?.storage.workspace).toBe("persistent");
+    // BLO-31443: keeping the *workspace* persistent must not leak into the
+    // sibling storage classes. These three are the ones that would move if
+    // someone later widened `usesEphemeralWorkspace` to cover them too.
+    expect(isolation?.storage.home).toBe("ephemeral");
+    expect(isolation?.storage.session).toBe("ephemeral");
+    expect(isolation?.storage.cache).toBe("ephemeral");
+  });
+
+  // BLO-31443: a DIFFERENT invariant from the storage classes above, split out
+  // so a failure here is not misread as the widening regression. `homeRoot` and
+  // `sessionRoot` never consult `usesEphemeralWorkspace` -- they key purely off
+  // `isolationMode` -- so that widening cannot move them. What these pin is the
+  // ephemeral root LAYOUT, which is worth catching if it ever changes silently.
+  it("keeps the sibling roots under the per-run ephemeral root when the worktree is pinned", () => {
+    const isolation = buildPrecomputedIdentityDescriptor();
+    expect(isolation?.homeRoot).toBe("/runtime-cache/paperclip-runs/run-1/home");
+    expect(isolation?.sessionRoot).toBe("/runtime-cache/paperclip-runs/run-1/session");
+  });
+
+  // BLO-31282: workspace *intent* is not evidence a worktree exists. A project
+  // configured `isolated_workspace` whose strategy realizes to `project_primary`
+  // has `cwd` pointing at the BASE checkout, so keying the workspace path off
+  // the mode would route every such run into the base deterministically.
+  it("stays ephemeral when isolated_workspace intent realized as the base checkout", () => {
+    const isolation = buildK8sRunIsolationDescriptor({
+      adapterType: "claude_k8s",
+      runId: "run-1",
+      companyId: "company-1",
+      agentId: "agent-1",
+      taskKey: "issue-1",
+      statelessPrReview: false,
+      executionWorkspace: {
+        cwd: "/paperclip/projects/project-1/repo",
+        source: "task_session",
+        strategy: "project_primary",
+      },
+      persistedExecutionWorkspaceId: null,
+      effectiveMaxConcurrentRuns: 12,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+    });
+
+    expect(isolation).toMatchObject({
+      isolationMode: "run",
+      workspaceRoot: "/runtime-cache/paperclip-runs/run-1/workspace",
+    });
+    expect(isolation?.storage.workspace).toBe("ephemeral");
+  });
+
+  // BLO-31282: a stateless PR review is forced to `run` isolation ahead of any
+  // persisted workspace and must stay fully ephemeral even though its realized
+  // strategy is `git_worktree`.
+  it("keeps a stateless PR review ephemeral despite a realized git worktree", () => {
+    const isolation = buildK8sRunIsolationDescriptor({
+      adapterType: "claude_k8s",
+      runId: "run-1",
+      companyId: "company-1",
+      agentId: "agent-1",
+      taskKey: "pr-review-42",
+      statelessPrReview: true,
+      executionWorkspace: {
+        cwd: "/paperclip/worktrees/pr-42",
+        source: "task_session",
+        strategy: "git_worktree",
+      },
+      persistedExecutionWorkspaceId: "execution-workspace-1",
+      effectiveMaxConcurrentRuns: 12,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+    });
+
+    expect(isolation).toMatchObject({
+      isolationMode: "run",
+      workspaceRoot: "/runtime-cache/paperclip-runs/run-1/workspace",
+    });
+    expect(isolation?.storage.workspace).toBe("ephemeral");
   });
 
   it("removes user-controlled mutable paths before K8s adapter dispatch", () => {
@@ -3932,6 +4144,156 @@ describe("isNonPrimaryWorkspaceTarget", () => {
   });
 });
 
+describe("resolveContainedWorkspaceSubpath", () => {
+  // BLO-25415: a git_repo workspace may declare a repo-relative cwd such as
+  // "packages/iwa". Before the fix that raw string reached fs.stat() and was
+  // resolved against the API process's cwd, so the run failed
+  // `preferred_workspace_unrealizable` naming a path that looked correct while
+  // the real checkout sat on disk untouched.
+  it("joins a repo-relative subpath onto the realized checkout", async () => {
+    await expect(
+      resolveContainedWorkspaceSubpath("/managed/pim-multicast-gateway", "packages/iwa"),
+    ).resolves.toBe("/managed/pim-multicast-gateway/packages/iwa");
+  });
+
+  it("normalizes redundant segments that stay inside the checkout", async () => {
+    await expect(
+      resolveContainedWorkspaceSubpath("/managed/repo", "./packages/../packages/iwa"),
+    ).resolves.toBe("/managed/repo/packages/iwa");
+  });
+
+  it("allows the checkout root itself", async () => {
+    await expect(resolveContainedWorkspaceSubpath("/managed/repo", ".")).resolves.toBe("/managed/repo");
+  });
+
+  it("refuses a subpath that escapes the checkout", async () => {
+    // cwd is operator-supplied config, so traversal must not point a run at an
+    // unrelated repo on the shared PVC.
+    await expect(resolveContainedWorkspaceSubpath("/managed/repo", "../other-repo")).rejects.toThrow(
+      /resolves outside its checkout/,
+    );
+    await expect(resolveContainedWorkspaceSubpath("/managed/repo", "../../../etc")).rejects.toThrow(
+      /resolves outside its checkout/,
+    );
+  });
+
+  it("refuses a sibling directory sharing the checkout name prefix", async () => {
+    // Guards the startsWith() containment check against "/managed/repo-evil"
+    // being treated as inside "/managed/repo".
+    await expect(resolveContainedWorkspaceSubpath("/managed/repo", "../repo-evil")).rejects.toThrow(
+      /resolves outside its checkout/,
+    );
+  });
+
+  it("refuses a subpath that escapes via a symlink inside the checkout", async () => {
+    // The lexical check alone is not enough: the checkout's *contents* are
+    // repo-controlled, so a repo carrying `packages/iwa -> /etc` passes
+    // path.resolve() and then fs.stat() follows the link, launching the run
+    // outside the checkout on a PVC shared with every other repo.
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "blo25415-symlink-"));
+    try {
+      const checkout = path.join(tmp, "repo");
+      const outside = path.join(tmp, "outside");
+      await fs.mkdir(path.join(checkout, "packages"), { recursive: true });
+      await fs.mkdir(outside, { recursive: true });
+      await fs.symlink(outside, path.join(checkout, "packages", "iwa"));
+
+      await expect(resolveContainedWorkspaceSubpath(checkout, "packages/iwa")).rejects.toThrow(
+        /resolves outside its checkout/,
+      );
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("allows a symlink that stays inside the checkout", async () => {
+    // Only escapes are refused — an in-repo symlink is legitimate.
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "blo25415-symlink-ok-"));
+    try {
+      const checkout = path.join(tmp, "repo");
+      await fs.mkdir(path.join(checkout, "packages", "real"), { recursive: true });
+      await fs.symlink(path.join(checkout, "packages", "real"), path.join(checkout, "iwa"));
+
+      await expect(resolveContainedWorkspaceSubpath(checkout, "iwa")).resolves.toBe(
+        path.join(checkout, "iwa"),
+      );
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("allows a subpath when the checkout root itself sits behind a symlink", async () => {
+    // The managed dir may be reached through a symlink (e.g. a PVC mount
+    // indirection). Resolving root and target independently keeps that from
+    // failing containment for a perfectly legitimate subpath.
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "blo25415-symlink-root-"));
+    try {
+      const realCheckout = path.join(tmp, "real-repo");
+      const linkedCheckout = path.join(tmp, "linked-repo");
+      await fs.mkdir(path.join(realCheckout, "packages", "iwa"), { recursive: true });
+      await fs.symlink(realCheckout, linkedCheckout);
+
+      await expect(resolveContainedWorkspaceSubpath(linkedCheckout, "packages/iwa")).resolves.toBe(
+        path.join(linkedCheckout, "packages", "iwa"),
+      );
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("resolveRepoRelativeWorkspaceCwd", () => {
+  // BLO-25415: only a repo-backed workspace has a checkout for a relative cwd
+  // to be relative to. Redirecting other source types into a managed checkout
+  // dir would change their meaning — and, via ensureManagedProjectWorkspace's
+  // repoUrl-less branch, mkdir an empty directory on the shared PVC that the
+  // subsequent stat can never satisfy.
+  const repoUrl = "https://github.com/Blockcast/pim-multicast-gateway.git";
+
+  it("returns the subpath for a repo-backed workspace with a relative cwd", () => {
+    expect(
+      resolveRepoRelativeWorkspaceCwd({ cwd: "packages/iwa", sourceType: "git_repo", repoUrl }),
+    ).toBe("packages/iwa");
+  });
+
+  it("accepts a repo-backed workspace whose source_type is not the canonical spelling", () => {
+    // source_type is an unconstrained text column; production carries a "git"
+    // row. An allowlist keyed on "git_repo" would silently skip it.
+    expect(resolveRepoRelativeWorkspaceCwd({ cwd: "packages/iwa", sourceType: "git", repoUrl })).toBe(
+      "packages/iwa",
+    );
+  });
+
+  it("leaves an absolute cwd untouched", () => {
+    expect(
+      resolveRepoRelativeWorkspaceCwd({ cwd: "/managed/repo/packages/iwa", sourceType: "git_repo", repoUrl }),
+    ).toBeNull();
+  });
+
+  it("leaves an empty cwd and the repo-only sentinel untouched", () => {
+    expect(resolveRepoRelativeWorkspaceCwd({ cwd: null, sourceType: "git_repo", repoUrl })).toBeNull();
+    expect(
+      resolveRepoRelativeWorkspaceCwd({ cwd: "/__paperclip_repo_only__", sourceType: "git_repo", repoUrl }),
+    ).toBeNull();
+  });
+
+  it("leaves a relative local_path / non_git_path / remote_managed cwd untouched", () => {
+    // These own their cwd outright — they must keep the prior semantics rather
+    // than being redirected into a managed checkout.
+    for (const sourceType of ["local_path", "non_git_path", "remote_managed"]) {
+      expect(resolveRepoRelativeWorkspaceCwd({ cwd: "packages/iwa", sourceType, repoUrl })).toBeNull();
+    }
+  });
+
+  it("leaves a relative cwd untouched when the workspace has no repo", () => {
+    // Nothing for the path to be relative to; taking the managed-checkout
+    // branch would create an empty directory and still fail the stat.
+    expect(
+      resolveRepoRelativeWorkspaceCwd({ cwd: "packages/iwa", sourceType: "git_repo", repoUrl: null }),
+    ).toBeNull();
+  });
+});
+
 describe("evaluatePreferredProjectWorkspaceRealization", () => {
   it("fails loud when an unrealized non-primary workspace is explicitly targeted", () => {
     // Mirrors BLO-8154: issue targets the trafficcontrol workspace but only the
@@ -4075,5 +4437,309 @@ describe("parseSessionCompactionPolicy", () => {
       maxSessionAgeHours: 0,
       maxConsecutiveFailedResumes: 5,
     });
+  });
+});
+
+// BLO-19063: the reuse path is the half of per-run isolation that PR #1143 did
+// not close. #1143 derives a run-scoped branch inside realizeExecutionWorkspace;
+// heartbeat then pins the issue to `reuse_existing`, and the restore path never
+// calls realize again. So the run token got derived once and frozen, and every
+// later run of that issue silently landed back in the first run's tree while the
+// config still read as per-run isolation.
+describe("BLO-19063 per_run scope refuses workspace restore", () => {
+  const perRunStrategy = { type: "git_worktree" as const, runScope: "per_run" as const };
+  const perIssueStrategy = { type: "git_worktree" as const, runScope: "per_issue" as const };
+  const perRunSettings = { mode: "isolated_workspace" as const, workspaceStrategy: perRunStrategy };
+  const perIssueSettings = { mode: "isolated_workspace" as const, workspaceStrategy: perIssueStrategy };
+
+  // `runScope` can be set on any of three layers, so the guard is driven by the
+  // resolved answer rather than by the issue row. This helper resolves it the
+  // same way heartbeat does.
+  const usesPerRunScope = (input: {
+    issueSettings?: Parameters<typeof executionWorkspaceUsesPerRunScope>[0]["issueSettings"];
+    projectPolicy?: Parameters<typeof executionWorkspaceUsesPerRunScope>[0]["projectPolicy"];
+    agentConfig?: Record<string, unknown>;
+    mode?: Parameters<typeof executionWorkspaceUsesPerRunScope>[0]["mode"];
+    issueAdapterConfig?: Record<string, unknown> | null;
+  }) =>
+    executionWorkspaceUsesPerRunScope({
+      agentConfig: input.agentConfig ?? {},
+      projectPolicy: input.projectPolicy ?? null,
+      issueSettings: input.issueSettings ?? null,
+      mode: input.mode ?? "isolated_workspace",
+      legacyUseProjectWorkspace: null,
+      issueAdapterConfig: input.issueAdapterConfig ?? null,
+    });
+
+  it("refuses to restore a per_run workspace even when the issue is already pinned to reuse_existing", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-run-1",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      usesPerRunScope: usesPerRunScope({ issueSettings: perRunSettings }),
+    });
+
+    // The whole point: a live, healthy, pinned workspace is still refused, so
+    // provisioning falls through to realizeExecutionWorkspace and the next run
+    // derives its own branch. Rescuing already-pinned issues matters because the
+    // pin outlives the config change that introduced per_run.
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(false);
+    expect(reuseRequest.existingExecutionWorkspaceAvailable).toBe(false);
+  });
+
+  // The guard originally read the issue row only. Project policy and the agent's
+  // adapterConfig are the two most natural ways to turn per-run isolation on for
+  // more than one issue, and nothing copies a strategy from either onto the issue
+  // row — `defaultIssueExecutionWorkspaceSettingsForProject` emits `mode` alone.
+  // So an issue-only guard would have restored in exactly the fleet-wide cases
+  // per_run exists for.
+  it.each([
+    {
+      name: "project policy",
+      input: { projectPolicy: { enabled: true, defaultMode: "isolated_workspace", workspaceStrategy: perRunStrategy } },
+    },
+    {
+      name: "agent adapterConfig",
+      input: { agentConfig: { workspaceStrategy: perRunStrategy }, issueSettings: { mode: "isolated_workspace" } },
+    },
+  ] as const)("refuses to restore when per_run comes from $name rather than the issue row", ({ input }) => {
+    expect(usesPerRunScope(input)).toBe(true);
+
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      usesPerRunScope: usesPerRunScope(input),
+    });
+
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(false);
+    expect(reuseRequest.existingExecutionWorkspaceAvailable).toBe(false);
+  });
+
+  it("lets issue settings override an agent-level per_run default, matching realization's precedence", () => {
+    // Precedence is issue -> project -> agent, whole-object, so an issue strategy
+    // without runScope shadows an agent one that has it. The guard must agree
+    // with what realizeExecutionWorkspace will actually do, not be more eager.
+    expect(
+      usesPerRunScope({
+        agentConfig: { workspaceStrategy: perRunStrategy },
+        issueSettings: perIssueSettings,
+      }),
+    ).toBe(false);
+  });
+
+  it.each([
+    { name: "per_issue scope", settings: perIssueSettings },
+    { name: "no workspace settings", settings: null },
+    { name: "settings without a strategy", settings: { mode: "isolated_workspace" as const } },
+  ])("still restores under $name, so shared_workspace stays default-safe", ({ settings }) => {
+    // AC4: this must not become a forced fleet-wide migration. Anything that did
+    // not explicitly opt into per_run keeps the pre-existing restore behaviour.
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      usesPerRunScope: usesPerRunScope({ issueSettings: settings }),
+    });
+
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(true);
+    expect(reuseRequest.existingExecutionWorkspaceAvailable).toBe(true);
+  });
+
+  it("still restores a shared_workspace issue whose agent happens to carry a per_run strategy", () => {
+    // AC4 again, and the regression the mode gate exists to prevent: per_run is
+    // meaningless outside isolated_workspace, and buildExecutionWorkspaceAdapterConfig
+    // drops workspaceStrategy there. A guard that ignored mode would strand every
+    // shared_workspace issue under such an agent on a fresh workspace per run.
+    const input = {
+      agentConfig: { workspaceStrategy: perRunStrategy },
+      issueSettings: { mode: "shared_workspace" as const },
+      mode: "shared_workspace" as const,
+    };
+    expect(usesPerRunScope(input)).toBe(false);
+
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      usesPerRunScope: usesPerRunScope(input),
+    });
+
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(true);
+  });
+
+  it("gives two runs of the SAME issue distinct, non-nested branches once restore is refused", () => {
+    // AC2, the vector #1143 alone did not close: same issue, two live runs.
+    // Refusing restore is only useful if what follows actually differs, so
+    // assert the realized branch names rather than just the boolean.
+    const issueBranch = "blo-19063-per-run-execution-workspaces";
+    const runA = applyRunScopeToBranchName(issueBranch, "per_run", "e60e672e-d7c6-48a9-bace-4e556ad9f106");
+    const runB = applyRunScopeToBranchName(issueBranch, "per_run", "1b716005-cdb1-4b3a-9667-16c74ba8c1a5");
+
+    expect(runA).not.toEqual(runB);
+    // Neither is a prefix of the other: worktree paths are join(parent, branch),
+    // so a prefix relationship would still be a nesting hazard.
+    expect(runA.startsWith(runB)).toBe(false);
+    expect(runB.startsWith(runA)).toBe(false);
+    expect(runA.startsWith(issueBranch)).toBe(true);
+  });
+});
+
+// BLO-19063 follow-up (PR #1154 review): the guard above is computed before
+// workspace realization, from the three *policy* layers. But those are not the
+// last word on `workspaceStrategy`: mergeModelProfileAdapterConfig shallow-spreads
+// the model profile and then issue.assigneeAdapterOverrides.adapterConfig over
+// the policy-resolved config, and the result — hostExecutionWorkspaceConfig — is
+// what realizeExecutionWorkspace actually reads `runScope` from.
+//
+// So the predicate and realization could disagree. Both directions are bugs: a
+// false negative restores a per_run workspace (the exact isolation failure this
+// whole issue exists to fix), and a false positive provisions a fresh workspace
+// for a run that did not need one. These assert they agree instead.
+describe("BLO-19063 per_run predicate agrees with the config realization consumes", () => {
+  const perRunStrategy = { type: "git_worktree" as const, runScope: "per_run" as const };
+  const perIssueStrategy = { type: "git_worktree" as const, runScope: "per_issue" as const };
+  const noProfile = {
+    requested: null,
+    requestedBy: null,
+    applied: null,
+    configSource: null,
+    fallbackReason: null,
+    adapterConfig: null,
+  } as const;
+
+  // The end-to-end shape the reviewer asked for: resolve the predicate from the
+  // policy layers exactly as heartbeat does, build the merged config exactly as
+  // heartbeat does, and assert the two see the same runScope. Returns both so a
+  // failure names which side drifted.
+  const resolveBothSides = (input: {
+    agentConfig?: Record<string, unknown>;
+    issueSettings?: Parameters<typeof executionWorkspaceUsesPerRunScope>[0]["issueSettings"];
+    mode?: Parameters<typeof executionWorkspaceUsesPerRunScope>[0]["mode"];
+    issueAdapterConfig?: Record<string, unknown> | null;
+    modelProfileAdapterConfig?: Record<string, unknown> | null;
+  }) => {
+    const policyInput = {
+      agentConfig: input.agentConfig ?? {},
+      projectPolicy: null,
+      issueSettings: input.issueSettings ?? null,
+      mode: input.mode ?? ("isolated_workspace" as const),
+      legacyUseProjectWorkspace: null,
+    };
+    const predicted = executionWorkspaceUsesPerRunScope({
+      ...policyInput,
+      issueAdapterConfig: input.issueAdapterConfig ?? null,
+    });
+    // This mirrors heartbeat.ts: buildExecutionWorkspaceAdapterConfig ->
+    // mergeModelProfileAdapterConfig -> (host config) -> realizeExecutionWorkspace.
+    const realizedConfig = mergeModelProfileAdapterConfig({
+      baseConfig: buildExecutionWorkspaceAdapterConfig(policyInput),
+      modelProfile: { ...noProfile, adapterConfig: input.modelProfileAdapterConfig ?? null },
+      issueAdapterConfig: input.issueAdapterConfig ?? null,
+    });
+    // Read it the way workspace-runtime.ts resolveExecutionWorkspaceRunScope does.
+    const realizedRunScope =
+      (realizedConfig.workspaceStrategy as { runScope?: unknown } | undefined)?.runScope === "per_run";
+    return { predicted, realizedRunScope };
+  };
+
+  it("sees per_run when an issue adapterConfig override introduces it", () => {
+    // The reachable vector: assigneeAdapterOverrides.adapterConfig is free-form
+    // (z.record(z.string(), z.unknown())) and overlaid last, so any actor able to
+    // patch the issue can set workspaceStrategy there. Before this fix the
+    // predicate read only the policy layers, stayed false, and the pinned
+    // workspace was restored — per-run isolation that reads as configured and
+    // delivers none.
+    const { predicted, realizedRunScope } = resolveBothSides({
+      issueSettings: { mode: "isolated_workspace", workspaceStrategy: perIssueStrategy },
+      issueAdapterConfig: { workspaceStrategy: perRunStrategy },
+    });
+
+    expect(realizedRunScope).toBe(true);
+    expect(predicted).toBe(realizedRunScope);
+  });
+
+  it("refuses to restore, and refuses to pin reuse_existing, on that override path", () => {
+    const { predicted } = resolveBothSides({
+      issueSettings: { mode: "isolated_workspace", workspaceStrategy: perIssueStrategy },
+      issueAdapterConfig: { workspaceStrategy: perRunStrategy },
+    });
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-run-1",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      usesPerRunScope: predicted,
+    });
+
+    expect(reuseRequest.requestedShouldReuseExisting).toBe(false);
+    expect(reuseRequest.existingExecutionWorkspaceAvailable).toBe(false);
+  });
+
+  it("sees per_issue when an issue adapterConfig override downgrades a per_run policy", () => {
+    // The reverse direction the reviewer flagged: predicting per_run here would
+    // refuse a restore that realization is perfectly happy to reuse, costing a
+    // fresh provision (and a dependency install) every run for no isolation gain.
+    const { predicted, realizedRunScope } = resolveBothSides({
+      issueSettings: { mode: "isolated_workspace", workspaceStrategy: perRunStrategy },
+      issueAdapterConfig: { workspaceStrategy: perIssueStrategy },
+    });
+
+    expect(realizedRunScope).toBe(false);
+    expect(predicted).toBe(realizedRunScope);
+  });
+
+  it("keeps the override's re-introduction of a strategy visible outside isolated_workspace", () => {
+    // buildExecutionWorkspaceAdapterConfig deletes workspaceStrategy when the mode
+    // is not isolated_workspace, but the overlay is applied *after* that delete and
+    // realization reads the strategy type off the config rather than off the mode
+    // (resolveEffectiveWorkspaceStrategyType). So the key really can come back —
+    // and the predicate has to agree with that rather than assume the mode gate held.
+    const { predicted, realizedRunScope } = resolveBothSides({
+      issueSettings: { mode: "shared_workspace" },
+      mode: "shared_workspace",
+      issueAdapterConfig: { workspaceStrategy: perRunStrategy },
+    });
+
+    expect(predicted).toBe(realizedRunScope);
+  });
+
+  it("ignores a workspaceStrategy arriving via a model profile, on both sides", () => {
+    // A model profile selects a model and an effort; it has no business moving the
+    // run's tree. Excluding it is also what lets the predicate run before the
+    // profile is resolved (that needs an async listAdapterModelProfiles) without
+    // being able to drift from the merge.
+    const { predicted, realizedRunScope } = resolveBothSides({
+      issueSettings: { mode: "isolated_workspace", workspaceStrategy: perIssueStrategy },
+      modelProfileAdapterConfig: { workspaceStrategy: perRunStrategy },
+    });
+
+    expect(realizedRunScope).toBe(false);
+    expect(predicted).toBe(realizedRunScope);
+  });
+
+  it("drops a model-profile-only strategy rather than leaving the key set to undefined", () => {
+    // No policy layer and no override supply one, so the merged config must not
+    // carry the profile's. Presence is observable (Object.hasOwn), so the key is
+    // deleted rather than assigned undefined.
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: {},
+      modelProfile: { ...noProfile, adapterConfig: { workspaceStrategy: perRunStrategy } },
+      issueAdapterConfig: null,
+    });
+
+    expect(Object.hasOwn(merged, "workspaceStrategy")).toBe(false);
+  });
+
+  it("still lets an issue override set non-scope strategy fields", () => {
+    // assigneeAdapterOverrides.adapterConfig.workspaceStrategy is a supported shape
+    // — workspace-command-authz.ts guards provisionCommand/teardownCommand on
+    // exactly that path. Pinning the strategy must not quietly disable it.
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { workspaceStrategy: { type: "git_worktree", baseRef: "main" } },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { workspaceStrategy: { type: "git_worktree", baseRef: "release" } },
+    });
+
+    expect(merged.workspaceStrategy).toMatchObject({ baseRef: "release" });
   });
 });

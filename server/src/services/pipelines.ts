@@ -4,6 +4,7 @@ import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "dri
 import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
+  agentWakeupRequests,
   agents,
   documents,
   documentRevisions,
@@ -43,9 +44,11 @@ import {
   type RoutineRevisionSnapshotV1,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import { routineService } from "./routines.js";
 import { secretService } from "./secrets.js";
 import type { IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
+import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService } from "./authorization.js";
@@ -409,6 +412,8 @@ async function resolveLatestCaseIssueLink(
       eq(pipelineCaseIssueLinks.companyId, input.companyId),
       eq(pipelineCaseIssueLinks.caseId, input.caseId),
       inArray(pipelineCaseIssueLinks.role, input.roles),
+      isNull(pipelineCaseIssueLinks.retiredAt),
+      eq(pipelineCaseIssueLinks.attachmentState, "attached"),
       eq(issues.companyId, input.companyId),
       visibleIssueCondition(),
       isNull(issues.cancelledAt),
@@ -1481,6 +1486,7 @@ async function writeCaseEvent(
     actor: PipelineActor;
     fromStageId?: string | null;
     toStageId?: string | null;
+    stageGeneration?: number | null;
     payload?: Record<string, unknown>;
   },
 ) {
@@ -1493,6 +1499,7 @@ async function writeCaseEvent(
       ...eventActorPatch(input.actor),
       fromStageId: input.fromStageId ?? null,
       toStageId: input.toStageId ?? null,
+      stageGeneration: input.stageGeneration ?? null,
       payload: input.payload ?? {},
     })
     .returning();
@@ -1924,6 +1931,8 @@ async function postSystemCommentOnLinkedIssues(
       eq(pipelineCaseIssueLinks.companyId, input.companyId),
       eq(pipelineCaseIssueLinks.caseId, input.caseId),
       inArray(pipelineCaseIssueLinks.role, input.roles),
+      isNull(pipelineCaseIssueLinks.retiredAt),
+      eq(pipelineCaseIssueLinks.attachmentState, "attached"),
       ne(issues.status, "done"),
       ne(issues.status, "cancelled"),
       visibleIssueCondition(),
@@ -2153,6 +2162,7 @@ async function enqueueStageAutomationLedger(
     companyId: string;
     caseId: string;
     stage: typeof pipelineStages.$inferSelect;
+    stageGeneration: number;
     eventId: string;
     retryOfExecutionId?: string | null;
     generation?: number;
@@ -2171,6 +2181,8 @@ async function enqueueStageAutomationLedger(
       status: "failed",
       retryOfExecutionId: input.retryOfExecutionId ?? null,
       generation: input.generation ?? 1,
+      stageId: input.stage.id,
+      stageGeneration: input.stageGeneration,
       error: "pending_dispatch",
     })
     .onConflictDoNothing({
@@ -2222,11 +2234,92 @@ async function descendantCaseIds(db: PipelineDb, companyId: string, rootCaseIds:
   return Array.from(result).map((row) => String((row as { id: string }).id));
 }
 
-export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeupDeps } = {}) {
-  const routinesSvc = routineService(db, { heartbeat: deps.heartbeat });
+type PipelineHeartbeatDeps = IssueAssignmentWakeupDeps & {
+  cancelRun?: ReturnType<typeof heartbeatService>["cancelRun"];
+};
+
+type PipelineServiceTestHooks = {
+  /**
+   * Test-only synchronization point after a routine has returned its execution
+   * issue but before the pipeline claims that issue for stage attachment.
+   */
+  afterStageAutomationRoutine?: (input: {
+    companyId: string;
+    caseId: string;
+    executionId: string;
+    issueId: string;
+    stageGeneration: number | null;
+  }) => Promise<void> | void;
+
+  /**
+   * Test-only synchronization point after a coalesced automation owner has
+   * committed its durable reservation, before the attachment is finalized.
+   */
+  afterStageAutomationReservation?: (input: {
+    companyId: string;
+    caseId: string;
+    executionId: string;
+    issueId: string;
+  }) => Promise<void> | void;
+};
+
+export function pipelineService(
+  db: Db,
+  deps: { heartbeat?: PipelineHeartbeatDeps; testHooks?: PipelineServiceTestHooks } = {},
+) {
+  const heartbeat: PipelineHeartbeatDeps = deps.heartbeat ?? heartbeatService(db);
+  const routinesSvc = routineService(db, { heartbeat });
   const outputsSvc = pipelineCaseOutputsService(db);
   const authorization = authorizationService(db);
   const secretsSvc = secretService(db);
+
+  /**
+   * Interrupt a run only after the transaction that retires its pipeline
+   * ownership has committed. Cancelling an external process under the case and
+   * issue locks can otherwise turn a slow adapter into a database lock convoy.
+   *
+   * The durable marker written by the retirement transaction is the retry
+   * contract. A best-effort immediate cancellation is intentionally isolated:
+   * transition callers must never report a false failure after their case and
+   * issue state have already committed.
+   */
+  async function cancelRetiredStageAutomationRuns(runIds: Iterable<string>) {
+    if (!heartbeat.cancelRun) return;
+    for (const runId of new Set(runIds)) {
+      try {
+        await heartbeat.cancelRun(
+          runId,
+          "Cancelled because the pipeline case left the automation issue's originating stage",
+          {
+            errorCode: "pipeline_stage_exited",
+            eventMessage: "run cancelled after pipeline stage exit",
+          },
+        );
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger.warn({ err: error, runId }, "failed to cancel running stage automation after transition commit");
+        const run = await db
+          .select({ companyId: heartbeatRuns.companyId, issueId: heartbeatRuns.contextIssueId })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+          .catch(() => null);
+        if (run) {
+          await logActivity(db, {
+            companyId: run.companyId,
+            actorType: "system",
+            actorId: "pipelines",
+            action: "heartbeat.cancel_failed",
+            entityType: "heartbeat_run",
+            entityId: runId,
+            issueId: run.issueId,
+            details: { source: "pipeline_stage_exited", error: errorMessage },
+          }).catch(() => undefined);
+        }
+      }
+    }
+  }
 
   async function assertRoutineInCompany(companyId: string, routineId: string) {
     const routine = await db
@@ -2548,8 +2641,16 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           eq(pipelineAutomationExecutions.companyId, input.companyId),
           eq(pipelineAutomationExecutions.caseId, input.caseId),
           eq(pipelineAutomationExecutions.automationId, automation.id),
+          eq(pipelineAutomationExecutions.stageId, targetStage!.id),
+          input.scope === "current_stage"
+            ? eq(pipelineAutomationExecutions.stageGeneration, detail.case.stageGeneration)
+            : undefined,
         ))
-        .orderBy(desc(pipelineAutomationExecutions.generation), desc(pipelineAutomationExecutions.createdAt))
+        .orderBy(
+          desc(pipelineAutomationExecutions.stageGeneration),
+          desc(pipelineAutomationExecutions.generation),
+          desc(pipelineAutomationExecutions.createdAt),
+        )
         .limit(1)
         .then((rows) => rows[0] ?? null)
       : null;
@@ -2904,6 +3005,264 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     });
   }
 
+  /**
+   * Retire one automation ownership link and, only after no active ownership
+   * remains, cancel the routine-owned issue generation it made obsolete.
+   * The issue lock is intentionally taken before every cancellation decision:
+   * attachment takes the same lock before publishing its link, so a coalesced
+   * owner is never invisible during a last-owner check.
+   */
+  async function retireStageAutomationLink(
+    tx: PipelineDb,
+    input: {
+      companyId: string;
+      linkId: string;
+      caseTitle: string;
+      caseKey: string;
+      stageName: string;
+      runningRunIdsToCancel?: Set<string>;
+    },
+  ) {
+    const candidate = await tx
+      .select({ issueId: pipelineCaseIssueLinks.issueId })
+      .from(pipelineCaseIssueLinks)
+      .where(and(
+        eq(pipelineCaseIssueLinks.id, input.linkId),
+        eq(pipelineCaseIssueLinks.companyId, input.companyId),
+        eq(pipelineCaseIssueLinks.role, "automation"),
+        isNull(pipelineCaseIssueLinks.retiredAt),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!candidate) return;
+
+    await tx.execute(sql`select id from ${issues} where ${issues.id} = ${candidate.issueId} for update`);
+    const row = await tx
+      .select({
+        issueId: issues.id,
+        issueStatus: issues.status,
+        issueOriginKind: issues.originKind,
+        issueOriginId: issues.originId,
+        issueOriginRunId: issues.originRunId,
+        issueExecutionRunId: issues.executionRunId,
+        issueCheckoutRunId: issues.checkoutRunId,
+        routineId: pipelineAutomationExecutions.routineId,
+      })
+      .from(pipelineCaseIssueLinks)
+      .leftJoin(
+        pipelineAutomationExecutions,
+        eq(pipelineCaseIssueLinks.automationAttemptId, pipelineAutomationExecutions.id),
+      )
+      .innerJoin(issues, eq(pipelineCaseIssueLinks.issueId, issues.id))
+      .where(and(
+        eq(pipelineCaseIssueLinks.id, input.linkId),
+        eq(pipelineCaseIssueLinks.companyId, input.companyId),
+        eq(pipelineCaseIssueLinks.role, "automation"),
+        isNull(pipelineCaseIssueLinks.retiredAt),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!row) return;
+
+    const now = nowDate();
+    const [retiredLink] = await tx
+      .update(pipelineCaseIssueLinks)
+      .set({ retiredAt: now, retiredReason: "stage_exited", updatedAt: now })
+      .where(and(
+        eq(pipelineCaseIssueLinks.id, input.linkId),
+        isNull(pipelineCaseIssueLinks.retiredAt),
+      ))
+      .returning({ id: pipelineCaseIssueLinks.id });
+    if (!retiredLink) return;
+
+    // Links can be kept for audit after their issue has completed, or repurposed
+    // for non-routine work. Retiring the link is still correct; cancelling that
+    // work is not.
+    if (
+      ["done", "cancelled"].includes(row.issueStatus) ||
+      !row.routineId ||
+      row.issueOriginKind !== "routine_execution" ||
+      row.issueOriginId !== row.routineId ||
+      !row.issueOriginRunId
+    ) {
+      return;
+    }
+
+    const activeExecutionRun = row.issueExecutionRunId
+      ? await tx
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, row.issueExecutionRunId),
+          eq(heartbeatRuns.companyId, input.companyId),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null)
+      : null;
+    const preserveRunningGeneration = activeExecutionRun?.status === "running";
+
+    // `IS NOT DISTINCT FROM` makes the decision null-safe: a recovery that
+    // swaps a generation while this transaction waits on the issue lock must
+    // win over retirement rather than have its lock silently cleared.
+    const [cancelledIssue] = await tx
+      .update(issues)
+      .set({
+        status: "cancelled",
+        cancelledAt: now,
+        completedAt: null,
+        checkoutRunId: preserveRunningGeneration && row.issueCheckoutRunId === row.issueExecutionRunId
+          ? row.issueCheckoutRunId
+          : null,
+        executionRunId: preserveRunningGeneration ? row.issueExecutionRunId : null,
+        executionAgentNameKey: preserveRunningGeneration ? undefined : null,
+        executionLockedAt: preserveRunningGeneration ? undefined : null,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(issues.id, row.issueId),
+        eq(issues.companyId, input.companyId),
+        eq(issues.status, row.issueStatus),
+        eq(issues.originKind, "routine_execution"),
+        eq(issues.originId, row.routineId),
+        eq(issues.originRunId, row.issueOriginRunId),
+        sql`${issues.executionRunId} is not distinct from ${row.issueExecutionRunId}`,
+        sql`${issues.checkoutRunId} is not distinct from ${row.issueCheckoutRunId}`,
+        sql`not exists (
+          select 1 from ${pipelineCaseIssueLinks} other_link
+          where other_link.company_id = ${input.companyId}
+            and other_link.issue_id = ${row.issueId}
+            and other_link.retired_at is null
+        )`,
+      ))
+      .returning({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        title: issues.title,
+        status: issues.status,
+      });
+    if (!cancelledIssue) return;
+
+    const cancellationReason = "Cancelled because the pipeline case left the automation issue's originating stage";
+    const cancelledRuns = await tx
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        finishedAt: now,
+        error: cancellationReason,
+        errorCode: "pipeline_stage_exited",
+        updatedAt: now,
+      })
+      .where(and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${cancelledIssue.id}`,
+      ))
+      .returning({ wakeupRequestId: heartbeatRuns.wakeupRequestId });
+    const runningRuns = await tx
+      .update(heartbeatRuns)
+      .set({
+        resultJson: sql`jsonb_set(
+          coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb),
+          '{pipelineStageExitCancellationRequestedAt}',
+          to_jsonb(${now.toISOString()}::text),
+          true
+        )`,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.status, "running"),
+        row.issueExecutionRunId
+          ? eq(heartbeatRuns.id, row.issueExecutionRunId)
+          : eq(heartbeatRuns.contextIssueId, row.issueId),
+      ))
+      .returning({ id: heartbeatRuns.id });
+    for (const runningRun of runningRuns) {
+      input.runningRunIdsToCancel?.add(runningRun.id);
+    }
+
+    const wakeupRequestIds = cancelledRuns
+      .map((run) => run.wakeupRequestId)
+      .filter((id): id is string => Boolean(id));
+    if (wakeupRequestIds.length > 0) {
+      await tx
+        .update(agentWakeupRequests)
+        .set({
+          status: "skipped",
+          finishedAt: now,
+          error: cancellationReason,
+          updatedAt: now,
+        })
+        .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
+    }
+    // A deferred wake can otherwise be promoted by cancelRun's execution-lock
+    // release and immediately resurrect the now-obsolete automation issue.
+    await tx
+      .update(agentWakeupRequests)
+      .set({
+        status: "cancelled",
+        finishedAt: now,
+        error: cancellationReason,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload} ->> 'issueId' = ${cancelledIssue.id}`,
+      ));
+    await tx.insert(issueComments).values({
+      companyId: input.companyId,
+      issueId: cancelledIssue.id,
+      authorType: "system",
+      body: `Pipeline case "${input.caseTitle}" (${input.caseKey}) left stage "${input.stageName}". This stage-entry automation issue was cancelled because its work is no longer current.`,
+    });
+    await finalizeSummarySlotsForTerminalIssue(tx, {
+      ...cancelledIssue,
+      status: "cancelled",
+    });
+  }
+
+  async function retireStageAutomationForExitedStage(
+    tx: PipelineDb,
+    input: {
+      companyId: string;
+      caseId: string;
+      caseTitle: string;
+      caseKey: string;
+      stageId: string;
+      stageGeneration: number;
+      stageName: string;
+      runningRunIdsToCancel?: Set<string>;
+    },
+  ) {
+    const stageAutomationLinks = await tx
+      .select({ linkId: pipelineCaseIssueLinks.id })
+      .from(pipelineCaseIssueLinks)
+      .innerJoin(
+        pipelineAutomationExecutions,
+        eq(pipelineCaseIssueLinks.automationAttemptId, pipelineAutomationExecutions.id),
+      )
+      .where(and(
+        eq(pipelineCaseIssueLinks.companyId, input.companyId),
+        eq(pipelineCaseIssueLinks.caseId, input.caseId),
+        eq(pipelineCaseIssueLinks.role, "automation"),
+        isNull(pipelineCaseIssueLinks.retiredAt),
+        eq(pipelineAutomationExecutions.stageId, input.stageId),
+        eq(pipelineAutomationExecutions.stageGeneration, input.stageGeneration),
+      ));
+    for (const { linkId } of stageAutomationLinks) {
+      await retireStageAutomationLink(tx, {
+        companyId: input.companyId,
+        linkId,
+        caseTitle: input.caseTitle,
+        caseKey: input.caseKey,
+        stageName: input.stageName,
+        runningRunIdsToCancel: input.runningRunIdsToCancel,
+      });
+    }
+  }
+
   async function validateStageTargets(companyId: string, pipelineId: string, kind: PipelineStageKind | string, config: PipelineStageConfig) {
     if (kind !== "review") return;
     const rows = await db
@@ -2914,11 +3273,96 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     assertReviewTargetsInSet(kind, config, new Set(rows.map((row) => row.key)));
   }
 
+  function executionMatchesCurrentStage(
+    execution: typeof pipelineAutomationExecutions.$inferSelect,
+    caseRow: typeof pipelineCases.$inferSelect,
+  ) {
+    return execution.stageId !== null &&
+      execution.stageGeneration !== null &&
+      execution.stageId === caseRow.stageId &&
+      execution.stageGeneration === caseRow.stageGeneration;
+  }
+
+  async function hydrateLegacyPendingExecutionStageIdentity(
+    execution: typeof pipelineAutomationExecutions.$inferSelect,
+    detail: {
+      case: typeof pipelineCases.$inferSelect;
+      stage: typeof pipelineStages.$inferSelect;
+    },
+  ) {
+    // Migration 0214 deliberately leaves prior executions nullable. Recover
+    // only a record that proves it still belongs to this unchanged stage entry:
+    // the old trigger must be a legacy entry event, the current case must still
+    // be generation one, and the configured automation must be identical.
+    if (
+      execution.stageId !== null ||
+      execution.stageGeneration !== null ||
+      execution.status !== "failed" ||
+      execution.error !== "pending_dispatch" ||
+      detail.case.stageGeneration !== 1
+    ) {
+      return execution;
+    }
+    const automation = stageAutomation(detail.stage);
+    if (!automation || automation.id !== execution.automationId || automation.routineId !== execution.routineId) {
+      return execution;
+    }
+    const triggeringEvent = await db
+      .select({
+        type: pipelineCaseEvents.type,
+        toStageId: pipelineCaseEvents.toStageId,
+        stageGeneration: pipelineCaseEvents.stageGeneration,
+        payload: pipelineCaseEvents.payload,
+      })
+      .from(pipelineCaseEvents)
+      .where(and(
+        eq(pipelineCaseEvents.id, execution.triggeringEventId),
+        eq(pipelineCaseEvents.companyId, execution.companyId),
+        eq(pipelineCaseEvents.caseId, execution.caseId),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const triggerVersion = triggeringEvent?.payload.version;
+    const isOriginalEntry = triggeringEvent?.type === "ingested"
+      ? detail.case.version === 1
+      : typeof triggerVersion === "number" && triggerVersion === detail.case.version;
+    if (
+      !triggeringEvent ||
+      triggeringEvent.stageGeneration !== null ||
+      triggeringEvent.toStageId !== detail.case.stageId ||
+      !isOriginalEntry
+    ) {
+      return execution;
+    }
+    const [hydrated] = await db
+      .update(pipelineAutomationExecutions)
+      .set({
+        stageId: detail.case.stageId,
+        stageGeneration: detail.case.stageGeneration,
+        updatedAt: nowDate(),
+      })
+      .where(and(
+        eq(pipelineAutomationExecutions.id, execution.id),
+        isNull(pipelineAutomationExecutions.stageId),
+        isNull(pipelineAutomationExecutions.stageGeneration),
+        eq(pipelineAutomationExecutions.status, "failed"),
+        eq(pipelineAutomationExecutions.error, "pending_dispatch"),
+      ))
+      .returning();
+    if (hydrated) return hydrated;
+    return db
+      .select()
+      .from(pipelineAutomationExecutions)
+      .where(eq(pipelineAutomationExecutions.id, execution.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? execution);
+  }
+
   async function executeAutomationLedger(
     executionId: string,
     actor: PipelineActor = { type: "system" },
   ): Promise<PipelineAutomationExecutionResult> {
-    const execution = await db
+    let execution = await db
       .select()
       .from(pipelineAutomationExecutions)
       .where(eq(pipelineAutomationExecutions.id, executionId))
@@ -2930,6 +3374,34 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     }
 
     const detail = await getCaseWithStageOrThrow(db, execution.companyId, execution.caseId);
+    execution = await hydrateLegacyPendingExecutionStageIdentity(execution, detail);
+    if (execution.status === "succeeded" && execution.executionIssueId) {
+      return { status: "succeeded", execution };
+    }
+    if (!executionMatchesCurrentStage(execution, detail.case)) {
+      const [failed] = await db
+        .update(pipelineAutomationExecutions)
+        .set({ status: "failed", error: "stage_exited_before_dispatch", updatedAt: nowDate() })
+        .where(eq(pipelineAutomationExecutions.id, execution.id))
+        .returning();
+      await writeCaseEvent(db, {
+        companyId: execution.companyId,
+        caseId: execution.caseId,
+        type: "automation_failed",
+        actor,
+        stageGeneration: execution.stageGeneration,
+        payload: {
+          automationId: execution.automationId,
+          routineId: execution.routineId,
+          error: "stage_exited_before_dispatch",
+          expectedStageId: execution.stageId,
+          expectedStageGeneration: execution.stageGeneration,
+          actualStageId: detail.case.stageId,
+          actualStageGeneration: detail.case.stageGeneration,
+        },
+      });
+      return { status: "failed", execution: failed! };
+    }
     const automation = stageAutomation(detail.stage);
     if (!automation || automation.id !== execution.automationId) {
       const [failed] = await db
@@ -3012,41 +3484,251 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             : `Routine run ${run.id} did not create or coalesce an execution issue`,
         );
       }
-      const [updated] = await db
-        .update(pipelineAutomationExecutions)
-        .set({
-          status: "succeeded",
-          executionIssueId: run.linkedIssueId,
-          error: null,
-          updatedAt: nowDate(),
-        })
-        .where(eq(pipelineAutomationExecutions.id, execution.id))
-        .returning();
-      await db
-        .insert(pipelineCaseIssueLinks)
-        .values({
+      const executionIssueId = run.linkedIssueId;
+      await deps.testHooks?.afterStageAutomationRoutine?.({
+        companyId: execution.companyId,
+        caseId: execution.caseId,
+        executionId: execution.id,
+        issueId: executionIssueId,
+        stageGeneration: execution.stageGeneration,
+      });
+      const runningRunIdsToCancel = new Set<string>();
+      const reservation = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as PipelineDb;
+        // Take case then issue locks, matching retirement's order. The durable
+        // row committed below is deliberately a separate phase from attachment:
+        // once a routine has returned a coalesced issue, a concurrent last-owner
+        // exit must be able to see this owner before it decides to cancel.
+        const current = await getCaseWithStageForUpdateOrThrow(txDb, execution.companyId, execution.caseId);
+        const stageStillCurrent = executionMatchesCurrentStage(execution, current.case);
+        const lockedIssue = await txDb
+          .select({
+            id: issues.id,
+            status: issues.status,
+            originKind: issues.originKind,
+            originId: issues.originId,
+          })
+          .from(issues)
+          .where(and(eq(issues.id, executionIssueId), eq(issues.companyId, execution.companyId)))
+          .limit(1)
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!lockedIssue || ["done", "cancelled"].includes(lockedIssue.status)) {
+          throw new Error(`Routine run ${run.id} returned an execution issue that became terminal before attachment`);
+        }
+        if (lockedIssue.originKind !== "routine_execution" || lockedIssue.originId !== execution.routineId) {
+          throw new Error(`Routine run ${run.id} returned an execution issue that was repurposed before attachment`);
+        }
+
+        const existingLink = await txDb
+          .select({
+            id: pipelineCaseIssueLinks.id,
+            issueId: pipelineCaseIssueLinks.issueId,
+            retiredAt: pipelineCaseIssueLinks.retiredAt,
+          })
+          .from(pipelineCaseIssueLinks)
+          .where(and(
+            eq(pipelineCaseIssueLinks.companyId, execution.companyId),
+            eq(pipelineCaseIssueLinks.caseId, execution.caseId),
+            eq(pipelineCaseIssueLinks.role, "automation"),
+            eq(pipelineCaseIssueLinks.automationAttemptId, execution.id),
+          ))
+          .limit(1)
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (existingLink && existingLink.issueId !== executionIssueId) {
+          throw new Error(`Routine run ${run.id} attempted to attach a second execution issue`);
+        }
+
+        let link = existingLink;
+        if (!link) {
+          const [insertedLink] = await txDb
+            .insert(pipelineCaseIssueLinks)
+            .values({
+              companyId: execution.companyId,
+              caseId: execution.caseId,
+              issueId: executionIssueId,
+              role: "automation",
+              createdByRunId: null,
+              automationAttemptId: execution.id,
+              attachmentState: "reserved",
+            })
+            .onConflictDoNothing()
+            .returning({
+              id: pipelineCaseIssueLinks.id,
+              issueId: pipelineCaseIssueLinks.issueId,
+              retiredAt: pipelineCaseIssueLinks.retiredAt,
+            });
+          link = insertedLink ?? await txDb
+            .select({
+              id: pipelineCaseIssueLinks.id,
+              issueId: pipelineCaseIssueLinks.issueId,
+              retiredAt: pipelineCaseIssueLinks.retiredAt,
+            })
+            .from(pipelineCaseIssueLinks)
+            .where(and(
+              eq(pipelineCaseIssueLinks.companyId, execution.companyId),
+              eq(pipelineCaseIssueLinks.caseId, execution.caseId),
+              eq(pipelineCaseIssueLinks.role, "automation"),
+              eq(pipelineCaseIssueLinks.automationAttemptId, execution.id),
+            ))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+        }
+        if (!link) {
+          throw new Error(`Routine run ${run.id} could not reserve its execution issue attachment`);
+        }
+
+        const [reservationExecution] = await txDb
+          .update(pipelineAutomationExecutions)
+          .set({
+            executionIssueId,
+            updatedAt: nowDate(),
+          })
+          .where(and(
+            eq(pipelineAutomationExecutions.id, execution.id),
+            or(
+              isNull(pipelineAutomationExecutions.executionIssueId),
+              eq(pipelineAutomationExecutions.executionIssueId, executionIssueId),
+            ),
+          ))
+          .returning();
+        if (!reservationExecution) {
+          throw new Error(`Routine run ${run.id} returned an execution issue that conflicts with an existing reservation`);
+        }
+        return { link, stageStillCurrent };
+      });
+
+      await deps.testHooks?.afterStageAutomationReservation?.({
+        companyId: execution.companyId,
+        caseId: execution.caseId,
+        executionId: execution.id,
+        issueId: executionIssueId,
+      });
+
+      const attachment = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as PipelineDb;
+        const current = await getCaseWithStageForUpdateOrThrow(txDb, execution.companyId, execution.caseId);
+        const currentExecution = await txDb
+          .select()
+          .from(pipelineAutomationExecutions)
+          .where(eq(pipelineAutomationExecutions.id, execution.id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (!currentExecution?.executionIssueId) {
+          throw new Error(`Routine run ${run.id} lost its execution issue reservation`);
+        }
+        const attachedIssueId = currentExecution.executionIssueId;
+        const lockedIssue = await txDb
+          .select({
+            status: issues.status,
+            originKind: issues.originKind,
+            originId: issues.originId,
+          })
+          .from(issues)
+          .where(and(eq(issues.id, attachedIssueId), eq(issues.companyId, execution.companyId)))
+          .limit(1)
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        const link = await txDb
+          .select({
+            id: pipelineCaseIssueLinks.id,
+            issueId: pipelineCaseIssueLinks.issueId,
+            attachmentState: pipelineCaseIssueLinks.attachmentState,
+            retiredAt: pipelineCaseIssueLinks.retiredAt,
+          })
+          .from(pipelineCaseIssueLinks)
+          .where(and(
+            eq(pipelineCaseIssueLinks.id, reservation.link.id),
+            eq(pipelineCaseIssueLinks.companyId, execution.companyId),
+            eq(pipelineCaseIssueLinks.caseId, execution.caseId),
+            eq(pipelineCaseIssueLinks.role, "automation"),
+            eq(pipelineCaseIssueLinks.automationAttemptId, execution.id),
+          ))
+          .limit(1)
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!link || link.issueId !== attachedIssueId) {
+          throw new Error(`Routine run ${run.id} lost its execution issue reservation`);
+        }
+
+        const stageStillCurrent = executionMatchesCurrentStage(currentExecution, current.case);
+        const issueStillUsable = Boolean(
+          lockedIssue &&
+          !["done", "cancelled"].includes(lockedIssue.status) &&
+          lockedIssue.originKind === "routine_execution" &&
+          lockedIssue.originId === currentExecution.routineId,
+        );
+        const shouldAttach = stageStillCurrent && issueStillUsable && !link.retiredAt;
+        const [updatedExecution] = await txDb
+          .update(pipelineAutomationExecutions)
+          .set({
+            status: issueStillUsable ? "succeeded" : "failed",
+            executionIssueId: attachedIssueId,
+            error: issueStillUsable ? null : "execution_issue_unusable_before_attachment",
+            updatedAt: nowDate(),
+          })
+          .where(eq(pipelineAutomationExecutions.id, currentExecution.id))
+          .returning();
+        if (!updatedExecution) throw new Error(`Pipeline automation execution ${execution.id} disappeared during attachment`);
+
+        if (shouldAttach) {
+          await txDb
+            .update(pipelineCaseIssueLinks)
+            .set({ attachmentState: "attached", updatedAt: nowDate() })
+            .where(and(
+              eq(pipelineCaseIssueLinks.id, link.id),
+              eq(pipelineCaseIssueLinks.attachmentState, "reserved"),
+              isNull(pipelineCaseIssueLinks.retiredAt),
+            ));
+        } else if (!link.retiredAt) {
+          await retireStageAutomationLink(txDb, {
+            companyId: execution.companyId,
+            linkId: link.id,
+            caseTitle: current.case.title,
+            caseKey: current.case.caseKey,
+            stageName: detail.stage.name,
+            runningRunIdsToCancel,
+          });
+        }
+        return { execution: updatedExecution, attached: shouldAttach, stageStillCurrent, issueStillUsable };
+      });
+
+      await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
+      if (!attachment.issueStillUsable) {
+        await writeCaseEvent(db, {
           companyId: execution.companyId,
           caseId: execution.caseId,
-          issueId: run.linkedIssueId,
-          role: "automation",
-          createdByRunId: null,
-          automationAttemptId: execution.id,
-        })
-        .onConflictDoNothing({ target: [pipelineCaseIssueLinks.caseId, pipelineCaseIssueLinks.issueId] });
+          type: "automation_failed",
+          actor,
+          stageGeneration: execution.stageGeneration,
+          payload: {
+            automationId: execution.automationId,
+            routineId: execution.routineId,
+            routineRunId: run.id,
+            issueId: executionIssueId,
+            error: "execution_issue_unusable_before_attachment",
+          },
+        });
+        return { status: "failed", execution: attachment.execution };
+      }
       await writeCaseEvent(db, {
         companyId: execution.companyId,
         caseId: execution.caseId,
         type: "automation_executed",
         actor,
+        stageGeneration: execution.stageGeneration,
         payload: {
           automationId: execution.automationId,
           routineId: execution.routineId,
           routineRunId: run.id,
           issueId: run.linkedIssueId,
           status: run.status,
+          attached: attachment.attached,
+          stageStillCurrent: attachment.stageStillCurrent,
         },
       });
-      return { status: "succeeded", execution: updated! };
+      return { status: "succeeded", execution: attachment.execution };
     } catch (error) {
       const permissionPreflight = error instanceof PipelinePermissionPreflightError ? error : null;
       const message = permissionPreflight
@@ -3069,6 +3751,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         caseId: execution.caseId,
         type: "automation_failed",
         actor,
+        stageGeneration: execution.stageGeneration,
         payload: {
           automationId: execution.automationId,
           routineId: execution.routineId,
@@ -3113,6 +3796,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       expectedVersion?: number;
       leaseToken?: string | null;
       actor: PipelineActor;
+      runningRunIdsToCancel?: Set<string>;
     },
   ) {
     if (input.fields !== undefined) assertJsonSize(input.fields, "fields");
@@ -3187,7 +3871,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         terminalChildDelta: terminalDelta,
       });
       if (isTerminalKind(current.terminalKind)) {
-        await handleChildrenTerminal(tx, input.companyId, input.parentCaseId);
+        await handleChildrenTerminal(tx, input.companyId, input.parentCaseId, undefined, {
+          runningRunIdsToCancel: input.runningRunIdsToCancel,
+        });
       }
     }
     if (materialChanged) {
@@ -3218,6 +3904,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       automationLedgers?: Array<typeof pipelineAutomationExecutions.$inferSelect>;
       autoAdvanceVisitedStageIds?: Set<string>;
       skipChildrenTerminalGate?: boolean;
+      runningRunIdsToCancel?: Set<string>;
     },
   ) {
     if (input.transitionClass === "auto" && input.actor.type !== "system") {
@@ -3270,10 +3957,14 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     await assertNoOpenBlockers(tx, current, toStage);
 
     const enteringTerminal = terminalKindForStage(toStage.kind);
+    const enteringStageGeneration = fromStage.id === toStage.id
+      ? current.stageGeneration
+      : current.stageGeneration + 1;
     const [updated] = await tx
       .update(pipelineCases)
       .set({
         stageId: toStage.id,
+        stageGeneration: enteringStageGeneration,
         version: current.version + 1,
         terminalKind: enteringTerminal,
         terminalAt: enteringTerminal ? nowDate() : null,
@@ -3299,6 +3990,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       actor: input.actor,
       fromStageId: fromStage.id,
       toStageId: toStage.id,
+      stageGeneration: updated.stageGeneration,
       payload: {
         previousVersion: current.version,
         version: updated.version,
@@ -3307,6 +3999,18 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         transitionClass: input.transitionClass ?? "manual",
       },
     });
+    if (fromStage.id !== toStage.id) {
+      await retireStageAutomationForExitedStage(tx, {
+        companyId: input.companyId,
+        caseId: current.id,
+        caseTitle: current.title,
+        caseKey: current.caseKey,
+        stageId: fromStage.id,
+        stageGeneration: current.stageGeneration,
+        stageName: fromStage.name,
+        runningRunIdsToCancel: input.runningRunIdsToCancel,
+      });
+    }
     if (forcedTransition) {
       await writeCaseEvent(tx, {
         companyId: input.companyId,
@@ -3327,6 +4031,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       companyId: input.companyId,
       caseId: current.id,
       stage: toStage,
+      stageGeneration: updated.stageGeneration,
       eventId: event.id,
     });
     if (ledger) input.automationLedgers?.push(ledger);
@@ -3342,7 +4047,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       await handleBlockersResolved(tx, input.companyId, current.id);
     }
     if (!wasTerminal && isTerminal) {
-      await handleChildrenTerminal(tx, input.companyId, current.parentCaseId, input.automationLedgers);
+      await handleChildrenTerminal(tx, input.companyId, current.parentCaseId, input.automationLedgers, {
+        runningRunIdsToCancel: input.runningRunIdsToCancel,
+      });
     }
     if (!isTerminal) {
       await maybeAutoAdvanceOnStageEntry(tx, {
@@ -3351,6 +4058,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         stage: toStage,
         automationLedgers: input.automationLedgers,
         visitedStageIds: input.autoAdvanceVisitedStageIds,
+        runningRunIdsToCancel: input.runningRunIdsToCancel,
       });
     }
     return { case: updated, event, automationLedger: ledger };
@@ -3368,6 +4076,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       stage: typeof pipelineStages.$inferSelect;
       automationLedgers?: Array<typeof pipelineAutomationExecutions.$inferSelect>;
       visitedStageIds?: Set<string>;
+      runningRunIdsToCancel?: Set<string>;
     },
   ) {
     const gate = childrenGateConfig(stageConfig(input.stage));
@@ -3392,6 +4101,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         reason: "children_terminal",
         automationLedgers: input.automationLedgers,
         autoAdvanceVisitedStageIds: visited,
+        runningRunIdsToCancel: input.runningRunIdsToCancel,
       });
     } catch (error) {
       // Best-effort: an unsatisfied gate (drift, approval) on the chained
@@ -3405,7 +4115,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
     companyId: string,
     parentCaseId: string | null | undefined,
     automationLedgers?: Array<typeof pipelineAutomationExecutions.$inferSelect>,
-    options: { allowExplicitZeroChildrenPass?: boolean } = {},
+    options: { allowExplicitZeroChildrenPass?: boolean; runningRunIdsToCancel?: Set<string> } = {},
   ) {
     const ancestors = await getAncestorCases(tx, companyId, parentCaseId);
     for (const ancestor of ancestors) {
@@ -3451,6 +4161,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           transitionClass: "auto",
           reason: "children_terminal",
           automationLedgers,
+          runningRunIdsToCancel: options.runningRunIdsToCancel,
         });
       } catch (error) {
         // Best-effort: an unsatisfied gate (drift, approval, blocker) on the
@@ -3722,7 +4433,12 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             fieldPath: "env",
           }) as Record<string, EnvBinding>;
       const actorPatch = routineActorPatch(input.actor);
-      const updatedRoutine = await db.transaction(async (tx) => {
+      // logActivity's publisher escapes the transaction (in-process emitter +
+      // plugin outbox insert on its own handle), so it is returned from the
+      // transaction rather than fired inline — capturing it as the
+      // transaction's return value means a rollback throws past the
+      // `publish()` call below rather than falling through to it.
+      const { updatedRoutine, publish } = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${routineId} for update`);
         const locked = await txDb
@@ -3768,9 +4484,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         );
         const envKeys = Object.keys(normalizedEnv ?? {}).sort();
         const secretRefs = secretRefsFromEnv(normalizedEnv);
-        // This action has no plugin-event mapping, so no outbox write can
-        // escape the transaction; keep the default publication semantics.
-        await logActivity(txDb, {
+        const activityPublish = await logActivity(txDb, {
           companyId: input.companyId,
           ...activityActorPatch(input.actor),
           action: "pipeline.stage_automation_env_updated",
@@ -3788,9 +4502,21 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             routineRevisionId: routineWithRevision.latestRevisionId,
             routineRevisionNumber: routineWithRevision.latestRevisionNumber,
           },
+        }, {
+          enlistPluginOutbox: true,
+          deferPublish: true,
         });
-        return routineWithRevision;
+        return { updatedRoutine: routineWithRevision, publish: activityPublish };
       });
+      // Reached only on commit; a rollback throws straight past this.
+      try {
+        await publish();
+      } catch (err) {
+        logger.warn(
+          { err, companyId: input.companyId, stageId: input.stageId },
+          "failed to publish pipeline.stage_automation_env_updated activity event",
+        );
+      }
 
       return derivedStageAutomationPayload(updatedRoutine);
     },
@@ -3802,7 +4528,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       moveCasesToStageId?: string | null;
       actor?: PipelineActor;
     }) {
-      return db.transaction(async (tx) => {
+      const runningRunIdsToCancel = new Set<string>();
+      const result = await db.transaction(async (tx) => {
         await getPipelineOrThrow(tx, input.companyId, input.pipelineId);
         const stage = await getStageOrThrow(tx, input.pipelineId, input.stageId);
         const targetStage = input.moveCasesToStageId
@@ -3820,6 +4547,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             .update(pipelineCases)
             .set({
               stageId: targetStage.id,
+              stageGeneration: sql`${pipelineCases.stageGeneration} + 1` as unknown as number,
               version: sql`${pipelineCases.version} + 1`,
               terminalKind: terminalKindForStage(targetStage.kind),
               terminalAt: isTerminalKind(targetStage.kind) ? nowDate() : null,
@@ -3844,17 +4572,30 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
               actor: input.actor ?? { type: "system" },
               fromStageId: stage.id,
               toStageId: targetStage.id,
+              stageGeneration: movedCase.stageGeneration,
               payload: {
                 reason: "stage_deleted",
                 previousVersion: previous?.version ?? movedCase.version - 1,
                 version: movedCase.version,
               },
             });
+            await retireStageAutomationForExitedStage(tx, {
+              companyId: input.companyId,
+              caseId: movedCase.id,
+              caseTitle: movedCase.title,
+              caseKey: movedCase.caseKey,
+              stageId: stage.id,
+              stageGeneration: previous?.stageGeneration ?? movedCase.stageGeneration - 1,
+              stageName: stage.name,
+              runningRunIdsToCancel,
+            });
             if (!wasTerminal && movedCase.terminalKind === "done") {
               await handleBlockersResolved(tx, input.companyId, movedCase.id);
             }
             if (!wasTerminal && isTerminal) {
-              await handleChildrenTerminal(tx, input.companyId, previous?.parentCaseId);
+              await handleChildrenTerminal(tx, input.companyId, previous?.parentCaseId, undefined, {
+                runningRunIdsToCancel,
+              });
             }
           }
         }
@@ -3872,6 +4613,8 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         }
         return { deleted: true };
       });
+      await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
+      return result;
     },
 
     async createTransition(input: { companyId: string; pipelineId: string; fromStageId: string; toStageId: string; label?: string | null }) {
@@ -3980,6 +4723,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             parentCaseVersion: parentCase?.version ?? null,
             requestKey,
             automationAttemptId: automationAttempt?.id ?? null,
+            stageGeneration: 1,
             terminalKind: terminalKindForStage(stage.kind),
             terminalAt: isTerminalKind(stage.kind) ? nowDate() : null,
             createdByUserId: input.actor.type === "user" ? input.actor.userId : null,
@@ -4026,6 +4770,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           type: "ingested",
           actor: input.actor,
           toStageId: stage.id,
+          stageGeneration: inserted.stageGeneration,
           payload: { caseKey, requestKey, parentCaseVersion: inserted.parentCaseVersion },
         });
         await adjustParentCounts(tx, {
@@ -4055,6 +4800,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             companyId: input.companyId,
             caseId: inserted.id,
             stage,
+            stageGeneration: inserted.stageGeneration,
             eventId: ingestEvent.id,
           });
           if (ledger) automationLedgers.push(ledger);
@@ -4293,11 +5039,14 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         });
       }
       if (!replayingCompletedBreakdown && items.length === 0 && config.waitForPieces && config.whenFinishedMoveTo) {
+        const runningRunIdsToCancel = new Set<string>();
         await db.transaction(async (tx) => {
           await handleChildrenTerminal(tx, input.companyId, detail.case.id, undefined, {
             allowExplicitZeroChildrenPass: true,
+            runningRunIdsToCancel,
           });
         });
+        await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
         parent = await getCaseOrThrow(db, input.companyId, detail.case.id);
       }
 
@@ -4321,10 +5070,13 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       leaseToken?: string | null;
       actor: PipelineActor;
     }) {
-      return db.transaction(async (tx) => {
-        const result = await patchCaseContentInTransaction(tx, input);
+      const runningRunIdsToCancel = new Set<string>();
+      const result = await db.transaction(async (tx) => {
+        const result = await patchCaseContentInTransaction(tx, { ...input, runningRunIdsToCancel });
         return result.case;
       });
+      await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
+      return result;
     },
 
     async acknowledgeDrift(input: {
@@ -4450,7 +5202,13 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       skipChildrenTerminalGate?: boolean;
     }) {
       const automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect> = [];
-      const result = await db.transaction((tx) => transitionCaseInTransaction(tx, { ...input, automationLedgers }));
+      const runningRunIdsToCancel = new Set<string>();
+      const result = await db.transaction((tx) => transitionCaseInTransaction(tx, {
+        ...input,
+        automationLedgers,
+        runningRunIdsToCancel,
+      }));
+      await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
       const automationExecutions = await executeAutomationLedgers(automationLedgers, { type: "system" });
       if (result.automationLedger) {
         return {
@@ -4468,17 +5226,47 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       automationId: string;
       actor: PipelineActor;
     }) {
-      const execution = await db
+      const detail = await getCaseWithStageOrThrow(db, input.companyId, input.caseId);
+      let execution = await db
         .select()
         .from(pipelineAutomationExecutions)
         .where(and(
           eq(pipelineAutomationExecutions.companyId, input.companyId),
           eq(pipelineAutomationExecutions.caseId, input.caseId),
           eq(pipelineAutomationExecutions.automationId, input.automationId),
+          eq(pipelineAutomationExecutions.stageId, detail.stage.id),
+          eq(pipelineAutomationExecutions.stageGeneration, detail.case.stageGeneration),
         ))
-        .orderBy(sql`case when ${pipelineAutomationExecutions.status} = 'failed' then 0 else 1 end`, asc(pipelineAutomationExecutions.createdAt))
+        .orderBy(
+          sql`case when ${pipelineAutomationExecutions.status} = 'failed' then 0 else 1 end`,
+          desc(pipelineAutomationExecutions.generation),
+          desc(pipelineAutomationExecutions.createdAt),
+        )
         .limit(1)
         .then((rows) => rows[0] ?? null);
+      if (!execution) {
+        const legacyExecutions = await db
+          .select()
+          .from(pipelineAutomationExecutions)
+          .where(and(
+            eq(pipelineAutomationExecutions.companyId, input.companyId),
+            eq(pipelineAutomationExecutions.caseId, input.caseId),
+            eq(pipelineAutomationExecutions.automationId, input.automationId),
+            isNull(pipelineAutomationExecutions.stageId),
+            isNull(pipelineAutomationExecutions.stageGeneration),
+            eq(pipelineAutomationExecutions.status, "failed"),
+            eq(pipelineAutomationExecutions.error, "pending_dispatch"),
+          ))
+          .orderBy(desc(pipelineAutomationExecutions.generation), desc(pipelineAutomationExecutions.createdAt))
+          .limit(20);
+        for (const legacyExecution of legacyExecutions) {
+          const hydrated = await hydrateLegacyPendingExecutionStageIdentity(legacyExecution, detail);
+          if (executionMatchesCurrentStage(hydrated, detail.case)) {
+            execution = hydrated;
+            break;
+          }
+        }
+      }
       if (!execution) throw notFound("Pipeline automation execution not found");
       return executeAutomationLedger(execution.id, input.actor);
     },
@@ -4503,6 +5291,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       cleanup: PipelineAutomationRetryCleanupOptions;
       actor: PipelineActor;
     }) {
+      const runningRunIdsToCancel = new Set<string>();
       const result = await db.transaction(async (tx) => {
         const detail = await getCaseWithStageForUpdateOrThrow(tx, input.companyId, input.caseId);
         if (detail.case.version !== input.expectedVersion) {
@@ -4524,6 +5313,9 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             blockers: plan.blockers,
           });
         }
+        const targetStageGeneration = detail.case.stageId === plan.targetStageRow.id
+          ? detail.case.stageGeneration
+          : detail.case.stageGeneration + 1;
         const requestedEvent = await writeCaseEvent(tx, {
           companyId: input.companyId,
           caseId: input.caseId,
@@ -4531,6 +5323,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           actor: input.actor,
           fromStageId: detail.stage.id,
           toStageId: plan.targetStageRow.id,
+          stageGeneration: targetStageGeneration,
           payload: {
             scope: input.scope,
             targetStageId: input.targetStageId ?? null,
@@ -4544,6 +5337,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           companyId: input.companyId,
           caseId: input.caseId,
           stage: plan.targetStageRow,
+          stageGeneration: targetStageGeneration,
           eventId: requestedEvent.id,
           retryOfExecutionId: plan.previousAttemptId,
           generation: plan.generation,
@@ -4607,12 +5401,53 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             parentCaseId,
             terminalChildDelta,
           });
-          await handleChildrenTerminal(tx, input.companyId, parentCaseId);
+          await handleChildrenTerminal(tx, input.companyId, parentCaseId, undefined, {
+            runningRunIdsToCancel,
+          });
         }
         const issueIdsToCancel = input.cleanup.cancelLinkedAutomationIssues
           ? effects.linkedAutomationIssueIds
           : [];
-        if (issueIdsToCancel.length > 0) {
+        const exitsCurrentStage = input.scope === "previous_stage" && detail.case.stageId !== plan.targetStageRow.id;
+        if (exitsCurrentStage) {
+          await retireStageAutomationForExitedStage(tx, {
+            companyId: input.companyId,
+            caseId: detail.case.id,
+            caseTitle: detail.case.title,
+            caseKey: detail.case.caseKey,
+            stageId: detail.stage.id,
+            stageGeneration: detail.case.stageGeneration,
+            stageName: detail.stage.name,
+            runningRunIdsToCancel,
+          });
+        }
+        // Generic retry cleanup predates coalesced stage automation. On a
+        // previous-stage retry it would cancel every linked issue, including a
+        // still-owned issue from another case. Retire only this prior attempt
+        // through the same locked last-owner path instead.
+        if (exitsCurrentStage && input.cleanup.cancelLinkedAutomationIssues && plan.previousAttemptId) {
+          const previousAttemptLinks = await tx
+            .select({ linkId: pipelineCaseIssueLinks.id })
+            .from(pipelineCaseIssueLinks)
+            .where(and(
+              eq(pipelineCaseIssueLinks.companyId, input.companyId),
+              eq(pipelineCaseIssueLinks.caseId, input.caseId),
+              eq(pipelineCaseIssueLinks.role, "automation"),
+              eq(pipelineCaseIssueLinks.automationAttemptId, plan.previousAttemptId),
+              isNull(pipelineCaseIssueLinks.retiredAt),
+            ));
+          for (const { linkId } of previousAttemptLinks) {
+            await retireStageAutomationLink(tx, {
+              companyId: input.companyId,
+              linkId,
+              caseTitle: detail.case.title,
+              caseKey: detail.case.caseKey,
+              stageName: plan.targetStageRow.name,
+              runningRunIdsToCancel,
+            });
+          }
+        }
+        if (!exitsCurrentStage && issueIdsToCancel.length > 0) {
           const cancelledIssues = await tx
             .update(issues)
             .set({ status: "cancelled", updatedAt: now })
@@ -4666,6 +5501,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             .update(pipelineCases)
             .set({
               stageId: plan.targetStageRow.id,
+              stageGeneration: targetStageGeneration,
               terminalKind: enteringTerminal,
               terminalAt: isTerminalKind(enteringTerminal) ? now : null,
               pendingSuggestion: null,
@@ -4682,6 +5518,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             actor: input.actor,
             fromStageId: detail.stage.id,
             toStageId: plan.targetStageRow.id,
+            stageGeneration: updatedCase.stageGeneration,
             payload: {
               transitionClass: "retry",
               retryAttemptId: ledger.id,
@@ -4697,6 +5534,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           type: "automation_retry_dispatched",
           actor: input.actor,
           toStageId: plan.targetStageRow.id,
+          stageGeneration: updatedCase.stageGeneration,
           payload: {
             automationId: plan.automationId,
             routineId: plan.automationRoutineId,
@@ -4717,6 +5555,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           },
         };
       });
+      await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
       const automationExecution = await executeAutomationLedger(result.ledger.id, input.actor);
       const { targetStageRow: _targetStageRow, automationRoutineId: _automationRoutineId, ...plan } = result.plan;
       return {
@@ -4747,6 +5586,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           type: "updated",
           actor: input.actor,
           toStageId: detail.stage.id,
+          stageGeneration: detail.case.stageGeneration,
           payload: {
             action: "stage_automation_rerun_requested",
             automationId: automation.id,
@@ -4759,6 +5599,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           companyId: input.companyId,
           caseId: input.caseId,
           stage: detail.stage,
+          stageGeneration: detail.case.stageGeneration,
           eventId: event.id,
         });
         if (!nextLedger) {
@@ -4766,6 +5607,24 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             code: "automation_not_configured",
           });
         }
+        // The request event is audit context; the case's persisted stage
+        // generation remains the stable identity for this in-place rerun.
+        await writeCaseEvent(tx, {
+          companyId: input.companyId,
+          caseId: input.caseId,
+          type: "automation_retry_dispatched",
+          actor: input.actor,
+          toStageId: detail.stage.id,
+          stageGeneration: detail.case.stageGeneration,
+          payload: {
+            action: "stage_automation_rerun_dispatched",
+            automationId: automation.id,
+            routineId: automation.routineId,
+            targetStageId: detail.stage.id,
+            targetStageKey: detail.stage.key,
+            retryAttemptId: nextLedger.id,
+          },
+        });
         return nextLedger;
       });
       const automationExecution = await executeAutomationLedger(ledger.id, input.actor);
@@ -4823,6 +5682,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       reason?: string | null;
       leaseToken?: string | null;
     }) {
+      const runningRunIdsToCancel = new Set<string>();
       const result = await db.transaction(async (tx) => {
         const { case: existing } = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
         const suggestion = existing.pendingSuggestion;
@@ -4857,6 +5717,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           suggestionId: input.suggestionId,
           reason: input.reason,
           automationLedgers,
+          runningRunIdsToCancel,
         });
         await writeCaseEvent(tx, {
           companyId: input.companyId,
@@ -4867,6 +5728,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         });
         return { ...transition, automationLedgers };
       });
+      await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
       if ("automationLedgers" in result) {
         const automationExecutions = await executeAutomationLedgers(result.automationLedgers, { type: "system" });
         if (result.automationLedger) {
@@ -4902,6 +5764,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
       actor: PipelineActor;
     }) {
       const automationLedgers: Array<typeof pipelineAutomationExecutions.$inferSelect> = [];
+      const runningRunIdsToCancel = new Set<string>();
       const result = await db.transaction(async (tx) => {
         const detail = await getCaseWithStageOrThrow(tx, input.companyId, input.caseId);
         if (detail.stage.kind !== "review") {
@@ -4929,6 +5792,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
             expectedVersion,
             leaseToken: input.leaseToken,
             actor: input.actor,
+            runningRunIdsToCancel,
           });
           expectedVersion = updated.case.version;
           updateEvent = updated.event;
@@ -4943,6 +5807,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
           reason: input.reason,
           actor: input.actor,
           automationLedgers,
+          runningRunIdsToCancel,
         });
         const reviewEvent = await writeCaseEvent(tx, {
           companyId: input.companyId,
@@ -4963,6 +5828,7 @@ export function pipelineService(db: Db, deps: { heartbeat?: IssueAssignmentWakeu
         });
         return { ...transitioned, updateEvent, reviewEvent };
       });
+      await cancelRetiredStageAutomationRuns(runningRunIdsToCancel);
       const automationExecutions = await executeAutomationLedgers(automationLedgers, { type: "system" });
       if (result.automationLedger) {
         return {

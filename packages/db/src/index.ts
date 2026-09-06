@@ -1,6 +1,7 @@
 export {
   createDb,
   createDbFromPostgresClient,
+  POSTGRES_POOL_MAX,
   getPostgresDataDirectory,
   ensurePostgresDatabase,
   resetPostgresDatabase,
@@ -13,6 +14,23 @@ export {
   type MigrationBootstrapResult,
   type Db,
 } from "./client.js";
+export {
+  checkPendingMigrationPreflight,
+  formatPreflightFailure,
+  selectGuardedPendingIndexes,
+  PRECREATE_REQUIRED_INDEXES,
+  type PrecreateRequiredIndex,
+  type PreflightBlocker,
+  type PendingMigrationPreflightResult,
+} from "./pending-migration-preflight.js";
+export {
+  ensurePendingConcurrentIndexes,
+  PENDING_CONCURRENT_INDEXES,
+  type ConcurrentIndexSpec,
+  type ConcurrentIndexEnsureAction,
+  type ConcurrentIndexEnsureResult,
+  type EnsurePendingConcurrentIndexesOptions,
+} from "./concurrent-index-guard.js";
 export {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,

@@ -13,6 +13,8 @@ export const models = [
   { id: "claude-opus-5", label: "Claude Opus 5" },
   { id: "claude-opus-5[1m]", label: "Claude Opus 5 (1M)" },
   { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
+  { id: "claude-fable-5-1", label: "Claude Fable 5.1" },
+  { id: "claude-fable-5-1[1m]", label: "Claude Fable 5.1 (1M)" },
   { id: "claude-fable-5", label: "Claude Fable 5" },
   { id: "claude-mythos-5", label: "Claude Mythos 5" },
   { id: "claude-opus-4-7", label: "Claude Opus 4.7" },

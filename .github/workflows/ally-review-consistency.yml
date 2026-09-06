@@ -1,10 +1,14 @@
 name: Ally Review Consistency Guard
 
-# Asserts that every open PR carries at most one operative Ally review verdict
-# at its current head, that no standing APPROVED masks a Critical/Important
-# finding, and that a review's body-attested head matches the commit GitHub
-# recorded it against. See scripts/check-ally-review-consistency.mjs and
-# BLO-19778 for the incident this guards.
+# Asserts three things about every open PR: that it carries at most one
+# operative Ally review at its current head — except for the exact current-head
+# App/User approval pair required by protected merge, which must carry two
+# *distinct* bodies, since one body under both credentials is a single verdict
+# posted twice (BLO-22916); that no standing APPROVED masks a Critical/Important
+# finding; and that a review's body-attested head matches the commit GitHub
+# recorded it against.
+# See scripts/check-ally-review-consistency.mjs and BLO-19778 for the incident
+# this guards.
 
 on:
   schedule:
@@ -28,7 +32,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Assert one operative Ally verdict per PR head
+      - name: Assert the allowed operative Ally review shape per PR head
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ALLY_REVIEW_REPO: ${{ inputs.repo || 'Blockcast/paperclip' }}

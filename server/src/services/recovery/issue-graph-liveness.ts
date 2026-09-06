@@ -8,6 +8,7 @@ export type IssueLivenessState =
   | "blocked_by_assigned_backlog_issue"
   | "blocked_by_uninvokable_assignee"
   | "blocked_by_cancelled_issue"
+  | "blocked_without_blockers"
   | "invalid_review_participant"
   | "in_review_without_action_path";
 
@@ -33,6 +34,20 @@ export interface IssueLivenessIssueInput {
   lastActivityAt?: Date | null;
   monitorNextCheckAt?: Date | string | null;
   monitorAttemptCount?: number | null;
+  // BLO-27912: the row carries a deliberate-park disposition expiring at this instant, set
+  // via `parkedDisposition` by the assignee OR by an actor the assignee cannot block —
+  // the issue's creator, or a manager in the assignee's reporting chain. Unlike the six
+  // pre-existing satisfiers, this one is reachable by somebody other than the assignee,
+  // which is the whole point: a parked row's assignee is by construction not working on
+  // it, so gating the only silencing mechanism on them made the invariant unsatisfiable.
+  // Consumed by `hasExplicitWaitingPath` — see the note there for why it sits there rather
+  // than being scoped to one rule the way `hasExternalWaitOwner` is.
+  parkedUntil?: Date | string | null;
+  // BLO-24662: the issue's description declares an `external owner:` / `external action:`
+  // pair, i.e. a human gate narrated in prose rather than modelled as a blocker edge.
+  // Consumed only by `blocked_without_blockers`, which is the one rule that
+  // would otherwise read that deliberate parking as a dead end.
+  hasExternalWaitOwner?: boolean | null;
 }
 
 export interface IssueLivenessRelationInput {
@@ -224,6 +239,21 @@ function hasScheduledMonitor(issue: IssueLivenessIssueInput, nowMs: number) {
   if (maxAttempts !== null && attemptCount >= maxAttempts) return false;
 
   return true;
+}
+
+/**
+ * BLO-27912: is a deliberate-park disposition currently in force?
+ *
+ * Deliberately keyed on the deadline alone rather than on a boolean or on the presence of
+ * `parkedReason`, and compared with `<= nowMs` exactly as `hasScheduledMonitor` does. That
+ * makes expiry the default: a park that nobody restates stops suppressing on its own, so
+ * the mechanism cannot decay into permanent silence on a leaf that genuinely needs
+ * escalating. Un-parking (writing `parkedDisposition: null`) clears the column and has the
+ * same effect immediately.
+ */
+function hasActiveParkedDisposition(issue: IssueLivenessIssueInput, nowMs: number) {
+  const parkedUntilMs = readDateMs(issue.parkedUntil);
+  return parkedUntilMs !== null && parkedUntilMs > nowMs;
 }
 
 function readPrincipalAgentId(principal: unknown): string | null {
@@ -440,13 +470,131 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     });
   }
 
+  /**
+   * Does somebody or something own the next action on this issue?
+   *
+   * Six of the seven satisfiers are reachable only by the row's own assignee, which is what
+   * BLO-27912 records as a defect rather than a design: a *deliberately parked* row is by
+   * construction one its assignee is not working on, so an invariant whose only escape
+   * hatch is the assignee is unsatisfiable exactly where it fires hardest. Three
+   * escalations landed on one leaf (BLO-24266) with a byte-identical `originFingerprint`,
+   * and two correct remedies — assigning an owner, adding a `blockedBy` edge — both failed
+   * because neither is on this list.
+   *
+   * `hasActiveParkedDisposition` is the seventh, and the only one a non-assignee can set.
+   *
+   * On why it belongs HERE rather than being scoped to a single rule the way BLO-24662
+   * scoped `hasExternalWaitOwner` to `blocked_without_blockers`: that signal is parsed out
+   * of description prose, so it is unattributed, unbounded and easy to write by accident —
+   * hence the narrow blast radius. A park is the opposite on every axis. It is structured,
+   * attributed to the agent that set it, and expires on a stated deadline, so it is a
+   * strictly stronger claim: "this row is deliberately not being worked, by decision of a
+   * named actor, until T." That claim answers every assignee-shaped rule below, not just
+   * one, and `blocked_by_assigned_backlog_issue` / `blocked_by_unassigned_issue` — the two
+   * that fired on BLO-24266 — are precisely the ones it must answer.
+   *
+   * It does NOT reach `blocked_by_cancelled_issue`, and that asymmetry is deliberate rather
+   * than incidental: `blockedFindingForLeaf` tests the cancelled shape BEFORE consulting
+   * this predicate, so a park cannot make a cancelled blocker acceptable. Parking says
+   * nobody should be working on this yet; it does not say a dependency on a cancelled row
+   * is a coherent thing to wait for.
+   */
   function hasExplicitWaitingPath(issue: IssueLivenessIssueInput) {
     return Boolean(issue.assigneeUserId) ||
       hasScheduledMonitor(issue, nowMs) ||
+      hasActiveParkedDisposition(issue, nowMs) ||
       hasActiveExecutionPath(issue.companyId, issue.id, activeRuns, queuedWakeRequests) ||
       hasWaitingPath(issue.companyId, issue.id, pendingInteractions) ||
       hasWaitingPath(issue.companyId, issue.id, pendingApprovals) ||
       hasWaitingPath(issue.companyId, issue.id, openRecoveryIssues);
+  }
+
+  /**
+   * Does this issue still have a blocker edge that could plausibly resolve?
+   *
+   * `done` is the only status that retires an edge here. A `cancelled` blocker
+   * deliberately still counts as unresolved, because that shape has its own, more
+   * specific finding (`blocked_by_cancelled_issue`) and treating it as retired would
+   * reclassify it as a dead end and lose the "remove this edge" instruction.
+   */
+  function hasUnresolvedBlockerEdge(issue: IssueLivenessIssueInput) {
+    return (blockersByBlockedIssueId.get(issue.id) ?? []).some((relation) => {
+      if (relation.companyId !== issue.companyId) return false;
+      const blocker = issuesById.get(relation.blockerIssueId);
+      return Boolean(blocker && blocker.companyId === issue.companyId && blocker.status !== "done");
+    });
+  }
+
+  /**
+   * Does this issue have any blocker edge at all to a real, same-company issue?
+   *
+   * Distinct from `hasUnresolvedBlockerEdge`, and the difference is load-bearing. An issue
+   * blocked behind a blocker set that has all gone `done` is NOT terminal: it is the
+   * resolved-dependency case, and `reconcileResolvedDependencyWakeBackstop` exists to wake
+   * it — in the same sweep. Reporting it here would raise a critical finding against work
+   * that is already being healed automatically. The dead-end rule therefore keys on "no
+   * edge exists at all", which is the shape BLO-24662 actually describes.
+   */
+  function hasAnyBlockerEdge(issue: IssueLivenessIssueInput) {
+    return (blockersByBlockedIssueId.get(issue.id) ?? []).some((relation) => {
+      if (relation.companyId !== issue.companyId) return false;
+      const blocker = issuesById.get(relation.blockerIssueId);
+      return Boolean(blocker && blocker.companyId === issue.companyId);
+    });
+  }
+
+  /**
+   * BLO-24662: `status: blocked` with no blocker edge at all is silently terminal.
+   *
+   * `blocked` means "waiting on a dependency to resolve". With an empty blocker set
+   * there is nothing that *can* resolve, so no edge will ever fire a wake — and the row
+   * is indistinguishable at a glance from a legitimately-blocked issue, which is what
+   * makes it dangerous: it reads as healthy waiting. On BLO-20995 this state held for
+   * ~13h and emitted nothing, while the detector fired two levels up the stack on the
+   * one issue in the chain that was completely healthy.
+   *
+   * The bare two-field check would over-fire: an agent may legitimately set `blocked`
+   * while narrating a human gate. So the caller gates this on `hasExplicitWaitingPath`
+   * first, which is what distinguishes "parked with someone owning the next action"
+   * (monitor armed, human assignee, pending interaction/approval, live run, open
+   * recovery issue) from "parked with nothing that can ever wake it" — plus
+   * `hasExternalWaitOwner`, which covers the same intent expressed in prose rather than
+   * in structure. That last one is deliberately scoped to this rule instead of folded
+   * into `hasExplicitWaitingPath`: an external owner named in a description does not make
+   * an unassigned or cancelled blocker acceptable, so the other rules must keep firing.
+   */
+  function isDeadEndBlocked(issue: IssueLivenessIssueInput) {
+    return issue.status === "blocked" &&
+      !hasAnyBlockerEdge(issue) &&
+      !issue.hasExternalWaitOwner;
+  }
+
+  function blockedWithoutBlockersFinding(
+    source: IssueLivenessIssueInput,
+    deadEnd: IssueLivenessIssueInput,
+    dependencyPath: IssueLivenessIssueInput[],
+  ): IssueLivenessFinding {
+    const ownerCandidates = ownerCandidatesForRecoveryIssue(deadEnd, input.agents, agentsById, {
+      includeStalledAssignee: true,
+    });
+    const isSelf = deadEnd.id === source.id;
+
+    return finding({
+      issue: source,
+      state: "blocked_without_blockers",
+      reason: isSelf
+        ? `${issueLabel(deadEnd)} is blocked with no unresolved blockers and no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action, so nothing can ever unblock it.`
+        : `${issueLabel(source)} is blocked by ${issueLabel(deadEnd)}, which is itself blocked with no unresolved blockers and no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action.`,
+      dependencyPath,
+      recoveryIssue: deadEnd,
+      recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
+      recommendedOwnerCandidates: ownerCandidates,
+      recommendedAction:
+        `Review ${issueLabel(deadEnd)} and give it a next action: move it back to todo/in_progress so its assignee wakes, ` +
+        `add the blocker it is actually waiting on, assign a human owner or interaction if it is intentionally parked, ` +
+        `or close it if it is no longer required.`,
+      blockerIssueId: deadEnd.id,
+    });
   }
 
   function reviewFinding(
@@ -554,6 +702,14 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
 
     if (hasExplicitWaitingPath(blocker)) return null;
 
+    // Before the assignee-shaped checks below: a blocked blocker with nothing left to
+    // wait on is a dead end regardless of who it is assigned to, and saying so names the
+    // real defect. The invokable-assignee path in particular returns null further down,
+    // which is exactly how BLO-20995 stayed silent.
+    if (blocker.status === "blocked" && isDeadEndBlocked(blocker)) {
+      return blockedWithoutBlockersFinding(source, blocker, dependencyPath);
+    }
+
     if (blocker.status === "in_review") {
       return reviewFinding(source, blocker, dependencyPath);
     }
@@ -589,6 +745,30 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     }
 
     if (!blocker.assigneeAgentId) return null;
+
+    /**
+     * BLO-15200: an assignee's invokability only gates a blocker that is otherwise ready
+     * to be worked.
+     *
+     * A blocker that is itself `blocked` behind its own unresolved edges is waiting on
+     * those edges, not on its owner. The chain walk above has already descended through
+     * them and come back empty, which means every issue further down has a live owner or
+     * an explicit waiting path — so the dependency is progressing and the assignee is
+     * simply not the thing holding it. Escalating here states the wrong fact and, worse,
+     * recommends a remedy that provably cannot work: a freshly-assigned active owner
+     * would be blocked on exactly the same edges the moment it woke.
+     *
+     * This defers the finding rather than discarding it. When the blocker's own edges
+     * clear, `hasUnresolvedBlockerEdge` goes false, the blocker becomes genuinely
+     * dispatchable, and an uninvokable assignee is then the real defect — so the next
+     * sweep escalates it, at the point where "assign it to an active owner" is finally
+     * actionable.
+     *
+     * Deliberately scoped to this rule. `blocked_by_cancelled_issue` names a broken edge
+     * and `blocked_by_assigned_backlog_issue` names a status that never dispatches; both
+     * stay true regardless of what the blocker is waiting on, so both must keep firing.
+     */
+    if (blocker.status === "blocked" && hasUnresolvedBlockerEdge(blocker)) return null;
 
     const blockerAgent = agentsById.get(blocker.assigneeAgentId);
     const blockerEligibility = blockerAgent
@@ -651,22 +831,32 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   }
 
   for (const issue of input.issues) {
-    const hasUnresolvedBlockerEdge = (blockersByBlockedIssueId.get(issue.id) ?? []).some((relation) => {
-      if (relation.companyId !== issue.companyId) return false;
-      const blocker = issuesById.get(relation.blockerIssueId);
-      return Boolean(blocker && blocker.companyId === issue.companyId && blocker.status !== "done");
-    });
     const shouldInspectBlockedChain = issue.status === "blocked" || (
       issue.status !== "done" &&
       issue.status !== "cancelled" &&
       Boolean(issue.assigneeAgentId) &&
-      hasUnresolvedBlockerEdge
+      hasUnresolvedBlockerEdge(issue)
     );
 
     let chainFinding: IssueLivenessFinding | null = null;
     if (shouldInspectBlockedChain) {
       if (unresolvedBlockers.has(issue.id)) continue;
       chainFinding = firstBlockedChainFinding(issue, issue, [issue], new Set());
+
+      // The dead-end shape has no blocker edge to walk, so the chain search above cannot
+      // reach it — `firstBlockedChainFinding` iterates relations and this issue has none
+      // that still matter. Reported against the issue itself, which is the node that is
+      // actually stuck (BLO-24662). Issues that ARE somebody's unresolved blocker took
+      // the `continue` above and surface through their blocked parent instead, so the
+      // finding still names this leaf without being emitted twice.
+      if (
+        !chainFinding &&
+        isDeadEndBlocked(issue) &&
+        !hasExplicitWaitingPath(issue)
+      ) {
+        chainFinding = blockedWithoutBlockersFinding(issue, issue, [issue]);
+      }
+
       if (chainFinding) findings.push(chainFinding);
     }
 

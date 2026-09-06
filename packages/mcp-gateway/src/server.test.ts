@@ -1,9 +1,11 @@
 import http from "node:http";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import ts from "typescript";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MCP_SESSION_HEADER } from "./session-keepalive.js";
 import { buildInitializeReplayHeaders, createGatewayServer, loadGatewayConfig, type GatewayState } from "./server.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
@@ -223,6 +225,31 @@ function postJson(
     headers: res.headers,
     json: async () => JSON.parse(res.body),
   }));
+}
+
+// Announces a body larger than what it actually sends, then destroys the
+// socket before the announced Content-Length is reached — this is what an
+// aborted upload / dropped client connection looks like to readBody()'s
+// `for await` iteration over the request stream, and is the failure mode the
+// audit-coverage regression test below exercises.
+function destroySocketMidBody(url: string): Promise<void> {
+  const parsed = new URL(url);
+  return new Promise((resolve) => {
+    const socket = net.connect(Number(parsed.port), parsed.hostname, () => {
+      socket.write(
+        `POST ${parsed.pathname} HTTP/1.1\r\n` +
+          `Host: ${parsed.host}\r\n` +
+          "Content-Type: application/json\r\n" +
+          "Content-Length: 200\r\n\r\n" +
+          '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ping"',
+      );
+      setTimeout(() => {
+        socket.destroy();
+        setTimeout(resolve, 150);
+      }, 50);
+    });
+    socket.on("error", () => undefined);
+  });
 }
 
 async function createHangingUpstream(): Promise<{ url: string }> {
@@ -1666,6 +1693,139 @@ describe("mcp gateway lifecycle compatibility", () => {
   });
 });
 
+describe("mcp gateway request logging", () => {
+  it("logs source ip, matched prefix, and tool name for a direct tools/call, and never leaks the Authorization header or arguments", async () => {
+    const upstream = await createStrictMcpUpstream([{ name: "ping", description: "Ping" }]);
+    const gateway = await createGateway(upstream.url);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      const response = await fetch(gateway.url, {
+        method: "POST",
+        headers: { ...jsonHeaders(), authorization: "Bearer super-secret-caller-token" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "ping", arguments: { secret: "arg-value" } },
+        }),
+      });
+      expect(response.status).toBe(200);
+
+      const lines = logSpy.mock.calls.map((call) => String(call[0]));
+      const requestLine = lines.find((line) => line.includes("mcp_gateway_request"));
+      expect(requestLine).toBeTruthy();
+      const parsed = JSON.parse(requestLine!) as Record<string, unknown>;
+      expect(parsed).toMatchObject({ prefix: "k8s-admin", method: "tools/call", tool: "ping" });
+      expect(parsed.sourceIp).toBeTruthy();
+      expect(parsed.requestId).toBeTruthy();
+
+      for (const line of lines) {
+        expect(line).not.toContain("super-secret-caller-token");
+        expect(line).not.toContain("arg-value");
+      }
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("bounds aggregate fan-out to exactly one log line per inbound initialize request", async () => {
+    const alpha = await createStrictMcpUpstream([{ name: "search", description: "Alpha search" }]);
+    const beta = await createStrictMcpUpstream([{ name: "search", description: "Beta search" }]);
+    const gateway = await createAggregateGateway({
+      alpha: { url: alpha.url, credentialHeaders: [] },
+      beta: { url: beta.url, credentialHeaders: [] },
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      const response = await postJson(gateway.url, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+      expect(response.status).toBe(200);
+
+      const requestLines = logSpy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("mcp_gateway_request"));
+      expect(requestLines).toHaveLength(1);
+      expect(JSON.parse(requestLines[0]) as Record<string, unknown>).toMatchObject({ method: "initialize" });
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("logs the qualified tool name and resolved prefix for an aggregate tools/call", async () => {
+    const upstream = await createStrictMcpUpstream([{ name: "inspect", description: "Inspect" }]);
+    const gateway = await createAggregateGateway({ "k8s-admin": { url: upstream.url, credentialHeaders: [] } });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      const response = await postJson(
+        gateway.url,
+        { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "k8s-admin__inspect", arguments: {} } },
+        { ...jsonHeaders("aggregate-session"), authorization: "Bearer super-secret-caller-token" },
+      );
+      expect(response.status).toBe(200);
+
+      const lines = logSpy.mock.calls.map((call) => String(call[0]));
+      const requestLine = lines.find((line) => line.includes("mcp_gateway_request"));
+      expect(requestLine).toBeTruthy();
+      expect(JSON.parse(requestLine!) as Record<string, unknown>).toMatchObject({
+        prefix: "k8s-admin",
+        method: "tools/call",
+        tool: "k8s-admin__inspect",
+      });
+      for (const line of lines) {
+        expect(line).not.toContain("super-secret-caller-token");
+      }
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("logs one fallback line (matched prefix, HTTP method) when body consumption fails on the direct route", async () => {
+    const upstream = await createStrictMcpUpstream([{ name: "ping", description: "Ping" }]);
+    const gateway = await createGateway(upstream.url);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      await destroySocketMidBody(gateway.url);
+
+      const requestLines = logSpy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("mcp_gateway_request"));
+      expect(requestLines).toHaveLength(1);
+      expect(JSON.parse(requestLines[0]) as Record<string, unknown>).toMatchObject({
+        prefix: "k8s-admin",
+        method: "POST",
+      });
+      expect((JSON.parse(requestLines[0]) as Record<string, unknown>).tool).toBeUndefined();
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("logs one fallback line (prefix '*', HTTP method) when body consumption fails on the aggregate route", async () => {
+    const upstream = await createStrictMcpUpstream([{ name: "ping", description: "Ping" }]);
+    const gateway = await createAggregateGateway({ "k8s-admin": { url: upstream.url, credentialHeaders: [] } });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      await destroySocketMidBody(gateway.url);
+
+      const requestLines = logSpy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("mcp_gateway_request"));
+      expect(requestLines).toHaveLength(1);
+      expect(JSON.parse(requestLines[0]) as Record<string, unknown>).toMatchObject({ prefix: "*", method: "POST" });
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+});
+
 describe("upstream resilience: timeout + circuit breaker", () => {
   it("returns 504 when the upstream hangs past the configured timeout", async () => {
     const hanging = await createHangingUpstream();
@@ -1719,5 +1879,158 @@ describe("upstream resilience: timeout + circuit breaker", () => {
       expect(res.status).toBe(200);
     }
     expect(gateway.state.breaker.stateOf("k8s-admin")).toBe("closed");
+  });
+});
+
+/**
+ * PEN-2370 ask 3 — a control that closes the class rather than the spelling.
+ *
+ * This module's recurring failure is not any one leak: it is that a SECOND
+ * path to the client keeps appearing beside the one that scrubs. The scrubber
+ * was wired into `writeResponse`, whose comment claimed it covered every
+ * response — while the aggregate `tools/list` reply, assembled by spreading
+ * upstream tool records, was written straight to the socket and reached agents
+ * unscrubbed. Six earlier fixes each closed the spelling an observer had
+ * probed; none made the next bypass fail.
+ *
+ * So the invariant is asserted against the source itself, and it is an
+ * allowlist of exactly one: a body may reach the client through `writeResponse`
+ * and nowhere else. Adding a body-bearing write anywhere in `server.ts` fails
+ * here, whether or not anyone remembers the scrubber exists.
+ *
+ * The scan is over the AST, not over source text, and it deliberately matches
+ * MORE than today's single call site. A text scan is a denylist of spellings —
+ * which is the exact failure mode this suite exists to close — and the first
+ * version of it was blind to three bypasses that all still leak:
+ *
+ *   - `res.end(\n  body,\n)` — the argument starts on the next line, so a
+ *     per-line regex never sees it.
+ *   - `response.end(body)` — same call, receiver renamed.
+ *   - `res.write(body)` — a body-bearing exit that is not `end` at all.
+ *
+ * So the predicate is: any call to a member named `end` or `write`, on any
+ * receiver, spelled with dot or bracket access, carrying at least one
+ * argument. That is broad on purpose. It fails CLOSED — a legitimate new
+ * `.write()` on some non-response object trips it and costs one reviewer a
+ * conversation, whereas a miss costs a fleet-wide credential leak — and the
+ * breadth is the point: the allowlist is "one exit", not "one spelling".
+ *
+ * A bodyless `res.end()` is not in scope: it carries nothing to disclose.
+ */
+
+/** A call that hands at least one argument to `.end()`/`.write()`. */
+interface BodyBearingWrite {
+  line: number;
+  text: string;
+  node: ts.CallExpression;
+}
+
+function parseServerSource(source: string): ts.SourceFile {
+  return ts.createSourceFile("server.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+}
+
+/** The member name being called, for `a.end()` and `a["end"]()` alike. */
+function calledMemberName(expression: ts.LeftHandSideExpression): string | null {
+  if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
+  if (ts.isElementAccessExpression(expression) && ts.isStringLiteralLike(expression.argumentExpression)) {
+    return expression.argumentExpression.text;
+  }
+  return null;
+}
+
+function findBodyBearingWrites(sourceFile: ts.SourceFile): BodyBearingWrite[] {
+  const found: BodyBearingWrite[] = [];
+
+  function visit(node: ts.Node): void {
+    if (ts.isCallExpression(node)) {
+      const member = calledMemberName(node.expression);
+      if ((member === "end" || member === "write") && node.arguments.length > 0) {
+        found.push({
+          line: sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1,
+          // Collapsed so a multiline call still reports as one readable line.
+          text: node.getText(sourceFile).replace(/\s+/g, " "),
+          node,
+        });
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return found;
+}
+
+/** The first call to a free function named `name` within `root`, if any. */
+function findCallTo(root: ts.Node, name: string): ts.CallExpression | null {
+  let found: ts.CallExpression | null = null;
+
+  function visit(node: ts.Node): void {
+    if (found) return;
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name) {
+      found = node;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(root);
+  return found;
+}
+
+describe("PEN-2370: response bodies have exactly one exit", () => {
+  const source = fs.readFileSync(new URL("./server.ts", import.meta.url), "utf8");
+  const sourceFile = parseServerSource(source);
+
+  it("writes a response body in exactly one place", () => {
+    const writes = findBodyBearingWrites(sourceFile);
+
+    expect(
+      writes.map(({ line, text }) => `${line}: ${text}`),
+      "every response body must leave through writeResponse, so that it passes the scrubber on the "
+        + "way out — see this suite's comment. If this is a legitimate non-response `.write()`/`.end()`, "
+        + "that judgement belongs in review, not in a widened regex.",
+    ).toHaveLength(1);
+  });
+
+  it("puts that one exit inside writeResponse, downstream of the scrubber", () => {
+    const writeResponse = sourceFile.statements.find(
+      (statement): statement is ts.FunctionDeclaration =>
+        ts.isFunctionDeclaration(statement) && statement.name?.text === "writeResponse",
+    );
+    expect(writeResponse, "writeResponse must exist for the single exit to live inside it").toBeDefined();
+
+    const [exit] = findBodyBearingWrites(sourceFile);
+    expect(exit, "there must be a body-bearing write to place").toBeDefined();
+
+    // Containment by source position: the exit is lexically inside writeResponse.
+    expect(exit!.node.getStart(sourceFile)).toBeGreaterThan(writeResponse!.getStart(sourceFile));
+    expect(exit!.node.getEnd()).toBeLessThan(writeResponse!.getEnd());
+
+    // ...and the scrubber runs ahead of it in the same function, so the value
+    // being written cannot be the unscrubbed one.
+    const scrub = findCallTo(writeResponse!, "scrubResponseBody");
+    expect(scrub, "writeResponse must call scrubResponseBody").not.toBeNull();
+    expect(scrub!.getStart(sourceFile)).toBeLessThan(exit!.node.getStart(sourceFile));
+  });
+
+  // Fixtures for the detector itself. Without these the guard could silently
+  // stop detecting anything — a scan that matches nothing also reports "one
+  // exit is fine" once the real call site drifts out of its predicate.
+  it("counts a body-bearing exit however it is spelled", () => {
+    const bypasses: Record<string, string> = {
+      "argument on the next line": "res.end(\n  body,\n);",
+      "receiver renamed": "response.end(body);",
+      "write instead of end": "res.write(body);",
+      "bracket access": 'res["end"](body);',
+      "chained off an expression": "getRes(req).end(body);",
+    };
+
+    for (const [label, snippet] of Object.entries(bypasses)) {
+      expect(findBodyBearingWrites(parseServerSource(snippet)), label).toHaveLength(1);
+    }
+  });
+
+  it("does not count a bodyless end, which carries nothing to disclose", () => {
+    expect(findBodyBearingWrites(parseServerSource("res.end();\nres.end();"))).toHaveLength(0);
   });
 });

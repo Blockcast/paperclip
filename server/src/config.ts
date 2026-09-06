@@ -97,6 +97,41 @@ export interface Config {
   prReconcilerIntervalMinutes: number;
   prReconcilerWindowDays: number;
   prReconcilerEnrichLoc: boolean;
+  // Stranded-blocked-issue reconciler (BLO-21523 phase 1): drains issues stuck
+  // `blocked` with zero unresolved blockers (last blocker cleared but `status`
+  // was never recomputed). Worker-tier only, same rationale as the PR reconciler.
+  strandedBlockedIssueReconcilerEnabled: boolean;
+  strandedRecoveryHandBackDrainEnabled: boolean;
+  strandedRecoveryHandBackMaxPerPass: number;
+  strandedRecoveryHandBackIntervalMinutes: number;
+  strandedBlockedIssueReconcilerIntervalMinutes: number;
+  // Isolation-workspace reaper (BLO-31222): removes aged per-execution-workspace
+  // scratch under `data/k8s-isolation/workspaces`, which had no retention path of
+  // any kind and reached 406.7 GiB on a CephFS volume that ran out of headroom.
+  // Worker-tier only. Opt-IN — it deletes irreversibly.
+  isolationWorkspaceReaperEnabled: boolean;
+  isolationWorkspaceReaperIntervalMinutes: number;
+  isolationWorkspaceReaperMaxAgeDays: number;
+  isolationWorkspaceReaperMaxDeletesPerTick: number;
+  isolationWorkspaceReaperDryRun: boolean;
+  // Human-gated ageing digest (BLO-29420): delivers the BLO-19130 ageing report
+  // to a durable, human-assigned issue refreshed in place each period. Worker-tier
+  // only, same rationale as the reconcilers above.
+  humanGatedDigestEnabled: boolean;
+  humanGatedDigestIntervalMinutes: number;
+  humanGatedDigestPeriodDays: number;
+  // Open-PR review-state reconciler (BLO-30259): persists pending review
+  // requests + reviews so the ageing digest producer can be a pure DB read.
+  // The producer runs under the digest's advisory lock and must not do network
+  // I/O, so the GitHub polling lives here on its own interval.
+  prReviewStateReconcilerEnabled: boolean;
+  prReviewStateReconcilerIntervalMinutes: number;
+  prReviewStateMaxPullRequestsPerRepo: number;
+  // Approval-gate reconciler (BLO-29359): closes board approval cards whose
+  // external GitHub gate has terminated, so an approver is never sent to a dead
+  // run. Worker-tier only, same rationale as the PR reconciler.
+  approvalGateReconcilerEnabled: boolean;
+  approvalGateReconcilerIntervalMinutes: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -113,6 +148,23 @@ export interface Config {
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  // Bounds stamped on newly-created wake_owner recovery actions. They remain
+  // attached to the action for its lifetime, so a later config change cannot
+  // extend a recovery attempt that has already started.
+  recoveryActionMaxAttempts: number;
+  recoveryActionTimeoutMs: number;
+  // BLO-24782: how long a monitor that has already fired (`status: "triggered"`)
+  // but has not been re-armed still counts as a live wake path. Past this bound
+  // the recovery sweep treats the issue as having no wake path and escalates it
+  // normally, which is what creates the `issue_recovery_actions` row that the
+  // BLO-19124 reaper then bounds.
+  //
+  // Deliberately a separate knob from `recoveryActionTimeoutMs` even though the
+  // defaults match: one bounds the lifetime of a recovery attempt that has
+  // started, the other bounds how long an un-re-armed watch is believed. They
+  // are independently choosable and collapsing them would make raising either
+  // one silently move the other.
+  lapsedMonitorGraceMs: number;
   // Process role for HA topology. When set to "api", the process serves
   // HTTP traffic only — no in-process plugin workers, no heartbeat
   // scheduler. When set to "worker", the process owns the heartbeat
@@ -160,6 +212,18 @@ export interface Config {
   // GitHub login of the PR-reviewer bot (the GitHub App's bot user, e.g.
   // "allyblockcast[bot]") used to filter reviews/comments during verification.
   prReviewerBotLogin: string;
+  // Capture is deployed one rollout before authority processing so every API
+  // replica durably records deliveries before any replica can activate the gate.
+  githubReviewGateCaptureEnabled: boolean;
+  // Repositories whose signed GitHub webhook deliveries drive review-gate
+  // revocation and reconciliation. Empty keeps capture disabled.
+  githubReviewGateEnabled: boolean;
+  githubReviewGateRepositories: string[];
+  // Deployment-pinned identity allowed to produce the protected status.
+  // These are deliberately separate from the mounted credential fields so a
+  // secret rotation cannot silently transfer review authority to another App.
+  githubReviewGateExpectedAppId: string;
+  githubReviewGateExpectedInstallationId: string;
   // Commit-status context to fail when a PR-review run exhausts its bounded
   // retry chain (e.g. "review/ally-complete"). A required status that is never
   // posted shows as "Expected — waiting for status" forever, so an exhausted
@@ -168,6 +232,16 @@ export interface Config {
   // the feature is opt-in per deployment because the context name belongs to
   // whoever owns the branch-protection rule, not to this server.
   prReviewGateStatusContext: string;
+  // Commit-status context for comment-shaped Ally findings. Empty by default:
+  // operators must opt in and make the context required in branch protection.
+  prCommentReviewGateStatusContext: string;
+  // Contexts this gate used to publish to and has since moved off. GitHub
+  // commit statuses have no delete, so a context left behind by a rename keeps
+  // showing its final write forever. After posting the live status the gate
+  // also writes each of these a retirement pointer, which supersedes the stale
+  // row in place and keeps any repo that still requires the old context
+  // satisfied (BLO-29711).
+  prCommentReviewGateRetiredStatusContexts: string[];
   telemetryEnabled: boolean;
 }
 
@@ -188,6 +262,301 @@ function detectTailnetBindHost(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Configured PR reviewer agents, purely env-derived (no config-file input).
+ *
+ * Split out of loadConfig() so callers on hot paths can read it without paying
+ * loadConfig()'s synchronous config-file read — the duplicate-PR-review issue
+ * guard consults this on every agent-assigned issue creation (BLO-20526).
+ */
+export function readGithubPrReviewerAgentIds(): string[] {
+  return [
+    ...new Set(
+      (
+        process.env.PAPERCLIP_PR_REVIEWER_AGENT_IDS ??
+        process.env.PAPERCLIP_PR_REVIEWER_AGENT_ID ??
+        ""
+      )
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+/**
+ * Largest delay `setTimeout`/`setInterval` accepts before Node coerces it.
+ *
+ * Above this, Node does *not* mean "never" — it emits `TimeoutOverflowWarning`
+ * and sets the duration to **1 ms**, turning a period into a hot loop. This is
+ * why every timer setting below needs an explicit ceiling and not merely a
+ * finiteness check: `2 ** 31 - 1` ms is ~24.8 days, so an ordinary
+ * minutes/milliseconds confusion reaches it with a finite value.
+ */
+export const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/** Ceiling shared by the minute-denominated timer periods (7d, well under the overflow). */
+const TIMER_PERIOD_MINUTES_MAX = 7 * 24 * 60;
+
+type NumericSettingBounds = {
+  /** Used when no candidate is usable. Clamped like any other value. */
+  fallback: number;
+  min: number;
+  max: number;
+};
+
+/**
+ * Bounds for every numeric env override in this file, in one table so the
+ * ceilings are reviewable together and a test can assert them without
+ * restating the numbers.
+ *
+ * BLO-27641. The previous idiom at each of these sites was
+ * `Math.max(FLOOR, Number(process.env.X) || DEFAULT)`, which looks doubly
+ * guarded and is not: `Number("Infinity")` is truthy so `|| DEFAULT` never
+ * fires, and `Math.max(FLOOR, Infinity)` is `Infinity`. The consequence splits
+ * two ways depending on the consumer, and the second is the non-obvious one:
+ *
+ *  - **Comparison bounds** (`recoveryActionTimeoutMs`, `recoveryActionMaxAttempts`,
+ *    the retention/window days) silently stop bounding. `recoveryActionTimeoutMs`
+ *    is worse than "very long": it feeds `new Date(now + timeoutMs)`, and an
+ *    infinite offset yields an *Invalid Date*, whose comparisons are all false —
+ *    so the BLO-19124 bound is not loosened but absent.
+ *  - **Timer periods** degrade to a 1 ms hot loop, not to "never" — see
+ *    `MAX_TIMER_DELAY_MS`. `PAPERCLIP_DB_BACKUP_INTERVAL_MINUTES=Infinity` would
+ *    schedule a database backup every millisecond: a self-inflicted outage
+ *    rather than a disabled feature.
+ */
+export const NUMERIC_SETTING_BOUNDS = {
+  databaseBackupIntervalMinutes: { fallback: 60, min: 1, max: TIMER_PERIOD_MINUTES_MAX },
+  databaseBackupRetentionDays: { fallback: 7, min: 1, max: 3650 },
+  prReconcilerIntervalMinutes: { fallback: 360, min: 1, max: TIMER_PERIOD_MINUTES_MAX },
+  prReconcilerWindowDays: { fallback: 21, min: 1, max: 365 },
+  strandedBlockedIssueReconcilerIntervalMinutes: {
+    fallback: 15,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
+  // BLO-31222. Daily is the right cadence: the cohort is defined in days, so a
+  // tighter interval re-scans the same tree for nothing. The age floor is 7 —
+  // below that a between-runs workspace looks reapable.
+  isolationWorkspaceReaperIntervalMinutes: {
+    fallback: 1440,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
+  isolationWorkspaceReaperMaxAgeDays: { fallback: 30, min: 7, max: 3650 },
+  isolationWorkspaceReaperMaxDeletesPerTick: { fallback: 200, min: 1, max: 10_000 },
+  // BLO-19123. Per-tick ceiling on how many *distinct* rows the hand-back drain returns.
+  //
+  // The pass already had two per-issue guards — max 2 hand-backs per source issue and a 6h
+  // source-scoped cooldown — but those bound how often a single row can bounce, not how many
+  // rows move in a tick. Volume was governed only by the candidate limit's 500 default, so
+  // the first tick after the drain flag flipped would have returned the entire backlog at
+  // once (89 rows on the CEO alone, ~360 estate-wide when the plan was written).
+  //
+  // The original justification for metering was destination load: a single pass would take the
+  // CTO from 369 open `todo` to 458, and at ~7.8 closures/day that is weeks of queue. That
+  // reasoning was checked against the implementation on 2026-09-01 and does **not** hold at flip
+  // time. The pass is ownership-only: it rewrites the owner on rows that are already `blocked`
+  // (`recovery/service.ts`, `status: "blocked"`) and enqueues no wake, so at the moment the flag
+  // flips it adds zero dispatchable work to any destination queue. The deferred load arrives
+  // later, spread across the natural blocker-resolution rate — which is the rate at which that
+  // work becomes real anyway.
+  //
+  // The meter is still correct, for a different and better reason: **blast-radius reversibility
+  // against a bug in the gates.** A mis-routing defect in the eligibility or evidence checks
+  // costs one bounded pass of rows, not the whole backlog. Do not read the collapse of the load
+  // argument as grounds to widen the count or shorten the interval — the reason changed, the
+  // requirement did not.
+  //
+  // Deferred rows are not lost. They are enumerated per row with reason
+  // `candidate_limit_deferred` and picked up on the next tick, so a low ceiling trades drain
+  // latency for observability rather than completeness. Ceiling is the service-side candidate
+  // default, which is the most this ever did before it was metered.
+  strandedRecoveryHandBackMaxPerPass: { fallback: 10, min: 1, max: 500 },
+  // BLO-19123. How often that bounded pass is allowed to run — the other half of the meter.
+  //
+  // The count above bounds one pass; this bounds the rate. They are only useful together: the
+  // drain rides the heartbeat tick (30s by default), so a count alone still returns ~90 rows
+  // in under five minutes, which is the bulk move the meter exists to prevent. At the 60m
+  // default, 10 rows/hour clears a ~90-row backlog over about nine passes.
+  //
+  // What those nine passes buy is a window to catch a *gate* defect — a row routed to the wrong
+  // owner by a bug in the eligibility or evidence checks — while it has cost one batch instead
+  // of the backlog. It is explicitly **not** about giving the destination queue time to absorb
+  // load; that premise was checked and dropped (see the count above). An earlier draft of this
+  // comment reasoned in "ticks" as if a tick were an observation interval: it is 30 seconds, so
+  // nine of them is 4.5 minutes — a bulk return with extra steps, not a rate anyone can watch.
+  // The hour is what makes the passes separable events.
+  //
+  // Floor of 1m rather than 0: "no delay" would silently restore the per-tick behaviour this
+  // setting exists to remove, and an operator who wants the drain faster should raise the
+  // count, where the blast radius of the change is legible.
+  strandedRecoveryHandBackIntervalMinutes: {
+    fallback: 60,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
+  humanGatedDigestIntervalMinutes: {
+    fallback: 360,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
+  humanGatedDigestPeriodDays: { fallback: 7, min: 1, max: 365 },
+  prReviewStateReconcilerIntervalMinutes: {
+    fallback: 360,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
+  prReviewStateMaxPullRequestsPerRepo: { fallback: 400, min: 1, max: 5000 },
+  approvalGateReconcilerIntervalMinutes: {
+    fallback: 10,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
+  heartbeatSchedulerIntervalMs: { fallback: 30_000, min: 10_000, max: 24 * 60 * 60_000 },
+  recoveryActionMaxAttempts: { fallback: 5, min: 1, max: 1_000 },
+  recoveryActionTimeoutMs: {
+    fallback: 6 * 60 * 60_000,
+    min: 60 * 60_000,
+    max: 7 * 24 * 60 * 60_000,
+  },
+  // BLO-24782. Floor well above a continuation run's turnaround: the BLO-16146
+  // race this grace exists to avoid is measured in seconds, so no operator
+  // setting may shrink it to where the sweep can beat a run that is legitimately
+  // about to re-arm. Ceiling is 28x the default and far past the worst lapse ever
+  // measured (~207h), so an override above it is asking for a bound that does not
+  // bound — and `Infinity` in particular would restore the unbounded belief this
+  // setting exists to remove, which `resolveNumericSetting` rejects outright.
+  lapsedMonitorGraceMs: {
+    fallback: 6 * 60 * 60_000,
+    min: 15 * 60_000,
+    max: 7 * 24 * 60 * 60_000,
+  },
+} as const satisfies Record<string, NumericSettingBounds>;
+
+/**
+ * The subset of the above consumed as a `setTimeout`/`setInterval` delay, with
+ * the factor converting each to milliseconds. Declared rather than inferred so
+ * the overflow invariant (`value * factor <= MAX_TIMER_DELAY_MS`) is checkable
+ * for the minute-denominated settings, whose ceiling is not in the timer's unit.
+ */
+export const TIMER_SETTING_MS_FACTOR = {
+  databaseBackupIntervalMinutes: 60_000,
+  prReconcilerIntervalMinutes: 60_000,
+  strandedBlockedIssueReconcilerIntervalMinutes: 60_000,
+  isolationWorkspaceReaperIntervalMinutes: 60_000,
+  // Minute-denominated like its neighbours, though it gates an elapsed-time comparison rather
+  // than a `setInterval` delay. Registered anyway: the guard that requires this entry keys off
+  // the name, and an unregistered minute setting is exactly the omission that guard exists to
+  // catch — being exempt on a technicality would make the next real one invisible too.
+  strandedRecoveryHandBackIntervalMinutes: 60_000,
+  humanGatedDigestIntervalMinutes: 60_000,
+  prReviewStateReconcilerIntervalMinutes: 60_000,
+  approvalGateReconcilerIntervalMinutes: 60_000,
+  heartbeatSchedulerIntervalMs: 1,
+} as const satisfies Partial<Record<keyof typeof NUMERIC_SETTING_BOUNDS, number>>;
+
+/**
+ * What the call sites actually supply: env vars (`string | undefined`) and
+ * file-config numbers. Narrower than `unknown` on purpose — `Number(true)` is
+ * `1` and `Number([5])` is `5`, so a boolean or single-element array in a
+ * config file would otherwise resolve to a plausible-looking interval instead
+ * of falling through to the documented default.
+ */
+export type NumericSettingCandidate = string | number | null | undefined;
+
+const numericSettingWarnings = new Set<string>();
+
+/**
+ * Test seam. The dedupe is deliberately process-global: an operator needs each
+ * adjustment reported once at startup, not once per `loadConfig()` call (which
+ * is un-memoized and re-invoked freely).
+ */
+export function resetNumericSettingWarnings(): void {
+  numericSettingWarnings.clear();
+}
+
+function warnNumericSettingAdjustment(name: string | undefined, message: string): void {
+  if (name === undefined) return;
+  const key = `${name}:${message}`;
+  if (numericSettingWarnings.has(key)) return;
+  numericSettingWarnings.add(key);
+  console.warn(`[config] ${name}: ${message}`);
+}
+
+/**
+ * Render a rejected candidate for the operator.
+ *
+ * `JSON.stringify` maps every non-finite number to the string `null`, which
+ * would make the reject warning unable to name the one input class it exists to
+ * report: a config file carrying an overflowing literal parses to the *number*
+ * `Infinity` (JSON has no `Infinity` token, but `JSON.parse("1e999")` yields
+ * one), and the warning would then read `ignoring override null` and send the
+ * operator looking for a literal `null` that is not in their file. Numbers are
+ * therefore rendered with `String`; everything else keeps `JSON.stringify` so
+ * the quoting still distinguishes the string `"abc"` from a bare number.
+ */
+function describeNumericCandidate(candidate: NumericSettingCandidate): string {
+  return typeof candidate === "number" ? String(candidate) : JSON.stringify(candidate);
+}
+
+/**
+ * Resolve the first usable candidate for a numeric setting, clamped to `[min, max]`.
+ *
+ * A candidate is usable only when it is finite and positive. Unusable
+ * candidates fall through to the next one — matching the old `Number(x) || y`
+ * chain, so a configured file-level fallback still wins over a bad env var —
+ * and non-finite input therefore lands on the documented default rather than
+ * being clamped to the ceiling. That distinction is deliberate: clamping
+ * `Infinity` to `max` would silently read as an operator asking for the maximum,
+ * where falling back keeps the startup banner honest about what is in effect.
+ *
+ * Two intentional behaviour changes, both of which an operator should audit on
+ * upgrade — the second one affects input that was previously honoured verbatim:
+ *
+ *  1. A negative override used to survive `||` and get pulled up to the floor;
+ *     it now falls back to the default instead.
+ *  2. A *finite* override above the new ceiling is now clamped down to it. The
+ *     clamps plausibly reachable in an existing deployment are:
+ *       - `HEARTBEAT_SCHEDULER_INTERVAL_MS=172800000` (48h) → `86400000` (24h)
+ *       - `PAPERCLIP_PR_RECONCILER_WINDOW_DAYS=730` → `365`
+ *       - `PAPERCLIP_DB_BACKUP_RETENTION_DAYS=7300` → `3650`, which *shortens*
+ *         retention, so the next prune deletes backups the operator asked to keep.
+ *
+ * Both are reported through `warnNumericSettingAdjustment` when `name` is
+ * supplied, because the startup banner prints only the post-clamp number and so
+ * cannot distinguish "operator asked for 365" from "operator asked for 730".
+ */
+export function resolveNumericSetting(
+  candidates: readonly NumericSettingCandidate[],
+  { fallback, min, max }: NumericSettingBounds,
+  name?: string,
+): number {
+  for (const candidate of candidates) {
+    if (candidate === undefined || candidate === null || candidate === "") continue;
+    const parsed = Number(candidate);
+    // Rejects NaN (unparseable), ±Infinity (including overflow literals such as
+    // "1e999"), and anything non-positive.
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      warnNumericSettingAdjustment(
+        name,
+        `ignoring override ${describeNumericCandidate(candidate)} — not a finite positive number`,
+      );
+      continue;
+    }
+    const resolved = Math.min(max, Math.max(min, parsed));
+    if (resolved !== parsed) {
+      warnNumericSettingAdjustment(
+        name,
+        `override ${parsed} is outside [${min}, ${max}] and was clamped to ${resolved}`,
+      );
+    }
+    return resolved;
+  }
+  return Math.min(max, Math.max(min, fallback));
 }
 
 export function loadConfig(): Config {
@@ -340,17 +709,15 @@ export function loadConfig(): Config {
     process.env.PAPERCLIP_DB_BACKUP_ENABLED !== undefined
       ? process.env.PAPERCLIP_DB_BACKUP_ENABLED === "true"
       : (fileDatabaseBackup?.enabled ?? true);
-  const databaseBackupIntervalMinutes = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_DB_BACKUP_INTERVAL_MINUTES) ||
-      fileDatabaseBackup?.intervalMinutes ||
-      60,
+  const databaseBackupIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_DB_BACKUP_INTERVAL_MINUTES, fileDatabaseBackup?.intervalMinutes],
+    NUMERIC_SETTING_BOUNDS.databaseBackupIntervalMinutes,
+    "databaseBackupIntervalMinutes",
   );
-  const databaseBackupRetentionDays = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_DB_BACKUP_RETENTION_DAYS) ||
-      fileDatabaseBackup?.retentionDays ||
-      7,
+  const databaseBackupRetentionDays = resolveNumericSetting(
+    [process.env.PAPERCLIP_DB_BACKUP_RETENTION_DAYS, fileDatabaseBackup?.retentionDays],
+    NUMERIC_SETTING_BOUNDS.databaseBackupRetentionDays,
+    "databaseBackupRetentionDays",
   );
   const databaseBackupDir = resolveHomeAwarePath(
     process.env.PAPERCLIP_DB_BACKUP_DIR ??
@@ -365,18 +732,132 @@ export function loadConfig(): Config {
     process.env.PAPERCLIP_PR_RECONCILER_ENABLED !== undefined
       ? process.env.PAPERCLIP_PR_RECONCILER_ENABLED === "true"
       : true;
-  const prReconcilerIntervalMinutes = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_PR_RECONCILER_INTERVAL_MINUTES) || 360,
+  const prReconcilerIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_PR_RECONCILER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.prReconcilerIntervalMinutes,
+    "prReconcilerIntervalMinutes",
   );
-  const prReconcilerWindowDays = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_PR_RECONCILER_WINDOW_DAYS) || 21,
+  const prReconcilerWindowDays = resolveNumericSetting(
+    [process.env.PAPERCLIP_PR_RECONCILER_WINDOW_DAYS],
+    NUMERIC_SETTING_BOUNDS.prReconcilerWindowDays,
+    "prReconcilerWindowDays",
   );
   const prReconcilerEnrichLoc =
     process.env.PAPERCLIP_PR_RECONCILER_ENRICH_LOC !== undefined
       ? process.env.PAPERCLIP_PR_RECONCILER_ENRICH_LOC === "true"
       : true;
+  // Stranded-blocked-issue reconciler (BLO-21523). Enabled by default: leaving
+  // an issue permanently `blocked` after its last blocker clears is a silent
+  // dispatch-reliability defect, not an opt-in feature. 15m default interval —
+  // the backlog is small and re-checking is cheap (a guarded UPDATE that only
+  // matches rows still `blocked` with zero unresolved blockers).
+  const strandedBlockedIssueReconcilerEnabled =
+    process.env.PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_ENABLED !== undefined
+      ? process.env.PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_ENABLED === "true"
+      : true;
+  const strandedBlockedIssueReconcilerIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.strandedBlockedIssueReconcilerIntervalMinutes,
+    "strandedBlockedIssueReconcilerIntervalMinutes",
+  );
+
+  // BLO-31222. Opt-IN, like `strandedRecoveryHandBack` and unlike the
+  // reconcilers above: this removes directory trees irreversibly. Shipping it
+  // dark keeps "deploy the code" and "delete a month of workspaces" as two
+  // separate decisions, with a run in between to inspect what the predicate
+  // matched. `..._DRY_RUN=true` performs that inspection without deleting.
+  const isolationWorkspaceReaperEnabled =
+    process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_ENABLED === "true";
+  const isolationWorkspaceReaperDryRun =
+    process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_DRY_RUN === "true";
+  const isolationWorkspaceReaperIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.isolationWorkspaceReaperIntervalMinutes,
+    "isolationWorkspaceReaperIntervalMinutes",
+  );
+  const isolationWorkspaceReaperMaxAgeDays = resolveNumericSetting(
+    [process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_AGE_DAYS],
+    NUMERIC_SETTING_BOUNDS.isolationWorkspaceReaperMaxAgeDays,
+    "isolationWorkspaceReaperMaxAgeDays",
+  );
+  const isolationWorkspaceReaperMaxDeletesPerTick = resolveNumericSetting(
+    [process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_DELETES_PER_TICK],
+    NUMERIC_SETTING_BOUNDS.isolationWorkspaceReaperMaxDeletesPerTick,
+    "isolationWorkspaceReaperMaxDeletesPerTick",
+  );
+  // BLO-19123. Opt-IN, unlike its sibling reconcilers above, and deliberately so: this pass
+  // reassigns real in-flight work in bulk (~360 rows at the time of writing). Defaulting it
+  // on would make "deploy the code" and "perform the data move" the same irreversible act,
+  // with no run in between to re-derive the inventory the plan requires. Shipping it dark
+  // keeps those two decisions separate — enabling the flag is the drain.
+  const strandedRecoveryHandBackDrainEnabled =
+    process.env.PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_DRAIN_ENABLED === "true";
+  // The rate, separate from the on/off above so it can be tuned without a second deploy:
+  // the flag decides *whether* rows return, this decides *how fast*. See the bound's
+  // rationale in NUMERIC_SETTING_BOUNDS.
+  const strandedRecoveryHandBackMaxPerPass = resolveNumericSetting(
+    [process.env.PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_MAX_PER_PASS],
+    NUMERIC_SETTING_BOUNDS.strandedRecoveryHandBackMaxPerPass,
+    "strandedRecoveryHandBackMaxPerPass",
+  );
+  const strandedRecoveryHandBackIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.strandedRecoveryHandBackIntervalMinutes,
+    "strandedRecoveryHandBackIntervalMinutes",
+  );
+  // Human-gated ageing digest (BLO-29420). Enabled by default, consistent with
+  // the reconcilers above: BLO-19130's escalation shipped inert and never fired
+  // once, so an opt-in flag would just be a second way to stay silent. The sweep
+  // maintains exactly one durable row per company and rewrites nothing when the
+  // rendered body is unchanged, so a default-on tick is close to free.
+  //
+  // Interval (6h) is deliberately shorter than the period (7d): the period
+  // decides what the digest *reports*, the interval decides how quickly a closed
+  // or stale row is repaired. Refreshes are in-place description writes, so a
+  // shorter interval costs no extra notifications.
+  const humanGatedDigestEnabled =
+    process.env.PAPERCLIP_HUMAN_GATED_DIGEST_ENABLED !== undefined
+      ? process.env.PAPERCLIP_HUMAN_GATED_DIGEST_ENABLED === "true"
+      : true;
+  const humanGatedDigestIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_HUMAN_GATED_DIGEST_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.humanGatedDigestIntervalMinutes,
+    "humanGatedDigestIntervalMinutes",
+  );
+  const humanGatedDigestPeriodDays = resolveNumericSetting(
+    [process.env.PAPERCLIP_HUMAN_GATED_DIGEST_PERIOD_DAYS],
+    NUMERIC_SETTING_BOUNDS.humanGatedDigestPeriodDays,
+    "humanGatedDigestPeriodDays",
+  );
+  const prReviewStateReconcilerEnabled =
+    process.env.PAPERCLIP_PR_REVIEW_STATE_RECONCILER_ENABLED !== undefined
+      ? process.env.PAPERCLIP_PR_REVIEW_STATE_RECONCILER_ENABLED === "true"
+      : true;
+  const prReviewStateReconcilerIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_PR_REVIEW_STATE_RECONCILER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.prReviewStateReconcilerIntervalMinutes,
+    "prReviewStateReconcilerIntervalMinutes",
+  );
+  const prReviewStateMaxPullRequestsPerRepo = resolveNumericSetting(
+    [process.env.PAPERCLIP_PR_REVIEW_STATE_MAX_PULL_REQUESTS_PER_REPO],
+    NUMERIC_SETTING_BOUNDS.prReviewStateMaxPullRequestsPerRepo,
+    "prReviewStateMaxPullRequestsPerRepo",
+  );
+  const approvalGateReconcilerEnabled =
+    process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_ENABLED !== undefined
+      ? process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_ENABLED === "true"
+      : true;
+  // 10 minutes: the cost of a stale card is an approver walking to a dead gate, and
+  // the observed gate lifetimes that produced this defect were hours, not minutes.
+  // Each sweep costs one GitHub REST call per pending gate card, so the population
+  // (pending cards carrying a gate) bounds the rate-limit exposure, not the cadence.
+  // That accounting is what makes an unbounded period dangerous here rather than
+  // merely wrong: the 1 ms coercion turns the per-card cost into a REST flood.
+  const approvalGateReconcilerIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.approvalGateReconcilerIntervalMinutes,
+    "approvalGateReconcilerIntervalMinutes",
+  );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -395,6 +876,60 @@ export function loadConfig(): Config {
   });
   if (resolvedBind.errors.length > 0) {
     throw new Error(resolvedBind.errors[0]);
+  }
+
+  const githubWebhookSecret = process.env.GITHUB_WEBHOOK_SECRET ?? "";
+  const githubAppId = process.env.GITHUB_APP_ID ?? "";
+  const githubAppInstallationId = process.env.GITHUB_APP_INSTALLATION_ID ?? "";
+  const githubAppPrivateKey = (process.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n");
+  const githubReviewGateCaptureEnabled =
+    process.env.PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED === "true";
+  const githubReviewGateEnabled = process.env.PAPERCLIP_GITHUB_REVIEW_GATE_ENABLED === "true";
+  const githubReviewGateRepositories = [
+    ...new Set(
+      (process.env.PAPERCLIP_GITHUB_REVIEW_GATE_REPOSITORIES ?? "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean),
+    ),
+  ];
+  const githubReviewGateExpectedAppId = (
+    process.env.PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_APP_ID ?? ""
+  ).trim();
+  const githubReviewGateExpectedInstallationId = (
+    process.env.PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_INSTALLATION_ID ?? ""
+  ).trim();
+  const prReviewGateStatusContext = (process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT ?? "").trim();
+  if (githubReviewGateCaptureEnabled) {
+    const missing = [
+      ["GITHUB_WEBHOOK_SECRET", githubWebhookSecret.trim()],
+      ["PAPERCLIP_GITHUB_REVIEW_GATE_REPOSITORIES", githubReviewGateRepositories.join(",")],
+      ["PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_APP_ID", githubReviewGateExpectedAppId],
+      ["PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_INSTALLATION_ID", githubReviewGateExpectedInstallationId],
+      ["PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT", prReviewGateStatusContext],
+    ].filter(([, value]) => !value).map(([name]) => name);
+    if (missing.length > 0) {
+      throw new Error(`GitHub review-gate capture is enabled but missing: ${missing.join(", ")}`);
+    }
+  }
+  if (githubReviewGateEnabled) {
+    if (!githubReviewGateCaptureEnabled) {
+      throw new Error("GitHub review-gate authority requires durable capture to be enabled");
+    }
+    const missing = [
+      ["GITHUB_APP_ID", githubAppId.trim()],
+      ["GITHUB_APP_INSTALLATION_ID", githubAppInstallationId.trim()],
+      ["GITHUB_APP_PRIVATE_KEY", githubAppPrivateKey.trim()],
+    ].filter(([, value]) => !value).map(([name]) => name);
+    if (missing.length > 0) {
+      throw new Error(`GitHub review-gate authority is enabled but missing: ${missing.join(", ")}`);
+    }
+    if (
+      githubAppId.trim() !== githubReviewGateExpectedAppId ||
+      githubAppInstallationId.trim() !== githubReviewGateExpectedInstallationId
+    ) {
+      throw new Error("GitHub review-gate runtime credentials do not match the pinned App authority");
+    }
   }
 
   return {
@@ -421,6 +956,24 @@ export function loadConfig(): Config {
     prReconcilerIntervalMinutes,
     prReconcilerWindowDays,
     prReconcilerEnrichLoc,
+    strandedBlockedIssueReconcilerEnabled,
+    strandedRecoveryHandBackDrainEnabled,
+    strandedRecoveryHandBackMaxPerPass,
+    strandedRecoveryHandBackIntervalMinutes,
+    strandedBlockedIssueReconcilerIntervalMinutes,
+    isolationWorkspaceReaperEnabled,
+    isolationWorkspaceReaperIntervalMinutes,
+    isolationWorkspaceReaperMaxAgeDays,
+    isolationWorkspaceReaperMaxDeletesPerTick,
+    isolationWorkspaceReaperDryRun,
+    humanGatedDigestEnabled,
+    humanGatedDigestIntervalMinutes,
+    humanGatedDigestPeriodDays,
+    prReviewStateReconcilerEnabled,
+    prReviewStateReconcilerIntervalMinutes,
+    prReviewStateMaxPullRequestsPerRepo,
+    approvalGateReconcilerEnabled,
+    approvalGateReconcilerIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
     serveUi:
@@ -451,7 +1004,28 @@ export function loadConfig(): Config {
       paperclipNodeRole === "api"
         ? false
         : process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
-    heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    heartbeatSchedulerIntervalMs: resolveNumericSetting(
+      [process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS],
+      NUMERIC_SETTING_BOUNDS.heartbeatSchedulerIntervalMs,
+      "heartbeatSchedulerIntervalMs",
+    ),
+    // Preserve the existing wake-owner budget and six-hour horizon unless an
+    // operator explicitly opts into new bounds through the configurable settings.
+    recoveryActionMaxAttempts: resolveNumericSetting(
+      [process.env.RECOVERY_ACTION_MAX_ATTEMPTS],
+      NUMERIC_SETTING_BOUNDS.recoveryActionMaxAttempts,
+      "recoveryActionMaxAttempts",
+    ),
+    recoveryActionTimeoutMs: resolveNumericSetting(
+      [process.env.RECOVERY_ACTION_TIMEOUT_MS],
+      NUMERIC_SETTING_BOUNDS.recoveryActionTimeoutMs,
+      "recoveryActionTimeoutMs",
+    ),
+    lapsedMonitorGraceMs: resolveNumericSetting(
+      [process.env.LAPSED_MONITOR_GRACE_MS],
+      NUMERIC_SETTING_BOUNDS.lapsedMonitorGraceMs,
+      "lapsedMonitorGraceMs",
+    ),
     paperclipNodeRole,
     paperclipWorkersInternalUrl:
       process.env.PAPERCLIP_WORKERS_INTERNAL_URL?.trim().replace(/\/+$/, "") || null,
@@ -461,7 +1035,7 @@ export function loadConfig(): Config {
     linearOAuthRedirectUri:
       process.env.PAPERCLIP_LINEAR_REDIRECT_URI ??
       `http://localhost:${Number(process.env.PORT) || fileConfig?.server.port || 3100}/api/auth/linear/callback`,
-    githubWebhookSecret: process.env.GITHUB_WEBHOOK_SECRET ?? "",
+    githubWebhookSecret,
     // Agent IDs that receive additional wakes on `pull_request.opened`,
     // `pull_request.ready_for_review`, and `pull_request_review.submitted`
     // events to drive PR review automation. When unset, the github-webhook
@@ -470,28 +1044,31 @@ export function loadConfig(): Config {
     // identifier, so PRs without a BLO-XXX in the branch/title/body still
     // get reviewed. The plural CSV setting takes precedence; the singular
     // setting remains supported for existing deployments.
-    githubPrReviewerAgentIds: [
-      ...new Set(
-        (
-          process.env.PAPERCLIP_PR_REVIEWER_AGENT_IDS ??
-          process.env.PAPERCLIP_PR_REVIEWER_AGENT_ID ??
-          ""
-        )
-          .split(",")
-          .map((value) => value.trim())
-          .filter(Boolean),
-      ),
-    ],
+    githubPrReviewerAgentIds: readGithubPrReviewerAgentIds(),
     githubDependabotAgentId: process.env.PAPERCLIP_DEPENDABOT_AGENT_ID ?? "",
     githubDependabotMinSeverity: process.env.PAPERCLIP_DEPENDABOT_MIN_SEVERITY ?? "high",
     // GitHub App creds for server-side installation-token minting (PR-review
     // evidence verification). `private_key.pem` may arrive with escaped "\n"
     // depending on how it is injected, so normalize them to real newlines.
-    githubAppId: process.env.GITHUB_APP_ID ?? "",
-    githubAppInstallationId: process.env.GITHUB_APP_INSTALLATION_ID ?? "",
-    githubAppPrivateKey: (process.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n"),
+    githubAppId,
+    githubAppInstallationId,
+    githubAppPrivateKey,
     prReviewerBotLogin: process.env.PAPERCLIP_PR_REVIEWER_BOT_LOGIN ?? "allyblockcast[bot]",
-    prReviewGateStatusContext: (process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT ?? "").trim(),
+    prCommentReviewGateStatusContext: (process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT ?? "").trim(),
+    githubReviewGateCaptureEnabled,
+    githubReviewGateEnabled,
+    githubReviewGateRepositories,
+    githubReviewGateExpectedAppId,
+    githubReviewGateExpectedInstallationId,
+    prReviewGateStatusContext,
+    prCommentReviewGateRetiredStatusContexts: [
+      ...new Set(
+        (process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_RETIRED_STATUS_CONTEXTS ?? "")
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean),
+      ),
+    ],
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };
 }

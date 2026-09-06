@@ -36,7 +36,7 @@ function makeDb(overrides: Record<string, unknown> = {}) {
 
   const thenableChain = Object.assign(Promise.resolve([]), selectChain);
 
-  return {
+  const db = {
     select: vi.fn().mockReturnValue(thenableChain),
     insert: vi.fn().mockReturnValue({
       values: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([]) }),
@@ -45,6 +45,10 @@ function makeDb(overrides: Record<string, unknown> = {}) {
       set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([]) }),
     }),
     ...overrides,
+  };
+  return {
+    ...db,
+    transaction: vi.fn(async (callback) => callback(db)),
   };
 }
 
@@ -376,7 +380,17 @@ describe("cost routes", () => {
       .send({ budgetMonthlyCents: 2500 });
 
     expect(res.status).toBe(200);
-    expect(mockAgentService.update).toHaveBeenCalledWith("agent-1", { budgetMonthlyCents: 2500 });
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      "agent-1",
+      { budgetMonthlyCents: 2500 },
+      {
+        recordRevision: {
+          createdByAgentId: null,
+          createdByUserId: "board-user",
+          source: "budgets-patch",
+        },
+      },
+    );
     expect(mockBudgetService.upsertPolicy).toHaveBeenCalledWith(
       "company-1",
       {

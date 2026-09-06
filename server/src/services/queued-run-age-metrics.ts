@@ -1,0 +1,207 @@
+import { and, eq, isNotNull, lt, sql } from "drizzle-orm";
+import type { Db } from "@paperclipai/db";
+import { agents, heartbeatRuns } from "@paperclipai/db";
+import {
+  setOverdueScheduledRetryAgeMetrics,
+  setOverdueScheduledRetryAgeMetricsRefreshSuccess,
+  setQueuedRunAgeMetricsRefreshSuccess,
+  setQueuedRunOldestAgeMetrics,
+  setScheduledRetryParkHorizonMetrics,
+  setScheduledRetryParkHorizonRefreshSuccess,
+} from "./metrics.js";
+
+/**
+ * Refresh the per-agent oldest-`queued`-run-age gauge (BLO-21116). Recomputed
+ * live on every scrape from a MIN(coalesce(queued_at, created_at)) aggregate over `heartbeatRuns`
+ * status='queued', the same "compute on scrape, never trust a stale cache"
+ * shape as {@link refreshExternalRuntimeReservationMetrics}. `heartbeatRuns`
+ * is the correct table for this: a `queued` row is a run Paperclip has
+ * already decided to dispatch and is waiting on a concurrency slot or the
+ * scheduler tick to pick it up, which is exactly the "invisible strand" this
+ * issue reports -- not a run that failed to enqueue in the first place.
+ *
+ * Ages off `coalesce(queued_at, created_at)`, not bare `created_at` (Ally
+ * review, onprem-k8s#2013): `queued_at` is null for a fresh `queued` insert,
+ * where `created_at` already IS the queue-entry time, but gets stamped with
+ * `now()` by the specific transitions that put an *existing* row back into
+ * `queued` after it was something else (`promoteScheduledRetryRun`,
+ * `deferRunForK8sIsolationConflict`). Without the coalesce target, a run
+ * promoted after hours in `scheduled_retry` backoff would instantly report
+ * that entire backoff as queued-dispatch wait -- the false-stranded-run alert
+ * this gauge exists to prevent.
+ *
+ * Queries every agent id (not just ones with an active company/heartbeat
+ * enabled) so a genuinely idle agent reads back an explicit 0 rather than an
+ * absent series -- an absent series and "nothing stuck" render identically on
+ * a dashboard, which is exactly the failure mode BLO-21092 already named for
+ * a sibling gauge.
+ */
+export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Promise<void> {
+  try {
+    const [agentRows, oldestByAgent] = await Promise.all([
+      db.select({ id: agents.id }).from(agents),
+      // Keep this predicate in the same simple form as the queue-only age
+      // index from migration 0217 so scrapes never scan heartbeat history.
+      db
+        .select({
+          agentId: heartbeatRuns.agentId,
+          oldestQueuedAt: sql<Date | string | null>`min(coalesce(${heartbeatRuns.queuedAt}, ${heartbeatRuns.createdAt}))`,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.status, "queued"))
+        .groupBy(heartbeatRuns.agentId),
+    ]);
+
+    const knownAgentIds = new Set(agentRows.map((row) => row.id));
+    const entries = oldestByAgent
+      .filter((row) => row.agentId !== null && row.oldestQueuedAt)
+      .map((row) => ({
+        agentId: row.agentId,
+        ageSeconds: Math.max(0, (now.getTime() - new Date(row.oldestQueuedAt as Date | string).getTime()) / 1000),
+      }));
+
+    setQueuedRunOldestAgeMetrics(entries, knownAgentIds);
+    setQueuedRunAgeMetricsRefreshSuccess(true);
+  } catch (error) {
+    // Do not replace the last age snapshot with synthetic zeros: that would
+    // hide a real strand. The companion freshness gauge makes the stale data
+    // ineligible for the stranded-run alert and pages its own failure alert.
+    setQueuedRunAgeMetricsRefreshSuccess(false);
+    throw error;
+  }
+}
+
+/**
+ * Refresh the per-agent oldest-overdue-`scheduled_retry`-row-age gauge
+ * (BLO-22094). {@link refreshQueuedRunAgeMetrics} above only ever sees
+ * `status='queued'` rows -- a parked retry is `status: "scheduled_retry"`, a
+ * distinct value, so it never enters that aggregate at any age. That
+ * exclusion is intentional (it is what stops a promoted retry from replaying
+ * its whole backoff as queued-dispatch wait, onprem-k8s#2013), but it leaves
+ * a retry that is parked and never promoted invisible to any gauge, forever
+ * -- the exact gap this metric closes.
+ *
+ * Ages off `scheduled_retry_at`, not `created_at`: a parked row's `due` time
+ * is what a wedged promotion path fails to act on, and that is what an
+ * on-call reader needs to see overrun. Only rows already past due
+ * (`scheduled_retry_at < now`) count -- a run still backing off toward a
+ * future due time is working as designed and must contribute nothing, or
+ * this gauge would page on ordinary retry backoff instead of a stuck
+ * promotion sweep.
+ *
+ * Same "query every agent id, reset-then-set" shape as
+ * {@link refreshQueuedRunAgeMetrics} so an agent with no overdue parked row
+ * reads back an explicit 0 rather than an absent series.
+ *
+ * Failure handling mirrors the sibling, and matters more here (Ally review,
+ * #1184): the reset-then-set only runs on the success path, so a throw leaves
+ * the previous per-agent values frozen while `/metrics` still returns 200.
+ * The frozen value is almost always `0` -- the healthy reading -- so without
+ * the companion freshness gauge a dead refresh is indistinguishable from a
+ * quiet fleet, which is the exact invisible-failure mode this detector exists
+ * to eliminate.
+ */
+export async function refreshOverdueScheduledRetryAgeMetrics(db: Db, now = new Date()): Promise<void> {
+  try {
+    const [agentRows, oldestByAgent] = await Promise.all([
+      db.select({ id: agents.id }).from(agents),
+      db
+        .select({
+          agentId: heartbeatRuns.agentId,
+          oldestDueAt: sql<Date | string | null>`min(${heartbeatRuns.scheduledRetryAt})`,
+        })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.status, "scheduled_retry"), lt(heartbeatRuns.scheduledRetryAt, now)))
+        .groupBy(heartbeatRuns.agentId),
+    ]);
+
+    const knownAgentIds = new Set(agentRows.map((row) => row.id));
+    const entries = oldestByAgent
+      .filter((row) => row.agentId !== null && row.oldestDueAt)
+      .map((row) => ({
+        agentId: row.agentId,
+        ageSeconds: Math.max(0, (now.getTime() - new Date(row.oldestDueAt as Date | string).getTime()) / 1000),
+      }));
+
+    setOverdueScheduledRetryAgeMetrics(entries, knownAgentIds);
+    setOverdueScheduledRetryAgeMetricsRefreshSuccess(true);
+  } catch (error) {
+    // Do not zero the gauge here: synthetic zeros would read as "no overdue
+    // parked rows", the healthy state, and hide a real wedge. Leave the last
+    // snapshot in place and let the freshness gauge disqualify it -- the alert
+    // is gated on that gauge, and its own refresh-failed alert pages instead.
+    setOverdueScheduledRetryAgeMetricsRefreshSuccess(false);
+    throw error;
+  }
+}
+
+/**
+ * Refresh the per-agent maximum booked `scheduled_retry` park horizon
+ * (BLO-25036). Unlike the overdue sibling above, this measures the selected
+ * due time itself, including future due times, so it catches an implausibly
+ * distant retry before the run becomes overdue.
+ *
+ * The subtrahend is `updated_at`, NOT `created_at` (BLO-31174). A park is
+ * re-decided IN PLACE: both re-park paths in `heartbeat.ts` UPDATE the same row
+ * with `scheduledRetryAt = now + backoff`, a bumped `scheduledRetryAttempt`, and
+ * `updatedAt = now`, while `created_at` stays pinned at the FIRST park. Measured
+ * against `created_at` the gauge therefore reports how long a row has been
+ * re-parking rather than how far out any decision booked: it climbs by one
+ * backoff interval per re-check, without bound, and crosses a 5400s threshold
+ * after ~2 re-checks no matter how sane each individual booking was. That is a
+ * breach guaranteed by construction rather than a diagnostic one, and no
+ * threshold value fixes it — 9 agents were firing this way on 2026-09-03, all
+ * of them booking a correct ~1h `dependency_blocked` backoff.
+ *
+ * `updated_at` is bumped at exactly the moment the due time is chosen, so the
+ * difference recovers the booked interval itself — which is the quantity the
+ * alert is named for and the one its body tells the responder to inspect. A
+ * fresh park writes `updated_at == created_at`, so single-shot parks (including
+ * the 518,000s capacity park that motivated BLO-25036) read identically to
+ * before and the detector keeps its original sensitivity.
+ *
+ * Known limit: a writer that touches a still-parked row without re-deciding the
+ * due time also bumps `updated_at`. The paths known today are
+ * `coalesceGithubReviewDelivery` and the run-liveness backfill in
+ * `services/activity.ts`, whose update guards only on `id` +
+ * `isNull(liveness_state)` while its row selector admits parked rows
+ * (`status not in ('queued', 'running')`); that one is one-shot per run, since
+ * `classifyRunLiveness` always sets a non-null state. This is the set known
+ * today, not a proof that no other writer exists. Either way the reading
+ * degrades to the REMAINING horizon rather than zeroing it, so an implausibly
+ * distant park stays far above threshold and is still caught; it is a mild
+ * understatement, not a blind spot.
+ *
+ * `queued_at` represents a later promotion back to queued and must not be used.
+ */
+export async function refreshScheduledRetryParkHorizonMetrics(db: Db): Promise<void> {
+  try {
+    const [agentRows, horizonByAgent] = await Promise.all([
+      db.select({ id: agents.id }).from(agents),
+      db
+        .select({
+          agentId: heartbeatRuns.agentId,
+          horizonSeconds: sql<number | string>`max(extract(epoch from ${heartbeatRuns.scheduledRetryAt} - ${heartbeatRuns.updatedAt}))`,
+        })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.status, "scheduled_retry"), isNotNull(heartbeatRuns.scheduledRetryAt)))
+        .groupBy(heartbeatRuns.agentId),
+    ]);
+
+    const knownAgentIds = new Set(agentRows.map((row) => row.id));
+    setScheduledRetryParkHorizonMetrics(
+      horizonByAgent.map((row) => ({
+        agentId: row.agentId,
+        // Clamp as the overdue sibling does: a row whose due time has already
+        // passed can be touched again (see the known limit above), which would
+        // otherwise surface a negative horizon. Lateness is BLO-22094's gauge.
+        horizonSeconds: Math.max(0, Number(row.horizonSeconds)),
+      })),
+      knownAgentIds,
+    );
+    setScheduledRetryParkHorizonRefreshSuccess(true);
+  } catch (error) {
+    setScheduledRetryParkHorizonRefreshSuccess(false);
+    throw error;
+  }
+}

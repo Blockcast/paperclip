@@ -986,31 +986,44 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     run: { id: runId, source: "on_demand" },
     context,
   };
-  const renderedBootstrapPrompt =
-    !sessionId && bootstrapPromptTemplate.trim().length > 0
-      ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
-      : "";
-  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(sessionId) });
-  const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
-  const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
-    ? ""
-    : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const taskContextNote = asString(context.paperclipTaskMarkdown, "").trim();
-  const prompt = joinPromptSections([
-    renderedBootstrapPrompt,
-    wakePrompt,
-    sessionHandoffNote,
-    taskContextNote,
-    renderedPrompt,
-  ]);
-  const promptMetrics = {
-    promptChars: prompt.length,
-    bootstrapPromptChars: renderedBootstrapPrompt.length,
-    wakePromptChars: wakePrompt.length,
-    sessionHandoffChars: sessionHandoffNote.length,
-    taskContextChars: taskContextNote.length,
-    heartbeatPromptChars: renderedPrompt.length,
+  // Renders the stdin prompt for a single attempt, keyed on the session id that
+  // attempt will actually resume (or null when it starts a fresh session). This
+  // must be re-derived per attempt rather than computed once: both fresh-session
+  // fallbacks below (BLO-22497) call runAttempt(null) after a resume attempt
+  // fails — the session-unavailable/poisoned retry and the ccrotate rotation
+  // retry — and each is a genuinely new session. It needs fresh-session
+  // semantics (bootstrap prompt, resumedSession: false, full task-context
+  // prompt), not the resume-delta prompt built for the original sessionId.
+  const buildAttemptPrompt = (effectiveSessionId: string | null) => {
+    const renderedBootstrapPrompt =
+      !effectiveSessionId && bootstrapPromptTemplate.trim().length > 0
+        ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
+        : "";
+    const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+      resumedSession: Boolean(effectiveSessionId),
+    });
+    const shouldUseResumeDeltaPrompt = Boolean(effectiveSessionId) && wakePrompt.length > 0;
+    const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
+      ? ""
+      : renderTemplate(promptTemplate, templateData);
+    const prompt = joinPromptSections([
+      renderedBootstrapPrompt,
+      wakePrompt,
+      sessionHandoffNote,
+      taskContextNote,
+      renderedPrompt,
+    ]);
+    const promptMetrics = {
+      promptChars: prompt.length,
+      bootstrapPromptChars: renderedBootstrapPrompt.length,
+      wakePromptChars: wakePrompt.length,
+      sessionHandoffChars: sessionHandoffNote.length,
+      taskContextChars: taskContextNote.length,
+      heartbeatPromptChars: renderedPrompt.length,
+    };
+    return { prompt, promptMetrics };
   };
 
   const buildClaudeArgs = (
@@ -1094,6 +1107,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : undefined;
     const attemptInstructionsFilePath = resumeSessionId ? undefined : effectiveInstructionsFilePath;
     const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath);
+    const { prompt, promptMetrics } = buildAttemptPrompt(resumeSessionId);
     const commandNotes: string[] = [];
     if (!resumeSessionId) {
       commandNotes.push(`Using stable Claude prompt bundle ${promptBundle.bundleKey}.`);

@@ -45,7 +45,7 @@ export function isIdempotentFinishSuccessfulRunHandoffWakeStatus(status: string)
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type IssueRow = Pick<
   typeof issues.$inferSelect,
-  "id" | "companyId" | "identifier" | "title" | "status" | "assigneeAgentId" | "assigneeUserId" | "executionState"
+  "id" | "companyId" | "identifier" | "title" | "status" | "workMode" | "assigneeAgentId" | "assigneeUserId" | "executionState"
 >;
 type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status">;
 type NoticeIssue = Pick<typeof issues.$inferSelect, "id" | "identifier" | "title" | "status">;
@@ -348,20 +348,38 @@ function isProductiveSuccessfulRun(input: {
   return Boolean(input.detectedProgressSummary);
 }
 
+/**
+ * Which recovery lane the corrective wake is dispatched on.
+ *
+ * Resolved once in `decideSuccessfulRunHandoff` and threaded into both the guard
+ * context and the instruction text, so the wake can never tell the agent
+ * "document or plan updates are not allowed" while dispatching it on a lane
+ * where they are. Before BLO-23197 the instruction re-derived that sentence from
+ * `issue.workMode` independently, so any escalation not keyed on `workMode`
+ * would have contradicted its own payload.
+ */
+export type SuccessfulRunHandoffWorkClass = "planning_only" | "status_only";
+
 export function buildSuccessfulRunHandoffInstruction(input: {
   issueIdentifier: string | null;
   sourceRunId: string;
+  workClass: SuccessfulRunHandoffWorkClass;
 }) {
   const issueLabel = input.issueIdentifier ?? "this issue";
+  const isPlanningContinuation = input.workClass === "planning_only";
   return [
     `Your previous run on ${issueLabel} succeeded, but the issue is still in \`in_progress\` and Paperclip cannot identify a valid issue disposition.`,
     "",
-    "This is a status-only retry to the original agent. Record a disposition; do not start new work.",
+    isPlanningContinuation
+      ? "This is a normal-model planning continuation. Complete the required plan or issue-document update, then record a disposition. Do not begin implementation."
+      : "This is a status-only retry to the original agent. Record a disposition; do not start new work.",
     "",
-    "Resolve the missing disposition before creating or revising any new artifacts. Choose **exactly one** outcome and perform the matching Paperclip action:",
+    isPlanningContinuation
+      ? "Finish the planning deliverable, then choose **exactly one** outcome and perform the matching Paperclip action:"
+      : "Resolve the missing disposition before creating or revising any new artifacts. Choose **exactly one** outcome and perform the matching Paperclip action:",
     "",
     "**Is the issue finished?**",
-    "1. Mark it `done` (scope complete) or `cancelled` (intentionally stopped).",
+    "1. Mark it `done` only after verifying the acceptance criteria and one qualifying completion artifact: a committed, remotely resolvable artifact or PR, a run-attributed durable issue artifact, or the valid checked-out execution path. Otherwise keep it open on the correct continuation path. Mark it `cancelled` only when intentionally stopped.",
     "",
     "**Does someone else need to look at it?**",
     "2. Move it to `in_review` with a real reviewer path — `executionState.currentParticipant`, a human owner via `assigneeUserId`, a pending issue-thread interaction, or a linked pending approval.",
@@ -372,10 +390,23 @@ export function buildSuccessfulRunHandoffInstruction(input: {
     "**Is there more work to do?**",
     `4. Either delegate follow-up work (create/link a follow-up issue and block this one on it, or close this issue if its scope is independently complete) or record an explicit continuation path with \`resumeIntent: true\`, \`resumeFromRunId: ${input.sourceRunId}\`, and a concrete next action. Do not perform the remaining source work in this recovery run; the follow-up/resume wake must use the normal model lane.`,
     "",
-    "Comments, document revisions, work-product writes, and continuation summaries are supporting evidence only — they do not satisfy this handoff unless the issue state/path also records one valid disposition. If this wake is status-only recovery, document or plan updates are not allowed.",
+    isPlanningContinuation
+      ? "The plan or issue-document revision is the required deliverable, but it does not satisfy this handoff unless the issue state/path also records one valid disposition."
+      : "Comments, document revisions, work-product writes, and continuation summaries are supporting evidence only — they do not satisfy this handoff unless the issue state/path also records one valid disposition. If this wake is status-only recovery, document or plan updates are not allowed.",
   ].join("\n");
 }
 
+/**
+ * `input.run` must be a row re-read AFTER the source run body executed, not the
+ * claim-time snapshot. `statusOnlyDocumentWriteRefusedAt` is stamped mid-run by
+ * `assertDeliverableMutationAllowedByRunContext`, so a claim-time row would
+ * carry `null` and the BLO-23197 escalation below would never fire. Both
+ * dispatch paths satisfy this today — `classifyAndPersistRunLiveness` returns
+ * the row from an `UPDATE ... RETURNING()`, and the finalize path re-reads via
+ * `getRun` — but that is an invariant of `heartbeat.ts` rather than of this
+ * function, and no test here can observe it: pass a stale row and every case
+ * below still passes while the escalation silently stops firing.
+ */
 export function decideSuccessfulRunHandoff(input: {
   run: HeartbeatRunRow;
   issue: IssueRow | null;
@@ -442,11 +473,41 @@ export function decideSuccessfulRunHandoff(input: {
     return { kind: "skip", reason: "corrective handoff wake already exists for this source run" };
   }
 
+  // A status-only wake cannot write an issue document. So when the source run
+  // was refused exactly that write, dispatching another status-only wake
+  // guarantees the identical 403 and the issue can never self-heal — the
+  // BLO-23197 deadlock, measured live on BLO-23032 and five times since.
+  //
+  // `issue.workMode` alone is the wrong signal for it: it is a proxy for "is the
+  // remaining deliverable a document", and it reads `standard` in precisely the
+  // reported case, so the escalation that already existed here only ever fired
+  // for `planning` issues. The refusal itself is the direct signal, stamped on
+  // the run row by `assertDeliverableMutationAllowedByRunContext`.
+  //
+  // `planning_only` is the minimum escalation that clears it: the normal-model
+  // lane with `allowDocumentUpdates: true`, while deliverable and annotation
+  // writes stay barred. A run refused a *deliverable* or *annotation* write is
+  // deliberately not escalated — that needs a full normal-model run, a wider
+  // grant than this detector should make on its own — which is why the stamp is
+  // scoped to documents at the point of refusal.
+  //
+  // `Boolean(...)` guards a narrowed column projection, not `undefined`: the row
+  // type is `Date | null` and never `undefined`, so the only way this field goes
+  // absent is a `select()` that omits it. `getRun` is projected, but both
+  // `heartbeatRunSafeColumns` and `heartbeatRunSqlAsciiSafeColumns` spread
+  // `...getTableColumns(heartbeatRuns)` — that spread is what keeps this field
+  // present, and a future hand-enumerated projection there would disable the
+  // escalation in production while every test in this file still passed.
+  const workClass: SuccessfulRunHandoffWorkClass =
+    issue.workMode === "planning" || Boolean(run.statusOnlyDocumentWriteRefusedAt)
+      ? "planning_only"
+      : "status_only";
   const instruction = buildSuccessfulRunHandoffInstruction({
     issueIdentifier: issue.identifier,
     sourceRunId: run.id,
+    workClass,
   });
-  const payload = withRecoveryModelProfileHint({
+  const payloadInput = {
     issueId: issue.id,
     taskId: issue.id,
     sourceIssueId: issue.id,
@@ -463,7 +524,10 @@ export function decideSuccessfulRunHandoff(input: {
     resumeFromRunId: run.id,
     ...(input.taskKey ? { taskKey: input.taskKey } : {}),
     instruction,
-  }, "status_only");
+  };
+  const payload = workClass === "planning_only"
+    ? withRecoveryModelProfileHint(payloadInput, "planning_only")
+    : withRecoveryModelProfileHint(payloadInput, "status_only");
 
   return {
     kind: "enqueue",
@@ -474,10 +538,16 @@ export function decideSuccessfulRunHandoff(input: {
     }),
     payload,
     instruction,
-    contextSnapshot: withRecoveryModelProfileHint({
-      ...payload,
-      wakeReason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
-      livenessState: input.livenessState,
-    }, "status_only"),
+    contextSnapshot: workClass === "planning_only"
+      ? withRecoveryModelProfileHint({
+        ...payload,
+        wakeReason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+        livenessState: input.livenessState,
+      }, "planning_only")
+      : withRecoveryModelProfileHint({
+        ...payload,
+        wakeReason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+        livenessState: input.livenessState,
+      }, "status_only"),
   };
 }

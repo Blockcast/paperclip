@@ -8,6 +8,7 @@ import {
   authUsers,
   budgetIncidents,
   costEvents,
+  financeEvents,
   heartbeatRuns,
   invites,
   issues as issuesTable,
@@ -32,8 +33,9 @@ import type {
   PluginExecutionWorkspaceMetadata,
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import { isClosedExecutionWorkspace, pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import { companyService } from "./companies.js";
+import { recordPluginMetric } from "./metrics.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
@@ -44,6 +46,7 @@ import { createMilestonesService } from "./milestones.js";
 import { documentService } from "./documents.js";
 import { heartbeatService, type HeartbeatServiceOptions } from "./heartbeat.js";
 import { budgetService } from "./budgets.js";
+import { financeService } from "./finance.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -51,6 +54,12 @@ import path from "node:path";
 import { pluginRegistryService } from "./plugin-registry.js";
 import { pluginStateStore } from "./plugin-state-store.js";
 import { pluginDatabaseService } from "./plugin-database.js";
+import {
+  assertPluginFencingGeneration,
+  resolvePluginFencingPrecondition,
+  type PluginFencingPreconditionInput,
+  type ResolvedPluginFencingPrecondition,
+} from "./plugin-fencing.js";
 import { pluginManagedAgentService } from "./plugin-managed-agents.js";
 import { pluginManagedRoutineService } from "./plugin-managed-routines.js";
 import { pluginManagedSkillService } from "./plugin-managed-skills.js";
@@ -597,6 +606,21 @@ export function buildHostServices(
   const projects = projectService(db);
   const executionWorkspaces = executionWorkspaceService(db);
   const issues = issueService(db);
+  /**
+   * Bind a caller-supplied fencing generation to *this* plugin's own schema.
+   *
+   * The namespace is resolved from the authenticated `pluginId`, never from the
+   * request, so a plugin can only ever fence on a table it already owns — this
+   * adds no SQL reach. Table and column names are validated as bare identifiers
+   * before quoting; values are bound as parameters.
+   */
+  const resolveCallerFencingPrecondition = async (
+    fencing: PluginFencingPreconditionInput | null | undefined,
+  ): Promise<ResolvedPluginFencingPrecondition | null> => {
+    if (!fencing) return null;
+    const namespace = await pluginDb.getRuntimeNamespace(pluginId);
+    return resolvePluginFencingPrecondition(namespace, fencing);
+  };
   const documents = documentService(db);
   const goals = goalService(db);
   const milestoneSvc = createMilestonesService(db);
@@ -701,12 +725,19 @@ export function buildHostServices(
     companyId: workspace.companyId,
     projectId: workspace.projectId,
     projectWorkspaceId: workspace.projectWorkspaceId,
+    name: workspace.name,
     path: workspace.cwd ?? workspace.providerRef,
     cwd: workspace.cwd,
     repoUrl: workspace.repoUrl,
     baseRef: workspace.baseRef,
     branchName: workspace.branchName,
     providerType: workspace.providerType,
+    mode: workspace.mode,
+    // BLO-31349: expose the host's own closed-ness verdict rather than the raw
+    // `status`/`closedAt` columns, so plugins (and the SDK test double) branch
+    // on the same predicate `getWorkspaceForIssue` uses to reject a torn-down
+    // workspace, instead of each re-deriving it and missing `cleanup_failed`.
+    closed: isClosedExecutionWorkspace(workspace),
     providerMetadata: readProviderMetadata(workspace.metadata),
   });
 
@@ -756,6 +787,25 @@ export function buildHostServices(
   const assertReadableOriginFilter = (originKind: unknown) => {
     if (typeof originKind !== "string" || !originKind.startsWith("plugin:")) return;
     normalizePluginOriginKind(originKind);
+  };
+
+  /**
+   * BLO-29908: normalize an execution-lock write precondition arriving over
+   * JSON-RPC, where a plugin can send any JSON value.
+   *
+   * `undefined` means "no precondition", `null` means "the issue must be
+   * unheld", and a run id pins that specific holder. Anything else is a caller
+   * bug and throws rather than degrading to `undefined` — silently dropping
+   * the guard would restore the exact eviction this precondition prevents,
+   * and it would do so invisibly.
+   */
+  const normalizeExpectedRunId = (value: unknown): string | null | undefined => {
+    if (value === undefined) return undefined;
+    if (value === null) return null;
+    if (typeof value === "string" && value.length > 0) return value;
+    throw new Error(
+      "Plugin issue execution-lock precondition must be null or a non-empty run id string",
+    );
   };
 
   const logPluginActivity = async (input: {
@@ -1280,13 +1330,17 @@ export function buildHostServices(
         };
       },
       async set(params) {
-        await stateStore.set(pluginId, {
-          scopeKind: params.scopeKind as any,
-          scopeId: params.scopeId,
-          namespace: params.namespace,
-          stateKey: params.stateKey,
-          value: params.value,
-        });
+        await stateStore.set(
+          pluginId,
+          {
+            scopeKind: params.scopeKind as any,
+            scopeId: params.scopeId,
+            namespace: params.namespace,
+            stateKey: params.stateKey,
+            value: params.value,
+          },
+          await resolveCallerFencingPrecondition(params.fencing),
+        );
       },
       async delete(params) {
         await stateStore.delete(pluginId, params.scopeKind as any, params.stateKey, {
@@ -1321,6 +1375,35 @@ export function buildHostServices(
       async emit(params) {
         if (params.companyId) {
           await ensurePluginAvailableForCompany(params.companyId);
+        }
+        // A best-effort pre-dispatch ownership check, NOT a fence — which is
+        // why the param is `ownershipCheck` and carries its own type rather
+        // than reusing `fencing`. The `issues.*` / `state.set` fences join the
+        // mutation's own transaction and hold the lock to commit, so a
+        // displaced caller's write cannot land. A bus emit is an in-memory
+        // fan-out with no transaction to join, so the best available guarantee
+        // is "re-read the generation immediately before dispatch, and refuse
+        // once it is gone".
+        //
+        // The residual window is real and deliberate: a steal committing
+        // between this check's commit and the fan-out below still results in
+        // delivery. Holding the lock across the fan-out would close it and is
+        // rejected on purpose — subscriber handlers run arbitrary plugin code,
+        // so one slow handler would block a steal, recreating the unstealable
+        // fence this whole mechanism exists to prevent (BLO-31036).
+        //
+        // Consequence for consumers, and it is part of the contract: an event
+        // is a notification, not an authorization to act on the named
+        // aggregate. A subscriber doing anything durable must re-establish
+        // ownership itself. Making delivery authoritative needs a
+        // transactional outbox in this event subsystem (BLO-31113) and cannot be
+        // done from the emitting side. Both halves are pinned by
+        // `server/src/__tests__/plugin-events-ownership-check.test.ts`.
+        const ownershipCheck = await resolveCallerFencingPrecondition(params.ownershipCheck);
+        if (ownershipCheck) {
+          await db.transaction(async (tx) => {
+            await assertPluginFencingGeneration(tx, ownershipCheck);
+          });
         }
         await scopedBus.emit(params.name, params.companyId, params.payload);
       },
@@ -1394,6 +1477,11 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         return secretsHandler.resolve({ ...params, companyId });
       },
+      async verify(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return secretsHandler.verify({ ...params, companyId });
+      },
       async list(params) {
         const svc = secretService(db);
         return svc.list(params.companyId);
@@ -1451,10 +1539,107 @@ export function buildHostServices(
       },
     },
 
+    costs: {
+      async createFinanceEvent(params) {
+        const companyId = ensureCompanyId(params.companyId);
+
+        // finance_events is the settlement ledger that sits *alongside* the
+        // adapter-written cost_events estimates. Plugins deliberately cannot
+        // reach cost_events: adapters already emit a row per run for the same
+        // traffic, so a second writer there would double-count it.
+        const amountCents = Number(params.amountCents);
+        if (!Number.isFinite(amountCents) || !Number.isSafeInteger(amountCents)) {
+          throw new Error("amountCents must be a safe integer number of cents");
+        }
+        const occurredAt = new Date(params.occurredAt);
+        if (Number.isNaN(occurredAt.getTime())) {
+          throw new Error("occurredAt must be a valid ISO 8601 timestamp");
+        }
+        const biller = String(params.biller ?? "").trim();
+        if (!biller) throw new Error("biller is required");
+        const eventKind = String(params.eventKind ?? "").trim();
+        if (!eventKind) throw new Error("eventKind is required");
+
+        const externalInvoiceId = params.externalInvoiceId?.trim() || null;
+
+        // Idempotency: a scheduled reconciler re-running over the same window
+        // must not accumulate duplicate rows. Callers supply a stable
+        // externalInvoiceId and we treat it as the natural key.
+        //
+        // NOTE: select-then-insert is racy under concurrent writers. It is safe
+        // for the single-scheduled-job case this was built for. Hardening it
+        // needs a partial unique index on
+        // (company_id, external_invoice_id) WHERE external_invoice_id IS NOT NULL
+        // plus ON CONFLICT DO NOTHING — tracked as follow-up.
+        if (externalInvoiceId) {
+          const existing = await db
+            .select({ id: financeEvents.id })
+            .from(financeEvents)
+            .where(
+              and(
+                eq(financeEvents.companyId, companyId),
+                eq(financeEvents.externalInvoiceId, externalInvoiceId),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (existing) {
+            logger.debug(
+              { pluginId, companyId, externalInvoiceId },
+              "Plugin finance event already recorded; returning existing row",
+            );
+            return { id: existing.id, created: false };
+          }
+        }
+
+        const event = await financeService(db).createEvent(companyId, {
+          eventKind,
+          biller,
+          provider: params.provider ?? null,
+          model: params.model ?? null,
+          amountCents,
+          currency: params.currency ?? "USD",
+          estimated: params.estimated ?? false,
+          quantity: params.quantity ?? null,
+          unit: params.unit ?? null,
+          externalInvoiceId,
+          description: params.description ?? null,
+          occurredAt,
+          metadataJson: params.metadata ? sanitiseMeta(params.metadata) : null,
+        });
+
+        logger.debug(
+          { pluginId, companyId, biller, amountCents, estimated: params.estimated ?? false },
+          "Plugin finance event recorded",
+        );
+        return { id: event.id, created: true };
+      },
+    },
+
     metrics: {
       async write(params) {
         const safeName = truncStr(String(params.name ?? ""), MAX_METRIC_NAME_LENGTH);
         logger.debug({ pluginId, name: safeName, value: params.value, tags: params.tags }, "Plugin metric write");
+
+        // Publish to Prometheus FIRST (PEN-2799). Ordered before the
+        // plugin_logs buffer push deliberately: the buffer write can fail or be
+        // lost on a flush error, and the exposition path is the one an alert
+        // rule depends on. `recordPluginMetric` never throws, so this cannot
+        // turn a mis-shaped metric into a failed plugin call.
+        //
+        // Note this passes the *untruncated* name: recordPluginMetric applies
+        // its own length bound and counts an over-long name as an explicit
+        // `bad_name` drop. Handing it the pre-truncated string would let a
+        // too-long name silently masquerade as a valid shorter one and occupy a
+        // real series.
+        recordPluginMetric({
+          pluginId,
+          pluginKey,
+          name: String(params.name ?? ""),
+          value: typeof params.value === "number" ? params.value : Number(params.value),
+          tags: (params.tags ?? null) as Readonly<Record<string, unknown>> | null,
+          declaredLabels: options.manifest?.metricLabels ?? null,
+        });
 
         // Persist metrics to plugin_logs via the batch buffer (same path as
         // logger.log) so they benefit from batched writes and are flushed
@@ -1607,7 +1792,10 @@ export function buildHostServices(
           repoUrl: row?.repoUrl ?? project.codebase.repoUrl,
           repoRef: row?.repoRef ?? project.codebase.repoRef,
           defaultRef: row?.defaultRef ?? project.codebase.defaultRef,
-          isPrimary: true,
+          // BLO-26184: report whether this was an explicit choice or a
+          // fallback guess rather than always claiming "true" — a plugin
+          // reading this as fact previously had no way to tell the two apart.
+          isPrimary: project.primaryWorkspaceSource === "explicit",
           createdAt: (row?.createdAt ?? project.createdAt).toISOString(),
           updatedAt: (row?.updatedAt ?? project.updatedAt).toISOString(),
         };
@@ -1641,6 +1829,74 @@ export function buildHostServices(
         if (!projectId) return null;
         const project = await projects.getById(projectId);
         if (!inCompany(project, companyId)) return null;
+
+        // BLO-31349: prefer the issue's OWN execution workspace. This method
+        // takes an issueId and promises issue scope; previously it used the
+        // issueId only to find the project and then returned the project base
+        // checkout, so every issue in a project got the same path — and under
+        // an `isolated_workspace` policy that path is the one directory the
+        // policy exists to keep agents out of.
+        const executionWorkspaceId = (issue as Record<string, unknown>)
+          .executionWorkspaceId as string | null | undefined;
+        if (executionWorkspaceId) {
+          const workspace = await executionWorkspaces.getById(executionWorkspaceId);
+          // A closed/archived workspace may already have had its directory torn
+          // down, so treat it as absent rather than handing back a path that no
+          // longer exists. Deliberately the mode-INDEPENDENT guard: the reason
+          // ("the directory may be gone") is true of an archived cloud_sandbox
+          // or shared_workspace exactly as much as of an isolated worktree, and
+          // the isolated-only variant reports false for four of the five modes.
+          if (inCompany(workspace, companyId) && !isClosedExecutionWorkspace(workspace)) {
+            // `cwd`, NOT `agentCwd`: agentCwd is documented as the path to
+            // prefer for filesystem ops *inside the adapter session*, and for
+            // an ssh-transport realization it is a path on the REMOTE host. The
+            // plugin host runs in the server process, so that path may not
+            // exist here — and PLUGIN_SPEC tells plugins to hand `path`
+            // straight to Node and git. `cwd` is the canonical local
+            // realization and equals `agentCwd` whenever the realization is
+            // local, so nothing is lost in the common case; a null `cwd`
+            // correctly drops to the honest project-scoped fallback below.
+            const path = sanitizeWorkspacePath(workspace.cwd);
+            // An unrealized workspace (no cwd yet) has no directory to offer.
+            // Returning `path: ""` with `isIssueScoped: true` would be worse
+            // than the honest project-scoped fallback below.
+            if (path) {
+              // Deliberate: `name` becomes the execution workspace's own label
+              // (e.g. the branch slug) rather than the project name, so a
+              // caller rendering it sees which working copy it actually got.
+              // A project-name label on a per-issue worktree would be the same
+              // conflation this method is being fixed for.
+              const name = sanitizeWorkspaceName(workspace.name, path);
+              return {
+                id: workspace.id,
+                projectId: workspace.projectId,
+                name,
+                path,
+                repoUrl: workspace.repoUrl ?? project.codebase.repoUrl,
+                // For a worktree the checked-out ref *is* the branch, and the
+                // base ref is what tooling should diff against.
+                repoRef: workspace.branchName ?? project.codebase.repoRef,
+                defaultRef: workspace.baseRef ?? project.codebase.defaultRef,
+                branchName: workspace.branchName ?? null,
+                // An execution workspace is never the project primary.
+                isPrimary: false,
+                isIssueScoped: true,
+                // Provenance alone does not tell a caller whether the path is
+                // private to this issue — `shared_workspace` and
+                // `operator_branch` are issue-bound but NOT isolated. Surface
+                // the mode so the isolation question is answerable.
+                mode: workspace.mode,
+                createdAt: workspace.createdAt.toISOString(),
+                updatedAt: workspace.updatedAt.toISOString(),
+              };
+            }
+          }
+        }
+
+        // Fallback: no live execution workspace bound to this issue. Return the
+        // project primary rather than null, so callers do not each invent their
+        // own fallback and re-derive `effectiveLocalFolder` — the very defect
+        // this method had. `isIssueScoped: false` tells them what they got.
         const row = project.primaryWorkspace;
         const path = sanitizeWorkspacePath(project.codebase.effectiveLocalFolder);
         const name = sanitizeWorkspaceName(row?.name ?? project.name, path);
@@ -1652,7 +1908,13 @@ export function buildHostServices(
           repoUrl: row?.repoUrl ?? project.codebase.repoUrl,
           repoRef: row?.repoRef ?? project.codebase.repoRef,
           defaultRef: row?.defaultRef ?? project.codebase.defaultRef,
-          isPrimary: true,
+          branchName: null,
+          // BLO-26184: see getPrimaryWorkspace above — do not claim explicit
+          // choice for a fallback guess.
+          isPrimary: project.primaryWorkspaceSource === "explicit",
+          isIssueScoped: false,
+          // Project-scoped: no execution workspace, so no mode to report.
+          mode: null,
           createdAt: (row?.createdAt ?? project.createdAt).toISOString(),
           updatedAt: (row?.updatedAt ?? project.updatedAt).toISOString(),
         };
@@ -1810,7 +2072,8 @@ export function buildHostServices(
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
-        const { actorAgentId, actorUserId, actorRunId, originKind, surfaceVisibility, ...issueInput } = params;
+        const { actorAgentId, actorUserId, actorRunId, originKind, surfaceVisibility, fencing, ...issueInput } = params;
+        const fencingPrecondition = await resolveCallerFencingPrecondition(fencing);
         const normalizedOriginKind = normalizePluginOriginKind(
           surfaceVisibility === "plugin_operation" && !originKind
             ? pluginOperationIssueOriginKind(pluginKey)
@@ -1818,6 +2081,7 @@ export function buildHostServices(
         );
         const issue = (await issues.create(companyId, {
           ...(issueInput as any),
+          fencingPrecondition,
           originKind: normalizedOriginKind,
           originId: params.originId ?? null,
           originRunId: params.originRunId ?? actorRunId ?? null,
@@ -1864,11 +2128,27 @@ export function buildHostServices(
         delete patch.actorAgentId;
         delete patch.actorUserId;
         delete patch.actorRunId;
+        // BLO-29908: execution-lock compare-and-set. These are write
+        // preconditions, not fields, so they are lifted out of `patch` before
+        // it is applied or logged — otherwise they read as attempted column
+        // writes in the activity trail.
+        //
+        // Forwarded explicitly rather than left to ride along in the spread:
+        // a plugin cancelling an issue it does not hold depends on these
+        // reaching `updateIssue`, and an implicit passthrough is one refactor
+        // away from silently dropping the guard and restoring the eviction bug.
+        const expectedCurrentCheckoutRunId = normalizeExpectedRunId(patch.expectedCurrentCheckoutRunId);
+        const expectedCurrentExecutionRunId = normalizeExpectedRunId(patch.expectedCurrentExecutionRunId);
+        delete patch.expectedCurrentCheckoutRunId;
+        delete patch.expectedCurrentExecutionRunId;
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }
         const updated = (await issues.update(params.issueId, {
           ...(patch as any),
+          fencingPrecondition: await resolveCallerFencingPrecondition(params.fencing),
+          ...(expectedCurrentCheckoutRunId === undefined ? {} : { expectedCurrentCheckoutRunId }),
+          ...(expectedCurrentExecutionRunId === undefined ? {} : { expectedCurrentExecutionRunId }),
           actorAgentId,
           actorUserId,
         })) as Issue;
@@ -2293,23 +2573,70 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
-        const comment = (await issues.addComment(
-          params.issueId,
-          params.body,
-          { agentId: params.authorAgentId },
-        )) as IssueComment;
-        await logPluginActivity({
-          companyId,
-          action: "issue.comment.created",
-          entityType: "issue",
-          entityId: issue.id,
-          actor: { actorAgentId: params.authorAgentId ?? null },
-          details: {
-            identifier: issue.identifier,
-            commentId: comment.id,
-            bodySnippet: comment.body.slice(0, 120),
-          },
-        });
+        const fencingPrecondition = await resolveCallerFencingPrecondition(params.fencing);
+        // Namespaced so one plugin's delivery ids can never resolve to another's
+        // comment. The system-author uniqueness scope is
+        // `(issue_id, idempotency_key)` alone — no plugin discriminator — so a
+        // raw natural key (`comment:<id>`, a delivery id, `sync:1`) shared by two
+        // plugins on one issue would hand the second caller the first's comment,
+        // a different body, with `deduplicated: true` and no error. The same
+        // collision reaches server-internal keys such as
+        // `issueRepoBindingCommentIdempotencyKey(...)`. Matches `agents.invoke`
+        // (`plugin:${pluginId}:` there too), deliberately: `pluginId` is the
+        // install row's PK rather than the durable manifest `pluginKey`, so the
+        // namespace is per-installation. It is more durable than that sounds —
+        // `install` reuses the existing row on reinstall after the default soft
+        // uninstall (`plugin-registry.ts`, `.where(eq(plugins.id, existing.id))`,
+        // pinned by `plugin-registry-reinstall-identity.test.ts`), so the id and
+        // this namespace survive an uninstall/reinstall cycle. Only a purge
+        // (`?purge=true`) or a table reseed orphans earlier keys, and that fails
+        // safe (an extra comment, never a wrong body). If this is ever re-keyed
+        // on `pluginKey`, the two *dedup* namespaces — here and `agents.invoke`
+        // below — must move together. The third `plugin:${pluginId}:` derivation
+        // below, `scopeKey`, deliberately stays put: it is a run-coalescing
+        // scope, not a durable namespace, and its keyless branch is already
+        // `plugin:${pluginId}:${randomUUID()}`.
+        const callerIdempotencyKey = readNonEmptyParam(params.idempotencyKey);
+        const idempotencyKey = callerIdempotencyKey
+          ? `plugin:${pluginId}:${callerIdempotencyKey}`
+          : null;
+        // `addComment` does not open its own transaction, and a share lock only
+        // fences for as long as its transaction lives — so when a generation is
+        // supplied, open one here and hand it down.
+        const comment = (fencingPrecondition
+          ? await db.transaction((tx) =>
+              issues.addComment(
+                params.issueId,
+                params.body,
+                { agentId: params.authorAgentId },
+                { fencingPrecondition, idempotencyKey },
+                tx,
+              ),
+            )
+          : await issues.addComment(
+              params.issueId,
+              params.body,
+              { agentId: params.authorAgentId },
+              { idempotencyKey },
+            )) as IssueComment & { deduplicated?: true };
+        // On the dedup path no row was written, so logging `issue.comment.created`
+        // would report a creation that did not happen — once per duplicate
+        // delivery, which is exactly the noise an idempotency key is bought to
+        // remove.
+        if (!comment.deduplicated) {
+          await logPluginActivity({
+            companyId,
+            action: "issue.comment.created",
+            entityType: "issue",
+            entityId: issue.id,
+            actor: { actorAgentId: params.authorAgentId ?? null },
+            details: {
+              identifier: issue.identifier,
+              commentId: comment.id,
+              bodySnippet: comment.body.slice(0, 120),
+            },
+          });
+        }
         return comment;
       },
       async createInteraction(params) {

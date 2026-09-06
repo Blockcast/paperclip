@@ -233,7 +233,7 @@ export function derivePersistedMonitorState(input: {
   const notes = scheduledMonitor?.notes ?? normalizeMonitorNotes(input.issue.monitorNotes) ?? fromState?.notes ?? null;
   const scheduledByRaw = input.issue.monitorScheduledBy ?? scheduledMonitor?.scheduledBy ?? fromState?.scheduledBy ?? null;
   const scheduledBy =
-    scheduledByRaw === "assignee" || scheduledByRaw === "board" ? scheduledByRaw : null;
+    scheduledByRaw === "assignee" || scheduledByRaw === "board" || scheduledByRaw === "manager" ? scheduledByRaw : null;
   const metadata = scheduledMonitor ? monitorMetadataFromPolicy(scheduledMonitor) : monitorMetadataFromState(fromState);
   // BLO-18294: convergence bookkeeping has no dedicated columns, so it only
   // survives via executionState. Carry it across every derived shape.
@@ -528,7 +528,7 @@ export const DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS = 24;
  * monitor with no configured limit remains unbounded.
  */
 export function exhaustedMonitorClearReason(input: {
-  monitor: IssueExecutionMonitorPolicy | null;
+  monitor: Pick<IssueExecutionMonitorPolicy, "timeoutAt" | "maxAttempts"> | null;
   attemptCount: number;
   now: Date;
   defaultMaxAttempts?: number | null;
@@ -542,6 +542,55 @@ export function exhaustedMonitorClearReason(input: {
     return "max_attempts_exhausted";
   }
   return null;
+}
+
+/**
+ * Single source of truth for "is this monitor's next check still a live wake path?"
+ * — shared by the stranded-assigned sweep and the `in_review` disposition validator
+ * (PEN-2853).
+ *
+ * The two were written independently and disagreed about the same column. The sweep
+ * (`hasActiveMonitorPath`, recovery/service.ts) required a genuinely future instant;
+ * the validator (`hasScheduledMonitor`, routes/issues.ts) accepted any non-null one.
+ * So an issue could pass the write-side gate on a monitor the read-side had already
+ * stopped counting — admitted to `in_review` and seizable as stranded at the same
+ * moment, off the same `monitorNextCheckAt`. A week-old lapsed monitor, or a patch
+ * arming one in the past, cleared the 422 (`nextCheckAt` has no future constraint in
+ * the validator, unlike `timeoutAt`, which `exhaustedMonitorClearReason` rejects).
+ *
+ * That compounded badly. Of the five review paths the validator accepts, the monitor
+ * is the only one an agent can satisfy unilaterally — the other four need a human, a
+ * board decision, a counterparty to ask, or a configured execution policy. So the one
+ * remedy always in reach was also the one verified least.
+ *
+ * This is the BLO-24782 divergence again, one predicate over, and it takes that
+ * remedy: delegate rather than restate. A restated rule is only ever as good as the
+ * test that notices it drifting; delegation makes the drift unrepresentable. Hence
+ * `>` at millisecond resolution, no grace, in one place.
+ *
+ * Two asymmetries are deliberate, not oversights:
+ *
+ * - The sweep ORs a bounded lapsed-trigger window on top of this (BLO-18643 /
+ *   BLO-24782) and the validator does not, so the validator is strictly the tighter
+ *   reading. That is safe in exactly one direction and this is it: everything the
+ *   validator accepts, the sweep counts. The leniency exists to avoid *seizing* a row
+ *   whose owner has not had a chance to re-arm; it is not a licence to *assert* a
+ *   review path. On a write the agent supplies the instant, so it can always name a
+ *   real one.
+ * - `hasScheduledMonitor` in recovery/issue-graph-liveness.ts is a third copy of this
+ *   rule and is deliberately left alone. It is already future-bounded — on the safe
+ *   side of the invariant, no defect — and that module is pure by construction
+ *   (`@paperclipai/shared` and one sibling only, its own structural row type and date
+ *   readers), so importing this file into it would cost more than the duplication.
+ */
+export function isMonitorNextCheckAtLive(
+  nextCheckAt: Date | string | null | undefined,
+  nowMs: number,
+): boolean {
+  const parsed = nextCheckAt instanceof Date
+    ? (Number.isNaN(nextCheckAt.getTime()) ? null : nextCheckAt)
+    : parseMonitorDate(nextCheckAt ?? null);
+  return parsed !== null && parsed.getTime() > nowMs;
 }
 
 function nextAssigneeIds(input: {
@@ -587,6 +636,28 @@ export function setIssueExecutionPolicyMonitorScheduledBy(
       scheduledBy,
     },
   };
+}
+
+/**
+ * Merge a requested monitor into an existing policy rather than replacing the
+ * policy outright.
+ *
+ * `PATCH /issues/:id` writes `executionPolicy` wholesale, which is correct for
+ * an actor who already holds general mutation authority over the issue. It is
+ * wrong for the narrow manager-chain monitor re-arm (BLO-22860): that actor is
+ * *not* the assignee and holds no general mutation grant, so restoring a lapsed
+ * timer must not also drop the report's `stages`, `reviewPreset`,
+ * `authorizationPolicy` or `mode` as a side effect.
+ */
+export function mergeIssueExecutionPolicyMonitor(
+  previous: IssueExecutionPolicy | null,
+  monitor: IssueExecutionMonitorPolicy | null,
+): IssueExecutionPolicy | null {
+  if (!monitor) return previous;
+  if (!previous) {
+    return { mode: "normal", commentRequired: true, stages: [], monitor };
+  }
+  return { ...previous, monitor };
 }
 
 export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPolicy | null {
@@ -1147,6 +1218,24 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
   };
 }
 
+/**
+ * PEN-1995: `issues.monitorNotes` describes the monitor that is currently armed.
+ * Every clear path already nulls `monitorNextCheckAt`/`monitorWakeRequestedAt`
+ * but used to leave the notes column populated, so a retired monitor's notes
+ * survived as a live-looking instruction. Observed cost: notes registering a
+ * discriminator to read at a trigger time outlived their monitor by four days,
+ * and the next reader treated them as an active gate. The audit copy lives on
+ * `executionState.monitor.notes` (`buildClearedMonitorState` carries it
+ * forward), so nulling the column loses nothing.
+ *
+ * Applied by every clear site so a future branch cannot forget one.
+ */
+function clearArmedMonitorColumns(patch: Record<string, unknown>) {
+  patch.monitorNextCheckAt = null;
+  patch.monitorWakeRequestedAt = null;
+  patch.monitorNotes = null;
+}
+
 function applyMonitorTransition(
   input: TransitionInput,
   stagePatch: Record<string, unknown>,
@@ -1216,8 +1305,7 @@ function applyMonitorTransition(
         throw unprocessable(MONITOR_INVALID_MESSAGE);
       }
       patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
-      patch.monitorNextCheckAt = null;
-      patch.monitorWakeRequestedAt = null;
+      clearArmedMonitorColumns(patch);
       targetMonitorState = buildClearedMonitorState({
         previous: currentMonitorState,
         clearReason: invalidReason,
@@ -1234,8 +1322,7 @@ function applyMonitorTransition(
           throw unprocessable(MONITOR_BOUNDS_EXHAUSTED_MESSAGE, { clearReason: exhaustedReason });
         }
         patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
-        patch.monitorNextCheckAt = null;
-        patch.monitorWakeRequestedAt = null;
+        clearArmedMonitorColumns(patch);
         targetMonitorState = buildClearedMonitorState({
           previous: currentMonitorState,
           clearReason: exhaustedReason,
@@ -1266,8 +1353,7 @@ function applyMonitorTransition(
           : null;
         if (convergence?.converged) {
           patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
-          patch.monitorNextCheckAt = null;
-          patch.monitorWakeRequestedAt = null;
+          clearArmedMonitorColumns(patch);
           patch.status = "blocked";
           targetMonitorState = buildClearedMonitorState({
             previous: currentMonitorState,
@@ -1291,8 +1377,7 @@ function applyMonitorTransition(
       }
     }
   } else if (previousPolicy?.monitor) {
-    patch.monitorNextCheckAt = null;
-    patch.monitorWakeRequestedAt = null;
+    clearArmedMonitorColumns(patch);
     targetMonitorState = buildClearedMonitorState({
       previous: currentMonitorState,
       clearReason:
@@ -1367,6 +1452,44 @@ export function buildIssueMonitorTriggeredPatch(input: {
   };
 }
 
+export function buildIssueMonitorDispatchRearmPatch(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy;
+  /**
+   * Attempt count to persist. Defaults to restoring the attempt the undelivered
+   * wake consumed — the tick-detected lapse path, where the wake never ran and
+   * so must not count against maxAttempts.
+   *
+   * The watchdog *dispatch* path passes the already-incremented count instead:
+   * that fire did real work (it re-dispatched the stuck run), so it consumes an
+   * attempt and the retry loop stays bounded by maxAttempts rather than
+   * re-arming forever against a run that never moves (BLO-22860).
+   */
+  attemptCount?: number;
+}) {
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const currentMonitorState = derivePersistedMonitorState({
+    issue: input.issue,
+    state: existingState,
+    policy: input.policy,
+  });
+  const restoredAttemptCount = input.attemptCount ?? Math.max(0, (currentMonitorState?.attemptCount ?? 1) - 1);
+  const previousMonitorState = currentMonitorState
+    ? { ...currentMonitorState, attemptCount: restoredAttemptCount }
+    : null;
+  const nextMonitorState = buildScheduledMonitorState(previousMonitorState, input.policy.monitor!);
+
+  return {
+    executionPolicy: input.policy as unknown as Record<string, unknown>,
+    executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
+    monitorNextCheckAt: new Date(input.policy.monitor!.nextCheckAt),
+    monitorWakeRequestedAt: null,
+    monitorAttemptCount: restoredAttemptCount,
+    monitorNotes: nextMonitorState.notes,
+    monitorScheduledBy: nextMonitorState.scheduledBy,
+  };
+}
+
 export function buildIssueMonitorClearedPatch(input: {
   issue: IssueLike;
   policy: IssueExecutionPolicy | null;
@@ -1390,7 +1513,47 @@ export function buildIssueMonitorClearedPatch(input: {
     executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
     monitorNextCheckAt: null,
     monitorWakeRequestedAt: null,
+    // PEN-1995: see clearArmedMonitorColumns — the notes describe the armed
+    // monitor, and the audit copy is on executionState.monitor.notes.
+    monitorNotes: null,
   };
+}
+
+/**
+ * BLO-28900 — reconcile a monitor that a raw status/assignee write just made
+ * undeliverable.
+ *
+ * `tickDueIssueMonitors` only selects rows that are `in_progress`/`in_review`
+ * and agent-assigned. A write that demotes a row out of that set has to clear
+ * the monitor too, or it survives reading `scheduled` with a populated
+ * `nextCheckAt` while being structurally incapable of firing — indistinguishable
+ * from an idle assignee, and silent. A fleet census on 2026-08-19 found 24 such
+ * rows, 18 of them already past their check time.
+ *
+ * `applyMonitorTransition` already does this for writes routed through
+ * `issuesSvc.update`. This is the same reconciliation for the set-based raw
+ * writes (checkout-restore, release) that bypass the service layer.
+ *
+ * Deliberately keyed on `monitorNextCheckAt` alone: a monitor that already fired
+ * and is sitting in `triggered` with a null check time is a different defect
+ * (BLO-25865) and is left untouched here.
+ *
+ * Returns an empty patch when the row holds no monitor or the monitor is still
+ * deliverable, so callers can spread it unconditionally.
+ */
+export function buildIssueMonitorEligibilityPatch(issue: IssueLike): Record<string, unknown> {
+  if (!issue.monitorNextCheckAt) return {};
+  const clearReason = monitorClearReasonForIssue(
+    issue.status,
+    issue.assigneeAgentId ?? null,
+    issue.assigneeUserId ?? null,
+  );
+  if (!clearReason) return {};
+  return buildIssueMonitorClearedPatch({
+    issue,
+    policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
+    clearReason,
+  });
 }
 
 export function applyIssueExecutionPolicyTransition(input: TransitionInput): TransitionResult {

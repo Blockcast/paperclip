@@ -389,4 +389,53 @@ describeEmbeddedPostgres("recovery observability report", () => {
     expect(report.window.since).not.toContain("T");
     expect(report.weekly).toHaveLength(MAX_WINDOW_WEEKS);
   });
+
+  it("lists recovery actions by owner, kind, and status", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+
+    await seedRecoveryAction({
+      companyId,
+      n: 1,
+      createdAt: regressionWeek,
+      cause: "stranded_assigned_issue",
+      errorCode: "adapter_failed",
+      status: "escalated",
+      outcome: null,
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: managerId,
+      finalIssueStatus: "in_progress",
+    });
+    await seedRecoveryAction({
+      companyId,
+      n: 2,
+      createdAt: latestWeek,
+      cause: "process_lost",
+      errorCode: "process_lost",
+      status: "resolved",
+      outcome: "restored",
+      ownerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "done",
+    });
+
+    const service = recoveryObservabilityService(db);
+    const ownerActions = await service.listActions(companyId, {
+      ownerAgentId: managerId,
+      kind: "stranded_assigned_issue",
+      status: "escalated",
+    });
+    expect(ownerActions).toHaveLength(1);
+    expect(ownerActions[0]).toMatchObject({
+      kind: "stranded_assigned_issue",
+      status: "escalated",
+      ownerAgentId: managerId,
+      sourceIssueIdentifier: "SRC-1",
+    });
+
+    const resolved = await service.listActions(companyId, { status: "resolved" });
+    expect(resolved).toHaveLength(1);
+    expect(resolved[0]?.outcome).toBe("restored");
+  });
 });

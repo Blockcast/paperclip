@@ -29,6 +29,7 @@ const issue = {
   identifier: "PAP-1",
   title: "Finish backend handoff",
   status: "in_progress",
+  workMode: "standard",
   assigneeAgentId: "agent-1",
   assigneeUserId: null,
   executionState: null,
@@ -99,7 +100,99 @@ describe("successful run handoff decision", () => {
     );
     expect(decision.instruction).toContain("Resolve the missing disposition before creating or revising any new artifacts");
     expect(decision.instruction).toContain("Choose **exactly one** outcome");
+    expect(decision.instruction).toContain(
+      "Mark it `done` only after verifying the acceptance criteria and one qualifying completion artifact: a committed, remotely resolvable artifact or PR, a run-attributed durable issue artifact, or the valid checked-out execution path",
+    );
     expect(decision.instruction).toContain("record an explicit continuation path");
+  });
+
+  it("uses the normal model lane when a planning handoff must revise an issue document", () => {
+    const decision = decide({ issue: { ...issue, workMode: "planning" } as any });
+
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") return;
+    expect(decision.payload).not.toHaveProperty("modelProfile");
+    expect(decision.payload).toMatchObject({
+      recoveryIntent: "planning_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: true,
+      resumeRequiresNormalModel: false,
+    });
+    expect(decision.contextSnapshot).not.toHaveProperty("modelProfile");
+    expect(decision.contextSnapshot).toMatchObject({
+      recoveryIntent: "planning_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: true,
+      resumeRequiresNormalModel: false,
+    });
+    expect(decision.instruction).toContain("normal-model planning continuation");
+    expect(decision.instruction).toContain("Complete the required plan or issue-document update");
+    expect(decision.instruction).not.toContain("document or plan updates are not allowed");
+  });
+
+  // BLO-23197. The deadlock: a status-only run is refused an issue-document
+  // write, ends without a disposition, and the corrective wake queued in
+  // response inherits the same status-only lane — so it hits the identical 403
+  // and the issue can never self-heal. `workMode` cannot detect this; the issue
+  // in the live report (and BLO-23032 before it) is `standard`.
+  //
+  // `workMode: "standard"` is asserted explicitly here rather than inherited
+  // from the fixture: if that fixture ever changes to `planning`, this test
+  // would pass via the pre-existing escalation and stop covering the defect.
+  it("escalates off the status-only lane when the source run was refused an issue-document write", () => {
+    expect(issue.workMode).toBe("standard");
+    const decision = decide({
+      run: { ...run, statusOnlyDocumentWriteRefusedAt: new Date("2026-09-04T17:00:00Z") } as any,
+    });
+
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") return;
+    // The load-bearing assertion, straight off the acceptance criteria: the
+    // follow-up wake is not cheap/status_only, so it can write the artifact.
+    expect(decision.payload).not.toHaveProperty("modelProfile");
+    expect(decision.contextSnapshot).not.toHaveProperty("modelProfile");
+    expect(decision.payload).toMatchObject({
+      recoveryIntent: "planning_only",
+      allowDocumentUpdates: true,
+      resumeRequiresNormalModel: false,
+    });
+    expect(decision.contextSnapshot).toMatchObject({
+      recoveryIntent: "planning_only",
+      allowDocumentUpdates: true,
+      resumeRequiresNormalModel: false,
+    });
+    // Escalation is to planning_only, NOT to unrestricted work: the refused
+    // write was a document, and deliverables still require a full normal-model
+    // run that this detector does not hand out on its own.
+    expect(decision.payload).toMatchObject({ allowDeliverableWork: false });
+    // The instruction must not contradict the lane it is dispatched on. It used
+    // to re-derive this sentence from `workMode` independently, so on a
+    // `standard` issue it would have told the agent document updates were
+    // barred while granting a lane that permits them.
+    expect(decision.instruction).not.toContain("document or plan updates are not allowed");
+    expect(decision.instruction).toContain("Complete the required plan or issue-document update");
+  });
+
+  // Guards the sign of the check. `statusOnlyDocumentWriteRefusedAt` is absent
+  // (rather than null) on any partially-constructed run row, and a truthiness
+  // slip such as `!== null` would read that as "refused" and silently escalate
+  // EVERY corrective wake to the normal model — a cost regression invisible to
+  // the test above, which only ever sets the field.
+  it.each([
+    ["null", null],
+    ["undefined", undefined],
+  ])("keeps the status-only lane when no document write was refused (%s)", (_label, refusedAt) => {
+    const decision = decide({ run: { ...run, statusOnlyDocumentWriteRefusedAt: refusedAt } as any });
+
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") return;
+    expect(decision.payload).toMatchObject({
+      modelProfile: "cheap",
+      recoveryIntent: "status_only",
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    });
+    expect(decision.instruction).toContain("This is a status-only retry to the original agent.");
   });
 
   it("does not queue when the issue already has a valid disposition", () => {

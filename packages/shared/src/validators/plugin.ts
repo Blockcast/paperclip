@@ -724,6 +724,20 @@ export const pluginManifestV1Schema = z.object({
     "minimumPaperclipVersion must follow semver (e.g. 1.0.0)",
   ).optional(),
   capabilities: z.array(z.enum(PLUGIN_CAPABILITIES)).min(1),
+  // PEN-2799. Capped at 5 and shape-checked here; which of these keys the host
+  // will actually promote is decided by its own allow-list, so a manifest
+  // naming an unlisted key is valid but promotes nothing rather than failing
+  // installation. Uniqueness is enforced because a duplicate would silently
+  // consume one of the 5 slots.
+  metricLabels: z.array(
+    z.string().regex(
+      /^[a-z][a-z0-9_]*$/,
+      "metricLabels entries must be snake_case (e.g. error_code)",
+    ).max(40),
+  ).max(5).refine(
+    (keys) => new Set(keys).size === keys.length,
+    "metricLabels must not contain duplicates",
+  ).optional(),
   entrypoints: z.object({
     worker: z.string().min(1),
     ui: z.string().min(1).optional(),
@@ -1130,6 +1144,12 @@ export const installPluginSchema = z.object({
   version: z.string().min(1).optional(),
   /** Set by loader for local-path installs so the worker can be resolved. */
   packagePath: z.string().min(1).optional(),
+  /**
+   * npm install prefix this plugin was installed into, when it differs from
+   * the shared plugins directory (see BLO-20961). Null clears back to the
+   * shared store; undefined leaves the existing value untouched on repoint.
+   */
+  installDir: z.string().min(1).nullable().optional(),
 });
 
 export type InstallPlugin = z.infer<typeof installPluginSchema>;

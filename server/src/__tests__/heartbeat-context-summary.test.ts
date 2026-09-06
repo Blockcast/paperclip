@@ -4,6 +4,8 @@ import {
   derivePaperclipPrReview,
   evaluatePrReviewCompletionEvidence,
   mergeCoalescedContextSnapshot,
+  prReviewAlreadyReviewedVetoCue,
+  prReviewOutputHasAlreadyReviewedSkip,
   summarizeHeartbeatRunContextSnapshot,
   summarizeHeartbeatRunListResultJson,
 } from "../services/heartbeat.js";
@@ -243,6 +245,204 @@ describe("buildPaperclipTaskMarkdown", () => {
     });
     expect(authorMarkdown).toContain("A reviewer just posted findings on YOUR pull request.");
     expect(authorMarkdown).not.toContain("Latest review body:");
+  });
+
+  // BLO-20886: github_pr_review_requested fires on a bare `@ally review` ASK
+  // -- no review has been posted -- and the author-role wake loop also
+  // covers plain PR lifecycle events with no review data at all. Both used
+  // to render the review-feedback directive unconditionally, telling the
+  // woken agent "a reviewer just posted findings on YOUR pull request" and
+  // to push a follow-up commit against a PR with zero recorded reviews
+  // (observed live: Blockcast/paperclip#953).
+  //
+  // review_requested is claimed by the more specific BLO-19522 branch above,
+  // which says the same true thing in more useful words (it names the
+  // requester and carries the anti-loop instruction). What BLO-20886 adds is
+  // the allowlist that catches every OTHER reasonless wakeReason -- the
+  // lifecycle events asserted below, and any reason added later.
+  it("does not instruct a push when no review has actually been submitted", () => {
+    const requestedMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_requested",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+      },
+    });
+    expect(requestedMarkdown).not.toContain("just posted findings on YOUR pull request");
+    expect(requestedMarkdown).not.toContain("push a follow-up commit");
+    expect(requestedMarkdown).not.toContain("GitHub PR review feedback directive:");
+    expect(requestedMarkdown).toContain("GitHub PR review request directive:");
+
+    // A lifecycle event carries no review either, and no branch above claims
+    // it -- so it must land on the generic directive rather than fall through
+    // to the feedback one.
+    for (const wakeReason of [
+      "github_pr_opened",
+      "github_pr_reopened",
+      "github_pr_synchronize",
+      "github_pr_ready_for_review",
+    ]) {
+      const lifecycleMarkdown = buildPaperclipTaskMarkdown({
+        issue: null,
+        prReview: {
+          wakeReason,
+          prNumber: 35,
+          repoFullName: "Blockcast/paperclip",
+          event: "pull_request",
+          prRole: "author",
+        },
+      });
+      expect(lifecycleMarkdown).not.toContain("YOUR pull request");
+      expect(lifecycleMarkdown).not.toContain("push a follow-up commit");
+      expect(lifecycleMarkdown).not.toContain("GitHub PR review feedback directive:");
+      expect(lifecycleMarkdown).toContain("GitHub PR event directive:");
+      expect(lifecycleMarkdown).toContain(`"${wakeReason}"`);
+      expect(lifecycleMarkdown).toContain("No review findings are recorded for this PR yet");
+    }
+
+    // The allowlist is what makes this hold for a wakeReason nobody has
+    // written yet: unrecognized must fail into "no findings", not into a
+    // false claim that findings exist.
+    const unknownMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_some_future_reason",
+        prNumber: 36,
+        repoFullName: "Blockcast/paperclip",
+        event: "pull_request",
+        prRole: "author",
+      },
+    });
+    expect(unknownMarkdown).toContain("GitHub PR event directive:");
+    expect(unknownMarkdown).not.toContain("GitHub PR review feedback directive:");
+  });
+
+  // Real review content must still get the author-shaped directive -- this
+  // fix narrows WHEN "YOUR pull request" fires, it doesn't remove it.
+  it("still asserts 'YOUR pull request' for an actionable review-feedback comment wake", () => {
+    const feedbackMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_feedback",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+        reviewBody: "Critical: missing null check.",
+        reviewAuthorLogin: "ally",
+      },
+    });
+    expect(feedbackMarkdown).toContain("GitHub PR review feedback directive:");
+    expect(feedbackMarkdown).toContain("YOUR pull request");
+  });
+
+  // BLO-20886 AC3. Owning-issue routing fixed WHICH issue is woken, but the
+  // recipient still isn't necessarily the PR's author: `kkroo/blo-19132-*`
+  // resolves to BLO-19132 via the branch tier, so BLO-19132's assignee is woken
+  // about a branch a human owns. That is the original paperclip#953 damage path
+  // -- #953 existed precisely to have a non-bot author, so a bot commit there
+  // destroys the independence it was opened to establish.
+  it("drops the possessive and the push instruction when the PR was authored by a third party", () => {
+    const thirdPartyMarkdown = buildPaperclipTaskMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "BLO-19132",
+        title: "Approval dedupe",
+        workMode: null,
+        description: null,
+      },
+      prReview: {
+        wakeReason: "github_pr_review_submitted",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        prUrl: "https://github.com/Blockcast/paperclip/pull/953",
+        event: "pull_request_review",
+        prRole: "author",
+        reviewBody: "Critical: missing null check.",
+        reviewState: "changes_requested",
+        reviewAuthorLogin: "ally",
+        // The signed webhook's pull_request.user.login -- a human, not the fleet bot.
+        prAuthorLogin: "kkroo",
+      },
+    });
+
+    // The two things AC3 forbids asserting about a PR we did not write.
+    expect(thirdPartyMarkdown).not.toContain("YOUR pull request");
+    expect(thirdPartyMarkdown).not.toContain("push a follow-up commit");
+    // It still delivers the findings -- the review is real, only the ownership
+    // claim was false -- and names who actually owns the branch.
+    expect(thirdPartyMarkdown).toContain("GitHub PR review feedback directive:");
+    expect(thirdPartyMarkdown).toContain("pull request #953");
+    expect(thirdPartyMarkdown).toContain('authored by "kkroo", NOT by you');
+    expect(thirdPartyMarkdown).toContain("Do NOT push commits to it");
+    expect(thirdPartyMarkdown).toContain("Critical: missing null check.");
+  });
+
+  it("keeps the possessive when the PR was authored by the configured bot identity", () => {
+    // Control for the test above: the gate must fire on a positive mismatch
+    // only, never blanket-strip the possessive from PRs the fleet did write.
+    const botAuthoredMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_submitted",
+        prNumber: 1367,
+        repoFullName: "Blockcast/paperclip",
+        event: "pull_request_review",
+        prRole: "author",
+        reviewBody: "Critical: missing null check.",
+        reviewState: "changes_requested",
+        reviewAuthorLogin: "ally",
+        prAuthorLogin: "allyblockcast[bot]",
+      },
+    });
+    expect(botAuthoredMarkdown).toContain("YOUR pull request");
+    expect(botAuthoredMarkdown).toContain("push a follow-up commit");
+    expect(botAuthoredMarkdown).not.toContain("NOT by you");
+  });
+
+  it("fails open and keeps the possessive when the PR author is unknown", () => {
+    // An absent author login is not PROOF of third-party authorship, and the
+    // bot-authored case is the common one, so an unknown author must not
+    // silently strip the directive the author actually needs.
+    const unknownAuthorMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_submitted",
+        prNumber: 1367,
+        repoFullName: "Blockcast/paperclip",
+        event: "pull_request_review",
+        prRole: "author",
+        reviewBody: "Critical: missing null check.",
+        reviewState: "changes_requested",
+        reviewAuthorLogin: "ally",
+        prAuthorLogin: null,
+      },
+    });
+    expect(unknownAuthorMarkdown).toContain("YOUR pull request");
+  });
+
+  it("drops the possessive on a review REQUEST for a third-party-authored PR", () => {
+    // The review_requested branch carries no push instruction already, but it
+    // still asserted ownership -- paperclip#953's wake was exactly this shape.
+    const requestedMarkdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_review_requested",
+        prNumber: 953,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+        requestCommentAuthorLogin: "kkroo",
+        prAuthorLogin: "kkroo",
+      },
+    });
+    expect(requestedMarkdown).toContain("GitHub PR review request directive:");
+    expect(requestedMarkdown).not.toContain("YOUR pull request");
+    expect(requestedMarkdown).toContain("pull request #953");
+    expect(requestedMarkdown).toContain("NOT by you");
   });
 
   it("adds accepted-plan continuation guidance for standard-work issues when the wake is flagged as a plan continuation", () => {
@@ -526,6 +726,794 @@ describe("evaluatePrReviewCompletionEvidence", () => {
         summary: "already reviewed at 2026-05-26T04:38:27Z for 86fd374dc3b456622b3852c98320f38997ef46b6",
       }),
     ).toEqual({ status: "already_reviewed" });
+  });
+
+  // BLO-31374: the same idempotent exit as the reviewer actually writes it —
+  // markdown-formatted, and with the sha either after `for` or directly after
+  // `at`. Both texts are verbatim openings of real Ally runs on 2026-09-02 that
+  // exited cleanly and were still classified `pr_review_output_missing`,
+  // flipping Ally to `error`.
+  it.each([
+    {
+      label: "run b7a984bf — sha directly after `at`, bold + backticks",
+      summary:
+        "**Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`** — no action taken.\n\n" +
+        "The wake was a `transient_failure_retry` carrying a stale head (`0936fba6…`). Against the live PR state:\n\n" +
+        "- **Live head:** `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` (the wake-time SHA is superseded).\n" +
+        "- **Existing review:** `5096237327` — `allyblockcast[bot]` (Bot), state `COMMENTED`, submitted 2026-09-02T23:28:20Z, " +
+        "body starting `## Ally — Consolidated PR Review` with exactly one `Reviewed head:` line attesting `8b237675…`.\n\n" +
+        "Posting again would be a duplicate verdict on the same head, which the one-review-per-(PR, head) contract prohibits. Exiting cleanly.",
+    },
+    {
+      label: "run 3ace1eef — timestamp + `for` + backticked sha",
+      summary:
+        "Exiting without posting — the idempotency check proves this head was already reviewed.\n\n" +
+        "## Wake disposition: already reviewed\n\n" +
+        "**`Blockcast/penstock-vault-node#554`** — the wake carried head `8d47ae36`, which has been superseded. " +
+        "Live head is **`90193c30abb9a75ac17e167b9aea8ca83cebc2cb`**, and the PR is **merged**.\n\n" +
+        "**Already reviewed at 2026-09-02T20:41:53Z for `90193c30abb9a75ac17e167b9aea8ca83cebc2cb`** (review `5094874877`).\n\n" +
+        "No review posted, no PR state touched.",
+    },
+    {
+      label: "sha after a `head` noun",
+      summary: "Already reviewed at head 90193c30abb9a75ac17e167b9aea8ca83cebc2cb; skipping.",
+    },
+  ])("BLO-31374: accepts a markdown-formatted already-reviewed exit ($label)", ({ summary }) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({
+      status: "already_reviewed",
+    });
+  });
+
+  // Masking guard: an "already reviewed" claim that cites no sha is not an
+  // idempotency exit — nothing ties it to a head — and stays `missing`.
+  it("BLO-31374: rejects an already-reviewed claim that cites no sha", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "Already reviewed at 2026-09-02T20:41:53Z; nothing further to do.",
+      }),
+    ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
+  });
+
+  // Masking guard: a negated clause describes the opposite situation — and the
+  // negation must survive the same markdown the clause tolerates (Ally review
+  // of #1613: a bare `\s+` prefix let `**not**` through).
+  it.each([
+    { label: "plain not", summary: "This head was not already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; the draft review was never posted." },
+    { label: "bold not", summary: "This head was **not** already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; the draft review was never posted." },
+    { label: "italic not", summary: "It was *not* already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`." },
+    { label: "not yet been", summary: "Has not yet been already reviewed at 8b237675b19fa5ae061821fd3b1d87cd8cd1836f." },
+  ])("BLO-31374: rejects a negated already-reviewed clause ($label)", ({ summary }) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
+  // Masking guard: hedged or prior-head narration from a run that did NOT post
+  // (Ally review of #1613). The old `for`-anchored regex rejected all three.
+  it.each([
+    { label: "could not confirm whether", summary: "I could not confirm whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; the API call failed." },
+    { label: "unclear if", summary: "Unclear if already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`. Aborting before the post step." },
+    { label: "prior head, did not post", summary: "The prior head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`, but the branch moved and I did not post a review for the new head." },
+    { label: "unclear that + copula", summary: "It is unclear that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`." },
+  ])("BLO-31374: rejects hedged or prior-head already-reviewed narration ($label)", ({ summary }) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
+  // Not vetoed: stating that no second review was posted is the defining
+  // property of this exit (second Ally pass on #1613 — a posted-negation veto
+  // sent all five of these to `missing`).
+  it.each([
+    "**Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`** — I did not post a second review.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; I didn't post again.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`. Did not post a duplicate verdict.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — could not post a duplicate; contract forbids it.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; unable to post a second verdict on the same head.",
+  ])("BLO-31374: a correct skip that says it did not post again still classifies (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({ status: "already_reviewed" });
+  });
+
+  // Precedence guard: a hedge or bare `if`/`whether` in an earlier clause does
+  // not veto a later unhedged clause — whatever joins the two clauses.
+  it.each([
+    "I checked whether a review exists. Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — no action taken.",
+    "Checked whether a prior review exists: already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Checked whether a prior review exists, already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Checked whether a prior review exists — already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Checked whether a prior review exists; already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Skipping the post step if a review exists; already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Determining if this is a duplicate: already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: an earlier clause's hedge or bare if/whether does not veto the clause (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({ status: "already_reviewed" });
+  });
+
+  // Pins the two halves of the hedge veto independently. (1) A bare
+  // `whether`/`if` in the SAME clause that does not govern the review clause
+  // must not veto — only a governing hedge ("unclear whether", "could not
+  // confirm whether") does. (2) A governing hedge about something else in the
+  // PREVIOUS clause, joined by ; : , or —, is out of scope for the review
+  // clause.
+  it.each([
+    "Whether the wake was stale is moot because the head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Regardless of if the wake head moved, this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Unclear whether CI is green; already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — no action taken.",
+    "I could not confirm whether CI passed: already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Not sure if the lockstep check ran, already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: only a hedge governing the review clause in its own clause vetoes (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({ status: "already_reviewed" });
+  });
+
+  // Stale/prior-head narration AFTER the clause is how a correct skip explains
+  // the wake (third Ally pass); only a prior-head subject BEFORE the clause
+  // vetoes.
+  it.each([
+    "**Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`** — the wake carried a stale head, superseded by this one.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`, the wake head has moved since the original wake.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — the branch moved after the wake, so the wake SHA is not the live one.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; the prior head in the payload is superseded.",
+    "Already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` (the earlier head `0936fba6` is stale) — no action taken.",
+  ])("BLO-31374: stale-head narration after the clause does not veto (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({ status: "already_reviewed" });
+  });
+
+  // Markdown closing before the sha: the clause interior tolerates the same
+  // markdown class as its tail.
+  it.each([
+    "**Already reviewed** at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — no action taken.",
+    "*Already reviewed* at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "`Already reviewed` at 8b237675b19fa5ae061821fd3b1d87cd8cd1836f.",
+  ])("BLO-31374: markdown that closes before the sha still matches (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({ status: "already_reviewed" });
+  });
+
+  it("BLO-31374: a glued `alreadyreviewed` is not the clause", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "alreadyreviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+      }),
+    ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
+  });
+
+  // Multi-word hedges still govern the clause.
+  it.each([
+    "I could not fully confirm whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; aborting.",
+    "I was not able to confirm whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: a multi-word governing hedge still vetoes (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
+  // Masking guard (fourth Ally pass): a negation governing the clause from the
+  // subject position, not adjacent to `already`. All four were `false` on
+  // master and must stay `missing`.
+  it.each([
+    "There is no evidence this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`, so I posted a fresh verdict.",
+    "I do not believe this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I cannot see that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Found no review; nothing indicates this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: rejects a non-adjacent negation governing the clause (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
+  // A correct skip explains WHY it did not post, often with a negation word in
+  // the same clause and before the review clause (fifth Ally pass). Only an
+  // epistemic negation vetoes; these all classify.
+  it.each([
+    "Exiting without posting since this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I did not post a duplicate because this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "There is no need to post again because this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "No action taken because this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Nothing to do here because the head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I don't need to post since the head was already reviewed at 2026-09-02T20:41:53Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f.",
+    "The contract does not permit a second verdict and this head was already reviewed at 2026-09-02T20:41:53Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f.",
+    "I cannot post a second verdict because this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "No second verdict is needed as this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Skipping — no duplicate verdict is permitted and this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: a non-epistemic negation explaining the skip does not veto (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({ status: "already_reviewed" });
+  });
+
+  it("BLO-31374: 'failed to confirm whether' is a governing hedge", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "I failed to confirm whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; aborting.",
+      }),
+    ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
+  });
+
+  // Masking guard (sixth Ally pass): a `that`-complement of an establishing
+  // verb that the run could NOT complete. The hedge only sees `if|whether`.
+  it.each([
+    "I could not verify that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I could not establish that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I could not determine that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I could not find that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I have not verified that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Unable to establish that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I could not check that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`; the API failed.",
+    "I couldn't verify that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I failed to establish that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: rejects a failed establishing verb with a that-complement (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
+  // Seventh Ally pass, over-veto direction: the establishing verbs are
+  // transitive over arbitrary objects, so a correct skip that negates finding
+  // or checking a DIFFERENT thing must still classify as a skip. Master
+  // accepted every one of these in the plain shape.
+  it.each([
+    "I did not find a newer head so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "No newer review was found so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "I could not find any reason to re-review so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "I did not check the comments API but already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "I could not see a newer head so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "Cannot tell you more; nothing else found so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "I did not find a newer head so **already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`** — no action taken.",
+  ])("BLO-31374: a negated establishing verb with an unrelated object is still a skip (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({
+      status: "already_reviewed",
+    });
+  });
+
+  // …while the same verb bound to the clause by a complementizer still vetoes.
+  it("BLO-31374: the complementizer is what binds a negated establishing verb to the clause", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "I did not find that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+      }),
+    ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
+  });
+
+  // Seventh Ally pass, masking direction: hedges outside the original four
+  // stems, `that` after a hedge stem, and assumptions with no negation and no
+  // complementizer at all.
+  it.each([
+    "Unknown whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "It remains unverified whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I have no idea whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "It is ambiguous whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "It is not clear that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I doubt this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "Possibly already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`, but I could not check.",
+    "Assuming this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` (not confirmed).",
+  ])("BLO-31374: rejects a hedge or assumption governing the clause (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
+  // Eighth Ally pass, over-veto direction: hedging about the WAKE is the most
+  // natural thing this exit says, and the assumption stem must not veto it.
+  // Master accepted all six.
+  it.each([
+    "The wake was probably a duplicate dispatch so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "This is presumably a retry wake so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "The retry was apparently spurious so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "The PR may have been updated since but already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "Possibly a duplicate wake and already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "The wake payload was probably stale so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+  ])("BLO-31374: an assumption about the wake is still a skip (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({
+      status: "already_reviewed",
+    });
+  });
+
+  // Eighth Ally pass, masking direction: the complementizer elided, the verb
+  // bound to the clause by the copula at the clause edge.
+  it.each([
+    "I cannot say this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I cannot state this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I could not confirm this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I could not establish this head had been already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: rejects an elided complementizer bound by a copula (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
+  // Ninth Ally pass, over-veto direction: an epistemic NOUN whose negated
+  // object is not the review claim. Master accepted all of these.
+  it.each([
+    "No evidence of a force-push, so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "No indication the branch advanced, so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "There is no record of a newer wake, and already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "I do not believe the payload was fresh, but already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "Nothing suggests a retry storm; already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+    "I did not check whether a newer head exists so already reviewed at 2026-09-02T23:31:00Z for 8b237675b19fa5ae061821fd3b1d87cd8cd1836f",
+  ])("BLO-31374: a negated NON-review object is still a skip (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toEqual({
+      status: "already_reviewed",
+    });
+  });
+
+  // …and the same nouns bound to the clause still veto.
+  it.each([
+    "No evidence that this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "No indication this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I do not believe this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: an epistemic noun bound to the clause still vetoes (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
+  // Ninth pass, masking direction: a hedge outside the stem vocabulary that
+  // still questions THIS clause through `whether`.
+  it.each([
+    "It remains an open question whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "The evidence is inconclusive as to whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+    "I would have to guess whether this head was already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+  ])("BLO-31374: any question whose complement is the clause vetoes (%#)", (summary) => {
+    expect(evaluatePrReviewCompletionEvidence(reviewerContext, { summary })).toMatchObject({
+      status: "missing",
+      errorCode: "pr_review_output_missing",
+    });
+  });
+
+  // An assumption in the PREVIOUS clause does not reach the review clause.
+  it("BLO-31374: an assumption in an earlier clause does not veto the clause", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "Presumably the earlier run posted; already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — no action taken.",
+      }),
+    ).toEqual({ status: "already_reviewed" });
+  });
+
+  // A negation in the PREVIOUS clause does not reach the review clause.
+  it("BLO-31374: a negation in an earlier clause does not veto the clause", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "No changes were requested on the prior head; already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f` — no action taken.",
+      }),
+    ).toEqual({ status: "already_reviewed" });
+  });
+
+  // Direct table over the predicate: pins each veto boundary in one line.
+  describe("BLO-31374: prReviewOutputHasAlreadyReviewedSkip boundaries", () => {
+    const sha = "8b237675b19fa5ae061821fd3b1d87cd8cd1836f";
+    it.each([
+      [`Already reviewed at \`${sha}\` — no action taken.`, true],
+      [`already reviewed at 2026-05-26T04:38:27Z for ${sha}`, true],
+      [`**Already reviewed** at \`${sha}\`.`, true],
+      [`Already reviewed at head ${sha}; skipping.`, true],
+      [`Already reviewed at ${sha} — the wake carried a stale head, superseded by this one.`, true],
+      [`Checked whether a prior review exists: already reviewed at \`${sha}\`.`, true],
+      [`Unclear whether CI is green; already reviewed at \`${sha}\`.`, true],
+      [`Already reviewed at \`${sha}\`; I did not post again.`, true],
+      [`Already reviewed at 2026-09-02T20:41:53Z; nothing further to do.`, false],
+      [`This head was **not** already reviewed at \`${sha}\`.`, false],
+      [`There is no evidence this head was already reviewed at \`${sha}\`.`, false],
+      [`I cannot see that this head was already reviewed at \`${sha}\`.`, false],
+      [`Exiting without posting since this head was already reviewed at \`${sha}\`.`, true],
+      [`No action taken because this head was already reviewed at \`${sha}\`.`, true],
+      [`I failed to confirm whether this head was already reviewed at \`${sha}\`.`, false],
+      [`I could not verify that this head was already reviewed at \`${sha}\`.`, false],
+      [`I did not find a newer head so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I did not find that this head was already reviewed at \`${sha}\`.`, false],
+      [`Possibly already reviewed at \`${sha}\`, but I could not check.`, false],
+      [`The wake was probably a duplicate dispatch so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I cannot say this head was already reviewed at \`${sha}\`.`, false],
+      [`No evidence of a force-push, so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No evidence that this head was already reviewed at \`${sha}\`.`, false],
+      [`It remains an open question whether this head was already reviewed at \`${sha}\`.`, false],
+      [`Unable to establish that this head was already reviewed at \`${sha}\`.`, false],
+      [`Unclear if already reviewed at \`${sha}\`. Aborting.`, false],
+      [`It is unclear that this head was already reviewed at \`${sha}\`.`, false],
+      [`Unclear that a rerun helps so already reviewed at \`${sha}\`.`, true],
+      [`I could not fully confirm whether this head was already reviewed at \`${sha}\`.`, false],
+      [`The prior head was already reviewed at \`${sha}\`, but the branch moved.`, false],
+      [`Nothing indicates the branch moved so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Checked that no stale head is involved so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`The old head and the current head are the same so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No force-push, so the branch moved nowhere and already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`The branch has moved so the earlier head was already reviewed at \`${sha}\`.`, false],
+      [`The stale head was already reviewed at \`${sha}\`.`, false],
+      [`The reviews API 500'd; I am guessing this head was already reviewed at \`${sha}\`.`, false],
+      [`I guess this head was already reviewed at \`${sha}\`.`, false],
+      [`My best guess is that this head was already reviewed at \`${sha}\`.`, false],
+      [`The wake was a guess at the head so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`My guess about the retry cause is irrelevant so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`There is no doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I have no doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Without doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Beyond doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`It is not in doubt that this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I doubt this head was already reviewed at \`${sha}\`.`, false],
+      [`There is some doubt this head was already reviewed at \`${sha}\`.`, false],
+      [`It is doubtful this head was already reviewed at \`${sha}\`.`, false],
+      [`alreadyreviewed at \`${sha}\`.`, false],
+      [`Already reviewed at${sha}.`, false],
+      [`There is no real doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`There is no serious doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Beyond reasonable doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Without any doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I have no genuine doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`There is not the slightest doubt this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No newer commits were found so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No newer head was found so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Nothing new was seen so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No later commit was found so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No other review was found so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No newer head was found but this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No newer head was found because this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`It appears this head was already reviewed at \`${sha}\`.`, false],
+      [`It seems likely this head was already reviewed at \`${sha}\`.`, false],
+      [`I believe this head was already reviewed at \`${sha}\`.`, false],
+      [`I think this head was already reviewed at \`${sha}\`.`, false],
+      [`I suspect this head was already reviewed at \`${sha}\`.`, false],
+      [`Perhaps this head was already reviewed at \`${sha}\`.`, false],
+      [`Maybe this head was already reviewed at \`${sha}\`.`, false],
+      [`It looks like this head was already reviewed at \`${sha}\`.`, false],
+      [`It is plausible this head was already reviewed at \`${sha}\`.`, false],
+      [`There is no confirmation this head was already reviewed at \`${sha}\`.`, false],
+      [`I cannot rule out that this head was already reviewed at \`${sha}\`.`, false],
+      [`My assumption is that this head was already reviewed at \`${sha}\`.`, false],
+      [`My assumption about the wake was wrong so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`It appears no new commits landed so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`This looks like a duplicate wake so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No newer commits were found yet this head was already reviewed at \`${sha}\`.`, true],
+      [`No newer commits were found however this head was already reviewed at \`${sha}\`.`, true],
+      [`No newer commits were found though this head was already reviewed at \`${sha}\`.`, true],
+      [`No newer commits were found although this head was already reviewed at \`${sha}\`.`, true],
+      [`No newer commits were found still this head was already reviewed at \`${sha}\`.`, true],
+      [`No newer commits were found nonetheless this head was already reviewed at \`${sha}\`.`, true],
+      [`No newer commits were found nevertheless this head was already reviewed at \`${sha}\`.`, true],
+      [`No newer commits were found whereas this head was already reviewed at \`${sha}\`.`, true],
+      [`No newer commits were found while this head was already reviewed at \`${sha}\`.`, true],
+      [`No newer commits were found then this head was already reviewed at \`${sha}\`.`, true],
+      [`No newer commits were found consequently this head was already reviewed at \`${sha}\`.`, true],
+      [`No newer commits were found accordingly this head was already reviewed at \`${sha}\`.`, true],
+      [`No newer commits were found, yet this head was already reviewed at \`${sha}\`.`, true],
+      [`Already reviewed at 20260902T204153Z`, false],
+      [`Already reviewed at 1234567`, false],
+      [`Already reviewed at 2026-09-02T20:41:53Z`, false],
+      [`Already reviewed at 2026-09-02T23:31:00Z for 1234567`, true],
+      [`Already reviewed at head 1234567`, true],
+      [`Already reviewed at commit 1234567`, true],
+      [`Already reviewed at 8B237675B19FA5AE061821FD3B1D87CD8CD1836F`, false],
+      [`Already reviewed at \`${sha}\`.`, true],
+      [`This head never was already reviewed at \`${sha}\`.`, false],
+      [`This head not yet was already reviewed at \`${sha}\`.`, false],
+      [`This head was never already reviewed at \`${sha}\`.`, false],
+      [`Already reviewed at head 8B237675B19FA5AE061821FD3B1D87CD8CD1836F`, false],
+      [`Already reviewed at 2026-09-02T23:31:00Z for 8B237675B19FA5AE061821FD3B1D87CD8CD1836F`, false],
+      [`Already reviewed at 8b237675B19FA5AE061821FD3B1D87CD8CD1836F`, false],
+      [`No confirmation yet that this head was already reviewed at \`${sha}\`.`, false],
+      [`No evidence yet that this head was already reviewed at \`${sha}\`.`, false],
+      [`There is no record yet that this head was already reviewed at \`${sha}\`.`, false],
+      [`No indication yet that this head was already reviewed at \`${sha}\`.`, false],
+      [`I have no proof yet that this head was already reviewed at \`${sha}\`.`, false],
+      [`No sign yet that this head was already reviewed at \`${sha}\`.`, false],
+      [`Cannot confirm yet that this head was already reviewed at \`${sha}\`.`, false],
+      [`No verification yet that this head was already reviewed at \`${sha}\`.`, false],
+      [`No confirmation still that this head was already reviewed at \`${sha}\`.`, false],
+      [`No evidence however that this head was already reviewed at \`${sha}\`.`, false],
+      [`No record though that this head was already reviewed at \`${sha}\`.`, false],
+      [`No evidence while checking that this head was already reviewed at \`${sha}\`.`, false],
+      [`No confirmation from the reviews API yet that this head was already reviewed at \`${sha}\`.`, false],
+      [`I could not find any record in the last hour that this head was already reviewed at \`${sha}\`.`, false],
+      [`No newer commits were found in the last hour so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`It appeared this head was already reviewed at \`${sha}\`.`, false],
+      [`It looked like this head was already reviewed at \`${sha}\`.`, false],
+      [`I am thinking this head was already reviewed at \`${sha}\`.`, false],
+      [`It is probable this head was already reviewed at \`${sha}\`.`, false],
+      [`It is possible this head was already reviewed at \`${sha}\`.`, false],
+      [`It is conceivable this head was already reviewed at \`${sha}\`.`, false],
+      [`It is presumable this head was already reviewed at \`${sha}\`.`, false],
+      [`It is apparent this head was already reviewed at \`${sha}\`.`, false],
+      [`My presumption is that this head was already reviewed at \`${sha}\`.`, false],
+      [`My belief is that this head was already reviewed at \`${sha}\`.`, false],
+      [`My impression is that this head was already reviewed at \`${sha}\`.`, false],
+      [`My understanding is that this head was already reviewed at \`${sha}\`.`, false],
+      [`It appeared no new commits landed so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`My understanding of the wake was wrong so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`My impression about the retry cause is irrelevant so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`It is possible to re-run the gate so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Already reviewed at 1234567 (sha \`${sha}\`)`, true],
+      [`Already reviewed at 20260902T204153Z commit ${sha}`, true],
+      [`Already reviewed at 1234567 and the deadbeef branch`, false],
+      [`Already reviewed at 1234567 (see deadbeef)`, false],
+      [`Already reviewed at 1234567. The commit ${sha} is unrelated.`, false],
+      [`No evidence ${"word ".repeat(23)}was already reviewed at \`${sha}\`.`, true],
+      [`No evidence ${"word ".repeat(6)}was already reviewed at \`${sha}\`.`, false],
+      [`Already reviewed at head: ${sha}`, true],
+      [`Already reviewed at the head ${sha}`, true],
+      [`Already reviewed at current head ${sha}`, true],
+      [`Already reviewed at head sha ${sha}`, true],
+      [`Already reviewed at commit sha ${sha}`, true],
+      [`Already reviewed at head=${sha}`, true],
+      [`Already reviewed at sha 1234567`, false],
+      [`Already reviewed at head sha 1234567`, true],
+      [`I haven't confirmed that this head was already reviewed at \`${sha}\`.`, false],
+      [`I hadn't verified that this head was already reviewed at \`${sha}\`.`, false],
+      [`The run didn't establish that this head was already reviewed at \`${sha}\`.`, false],
+      [`The API hasn't confirmed that this head was already reviewed at \`${sha}\`.`, false],
+      [`The checks weren't showing that this head was already reviewed at \`${sha}\`.`, false],
+      [`I am failing to confirm that this head was already reviewed at \`${sha}\`.`, false],
+      [`There was a failure to confirm that this head was already reviewed at \`${sha}\`.`, false],
+      [`Nothing indicated this head was already reviewed at \`${sha}\`.`, false],
+      [`There is no suggestion that this head was already reviewed at \`${sha}\`.`, false],
+      [`There are no records that this head was already reviewed at \`${sha}\`.`, false],
+      [`There are no traces that this head was already reviewed at \`${sha}\`.`, false],
+      [`I never saw that this head was already reviewed at \`${sha}\`.`, false],
+      [`I am unaware that this head was already reviewed at \`${sha}\`.`, false],
+      [`No statement that this head was already reviewed at \`${sha}\`.`, false],
+      [`Nothing was demonstrating that this head was already reviewed at \`${sha}\`.`, false],
+      [`The run never told me that this head was already reviewed at \`${sha}\`.`, false],
+      [`I could not rule out that this head was already reviewed at \`${sha}\`.`, false],
+      [`Nothing indicated a newer commit so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No records of a force-push so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I never saw a newer head so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I am unaware of any newer commits so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No newer commit was found for the head that was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Nothing found since the commit that was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I could not find any commit newer than the one that was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`The head moved to a commit which was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I cannot confirm \`8b23767\` was already reviewed at \`${sha}\`.`, false],
+      [`I could not verify this PR's head was already reviewed at \`${sha}\`.`, false],
+      [`I could not verify (after two retries) this head was already reviewed at \`${sha}\`.`, false],
+      [`There is no evidence - none - this head was already reviewed at \`${sha}\`.`, false],
+      [`I cannot confirm "this" head was already reviewed at \`${sha}\`.`, false],
+      [`I cannot confirm the wake. This head was already reviewed at \`${sha}\`.`, true],
+      [`No evidence of a force-push; this head was already reviewed at \`${sha}\`.`, true],
+      [`I remain unconvinced that this head was already reviewed at \`${sha}\`.`, false],
+      [`Unaware whether this head was already reviewed at \`${sha}\`.`, false],
+      [`Unconvinced the wake was legitimate so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Nothing showed that this head was already reviewed at \`${sha}\`.`, false],
+      [`Nothing showed a newer commit so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      // negatedHeadConnective's adversative-only guard, not position: same slot,
+      // opposite verdict for the two families. Consequence-side control:
+      // `No evidence so this head was …` (below, and a minimal-pair backtick-sha
+      // form beside the consequence-connective rows further down).
+      [`No evidence yet this head was already reviewed at \`${sha}\`.`, false],
+      [`No evidence still this head was already reviewed at \`${sha}\`.`, false],
+      [`No evidence however this head was already reviewed at \`${sha}\`.`, false],
+      [`No indication yet this head was already reviewed at \`${sha}\`.`, false],
+      [`No indication still this head was already reviewed at \`${sha}\`.`, false],
+      [`No indication however this head was already reviewed at \`${sha}\`.`, false],
+      [`No confirmation yet this head was already reviewed at \`${sha}\`.`, false],
+      [`No confirmation still this head was already reviewed at \`${sha}\`.`, false],
+      [`No confirmation however this head was already reviewed at \`${sha}\`.`, false],
+      [`I cannot say yet this head was already reviewed at \`${sha}\`.`, false],
+      [`I cannot say still this head was already reviewed at \`${sha}\`.`, false],
+      [`I cannot say however this head was already reviewed at \`${sha}\`.`, false],
+      [`There is no record yet this head was already reviewed at \`${sha}\`.`, false],
+      [`There is no record still this head was already reviewed at \`${sha}\`.`, false],
+      [`There is no record however this head was already reviewed at \`${sha}\`.`, false],
+      [`Nothing suggests yet this head was already reviewed at \`${sha}\`.`, false],
+      [`Nothing suggests still this head was already reviewed at \`${sha}\`.`, false],
+      [`Nothing suggests however this head was already reviewed at \`${sha}\`.`, false],
+      [`No newer commits were found yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Nothing new was seen still this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No evidence of a force-push however this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No newer commits were found yet that head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No newer commits were found so that commit was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Nothing new was seen still that head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No evidence still that this head was already reviewed at \`${sha}\`.`, false],
+      [`I assume this head was already reviewed at \`${sha}\`.`, false],
+      [`I assumed this head was already reviewed at \`${sha}\`.`, false],
+      [`The run assumes this head was already reviewed at \`${sha}\`.`, false],
+      [`My assumptions are that this head was already reviewed at \`${sha}\`.`, false],
+      [`I presume this head was already reviewed at \`${sha}\`.`, false],
+      [`Possibly, this head was already reviewed at \`${sha}\`.`, false],
+      [`Probably, this head was already reviewed at \`${sha}\`.`, false],
+      [`Perhaps, this head was already reviewed at \`${sha}\`.`, false],
+      [`I checked the wake. Possibly, a retry so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`The wake was possibly a duplicate, so already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Not possibly, this head was already reviewed at \`${sha}\`.`, true],
+      [`No clear evidence yet this head was already reviewed at \`${sha}\`.`, false],
+      [`No direct evidence yet this head was already reviewed at \`${sha}\`.`, false],
+      [`No strong indication yet this head was already reviewed at \`${sha}\`.`, false],
+      [`No independent confirmation yet this head was already reviewed at \`${sha}\`.`, false],
+      [`There is no real evidence yet this head was already reviewed at \`${sha}\`.`, false],
+      [`No further indication still this head was already reviewed at \`${sha}\`.`, false],
+      [`No newer revisions were seen yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Nothing new has been found still this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No newer head is known yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No evidence so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      // minimal pair with the adversative row above: same backtick-sha shape,
+      // connective family is the only variable that changes.
+      [`No evidence so this head was already reviewed at \`${sha}\`.`, true],
+      [`No clear evidence because this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Nothing else found so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Nothing new seen therefore this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No confirmation hence this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No indication thus this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Nothing else found consequently this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No confirmation accordingly this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Nothing else found therefore this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No evidence then this head was already reviewed at \`${sha}\`.`, false],
+      [`No newer commits appear yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No newer revisions indicate yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No other branches suggest yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No strong indication still this head was already reviewed at \`${sha}\`.`, false],
+      [`I cannot fully confirm yet this head was already reviewed at \`${sha}\`.`, false],
+      [`I am not fully aware yet this head was already reviewed at \`${sha}\`.`, false],
+      [`I cannot definitively say yet this head was already reviewed at \`${sha}\`.`, false],
+      [`We do not currently believe yet this head was already reviewed at \`${sha}\`.`, false],
+      [`I have not conclusively verified yet this head was already reviewed at \`${sha}\`.`, false],
+      [`No longer aware yet this head was already reviewed at \`${sha}\`.`, false],
+      [`No anomaly indicates yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No reply suggests yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No supply shows yet this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I am not certain yet this head was already reviewed at \`${sha}\`.`, false],
+      [`I am not convinced that this head was already reviewed at \`${sha}\`.`, false],
+      [`It is not clear yet this head was already reviewed at \`${sha}\`.`, false],
+      [`It is not apparent yet this head was already reviewed at \`${sha}\`.`, false],
+      [`I am not positive yet this head was already reviewed at \`${sha}\`.`, false],
+      [`I am not positive that this head was already reviewed at \`${sha}\`.`, false],
+      [`It is unclear this head was already reviewed at \`${sha}\`.`, false],
+      [`I am unaware this head was already reviewed at \`${sha}\`.`, false],
+      [`It is inconclusive this head was already reviewed at \`${sha}\`.`, false],
+      [`It is not obvious yet this head was already reviewed at \`${sha}\`.`, false],
+      [`I have no idea this head was already reviewed at \`${sha}\`.`, false],
+      [`No idea yet this head was already reviewed at \`${sha}\`.`, false],
+      [`Everything is clear so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I am satisfied with the checks so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`The evidence is conclusive so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No blocker is apparent so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No positive drift detected, so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No result was positive, but this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No coverage delta was positive, so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`Results are unambiguous so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`It is unambiguous this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No new idea landed so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I dropped the idea of a rebase, so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`I resolved every unclear row, so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`It is obvious no newer head exists so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      [`No unknown commits were found so this head was already reviewed at 2026-09-02T23:31:00Z for ${sha}`, true],
+      // pass 23: a negation governing the PREVIOUS clause may not cross a
+      // consequence connective into this one (was false-vetoed 7/10).
+      [`Nothing changed so I see this head was already reviewed at \`${sha}\`.`, true],
+      [`Not stale since I verified this head was already reviewed at \`${sha}\`.`, true],
+      [`No drift so we confirm this head was already reviewed at \`${sha}\`.`, true],
+      [`Nothing moved therefore I see this head was already reviewed at \`${sha}\`.`, true],
+      // …but a connective in FILLER role (complementizer follows) still lets
+      // the negation govern this clause — the pass-15 balance, unchanged.
+      [`No sign but that this head was already reviewed at \`${sha}\`.`, false],
+      [`No evidence so far that this head was already reviewed at \`${sha}\`.`, false],
+      // pass 23/24: the negation filler's token class can cross a citation or
+      // punctuation; with `\\w+` these four were accepted (masking).
+      [`I have no \`direct\` evidence this head was already reviewed at \`${sha}\`.`, false],
+      [`No (verified) proof that this head was already reviewed at \`${sha}\`.`, false],
+      [`No force-push evidence that this head was already reviewed at \`${sha}\`.`, false],
+      [`There is no up-to-date confirmation that this head was already reviewed at \`${sha}\`.`, false],
+      [`Already reviewed at head${sha}.`, false],
+    ])("%s → %s", (text, want) => {
+      expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
+    });
+  });
+
+  // Attribution: which cue vetoes. Eleven review passes have each needed a
+  // by-hand bisection to answer this; the table below pins one representative
+  // clause per cue so the next regression report can name the cue directly.
+  describe("BLO-31374: veto attribution names the governing cue", () => {
+    it.each([
+      ["It is unclear that this head was ", "hedge"],
+      ["Possibly ", "assumption"],
+      ["I am guessing this head was ", "assumption"],
+      ["I doubt this head was ", "assumption"],
+      ["It remains an open question whether this head was ", "questioned"],
+      ["Unclear if ", "questioned"],
+      ["The prior head was ", "priorHead"],
+      ["No evidence that this head was ", "negation"],
+      ["I cannot say this head was ", "negation"],
+      ["I am unaware that this head was ", "fusedNegation"],
+      ["No evidence yet this head was ", "negatedHeadConnective"],
+      ["I cannot fully confirm yet this head was ", "negatedHeadConnective"],
+      ["I am not certain yet this head was ", "negatedHeadConnective"],
+      ["I am not convinced that this head was ", "negation"],
+      ["It is unclear this head was ", "fusedNegation"],
+      ["It is not obvious yet this head was ", "negatedHeadConnective"],
+      ["I have no idea this head was ", "negation"],
+      ["No evidence that this head was ", "negation"],
+      ["I am not aware that this head was ", "negation"],
+      // Correct skips: no cue governs the clause, so nothing vetoes.
+      ["No evidence of a force-push, so ", null],
+      ["I did not check whether a newer head exists so ", null],
+      ["No newer commits were found so this head was ", null],
+      ["No force-push evidence that this head was ", "negation"],
+      ["Nothing changed so I see this head was ", null],
+      ["Beyond reasonable doubt this head was ", null],
+      ["The wake was probably a duplicate dispatch so ", null],
+    ])("%s -> %s", (before, cue) => {
+      expect(prReviewAlreadyReviewedVetoCue(before)).toBe(cue);
+    });
+  });
+
+  // CHARACTERIZATION, NOT CORRECTNESS. Every row below is a KNOWN FALSE-VETO:
+  // the verdict asserted is the one the classifier currently produces, and it
+  // is wrong. They are pinned so that a future change which widens or narrows
+  // the residual is visible in the diff rather than discovered by the twenty-
+  // third review pass.
+  //
+  // The shape is a preposition-led adjunct with no connective, no comma and no
+  // sentence boundary, so nothing in CLAUSE_REACH separates the adjunct from
+  // the review clause. It has never been survivable for any epistemic cue —
+  // the `negation` row here false-vetoes at every head in this PR's history —
+  // and it fails toward `missing`, a re-review rather than a masked
+  // non-review. Passes 20-23 each widened it to more words or shapes; none
+  // opened it. Pass 23's connective-role exclusion does not touch these frames
+  // (they carry no connective for it to act on), but the token class it
+  // shares with COPULA_FILLER does, by one shape: punctuated filler tokens.
+  //
+  // If a later pass fixes CLAUSE_REACH so an adjunct no longer swallows the
+  // clause, these expectations flip to `true` and SHOULD be updated to `true`.
+  // Do not "fix" a failure here by re-narrowing a cue.
+  describe("BLO-31374: known CLAUSE_REACH adjunct residual (characterization)", () => {
+    const sha = "8b237675b19fa5ae061821fd3b1d87cd8cd1836f";
+    it.each([
+      // pre-existing at every head — the control that proves the class is old
+      [`Despite no evidence of a force-push this head was already reviewed at \`${sha}\`.`, false],
+      // widened by the pass-21 bare fusedNegation stem
+      [`Despite the unclear wake payload this head was already reviewed at \`${sha}\`.`, false],
+      [`Following the inconclusive CI run this head was already reviewed at \`${sha}\`.`, false],
+      // widened by the pass-20 adjective family and the pass-21 `obvious`
+      [`Given no certain match this head was already reviewed at \`${sha}\`.`, false],
+      [`Aside from no obvious drift this head was already reviewed at \`${sha}\`.`, false],
+      // widened by the pass-22 `ideas?` lemma
+      [`No new idea landed for this head was already reviewed at \`${sha}\`.`, false],
+      // widened by the pass-23 NON_CONNECTIVE_WORD token class
+      [`No force-push evidence this head was already reviewed at \`${sha}\`.`, false],
+    ])("known residual: %s -> %s", (text, want) => {
+      expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(want);
+    });
+
+    // The same words in the shapes real output actually uses. These are the
+    // rows that must never change: a connective, a comma or a sentence
+    // boundary separates the adjunct, and the skip survives.
+    it.each([
+      `Skipping: the merge state is unknown but this head was already reviewed at \`${sha}\`.`,
+      `The wake head was unknown, so this head was already reviewed at \`${sha}\`.`,
+      `Merge state unknown; nothing to do. This head was already reviewed at \`${sha}\`.`,
+      `Nothing ambiguous remained, so this head was already reviewed at \`${sha}\`.`,
+    ])("house-style skip containing a residual word still classifies (%#)", (text) => {
+      expect(prReviewOutputHasAlreadyReviewedSkip(text)).toBe(true);
+    });
+  });
+
+  // A hedge about something OTHER than the review does not mask the skip: the
+  // `that`-complement closes before the clause, so no copula reaches it. Drop
+  // the copula bind from the hedge cue and this row flips to `missing` — the
+  // false-`missing` regression this PR exists to eliminate.
+  it("BLO-31374: a hedge whose complement closes before the clause still skips", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "Unclear that a rerun helps so already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+      }),
+    ).toMatchObject({ status: "already_reviewed" });
+  });
+
+  // `notalready` is not a negation and not the clause: no word boundary before
+  // `already`, so the shape does not match at all and the run stays `missing`.
+  it("BLO-31374: a glued `notalready` is neither a negation nor the clause", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "This head was notalready reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+      }),
+    ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
+  });
+
+  it("BLO-31374: rejects a plural negation", () => {
+    expect(
+      evaluatePrReviewCompletionEvidence(reviewerContext, {
+        summary: "These heads weren't already reviewed at `8b237675b19fa5ae061821fd3b1d87cd8cd1836f`.",
+      }),
+    ).toMatchObject({ status: "missing", errorCode: "pr_review_output_missing" });
   });
 
   it("accepts archived Network-Management-Portal skips", () => {
