@@ -4743,3 +4743,128 @@ describe("BLO-19063 per_run predicate agrees with the config realization consume
     expect(merged.workspaceStrategy).toMatchObject({ baseRef: "release" });
   });
 });
+
+// BLO-23144 (1): the overlay above is applied field by field, not wholesale.
+//
+// The tests in the preceding describe all have the issue override *mention*
+// runScope, so they pass under either merge semantics. These cover the case the
+// fleet actually hits: an override that means to change one unrelated field and
+// never mentions runScope at all. Under the old wholesale replace that override
+// silently deleted an agent-level `per_run`, which is the same silent-downgrade
+// shape as the bug PR #1154 fixed one level up — isolation that reads as
+// configured and delivers none.
+describe("BLO-23144 issue workspaceStrategy overlay merges field-wise", () => {
+  const noProfile = {
+    requested: null,
+    requestedBy: null,
+    applied: null,
+    configSource: null,
+    fallbackReason: null,
+    adapterConfig: null,
+  } as const;
+
+  const mergeStrategy = (
+    baseStrategy: unknown,
+    overlayStrategy: unknown,
+  ): Record<string, unknown> | undefined =>
+    mergeModelProfileAdapterConfig({
+      baseConfig: { workspaceStrategy: baseStrategy },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { workspaceStrategy: overlayStrategy },
+    }).workspaceStrategy as Record<string, unknown> | undefined;
+
+  it("inherits runScope when the issue override omits it", () => {
+    // The fleet-wide default is set once on the agent; an issue that only wanted
+    // a different baseRef must not silently opt itself out of per-run isolation.
+    const strategy = mergeStrategy(
+      { type: "git_worktree", runScope: "per_run" },
+      { type: "git_worktree", baseRef: "release" },
+    );
+
+    expect(strategy).toMatchObject({
+      type: "git_worktree",
+      runScope: "per_run",
+      baseRef: "release",
+    });
+  });
+
+  it("agrees with the per_run predicate on that same override", () => {
+    // The predicate and the merge share resolveOverlaidWorkspaceStrategy exactly
+    // so they cannot drift. A disagreement here restores a pinned workspace for a
+    // run that realization then treats as per_run — two runs, one tree.
+    const policyInput = {
+      agentConfig: {
+        workspaceStrategy: { type: "git_worktree", runScope: "per_run" },
+      },
+      projectPolicy: null,
+      issueSettings: null,
+      mode: "isolated_workspace" as const,
+      legacyUseProjectWorkspace: null,
+    };
+    const issueAdapterConfig = { workspaceStrategy: { type: "git_worktree", baseRef: "release" } };
+
+    const predicted = executionWorkspaceUsesPerRunScope({ ...policyInput, issueAdapterConfig });
+    const realized = mergeModelProfileAdapterConfig({
+      baseConfig: buildExecutionWorkspaceAdapterConfig(policyInput),
+      modelProfile: { ...noProfile },
+      issueAdapterConfig,
+    });
+
+    expect((realized.workspaceStrategy as { runScope?: unknown }).runScope).toBe("per_run");
+    expect(predicted).toBe(true);
+  });
+
+  it("lets an explicit per_issue in the override still win", () => {
+    // Only *omission* inherits. Naming the field is an explicit downgrade and
+    // must keep working, or this fix would trade one silent override for another.
+    const strategy = mergeStrategy(
+      { type: "git_worktree", runScope: "per_run" },
+      { type: "git_worktree", runScope: "per_issue" },
+    );
+
+    expect(strategy).toMatchObject({ runScope: "per_issue" });
+  });
+
+  it("treats a non-object override as a wholesale clear, not a merge", () => {
+    // `null` is an explicit reset; merging into it is not meaningful, and
+    // inheriting through it would make the strategy impossible to clear.
+    expect(mergeStrategy({ type: "git_worktree", runScope: "per_run" }, null)).toBeNull();
+  });
+
+  it("does not resurrect a base strategy the mode gate deleted", () => {
+    // buildExecutionWorkspaceAdapterConfig removes workspaceStrategy outside
+    // isolated_workspace. With no own key on the base there is nothing to
+    // inherit, so the override stands alone — shared_workspace stays default-safe
+    // (BLO-19063 AC4).
+    const base = buildExecutionWorkspaceAdapterConfig({
+      agentConfig: { workspaceStrategy: { type: "git_worktree", runScope: "per_run" } },
+      projectPolicy: null,
+      issueSettings: { mode: "shared_workspace" },
+      mode: "shared_workspace",
+      legacyUseProjectWorkspace: null,
+    });
+    expect(Object.hasOwn(base, "workspaceStrategy")).toBe(false);
+
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: base,
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { workspaceStrategy: { type: "git_worktree", baseRef: "release" } },
+    });
+
+    expect((merged.workspaceStrategy as { runScope?: unknown }).runScope).toBeUndefined();
+  });
+
+  it("still ignores a model profile's strategy rather than merging it in", () => {
+    // The profile slot remains excluded entirely: field-wise merging is between
+    // the two *authoritative* slots, and widening it to the profile would let a
+    // model choice move the run's tree.
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { workspaceStrategy: { type: "git_worktree", baseRef: "main" } },
+      modelProfile: { ...noProfile, adapterConfig: { workspaceStrategy: { runScope: "per_run" } } },
+      issueAdapterConfig: null,
+    });
+
+    expect(merged.workspaceStrategy).toMatchObject({ baseRef: "main" });
+    expect((merged.workspaceStrategy as { runScope?: unknown }).runScope).toBeUndefined();
+  });
+});
