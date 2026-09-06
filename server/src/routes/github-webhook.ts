@@ -69,6 +69,10 @@ import {
   githubPostIssueComment,
 } from "../services/github-app-auth.js";
 import {
+  allyReviewAlreadyAttestsHead,
+  type ListPrReviewsForAttestation,
+} from "../services/pr-review-head-attestation.js";
+import {
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
 } from "../services/ally-review-detection.js";
@@ -167,6 +171,12 @@ export interface GithubWebhookConfig {
    * uses the GitHub App lookup; route tests can provide a deterministic seam.
    */
   resolvePrReviewHeadSha?: typeof githubFetchPrHeadSha;
+  /**
+   * Optional seam for the head-attestation idempotency check (BLO-32198).
+   * Production lists reviews through the GitHub App; route tests supply a
+   * deterministic list so the suppression path is verified without network.
+   */
+  listPrReviewsForAttestation?: ListPrReviewsForAttestation;
   /**
    * Optional seam for the comment-review status gate. Production uses the
    * service implementation; route tests supply a local recorder so webhook
@@ -3217,6 +3227,55 @@ export async function reconcileContendedPrReviewerWakes(
       result.superseded += 1;
       continue;
     }
+    // BLO-32198: re-check attestation before replaying. The route-level gate
+    // ran when this row was written and correctly let the wake through — no
+    // review existed yet. But this row is replayed here, NOT through the route,
+    // so nothing re-evaluates that. A wake deferred for reviewer-unavailability
+    // waits up to PR_REVIEWER_UNAVAILABLE_MAX_WAIT_MS, and in that window
+    // another delivery's run can post a review at this same head; replaying
+    // then produces exactly the duplicate the route gate exists to prevent, in
+    // exactly the multi-hour shape that motivated it. Deferral for
+    // unavailability is also the single likeliest way to open a gap that wide,
+    // so the deferred path needs the check more than the live one does.
+    //
+    // Retired as `superseded` rather than `recovered`: the work this row
+    // represents has been done, by whichever delivery won. That is the same
+    // meaning the `duplicate` outcome already carries below. Checked before the
+    // attempt counter and the `retried` metric, because this is not an attempt
+    // that happened — counting it would overstate retries and hide the
+    // supersession.
+    if (replay.context.headSha && replay.context.repoFullName) {
+      const replayAttestation = await allyReviewAlreadyAttestsHead({
+        repoFullName: replay.context.repoFullName,
+        prNumber: replay.context.prNumber,
+        headSha: replay.context.headSha,
+        botLogin: config.prReviewerBotLogin,
+        ...(config.listPrReviewsForAttestation
+          ? { listPrReviews: config.listPrReviewsForAttestation }
+          : {}),
+      });
+      if (replayAttestation.outcome === "attested") {
+        await retireContendedRow(
+          db,
+          row.id,
+          PR_REVIEWER_CONTENDED_SUPERSEDED_STATUS,
+          "head already attested by an operative Ally review",
+        );
+        result.superseded += 1;
+        logger.info(
+          {
+            taskKey: replay.taskKey,
+            deliveryId: replay.deliveryId,
+            repoFullName: replay.context.repoFullName,
+            prNumber: replay.context.prNumber,
+            headSha: replay.context.headSha,
+            attestingReviewCount: replayAttestation.attestingReviewCount,
+          },
+          "contended PR-reviewer wake superseded: this head was reviewed while the retry was deferred (BLO-32198)",
+        );
+        continue;
+      }
+    }
     const attempts = replay.attempts + 1;
     // Counted up-front so a pass that throws somewhere unexpected still shows
     // as an attempt rather than looking like it never ran.
@@ -4402,6 +4461,85 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           "github webhook reviewer wake skipped: self-echo of the reviewer's own posted review",
         );
         return false;
+      }
+      // BLO-32198: don't wake the reviewer for a head it has already reviewed.
+      //
+      // Until this check existed the only thing enforcing "at most one
+      // operative Ally App review per (PR, head)" — invariant I1 of
+      // scripts/check-ally-review-consistency.mjs — was a prose instruction to
+      // the agent (.planning/ally-agent/AGENTS.md "Step 2"), which is not the
+      // agent's live instruction source and so was advisory. Four open PRs were
+      // measured carrying duplicate operative reviews at one head, with gaps
+      // from 53 s to 6h35m; a spread that wide is a step being skipped, not a
+      // delivery race, and the delivery/comment-scoped idempotency keys above
+      // cannot catch it because two DIFFERENT wake sources at one head
+      // legitimately produce two different keys.
+      //
+      // This suppresses unconditionally across wake reasons, matching what the
+      // agent instructions already state ("there is no wake reason that exempts
+      // it ... if a re-review is genuinely wanted, the PR needs a new commit").
+      // The asymmetry that justifies including the explicit-request reason: a
+      // duplicate COMMENTED review can never be retracted — GitHub's dismiss
+      // endpoint rejects COMMENTED (422) and there is no delete-review API — so
+      // the violation is permanent, whereas a re-review someone still wants is
+      // one commit away. On `github_pr_synchronized` the head is new by
+      // definition, so this costs one API call and always falls through.
+      //
+      // Fail-open by construction: only an `attested` outcome suppresses. An
+      // unreachable GitHub, an unparseable body, or a missing head all yield
+      // `unknown` and let the wake proceed, because an unreviewed PR is a worse
+      // failure than a redundant review and nothing else retries this.
+      //
+      // One asymmetry to know about. On `github_pr_review_submitted`,
+      // `context.headSha` is `review.commit_id ?? head.sha` (see
+      // resolveEventContext), i.e. the commit the INCOMING review was left
+      // against — which for a review on an outdated diff is not the live head.
+      // So this can answer "already attested" about a superseded head and skip
+      // the counter-review pass for the current one. The attesting side of the
+      // comparison deliberately never reads `commit_id`; this is the querying
+      // side, and the value arrives that way from GitHub's own payload.
+      // Deliberately not "fixed" by re-resolving the live head here: that
+      // would spend an extra API call on every wake to change behaviour only
+      // for reviews left on stale diffs, and the failure is a missed
+      // counter-review — recoverable by a push or a fresh request — not a
+      // permanent duplicate.
+      if (context.headSha && context.repoFullName) {
+        const attestation = await allyReviewAlreadyAttestsHead({
+          repoFullName: context.repoFullName,
+          prNumber: context.prNumber,
+          headSha: context.headSha,
+          botLogin: config.prReviewerBotLogin,
+          ...(config.listPrReviewsForAttestation
+            ? { listPrReviews: config.listPrReviewsForAttestation }
+            : {}),
+        });
+        if (attestation.outcome === "attested") {
+          logger.info(
+            {
+              deliveryId,
+              repoFullName: context.repoFullName,
+              prNumber: context.prNumber,
+              wakeReason: context.wakeReason,
+              headSha: context.headSha,
+              attestingReviewCount: attestation.attestingReviewCount,
+            },
+            "github webhook reviewer wake skipped: this head is already attested by an operative Ally review",
+          );
+          return false;
+        }
+        if (attestation.outcome === "unknown") {
+          logger.warn(
+            {
+              deliveryId,
+              repoFullName: context.repoFullName,
+              prNumber: context.prNumber,
+              wakeReason: context.wakeReason,
+              headSha: context.headSha,
+              reason: attestation.reason,
+            },
+            "github webhook could not establish whether this head was already reviewed; dispatching the reviewer wake anyway",
+          );
+        }
       }
       try {
         const outcome = await attemptPrReviewerWake({
