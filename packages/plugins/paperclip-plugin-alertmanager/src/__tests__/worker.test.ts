@@ -1025,9 +1025,16 @@ describe("handleWebhook — dedup on re-fire", () => {
       firstSeenAt: "2026-04-29T08:00:00Z",
       lastFiredAt: "2026-04-29T08:00:00Z",
       resolvedAt: "2026-04-29T09:00:00Z",
+      // BLO-31736: the recurrence contract is keyed on *our* close, recorded
+      // here, not on `resolvedAt`. `cancelled` (not `done`) is what the plugin
+      // actually writes on resolve — it has no code path that writes `done`.
+      pluginClosedAt: "2026-04-29T09:00:00Z",
     };
     mocks.state.get.mockResolvedValueOnce(existing);
-    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "done" });
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-existing",
+      status: "cancelled",
+    });
 
     await handleWebhook(ctx, config, true, baseInput());
 
@@ -1155,6 +1162,305 @@ describe("handleWebhook — dedup on re-fire", () => {
     expect(mocks.issues.update).not.toHaveBeenCalled();
     expect(mocks.metrics.write).not.toHaveBeenCalledWith(
       "alertmanager.firing.reopened",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BLO-31736 — multi-cycle: a deliberate close must survive fire/clear churn
+//
+// Every re-fire test above is single-shot: one delivery against a hand-written
+// state row. That is why this defect shipped. The terminal guard in
+// `handleResolved` refuses to overwrite an agent's `done`, so the *first*
+// cycle looks correct — and the same delivery writes `resolvedAt`, which the
+// next re-fire read as "the plugin closed this" and acted on. The failure is
+// only observable across two cycles, so these tests carry both the state row
+// and the issue's status forward between deliveries the way production does.
+//
+// Deliberately NOT stubbed per-call: `issues.update` mutates the live issue, so
+// if a delivery does resurrect the row, the following delivery sees a
+// non-terminal issue and the cancel genuinely lands. The second-stage
+// assertion therefore observes the real cascade rather than assuming it.
+// ---------------------------------------------------------------------------
+
+describe("handleWebhook — closure authorship across cycles (BLO-31736)", () => {
+  /**
+   * Wire the mocks into a small live world: one alert state row and one issue,
+   * both read back on every delivery and mutated by the handler's own writes.
+   */
+  const mkCycleWorld = (
+    mocks: MockClients,
+    opts: { issueStatus: string; state: AlertStateRecord },
+  ) => {
+    const world = {
+      issue: { id: "issue-existing", status: opts.issueStatus },
+      state: { ...opts.state } as AlertStateRecord,
+    };
+    mocks.state.get.mockImplementation(async () => world.state);
+    mocks.state.set.mockImplementation(async (_ref: unknown, record: AlertStateRecord) => {
+      world.state = { ...record };
+    });
+    mocks.issues.get.mockImplementation(async () => ({ ...world.issue }));
+    mocks.issues.update.mockImplementation(
+      async (_id: string, patch: { status?: string }) => {
+        if (patch.status) world.issue.status = patch.status;
+        return { id: world.issue.id };
+      },
+    );
+    return world;
+  };
+
+  const firingDelivery = () => baseInput();
+  const resolvedDelivery = (endsAt: string) =>
+    baseInput({
+      parsedBody: baseEnvelope({
+        status: "resolved",
+        alerts: [baseAlert({ status: "resolved", endsAt })],
+      }),
+    });
+
+  /** State as it stands right after a fresh firing created the issue. */
+  const freshlyFiredState = (): AlertStateRecord => ({
+    paperclipIssueId: "issue-existing",
+    paperclipCompanyId: "company-1",
+    assigneeUserId: null,
+    assigneeAgentId: "agent-1",
+    alertname: "CiliumPolicyDropsHigh",
+    severity: "critical",
+    firstSeenAt: "2026-04-29T08:00:00Z",
+    lastFiredAt: "2026-04-29T08:00:00Z",
+    resolvedAt: null,
+    pluginClosedAt: null,
+  });
+
+  const statusPatches = (mocks: MockClients) =>
+    mocks.issues.update.mock.calls
+      .map(([, patch]) => (patch as { status?: string }).status)
+      .filter((s): s is string => typeof s === "string");
+
+  it("never resurrects an agent's `done` across resolve → re-fire → resolve", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    // An agent investigated this alert and closed it `done` — the deliberate
+    // terminal disposition this whole ticket is about protecting.
+    const world = mkCycleWorld(mocks, {
+      issueStatus: "done",
+      state: freshlyFiredState(),
+    });
+
+    // Cycle 1 — the alert clears. The terminal guard holds (this already
+    // worked), but the state write is what used to plant the defect.
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-29T10:00:00Z"));
+    expect(statusPatches(mocks)).toEqual([]);
+    expect(world.state.resolvedAt).toBe("2026-04-29T10:00:00Z");
+    // The load-bearing line: the alert resolved, but WE did not close it.
+    expect(world.state.pluginClosedAt).toBeNull();
+
+    // Cycle 2 — the alert re-fires. This is the delivery that used to patch
+    // the row back to `todo` (AC 1).
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(statusPatches(mocks)).not.toContain("todo");
+    expect(world.issue.status).toBe("done");
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.suppressed",
+      1,
+      expect.objectContaining({ alertname: "CiliumPolicyDropsHigh" }),
+    );
+
+    // Cycle 2 clears — the step that used to convert the `done` into a
+    // plugin-authored `cancelled`, because the row was no longer terminal.
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-30T10:00:00Z"));
+    expect(statusPatches(mocks)).not.toContain("cancelled");
+    expect(world.issue.status).toBe("done");
+
+    // And it stays fixed on the next day's fire, not just the first one.
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(statusPatches(mocks)).toEqual([]);
+    expect(world.issue.status).toBe("done");
+  });
+
+  it("reaches operator suppression for a hand-cancelled row whose alert resolved before", async () => {
+    // AC 2. Suppression used to require `resolvedAt` to be null — i.e. an
+    // alert that had never once cleared — which made it dead code for every
+    // flapping alert, precisely the ones operators close by hand.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    const world = mkCycleWorld(mocks, {
+      issueStatus: "todo",
+      state: freshlyFiredState(),
+    });
+
+    // The plugin's own close, on a genuine resolve.
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-29T10:00:00Z"));
+    expect(world.issue.status).toBe("cancelled");
+    expect(world.state.pluginClosedAt).toBe("2026-04-29T10:00:00Z");
+
+    // Re-fire: our close, so this correctly re-opens (AC 3).
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(world.issue.status).toBe("todo");
+    expect(world.state.pluginClosedAt).toBeNull();
+
+    // Now an operator cancels it by hand while the alert is still firing.
+    world.issue.status = "cancelled";
+
+    // The alert clears. The guard declines to re-close it; authorship must
+    // stay "not ours" rather than being inferred from the new `resolvedAt`.
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-30T10:00:00Z"));
+    expect(world.state.resolvedAt).toBe("2026-04-30T10:00:00Z");
+    expect(world.state.pluginClosedAt).toBeNull();
+
+    // ...so the next re-fire honours the operator instead of re-opening.
+    mocks.issues.update.mockClear();
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(statusPatches(mocks)).not.toContain("todo");
+    expect(world.issue.status).toBe("cancelled");
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.suppressed",
+      1,
+      expect.objectContaining({ alertname: "CiliumPolicyDropsHigh" }),
+    );
+  });
+
+  it("keeps re-opening its own close when a resolved notification is redelivered", async () => {
+    // AC 3, and the regression the conditional write exists for. Alertmanager
+    // can redeliver a `resolved` notification. The second one finds the issue
+    // already `cancelled`, so the guard holds and no cancel of ours lands on
+    // THAT delivery — but our earlier close still stands, so clearing the
+    // authorship record here would mute the next genuine recurrence.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    const world = mkCycleWorld(mocks, {
+      issueStatus: "todo",
+      state: freshlyFiredState(),
+    });
+
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-29T10:00:00Z"));
+    expect(world.issue.status).toBe("cancelled");
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-29T10:00:00Z"));
+    expect(world.state.pluginClosedAt).toBe("2026-04-29T10:00:00Z");
+
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(world.issue.status).toBe("todo");
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.reopened",
+      1,
+      expect.objectContaining({ alertname: "CiliumPolicyDropsHigh" }),
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // The tests above are single-*fingerprint*, which is the same blind spot one
+  // level up from the single-*shot* tests that let the original defect ship.
+  // `pluginClosedAt` lives on the per-fingerprint state row, but the close it
+  // records happens to a shared issue, and only the last member to resolve
+  // actually lands it. So the record and the fact it records sit at different
+  // scopes, and the gap is invisible until an aggregate has two members.
+  // -------------------------------------------------------------------------
+  it("re-opens for a non-last aggregate member whose sibling landed the cancel", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    const AGG = "CiliumPolicyDropsHigh|critical";
+    const memberState = (fingerprint: string): AlertStateRecord => ({
+      ...freshlyFiredState(),
+      paperclipIssueId: "issue-shared",
+      aggregateKey: AGG,
+      // Both members fired, so both rows carry the firing write's "no close of
+      // ours on record" — the value that used to persist into the shared
+      // issue's cancellation and mute the non-last member.
+      pluginClosedAt: null,
+      lastFiredAt: "2026-04-29T08:00:00Z",
+    });
+
+    // One shared issue, one state row per member fingerprint, and a members
+    // table that reports a sibling unresolved until both have cleared.
+    const rows: Record<string, AlertStateRecord> = {
+      "alert-a": memberState("alert-a"),
+      "alert-b": memberState("alert-b"),
+    };
+    const resolvedMembers = new Set<string>();
+    const issue = { id: "issue-shared", status: "todo" };
+    const fpOf = (ref: { stateKey: string }) => ref.stateKey.replace(/^alert:/, "");
+
+    mocks.state.get.mockImplementation(async (ref: { stateKey: string }) => rows[fpOf(ref)] ?? null);
+    mocks.state.set.mockImplementation(
+      async (ref: { stateKey: string }, record: AlertStateRecord) => {
+        rows[fpOf(ref)] = { ...record };
+      },
+    );
+    mocks.issues.get.mockImplementation(async () => ({ ...issue }));
+    mocks.issues.update.mockImplementation(async (_id: string, patch: { status?: string }) => {
+      if (patch.status) issue.status = patch.status;
+      return { id: issue.id };
+    });
+    mocks.db.execute.mockImplementation(async (sql: string, params: unknown[]) => {
+      if (/UPDATE alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+        resolvedMembers.add(String(params[2]));
+        return { rowCount: 1 };
+      }
+      if (/INSERT INTO alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+        resolvedMembers.delete(String(params[2]));
+        return { rowCount: 1 };
+      }
+      return { rowCount: 1 };
+    });
+    mocks.db.query.mockImplementation(async (sql: string) => {
+      if (FENCE_GENERATION_SELECT.test(sql)) return HELD_FENCE;
+      if (/SELECT issue_id\s+FROM alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+        return [{ issue_id: "issue-shared" }];
+      }
+      // The unresolved-sibling probe: true until every member has cleared.
+      if (/SELECT 1 AS one/i.test(sql)) {
+        return Object.keys(rows).some((fp) => !resolvedMembers.has(fp)) ? [{ one: 1 }] : [];
+      }
+      return [];
+    });
+
+    const deliver = (fingerprint: string, endsAt?: string) =>
+      handleWebhook(
+        ctx,
+        config,
+        true,
+        baseInput({
+          parsedBody: baseEnvelope({
+            status: endsAt ? "resolved" : "firing",
+            alerts: [
+              baseAlert({
+                fingerprint,
+                ...(endsAt ? { status: "resolved" as const, endsAt } : {}),
+              }),
+            ],
+          }),
+        }),
+      );
+
+    // Member A clears first. Its cancel is deferred to the sibling, so this
+    // delivery decided nothing about authorship — and must not keep asserting
+    // the firing write's `null`, which is now a claim it cannot back.
+    await deliver("alert-a", "2026-04-29T10:00:00Z");
+    expect(issue.status).toBe("todo");
+    expect(rows["alert-a"].resolvedAt).toBe("2026-04-29T10:00:00Z");
+    expect(rows["alert-a"].pluginClosedAt).toBeUndefined();
+
+    // Member B clears last, so the aggregate's cancel lands here. B records the
+    // close it authored; A cannot be reached to record anything.
+    await deliver("alert-b", "2026-04-29T10:05:00Z");
+    expect(issue.status).toBe("cancelled");
+    expect(rows["alert-b"].pluginClosedAt).toBe("2026-04-29T10:05:00Z");
+
+    // A re-fires against an issue the plugin itself cancelled. This is a
+    // genuine recurrence: before the fix A's `null` read as an operator close
+    // and muted it for the whole suppression window.
+    await deliver("alert-a");
+    expect(issue.status).toBe("todo");
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.reopened",
+      1,
+      expect.objectContaining({ alertname: "CiliumPolicyDropsHigh" }),
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.firing.suppressed",
       expect.any(Number),
       expect.any(Object),
     );
@@ -3677,11 +3983,83 @@ describe("decideRefire", () => {
   });
 
   it("re-opens a terminal issue the plugin closed on resolve", () => {
-    for (const status of ["done", "cancelled"]) {
-      expect(
-        decideRefire({ status }, { resolvedAt: ago(1), operatorSuppressedAt: null }, cfg(), NOW),
-      ).toEqual({ kind: "reopen", reason: "plugin_resolved" });
-    }
+    expect(
+      decideRefire(
+        { status: "cancelled" },
+        { resolvedAt: ago(1), operatorSuppressedAt: null, pluginClosedAt: ago(1) },
+        cfg(),
+        NOW,
+      ),
+    ).toEqual({ kind: "reopen", reason: "plugin_resolved" });
+  });
+
+  // -------------------------------------------------------------------------
+  // BLO-31736 — authorship is a recorded fact, not an inference from
+  // `resolvedAt`. `resolvedAt` means "the alert cleared", which is also true
+  // when the terminal guard *declined* to overwrite someone else's close.
+  // -------------------------------------------------------------------------
+
+  it("suppresses a `done` row even when the alert has resolved since", () => {
+    // The reported defect. The plugin has no code path that writes `done`, so
+    // `done` is always agent- or human-authored however the row reads. This is
+    // the branch that used to return reopen/plugin_resolved and resurrect a
+    // deliberate close.
+    expect(
+      decideRefire(
+        { status: "done" },
+        { resolvedAt: ago(1), operatorSuppressedAt: null },
+        cfg(),
+        NOW,
+      ),
+    ).toEqual({
+      kind: "suppressed",
+      suppressedAt: new Date(NOW).toISOString(),
+      firstObservation: true,
+    });
+  });
+
+  it("suppresses a hand-cancelled row whose alert has resolved before", () => {
+    // AC 2: BLO-24234's suppression must be reachable for an alert that has
+    // resolved at some point, which is every flapping alert — i.e. precisely
+    // the ones operators close by hand. `pluginClosedAt: null` is the positive
+    // record that the close was not ours.
+    expect(
+      decideRefire(
+        { status: "cancelled" },
+        { resolvedAt: ago(1), operatorSuppressedAt: null, pluginClosedAt: null },
+        cfg(),
+        NOW,
+      ),
+    ).toEqual({
+      kind: "suppressed",
+      suppressedAt: new Date(NOW).toISOString(),
+      firstObservation: true,
+    });
+  });
+
+  it("falls back to resolvedAt for a legacy row with no authorship recorded", () => {
+    // Rows written before `pluginClosedAt` existed. The fallback is deliberate
+    // and asymmetric: reading our close as an operator's would MUTE a live
+    // recurring alert for the whole suppression window, while reading an
+    // operator's close as ours costs one unwanted re-open that the next firing
+    // state-write corrects. Legacy rows drain on their first post-deploy fire.
+    expect(
+      decideRefire(
+        { status: "cancelled" },
+        { resolvedAt: ago(1), operatorSuppressedAt: null },
+        cfg(),
+        NOW,
+      ),
+    ).toEqual({ kind: "reopen", reason: "plugin_resolved" });
+    // ...but a legacy `done` row is still never ours, so signal 1 wins.
+    expect(
+      decideRefire(
+        { status: "done" },
+        { resolvedAt: ago(1), operatorSuppressedAt: null },
+        cfg(),
+        NOW,
+      ).kind,
+    ).toBe("suppressed");
   });
 
   it("suppresses an operator close, anchoring on first observation", () => {
