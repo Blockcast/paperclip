@@ -286,5 +286,38 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
     // EXISTS is served without it. Pinned here because it is the contract that makes the withheld
     // projection usable rather than merely safe.
     expect(res.body.mentionedProjects[0].workspaces[0].hasWorkspaceRuntimeConfig).toBe(true);
+    // …and on the COMPACTED path, which is the one that can lose it: that projection selects fields
+    // by name, so the flag survives only if it is named. Without it a withheld caller cannot tell
+    // "no runtime config" from "withheld" — a distinction it had before withholding, when the
+    // config was disclosed outright.
+    expect(res.body.project.workspaces[0].hasWorkspaceRuntimeConfig).toBe(true);
+    expect(res.body.project.primaryWorkspace.hasWorkspaceRuntimeConfig).toBe(true);
+  });
+
+  it("withholds currentExecutionWorkspace on heartbeat-context — the read an agent makes on wake", async () => {
+    const { companyId, agentId, issueId } = await seedScenario();
+
+    const res = await request(createApp(agentActor(companyId, agentId))).get(
+      `/api/issues/${issueId}/heartbeat-context`,
+    );
+
+    // `GET /issues/:id` is not the only exit this boundary has to cover. Heartbeat-context is the
+    // other call site that projects an execution workspace, and it is read by the exact principal
+    // the entitlement exists for, on every wake — the highest-frequency read of this material.
+    expect(res.status).toBe(200);
+    expect(res.body.currentExecutionWorkspace.name).toBe("issue-execution");
+    expect(res.body.currentExecutionWorkspace.config.workspaceRuntime).toBeNull();
+    expect(JSON.stringify(res.body)).not.toContain(EXECUTION_WS_SENTINEL);
+  });
+
+  it("still discloses heartbeat-context runtime config to an entitled owner member", async () => {
+    const { companyId, issueId } = await seedScenario();
+
+    const res = await request(createApp(ownerActor(companyId))).get(
+      `/api/issues/${issueId}/heartbeat-context`,
+    );
+
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(res.body)).toContain(EXECUTION_WS_SENTINEL);
   });
 });

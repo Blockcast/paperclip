@@ -150,10 +150,12 @@ import {
 } from "./workspace-command-authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import {
+  executionWorkspaceIdentity,
   publicExecutionWorkspace,
   publicProjects,
   publicProjectWorkspace,
   resolveWorkspaceRuntimeViewer,
+  type ExecutionWorkspaceIdentity,
   type WorkspaceRuntimeViewer,
 } from "./workspace-response.js";
 import {
@@ -234,7 +236,6 @@ import {
   type CommentEffectIntent,
   type CommentEffectRow,
 } from "../services/issue-comment-effects.js";
-import { maskProjectEnv } from "./project-env-response.js";
 
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
@@ -7301,11 +7302,17 @@ export function issueRoutes(
 
   function respondClosedIssueExecutionWorkspace(
     res: Response,
-    workspace: Pick<ExecutionWorkspace, "closedAt" | "id" | "mode" | "name" | "status">,
+    workspace: ExecutionWorkspaceIdentity,
   ) {
     res.status(409).json({
       error: getClosedIsolatedExecutionWorkspaceMessage(workspace),
-      executionWorkspace: workspace,
+      // The parameter type promises five fields, but every caller passes the full row returned by
+      // `executionWorkspacesSvc.getById` (a bare `db.select()` fed through `toExecutionWorkspace`,
+      // which sets `workspaceRuntime`). TypeScript does not strip excess properties at runtime, so
+      // `executionWorkspace: workspace` served the operator-authored `workspaceRuntime` on this 409
+      // — the same material `publicExecutionWorkspace` exists to withhold. The narrow declared type
+      // is what hid it; perform the narrowing instead of declaring it.
+      executionWorkspace: executionWorkspaceIdentity(workspace),
     });
   }
 
@@ -7406,6 +7413,13 @@ export function issueRoutes(
       remoteWorkspaceRef: workspace.remoteWorkspaceRef,
       sharedWorkspaceKey: workspace.sharedWorkspaceKey,
       runtimeConfig: workspace.runtimeConfig,
+      // The compensating field the boundary promises: `workspace-response.ts` states that callers
+      // keep `hasWorkspaceRuntimeConfig` regardless of entitlement, so a UI needing only existence
+      // never needs the contents. This projection selects fields explicitly, so omitting it left a
+      // withheld caller unable to tell "no runtime config" from "withheld" — a distinction that
+      // WAS available before withholding, because the config was disclosed outright. The service
+      // mapper computes it from the raw row, so it survives the mask.
+      hasWorkspaceRuntimeConfig: workspace.hasWorkspaceRuntimeConfig,
       isPrimary: workspace.isPrimary,
       createdAt: workspace.createdAt,
       updatedAt: workspace.updatedAt,
@@ -8510,8 +8524,13 @@ export function issueRoutes(
     // clear. The primary project on this very response is already stripped (`compactIssueProject`
     // sets `env: null`) — the class was closed in one direction only, and the mentioned projects
     // handed the same material out one key over.
+    //
+    // The `env` mask is applied by `publicProjects` at the response boundary below, NOT here: it
+    // runs inside `publicProject` ahead of the `revealRuntimeConfig` early return, so it covers the
+    // entitled viewer too. A second `.map(maskProjectEnv)` at construction was idempotent but left
+    // two masks where one is load-bearing, which invites a later reader to delete the wrong one.
     const mentionedProjects = mentionedProjectIds.length > 0
-      ? (await projectsSvc.listByIds(issue.companyId, mentionedProjectIds)).map(maskProjectEnv)
+      ? await projectsSvc.listByIds(issue.companyId, mentionedProjectIds)
       : [];
     const currentExecutionWorkspace = issue.executionWorkspaceId
       ? await executionWorkspacesSvc.getById(issue.executionWorkspaceId)
