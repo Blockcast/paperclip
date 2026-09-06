@@ -30,6 +30,8 @@ const tsx = path.resolve(here, "..", "..", "node_modules", ".bin", "tsx");
 
 /** Enough to overrun the 64 KB pipe buffer several times over. */
 const PIPE_PRESSURE_BYTES = 200_000;
+/** Child startup is outside the measured crash deadline and can lag on loaded CI runners. */
+const FIXTURE_STARTUP_TIMEOUT_MS = 10_000;
 
 interface CrashResult {
   code: number | null;
@@ -77,7 +79,7 @@ function runFixture(kind: "throw" | "reject", padBytes: number, strictRejections
 function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(tsx, [fixture, "throw", "0", "prefill-stderr"], {
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
     child.stderr.pause();
 
@@ -86,7 +88,7 @@ function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
     const startupWatchdog = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error("fixture did not observe stderr backpressure"));
-    }, 2_000);
+    }, FIXTURE_STARTUP_TIMEOUT_MS);
 
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
@@ -97,6 +99,7 @@ function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
         child.kill("SIGKILL");
         reject(new Error("crash guard did not exit while stderr was stalled"));
       }, 2_000);
+      child.stdin.end("CRASH\n");
     });
 
     child.on("error", reject);

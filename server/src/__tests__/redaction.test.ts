@@ -7,6 +7,8 @@ import {
   redactEventPayload,
   redactSensitiveText,
   sanitizeRecord,
+  withholdAgentConfigFromApprovalPayload,
+  withholdAgentConfigKeys,
 } from "../redaction.js";
 
 describe("redaction", () => {
@@ -357,6 +359,67 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
     expect(result?.userAuthContext).toBe(REDACTED_EVENT_VALUE);
   });
 
+  // Confirmed live on a currently-pending approval card during BLO-20810
+  // verification (post-#943-merge census), not hypothetical: an
+  // `authoritative_state` field — Tier 2, since "auth" is a substring of
+  // "authoritative", the same collision class as "author" — carried a long
+  // whitespace-free status-slug value and was blanked by the generic
+  // opaque-token length backstop. The backstop must still catch a real
+  // unbroken opaque token of the same length.
+  it("does not redact a long whitespace-free status-slug value under an ambiguous key, but still redacts an equally long opaque token", () => {
+    const result = redactEventPayload({
+      authoritative_state: "pending_human_merge_review_required_for_pr_2132",
+      userAuthContext: "a1B2c3D4e5F6g7H8i9J0k1L2m3N4",
+    });
+
+    expect(result?.authoritative_state).toBe(
+      "pending_human_merge_review_required_for_pr_2132",
+    );
+    expect(result?.userAuthContext).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  // Important finding (#1136 review, head b78bb2e9): the readable-slug
+  // exemption keyed on arity + part length alone, so a delimiter-chunked
+  // opaque token satisfied it (3 parts, each <=12) and escaped the generic
+  // backstop that is supposed to fail closed on unrecognized long values.
+  // The paired benign value is the one the exemption exists for, so this
+  // cannot pass by simply deleting the exemption.
+  it("redacts a delimiter-chunked opaque token under an ambiguous key while keeping a real word slug readable", () => {
+    const result = redactEventPayload({
+      author: "a1b2c3d4-e5f6g7h8-i9j0k1l2",
+      authoritative_state: "pending_human_merge_review",
+    });
+
+    expect(result?.author).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.authoritative_state).toBe("pending_human_merge_review");
+  });
+
+  // Same exemption, all-numeric chunking: no part mixes letters and digits,
+  // so a word/number lexical test alone would still admit it. At least two
+  // word-shaped parts are required, which a bare number grouping never has.
+  it("redacts an all-numeric chunked token under an ambiguous key", () => {
+    const result = redactEventPayload({
+      author_reference: "12345678-87654321-11223344",
+    });
+
+    expect(result?.author_reference).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  // The same predicate gates URL path segments, so the tightening has to hold
+  // on that branch too — and must not re-blank an issue-numbered branch slug,
+  // which mixes word parts with a bare number.
+  it("redacts a delimiter-chunked opaque URL path segment but keeps an issue-numbered branch slug readable", () => {
+    const result = redactEventPayload({
+      author_link: "https://example.test/evidence/blo-20810-redaction-followup-critical-findings",
+      base_url: "https://hooks.slack.test/services/T000/x9y8z7w6-v5u4t3s2-r1q0p9o8",
+    });
+
+    expect(result?.author_link).toBe(
+      "https://example.test/evidence/blo-20810-redaction-followup-critical-findings",
+    );
+    expect(result?.base_url).toBe(REDACTED_EVENT_VALUE);
+  });
+
   // Residual finding (#943 review, post-tiering): `auth`/`secret` as a whole
   // token in a short key (<=2 tokens) is an ordinary credential field name,
   // not the "author"/"no_secrets_in_payload" collision Tier 2 exists for —
@@ -389,9 +452,74 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
       authors: ["alice", "bob"],
       ask_2_author_identity: "PR #1898 was authored by the app account, not a human.",
       no_secrets_in_payload: "No secret values are present in this payload.",
+      secret_fields_must_stay_redacted: "This field intentionally left blank.",
+      no_secret_values_in_this_report: "No secret values are present in this report.",
     };
 
     expect(redactEventPayload(structuredClone(input))).toEqual(input);
+  });
+
+  // Still-present finding (#943 review, head b7620dba): the original
+  // "<=2 tokens" cap under-promoted real three-token-plus credential field
+  // names, so `stripe_webhook_secret` stayed Tier 2 and a short value under
+  // it fell through `looksLikeCredentialValue`'s shape gate. Promotion is now
+  // keyed on the trigger word being the *trailing* token, which fixes these
+  // while the sentence-shaped collisions above (trigger word mid-sentence)
+  // are untouched.
+  it("promotes multi-token credential field names ending in auth/secret to tier 1 regardless of token count", () => {
+    const result = redactEventPayload({
+      stripe_webhook_secret: "whsec123",
+      database_client_secret: "s3cr3t99",
+      my_webhook_secret: "hunter2",
+      thirdPartyAuth: "pw12345",
+    });
+
+    expect(result?.stripe_webhook_secret).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.database_client_secret).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.my_webhook_secret).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.thirdPartyAuth).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  // Still-present finding (#943 review, head b7620dba): the URL branch only
+  // ever inspected `search`, so an OAuth2 implicit-flow fragment
+  // (`#access_token=...`) crossed the approval display boundary in
+  // plaintext under a Tier-2 key.
+  it("still redacts a Tier-2 key's URL carrying a credential in the fragment", () => {
+    const result = redactEventPayload({
+      base_url: "https://client.example/callback#access_token=abc123def456&token_type=bearer",
+    });
+
+    expect(result?.base_url).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  // Still-present finding (#943 review, head b7620dba): every whitespace-free
+  // path segment >=20 chars was treated as opaque/credential-shaped, which
+  // re-blanks exactly the kind of evidence link (commit SHA, UUID, slug)
+  // this issue exists to stop over-redacting.
+  it("does not redact benign long identifier-shaped path segments under a Tier-2 key", () => {
+    const result = redactEventPayload({
+      base_url: "https://github.com/Blockcast/paperclip/commit/76c13c6e9a883091335220be89cdcf12b2823ad9",
+      links: {
+        no_secrets_in_payload_uuid: "https://example.test/evidence/550e8400-e29b-41d4-a716-446655440000",
+        author_link: "https://example.test/blo-20810-approval-redaction-key-name",
+      },
+    });
+
+    expect(result?.base_url).toBe(
+      "https://github.com/Blockcast/paperclip/commit/76c13c6e9a883091335220be89cdcf12b2823ad9",
+    );
+    expect(result?.links).toEqual({
+      no_secrets_in_payload_uuid: "https://example.test/evidence/550e8400-e29b-41d4-a716-446655440000",
+      author_link: "https://example.test/blo-20810-approval-redaction-key-name",
+    });
+  });
+
+  it("still redacts a Slack-style opaque webhook secret path segment (mutation guard for the slug/hex exemptions)", () => {
+    const result = redactEventPayload({
+      base_url: "https://hooks.slack.test/services/T000/B000/AbCdEfGhIjKlMnOpQrSt99",
+    });
+
+    expect(result?.base_url).toBe(REDACTED_EVENT_VALUE);
   });
 
   // Critical (#943 review, post-tiering): a Tier-2 parent (`authorInfo`
@@ -618,6 +746,134 @@ describe("redactAgentConfigPayload", () => {
       title: "Pick deployment target",
       env: { target: REDACTED_EVENT_VALUE },
       colorChoice: { type: "plain", value: REDACTED_EVENT_VALUE },
+    });
+  });
+
+  it("withholds every agent-config subtree from a hire payload, at any depth (PEN-2777)", () => {
+    // The redactors above decide what is secret; this decides what an
+    // ungranted caller is entitled to. The masked-but-diagnosable upstream is
+    // exactly what survives them, so it is what has to be withheld here.
+    const upstream = "https://svc-account@k8s-mcp-admin.internal:8443/mcp";
+    const payload = {
+      name: "Worker",
+      adapterType: "claude_k8s",
+      adapterConfig: { mcpServers: { k8s: { url: upstream } } },
+      runtimeConfig: { modelProfiles: { cheap: { adapterConfig: { mcpServers: {} } } } },
+      requestedConfigurationSnapshot: {
+        adapterType: "claude_k8s",
+        adapterConfig: { mcpServers: { k8s: { url: upstream } } },
+      },
+    };
+
+    const { payload: withheld, withheldFields } = withholdAgentConfigFromApprovalPayload(
+      "hire_agent",
+      structuredClone(payload),
+    );
+
+    expect(JSON.stringify(withheld)).not.toContain("k8s-mcp-admin.internal");
+    expect(withheld).toEqual({
+      name: "Worker",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      requestedConfigurationSnapshot: { adapterType: "claude_k8s", adapterConfig: {} },
+    });
+    expect(withheldFields).toEqual([
+      "adapterConfig",
+      "runtimeConfig",
+      "requestedConfigurationSnapshot.adapterConfig",
+    ]);
+  });
+
+  it("withholds non-object agent-config values, which the payload schema permits (PEN-2777)", () => {
+    // `approvalPayloadSchema` is a `.catchall(z.unknown())` and
+    // `normalizeHireApprovalPayloadForPersistence` only normalizes a record, so
+    // `POST /companies/:companyId/approvals` can persist any shape under these
+    // keys. An array of configs and a JSON-encoded string both carry the
+    // upstream topology, so letting the shape decide entitlement would reopen
+    // the hole through the generic create route.
+    const upstream = "https://svc-account@k8s-mcp-admin.internal:8443/mcp";
+    const { payload: withheld, withheldFields } = withholdAgentConfigFromApprovalPayload("hire_agent", {
+      name: "Worker",
+      adapterConfig: [{ mcpServers: { k8s: { url: upstream } } }],
+      runtimeConfig: JSON.stringify({ mcpServers: { k8s: { url: upstream } } }),
+      requestedConfigurationSnapshot: { adapterConfig: [{ mcpServers: { k8s: { url: upstream } } }] },
+    });
+
+    expect(JSON.stringify(withheld)).not.toContain("k8s-mcp-admin.internal");
+    expect(withheld).toEqual({
+      name: "Worker",
+      adapterConfig: {},
+      runtimeConfig: {},
+      requestedConfigurationSnapshot: { adapterConfig: {} },
+    });
+    expect(withheldFields).toEqual([
+      "adapterConfig",
+      "runtimeConfig",
+      "requestedConfigurationSnapshot.adapterConfig",
+    ]);
+  });
+
+  it("keeps an absent agent config readable rather than reporting it withheld (PEN-2777)", () => {
+    // `null` carries no topology, and blanking it would make the board queue
+    // unable to tell "you may not see this" from "no config was requested".
+    const { payload: withheld, withheldFields } = withholdAgentConfigFromApprovalPayload("hire_agent", {
+      name: "Worker",
+      adapterConfig: null,
+      runtimeConfig: undefined,
+    });
+
+    expect(withheld).toEqual({ name: "Worker", adapterConfig: null, runtimeConfig: undefined });
+    expect(withheldFields).toEqual([]);
+  });
+
+  it("leaves non-hire approval payloads untouched when withholding agent config", () => {
+    const payload = { title: "Ship it", adapterConfig: { note: "not a hire card" } };
+    const { payload: untouched, withheldFields } = withholdAgentConfigFromApprovalPayload(
+      "request_board_approval",
+      structuredClone(payload),
+    );
+
+    expect(untouched).toEqual(payload);
+    expect(withheldFields).toEqual([]);
+  });
+
+  it("withholds the agent config pair from any read projection, not only hire cards (PEN-2839)", () => {
+    // Door #10: the skill test-run `agentConfigSnapshot` reaches the same pair
+    // under `company_scope:read`, the same weaker entitlement PEN-2777 closed
+    // on the approval card. It shares this walk rather than copying it, so the
+    // array/JSON-string bypass Ally caught in #1574 cannot be re-derived and
+    // re-missed on the second path.
+    const upstream = "https://svc-account@k8s-mcp-admin.internal:8443/mcp";
+    const { payload: withheld, withheldFields } = withholdAgentConfigKeys({
+      agentId: "agent-1",
+      name: "Worker",
+      adapterConfig: { env: { OPENAI_API_KEY: SECRET }, mcpServers: { k8s: { url: upstream } } },
+      runtimeConfig: [{ mcpServers: { k8s: { url: upstream } } }],
+    });
+
+    expect(JSON.stringify(withheld)).not.toContain(SECRET);
+    expect(JSON.stringify(withheld)).not.toContain("k8s-mcp-admin.internal");
+    expect(withheld).toEqual({
+      agentId: "agent-1",
+      name: "Worker",
+      adapterConfig: {},
+      runtimeConfig: {},
+    });
+    expect(withheldFields).toEqual(["adapterConfig", "runtimeConfig"]);
+  });
+
+  it("keeps withholdAgentConfigFromApprovalPayload's hire-only precondition after the extraction (PEN-2839)", () => {
+    // The extraction must not widen the approval filter. `withholdAgentConfigKeys`
+    // has no type precondition by design; the approval wrapper must still refuse
+    // to touch a non-hire card, or PEN-2777's scoping silently becomes global.
+    const payload = { title: "Ship it", adapterConfig: { note: "not a hire card" } };
+
+    expect(withholdAgentConfigFromApprovalPayload("request_board_approval", structuredClone(payload)))
+      .toEqual({ payload, withheldFields: [] });
+    expect(withholdAgentConfigKeys(structuredClone(payload))).toEqual({
+      payload: { title: "Ship it", adapterConfig: {} },
+      withheldFields: ["adapterConfig"],
     });
   });
 

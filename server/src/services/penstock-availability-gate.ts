@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export interface PenstockAvailabilityGateLogger {
   info(payload: Record<string, unknown>, msg: string): void;
@@ -26,9 +26,16 @@ export interface PenstockAvailabilityGateAllowResult {
   allow: true;
 }
 
+/**
+ * Penstock-side provider identity. Distinct from the ccrotate target
+ * ("claude" | "codex", see `ccrotate-target.ts`) because penstock names the
+ * Anthropic pool `anthropic` while ccrotate names it `claude`.
+ */
+export type PenstockProvider = "anthropic" | "codex";
+
 export interface PenstockAvailabilityGateDenyResult {
   allow: false;
-  provider: "anthropic";
+  provider: PenstockProvider;
   reason: "penstock.model_capacity_unavailable" | "penstock.model_temporarily_unavailable";
   model: string;
   resumeAt: Date | null;
@@ -42,6 +49,11 @@ export type PenstockAvailabilityGateResult =
 export interface PenstockAvailabilityGate {
   checkAdapter(input: PenstockAvailabilityGateCheckInput): Promise<PenstockAvailabilityGateResult>;
   _resetForTesting(): void;
+  /**
+   * Resident verdict-cache entries. Test-only, and optional so the hand-rolled
+   * gate fakes in the heartbeat suites do not have to implement it.
+   */
+  _cacheSizeForTesting?(): number;
 }
 
 interface CacheEntry {
@@ -49,9 +61,113 @@ interface CacheEntry {
   result: PenstockAvailabilityGateResult;
 }
 
-interface ResolvedPenstockAnthropicCheck {
+/**
+ * Cache identity for one capacity verdict (PEN-2385).
+ *
+ * Every dimension the probe actually varies on has to appear here, or one
+ * agent's verdict is served to another agent the answer was never computed
+ * for. The credential is such a dimension and used to be missing.
+ *
+ * The readback authenticates as the *agent* -- `resolvePenstockCheck` reads
+ * `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` from that agent's
+ * `adapterConfig.env` before falling back to `process.env`, and
+ * `readPenstockCapacity` sends it as both `authorization` and `x-api-key`.
+ * Penstock answers per credential: quota and rate-limit state belong to the
+ * subscription behind the token, not to the endpoint. A fleet pointed at one
+ * `ANTHROPIC_BASE_URL` on one model therefore collapsed onto a single entry
+ * and inherited whichever agent probed first, in both directions:
+ *
+ *   - an exhausted credential's deny parked agents whose own credential was
+ *     fine, which is a capacity-gated wake for no reason;
+ *   - a healthy credential's allow released agents whose own credential was
+ *     exhausted, which dispatches a run that 429s before it spends a token --
+ *     the `rate_limit_exhausted` the gate exists to prevent.
+ *
+ * Observed 2026-08-18/19 on the Blockcast fleet: the reviewer held capacity
+ * and posted reviews while four authors on the same endpoint and model could
+ * not start, and a `/v1/pools/default/capacity` readback that was green for
+ * one credential was green for all of them.
+ *
+ * Hashed, not embedded: this string is held in a Map for the life of the
+ * process, so it reaches heap dumps and anything else that walks live objects,
+ * and a bearer token has no business there. (Logs are not the reason -- no
+ * payload in this module carries the key -- and the heap-dump rationale stands
+ * on its own.) A truncated SHA-256 is sufficient: the key needs to
+ * *distinguish* credentials, not authenticate them, and a collision degrades
+ * to the pre-existing shared-entry behaviour rather than to a new failure.
+ *
+ * Cost, in probes: these now scale with distinct credentials rather than with
+ * distinct (endpoint, model) pairs. Each is one cached GET bounded by
+ * `cacheTtlMs`, so the ceiling is one probe per credential per TTL.
+ *
+ * Cost, in resident entries (PEN-2462): the same widening makes the key space
+ * open-ended over the process lifetime. A rotated or retired token is never
+ * probed again, but nothing gives its entry a reason to leave, and the gate is
+ * constructed once per process (`createPenstockAvailabilityGate`, called from
+ * `heartbeatService`) -- so that tail would accumulate until restart.
+ * `sweepExpiredCapacityCacheEntries` is what bounds it; the argument for why
+ * that suffices is there.
+ */
+function penstockCapacityCacheKey(input: {
   capacityUrl: URL;
-  messagesUrl: URL;
+  provider: PenstockProvider;
+  model: string;
+  token: string;
+}): string {
+  const credential = createHash("sha256").update(input.token).digest("hex").slice(0, 16);
+  return [
+    `${input.capacityUrl.origin}${input.capacityUrl.pathname}`,
+    input.provider,
+    input.model,
+    credential,
+  ].join("::");
+}
+
+/**
+ * Reclaim verdict-cache entries that are already unreachable (PEN-2462).
+ *
+ * Behaviour-preserving by construction: `checkAdapter` will only serve an
+ * entry while `nowMs - fetchedAt < cacheTtlMs`, so an entry at or past the TTL
+ * can never be returned again. Deleting it frees memory and changes no
+ * verdict. (An entry with a `fetchedAt` ahead of `nowMs` yields a negative
+ * age and is kept, so a caller-supplied clock that goes backwards costs at
+ * most a stale entry, never a wrong one.)
+ *
+ * This is what bounds the map, and sweeping at `set` is enough on its own -- a
+ * size cap would be redundant. A `set` only ever follows a non-hit, and a hit
+ * is served for a TTL after each write, so a credential can hold at most one
+ * entry within a TTL window. (It may be *written* more than once -- a deny
+ * whose `resumeAt` has elapsed re-probes while still inside the TTL -- but
+ * that overwrites in place under the same key and does not add residency.)
+ * The survivors of a sweep are therefore exactly the credentials probed within
+ * the last TTL: residency is bounded by the credentials *actively probing*,
+ * not by every credential the process has ever seen -- which is the bound the
+ * credential dimension took away.
+ *
+ * Note that `cache.delete(key)` on the stale-read branch would not achieve
+ * this. A key only comes back around when its credential is still in use, so
+ * the retired-credential tail is precisely the part such a delete never
+ * reaches.
+ */
+function sweepExpiredCapacityCacheEntries(
+  cache: Map<string, CacheEntry>,
+  nowMs: number,
+  cacheTtlMs: number,
+): void {
+  for (const [key, entry] of cache) {
+    if (nowMs - entry.fetchedAt >= cacheTtlMs) cache.delete(key);
+  }
+}
+
+interface ResolvedPenstockCheck {
+  capacityUrl: URL;
+  /**
+   * Secondary probe URL, used only when the capacity readback is
+   * inconclusive. Anthropic-shaped (`/v1/messages`); `null` for providers
+   * with no probe implementation, which then fail open exactly as they did
+   * before this gate covered them.
+   */
+  messagesUrl: URL | null;
   token: string;
   model: string;
 }
@@ -75,20 +191,31 @@ export function createPenstockAvailabilityGate(
 
   return {
     async checkAdapter(input: PenstockAvailabilityGateCheckInput): Promise<PenstockAvailabilityGateResult> {
-      if (input.adapterType !== "claude_k8s") return { allow: true };
+      const provider = mapAdapterToPenstockProvider(input.adapterType);
+      if (!provider) return { allow: true };
 
-      const resolved = resolvePenstockAnthropicCheck(input);
+      const resolved = resolvePenstockCheck(input, provider);
       if (!resolved) return { allow: true };
 
       const nowMs = input.now.getTime();
-      const key = `${resolved.capacityUrl.origin}${resolved.capacityUrl.pathname}::anthropic::${resolved.model}`;
+      const key = penstockCapacityCacheKey({
+        capacityUrl: resolved.capacityUrl,
+        provider,
+        model: resolved.model,
+        token: resolved.token,
+      });
       const cached = cache.get(key);
-      if (cached && nowMs - cached.fetchedAt < cacheTtlMs) {
+      const cachedResetStillFuture =
+        cached?.result.allow !== false ||
+        cached.result.resumeAt === null ||
+        cached.result.resumeAt.getTime() > nowMs;
+      if (cached && nowMs - cached.fetchedAt < cacheTtlMs && cachedResetStillFuture) {
         return cached.result;
       }
 
-      const readback = await readPenstockAnthropicCapacity({
+      const readback = await readPenstockCapacity({
         fetchImpl,
+        provider,
         url: resolved.capacityUrl,
         token: resolved.token,
         model: resolved.model,
@@ -100,42 +227,79 @@ export function createPenstockAvailabilityGate(
       });
       const result =
         readback ??
-        (await probePenstockAnthropicModel({
-          fetchImpl,
-          url: resolved.messagesUrl,
-          token: resolved.token,
-          model: resolved.model,
-          agentId: input.agentId,
-          timeoutMs,
-          defaultRetryDelayMs,
-          now: nowFn,
-          log: opts.log,
-        }));
+        (resolved.messagesUrl
+          ? await probePenstockAnthropicModel({
+              fetchImpl,
+              url: resolved.messagesUrl,
+              token: resolved.token,
+              model: resolved.model,
+              agentId: input.agentId,
+              timeoutMs,
+              defaultRetryDelayMs,
+              now: nowFn,
+              log: opts.log,
+            })
+          : // No secondary probe for this provider: fail open, which is the
+            // pre-existing behaviour for any adapter this gate did not cover.
+            ({ allow: true } as PenstockAvailabilityGateResult));
+      sweepExpiredCapacityCacheEntries(cache, nowMs, cacheTtlMs);
       cache.set(key, { fetchedAt: nowMs, result });
       return result;
     },
     _resetForTesting() {
       cache.clear();
     },
+    _cacheSizeForTesting() {
+      return cache.size;
+    },
   };
 }
 
-function resolvePenstockAnthropicCheck(
+/**
+ * Adapter → penstock provider. Only the k8s adapters are mapped: this gate
+ * exists to defer k8s *dispatch*, and the `*_local` adapters do not dispatch
+ * through it. Returning `null` means "not covered by this gate" and results
+ * in an unconditional allow.
+ */
+export function mapAdapterToPenstockProvider(adapterType: string): PenstockProvider | null {
+  if (adapterType === "claude_k8s") return "anthropic";
+  if (adapterType === "opencode_k8s") return "codex";
+  return null;
+}
+
+/**
+ * Env var names per provider. Both are read from the agent's `adapterConfig.env`
+ * first and `process.env` second, exactly as before.
+ */
+const PROVIDER_ENV: Record<PenstockProvider, { baseUrl: string; tokens: readonly string[] }> = {
+  anthropic: {
+    baseUrl: "ANTHROPIC_BASE_URL",
+    tokens: ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
+  },
+  codex: {
+    baseUrl: "OPENAI_BASE_URL",
+    tokens: ["OPENAI_AUTH_TOKEN", "OPENAI_API_KEY"],
+  },
+};
+
+function resolvePenstockCheck(
   input: PenstockAvailabilityGateCheckInput,
-): ResolvedPenstockAnthropicCheck | null {
+  provider: PenstockProvider,
+): ResolvedPenstockCheck | null {
   const adapterConfig = asRecord(input.adapterConfig);
   const envConfig = asRecord(adapterConfig?.env);
   const env = input.env ?? process.env;
+  const names = PROVIDER_ENV[provider];
+
   const baseUrl =
-    readConfigEnvString(envConfig, "ANTHROPIC_BASE_URL") ??
-    readProcessEnvString(env, "ANTHROPIC_BASE_URL");
+    readConfigEnvString(envConfig, names.baseUrl) ?? readProcessEnvString(env, names.baseUrl);
   if (!baseUrl || !isPenstockBaseUrl(baseUrl)) return null;
 
-  const token =
-    readConfigEnvString(envConfig, "ANTHROPIC_AUTH_TOKEN") ??
-    readConfigEnvString(envConfig, "ANTHROPIC_API_KEY") ??
-    readProcessEnvString(env, "ANTHROPIC_AUTH_TOKEN") ??
-    readProcessEnvString(env, "ANTHROPIC_API_KEY");
+  let token: string | null = null;
+  for (const name of names.tokens) {
+    token = readConfigEnvString(envConfig, name) ?? readProcessEnvString(env, name);
+    if (token) break;
+  }
   if (!token || token === "[redacted]") return null;
 
   const model = readNonEmptyString(adapterConfig?.model);
@@ -143,8 +307,10 @@ function resolvePenstockAnthropicCheck(
 
   try {
     return {
-      capacityUrl: buildCapacityUrl(baseUrl, model),
-      messagesUrl: buildMessagesUrl(baseUrl),
+      capacityUrl: buildCapacityUrl(baseUrl, model, provider),
+      // The secondary probe is an Anthropic Messages call; there is no codex
+      // equivalent implemented, so codex relies on the capacity readback alone.
+      messagesUrl: provider === "anthropic" ? buildMessagesUrl(baseUrl) : null,
       token,
       model,
     };
@@ -168,18 +334,19 @@ function buildMessagesUrl(baseUrl: string): URL {
   return new URL(`${trimmed}/v1/messages`);
 }
 
-function buildCapacityUrl(baseUrl: string, model: string): URL {
+function buildCapacityUrl(baseUrl: string, model: string, provider: PenstockProvider): URL {
   const url = new URL(baseUrl);
   url.pathname = "/v1/pools/default/capacity";
   url.search = "";
-  url.searchParams.set("provider", "anthropic");
+  url.searchParams.set("provider", provider);
   url.searchParams.set("model", model);
   url.hash = "";
   return url;
 }
 
-async function readPenstockAnthropicCapacity(input: {
+async function readPenstockCapacity(input: {
   fetchImpl: typeof fetch;
+  provider: PenstockProvider;
   url: URL;
   token: string;
   model: string;
@@ -237,7 +404,7 @@ async function readPenstockAnthropicCapacity(input: {
     const retry = capacityRetryFromBody(body, input.defaultRetryDelayMs, now);
     const result: PenstockAvailabilityGateDenyResult = {
       allow: false,
-      provider: "anthropic",
+      provider: input.provider,
       reason: "penstock.model_capacity_unavailable",
       model: input.model,
       resumeAt: retry.resumeAt,
@@ -273,6 +440,7 @@ async function readPenstockAnthropicCapacity(input: {
 
 function capacityEndpointUnavailable(
   input: {
+    provider: PenstockProvider;
     model: string;
     defaultRetryDelayMs: number;
     now: () => Date;
@@ -287,7 +455,7 @@ function capacityEndpointUnavailable(
   const retry = defaultCapacityRetry(input.defaultRetryDelayMs, input.now());
   const result: PenstockAvailabilityGateDenyResult = {
     allow: false,
-    provider: "anthropic",
+    provider: input.provider,
     reason:
       status === 429
         ? "penstock.model_capacity_unavailable"
@@ -312,6 +480,12 @@ function capacityEndpointUnavailable(
   return result;
 }
 
+/**
+ * Anthropic-only secondary probe (Messages API shape, `anthropic-version`
+ * header). Reachable only when `ResolvedPenstockCheck.messagesUrl` is non-null,
+ * which `resolvePenstockCheck` sets for `anthropic` alone — hence the
+ * hardcoded provider in its deny result.
+ */
 async function probePenstockAnthropicModel(input: {
   fetchImpl: typeof fetch;
   url: URL;

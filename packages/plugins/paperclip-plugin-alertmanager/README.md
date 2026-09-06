@@ -17,11 +17,21 @@ See `docs/specs/2026-04-29-alertmanager-plugin-spec.md` for the full design.
   delivery (constant-time compare).
 - Parses the AM v2 envelope, drops malformed / unsupported-version payloads
   with a 200 (so AM doesn't retry-storm).
+- Drops firing `severity=info` alerts before issue or state mutation and honors
+  `paperclip_issue: "false"` at every severity.
+- Assigns the configured exact `fallbackAgentName` when owner and issue-route
+  resolution find nobody. Missing or ambiguous fallback configuration fails
+  closed instead of creating an ownerless issue.
+- Deduplicates open issue creation by alertname and optional
+  `paperclip_dedupe_domain`. A database unique index makes concurrent first
+  deliveries attach to one winner.
 - Deduplicates by `alert.fingerprint` per spec §5.3 — re-fires bump the
   state row and refresh the issue body, they don't create a second issue.
 - Re-opens issues the plugin auto-cancelled on resolve when the same
-  fingerprint re-fires (§8.3 option A), while preserving operator-cancelled
-  suppressions.
+  fingerprint re-fires (§8.3 option A). An issue closed by an *operator* while
+  its alert was still firing suppresses re-opens instead — but only for
+  `operatorSuppressionHours` (default 24h), after which a still-firing alert
+  re-opens it with an explanatory comment. See "Operator suppression" below.
 - Resolves issues per `autoCloseOnResolve`: either close the issue (status
   → cancelled) or post an `Alert resolved at <ts>` comment.
 - Renders observability drill-in links (Grafana / Tempo / Pyroscope / Hubble
@@ -30,6 +40,117 @@ See `docs/specs/2026-04-29-alertmanager-plugin-spec.md` for the full design.
 - Emits `plugin.alertmanager.alert.firing` and
   `plugin.alertmanager.alert.resolved` so sibling plugins (status pages,
   paging integrations) can subscribe.
+
+## Recovering an interrupted aggregate delivery
+
+The aggregate lifecycle fence intentionally fails closed: if the worker stops
+after it claims a fence but before it finishes the delivery, later firings and
+final resolution wait until an operator releases that exact fence.
+
+Two phases hold a fence this way, and both are recoverable here:
+
+| held phase | left behind by | token to release it |
+| --- | --- | --- |
+| `firing` | an interrupted firing delivery | `firing_token` |
+| `cancelling` | an interrupted terminal transition | `resolution_token` |
+
+Both are reported by the listing route as `phase`, with the token to use in
+`firingToken` regardless of which column it came from. `active` and `finalizing`
+never block a firing claim, so neither ever needs recovery.
+
+### Recognising the wedge
+
+A firing claim refused by a live holder is **not** a wedge, and is no longer
+reported as a failure. Contention is routine: the fence is keyed on the creation
+identity, so every alert sharing an alertname contends for one fence by design.
+A refused claim is retried in-process with jittered backoff for a few seconds
+(PEN-3013), and the common case is absorbed silently. A delivery that had to
+wait says so, at info:
+
+```
+Alertmanager aggregate <key> was held by a concurrent delivery; claimed it
+after <n> attempt(s) over <ms>ms instead of failing the delivery.
+```
+
+Only once that budget is spent does the delivery fail, with:
+
+```
+Alertmanager aggregate <key> is held in phase '<firing|cancelling>' by a
+delivery in progress; retrying firing delivery. A fence abandoned by a dead
+process is released automatically by its slot's next worker; if this persists,
+the holder is either live or in another slot, and an operator can release it via
+the plugin's recover-aggregate-firing route.
+```
+
+The failure is per-alert, but one held aggregate fails the whole delivery batch
+so Alertmanager retries it — which is why a single wedged key can stall all
+webhook alert delivery. The wait budget is spent at most once per aggregate key
+per delivery, not once per alert: the first alert to exhaust it marks that key,
+and the rest of the batch fails fast rather than each waiting in turn. So a
+wedged fence delays a delivery by roughly one budget, not by one per alert — a
+batch of 10 costs seconds, not tens of seconds. A fence abandoned by a dead
+process now self-clears via its slot's next worker (BLO-31036), so a *sustained*
+failure means the holder is live or in another slot.
+
+**Do not diagnose this from
+`alertmanager_notifications_failed_total{integration="webhook"}`.** It undercounts
+and cannot witness the fault: Alertmanager increments it only when a
+notification's retry budget is *exhausted*, not per failed request, so a request
+that fails and is later retried successfully leaves no trace at all. Measured on
+PEN-2988, 14 HTTP 502s inside 40 seconds produced **zero** counter movement — a
+flat counter is fully compatible with a continuously-failing handler. Diagnose at
+the HTTP layer (502s at the webhook route) and from the handler logs above. Note
+that `paperclip_plugin_error` also stays `0` throughout: the plugin is running and
+healthy at the lifecycle level, and is failing per alert.
+
+The recovery API is board-authenticated and company-scoped. The examples below
+use a Paperclip board token in `PAPERCLIP_BOARD_TOKEN` (a browser session cookie
+can be used instead). Keep that token in the environment, never in the command
+itself.
+
+1. List the currently held fences. The response is sensitive and is
+   marked `Cache-Control: no-store`; only an authorized board user for the
+   requested company can read it.
+
+   ```sh
+   curl --fail --silent --show-error \
+     -H "Authorization: Bearer $PAPERCLIP_BOARD_TOKEN" \
+     "$PAPERCLIP_URL/api/plugins/$PLUGIN_ID/api/aggregate-firing-fences?companyId=$COMPANY_ID"
+   ```
+
+   Copy the `aggregateKey` and its matching `firingToken` from the response.
+   The token is bearer-equivalent; do not put it in tickets, chat, shell
+   history, or logs.
+
+2. Release that exact token through the board-authenticated recovery route.
+   The response contains only whether the compare-and-set matched; it never
+   returns the token.
+
+   Keep the token out of shell history by reading it without echo and piping a
+   generated JSON body to curl:
+
+   ```sh
+   read -r -s FIRING_TOKEN
+   printf '\n'
+   jq -n \
+     --arg companyId "$COMPANY_ID" \
+     --arg aggregateKey "$AGGREGATE_KEY" \
+     --arg firingToken "$FIRING_TOKEN" \
+     '{companyId: $companyId, aggregateKey: $aggregateKey, firingToken: $firingToken}' \
+   | curl --fail --silent --show-error \
+     -H "Authorization: Bearer $PAPERCLIP_BOARD_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -X POST \
+     "$PAPERCLIP_URL/api/plugins/$PLUGIN_ID/api/aggregate-firing-fences/recover" \
+     --data-binary @-
+   unset FIRING_TOKEN
+   ```
+
+   A result of `{"recovered":true}` means the exact fence was released.
+   `{"recovered":false}` means the token was stale, already recovered, or
+   replaced by a later firing; obtain a fresh listing before retrying. Recovery
+   activity records the company, aggregate key, and result, but never the
+   token.
 
 ## Configuration
 
@@ -52,12 +173,14 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 | Key                  | Type    | Required | Notes |
 |----------------------|---------|----------|-------|
 | `defaultCompanyId`   | string  | no       | Company that receives alerts when no routing label is set. Defaults to the delivering company; must match it when set. |
-| `webhookToken`       | string  | for accepted deliveries | Static bearer token. AM sends `Authorization: Bearer <token>`. |
-| `webhookTokenRef`    | secret-ref | no       | Disabled in the worker webhook path until the host can verify secret refs before invoking public plugin code. Configured refs fail closed. |
+| `webhookToken`       | string  | no       | Inline static bearer token for development. AM sends `Authorization: Bearer <token>`. |
+| `webhookTokenRef`    | secret-ref | for production deliveries | Preferred production credential. The host verifies it without returning the value to the worker or consuming secret-resolution quota. Must point at a secret Paperclip wrote itself — see Security below. |
 | `acceptOnlyLabels`   | object  | no       | Accept-only label filter, e.g. `{ paperclip: "true" }`. |
 | `severityToPriority` | object  | no       | Override the default severity map. |
 | `autoCloseOnResolve` | boolean | no       | Defaults to true (status → cancelled). Set false for comment-only. |
+| `operatorSuppressionHours` | number | no  | How long an operator-closed issue mutes re-fires before the plugin re-opens it anyway. Defaults to 24, clamped to a 720h (30-day) ceiling. `0` = suppress indefinitely (pre-BLO-24234 behaviour). |
 | `ownerMap`           | object  | no       | `{ <labelKey>: { <labelValue>: <email> } }`. |
+| `fallbackAgentName`  | string  | conditionally | Exact agent name used when no mapped owner or issue route resolves. Ownerless creation is refused if this is missing or ambiguous. |
 | `issueRouteMap`      | object  | no       | `{ <labelKey>: { <labelValue>: { projectId, goalId, assigneeAgentId, status } } }`. |
 
 ### Example `AlertmanagerConfig` YAML
@@ -83,7 +206,7 @@ route:
 
 ```yaml
 defaultCompanyId: 11111111-1111-1111-1111-111111111111
-webhookToken: "<same bearer token Alertmanager sends>"
+webhookTokenRef: "<secret reference for the bearer token Alertmanager sends>"
 acceptOnlyLabels:
   paperclip: "true"
 severityToPriority:
@@ -102,6 +225,7 @@ ownerMap:
   team:
     platform:   alice@blockcast.net
     networking: ned@blockcast.net
+fallbackAgentName: Alert Triage
 issueRouteMap:
   class:
     physical_infra_proxmox:
@@ -162,11 +286,50 @@ First hit wins:
 1. `alert.labels.paperclip_assignee_email`
 2. `ownerMap[<label>][<value>]` matched against `alert.labels`
 3. `alert.annotations.paperclip_assignee_email`
-4. unassigned
+4. the exact configured `fallbackAgentName`
+
+If no mapped user, issue-route assignee, or unique fallback agent resolves, the
+delivery emits `alertmanager.owner.fallback_failed` and creates no issue.
 
 Resolved emails are looked up against `ctx.users.findByEmail` and cached
 per email in plugin state (`owner-by-email:<email>`). Negative results are
 cached too (empty string) so a missing user doesn't cause repeated lookups.
+
+### Issue creation floor and rule-level opt-out
+
+Two gates keep low-value alerts from becoming issues:
+
+- **`severity: info` creates no issue.** The gate is *creation-only* and runs
+  after the re-fire branch, so an `info` issue that already exists (filed
+  before this floor) still gets refreshed and still closes on resolve.
+  Emits `alertmanager.webhook.below_issue_floor`.
+- **`paperclip_issue: "false"`** — as a label *or* an annotation — suppresses
+  the alert at **any** severity. Like the floor, the gate is *creation-only*: it
+  suppresses the **firing** path entirely (no issue created, no existing one
+  refreshed, no state written, no suppression anchor banked) but deliberately
+  lets the **resolved** path through. Emits
+  `alertmanager.webhook.issue_opt_out`.
+
+Letting resolve through is what keeps the opt-out from wedging the issues it was
+added to silence. Gating it too would mean `handleResolved` never runs for an
+opted-out rule, so `state.resolvedAt` would stay `null` and the issue would
+never reach a terminal status — and `advanceIssueLadder` returns early only on
+`resolvedAt`, `escalationComplete`, or a terminal issue status. The escalation
+sweep would keep climbing the ladder, waking agents, and eventually file a
+`[user-cover]` board escalation for a rule that was explicitly opted out and
+whose alert had already resolved. That is the normal adoption path, not an edge
+case: operators opt a rule out *because* it has already been filing noisy
+issues, so a tracked issue usually exists at that moment.
+
+This does not weaken the guarantee for a rule opted out from the start: with no
+issue ever filed there is no state row, and a resolved delivery for an unknown
+fingerprint is dropped without touching anything.
+
+Both are permanent policy decisions, so a failure to write their telemetry is
+logged but does not fail the delivery — otherwise Alertmanager would redeliver
+an alert that will be dropped identically every time. A non-string
+`paperclip_issue` is refused rather than coerced
+(`alertmanager.alert.malformed`).
 
 ### Severity → priority defaults
 
@@ -176,6 +339,36 @@ cached too (empty string) so a missing user doesn't cause repeated lookups.
 | warning  | high     |
 | info     | medium   |
 | (other)  | medium   |
+
+`info` remains explicit for compatibility, but the firing creation floor runs
+first, so it creates no new issue. Accepted `critical`, `warning`, and custom
+severities continue through this mapping.
+
+### Aggregate creation identity
+
+The canonical creation key is
+`alert-aggregate:v1:[<alertname>,<paperclip_dedupe_domain-or-null>]` and is
+stored in `originFingerprint`. Without an explicit domain, distinct label sets
+for one alertname converge on one open issue. Set `paperclip_dedupe_domain` as a
+label or annotation when a rule intentionally needs separate resource domains.
+
+The host enforces one open row per company and aggregate key with
+`issues_active_alertmanager_aggregate_creation_uq`. The plugin also takes a
+short-lived aggregate creation claim before calling issue creation so concurrent
+losers re-check for the winner instead of reaching external identifier
+allocation. Each attached fingerprint is tracked in
+`alertmanager_aggregate_members`; resolving one member closes the shared issue
+only after the last unresolved sibling clears. Same-fingerprint re-fires that
+point at an older terminal issue rebind to the current active aggregate winner.
+
+### Channel precision policy
+
+The target is at least 70% actionable issues, measured as a 14-day cancellation
+rate at or below 30%. The pre-change baseline from
+[BLO-20576](/BLO/issues/BLO-20576) is 73.6% cancelled. If the first 14-day
+cohort remains above 36.8% cancelled, opt the noisiest rules out with
+`paperclip_issue: "false"`, recalibrate their thresholds and dedupe domains,
+and require a replay before restoring issue creation.
 
 ### Observability drill-in links
 
@@ -193,23 +386,84 @@ ending in `_url` is ignored.
 | `runbook_url`    | Runbook |
 | (alert.generatorURL) | Source query in Prometheus |
 
+### Operator suppression, and what a re-fire does (BLO-24234)
+
+Every re-fire of a known fingerprint takes exactly one of four branches. The
+branch is decided by `decideRefire()` in `webhook-handler.ts` and each one emits
+a distinct metric, so "the alert delivered but I see no issue" is answerable
+from telemetry rather than by reading the issue body's `Started:` timestamp.
+
+| Issue status at re-fire | `resolvedAt` in state | Outcome | Metric |
+|---|---|---|---|
+| open (any non-terminal) | — | refresh description | `alertmanager.firing.deduped` |
+| `done` / `cancelled` | set (plugin closed it on resolve) | re-open → `todo` | `alertmanager.firing.reopened` |
+| `done` / `cancelled` | null (**operator** closed it) — inside window | stay closed, stay quiet | `alertmanager.firing.suppressed` |
+| `done` / `cancelled` | null — window expired | re-open → `todo` + comment | `alertmanager.firing.suppression_expired` |
+| issue unreadable / deleted | — | leave state intact | `alertmanager.firing.issue_missing` |
+
+`alertmanager.firing.deduped` is still emitted on **every** re-fire, so existing
+dashboards keep working; the metrics above narrate what the re-fire actually did.
+
+**Why the window exists.** Closing an alert issue by hand means "stop nagging
+me", and the plugin honours that. But an unbounded mute is a footgun: a
+fingerprint is `hash(sorted(labels))`, so a provider-agnostic alert such as
+`LLMProxyHighErrorRate` re-uses **one** fingerprint across every future root
+cause. Before this change, one operator closing a noisy issue muted that alert
+permanently — the webhook kept delivering 200s, the state row kept updating, and
+nothing was visible in any open-status view. That is the failure mode behind the
+2026-08-08 investigation in BLO-23405/BLO-24234.
+
+Suppression is anchored on the **first re-fire observed against the closed
+issue**, not on the close itself (the plugin never sees the close), and the
+anchor is not refreshed by later re-fires — otherwise the window would slide
+forever and never expire. Closing the issue again after a re-open starts a fresh
+window. Set `operatorSuppressionHours: 0` to restore the old unbounded mute.
+
+Any other value is clamped to `MAX_OPERATOR_SUPPRESSION_HOURS` (720h / 30 days)
+before it is converted to milliseconds. Rejecting only non-finite input is not
+enough: the conversion multiplies by 3.6e6, so anything above ~5e301 overflows
+to `Infinity` and `now - anchor >= Infinity` is never true — and a merely large
+finite value (1e15 hours is ~1e11 years) never expires either. Both re-create
+the unbounded mute this section exists to prevent, reachable through a config
+typo rather than a code path. `0` stays the one explicit, documented way to ask
+for indefinite suppression on purpose.
+
+**Known asymmetry, deliberate:** if the state row is lost *and* the issue is
+terminal, `recoverStateFromIssue()` declines to adopt it and a fresh issue is
+filed instead. After a state loss the plugin cannot tell whether the close was
+its own or an operator's, and for a paging system a visible duplicate is a safer
+failure than an inherited mute.
+
 ## Security
 
-- **Always set `webhookToken`.** Without a token the
+- **Always set `webhookTokenRef` in production** (or `webhookToken` for local
+  development). Without a token the
   webhook endpoint rejects every request — there is no "open" mode.
-- **Do not configure `webhookTokenRef` on this build.** Secret refs require a
-  host-side verifier so invalid public requests cannot spend shared
-  secret-resolution capacity before authentication. Until that host path exists,
-  configured refs fail closed and deliveries are retried instead of accepted.
+- **`webhookTokenRef` must point at a secret Paperclip wrote itself.**
+  Authentication compares digests host-side, so it needs a digest of the secret
+  VALUE. Paperclip stores one for secrets it created (`local_encrypted`, and
+  provider-managed versions). A secret IMPORTED as an external provider
+  reference — for example an existing AWS Secrets Manager ARN registered by
+  reference — stores a fingerprint of the *reference* instead, and cannot be
+  verified. Configure one of those and every delivery fails permanently:
+  `onHealth()` reports `degraded` naming the company, and the worker logs
+  `points at an external provider reference, which cannot be verified
+  host-side`. Create the token as a Paperclip secret rather than importing it.
+- **Anonymous floods are free, wrong-token floods are cheap.** A request with no
+  `Authorization: Bearer` header is rejected before any host call, and
+  verification is metered on its own budget rather than the secret-resolution
+  budget — so neither can starve genuine deliveries of the resolution quota they
+  need (BLO-20706, BLO-20738).
 - **IP allowlist at ingress** as defense in depth. Alertmanager pods reschedule on
   restart and their pod IP changes; allowlist the namespace's pod CIDR
   rather than per-pod IPs.
 - **mTLS is the V2 upgrade path** for stronger mutual auth (spec §11 Q4).
   Static bearer is V1 because it's the lowest-friction way to get rolling.
-- The bearer token is read from the delivering company's config **per
-  delivery** and is never written to plugin state or logs. A config update takes
-  effect on the next request, and a restart can never leave the worker holding a
-  stale (or absent) token.
+- The bearer credential config is read for the delivering company **per
+  delivery** and is never written to plugin state or logs. Secret-ref values
+  remain in the host process; the worker receives only the comparison result.
+  A config update takes effect on the next request, and a restart can never leave
+  the worker holding a stale (or absent) token.
 
 ### Config is resolved per delivery, per company
 

@@ -35,6 +35,10 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import * as providerRegistry from "../secrets/provider-registry.js";
 import type { SecretProviderModule } from "../secrets/types.js";
 import { routineService } from "../services/routines.js";
+import {
+  getRoutineDispatchMetric,
+  resetRoutineDispatchMetrics,
+} from "../services/routine-dispatch-metrics.js";
 import { secretService } from "../services/secrets.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -1122,7 +1126,11 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       triggerDetail: "system",
       status: "running",
       contextSnapshot: { issueId: previousIssue.id },
-      startedAt: new Date("2026-03-20T12:01:00.000Z"),
+      // BLO-25692: dated from wall-clock `now`, not the fixed 2026-03-20 clock
+      // the issue rows use. Run age is now part of the live test, so a run
+      // pinned to a fixed past date reads as stale and stops gating -- which is
+      // the behaviour under test here, not the thing being asserted.
+      startedAt: new Date(),
     });
 
     await db
@@ -1186,7 +1194,11 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       triggerDetail: "system",
       status: "running",
       contextSnapshot: { issueId: previousIssue.id },
-      startedAt: new Date("2026-03-20T12:01:00.000Z"),
+      // BLO-25692: dated from wall-clock `now`, not the fixed 2026-03-20 clock
+      // the issue rows use. Run age is now part of the live test, so a run
+      // pinned to a fixed past date reads as stale and stops gating -- which is
+      // the behaviour under test here, not the thing being asserted.
+      startedAt: new Date(),
     });
     await db
       .update(issues)
@@ -1269,7 +1281,11 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       triggerDetail: "system",
       status: "running",
       contextSnapshot: { issueId: previousIssue.id },
-      startedAt: new Date("2026-03-20T12:01:00.000Z"),
+      // BLO-25692: dated from wall-clock `now`, not the fixed 2026-03-20 clock
+      // the issue rows use. Run age is now part of the live test, so a run
+      // pinned to a fixed past date reads as stale and stops gating -- which is
+      // the behaviour under test here, not the thing being asserted.
+      startedAt: new Date(),
     });
     await db
       .update(issues)
@@ -1309,6 +1325,455 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       includeRoutineExecutions: true,
     });
     expect(inboxIssues.map((issue) => issue.id)).toContain(previousIssue.id);
+  });
+
+  // BLO-23379: seed an open routine execution issue bound to a heartbeat run in
+  // the given state, so dispatch gating (skip_if_active / coalesce_if_active)
+  // sees it as a candidate "live" issue.
+  //
+  // `bindExecutionRun` defaults to false to match production: routine execution
+  // issues observed on the live board (BLO-23347, BLO-24323) both carry
+  // `executionRunId: null`, so they are matched by the contextSnapshot->>'issueId'
+  // join rather than the executionRunId join. That also keeps them outside the
+  // `issues_open_routine_execution_uq` partial index, which only covers rows with
+  // `execution_run_id is not null` -- which is why a bypassed fire can create a
+  // second open execution issue without a 23505 conflict.
+  //
+  // BLO-25692: `runStartedAt` dates the heartbeat run and is deliberately
+  // separate from `updatedAt`, which only orders the issue rows. It defaults to
+  // "just now" so a seeded run is inside ROUTINE_LIVE_RUN_AGE_HORIZON_MS and
+  // reads as genuinely in-flight; pass an older value to seed a run that has
+  // been queued/running past the horizon. Before that horizon existed the two
+  // were the same field, so every "still gates" fixture was silently seeding a
+  // months-old run and only passing because run age was not being checked.
+  // `startedAt` is left null for `queued` runs, matching production -- a run
+  // that has not started has no start time, and its age comes from `createdAt`.
+  async function seedGatingExecutionIssue(params: {
+    companyId: string;
+    agentId: string;
+    routine: Awaited<ReturnType<typeof seedFixture>>["routine"];
+    issueSvc: Awaited<ReturnType<typeof seedFixture>>["issueSvc"];
+    runStatus: string;
+    scheduledRetryAt?: Date | null;
+    updatedAt: Date;
+    runStartedAt?: Date;
+    bindExecutionRun?: boolean;
+  }) {
+    const previousRunId = randomUUID();
+    const heartbeatRunId = randomUUID();
+    const runStartedAt = params.runStartedAt ?? new Date();
+    const issue = await params.issueSvc.create(params.companyId, {
+      projectId: params.routine.projectId,
+      title: params.routine.title,
+      description: params.routine.description,
+      status: "in_progress",
+      priority: params.routine.priority,
+      assigneeAgentId: params.routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: params.routine.id,
+      originRunId: previousRunId,
+    });
+
+    await db.insert(routineRuns).values({
+      id: previousRunId,
+      companyId: params.companyId,
+      routineId: params.routine.id,
+      triggerId: null,
+      source: "manual",
+      status: "issue_created",
+      triggeredAt: params.updatedAt,
+      linkedIssueId: issue.id,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: heartbeatRunId,
+      companyId: params.companyId,
+      agentId: params.agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: params.runStatus,
+      contextSnapshot: { issueId: issue.id },
+      // A queued run has not started, so it carries no `startedAt` and is aged
+      // from `createdAt` instead -- pinned here so the age is deterministic
+      // rather than defaulting to insert time.
+      createdAt: runStartedAt,
+      startedAt: params.runStatus === "queued" ? null : runStartedAt,
+      scheduledRetryAt: params.scheduledRetryAt ?? null,
+    });
+    await db
+      .update(issues)
+      .set({
+        ...(params.bindExecutionRun
+          ? {
+              checkoutRunId: heartbeatRunId,
+              executionRunId: heartbeatRunId,
+              executionLockedAt: params.updatedAt,
+            }
+          : {}),
+        updatedAt: params.updatedAt,
+      })
+      .where(eq(issues.id, issue.id));
+
+    return { issue, heartbeatRunId };
+  }
+
+  // BLO-23379: a `ccrotate_capacity` park schedules `scheduledRetryAt` days out.
+  // Treating that as "live" let a single parked execution issue silently disable
+  // routine 4756349d for the whole park (BLO-23347 -> +6d, four consecutive
+  // skipped fires). The park must stop gating; a genuine in-flight run must not.
+  it("fires when the only live execution issue is parked on a long-horizon scheduled_retry", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const parked = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "scheduled_retry",
+      // Six days out, matching the BLO-23347 park that triggered this issue.
+      scheduledRetryAt: new Date(Date.now() + 6 * 24 * 60 * 60 * 1000),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+    });
+
+    resetRoutineDispatchMetrics();
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(parked.issue.id);
+    // The bypass is observable, so "skipped because work is in flight" and
+    // "fired past a long-parked gate" are distinguishable from the outside.
+    expect(getRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue")).toBe(1);
+  });
+
+  it("still skips when the live execution issue is actively running", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const running = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "running",
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+    });
+
+    resetRoutineDispatchMetrics();
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("skipped");
+    expect(run.linkedIssueId).toBe(running.issue.id);
+    expect(getRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue")).toBe(0);
+  });
+
+  // Same bypass, but reached through the executionRunId join rather than the
+  // contextSnapshot join, so both arms of findLiveExecutionIssue are covered.
+  it("fires past a long-horizon park that is bound via executionRunId", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const parked = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 6 * 24 * 60 * 60 * 1000),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      bindExecutionRun: true,
+    });
+
+    resetRoutineDispatchMetrics();
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(parked.issue.id);
+    expect(getRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue")).toBe(1);
+  });
+
+  it("still skips when the execution issue's scheduled_retry is due within the horizon", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const retrying = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "scheduled_retry",
+      // A normal short backoff is still in-flight work, not a park.
+      scheduledRetryAt: new Date(Date.now() + 5 * 60 * 1000),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+    });
+
+    resetRoutineDispatchMetrics();
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("skipped");
+    expect(run.linkedIssueId).toBe(retrying.issue.id);
+    expect(getRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue")).toBe(0);
+  });
+
+  it("does not let a parked execution issue shadow a genuinely running one", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const running = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "running",
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+    });
+    // Touched more recently, so it sorts ahead of the running issue. A
+    // single-row lookup would report "nothing live" and fire over the top of a
+    // run that is genuinely in flight.
+    await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 6 * 24 * 60 * 60 * 1000),
+      updatedAt: new Date("2026-03-20T12:05:00.000Z"),
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("skipped");
+    expect(run.linkedIssueId).toBe(running.issue.id);
+  });
+
+  // BLO-23379 review follow-up: the guarantee above must not depend on how many
+  // parked rows sort ahead of the running one. A bounded scan ordered by
+  // `updatedAt` drops the running row out of the window once enough newer parks
+  // exist, and dispatch then fires alongside genuinely in-flight work. Seed more
+  // parked issues than the scan window to pin that the live lookup is
+  // independent of it.
+  it("does not let more parked issues than the scan window shadow a running one", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const running = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "running",
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+    });
+
+    // ROUTINE_LIVE_EXECUTION_ISSUE_SCAN_LIMIT is 10; go past it so the running
+    // row provably falls outside any top-N window.
+    const parkedCount = 12;
+    for (let index = 0; index < parkedCount; index += 1) {
+      await seedGatingExecutionIssue({
+        companyId,
+        agentId,
+        routine,
+        issueSvc,
+        runStatus: "scheduled_retry",
+        scheduledRetryAt: new Date(Date.now() + 6 * 24 * 60 * 60 * 1000),
+        // All newer than the running issue, so every one of them sorts ahead.
+        updatedAt: new Date(Date.parse("2026-03-20T12:05:00.000Z") + index * 60_000),
+      });
+    }
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("skipped");
+    expect(run.linkedIssueId).toBe(running.issue.id);
+  });
+
+  // BLO-23379 review follow-up: `always_enqueue` never consults `activeIssue` to
+  // gate dispatch, so nothing is bypassed when it fires past a parked row.
+  // Counting one there would make the metric fire on every long-parked issue of
+  // every always_enqueue routine -- a false positive on the operational signal.
+  it("does not count a bypass for always_enqueue, which never gates on an active issue", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "always_enqueue" })
+      .where(eq(routines.id, routine.id));
+
+    const parked = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 6 * 24 * 60 * 60 * 1000),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+    });
+
+    resetRoutineDispatchMetrics();
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(parked.issue.id);
+    expect(getRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue")).toBe(0);
+  });
+
+  // BLO-25692: the `scheduled_retry` horizon above covers only one of the three
+  // live statuses. `queued`/`running` had no bound at all, so a single
+  // long-lived execution run gated every later fire. Measured on routine
+  // 4756349d: BLO-24323's run was live ~16h47m with `scheduledRetry: null` --
+  // so the park horizon never applied -- and suppressed three consecutive
+  // scheduled fires, stretching a ~6h cadence to 12h/6h/24h/18h gaps.
+  const STALE_RUN_AGE_MS = 7 * 60 * 60 * 1000;
+
+  for (const runStatus of ["running", "queued"] as const) {
+    it(`fires when the only live execution issue has been ${runStatus} past the run-age horizon`, async () => {
+      const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+      await db
+        .update(routines)
+        .set({ concurrencyPolicy: "skip_if_active" })
+        .where(eq(routines.id, routine.id));
+
+      const stale = await seedGatingExecutionIssue({
+        companyId,
+        agentId,
+        routine,
+        issueSvc,
+        runStatus,
+        runStartedAt: new Date(Date.now() - STALE_RUN_AGE_MS),
+        updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      });
+
+      resetRoutineDispatchMetrics();
+      const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+      expect(run.status).toBe("issue_created");
+      expect(run.linkedIssueId).not.toBe(stale.issue.id);
+      // A stale run and a quota park are different causes, so they must not
+      // land on the same label -- an operator has to be able to tell a stalled
+      // execution from a provider-quota park.
+      expect(getRoutineDispatchMetric("routine_dispatch_bypassed_stale_execution_issue")).toBe(1);
+      expect(getRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue")).toBe(0);
+    });
+
+    // The guard on the bypass: normal overlapping work must still be gated, or
+    // this fix would turn skip_if_active into always_enqueue.
+    it(`still skips when the ${runStatus} execution run is inside the run-age horizon`, async () => {
+      const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+      await db
+        .update(routines)
+        .set({ concurrencyPolicy: "skip_if_active" })
+        .where(eq(routines.id, routine.id));
+
+      const live = await seedGatingExecutionIssue({
+        companyId,
+        agentId,
+        routine,
+        issueSvc,
+        runStatus,
+        runStartedAt: new Date(Date.now() - 5 * 60 * 1000),
+        updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      });
+
+      resetRoutineDispatchMetrics();
+      const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+      expect(run.status).toBe("skipped");
+      expect(run.linkedIssueId).toBe(live.issue.id);
+      expect(getRoutineDispatchMetric("routine_dispatch_bypassed_stale_execution_issue")).toBe(0);
+    });
+  }
+
+  // The run-age bound must not weaken the guarantee BLO-23379 established: a
+  // bypassable row sorting ahead of a genuinely in-flight one must never let
+  // dispatch fire alongside real work. Here the newer row is stale rather than
+  // parked, exercising the same shadowing hazard through the new branch.
+  it("does not let a stale execution issue shadow a recently started one", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const running = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "running",
+      runStartedAt: new Date(Date.now() - 5 * 60 * 1000),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+    });
+    // Touched more recently, so it sorts ahead of the running issue.
+    await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "running",
+      runStartedAt: new Date(Date.now() - STALE_RUN_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:05:00.000Z"),
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("skipped");
+    expect(run.linkedIssueId).toBe(running.issue.id);
+  });
+
+  // A run past the age horizon whose retry is imminent stays gating: the
+  // scheduled_retry branch keeps its own rule, so the age bound must not leak
+  // into it and start firing over work that is about to resume.
+  it("still skips when an old run is parked on a scheduled_retry due within the horizon", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const retrying = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 5 * 60 * 1000),
+      runStartedAt: new Date(Date.now() - STALE_RUN_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+    });
+
+    resetRoutineDispatchMetrics();
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("skipped");
+    expect(run.linkedIssueId).toBe(retrying.issue.id);
+    expect(getRoutineDispatchMetric("routine_dispatch_bypassed_stale_execution_issue")).toBe(0);
   });
 
   it("does not coalesce live routine runs with different resolved variables", async () => {
@@ -2166,6 +2631,16 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(runs).toHaveLength(3);
     expect(runs.filter((run) => run.status === "issue_created")).toHaveLength(1);
     expect(runs.filter((run) => run.status === "coalesced")).toHaveLength(2);
+    expect(runs.map((run) => run.triggerPayload?.__paperclipRoutineWindowClosesAt)).toEqual([
+      "2026-07-16T01:00:00.000Z",
+      "2026-07-16T02:00:00.000Z",
+      "2026-07-16T03:00:00.000Z",
+    ]);
+    expect(runs.map((run) => run.triggeredAt)).toEqual([
+      new Date("2026-07-16T00:00:00.000Z"),
+      new Date("2026-07-16T01:00:00.000Z"),
+      new Date("2026-07-16T02:00:00.000Z"),
+    ]);
     const updatedTrigger = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id)).then((rows) => rows[0]);
     expect(updatedTrigger?.nextRunAt).toEqual(new Date("2026-07-16T03:00:00.000Z"));
   });

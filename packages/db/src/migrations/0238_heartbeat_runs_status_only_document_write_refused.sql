@@ -1,0 +1,45 @@
+-- BLO-23197: give the successful-run-handoff detector a durable signal that a
+-- run was refused an issue-document write, so the corrective wake it queues is
+-- not one that provably cannot satisfy the guard.
+--
+-- The deadlock: a run executing under `modelProfile: cheap` /
+-- `recoveryIntent: status_only` completes its analysis, tries to land the
+-- deliverable, and is refused 403 by
+-- `assertDeliverableMutationAllowedByRunContext`. The run correctly respects the
+-- guard and ends. `decideSuccessfulRunHandoff` then sees progress with no
+-- disposition and queues one corrective wake — on the SAME status-only lane,
+-- because it resolves the lane from `issues.work_mode`:
+--
+--   const workClass = issue.workMode === "planning" ? "planning_only" : "status_only";
+--
+-- `work_mode` is a proxy for "is the remaining deliverable a document", and it
+-- is wrong in exactly the reported case: BLO-23197 itself and BLO-23032 are both
+-- `standard`, so both take the status_only arm, hit the identical 403, and can
+-- never self-heal. A `planning` issue in the same situation is already fine.
+--
+-- The 403 body already names the remedy (`resumeRequiresNormalModel: true`) but
+-- it lives only in an HTTP response nobody re-reads, so the detector has no
+-- signal. This column is that signal, on the run row the detector already loads
+-- — no extra query, and it is written before the refusal is returned.
+--
+-- Why not the existing denied-write activity log, which the guard's siblings
+-- already write: `recordDeniedIssueWrite` is bounded by
+-- DENIED_ISSUE_WRITE_AGGREGATE_MAX_RECORDS = 5 per (company, actor, issue) plus
+-- an exact-repeat dedupe, and both bounds `return null` — dropping the record
+-- silently. An escalation keyed on that log would stop escalating precisely
+-- when an issue is churning through repeated denials, i.e. under the load that
+-- produces this deadlock, while still passing a single-denial unit test. Those
+-- rows are also written `quarantined: true` as untrusted-actor telemetry, which
+-- is the wrong layering for a control-plane scheduling input regardless of the
+-- cap. A single UPDATE by primary key has neither bound: re-refusals re-stamp
+-- the same row and the signal survives any number of them.
+--
+-- Deliberately NOT backfilled to now(): a null means "never refused", and
+-- stamping pre-existing rows would escalate the next corrective wake for every
+-- historical run at deploy time. Runs that predate this column simply keep
+-- today's behaviour; the fix applies from the first refusal after deploy.
+--
+-- Nullable ADD COLUMN with no DEFAULT is a catalog-only change, so this does not
+-- scan or rewrite heartbeat_runs (~1.8 GB) and holds ACCESS EXCLUSIVE only for
+-- the catalog update.
+ALTER TABLE "heartbeat_runs" ADD COLUMN "status_only_document_write_refused_at" timestamp with time zone;

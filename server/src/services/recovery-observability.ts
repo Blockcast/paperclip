@@ -1,6 +1,6 @@
-import { and, eq, gte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
+import { agents, heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
 
 // Default alert threshold: the recovery rate that a regression like the 07-06
 // week (3.26% of runs) blew past while nobody noticed by feel. See the plan on
@@ -83,6 +83,36 @@ export type RecoveryObservabilityReport = {
   perCauseRouting: RecoveryCauseRouting[];
 };
 
+export type RecoveryActionListItem = {
+  id: string;
+  sourceIssueId: string;
+  sourceIssueIdentifier: string | null;
+  sourceIssueTitle: string | null;
+  kind: string;
+  status: string;
+  ownerType: string;
+  ownerAgentId: string | null;
+  ownerAgentName: string | null;
+  ownerUserId: string | null;
+  returnOwnerAgentId: string | null;
+  cause: string;
+  nextAction: string;
+  attemptCount: number;
+  maxAttempts: number | null;
+  timeoutAt: Date | null;
+  lastAttemptAt: Date | null;
+  outcome: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type RecoveryActionListOptions = {
+  ownerAgentId?: string;
+  kind?: string;
+  status?: string;
+  limit?: number;
+};
+
 export type HandoffClass =
   | "self_recovery"
   | "handed_back"
@@ -161,6 +191,53 @@ function utcWeekStart(now: Date, weeksAgo: number): Date {
 }
 
 export function recoveryObservabilityService(db: Db) {
+  async function listActions(
+    companyId: string,
+    opts: RecoveryActionListOptions = {},
+  ): Promise<RecoveryActionListItem[]> {
+    const filters = [eq(issueRecoveryActions.companyId, companyId)];
+    if (opts.ownerAgentId) filters.push(eq(issueRecoveryActions.ownerAgentId, opts.ownerAgentId));
+    if (opts.kind) filters.push(eq(issueRecoveryActions.kind, opts.kind));
+    if (opts.status) {
+      const statuses = opts.status
+        .split(",")
+        .map((status) => status.trim())
+        .filter(Boolean);
+      if (statuses.length > 0) filters.push(inArray(issueRecoveryActions.status, statuses));
+    }
+
+    const limit = Math.min(500, Math.max(1, Math.floor(opts.limit ?? 100)));
+    return db
+      .select({
+        id: issueRecoveryActions.id,
+        sourceIssueId: issueRecoveryActions.sourceIssueId,
+        sourceIssueIdentifier: issues.identifier,
+        sourceIssueTitle: issues.title,
+        kind: issueRecoveryActions.kind,
+        status: issueRecoveryActions.status,
+        ownerType: issueRecoveryActions.ownerType,
+        ownerAgentId: issueRecoveryActions.ownerAgentId,
+        ownerAgentName: agents.name,
+        ownerUserId: issueRecoveryActions.ownerUserId,
+        returnOwnerAgentId: issueRecoveryActions.returnOwnerAgentId,
+        cause: issueRecoveryActions.cause,
+        nextAction: issueRecoveryActions.nextAction,
+        attemptCount: issueRecoveryActions.attemptCount,
+        maxAttempts: issueRecoveryActions.maxAttempts,
+        timeoutAt: issueRecoveryActions.timeoutAt,
+        lastAttemptAt: issueRecoveryActions.lastAttemptAt,
+        outcome: issueRecoveryActions.outcome,
+        createdAt: issueRecoveryActions.createdAt,
+        updatedAt: issueRecoveryActions.updatedAt,
+      })
+      .from(issueRecoveryActions)
+      .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
+      .leftJoin(agents, eq(agents.id, issueRecoveryActions.ownerAgentId))
+      .where(and(...filters))
+      .orderBy(desc(issueRecoveryActions.createdAt))
+      .limit(limit);
+  }
+
   async function report(
     companyId: string,
     opts?: { now?: Date; weeks?: number; thresholdPercent?: number },
@@ -367,5 +444,5 @@ export function recoveryObservabilityService(db: Db) {
     };
   }
 
-  return { report };
+  return { listActions, report };
 }

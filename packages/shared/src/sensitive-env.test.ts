@@ -13,6 +13,7 @@ describe("sensitive env detection", () => {
     "GHTOKEN",
     "CONTROLTOKEN",
     "GH_SEAT_TOKEN_VALUE",
+    "authentication",
     "LINEAR_API_KEY",
     "OCM_QA_WALLET_PRIVATE_KEY_BASE58",
   ])("recognizes %s as a sensitive key", (key) => {

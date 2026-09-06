@@ -1,27 +1,113 @@
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, approvalComments, approvals } from "@paperclipai/db";
+import { agents, approvalComments, approvals, issueApprovals } from "@paperclipai/db";
+import { APPROVAL_UNDECIDED_STATUSES } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
+import { logger } from "../middleware/logger.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
+import { REDACTED_EVENT_VALUE, redactApprovalPayloadByType } from "../redaction.js";
 import { agentService } from "./agents.js";
+import { insertApprovalRecord } from "./approval-insert.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
 import { instanceSettingsService } from "./instance-settings.js";
 
+type ApprovalListFilters = {
+  status?: string;
+  type?: string;
+  issueId?: string;
+  requestedByAgentId?: string;
+  idempotencyKey?: string;
+};
+
 export function approvalService(db: Db) {
   const agentsSvc = agentService(db);
   const instanceSettings = instanceSettingsService(db);
-  const canResolveStatuses = new Set(["pending", "revision_requested"]);
+  // Single source of truth shared with the partial unique indexes on
+  // approvals.idempotency_key. If these drift, an idempotent replay becomes a raw
+  // unique-violation 500 instead of returning the original.
+  const canResolveStatuses = new Set<string>(APPROVAL_UNDECIDED_STATUSES);
   const resolvableStatuses = Array.from(canResolveStatuses);
   type ApprovalRecord = typeof approvals.$inferSelect;
   type ResolutionResult = { approval: ApprovalRecord; applied: boolean };
+  type CreateWithIdempotencyOptions = {
+    afterCreate?: (txDb: Db, approval: ApprovalRecord) => Promise<void>;
+    /**
+     * Who the key collides against. Default `"requester"` — two agents filing similar asks never
+     * collide, one agent retrying always does.
+     *
+     * `"company"` is for SERVER-DERIVED keys only (BLO-24744). A liveness incident can hand the
+     * same root-cause key to escalation runs owned by different agents, and the question on the
+     * card is the incident's, not the filer's — so requester scoping would mint one card per owner
+     * for one human decision. Never widen a caller-supplied key this way: the requester scoping is
+     * what stops one agent's key from swallowing another's unrelated ask.
+     */
+    dedupeScope?: "requester" | "company";
+  };
 
   function redactApprovalComment<T extends { body: string }>(comment: T, censorUsernameInLogs: boolean): T {
     return {
       ...comment,
       body: redactCurrentUserText(comment.body, { enabled: censorUsernameInLogs }),
     };
+  }
+
+  function normalizeListFilters(filters?: string | ApprovalListFilters): ApprovalListFilters {
+    return typeof filters === "string" ? { status: filters } : (filters ?? {});
+  }
+
+  function approvalListConditions(companyId: string, filters: ApprovalListFilters = {}) {
+    const conditions = [eq(approvals.companyId, companyId)];
+    if (filters.status) conditions.push(eq(approvals.status, filters.status));
+    if (filters.type) conditions.push(eq(approvals.type, filters.type));
+    if (filters.requestedByAgentId) {
+      conditions.push(eq(approvals.requestedByAgentId, filters.requestedByAgentId));
+    }
+    if (filters.idempotencyKey) {
+      conditions.push(eq(approvals.idempotencyKey, filters.idempotencyKey));
+    }
+    if (filters.issueId) {
+      conditions.push(
+        sql`EXISTS (SELECT 1 FROM ${issueApprovals} WHERE ${issueApprovals.approvalId} = ${approvals.id} AND ${issueApprovals.issueId} = ${filters.issueId})`,
+      );
+    }
+    return conditions;
+  }
+
+  // A board note worth protecting from a requester-initiated transition. Blank or
+  // absent is treated as "the board wrote nothing", so an ordinary withdrawal of a
+  // never-decided card keeps recording its reason in the note field as before.
+  function readBoardDecisionNote(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    return value.trim() === "" ? null : value;
+  }
+
+  function readSafeLabel(value: unknown) {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === REDACTED_EVENT_VALUE) return null;
+    return trimmed;
+  }
+
+  function deriveSummaryLabel(row: {
+    id: string;
+    type: string;
+    title: unknown;
+    summary: unknown;
+    description: unknown;
+  }) {
+    const redacted = redactApprovalPayloadByType(row.type, {
+      title: row.title,
+      summary: row.summary,
+      description: row.description,
+    });
+    return (
+      readSafeLabel(redacted.title) ??
+      readSafeLabel(redacted.summary) ??
+      readSafeLabel(redacted.description) ??
+      `${row.type} ${row.id.slice(0, 8)}`
+    );
   }
 
   async function reconcileApprovedBuiltInAgent(
@@ -138,10 +224,59 @@ export function approvalService(db: Db) {
   }
 
   return {
-    list: (companyId: string, status?: string) => {
-      const conditions = [eq(approvals.companyId, companyId)];
-      if (status) conditions.push(eq(approvals.status, status));
+    list: (companyId: string, filters?: string | ApprovalListFilters) => {
+      const conditions = approvalListConditions(companyId, normalizeListFilters(filters));
       return db.select().from(approvals).where(and(...conditions));
+    },
+
+    /**
+     * Existence-check listing. Selects an explicit column set that excludes `payload`
+     * — the whole point is that checking for an already-filed ask must cost far less
+     * than re-filing it. `label` is derived server-side so the caller still gets
+     * something triageable without shipping the payload body.
+     *
+     * `issueId` filters through the issue_approvals join table.
+     */
+    listSummary: async (
+      companyId: string,
+      filters: ApprovalListFilters = {},
+    ) => {
+      const conditions = approvalListConditions(companyId, filters);
+
+      const rows = await db
+        .select({
+          id: approvals.id,
+          type: approvals.type,
+          status: approvals.status,
+          requestedByAgentId: approvals.requestedByAgentId,
+          requestedByUserId: approvals.requestedByUserId,
+          idempotencyKey: approvals.idempotencyKey,
+          createdAt: approvals.createdAt,
+          decidedAt: approvals.decidedAt,
+          title: sql<string | null>`${approvals.payload} ->> 'title'`,
+          summary: sql<string | null>`${approvals.payload} ->> 'summary'`,
+          description: sql<string | null>`${approvals.payload} ->> 'description'`,
+        })
+        .from(approvals)
+        .where(and(...conditions))
+        .orderBy(asc(approvals.createdAt));
+
+      return rows.map(({ title, summary, description, ...row }) => ({
+        ...row,
+        label: deriveSummaryLabel({ ...row, title, summary, description }),
+      }));
+    },
+
+    countBy: async (
+      companyId: string,
+      filters: ApprovalListFilters = {},
+    ) => {
+      const conditions = approvalListConditions(companyId, filters);
+      const rows = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(approvals)
+        .where(and(...conditions));
+      return rows[0]?.count ?? 0;
     },
 
     getById: (id: string) =>
@@ -166,12 +301,102 @@ export function approvalService(db: Db) {
       return rows[0] ?? null;
     },
 
+    // Routed through insertApprovalRecord() (BLO-22705) rather than a direct
+    // db.insert(approvals) so this generic, caller-supplied-payload boundary
+    // can't silently file a card with no title/name/summary/recommendedAction
+    // to render. The HTTP route additionally enforces payload.title via
+    // createApprovalSchema before calling this.
     create: (companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">) =>
-      db
-        .insert(approvals)
-        .values({ ...data, companyId })
-        .returning()
-        .then((rows) => rows[0]),
+      insertApprovalRecord(db, { ...data, companyId }).then((rows) => rows[0]),
+
+    /**
+     * Create, replaying an existing undecided approval when the same requester reuses
+     * an idempotency key. Returns `{ approval, deduplicated }` so the route can answer
+     * 200-with-readback instead of 201, which is the signal a requester currently
+     * lacks — silence today is indistinguishable from "not yet decided", so retrying
+     * is the only way to find out, which is exactly what floods the queue.
+     *
+     * Race safety comes from the advisory lock, matching the issue-create path
+     * (server/src/services/issues.ts). The partial unique indexes are the backstop.
+     */
+    createWithIdempotency: async (
+      companyId: string,
+      data: Omit<typeof approvals.$inferInsert, "companyId">,
+      options: CreateWithIdempotencyOptions = {},
+    ): Promise<{ approval: ApprovalRecord; deduplicated: boolean }> => {
+      const idempotencyKey = typeof data.idempotencyKey === "string"
+        ? data.idempotencyKey.trim() || null
+        : null;
+      const requestedByAgentId = data.requestedByAgentId ?? null;
+      const requestedByUserId = data.requestedByUserId ?? null;
+
+      if (requestedByAgentId && requestedByUserId) {
+        throw unprocessable("Approval requester must be either an agent or a user, not both");
+      }
+
+      // Routed through insertApprovalRecord() (BLO-22705), matching create() above,
+      // rather than a direct db.insert(approvals) — this is the same HTTP-validated
+      // (createApprovalSchema) caller-supplied-payload boundary, and going through
+      // the shared helper keeps every db.insert(approvals) call site in this file
+      // covered by approval-payload-title-guard.test.ts instead of needing its own
+      // allowlist entry.
+      async function insertNew(client: Db, normalizedKey: string | null) {
+        const approval = await insertApprovalRecord(client, {
+          ...data,
+          companyId,
+          idempotencyKey: normalizedKey,
+        }).then((rows) => rows[0]);
+        await options.afterCreate?.(client, approval);
+        return { approval, deduplicated: false };
+      }
+
+      if (!idempotencyKey) {
+        if (options.afterCreate) {
+          return db.transaction(async (tx) => insertNew(tx as unknown as Db, null));
+        }
+        return insertNew(db, null);
+      }
+
+      // The requester identity that scopes the key. Exactly one of these is set by the
+      // route; scoping to the requester means two agents filing similar asks never
+      // collide, while one agent retrying always does.
+      const requesterColumn = requestedByAgentId
+        ? approvals.requestedByAgentId
+        : approvals.requestedByUserId;
+      const requesterValue = requestedByAgentId ?? requestedByUserId ?? null;
+
+      if (!requesterValue) {
+        throw unprocessable("Approval idempotency key requires an authenticated requester");
+      }
+
+      // A company-scoped key is one incident's, not one filer's, so both the read and the advisory
+      // lock must drop the requester — leaving it in the lock would let two owners of the same
+      // incident run the read concurrently and both insert.
+      const companyScoped = options.dedupeScope === "company";
+
+      return db.transaction(async (tx) => {
+        const guardKey = companyScoped
+          ? `approval-create:idempotency:${companyId}:${idempotencyKey}`
+          : `approval-create:idempotency:${companyId}:${requesterValue ?? "anonymous"}:${idempotencyKey}`;
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${guardKey}, 0))`);
+
+        const existing = await tx
+          .select()
+          .from(approvals)
+          .where(
+            and(
+              eq(approvals.companyId, companyId),
+              eq(approvals.idempotencyKey, idempotencyKey),
+              ...(companyScoped ? [] : [eq(requesterColumn, requesterValue)]),
+              inArray(approvals.status, resolvableStatuses),
+            ),
+          )
+          .limit(1);
+        if (existing[0]) return { approval: existing[0], deduplicated: true };
+
+        return insertNew(tx as unknown as Db, idempotencyKey);
+      });
+    },
 
     approve: async (id: string, decidedByUserId: string, decisionNote?: string | null) => {
       const now = new Date();
@@ -348,25 +573,69 @@ export function approvalService(db: Db) {
     },
 
     resubmit: async (id: string, payload?: Record<string, unknown>) => {
-      const existing = await getExistingApproval(id);
-      if (existing.status !== "revision_requested") {
-        throw unprocessable("Only revision requested approvals can be resubmitted");
-      }
+      return db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const existing = await getExistingApproval(id, txDb);
+        if (existing.status !== "revision_requested") {
+          throw unprocessable("Only revision requested approvals can be resubmitted");
+        }
 
-      const now = new Date();
-      return db
-        .update(approvals)
-        .set({
-          status: "pending",
-          payload: payload ?? existing.payload,
-          decisionNote: null,
-          decidedByUserId: null,
-          decidedAt: null,
-          updatedAt: now,
-        })
-        .where(eq(approvals.id, id))
-        .returning()
-        .then((rows) => rows[0]);
+        // Clearing the decision fields is right for a card going back to `pending`
+        // -- it is genuinely undecided again, and leaving `decidedAt` populated
+        // would make it read as decided. But the note itself is the board's only
+        // record of *why* revision was asked for, and there is no history on the
+        // column, so archive it as a comment first. Without this the single
+        // operation the workflow tells agents to use is silent, permanent data
+        // loss (BLO-27036, reproduced on approval f946c9b3).
+        const boardDecisionNote = readBoardDecisionNote(existing.decisionNote);
+        if (boardDecisionNote !== null) {
+          await txDb.insert(approvalComments).values({
+            companyId: existing.companyId,
+            approvalId: existing.id,
+            authorAgentId: null,
+            authorUserId: existing.decidedByUserId,
+            body: `Board decision note archived on resubmit (was \`revision_requested\`${
+              existing.decidedAt ? ` at ${existing.decidedAt.toISOString()}` : ""
+            }):\n\n${boardDecisionNote}`,
+          });
+        }
+
+        const now = new Date();
+        // Status-guarded for the same reason `requestRevision` and `withdraw` are,
+        // and this one closes the loss class above rather than merely avoiding a
+        // resurrection. The status check is a separate statement over an unlocked
+        // read, and `resolveApproval` accepts `revision_requested`, so a board
+        // approve/reject committing in between would otherwise be reverted to
+        // `pending` with its *fresh* decision note nulled -- while the comment
+        // archived just above records the older revision note, leaving the card
+        // reading as though its reasoning had been preserved. Losing the race must
+        // be a no-op, not a silent overwrite of the newer decision (BLO-27036).
+        const updated = await txDb
+          .update(approvals)
+          .set({
+            status: "pending",
+            payload: payload ?? existing.payload,
+            decisionNote: null,
+            decidedByUserId: null,
+            decidedAt: null,
+            updatedAt: now,
+          })
+          .where(and(eq(approvals.id, id), eq(approvals.status, "revision_requested")))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+
+        // Throwing rolls the transaction back, so the archive comment written above
+        // goes with it -- a lost race leaves no trace of a resubmit that never was.
+        if (!updated) {
+          const latest = await getExistingApproval(id, txDb);
+          throw unprocessable("Only revision requested approvals can be resubmitted", {
+            approvalId: id,
+            status: latest.status,
+          });
+        }
+
+        return updated;
+      });
     },
 
     withdraw: async (
@@ -377,16 +646,30 @@ export function approvalService(db: Db) {
         activity: Pick<LogActivityInput, "actorType" | "actorId" | "agentId">;
       },
     ) => {
-      return db.transaction(async (tx) => {
+      const { updated, publishWithdrawn } = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         const existing = await getExistingApproval(id, txDb);
-        if (existing.status !== "pending") {
-          throw conflict("Only pending approvals can be withdrawn", {
+        // Undecided, not merely `pending`. A `revision_requested` card used to have
+        // exactly one agent-reachable exit -- `resubmit` then `withdraw` -- and
+        // `resubmit` nulls `decisionNote`, so retiring a moot card destroyed the
+        // board's reasoning. Accepting the whole undecided set gives that card a
+        // one-hop terminal exit that touches no decision field (BLO-27036).
+        if (!canResolveStatuses.has(existing.status)) {
+          throw conflict("Only undecided approvals can be withdrawn", {
             approvalId: id,
             status: existing.status,
+            allowedStatuses: resolvableStatuses,
           });
         }
 
+        // The note is the board's, not the withdrawer's. Overwriting it with the
+        // withdrawal reason is unrecoverable -- there is no revision history on
+        // this column -- so a note that already exists is preserved byte-identical,
+        // along with the attribution that makes it readable. The reason is recorded
+        // separately, in the activity log and as an approval comment. Only a card
+        // the board never wrote on takes the reason into the note field, which is
+        // the pre-existing behaviour for an ordinary `pending` withdrawal.
+        const preservesDecision = readBoardDecisionNote(existing.decisionNote) !== null;
         const now = new Date();
         // Status-guarded so a concurrent board decision wins rather than being
         // silently overwritten by a withdrawal racing it.
@@ -394,20 +677,25 @@ export function approvalService(db: Db) {
           .update(approvals)
           .set({
             status: "withdrawn",
-            decisionNote: reason,
-            decidedByUserId: actor.userId ?? null,
-            decidedAt: now,
+            ...(preservesDecision
+              ? {}
+              : {
+                  decisionNote: reason,
+                  decidedByUserId: actor.userId ?? null,
+                  decidedAt: now,
+                }),
             updatedAt: now,
           })
-          .where(and(eq(approvals.id, id), eq(approvals.status, "pending")))
+          .where(and(eq(approvals.id, id), inArray(approvals.status, resolvableStatuses)))
           .returning()
           .then((rows) => rows[0] ?? null);
 
         if (!updated) {
           const latest = await getExistingApproval(id, txDb);
-          throw conflict("Only pending approvals can be withdrawn", {
+          throw conflict("Only undecided approvals can be withdrawn", {
             approvalId: id,
             status: latest.status,
+            allowedStatuses: resolvableStatuses,
           });
         }
 
@@ -419,23 +707,62 @@ export function approvalService(db: Db) {
           if (boundPendingAgent) await agentService(txDb).terminate(boundPendingAgent.id);
         }
 
-        await logActivity(txDb, {
+        // Where the note was preserved, this comment is the only place the reason
+        // is legible on the card itself. Written inside the transaction so a card
+        // can never end up `withdrawn` with no recorded reason.
+        if (preservesDecision) {
+          await txDb.insert(approvalComments).values({
+            companyId: updated.companyId,
+            approvalId: updated.id,
+            authorAgentId: actor.activity.agentId ?? null,
+            authorUserId: actor.userId ?? null,
+            body: `Withdrawn from \`${existing.status}\`: ${reason}\n\nThe board's decision note above is preserved unchanged.`,
+          });
+        }
+
+        const publishWithdrawn = await logActivity(txDb, {
           companyId: updated.companyId,
           ...actor.activity,
           action: "approval.withdrawn",
           entityType: "approval",
           entityId: updated.id,
-          details: { type: updated.type, reason },
+          details: {
+            type: updated.type,
+            reason,
+            withdrawnFromStatus: existing.status,
+            decisionNotePreserved: preservesDecision,
+          },
           // This transaction has already terminated the linked agent by the time
           // we get here. If the commit then fails, the default fire-and-forget
           // outbox write would still have told every plugin the approval was
           // decided -- a durable phantom for an approval that is in fact still
           // pending. Bind the event to this transaction so it retracts too.
           atomicPluginEvent: true,
+        }, {
+          // ...and defer the in-memory live event past commit, which
+          // `atomicPluginEvent` alone does not cover: it binds the outbox row,
+          // but `publishLiveEvent` is not transactional and would announce a
+          // withdrawal that a failed commit then un-did.
+          deferPublish: true,
         });
 
-        return updated;
+        return { updated, publishWithdrawn };
       });
+
+      // Reached only on commit; a rollback throws straight past this.
+      try {
+        await publishWithdrawn();
+      } catch (err) {
+        // The withdrawal itself is committed and durable -- only its live
+        // refresh hint failed. The outbox row committed with the transaction,
+        // so plugins are still told.
+        logger.warn(
+          { err, approvalId: updated.id },
+          "withdrew approval but failed to publish its live activity event",
+        );
+      }
+
+      return updated;
     },
 
     listComments: async (approvalId: string) => {

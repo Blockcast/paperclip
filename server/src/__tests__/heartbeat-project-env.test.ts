@@ -696,7 +696,7 @@ describe("resolveExecutionRunAdapterConfig", () => {
       issueId: "issue-1",
       executionRunConfig: {
         env: {
-          FOO_TOKEN: "inline-secret",
+          OPENAI_API_KEY: "inline-secret",
         },
       },
       projectEnv: null,
@@ -720,10 +720,6 @@ describe("resolveExecutionRunAdapterConfig", () => {
     });
   });
 
-  // GH_SEAT_TOKEN_VALUE carries a raw token but matches none of the name-shaped
-  // substrings the sensitive-key heuristic looks for, so without an explicit
-  // rule a low-trust run could inline the seat credential. Introduced with the
-  // key itself (BLO-18927) rather than left for later.
   it.each([
     ["an inline agent-scope-only seat token", "GH_SEAT_TOKEN_VALUE", "inline-seat-token"],
     [

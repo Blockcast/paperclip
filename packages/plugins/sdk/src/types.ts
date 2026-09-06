@@ -51,7 +51,12 @@ import type {
   PrincipalType,
   EnvSecretRefBinding,
 } from "@paperclipai/shared";
-import type { PluginPerformActionContext } from "./protocol.js";
+import type {
+  PluginEventOwnershipCheck,
+  PluginFencingPrecondition,
+  PluginPerformActionContext,
+  WorkerToHostMethods,
+} from "./protocol.js";
 
 // ---------------------------------------------------------------------------
 // Re-exports from @paperclipai/shared (plugin authors import from one place)
@@ -270,6 +275,16 @@ export interface PluginJobContext {
   trigger: "schedule" | "manual" | "retry";
   /** ISO 8601 timestamp when the run was scheduled to start. */
   scheduledAt: string;
+  /**
+   * Company this dispatch is scoped to, when the plugin has company-scoped
+   * configuration. The host dispatches a scheduled job once per company that
+   * has configured the plugin (BLO-20957), so a handler whose company-scoped
+   * host calls (`ctx.issues.*`, `ctx.config.get(companyId)`, ...) pass this
+   * value is granted exactly that company's invocation scope. `null`/absent
+   * when the plugin has zero configured companies — such a dispatch has no
+   * company scope and company-scoped host calls will be denied.
+   */
+  companyId?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +398,20 @@ export interface PluginEntityQuery {
 // ---------------------------------------------------------------------------
 
 /**
+ * Mode of an execution workspace, as surfaced on {@link PluginWorkspace.mode}.
+ *
+ * Only `isolated_workspace` and `cloud_sandbox` guarantee the path is private
+ * to one issue. `shared_workspace` and `operator_branch` are issue-*bound* but
+ * point at a shared checkout.
+ */
+export type PluginWorkspaceMode =
+  | "shared_workspace"
+  | "isolated_workspace"
+  | "operator_branch"
+  | "adapter_managed"
+  | "cloud_sandbox";
+
+/**
  * Workspace metadata provided by the host. Plugins use this to resolve local
  * filesystem paths for file browsing, git, terminal, and process operations.
  *
@@ -390,13 +419,23 @@ export interface PluginEntityQuery {
  * @see PLUGIN_SPEC.md §20 — Local Tooling
  */
 export interface PluginWorkspace {
-  /** UUID primary key. */
+  /**
+   * Primary key. Note this carries three namespaces depending on how the
+   * workspace was resolved, and only `isIssueScoped` distinguishes them:
+   * an `execution_workspaces.id` when `isIssueScoped` is `true`, a
+   * `project_workspaces.id` when a project workspace row exists, and the
+   * synthetic non-UUID `${projectId}:managed` for a managed checkout with no
+   * row. Do not round-trip it into a lookup without checking which you hold.
+   */
   id: string;
   /** UUID of the parent project. */
   projectId: string;
   /** Display name for this workspace. */
   name: string;
-  /** Absolute filesystem path to the workspace directory. */
+  /**
+   * Absolute filesystem path to the workspace directory, on the machine the
+   * plugin host runs on.
+   */
   path: string;
   /**
    * Repository URL, when known. Optional for SDK back-compat — external
@@ -406,10 +445,55 @@ export interface PluginWorkspace {
   repoUrl?: string | null;
   /** Checkout/ref requested for the workspace, when known. Optional for SDK back-compat. */
   repoRef?: string | null;
-  /** Default comparison ref for workspace tooling, when known. Optional for SDK back-compat. */
+  /**
+   * Default comparison ref for workspace tooling, when known. Optional for SDK
+   * back-compat.
+   *
+   * Note the ref *namespace* differs by provenance: when `isIssueScoped` is
+   * `true` this is the execution workspace's base ref, which is typically a
+   * remote-tracking form (`origin/master`); otherwise it is the project's bare
+   * configured ref (`master`). `git merge-base` accepts both, but
+   * `rev-parse --verify` against an unfetched remote does not — fetch first, or
+   * normalize, rather than assuming a namespace.
+   */
   defaultRef?: string | null;
+  /**
+   * Branch checked out in this workspace, when it is an execution workspace
+   * backed by a real branch. `null` for project-scoped workspaces, which are
+   * not pinned to one branch. Optional for SDK back-compat.
+   */
+  branchName?: string | null;
   /** Whether this is the project's primary workspace. */
   isPrimary: boolean;
+  /**
+   * BLO-31349: **provenance**, not isolation. `true` means `path` was resolved
+   * from the issue's own bound execution workspace; `false` means no live
+   * workspace was bound and this is a project-scoped fallback.
+   *
+   * This does NOT tell you the path is private to the issue — `shared_workspace`
+   * and `operator_branch` are issue-bound modes that resolve to a shared
+   * checkout and still report `true`. To answer the isolation question, read
+   * {@link PluginWorkspace.mode}.
+   *
+   * Only meaningful on `getWorkspaceForIssue`, which always sets it. The
+   * project-scoped readers (`listWorkspaces`, `getPrimaryWorkspace`) leave it
+   * undefined because the question does not apply to them. Optional for SDK
+   * back-compat.
+   */
+  isIssueScoped?: boolean;
+  /**
+   * Mode of the bound execution workspace, when `isIssueScoped` is `true`.
+   * `null` **or absent** for project-scoped results: `getWorkspaceForIssue`'s
+   * fallback limb writes `null`, while the project-scoped readers
+   * (`listWorkspaces`, `getPrimaryWorkspace`) leave it `undefined` for the same
+   * reason they leave `isIssueScoped` undefined. Branch on truthiness or
+   * compare against a specific mode — do NOT test `mode === null` to mean
+   * "project-scoped", as that misses the `undefined` case.
+   *
+   * This is the field that answers "is this path private to my issue" — see
+   * {@link PluginWorkspaceMode}. Optional for SDK back-compat.
+   */
+  mode?: PluginWorkspaceMode | null;
   /** ISO 8601 creation timestamp. */
   createdAt: string;
   /** ISO 8601 last-updated timestamp. */
@@ -434,6 +518,13 @@ export interface PluginExecutionWorkspaceMetadata {
   projectId: string;
   /** UUID of the backing project workspace, when present. */
   projectWorkspaceId: string | null;
+  /**
+   * The workspace's own label (e.g. the branch slug), as stored on the row.
+   * This is what `getWorkspaceForIssue` renders as {@link PluginWorkspace.name}
+   * for an issue-scoped result, so a double that seeds workspaces should carry
+   * it to label them the way the host does. Optional for SDK back-compat.
+   */
+  name?: string | null;
   /** Absolute filesystem path to the workspace when locally realized. */
   path: string | null;
   /** Current working directory for local workspace tooling. */
@@ -446,6 +537,33 @@ export interface PluginExecutionWorkspaceMetadata {
   branchName: string | null;
   /** Host provider type for the realized workspace. */
   providerType: string | null;
+  /**
+   * BLO-31349: whether the host considers this workspace closed — its directory
+   * may already have been torn down, so `cwd`/`path` can point at nothing.
+   * `getWorkspaceForIssue` refuses to resolve a closed workspace and falls back
+   * to the project-scoped result, so seed `closed: true` to exercise that
+   * fallback in tests.
+   *
+   * Deliberately a host-computed boolean rather than the raw `status`/`closedAt`
+   * columns: "closed" is `closedAt != null || status is archived/cleanup_failed`,
+   * and a plugin re-deriving that from raw columns would very likely check
+   * `closedAt` alone and miss `cleanup_failed`. Keeping the predicate on the
+   * host side keeps it single-sourced. Optional for SDK back-compat; absent or
+   * `false` both mean "not closed".
+   */
+  closed?: boolean;
+  /**
+   * Mode of this execution workspace — the field that answers whether its
+   * path is private to one issue. Optional for SDK back-compat.
+   *
+   * Absent *or* `null` both mean "unspecified", and the test double substitutes
+   * a concrete `shared_workspace` rather than passing the blank through — the
+   * host's column is non-null, so an issue-scoped result always carries a real
+   * mode. The substitute is deliberately one of the non-isolated modes: seeding
+   * nothing must not read as a claim that the path is private. Seed the mode
+   * explicitly if your plugin branches on isolation.
+   */
+  mode?: PluginWorkspaceMode | null;
   /** Provider metadata already safe for plugin consumption. */
   providerMetadata: Record<string, unknown> | null;
 }
@@ -601,8 +719,38 @@ export interface PluginEventsClient {
    * @param name - Bare event name (e.g. `"sync-done"`)
    * @param companyId - UUID of the company this event belongs to
    * @param payload - JSON-serializable event payload
+   * @param options.ownershipCheck - Best-effort pre-dispatch ownership check.
+   *
+   * **This is not a fence, and the option is deliberately not called
+   * `fencing`.** The `issues.*` and `state.set` options of that name mutate a
+   * row, so the host takes the generation lock inside the mutation's own
+   * transaction and holds it to commit — no interleaving is possible, and a
+   * displaced caller's write cannot land. Event delivery is an in-memory
+   * fan-out to subscriber handlers with no transaction to join, so no lock can
+   * be held from the check through the dispatch.
+   *
+   * What you get: the host re-reads the generation immediately before fan-out
+   * and refuses to dispatch if it is already gone. A steal committing in the
+   * remaining window between that check and the fan-out still results in
+   * delivery. Holding the share lock across the handlers would close it and is
+   * rejected on purpose — handlers run arbitrary plugin code, so a slow or
+   * wedged handler would block the steal path, reintroducing the
+   * unstealable-fence failure this mechanism exists to prevent (BLO-31036).
+   *
+   * Consequently a subscriber must treat an event as a notification, not as an
+   * authorization to act: anything durable or side-effecting has to
+   * re-establish ownership itself. Making delivery authoritative requires a
+   * transactional outbox in the host event subsystem (BLO-31113) and cannot be
+   * fixed from the emitting side.
+   *
+   * @see PluginEventOwnershipCheck
    */
-  emit(name: string, companyId: string, payload: unknown): Promise<void>;
+  emit(
+    name: string,
+    companyId: string,
+    payload: unknown,
+    options?: { ownershipCheck?: PluginEventOwnershipCheck },
+  ): Promise<void>;
 }
 
 /**
@@ -680,7 +828,8 @@ export interface PluginHttpClient {
 /**
  * `ctx.secrets` — resolve secret references.
  *
- * Requires `secrets.read-ref` capability.
+ * Resolving plaintext requires `secrets.read-ref`; boolean verification requires
+ * `secrets.verify-ref`.
  *
  * Plugins store shared `{ type: "secret_ref", secretId, version? }` bindings in
  * company-scoped config. This client resolves a bound ref through the
@@ -705,6 +854,40 @@ export interface PluginSecretsClient {
     secretRef: string | EnvSecretRefBinding,
     options?: { companyId?: string; configPath?: string },
   ): Promise<string>;
+
+  /**
+   * Compare a presented credential with a bound secret without returning the
+   * secret value to the worker. Verification is metered on its own budget, so
+   * invalid public requests cannot starve trusted resolution.
+   * Requires `secrets.verify-ref`.
+   *
+   * Intended for authenticating a PUBLIC endpoint — a webhook bearer token —
+   * where `resolve` would be wrong twice over: it would put the secret in the
+   * worker, and an anonymous flood would exhaust the resolution budget that
+   * genuine deliveries need.
+   *
+   * NOT SUPPORTED FOR EVERY SECRET. Verification compares digests, so it works
+   * only where Paperclip holds a digest of the VALUE — secrets it wrote itself
+   * (`local_encrypted`, and provider-managed versions). A version IMPORTED as
+   * an external provider reference stores a fingerprint of the reference
+   * instead, and there is no value digest to compare against. Those reject with
+   * `secret_verifier_unsupported` rather than returning `false`, because a
+   * confident `false` would be indistinguishable from a wrong credential and
+   * would silently reject every genuine one.
+   *
+   * Handle that rejection: it is a permanent configuration fault for the
+   * company, not a failed authentication. Read the code from the thrown error's
+   * `data.code` — `error.code` is the numeric JSON-RPC code, and the message is
+   * prose, not a contract.
+   *
+   * @returns `true` when the presented value matches, `false` when it does not
+   * @throws when the bound secret has no value verifier (`secret_verifier_unsupported`)
+   */
+  verify(
+    secretRef: string | EnvSecretRefBinding,
+    presented: string,
+    options?: { companyId?: string; configPath?: string },
+  ): Promise<boolean>;
 
   /** List all secrets for a company. Requires `secrets.list`. */
   list(companyId: string): Promise<CompanySecret[]>;
@@ -851,8 +1034,17 @@ export interface PluginStateClient {
    *
    * @param input - Scope key identifying the entry to write
    * @param value - JSON-serializable value to store
+   * @param options.fencing - Only apply the write while this fencing generation
+   *   is still held. The host takes a share lock on the named row inside the
+   *   upsert's own transaction and holds it to commit, so a concurrent steal
+   *   cannot land between the check and the write. Rejection throws with
+   *   `code: "fencing_generation_lost"`.
    */
-  set(input: ScopeKey, value: unknown): Promise<void>;
+  set(
+    input: ScopeKey,
+    value: unknown,
+    options?: { fencing?: PluginFencingPrecondition },
+  ): Promise<void>;
 
   /**
    * Delete a state value. No-ops silently if the entry does not exist
@@ -934,16 +1126,41 @@ export interface PluginProjectsClient {
   getPrimaryWorkspace(projectId: string, companyId: string): Promise<PluginWorkspace | null>;
 
   /**
-   * Resolve the primary workspace for an issue by looking up the issue's
-   * project and returning its primary workspace.
+   * Resolve the working directory for an issue.
    *
-   * This is a convenience method that combines `issues.get()` and
-   * `getPrimaryWorkspace()` in a single RPC call.
+   * Prefers the issue's own bound execution workspace — the per-issue worktree
+   * or sandbox an agent actually works in — and only falls back to the
+   * project-scoped primary workspace when the issue has none.
+   *
+   * Read {@link PluginWorkspace.isIssueScoped} for **provenance** — where the
+   * path came from:
+   *
+   * - `true` — `path` is the bound execution workspace's local `cwd`, and
+   *   `branchName` is the branch checked out there.
+   * - `false` — the issue has no live execution workspace, so `path` is the
+   *   shared project checkout. Under an `isolated_workspace` policy this is
+   *   the directory the policy exists to keep work *out* of; prefer
+   *   read-only use, or provision a workspace first.
+   *
+   * Read {@link PluginWorkspace.mode} for **isolation** — whether the path is
+   * private to this issue. `isIssueScoped: true` alone does not establish that:
+   * `shared_workspace` and `operator_branch` are issue-bound modes that resolve
+   * to a shared checkout. Check `mode` before assuming a write is confined to
+   * this issue.
+   *
+   * `path` is the local `cwd`, never `agentCwd` — the latter is the
+   * adapter-session path and points at the remote host for ssh-transport
+   * realizations, which is not where the plugin host runs.
+   *
+   * A closed or archived workspace is treated as absent — in any mode, not just
+   * `isolated_workspace` — because its directory may already have been torn
+   * down.
    *
    * @param issueId - UUID of the issue
    * @param companyId - UUID of the company that owns the issue
-   * @returns The primary workspace for the issue's project, or `null` if
-   *   the issue has no project or the project has no workspace
+   * @returns The issue's execution workspace when one is bound and live,
+   *   otherwise the project's primary workspace with `isIssueScoped: false`;
+   *   `null` if the issue has no project, or the project has no workspace
    *
    * @see PLUGIN_SPEC.md §20 — Local Tooling
    */
@@ -1098,6 +1315,36 @@ export interface PluginLogger {
 // ---------------------------------------------------------------------------
 // Plugin metrics
 // ---------------------------------------------------------------------------
+
+/**
+ * `ctx.costs` — record settlement-side finance events.
+ *
+ * Requires `costs.write` capability.
+ *
+ * This writes `finance_events`, **not** `cost_events`. Execution adapters already
+ * emit a `cost_events` row per run from their own token accounting; a plugin writing
+ * there would double-count the same traffic. `finance_events` is the settlement ledger
+ * that sits alongside those estimates, so an external biller can be reconciled against
+ * what the adapters self-reported.
+ *
+ * @see PLUGIN_SPEC.md §15.1 — Capabilities: Data Write
+ */
+export interface PluginCostsClient {
+  /**
+   * Record a finance event.
+   *
+   * Idempotent on `(companyId, externalInvoiceId)`: calling again with the same
+   * `externalInvoiceId` returns the existing row with `created: false` rather than
+   * inserting a duplicate. Always supply a stable `externalInvoiceId` for anything
+   * a scheduled job may re-run.
+   *
+   * Set `estimated: true` whenever the amount is derived from an estimate rather
+   * than a settled invoice.
+   */
+  recordFinanceEvent(
+    params: WorkerToHostMethods["costs.finance.create"][0],
+  ): Promise<WorkerToHostMethods["costs.finance.create"][1]>;
+}
 
 /**
  * `ctx.metrics` — write plugin-contributed metrics.
@@ -1528,6 +1775,12 @@ export interface PluginIssuesClient {
      * row points at the duplicate, not the original.
      */
     linkedLinearIssue?: { id: string; identifier: string };
+    /**
+     * Only create the issue while this fencing generation is still held. The
+     * host checks it under a share lock inside the create transaction, so a
+     * displaced caller cannot file an issue behind the current owner's back.
+     */
+    fencing?: PluginFencingPrecondition;
   }): Promise<Issue>;
   update(
     issueId: string,
@@ -1550,9 +1803,38 @@ export interface PluginIssuesClient {
       blockedByIssueIds?: string[];
       labelIds?: string[];
       executionWorkspaceSettings?: Record<string, unknown> | null;
+      /**
+       * Compare-and-set on the issue's execution-lock columns, evaluated as a
+       * write precondition inside `updateIssue`'s transaction. When the pinned
+       * value does not match, the update applies nothing and throws a 409
+       * whose message ends in "before the update could be applied".
+       *
+       * Pass `null` for both to mean "only apply this if no run holds the
+       * issue". Any plugin that transitions an issue it does not itself hold
+       * should do so: `updateIssue` clears all four lock columns on a
+       * transition out of `in_progress`, so an unguarded status write silently
+       * evicts whatever run was working the row (BLO-29908).
+       *
+       * Pinning one column is not sufficient — an issue can be held via
+       * `checkoutRunId` with `executionRunId` still null (BLO-19749).
+       */
+      expectedCurrentCheckoutRunId?: string | null;
+      expectedCurrentExecutionRunId?: string | null;
     },
     companyId: string,
     actor?: PluginIssueMutationActor,
+    options?: {
+      /**
+       * Only apply the patch while this fencing generation is still held.
+       *
+       * Distinct from the `expectedCurrent*` preconditions above: those compare
+       * columns of *this* issue against a snapshot, while this locks a row in
+       * the calling plugin's own schema for the life of the update transaction.
+       * That is what makes it a fence rather than a barrier — a steal cannot
+       * commit between the check and the write.
+       */
+      fencing?: PluginFencingPrecondition;
+    },
   ): Promise<Issue>;
   assertCheckoutOwner(input: {
     issueId: string;
@@ -1592,8 +1874,39 @@ export interface PluginIssuesClient {
     issueId: string,
     body: string,
     companyId: string,
-    options?: { authorAgentId?: string },
-  ): Promise<IssueComment>;
+    options?: {
+      authorAgentId?: string;
+      /**
+       * Only write the comment while this fencing generation is still held.
+       * Checked under a share lock inside the insert's transaction.
+       */
+      fencing?: PluginFencingPrecondition;
+      /**
+       * Dedup key, scoped to this plugin *installation*: the host namespaces it
+       * as `plugin:<pluginId>:<key>`, so a natural key (a delivery id,
+       * `comment:<id>`) cannot collide with another plugin's or with a
+       * server-internal one. `pluginId` is the install row's id, not the
+       * manifest `pluginKey`, but that row and its id are retained by the
+       * default (soft) uninstall and reused on reinstall, so keys keep matching
+       * across an uninstall/reinstall cycle. They are orphaned only by a purge
+       * (`DELETE /api/plugins/:pluginId?purge=true`) or a table reseed, and that
+       * boundary fails in the safe direction (an extra comment, never a wrong
+       * body handed back). A second create
+       * carrying a key already written to this issue returns the existing
+       * comment — `deduplicated: true` — instead
+       * of inserting, atomically in the database, so it holds across replicas
+       * and across concurrent deliveries. Empty and whitespace-only strings are
+       * treated as omitted. Omit for today's behaviour: no key means no dedup.
+       *
+       * Caveat when combined with `fencing`: the generation is asserted *before*
+       * the dedup lookup, so a duplicate delivery arriving after the generation
+       * has advanced throws a fencing error rather than returning the existing
+       * comment. Treat that error as "may already be applied", not as "not
+       * written".
+       */
+      idempotencyKey?: string | null;
+    },
+  ): Promise<IssueComment & { deduplicated?: boolean }>;
   createInteraction(
     issueId: string,
     interaction: CreateIssueThreadInteraction,
@@ -2099,7 +2412,7 @@ export interface PluginContext {
   /** Make outbound HTTP requests. Requires `http.outbound`. */
   http: PluginHttpClient;
 
-  /** Resolve secret references. Requires `secrets.read-ref`. */
+  /** Resolve or verify secret references. Requires the corresponding secrets capability. */
   secrets: PluginSecretsClient;
 
   /** Write activity log entries. Requires `activity.log.write`. */
@@ -2167,6 +2480,9 @@ export interface PluginContext {
 
   /** Register agent tool handlers. Requires `agent.tools.register`. */
   tools: PluginToolsClient;
+
+  /** Record settlement-side finance events. Requires `costs.write`. */
+  costs: PluginCostsClient;
 
   /** Write plugin metrics. Requires `metrics.write`. */
   metrics: PluginMetricsClient;

@@ -92,6 +92,54 @@ RUN curl -fsSL https://sh.rustup.rs \
   | sh -s -- -y --no-modify-path --default-toolchain stable \
   && for b in /usr/local/cargo/bin/*; do ln -sf "$b" /usr/local/bin/; done
 
+# AMT protocol FFI (libamt_protocol) — BLO-30359
+# cgo dependency of multicast's cmd/caddy/sender and cmd/caddy/receiver, which
+# link against -lamt_protocol. Without it EVERY cgo build of those two packages
+# fails at link time with `cannot find -lamt_protocol`, so agents cannot compile
+# — let alone test — any fix that lives in them. Three defect rows sat blocked on
+# exactly this for four days (BLO-30049, BLO-30253, BLO-30278).
+#
+# Mirrors multicast's own CI (.github/workflows/integ-tests.yml: "Build and
+# install amt-protocol"): clone over HTTPS (the repo is public; the submodule's
+# SSH URL is deliberately NOT used here), `make ffi`, `make install` into
+# INSTALL_PREFIX=/usr/local, then ldconfig. Runs AFTER the Rust block because
+# `make ffi` shells out to cargo.
+#
+# The ldconfig grep is a self-check in the same spirit as the tinygo/java/protoc
+# ones: a silent failure here reproduces the exact blocker this stage exists to
+# remove, and it would only surface days later as an agent's link error.
+#
+# NOTE: fec-raptorq is deliberately NOT baked. It is a submodule of the multicast
+# repo, versioned with it, so a per-run `cargo build` in the workspace is correct
+# — which is what the writable CARGO_HOME below enables.
+#
+# PINNED to an immutable commit, not a branch. This image's tag is content-derived
+# from this Dockerfile (scripts/container-base-tag.sh), so a floating ref would let
+# identical inputs produce a different library — breaking the reproducibility
+# contract the content-addressing exists to provide. The pin below is exactly the
+# commit multicast's own `amt-protocol` submodule points at, so the baked library
+# matches what the consuming repo expects. Bump both together, deliberately.
+ARG AMT_PROTOCOL_REF=ef1bf21a7b82e964dd336b8fe1f7204860c839d5
+RUN set -eux; \
+  mkdir -p /tmp/amt-protocol; \
+  git -C /tmp/amt-protocol init -q; \
+  git -C /tmp/amt-protocol remote add origin https://github.com/Blockcast/amt-protocol.git; \
+  git -C /tmp/amt-protocol fetch -q --depth 1 origin "${AMT_PROTOCOL_REF}"; \
+  git -C /tmp/amt-protocol checkout -q --detach FETCH_HEAD; \
+  resolved="$(git -C /tmp/amt-protocol rev-parse HEAD)"; \
+  echo "amt-protocol pinned=${AMT_PROTOCOL_REF} resolved=${resolved}"; \
+  if [ "${AMT_PROTOCOL_REF}" != "${resolved}" ]; then \
+    echo "ERROR: AMT_PROTOCOL_REF must be a full immutable commit SHA; '${AMT_PROTOCOL_REF}' resolved to ${resolved}" >&2; \
+    exit 1; \
+  fi; \
+  cd /tmp/amt-protocol; \
+  make ffi; \
+  make install; \
+  ldconfig; \
+  cd /; rm -rf /tmp/amt-protocol; \
+  ldconfig -p | grep -q amt_protocol; \
+  test -f /usr/local/include/amt_protocol.h
+
 # Python dev headers (node:lts-trixie-slim ships python3 but no -dev/venv)
 RUN apt-get update \
   && apt-get install -y --no-install-recommends python3-pip python3-venv python3-dev \
@@ -261,6 +309,22 @@ RUN apt-get update \
 ENV NPM_CONFIG_PREFIX=/home/node/.npm-global
 ENV NPM_CONFIG_CACHE=/home/node/.npm-cache
 ENV PATH=/home/node/.npm-global/bin:$PATH
+
+# Writable CARGO_HOME for the `node` user — BLO-30359
+# The Rust block above sets CARGO_HOME=/usr/local/cargo so the toolchain installs
+# system-wide, but that directory is root-owned and agents run as `node`. Any
+# `cargo build` in a workspace therefore dies with:
+#
+#   error: failed to open `/usr/local/cargo/registry/cache/.../<crate>.crate`
+#   Caused by: Permission denied (os error 13)
+#
+# which is what blocks building multicast's fec-raptorq c-bindings per run. Same
+# shape, and same remedy, as the npm prefix directly above: point the cache at a
+# node-owned path under /home/node. RUSTUP_HOME deliberately stays at
+# /usr/local/rustup — the toolchain is read-only shared state and rustup does not
+# need to write it once `stable` is installed.
+RUN install -d -o node -g node -m 0755 /home/node/.cargo
+ENV CARGO_HOME=/home/node/.cargo
 
 # ---------------------------------------------------------------------------
 # Blockcast FFmpeg with the moq_mmt muxer (MMTP container + RaptorQ FEC) — BLO-8717

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -10,6 +11,7 @@ import {
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { companySkillPolicyService } from "../services/company-skill-policy.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -260,6 +262,30 @@ describeEmbeddedPostgres("companySkillPolicyService", () => {
     });
   });
 
+  // Subscribes to `activity.logged` for the given action and, at the moment
+  // each event fires, kicks off a `snapshot()` read on a pooled connection
+  // outside the transaction that logged it. Whether that read observes the
+  // committed effect is what distinguishes "published after commit" from
+  // "published from inside the transaction" — the bug BLO-21605 is about.
+  function captureActivityEvents<T>(companyId: string, action: string, snapshot: () => Promise<T>) {
+    const seen: { valueAtPublish: Promise<T> }[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+      if (event.type !== "activity.logged") return;
+      const payload = event.payload as Record<string, unknown>;
+      if (payload.action !== action) return;
+      seen.push({ valueAtPublish: snapshot() });
+    });
+    return { seen, stop: unsubscribe };
+  }
+
+  async function currentPolicyRevision(companyId: string) {
+    return db
+      .select({ revision: companySkillPolicies.revision })
+      .from(companySkillPolicies)
+      .where(eq(companySkillPolicies.companyId, companyId))
+      .then((rows) => rows[0]?.revision ?? null);
+  }
+
   it("rolls back policy replacement when the required activity record cannot persist", async () => {
     const seeded = await seedAgent();
     const service = companySkillPolicyService(db);
@@ -278,5 +304,99 @@ describeEmbeddedPostgres("companySkillPolicyService", () => {
       materialized: false,
       defaultEffect: "allow",
     });
+  });
+
+  // BLO-21605: `replace`/`reset` used to fire `logActivity` from inside their
+  // `db.transaction` callback, so a consumer could receive `activity.logged`
+  // and read the pre-replacement policy before the new revision committed,
+  // and a rollback still emitted an event for a revision that never existed.
+  it("emits no activity.logged event when policy replacement rolls back", async () => {
+    const seeded = await seedAgent();
+    const service = companySkillPolicyService(db);
+    const events = captureActivityEvents(
+      seeded.companyId,
+      "company.skill_policy_replaced",
+      () => currentPolicyRevision(seeded.companyId),
+    );
+    try {
+      await expect(service.replace({
+        companyId: seeded.companyId,
+        expectedRevision: 0,
+        policy: { schemaVersion: 1, defaultEffect: "deny", rules: [] },
+        activity: {
+          actorType: "agent",
+          actorId: seeded.agentId,
+          // Foreign-key violation on insert: the activity_log row cannot be
+          // written, so the whole transaction (including the policy write)
+          // rolls back.
+          agentId: randomUUID(),
+        },
+      })).rejects.toBeDefined();
+    } finally {
+      events.stop();
+    }
+    expect(
+      events.seen,
+      "a rolled-back policy replacement must not publish a phantom activity event",
+    ).toHaveLength(0);
+    await expect(currentPolicyRevision(seeded.companyId)).resolves.toBeNull();
+  });
+
+  it("publishes company.skill_policy_replaced only once the new revision is visible", async () => {
+    const seeded = await seedAgent();
+    const service = companySkillPolicyService(db);
+    const events = captureActivityEvents(
+      seeded.companyId,
+      "company.skill_policy_replaced",
+      () => currentPolicyRevision(seeded.companyId),
+    );
+    try {
+      await service.replace({
+        companyId: seeded.companyId,
+        expectedRevision: 0,
+        policy: { schemaVersion: 1, defaultEffect: "deny", rules: [] },
+        activity: { actorType: "agent", actorId: seeded.agentId, agentId: seeded.agentId },
+      });
+    } finally {
+      events.stop();
+    }
+    expect(events.seen).toHaveLength(1);
+    // Read taken from inside the event listener, on a connection outside the
+    // replacing transaction: the new revision is only visible there after
+    // commit, so a pre-commit publication would observe null/stale revision.
+    await expect(
+      events.seen[0]!.valueAtPublish,
+      "the new revision must already be visible to other connections when the event fires",
+    ).resolves.toBe(1);
+  });
+
+  it("publishes company.skill_policy_reset only once the policy row is gone", async () => {
+    const seeded = await seedAgent();
+    const service = companySkillPolicyService(db);
+    await service.replace({
+      companyId: seeded.companyId,
+      expectedRevision: 0,
+      policy: { schemaVersion: 1, defaultEffect: "deny", rules: [] },
+      activity: { actorType: "agent", actorId: seeded.agentId, agentId: seeded.agentId },
+    });
+
+    const events = captureActivityEvents(
+      seeded.companyId,
+      "company.skill_policy_reset",
+      () => currentPolicyRevision(seeded.companyId),
+    );
+    try {
+      await service.reset({
+        companyId: seeded.companyId,
+        activity: { actorType: "agent", actorId: seeded.agentId, agentId: seeded.agentId },
+      });
+    } finally {
+      events.stop();
+    }
+    expect(events.seen).toHaveLength(1);
+    await expect(
+      events.seen[0]!.valueAtPublish,
+      "the deletion must already be visible to other connections when the event fires",
+    ).resolves.toBeNull();
   });
 });

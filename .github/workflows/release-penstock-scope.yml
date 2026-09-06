@@ -1,5 +1,5 @@
 # Republish the fork's SDK packages under the Blockcast-owned @penstock/* scope to
-# public npm via OIDC Trusted Publishing.
+# public npm, authenticating with a granular access token.
 #
 # WHY: Blockcast/paperclip is a fork of paperclipai/paperclip. It cannot publish
 # under @paperclipai/* (upstream owns the scope) and the upstream release jobs are
@@ -8,11 +8,33 @@
 # shared} so consumers (e.g. @penstock/paperclip-plugin) can pin the fork's surface
 # via a pnpm alias. See scripts/publish-penstock-scope.mjs.
 #
-# PREREQUISITE (one-time, npm UI): @penstock/plugin-sdk and @penstock/shared must
-# already exist on npm AND have a Trusted Publisher configured for this repo +
-# workflow. npm cannot do the *first* publish of a brand-new package over OIDC, so
-# the initial version is published manually with 2FA; every release after that is
-# OIDC. (Same bootstrap as @penstock/paperclip-plugin.)
+# WHY A TOKEN AND NOT OIDC TRUSTED PUBLISHING
+# -------------------------------------------
+# Trusted publishing was tried and is structurally impossible on this repo's
+# runners. It mints a sigstore provenance attestation UNCONDITIONALLY whenever the
+# CLI can reach an OIDC token, and npm rejects an attestation minted on a
+# self-hosted runner:
+#
+#   422 Unprocessable Entity - Error verifying sigstore provenance bundle:
+#   Unsupported GitHub Actions runner environment: "self-hosted".
+#
+# Verified twice: runs 32295237299 and 32354111699 (the latter with NO provenance
+# flag, which still signed). Dropping the flag does not opt out — see PR #1428,
+# which did exactly that and changed nothing, and PR #1523 which corrected the
+# record. GitHub-hosted runners are barred by scripts/check-github-runner-labels.mjs.
+#
+# So this workflow deliberately does NOT request `id-token: write`. With no OIDC
+# token reachable, npm cannot attempt trusted publishing, mints no attestation, and
+# authenticates from NPM_TOKEN instead. That is the whole fix: the permission, not
+# the flag, is the switch.
+#
+# PREREQUISITES (one-time, npm UI — see the publish step for detail):
+#   1. A granular access token with read+write on @penstock/plugin-sdk and
+#      @penstock/shared, stored as repo secret NPM_TOKEN.
+#   2. Trusted Publishing DISABLED for both packages (if "require trusted
+#      publishing" is on, npm rejects token publishes outright).
+#   3. Both packages must already exist — npm cannot create a brand-new package
+#      from CI. The first version of each was published manually.
 #
 # MANUAL ONLY: workflow_dispatch — never runs on push. Defaults to dry_run.
 name: Release @penstock-scoped SDK
@@ -30,7 +52,10 @@ on:
 
 permissions:
   contents: read
-  id-token: write # required: lets the runner mint the OIDC token npm exchanges
+  # NO `id-token: write`, deliberately. Granting it lets npm reach an OIDC token,
+  # which silently re-enables trusted publishing and its unconditional provenance
+  # attestation — which then 422s on these self-hosted runners. Do not add it back
+  # without reading the header note first.
 
 env:
   SCCACHE_GHA_ENABLED: "true"
@@ -47,9 +72,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9.15.4
+        uses: ./.github/actions/setup-pnpm
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -75,11 +98,19 @@ jobs:
           pnpm --filter @paperclipai/shared build
           pnpm --filter @paperclipai/plugin-sdk build
 
-      - name: Publish under @penstock (OIDC)
+      # Authenticates from NPM_TOKEN (see header). No provenance is produced: that
+      # is intentional and is what makes this work on ARC. If this step ever fails
+      # with a sigstore/provenance 422, something re-granted `id-token: write` —
+      # fix that rather than touching the publish flags.
+      #
+      # If it fails 404/403 on a package, check the granular token's package scope
+      # and that Trusted Publishing is not set to "required" for that package.
+      - name: Publish under @penstock
         if: ${{ !inputs.dry_run }}
         env:
           VERSION: ${{ inputs.version }}
-        run: node scripts/publish-penstock-scope.mjs --version "$VERSION" --publish --provenance
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: node scripts/publish-penstock-scope.mjs --version "$VERSION" --publish
 
       - name: Dry run (pack + validate only)
         if: ${{ inputs.dry_run }}

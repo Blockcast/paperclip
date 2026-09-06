@@ -1,3 +1,4 @@
+{{- include "paperclip.validateGithubReviewGate" . }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -25,7 +26,34 @@ spec:
         {{- with .Values.pod.labels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.pod.annotations }}
+      {{- /*
+      BLO-29008: stamp the deployed commit onto the WORKER pod template, the
+      same way deployment-api.yaml stamps the API tier.
+
+      This tier is the one that drives heartbeat dispatch. Before this stamp
+      existed there was no assertable signal for what commit it ran: the deploy
+      job waited only on `deployment/paperclip-api`, so a roll that updated the
+      api and left the worker behind reported `success` while the worker served
+      pre-fix code. In BLO-28920 that cost hours of a live incident with the
+      stated acceptance criterion ("paperclip-api deployed-commit is at or past
+      X") fully satisfied the whole time.
+
+      Kept structurally identical to the API stamp — reserved-key guard, then
+      40-hex validation, then a single merged key — so that setting it changes
+      NOTHING ELSE in the render. That property is what lets the deploy job
+      compare the two tiers' values directly.
+      */}}
+      {{- $podAnnotations := deepCopy (.Values.pod.annotations | default dict) }}
+      {{- if hasKey $podAnnotations "paperclip.blockcast.net/deployed-commit" }}
+      {{- fail "pod.annotations must not set reserved key paperclip.blockcast.net/deployed-commit; use worker.deployedCommit through the release workflow" }}
+      {{- end }}
+      {{- with .Values.worker.deployedCommit }}
+      {{- if not (regexMatch "^[0-9a-f]{40}$" .) }}
+      {{- fail (printf "worker.deployedCommit must be 40 lowercase hex characters, got %q" .) }}
+      {{- end }}
+      {{- $_ := set $podAnnotations "paperclip.blockcast.net/deployed-commit" . }}
+      {{- end }}
+      {{- with $podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -50,7 +78,7 @@ spec:
       initContainers:
         - name: seed
           image: {{ include "paperclip.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ include "paperclip.imagePullPolicy" . }}
           securityContext:
             {{- toYaml .Values.pod.containerSecurityContext | nindent 12 }}
           command:
@@ -315,11 +343,49 @@ spec:
               # from this pod, so gh/git/github-mcp-server read the current
               # App installation token file at process start instead of carrying
               # the env snapshot from Job creation time.
+              #
+              # GH_SEAT_TOKEN_VALUE (BLO-22243): a narrow, explicit per-call
+              # override, mirroring the one scripts/gh-token-wrapper.sh already
+              # documents for the base image's /usr/bin/gh. Before this fix the
+              # override was silently ignored here, because .local/bin precedes
+              # /usr/bin on PATH and this file is the one every agent pod
+              # actually runs. That gap is why the fleet-wide merge-token PAT
+              # mounted at /paperclip/.secrets/github-merge-token/token (covers
+              # repos outside the allyblockcast[bot] App installation, e.g.
+              # user-owned allyblockcast/*) had no wired-in way to reach `gh`
+              # or `git` except a bare 403. Do not make this override the
+              # default token source — it exists so a caller can opt in for one
+              # invocation, not so every call silently gains the PAT's broader
+              # reach.
               LOCAL_BIN="${BASE}/.local/bin"
               mkdir -p "${LOCAL_BIN}"
               cat > "${LOCAL_BIN}/paperclip-github-token-env" <<'EOF'
               #!/bin/sh
               set -eu
+              if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
+                TOKEN="${GH_SEAT_TOKEN_VALUE}"
+                while :; do
+                  case "${TOKEN}" in
+                    [[:space:]]*) TOKEN="${TOKEN#?}" ;;
+                    *[[:space:]]) TOKEN="${TOKEN%?}" ;;
+                    *) break ;;
+                  esac
+                done
+                if [ -z "${TOKEN}" ]; then
+                  echo "paperclip-github-token-env: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
+                  exit 64
+                fi
+                case "${TOKEN}" in
+                  *[[:space:]]*)
+                    echo "paperclip-github-token-env: GH_SEAT_TOKEN_VALUE contains embedded whitespace; refusing to guess at the intended token" >&2
+                    exit 64
+                    ;;
+                esac
+                export GH_TOKEN="${TOKEN}"
+                export GITHUB_TOKEN="${TOKEN}"
+                export GITHUB_PERSONAL_ACCESS_TOKEN="${TOKEN}"
+                exec "$@"
+              fi
               TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
               if [ ! -r "${TOKEN_FILE}" ]; then
                 echo "paperclip github token file not readable: ${TOKEN_FILE}" >&2
@@ -339,10 +405,42 @@ spec:
               #!/bin/sh
               [ "${1:-get}" = "get" ] || exit 0
               INPUT="$(cat)"
-              case "${INPUT}" in
-                *"host=github.com"*) ;;
-                *) exit 0 ;;
-              esac
+              # Require exact "protocol=https" and "host=github.com" lines,
+              # not substrings: git sends one key=value pair per line. A
+              # substring match on the raw blob would also match a line like
+              # "host=github.com.evil.example", handing that attacker-chosen
+              # host the merge-token PAT this override exists to gate. Pinning
+              # protocol=https as well keeps the token off plaintext HTTP,
+              # where an http://github.com/... remote could otherwise send it
+              # unencrypted before any redirect could protect it.
+              if ! printf '%s\n' "${INPUT}" | grep -Fxq 'protocol=https'; then
+                exit 0
+              fi
+              if ! printf '%s\n' "${INPUT}" | grep -Fxq 'host=github.com'; then
+                exit 0
+              fi
+              if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
+                TOKEN="${GH_SEAT_TOKEN_VALUE}"
+                while :; do
+                  case "${TOKEN}" in
+                    [[:space:]]*) TOKEN="${TOKEN#?}" ;;
+                    *[[:space:]]) TOKEN="${TOKEN%?}" ;;
+                    *) break ;;
+                  esac
+                done
+                case "${TOKEN}" in
+                  "")
+                    echo "github-token-credential-helper: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
+                    exit 1
+                    ;;
+                  *[[:space:]]*)
+                    echo "github-token-credential-helper: GH_SEAT_TOKEN_VALUE contains embedded whitespace; refusing to guess at the intended token" >&2
+                    exit 1
+                    ;;
+                esac
+                printf 'username=x-access-token\npassword=%s\n\n' "${TOKEN}"
+                exit 0
+              fi
               TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
               [ -r "${TOKEN_FILE}" ] || exit 0
               TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}")"
@@ -351,7 +449,11 @@ spec:
               EOF
               cat > "${LOCAL_BIN}/gh" <<'EOF'
               #!/bin/sh
-              exec /paperclip/.local/bin/paperclip-github-token-env /usr/bin/gh "$@"
+              # Keep egress scrubbing at the last wrapper before the real GitHub
+              # CLI. /usr/bin/gh is itself the image-level token wrapper, so it
+              # still supplies the live App/seat token after this runtime has
+              # rewritten authored argv and file-backed bodies.
+              exec /usr/local/bin/node /opt/paperclip-bundled-adapters/node_modules/@paperclipai/adapter-utils/dist/github-cli-egress-runtime.js /usr/bin/gh "$@"
               EOF
               cat > "${LOCAL_BIN}/github-mcp-server" <<'EOF'
               #!/bin/sh
@@ -371,7 +473,28 @@ spec:
                 "${LOCAL_BIN}/github-mcp-server" \
                 "${LOCAL_BIN}/git"
               chown 1000:1000 "${LOCAL_BIN}" "${LOCAL_BIN}"/* 2>/dev/null || true
+
+              # PEN-2527: ${LOCAL_BIN} is only prepended to PATH by ${BASE}/.profile
+              # and ${BASE}/.bashrc, which a *login* shell sources. Agent tool
+              # harnesses spawn non-login, non-interactive shells, so there `gh`
+              # resolves straight to /usr/bin/gh and the egress scrubber above is
+              # never reached — the choke point exists but sits off the traffic
+              # path. ${BASE}/bin is placed ahead of /usr/bin by the container
+              # PATH the chart sets ("paperclip.runtimePath"), for every shell,
+              # so publish `gh` there too. That PATH is chart-managed rather than
+              # image-supplied or set per-overlay on purpose: while it lived only
+              # in values.blockcast.yaml, every other deployment of this chart
+              # resolved `gh` to the unscrubbed image CLI.
+              #
+              # A symlink rather than a second copy: one canonical wrapper file
+              # stays the only thing to edit, so the two locations cannot drift
+              # into two different rules.
+              PATH_BIN="${BASE}/bin"
+              mkdir -p "${PATH_BIN}"
+              ln -sf "${LOCAL_BIN}/gh" "${PATH_BIN}/gh"
+              chown -h 1000:1000 "${PATH_BIN}/gh" 2>/dev/null || true
               echo "seed: installed fresh-read GitHub token wrappers in ${LOCAL_BIN}"
+              echo "seed: published egress-scrubbing gh on the default PATH at ${PATH_BIN}/gh"
 
               # Seed a project-scope .mcp.json at $HOME (CWD for k8s Job pods is
               # /paperclip by default — matches PAPERCLIP_HOME) so every claude
@@ -389,21 +512,45 @@ spec:
               MCP_FILE="${BASE}/.mcp.json"
               MCP_BRIDGE_JS="/app/packages/mcp-server/dist/stdio.js"
 
-              # gbrain endpoint selection. Two paths exist:
-              #   1. admin-ui:3130/mcp   — OAuth Bearer, scales independently
-              #   2. gbrain-mcp-internal:3131/gbrain — bridge (unauthed),
-              #      same gbrain backend but OOMs ~3/hr under aggregate load.
-              # We pick #1 by fetching the per-agent OAuth clients bundle from
-              # Penstock/Authbot, then minting a Bearer here against the CEO
-              # agent's OAuth client at boot. Per-agent identity at the
-              # paperclip plugin layer is preserved via
-              # adapter_config.mcpServers.gbrain (refreshed by the
-              # gbrain-oauth-refresher CronJob in onprem-k8s/paperclip/). All
-              # 7 agents have equivalent /mcp access; using CEO's client for
-              # the shared claude-direct path is operationally neutral.
-              # Falls back to the bridge if minting fails so claude_k8s still
-              # has a working gbrain MCP path on first deploy / outage.
-              GBRAIN_ENTRY='{"type":"http","url":"http://gbrain-mcp-internal.paperclip.svc.cluster.local:3131/gbrain"}'
+              # gbrain endpoint selection. We mint a Bearer against
+              # admin-ui:3130/mcp by fetching the per-agent OAuth clients
+              # bundle from Penstock/Authbot and using the CEO agent's OAuth
+              # client at boot. Per-agent identity at the paperclip plugin
+              # layer is preserved via adapter_config.mcpServers.gbrain
+              # (refreshed by the gbrain-oauth-refresher CronJob in
+              # onprem-k8s/paperclip/).
+              #
+              # This previously defaulted to a second path —
+              # gbrain-mcp-internal:3131/gbrain, an UNAUTHENTICATED bridge —
+              # and fell back to it whenever the Authbot fetch, the CEO client
+              # lookup, or the /token mint failed. That fallback is removed
+              # (PEN-2428). Two reasons, in order of importance:
+              #
+              #   1. It was a fail-OPEN. Any transient Authbot or mint failure
+              #      silently swapped an OAuth-authenticated route for an
+              #      unauthenticated one, fleet-wide, with no signal.
+              #   2. As of 2026-08-28 it no longer resolves anyway: there is no
+              #      `gbrain-mcp-internal` Service, and the gbrain-mcp pod runs
+              #      only admin-ui (:3130) and auth-proxy (:9012) — the bridge
+              #      container is gone. So the "working gbrain MCP path on
+              #      first deploy / outage" the old comment promised had
+              #      already become a non-resolving entry that no probe caught.
+              #
+              # So: fail CLOSED. On any failure we emit `null` here, the key is
+              # dropped from mcp.json below, and the omission is logged loudly.
+              # Losing gbrain is the same availability outcome the dead bridge
+              # produced, but it is honest and greppable instead of silent.
+              #
+              # NOTE: the CEO client is a SHARED identity — every agent in both
+              # companies presents `paperclip:Blockcast:CEO` on this path, so
+              # gbrain-side audit cannot attribute a write to an agent. That is
+              # the open finding in PEN-2428; do not read the line above as a
+              # claim that it is fine. Removing this block entirely is the
+              # terminal state, but only AFTER every agent is covered by a
+              # per-agent client — today the bundle covers 7 Blockcast agents
+              # and no Penstock ones, so removing it now would drop gbrain for
+              # every uncovered agent.
+              GBRAIN_ENTRY='null'
               GBRAIN_CLIENTS_FILE=""
               GBRAIN_AUTHBOT_URL="${PAPERCLIP_GBRAIN_OAUTH_CLIENTS_URL:-https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients}"
               GBRAIN_AUTHBOT_KEY_FILE="${PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE:-/var/run/authbot/gbrain-plugin-service-key}"
@@ -448,12 +595,29 @@ spec:
                       '{type:"http", url:$url, headers:{Authorization:$auth}}')
                     echo "seed: minted gbrain Bearer; routing claude direct MCP at admin-ui:3130/mcp"
                   else
-                    echo "seed: gbrain /token call failed; falling back to bridge:3131/gbrain"
+                    echo "seed: FAIL-CLOSED gbrain — /token call failed; omitting gbrain from mcp.json"
                   fi
+                else
+                  echo "seed: FAIL-CLOSED gbrain — CEO OAuth client absent from clients bundle; omitting gbrain from mcp.json"
                 fi
+              else
+                echo "seed: FAIL-CLOSED gbrain — no OAuth clients bundle available; omitting gbrain from mcp.json"
               fi
 
               if [ -f "${MCP_BRIDGE_JS}" ]; then
+                # Emit the gbrain key ONLY when a Bearer was actually minted.
+                # Building the fragment here — rather than writing `"gbrain":
+                # null` and stripping it afterwards — means a null-valued entry
+                # is never written to the live file at any instant. The
+                # fail-closed invariant then holds by construction, instead of
+                # depending on a post-write jq pass that could itself fail and
+                # leave the null behind (the exact hole in the first cut of
+                # this change).
+                GBRAIN_JSON=""
+                if [ "${GBRAIN_ENTRY}" != "null" ]; then
+                  GBRAIN_JSON=",
+                  \"gbrain\": ${GBRAIN_ENTRY}"
+                fi
                 # Cluster-internal MCP servers (deployed via kubectl in the
                 # paperclip ns; see .planning/mcp-servers.yaml). All agents
                 # in this instance get the same baseline set:
@@ -464,10 +628,12 @@ spec:
                 #   - tempo       — Tempo 2.10's built-in MCP at /api/mcp.
                 #   - k8s-ro      — containers/kubernetes-mcp-server, READONLY
                 #                    tier (cluster-wide get/list/watch, no
-                #                    secrets). Direct in-cluster reach via the
-                #                    `-readonly` Service; bypasses the public
-                #                    paperclip-mcp-gateway hop. Uses Streamable
-                #                    HTTP to match the stateless server. Its
+                #                    secrets). Traffic goes through the
+                #                    dedicated ClusterIP scrubbing gateway;
+                #                    direct access to the readonly Service is
+                #                    closed separately after this path is live.
+                #                    Uses Streamable HTTP to match the
+                #                    stateless server. Its
                 #                    name matches
                 #                    the public path convention (/k8s-ro/mcp,
                 #                    /k8s-rw/mcp, /k8s-admin/mcp) so escalations
@@ -500,7 +666,7 @@ spec:
                   },
                   "k8s-ro": {
                     "type": "http",
-                    "url": "http://kubernetes-mcp-server-readonly.paperclip.svc.cluster.local:8080/mcp"
+                    "url": "http://paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local:8080/k8s-ro/mcp"
                   },
                   "github": {
                     "command": "/paperclip/.local/bin/github-mcp-server",
@@ -509,13 +675,14 @@ spec:
                   "linear": {
                     "type": "http",
                     "url": "http://linear-mcp-server.paperclip.svc.cluster.local:8000/mcp"
-                  },
-                  "gbrain": ${GBRAIN_ENTRY}
+                  }${GBRAIN_JSON}
                 }
               }
               EOF
                 chown 1000:1000 "${MCP_FILE}" 2>/dev/null || true
-                echo "seed: wrote ${MCP_FILE} with paperclip + prometheus + tempo + k8s-ro + github + linear + gbrain MCP servers"
+                # Report what actually landed rather than a hardcoded list, so
+                # a fail-closed gbrain omission is visible in this same line.
+                echo "seed: wrote ${MCP_FILE} with MCP servers: $(jq -r '.mcpServers | keys | join(", ")' "${MCP_FILE}" 2>/dev/null || echo '(unreadable)')"
               else
                 echo "seed: skipping mcp.json — bridge stdio.js not found at ${MCP_BRIDGE_JS}"
               fi
@@ -570,7 +737,9 @@ spec:
                 ; do
                   run_claude_plugin_seed "plugin install ${plugin}" "${CLAUDE_BIN}" plugin install "${plugin}" | tail -2 || true
                 done
-                chown -R 1000:1000 "${BASE}/.claude" 2>/dev/null || true
+                # The init container already runs as UID/GID 1000. Never walk
+                # the shared .claude tree here: it can contain millions of
+                # CephFS-backed files and prevent the worker pod from starting.
               else
                 echo "seed: skipping plugin install — claude not at ${CLAUDE_BIN}"
               fi
@@ -656,7 +825,7 @@ spec:
       containers:
         - name: paperclip
           image: {{ include "paperclip.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ include "paperclip.imagePullPolicy" . }}
           securityContext:
             {{- toYaml .Values.pod.containerSecurityContext | nindent 12 }}
           workingDir: /app
@@ -684,6 +853,10 @@ spec:
               value: {{ .Values.env.serveUi | quote }}
             - name: PAPERCLIP_HOME
               value: {{ .Values.persistence.mountPath | quote }}
+            # Keeps the seeded GitHub egress wrappers ahead of /usr/bin for every
+            # shell, login or not. See "paperclip.runtimePath" (PEN-2527).
+            - name: PATH
+              value: {{ include "paperclip.runtimePath" . | quote }}
             - name: PAPERCLIP_INSTANCE_ID
               value: {{ .Values.env.instanceId | quote }}
             {{- if .Values.runtimeCache.enabled }}
@@ -737,8 +910,36 @@ spec:
             - name: PAPERCLIP_PR_REVIEWER_BOT_LOGIN
               value: {{ . | quote }}
             {{- end }}
+            {{- if ((.Values.githubApp).reviewGateCaptureEnabled) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED
+              value: "true"
+            {{- with ((.Values.githubApp).reviewGateRepositories) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_REPOSITORIES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with ((.Values.githubApp).reviewGateExpectedAppId) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_APP_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with ((.Values.githubApp).reviewGateExpectedInstallationId) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_INSTALLATION_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if ((.Values.githubApp).reviewGateEnabled) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_ENABLED
+              value: "true"
+            {{- end }}
             {{- with ((.Values.githubApp).prReviewGateStatusContext) }}
             - name: PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with ((.Values.githubApp).prCommentReviewGateStatusContext) }}
+            - name: PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with ((.Values.githubApp).prCommentReviewGateRetiredStatusContexts) }}
+            - name: PAPERCLIP_PR_COMMENT_REVIEW_GATE_RETIRED_STATUS_CONTEXTS
               value: {{ . | quote }}
             {{- end }}
             {{- end }}

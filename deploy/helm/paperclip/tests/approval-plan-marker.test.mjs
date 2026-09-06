@@ -34,10 +34,22 @@ const repoRoot = path.resolve(
 
 const MARKER = "paperclip.blockcast.net/approval-plan-sha256";
 const DEPLOYED_COMMIT = "paperclip.blockcast.net/deployed-commit";
+const DEPLOY_NAMESPACE = "paperclip";
 // Any 64-hex string exercises the plumbing; the real value is a SHA-256 the
 // release job computes from the unstamped render.
 const SAMPLE = "a".repeat(64);
 const SAMPLE_COMMIT = "0123456789abcdef0123456789abcdef01234567";
+
+function parseYaml(yaml) {
+  const parsed = JSON.parse(
+    execFileSync("yq", ["eval", "-o=json", "."], {
+      input: yaml,
+      encoding: "utf8",
+    }),
+  );
+  parsed.metadata.namespace ??= DEPLOY_NAMESPACE;
+  return parsed;
+}
 
 function renderApiDeployment(extraArgs = []) {
   const yaml = execFileSync(
@@ -56,18 +68,15 @@ function renderApiDeployment(extraArgs = []) {
     ],
     { cwd: repoRoot, encoding: "utf8" },
   );
-  // kubectl is the YAML->JSON reader here purely so the comparison below is
-  // structural rather than textual; --dry-run=client needs no cluster.
-  return JSON.parse(
-    execFileSync("kubectl", ["create", "--dry-run=client", "-o", "json", "-f", "-"], {
-      input: yaml,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "ignore"],
-    }),
-  );
+  return parseYaml(yaml);
 }
 
-function stampApiDeployment(deployment, marker = SAMPLE, deployedCommit = "") {
+function stampApiDeployment(
+  deployment,
+  marker = SAMPLE,
+  deployedCommit = "",
+  deploymentName = "paperclip-api",
+) {
   const yaml = execFileSync(
     "bash",
     ["scripts/stamp-paperclip-api-approval-plan.sh"],
@@ -77,18 +86,14 @@ function stampApiDeployment(deployment, marker = SAMPLE, deployedCommit = "") {
       input: JSON.stringify(deployment),
       env: {
         ...process.env,
+        PAPERCLIP_API_DEPLOYMENT: deploymentName,
         PAPERCLIP_APPROVAL_PLAN_SHA256: marker,
         PAPERCLIP_DEPLOYED_COMMIT: deployedCommit,
+        PAPERCLIP_DEPLOY_NAMESPACE: DEPLOY_NAMESPACE,
       },
     },
   );
-  return JSON.parse(
-    execFileSync("kubectl", ["create", "--dry-run=client", "-o", "json", "-f", "-"], {
-      input: yaml,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "ignore"],
-    }),
-  );
+  return parseYaml(yaml);
 }
 
 function markerFor(deployment) {
@@ -225,6 +230,16 @@ test("trusted post-renderer stamps an unstamped legacy chart without other chang
   const marker = markerFor(unstamped);
   const stamped = stampApiDeployment(unstamped, marker);
 
+  assert.equal(stamped.spec.template.metadata.annotations[MARKER], marker);
+  assert.deepEqual(stripMarker(stamped), unstamped);
+});
+
+test("trusted post-renderer stamps the Helm-resolved API Deployment name", () => {
+  const unstamped = renderApiDeployment(["--set", "fullnameOverride=paperclip-production"]);
+  const marker = markerFor(unstamped);
+  const stamped = stampApiDeployment(unstamped, marker, "", "paperclip-production-api");
+
+  assert.equal(stamped.metadata.name, "paperclip-production-api");
   assert.equal(stamped.spec.template.metadata.annotations[MARKER], marker);
   assert.deepEqual(stripMarker(stamped), unstamped);
 });

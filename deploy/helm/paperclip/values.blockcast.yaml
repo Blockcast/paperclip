@@ -10,8 +10,17 @@
 image:
   repository: harbor.blockcast.net/paperclip/paperclip
   tag: sha-d1409bf-k8s-vendored
-  pullPolicy: Always
   # Bump this to the kkroo image tag built from this repo when deploying.
+  #
+  # Empty = derive the policy from whether the image is digest-pinned; see
+  # `paperclip.imagePullPolicy` in templates/_helpers.tpl for the reasoning.
+  # Every CI deploy path in .github/workflows/docker.yml passes
+  # `--set-string image.digest=sha256:...`, so production renders IfNotPresent
+  # and a pod restart on a node that already holds that digest no longer needs
+  # Harbor to be serving auth. A manual `helm upgrade` that passes no digest
+  # still renders Always, so the mutable `sha-` tag above keeps being
+  # re-resolved. Do not hardcode `Always` back here — BLO-29306.
+  pullPolicy: ""
 
 imagePullSecrets:
   - name: registry-blockcast-net-pull
@@ -52,6 +61,14 @@ env:
         secretKeyRef:
           name: paperclip-database-url
           key: url
+    # Production PostgreSQL backups are owned by the paperclip-pg-backup
+    # CronJob in Blockcast/onprem-k8s. It writes validated custom-format dumps
+    # to the dedicated backup PVC and authoritative Azure Blob destination,
+    # with freshness/failure alerting from kube-state-metrics. Do not also run
+    # Paperclip's local .sql.gz scheduler against paperclip-data: that creates a
+    # second retention policy and reports stale health for an obsolete path.
+    - name: PAPERCLIP_DB_BACKUP_ENABLED
+      value: "false"
     # Shared bearer token so paperclip-plugin-alertmanager auto-config matches
     # the cluster's monitoring/alertmanager-receivers Secret. Same value, two
     # namespaces. Bootstrap reads this at startup via
@@ -129,6 +146,14 @@ env:
     # PAPERCLIP_PR_REVIEWER_AGENT_ID for older deployments.
     - name: PAPERCLIP_PR_REVIEWER_AGENT_IDS
       value: "e0a5011d-5c94-4801-be52-64c14f98ac26"
+    # Phase one of the PR-review task-key casing rollout. Keep issue-create
+    # locking disabled while this release deploys dual-read/dual-lock webhook
+    # pods: a pre-compatibility pod locks GitHub's canonical mixed-case repo
+    # spelling, which cannot be reconstructed from a lowercase user-authored
+    # PR URL. Remove this override only after every API pod runs the
+    # compatibility code, then deploy again to enable the duplicate guard.
+    - name: PAPERCLIP_DISABLE_PR_REVIEW_DUPLICATE_GUARD
+      value: "true"
     # Designated Dependabot remediation agent (Release Engineer). The
     # github-webhook route wakes this agent on `dependabot_alert`
     # created/reintroduced/reopened events at or above the severity floor
@@ -147,13 +172,17 @@ env:
     # can be swept manually or by lowering this temporarily.
     - name: PAPERCLIP_DEPENDABOT_MIN_SEVERITY
       value: "high"
-    # Put Paperclip-seeded GitHub wrappers before the system binaries. The
-    # wrappers read the mounted `paperclip-github-mcp-token` Secret file at
-    # command startup, so long-running server/agent pods stop snapshotting the
-    # 60-minute App installation token through env vars. Keep /paperclip/bin in
-    # PATH too: Claude hooks call the shared ccrotate wrapper from there.
-    - name: PATH
-      value: /paperclip/.local/bin:/paperclip/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    # PATH is no longer set here. It moved into the chart itself
+    # ("paperclip.runtimePath"), because putting the Paperclip-seeded GitHub
+    # wrappers before the system binaries is a security invariant (PEN-2527)
+    # rather than a Blockcast preference: setting it only in this overlay left
+    # every other deployment of this chart resolving `gh` to the unscrubbed
+    # image CLI. The chart-derived value is byte-identical to what this entry
+    # held. The wrappers read the mounted `paperclip-github-mcp-token` Secret
+    # file at command startup, so long-running server/agent pods stop
+    # snapshotting the 60-minute App installation token through env vars; and
+    # /paperclip/bin stays on PATH because Claude hooks call the shared ccrotate
+    # wrapper from there. Override with `env.path`, not an `env.extra` entry.
     - name: PAPERCLIP_GITHUB_TOKEN_FILE
       value: /paperclip/.secrets/github-token/token
     # gbrain per-agent OAuth clients are now read from Penstock/Authbot instead
@@ -259,9 +288,20 @@ env:
     # Penstock route. `opencode models` also advertises generic/fast/pro/Luna
     # aliases that this route does not currently serve.
     - name: PAPERCLIP_OPENCODE_MODEL_ALLOWLIST
-      value: "openai/gpt-5.6-sol,openai/gpt-5.6-terra,openai/gpt-5.5"
+      value: "openai/gpt-5.6-sol,openai/gpt-5.6-terra,openai/gpt-5.5,anthropic/claude-opus-5"
     - name: PAPERCLIP_CODEX_PROVIDERS
       value: '{"providers":{"penstock":{"name":"Penstock OpenAI gateway","base_url":"https://api.penstock.run/v1","env_key":"OPENAI_API_KEY","wire_api":"responses"}},"model_provider":"penstock"}'
+    # BLO-25308 / BLO-21812: fleet default ServiceAccount for claude_k8s agent
+    # Job pods. paperclip-adapter-claude-k8s's resolveServiceAccountName()
+    # (merge commit c5d1389f) resolves per-agent adapterConfig.serviceAccountName
+    # first, then this env var, then refuses to build the Job manifest — it no
+    # longer lets an unset value silently fall through to the namespace `default`
+    # ServiceAccount (which has no cluster-scoped read; see BLO-21499/BLO-21812).
+    # Must be live before or in the same rollout as any adapter build carrying
+    # that resolver, or every claude_k8s agent without a per-agent
+    # serviceAccountName hard-fails at Job build instead of launching.
+    - name: PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME
+      value: paperclip
 
 # Worker tier also runs plugin workers and scheduled plugin jobs. Linear's
 # periodic sync can transiently burn CPU over large BLO backlogs; keep enough
@@ -357,6 +397,59 @@ tolerations:
     value: paperclip
     effect: NoSchedule
 
+# Keep production off nodes whose Proxmox host is pve3 (BLO-32054). pve3 runs
+# ~172 vCPUs on 80 cores and steals 20-40% of CPU time from every guest; a 5 s
+# liveness probe on a stalled vCPU misses its deadline and the kubelet kills a
+# healthy container (paperclip-api + paperclip-0 on 2026-09-05). Nodes already
+# carry blockcast.net/pve-storage-domain=<pve host>, so the rule keys on that.
+# The API template merges this beside its own podAntiAffinity; the StatefulSet
+# takes it verbatim. Drop the entry once pve3 is rebalanced.
+#
+# pve2 saturates the same way whenever CI runner bursts land on
+# paperclip-5/-10/-11 (load 135/80 seen 2026-09-05 17:30Z, 20-24% steal), but
+# it cannot be excluded outright: the API's hard two-host spread
+# (api.spreadAcrossNodes) needs a second eligible node, pve4 hosts only
+# paperclip-3, and the pve1 nodes (paperclip-1/-4/-8) carry reserved taints
+# (arc-dind-reserved, arc-multicast-integ-reserved) that production does not
+# tolerate. A NotIn [pve2, pve3] rule therefore wedged the rollout with a
+# replica Pending (2026-09-05 17:45Z). Instead: prefer pve4 outright, fall
+# back to any host that is not pve2, and let the spread rule place the second
+# replica on a pve2 node. This is a scheduler bias, not a pin.
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: blockcast.net/pve-storage-domain
+              operator: NotIn
+              values:
+                - pve3
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+            - key: blockcast.net/pve-storage-domain
+              operator: In
+              values:
+                - pve4
+      - weight: 50
+        preference:
+          matchExpressions:
+            - key: blockcast.net/pve-storage-domain
+              operator: NotIn
+              values:
+                - pve2
+
+# A vCPU stalled by hypervisor steal can hold /healthz past 5 s for a couple of
+# probe periods without the process being wedged; the worker already tolerates
+# 10 s x 6. Killing the API on 3 x 5 s is how the 2026-09-05 outage happened
+# (BLO-32054). Readiness keeps the chart default so a slow replica still leaves
+# rotation quickly.
+probes:
+  liveness:
+    timeoutSeconds: 10
+    failureThreshold: 6
+
 secret:
   existingSecret: paperclip-credentials
 
@@ -368,6 +461,66 @@ secret:
 # StatefulSet runs the heartbeat executeRun finalization where the check fires.
 githubApp:
   enabled: true
+  # Comment-shaped Ally review gate (BLO-21907 / BLO-26602). Setting this makes
+  # the server publish a success/failure commit status for Ally's consolidated
+  # PR-review comments; it does NOT block anything until the same context is
+  # marked required on the `master` branch-protection rule. That second step is
+  # human-only (agent tokens get 403 on branch protection) and is deliberately
+  # sequenced after this one: GitHub's required-checks picker only offers
+  # contexts it has observed recently, and this repo has never carried a commit
+  # status, so the context has to be posted at least once before a human can
+  # select it. Until then this is observe-only.
+  #
+  # Deliberately NOT under `review/` (BLO-29711). This gate reads only the
+  # comment-shaped surface, so "nothing attests this head" is a legitimate and
+  # common outcome for a formally-reviewed PR, and it must stay green there or
+  # every such PR deadlocks. A green under `review/` reads as review evidence,
+  # which this gate cannot supply — so the fail-open and the namespace cannot
+  # coexist. Moving the namespace is the half that is safe to change.
+  # Verified before renaming: `review/ally-comment` was not a required check on
+  # paperclip `master` (required: `verify`) nor on penstock-llm-proxy-core
+  # `main` (required: validate-and-build, secret-scan, redaction-tests,
+  # secrets-controls-static-check, review/ally-complete), so this drops nothing.
+  prCommentReviewGateStatusContext: "gate/ally-comment-findings"
+  prCommentReviewGateRetiredStatusContexts: "review/ally-comment"
+  # PEN-2073 rollout order:
+  # 1. Freeze review-gate merges.
+  # 2. Deploy this producer migration/code with both flags false; wait for every pod.
+  # 3. Set reviewGateCaptureEnabled=true, keep reviewGateEnabled=false, deploy,
+  #    and wait for every API replica. Deliveries now queue durably without dispatch.
+  # 4. Merge and deploy the Penstock repository_dispatch consumer.
+  # 5. Set reviewGateEnabled=true and deploy Paperclip. Release tooling refuses
+  #    promotion unless the live API Deployment has completed the capture-only
+  #    rollout, so old replicas keep capturing while workers drain the backlog.
+  # 6. Trigger a full reconciliation and verify statuses are authored by App 3966421.
+  # 7. Bind branch protection to review/ally-complete from App 3966421, then lift the freeze.
+  reviewGateCaptureEnabled: false
+  reviewGateEnabled: false
+  reviewGateRepositories:
+    - Blockcast/penstock-llm-proxy-core
+  reviewGateExpectedAppId: "3966421"
+  reviewGateExpectedInstallationId: "138085375"
+  # NOTE: `prReviewGateStatusContext` IS set here (below), and it is required to
+  # be: the chart hard-fails when `reviewGateCaptureEnabled` is true and this is
+  # empty (templates/_helpers.tpl). Two server writers share the one field, and
+  # neither posts success:
+  #   * the legacy failure writer — `queueFailedPrReviewGateStatus` in
+  #     server/src/services/heartbeat.ts — posts state=failure only (reviewer
+  #     chain exhausted / non-retryable external lifecycle end);
+  #   * the durable review-gate authority —
+  #     server/src/services/github-review-gate-authority.ts — posts
+  #     state=pending only, then hands off via `repository_dispatch`
+  #     (`review_gate_reconcile`) to the consumer in the Penstock repo. That
+  #     external consumer is the success writer for this context; nothing in
+  #     this repo, server or workflow, ever posts success for it.
+  # Both flags above are false today, so only the legacy failure writer can
+  # fire; the authority is pre-configured for the rollout, not yet live.
+  # Therefore: do NOT mark this context required on paperclip `master`. With no
+  # in-repo success writer, every healthy PR would sit at "Expected — waiting
+  # for status" forever. Requiring it is correct only where an external producer
+  # posts success — step 7 of the rollout above, on penstock-llm-proxy-core, or
+  # a pre-existing external writer as on onprem-k8s.
+  prReviewGateStatusContext: review/ally-complete
 
 # paperclip-plugin-gbrain reads per-agent OAuth client credentials through
 # Penstock/Authbot. The mounted Secret below contains only the managed service
@@ -390,13 +543,25 @@ extraVolumes:
   # token (identity app/allyblockcast[bot]) — and it is ALSO the review bot, so a
   # PR authored by the App cannot be formally reviewed by it (GitHub forbids
   # reviewing your own PR; the bot degrades to comment-mode). This separate secret
-  # holds the @allyblockcast USER token (a distinct identity from the [bot] App,
-  # granted write on Blockcast/multicast + the penstock repos). Agents use it to
-  # push the branch + `gh pr create` (so the PR author is the user seat, formally
-  # reviewable by the bot) and for the final `gh pr merge` — see the
-  # github-pr-workflow skill. optional:true so the pod still starts if the secret
-  # is absent. The adapter auto-propagates this main-container secret volume into
-  # agent Job pods (selfPod.secretVolumes).
+  # holds the @allyblockcast USER token (a distinct identity from the [bot] App).
+  #
+  # CORRECTED (BLO-24056): the previous text here claimed agents use this to
+  # "push the branch + `gh pr create` ... and for the final `gh pr merge`". That
+  # was stale and contradicted the github-pr-workflow skill, which documents the
+  # seat as reserved for a dedicated reviewer service and explicitly NOT an
+  # authoring credential. Measurement settled it: across 240 PRs in onprem-k8s,
+  # penstock-llm-proxy-core, paperclip and multicast the seat authored 0 and
+  # pushed 0 — authorship is 100% the App. Anyone auditing intent from the infra
+  # side was being told the opposite of what the deployment does.
+  #
+  # This volume is CONTROL-PLANE ONLY. It is no longer auto-propagated into
+  # agent Job pods: `paperclip-github-merge-token` was removed from
+  # AGENT_SECRET_VOLUME_ALLOWLIST (vendor/paperclip-adapter-claude-k8s). It was
+  # unreachable from an agent anyway — the `gh` wrapper resolves
+  # PAPERCLIP_GITHUB_TOKEN_FILE, pinned above to the App token, and shipped
+  # skills may not name the seat path — while putting a review-clearing
+  # credential on 108 agent Job pods. optional:true so the pod still starts if
+  # the secret is absent.
   - name: github-merge-token
     secret:
       secretName: paperclip-github-merge-token
@@ -442,6 +607,20 @@ prometheusRule:
   enabled: false
   labels:
     release: kube-prometheus-stack
+
+# ENABLED, unlike the two CRD-backed resources above (BLO-20171). The reason
+# they are off does not apply here: this renders a core `ConfigMap`, and
+# paperclip-ci-deploy is bound to ClusterRole/admin in this namespace
+# (RoleBinding paperclip-ci-deploy-admin), which covers configmaps. It is the
+# monitoring.coreos.com CRDs that admin does not reach.
+#
+# orc8r-user-grafana's dashboard sidecar watches `grafana_dashboard=1` with
+# NAMESPACE=ALL, so this ConfigMap is adopted straight out of the paperclip
+# namespace with no orc8r-side change. `cluster` is the only datasource on that
+# Grafana that can see paperclip_* series.
+grafanaDashboard:
+  enabled: true
+  datasourceUid: cluster
 
 networkPolicy:
   enabled: true

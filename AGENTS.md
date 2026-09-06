@@ -201,6 +201,45 @@ running `gh auth setup-git`, which writes a `gh.real` helper that cannot read
 the token file. Widening an installation's repository selection is never the
 right remedy for these symptoms.
 
+### Repos outside the App installation (BLO-22243)
+
+The App installation can only ever cover repos owned by the same account it's
+installed on. A repo owned by a *different* account — e.g.
+`allyblockcast/paperclip-adapter-claude-k8s`, a `User`-owned repo, not an
+`Organization` one — is permanently out of `allyblockcast[bot]`'s reach. That
+shows up as a bare `remote: Permission ... denied to allyblockcast[bot]` /
+`403` on push, which reads like a missing grant but usually isn't one.
+
+A second credential is mounted fleet-wide at
+`/paperclip/.secrets/github-merge-token/token`: a classic PAT for the
+`allyblockcast` **user** account (scopes `repo, write:packages,
+delete:packages, admin:public_key`). It reaches 31 repos — 29 `Blockcast/*`
+plus 2 `allyblockcast/*` — with push access on 11 of them, including repos
+the App installation cannot see at all.
+
+Do not point `gh`/`git` at this token by default. It is broader than the App
+installation and already mounted in every pod, so wiring it in unconditionally
+would silently widen every agent's effective write access with no new grant
+having actually been made. Instead opt in for a single invocation via
+`GH_SEAT_TOKEN_VALUE`, the narrow per-call override both `gh` and `git`
+already honor:
+
+```bash
+# gh
+GH_SEAT_TOKEN_VALUE="$(cat /paperclip/.secrets/github-merge-token/token)" \
+  gh pr create --repo allyblockcast/paperclip-adapter-claude-k8s --title "..." --body "..."
+
+# git push (same variable — the git credential helper reads it too)
+GH_SEAT_TOKEN_VALUE="$(cat /paperclip/.secrets/github-merge-token/token)" \
+  git push https://github.com/allyblockcast/paperclip-adapter-claude-k8s.git HEAD:refs/heads/<branch>
+```
+
+Confirm the target repo is actually in this token's reach before relying on
+it — e.g. `GH_SEAT_TOKEN_VALUE="$(cat /paperclip/.secrets/github-merge-token/token)" gh api /user/repos --paginate --jq '.[].full_name'`
+— rather than assuming every out-of-installation repo is covered. If it
+isn't, that's a real access gap: escalate rather than widening this PAT's
+use further.
+
 ### Commit attribution is write-path dependent, not agent dependent (BLO-21416)
 
 Every agent pod authenticates as the same shared credential — the
@@ -210,19 +249,32 @@ merge API, and the MCP `create_or_update_file`/`push_files` tools, which are
 thin wrappers over the same endpoints) default `commit.author` to the
 *authenticated* identity whenever the caller doesn't supply one — so **every
 agent's commit made through that path is stamped `allyblockcast[bot]`**,
-regardless of which agent actually wrote it. `git push` is unaffected: git
-reads `user.name`/`user.email` from local config, which is already set
-per-agent (e.g. `<agentnamekey>@paperclip.blockcast.net`), so a pushed commit
-correctly carries the acting agent's identity.
+regardless of which agent actually wrote it. `git push` reads
+`user.name`/`user.email` from the checkout's *local* git config instead, so
+it is not subject to this server-side default — but that only produces a
+correctly-attributed commit if the local config actually holds your own
+per-agent identity (e.g. `<agentnamekey>@paperclip.blockcast.net`). It is not
+guaranteed to: **a 2026-08-10 sweep of 71 checkouts under `/paperclip/work`
+found 11 with local config already stamped to the shared App identity and 18
+with no local identity set at all (BLO-23894)**. `policy` failing on a
+commit you made with `git push` is therefore not proof of a REST/MCP write —
+check `git config user.email` in the checkout first.
 
 This is a controlled, reproduced finding (BLO-21416), not a hunch — do not
 re-derive it or re-file it as a fresh misattribution report:
 
-- **Use `git push` for every repo commit.** It is the only write path that is
-  already correctly per-agent. Do not use the MCP `create_or_update_file` /
+- **Use `git push` for every repo commit.** It is the only write path that
+  *can* be correctly per-agent. Do not use the MCP `create_or_update_file` /
   `push_files` tools to land commits — they have no `author` field in their
   schema, so there is no way to override the App stamp through them, and using
   them silently erases your authorship.
+- **Verify your checkout's local identity before you push, don't assume it.**
+  Run `git config user.email`. If it is unset or equals
+  `290875700+allyblockcast[bot]@users.noreply.github.com` or
+  `allyblockcast[bot]@users.noreply.github.com`, set it yourself:
+  `git config user.email "<agentnamekey>@paperclip.blockcast.net"` and
+  `git config user.name "<YourAgentName>"`. This is a known, unfixed
+  provisioning gap (BLO-23894), not a hypothetical.
 - If you must create a commit via the raw API (no local checkout available),
   use `gh api` directly and pass an explicit author, e.g.:
   ```bash
@@ -241,10 +293,45 @@ re-derive it or re-file it as a fresh misattribution report:
 - **Merge and squash-merge commits are legitimately App-attributed** — GitHub
   itself creates those via the merge API on your behalf. This is out of
   scope; don't flag them.
+- **The gate matches only the numeric-prefixed App email
+  (`290875700+allyblockcast[bot]@users.noreply.github.com`), deliberately not
+  the bare `allyblockcast[bot]@users.noreply.github.com`.** That bare form is
+  the `graphify-reindex` bot's own legitimate `git push` identity, verified
+  against real PRs (#789, #944) — widening the match would flag its
+  commits. If your checkout's local `user.email` shows the bare form, that
+  is still a misconfigured checkout (see above): fix the local config; do
+  not ask the gate to catch it, it cannot distinguish the two cases by email
+  alone.
 - CI enforces this going forward on every `paperclip` PR
   (`scripts/check-commit-author-attribution.mjs`, wired into `pr.yml`); an
   on-demand cross-repo audit mode (`--audit-merged`) covers
   `Blockcast/trafficcontrol` and `Blockcast/paperclip` for retroactive checks.
+- **Commits authored before 2026-08-09T01:38:20Z (`ATTRIBUTION_GATE_CUTOFF`)
+  are grandfathered by an explicit SHA allowlist, not a date comparison
+  (BLO-23894).** That timestamp is when the gate above landed on master
+  (`e7162b906` / `3fa6e41d8`) — the first moment the rule was knowable — and
+  it still bounds which commits are *eligible* for grandfathering, but the
+  gate no longer trusts a commit's own `authorDate` to decide the question:
+  `authorDate` is caller-controlled (`GIT_AUTHOR_DATE`, `git commit --date`)
+  on the `git push` write path this gate also polices, so a pure date cutoff
+  can be defeated by backdating a brand-new violation straight past it. The
+  actual grandfather list is `GRANDFATHERED_OFFENSE_SHAS` in
+  `scripts/check-commit-author-attribution.mjs` — a finite, enumerated set of
+  the specific pre-cutoff commit shas this gate cannot ask anyone to fix (the
+  App stamp already destroyed the acting agent's identity, so there is no
+  correct author to rewrite it to, and guessing one would write a false
+  attribution — the exact harm this gate exists to prevent). **If `policy`
+  fails your PR on a commit that genuinely predates the cutoff (its
+  `authorDate` is verifiably before it) and isn't clearing, that's either a
+  gap in the allowlist or your commit got a new sha from a local `git
+  rebase`** (file either against BLO-23894's owner, with the sha, to add it)
+  — don't work around it: squashing relabels other contributors'
+  correctly-attributed commits under one author, and force-pushing rewrites a
+  human contributor's history and can orphan branches stacked on top. An
+  ordinary GitHub "Update branch" (merge) leaves a grandfathered commit's sha
+  untouched and does not trigger this. `--audit-merged` still reports
+  pre-cutoff violations; treat those as historical record, not something to
+  fix.
 
 ## 10. UI Expectations
 

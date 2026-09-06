@@ -850,6 +850,7 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `local.folders`
 - `http.outbound`
 - `secrets.read-ref`
+- `secrets.verify-ref`
 - `environment.drivers.register`
 
 ### Agent Tools
@@ -1241,6 +1242,17 @@ For plugins that need a company-scoped settings surface, declare a `companySetti
 Plugins that need filesystem, git, terminal, or process operations implement those directly. The host does not wrap or proxy these operations.
 
 The host provides workspace metadata through `ctx.projects` (list workspaces, get primary workspace, resolve workspace from issue or agent/run). Plugins use this metadata to resolve local paths and then operate on the filesystem, spawn processes, shell out to `git`, or open PTY sessions using standard Node APIs or any libraries they choose.
+
+`getWorkspaceForIssue` prefers the issue's own execution workspace — the per-issue worktree or sandbox an agent actually works in — and falls back to the project's primary workspace when the issue has none.
+
+Two distinct fields answer two distinct questions, and conflating them is the mistake to avoid:
+
+- **`isIssueScoped` is provenance.** `true` — `path` was resolved from the issue's bound execution workspace. `false` — no live workspace was bound, so `path` is the project-scoped fallback (the shared project checkout). Under an `isolated_workspace` policy that fallback is the directory the policy exists to keep work *out* of; prefer read-only use, or provision a workspace first.
+- **`mode` is isolation.** `isIssueScoped: true` does *not* by itself mean the path is private to your issue: `shared_workspace` and `operator_branch` are issue-*bound* modes that resolve to a shared checkout and still report `true`. Only `isolated_workspace` and `cloud_sandbox` guarantee a private directory. Read `mode` before assuming a write is confined to this issue.
+
+`path` is always a path on the machine the plugin host runs on. Note that `defaultRef` changes ref namespace with provenance — a remote-tracking form (`origin/master`) when `isIssueScoped` is `true`, the project's bare configured ref (`master`) otherwise — so fetch or normalize rather than assuming. `id` likewise carries three namespaces (execution workspace, project workspace, or a synthetic `${projectId}:managed`); do not round-trip it into a lookup without checking which you hold.
+
+Do not re-derive a workspace path from the project's local folder yourself. That is the same shortcut the host itself used to take (BLO-31349), and it silently routes every issue in a project to one shared directory.
 
 This keeps the host lean — it does not need to maintain a parallel API surface for every OS-level operation a plugin might need. Plugins own their own logic for file browsing, git workflows, terminal sessions, and process management.
 

@@ -11,6 +11,7 @@ import {
 
 describe("redactEnvValue", () => {
   it("redacts credential-shaped values under benign keys", () => {
+    expect(redactEnvValue("authentication", "short-password", false)).toBe("***REDACTED***");
     expect(redactEnvValue("CONFIG", "ghp_0123456789abcdef0123456789abcdef", false)).toBe(
       "***REDACTED***",
     );

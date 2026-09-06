@@ -36,8 +36,10 @@ const manifest: PaperclipPluginManifestV1 = {
     // Operator-visible signal
     "metrics.write",
     "activity.log.write",
-    // Reserved for host-side secret-ref bearer verification once supported.
-    "secrets.read-ref",
+    "ui.action.register",
+    "api.routes.register",
+    // Compare webhook credentials without exposing secret values to the worker.
+    "secrets.verify-ref",
     // Webhook entrypoint (the plugin is webhook-driven)
     "webhooks.receive",
     "instance.settings.register",
@@ -67,15 +69,15 @@ const manifest: PaperclipPluginManifestV1 = {
       webhookTokenRef: {
         type: "string",
         format: "secret-ref",
-        title: "Webhook bearer token (secret reference, disabled)",
+        title: "Webhook bearer token (secret reference)",
         description:
-          "Disabled in the worker webhook path until the host can verify secret refs before invoking public plugin code. Configure webhookToken instead on this build.",
+          "Preferred for production. The host compares bearer credentials without exposing this value to the worker.",
       },
       webhookToken: {
         type: "string",
         title: "Webhook bearer token",
         description:
-          "Static bearer token Alertmanager sends in the Authorization header. This is the only enabled worker-side token mechanism on this build.",
+          "Inline development fallback. When webhookTokenRef is also configured, the secret reference takes precedence.",
       },
       acceptOnlyLabels: {
         type: "object",
@@ -107,6 +109,12 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Owner map (label-key → value → email)",
         description:
           "Per-instance config. e.g. { team: { 'platform': 'alice@blockcast.net' } }. Resolution chain documented in the plugin spec §7.7.",
+      },
+      fallbackAgentName: {
+        type: "string",
+        title: "Fallback agent name",
+        description:
+          "Exact agent name assigned when no label, annotation, or issue route resolves. Missing or ambiguous configuration fails closed.",
       },
       issueRouteMap: {
         type: "object",
@@ -171,6 +179,24 @@ const manifest: PaperclipPluginManifestV1 = {
       displayName: "Check unresolved alert escalations",
       description: "Advances overdue alerts through the reportsTo chain.",
       schedule: "*/1 * * * *",
+    },
+  ],
+  apiRoutes: [
+    {
+      routeKey: "list-aggregate-firing-fences",
+      method: "GET",
+      path: "/aggregate-firing-fences",
+      auth: "board",
+      capability: "api.routes.register",
+      companyResolution: { from: "query", key: "companyId" },
+    },
+    {
+      routeKey: "recover-aggregate-firing",
+      method: "POST",
+      path: "/aggregate-firing-fences/recover",
+      auth: "board",
+      capability: "api.routes.register",
+      companyResolution: { from: "body", key: "companyId" },
     },
   ],
   // No tools registered for V1 — pure event/webhook plugin.

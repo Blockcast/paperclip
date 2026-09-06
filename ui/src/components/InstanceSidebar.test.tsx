@@ -65,6 +65,7 @@ function makePlugin(overrides: Partial<PluginRecord> & { manifestJson: PluginRec
     status: overrides.status ?? "ready",
     installOrder: overrides.installOrder ?? 0,
     packagePath: overrides.packagePath ?? null,
+    installDir: overrides.installDir ?? null,
     lastError: overrides.lastError ?? null,
     installedAt: overrides.installedAt ?? new Date(0),
     updatedAt: overrides.updatedAt ?? new Date(0),

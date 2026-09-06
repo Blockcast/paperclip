@@ -73,6 +73,8 @@ import type {
   JsonRpcResponse,
   InitializeParams,
   InitializeResult,
+  PluginEventOwnershipCheck,
+  PluginFencingPrecondition,
   ConfigChangedParams,
   ValidateConfigParams,
   OnEventParams,
@@ -535,8 +537,18 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           };
         },
 
-        async emit(name: string, companyId: string, payload: unknown): Promise<void> {
-          await callHost("events.emit", { name, companyId, payload });
+        async emit(
+          name: string,
+          companyId: string,
+          payload: unknown,
+          options?: { ownershipCheck?: PluginEventOwnershipCheck },
+        ): Promise<void> {
+          await callHost("events.emit", {
+            name,
+            companyId,
+            payload,
+            ownershipCheck: options?.ownershipCheck,
+          });
         },
       },
 
@@ -612,6 +624,14 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             configPath: options.configPath,
           });
         },
+        async verify(secretRef, presented, options = {}): Promise<boolean> {
+          return callHost("secrets.verify", {
+            secretRef,
+            presented,
+            companyId: options.companyId,
+            configPath: options.configPath,
+          });
+        },
         async list(companyId: string) {
           return callHost("secrets.list" as any, { companyId });
         },
@@ -665,13 +685,18 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           });
         },
 
-        async set(input: ScopeKey, value: unknown): Promise<void> {
+        async set(
+          input: ScopeKey,
+          value: unknown,
+          options?: { fencing?: PluginFencingPrecondition },
+        ): Promise<void> {
           await callHost("state.set", {
             scopeKind: input.scopeKind,
             scopeId: input.scopeId,
             namespace: input.namespace,
             stateKey: input.stateKey,
             value,
+            fencing: options?.fencing,
           });
         },
 
@@ -897,10 +922,11 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             actorUserId: input.actor?.actorUserId,
             actorRunId: input.actor?.actorRunId,
             linkedLinearIssue: input.linkedLinearIssue,
+            fencing: input.fencing,
           });
         },
 
-        async update(issueId: string, patch, companyId: string, actor) {
+        async update(issueId: string, patch, companyId: string, actor, options) {
           return callHost("issues.update", {
             issueId,
             patch: {
@@ -910,6 +936,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
               actorRunId: actor?.actorRunId,
             },
             companyId,
+            fencing: options?.fencing,
           });
         },
 
@@ -959,8 +986,8 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           return callHost("issues.listComments", { issueId, companyId });
         },
 
-        async createComment(issueId: string, body: string, companyId: string, options?: { authorAgentId?: string }) {
-          return callHost("issues.createComment", { issueId, body, companyId, authorAgentId: options?.authorAgentId });
+        async createComment(issueId: string, body: string, companyId: string, options?: { authorAgentId?: string; fencing?: PluginFencingPrecondition; idempotencyKey?: string | null }) {
+          return callHost("issues.createComment", { issueId, body, companyId, authorAgentId: options?.authorAgentId, fencing: options?.fencing, idempotencyKey: options?.idempotencyKey });
         },
 
         async createInteraction(issueId: string, interaction, companyId: string, options?: { authorAgentId?: string }) {
@@ -1411,6 +1438,14 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           fn: (params: unknown, runCtx: ToolRunContext) => Promise<ToolResult>,
         ): void {
           toolHandlers.set(name, { declaration, fn });
+        },
+      },
+
+      costs: {
+        async recordFinanceEvent(
+          params: WorkerToHostMethods["costs.finance.create"][0],
+        ): Promise<WorkerToHostMethods["costs.finance.create"][1]> {
+          return callHost("costs.finance.create", params);
         },
       },
 

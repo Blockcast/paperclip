@@ -167,6 +167,7 @@ describe("secrets CLI helpers", () => {
               WEBFLOW_BOT_CONTROL_TOKEN: "webflow-token",
               ORC8R_CERTIFIER_TOKEN: "orc8r-token",
               GENERIC_TOKEN: "generic-token",
+              GH_SEAT_TOKEN_VALUE: "seat-token",
               EMPTY_TOKEN: "   ",
               GH_TOKEN: {
                 type: "plain",
@@ -219,6 +220,13 @@ describe("secrets CLI helpers", () => {
         agentName: "Coder",
         envKey: "GENERIC_TOKEN",
         secretName: "agent_agent-12_generic_token",
+        existingSecretId: null,
+      },
+      {
+        agentId: "agent-12345678",
+        agentName: "Coder",
+        envKey: "GH_SEAT_TOKEN_VALUE",
+        secretName: "agent_agent-12_gh_seat_token_value",
         existingSecretId: null,
       },
       {

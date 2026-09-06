@@ -70,6 +70,12 @@ import { adapterRoutes } from "./routes/adapters.js";
 import { metricsIngestRoutes } from "./routes/metrics-ingest.js";
 import { renderMetrics } from "./services/metrics.js";
 import { refreshExternalRuntimeReservationMetrics } from "./services/external-runtime-reservations.js";
+import {
+  refreshOverdueScheduledRetryAgeMetrics,
+  refreshQueuedRunAgeMetrics,
+  refreshScheduledRetryParkHorizonMetrics,
+} from "./services/queued-run-age-metrics.js";
+import { refreshExternalRuntimeReservationStrandMetrics } from "./services/external-runtime-reservation-strand-metrics.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -86,7 +92,10 @@ import { buildHostServices, flushPluginLogBuffer } from "./services/plugin-host-
 import { createPluginEventBus } from "./services/plugin-event-bus.js";
 import { setPluginEventBus, setPluginEventOutboxDb } from "./services/activity-log.js";
 import { startPluginEventOutbox } from "./services/plugin-event-outbox.js";
+import { startPluginStatusCollector } from "./services/plugin-status-metrics.js";
 import { startGitHubCommitStatusDeliveryOutbox } from "./services/github-status-delivery-outbox.js";
+import { startGithubReviewGateDeliveryWorker } from "./services/github-review-gate-authority.js";
+import { startIssueCommentEffectReconciler } from "./services/issue-comment-effects.js";
 import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
@@ -309,6 +318,22 @@ export async function createApp(
       await refreshExternalRuntimeReservationMetrics(db).catch((err) => {
         logger.warn({ err }, "failed to refresh external-runtime reservation metrics before scrape");
       });
+      await refreshQueuedRunAgeMetrics(db).catch((err) => {
+        logger.warn({ err }, "failed to refresh queued-run-age metrics before scrape");
+      });
+      await refreshOverdueScheduledRetryAgeMetrics(db).catch((err) => {
+        logger.warn({ err }, "failed to refresh overdue-scheduled-retry-age metrics before scrape");
+      });
+      await refreshScheduledRetryParkHorizonMetrics(db).catch((err) => {
+        logger.warn({ err }, "failed to refresh scheduled-retry park horizon metrics before scrape");
+      });
+      // BLO-28865. Swallowing the rejection here is safe and intended: the
+      // refresh has already set its own freshness gauge to 0 on the way out,
+      // which is what makes the stale age ineligible for the strand alert and
+      // pages the refresh failure on its own. Same contract as the two above.
+      await refreshExternalRuntimeReservationStrandMetrics(db).catch((err) => {
+        logger.warn({ err }, "failed to refresh stranded-reservation metrics before scrape");
+      });
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);
     } catch (err) {
@@ -513,6 +538,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     db,
     jobStore,
     workerManager,
+    listConfigCompanyIds: (pluginId) => pluginRegistry.listConfigCompanyIds(pluginId),
   });
   const toolDispatcher = createPluginToolDispatcher({
     workerManager,
@@ -528,10 +554,14 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // Issue routes are intentionally mounted after the gateway is constructed because
   // issue approval endpoints delegate to it. The intervening routers use distinct
   // route prefixes, so this dependency does not change issue-route precedence.
+  let processIssueCommentEffects: ((commentId: string) => Promise<unknown>) | null = null;
   api.use(issueRoutes(db, opts.storageService, {
     feedbackExportService: opts.feedbackExportService,
     pluginWorkerManager: workerManager,
     approveToolActionRequest: (input) => toolGateway.approveActionRequest(input),
+    registerCommentEffectProcessor: (processor) => {
+      processIssueCommentEffects = processor;
+    },
   }));
   app.use(mcpGatewayProtocolRoutes(toolGateway));
   api.use(toolAccessRoutes(db, {
@@ -635,6 +665,16 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
       heartbeatOptions: { paperclipNodeRole: appConfig.paperclipNodeRole },
       prReviewerAgentIds: appConfig.githubPrReviewerAgentIds,
       prReviewerBotLogin: appConfig.prReviewerBotLogin || null,
+      reviewGateAuthority: appConfig.githubReviewGateCaptureEnabled
+        ? {
+            authorityEnabled: appConfig.githubReviewGateEnabled,
+            repositories: appConfig.githubReviewGateRepositories,
+            statusContext: appConfig.prReviewGateStatusContext,
+            expectedAppId: appConfig.githubReviewGateExpectedAppId,
+            expectedInstallationId: appConfig.githubReviewGateExpectedInstallationId,
+            reviewerBotLogin: appConfig.prReviewerBotLogin || null,
+          }
+        : null,
       // PR→issue back-link (BLO-13353). Absolute public origin used to build the
       // issue URL posted onto PRs; null (unset PAPERCLIP_PUBLIC_URL) disables it.
       // Opt-out gate is env-driven and defaults on; the poster also self-gates
@@ -999,6 +1039,9 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // can host workers.
   let stopPluginEventOutbox: (() => void) | null = null;
   let stopGitHubStatusDeliveryOutbox: (() => void) | null = null;
+  let stopPluginStatusCollector: (() => void) | null = null;
+  let stopGithubReviewGateDeliveryWorker: (() => Promise<void>) | null = null;
+  let stopIssueCommentEffectReconciler: (() => Promise<void>) | null = null;
   if (appConfig.paperclipNodeRole === "api") {
     logger.info(
       { role: appConfig.paperclipNodeRole },
@@ -1006,6 +1049,19 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     );
   } else {
     stopGitHubStatusDeliveryOutbox = startGitHubCommitStatusDeliveryOutbox(db);
+    // Status collection doesn't depend on loadAll() completing -- an
+    // already-error'd plugin from a previous boot must be visible on /metrics
+    // immediately, not only after this boot's own load attempt resolves.
+    stopPluginStatusCollector = startPluginStatusCollector(db);
+    // Capture is staged across every API replica before processing is enabled.
+    // This prevents an old replica from acknowledging a delivery without
+    // persisting it during the authority activation rollout.
+    if (appConfig.githubReviewGateEnabled) {
+      stopGithubReviewGateDeliveryWorker = startGithubReviewGateDeliveryWorker(db);
+    }
+    if (processIssueCommentEffects) {
+      stopIssueCommentEffectReconciler = startIssueCommentEffectReconciler(db, processIssueCommentEffects);
+    }
     void ensureBundledKubernetesPlugin()
       .then(() => retireLegacyCcrotatePlugin())
       .then(() => retireIncompatiblePluginUpdater())
@@ -1027,20 +1083,25 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
       });
   }
   let appServicesShutdown = false;
-  const shutdownAppServices = () => {
+  const shutdownAppServices = async () => {
     if (appServicesShutdown) return;
     appServicesShutdown = true;
     stopPluginEventOutbox?.();
     stopGitHubStatusDeliveryOutbox?.();
+    stopPluginStatusCollector?.();
+    await stopIssueCommentEffectReconciler?.();
     disableFeedbackExportFlushes();
     devWatcher?.close();
     viteHtmlRenderer?.dispose();
     hostServiceCleanup?.disposeAll();
     hostServiceCleanup?.teardown();
+    await stopGithubReviewGateDeliveryWorker?.();
   };
   app.locals.paperclipShutdown = shutdownAppServices;
 
-  process.once("exit", shutdownAppServices);
+  process.once("exit", () => {
+    void shutdownAppServices();
+  });
   process.once("beforeExit", () => {
     void flushPluginLogBuffer();
   });
