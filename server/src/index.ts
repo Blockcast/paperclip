@@ -1318,7 +1318,73 @@ export async function startServer(): Promise<StartedServer> {
       // resolver (e.g. worktree run-execution opt-in). The gated work is still
       // wrapped in trackHeartbeatSchedulerWork with its own error handling.
       void (async () => {
-        if (heartbeatSchedulerStopped || heartbeatStartupRecoveryPending) return;
+        if (heartbeatSchedulerStopped) return;
+
+        // All three gauge publishers are registered above BOTH gates — the
+        // startup-recovery gate immediately below and the scheduling-suppression
+        // gate further down (BLO-31335).
+        //
+        // The startup-recovery gate matters as much as the suppression one, and
+        // for the same reason. Every one of these gauges is zero-initialized at
+        // registration, so a replica that early-returned here would not render
+        // "No data" while recovery ran — it would export a confident `0`. That
+        // chain (crash reconciliation, orphan reaping, reattach, issue-graph
+        // liveness, watchdogs, silent-run scan, productivity, blocker
+        // dependents, wake dispatches) is long and serial, so the exposure is
+        // "recovery duration + one tick", not "one tick", and it lands hardest
+        // on a replica crash-looping through startup. Fabricated health is the
+        // defect this issue exists to remove; time-boxing it to boot does not
+        // make it a different defect.
+        //
+        // Publishing during recovery is safe: all three are read-only queries
+        // plus a full-rewrite metric set, so a value observed mid-recovery is
+        // self-correcting on the next tick rather than sticky.
+        //
+        // All three registrations are synchronous and precede this callback's
+        // first `await`, so hoisting them above the recovery gate does not open
+        // a BLO-20822 shutdown-drain window: `heartbeatSchedulerStopped` is
+        // still checked first, and the work is registered with
+        // `trackHeartbeatSchedulerWork` before anything can suspend.
+        trackHeartbeatSchedulerWork(heartbeat
+          .publishAgentLivenessGauges(new Date())
+          .catch((err) => {
+            // Defensive only. The publisher wraps its whole body in try/catch
+            // and logs there, so this handler is currently unreachable; it is
+            // kept so a future refactor that lets the body throw still lands in
+            // the scheduler's error path rather than as an unhandled rejection.
+            logger.error({ err }, "periodic agent-liveness gauge publication failed");
+          }));
+
+        // Same decoupling for the two wake-dispatch gauges (BLO-31335). They
+        // used to publish from the tail of `reconcileFailedWakeDispatches`,
+        // which made them fragile twice over: that pass's periodic call site
+        // sits *below* the suppression gate, so a suppressed replica emitted
+        // neither gauge, and it is a late link of a long sequential `.then`
+        // chain, so any earlier reconciliation rejection skipped both silently.
+        // A stale gauge and a healthy-but-unchanged gauge render identically,
+        // so neither failure was visible on the dashboard.
+        //
+        // Registered as two independent units, not one, mirroring the liveness
+        // registration above: each publisher gets its own scheduler-tracked
+        // unit so neither one's lifecycle is coupled to the other's.
+        //
+        // One timestamp for both, preserving the shared `now` they had as
+        // consecutive statements — both derive age windows from it.
+        const wakeDispatchGaugeNow = new Date();
+        trackHeartbeatSchedulerWork(heartbeat
+          .publishGithubReviewDeadLetterGauge(wakeDispatchGaugeNow)
+          .catch((err) => {
+            // Defensive only, as above.
+            logger.error({ err }, "periodic github-review dead-letter gauge publication failed");
+          }));
+        trackHeartbeatSchedulerWork(heartbeat
+          .publishAgentWakeupTerminalFailedGauge(wakeDispatchGaugeNow)
+          .catch((err) => {
+            // Defensive only, as above.
+            logger.error({ err }, "periodic wake-terminal-failed gauge publication failed");
+          }));
+
+        if (heartbeatStartupRecoveryPending) return;
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
         if (sweptRuntimeStatuses > 0) {
           logger.info(
@@ -1326,14 +1392,6 @@ export async function startServer(): Promise<StartedServer> {
             "heartbeat runtime-status sweeper cleared expired entries",
           );
         }
-
-        // Keep the outcome-side health signal independent from scheduling
-        // suppression and the long recovery chain below.
-        trackHeartbeatSchedulerWork(heartbeat
-          .publishAgentLivenessGauges(new Date())
-          .catch((err) => {
-            logger.error({ err }, "periodic agent-liveness gauge publication failed");
-          }));
 
         const timerSuppression = await heartbeat.resolveSchedulingSuppression();
         // Re-check AFTER the await, not just before it (BLO-20822). This

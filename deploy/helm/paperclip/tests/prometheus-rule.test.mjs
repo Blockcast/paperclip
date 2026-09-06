@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import path from "node:path";
@@ -142,11 +143,22 @@ test("PaperclipGithubReviewRequestDeadLettered fires on any dead-lettered delive
   // recorded before the first scrape (no baseline for increase()) or one whose
   // pod is replaced before `for` elapses (series retires out of the range) is
   // silently un-alertable — a terminal loss that pages nobody. The gauge is
-  // re-derived from committed rows every reconcile pass, so it survives both.
+  // re-derived from committed rows on every heartbeat scheduler tick, so it
+  // survives both. (BLO-31335 moved that emission off the wake-dispatch
+  // reconcile pass, which only ran on an unsuppressed replica.)
+  //
+  // BLO-31335: the aggregation is pinned, not just the metric name. This gauge
+  // is a full rewrite of global, DB-derived state, so it is replica-invariant —
+  // every publishing pod exports the same value. A bare `sum()` therefore
+  // multiplies by the replica count (3× today) and silently rescales on any
+  // replica-count change. `max by (reason)` collapses the pod dimension first;
+  // the outer `sum` then adds the 8 reason buckets, which a bare `max()` would
+  // have undercounted to the single largest bucket. Both halves are load-bearing
+  // and neither is recoverable from `promtool check rules` or a render test.
   assert.match(
     rendered,
-    /or \(sum\(paperclip_github_review_request_dead_letter_unresolved\) > 0\)/,
-    "dead-letter alert must also key on the restart-safe durable gauge",
+    /or \(sum\(max by \(reason\) \(paperclip_github_review_request_dead_letter_unresolved\)\) > 0\)/,
+    "dead-letter alert must key on the restart-safe durable gauge, aggregated replica-safely",
   );
 });
 
@@ -303,6 +315,106 @@ test("PaperclipPrReviewWakeTerminalFailed is pr_review-scoped, gauge-keyed, and 
     rendered,
     /alert: PaperclipPrReviewWakeTerminalFailed[\s\S]*?runbook_url: "[^"]*runbooks\/agent-wakeup-terminal-failed\.md"/,
     "terminal-failed alert must link the runbook from its annotation",
+  );
+
+  // BLO-31335: the description hands the responder a query, and since this
+  // gauge moved onto the scheduler tick EVERY replica publishes it with the
+  // same value (full rewrite of global DB-derived state). So the aggregation
+  // has to be spelled out and it has to be replica-invariant -- a bare
+  // `sum by (error_code)` reads 3x on a 3-replica deploy. The rule's own
+  // `expr` is unaffected (it is the replica-invariant max() over the age
+  // gauge, asserted above), which is exactly why this can rot unnoticed: no
+  // rendered expression breaks, only the human following the instructions.
+  const [, terminalFailedDescription] = rendered.match(
+    /alert: PaperclipPrReviewWakeTerminalFailed[\s\S]*?\n\s+description: "([\s\S]*?)"\n/,
+  ) ?? [];
+  assert.ok(
+    terminalFailedDescription,
+    "terminal-failed alert must render a description annotation",
+  );
+  assert.match(
+    terminalFailedDescription,
+    /max by \(error_code, scope\)/,
+    "terminal-failed description must name the replica-invariant aggregation "
+      + "(max by (error_code, scope)), matching the metric's own help string",
+  );
+  assert.doesNotMatch(
+    terminalFailedDescription,
+    /Break down by the `error_code` label on the count series/,
+    "terminal-failed description must not tell the responder to break the "
+      + "count series down without naming an aggregation -- the natural "
+      + "reading is `sum by (error_code)`, which multiplies by replica count",
+  );
+});
+
+test("the terminal-failed runbook describes the post-BLO-31335 emission path", () => {
+  // The sibling of the description guard above, on the other side of
+  // `runbook_url`. BLO-31335 moved both wake-dispatch gauges off
+  // `reconcileFailedWakeDispatches` and onto the heartbeat scheduler tick,
+  // which silently falsified the runbook's "No data" triage step -- it sent an
+  // on-call responder mid-incident to check a pass that can no longer suppress
+  // these series. Nothing rendered breaks when this rots (the chart does not
+  // read the runbook at all), so only an assertion catches it, and this is the
+  // page an operator lands on from the alert.
+  const runbook = readFileSync(
+    path.join(repoRoot, "runbooks/agent-wakeup-terminal-failed.md"),
+    "utf8",
+  );
+
+  // Split at the status table so the two halves can be asserted apart. The
+  // table's `reconcileFailedWakeDispatches` mentions describe which ROWS that
+  // pass selects, which BLO-31335 did not change -- they must survive, so this
+  // guard must never be satisfiable by a blanket find-and-replace.
+  //
+  // The -1 check is load-bearing, not defensive boilerplate. `indexOf` returns
+  // -1 when the heading is renamed, and `slice(-1)` yields the file's LAST
+  // CHARACTER rather than "", which is truthy and matches no phrase -- so
+  // without this, `assert.ok` below would pass on a one-character string and
+  // the `doesNotMatch` regression guard would pass vacuously, while
+  // `slice(0, -1)` widened the row-selection assertion to the whole file. A
+  // guard that cannot fire is the same defect class this PR exists to remove.
+  const verifyIndex = runbook.indexOf("## Verifying the signal is live");
+  assert.notStrictEqual(
+    verifyIndex,
+    -1,
+    "runbook must keep a 'Verifying the signal is live' section -- the "
+      + "assertions below scope themselves to it by name and silently stop "
+      + "guarding if it is renamed",
+  );
+  const verifySection = runbook.slice(verifyIndex);
+
+  assert.doesNotMatch(
+    verifySection,
+    /reconcile pass/,
+    "runbook liveness section must not attribute gauge emission to the "
+      + "reconcile pass -- since BLO-31335 both gauges publish from the "
+      + "heartbeat scheduler tick, so a stalled reconcile no longer explains "
+      + "'No data' and sends the responder to the wrong subsystem",
+  );
+  assert.match(
+    verifySection,
+    /heartbeat scheduler tick/,
+    "runbook liveness section must name the heartbeat scheduler tick as the "
+      + "emission path to check",
+  );
+
+  // The row-selection statements outside the liveness section are correct and
+  // load-bearing; assert they survive so a future sweep of the phrase above
+  // cannot take them with it.
+  assert.match(
+    runbook.slice(0, verifyIndex),
+    /`reconcileFailedWakeDispatches` only ever\nselects `dispatch_failed`/,
+    "runbook must keep the row-selection statement -- BLO-31335 changed which "
+      + "path EMITS the gauges, not which rows that pass selects",
+  );
+
+  // Same replica-invariance rule as the alert description: every replica
+  // publishes the same value, so a bare `sum` reads 3x on a 3-replica deploy.
+  assert.match(
+    verifySection,
+    /sum\(max by \(error_code, scope\) \(paperclip_agent_wakeup_terminal_failed_unresolved/,
+    "runbook copy-paste query must use the replica-invariant aggregation, "
+      + "matching the alert description it sits one hop from",
   );
 });
 

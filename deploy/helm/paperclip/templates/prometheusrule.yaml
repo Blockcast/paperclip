@@ -126,10 +126,11 @@ spec:
           #    definitely exists, so the 400 is the shape, not a missing series.
           #
           # 2. DUPLICATE MATCH. Simply moving the parens is NOT sufficient here.
-          #    These gauges are published from the reconcileFailedWakeDispatches
-          #    pass, and every control-plane pod that runs it exports its own
+          #    These gauges are published on every heartbeat scheduler tick
+          #    (BLO-31335; they used to ride the reconcileFailedWakeDispatches
+          #    pass), and every control-plane pod that runs it exports its own
           #    copy: paperclip_agent_wakeup_terminal_failed_unresolved (same
-          #    pass, same registry) is live on 3 pods x 16 agents = 48 series.
+          #    tick, same registry) is live on 3 pods x 16 agents = 48 series.
           #    With 3 series per agent_id on both sides, `on (agent_id)` is a
           #    many-to-many match and errors at RUNTIME:
           #      wakeup_terminal_failed_unresolved
@@ -213,15 +214,27 @@ spec:
           #      nothing, and the replacement starts at 0 — so a dead letter can
           #      vanish from the range before this rule's `for` has elapsed.
           # The gauge arm closes both: it is recomputed from committed
-          # agent_wakeup_requests rows on every wake-dispatch reconcile pass, so
+          # agent_wakeup_requests rows on every heartbeat scheduler tick, so
           # it is republished by whatever process is alive and does not depend on
           # a delta between two samples. It is an OR rather than a replacement
           # because the gauge cannot see the one dead-letter path that leaves no
           # row at all (the durable safety-net insert itself failing) — that path
           # is counter-only, and it is the more alarming of the two.
+          #
+          # `sum(max by (reason) (...))` on the gauge arm, NOT a bare sum
+          # (BLO-31335). Since that issue every replica publishes this gauge on
+          # its own tick, and it is a full rewrite of GLOBAL, DB-derived state,
+          # so all replicas publish the SAME number — a bare sum multiplies by
+          # the replica count. `max by (reason)` collapses the pod dimension
+          # first; the outer sum then adds the 8 `reason` buckets, which is the
+          # real total. A bare `max(...)` would instead return only the largest
+          # single reason bucket and undercount whenever more than one reason is
+          # populated. Harmless at this `> 0` threshold either way, but written
+          # so it is right for the reason it looks right rather than by accident
+          # of the threshold being zero.
           expr: >-
             (sum(increase(paperclip_github_review_request_delivery_total{state="dead_lettered"}[{{ .Values.prometheusRule.githubDeliveryDeadLetterWindow }}])) > 0)
-            or (sum(paperclip_github_review_request_dead_letter_unresolved) > 0)
+            or (sum(max by (reason) (paperclip_github_review_request_dead_letter_unresolved)) > 0)
           for: {{ .Values.prometheusRule.githubDeliveryDeadLetterFor }}
           labels:
             severity: warning
@@ -294,8 +307,8 @@ spec:
           # Gauge-only (no counter arm). Unlike the dead-letter case there is no
           # process-local counter to OR against — every path that reaches this
           # state leaves a durable row, so the re-derived gauge is complete on
-          # its own. It is recomputed from committed rows on every
-          # wake-dispatch reconcile pass, so it survives a restart and a pod
+          # its own. It is recomputed from committed rows on every heartbeat
+          # scheduler tick, so it survives a restart and a pod
           # replacement mid-`for`.
           #
           # Scoped to pr_review because that is the user-visible loss: the PR
@@ -350,7 +363,7 @@ spec:
             severity: warning
           annotations:
             summary: "Paperclip PR-review wake is terminally failed and will never be retried"
-            description: "A pr_review-scoped agent_wakeup_requests row has been sitting at status='failed' for more than {{ .Values.prometheusRule.wakeTerminalFailedAgeSeconds }}s with no successor wake for the same taskKey (BLO-20255). The age is the server-computed age of the oldest such row, published as paperclip_agent_wakeup_terminal_failed_oldest_age_seconds; the companion count series paperclip_agent_wakeup_terminal_failed_unresolved{scope=\"pr_review\"} breaks the population down by error_code. This state is TERMINAL: reconcileFailedWakeDispatches only selects dispatch_failed, so nothing re-drives it, and the BLO-18030 bounded retry deliberately declines three cases so it can never double-post a review (the GitHub probe found an existing review, the probe threw or there was no PR context, or the run was not a pr_review context). The PR has a posted review trigger and no review. Break down by the `error_code` label on the count series to decide: it is joined from heartbeat_runs.error_code via agent_wakeup_requests.run_id, because the wake table has no error_code column of its own. `external_lifecycle_stale_killed` means the reviewer Job went silent past the 45m hard-stale window and was force-terminated. `job_failed` means the Job itself exited non-zero. `none` means there was no run row or no code recorded. `other` means a code missing from KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES in services/metrics.ts — triage it into that list. Query the rows with `select w.id, w.agent_id, w.reason, w.error, w.payload ->> 'taskKey' as task_key, r.error_code from agent_wakeup_requests w left join heartbeat_runs r on r.id = w.run_id where w.status = 'failed' and w.finished_at > now() - interval '24 hours' order by w.finished_at desc`. See the runbook for the re-review-vs-accept decision."
+            description: "A pr_review-scoped agent_wakeup_requests row has been sitting at status='failed' for more than {{ .Values.prometheusRule.wakeTerminalFailedAgeSeconds }}s with no successor wake for the same taskKey (BLO-20255). The age is the server-computed age of the oldest such row, published as paperclip_agent_wakeup_terminal_failed_oldest_age_seconds; the companion count series paperclip_agent_wakeup_terminal_failed_unresolved{scope=\"pr_review\"} breaks the population down by error_code. This state is TERMINAL: reconcileFailedWakeDispatches only selects dispatch_failed, so nothing re-drives it, and the BLO-18030 bounded retry deliberately declines three cases so it can never double-post a review (the GitHub probe found an existing review, the probe threw or there was no PR context, or the run was not a pr_review context). The PR has a posted review trigger and no review. Break down with `max by (error_code, scope) (paperclip_agent_wakeup_terminal_failed_unresolved{scope=\"pr_review\"})` to decide — NOT a bare `sum by (error_code)`: since BLO-31335 every replica publishes this gauge on its own scheduler tick and it is a full rewrite of global DB-derived state, so all replicas carry the SAME number and summing multiplies by the replica count. The ranking between codes survives either way, so this only matters when you read an absolute count. `error_code` is joined from heartbeat_runs.error_code via agent_wakeup_requests.run_id, because the wake table has no error_code column of its own. `external_lifecycle_stale_killed` means the reviewer Job went silent past the 45m hard-stale window and was force-terminated. `job_failed` means the Job itself exited non-zero. `none` means there was no run row or no code recorded. `other` means a code missing from KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES in services/metrics.ts — triage it into that list. Query the rows with `select w.id, w.agent_id, w.reason, w.error, w.payload ->> 'taskKey' as task_key, r.error_code from agent_wakeup_requests w left join heartbeat_runs r on r.id = w.run_id where w.status = 'failed' and w.finished_at > now() - interval '24 hours' order by w.finished_at desc`. See the runbook for the re-review-vs-accept decision."
             runbook_url: {{ .Values.prometheusRule.wakeTerminalFailedRunbookUrl | quote }}
     - name: paperclip-queued-run-stranded
       rules:
