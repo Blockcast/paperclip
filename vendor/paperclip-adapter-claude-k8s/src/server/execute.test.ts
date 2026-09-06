@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
+import { ApiException } from "@kubernetes/client-node";
 import type { Writable } from "node:stream";
 import { readFile } from "node:fs/promises";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
@@ -1160,11 +1161,18 @@ describe("execute: job creation", () => {
   // holding a stale k8s_*_secret_create_failed for a Secret that no longer
   // existed. These drive the real execute() path, not the helper directly.
   //
-  // The 409 is shaped as the incident's was: status only in the message.
+  // The 409 is the genuine `ApiException` the client throws (it sets `code`
+  // and leaves `statusCode`/`response` undefined), so these fixtures match the
+  // production shape and the unit-test ones. An earlier revision built a plain
+  // Error and described it as "status only in the message" — that account of
+  // the incident was retracted; see the isK8s409 comment in execute.ts.
   const alreadyExists409 = () =>
-    new Error(
-      'HTTP-Code: 409\nMessage: Conflict\nBody: {"kind":"Status","reason":"AlreadyExists","code":409}',
-    );
+    new ApiException(
+      409,
+      "Conflict",
+      { kind: "Status", status: "Failure", reason: "AlreadyExists", code: 409 },
+      {},
+    ) as unknown as Error;
 
   // A prompt over the 256 KiB threshold forces the prompt Secret path.
   const largePromptCtx = () =>
@@ -1202,7 +1210,9 @@ describe("execute: job creation", () => {
 
   it("re-creates when the leftover Secret is deleted between create and read", async () => {
     mockCoreCreateSecret.mockRejectedValueOnce(alreadyExists409()).mockResolvedValue({});
-    mockCoreReadSecret.mockRejectedValue(new Error("HTTP-Code: 404\nMessage: Not Found"));
+    mockCoreReadSecret.mockRejectedValue(
+      new ApiException(404, "Not Found", { kind: "Status", reason: "NotFound", code: 404 }, {}),
+    );
 
     const result = await execute(largePromptCtx());
 
