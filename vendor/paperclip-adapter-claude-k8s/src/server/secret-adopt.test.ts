@@ -204,6 +204,41 @@ describe("createOrAdoptRunSecret", () => {
     expect(coreApi.replaceNamespacedSecret).not.toHaveBeenCalled();
   });
 
+  it("adopts when the re-created name is taken again by a second racer", async () => {
+    // The re-create is itself a create and can itself 409. Previously it was
+    // unguarded, so a second racer resurfaced the raw error and killed the run
+    // with the very code this change exists to prevent.
+    const create = vi
+      .fn()
+      .mockRejectedValueOnce(apiException(409, "AlreadyExists"))
+      .mockRejectedValueOnce(apiException(409, "AlreadyExists"));
+    const read = vi
+      .fn()
+      .mockRejectedValueOnce(apiException(404, "NotFound"))
+      .mockResolvedValueOnce({
+        metadata: { name: NAME, resourceVersion: "3", labels: { [RUN_ID_LABEL]: RUN_ID } },
+      });
+    const coreApi = makeCoreApi({ createNamespacedSecret: create, readNamespacedSecret: read });
+
+    await expect(createOrAdoptRunSecret(coreApi, INPUT)).resolves.toBe("adopted");
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(coreApi.replaceNamespacedSecret).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives up with the original 409 rather than spinning on a churning name", async () => {
+    // create-409 -> read-404 twice running means something is actively
+    // creating and deleting this name. Bounded at two passes.
+    const err = apiException(409, "AlreadyExists");
+    const coreApi = makeCoreApi({
+      createNamespacedSecret: vi.fn().mockRejectedValue(err),
+      readNamespacedSecret: vi.fn().mockRejectedValue(apiException(404, "NotFound")),
+    });
+
+    await expect(createOrAdoptRunSecret(coreApi, INPUT)).rejects.toBe(err);
+    expect(coreApi.createNamespacedSecret).toHaveBeenCalledTimes(2);
+    expect(coreApi.replaceNamespacedSecret).not.toHaveBeenCalled();
+  });
+
   it("rethrows a non-409 create failure untouched", async () => {
     const boom = new Error("HTTP-Code: 403\nMessage: Forbidden");
     const coreApi = makeCoreApi({ createNamespacedSecret: vi.fn().mockRejectedValue(boom) });
