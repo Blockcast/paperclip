@@ -391,20 +391,26 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
   // place that could quietly skip it. So this drives a real run against a real
   // `companySkills` row and asserts on the prompt the pod receives.
   //
-  // The state under test is "catalog row present, runtime files absent". In
-  // production that is a rolling materialization sweep caught mid-flight — its
-  // rm -rf → mkdir → per-file write is not atomic. Reproducing a race in a test
-  // would be flaky, so it is induced deterministically instead: a row whose
-  // source directory does not exist AND whose fileInventory carries no
-  // SKILL.md, which makes `materializeRuntimeSkillFiles` throw and the caller
-  // drop the key with its bare `continue`. Different trigger, byte-identical
-  // state at the classification seam — which is what is being tested.
+  // The state under test is "catalog row present, runtime files absent". It is
+  // induced deterministically — a row whose source directory does not exist AND
+  // whose fileInventory carries no SKILL.md, so `materializeRuntimeSkillFiles`
+  // throws and the caller drops the key with its bare `continue`.
+  //
+  // Note which branch that is: it is the *permanent* one. It throws identically
+  // on every subsequent run, unlike a rolling sweep caught mid-flight (rm -rf →
+  // mkdir → per-file write is not atomic), which clears on its own. Both reach
+  // this classification byte-identically, because `.catch(() => null)` discards
+  // which throw it was — so the seam cannot tell them apart, and the reason is
+  // named `runtime_files_unpublished` for the observed state rather than for a
+  // cause. Inducing the permanent branch here is therefore the load-bearing
+  // choice: it is the case a transient-sounding notice would mislead, so the
+  // assertions below pin that the notice claims only what is known.
   it("distinguishes a catalog row awaiting materialization from a key with no row", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const pendingKey = `company/${companyId}/pending-materialization-skill`;
     // No `companySkills` row at all — the genuinely-absent control. Without it
-    // this test could pass by relabelling everything `materialization_pending`.
+    // this test could pass by relabelling everything `runtime_files_unpublished`.
     const danglingKey = `company/${companyId}/never-imported-skill`;
     const skillDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-blo31993-"));
     cleanupDirs.add(skillDir);
@@ -468,6 +474,11 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     );
     expect(taskMarkdown).toContain(`\`${danglingKey}\` — not in the company skill library`);
     expect(taskMarkdown).toContain("do not import them again");
+    // This run induced the PERMANENT branch (see the comment above), so the
+    // notice must not promise the state clears by itself — it must state only
+    // what is known and say to report a persistent one.
+    expect(taskMarkdown).not.toContain("so a later run will pick them up");
+    expect(taskMarkdown).toContain("Report it if it persists across runs");
     // Counts are unchanged by the reclassification (AC).
     expect(taskMarkdown).toContain("2 skills configured, 0 available");
 
@@ -475,7 +486,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
       declaredCount: 2,
       materializedCount: 0,
       missing: [
-        { key: pendingKey, reason: "materialization_pending" },
+        { key: pendingKey, reason: "runtime_files_unpublished" },
         { key: danglingKey, reason: "absent" },
       ],
     });

@@ -5434,8 +5434,7 @@ export function companySkillService(db: Db) {
               inArray(companySkills.key, requestedKeys),
             )
           : eq(companySkills.companyId, companyId),
-      )
-      .orderBy(asc(companySkills.key));
+      );
     return rows.map((row) => row.key);
   }
 

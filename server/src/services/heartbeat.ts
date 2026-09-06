@@ -2641,20 +2641,30 @@ export type UnmaterializedDesiredSkill = {
    *             `companySkills` row, so it never enters the filter loop in
    *             `listRuntimeSkillEntries`. A genuine configuration fault: the
    *             skill has to be imported before it can be desired.
-   * `materialization_pending` — BLO-31993. The key resolved to no runtime entry
-   *             but its `companySkills` row *does* exist. `resolveRuntimeSkillSource`
-   *             returned `null` and the caller dropped it with a bare `continue`,
-   *             which is what a rolling materialization sweep looks like from
-   *             here: rm -rf → mkdir → per-file write is not atomic, so a run
-   *             launching mid-sweep sees the row without the files. Transient,
-   *             self-healing, and — critically — NOT something re-importing
-   *             fixes, since the skill is already imported.
+   * `runtime_files_unpublished` — BLO-31993. The key resolved to no runtime
+   *             entry but its `companySkills` row *does* exist:
+   *             `resolveRuntimeSkillSource` returned `null` and the caller
+   *             dropped it with a bare `continue`.
+   *
+   *             Named for the observed state, not for a cause, because this
+   *             seam cannot tell the two causes apart. `resolveRuntimeSkillSource`
+   *             reaches `null` only when materialization *throws*, and
+   *             `.catch(() => null)` discards which throw it was:
+   *               - a rolling sweep mid-flight (rm -rf → mkdir → per-file write
+   *                 is not atomic), which a later run clears on its own; or
+   *               - `materializeRuntimeSkillFiles` failing deterministically
+   *                 because no `SKILL.md` content can be produced, which will
+   *                 throw identically on every subsequent run.
+   *             Both land here byte-identically, so the notice must not promise
+   *             self-healing. What IS known for both, and is the actionable
+   *             half, is that the skill is already imported — re-importing is
+   *             never the fix.
    * `unresolved_source` — an entry *was* produced, but its source directory is
    *             not on disk (`sourceStatus: "missing"`). The pod still counts
    *             it as bundled and then fails at use time with "Skill not
    *             found", which is how BLO-7991 originally presented.
    */
-  reason: "absent" | "materialization_pending" | "unresolved_source";
+  reason: "absent" | "runtime_files_unpublished" | "unresolved_source";
   detail: string | null;
 };
 
@@ -2681,7 +2691,7 @@ export function computeUnmaterializedDesiredSkills(input: {
   /**
    * BLO-31993 — keys that have a `companySkills` catalog row, from
    * `companySkills.listCatalogSkillKeys`. Only ever read to split "no runtime
-   * entry" into `absent` vs `materialization_pending`; it can never add,
+   * entry" into `absent` vs `runtime_files_unpublished`; it can never add,
    * remove or reorder a reported key, so the counts and the named set are
    * identical with and without it.
    *
@@ -2711,7 +2721,7 @@ export function computeUnmaterializedDesiredSkills(input: {
         key,
         // A catalog row means the library half is fine and only the runtime
         // files are behind — the opposite remediation from a key with no row.
-        reason: catalogKeys?.has(key) ? "materialization_pending" : "absent",
+        reason: catalogKeys?.has(key) ? "runtime_files_unpublished" : "absent",
         detail: null,
       });
       continue;
@@ -2769,7 +2779,7 @@ const UNMATERIALIZED_SKILL_REASON_SUMMARY: Record<
   string
 > = {
   absent: "not in the company skill library",
-  materialization_pending:
+  runtime_files_unpublished:
     "in the company skill library, but its runtime files are not published yet",
   unresolved_source: "library entry exists but its files are not on the runtime volume",
 };
@@ -2787,14 +2797,29 @@ export function buildUnmaterializedSkillNoticeMarkdown(
     const detail = entry.detail ? ` (${sanitizeSkillKeyForPrompt(entry.detail)})` : "";
     return `- \`${sanitizeSkillKeyForPrompt(entry.key)}\` — ${reason}${detail}`;
   });
-  if (overflow > 0) lines.push(`- …and ${overflow} more`);
+  if (overflow > 0) {
+    // The remediation paragraphs below are derived from every reported key, not
+    // just the visible ones, so a truncated list has to say what it is hiding —
+    // otherwise a paragraph can describe a class with no visible referent.
+    // Deriving those flags from `shown` instead would be worse: it would assert
+    // "configuration fault … retrying will not fix it" over hidden pending keys,
+    // which is the false-trigger bug this change exists to remove.
+    const hiddenPending = missing
+      .slice(shown.length)
+      .filter((entry) => entry.reason === "runtime_files_unpublished").length;
+    lines.push(
+      hiddenPending > 0
+        ? `- …and ${overflow} more (${hiddenPending} with runtime files unpublished)`
+        : `- …and ${overflow} more`,
+    );
+  }
 
   // BLO-31993: the two classes need opposite advice, so the remediation is
   // built from what is actually in `missing` rather than asserted flatly. When
   // nothing is pending — the only case that existed before — this reproduces
   // the original paragraph byte for byte.
-  const hasPending = missing.some((entry) => entry.reason === "materialization_pending");
-  const hasConfigFault = missing.some((entry) => entry.reason !== "materialization_pending");
+  const hasPending = missing.some((entry) => entry.reason === "runtime_files_unpublished");
+  const hasConfigFault = missing.some((entry) => entry.reason !== "runtime_files_unpublished");
   const remediation = [
     "Invoking one of these will fail with `Skill \"<name>\" not found`.",
   ];
@@ -2808,10 +2833,12 @@ export function buildUnmaterializedSkillNoticeMarkdown(
   }
   if (hasPending) {
     remediation.push(
-      "The keys whose runtime files are not published yet are already imported — do not import "
-        + "them again. Their library row exists and a materialization sweep has not finished "
-        + "writing their files to the runtime volume; that clears on its own, so a later run "
-        + "will pick them up.",
+      "The keys whose runtime files are not published yet are already in the company skill "
+        + "library — do not import them again. What is known is only that their library row "
+        + "exists and their files are not on the runtime volume: that can be a materialization "
+        + "sweep still in flight, which a later run would clear on its own, or a skill whose "
+        + "stored copy cannot be materialized at all, which will not clear. Report it if it "
+        + "persists across runs.",
     );
   }
   remediation.push(
