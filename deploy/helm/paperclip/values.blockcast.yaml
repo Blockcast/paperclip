@@ -402,8 +402,14 @@ tolerations:
   # to 9.9 s against a 10 s liveness timeout). paperclip-8 (pve1, 32 cores)
   # idles at ~87% carrying only the multicast-integ runners, so production
   # tolerates that node's reserved taint and the pve4-then-not-pve2 preference
-  # places the second replica there instead (BLO-32054). One API pod alongside
-  # those runners is the accepted trade; drop this once pve2 is rebalanced.
+  # places the second replica there instead (BLO-32054). One API pod (1.5 CPU
+  # request, 4 limit) alongside those runners is the accepted trade. Budget on
+  # that 32-CPU node: the three multicast-integ runners request 3 x 8 = 24 and
+  # DaemonSets ~1.1, so everything else (this API pod included) must fit in
+  # ~5 CPU or the third runner sits Pending. The runners are priority 500000
+  # with preemptionPolicy Never and the API is priority 0, so a runner that no
+  # longer fits waits silently rather than preempting. Drop this once pve2 is
+  # rebalanced.
   - key: blockcast.net/arc-multicast-integ-reserved
     operator: Equal
     value: "true"
@@ -418,15 +424,17 @@ tolerations:
 # takes it verbatim. Drop the entry once pve3 is rebalanced.
 #
 # pve2 saturates the same way whenever CI runner bursts land on
-# paperclip-5/-10/-11 (load 135/80 seen 2026-09-05 17:30Z, 20-24% steal), but
-# it cannot be excluded outright: the API's hard two-host spread
-# (api.spreadAcrossNodes) needs a second eligible node, pve4 hosts only
-# paperclip-3, and the pve1 nodes (paperclip-1/-4/-8) carry reserved taints
-# (arc-dind-reserved, arc-multicast-integ-reserved) that production does not
-# tolerate. A NotIn [pve2, pve3] rule therefore wedged the rollout with a
-# replica Pending (2026-09-05 17:45Z). Instead: prefer pve4 outright, fall
-# back to any host that is not pve2, and let the spread rule place the second
-# replica on a pve2 node. This is a scheduler bias, not a pin.
+# paperclip-5/-10/-11 (load 135/80 seen 2026-09-05 17:30Z, 20-24% steal;
+# 148/80 and 49% steal on 2026-09-06 03:00Z), but it is still not excluded
+# outright: the API's hard two-host spread (api.spreadAcrossNodes) needs a
+# second eligible node, pve4 hosts only paperclip-3, and the pve1 nodes
+# paperclip-1/-4 carry arc-dind-reserved, which production does not tolerate.
+# A NotIn [pve2, pve3] rule therefore wedged the rollout with a replica
+# Pending (2026-09-05 17:45Z). Instead: prefer pve4 outright, fall back to any
+# host that is not pve2, and let the spread rule place the second replica on
+# the best remaining host. Since the arc-multicast-integ-reserved toleration
+# above, that host is paperclip-8 (pve1); pve2 stays reachable only as the
+# fallback if paperclip-8 is full. This is a scheduler bias, not a pin.
 affinity:
   nodeAffinity:
     requiredDuringSchedulingIgnoredDuringExecution:

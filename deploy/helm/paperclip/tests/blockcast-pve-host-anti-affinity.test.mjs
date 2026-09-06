@@ -112,8 +112,19 @@ test("API liveness tolerates 10 s x 6 like the worker", () => {
 // 10 s liveness timeout). paperclip-8 (pve1) idles at 87% with two
 // multicast-integ runners, so production tolerates that node's reserved taint
 // and the pve4-then-not-pve2 preference lands the second replica there.
+// Slice the pod-spec tolerations list (key at six spaces, entries at eight, in
+// both templates) so the assertion cannot be satisfied by a tolerations key
+// elsewhere in the document.
+function podTolerations(rendered) {
+  const match = rendered.match(/\n {6}tolerations:\n((?: {8}- .*\n(?: {10}.*\n)*)+)/);
+  assert.ok(match, "pod-spec tolerations block not found");
+  return match[1];
+}
+
 const MULTICAST_INTEG_TOLERATION =
-  /tolerations:[\s\S]*?- effect: NoSchedule\s*\n\s*key: blockcast\.net\/arc-multicast-integ-reserved\s*\n\s*operator: Equal\s*\n\s*value: "true"/;
+  / {8}- effect: NoSchedule\n {10}key: blockcast\.net\/arc-multicast-integ-reserved\n {10}operator: Equal\n {10}value: "true"\n/;
+const DEDICATED_TOLERATION =
+  / {8}- effect: NoSchedule\n {10}key: dedicated\n {10}operator: Equal\n {10}value: paperclip\n/;
 
 test("API deployment tolerates the paperclip-8 multicast-integ reserved taint", () => {
   const rendered = renderTemplate("templates/deployment-api.yaml", [
@@ -121,13 +132,16 @@ test("API deployment tolerates the paperclip-8 multicast-integ reserved taint", 
     "api.enabled=true",
   ]);
 
-  assert.match(rendered, MULTICAST_INTEG_TOLERATION);
+  const tolerations = podTolerations(rendered);
+  assert.match(tolerations, MULTICAST_INTEG_TOLERATION);
   // The dedicated=paperclip toleration must survive alongside it.
-  assert.match(rendered, /key: dedicated\s*\n\s*operator: Equal\s*\n\s*value: paperclip/);
+  assert.match(tolerations, DEDICATED_TOLERATION);
 });
 
 test("worker StatefulSet tolerates the paperclip-8 multicast-integ reserved taint", () => {
   const rendered = renderTemplate("templates/statefulset.yaml");
 
-  assert.match(rendered, MULTICAST_INTEG_TOLERATION);
+  const tolerations = podTolerations(rendered);
+  assert.match(tolerations, MULTICAST_INTEG_TOLERATION);
+  assert.match(tolerations, DEDICATED_TOLERATION);
 });
