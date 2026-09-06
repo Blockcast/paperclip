@@ -2784,6 +2784,17 @@ const UNMATERIALIZED_SKILL_REASON_SUMMARY: Record<
   unresolved_source: "library entry exists but its files are not on the runtime volume",
 };
 
+/**
+ * The reasons the "configuration fault" verdict actually covers, in render
+ * order. This is an allowlist rather than `reason !== "runtime_files_unpublished"`
+ * so that a reason added to the union later renders *no* verdict instead of
+ * being silently enrolled in "retrying will not fix it". A verdict that
+ * defaults to covering a class it does not describe is the precise failure
+ * shape this change exists to remove — `tsc` would not flag either form, so
+ * the safety has to come from the shape of the predicate.
+ */
+const UNMATERIALIZED_SKILL_CONFIG_FAULT_REASONS = ["absent", "unresolved_source"] as const;
+
 export function buildUnmaterializedSkillNoticeMarkdown(
   missing: UnmaterializedDesiredSkill[],
   declaredCount: number,
@@ -2792,6 +2803,17 @@ export function buildUnmaterializedSkillNoticeMarkdown(
   const materializedCount = Math.max(declaredCount - missing.length, 0);
   const shown = missing.slice(0, UNMATERIALIZED_SKILL_NOTICE_MAX_KEYS);
   const overflow = missing.length - shown.length;
+
+  // BLO-31993: the two classes need opposite advice, so the remediation is
+  // built from what is actually in `missing` rather than asserted flatly. When
+  // nothing is pending — the only case that existed before — this reproduces
+  // the original paragraph byte for byte.
+  const hasPending = missing.some((entry) => entry.reason === "runtime_files_unpublished");
+  const configFaultReasons = UNMATERIALIZED_SKILL_CONFIG_FAULT_REASONS.filter((reason) =>
+    missing.some((entry) => entry.reason === reason),
+  );
+  const isMixed = hasPending && configFaultReasons.length > 0;
+
   const lines = shown.map((entry) => {
     const reason = UNMATERIALIZED_SKILL_REASON_SUMMARY[entry.reason];
     const detail = entry.detail ? ` (${sanitizeSkillKeyForPrompt(entry.detail)})` : "";
@@ -2804,30 +2826,48 @@ export function buildUnmaterializedSkillNoticeMarkdown(
     // Deriving those flags from `shown` instead would be worse: it would assert
     // "configuration fault … retrying will not fix it" over hidden pending keys,
     // which is the false-trigger bug this change exists to remove.
-    const hiddenPending = missing
-      .slice(shown.length)
-      .filter((entry) => entry.reason === "runtime_files_unpublished").length;
+    //
+    // Both directions need disclosing, not just hidden pending keys: 20 visible
+    // pending keys plus one hidden `absent` renders the config-fault paragraph
+    // with no visible referent, which is the same defect mirrored. Only a
+    // *mixed* notice needs any of this — when every reported key is one class,
+    // the single paragraph already describes the hidden ones too.
+    const hidden = missing.slice(shown.length);
+    const hiddenPending = hidden.filter(
+      (entry) => entry.reason === "runtime_files_unpublished",
+    ).length;
+    const hiddenConfigFault = hidden.length - hiddenPending;
+    const disclosures = isMixed
+      ? [
+          ...(hiddenPending > 0 ? [`${hiddenPending} with runtime files unpublished`] : []),
+          ...(hiddenConfigFault > 0 ? [`${hiddenConfigFault} a configuration fault`] : []),
+        ]
+      : [];
     lines.push(
-      hiddenPending > 0
-        ? `- …and ${overflow} more (${hiddenPending} with runtime files unpublished)`
+      disclosures.length > 0
+        ? `- …and ${overflow} more (${disclosures.join(", ")})`
         : `- …and ${overflow} more`,
     );
   }
 
-  // BLO-31993: the two classes need opposite advice, so the remediation is
-  // built from what is actually in `missing` rather than asserted flatly. When
-  // nothing is pending — the only case that existed before — this reproduces
-  // the original paragraph byte for byte.
-  const hasPending = missing.some((entry) => entry.reason === "runtime_files_unpublished");
-  const hasConfigFault = missing.some((entry) => entry.reason !== "runtime_files_unpublished");
   const remediation = [
     "Invoking one of these will fail with `Skill \"<name>\" not found`.",
   ];
-  if (hasConfigFault) {
+  if (configFaultReasons.length > 0) {
+    // In a mixed notice the verdict has to name *which* keys it covers, and the
+    // only referent the reader can resolve is the bullet label they can see —
+    // so quote those labels verbatim rather than paraphrasing the state. A
+    // paraphrase ("whose files are missing from the runtime volume") reads as a
+    // description of the pending keys, which the very next sentence gives the
+    // opposite advice to: a flat verdict asserted over a key it does not
+    // describe, i.e. this bug again one level up.
+    const covered = configFaultReasons
+      .map((reason) => `*${UNMATERIALIZED_SKILL_REASON_SUMMARY[reason]}*`)
+      .join(" or ");
     remediation.push(
       hasPending
-        ? "The keys that are not in the library, or whose files are missing from the runtime "
-          + "volume, are a configuration fault, not a transient error — retrying will not fix them."
+        ? `The keys marked ${covered} are a configuration fault, not a transient error — `
+          + "retrying will not fix them."
         : "This is a configuration fault, not a transient error — retrying will not fix it.",
     );
   }

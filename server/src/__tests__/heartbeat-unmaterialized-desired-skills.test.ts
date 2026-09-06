@@ -270,6 +270,50 @@ describe("buildUnmaterializedSkillNoticeMarkdown", () => {
     expect(notice).toContain("4 skills configured, 2 available");
   });
 
+  // Review follow-up on #1679. The config-fault verdict used to be scoped by a
+  // paraphrase — "the keys that are not in the library, or whose files are
+  // missing from the runtime volume" — whose second clause has NO referent in a
+  // {pending, absent} notice (there is no `unresolved_source` key), and reads as
+  // a description of the pending key, which the next sentence gives the opposite
+  // advice to. That is this bug's own shape: a flat verdict over a key it does
+  // not describe. The verdict now quotes the bullet labels the reader can see.
+  it("scopes the config-fault verdict to the reasons actually present", () => {
+    const notice = buildUnmaterializedSkillNoticeMarkdown(
+      [
+        { key: "a/b/pending", reason: "runtime_files_unpublished", detail: null },
+        { key: "a/b/gone", reason: "absent", detail: null },
+      ],
+      4,
+    );
+    // The verdict names the absent bullet verbatim, so it resolves against a
+    // visible line rather than against the pending key it used to resemble.
+    expect(notice).toContain(
+      "The keys marked *not in the company skill library* are a configuration fault, "
+      + "not a transient error — retrying will not fix them.",
+    );
+    // The unreferented clause is gone: no `unresolved_source` key is reported
+    // here, so nothing in this notice may claim to describe one.
+    expect(notice).not.toContain("whose files are missing from the runtime volume");
+    // ...and the pending key still gets the opposite advice, unchanged.
+    expect(notice).toContain("do not import them again");
+  });
+
+  it("names both config-fault bullets when both classes are reported", () => {
+    const notice = buildUnmaterializedSkillNoticeMarkdown(
+      [
+        { key: "a/b/pending", reason: "runtime_files_unpublished", detail: null },
+        { key: "a/b/gone", reason: "absent", detail: null },
+        { key: "a/b/unresolved", reason: "unresolved_source", detail: null },
+      ],
+      5,
+    );
+    expect(notice).toContain(
+      "The keys marked *not in the company skill library* or *library entry exists but its "
+      + "files are not on the runtime volume* are a configuration fault, not a transient "
+      + "error — retrying will not fix them.",
+    );
+  });
+
   // Review follow-up on #1679: the remediation flags are derived from every
   // reported key, but only the first 20 are rendered. A pending key past the
   // cap would otherwise produce a paragraph with no visible referent.
@@ -288,12 +332,39 @@ describe("buildUnmaterializedSkillNoticeMarkdown", () => {
     );
     // Both pending keys are past the cap, so neither is rendered as a bullet...
     expect(notice).not.toContain("a/b/pending-one");
+    // Asserting the second one too makes this fail if the cap is ever raised
+    // past 21 — which is the boundary the test exists to guard.
+    expect(notice).not.toContain("a/b/pending-two");
     // ...but the reader is still told they are there, and still gets the
     // "do not re-import" advice that applies to them. Deriving the flags from
     // the visible slice instead would drop that advice AND assert the flat
     // "retrying will not fix it" verdict over them — the bug this PR removes.
     expect(notice).toContain("- …and 2 more (2 with runtime files unpublished)");
     expect(notice).toContain("do not import them again");
+    expect(notice).toContain("retrying will not fix them");
+  });
+
+  // The mirror of the case above, which the original disclosure did not cover:
+  // when the hidden keys are the config-fault ones, it is the config-fault
+  // paragraph that renders with no visible referent. Same defect, same fix.
+  it("discloses hidden config-fault keys too, not just hidden pending ones", () => {
+    const notice = buildUnmaterializedSkillNoticeMarkdown(
+      [
+        ...Array.from({ length: 20 }, (_unused, index) => ({
+          key: `a/b/pending-${index}`,
+          reason: "runtime_files_unpublished" as const,
+          detail: null,
+        })),
+        { key: "a/b/gone-one", reason: "absent" as const, detail: null },
+        { key: "a/b/gone-two", reason: "absent" as const, detail: null },
+      ],
+      30,
+    );
+    expect(notice).not.toContain("a/b/gone-one");
+    expect(notice).not.toContain("a/b/gone-two");
+    // The config-fault verdict is rendered, so the reader must be told which
+    // keys it is about — none of them are visible.
+    expect(notice).toContain("- …and 2 more (2 a configuration fault)");
     expect(notice).toContain("retrying will not fix them");
   });
 
