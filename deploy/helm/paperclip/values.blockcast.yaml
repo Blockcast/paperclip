@@ -404,9 +404,12 @@ tolerations:
   # tolerates that node's reserved taint and the pve4-then-not-pve2 preference
   # places the second replica there instead (BLO-32054). One API pod (1.5 CPU
   # request, 4 limit) alongside those runners is the accepted trade. Budget on
-  # that 32-CPU node: the three multicast-integ runners request 3 x 8 = 24 and
-  # DaemonSets ~1.1, so everything else (this API pod included) must fit in
-  # ~5 CPU or the third runner sits Pending. The runners are priority 500000
+  # that 32-CPU node: the three multicast-integ runners request 3 x 9 = 27
+  # (8 for the runner container plus 1 for the dind native sidecar, which
+  # counts toward the pod's scheduling request) and DaemonSets ~1.2, so
+  # everything else (this API pod included) must fit in ~4 CPU or the third
+  # runner sits Pending; with the API placed, ~2.3 CPU is free. The runners
+  # are priority 500000
   # with preemptionPolicy Never and the API is priority 0, so a runner that no
   # longer fits waits silently rather than preempting. Drop this once pve2 is
   # rebalanced.
