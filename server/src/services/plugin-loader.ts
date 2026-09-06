@@ -272,7 +272,7 @@ export interface SharedDependencyConsistencyCheck {
   lockfileState: "missing" | "ok" | "invalid";
   installedState: "missing" | "ok" | "invalid";
   consistent: boolean;
-  problem: "metadata_invalid" | "version_mismatch" | null;
+  problem: "metadata_invalid" | "version_mismatch" | "not_installed" | null;
   diagnostic: string | null;
 }
 
@@ -421,10 +421,37 @@ async function readLockfileVersion(
  * package-lock.json against the version physically installed under
  * `installDir/node_modules`.
  *
- * Absence on either side is NOT treated as a mismatch — a missing lockfile
- * (local dev without one) or a not-yet-installed package makes no claim to
- * disagree with. Present-but-invalid metadata fails closed, as do two
- * present, differing versions.
+ * Absence on *one* side is NOT treated as a mismatch — a missing lockfile
+ * entry or a not-yet-installed package makes no claim to disagree with.
+ * Present-but-invalid metadata fails closed, as do two present, differing
+ * versions.
+ *
+ * The two single-sided absences are deliberately asymmetric, and neither
+ * default is arbitrary (BLO-31857):
+ *
+ * - `(lock absent)/(installed ok)` is **congruent**, because it is the normal
+ *   steady state of every isolated install dir in production. Measured on the
+ *   live PVC 2026-09-04, all of `@lucitra/paperclip-plugin-secrets`,
+ *   `@lucitra/paperclip-plugin-chat` and `@penstock/paperclip-plugin` carry a
+ *   package-lock.json with zero `plugin-sdk` entries while the SDK itself is
+ *   installed and working — a peer-dependency-only plugin records no direct
+ *   dependency to lock. Rejecting this shape fails activation for all three at
+ *   once, since the caller below throws on `!consistent` before spawning a
+ *   worker. `plugin-store-consistency.test.ts` pins it as congruent.
+ * - `(lock ok)/(installed absent)` is also congruent, because it is the
+ *   boot-time install race that `SDK_INSTALL_RACE_RETRY_DELAYS_MS` already
+ *   owns: the worker raises ERR_MODULE_NOT_FOUND and recovers on retry.
+ *
+ * `(absent)/(absent)` is the one absence that fails closed. Nothing is
+ * recorded and nothing is installed, so there is no tree here for a worker to
+ * import the SDK from — and unlike the two rows above, no other mechanism
+ * covers it: it is not a version disagreement, and a guard that called it
+ * congruent would let a boot fixture pass vacuously while asserting nothing.
+ * A transient `(absent)/(absent)` during the concurrent boot install is still
+ * safe, because every inconsistent result routes through
+ * `checkSharedDependencyConsistencyAfterRecheck`, which returns as soon as the
+ * problem clears and only fails closed on a mismatch stable past
+ * `SDK_STORE_CONSISTENCY_MIN_STABLE_MISMATCH_MS`.
  */
 export async function checkSharedDependencyConsistency(
   installDir: string,
@@ -442,9 +469,11 @@ export async function checkSharedDependencyConsistency(
     lockfileRead.state === "ok" &&
     installedRead.state === "ok" &&
     lockfileVersion !== installedVersion;
+  const notInstalled = lockfileRead.state === "missing" && installedRead.state === "missing";
   const consistent =
     !metadataInvalid &&
-    !versionMismatch;
+    !versionMismatch &&
+    !notInstalled;
   const diagnostics = [lockfileRead.diagnostic, installedRead.diagnostic].filter((detail): detail is string => !!detail);
 
   return {
@@ -454,7 +483,13 @@ export async function checkSharedDependencyConsistency(
     lockfileState: lockfileRead.state,
     installedState: installedRead.state,
     consistent,
-    problem: metadataInvalid ? "metadata_invalid" : versionMismatch ? "version_mismatch" : null,
+    problem: metadataInvalid
+      ? "metadata_invalid"
+      : versionMismatch
+        ? "version_mismatch"
+        : notInstalled
+          ? "not_installed"
+          : null,
     diagnostic: diagnostics.length > 0 ? diagnostics.join("; ") : null,
   };
 }
@@ -510,6 +545,17 @@ export async function checkSharedDependencyConsistencyAfterRecheck(
  */
 export const TORN_STORE_ERROR_MARKER = "Torn plugin store detected";
 
+/**
+ * Leading text of the nothing-installed refusal. Deliberately NOT
+ * `TORN_STORE_ERROR_MARKER`: `reconcileLegacyIsolatedInstallsAtStartup`
+ * un-latches rows carrying that marker on the theory that relocating the
+ * install dir resolves them, which is true of a version disagreement inside a
+ * populated tree and false here. An empty tree needs an actual install, so a
+ * row that failed this way must stay errored until that happens rather than be
+ * revived into the same failure on the next boot (BLO-31857).
+ */
+export const SDK_NOT_INSTALLED_ERROR_MARKER = "Plugin SDK is not installed";
+
 function formatSharedDependencyConsistencyError(check: SharedDependencyConsistencyCheck, installDir: string): string {
   const installedPath = path.join(installDir, "node_modules", ...check.packageName.split("/"));
   if (check.problem === "metadata_invalid") {
@@ -518,6 +564,16 @@ function formatSharedDependencyConsistencyError(check: SharedDependencyConsisten
       `Refusing to activate to avoid a silent worker initialize timeout. Reconcile the shared plugin store ` +
       `(e.g. inspect ${path.join(installDir, "package-lock.json")} and ${path.join(installedPath, "package.json")}, ` +
       `then re-run 'npm install --prefix ${installDir}') before re-enabling this plugin.`
+    );
+  }
+  if (check.problem === "not_installed") {
+    return (
+      `${SDK_NOT_INSTALLED_ERROR_MARKER}: ${path.join(installDir, "package-lock.json")} records no ` +
+      `${check.packageName} entry and nothing is installed at ${installedPath}. The install dir is empty of ` +
+      `the SDK, so the worker has no tree to import it from. Refusing to activate to avoid a silent worker ` +
+      `initialize timeout. Run 'npm install --prefix ${installDir}' before re-enabling this plugin. ` +
+      `(A populated install dir that merely omits the SDK from its lockfile — the normal ` +
+      `peer-dependency-only shape — is congruent and is not this error.)`
     );
   }
   return (
@@ -2826,6 +2882,19 @@ export function pluginLoader(
       // npm install / workspace SDK re-patch can settle before we mark the
       // plugin errored, while a persistent mismatch still fails well before
       // the worker initialize timeout.
+      //
+      // Deliberately NOT a resolvability probe (BLO-31857). The obvious
+      // stronger gate — "can this tree actually resolve the SDK?" — was
+      // measured against the live layout on 2026-09-04 and cannot be used:
+      // `require.resolve('@paperclipai/plugin-sdk', { paths: [installDir] })`
+      // throws ERR_PACKAGE_PATH_NOT_EXPORTED on all three isolated trees,
+      // including the two known-good ones, because the SDK's `exports` map is
+      // ESM-only with no `require` condition; `import.meta.resolve(spec,
+      // parentURL)` failed on all four targets including hindsight, which is
+      // provably working. Either one would fail closed for every plugin on the
+      // box. If a resolvability gate is ever added here, verify it passes
+      // against the current production layout FIRST — otherwise it tests the
+      // probe rather than the tree.
       // ------------------------------------------------------------------
       const sdkConsistency = await checkSharedDependencyConsistencyAfterRecheck(pluginInstallDir);
       if (!sdkConsistency.consistent) {
