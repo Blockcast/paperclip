@@ -569,10 +569,26 @@ function deploymentWith({
 // above. `readyReplicas` of 0 is written as an ABSENT field by default, matching
 // what a never-ready ReplicaSet actually looks like on the live cluster —
 // observed 2026-09-04 across the 7 scaled-down paperclip-api ReplicaSets.
-function replicaSetWith({ name, images = [], ready = 0, uid = DEPLOYMENT_UID } = {}) {
+//
+// `created` defaults to a fixed stamp because every real ReplicaSet carries one;
+// it is the tie-break the reader uses once two of them are serving (BLO-32101).
+// The default is SHARED, so two fixtures that do not both override it tie and the
+// reader declines — which is the conservative direction, and is pinned by its own
+// case below rather than left as an accident. Pass `created: null` to omit the
+// field entirely, the other shape that leaves no oldest to pick.
+const RS_CREATED_DEFAULT = "2026-09-04T00:00:00Z";
+
+function replicaSetWith({
+  name,
+  images = [],
+  ready = 0,
+  uid = DEPLOYMENT_UID,
+  created = RS_CREATED_DEFAULT,
+} = {}) {
   return {
     metadata: {
       name,
+      ...(created === null ? {} : { creationTimestamp: created }),
       ownerReferences: [{ kind: "Deployment", name: "paperclip-api", uid }],
     },
     spec: { template: { spec: { containers: images.map((image) => ({ image })) } } },
@@ -738,28 +754,185 @@ test("a landed rollout is answered from the Deployment and never consults Replic
   assert.equal(run.argv.filter((line) => line.includes("replicasets")).length, 0);
 });
 
-test("two ReplicaSets with ready pods are ambiguous and yield no digest", () => {
-  // A rollout genuinely in flight: both digests are serving and neither is "the
-  // running one". Naming the newer would pin a half-rolled digest.
+// Two ReplicaSets with ready pods used to be refused outright, on the reasoning
+// that neither digest is unambiguously "the running one". True, and it threw away
+// the answer: the OLDER of two serving ReplicaSets is the one carrying the
+// last-healthy digest this reader exists to recover, and in the stalled-roll case
+// it is the only object that still names it. Age breaks the tie only among
+// ReplicaSets that already passed ownership and readiness, and the winner still
+// faces the container and repository checks with no fallthrough to the runner-up
+// (BLO-32101).
+
+const OLDER = "2026-09-04T10:00:00Z";
+const NEWER = "2026-09-04T11:00:00Z";
+
+function twoServingReplicaSets({ olderImages, newerImages, olderUid = DEPLOYMENT_UID }) {
+  return {
+    replicaSets: [
+      replicaSetWith({
+        name: "paperclip-api-new",
+        images: newerImages,
+        ready: 1,
+        created: NEWER,
+      }),
+      replicaSetWith({
+        name: "paperclip-api-old",
+        images: olderImages,
+        ready: 1,
+        created: OLDER,
+        uid: olderUid,
+      }),
+    ],
+  };
+}
+
+// The Deployment fixture every case below shares: a rollout applied and never made
+// ready, which is what sends the reader to the ReplicaSets in the first place.
+function neverReadyDeployment(applied = digest(0xcc)) {
+  return deploymentWith({ images: [`${IMAGE_REPOSITORY}@${applied}`], status: NEVER_READY });
+}
+
+test("two ReplicaSets with ready pods resolve to the older one's digest", () => {
+  // The stalled roll the reader exists for: maxSurge parks the Deployment at
+  // old=1 ready / new=1 ready, and the older digest is the last healthy one.
+  const lastHealthy = digest(0xaa);
   assert.equal(
     runningDigestFor(
-      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`], status: NEVER_READY }),
-      {
-        replicaSets: [
-          replicaSetWith({
-            name: "paperclip-api-new",
-            images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
-            ready: 1,
-          }),
-          replicaSetWith({
-            name: "paperclip-api-old",
-            images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
-            ready: 1,
-          }),
-        ],
-      },
+      neverReadyDeployment(),
+      twoServingReplicaSets({
+        olderImages: [`${IMAGE_REPOSITORY}@${lastHealthy}`],
+        newerImages: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+      }),
+    ),
+    lastHealthy,
+  );
+});
+
+test("three ReplicaSets with ready pods resolve to the oldest, not merely a previous one", () => {
+  const oldest = digest(0xaa);
+  assert.equal(
+    runningDigestFor(neverReadyDeployment(), {
+      replicaSets: [
+        replicaSetWith({
+          name: "paperclip-api-mid",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`],
+          ready: 1,
+          created: "2026-09-04T10:30:00Z",
+        }),
+        replicaSetWith({
+          name: "paperclip-api-new",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+          ready: 1,
+          created: NEWER,
+        }),
+        replicaSetWith({
+          name: "paperclip-api-old",
+          images: [`${IMAGE_REPOSITORY}@${oldest}`],
+          ready: 1,
+          created: OLDER,
+        }),
+      ],
+    }),
+    oldest,
+  );
+});
+
+test("two serving ReplicaSets stamped the same second stay ambiguous and yield no digest", () => {
+  // creationTimestamp is second-granular, so this is a real tie rather than a
+  // contrived one. There is no oldest, and jq's sort would resolve it on
+  // apiserver list order — an arbitrary answer dressed as a decision.
+  assert.equal(
+    runningDigestFor(neverReadyDeployment(), {
+      replicaSets: [
+        replicaSetWith({
+          name: "paperclip-api-new",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+          ready: 1,
+          created: OLDER,
+        }),
+        replicaSetWith({
+          name: "paperclip-api-old",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+          ready: 1,
+          created: OLDER,
+        }),
+      ],
+    }),
+    "",
+  );
+});
+
+test("a serving ReplicaSet with no creationTimestamp is never ranked as the oldest", () => {
+  // The missing field defaults to the empty string, which sorts before every real
+  // timestamp — so without this branch an unstamped ReplicaSet would win as
+  // "oldest" on the strength of the field being absent.
+  assert.equal(
+    runningDigestFor(neverReadyDeployment(), {
+      replicaSets: [
+        replicaSetWith({
+          name: "paperclip-api-unstamped",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+          ready: 1,
+          created: null,
+        }),
+        replicaSetWith({
+          name: "paperclip-api-new",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+          ready: 1,
+          created: NEWER,
+        }),
+      ],
+    }),
+    "",
+  );
+});
+
+// Age is the LAST filter applied, and the ReplicaSet it elects is then held to the
+// same standard a lone serving ReplicaSet is. These three cases are the teeth of
+// that: in each, the older ReplicaSet is disqualified and a naive "skip it and
+// take the next oldest" would happily pin the newer digest instead.
+
+test("an oldest serving ReplicaSet from another repository yields no digest, not the runner-up", () => {
+  assert.equal(
+    runningDigestFor(
+      neverReadyDeployment(),
+      twoServingReplicaSets({
+        olderImages: [`ghcr.io/someone/else@${digest(0xaa)}`],
+        newerImages: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+      }),
     ),
     "",
+  );
+});
+
+test("an oldest serving ReplicaSet whose containers disagree yields no digest, not the runner-up", () => {
+  assert.equal(
+    runningDigestFor(
+      neverReadyDeployment(),
+      twoServingReplicaSets({
+        olderImages: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`, `${IMAGE_REPOSITORY}@${digest(0xdd)}`],
+        newerImages: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+      }),
+    ),
+    "",
+  );
+});
+
+test("an older ReplicaSet owned by a different Deployment does not outrank ours", () => {
+  // Ownership filters BEFORE age, so a foreign ReplicaSet is not a candidate at
+  // all — it neither wins on age nor makes ours ambiguous. Ours is then the only
+  // serving ReplicaSet, and is pinned exactly as it would be alone.
+  const ours = digest(0xcc);
+  assert.equal(
+    runningDigestFor(
+      neverReadyDeployment(),
+      twoServingReplicaSets({
+        olderImages: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+        newerImages: [`${IMAGE_REPOSITORY}@${ours}`],
+        olderUid: "99999999-9999-4999-8999-999999999999",
+      }),
+    ),
+    ours,
   );
 });
 
