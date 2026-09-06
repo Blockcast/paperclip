@@ -10,6 +10,40 @@ import type {
 } from "@paperclipai/shared";
 
 export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
+
+/**
+ * Recovery-action statuses that still hold a live repair path, for the purpose of
+ * suppressing blocked-issue auto-resume.
+ *
+ * Deliberately NARROWER than `ACTIVE_RECOVERY_ACTION_STATUSES`, and the asymmetry is
+ * load-bearing (BLO-21523). `escalated` belongs in the wider set — it holds
+ * `issue_recovery_actions_active_source_uq` so a fresh action cannot be minted with a
+ * new budget (BLO-18996), it keeps the handoff comment grant open, and it keeps the
+ * owner able to check the issue out. What it does NOT do is wake anyone:
+ *
+ *   - `escalateExpiredWakeHorizons` is the ONLY writer of `escalated`, and it sets it
+ *     exactly when `maxAttempts !== null && timeoutAt !== null && timeoutAt <= now`.
+ *     `strandedRecoveryWakeAttemptsExhausted` returns true for precisely that condition.
+ *     (`upsertSourceScoped` only ever *preserves* an existing `escalated` — it never
+ *     creates one — so there is no second way in.)
+ *   - So every `escalated` action is already wake-exhausted.
+ *     `reconcileStrandedRecoveryWakeBackstop` selects it and then always drops it at
+ *     `exhaustedSkipped`. Should a later re-upsert ever null out `maxAttempts`, the
+ *     conclusion is unchanged: a null budget is reserved for the causes that never wake
+ *     an owner at all.
+ *
+ * The platform says as much verbatim when it escalates: "Paperclip has stopped waking
+ * anyone for it". Suppressing auto-resume on an `escalated` action therefore preserves
+ * no repair path — it only pins the issue `blocked` with zero unresolved blockers, which
+ * is the exact stranded state the reconciler exists to drain, and which no wake, retry or
+ * monitor will ever re-enter. Measured 2026-08-24: 88 of 106 stranded rows were held this
+ * way, 87 of them with no run, no monitor and no scheduled retry, the oldest 6 weeks old.
+ *
+ * Resolving or cancelling the action remains the way to clear the wider set; this constant
+ * only decides whether the row may return to `todo`.
+ */
+export const BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES = ["active"] as const satisfies readonly IssueRecoveryActionStatus[];
+
 const MAX_UPSERT_RETRIES = 3;
 const SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY = "sourceScopedWakeHorizonAt";
 const RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY = "recoveryHandoffGrantAnchorAt";
@@ -526,8 +560,14 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           // preserving it would exhaust the new owner on its first wake — the deadlock this
           // ticket exists to fix, reintroduced through the back door. So on
           // unbounded -> bounded, adopt the fresh wake horizon; thereafter never rewrite it.
-          // Staying unbounded still preserves, which keeps the quota `retryAt` intact and the
-          // `pr_review_non_convergence` caller (also `maxAttempts: null`) unaffected.
+          // Staying unbounded still preserves, which keeps the quota `retryAt` intact.
+          //
+          // PEN-2756: this used to also name `pr_review_non_convergence` as an unbounded
+          // caller. It is bounded at creation now (it wakes an owner, so the same rule that
+          // bounds every other waking shape applies), which means it reaches the
+          // unbounded -> bounded arm above on its first sweep after rollout, exactly like the
+          // ROLLOUT NOTE describes. Only the ownerless board-escalation variant of that kind
+          // stays unbounded, and that one wakes nobody.
           timeoutAt: inputMaxAttempts !== null
             ? (wakeHorizonAt ?? input.timeoutAt ?? null)
             : (existingTimeoutAt ?? input.timeoutAt ?? null),
@@ -610,8 +650,16 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   // reports its non-delivery paths (capacity deferral, tree hold, cooldown, disabled wake).
   // So only wakes that actually reached the queue count against the budget. Floors at 0 so a
   // refunded first attempt makes the next sweep's `existing.attemptCount + 1` land back on 1.
-  // Scoped to active statuses and matched on company so it cannot touch a resolved row.
-  async function releaseWakeAttempt(input: { companyId: string; actionId: string }): Promise<void> {
+  // The owner and attempt count are the reservation token captured by the caller. Keep both
+  // in the UPDATE predicate so a refund from an older wake is an atomic no-op after ownership
+  // changes or a newer reservation. Scoped to active statuses and matched on company so it
+  // cannot touch a resolved row.
+  async function releaseWakeAttempt(input: {
+    companyId: string;
+    actionId: string;
+    expectedOwnerAgentId: string;
+    expectedAttemptCount: number;
+  }): Promise<void> {
     await db
       .update(issueRecoveryActions)
       .set({
@@ -622,6 +670,8 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         and(
           eq(issueRecoveryActions.id, input.actionId),
           eq(issueRecoveryActions.companyId, input.companyId),
+          eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
+          eq(issueRecoveryActions.attemptCount, input.expectedAttemptCount),
           inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
         ),
       );

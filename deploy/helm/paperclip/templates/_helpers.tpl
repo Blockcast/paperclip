@@ -151,3 +151,87 @@ rendered:
 {{- "Always" }}
 {{- end }}
 {{- end }}
+
+{{/* Fail rendering instead of silently disabling an enabled review-gate producer. */}}
+{{- define "paperclip.validateGithubReviewGate" -}}
+{{- if and ((.Values.githubApp).reviewGateEnabled) (not ((.Values.githubApp).reviewGateCaptureEnabled)) -}}
+{{- fail "githubApp.reviewGateEnabled requires githubApp.reviewGateCaptureEnabled=true" -}}
+{{- end -}}
+{{- if (.Values.githubApp).reviewGateCaptureEnabled -}}
+{{- if not (.Values.githubApp).enabled -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires githubApp.enabled=true" -}}
+{{- end -}}
+{{- if not (gt (len ((.Values.githubApp).reviewGateRepositories)) 0) -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires at least one githubApp.reviewGateRepositories entry" -}}
+{{- end -}}
+{{- if not (regexMatch "^[0-9]+$" (toString ((.Values.githubApp).reviewGateExpectedAppId))) -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires a numeric githubApp.reviewGateExpectedAppId" -}}
+{{- end -}}
+{{- if not (regexMatch "^[0-9]+$" (toString ((.Values.githubApp).reviewGateExpectedInstallationId))) -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires a numeric githubApp.reviewGateExpectedInstallationId" -}}
+{{- end -}}
+{{- if empty ((.Values.githubApp).prReviewGateStatusContext) -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires githubApp.prReviewGateStatusContext" -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The directories the seed init container publishes the GitHub egress wrappers
+into, in the order they must appear on PATH. Derived from persistence.mountPath
+because the seed derives them the same way (`BASE={{ .Values.persistence.mountPath }}`);
+a hardcoded /paperclip would silently miss every deployment that relocates the PVC.
+*/}}
+{{- define "paperclip.wrapperBinDirs" -}}
+{{- $base := .Values.persistence.mountPath | trimSuffix "/" -}}
+{{- printf "%s/.local/bin,%s/bin" $base $base -}}
+{{- end }}
+
+{{/*
+PATH for containers that run agent tooling.
+
+PEN-2527/PEN-2526: agent-authored GitHub content is scrubbed of credential-shaped
+material by wrapper binaries the seed init container publishes into
+`<mountPath>/.local/bin` and `<mountPath>/bin`. The scrubber only sits on the
+traffic path if those directories precede /usr/bin, where the unscrubbed image
+`gh` lives. `.local/bin` is prepended by the PVC's `.profile`/`.bashrc`, which
+only a *login* shell sources; agent tool harnesses spawn non-login shells. So the
+PATH the container itself carries is the only thing that reaches the scrubber,
+which makes it a chart-level invariant rather than one operator's values file.
+
+Override with `env.path`. The override is validated rather than trusted: it must
+keep both wrapper directories ahead of /usr/bin or the render fails, because the
+failure mode being prevented is an agent that looks healthy while publishing
+unscrubbed.
+*/}}
+{{- define "paperclip.runtimePath" -}}
+{{- $wrapperDirs := splitList "," (include "paperclip.wrapperBinDirs" .) -}}
+{{- range $entry := .Values.env.extra -}}
+{{- if eq ($entry.name | toString) "PATH" -}}
+{{- fail "env.extra must not define PATH: a duplicate env var would silently override the chart-managed PATH that keeps the GitHub egress scrubber (PEN-2527) ahead of /usr/bin. Set env.path instead, which is validated." -}}
+{{- end -}}
+{{- end -}}
+{{- $path := .Values.env.path | default (printf "%s:%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" (index $wrapperDirs 0) (index $wrapperDirs 1)) -}}
+{{- $entries := splitList ":" $path -}}
+{{- $systemIdx := -1 -}}
+{{- range $i, $entry := $entries -}}
+{{- if and (eq $entry "/usr/bin") (lt $systemIdx 0) -}}
+{{- $systemIdx = $i -}}
+{{- end -}}
+{{- end -}}
+{{- range $dir := $wrapperDirs -}}
+{{- $idx := -1 -}}
+{{- range $i, $entry := $entries -}}
+{{- if and (eq $entry $dir) (lt $idx 0) -}}
+{{- $idx = $i -}}
+{{- end -}}
+{{- end -}}
+{{- if lt $idx 0 -}}
+{{- fail (printf "env.path must include the Paperclip GitHub egress wrapper directory %q, or agent `gh` resolves to the unscrubbed image CLI (PEN-2527)" $dir) -}}
+{{- end -}}
+{{- if and (ge $systemIdx 0) (gt $idx $systemIdx) -}}
+{{- fail (printf "env.path must place the Paperclip GitHub egress wrapper directory %q before /usr/bin, or agent `gh` resolves to the unscrubbed image CLI (PEN-2527)" $dir) -}}
+{{- end -}}
+{{- end -}}
+{{- $path -}}
+{{- end }}

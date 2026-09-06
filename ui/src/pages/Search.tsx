@@ -56,7 +56,9 @@ import {
 import type { ReactNode } from "react";
 import type { Agent, IssueLabel, Project } from "@paperclipai/shared";
 
-const SEARCH_DEBOUNCE_MS = 250;
+// Exported so Search.test.tsx can derive its wait budget from this value rather than
+// hard-coding a margin that silently goes stale when the debounce changes (BLO-30247).
+export const SEARCH_DEBOUNCE_MS = 250;
 const IDENTIFIER_PATTERN = /^[A-Z]+-\d+$/;
 
 const SCOPE_LABELS: Record<CompanySearchScope, string> = {

@@ -9,6 +9,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueExecutionDecisions,
@@ -49,6 +50,10 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     await db.delete(issueRelations);
     await db.delete(activityLog);
     await db.delete(issues);
+    // Must precede heartbeatRuns: any test that cancels a RUNNING run writes
+    // heartbeat_run_events, whose FK then blocks the heartbeatRuns delete and
+    // fails every subsequent test in the file rather than just its own.
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agents);
@@ -104,7 +109,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         agentId,
         status: staleRunStatus,
         invocationSource: "manual",
-        finishedAt: new Date(),
+        ...(staleRunStatus === "running" ? { startedAt: new Date() } : { finishedAt: new Date() }),
         createdAt: staleRunCreatedAt,
       },
       {
@@ -639,6 +644,55 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(res.body.error).toBe("Issue run ownership conflict");
   });
 
+  // BLO-28219: the conflict body used to carry only the two run ids, which cannot
+  // distinguish "a live sibling run of my own agent holds this" (working as
+  // designed — yield) from "the lock outlived a dead run" (a wedge worth
+  // escalating). BLO-28219 was filed as the second and was in fact the first.
+  it("reports live-sibling liveness and an unblock path on an ownership conflict", async () => {
+    const { companyId, agentId, failedRunId: liveHolderRunId, currentRunId } =
+      await seedCompanyAgentAndRuns({ staleRunStatus: "running" });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Live sibling conflict diagnostics",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: liveHolderRunId,
+      executionRunId: liveHolderRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toBe("Issue run ownership conflict");
+
+    // The holder is `running` and belongs to the actor's own agent, so this is
+    // the concurrency fence, not a stale lock.
+    expect(res.body.details?.holderLiveness, JSON.stringify(res.body)).toBe("live");
+    expect(res.body.details?.concurrentSiblingRun).toBe(true);
+    // `remediation` is hoisted to the top level by the error handler, so the fix
+    // path is visible without digging into `details`.
+    expect(res.body.remediation, JSON.stringify(res.body)).toContain(
+      "concurrent run of your own agent",
+    );
+    // Must steer the caller away from the two responses that wasted runs.
+    expect(res.body.remediation).toContain("Do NOT retry or re-file");
+
+    const holder = (res.body.details?.lockHolders ?? []).find(
+      (entry: { runId: string }) => entry.runId === liveHolderRunId,
+    );
+    expect(holder, JSON.stringify(res.body)).toBeTruthy();
+    expect(holder.live).toBe(true);
+    expect(holder.status).toBe("running");
+    expect(holder.sameAgentAsActor).toBe(true);
+  });
+
   it("allows the rightful assignee to release after the owning run failed", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
     const issueId = randomUUID();
@@ -758,6 +812,83 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         error: "Cancelled because the issue was released",
       },
     });
+  });
+
+  // BLO-23206. The cancel path used to end at most ONE run — the running one,
+  // via resolveActiveIssueRun — so queued and scheduled_retry rows for the same
+  // issue survived the close and were claimed against it on the next scheduler
+  // tick. This is the cancel-path analogue of the release test above.
+  it("cancels queued and scheduled issue-context runs when an issue is cancelled", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Cancelled duplicate with queued runs behind it",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+    const staleContext = await seedQueuedIssueContextRuns({ companyId, agentId, issueId });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "cancelled", comment: "Cancelling as a duplicate." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const runs = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+      })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.id, [
+        staleContext.queuedRunId,
+        staleContext.scheduledRunId,
+      ]));
+    expect(Object.fromEntries(runs.map((run) => [run.id, {
+      status: run.status,
+      errorCode: run.errorCode,
+    }]))).toEqual({
+      [staleContext.queuedRunId]: {
+        status: "cancelled",
+        errorCode: "issue_terminal_status",
+      },
+      [staleContext.scheduledRunId]: {
+        status: "cancelled",
+        errorCode: "issue_terminal_status",
+      },
+    });
+
+    const wakeups = await db
+      .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(inArray(agentWakeupRequests.id, [
+        staleContext.queuedWakeupId,
+        staleContext.scheduledWakeupId,
+      ]));
+    for (const wakeup of wakeups) {
+      expect(wakeup.status).toBe("skipped");
+    }
+
+    // The execution lock does not outlive the drained runs.
+    const [issueAfter] = await db
+      .select({
+        status: issues.status,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(issueAfter.status).toBe("cancelled");
+    expect(issueAfter.executionRunId).toBeNull();
+    expect(issueAfter.executionLockedAt).toBeNull();
   });
 
   it("lets the current assignee recover a timed_out stale checkout owner during PATCH", async () => {

@@ -17,7 +17,7 @@ platform cannot resolve automatically. Each runbook should be:
   PR-review wake left terminal at `agent_wakeup_requests.status='failed'`,
   which nothing re-drives: decide re-review vs accept without double-posting a
   review. Trigger: alert `PaperclipPrReviewWakeTerminalFailed`, or
-  `paperclip_agent_wakeup_terminal_failed_unresolved{scope="pr_review"} > 0`.
+  `max by (error_code, scope) (paperclip_agent_wakeup_terminal_failed_unresolved{scope="pr_review"}) > 0`.
 - [`clear-polluted-ssh-workspace.md`](clear-polluted-ssh-workspace.md) —
   recover a stranded SSH-driven run whose workspace import is failing on a
   sibling task's leftover scratch state. Trigger: blocked issue auto-comment
@@ -46,9 +46,31 @@ platform cannot resolve automatically. Each runbook should be:
   snapshot cannot be refreshed safely. Trigger: alert
   `PaperclipQueuedRunStranded`, `PaperclipQueuedRunAgeMetricsRefreshFailed`,
   or `max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > 1800`.
+- [`queued-run-stranded.md#overdue-scheduled-retry-blo-22094`](queued-run-stranded.md#overdue-scheduled-retry-blo-22094) —
+  a `heartbeat_runs` row parked at `status='scheduled_retry'` past its own due
+  time, never promoted: the retry-promotion sweep either wedged or is
+  systematically failing this row, and (unlike the alert above) the row never
+  even reached `queued`. Also covers the case where that row's age snapshot
+  cannot be refreshed safely — read a stale snapshot as a detector outage, not
+  an all-clear. Trigger: alert `PaperclipOverdueScheduledRetry`,
+  `PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed`, or
+  `max(paperclip_overdue_scheduled_retry_oldest_age_seconds) by (agent_id) > 5400`.
+- [`external-runtime-reservation-stranded.md`](external-runtime-reservation-stranded.md)
+  — an agent holds an unreleased `external_runtime_reservations` row whose run
+  is terminal or silent. The row IS the agent's concurrency lock, so the blast
+  radius is every launch for that agent, not just the run that stranded it.
+  Covers the adapter-type-migration cause (BLO-27700), why the raw
+  `..._oldest_age_seconds` gauge must not be alerted on, and why clearing
+  `job_name`/`job_uid` to unwedge it leaks a live pod. Trigger: alert
+  `PaperclipExternalRuntimeReservationStranded` or
+  `PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed`.
 - [`productivity-review-monitor-rearm.md`](productivity-review-monitor-rearm.md)
   — you are adjudicating an open productivity review and the reviewed issue's
   monitor has lapsed (`status: "triggered"`, `nextCheckAt: null`, no active
   run): the supported one-call repair path, and why the `PATCH {status:
-  "todo"}` bounce is superseded. Trigger: review evidence reads `monitor
-  lapsed at …, never re-armed`.
+  "todo"}` bounce is superseded. Trigger: review evidence reads
+  `monitor lapsed at …, never re-armed`.
+- [`plugin-error.md`](plugin-error.md) — an installed plugin has sat at
+  `plugins.status='error'` past the grace period, distinct from an
+  operator-disabled plugin. Trigger: alert `PaperclipPluginCriticalErrored` or
+  `PaperclipPluginErrored`, or `paperclip_plugin_error == 1`.

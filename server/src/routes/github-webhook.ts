@@ -40,6 +40,10 @@ import {
 } from "@paperclipai/db";
 import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
+import {
+  evaluateAgentInvokability,
+  type AgentOrgRow,
+} from "../services/agent-invokability.js";
 import { issueService } from "../services/issues.js";
 import {
   GITHUB_DEPENDABOT_ALERT_ORIGIN_KIND,
@@ -51,6 +55,7 @@ import {
 } from "../services/dependabot-alert-issues.js";
 import { logger } from "../middleware/logger.js";
 import { HttpError } from "../errors.js";
+import { redactSensitiveText } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
   extractPaperclipIdentifiers,
@@ -58,6 +63,7 @@ import {
   type OwningIdentifierResolution,
 } from "../services/paperclip-identifiers.js";
 import {
+  githubFetchPrHeadSha,
   githubReviewerIdentityMatches,
   githubListIssueCommentBodies,
   githubPostIssueComment,
@@ -67,10 +73,15 @@ import {
   hasAllyConsolidatedReviewHeading,
 } from "../services/ally-review-detection.js";
 import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.js";
+import { enqueueGithubCommitStatusDelivery } from "../services/github-status-delivery-outbox.js";
 import { recoveryService } from "../services/recovery/service.js";
 import {
+  GITHUB_SUPPRESSION_CAUSE_REVIEWER_LOCK_CONTENDED,
   recordGithubReviewRequestDelivery,
+  recordGithubReviewRequestSuppressed,
+  recordGithubReviewPosted,
   recordGithubWorkflowRunConclusion,
+  type GithubReviewSurface,
 } from "../services/metrics.js";
 import {
   recordMergedPullRequest,
@@ -86,6 +97,11 @@ import {
   pullRequestExternalId,
 } from "../services/pull-request-work-products.js";
 import { matchesTaskKey, normalizePrReviewRepoFullName } from "../services/pr-review-duplicate-issue-guard.js";
+import {
+  activateGithubReviewGateDelivery,
+  enqueueGithubReviewGateDelivery,
+  type GithubReviewGateAuthorityConfig,
+} from "../services/github-review-gate-authority.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
@@ -126,7 +142,7 @@ export interface GithubWebhookConfig {
   pluginWorkerManager?: PluginWorkerManager;
   /**
    * Agent IDs that receive additional wakes on PR-shaped events. New reviews
-   * are assigned to the least-loaded active reviewer. The singular option is
+   * are assigned to the least-loaded invokable reviewer. The singular option is
    * retained for callers that have not migrated to the pool configuration.
    *
    * Review-driving events are
@@ -144,6 +160,13 @@ export interface GithubWebhookConfig {
    * than pull_request_review.submitted.
    */
   prReviewerBotLogin?: string | null;
+  /**
+   * Resolve the current PR head for issue-comment review events. GitHub's
+   * `issue_comment` payload omits `pull_request.head.sha`, but reviewer
+   * evidence is valid only for the exact head that was reviewed. Production
+   * uses the GitHub App lookup; route tests can provide a deterministic seam.
+   */
+  resolvePrReviewHeadSha?: typeof githubFetchPrHeadSha;
   /**
    * Optional seam for the comment-review status gate. Production uses the
    * service implementation; route tests supply a local recorder so webhook
@@ -183,6 +206,12 @@ export interface GithubWebhookConfig {
    * agent runs.
    */
   dependabotMinSeverity?: "low" | "medium" | "high" | "critical";
+  /**
+   * Optional signed-webhook authority for an App-owned required review status.
+   * The route durably records revocation intent before processing the existing
+   * webhook effects, so cancelling a workflow cannot preserve authorization.
+   */
+  reviewGateAuthority?: GithubReviewGateAuthorityConfig | null;
   /**
    * Dispatch ownership and test overrides for heartbeat wakes. Split-tier
    * production forwards its node role so API handlers enqueue for the worker.
@@ -401,6 +430,82 @@ function isActionablePrReviewComment(
   return isConfiguredPrReviewerAuthor(authorLogin, configuredReviewerLogin) || hasAllyConsolidatedReviewHeader(body);
 }
 
+/**
+ * Detect that this delivery IS a review the reviewer identity just published
+ * (BLO-27608), for {@link recordGithubReviewPosted}.
+ *
+ * Deliberately independent of `resolveEventContext`. That resolver answers "does
+ * this event need a wake", and its answer is `null` for most of what we need to
+ * count here: a CLEAN comment-shaped review is neither a review REQUEST nor
+ * actionable FEEDBACK (`isActionablePrReviewComment` requires findings), so it
+ * falls out as no context at all, and the reviewer's own formal review is
+ * dropped downstream as a self-echo (BLO-15799). Both of those are correct wake
+ * decisions and both would silently zero this counter — the reviewer's own
+ * output is precisely the artifact whose absence we are trying to alert on. So
+ * this reads the signed payload directly and shares no control flow with the
+ * wake path.
+ *
+ * Returns `null` for anything that is not a freshly-published reviewer review.
+ */
+function resolvePostedReviewObservation(
+  eventName: string,
+  payload: Record<string, unknown>,
+  configuredReviewerLogin: string | null | undefined,
+): { repoFullName: string | null; prNumber: number | null; surface: GithubReviewSurface } | null {
+  const repository = payload.repository as Record<string, unknown> | undefined;
+  const repoFullName = readStringField(repository, "full_name");
+  const action = payload.action as string | undefined;
+
+  if (eventName === "pull_request_review") {
+    // Only `submitted` publishes a review; `edited`/`dismissed` mutate one that
+    // was already counted when it landed.
+    if (action !== "submitted") return null;
+    const review = payload.review as Record<string, unknown> | undefined;
+    const reviewUser = review?.user as Record<string, unknown> | undefined;
+    if (!isConfiguredPrReviewerAuthor(readStringField(reviewUser, "login"), configuredReviewerLogin)) {
+      return null;
+    }
+    const pr = payload.pull_request as Record<string, unknown> | undefined;
+    const prNumberRaw = pr?.number;
+    return {
+      repoFullName,
+      prNumber: typeof prNumberRaw === "number" ? prNumberRaw : null,
+      surface: "formal",
+    };
+  }
+
+  if (eventName === "issue_comment") {
+    if (action !== "created") return null;
+    const issue = payload.issue as Record<string, unknown> | undefined;
+    // `issue_comment` fires for plain issues too; only a PR carries this key.
+    if (!issue?.pull_request) return null;
+    const comment = payload.comment as Record<string, unknown> | undefined;
+    const commentUser = comment?.user as Record<string, unknown> | undefined;
+    if (!isConfiguredPrReviewerAuthor(readStringField(commentUser, "login"), configuredReviewerLogin)) {
+      return null;
+    }
+    const commentBody = readStringField(comment, "body");
+    // The heading is what separates a published review from the reviewer
+    // identity's other PR comments — the control plane's own back-link comment
+    // (githubPostIssueComment) and an agent's review REQUEST are both authored
+    // under this same login and must not be counted as review output.
+    if (!hasAllyConsolidatedReviewHeading(commentBody)) return null;
+    // BLO-21618: a marker-prefixed agent request may legitimately quote a
+    // heading-shaped line while asking for a fresh pass. The marker is anchored
+    // to literal byte 0 and Ally's own output opens with the heading, so marker
+    // presence cleanly excludes the request case without touching real reviews.
+    if (hasPrReviewerAgentRequestMarker(commentBody)) return null;
+    const prNumberRaw = issue.number;
+    return {
+      repoFullName,
+      prNumber: typeof prNumberRaw === "number" ? prNumberRaw : null,
+      surface: "comment",
+    };
+  }
+
+  return null;
+}
+
 function timingSafeStringEq(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
@@ -546,6 +651,65 @@ function resolvePrCommentReviewGateWebhookTrigger(
     };
   }
 
+  // The formal-review surface, which is the one Ally actually uses: 33 of 33
+  // consolidated reviews measured in this repo arrived as reviews-API objects
+  // and none as issue comments (see pr-comment-review-gate.ts). Without this
+  // branch the gate only ever ran on `issue_comment` and at push time — and
+  // push time is the one instant at which a review of that head cannot yet
+  // exist — so the reviews half of the both-surfaces read added by #1464 was
+  // structurally unreachable and every verdict the gate ever published was a
+  // green "not evaluated" (BLO-29853: 30/30 recent merges, 9/10 of them on
+  // heads that demonstrably had been reviewed).
+  if (eventName === "pull_request_review") {
+    // All three mutating actions, because the trigger's only job is to answer
+    // "could the evaluator now compute something different?" — and it is not
+    // this function's job to guess what. `executeCommentReviewGateCheck` never
+    // reads this payload: it re-lists both surfaces live and recomputes from
+    // the whole history. So the predicate is the reviewer's identity and the
+    // fact that their review set changed, nothing about *this* review's body.
+    //
+    // `dismissed` is included because `githubListPrReviewsWithTimestamps`
+    // (github-app-auth.ts:688) drops `DISMISSED` reviews before the evaluator
+    // sees them. Dismissing a blocking review therefore does change the
+    // verdict, and excluding it here would strand the old `failure` on the PR
+    // indefinitely. An earlier revision of this branch excluded `dismissed` on
+    // the reasoning that "dismissal leaves the body untouched" — true, and
+    // irrelevant, because the reader filters on `state`, not body.
+    if (payload.action !== "submitted" && payload.action !== "edited" && payload.action !== "dismissed") {
+      return null;
+    }
+    const review = payload.review as Record<string, unknown> | undefined;
+    const reviewUser = review?.user as Record<string, unknown> | undefined;
+    const reviewedPr = payload.pull_request as Record<string, unknown> | undefined;
+    const reviewedPrNumber = typeof reviewedPr?.number === "number" ? reviewedPr.number : null;
+    // Deliberately no consolidated-heading check. Gating dispatch on this
+    // payload's body cannot see the body it *replaced*: editing a blocking
+    // consolidated review into an ordinary comment would return null here and
+    // leave the old `failure` standing forever. The evaluator decides what
+    // attests; this function only decides when to ask it.
+    if (
+      reviewedPrNumber === null ||
+      !githubReviewerIdentityMatches(
+        readStringField(reviewUser, "login") ?? "",
+        configuredReviewerLogin || DEFAULT_PR_REVIEWER_BOT_LOGIN,
+      )
+    ) {
+      return null;
+    }
+    // No `headSha`, deliberately — let the gate resolve the live head rather
+    // than trusting `review.commit_id` or this payload's snapshot. A review can
+    // be submitted against a head the branch has already moved past, and a
+    // status written to a non-head commit is invisible to branch protection.
+    // Resolving live also lets the carried-finding path (BLO-29711) see that
+    // the new head is unattested, which passing the stale sha would defeat.
+    // Matches the `issue_comment` branch above.
+    return {
+      repoFullName,
+      prNumber: reviewedPrNumber,
+      prUrl: githubPrUrl(repoFullName, reviewedPrNumber, readStringField(reviewedPr, "html_url")),
+    };
+  }
+
   if (eventName !== "pull_request") return null;
   const action = payload.action;
   if (action !== "opened" && action !== "reopened" && action !== "synchronize") return null;
@@ -646,6 +810,10 @@ interface ResolvedEventContext {
   // so the assignee wake's prompt carries the reviewer's findings without
   // needing a separate `gh pr view` shellout.
   reviewBody?: string | null;
+  // Classification must use the raw review body. reviewBody is deliberately
+  // clamped for heartbeat context size, but a findings heading can occur
+  // after the clamp boundary (as in frr#61 review 4968003838).
+  reviewHasActionableFeedback?: boolean;
   reviewState?: string | null;
   // pull_request_review.submitted only — the numeric GitHub review id.
   // Preferred over reviewUrl for the feedback-comment dedupe key (BLO-19497):
@@ -689,13 +857,40 @@ interface ResolvedEventContext {
 // fetch the full body via `gh pr view`.
 const REVIEW_BODY_MAX_BYTES = 4096;
 
+/**
+ * PEN-2370 (door #7): scrub an externally-authored GitHub body before it is
+ * mirrored into Paperclip. Null-preserving so call sites keep their
+ * `string | null` contract.
+ */
+function redactExternalBody(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  return redactSensitiveText(value);
+}
+
 function clampReviewBody(value: string | null | undefined): string | null {
   if (typeof value !== "string") return null;
+  // PEN-2370 (door #7): this is the single normalization choke point for every
+  // externally-authored review/comment body that gets mirrored into an
+  // `authorType: "system"` issue comment, so it is where scrubbing belongs --
+  // patching the individual comment builders would leave the next mirror site
+  // to rediscover the problem.
+  //
+  // Redact BEFORE clamping, never after -- and on BOTH branches. Every rule in
+  // `redactSensitiveText` is anchored on a terminator that sits to the *right*
+  // of the secret: `URI_CREDENTIAL_RE` needs the trailing `@`, the env-dump
+  // rules need the line end. Truncation deletes exactly that terminator while
+  // leaving the head of the value visible, so a clamp-then-redact ordering does
+  // not merely miss the secret -- it destroys the pattern that would have
+  // caught it. The result is a body that carries a partial credential *and* a
+  // `…(truncated)` marker implying the scrubber ran: a fail-open that reads as
+  // coverage, which is the failure mode this ticket exists to stop.
   const trimmed = value.trim();
   if (trimmed.length === 0) return null;
-  if (Buffer.byteLength(trimmed, "utf8") <= REVIEW_BODY_MAX_BYTES) return trimmed;
+  // One redaction pass over the FULL body, before any length decision.
+  const redacted = redactSensitiveText(trimmed);
+  if (Buffer.byteLength(redacted, "utf8") <= REVIEW_BODY_MAX_BYTES) return redacted;
   // Byte-length truncation so UTF-8 multibyte characters don't split.
-  const buf = Buffer.from(trimmed, "utf8");
+  const buf = Buffer.from(redacted, "utf8");
   let cut = buf.subarray(0, REVIEW_BODY_MAX_BYTES).toString("utf8");
   // `toString("utf8")` replaces split surrogates with U+FFFD; strip a
   // trailing replacement char to avoid a visible glyph in the directive.
@@ -1119,6 +1314,7 @@ function resolveEventContextRaw(
         headSha: reviewCommitId ?? collected.headSha,
         prAuthorLogin: collected.authorLogin,
         reviewBody,
+        reviewHasActionableFeedback: hasActionablePrReviewFeedback(rawReviewBody, reviewState),
         reviewState,
         reviewId,
         reviewAuthorLogin,
@@ -1182,7 +1378,9 @@ function resolveEventContextRaw(
         prAdditions: typeof pr?.additions === "number" ? (pr.additions as number) : null,
         prDeletions: typeof pr?.deletions === "number" ? (pr.deletions as number) : null,
         prBranch: (head?.ref as string | undefined) ?? null,
-        prBody: (pr?.body as string | undefined) ?? null,
+        // PEN-2370: externally-authored, same exposure shape as reviewBody /
+        // commentBody. It bypasses clampReviewBody, so it needs the scrub here.
+        prBody: redactExternalBody(pr?.body as string | undefined),
         prAction: action,
       };
     }
@@ -1342,7 +1540,22 @@ function buildDependabotAlertIssueBody(input: {
     "## Note on the Dependabot Alerts REST API (operational, not evidentiary)",
     "Every field under **Alert** above comes from this delivery's GitHub webhook payload. Do NOT call the GitHub Dependabot Alerts REST API to re-derive them: some repositories return `403 Dependabot alerts are disabled for this repository` on that endpoint even though the webhook still fires. Treat that 403 as expected and work from this issue instead of chasing the API.",
     "",
-    "This note is scoped to re-deriving the metadata fields above. It is NOT an evidentiary standard: it does not restrict which **Verifying signal** branch you may use, and it does not forbid the repository contents API or GraphQL.",
+    "This note is scoped to re-deriving the metadata fields above. It is NOT an evidentiary standard: it does not restrict which **Verifying signal** branch you may use, and it does not forbid the repository contents API. It does rule out one specific query as state evidence -- see the next section.",
+    "",
+    "## Alert state may be unreadable, and the unreadable case LOOKS LIKE ZERO",
+    "Branches 2 and 3 can each be satisfied two ways, and only one of the two needs a credential. **A terminal dismissal webhook receipt already on this issue is sufficient evidence on its own.** The receipt is pushed to us by the HMAC-verified Dependabot delivery, not polled, so producing it needs no permission, no token and no API call. If one is already on this issue, use it and close: nothing in this section applies to you, and you must NOT escalate on the grounds that you lack a permission.",
+    "",
+    "Observing terminal state *by querying GitHub directly* is the other way, and that read needs the `Dependabot alerts` repository permission (GitHub App) or the `security_events` scope (classic PAT). When no credential available to you holds it, the two read paths fail in **different** ways and only one fails loudly:",
+    `- REST \`GET /repos/${repoFullName}/dependabot/alerts/${alert.alertNumber}\` returns a visible \`403\`: \`Resource not accessible by integration\` for an App installation, \`You are not authorized to perform this operation.\` for a PAT missing the scope. Both differ from the \`Dependabot alerts are disabled for this repository\` variant above -- these mean the credential lacks the permission, not that the repository has the feature switched off.`,
+    "- GraphQL `repository.vulnerabilityAlerts` returns **`totalCount: 0` with no `errors` block**: an unerrored empty connection, indistinguishable from a repository that genuinely has no alerts. Zero across `[OPEN, FIXED, DISMISSED, AUTO_DISMISSED]` on a repository that demonstrably has alerts is the signature of the permission gap.",
+    "",
+    "So do NOT use `vulnerabilityAlerts` as terminal-state evidence, and do NOT close this issue on a zero it returns. An absence-shaped answer from a permission-gated source means UNKNOWN, never NONE. Closing on that zero is a silent false-green on security work.",
+    "",
+    "## When branch 1 is unsatisfiable (phantom alerts)",
+    `If the manifest named above no longer exists on the default branch there is no code change to make and branch 1 cannot be satisfied. Confirm with \`GET /repos/${repoFullName}/contents/${alert.manifestPath ?? "{manifest_path}"}\` returning \`404\`, then:`,
+    `1. Establish whether a patched version is what the repository actually resolves, via \`GET /repos/${repoFullName}/dependency-graph/sbom\`. That endpoint needs only \`contents: read\`, so it answers when the alerts API does not, and it is repository-wide rather than per-manifest -- which is exactly what the phantom case needs. Compare the **minimum** resolved version across every entry for ${alert.packageName ?? "the dependency"} against the vulnerable range, never the common case: a summary over hundreds of packages hides a single outlier, and the outlier is the whole question.`,
+    `2. Read the SBOM's limits before you conclude anything from it. It is generated from the **same GitHub dependency graph that generates these alerts**, so it cannot distinguish a live dependency from a phantom one -- a stale entry appears in both, which is *why* the alert keeps firing. Use it to establish that a patched version is present; never to establish that a vulnerable one is real. SBOM metadata will not settle that for you: \`filesAnalyzed\` is \`false\` and \`downloadLocation\` is \`NOASSERTION\` for essentially every entry, so neither field discriminates. The only reliable check is whether a tracked file on the default branch pins the version at all (\`GET /search/code?q=<version>+repo:${repoFullName}\`, plus the manifests themselves). An entry no tracked file pins is a phantom.`,
+    "3. Escalate to a repository admin instead of treating it as code work, and say on this issue that you are doing so. Only an admin can rebuild the repository's dependency graph (the durable fix when a deleted manifest keeps getting re-indexed) or dismiss the alert in the GitHub UI. Do NOT close this issue as a substitute for dismissal, and do NOT poll for a state change: neither action moves alert state, and a dismissal an agent cannot perform will not happen on a timer.",
   ].join("\n");
 }
 
@@ -2077,7 +2290,7 @@ function buildPrReviewerWakeIdempotencyKey(
 }
 
 // Deliberately PR-scoped, with no head sha: this key also scopes the reviewer
-// affinity lookup (findActivePrReviewerForTask), the withPrReviewerTaskLock
+// affinity lookup (findInvokablePrReviewerForTask), the withPrReviewerTaskLock
 // serialization, and the cancel-queued-runs-on-close sweep, all of which must
 // stay stable across heads for one PR. Head-awareness for review requests lives
 // in heartbeat's coalescing decision instead (BLO-18953).
@@ -2184,30 +2397,17 @@ function configuredPrReviewerAgentIds(config: GithubWebhookConfig): string[] {
 
 async function selectPrReviewerAgentId(
   db: PrReviewerSelectionDb,
-  configuredAgentIds: readonly string[],
+  invokableAgentIds: readonly string[],
   taskKey: string,
 ): Promise<string | null> {
-  if (configuredAgentIds.length === 0) return null;
-
-  const activeRows = await db
-    .select({ id: agents.id })
-    .from(agents)
-    .where(
-      and(
-        inArray(agents.id, [...configuredAgentIds]),
-        inArray(agents.status, ["idle", "running"]),
-      ),
-    );
-  const activeSet = new Set(activeRows.map((row) => row.id));
-  const activeAgentIds = configuredAgentIds.filter((agentId) => activeSet.has(agentId));
-  if (activeAgentIds.length === 0) return null;
+  if (invokableAgentIds.length === 0) return null;
 
   const loadRows = await db
     .select({ agentId: heartbeatRuns.agentId, count: sql<number>`count(*)::int` })
     .from(heartbeatRuns)
     .where(
       and(
-        inArray(heartbeatRuns.agentId, activeAgentIds),
+        inArray(heartbeatRuns.agentId, [...invokableAgentIds]),
         inArray(heartbeatRuns.status, [...ACTIVE_PR_REVIEWER_RUN_STATUSES]),
       ),
     )
@@ -2216,9 +2416,9 @@ async function selectPrReviewerAgentId(
     loadRows.map((row) => [row.agentId, Number(row.count)]),
   );
   const minimumLoad = Math.min(
-    ...activeAgentIds.map((agentId) => loadByAgent.get(agentId) ?? 0),
+    ...invokableAgentIds.map((agentId) => loadByAgent.get(agentId) ?? 0),
   );
-  const leastLoadedAgentIds = activeAgentIds.filter(
+  const leastLoadedAgentIds = invokableAgentIds.filter(
     (agentId) => (loadByAgent.get(agentId) ?? 0) === minimumLoad,
   );
 
@@ -2230,28 +2430,105 @@ async function selectPrReviewerAgentId(
   return leastLoadedAgentIds[tieBreak % leastLoadedAgentIds.length] ?? null;
 }
 
-async function findActivePrReviewerForTask(
+async function findInvokablePrReviewerForTask(
   db: PrReviewerSelectionDb,
-  configuredAgentIds: readonly string[],
+  invokableAgentIds: readonly string[],
   taskKey: string,
 ): Promise<string | null> {
-  if (configuredAgentIds.length === 0) return null;
+  if (invokableAgentIds.length === 0) return null;
 
   return db
     .select({ agentId: heartbeatRuns.agentId })
     .from(heartbeatRuns)
-    .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
     .where(
       and(
-        inArray(heartbeatRuns.agentId, [...configuredAgentIds]),
+        inArray(heartbeatRuns.agentId, [...invokableAgentIds]),
         inArray(heartbeatRuns.status, [...ACTIVE_PR_REVIEWER_RUN_STATUSES]),
-        inArray(agents.status, ["idle", "running"]),
         matchesTaskKey(heartbeatRuns.contextTaskKey, taskKey),
       ),
     )
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
     .limit(1)
     .then((rows) => rows[0]?.agentId ?? null);
+}
+
+interface PrReviewerEligibility {
+  invokableAgentIds: string[];
+  transientlyUnavailable: boolean;
+}
+
+/**
+ * Keep reviewer routing on the same invokability contract as ordinary
+ * heartbeat dispatch. In particular, `error` is still invokable when the
+ * reporting chain is healthy; paused/terminated/pending agents and invalid
+ * chains remain excluded. A healthy paused reviewer is tracked separately as
+ * transiently unavailable so the request can use the bounded availability
+ * retry without turning terminal configuration errors into six hours of
+ * polling. The webhook runs this under its PR lock, so a single company-scoped
+ * snapshot is sufficient for the selection decision.
+ */
+async function resolvePrReviewerEligibility(
+  db: PrReviewerSelectionDb,
+  configuredAgentIds: readonly string[],
+): Promise<PrReviewerEligibility> {
+  if (configuredAgentIds.length === 0) {
+    return { invokableAgentIds: [], transientlyUnavailable: false };
+  }
+
+  const configuredRows: AgentOrgRow[] = await db
+    .select({
+      id: agents.id,
+      companyId: agents.companyId,
+      name: agents.name,
+      reportsTo: agents.reportsTo,
+      status: agents.status,
+    })
+    .from(agents)
+    .where(inArray(agents.id, [...configuredAgentIds]));
+  if (configuredRows.length === 0) {
+    return { invokableAgentIds: [], transientlyUnavailable: false };
+  }
+
+  const companyIds = [...new Set(configuredRows.map((row) => row.companyId))];
+  const companyRows: AgentOrgRow[] = await db
+    .select({
+      id: agents.id,
+      companyId: agents.companyId,
+      name: agents.name,
+      reportsTo: agents.reportsTo,
+      status: agents.status,
+    })
+    .from(agents)
+    .where(inArray(agents.companyId, companyIds));
+  const rowsByCompany = new Map<string, AgentOrgRow[]>();
+  for (const row of companyRows) {
+    const rows = rowsByCompany.get(row.companyId) ?? [];
+    rows.push(row);
+    rowsByCompany.set(row.companyId, rows);
+  }
+  const configuredById = new Map(configuredRows.map((row) => [row.id, row]));
+  let transientlyUnavailable = false;
+  const invokableAgentIds = configuredAgentIds.filter((agentId) => {
+    const agent = configuredById.get(agentId);
+    if (!agent) return false;
+    const invokability = evaluateAgentInvokability(
+      agent,
+      rowsByCompany.get(agent.companyId) ?? [],
+    );
+    if (invokability.invokable) return true;
+    const orgChainHealth = getAgentOrgChainHealth({
+      agent,
+      agents: rowsByCompany.get(agent.companyId) ?? [],
+    });
+    if (
+      invokability.reason === "paused" &&
+      orgChainHealth?.status === "healthy"
+    ) {
+      transientlyUnavailable = true;
+    }
+    return false;
+  });
+  return { invokableAgentIds, transientlyUnavailable };
 }
 
 async function withPrReviewerTaskLock<T>(
@@ -2449,9 +2726,18 @@ async function attemptPrReviewerWake(params: {
         return "duplicate";
       }
 
+      const reviewerEligibility = await resolvePrReviewerEligibility(tx, reviewerAgentIds);
       const reviewerAgentId =
-        (await findActivePrReviewerForTask(tx, reviewerAgentIds, reviewerTaskKey)) ??
-        (await selectPrReviewerAgentId(tx, reviewerAgentIds, reviewerTaskKey));
+        (await findInvokablePrReviewerForTask(
+          tx,
+          reviewerEligibility.invokableAgentIds,
+          reviewerTaskKey,
+        )) ??
+        (await selectPrReviewerAgentId(
+          tx,
+          reviewerEligibility.invokableAgentIds,
+          reviewerTaskKey,
+        ));
       if (!reviewerAgentId) {
         logger.warn(
           {
@@ -2459,9 +2745,13 @@ async function attemptPrReviewerWake(params: {
             event: eventName,
             prNumber: context.prNumber,
             repoFullName: context.repoFullName,
+            transientlyUnavailable: reviewerEligibility.transientlyUnavailable,
           },
-          "github webhook reviewer wake skipped: no configured reviewer is active",
+          "github webhook reviewer wake skipped: no configured reviewer is invokable",
         );
+        if (reviewerEligibility.transientlyUnavailable) {
+          throw new PrReviewerUnavailableError();
+        }
         return "no_reviewer";
       }
 
@@ -2606,6 +2896,8 @@ interface ContendedPrReviewerReplay {
   context: ResolvedEventContext & { prNumber: number };
 }
 
+type PrReviewerRetryCause = "contention" | "unavailable";
+
 /**
  * Persist a PR-reviewer wake that lost its scope lock, so a worker can replay
  * it (BLO-21995).
@@ -2637,17 +2929,35 @@ async function persistContendedPrReviewerWake(params: {
   deliveryId: string | null;
   reviewerAgentIds: readonly string[];
   taskKey: string;
+  cause?: PrReviewerRetryCause;
 }): Promise<boolean> {
-  const { db, context, eventName, deliveryId, reviewerAgentIds, taskKey } = params;
+  const {
+    db,
+    context,
+    eventName,
+    deliveryId,
+    reviewerAgentIds,
+    taskKey,
+    cause = "contention",
+  } = params;
   const wakeupOptions = buildPrReviewerWakeupOptions(context, eventName, deliveryId);
   const idempotencyKey = wakeupOptions.idempotencyKey;
 
   // Prefer a reviewer that is actually invokable so the provisional pick is
   // usually the one the replay lands on anyway, but fall back to any
   // *configured* reviewer row: the column is an FK anchor, not a decision.
+  const reviewerEligibility = await resolvePrReviewerEligibility(db, reviewerAgentIds);
   const provisionalAgentId =
-    (await findActivePrReviewerForTask(db, reviewerAgentIds, taskKey)) ??
-    (await selectPrReviewerAgentId(db, reviewerAgentIds, taskKey)) ??
+    (await findInvokablePrReviewerForTask(
+      db,
+      reviewerEligibility.invokableAgentIds,
+      taskKey,
+    )) ??
+    (await selectPrReviewerAgentId(
+      db,
+      reviewerEligibility.invokableAgentIds,
+      taskKey,
+    )) ??
     (await db
       .select({ id: agents.id })
       .from(agents)
@@ -2674,14 +2984,20 @@ async function persistContendedPrReviewerWake(params: {
 
   const replay: ContendedPrReviewerReplay = {
     attempts: 0,
-    // Null until a replay actually finds the reviewer gone; the availability
-    // clock starts then, not at contention time.
-    unavailableSince: null,
-    availabilityAttempts: 0,
+    // An initial no-reviewer outcome is already an availability observation,
+    // so start its wall clock and ladder here. Contention records keep the
+    // clock dormant until a replay first observes the reviewer unavailable.
+    unavailableSince: cause === "unavailable" ? new Date().toISOString() : null,
+    availabilityAttempts: cause === "unavailable" ? 1 : 0,
     // Never null: a record the due-ness filter can't select is stranded
     // silently, the failure mode the provider-capacity path guards with its
     // own default delay.
-    nextAttemptAt: new Date(Date.now() + PR_REVIEWER_CONTENDED_BACKOFF_MS[0]).toISOString(),
+    nextAttemptAt: new Date(
+      Date.now() +
+        (cause === "unavailable"
+          ? PR_REVIEWER_UNAVAILABLE_BACKOFF_MS[0]
+          : PR_REVIEWER_CONTENDED_BACKOFF_MS[0]),
+    ).toISOString(),
     eventName,
     deliveryId,
     taskKey,
@@ -2738,7 +3054,7 @@ async function persistContendedPrReviewerWake(params: {
     // Still durable, so the caller must not 503 and invite a third replay.
     logger.info(
       { taskKey, deliveryId, event: eventName, idempotencyKey },
-      "contended PR-reviewer wake already recorded by a concurrent delivery (BLO-21995)",
+      "deferred PR-reviewer wake already recorded by a concurrent delivery (BLO-21995)",
     );
     return true;
   }
@@ -2760,8 +3076,11 @@ async function persistContendedPrReviewerWake(params: {
       idempotencyKey,
       provisionalAgentId,
       nextAttemptAt: replay.nextAttemptAt,
+      retryCause: cause,
     },
-    "github webhook reviewer wake deferred: PR scope contended, durable retry recorded (BLO-21995)",
+    cause === "unavailable"
+      ? "github webhook reviewer wake deferred: configured reviewer temporarily unavailable, durable retry recorded"
+      : "github webhook reviewer wake deferred: PR scope contended, durable retry recorded (BLO-21995)",
   );
   return true;
 }
@@ -2800,6 +3119,30 @@ function parseContendedReplay(payload: unknown): ContendedPrReviewerReplay | nul
   // non-castable value as NULL (= due), so a row that got here with garbage
   // would otherwise replay on every pass forever instead of being retired.
   if (Number.isNaN(Date.parse(candidate.nextAttemptAt))) return null;
+  if (
+    candidate.unavailableSince !== null &&
+    candidate.unavailableSince !== undefined &&
+    (typeof candidate.unavailableSince !== "string" ||
+      Number.isNaN(Date.parse(candidate.unavailableSince)))
+  ) {
+    return null;
+  }
+  if (
+    candidate.attempts !== undefined &&
+    (typeof candidate.attempts !== "number" ||
+      !Number.isFinite(candidate.attempts) ||
+      candidate.attempts < 0)
+  ) {
+    return null;
+  }
+  if (
+    candidate.availabilityAttempts !== undefined &&
+    (typeof candidate.availabilityAttempts !== "number" ||
+      !Number.isFinite(candidate.availabilityAttempts) ||
+      candidate.availabilityAttempts < 0)
+  ) {
+    return null;
+  }
   return {
     attempts: typeof candidate.attempts === "number" ? candidate.attempts : 0,
     unavailableSince:
@@ -2898,14 +3241,21 @@ export async function reconcileContendedPrReviewerWakes(
         continue;
       }
       if (outcome === "no_reviewer") {
-        // NOT terminal. Reviewer availability is transient — paused for a
-        // config push, mid-restart, momentarily between runs — and the whole
-        // point of a durable record is to outlive exactly that. Retiring here
-        // would drop a sanctioned review request because the reviewer happened
-        // to be down for the seconds this pass ran. Re-armed below on the
-        // dedicated availability ladder, bounded by wall-clock rather than by
-        // the lock-contention attempt budget.
-        throw new PrReviewerUnavailableError();
+        // `attemptPrReviewerWake` throws PrReviewerUnavailableError itself
+        // when it sees a healthy paused reviewer. Reaching this branch means
+        // every configured reviewer is in a terminal policy/configuration
+        // state (terminated, pending approval, invalid chain, unknown status,
+        // or missing), so retrying cannot change the answer. Retire the
+        // contention record without emitting a dead-letter alert for a request
+        // the configured policy has deliberately refused.
+        await retireContendedRow(
+          db,
+          row.id,
+          PR_REVIEWER_CONTENDED_SUPERSEDED_STATUS,
+          "no configured reviewer is invokable",
+        );
+        result.superseded += 1;
+        continue;
       }
       // duplicate / declined are terminal for this delivery: replaying cannot
       // change either. `duplicate` is the expected outcome when the delivery
@@ -3049,6 +3399,7 @@ function prFeedbackAuthorLogin(context: ResolvedEventContext): string | null {
 function isActionableReviewFeedbackContext(context: ResolvedEventContext): boolean {
   if (context.wakeReason === "github_pr_review_feedback") return true;
   if (context.wakeReason !== "github_pr_review_submitted") return false;
+  if (context.reviewHasActionableFeedback !== undefined) return context.reviewHasActionableFeedback;
   return hasActionablePrReviewFeedback(context.reviewBody, context.reviewState);
 }
 
@@ -3539,6 +3890,15 @@ const IDEMPOTENT_REVIEWER_WAKE_STATUSES = [
   // already prevents any real duplicate execution if the exhausted retry chain
   // and the fresh attempt ever raced.
   "dispatch_failed",
+  // BLO-25726: `dispatch_retrying` is the same "pending in-flight retry" state
+  // as `dispatch_failed` -- it is what a row is set to for the duration of one
+  // reconciler re-dispatch. Omitting it would silently narrow this deferral:
+  // before that status existed, a row being actively re-dispatched still read
+  // as `dispatch_failed` and deferred here, so leaving it out would make a
+  // webhook event arriving mid-dispatch enqueue a second wake. Its claim is
+  // lease-bounded, so a crashed holder defers new events for at most that
+  // lease -- the same bounded wait this list already accepts above.
+  "dispatch_retrying",
   "dispatch_recovered",
   "dispatch_superseded",
 ];
@@ -3610,16 +3970,86 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
 
     const eventName = req.header("x-github-event") ?? "";
     const deliveryId = req.header("x-github-delivery") ?? null;
+    const payload = (req.body ?? {}) as Record<string, unknown>;
+    let reviewGateReceipt: Record<string, unknown> | null = null;
+    const respond = (status: number, body: Record<string, unknown>) => {
+      if (!res.headersSent) res.status(reviewGateReceipt ? 202 : status).json(reviewGateReceipt ?? body);
+    };
+
+    if (config.reviewGateAuthority?.repositories.length) {
+      const gateDelivery = await enqueueGithubReviewGateDelivery({
+        db,
+        eventName,
+        deliveryId,
+        rawBody,
+        payload,
+        config: config.reviewGateAuthority,
+      });
+      if (gateDelivery.matched && !gateDelivery.queued) {
+        logger.error(
+          {
+            event: eventName,
+            deliveryId,
+            repoFullName: gateDelivery.repoFullName,
+            prNumber: gateDelivery.prNumber,
+            reason: gateDelivery.reason,
+          },
+          "github review-gate delivery could not be persisted",
+        );
+        res.status(gateDelivery.reason === "delivery_id_payload_conflict" ? 409 : 503).json({
+          error: "github review-gate delivery was not queued",
+          reason: gateDelivery.reason,
+        });
+        return;
+      }
+      if (gateDelivery.matched) {
+        if (gateDelivery.requiresRevocation && config.reviewGateAuthority.authorityEnabled) {
+          const revocation = await activateGithubReviewGateDelivery(db, gateDelivery.deliveryDbId);
+          if (!revocation.ok) {
+            logger.error(
+              {
+                event: eventName,
+                deliveryId,
+                deliveryDbId: gateDelivery.deliveryDbId,
+                reason: revocation.reason,
+              },
+              "github review-gate delivery persisted but pending revocation failed",
+            );
+            res.status(503).json({
+              error: "github review-gate pending revocation failed",
+              reason: revocation.reason,
+            });
+            return;
+          }
+        }
+        logger.info(
+          {
+            event: eventName,
+            deliveryId,
+            repoFullName: gateDelivery.repoFullName,
+            prNumber: gateDelivery.prNumber,
+            deliveryDbId: gateDelivery.deliveryDbId,
+            duplicate: gateDelivery.duplicate,
+          },
+          "github review-gate delivery queued durably",
+        );
+        reviewGateReceipt = {
+          ok: true,
+          reviewGateDeliveryQueued: true,
+          deliveryId,
+          duplicate: gateDelivery.duplicate,
+        };
+      }
+    }
 
     if (!WAKE_DRIVING_EVENTS.has(eventName)) {
       // Acked but ignored. GitHub retries on non-2xx, and it would
       // hammer us if we 4xx'd every event we don't handle.
-      res.status(200).json({ ok: true, ignored: eventName });
+      respond(200, { ok: true, ignored: eventName });
       return;
     }
 
-    const payload = (req.body ?? {}) as Record<string, unknown>;
-    const context = resolveEventContext(eventName, payload, {
+    let context = resolveEventContext(eventName, payload, {
       prReviewerBotLogin: config.prReviewerBotLogin,
       // BLO-18273/BLO-21618: surface both silent drops in this handler — an
       // agent request missing the marker, and a marker-bearing agent request
@@ -3678,6 +4108,56 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       },
     });
 
+    // GitHub's issue_comment payload identifies the PR but does not include
+    // `pull_request.head.sha`. Reviewer runs persist the head in their
+    // contextSnapshot and the evidence gate compares against that exact value;
+    // without this lookup a valid Ally comment review is recorded with no head
+    // and can never satisfy the gate. Do this only for actionable review
+    // comments, and never infer a SHA from comment prose.
+    if (
+      context &&
+      eventName === "issue_comment" &&
+      (context.wakeReason === "github_pr_review_requested" ||
+        context.wakeReason === "github_pr_review_feedback") &&
+      !context.headSha &&
+      typeof context.prNumber === "number" &&
+      context.repoFullName
+    ) {
+      const resolveHeadSha = config.resolvePrReviewHeadSha ?? githubFetchPrHeadSha;
+      try {
+        const headSha = await resolveHeadSha({
+          repoFullName: context.repoFullName,
+          prNumber: context.prNumber,
+        });
+        if (headSha) {
+          context = { ...context, headSha };
+        } else {
+          logger.warn(
+            {
+              event: eventName,
+              deliveryId,
+              repoFullName: context.repoFullName,
+              prNumber: context.prNumber,
+              wakeReason: context.wakeReason,
+            },
+            "github webhook could not resolve current PR head for review comment; continuing without head context",
+          );
+        }
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            event: eventName,
+            deliveryId,
+            repoFullName: context.repoFullName,
+            prNumber: context.prNumber,
+            wakeReason: context.wakeReason,
+          },
+          "github webhook PR-head lookup failed for review comment; continuing without head context",
+        );
+      }
+    }
+
     // BLO-21078: fleet-wide visibility into workflow_run conclusions, so a
     // mass-cancellation wave (GitHub cancelling live runners mid-job across
     // unrelated PRs, as opposed to an ordinary per-PR `failure`) is a metric
@@ -3712,6 +4192,37 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     }
 
+    // BLO-27608: the review-OUTPUT counter. Every other GitHub review metric is
+    // request-side and read healthy right through the ~8.6h fleet-wide review
+    // blackout on 2026-08-12 (BLO-27123), because the runs really were enqueued
+    // and dispatched — they died at the model call and produced no artifact.
+    // This is the only signal that separates "a review came out" from "a run
+    // started". Recorded off the signed payload, before and independent of every
+    // wake decision below: the reviewer's own review is dropped as a self-echo
+    // and a clean comment-shaped review resolves to no context at all, so
+    // anything downstream of those would zero exactly the series we need.
+    const postedReview = resolvePostedReviewObservation(
+      eventName,
+      payload,
+      config.prReviewerBotLogin,
+    );
+    if (postedReview) {
+      recordGithubReviewPosted({
+        repo: postedReview.repoFullName,
+        surface: postedReview.surface,
+      });
+      logger.info(
+        {
+          event: eventName,
+          deliveryId,
+          repoFullName: postedReview.repoFullName,
+          prNumber: postedReview.prNumber,
+          surface: postedReview.surface,
+        },
+        "github webhook observed a published reviewer review",
+      );
+    }
+
     // A consolidated review can arrive as a plain issue comment, which GitHub
     // does not reflect in reviewDecision. Run the opt-in status gate directly
     // from the signed payload, independent of Paperclip issue matching and the
@@ -3723,11 +4234,47 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       config.prReviewerBotLogin,
     );
     if (commentReviewGateTrigger) {
-      void (config.runPrCommentReviewGateCheck ?? runPrCommentReviewGateCheck)(commentReviewGateTrigger)
+      // Build the input once and hand the SAME object to both branches, so the
+      // injection seam observes the real argument — including `db`. When the
+      // seam was called with the bare trigger, no webhook-level test could
+      // assert that production actually supplies the serialization handle.
+      const commentReviewGateInput = { ...commentReviewGateTrigger, db };
+      const commentReviewGateCheck = config.runPrCommentReviewGateCheck
+        ? config.runPrCommentReviewGateCheck(commentReviewGateInput)
+        : runPrCommentReviewGateCheck(commentReviewGateInput);
+      void commentReviewGateCheck
         .then((result) => {
           // The disabled default must be silent; otherwise every PR webhook in
           // a deployment that has not opted in would emit a warning.
           if (!result.posted && result.reason === "not_configured") return;
+          if (!result.posted && result.retirementDeliveries) {
+            void Promise.all(result.retirementDeliveries.map((delivery) =>
+              enqueueGithubCommitStatusDelivery(db, {
+                // Explicitly provenance-less: a retirement is triggered by the
+                // webhook, not by an agent run, so there is no company or run
+                // to attribute it to. Passing `null` rather than omitting the
+                // keys is deliberate — the enqueue normalizes either shape, but
+                // the omission read as an oversight to several reviewers and is
+                // what the NULL semantics of preserveExistingDelivery rely on.
+                companyId: null,
+                sourceRunId: null,
+                repoFullName: commentReviewGateTrigger.repoFullName,
+                sha: delivery.sha,
+                context: delivery.context,
+                state: delivery.state,
+                description: delivery.description,
+                targetUrl: delivery.targetUrl,
+                prNumber: commentReviewGateTrigger.prNumber,
+                prUrl: commentReviewGateTrigger.prUrl,
+                forceWrite: true,
+              }),
+            )).catch((err) => {
+              logger.error(
+                { err, event: eventName, deliveryId, ...commentReviewGateTrigger },
+                "github webhook comment-review retired-context retry enqueue failed",
+              );
+            });
+          }
           logger[result.posted ? "info" : "warn"](
             { deliveryId, event: eventName, ...commentReviewGateTrigger, result },
             "github webhook comment-review gate check completed",
@@ -3755,21 +4302,25 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       if (
         reviewerAgentIds.length === 0 ||
         !reviewerWorkRetired ||
+        !context ||
         typeof context.prNumber !== "number"
       ) {
         return 0;
       }
 
+      const reviewerContext = context;
+      const reviewerPrNumber = reviewerContext.prNumber;
+      if (typeof reviewerPrNumber !== "number") return 0;
       const reviewerTaskKey = buildPrReviewerTaskKey({
-        ...context,
-        prNumber: context.prNumber,
+        ...reviewerContext,
+        prNumber: reviewerPrNumber,
       });
       const heartbeat = heartbeatService(db, {
         pluginWorkerManager: config.pluginWorkerManager,
         ...config.heartbeatOptions,
       });
-      const reason = `Cancelled because GitHub PR ${context.repoFullName ?? "unknown"}#${context.prNumber} ${
-        context.wakeReason === "github_pr_closed" ? "closed" : "became a draft"
+      const reason = `Cancelled because GitHub PR ${reviewerContext.repoFullName ?? "unknown"}#${reviewerPrNumber} ${
+        reviewerContext.wakeReason === "github_pr_closed" ? "closed" : "became a draft"
       } before review dispatch`;
       let cancelled = 0;
       for (const reviewerAgentId of reviewerAgentIds) {
@@ -3782,9 +4333,9 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       logger.info(
         {
           deliveryId,
-          repoFullName: context.repoFullName,
-          prNumber: context.prNumber,
-          wakeReason: context.wakeReason,
+          repoFullName: reviewerContext.repoFullName,
+          prNumber: reviewerPrNumber,
+          wakeReason: reviewerContext.wakeReason,
           reviewerTaskKey,
           reviewerCount: reviewerAgentIds.length,
           cancelled,
@@ -3863,6 +4414,44 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         });
         return outcome === "queued";
       } catch (err) {
+        if (err instanceof PrReviewerUnavailableError) {
+          let recorded = false;
+          try {
+            recorded = await persistContendedPrReviewerWake({
+              db,
+              context,
+              eventName,
+              deliveryId,
+              reviewerAgentIds,
+              taskKey: buildPrReviewerWakeupOptions(context, eventName, deliveryId).payload.taskKey,
+              cause: "unavailable",
+            });
+          } catch (persistErr) {
+            logger.error(
+              {
+                err: persistErr,
+                agentIds: reviewerAgentIds,
+                event: eventName,
+                prNumber: context.prNumber,
+                repoFullName: context.repoFullName,
+              },
+              "github webhook reviewer availability retry persistence failed",
+            );
+          }
+          if (recorded) return false;
+          logger.error(
+            {
+              agentIds: reviewerAgentIds,
+              event: eventName,
+              prNumber: context.prNumber,
+              repoFullName: context.repoFullName,
+            },
+            "github webhook reviewer was temporarily unavailable and no durable retry could be recorded",
+          );
+          throw new HttpError(503, "PR reviewer is temporarily unavailable", {
+            code: "pr_reviewer_unavailable",
+          });
+        }
         if (err instanceof PrReviewerTaskLockTimeoutError) {
           // BLO-21995: a concurrent delivery for this same PR held the scope for
           // the whole timeout. Nothing reached heartbeat, so there is no partial
@@ -3896,8 +4485,21 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               prNumber: context.prNumber,
               repoFullName: context.repoFullName,
             },
-            "github webhook reviewer lock timed out and no durable retry was recorded; asking GitHub to retry",
+            "github webhook reviewer lock timed out and no durable retry was recorded; "
+              + "failing the delivery so it stays manually redeliverable. NOTE: this throw "
+              + "escapes the whole route handler, so the Dependabot remediation wake and the "
+              + "paperclip-identifier issue-assignee path are skipped for this delivery too — "
+              + "neither contends for this lock. That collateral loss is accepted only because "
+              + "this branch is the rare fallback after persistContendedPrReviewerWake failed.",
           );
+          // Count the loss. Nothing else records it: the `received` counter is
+          // incremented INSIDE the lock, so a lock-ACQUISITION timeout moves
+          // neither `received` nor `queued` and this permanent drop is
+          // invisible on the funnel it is supposed to appear in.
+          recordGithubReviewRequestSuppressed({
+            reason: context.wakeReason,
+            cause: GITHUB_SUPPRESSION_CAUSE_REVIEWER_LOCK_CONTENDED,
+          });
           throw new PrReviewerTaskLockContentionError();
         }
         logger.error(
@@ -4120,7 +4722,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     })();
 
     if (!context) {
-      res.status(200).json({
+      respond(200, {
         ok: true,
         ignored: "no_paperclip_identifier",
         reviewerWakeFired,
@@ -4167,7 +4769,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       : [];
 
     if (context.identifiers.length === 0 && previouslyLinkedPullRequestIssues.length === 0) {
-      res.status(200).json({
+      respond(200, {
         ok: true,
         ignored: "no_paperclip_identifier",
         reviewerWakeFired,
@@ -4361,7 +4963,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     }
 
     if (matched.length === 0) {
-      res.status(200).json({
+      respond(200, {
         ok: true,
         ignored: "no_matching_issue",
         identifiers: context.identifiers,
@@ -4753,7 +5355,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       "github webhook drove issue wakes",
     );
 
-    res.status(200).json({
+    respond(200, {
       ok: true,
       wakes,
       skipped,
@@ -4782,6 +5384,7 @@ export const __test_verifyGithubSignature = verifyGithubSignature;
 export const __test_resolveEventContext = resolveEventContext;
 export const __test_shouldFirePrReviewerWake = shouldFirePrReviewerWake;
 export const __test_isReviewerSelfEchoReview = isReviewerSelfEchoReview;
+export const __test_resolvePostedReviewObservation = resolvePostedReviewObservation;
 export const __test_buildPrReviewerWakeIdempotencyKey = buildPrReviewerWakeIdempotencyKey;
 export const __test_prReviewerWakeIdempotencyScope = prReviewerWakeIdempotencyScope;
 export const __test_idempotentWakeStatuses = idempotentWakeStatuses;

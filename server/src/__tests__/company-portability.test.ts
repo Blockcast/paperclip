@@ -2582,6 +2582,298 @@ describe("company portability", () => {
     expect(extension).toContain('kind: "secret"');
   });
 
+  describe("export credential redaction (PEN-2778)", () => {
+    // Every value below is a fabricated fixture. The export routes are
+    // agent-reachable (a CEO agent can POST /companies/:id/export), so each of
+    // these reached a sibling agent's response in the clear: the portable-config
+    // filter is a key skip-list whose `env` entry is top-level only.
+    const ADAPTER_API_KEY = "sk-adapter-api-key-value";
+    const ADAPTER_HEADER_TOKEN = "Bearer adapter-header-token";
+    const MCP_UPSTREAM_TOKEN = "Bearer mcp-upstream-token";
+    const MCP_ARG_TOKEN = "mcp-arg-token-value";
+    const NESTED_PROFILE_KEY = "sk-nested-profile-key";
+    const NESTED_SIGNING_MATERIAL = "nested-signing-material-value";
+    const METADATA_TOKEN = "metadata-support-token-value";
+    // The redactor does not always write the sentinel as the *whole* value. In
+    // three reachable places it splices it into a longer string, and an
+    // import-side rule that matches on equality lets every one of them through:
+    //  - `redactUriCredentialsInValue` rewrites a URI's userinfo
+    //    (`://user:<mask>@host`) and a credential query parameter
+    //    (`?access_token=<mask>`) — reached via `sanitizeValue` for any key,
+    //    including `mcpServers.*.url`;
+    //  - `redactSensitiveText` rewrites JSON/env-assignment secret fields
+    //    *inside* a blob — reached for `COMMAND_PAYLOAD_KEY_RE` keys
+    //    (`command`) and, per element, for `args` via `sanitizeCommandArgs`.
+    // Each fixture below is the surviving-mask shape, not a restatement of the
+    // bare-sentinel case the equality rule already caught.
+    const MCP_URI_PASSWORD = "mcp-uri-password-value";
+    const MCP_QUERY_TOKEN = "mcp-query-access-token-value";
+    const CMD_EMBEDDED_KEY = "cmd-embedded-api-key-value";
+    const MCP_ARG_EMBEDDED_TOKEN = "mcp-arg-embedded-token-value";
+
+    const secretBearingAgent = () => ({
+      id: "agent-1",
+      name: "ClaudeCoder",
+      status: "idle",
+      role: "engineer",
+      title: "Software Engineer",
+      icon: "code",
+      reportsTo: null,
+      capabilities: "Writes code",
+      adapterType: "claude_local",
+      adapterConfig: {
+        promptTemplate: "You are ClaudeCoder.",
+        apiKey: ADAPTER_API_KEY,
+        headers: { Authorization: ADAPTER_HEADER_TOKEN },
+        // Deliberately relative: `isAbsoluteCommand` deletes an absolute
+        // `command` from the bundle as system-dependent, which would make
+        // every assertion about it below pass vacuously.
+        command: `gateway --config '{"apiKey":"${CMD_EMBEDDED_KEY}"}'`,
+        mcpServers: {
+          gbrain: {
+            url: `https://svc-account:${MCP_URI_PASSWORD}@gbrain.example.com/mcp`,
+            headers: { Authorization: MCP_UPSTREAM_TOKEN },
+            args: [
+              "--token",
+              MCP_ARG_TOKEN,
+              "--config",
+              `{"token":"${MCP_ARG_EMBEDDED_TOKEN}"}`,
+            ],
+          },
+          tempo: {
+            url: `https://tempo.example.com/mcp?access_token=${MCP_QUERY_TOKEN}&team=core`,
+          },
+        },
+      },
+      runtimeConfig: {
+        modelProfiles: {
+          cheap: {
+            adapterConfig: {
+              env: {
+                OPENAI_API_KEY: { type: "plain", value: NESTED_PROFILE_KEY },
+                SIGNING_MATERIAL: { type: "plain", value: NESTED_SIGNING_MATERIAL },
+              },
+            },
+          },
+        },
+      },
+      budgetMonthlyCents: 0,
+      permissions: {},
+      metadata: { supportContactToken: METADATA_TOKEN },
+    });
+
+    const leakedValues = [
+      ADAPTER_API_KEY,
+      ADAPTER_HEADER_TOKEN,
+      MCP_UPSTREAM_TOKEN,
+      MCP_ARG_TOKEN,
+      NESTED_PROFILE_KEY,
+      NESTED_SIGNING_MATERIAL,
+      METADATA_TOKEN,
+      MCP_URI_PASSWORD,
+      MCP_QUERY_TOKEN,
+      CMD_EMBEDDED_KEY,
+      MCP_ARG_EMBEDDED_TOKEN,
+    ];
+
+    const exportInput = {
+      include: {
+        company: true,
+        agents: true,
+        projects: false,
+        issues: false,
+      },
+    };
+
+    beforeEach(() => {
+      agentSvc.list.mockResolvedValue([secretBearingAgent()]);
+    });
+
+    it("keeps no credential value in an export bundle, at any depth", async () => {
+      const portability = companyPortabilityService({} as any);
+
+      const exported = await portability.exportBundle("company-1", exportInput);
+      const extension = asTextFile(exported.files[".paperclip.yaml"]);
+
+      for (const value of leakedValues) {
+        expect(extension).not.toContain(value);
+      }
+      // Nothing may carry a value out through a file other than the extension
+      // either — the bundle is what ships, not one entry in it. Binary entries
+      // are scanned as their serialized form rather than skipped.
+      for (const [, entry] of Object.entries(exported.files)) {
+        const serialized = typeof entry === "string" ? entry : JSON.stringify(entry);
+        for (const value of leakedValues) {
+          expect(serialized).not.toContain(value);
+        }
+      }
+      // The manifest is a second exit on the same response. It happens to be
+      // derived from the emitted files today, so it inherits the redaction —
+      // assert it rather than rely on that, because a refactor that re-sourced
+      // it from the agent rows would reopen the leak with the file scan green.
+      for (const value of leakedValues) {
+        expect(JSON.stringify(exported.manifest)).not.toContain(value);
+      }
+    });
+
+    it("preserves the field names, so the export stays diagnostically useful", async () => {
+      const portability = companyPortabilityService({} as any);
+
+      const exported = await portability.exportBundle("company-1", exportInput);
+      const extension = asTextFile(exported.files[".paperclip.yaml"]);
+
+      expect(extension).toContain("mcpServers:");
+      expect(extension).toContain("gbrain:");
+      expect(extension).toContain("apiKey:");
+      expect(extension).toContain("modelProfiles:");
+      expect(extension).toContain("OPENAI_API_KEY:");
+      expect(extension).toContain("SIGNING_MATERIAL:");
+    });
+
+    it("names every redacted field in the warnings so an import can be re-supplied", async () => {
+      const portability = companyPortabilityService({} as any);
+
+      const exported = await portability.exportBundle("company-1", exportInput);
+      const redactionWarnings = exported.warnings.filter((warning) =>
+        warning.includes("redacted credential material"),
+      );
+
+      expect(redactionWarnings.some((warning) => warning.includes("adapter config"))).toBe(true);
+      expect(redactionWarnings.some((warning) => warning.includes("runtime config"))).toBe(true);
+      expect(redactionWarnings.some((warning) => warning.includes("metadata"))).toBe(true);
+      expect(
+        redactionWarnings.some((warning) =>
+          warning.includes("modelProfiles.cheap.adapterConfig.env.OPENAI_API_KEY"),
+        ),
+      ).toBe(true);
+      // A warning that quoted the value would reintroduce the disclosure.
+      for (const warning of redactionWarnings) {
+        for (const value of leakedValues) {
+          expect(warning).not.toContain(value);
+        }
+      }
+    });
+
+    it("redacts on the preview route too — it returns the same bundle body", async () => {
+      const portability = companyPortabilityService({} as any);
+
+      const preview = await portability.previewExport("company-1", exportInput);
+      const extension = asTextFile(preview.files[".paperclip.yaml"]);
+
+      for (const value of leakedValues) {
+        expect(extension).not.toContain(value);
+      }
+    });
+    it("round-trips without installing the redaction placeholder as a credential", async () => {
+      const portability = companyPortabilityService({} as any);
+
+      companySvc.create.mockResolvedValue({ id: "company-imported", name: "Imported Paperclip" });
+      accessSvc.ensureMembership.mockResolvedValue(undefined);
+      agentSvc.create.mockResolvedValue({ id: "agent-created", name: "ClaudeCoder" });
+
+      const exported = await portability.exportBundle("company-1", exportInput);
+      agentSvc.list.mockResolvedValue([]);
+
+      const imported = await portability.importBundle({
+        source: { type: "inline", rootPath: exported.rootPath, files: exported.files },
+        include: { company: true, agents: true, projects: false, issues: false },
+        target: { mode: "new_company", newCompanyName: "Imported Paperclip" },
+        agents: "all",
+        collisionStrategy: "rename",
+      }, "user-1");
+
+      // Importing the mask verbatim would turn a disclosure into an agent that
+      // authenticates with the string "***REDACTED***".
+      const createCall = agentSvc.create.mock.calls.at(-1);
+      expect(JSON.stringify(createCall)).not.toContain("***REDACTED***");
+      expect(createCall?.[1].adapterConfig).not.toHaveProperty("apiKey");
+      // Dropping the placeholder out of an array must remove the entry, not
+      // leave a hole: a mapped `undefined` serializes to `null` and would hand
+      // the adapter a malformed argv instead of an absent one.
+      expect(JSON.stringify(createCall)).not.toContain("null]");
+      expect(createCall?.[1].adapterConfig?.mcpServers?.gbrain?.args).toEqual([
+        "--token",
+        "--config",
+      ]);
+      // Same rule for an env binding: `{type:"plain"}` without `value` fails
+      // envBindingPlainSchema, so the husk must go rather than persist as an
+      // invalid binding.
+      expect(
+        createCall?.[1].runtimeConfig?.modelProfiles?.cheap?.adapterConfig?.env ?? {},
+      ).toEqual({});
+      expect(
+        imported.warnings.some((warning: string) =>
+          warning.includes("imported without redacted values"),
+        ),
+      ).toBe(true);
+    });
+
+    it("drops values that merely CONTAIN the sentinel, not just those equal to it", async () => {
+      // The equality rule this replaces was satisfied by the bare-sentinel
+      // cases and blind to every spliced one. Asserting "no surviving string
+      // contains the sentinel" tests the class, so a fourth splice site added
+      // to the redactor later is covered here without editing this test.
+      const portability = companyPortabilityService({} as any);
+
+      companySvc.create.mockResolvedValue({ id: "company-imported", name: "Imported Paperclip" });
+      accessSvc.ensureMembership.mockResolvedValue(undefined);
+      agentSvc.create.mockResolvedValue({ id: "agent-created", name: "ClaudeCoder" });
+
+      const exported = await portability.exportBundle("company-1", exportInput);
+      agentSvc.list.mockResolvedValue([]);
+
+      const imported = await portability.importBundle({
+        source: { type: "inline", rootPath: exported.rootPath, files: exported.files },
+        include: { company: true, agents: true, projects: false, issues: false },
+        target: { mode: "new_company", newCompanyName: "Imported Paperclip" },
+        agents: "all",
+        collisionStrategy: "rename",
+      }, "user-1");
+
+      const createCall = agentSvc.create.mock.calls.at(-1);
+      const adapterConfig = createCall?.[1].adapterConfig;
+
+      // Guard the fixture before trusting the assertions below it: if the
+      // redactor ever stops splicing, these fields would round-trip clean and
+      // the test would pass while proving nothing.
+      const exportedText = asTextFile(exported.files[".paperclip.yaml"]);
+      expect(exportedText).toContain("***REDACTED***@gbrain.example.com");
+      expect(exportedText).toContain("access_token=***REDACTED***");
+      // `command` is dropped from the bundle when absolute, so confirm this
+      // one shipped before asserting the import removed it.
+      expect(exportedText).toContain("command:");
+
+      // A URI whose userinfo is a mask would have the agent authenticate as
+      // the literal `***REDACTED***`; a query-string mask does the same one
+      // delimiter over. Both fields go, and the warning names them.
+      expect(adapterConfig?.mcpServers?.gbrain).not.toHaveProperty("url");
+      expect(adapterConfig?.mcpServers?.tempo).not.toHaveProperty("url");
+      // Spliced inside a blob rather than a whole value — same rule.
+      expect(adapterConfig).not.toHaveProperty("command");
+
+      // The class assertion. `JSON.stringify` walks every surviving leaf, so
+      // this fails for a splice site nobody enumerated.
+      expect(JSON.stringify(createCall)).not.toContain("***REDACTED***");
+
+      // Field *names* survive where the object still exists, so the operator
+      // can see which upstream needs re-supplying — the diagnostic property
+      // the export exists for.
+      expect(Object.keys(adapterConfig?.mcpServers ?? {}).sort()).toEqual(["gbrain", "tempo"]);
+      for (const path of [
+        "mcpServers.gbrain.url",
+        "mcpServers.tempo.url",
+        "command",
+      ]) {
+        expect(
+          imported.warnings.some(
+            (warning: string) =>
+              warning.includes("imported without redacted values") && warning.includes(path),
+          ),
+        ).toBe(true);
+      }
+    });
+  });
+
   it("imports packaged skills and restores desired skill refs on agents", async () => {
     const portability = companyPortabilityService({} as any);
 

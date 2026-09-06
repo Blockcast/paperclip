@@ -4,10 +4,14 @@ description: Self-hosted Paperclip AI — company orchestration platform with a 
 type: application
 version: 0.1.0
 appVersion: "v2026.416.0"
-# The api Deployment's topologySpreadConstraints (BLO-20901) uses minDomains
-# (GA in 1.30) and matchLabelKeys (beta, default-enabled since 1.27). 1.30 is
-# the binding floor between the two.
-kubeVersion: ">=1.30.0-0"
+# No chart-wide kubeVersion floor: the api Deployment's topologySpreadConstraints
+# (BLO-20901) needs minDomains (GA in 1.30) and matchLabelKeys (beta since 1.27),
+# but that requirement only applies on the api.enabled && api.spreadAcrossNodes
+# path. A chart-level `kubeVersion` field is evaluated unconditionally at
+# install/template time regardless of .Values, so it would reject installs on
+# older clusters even when that path never renders. The version is instead
+# enforced in templates/deployment-api.yaml, guarded by the same condition
+# that renders the constraint.
 keywords:
   - paperclip
   - ai

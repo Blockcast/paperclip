@@ -416,8 +416,300 @@ export interface McpConfigSecret {
  */
 const SENSITIVE_ENV_NAME_RE = /(TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL|AUTH)/i;
 
+export type EnvClassification = "SECRET" | "SAFE_LITERAL";
+
+/** One declared env name (or name family) this file can put on a Job pod. */
+export interface EnvNameClassification {
+  /** Exact env var name, or the family prefix when `prefix` is true. */
+  name: string;
+  /** True when `name` is a prefix covering a family of generated names. */
+  prefix?: boolean;
+  classification: EnvClassification;
+  /**
+   * Why this classification. For SAFE_LITERAL this is the review artifact —
+   * the sentence a future reviewer reads instead of re-deriving whether the
+   * value can carry a credential.
+   */
+  reason: string;
+}
+
+/**
+ * Declarative classification of every env name this adapter's own code can put
+ * on an agent Job pod (BLO-29804, recording the decision on BLO-21858 remedy 2).
+ *
+ * WHY THIS EXISTS. `SENSITIVE_ENV_NAME_RE` is fail-closed against over-matching
+ * but fail-*open* against a credential-carrying variable whose name simply
+ * doesn't match; BLO-21858 is the proof it happens. Pinning names one at a time
+ * only fixes the instances someone notices. This table is the forcing function:
+ * `job-manifest.test.ts` builds manifests across the config permutations and
+ * fails, naming the variable, when an emitted name is absent here. A new env var
+ * therefore reddens CI in the pull request that introduces it, and the author
+ * has to state which class it is rather than inheriting a default.
+ *
+ * The alternative considered and declined was inverting to "everything is
+ * Secret-backed unless declared safe-literal". Measured on live `ac-*` pods
+ * there are 8 secretKeyRef vars against 37-41 non-sensitive literals, so
+ * inversion would move ~40 operationally-load-bearing fields (`HOME`, `TMPDIR`,
+ * `PAPERCLIP_RUN_ID`, the isolation roots) into an opaque Secret and stop
+ * `GET Pod` being a triage tool — a bounded security gain for an unbounded
+ * operability loss. See BLO-29804 for the full reasoning.
+ *
+ * SCOPE — read this before adding an entry. This table covers names *this code*
+ * introduces. Three channels put operator-supplied names on the pod and cannot
+ * be pre-declared, because their names are data rather than code:
+ *
+ *   1. `adapterConfig.env` (layer 4) — arbitrary keys chosen by an operator.
+ *   2. `selfPod.inheritedEnv` — the server Deployment's env, already governed by
+ *      `AGENT_ENV_ALLOWLIST` in `inherit-allowlist.ts`, which is the same
+ *      declare-or-refuse shape applied at that boundary.
+ *   3. `selfPod.inheritedEnvValueFrom` — Deployment `valueFrom` entries, which
+ *      carry no literal value on the pod spec at all.
+ *
+ * The test supplies known values through all three and subtracts exactly those
+ * names, so what remains is code-originated and must appear below.
+ *
+ * NOT a behaviour switch. `isSensitiveEnvName()` keeps its semantics — regex ∪
+ * pinned SECRET names — so which vars are Secret-backed is unchanged by the
+ * table's existence. A `SECRET` entry whose name the regex already matches is a
+ * statement about that name, not a new route.
+ */
+export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
+  // --- SECRET -----------------------------------------------------------
+  {
+    name: "PAPERCLIP_API_KEY",
+    classification: "SECRET",
+    reason: "Run-scoped JWT authenticating agent callbacks to the Paperclip API.",
+  },
+  {
+    name: "ANTHROPIC_CUSTOM_HEADERS",
+    classification: "SECRET",
+    reason:
+      "Arbitrary 'Name: value' lines Claude Code forwards on every Anthropic API call, so it can hold a real Authorization: header; matches none of the regex patterns, hence pinned (BLO-21858).",
+  },
+  {
+    name: "PAPERCLIP_K8S_ISOLATION_KEY",
+    classification: "SECRET",
+    reason:
+      "Not a credential — an isolation-root path segment — but the name contains KEY, so SENSITIVE_ENV_NAME_RE already routes it to a secretKeyRef. Declared SECRET to record today's behaviour truthfully; reclassifying it is a behaviour change and gets its own row (BLO-29804).",
+  },
+
+  // --- SAFE_LITERAL: identity and run context ---------------------------
+  {
+    name: "PAPERCLIP_AGENT_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Opaque agent UUID. Confers nothing without PAPERCLIP_API_KEY, and is already a Job label.",
+  },
+  {
+    name: "PAPERCLIP_COMPANY_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Opaque company UUID; scoping identifier, not an authorization token.",
+  },
+  {
+    name: "PAPERCLIP_API_URL",
+    classification: "SAFE_LITERAL",
+    reason: "In-cluster service URL inherited from the Deployment; an address, not a secret.",
+  },
+  {
+    name: "PAPERCLIP_RUN_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Opaque run UUID. Load-bearing for triage — it is how an SRE ties a wedged pod to its run.",
+  },
+  {
+    name: "PAPERCLIP_TASK_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Issue UUID the run was woken for; readable by anyone who can read the board.",
+  },
+  {
+    name: "PAPERCLIP_LINKED_ISSUE_IDS",
+    classification: "SAFE_LITERAL",
+    reason: "Comma-separated issue UUIDs from the approval wake; board identifiers.",
+  },
+
+  // --- SAFE_LITERAL: wake context ---------------------------------------
+  {
+    name: "PAPERCLIP_WAKE_REASON",
+    classification: "SAFE_LITERAL",
+    reason: "Enum-shaped wake cause (issue_assigned, issue_commented, ...).",
+  },
+  {
+    name: "PAPERCLIP_WAKE_COMMENT_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Opaque comment UUID.",
+  },
+  {
+    name: "PAPERCLIP_WAKE_PAYLOAD_JSON",
+    classification: "SAFE_LITERAL",
+    reason:
+      "Compact issue summary plus the new-comment batch. Board content, not credential material, and already readable by this pod through its own API token — but it is the one SAFE_LITERAL here whose value is free-form text, so a credential pasted into an issue comment would appear on the pod spec. Accepted: the same text is equally readable via the API, so Secret-backing it would not close that path.",
+  },
+  {
+    name: "PAPERCLIP_APPROVAL_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Opaque approval UUID.",
+  },
+  {
+    name: "PAPERCLIP_APPROVAL_STATUS",
+    classification: "SAFE_LITERAL",
+    reason: "Enum-shaped approval outcome.",
+  },
+
+  // --- SAFE_LITERAL: workspace wiring -----------------------------------
+  {
+    name: "PAPERCLIP_WORKSPACE_",
+    prefix: true,
+    classification: "SAFE_LITERAL",
+    reason:
+      "Workspace coordinates — cwd, source, strategy, id, repo URL/ref, branch, worktree path. Filesystem paths and a git remote; the remote is authenticated separately by the gh App token, never embedded here. Prefix because the family is set field-by-field from workspace context.",
+  },
+  {
+    name: "PAPERCLIP_WORKSPACES_JSON",
+    classification: "SAFE_LITERAL",
+    reason: "Serialized list of the same workspace coordinates for multi-workspace projects.",
+  },
+  {
+    name: "AGENT_HOME",
+    classification: "SAFE_LITERAL",
+    reason: "Filesystem path to the agent's home directory on the mounted PVC.",
+  },
+
+  // --- SAFE_LITERAL: runtime services -----------------------------------
+  {
+    name: "PAPERCLIP_RUNTIME_SERVICES_JSON",
+    classification: "SAFE_LITERAL",
+    reason: "Managed preview/dev service descriptors: names, ports, in-cluster URLs.",
+  },
+  {
+    name: "PAPERCLIP_RUNTIME_SERVICE_INTENTS_JSON",
+    classification: "SAFE_LITERAL",
+    reason: "Requested runtime services not yet started; same shape as above.",
+  },
+  {
+    name: "PAPERCLIP_RUNTIME_PRIMARY_URL",
+    classification: "SAFE_LITERAL",
+    reason: "In-cluster URL of the primary runtime service; an address.",
+  },
+
+  // --- SAFE_LITERAL: isolation and home ---------------------------------
+  {
+    name: "HOME",
+    classification: "SAFE_LITERAL",
+    reason: "Must be readable off the pod spec — it is the first thing checked when session resume misbehaves.",
+  },
+  {
+    name: "CLAUDE_CONFIG_DIR",
+    classification: "SAFE_LITERAL",
+    reason: "Path to the run's Claude config dir under the isolation root.",
+  },
+  {
+    name: "XDG_CONFIG_HOME",
+    classification: "SAFE_LITERAL",
+    reason: "Path to the run's XDG config root.",
+  },
+  {
+    name: "PAPERCLIP_K8S_ISOLATION_MODE",
+    classification: "SAFE_LITERAL",
+    reason: "Enum: shared | run | workspace. Diagnostic for cross-run state bleed.",
+  },
+
+  // --- SAFE_LITERAL: caches and temp ------------------------------------
+  {
+    name: "XDG_CACHE_HOME",
+    classification: "SAFE_LITERAL",
+    reason: "Cache path on the runtime-cache volume.",
+  },
+  {
+    name: "GOCACHE",
+    classification: "SAFE_LITERAL",
+    reason: "Go build cache path.",
+  },
+  {
+    name: "GOMODCACHE",
+    classification: "SAFE_LITERAL",
+    reason: "Go module cache path.",
+  },
+  {
+    name: "npm_config_cache",
+    classification: "SAFE_LITERAL",
+    reason: "npm cache path. Lower-cased by npm convention; matching is case-sensitive so this is exact.",
+  },
+  {
+    name: "BUN_INSTALL_CACHE",
+    classification: "SAFE_LITERAL",
+    reason: "Bun install cache path.",
+  },
+  {
+    name: "PIP_CACHE_DIR",
+    classification: "SAFE_LITERAL",
+    reason: "pip cache path.",
+  },
+  {
+    name: "PLAYWRIGHT_BROWSERS_PATH",
+    classification: "SAFE_LITERAL",
+    reason: "Playwright browser download path.",
+  },
+  {
+    name: "TMPDIR",
+    classification: "SAFE_LITERAL",
+    reason: "Run-scoped temp dir (BLO-16219). Load-bearing for triaging concurrent-run collisions.",
+  },
+  {
+    name: "TMP",
+    classification: "SAFE_LITERAL",
+    reason: "Same path as TMPDIR, for tools that read TMP.",
+  },
+  {
+    name: "TEMP",
+    classification: "SAFE_LITERAL",
+    reason: "Same path as TMPDIR, for tools that read TEMP.",
+  },
+
+  // --- SAFE_LITERAL: container wiring -----------------------------------
+  {
+    name: "DOCKER_HOST",
+    classification: "SAFE_LITERAL",
+    reason: "unix:///var/run/docker.sock — the DinD sidecar socket path. Constant, no credential.",
+  },
+  {
+    name: "DOCKER_TLS_CERTDIR",
+    classification: "SAFE_LITERAL",
+    reason: "Set empty on the DinD sidecar to disable TLS on the shared emptyDir socket. A constant.",
+  },
+  {
+    name: "PROMPT_CONTENT",
+    classification: "SAFE_LITERAL",
+    reason:
+      "Init-container-only. The prompt the agent is about to run; it is written to an emptyDir and read via stdin. Oversized prompts already move to a Secret-backed volume for size reasons, so this path carries only small prompts. Not credential material by construction — the prompt is board-authored text.",
+  },
+];
+
+/**
+ * Names pinned as always-Secret because they carry credential material while
+ * matching none of the patterns above (BLO-21858, from the BLO-21593 review).
+ *
+ * Derived from ENV_NAME_CLASSIFICATION so the table is the single source of
+ * truth: declaring a name SECRET there is what pins it here. Compared
+ * upper-cased so it behaves like the case-insensitive regex.
+ */
+const ALWAYS_SECRET_ENV_NAMES = new Set(
+  ENV_NAME_CLASSIFICATION.filter((e) => e.classification === "SECRET" && !e.prefix).map((e) =>
+    e.name.toUpperCase(),
+  ),
+);
+
 export function isSensitiveEnvName(name: string): boolean {
-  return SENSITIVE_ENV_NAME_RE.test(name);
+  return ALWAYS_SECRET_ENV_NAMES.has(name.toUpperCase()) || SENSITIVE_ENV_NAME_RE.test(name);
+}
+
+/**
+ * Look up an env name in ENV_NAME_CLASSIFICATION. Exact matches win over
+ * prefix matches. Returns null when the name is undeclared — which is what
+ * the classification test in job-manifest.test.ts fails on.
+ */
+export function classifyEnvName(name: string): EnvClassification | null {
+  const exact = ENV_NAME_CLASSIFICATION.find((e) => !e.prefix && e.name === name);
+  if (exact) return exact.classification;
+  const prefixed = ENV_NAME_CLASSIFICATION.find((e) => e.prefix && name.startsWith(e.name));
+  return prefixed ? prefixed.classification : null;
 }
 
 /**
@@ -1309,6 +1601,60 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // the pod marks Succeeded even when claude never emits any stream-json
   // — paperclip-server's parser only catches type:error events from
   // inside the JSON stream, not pre-stream crashes.
+  // BLO-31359: `git clone` points the new clone's `origin` at whatever it was
+  // cloned from, so cloning the project base checkout hands every ephemeral run
+  // a remote that writes back into shared, long-lived state on the PVC. Git only
+  // refuses a push to the base's *currently checked out* branch; any other
+  // refname lands, which is how base checkouts accumulate agent-authored
+  // `blo-*` branches. Keep the clone — cloning from local disk with `--shared`
+  // is what makes provisioning cheap — but repoint `origin` at the real
+  // upstream so a push leaves the cluster instead of mutating the base.
+  //
+  // Remove-then-add rather than `set-url`: `git remote remove` drops the whole
+  // `remote.origin` section, so the re-added remote cannot inherit a stale
+  // `pushurl` still aimed at the base.
+  //
+  // `remote remove` also deletes every `refs/remotes/origin/*`, so the clone is
+  // briefly left with no remote-tracking refs and `origin/<branch>` is an
+  // unknown revision. That is deliberate, not collateral: those refs described
+  // the *base's* local branches while being named as though they described
+  // upstream, and a lying ref is worse than a missing one. The best-effort
+  // fetch below repopulates `refs/remotes/origin/<branch>` from the real
+  // upstream, which is the first time `origin/master` in a run workspace has
+  // actually meant upstream.
+  //
+  // `fetch` restores branches but NOT `refs/remotes/origin/HEAD` (a symbolic
+  // ref that a plain clone does carry, and that tooling reads via
+  // `git symbolic-ref refs/remotes/origin/HEAD` to find the default branch),
+  // so the fetch is paired with `remote set-head -a`. Same reasoning as the
+  // branches: the old `origin/HEAD` pointed at the *base's* current branch, so
+  // it too was a lying ref, and this repoints it at upstream's default.
+  //
+  // Guarding rule for this chain: commands that establish the security property
+  // (the base must not be reachable as a remote) stay UNGUARDED so a failure
+  // fails the run closed rather than handing back a base-writable workspace.
+  // Commands that only provide ergonomics or diagnostics are guarded, so a
+  // network blip or a read-only config cannot take down pod startup.
+  const upstreamRepoUrl = asString(workspaceContext.repoUrl, "").trim();
+  const runWorkspaceGit = `git -C ${quoteShellArg(isolation.workspaceRoot)}`;
+  // Both calls below reach the network, so both carry the same bound rather
+  // than only the fetch: `set-head -a` queries the remote for its default
+  // branch even when every remote-tracking ref is already present locally.
+  // Measured against an unreachable https remote with refs/remotes/origin/HEAD
+  // and origin/master intact and `symbolic-ref refs/remotes/origin/HEAD`
+  // already resolving: exit 128, `unable to access ...: Failed to connect`.
+  // Sharing one constant keeps the two from drifting apart.
+  //
+  // Two limits on what this bound actually buys, both deliberate:
+  //   - it aborts a *transfer* that stalls below 1 KiB/s for 15s. A connect
+  //     that never completes is still bounded only by the kernel's TCP retry,
+  //     which is finite but longer.
+  //   - both knobs are consumed by the curl-based HTTP transport, so an
+  //     `ssh://` or `git@host:` remote would ignore them silently and the
+  //     calls would be unbounded again. Every configured workspace `repoUrl`
+  //     is https today so nothing reaches that path, but a future SSH remote
+  //     needs its own bound rather than inheriting this one.
+  const boundedRunWorkspaceGit = `${runWorkspaceGit} -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15`;
   const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
     ? [
         `if git -C ${quoteShellArg(workspaceCwd)} rev-parse --verify HEAD >/dev/null 2>&1; then`,
@@ -1317,8 +1663,56 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           `rm -rf ${quoteShellArg(isolation.workspaceRoot)}`,
           // Git objects are immutable/content-addressed and may be shared read-only;
           // the clone still owns its refs, index, worktree, and lock files.
-          `git clone --shared --no-checkout -- ${quoteShellArg(workspaceCwd)} ${quoteShellArg(isolation.workspaceRoot)}`,
-          `git -C ${quoteShellArg(isolation.workspaceRoot)} checkout --detach "$source_head"`,
+          //
+          // `--origin origin` pins the remote name: `git clone` otherwise honors
+          // `clone.defaultRemoteName`, and because the removal below is unguarded,
+          // an image that ever set that config would hard-fail every run-isolated
+          // pod with `error: No such remote: 'origin'`.
+          `git clone --shared --no-checkout --origin origin -- ${quoteShellArg(workspaceCwd)} ${quoteShellArg(isolation.workspaceRoot)}`,
+          `${runWorkspaceGit} checkout --detach "$source_head"`,
+          `${runWorkspaceGit} remote remove origin`,
+          ...(upstreamRepoUrl
+            ? [
+                // `--` because `quoteShellArg` stops shell injection but not git's
+                // own option parsing, and a repoUrl starting with `-` would
+                // otherwise be read as a flag.
+                `${runWorkspaceGit} remote add origin -- ${quoteShellArg(upstreamRepoUrl)}`,
+                // Ergonomics, not security: restore `origin/<branch>` so the
+                // common `git rebase origin/master` / `git log origin/master..HEAD`
+                // phrasings resolve, then `set-head` so `origin/HEAD` resolves
+                // too. Guarded, and leaves a breadcrumb when it cannot run, so
+                // an offline pod degrades to "fetch first" rather than to a
+                // failed run or an unexplained `unknown revision`.
+                //
+                // This runs on every run-isolated pod start, so both network
+                // calls are bounded — see `boundedRunWorkspaceGit` above for
+                // exactly what that bound does and does not cover.
+                //
+                // `set-head` is nested inside its own guard so that when the
+                // fetch succeeds but `set-head` fails, the chain does not fall
+                // through and write the misleading `originFetchFailed`
+                // breadcrumb about a fetch that actually worked. It records its
+                // own breadcrumb instead, so both failure paths in this chain
+                // explain themselves on the workspace rather than leaving a
+                // bare `symbolic-ref` failure for an agent to diagnose. (The
+                // sibling `originRemoved` breadcrumb below is not a failure —
+                // it is the no-upstream branch.)
+                `(${boundedRunWorkspaceGit} fetch --no-tags --quiet origin && (${boundedRunWorkspaceGit} remote set-head origin -a >/dev/null 2>&1 || ${runWorkspaceGit} config paperclip.originHeadUnset 'origin/HEAD could not be resolved, possibly a stalled transfer hit by the low-speed bound; run \`git remote set-head origin -a\` if you need the default branch (BLO-31359)' || true) || ${runWorkspaceGit} config paperclip.originFetchFailed 'best-effort fetch failed; run \`git fetch origin\` before using origin/<branch> (BLO-31359)' || true)`,
+              ]
+            : [
+                // No recorded upstream: leave the clone with no remote at all
+                // rather than one aimed at the base, and say so on the
+                // workspace so the resulting `fatal: 'origin' does not appear
+                // to be a git repository` is self-explaining.
+                //
+                // The reachable case is a `local_path` project workspace.
+                // `validateProjectWorkspace` requires only *one* of `cwd` or
+                // `repoUrl`, so a workspace configured by path satisfies it via
+                // `cwd` and carries `repoUrl: null` by construction. A project
+                // with no git workspace at all never reaches here — it fails the
+                // `rev-parse --verify HEAD` guard above.
+                `(${runWorkspaceGit} config paperclip.originRemoved 'no upstream recorded for this run; origin removed so the clone source (a shared base checkout) is not a push target (BLO-31359)' || true)`,
+              ]),
         ].join(" && ")};`,
         // Stateless PR-review agents may start from the generic per-agent fallback
         // directory, which is intentionally not a repository. Give those runs a

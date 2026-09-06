@@ -284,11 +284,12 @@ describe("BLO-20961: installDir isolation survives a re-torn shared store across
     expect(bootOneShared.consistent).toBe(true);
     expect(bootOneIsolated.consistent).toBe(true);
 
-    // Boot 2: `copyWorkspaceSdkFiles()` / the workspace-fork copy in
-    // index.ts unconditionally re-vendors the fork (1.0.0) into the SHARED
-    // store's node_modules on every restart, without touching its
-    // package-lock.json — tearing it again exactly as it did live on
-    // 2026-08-01/02/04. It never touches the isolated dir; that's the fix.
+    // Boot 2: simulate the SHARED store being torn — node_modules moved to a
+    // version its package-lock.json does not record. Until 2026-09-01 the
+    // boot-time fork-vendor copy in index.ts did this on every restart (the
+    // live recurrences on 2026-08-01/02/04); that copy is gone now the store
+    // resolves the fork via an npm alias, but the shared tree still has
+    // uncoordinated writers, so the isolation guarantee below still matters.
     await writeInstalledPackageVersion(sharedDir, SDK_PACKAGE, "1.0.0");
 
     const bootTwoShared = await checkSharedDependencyConsistency(sharedDir, SDK_PACKAGE);
@@ -612,10 +613,11 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
       .returning();
     if (!plugin) throw new Error("fixture plugin row not inserted");
 
-    // Boot 2: `copyWorkspaceSdkFiles()` / the workspace-fork copy in
-    // index.ts unconditionally re-vendors the fork into the SHARED store on
-    // every restart — the exact recurrence from BLO-18384/BLO-18405. It
-    // never touches this plugin's isolated install dir.
+    // Boot 2: simulate the SHARED store being torn — the recurrence shape from
+    // BLO-18384/BLO-18405, which the boot-time fork-vendor copy used to cause
+    // on every restart. That copy is gone as of 2026-09-01, but a torn shared
+    // store is still reachable via other writers, and it must never reach this
+    // plugin's isolated install dir.
     await writeInstalledPackageVersion(sharedDir, SDK_PACKAGE, "1.0.0");
 
     const { runtimeServices, startWorker, markError } = createRuntimeServices();

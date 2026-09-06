@@ -7,8 +7,8 @@
  * independent of how the operator chose to supply it (secret-ref vs inline).
  */
 
-import { timingSafeEqual } from "node:crypto";
-import type { PluginContext, PluginWebhookInput } from "@paperclipai/plugin-sdk";
+import { randomUUID, timingSafeEqual } from "node:crypto";
+import type { PluginContext, PluginFencingPrecondition, PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import {
   ACCEPTED_SCHEMA_VERSIONS,
   DEFAULT_OPERATOR_SUPPRESSION_HOURS,
@@ -26,6 +26,7 @@ import {
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { resolveAssigneeUserId, resolveFallbackAgentId } from "./owner-resolver.js";
+import { aggregateKeyForAlert } from "./aggregate-key.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
 import {
   ORIGIN_KIND,
@@ -62,6 +63,912 @@ export class AlertDeliveryIncompleteError extends Error {
     this.name = "AlertDeliveryIncompleteError";
     this.fingerprints = fingerprints;
   }
+}
+
+const AGGREGATE_CREATION_CLAIMS_TABLE = "alertmanager_aggregate_creation_claims";
+const AGGREGATE_MEMBERS_TABLE = "alertmanager_aggregate_members";
+const AGGREGATE_LIFECYCLE_FENCES_TABLE = "alertmanager_aggregate_lifecycle_fences";
+
+/**
+ * Identity of *this* worker process, minted once at module load (BLO-31036).
+ *
+ * This is deliberately not the host's `instanceInfo.instanceId`, which the SDK
+ * documents as the UUID of the Paperclip *instance* and which therefore
+ * survives a restart — the one property that makes it useless as proof of
+ * death.
+ *
+ * Every concurrent delivery inside this process shares this id. That is the
+ * point, not an accident: the RPC layer pipelines `handleWebhook` calls into
+ * the single worker child, so two firing deliveries genuinely interleave, and
+ * a per-*delivery* id would let them steal each other's live fences — the
+ * exact race the fence exists to prevent.
+ */
+const WORKER_INSTANCE_ID = randomUUID();
+
+/**
+ * The worker's slot: stable across restarts, unique per concurrent host.
+ *
+ * Ownership is only ever stolen within the same slot. The plugin worker is a
+ * cluster-wide singleton today (StatefulSet `paperclip` runs `replicas: 1` with
+ * `PAPERCLIP_NODE_ROLE=worker`, while the api replicas swap in a plugin-worker
+ * stub that never forks a child), but that singleton rests partly on chart
+ * configuration: an unknown `PAPERCLIP_NODE_ROLE` value falls back to `"all"`,
+ * so a typo on an api replica would silently add a second plugin host.
+ *
+ * Keying the steal on the slot means correctness does not depend on that
+ * config being right. Within one slot, a new process proves the old one is gone
+ * (Kubernetes recreates a StatefulSet ordinal only after the previous pod has
+ * fully terminated); across slots, nothing is ever assumed dead.
+ *
+ * Falls back to a per-process value when `HOSTNAME` is unset, which is
+ * fail-safe: an unidentifiable slot matches no stored slot, so it steals
+ * nothing.
+ */
+const WORKER_SLOT = process.env.HOSTNAME?.trim() || `unknown-slot:${WORKER_INSTANCE_ID}`;
+
+/** Test seam: the identity this process claims fences under. */
+export function workerFenceIdentity(): { instanceId: string; slot: string } {
+  return { instanceId: WORKER_INSTANCE_ID, slot: WORKER_SLOT };
+}
+
+type IssueReference = {
+  id: string;
+  status?: string | null;
+  assigneeUserId?: string | null;
+  assigneeAgentId?: string | null;
+};
+
+type AggregateMemberResolution = {
+  disposition:
+    | "no-membership"
+    | "has-unresolved-siblings"
+    | "last-member-resolved"
+    | "finalization-pending";
+  issueId: string;
+  resolutionToken?: string;
+};
+
+/**
+ * Outcome of claiming the firing fence. On refusal it carries the phase that
+ * held the fence so the delivery error can name it, because that phase decides
+ * the operator's next move: `firing` and `cancelling` are both owners that a
+ * new claim will not displace while they may still be live.
+ *
+ * Since BLO-31036 a refusal no longer implies a permanent wedge — a fence whose
+ * owner has provably died is released by the next worker in that slot, either
+ * by the startup sweep or by the next firing claim. A refusal that *persists*
+ * therefore means the owner is live, or holds the fence from another slot.
+ */
+type AggregateFiringClaim =
+  | { ok: true; token: string }
+  | { ok: false; blockingPhase: string | null };
+
+function q(ns: string, table: string): string {
+  return `${ns}.${table}`;
+}
+
+async function findActiveAggregateIssue(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+): Promise<IssueReference | null> {
+  const activeStatuses = [
+    "backlog",
+    "todo",
+    "in_progress",
+    "in_review",
+    "blocked",
+  ] as const;
+  for (const status of activeStatuses) {
+    const [issue] = await ctx.issues.list({
+      companyId,
+      originKind: ORIGIN_KIND,
+      originFingerprint: aggregateKey,
+      status,
+      limit: 1,
+    });
+    if (issue) return issue;
+  }
+  return null;
+}
+
+async function tryClaimAggregateCreation(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+): Promise<string | null> {
+  const ns = ctx.db.namespace;
+  await ctx.db.execute(
+    `DELETE FROM ${q(ns, AGGREGATE_CREATION_CLAIMS_TABLE)}
+     WHERE company_id = $1
+       AND aggregate_key = $2
+       AND claimed_at < now() - interval '5 minutes'`,
+    [companyId, aggregateKey],
+  );
+  const claimToken = randomUUID();
+  const result = await ctx.db.execute(
+    `INSERT INTO ${q(ns, AGGREGATE_CREATION_CLAIMS_TABLE)}
+       (company_id, aggregate_key, claim_token)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (company_id, aggregate_key) DO NOTHING`,
+    [companyId, aggregateKey, claimToken],
+  );
+  return result.rowCount > 0 ? claimToken : null;
+}
+
+async function releaseAggregateCreationClaim(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+  claimToken: string,
+): Promise<void> {
+  const ns = ctx.db.namespace;
+  await ctx.db.execute(
+    `DELETE FROM ${q(ns, AGGREGATE_CREATION_CLAIMS_TABLE)}
+     WHERE company_id = $1 AND aggregate_key = $2 AND claim_token = $3`,
+    [companyId, aggregateKey, claimToken],
+  );
+}
+
+/**
+ * Raised when this delivery no longer holds the firing generation it claimed.
+ *
+ * Distinct from a generic failure because the re-fire path tolerates issue
+ * RPC errors (it records that the decision was not applied and carries on).
+ * Losing the generation is not a tolerable re-sync failure — it means another
+ * owner has taken the aggregate — so it must escape that catch, not be logged
+ * and swallowed.
+ */
+export class AggregateGenerationLostError extends Error {
+  constructor(aggregateKey: string) {
+    super(
+      `Alertmanager aggregate ${aggregateKey} was reclaimed by another owner ` +
+        `while this firing delivery was in flight; abandoning before mutating ` +
+        `the tracked issue. Failing the delivery so Alertmanager retries ` +
+        `against the owner that now holds the fence.`,
+    );
+    this.name = "AggregateGenerationLostError";
+  }
+}
+
+/**
+ * The same generation, expressed so the *host* can enforce it.
+ *
+ * `assertFiringGeneration` below can only prove ownership at the moment it
+ * runs. Passing this alongside a mutating `issues.*` call moves the check into
+ * the transaction that performs the mutation, where it is held under a share
+ * lock until commit — so a steal can no longer land between "still mine?" and
+ * the write. That is the difference between a barrier and a fence, and it is
+ * why the barrier is now only a fast path (BLO-31049).
+ */
+function firingFence(
+  companyId: string,
+  aggregateKey: string,
+  firingToken: string,
+): PluginFencingPrecondition {
+  return {
+    table: AGGREGATE_LIFECYCLE_FENCES_TABLE,
+    match: {
+      company_id: companyId,
+      aggregate_key: aggregateKey,
+      phase: "firing",
+      firing_token: firingToken,
+    },
+  };
+}
+
+/**
+ * Throw unless this delivery still holds the firing fence under `firingToken`.
+ *
+ * `upsertAggregateMember` gates the member row on the generation atomically,
+ * but the aggregate's other side effects are host RPCs — `issues.update`,
+ * `issues.create`, `issues.createComment` — which cannot join a transaction in
+ * this plugin's database. Without a check in front of them, a displaced
+ * predecessor ran the *whole* re-fire path (reopening a cancelled issue,
+ * rewriting its description, creating an orphan issue) and only lost the race
+ * at the member write, several RPCs later. The damage was already done.
+ *
+ * So this is a barrier, not a lock: it converts "always mutates, then fails"
+ * into "is rejected before mutating". A predecessor already displaced when it
+ * reaches the barrier cannot touch the issue at all.
+ *
+ * It is now a *fast path* rather than the authoritative check. Every mutating
+ * `issues.*` call below also carries `firingFence(...)`, which the host checks
+ * under a share lock inside the mutation's own transaction (BLO-31049). That is
+ * what closes the window this barrier alone could not: a steal committing
+ * between here and an RPC already in flight is caught server-side, because the
+ * steal cannot commit while the mutation holds the lock.
+ *
+ * Kept rather than deleted because it is strictly cheaper — one local SELECT
+ * rejects a long-displaced predecessor before it makes any RPC at all, instead
+ * of letting it round-trip to the host to be refused there.
+ *
+ * Deliberately a SELECT: it must not touch `updated_at`. That column is what
+ * the wedged-fence detector ages off (`phase in ('firing','cancelling') and
+ * updated_at < now() - interval '15 minutes'`), so a guard that bumped it
+ * would hide from monitoring exactly the fences this ticket exists to surface.
+ */
+async function assertFiringGeneration(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+  firingToken: string,
+): Promise<void> {
+  const rows = await ctx.db.query(
+    `SELECT 1 FROM ${q(ctx.db.namespace, AGGREGATE_LIFECYCLE_FENCES_TABLE)}
+      WHERE company_id = $1
+        AND aggregate_key = $2
+        AND phase = 'firing'
+        AND firing_token = $3`,
+    [companyId, aggregateKey, firingToken],
+  );
+  if (rows.length === 0) throw new AggregateGenerationLostError(aggregateKey);
+}
+
+/**
+ * Attach a member to the aggregate, but only while the caller still holds the
+ * firing fence under `firingToken`.
+ *
+ * This guard is what makes the ownership steal in `beginAggregateFiring` safe
+ * *without* relying on the predecessor being dead. `firing_token` is a fresh
+ * UUID minted on every claim and replaced on every steal, so it is already a
+ * per-claim generation in the fencing-token sense: a process that has been
+ * displaced — by a steal, by the startup sweep, or by its own `finally` — can
+ * no longer satisfy this predicate, and therefore cannot attach a member behind
+ * a newer owner's back.
+ *
+ * That matters because same-slot/different-instance is strong evidence of
+ * death, not proof of it: Kubernetes' at-most-one guarantee for a StatefulSet
+ * ordinal is suspended by force deletion, and by `podManagementPolicy:
+ * Parallel`. Rather than rest the fence's safety on that assumption holding,
+ * the mutation the fence exists to protect is gated on the generation directly.
+ * An overlapping predecessor loses the race deterministically instead of
+ * silently attaching a live member to an aggregate a resolver has begun to
+ * cancel — the race the design comment in `beginAggregateFiring` refuses to
+ * reopen.
+ *
+ * The guard and the write are one statement, so they are evaluated against a
+ * single committed snapshot: a concurrent steal either commits first (this
+ * write is refused) or after (this write already landed, and the steal's new
+ * owner sees it). There is no check-then-act window between them.
+ *
+ * Refusal throws rather than returning silently: the delivery must fail so
+ * Alertmanager retries against whichever owner now holds the fence.
+ */
+async function upsertAggregateMember(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+  issueId: string,
+  fingerprint: string,
+  firingToken: string,
+): Promise<void> {
+  const ns = ctx.db.namespace;
+  const result = await ctx.db.execute(
+    `INSERT INTO ${q(ns, AGGREGATE_MEMBERS_TABLE)}
+       (company_id, aggregate_key, fingerprint, issue_id)
+     SELECT $1, $2, $3, $4
+     WHERE EXISTS (
+       SELECT 1 FROM ${q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE)}
+        WHERE company_id = $1
+          AND aggregate_key = $2
+          AND phase = 'firing'
+          AND firing_token = $5
+     )
+     ON CONFLICT (company_id, aggregate_key, fingerprint)
+     DO UPDATE SET
+       issue_id = EXCLUDED.issue_id,
+       resolved_at = NULL,
+       updated_at = now()`,
+    [companyId, aggregateKey, fingerprint, issueId, firingToken],
+  );
+  if (result.rowCount === 0) {
+    throw new Error(
+      `Alertmanager aggregate ${aggregateKey} was reclaimed by another owner ` +
+        `while this firing delivery was in flight; refusing to attach member ` +
+        `${fingerprint} behind the current fence holder. Failing the delivery so ` +
+        `Alertmanager retries against the owner that now holds the fence.`,
+    );
+  }
+}
+
+/**
+ * Firing claims the aggregate fence before it mutates member state or touches
+ * the issue. A resolver may only begin finalization while the fence is active;
+ * once it is cancelling, a new firing fails its delivery and retries after the
+ * terminal transition instead of attaching a live member to a cancelled issue.
+ */
+async function beginAggregateFiring(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+): Promise<AggregateFiringClaim> {
+  const ns = ctx.db.namespace;
+  const token = randomUUID();
+  const fences = q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE);
+  // This is intentionally a fence rather than a lease. A delayed worker can
+  // resume after an arbitrary timeout, so stealing `firing` or `cancelling`
+  // on the strength of *elapsed time* would allow it to attach a member after a
+  // newer resolver has started the terminal transition. That race stays closed:
+  // nothing below releases a fence because it is old.
+  //
+  // What is admitted (BLO-31036) is a fence held by a different process in this
+  // same slot. A slot's previous occupant has ordinarily been replaced, because
+  // a StatefulSet recreates an ordinal only after the prior pod terminated — but
+  // that is strong evidence of death, NOT proof of it. Kubernetes suspends the
+  // at-most-one guarantee under force deletion (`--grace-period=0`) and under
+  // `podManagementPolicy: Parallel`, and a partitioned node can leave an old
+  // process running and able to do work while its replacement starts.
+  //
+  // So the steal is deliberately NOT load-bearing for safety. `firing_token` is
+  // a fresh UUID per claim, replaced on every steal, i.e. a generation in the
+  // fencing-token sense — and `upsertAggregateMember` and `finishAggregateFiring`
+  // both gate on it. An overlapping predecessor that loses this race can no
+  // longer attach a member or complete its delivery; its write is refused and
+  // the delivery fails loudly for Alertmanager to retry. Correctness therefore
+  // rests on the generation check at the mutation site, and this predicate only
+  // decides who is allowed to *proceed*, not whose writes count.
+  //
+  // A live sibling delivery in *this* process shares WORKER_INSTANCE_ID and is
+  // therefore excluded, as is any owner in another slot.
+  const result = await ctx.db.execute(
+    `INSERT INTO ${fences}
+       (company_id, aggregate_key, phase, firing_token, owner_instance_id, owner_slot)
+     VALUES ($1, $2, 'firing', $3, $4, $5)
+     ON CONFLICT (company_id, aggregate_key) DO UPDATE
+     SET phase = 'firing',
+         firing_token = EXCLUDED.firing_token,
+         resolution_token = NULL,
+         owner_instance_id = EXCLUDED.owner_instance_id,
+         owner_slot = EXCLUDED.owner_slot,
+         updated_at = now()
+     WHERE ${fences}.phase IN ('active', 'finalizing')
+        OR (
+          ${fences}.phase IN ('firing', 'cancelling')
+          AND ${fences}.owner_slot = $5
+          AND ${fences}.owner_instance_id IS DISTINCT FROM $4
+        )`,
+    [companyId, aggregateKey, token, WORKER_INSTANCE_ID, WORKER_SLOT],
+  );
+  if (result.rowCount > 0) return { ok: true, token };
+  // Read back the phase that actually refused the claim. The upsert admits
+  // 'active' and 'finalizing', so the blocker is necessarily 'firing' or
+  // 'cancelling' — an interrupted owner, not a live finalization. Naming it is
+  // what makes the wedge diagnosable from the delivery error alone; reporting a
+  // fixed phase here sent a six-day production investigation (PEN-2581) after
+  // `finalizing`, which is the one phase that cannot produce this failure.
+  const rows = await ctx.db.query<{ phase: string }>(
+    `SELECT phase
+       FROM ${fences}
+      WHERE company_id = $1
+        AND aggregate_key = $2`,
+    [companyId, aggregateKey],
+  );
+  return { ok: false, blockingPhase: rows[0]?.phase ?? null };
+}
+
+/**
+ * How long a firing delivery waits for a live sibling to release the aggregate
+ * fence before giving up and failing the delivery (PEN-3013).
+ *
+ * The fence is keyed on the *creation identity*
+ * (`alert-aggregate:v1:[alertname, dedupe-domain]`), so by design every alert
+ * sharing an alertname contends for one fence — that convergence is the whole
+ * point of the aggregate, and widening the key here would change which alerts
+ * share an issue, not merely who waits. So contention is expected, routine, and
+ * scales with the number of distinct firing instances per alertname; it is not
+ * a fault. Treating it as one is what produced the measured failure mode:
+ * unrelated objects under a shared alertname each returned 502, and
+ * Alertmanager's retry then collided with the delivery still holding the fence,
+ * sustaining the episode until the fan-out settled.
+ *
+ * The fence is only ever held for one delivery's issue RPCs, so the holder
+ * clears in the sub-second range and waiting nearly always beats failing. The
+ * budget is wall-clock and deliberately modest, because it is also paid on the
+ * path it cannot help: against a genuinely wedged fence a delivery now occupies
+ * a request slot for the full budget before failing, and Alertmanager keeps
+ * retrying throughout. That cost is per aggregate key per delivery, not per
+ * alert — see {@link AggregateFenceWedgedMemo}, without which it would scale
+ * with batch size. It does not need to cover the worst-case fan-out — only to
+ * collapse the common case. A delivery that loses the race anyway still
+ * throws exactly as it did before, so it is retried, not lost; the
+ * transient/permanent taxonomy is untouched.
+ *
+ * Delays are jittered because the alerts that contend here re-fire *together*
+ * after a worker restart. Retrying on a fixed schedule would re-collide the same
+ * set in lockstep on every attempt, converting one queue into repeated
+ * thundering herds.
+ */
+const AGGREGATE_FENCE_WAIT_BUDGET_MS = 3_000;
+const AGGREGATE_FENCE_WAIT_INITIAL_DELAY_MS = 25;
+const AGGREGATE_FENCE_WAIT_MAX_DELAY_MS = 500;
+
+export type AggregateFenceWaitPolicy = {
+  budgetMs: number;
+  initialDelayMs: number;
+  maxDelayMs: number;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  random: () => number;
+};
+
+const DEFAULT_AGGREGATE_FENCE_WAIT: AggregateFenceWaitPolicy = {
+  budgetMs: AGGREGATE_FENCE_WAIT_BUDGET_MS,
+  initialDelayMs: AGGREGATE_FENCE_WAIT_INITIAL_DELAY_MS,
+  maxDelayMs: AGGREGATE_FENCE_WAIT_MAX_DELAY_MS,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now: () => Date.now(),
+  random: () => Math.random(),
+};
+
+/**
+ * Aggregate keys this delivery has already spent a full wait budget on without
+ * winning the claim. Scoped to one webhook delivery, like {@link FallbackOwnerMemo}
+ * and for the same reason: a storm is the case that matters.
+ *
+ * The budget is per *call*, so without this a batch of N alerts costs N budgets
+ * against a fence nothing in this delivery can clear — and that lands on
+ * precisely the wrong population, because Alertmanager groups by alertname and
+ * the aggregate key is `[alertname, dedupe-domain]`, so one batch is exactly the
+ * set that maps to one fence. A 10-alert `CronJobSuccessStale` batch would hold a
+ * request slot for ~30s where it previously failed in milliseconds, worst under
+ * the restart fan-out this change exists to fix.
+ *
+ * Alerts 2..N gain nothing by waiting: the first already established that this
+ * key is not becoming claimable on this delivery's timescale, and none of them
+ * can release it. So they get one attempt and no wait — cheaper, and more
+ * honest about the information available.
+ */
+type AggregateFenceWedgedMemo = Set<string>;
+
+/**
+ * `beginAggregateFiring`, but waits out a fence held by a live holder instead of
+ * failing the delivery on first refusal (PEN-3013).
+ *
+ * This waits for a *claim*; it holds nothing while it sleeps, so it cannot
+ * itself wedge an aggregate or delay a holder's release. Ownership safety is
+ * unchanged — it still rests entirely on the `firing_token` generation checked
+ * at each mutation site, and a claim won on the second attempt is
+ * indistinguishable from one won on the first.
+ *
+ * Deliberately retries on BOTH blocking phases. 'cancelling' is the resolver
+ * finishing a terminal transition, which is exactly the case the original
+ * comment says should "retry after the terminal transition" — previously that
+ * retry had to arrive as a whole new HTTP delivery.
+ *
+ * The budget is spent at most once per aggregate key per delivery — see
+ * {@link AggregateFenceWedgedMemo}. Distinct keys still each get their own
+ * budget, because a claim refused on one fence says nothing about another.
+ */
+async function claimAggregateFiringWaiting(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+  policyOverrides?: Partial<AggregateFenceWaitPolicy>,
+  wedgedKeys?: AggregateFenceWedgedMemo,
+): Promise<AggregateFiringClaim> {
+  const policy: AggregateFenceWaitPolicy = policyOverrides
+    ? { ...DEFAULT_AGGREGATE_FENCE_WAIT, ...policyOverrides }
+    : DEFAULT_AGGREGATE_FENCE_WAIT;
+
+  // Still attempt once: the holder may have released since the alert that gave
+  // up, and skipping the attempt entirely would fail an alert that could have
+  // been served. Only the *waiting* is skipped.
+  if (wedgedKeys?.has(aggregateKey)) {
+    return beginAggregateFiring(ctx, companyId, aggregateKey);
+  }
+
+  const startedAt = policy.now();
+  let attempt = 0;
+  let claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+
+  while (!claim.ok) {
+    const elapsedMs = policy.now() - startedAt;
+    const remainingMs = policy.budgetMs - elapsedMs;
+    if (remainingMs <= 0) {
+      wedgedKeys?.add(aggregateKey);
+      return claim;
+    }
+
+    // Exponential with full jitter, clamped to whatever budget is left so the
+    // total wait cannot overrun even on the final attempt.
+    const ceiling = Math.min(
+      policy.maxDelayMs,
+      policy.initialDelayMs * 2 ** attempt,
+    );
+    const delayMs = Math.min(remainingMs, Math.ceil(policy.random() * ceiling));
+    await policy.sleep(delayMs);
+    attempt += 1;
+    claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+  }
+
+  if (attempt > 0) {
+    ctx.logger.info(
+      `Alertmanager aggregate ${aggregateKey} was held by a concurrent ` +
+        `delivery; claimed it after ${attempt} attempt(s) over ` +
+        `${policy.now() - startedAt}ms instead of failing the delivery.`,
+    );
+  }
+  return claim;
+}
+
+/**
+ * Release fences abandoned by a previous occupant of this slot (BLO-31036).
+ *
+ * Runs once per worker process, from `setup()`. The per-claim steal in
+ * `beginAggregateFiring` already unwedges any aggregate that keeps firing, but
+ * that is not sufficient on its own: an aggregate whose alert has since stopped
+ * firing receives no further delivery, so nothing would ever reclaim it and the
+ * row would sit in `firing` forever. This sweep is what makes "no fence stays
+ * held after the owner dies" an invariant rather than a property of alerts that
+ * happen to repeat.
+ *
+ * Release is justified by identity, never by age:
+ *   - `owner_instance_id IS DISTINCT FROM` this process — never touches a fence
+ *     held by a live sibling delivery in this same process. A delivery can
+ *     arrive while setup is still running, so this exclusion is load-bearing.
+ *   - same `owner_slot`, or NULL. NULL means the row was written before this
+ *     column existed, i.e. by a strictly older image, which the running process
+ *     has by definition replaced.
+ *
+ * Deliberately non-fatal: a failed sweep leaves fences wedged, which the
+ * per-claim steal can still recover. Throwing here would prevent the worker
+ * from starting at all and turn a partial outage into a total one.
+ */
+export async function reconcileAbandonedAggregateFences(
+  ctx: PluginContext,
+): Promise<number> {
+  try {
+    const fences = q(ctx.db.namespace, AGGREGATE_LIFECYCLE_FENCES_TABLE);
+    const result = await ctx.db.execute(
+      `UPDATE ${fences}
+       SET phase = 'active',
+           firing_token = NULL,
+           resolution_token = NULL,
+           owner_instance_id = NULL,
+           owner_slot = NULL,
+           updated_at = now()
+       WHERE phase IN ('firing', 'cancelling')
+         AND owner_instance_id IS DISTINCT FROM $1
+         AND (owner_slot IS NULL OR owner_slot = $2)`,
+      [WORKER_INSTANCE_ID, WORKER_SLOT],
+    );
+    if (result.rowCount > 0) {
+      ctx.logger.warn(
+        `paperclip-plugin-alertmanager: released ${result.rowCount} aggregate lifecycle fence(s) ` +
+          `abandoned by a previous occupant of slot ${WORKER_SLOT}. Each of these was refusing ` +
+          `every firing delivery for its aggregate until now.`,
+      );
+    }
+    return result.rowCount;
+  } catch (err) {
+    ctx.logger.error(
+      `paperclip-plugin-alertmanager: aggregate lifecycle fence reconciliation failed: ${String(err)}. ` +
+        `Aggregates abandoned by a previous process stay wedged until their next firing delivery reclaims them.`,
+    );
+    return 0;
+  }
+}
+
+async function finishAggregateFiring(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+  token: string,
+): Promise<void> {
+  const ns = ctx.db.namespace;
+  const result = await ctx.db.execute(
+    `UPDATE ${q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE)}
+     SET phase = 'active',
+         firing_token = NULL,
+         owner_instance_id = NULL,
+         owner_slot = NULL,
+         updated_at = now()
+     WHERE company_id = $1
+       AND aggregate_key = $2
+       AND phase = 'firing'
+       AND firing_token = $3`,
+    [companyId, aggregateKey, token],
+  );
+  if (result.rowCount === 0) {
+    throw new Error(
+      `Alertmanager aggregate firing fence was lost for ${aggregateKey}; retrying delivery`,
+    );
+  }
+}
+
+/**
+ * Recover only the exact fence named by an operator. This deliberately has no
+ * age check and never replaces a token: an interrupted delivery can be released
+ * only by a principal that has the token from that delivery.
+ *
+ * Both phases that refuse a firing claim are recoverable here. `cancelling` is
+ * included because a resolver that dies between `beginAggregateCancellation`
+ * and `releaseAggregateFinalization` leaves the fence held by a token no live
+ * process has, which permanently wedges every later firing for that aggregate.
+ * The transition it performs is the same `cancelling` -> `active` release the
+ * withheld-cancellation path already takes, so it introduces no new state.
+ *
+ * `token` is therefore a firing token or a resolution token depending on which
+ * phase holds the fence. The operator-facing request field is still named
+ * `firingToken` because that is the published wire contract; the listing route
+ * reports `phase` so the caller knows which one they are holding.
+ */
+export async function recoverAggregateFiring(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+  token: string,
+): Promise<boolean> {
+  const fences = q(ctx.db.namespace, AGGREGATE_LIFECYCLE_FENCES_TABLE);
+  const result = await ctx.db.execute(
+    `UPDATE ${fences}
+     SET phase = 'active',
+         firing_token = NULL,
+         owner_instance_id = NULL,
+         owner_slot = NULL,
+         updated_at = now()
+     WHERE company_id = $1
+       AND aggregate_key = $2
+       AND phase = 'firing'
+       AND firing_token = $3`,
+    [companyId, aggregateKey, token],
+  );
+  if (result.rowCount > 0) return true;
+  // Same compare-and-set discipline on the resolution token: a stale or wrong
+  // token releases nothing, so this cannot reopen a fence owned by a newer
+  // resolver.
+  const cancelling = await ctx.db.execute(
+    `UPDATE ${fences}
+     SET phase = 'active',
+         resolution_token = NULL,
+         owner_instance_id = NULL,
+         owner_slot = NULL,
+         updated_at = now()
+     WHERE company_id = $1
+       AND aggregate_key = $2
+       AND phase = 'cancelling'
+       AND resolution_token = $3`,
+    [companyId, aggregateKey, token],
+  );
+  return cancelling.rowCount > 0;
+}
+
+async function tryClaimAggregateFinalization(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+  issueId: string,
+): Promise<string | null> {
+  const ns = ctx.db.namespace;
+  const fences = q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE);
+  const members = q(ns, AGGREGATE_MEMBERS_TABLE);
+  const token = randomUUID();
+  await ctx.db.execute(
+    `INSERT INTO ${fences} (company_id, aggregate_key)
+     VALUES ($1, $2)
+     ON CONFLICT (company_id, aggregate_key) DO NOTHING`,
+    [companyId, aggregateKey],
+  );
+  const result = await ctx.db.execute(
+    `UPDATE ${fences}
+     SET phase = 'finalizing',
+         firing_token = NULL,
+         resolution_token = $4,
+         owner_instance_id = $5,
+         owner_slot = $6,
+         updated_at = now()
+     WHERE company_id = $1
+       AND aggregate_key = $2
+       AND phase = 'active'
+       AND NOT EXISTS (
+         SELECT 1
+         FROM ${members}
+         WHERE company_id = $1
+           AND aggregate_key = $2
+           AND issue_id = $3
+           AND resolved_at IS NULL
+       )`,
+    [
+      companyId,
+      aggregateKey,
+      issueId,
+      token,
+      WORKER_INSTANCE_ID,
+      WORKER_SLOT,
+    ],
+  );
+  return result.rowCount > 0 ? token : null;
+}
+
+async function beginAggregateCancellation(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+  token: string,
+): Promise<boolean> {
+  const ns = ctx.db.namespace;
+  // Re-stamp ownership as this process enters `cancelling`. Without it the
+  // fence would carry whatever identity claimed finalization, and a concurrent
+  // firing in this same process could then read the owner as "not me" and steal
+  // a terminal transition that is genuinely live — reintroducing exactly the
+  // race the fence exists to prevent (BLO-31036).
+  const result = await ctx.db.execute(
+    `UPDATE ${q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE)}
+     SET phase = 'cancelling',
+         owner_instance_id = $4,
+         owner_slot = $5,
+         updated_at = now()
+     WHERE company_id = $1
+       AND aggregate_key = $2
+       AND phase = 'finalizing'
+       AND resolution_token = $3`,
+    [companyId, aggregateKey, token, WORKER_INSTANCE_ID, WORKER_SLOT],
+  );
+  return result.rowCount > 0;
+}
+
+async function releaseAggregateFinalization(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+  token: string,
+): Promise<void> {
+  const ns = ctx.db.namespace;
+  await ctx.db.execute(
+    `UPDATE ${q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE)}
+     SET phase = 'active',
+         resolution_token = NULL,
+         owner_instance_id = NULL,
+         owner_slot = NULL,
+         updated_at = now()
+     WHERE company_id = $1
+       AND aggregate_key = $2
+       AND phase = 'cancelling'
+       AND resolution_token = $3`,
+    [companyId, aggregateKey, token],
+  );
+}
+
+async function resolveAggregateMember(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+  issueId: string,
+  fingerprint: string,
+  claimFinalization: boolean,
+): Promise<AggregateMemberResolution> {
+  const ns = ctx.db.namespace;
+  // Read the membership and mark it resolved as two statements, not one
+  // `UPDATE ... RETURNING`. `ctx.db.query` is SELECT-only and `ctx.db.execute`
+  // reports only a row count, so there is no host call that both writes and
+  // returns a column; issuing the `UPDATE ... RETURNING` through `ctx.db.query`
+  // is rejected with "ctx.db.query only allows SELECT statements", which threw
+  // on every resolve delivery for an aggregate-tracked fingerprint and 502'd the
+  // whole batch (BLO-31035).
+  //
+  // The split is exact rather than approximate here: both statements are keyed
+  // on the members primary key (company_id, aggregate_key, fingerprint), so the
+  // read matches at most the single row the write targets. Nothing deletes
+  // member rows, so the row cannot vanish between the two, and the write is
+  // idempotent (`COALESCE(resolved_at, now())`), so a concurrent delivery that
+  // resolves the same member in between lands on the same terminal state and
+  // keeps the earlier `resolved_at`.
+  const [member] = await ctx.db.query<{ issue_id: string }>(
+    `SELECT issue_id
+     FROM ${q(ns, AGGREGATE_MEMBERS_TABLE)}
+     WHERE company_id = $1 AND aggregate_key = $2 AND fingerprint = $3`,
+    [companyId, aggregateKey, fingerprint],
+  );
+  const resolvedIssueId = member?.issue_id ?? issueId;
+  if (!member) {
+    return { disposition: "no-membership", issueId: resolvedIssueId };
+  }
+  await ctx.db.execute(
+    `UPDATE ${q(ns, AGGREGATE_MEMBERS_TABLE)}
+     SET resolved_at = COALESCE(resolved_at, now()),
+         updated_at = now()
+     WHERE company_id = $1 AND aggregate_key = $2 AND fingerprint = $3`,
+    [companyId, aggregateKey, fingerprint],
+  );
+
+  const unresolved = await ctx.db.query<{ one: number }>(
+    `SELECT 1 AS one
+     FROM ${q(ns, AGGREGATE_MEMBERS_TABLE)}
+     WHERE company_id = $1
+       AND aggregate_key = $2
+       AND issue_id = $3
+       AND resolved_at IS NULL
+     LIMIT 1`,
+    [companyId, aggregateKey, resolvedIssueId],
+  );
+  if (unresolved.length > 0) {
+    return { disposition: "has-unresolved-siblings", issueId: resolvedIssueId };
+  }
+  if (!claimFinalization) {
+    return { disposition: "last-member-resolved", issueId: resolvedIssueId };
+  }
+  const resolutionToken = await tryClaimAggregateFinalization(
+    ctx,
+    companyId,
+    aggregateKey,
+    resolvedIssueId,
+  );
+  return resolutionToken
+    ? {
+        disposition: "last-member-resolved",
+        issueId: resolvedIssueId,
+        resolutionToken,
+      }
+    : { disposition: "finalization-pending", issueId: resolvedIssueId };
+}
+
+async function findAggregateMemberKey(
+  ctx: PluginContext,
+  companyId: string,
+  issueId: string,
+  fingerprint: string,
+): Promise<string | null> {
+  const ns = ctx.db.namespace;
+  const [member] = await ctx.db.query<{ aggregate_key: string }>(
+    `SELECT aggregate_key
+     FROM ${q(ns, AGGREGATE_MEMBERS_TABLE)}
+     WHERE company_id = $1
+       AND issue_id = $2
+       AND fingerprint = $3
+     ORDER BY updated_at DESC
+     LIMIT 1`,
+    [companyId, issueId, fingerprint],
+  );
+  return member?.aggregate_key ?? null;
+}
+
+async function recoverStateFromAggregateMember(
+  ctx: PluginContext,
+  config: AlertmanagerPluginConfig,
+  alert: AlertmanagerAlert,
+): Promise<AlertStateRecord | null> {
+  const companyId = config.defaultCompanyId;
+  if (!companyId) return null;
+  const ns = ctx.db.namespace;
+  const [member] = await ctx.db.query<{ issue_id: string; aggregate_key: string }>(
+    `SELECT issue_id, aggregate_key
+     FROM ${q(ns, AGGREGATE_MEMBERS_TABLE)}
+     WHERE company_id = $1
+       AND fingerprint = $2
+       AND resolved_at IS NULL
+     ORDER BY updated_at DESC
+     LIMIT 1`,
+    [companyId, alert.fingerprint],
+  );
+  if (!member) return null;
+  const issue = await ctx.issues.get(member.issue_id, companyId);
+  if (!issue || issue.status === "done" || issue.status === "cancelled") {
+    return null;
+  }
+  return buildRecoveredStateRecord(companyId, issue, alert, config, member.aggregate_key);
+}
+
+function rebindAlertState(
+  record: AlertStateRecord,
+  issue: IssueReference,
+): AlertStateRecord {
+  return {
+    ...record,
+    paperclipIssueId: issue.id,
+    assigneeUserId: issue.assigneeUserId ?? record.assigneeUserId ?? null,
+    assigneeAgentId: issue.assigneeAgentId ?? record.assigneeAgentId ?? null,
+  };
+}
+
+function isAggregateCreationConflict(err: unknown): boolean {
+  const message =
+    err instanceof Error
+      ? err.message
+      : typeof err === "object" && err !== null && typeof (err as { message?: unknown }).message === "string"
+        ? (err as { message: string }).message
+        : String(err);
+  return message.includes("Alertmanager aggregate creation conflict");
 }
 
 function nonEmptyString(value: string | null | undefined): string | undefined {
@@ -345,6 +1252,8 @@ export async function handleFiring(
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
   fallbackOwnerMemo?: FallbackOwnerMemo,
+  fenceWaitPolicy?: Partial<AggregateFenceWaitPolicy>,
+  fenceWedgedMemo?: AggregateFenceWedgedMemo,
 ): Promise<void> {
   // Resolved up front because it now scopes the state read, not just issue
   // creation. Without it there is no namespace to look in, so a delivery that
@@ -376,169 +1285,327 @@ export async function handleFiring(
   const nowIso = new Date().toISOString();
   const alertname = alert.labels.alertname ?? "UnnamedAlert";
   const severity = alert.labels.severity ?? "unknown";
-
-  if (existing && existing.paperclipIssueId) {
-    // Re-fire: refresh body (drill-in URLs may carry a fresh time range) and
-    // re-open if the plugin previously auto-cancelled it on resolve, or if an
-    // operator's close has aged past the suppression window (BLO-24234).
-    const newDescription = buildIssueDescription(alert);
-    // Carried out of the try so the state write below records what actually
-    // happened. A decision the RPC then failed to apply must not be persisted
-    // as applied — otherwise a transient issues.update outage would bank the
-    // suppression anchor (or clear it) on the strength of a call that never
-    // landed, and the next re-fire would reason from a fiction.
-    let decision: RefireDecision = { kind: "issue_missing" };
-    let decisionApplied = false;
-    try {
-      const issue = await ctx.issues.get(
-        existing.paperclipIssueId,
+  const storedAggregateKey = existing
+    ? (existing.aggregateKey ??
+      (await findAggregateMemberKey(
+        ctx,
         existing.paperclipCompanyId,
-      );
-      decision = decideRefire(issue, existing, config, Date.now());
+        existing.paperclipIssueId,
+        alert.fingerprint,
+      )))
+    : null;
+  const aggregateKey = storedAggregateKey ?? aggregateKeyForAlert(alert);
 
-      if (decision.kind === "reopen") {
-        await ctx.issues.update(
+  if (!existing && (alert.labels.severity ?? "").trim().toLowerCase() === "info") {
+    ctx.logger.info(
+      `Alertmanager: ${alertname} is below the issue creation floor (severity=info)`,
+    );
+    try {
+      await ctx.metrics.write("alertmanager.webhook.below_issue_floor", 1, {
+        alertname,
+        severity: "info",
+      });
+    } catch (metricErr) {
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record issue floor metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
+    return;
+  }
+
+  const firingClaim = await claimAggregateFiringWaiting(
+    ctx,
+    companyId,
+    aggregateKey,
+    fenceWaitPolicy,
+    fenceWedgedMemo,
+  );
+  if (!firingClaim.ok) {
+    throw new Error(
+      `Alertmanager aggregate ${aggregateKey} is held in phase ` +
+        `'${firingClaim.blockingPhase ?? "unknown"}' by a delivery in progress; ` +
+        `retrying firing delivery. A fence abandoned by a dead process is released ` +
+        `automatically by its slot's next worker; if this persists, the holder is ` +
+        `either live or in another slot, and an operator can release it via the ` +
+        `plugin's recover-aggregate-firing route.`,
+    );
+  }
+  const firingToken = firingClaim.token;
+
+  try {
+    if (existing && existing.paperclipIssueId) {
+      // Re-fire: refresh body (drill-in URLs may carry a fresh time range) and
+      // re-open if the plugin previously auto-cancelled it on resolve, or if an
+      // operator's close has aged past the suppression window (BLO-24234).
+      let tracked = existing;
+      const newDescription = buildIssueDescription(alert);
+      // Carried out of the try so the state write below records what actually
+      // happened. A decision the RPC then failed to apply must not be persisted
+      // as applied — otherwise a transient issues.update outage would bank the
+      // suppression anchor (or clear it) on the strength of a call that never
+      // landed, and the next re-fire would reason from a fiction.
+      let decision: RefireDecision = { kind: "issue_missing" };
+      let decisionApplied = false;
+      try {
+        const issue = await ctx.issues.get(
           existing.paperclipIssueId,
-          { status: "todo", description: newDescription },
           existing.paperclipCompanyId,
         );
-        if (decision.reason === "suppression_expired") {
-          // Say why the close did not stick, on the issue itself — an operator
-          // who closed this yesterday needs to know it re-opened because the
-          // alert never stopped firing, not because something ignored them.
-          try {
-            await ctx.issues.createComment(
-              existing.paperclipIssueId,
-              `Re-opened by paperclip-plugin-alertmanager: this issue was closed by hand, but \`${alertname}\` has kept firing past the ${operatorSuppressionHoursLabel(config)} suppression window. Closing it again will suppress it for another window; silence the alert rule itself if it should stop paging.`,
+        decision = decideRefire(issue, existing, config, Date.now());
+
+        // Barrier before the first issue mutation. Placed *after* the reads
+        // above so the window between proving ownership and acting on it holds
+        // no RPC of our own: everything from here to `upsertAggregateMember` is
+        // a write, and a predecessor displaced before this point performs none
+        // of them. The reads are unguarded on purpose — they mutate nothing.
+        await assertFiringGeneration(ctx, companyId, aggregateKey, firingToken);
+
+        if (decision.kind === "reopen") {
+          if (decision.reason === "plugin_resolved") {
+            // A different firing in this aggregate may already have created a
+            // live winner while this fingerprint was resolved. Rebind to that
+            // winner before reopening the terminal issue, which avoids
+            // resurrecting a cancelled aggregate member.
+            const activeAggregateIssue = await findActiveAggregateIssue(
+              ctx,
               existing.paperclipCompanyId,
+              aggregateKey,
             );
-          } catch (commentErr) {
-            // The re-open is the load-bearing half and has already landed.
+            if (
+              activeAggregateIssue &&
+              activeAggregateIssue.id !== existing.paperclipIssueId
+            ) {
+              tracked = rebindAlertState(existing, activeAggregateIssue);
+              await ctx.issues.update(
+                activeAggregateIssue.id,
+                { description: newDescription },
+                existing.paperclipCompanyId,
+                undefined,
+                { fencing: firingFence(companyId, aggregateKey, firingToken) },
+              );
+              await ctx.metrics.write("alertmanager.aggregate.rebound", 1, {
+                alertname,
+                severity,
+              });
+            } else {
+              try {
+                await ctx.issues.update(
+                  existing.paperclipIssueId,
+                  { status: "todo", description: newDescription },
+                  existing.paperclipCompanyId,
+                  undefined,
+                  { fencing: firingFence(companyId, aggregateKey, firingToken) },
+                );
+                await ctx.metrics.write("alertmanager.firing.reopened", 1, {
+                  alertname,
+                  severity,
+                });
+              } catch (err) {
+                // A competing firing can win the aggregate between the lookup
+                // and this update. Re-read the winner before surfacing the
+                // original error so the retry follows the active issue.
+                const reboundIssue = await findActiveAggregateIssue(
+                  ctx,
+                  existing.paperclipCompanyId,
+                  aggregateKey,
+                );
+                if (
+                  !reboundIssue ||
+                  reboundIssue.id === existing.paperclipIssueId
+                ) {
+                  throw err;
+                }
+                tracked = rebindAlertState(existing, reboundIssue);
+                await ctx.issues.update(
+                  reboundIssue.id,
+                  { description: newDescription },
+                  existing.paperclipCompanyId,
+                  undefined,
+                  { fencing: firingFence(companyId, aggregateKey, firingToken) },
+                );
+                await ctx.metrics.write("alertmanager.aggregate.rebound", 1, {
+                  alertname,
+                  severity,
+                });
+              }
+            }
+          } else {
+            await ctx.issues.update(
+              existing.paperclipIssueId,
+              { status: "todo", description: newDescription },
+              existing.paperclipCompanyId,
+              undefined,
+              { fencing: firingFence(companyId, aggregateKey, firingToken) },
+            );
+            // Say why the close did not stick, on the issue itself — an
+            // operator who closed this yesterday needs to know it re-opened
+            // because the alert never stopped firing, not because something
+            // ignored them.
+            try {
+              await ctx.issues.createComment(
+                existing.paperclipIssueId,
+                `Re-opened by paperclip-plugin-alertmanager: this issue was closed by hand, but \`${alertname}\` has kept firing past the ${operatorSuppressionHoursLabel(config)} suppression window. Closing it again will suppress it for another window; silence the alert rule itself if it should stop paging.`,
+                existing.paperclipCompanyId,
+                { fencing: firingFence(companyId, aggregateKey, firingToken) },
+              );
+            } catch (commentErr) {
+              // The re-open is the load-bearing half and has already landed.
+              ctx.logger.warn(
+                `Re-opened issue ${existing.paperclipIssueId} after suppression expiry but could not post the explanatory comment: ${String(commentErr)}`,
+              );
+            }
+            await ctx.metrics.write("alertmanager.firing.suppression_expired", 1, {
+              alertname,
+              severity,
+            });
+          }
+        } else if (decision.kind === "refresh") {
+          await ctx.issues.update(
+            existing.paperclipIssueId,
+            { description: newDescription },
+            existing.paperclipCompanyId,
+            undefined,
+            { fencing: firingFence(companyId, aggregateKey, firingToken) },
+          );
+        } else if (decision.kind === "suppressed") {
+          // The whole point of BLO-24234: this path used to be entirely silent,
+          // emitting only `firing.deduped` — indistinguishable from a healthy
+          // re-fire against an open issue. A muted fingerprint must be visible
+          // as muted, every time it fires, or nobody can tell that a delivered
+          // page produced no actionable artifact.
+          if (decision.firstObservation) {
             ctx.logger.warn(
-              `Re-opened issue ${existing.paperclipIssueId} after suppression expiry but could not post the explanatory comment: ${String(commentErr)}`,
+              `Alert ${alertname} (${alert.fingerprint}) re-fired against operator-closed issue ${existing.paperclipIssueId}; suppressing re-open until ${suppressionExpiryLabel(decision.suppressedAt, config)}`,
+            );
+          } else {
+            ctx.logger.info(
+              `Alert ${alertname} (${alert.fingerprint}) still suppressed by operator close of issue ${existing.paperclipIssueId} (until ${suppressionExpiryLabel(decision.suppressedAt, config)})`,
             );
           }
-          await ctx.metrics.write("alertmanager.firing.suppression_expired", 1, {
+          await ctx.metrics.write("alertmanager.firing.suppressed", 1, {
+            alertname,
+            severity,
+          });
+        } else {
+          // `issues.get` returned nothing — the issue was hard-deleted out from
+          // under the state row. Previously this fell through both branches in
+          // silence; say so, since the fingerprint is now tracking a ghost.
+          ctx.logger.warn(
+            `Alert ${alertname} (${alert.fingerprint}) re-fired but its tracked issue ${existing.paperclipIssueId} could not be read; leaving state intact`,
+          );
+          await ctx.metrics.write("alertmanager.firing.issue_missing", 1, {
             alertname,
             severity,
           });
         }
-        await ctx.metrics.write("alertmanager.firing.reopened", 1, {
-          alertname,
-          severity,
-        });
-      } else if (decision.kind === "refresh") {
-        await ctx.issues.update(
-          existing.paperclipIssueId,
-          { description: newDescription },
-          existing.paperclipCompanyId,
-        );
-      } else if (decision.kind === "suppressed") {
-        // The whole point of BLO-24234: this path used to be entirely silent,
-        // emitting only `firing.deduped` — indistinguishable from a healthy
-        // re-fire against an open issue. A muted fingerprint must be visible
-        // as muted, every time it fires, or nobody can tell that a delivered
-        // page produced no actionable artifact.
-        if (decision.firstObservation) {
-          ctx.logger.warn(
-            `Alert ${alertname} (${alert.fingerprint}) re-fired against operator-closed issue ${existing.paperclipIssueId}; suppressing re-open until ${suppressionExpiryLabel(decision.suppressedAt, config)}`,
-          );
-        } else {
-          ctx.logger.info(
-            `Alert ${alertname} (${alert.fingerprint}) still suppressed by operator close of issue ${existing.paperclipIssueId} (until ${suppressionExpiryLabel(decision.suppressedAt, config)})`,
-          );
-        }
-        await ctx.metrics.write("alertmanager.firing.suppressed", 1, {
-          alertname,
-          severity,
-        });
-      } else {
-        // `issues.get` returned nothing — the issue was hard-deleted out from
-        // under the state row. Previously this fell through both branches in
-        // silence; say so, since the fingerprint is now tracking a ghost.
+        decisionApplied = true;
+      } catch (err) {
+        // Losing the generation is not a re-sync failure to be tolerated: this
+        // delivery no longer owns the aggregate, so it must not fall through to
+        // the state write and event emission below on the strength of a
+        // decision it was never entitled to apply.
+        if (err instanceof AggregateGenerationLostError) throw err;
         ctx.logger.warn(
-          `Alert ${alertname} (${alert.fingerprint}) re-fired but its tracked issue ${existing.paperclipIssueId} could not be read; leaving state intact`,
+          `Failed to re-sync existing issue ${existing.paperclipIssueId} on re-fire: ${String(err)}`,
         );
-        await ctx.metrics.write("alertmanager.firing.issue_missing", 1, {
-          alertname,
-          severity,
-        });
       }
-      decisionApplied = true;
-    } catch (err) {
-      ctx.logger.warn(
-        `Failed to re-sync existing issue ${existing.paperclipIssueId} on re-fire: ${String(err)}`,
+
+      // Ladder restart keeps its original trigger — the alert going
+      // resolved → firing — which is independent of the issue's status: an
+      // operator may have re-opened the issue by hand, in which case the branch
+      // above is a plain `refresh` but `handleResolved` has still left
+      // `nextEscalationAt` null and `escalationComplete` true. Gating this on
+      // the re-open would silently disarm escalation for exactly that case.
+      //
+      // A suppression-expiry re-open is the one new trigger: the ladder has
+      // been frozen for the whole suppression window, so the now-visible issue
+      // needs a live deadline or it will never page anyone.
+      const suppressionExpiryReopen =
+        decisionApplied &&
+        decision.kind === "reopen" &&
+        decision.reason === "suppression_expired";
+      const ladderRestart = Boolean(existing.resolvedAt) || suppressionExpiryReopen;
+      // Only a decision we actually applied may move the anchor. `issue_missing`
+      // preserves it: the issue was unreadable, so we learned nothing about
+      // whether the operator's close still stands, and dropping the anchor would
+      // restart the whole window on the next readable re-fire.
+      const suppressionAnchor =
+        !decisionApplied || decision.kind === "issue_missing"
+          ? (existing.operatorSuppressedAt ?? null)
+          : decision.kind === "suppressed"
+            ? decision.suppressedAt
+            : null;
+
+      await upsertAggregateMember(
+        ctx,
+        tracked.paperclipCompanyId,
+        aggregateKey,
+        tracked.paperclipIssueId,
+        alert.fingerprint,
+        firingToken,
       );
-    }
 
-    // Ladder restart keeps its original trigger — the alert going
-    // resolved → firing — which is independent of the issue's status: an
-    // operator may have re-opened the issue by hand, in which case the branch
-    // above is a plain `refresh` but `handleResolved` has still left
-    // `nextEscalationAt` null and `escalationComplete` true. Gating this on the
-    // re-open would silently disarm escalation for exactly that case.
-    //
-    // A suppression-expiry re-open is the one new trigger: the ladder has been
-    // frozen for the whole suppression window, so the now-visible issue needs a
-    // live deadline or it will never page anyone.
-    const suppressionExpiryReopen =
-      decisionApplied &&
-      decision.kind === "reopen" &&
-      decision.reason === "suppression_expired";
-    const ladderRestart = Boolean(existing.resolvedAt) || suppressionExpiryReopen;
-    // Only a decision we actually applied may move the anchor. `issue_missing`
-    // preserves it: the issue was unreadable, so we learned nothing about
-    // whether the operator's close still stands, and dropping the anchor would
-    // restart the whole window on the next readable re-fire.
-    const suppressionAnchor =
-      !decisionApplied || decision.kind === "issue_missing"
-        ? (existing.operatorSuppressedAt ?? null)
-        : decision.kind === "suppressed"
-          ? decision.suppressedAt
-          : null;
-
-    const updated: AlertStateRecord = {
-      ...existing,
-      alertname,
-      severity,
-      lastFiredAt: nowIso,
-      resolvedAt: null,
-      operatorSuppressedAt: suppressionAnchor,
-      nextEscalationAt: ladderRestart
-        ? (() => {
-            const delay = escalationDeadlineMs(alert, config);
-            return delay === null ? null : new Date(Date.now() + delay).toISOString();
-          })()
-        : existing.nextEscalationAt,
-      escalationAttempt: ladderRestart ? 0 : existing.escalationAttempt,
-      escalationComplete: ladderRestart ? false : existing.escalationComplete,
-      escalationIntervalMs: ladderRestart
-        ? escalationDeadlineMs(alert, config)
-        : (existing.escalationIntervalMs ?? escalationDeadlineMs(alert, config)),
-    };
-    await ctx.state.set(stateRef, updated);
-
-    await ctx.events.emit(
-      "alertmanager.alert.firing",
-      existing.paperclipCompanyId,
-      {
-        fingerprint: alert.fingerprint,
+      const updated: AlertStateRecord = {
+        ...tracked,
+        aggregateKey,
         alertname,
         severity,
-        labels: alert.labels,
-        annotations: alert.annotations,
-        paperclipIssueId: existing.paperclipIssueId,
-        assigneeUserId: existing.assigneeUserId,
-        assigneeAgentId: existing.assigneeAgentId ?? null,
-        reFired: true,
-      },
-    );
-    await ctx.metrics.write("alertmanager.firing.deduped", 1, {
-      alertname,
-      severity,
-    });
-    return;
-  }
+        lastFiredAt: nowIso,
+        resolvedAt: null,
+        operatorSuppressedAt: suppressionAnchor,
+        nextEscalationAt: ladderRestart
+          ? (() => {
+              const delay = escalationDeadlineMs(alert, config);
+              return delay === null ? null : new Date(Date.now() + delay).toISOString();
+            })()
+          : existing.nextEscalationAt,
+        escalationAttempt: ladderRestart ? 0 : existing.escalationAttempt,
+        escalationComplete: ladderRestart ? false : existing.escalationComplete,
+        escalationIntervalMs: ladderRestart
+          ? escalationDeadlineMs(alert, config)
+          : (existing.escalationIntervalMs ?? escalationDeadlineMs(alert, config)),
+      };
+      // Fenced, like the member write above and for the same reason. Winning
+      // `upsertAggregateMember` proves ownership *at that statement*, not for
+      // the rest of the delivery: a steal committing right after it would
+      // otherwise let this displaced worker overwrite the aggregate's alert
+      // state with its own stale view. The host holds the generation lock to
+      // commit, so the steal and this write cannot interleave.
+      await ctx.state.set(stateRef, updated, {
+        fencing: firingFence(companyId, aggregateKey, firingToken),
+      });
+
+      // Same generation, re-read immediately before dispatch — but an
+      // ownership *check*, not a fence, and named accordingly. It stops a
+      // displaced predecessor announcing a re-fire in the common case, where
+      // the displacement happened long before this point. It does not make
+      // delivery authoritative: a steal landing between the check and the
+      // fan-out still delivers. Nothing in this repo subscribes to this event,
+      // and any future subscriber must re-establish ownership before acting on
+      // it rather than trusting delivery. See `PluginEventOwnershipCheck` and
+      // BLO-31113 for the authoritative-delivery follow-up.
+      await ctx.events.emit(
+        "alertmanager.alert.firing",
+        tracked.paperclipCompanyId,
+        {
+          fingerprint: alert.fingerprint,
+          alertname,
+          severity,
+          labels: alert.labels,
+          annotations: alert.annotations,
+          paperclipIssueId: tracked.paperclipIssueId,
+          assigneeUserId: tracked.assigneeUserId,
+          assigneeAgentId: tracked.assigneeAgentId ?? null,
+          reFired: true,
+        },
+        { ownershipCheck: firingFence(companyId, aggregateKey, firingToken) },
+      );
+      await ctx.metrics.write("alertmanager.firing.deduped", 1, {
+        alertname,
+        severity,
+      });
+      return;
+    }
 
   // Creation floor. Deliberately placed *after* the re-fire branch above and
   // before creation only: an `info` alert that already owns an issue (filed
@@ -571,13 +1638,9 @@ export async function handleFiring(
 
   // First time we've seen this fingerprint — create a new issue. `companyId` is
   // already resolved and non-empty; it scoped the state read above.
-  const { assigneeUserId, assigneeAgentId, resolution } =
-    await resolveAssigneeUserId(ctx, alert, config.ownerMap);
+  let retainedIssue = await findActiveAggregateIssue(ctx, companyId, aggregateKey);
   const issueRouteResolution = resolveIssueRoute(alert, config.issueRouteMap);
   const issueRoute = issueRouteResolution.route;
-  const ownerOverride =
-    resolution.source === "label-override" ||
-    resolution.source === "annotation-override";
   const routeAssigneeAgentId = nonEmptyString(issueRoute?.assigneeAgentId);
   const routeHasAssigneeUserId = Object.prototype.hasOwnProperty.call(
     issueRoute ?? {},
@@ -586,24 +1649,34 @@ export async function handleFiring(
   const routeAssigneeUserId = routeHasAssigneeUserId
     ? nonEmptyString(issueRoute?.assigneeUserId ?? undefined)
     : undefined;
-  const createAssigneeAgentId = ownerOverride
-    ? assigneeAgentId
-    : routeAssigneeAgentId ?? assigneeAgentId;
-  const createAssigneeUserId = createAssigneeAgentId
-    ? undefined
-    : ownerOverride
-      ? assigneeUserId
-      : routeHasAssigneeUserId
-        ? routeAssigneeUserId
-        : assigneeUserId;
-  // Last rung of the owner chain. Before this, an unresolved owner fell through
-  // to a conditional spread on `issues.create` that simply omitted the field —
-  // so the alert landed as an ownerless issue, which nobody is woken for and
-  // which auto-cancels unattended (BLO-27435 / BLO-27436 / BLO-27438 all did
-  // exactly this on 2026-08-17). Assigning a configured named agent is what
-  // makes an intake issue actionable.
+  let createAssigneeAgentId: string | undefined;
+  let createAssigneeUserId: string | undefined;
+  let assigneeResolutionSource = "aggregate-winner";
+  let resolvedTarget = "(aggregate-winner)";
+  if (!retainedIssue) {
+    const { assigneeUserId, assigneeAgentId, resolution } =
+      await resolveAssigneeUserId(ctx, alert, config.ownerMap);
+    const ownerOverride =
+      resolution.source === "label-override" ||
+      resolution.source === "annotation-override";
+    createAssigneeAgentId = ownerOverride
+      ? assigneeAgentId
+      : routeAssigneeAgentId ?? assigneeAgentId;
+    createAssigneeUserId = createAssigneeAgentId
+      ? undefined
+      : ownerOverride
+        ? assigneeUserId
+        : routeHasAssigneeUserId
+          ? routeAssigneeUserId
+          : assigneeUserId;
+    assigneeResolutionSource = resolution.source;
+    resolvedTarget =
+      resolution.agentId
+        ? `agent:${resolution.agentId}`
+        : resolution.email ?? "(none)";
+  }
   const fallbackAssigneeAgentId =
-    createAssigneeAgentId || createAssigneeUserId
+    retainedIssue || createAssigneeAgentId || createAssigneeUserId
       ? undefined
       : await resolveFallbackAgentIdMemoized(
           ctx,
@@ -612,32 +1685,14 @@ export async function handleFiring(
           fallbackOwnerMemo,
         );
   const finalAssigneeAgentId = createAssigneeAgentId ?? fallbackAssigneeAgentId;
-  if (!finalAssigneeAgentId && !createAssigneeUserId) {
-    // Fail closed. Throwing (rather than returning) is deliberate: this is a
-    // *configuration* fault, not a property of the alert, so the delivery is
-    // genuinely incomplete. handleWebhook collects the fingerprint and answers
-    // non-2xx, Alertmanager keeps retrying, and the alert survives until an
-    // operator fixes `fallbackAgentName`. Returning here would acknowledge the
-    // delivery and destroy the alert silently — the BLO-20467 loss class.
+  if (!retainedIssue && !finalAssigneeAgentId && !createAssigneeUserId) {
     ctx.logger.warn(
-      `Cannot create issue for ${alertname}: fallbackAgentName is missing, unmatched, ambiguous, or matched only non-invokable agents; refusing ownerless issue creation`,
+      `Cannot create issue for ${alertname}: fallbackAgentName is missing, invalid, or ambiguous`,
     );
-    try {
-      await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
-        alertname,
-        severity,
-      });
-    } catch (metricErr) {
-      // Unlike the policy drops above, this path throws either way — so the
-      // wrapper is not about the delivery outcome, it is about the message.
-      // An unwrapped metrics outage would replace the explicit
-      // "Fallback owner resolution failed" below with an opaque metrics error,
-      // degrading the diagnostic for exactly the misconfiguration this path
-      // exists to surface.
-      ctx.logger.error(
-        `paperclip-plugin-alertmanager: failed to record fallback owner failure metric for ${alert.fingerprint}: ${String(metricErr)}`,
-      );
-    }
+    await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
+      alertname,
+      severity,
+    });
     throw new Error(
       `Fallback owner resolution failed for ${alertname}; refusing ownerless issue creation`,
     );
@@ -645,16 +1700,10 @@ export async function handleFiring(
   const routeProjectId = nonEmptyString(issueRoute?.projectId);
   const routeGoalId = nonEmptyString(issueRoute?.goalId);
   const routeStatus = issueRoute?.status;
-  const resolvedTarget =
-    resolution.agentId
-      ? `agent:${resolution.agentId}`
-      : resolution.email ?? "(none)";
   const resolvedAssignee =
     finalAssigneeAgentId ?? createAssigneeUserId ?? "(no assignee)";
   ctx.logger.debug(
-    `Owner resolution for ${alertname}: ${resolution.source} → ${resolvedTarget} → ${resolvedAssignee}${
-      fallbackAssigneeAgentId ? " (named fallback)" : ""
-    }`,
+    `Owner resolution for ${alertname}: ${assigneeResolutionSource} → ${resolvedTarget} → ${resolvedAssignee}`,
   );
   if (issueRouteResolution.source) {
     ctx.logger.debug(
@@ -668,26 +1717,92 @@ export async function handleFiring(
 
   const billingCode = alert.labels.billing_code ?? null;
 
-  const issue = await ctx.issues.create({
-    companyId,
-    title,
-    description,
-    priority,
-    originKind: ORIGIN_KIND,
-    originId: alert.fingerprint,
-    ...(routeProjectId ? { projectId: routeProjectId } : {}),
-    ...(routeGoalId ? { goalId: routeGoalId } : {}),
-    ...(routeStatus ? { status: routeStatus } : {}),
-    ...(createAssigneeUserId ? { assigneeUserId: createAssigneeUserId } : {}),
-    ...(finalAssigneeAgentId ? { assigneeAgentId: finalAssigneeAgentId } : {}),
-    ...(billingCode ? { billingCode } : {}),
-  });
+  let created = retainedIssue === null;
+  let issue = retainedIssue;
+  // Same barrier as the re-fire path, before the creation path's own aggregate
+  // side effects. Without it a displaced predecessor filed a brand-new issue
+  // for an aggregate it no longer owned and only lost the race at the member
+  // write below, leaving an orphan issue no member row and no resolver refers
+  // to. All the owner/route resolution above is reads, so proving ownership
+  // here rather than at the claim keeps the window free of our own RPCs.
+  await assertFiringGeneration(ctx, companyId, aggregateKey, firingToken);
+  if (!issue) {
+    let claimToken: string | null = null;
+    try {
+      claimToken = await tryClaimAggregateCreation(ctx, companyId, aggregateKey);
+      if (!claimToken) {
+        const retained = await findActiveAggregateIssue(
+          ctx,
+          companyId,
+          aggregateKey,
+        );
+        if (retained) {
+          issue = retained;
+          created = false;
+        } else {
+          throw new Error(
+            `Alertmanager aggregate creation already in progress for ${aggregateKey}`,
+          );
+        }
+      }
+      if (!issue) {
+        issue = await ctx.issues.create({
+          companyId,
+          fencing: firingFence(companyId, aggregateKey, firingToken),
+          title,
+          description,
+          priority,
+          originKind: ORIGIN_KIND,
+          originId: alert.fingerprint,
+          originFingerprint: aggregateKey,
+          ...(routeProjectId ? { projectId: routeProjectId } : {}),
+          ...(routeGoalId ? { goalId: routeGoalId } : {}),
+          ...(routeStatus ? { status: routeStatus } : {}),
+          ...(createAssigneeUserId ? { assigneeUserId: createAssigneeUserId } : {}),
+          ...(finalAssigneeAgentId ? { assigneeAgentId: finalAssigneeAgentId } : {}),
+          ...(billingCode ? { billingCode } : {}),
+        });
+      }
+    } catch (err) {
+      if (!isAggregateCreationConflict(err)) throw err;
+      const retained = await findActiveAggregateIssue(
+        ctx,
+        companyId,
+        aggregateKey,
+      );
+      if (!retained) throw err;
+      issue = retained;
+      created = false;
+    } finally {
+      if (claimToken) {
+        try {
+          await releaseAggregateCreationClaim(
+            ctx,
+            companyId,
+            aggregateKey,
+            claimToken,
+          );
+        } catch (releaseErr) {
+          ctx.logger.warn(
+            `paperclip-plugin-alertmanager: failed to release aggregate creation claim for ${aggregateKey}: ${String(releaseErr)}`,
+          );
+        }
+      }
+    }
+  }
+  const effectiveAssigneeUserId = created
+    ? createAssigneeUserId ?? null
+    : issue.assigneeUserId ?? null;
+  const effectiveAssigneeAgentId = created
+    ? finalAssigneeAgentId ?? null
+    : issue.assigneeAgentId ?? null;
 
   const record: AlertStateRecord = {
     paperclipIssueId: issue.id,
     paperclipCompanyId: companyId,
-    assigneeUserId: createAssigneeUserId ?? null,
-    assigneeAgentId: finalAssigneeAgentId ?? null,
+    aggregateKey,
+    assigneeUserId: effectiveAssigneeUserId,
+    assigneeAgentId: effectiveAssigneeAgentId,
     alertname,
     severity,
     firstSeenAt: alert.startsAt || nowIso,
@@ -701,38 +1816,72 @@ export async function handleFiring(
     escalationComplete: false,
     escalationIntervalMs: escalationDeadlineMs(alert, config),
   };
-  await ctx.state.set(stateRef, record);
-
-  await ctx.events.emit("alertmanager.alert.firing", companyId, {
-    fingerprint: alert.fingerprint,
-    alertname,
-    severity,
-    labels: alert.labels,
-    annotations: alert.annotations,
-    paperclipIssueId: issue.id,
-    assigneeUserId: createAssigneeUserId ?? null,
-    assigneeAgentId: finalAssigneeAgentId ?? null,
-    reFired: false,
+  await upsertAggregateMember(
+    ctx,
+    companyId,
+    aggregateKey,
+    issue.id,
+    alert.fingerprint,
+    firingToken,
+  );
+  // Fenced for the same reason as the re-fire path above: winning the member
+  // write proves ownership at that statement only, and the creation path has
+  // the same unguarded tail. Ally flagged this site specifically — a creation
+  // delivery displaced right after the member upsert would otherwise publish
+  // alert state and a firing event for an aggregate it no longer owns.
+  await ctx.state.set(stateRef, record, {
+    fencing: firingFence(companyId, aggregateKey, firingToken),
   });
+
+  await ctx.events.emit(
+    "alertmanager.alert.firing",
+    companyId,
+    {
+      fingerprint: alert.fingerprint,
+      alertname,
+      severity,
+      labels: alert.labels,
+      annotations: alert.annotations,
+      paperclipIssueId: issue.id,
+      assigneeUserId: effectiveAssigneeUserId,
+      assigneeAgentId: effectiveAssigneeAgentId,
+      reFired: !created,
+    },
+    { ownershipCheck: firingFence(companyId, aggregateKey, firingToken) },
+  );
 
   await ctx.activity.log({
     companyId,
-    message: `Alertmanager: created issue for firing alert "${alertname}" (severity=${severity})`,
+    message: created
+      ? `Alertmanager: created issue for firing alert "${alertname}" (severity=${severity})`
+      : `Alertmanager: attached firing alert "${alertname}" to aggregate issue (severity=${severity})`,
     entityType: "issue",
     entityId: issue.id,
     metadata: {
       fingerprint: alert.fingerprint,
-      assigneeResolutionSource: resolution.source,
+      aggregateKey,
+      created,
+      assigneeResolutionSource,
       issueRouteSource: issueRouteResolution.source
         ? `${issueRouteResolution.source.labelKey}=${issueRouteResolution.source.labelValue}`
         : "no-match",
     },
   });
 
+  if (!created) {
+    await ctx.metrics.write("alertmanager.aggregate.joined", 1, {
+      alertname,
+      severity,
+    });
+  }
+
   await ctx.metrics.write("alertmanager.firing.handled", 1, {
     alertname,
     severity,
   });
+  } finally {
+    await finishAggregateFiring(ctx, companyId, aggregateKey, firingToken);
+  }
 }
 
 /**
@@ -748,6 +1897,59 @@ async function ensureResolutionComment(
   const body = `Alert resolved at ${resolvedAt}.`;
   const comments = await ctx.issues.listComments(issueId, companyId);
   if (comments.some((comment) => comment.body === body)) return;
+  await ctx.issues.createComment(issueId, body, companyId);
+}
+
+/**
+ * BLO-29908: the resolve-driven cancel pins both execution-lock columns to
+ * `null`, so a row a live run holds fails the precondition instead of being
+ * cancelled. `updateIssue` answers that with a 409 whose message is one of
+ * three "…before the update could be applied" variants (checkout owner,
+ * execution owner, or the in-transaction precondition catch-all).
+ *
+ * Matching the shared suffix is deliberate: those are the ONLY preconditions
+ * this call sets, so any of them failing means exactly one thing — a lock
+ * appeared or was already held. Anything else is a real fault and must
+ * propagate so the delivery fails and Alertmanager retries, rather than being
+ * silently reported as a withheld cancel.
+ */
+function isExecutionLockPreconditionFailure(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  return message.includes("before the update could be applied");
+}
+
+/**
+ * Marker line keyed on the holding run, not on `resolvedAt`. A flapping
+ * fingerprint resolves twice an hour (BLO-29905 / BLO-29393), so keying the
+ * idempotency on the timestamp would append a near-identical comment on every
+ * cycle. One notification per holding run is the useful signal: it tells the
+ * run that its subject cleared, once.
+ */
+function cancelWithheldMarker(runId: string): string {
+  return `<!-- alertmanager:cancel-withheld:${runId} -->`;
+}
+
+async function ensureCancelWithheldComment(
+  ctx: PluginContext,
+  issueId: string,
+  companyId: string,
+  resolvedAt: string,
+  runId: string,
+) {
+  const marker = cancelWithheldMarker(runId);
+  const comments = await ctx.issues.listComments(issueId, companyId);
+  if (comments.some((comment) => comment.body.includes(marker))) return;
+  const body = [
+    marker,
+    `**Alert resolved at ${resolvedAt} — auto-cancel withheld.**`,
+    "",
+    `This issue is held by execution run \`${runId}\`, so \`paperclip-plugin-alertmanager\` left`,
+    "the status untouched rather than cancelling the row and clearing the execution lock.",
+    "",
+    "- The underlying alert is no longer firing. If your investigation is done, close this issue yourself.",
+    "- The lock is intact: nothing was released out from under the holding run.",
+    "- Cancelling here is the holder's decision, not the bridge's ([BLO-29908](/BLO/issues/BLO-29908)).",
+  ].join("\n");
   await ctx.issues.createComment(issueId, body, companyId);
 }
 
@@ -780,59 +1982,166 @@ export async function handleResolved(
 
   const resolvedAt = alert.endsAt || new Date().toISOString();
   const alertname = existing.alertname;
-
-  if (config.autoCloseOnResolve !== false) {
-    const issue = await ctx.issues.get(
-      existing.paperclipIssueId,
+  const storedAggregateKey =
+    existing.aggregateKey ??
+    (await findAggregateMemberKey(
+      ctx,
       existing.paperclipCompanyId,
-    );
-    if (issue && issue.status !== "done" && issue.status !== "cancelled") {
-      await ctx.issues.update(
-        existing.paperclipIssueId,
-        { status: "cancelled" },
+      existing.paperclipIssueId,
+      alert.fingerprint,
+    ));
+  const aggregateKey = storedAggregateKey ?? aggregateKeyForAlert(alert);
+  const aggregateResolution = await resolveAggregateMember(
+    ctx,
+    existing.paperclipCompanyId,
+    aggregateKey,
+    existing.paperclipIssueId,
+    alert.fingerprint,
+    config.autoCloseOnResolve !== false,
+  );
+  let cancellationToken: string | null = null;
+  let cancelWithheldForRunId: string | null = null;
+
+  try {
+    if (config.autoCloseOnResolve !== false) {
+      if (aggregateResolution.disposition === "finalization-pending") {
+        throw new Error(
+          `Alertmanager aggregate ${aggregateKey} is already finalizing; retrying resolution delivery`,
+        );
+      }
+      // Old per-fingerprint records have no aggregate key or member row, so
+      // retain their historical close behavior. Aggregate-tracked records are
+      // fail-closed: a missing membership never authorizes cancellation.
+      const shouldCancel =
+        aggregateResolution.disposition === "last-member-resolved" ||
+        (!storedAggregateKey && aggregateResolution.disposition === "no-membership");
+      if (shouldCancel) {
+        if (aggregateResolution.disposition === "last-member-resolved") {
+          const resolutionToken = aggregateResolution.resolutionToken;
+          if (
+            !resolutionToken ||
+            !(await beginAggregateCancellation(
+              ctx,
+              existing.paperclipCompanyId,
+              aggregateKey,
+              resolutionToken,
+            ))
+          ) {
+            throw new Error(
+              `Alertmanager aggregate ${aggregateKey} firing invalidated finalization; retrying resolution delivery`,
+            );
+          }
+          cancellationToken = resolutionToken;
+        }
+        const issue = await ctx.issues.get(
+          aggregateResolution.issueId,
+          existing.paperclipCompanyId,
+        );
+        if (issue && issue.status !== "done" && issue.status !== "cancelled") {
+          try {
+            await ctx.issues.update(
+              aggregateResolution.issueId,
+              {
+                status: "cancelled",
+                // Do not cancel a row while a checkout or execution run owns
+                // it. The host evaluates both preconditions atomically.
+                expectedCurrentCheckoutRunId: null,
+                expectedCurrentExecutionRunId: null,
+              },
+              existing.paperclipCompanyId,
+            );
+          } catch (err) {
+            if (!isExecutionLockPreconditionFailure(err)) throw err;
+            // The diagnostic read before update is racy. Re-read after the
+            // failed CAS and only notify an owner that is still present.
+            const currentIssue = await ctx.issues.get(
+              aggregateResolution.issueId,
+              existing.paperclipCompanyId,
+            );
+            cancelWithheldForRunId =
+              currentIssue?.executionRunId ?? currentIssue?.checkoutRunId ?? null;
+            if (cancelWithheldForRunId) {
+              await ensureCancelWithheldComment(
+                ctx,
+                aggregateResolution.issueId,
+                existing.paperclipCompanyId,
+                resolvedAt,
+                cancelWithheldForRunId,
+              );
+            }
+            ctx.logger.info(
+              `Alertmanager: withheld resolve-cancel for ${alertname} (${alert.fingerprint}) — issue ${aggregateResolution.issueId} is held by run ${cancelWithheldForRunId ?? "an unobserved owner"}`,
+            );
+            await ctx.metrics.write("alertmanager.resolved.cancel_withheld", 1, {
+              alertname,
+              severity: existing.severity,
+            });
+          }
+        }
+      } else if (aggregateResolution.disposition === "no-membership") {
+        ctx.logger.warn(
+          `Alertmanager: refusing to cancel aggregate issue ${aggregateResolution.issueId} for ${alert.fingerprint} because its membership is missing`,
+        );
+      }
+    } else {
+      await ensureResolutionComment(
+        ctx,
+        aggregateResolution.issueId,
         existing.paperclipCompanyId,
+        resolvedAt,
       );
     }
-  } else {
-    await ensureResolutionComment(
+
+    // BLO-16120: mark this source resolved within every cover it's a member
+    // of, and close each cover only once its last unresolved member resolves.
+    // Runs unconditionally (independent of autoCloseOnResolve) — the ladder
+    // exhausted because the alert kept firing, not because the underlying
+    // issue's status policy says so, so a resolved alert means its membership
+    // in the shared cover is done either way.
+    await recordSourceResolvedAndCloseCovers(
       ctx,
-      existing.paperclipIssueId,
       existing.paperclipCompanyId,
-      resolvedAt,
+      aggregateResolution.issueId,
     );
-  }
 
-  // BLO-16120: mark this source resolved within every cover it's a member
-  // of, and close each cover only once its last unresolved member resolves.
-  // Runs unconditionally (independent of autoCloseOnResolve) — the ladder
-  // exhausted because the alert kept firing, not because the underlying
-  // issue's status policy says so, so a resolved alert means its membership
-  // in the shared cover is done either way.
-  await recordSourceResolvedAndCloseCovers(ctx, existing.paperclipCompanyId, existing.paperclipIssueId);
-
-  const updated: AlertStateRecord = {
-    ...existing,
-    resolvedAt,
-    nextEscalationAt: null,
-    escalationComplete: true,
-  };
-  await ctx.state.set(stateRef, updated);
-
-  await ctx.events.emit(
-    "alertmanager.alert.resolved",
-    existing.paperclipCompanyId,
-    {
-      fingerprint: alert.fingerprint,
-      alertname,
-      paperclipIssueId: existing.paperclipIssueId,
+    const updated: AlertStateRecord = {
+      ...existing,
+      aggregateKey,
+      paperclipIssueId: aggregateResolution.issueId,
       resolvedAt,
-    },
-  );
+      nextEscalationAt: null,
+      escalationComplete: true,
+      cancelWithheldForRunId,
+      cancelWithheldAt: cancelWithheldForRunId ? resolvedAt : null,
+    };
+    await ctx.state.set(stateRef, updated);
 
-  await ctx.metrics.write("alertmanager.resolved.handled", 1, {
-    alertname,
-    severity: existing.severity,
-  });
+    await ctx.events.emit(
+      "alertmanager.alert.resolved",
+      existing.paperclipCompanyId,
+      {
+        fingerprint: alert.fingerprint,
+        alertname,
+        paperclipIssueId: aggregateResolution.issueId,
+        resolvedAt,
+        cancelWithheldForRunId,
+      },
+    );
+
+    await ctx.metrics.write("alertmanager.resolved.handled", 1, {
+      alertname,
+      severity: existing.severity,
+    });
+  } finally {
+    if (cancellationToken) {
+      await releaseAggregateFinalization(
+        ctx,
+        existing.paperclipCompanyId,
+        aggregateKey,
+        cancellationToken,
+      );
+    }
+  }
 }
 
 async function recoverStateFromIssue(
@@ -850,20 +2159,29 @@ async function recoverStateFromIssue(
     limit: 1,
   });
   const issue = matches[0];
-  if (!issue) return null;
-  // A terminal issue is deliberately NOT adopted here, which means a lost state
-  // row plus a closed issue files a fresh one rather than reviving the old.
-  // That diverges from the state-present path (which suppresses per
-  // BLO-24234) — on purpose: after a state loss the plugin cannot tell whether
-  // the close was its own resolve or an operator's, and the safe failure mode
-  // for a paging system is a visible duplicate, not a silent mute. Do not
-  // "unify" this branch by returning the terminal issue; that would let a state
-  // loss inherit a suppression nobody chose.
-  if (issue.status === "done" || issue.status === "cancelled") return null;
+  // The per-fingerprint lookup can find an older terminal issue even while a
+  // newer aggregate member is still unresolved on the active winner. Do not
+  // let that historical row mask the aggregate membership fallback: state
+  // loss must recover the live aggregate binding, not conclude that the alert
+  // is unknown merely because its first origin match is terminal.
+  if (!issue || issue.status === "done" || issue.status === "cancelled") {
+    return recoverStateFromAggregateMember(ctx, config, alert);
+  }
 
+  return buildRecoveredStateRecord(companyId, issue, alert, config);
+}
+
+function buildRecoveredStateRecord(
+  companyId: string,
+  issue: IssueReference,
+  alert: AlertmanagerAlert,
+  config: AlertmanagerPluginConfig,
+  aggregateKey?: string,
+): AlertStateRecord {
   return {
     paperclipIssueId: issue.id,
     paperclipCompanyId: companyId,
+    ...(aggregateKey ? { aggregateKey } : {}),
     assigneeUserId: issue.assigneeUserId ?? null,
     assigneeAgentId: issue.assigneeAgentId ?? null,
     alertname: alert.labels.alertname ?? "UnnamedAlert",
@@ -915,6 +2233,7 @@ export async function handleWebhook(
   config: AlertmanagerPluginConfig,
   authenticated: boolean,
   input: PluginWebhookInput,
+  fenceWaitPolicy?: Partial<AggregateFenceWaitPolicy>,
 ): Promise<void> {
   if (input.endpointKey !== WEBHOOK_KEYS.alertmanager) {
     ctx.logger.warn(
@@ -955,6 +2274,10 @@ export async function handleWebhook(
   // matters: without it, every ownerless alert in the batch repeats the same
   // company-wide agent lookup.
   const fallbackOwnerMemo: FallbackOwnerMemo = new Map();
+  // Same scope, same reason — see AggregateFenceWedgedMemo. Bounds the fence
+  // wait at one budget per aggregate key per delivery instead of one per alert,
+  // so a wedged fence stays O(1) in batch size on the failure path.
+  const fenceWedgedMemo: AggregateFenceWedgedMemo = new Set();
 
   for (const alert of body.alerts) {
     if (!alertMatchesLabelFilter(alert, config.acceptOnlyLabels)) {
@@ -967,19 +2290,9 @@ export async function handleWebhook(
     const status = effectiveAlertStatus(alert, body);
     const alertname = alert.labels.alertname ?? "unknown";
     try {
-      // Rule-level `paperclip_issue` policy, honored before handleFiring so it
-      // precedes every issue-creating and state-writing side effect on the
-      // firing path, at any severity — an opted-out rule must not create an
-      // issue, refresh one, or bank a suppression anchor. Accepted from either
-      // labels or annotations because Prometheus rules commonly carry policy in
-      // annotations.
-      //
-      // BOTH gates it produces — the malformed drop and the opt-out — are
-      // evaluated here but applied only inside the firing branch, and
-      // deliberately do NOT gate the resolved path; see the dispatch below for
-      // why. `paperclip_issue` is a *creation* policy: nothing on the resolved
-      // path reads it, so neither a malformed value nor an explicit opt-out has
-      // any business suppressing the close of an issue that was already filed.
+      // These policy values govern issue creation only. They are evaluated
+      // before firing work, but must not prevent a resolved delivery from
+      // closing an issue that was already created.
       const policyValues = [
         alert.labels.paperclip_issue,
         alert.annotations.paperclip_issue,
@@ -1027,7 +2340,14 @@ export async function handleWebhook(
           }
           continue;
         }
-        await handleFiring(ctx, config, alert, fallbackOwnerMemo);
+        await handleFiring(
+          ctx,
+          config,
+          alert,
+          fallbackOwnerMemo,
+          fenceWaitPolicy,
+          fenceWedgedMemo,
+        );
       } else if (status === "resolved") {
         // Reached with BOTH policy gates above deliberately bypassed — this
         // path is creation-only, exactly like the severity floor in

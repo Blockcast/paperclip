@@ -36,6 +36,8 @@ const manifest: PaperclipPluginManifestV1 = {
     // Operator-visible signal
     "metrics.write",
     "activity.log.write",
+    "ui.action.register",
+    "api.routes.register",
     // Compare webhook credentials without exposing secret values to the worker.
     "secrets.verify-ref",
     // Webhook entrypoint (the plugin is webhook-driven)
@@ -112,7 +114,7 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "string",
         title: "Fallback agent name",
         description:
-          "Exact agent name assigned when no label, annotation, or issue route resolves an owner. Missing, unmatched, or ambiguous configuration fails closed: the alert creates no issue rather than an ownerless one.",
+          "Exact agent name assigned when no label, annotation, or issue route resolves. Missing or ambiguous configuration fails closed.",
       },
       issueRouteMap: {
         type: "object",
@@ -177,6 +179,24 @@ const manifest: PaperclipPluginManifestV1 = {
       displayName: "Check unresolved alert escalations",
       description: "Advances overdue alerts through the reportsTo chain.",
       schedule: "*/1 * * * *",
+    },
+  ],
+  apiRoutes: [
+    {
+      routeKey: "list-aggregate-firing-fences",
+      method: "GET",
+      path: "/aggregate-firing-fences",
+      auth: "board",
+      capability: "api.routes.register",
+      companyResolution: { from: "query", key: "companyId" },
+    },
+    {
+      routeKey: "recover-aggregate-firing",
+      method: "POST",
+      path: "/aggregate-firing-fences/recover",
+      auth: "board",
+      capability: "api.routes.register",
+      companyResolution: { from: "body", key: "companyId" },
     },
   ],
   // No tools registered for V1 — pure event/webhook plugin.

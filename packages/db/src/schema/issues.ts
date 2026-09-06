@@ -249,6 +249,28 @@ export const issues = pgTable(
           and ${table.hiddenAt} is null
           and ${table.status} not in ('done', 'cancelled')`,
       ),
+    // BLO-20074: one unresolved review-request issue per (repo, PR).
+    // originFingerprint carries the `pr_review:<repoFullName>:<prNumber>` key,
+    // so N concurrent requests as a branch advances collapse onto one row —
+    // the losers catch 23505 and reuse the winner instead of each launching an
+    // independent reviewer run. Scoped to unresolved rows so a genuinely new
+    // review is still creatable once the prior one reaches a terminal status.
+    activePrReviewIdx: uniqueIndex("issues_active_pr_review_uq")
+      .on(table.companyId, table.originKind, table.originFingerprint)
+      .where(
+        sql`${table.originKind} = 'pr_review'
+          and ${table.originFingerprint} <> 'default'
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
+    activeAlertmanagerAggregateCreationIdx: uniqueIndex("issues_active_alertmanager_aggregate_creation_uq")
+      .on(table.companyId, table.originKind, table.originFingerprint)
+      .where(
+        sql`${table.originKind} = 'plugin:paperclip-plugin-alertmanager'
+          and ${table.originFingerprint} <> 'default'
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
     // BLO-16319: one open issue per Dependabot alert. originId is the stable
     // `github-dependabot:<repoFullName>#<alertNumber>` key (the same key the
     // webhook route already uses for the wake idempotency key), so a

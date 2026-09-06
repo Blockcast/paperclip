@@ -92,6 +92,21 @@ function classifyKeyTier(key: string): 1 | 2 | null {
 const COMMAND_PAYLOAD_KEY_RE =
   /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
+/**
+ * `args` is the spelling real MCP stdio server configs use — see
+ * `services/tool-access.ts` (`Array.isArray(server.args)`) — so the three
+ * synonyms above covered every form except the one actually on the wire, and
+ * `adapterConfig.mcpServers.*.args: ["--api-key", "…"]` went out in the clear
+ * while `argv` carrying the identical value was masked (PEN-2747).
+ *
+ * Kept OUT of `COMMAND_ARGS_PAYLOAD_KEY_RE` and gated on `agentConfig`
+ * on purpose: a bare `args` array in a *generic* event payload is not command
+ * argv (tool-call arguments, job parameters), and treating it as such is an
+ * exclusion this module already made deliberately — see the "does not treat
+ * bare args payloads as command args" case in `redaction.test.ts`. Inside an
+ * agent config the key is unambiguous, so widen there and only there.
+ */
+const AGENT_CONFIG_ARGS_KEY_RE = /^args$/i;
 const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
 const CLI_SECRET_FLAG_RE = new RegExp(String.raw`^-{1,2}${SECRET_FIELD_NAME_PATTERN}$`, "i");
 const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
@@ -108,6 +123,42 @@ const ENV_DUMP_SECRET_ASSIGNMENT_RE = new RegExp(
   String.raw`(^|[\r\n\x00])((?:export\s+|declare\s+-x\s+)?${ENV_DUMP_SECRET_KEY_RE.source}=)("[^"\r\n\x00]*"|'[^'\r\n\x00]*'|[^\r\n\x00]*)`,
   "gi",
 );
+// PEN-2370: a connection string carries its credential in the *value*, so it
+// has to be reachable even when the surrounding text contains none of the
+// name-shaped hints below (`redis://u:p@cache:6379` has no hint word and no
+// dot). Gating on the scheme separator keeps URI-bearing text eligible.
+const URI_SEPARATOR_HINT = "://";
+// Value-shaped, deliberately name-blind: `scheme://user:secret@host`. The
+// name-based allowlist in ENV_DUMP_SECRET_KEY_RE only reaches a DSN when the
+// variable happens to be spelled *BASE_URL -- DATABASE_URL matches purely
+// because it contains the substring "BASE_URL", while REDIS_URL and AMQP_URL
+// do not match at all, and a DSN quoted inline in prose is not an assignment
+// so no name rule can see it. Matching the value closes the class.
+// The user component is preserved: knowing *which* principal is configured is
+// the diagnostic value; the password after it is the secret.
+//
+// The userinfo quantifier is `*`, not `+`, and that is load-bearing rather than
+// defensive: RFC 3986 makes the user optional, and `redis://:secret@host` is the
+// ORDINARY spelling for Redis and AMQP, which authenticate with a password and
+// no username at all (`requirepass`). A `+` here matches the textbook
+// `user:pass@` form and misses the shape those two services actually emit --
+// i.e. it would leak precisely the DSNs this rule was added for. Found by
+// probing the rule for a way around it rather than re-reading it.
+//
+// The trailing `@` is what keeps this from over-matching: a credential-free
+// URL (`https://example.com:8080/path`) has no `@`, and a bare userinfo URL
+// (`https://user@host`) has no `:` before it, so neither can match.
+const URI_CREDENTIAL_RE = /\b([a-z][a-z0-9+.-]*:\/\/)([^\s:/@]*):([^\s/@]+)@/gi;
+/**
+ * Replacing sibling of {@link URL_CREDENTIAL_QUERY_RE}, which is a detector
+ * (boolean) used by the Tier-2 value gate. The boundary class includes `#` so a
+ * fragment-borne credential (`…#access_token=…`, the OAuth2 implicit-flow
+ * shape) is covered by the same rule as a query-borne one, rather than needing
+ * the synthesized-`?` re-test `looksLikeCredentialValue` does.
+ */
+const URL_CREDENTIAL_PARAM_VALUE_RE =
+  /([?&#](?:token|sig|signature|api[-_]?key|access[-_]?token|auth|passwd|password|credential|x-amz-signature)=)[^&\s#]+/gi;
+
 const SECRET_TEXT_HINTS = [
   "api",
   "key",
@@ -134,7 +185,49 @@ export const REDACTED_EVENT_VALUE = "***REDACTED***";
 
 function maybeContainsSecretText(input: string) {
   const lower = input.toLowerCase();
-  return SECRET_TEXT_HINTS.some((hint) => lower.includes(hint)) || input.includes(".");
+  return SECRET_TEXT_HINTS.some((hint) => lower.includes(hint))
+    || lower.includes(URI_SEPARATOR_HINT)
+    || input.includes(".");
+}
+
+/**
+ * PEN-2747: value-shaped credential masking on the *structured* path.
+ *
+ * `sanitizeRecord`'s fallthrough hands an unrecognized key's string value back
+ * verbatim, so credential material carried inside a URL escaped every rule in
+ * this file. Three separate near-misses lined up:
+ *
+ *  - `url` is in no tier. `SECRET_TIER2_STEMS` spells `base[-_]?url`, which
+ *    requires the literal `base`, so `baseUrl` matched and a plain `url` did
+ *    not — nor did `endpoint`, `webhookUrl`, `serverUrl`, `proxyUrl`.
+ *  - The repo already owned {@link URI_CREDENTIAL_RE} and never called it here:
+ *    it was wired only into {@link redactSensitiveText}, which `sanitizeRecord`
+ *    reaches only for keys matching `COMMAND_PAYLOAD_KEY_RE`.
+ *  - The one test covering `mcpServers.*.url` used a credential-free fixture,
+ *    so it asserted the pass-through as correct output.
+ *
+ * Fixed by matching the *value*, in one place, rather than by adding four more
+ * key names: a key-name denylist fails open on the fifth spelling, and
+ * `adapterConfig.mcpServers.*.url` is precisely where an agent's k8s MCP
+ * upstream is swapped for a privileged (`ns-rw` / `admin`) tier.
+ *
+ * Deliberately surgical — only the credential component is masked, so scheme,
+ * principal, host, port and path survive. Knowing *which* upstream and *which*
+ * principal an agent is pointed at is the diagnostic value these read paths
+ * exist for; blanking the whole URL would destroy it, and over-redaction is the
+ * failure mode this module has been corrected for repeatedly (see the
+ * `looksLikeReadableSlug` comments). It also means a credential-free URL still
+ * round-trips byte-identical.
+ *
+ * Gated on the scheme separator so prose that merely contains `token=` is left
+ * alone; a bare `user@host` (no `:`) and a credential-free
+ * `https://host:8080/path` (no `@`) cannot match `URI_CREDENTIAL_RE` either.
+ */
+function redactUriCredentialsInValue(value: string): string {
+  if (!value.includes(URI_SEPARATOR_HINT)) return value;
+  return value
+    .replace(URI_CREDENTIAL_RE, `$1$2:${REDACTED_EVENT_VALUE}@`)
+    .replace(URL_CREDENTIAL_PARAM_VALUE_RE, `$1${REDACTED_EVENT_VALUE}`);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -207,6 +300,7 @@ function sanitizeValue(value: unknown, options?: SanitizeOptions): unknown {
       ? { type: "plain", value: REDACTED_EVENT_VALUE }
       : { type: "plain", value: sanitizeValue(value.value, options) };
   }
+  if (typeof value === "string") return redactUriCredentialsInValue(value);
   if (!isPlainObject(value)) return value;
   return sanitizeRecord(value, options);
 }
@@ -233,6 +327,41 @@ function sanitizeAgentEnvRecord(record: Record<string, unknown>): Record<string,
       continue;
     }
     redacted[key] = REDACTED_EVENT_VALUE;
+  }
+  return redacted;
+}
+
+/**
+ * The header map of an MCP server entry is credential-bearing by construction
+ * in the same way an `env` map is, so it gets the same allowlist treatment
+ * (PEN-2747). `Authorization` was masked only incidentally — "auth" is a Tier-1
+ * stem — which left every differently-spelled credential header in the clear:
+ * `X-Tenant-Signature`, `X-Gbrain-Bearer`, `Cookie`-adjacent vendor spellings.
+ * A denylist over header names has no bounded vocabulary to enumerate; a
+ * request header that is *not* content negotiation is, on this surface,
+ * overwhelmingly authorization or tenant-routing material.
+ *
+ * The exemption list is deliberately short and closed: headers whose value can
+ * never itself be a credential. Anything else masks, and the round-trip guard
+ * in `routes/agents.ts` (`restoreRedactedAdapterValue`) puts the stored value
+ * back if a caller PATCHes the redacted config in.
+ */
+const BENIGN_HEADER_NAMES = new Set([
+  "accept",
+  "accept-charset",
+  "accept-encoding",
+  "accept-language",
+  "cache-control",
+  "content-type",
+  "user-agent",
+]);
+
+function sanitizeAgentHeaderRecord(record: Record<string, unknown>, options?: SanitizeOptions): Record<string, unknown> {
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    redacted[key] = BENIGN_HEADER_NAMES.has(key.trim().toLowerCase())
+      ? sanitizeValue(value, options)
+      : REDACTED_EVENT_VALUE;
   }
   return redacted;
 }
@@ -473,7 +602,14 @@ export function sanitizeRecord(record: Record<string, unknown>, options?: Saniti
       redacted[key] = isPlainObject(value) ? sanitizeAgentEnvRecord(value) : REDACTED_EVENT_VALUE;
       continue;
     }
-    if (COMMAND_ARGS_PAYLOAD_KEY_RE.test(key) && Array.isArray(value)) {
+    if (options?.agentConfig && key === "headers") {
+      redacted[key] = isPlainObject(value) ? sanitizeAgentHeaderRecord(value, options) : REDACTED_EVENT_VALUE;
+      continue;
+    }
+    const argsLikeKey =
+      COMMAND_ARGS_PAYLOAD_KEY_RE.test(key)
+      || (options?.agentConfig === true && AGENT_CONFIG_ARGS_KEY_RE.test(key));
+    if (argsLikeKey && Array.isArray(value)) {
       redacted[key] = sanitizeCommandArgs(value, options);
       continue;
     }
@@ -531,6 +667,99 @@ export function redactApprovalPayloadByType(type: unknown, payload: unknown): Re
   if (!payload || !isPlainObject(payload)) return {};
   if (type === "hire_agent") return redactAgentConfigPayload(payload) ?? {};
   return redactEventPayload(payload) ?? {};
+}
+
+const WITHHELD_AGENT_CONFIG_KEYS = new Set(["adapterConfig", "runtimeConfig"]);
+
+/**
+ * Authorization filter for the approval read paths. Distinct in kind from the
+ * redactors above: those decide what is *secret*, this decides what the caller
+ * is *entitled to*.
+ *
+ * A `hire_agent` payload embeds the hire's `adapterConfig` / `runtimeConfig`.
+ * `redactAgentConfigPayload` masks the credential values inside them but
+ * deliberately keeps the config diagnosable, so the scheme, principal, host,
+ * port and path of every `mcpServers.*.url` survive. That residue is the
+ * agent's MCP upstream topology — which upstream a peer is pointed at and under
+ * which principal — and `GET /agents/:id` only hands it to a caller holding
+ * `agent_config:read` (`redactForRestrictedAgentView`). The approval card
+ * reaches the same material under `company_scope:read`, which every
+ * same-company agent is auto-allowed, so the weaker sibling path disclosed a
+ * reconnaissance surface the gated one withheld (PEN-2777).
+ *
+ * Applied at any depth and to any shape: the payload already carries the pair
+ * twice (`requestedConfigurationSnapshot.adapterConfig`), and a new copy — or a
+ * caller-chosen shape under the same key — would otherwise reopen the hole
+ * silently.
+ *
+ * Blanked to `{}` rather than `REDACTED_EVENT_VALUE` to match
+ * `redactForRestrictedAgentView`'s restricted-agent shape, and to keep that
+ * sentinel meaning "a scanner blanked this" rather than "you may not see this".
+ *
+ * Read projection only — the stored snapshot `activatePendingApproval` replays
+ * over the agent row is untouched.
+ */
+export function withholdAgentConfigFromApprovalPayload(
+  type: unknown,
+  payload: Record<string, unknown>,
+): { payload: Record<string, unknown>; withheldFields: string[] } {
+  if (type !== "hire_agent" || !isPlainObject(payload)) return { payload, withheldFields: [] };
+  return withholdAgentConfigKeys(payload);
+}
+
+/**
+ * The entitlement filter itself, with no payload-type precondition, so every
+ * read projection that reaches an agent's config pair under a weaker
+ * entitlement than `agent_config:read` can share one implementation.
+ *
+ * Extracted from `withholdAgentConfigFromApprovalPayload` rather than copied.
+ * This class propagates by copying: each of doors #7-#10 was the same
+ * disclosure re-derived on a path whose author could not see the others, and
+ * the array bypass Ally caught in #1574 is exactly the sort of correction a
+ * second copy silently misses. One walk means a finding against it lands
+ * everywhere at once.
+ *
+ * Callers, all reaching the pair under `company_scope:read`:
+ * - `hire_agent` approval cards (PEN-2777)
+ * - skill test-run `agentConfigSnapshot` (PEN-2839) — which additionally
+ *   persisted the pair unredacted, so this read projection is what repairs
+ *   rows already written.
+ *
+ * Read projection only: nothing here rewrites a stored row.
+ */
+export function withholdAgentConfigKeys(
+  payload: Record<string, unknown>,
+): { payload: Record<string, unknown>; withheldFields: string[] } {
+  if (!isPlainObject(payload)) return { payload, withheldFields: [] };
+  const withheldFields: string[] = [];
+
+  function walk(value: unknown, path: string): unknown {
+    if (Array.isArray(value)) return value.map((entry, index) => walk(entry, `${path}[${index}]`));
+    if (!isPlainObject(value)) return value;
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      const childPath = path ? `${path}.${key}` : key;
+      // Entitlement cannot depend on shape. Every path that builds a hire card
+      // server-side writes an object here, but `approvalPayloadSchema` is a
+      // `.catchall(z.unknown())`, so `POST /companies/:companyId/approvals` and
+      // the resubmit route persist whatever the filer sent, and
+      // `normalizeHireApprovalPayloadForPersistence` passes a non-record through
+      // untouched. An array of configs or a JSON-encoded string carries exactly
+      // the topology this gate withholds, so an object-only test would let the
+      // shape pick the authorization outcome. `null`/`undefined` stay readable:
+      // they carry no topology and are the honest "no config was requested" the
+      // board queue renders.
+      if (WITHHELD_AGENT_CONFIG_KEYS.has(key) && entry !== null && entry !== undefined) {
+        withheldFields.push(childPath);
+        out[key] = {};
+        continue;
+      }
+      out[key] = walk(entry, childPath);
+    }
+    return out;
+  }
+
+  return { payload: walk(payload, "") as Record<string, unknown>, withheldFields };
 }
 
 /**
@@ -595,7 +824,8 @@ export function redactSensitiveText(input: string): string {
   return redactCommandText(
     envRedacted
       .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
-      .replace(ESCAPED_JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`),
+      .replace(ESCAPED_JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
+      .replace(URI_CREDENTIAL_RE, `$1$2:${REDACTED_EVENT_VALUE}@`),
     REDACTED_EVENT_VALUE,
   );
 }

@@ -44,6 +44,33 @@ describe("runEvidenceGate", () => {
     expect(result.missing).toEqual([]);
     expect(result.unlabeledFallback).toBe(false);
     expect(result.evaluatedAt).toBe("2026-05-11T22:00:00.000Z");
+    expect(result.commitEvidence).toEqual([]);
+  });
+
+  it("extracts only agent-authored GitHub commit URLs for remote verification", async () => {
+    const fetch = vi.fn<(id: string) => Promise<EvidenceFetchResult>>(async () => ({
+      description: "## Done when\n- ship it",
+      labels: [],
+      comments: [
+        {
+          body: "commit https://github.com/Blockcast/paperclip/commit/ABCDEF1234567",
+          authorAgentId: "a1",
+          authorUserId: null,
+          createdAt: "2026-05-11T20:00:00.000Z",
+        },
+        {
+          body: "operator copied https://github.com/Blockcast/paperclip/commit/1111111",
+          authorAgentId: null,
+          authorUserId: "u1",
+          createdAt: "2026-05-11T20:01:00.000Z",
+        },
+      ],
+      workProducts: [],
+    }));
+    const result = await runEvidenceGate(fetch, "issue-commit");
+    expect(result.commitEvidence).toEqual([
+      { repoFullName: "Blockcast/paperclip", sha: "abcdef1234567" },
+    ]);
   });
 
   it("returns a block record when frontend evidence is missing", async () => {

@@ -238,6 +238,49 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     });
   });
 
+  it("reuses one unresolved PR review issue across four advancing heads", async () => {
+    const companyId = await seedCompany();
+    const app = createApp();
+    // GitHub owner/repo identity is case-insensitive, so the casing a caller
+    // happened to type must not open a second review scope for one PR. The
+    // third entry deliberately arrives lower-cased.
+    const requests = [
+      { title: "Review Blockcast/paperclip PR #876 at 15a949a4", repoFullName: "Blockcast/paperclip" },
+      { title: "Review Blockcast/paperclip PR #876 at ad0da2bc", repoFullName: "Blockcast/paperclip" },
+      { title: "Review paperclip PR #876 exact head ad0da2bc55", repoFullName: "blockcast/paperclip" },
+      { title: "Review Blockcast/paperclip PR #876 at ff1c72db", repoFullName: "BLOCKCAST/Paperclip" },
+    ];
+    const titles = requests.map((entry) => entry.title);
+
+    const responses = await Promise.all(requests.map((entry) => request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: entry.title,
+        prReviewTarget: { repoFullName: entry.repoFullName, prNumber: 876 },
+      })));
+
+    expect(responses.map((response) => response.status).sort()).toEqual([200, 200, 200, 201]);
+    expect(new Set(responses.map((response) => response.body.id)).size).toBe(1);
+    expect(responses.filter((response) => response.status === 200)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          body: expect.objectContaining({
+            deduplicated: true,
+            deduplicationReason: "pr_review_target",
+          }),
+        }),
+      ]),
+    );
+
+    const rows = await db.select().from(issues).where(eq(issues.companyId, companyId));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      originKind: "pr_review",
+      originFingerprint: "pr_review:blockcast/paperclip:876",
+    });
+    expect(titles).toContain(rows[0]!.title);
+  });
+
   it("serializes keyed and title-only creates for the same issue", async () => {
     const companyId = await seedCompany();
     const parent = await seedParent(companyId);

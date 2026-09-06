@@ -233,7 +233,7 @@ export function derivePersistedMonitorState(input: {
   const notes = scheduledMonitor?.notes ?? normalizeMonitorNotes(input.issue.monitorNotes) ?? fromState?.notes ?? null;
   const scheduledByRaw = input.issue.monitorScheduledBy ?? scheduledMonitor?.scheduledBy ?? fromState?.scheduledBy ?? null;
   const scheduledBy =
-    scheduledByRaw === "assignee" || scheduledByRaw === "board" ? scheduledByRaw : null;
+    scheduledByRaw === "assignee" || scheduledByRaw === "board" || scheduledByRaw === "manager" ? scheduledByRaw : null;
   const metadata = scheduledMonitor ? monitorMetadataFromPolicy(scheduledMonitor) : monitorMetadataFromState(fromState);
   // BLO-18294: convergence bookkeeping has no dedicated columns, so it only
   // survives via executionState. Carry it across every derived shape.
@@ -1468,6 +1468,43 @@ export function buildIssueMonitorClearedPatch(input: {
     // monitor, and the audit copy is on executionState.monitor.notes.
     monitorNotes: null,
   };
+}
+
+/**
+ * BLO-28900 — reconcile a monitor that a raw status/assignee write just made
+ * undeliverable.
+ *
+ * `tickDueIssueMonitors` only selects rows that are `in_progress`/`in_review`
+ * and agent-assigned. A write that demotes a row out of that set has to clear
+ * the monitor too, or it survives reading `scheduled` with a populated
+ * `nextCheckAt` while being structurally incapable of firing — indistinguishable
+ * from an idle assignee, and silent. A fleet census on 2026-08-19 found 24 such
+ * rows, 18 of them already past their check time.
+ *
+ * `applyMonitorTransition` already does this for writes routed through
+ * `issuesSvc.update`. This is the same reconciliation for the set-based raw
+ * writes (checkout-restore, release) that bypass the service layer.
+ *
+ * Deliberately keyed on `monitorNextCheckAt` alone: a monitor that already fired
+ * and is sitting in `triggered` with a null check time is a different defect
+ * (BLO-25865) and is left untouched here.
+ *
+ * Returns an empty patch when the row holds no monitor or the monitor is still
+ * deliverable, so callers can spread it unconditionally.
+ */
+export function buildIssueMonitorEligibilityPatch(issue: IssueLike): Record<string, unknown> {
+  if (!issue.monitorNextCheckAt) return {};
+  const clearReason = monitorClearReasonForIssue(
+    issue.status,
+    issue.assigneeAgentId ?? null,
+    issue.assigneeUserId ?? null,
+  );
+  if (!clearReason) return {};
+  return buildIssueMonitorClearedPatch({
+    issue,
+    policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
+    clearReason,
+  });
 }
 
 export function applyIssueExecutionPolicyTransition(input: TransitionInput): TransitionResult {

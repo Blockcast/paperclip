@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, lte, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import * as metricsModule from "../services/metrics.js";
 import {
   agents,
   agentWakeupRequests,
+  activityLog,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issues,
@@ -189,6 +191,289 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     return { companyId, agentId };
   }
 
+  async function seedCapacityPark(input: {
+    companyId: string;
+    agentId: string;
+    taskKey: string;
+    issueId?: string;
+    scheduledRetryReason?: string;
+  }): Promise<{ runId: string; wakeupRequestId: string }> {
+    const runId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const contextSnapshot = {
+      taskKey: input.taskKey,
+      ...(input.issueId ? { issueId: input.issueId, taskId: input.issueId } : {}),
+    };
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "provider_capacity_exhausted",
+      payload: contextSnapshot,
+      status: "scheduled",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 60 * 60 * 1000),
+      scheduledRetryAttempt: 3,
+      scheduledRetryReason: input.scheduledRetryReason ?? "ccrotate_capacity",
+      wakeupRequestId,
+      contextSnapshot,
+    });
+    await db
+      .update(agentWakeupRequests)
+      .set({ runId: runId })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    return { runId, wakeupRequestId };
+  }
+
+  function manualWake(taskKey: string, issueId?: string) {
+    return {
+      source: "on_demand" as const,
+      triggerDetail: "manual" as const,
+      reason: "manual_operator_wake",
+      requestedByActorType: "user" as const,
+      requestedByActorId: "operator",
+      payload: {
+        taskKey,
+        ...(issueId ? { issueId, taskId: issueId } : {}),
+      },
+      contextSnapshot: {
+        taskKey,
+        ...(issueId ? { issueId, taskId: issueId } : {}),
+      },
+    };
+  }
+
+  it("cancels an unscoped capacity park and queues a fresh manual wake", async () => {
+    const { companyId, agentId } = await seedAgent();
+    const taskKey = "agent:claude-capacity-reprobe";
+    const parked = await seedCapacityPark({ companyId, agentId, taskKey });
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: allowingGate(),
+      skipQueuedRunDispatch: true,
+    });
+
+    const freshRun = await heartbeat.wakeup(agentId, manualWake(taskKey));
+
+    expect(freshRun).not.toBeNull();
+    expect(freshRun?.id).not.toBe(parked.runId);
+    expect(freshRun?.status).toBe("queued");
+
+    const oldRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, parked.runId))
+      .then((rows) => rows[0] ?? null);
+    expect(oldRun).toMatchObject({
+      status: "cancelled",
+      errorCode: "manual_capacity_reprobe",
+      scheduledRetryReason: "ccrotate_capacity",
+    });
+
+    const oldWakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, parked.wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(oldWakeup?.status).toBe("cancelled");
+
+    const lifecycleEvent = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, parked.runId))
+      .then((rows) => rows.find((row) => row.message === "Provider-capacity retry superseded by an explicit manual wake"));
+    expect(lifecycleEvent).toMatchObject({ eventType: "lifecycle", level: "info" });
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.runId, parked.runId))
+      .then((rows) => rows.find((row) => row.action === "heartbeat.capacity_retry_superseded_by_manual_wake"));
+    expect(activity).toMatchObject({
+      actorType: "user",
+      actorId: "operator",
+      entityType: "heartbeat_run",
+      entityId: parked.runId,
+    });
+  });
+
+  it("releases issue ownership while retaining checkout promotion for a fresh replacement", async () => {
+    const { companyId, agentId } = await seedAgent();
+    const issueId = randomUUID();
+    const taskKey = "issue:capacity-reprobe";
+    const parked = await seedCapacityPark({ companyId, agentId, taskKey, issueId });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Capacity parked issue",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: parked.runId,
+      executionRunId: parked.runId,
+      executionAgentNameKey: "claudecoder",
+      executionLockedAt: new Date(),
+      checkoutRestoreStatus: "todo",
+    });
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: allowingGate(),
+      skipQueuedRunDispatch: true,
+    });
+
+    const freshRun = await heartbeat.wakeup(agentId, manualWake(taskKey, issueId));
+
+    expect(freshRun).not.toBeNull();
+    expect(freshRun?.status).toBe("queued");
+    const issue = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        checkoutRestoreStatus: issues.checkoutRestoreStatus,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toEqual({
+      status: "in_progress",
+      checkoutRunId: null,
+      executionRunId: null,
+      checkoutRestoreStatus: "todo",
+    });
+  });
+
+  it("does not cancel a sibling issue's capacity park that shares the task key", async () => {
+    const { companyId, agentId } = await seedAgent();
+    const sharedTaskKey = "shared:legacy-task-key";
+    const targetIssueId = randomUUID();
+    const siblingIssueId = randomUUID();
+    const targetPark = await seedCapacityPark({
+      companyId,
+      agentId,
+      taskKey: sharedTaskKey,
+      issueId: targetIssueId,
+    });
+    const siblingPark = await seedCapacityPark({
+      companyId,
+      agentId,
+      taskKey: sharedTaskKey,
+    });
+    await db.insert(issues).values([
+      {
+        id: targetIssueId,
+        companyId,
+        title: "Target capacity parked issue",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        executionRunId: targetPark.runId,
+      },
+      {
+        id: siblingIssueId,
+        companyId,
+        title: "Sibling capacity parked issue",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        executionRunId: siblingPark.runId,
+      },
+    ]);
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: allowingGate(),
+      skipQueuedRunDispatch: true,
+    });
+
+    const freshRun = await heartbeat.wakeup(agentId, manualWake(sharedTaskKey, targetIssueId));
+
+    expect(freshRun?.status).toBe("queued");
+    const [target, sibling] = await Promise.all([
+      db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, targetPark.runId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, siblingPark.runId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+    expect(target).toEqual({ status: "cancelled", errorCode: "manual_capacity_reprobe" });
+    expect(sibling).toEqual({ status: "scheduled_retry", errorCode: null });
+  });
+
+  it("coalesces concurrent manual capacity re-probes into one queued replacement", async () => {
+    const { companyId, agentId } = await seedAgent();
+    const taskKey = "agent:concurrent-capacity-reprobe";
+    const parked = await seedCapacityPark({ companyId, agentId, taskKey });
+    const first = heartbeatService(db, {
+      penstockAvailabilityGate: allowingGate(),
+      skipQueuedRunDispatch: true,
+    });
+    const secondDb = createDb(tempDb!.connectionString);
+    const second = heartbeatService(secondDb, {
+      penstockAvailabilityGate: allowingGate(),
+      skipQueuedRunDispatch: true,
+    });
+
+    const [firstRun, secondRun] = await Promise.all([
+      first.wakeup(agentId, manualWake(taskKey)),
+      second.wakeup(agentId, manualWake(taskKey)),
+    ]);
+
+    expect(firstRun).not.toBeNull();
+    expect(secondRun).not.toBeNull();
+    expect(firstRun?.id).toBe(secondRun?.id);
+    const runs = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toEqual(expect.arrayContaining([
+      { id: parked.runId, status: "cancelled", errorCode: "manual_capacity_reprobe" },
+      expect.objectContaining({ id: firstRun?.id, status: "queued", errorCode: null }),
+    ]));
+    expect(runs.filter((run) => run.status === "queued")).toHaveLength(1);
+  });
+
+  it("leaves non-capacity scheduled retries unchanged and coalesces manual wakes", async () => {
+    const { companyId, agentId } = await seedAgent();
+    const taskKey = "agent:transient-retry";
+    const parked = await seedCapacityPark({
+      companyId,
+      agentId,
+      taskKey,
+      scheduledRetryReason: "transient_failure",
+    });
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: allowingGate(),
+      skipQueuedRunDispatch: true,
+    });
+
+    const result = await heartbeat.wakeup(agentId, manualWake(taskKey));
+
+    expect(result?.id).toBe(parked.runId);
+    const run = await db
+      .select({ status: heartbeatRuns.status, reason: heartbeatRuns.scheduledRetryReason })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, parked.runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run).toEqual({ status: "scheduled_retry", reason: "transient_failure" });
+    const coalescedWake = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "coalesced")))
+      .then((rows) => rows[0] ?? null);
+    expect(coalescedWake).toEqual({ status: "coalesced", runId: parked.runId });
+  });
+
   it("coalesces concurrent capacity deferrals for one task across service instances", async () => {
     const { agentId } = await seedAgent();
     const taskKey = "pr_review:blockcast/linux-amt:123";
@@ -249,7 +534,12 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     // is honoured only while it sits inside CCROTATE_CAPACITY_MAX_PARK_MS — so
     // this fixture must be a *near-future* instant rather than a hardcoded past
     // date, which the clamp would (correctly) discard as telling us nothing.
-    const resumeAt = new Date(Date.now() + 60_000);
+    // Leave enough room above the 60s minimum park for the async wake path to
+    // finish before the resolver samples its own clock. At exactly the floor,
+    // that elapsed time can move the floor-based retry past this assertion's
+    // upper bound even though the resolver is behaving correctly.
+    const resumeDelayMs = 90_000;
+    const resumeAt = new Date(Date.now() + resumeDelayMs);
     const heartbeat = heartbeatService(db, {
       penstockAvailabilityGate: denyingGate(resumeAt),
       skipQueuedRunDispatch: true,
@@ -274,7 +564,7 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     const scheduledMs = retryRun!.scheduledRetryAt!.getTime();
     expect(scheduledMs).toBeGreaterThanOrEqual(resumeAt.getTime());
     expect(scheduledMs).toBeLessThanOrEqual(
-      resumeAt.getTime() + 60_000 * CCROTATE_CAPACITY_PARK_JITTER_RATIO + 1,
+      resumeAt.getTime() + resumeDelayMs * CCROTATE_CAPACITY_PARK_JITTER_RATIO + 1,
     );
     expect(retryRun?.scheduledRetryReason).toBe("ccrotate_capacity");
     // The rate-limit family + retryNotBefore make the existing bounded-retry
@@ -704,7 +994,58 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     );
   });
 
-  it("stops re-deferring and terminates once the pool has been down past the escalation horizon", async () => {
+  it("moves expired capacity re-deferrals beyond now so they cannot starve the bounded due scan", async () => {
+    const { companyId, agentId } = await seedAgent();
+    const due = new Date("2026-04-20T03:02:00.000Z");
+    const expiredReset = new Date("2026-04-20T03:01:59.000Z");
+    const capacityRows = Array.from({ length: 50 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "assignment" as const,
+      status: "scheduled_retry" as const,
+      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryAt: new Date(expiredReset.getTime() - (50 - index)),
+      scheduledRetryAttempt: 0,
+      errorCode: "rate_limit_exhausted",
+      resultJson: { errorFamily: "rate_limit_exhausted" },
+      contextSnapshot: { wakeSource: "assignment" },
+    }));
+    const targetRunId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      ...capacityRows,
+      {
+        id: targetRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "scheduled_retry",
+        scheduledRetryReason: "transient_failure",
+        scheduledRetryAt: due,
+        scheduledRetryAttempt: 1,
+        contextSnapshot: { wakeReason: "transient_failure_retry" },
+      },
+    ]);
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: denyingGate(expiredReset),
+      skipQueuedRunDispatch: true,
+    });
+
+    expect(await heartbeat.promoteDueScheduledRetries(due)).toMatchObject({ promoted: 0 });
+    expect(await heartbeat.promoteDueScheduledRetries(due)).toMatchObject({
+      promoted: 1,
+      runIds: [targetRunId],
+    });
+
+    const stillImmediatelyDue = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.status, "scheduled_retry"), lte(heartbeatRuns.scheduledRetryAt, due)))
+      .then((rows) => rows[0]?.count ?? 0);
+    expect(stillImmediatelyDue).toBe(0);
+  });
+
+  it("stops re-deferring and terminates once the retry cap is reached", async () => {
     const { companyId, agentId } = await seedAgent();
     const runId = randomUUID();
     const due = new Date("2026-04-20T03:02:00.000Z");

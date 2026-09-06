@@ -16,6 +16,7 @@ not in StatefulSet selector — selectors are immutable).
 Both tiers mount the SAME paperclip-data PVC (must be RWX when api.enabled —
 set `persistence.existingClaim` to a pre-provisioned cephfs RWX PVC).
 */}}
+{{- include "paperclip.validateGithubReviewGate" . }}
 {{- if .Values.api.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -113,6 +114,16 @@ spec:
       priorityClassName: {{ . }}
       {{- end }}
       {{- if .Values.api.spreadAcrossNodes }}
+      {{- /*
+      BLO-20901 follow-up: minDomains (GA 1.30) and matchLabelKeys (beta 1.27)
+      below need 1.30. This used to be a chart-wide `kubeVersion` floor in
+      Chart.yaml, which rejected installs on older clusters even with
+      api.enabled=false, where none of this renders. Scope the check to the
+      path that actually needs it instead.
+      */}}
+      {{- if not (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) }}
+      {{- fail (printf "paperclip-api: api.spreadAcrossNodes requires Kubernetes >=1.30.0-0 (cluster is %s) for topologySpreadConstraints minDomains/matchLabelKeys support. Set api.spreadAcrossNodes=false to install on this cluster." .Capabilities.KubeVersion.Version) }}
+      {{- end }}
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -205,6 +216,10 @@ spec:
               value: {{ .Values.env.serveUi | quote }}
             - name: PAPERCLIP_HOME
               value: {{ .Values.persistence.mountPath | quote }}
+            # The API tier mounts the same RWX PVC, so it sees the wrappers the
+            # workers' seed publishes. See "paperclip.runtimePath" (PEN-2527).
+            - name: PATH
+              value: {{ include "paperclip.runtimePath" . | quote }}
             - name: PAPERCLIP_INSTANCE_ID
               value: {{ .Values.env.instanceId | quote }}
             {{- if .Values.runtimeCache.enabled }}
@@ -258,12 +273,36 @@ spec:
             - name: PAPERCLIP_PR_REVIEWER_BOT_LOGIN
               value: {{ . | quote }}
             {{- end }}
+            {{- if ((.Values.githubApp).reviewGateCaptureEnabled) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED
+              value: "true"
+            {{- with ((.Values.githubApp).reviewGateRepositories) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_REPOSITORIES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with ((.Values.githubApp).reviewGateExpectedAppId) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_APP_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with ((.Values.githubApp).reviewGateExpectedInstallationId) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_INSTALLATION_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if ((.Values.githubApp).reviewGateEnabled) }}
+            - name: PAPERCLIP_GITHUB_REVIEW_GATE_ENABLED
+              value: "true"
+            {{- end }}
             {{- with ((.Values.githubApp).prReviewGateStatusContext) }}
             - name: PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT
               value: {{ . | quote }}
             {{- end }}
             {{- with ((.Values.githubApp).prCommentReviewGateStatusContext) }}
             - name: PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with ((.Values.githubApp).prCommentReviewGateRetiredStatusContexts) }}
+            - name: PAPERCLIP_PR_COMMENT_REVIEW_GATE_RETIRED_STATUS_CONTEXTS
               value: {{ . | quote }}
             {{- end }}
             {{- end }}

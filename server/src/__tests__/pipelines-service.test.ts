@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
@@ -41,6 +41,7 @@ import {
 import { routineService } from "../services/routines.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { subscribeCompanyLiveEvents } from "../services/live-events.ts";
+import { logger } from "../middleware/logger.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -2425,6 +2426,71 @@ describeEmbeddedPostgres("pipelineService", () => {
     expect(link).toMatchObject({ retiredReason: "stage_exited" });
   });
 
+  // BLO-19771: the live failure was a `drafting` automation issue that stayed
+  // `in_progress` after its case ran on to a terminal stage, waking the assigned
+  // agent 91 minutes later. Both stages are asserted: the one the case merely
+  // passed through, and the one it was sitting in when it went terminal.
+  it("retires stage automation issues from every stage once the case reaches a terminal stage", async () => {
+    const company = await seedCompany();
+    const draftingRoutine = await seedRoutine(company.id, "Terminal drafting");
+    const assetsRoutine = await seedRoutine(company.id, "Terminal assets");
+    const pipeline = await svc.createPipeline({
+      companyId: company.id,
+      key: "terminal-retirement",
+      name: "Terminal retirement",
+      actor: userActor,
+      stages: [
+        { key: "intake", name: "Intake", kind: "open" },
+        { key: "drafting", name: "Drafting", kind: "working", config: { onEnter: { type: "run_routine", routineId: draftingRoutine.id } } },
+        { key: "assets", name: "Assets", kind: "working", config: { onEnter: { type: "run_routine", routineId: assetsRoutine.id } } },
+        { key: "published", name: "Published", kind: "done" },
+        { key: "cancelled", name: "Cancelled", kind: "cancelled" },
+      ],
+    });
+    const created = await svc.ingestCase({ companyId: company.id, pipelineId: pipeline.id, caseKey: "blog-post", title: "Blog post", actor: userActor });
+    const drafting = await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "drafting",
+      expectedVersion: created.case.version,
+      actor: userActor,
+    });
+    const draftingIssueId = drafting.automationExecution.status === "succeeded"
+      ? drafting.automationExecution.execution.executionIssueId!
+      : "";
+    const assets = await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "assets",
+      expectedVersion: drafting.case.version,
+      actor: userActor,
+    });
+    const assetsIssueId = assets.automationExecution.status === "succeeded"
+      ? assets.automationExecution.execution.executionIssueId!
+      : "";
+    expect(draftingIssueId).not.toBe("");
+    expect(assetsIssueId).not.toBe("");
+    expect(assetsIssueId).not.toBe(draftingIssueId);
+
+    const terminal = await svc.transitionCase({
+      companyId: company.id,
+      caseId: created.case.id,
+      toStageKey: "published",
+      expectedVersion: assets.case.version,
+      actor: userActor,
+    });
+    expect(terminal.case.terminalKind).toBe("done");
+
+    // The stage the case passed through, and the stage it went terminal from.
+    for (const issueId of [draftingIssueId, assetsIssueId]) {
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const [link] = await db.select().from(pipelineCaseIssueLinks).where(eq(pipelineCaseIssueLinks.issueId, issueId));
+      expect(issue!.status).toBe("cancelled");
+      expect(link!.retiredAt).not.toBeNull();
+      expect(link).toMatchObject({ retiredReason: "stage_exited" });
+    }
+  });
+
   it("retires the automation link without cancelling an issue that has live non-automation ownership", async () => {
     const company = await seedCompany();
     const routine = await seedRoutine(company.id, "Shared ownership");
@@ -2980,6 +3046,49 @@ describeEmbeddedPostgres("pipelineService", () => {
         events.seen[0]!.valueAtPublish,
         "the bumped revision must already be visible to other connections when the event fires",
       ).resolves.toBe(revisionAfter);
+    });
+
+    it("observes and logs a throwing live-event subscriber after the env update commits", async () => {
+      const { company, pipeline, stageId } = await seedAutomatedStage();
+      const warning = "failed to publish pipeline.stage_automation_env_updated activity event";
+      const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+      const unsubscribe = subscribeCompanyLiveEvents(company.id, (event) => {
+        if (
+          event.type === "activity.logged" &&
+          (event.payload as Record<string, unknown>).action === "pipeline.stage_automation_env_updated"
+        ) {
+          throw new Error("pipeline live subscriber exploded");
+        }
+      });
+      let warningCalls: unknown[][] = [];
+
+      try {
+        await svc.updateStageAutomationEnv({
+          companyId: company.id,
+          pipelineId: pipeline.id,
+          stageId,
+          env: null,
+          actor: userActor,
+        });
+        warningCalls = warnSpy.mock.calls.map((call) => [...call]);
+      } finally {
+        unsubscribe();
+        warnSpy.mockRestore();
+      }
+
+      expect(
+        warningCalls,
+        "the post-commit publisher must be awaited so subscriber failures reach the existing logger",
+      ).toEqual(expect.arrayContaining([
+        [
+          expect.objectContaining({
+            err: expect.objectContaining({ message: "pipeline live subscriber exploded" }),
+            companyId: company.id,
+            stageId,
+          }),
+          warning,
+        ],
+      ]));
     });
   });
 });

@@ -33,6 +33,11 @@ import {
   type SlackMessage,
 } from "./slack-api.js";
 import { registerTool, registerTools } from "./tools.js";
+import {
+  withStateLock,
+  watchQueueLockKey,
+  costAccumulatorLockKey,
+} from "./state-lock.js";
 import { SlackAdapter } from "./adapter.js";
 import {
   routeMessageToAgent,
@@ -70,6 +75,7 @@ import {
   removeWatch,
   listWatches,
   checkWatches,
+  WatchesAlreadyDeliveredError,
   BUILTIN_WATCH_TEMPLATES,
 } from "./proactive-suggestions.js";
 import { resolveSlackUserId } from "./user-mapping.js";
@@ -1205,6 +1211,133 @@ async function resolveCompanyJobScope(
   return { config, token };
 }
 
+const WATCH_QUEUE_MAX = 100;
+
+/**
+ * Drain one company's watch-event queue and process the batch.
+ *
+ * The drain is an atomic swap — take the queue and reset it in one locked step,
+ * then do the slow work outside the lock. Reading, awaiting `checkWatches` and
+ * only then writing `[]` destroys every event that arrives while `checkWatches`
+ * is invoking agents and posting to Slack (BLO-23143, Ally finding 2 on #996).
+ *
+ * Emptying the queue up front means a `checkWatches` failure would drop the
+ * batch, so it is put back. That re-queue is itself `ctx.state` I/O against the
+ * backend that just failed, and `checkWatches` swallows every per-watch error
+ * internally — so the only failures that reach it come from the watch-registry
+ * state calls, i.e. it runs almost exclusively when the backend is unhealthy.
+ * An unguarded re-queue therefore rethrows on exactly the occasions it exists to
+ * handle, and the batch is gone (BLO-28764).
+ *
+ * **Delivery guarantee: at-most-once, and it is the re-queue condition that
+ * makes it true — not the absence of a retry.** The watch-registry calls that
+ * are `checkWatches`'s only escaping failures sit on *both* sides of the paid
+ * side effects: the registry read precedes them, the registry write follows
+ * them. Re-queueing on the second kind restores a batch whose agents have
+ * already been invoked and whose Slack messages have already been posted, so
+ * the next tick pays for them again. That is at-least-once on a path that
+ * spends money, and it is reachable from a telemetry blip alone
+ * (BLO-29663, Ally on #1374).
+ *
+ * So `checkWatches` distinguishes the two and this function re-queues only the
+ * first. Three outcomes, all bounded here rather than escaping to the caller:
+ *
+ * - Backend unhealthy for the whole tick: the swap's `set([])` fails too, so the
+ *   queue is never emptied and the batch survives untouched. Nothing is lost.
+ * - Swap completed, then failure *before* anything was delivered: nothing has
+ *   been paid for, so the batch is re-queued ahead of whatever arrived
+ *   meanwhile and retried on the next tick.
+ * - Swap completed, then failure *after* delivery
+ *   (`WatchesAlreadyDeliveredError`): the batch is deliberately **not**
+ *   re-queued. Any of its events that had not yet matched a watch are lost, and
+ *   that is the price of the guarantee — logged at `error` with the company id,
+ *   the delivered count and the event count, never silently. Retrying instead
+ *   would duplicate real agent invocations and real Slack posts, which is the
+ *   larger harm and the one the caller cannot undo.
+ */
+async function drainAndCheckWatches(
+  ctx: PluginContext,
+  token: string,
+  companyId: string,
+): Promise<void> {
+  const queueKey = {
+    scopeKind: "company" as const,
+    scopeId: companyId,
+    stateKey: "recent-watch-events",
+  };
+  const recentEvents = await withStateLock(
+    watchQueueLockKey(companyId),
+    async () => {
+      const recentEventsRaw = await ctx.state.get(queueKey);
+      const drained = Array.isArray(recentEventsRaw)
+        ? (recentEventsRaw as Array<{
+            eventType: string;
+            payload: Record<string, unknown>;
+          }>)
+        : [];
+      if (drained.length > 0) await ctx.state.set(queueKey, []);
+      return drained;
+    },
+  );
+  if (recentEvents.length === 0) return;
+  try {
+    await checkWatches(ctx, token, companyId, recentEvents);
+  } catch (err) {
+    if (err instanceof WatchesAlreadyDeliveredError) {
+      // Agents were invoked and Slack was posted to before this threw. The
+      // batch is unrecoverable by design: re-queueing it would buy back the
+      // undelivered tail at the price of duplicating everything already
+      // delivered (BLO-29663).
+      ctx.logger.error(
+        "check-watches failed after delivering; batch dropped rather than re-queued to avoid duplicate agent invocations",
+        {
+          companyId,
+          deliveredCount: err.delivered,
+          droppedEventCount: recentEvents.length,
+          err: err.cause ?? err,
+        },
+      );
+      return;
+    }
+    try {
+      await withStateLock(watchQueueLockKey(companyId), async () => {
+        const currentRaw = await ctx.state.get(queueKey);
+        const current = Array.isArray(currentRaw)
+          ? (currentRaw as typeof recentEvents)
+          : [];
+        // Keep the head, not the tail, on overflow. The whole point of this
+        // block is to preserve the drained batch, and `slice(-N)` would discard
+        // precisely that in favour of whatever arrived during the failed run.
+        const restored = [...recentEvents, ...current];
+        if (restored.length > WATCH_QUEUE_MAX) {
+          // The one case where the cap actually bites, and it bites hardest
+          // here: a full re-queue discards everything that arrived during the
+          // failed run. Silent truncation at a known-lossy point reads as
+          // "nothing was dropped" (BLO-29663).
+          ctx.logger.warn(
+            "re-queued watch batch exceeds the queue cap; dropping the newest events",
+            {
+              companyId,
+              droppedEventCount: restored.length - WATCH_QUEUE_MAX,
+              queueMax: WATCH_QUEUE_MAX,
+            },
+          );
+        }
+        await ctx.state.set(queueKey, restored.slice(0, WATCH_QUEUE_MAX));
+      });
+      ctx.logger.error(
+        "check-watches failed for company; re-queued its events",
+        { companyId, err },
+      );
+    } catch (requeueErr) {
+      ctx.logger.error(
+        "check-watches failed for company and its drained events could not be re-queued; batch lost",
+        { companyId, droppedEventCount: recentEvents.length, err, requeueErr },
+      );
+    }
+  }
+}
+
 // --- Plugin definition ---
 const plugin = definePlugin({
   async setup(ctx) {
@@ -1248,98 +1381,109 @@ const plugin = definePlugin({
       const companies = await listTargetCompanies(ctx);
       let posted = false;
       for (const company of companies) {
-        // Check the flag before resolving anything. Secret resolution draws on
-        // a shared budget, so a company that has the digest switched off should
-        // not cost one every day just to be skipped.
-        if (!(await isDailyDigestEnabled(ctx, company.id))) continue;
-        const scope = await resolveCompanyJobScope(
-          ctx,
-          company.id,
-          "daily-digest",
-        );
-        if (!scope) continue;
-        const { config, token } = scope;
-        const channelId = await resolveChannel(
-          ctx,
-          company.id,
-          config.defaultChannelId,
-        );
-        if (!channelId) continue;
-        const issues = await ctx.issues.list({
-          companyId: company.id,
-          limit: 200,
-          offset: 0,
-        });
-        const now = new Date();
-        const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-        let tasksCompleted = 0;
-        let tasksCreated = 0;
-        for (const issue of issues) {
-          const updated = new Date(issue.updatedAt);
-          const created = new Date(issue.createdAt);
-          if (issue.status === "done" && updated >= dayAgo) tasksCompleted++;
-          if (created >= dayAgo) tasksCreated++;
-        }
-        const agents = await ctx.agents.list({
-          companyId: company.id,
-          limit: 100,
-          offset: 0,
-        });
-        const agentsActive = agents.filter(
-          (a) => a.status === "active" || a.status === "running",
-        ).length;
-        const dateKey = now.toISOString().slice(0, 10);
-        const dailyCost = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyCost(dateKey),
-        });
-        const totalCost = dailyCost
-          ? String((dailyCost as number).toFixed(2))
-          : "0.00";
-        const topAgentCosts = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
-        });
-        let topAgent = "";
-        if (topAgentCosts && typeof topAgentCosts === "object") {
-          const costs = topAgentCosts as Record<string, number>;
-          let maxCost = 0;
-          for (const [name, cost] of Object.entries(costs)) {
-            if (cost > maxCost) {
-              maxCost = cost;
-              topAgent = name;
+        // Each company's whole body is isolated: an unreachable Slack channel,
+        // a revoked token or a failing host call for one tenant must not abort
+        // the loop and silently deny every later tenant its digest (BLO-23143,
+        // Ally finding 1 on #996).
+        try {
+          // Check the flag before resolving anything. Secret resolution draws on
+          // a shared budget, so a company that has the digest switched off should
+          // not cost one every day just to be skipped.
+          if (!(await isDailyDigestEnabled(ctx, company.id))) continue;
+          const scope = await resolveCompanyJobScope(
+            ctx,
+            company.id,
+            "daily-digest",
+          );
+          if (!scope) continue;
+          const { config, token } = scope;
+          const channelId = await resolveChannel(
+            ctx,
+            company.id,
+            config.defaultChannelId,
+          );
+          if (!channelId) continue;
+          const issues = await ctx.issues.list({
+            companyId: company.id,
+            limit: 200,
+            offset: 0,
+          });
+          const now = new Date();
+          const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+          let tasksCompleted = 0;
+          let tasksCreated = 0;
+          for (const issue of issues) {
+            const updated = new Date(issue.updatedAt);
+            const created = new Date(issue.createdAt);
+            if (issue.status === "done" && updated >= dayAgo) tasksCompleted++;
+            if (created >= dayAgo) tasksCreated++;
+          }
+          const agents = await ctx.agents.list({
+            companyId: company.id,
+            limit: 100,
+            offset: 0,
+          });
+          const agentsActive = agents.filter(
+            (a) => a.status === "active" || a.status === "running",
+          ).length;
+          const dateKey = now.toISOString().slice(0, 10);
+          const dailyCost = await ctx.state.get({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.dailyCost(dateKey),
+          });
+          const totalCost = dailyCost
+            ? String((dailyCost as number).toFixed(2))
+            : "0.00";
+          const topAgentCosts = await ctx.state.get({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+          });
+          let topAgent = "";
+          if (topAgentCosts && typeof topAgentCosts === "object") {
+            const costs = topAgentCosts as Record<string, number>;
+            let maxCost = 0;
+            for (const [name, cost] of Object.entries(costs)) {
+              if (cost > maxCost) {
+                maxCost = cost;
+                topAgent = name;
+              }
             }
           }
+          await postMessage(
+            ctx,
+            token,
+            channelId,
+            formatDailyDigest({
+              tasksCompleted,
+              tasksCreated,
+              agentsActive,
+              totalCost,
+              topAgent,
+            }),
+          );
+          posted = true;
+          // Clean up previous day's cost state
+          const yesterday = new Date(now.getTime() - 86400000)
+            .toISOString()
+            .slice(0, 10);
+          await ctx.state.delete({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.dailyCost(yesterday),
+          });
+          await ctx.state.delete({
+            scopeKind: "company",
+            scopeId: company.id,
+            stateKey: STATE_KEYS.dailyAgentCosts(yesterday),
+          });
+        } catch (err) {
+          ctx.logger.error(
+            "Daily digest failed for company; continuing with remaining companies",
+            { companyId: company.id, err },
+          );
         }
-        await postMessage(
-          ctx,
-          token,
-          channelId,
-          formatDailyDigest({
-            tasksCompleted,
-            tasksCreated,
-            agentsActive,
-            totalCost,
-            topAgent,
-          }),
-        );
-        posted = true;
-        // Clean up previous day's cost state
-        const yesterday = new Date(now.getTime() - 86400000)
-          .toISOString()
-          .slice(0, 10);
-        await ctx.state.delete({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyCost(yesterday),
-        });
-        await ctx.state.delete({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: STATE_KEYS.dailyAgentCosts(yesterday),
-        });
       }
       if (posted) {
         ctx.logger.info("Daily digest posted to Slack");
@@ -1358,36 +1502,46 @@ const plugin = definePlugin({
       if (cost <= 0) return;
       if (!(await isDailyDigestEnabled(ctx, event.companyId))) return;
       const dateKey = new Date().toISOString().slice(0, 10);
-      const currentTotal = await ctx.state.get({
-        scopeKind: "company",
-        scopeId: event.companyId,
-        stateKey: STATE_KEYS.dailyCost(dateKey),
-      });
-      await ctx.state.set(
-        {
-          scopeKind: "company",
-          scopeId: event.companyId,
-          stateKey: STATE_KEYS.dailyCost(dateKey),
-        },
-        ((currentTotal as number | null) ?? 0) + cost,
-      );
       const agentName = String(
         payload.agentName ?? payload.name ?? event.entityId,
       );
-      const agentCosts = await ctx.state.get({
-        scopeKind: "company",
-        scopeId: event.companyId,
-        stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
-      });
-      const costs = (agentCosts as Record<string, number> | null) ?? {};
-      costs[agentName] = (costs[agentName] ?? 0) + cost;
-      await ctx.state.set(
-        {
-          scopeKind: "company",
-          scopeId: event.companyId,
-          stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+      // Both accumulators are read-modify-write against a state API with no
+      // atomic increment, so concurrent cost events for one company would
+      // otherwise each read the same total and the last `set` would win —
+      // silently under-reporting the digest (BLO-23143, Ally finding 3 on
+      // #996). Serialize the whole sequence per company+day.
+      await withStateLock(
+        costAccumulatorLockKey(event.companyId, dateKey),
+        async () => {
+          const currentTotal = await ctx.state.get({
+            scopeKind: "company",
+            scopeId: event.companyId,
+            stateKey: STATE_KEYS.dailyCost(dateKey),
+          });
+          await ctx.state.set(
+            {
+              scopeKind: "company",
+              scopeId: event.companyId,
+              stateKey: STATE_KEYS.dailyCost(dateKey),
+            },
+            ((currentTotal as number | null) ?? 0) + cost,
+          );
+          const agentCosts = await ctx.state.get({
+            scopeKind: "company",
+            scopeId: event.companyId,
+            stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+          });
+          const costs = (agentCosts as Record<string, number> | null) ?? {};
+          costs[agentName] = (costs[agentName] ?? 0) + cost;
+          await ctx.state.set(
+            {
+              scopeKind: "company",
+              scopeId: event.companyId,
+              stateKey: STATE_KEYS.dailyAgentCosts(dateKey),
+            },
+            costs,
+          );
         },
-        costs,
       );
     });
     // Collect watchable events before the bootstrap credential gate below.
@@ -1407,33 +1561,40 @@ const plugin = definePlugin({
     ] as const;
     for (const eventType of watchableEvents) {
       ctx.events.on(eventType, async (event) => {
-        const recentEventsRaw = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: event.companyId,
-          stateKey: "recent-watch-events",
-        });
-        const recentEvents = Array.isArray(recentEventsRaw)
-          ? (recentEventsRaw as Array<{
-              eventType: string;
-              payload: Record<string, unknown>;
-            }>)
-          : [];
-        // Keep last 100 events
-        recentEvents.push({
-          eventType: event.eventType,
-          payload: event.payload as Record<string, unknown>,
-        });
-        if (recentEvents.length > 100) {
-          recentEvents.splice(0, recentEvents.length - 100);
-        }
-        await ctx.state.set(
-          {
+        // Append under the company's queue lock. Without it two events
+        // arriving together both read the same array and the second `set`
+        // drops the first (BLO-23143, Ally finding 2 on #996). The drain in
+        // check-watches takes the same lock, so an append can never be
+        // clobbered by the queue reset either.
+        await withStateLock(watchQueueLockKey(event.companyId), async () => {
+          const recentEventsRaw = await ctx.state.get({
             scopeKind: "company",
             scopeId: event.companyId,
             stateKey: "recent-watch-events",
-          },
-          recentEvents,
-        );
+          });
+          const recentEvents = Array.isArray(recentEventsRaw)
+            ? (recentEventsRaw as Array<{
+                eventType: string;
+                payload: Record<string, unknown>;
+              }>)
+            : [];
+          // Keep last 100 events
+          recentEvents.push({
+            eventType: event.eventType,
+            payload: event.payload as Record<string, unknown>,
+          });
+          if (recentEvents.length > WATCH_QUEUE_MAX) {
+            recentEvents.splice(0, recentEvents.length - WATCH_QUEUE_MAX);
+          }
+          await ctx.state.set(
+            {
+              scopeKind: "company",
+              scopeId: event.companyId,
+              stateKey: "recent-watch-events",
+            },
+            recentEvents,
+          );
+        });
       });
     }
     // Escalation timeout job
@@ -1525,35 +1686,25 @@ const plugin = definePlugin({
     ctx.jobs.register("check-watches", async () => {
       const companies = await listTargetCompanies(ctx);
       for (const company of companies) {
-        const scope = await resolveCompanyJobScope(
-          ctx,
-          company.id,
-          "check-watches",
-        );
-        if (!scope) continue;
-        const { token } = scope;
-        // Get recent events from state (populated by event listeners below)
-        const recentEventsRaw = await ctx.state.get({
-          scopeKind: "company",
-          scopeId: company.id,
-          stateKey: "recent-watch-events",
-        });
-        const recentEvents = Array.isArray(recentEventsRaw)
-          ? (recentEventsRaw as Array<{
-              eventType: string;
-              payload: Record<string, unknown>;
-            }>)
-          : [];
-        if (recentEvents.length > 0) {
-          await checkWatches(ctx, token, company.id, recentEvents);
-          // Clear after processing
-          await ctx.state.set(
-            {
-              scopeKind: "company",
-              scopeId: company.id,
-              stateKey: "recent-watch-events",
-            },
-            [],
+        // Each company's whole body is isolated, exactly as daily-digest above
+        // is. The atomic swap and the re-queue inside drainAndCheckWatches are
+        // both `ctx.state` I/O, so an unhealthy state backend throws here — and
+        // an unguarded throw aborts the loop and skips every later tenant for
+        // this tick. That is the same bug class as Ally finding 1 on #996,
+        // reintroduced on this path by the very fix for finding 2 (BLO-28764).
+        try {
+          const scope = await resolveCompanyJobScope(
+            ctx,
+            company.id,
+            "check-watches",
+          );
+          if (!scope) continue;
+          const { token } = scope;
+          await drainAndCheckWatches(ctx, token, company.id);
+        } catch (err) {
+          ctx.logger.error(
+            "check-watches failed for company; continuing with remaining companies",
+            { companyId: company.id, err },
           );
         }
       }
@@ -1610,23 +1761,13 @@ const plugin = definePlugin({
       );
       return;
     }
-    // Signing secret for the in-process thread-message router below, which
-    // (like `token`/`config` in this closure) is still bootstrap-snapshot
-    // scoped — see the BLO-21083 follow-up note near `resolveInteractionScope`.
-    // The webhook entrypoint (`onWebhook`) resolves its own signing secret
-    // per delivery via `resolveCompanySigningSecret` and does not use this.
-    let routerSigningSecret: string | null = null;
-    if (config.slackSigningSecretRef) {
-      try {
-        routerSigningSecret = await ctx.secrets.resolve(
-          config.slackSigningSecretRef,
-        );
-      } catch {
-        ctx.logger.warn(
-          "Slack signing secret not configured — webhook signature verification disabled",
-        );
-      }
-    }
+    // BLO-29455: the thread-message router used to resolve a signing secret
+    // here, once, from the setup() snapshot. It now resolves the DELIVERING
+    // company's secret per event via `resolveCompanySigningSecret` — the same
+    // way `onWebhook` already did — so there is deliberately nothing left to
+    // resolve at setup time. Do not reintroduce a bootstrap-scoped secret:
+    // a plugin config change does not restart the worker, so any credential
+    // captured here outlives the tenancy it was resolved for.
 
     // =========================================================================
     // PHASE 1: Escalation - using 3-arg ctx.tools.register with ToolRunContext
@@ -2114,7 +2255,17 @@ const plugin = definePlugin({
     // Native agent streaming output
     ctx.events.on("plugin.slack.agent-stream-chunk", async (event) => {
       const p = event.payload as Record<string, unknown>;
-      await handleAgentOutput(ctx, token, event.companyId, {
+      // Agent routing itself is credential-free, but this listener posts the
+      // resulting output to Slack. Resolve the delivering company's token at
+      // the side-effect boundary so a native session created for company B can
+      // never reuse the setup-time bootstrap token from company A.
+      const scope = await resolveInteractionScope(
+        ctx,
+        event.companyId,
+        "agent output",
+      );
+      if (!scope) return;
+      await handleAgentOutput(ctx, scope.token, event.companyId, {
         channel: String(p.channel ?? ""),
         threadTs: String(p.threadTs ?? ""),
         text: String(p.text ?? ""),
@@ -2127,7 +2278,15 @@ const plugin = definePlugin({
     // ACP output events (from cross-plugin)
     ctx.events.on(`plugin.paperclip-plugin-acp.output`, async (event) => {
       const p = event.payload as Record<string, unknown>;
-      await handleAgentOutput(ctx, token, event.companyId, {
+      // ACP output is also a Slack side effect; keep it on the same
+      // per-company credential path as native streaming output.
+      const scope = await resolveInteractionScope(
+        ctx,
+        event.companyId,
+        "agent output",
+      );
+      if (!scope) return;
+      await handleAgentOutput(ctx, scope.token, event.companyId, {
         channel: String(p.channel ?? ""),
         threadTs: String(p.threadTs ?? ""),
         text: String(p.text ?? ""),
@@ -2214,6 +2373,39 @@ const plugin = definePlugin({
         ? (p.files as Array<Record<string, unknown>>)
         : [];
       if (!channel || !threadTs) return;
+      // BLO-29455: resolved from THIS event's own company, never from the
+      // `token`/`config`/`routerSigningSecret` captured by setup(). That
+      // snapshot is only ever populated on a single-company install, and a
+      // plugin config change does NOT restart the worker (the host's restart
+      // path keys off a METHOD_NOT_IMPLEMENTED error the SDK never raises for
+      // a plugin without `onConfigChanged`). So on a 1->2-company transition
+      // the closure keeps company A's bot token AND A's approval allowlist
+      // while `event.companyId` is now B — a cross-tenant authorization
+      // defect, not just a wrong-credential one.
+      //
+      // Lazy + memoized: at most one config read and one secret resolution
+      // per event, and none at all for ordinary thread chatter that only
+      // routes to an agent. Same reasoning as handleReactionEvent, which
+      // defers resolution until it knows the message is an approval card.
+      let scopePromise: Promise<CompanyInteractionScope | null> | undefined;
+      const scopeFor = () =>
+        (scopePromise ??= resolveInteractionScope(
+          ctx,
+          event.companyId,
+          "thread message",
+        ));
+      // Only `kind === "secret"` yields a value: both "not configured" and
+      // "configured but unreadable" must leave the mutating-approval gate
+      // closed. Signature verification itself already happened in onWebhook
+      // against this same company's secret before the event was emitted.
+      let secretPromise: Promise<string | null> | undefined;
+      const signingSecretFor = () =>
+        (secretPromise ??= resolveCompanySigningSecret(
+          ctx,
+          event.companyId,
+        ).then((resolution) =>
+          resolution.kind === "secret" ? resolution.value : null,
+        ));
       // Phase 1 approval interactions: if this thread is an approval card,
       // parse !approve/!reject/!revise/!status and resolve commands, then stop
       // (don't fall through to agent routing for command replies).
@@ -2225,6 +2417,11 @@ const plugin = definePlugin({
       if (approvalId && text) {
         const parsed = parseThreadCommand(text);
         if (parsed.kind === "ignore") return;
+        // Every remaining branch posts to Slack, so the token is needed from
+        // here on. Refuse rather than fall back to another company's.
+        const scope = await scopeFor();
+        if (!scope) return;
+        const { config, token } = scope;
         if (parsed.kind === "usage") {
           await postMessage(ctx, token, channel, { text: parsed.message }, { threadTs });
           return;
@@ -2247,7 +2444,7 @@ const plugin = definePlugin({
             stateKey: STATE_KEYS.approvalPending(approvalId),
           });
           if (resolvedLock || pendingDecision) return;
-          if (!canProcessMutatingApprovalWebhook("freeform_revision", routerSigningSecret)) return;
+          if (!canProcessMutatingApprovalWebhook("freeform_revision", await signingSecretFor())) return;
           await requestRevision(ctx, token, {
             companyId: event.companyId,
             approvalId,
@@ -2284,7 +2481,7 @@ const plugin = definePlugin({
           return;
         }
         // parsed.kind === "decision"
-        if (!canProcessMutatingApprovalWebhook("thread_command", routerSigningSecret)) return;
+        if (!canProcessMutatingApprovalWebhook("thread_command", await signingSecretFor())) return;
         const slackUserId = p.slackUserId ? String(p.slackUserId) : "";
         if (!slackUserId || !isAuthorizedReactor(slackUserId, config)) {
           const text = slackUserId
@@ -2317,9 +2514,11 @@ const plugin = definePlugin({
         const fileId = String(file.id ?? "");
         const mimetype = String(file.mimetype ?? "");
         if (fileId && isMediaFile(mimetype)) {
+          const mediaScope = await scopeFor();
+          if (!mediaScope) break;
           await processMediaFile(
             ctx,
-            token,
+            mediaScope.token,
             event.companyId,
             fileId,
             channel,
@@ -2329,17 +2528,23 @@ const plugin = definePlugin({
       }
       // Phase 4: Check for custom commands
       if (text) {
-        const handled = await tryCustomCommand(
-          ctx,
-          token,
-          event.companyId,
-          channel,
-          threadTs,
-          text,
-        );
-        if (handled) return;
+        const commandScope = await scopeFor();
+        if (commandScope) {
+          const handled = await tryCustomCommand(
+            ctx,
+            commandScope.token,
+            event.companyId,
+            channel,
+            threadTs,
+            text,
+          );
+          if (handled) return;
+        }
       }
-      // Phase 2: Route to agent sessions
+      // Phase 2: Route to agent sessions. Deliberately NOT gated on a
+      // resolvable scope — this path posts nothing to Slack and needs no bot
+      // token, so a company with no Slack credential still gets its thread
+      // replies delivered to the agent session.
       if (text) {
         await routeMessageToAgent(
           ctx,

@@ -31,6 +31,7 @@ import {
   REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT,
   REQUEST_ITEM_VERDICTS_ITEM_LIMIT,
 } from "../constants.js";
+import { executionWorkspaceStrategySchema } from "./execution-workspace.js";
 import { multilineTextSchema } from "./text.js";
 import { lowTrustReviewPresetPolicySchema, trustAuthorizationPolicySchema } from "./trust-policy.js";
 
@@ -106,20 +107,6 @@ export const ISSUE_EXECUTION_WORKSPACE_PREFERENCES = [
   "reuse_existing",
   "agent_default",
 ] as const;
-
-const executionWorkspaceStrategySchema = z
-  .object({
-    type: z.enum(["project_primary", "git_worktree", "adapter_managed", "cloud_sandbox"]).optional(),
-    baseRef: z.string().optional().nullable(),
-    branchTemplate: z.string().optional().nullable(),
-    worktreeParentDir: z.string().optional().nullable(),
-    provisionCommand: z.string().optional().nullable(),
-    teardownCommand: z.string().optional().nullable(),
-    // BLO-19063: opt into a per-run working tree. Omitted => "per_issue", the
-    // historical behaviour.
-    runScope: z.enum(["per_issue", "per_run"]).optional().nullable(),
-  })
-  .strict();
 
 export const issueExecutionWorkspaceSettingsSchema = z
   .object({
@@ -306,13 +293,39 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "cancelled",
 ] as const;
 
+/**
+ * `sourceIssueStatus` is the status the resolver ASSERTS about the source issue.
+ *
+ * PEN-2756: the enum omits `in_progress` and `backlog`, and those are exactly the
+ * two states beacons most often sit on. No invariant enforces that omission —
+ * `in_progress` is NOT reserved for the execution lock (issues.ts sets it lock-free
+ * on any assigned row, and a deliberate `in_progress` write is explicitly protected
+ * from the checkout-restore sweep). So the exclusion is not load-bearing; it is
+ * simply a vocabulary that never grew a way to say "nothing".
+ *
+ * The fix is to allow asserting NOTHING rather than to widen the enum. Widening it
+ * would make the resolver claim execution state it cannot verify, and would route a
+ * status write through `issues.update` side effects (`startedAt`, checkout-restore
+ * marker clearing) purely to clear an unrelated beacon. Omitting the field asserts
+ * nothing, touches nothing, and leaves a live `in_progress` run or a board-approved
+ * `backlog` park exactly as it was.
+ *
+ * Omission is confined to `restored` on purpose. `blocked` must land the row on
+ * `blocked` (the route additionally requires a real first-class blocker), and the
+ * board-only `false_positive`/`cancelled` outcomes retire the recovery premise
+ * entirely, so they must say where the row lands rather than leave it mid-flight.
+ */
 export const resolveIssueRecoveryActionSchema = z.object({
   actionId: z.string().uuid().optional(),
   outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
-  sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
+  sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]).optional(),
   resolutionNote: multilineTextSchema.optional().nullable(),
 }).strict().superRefine((value, ctx) => {
   if (value.outcome === "restored") {
+    // Omitted => leave the source issue's status untouched. The route already
+    // guards every status-dependent step on this field being present, so an
+    // absent value resolves the action and writes no status.
+    if (value.sourceIssueStatus === undefined) return;
     if (
       value.sourceIssueStatus !== "todo" &&
       value.sourceIssueStatus !== "done" &&
@@ -320,7 +333,8 @@ export const resolveIssueRecoveryActionSchema = z.object({
     ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "Restored recovery actions must move the source issue to todo, done, or in_review",
+        message:
+          "Restored recovery actions must move the source issue to todo, done, or in_review, or omit sourceIssueStatus to leave it unchanged",
         path: ["sourceIssueStatus"],
       });
     }
@@ -592,6 +606,10 @@ const createIssueBaseSchema = z.object({
     agentId: z.string().uuid(),
     instructions: multilineTextSchema.optional().nullable(),
   }).strict().optional().nullable(),
+  prReviewTarget: z.object({
+    repoFullName: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
+    prNumber: z.number().int().positive(),
+  }).strict().optional().nullable(),
 });
 
 const createIssueDuplicateGuardSchema = {
@@ -649,6 +667,7 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   createdByUserId: true,
   responsibleUserId: true,
   watchdog: true,
+  prReviewTarget: true,
 }).partial().extend({
   requestDepth: issueRequestDepthInputSchema.optional(),
   assigneeAgentId: z.string().trim().min(1).optional().nullable(),

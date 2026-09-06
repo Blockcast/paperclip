@@ -103,8 +103,10 @@ const MAX_PARENT_WALK_DEPTH = 25;
 // Matches STALE_RUNNING_ISSUE_LOCK_MS in recovery/service.ts, which is the point
 // the stale-lock sweeper itself stops believing the holder — kept as a local
 // constant rather than an import to avoid coupling the detector to the recovery
-// service's module graph.
-const NON_LIVE_EXECUTION_SILENCE_MS = 2 * 60 * 60 * 1000;
+// service's module graph. BLO-30087 exports it so a drift guard can pin it
+// against the sweeper's own bound — the three consumers of this heuristic have
+// already drifted apart once.
+export const NON_LIVE_EXECUTION_SILENCE_MS = 2 * 60 * 60 * 1000;
 // BLO-23248/BLO-22331/BLO-19604/BLO-23624: three distinct mechanisms all
 // produce the same null hypothesis — "the assignee was never given an
 // executable turn" — which BLO-23248 originally tracked under a single
@@ -146,6 +148,7 @@ const NO_EXECUTABLE_TURN_DOMINANT_SHARE = 0.5;
 const COMMENT_POLICY_EXEMPT_ISSUE_COMMENT_STATUS = "not_applicable";
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
 const PRODUCTIVITY_REVIEW_CREATED_ACTION = "issue.productivity_review_created";
+const PRODUCTIVITY_REVIEW_SUPPRESSED_ACTION = "issue.productivity_review_suppressed";
 const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_STARTED_ACTION =
   "issue.productivity_review_assignment_wake_started";
 const PRODUCTIVITY_REVIEW_ASSIGNMENT_WAKE_FAILED_ACTION =
@@ -444,7 +447,7 @@ type EnqueueWakeup = (
   },
 ) => Promise<unknown | null>;
 
-const MONITOR_SCHEDULED_SUPPRESSION_ACTORS = new Set(["assignee", "board"]);
+const MONITOR_SCHEDULED_SUPPRESSION_ACTORS = new Set(["assignee", "board", "manager"]);
 
 // A linked approval in one of these statuses means the issue's next move belongs to a human.
 // Deliberately `pending` only: `revision_requested` hands the ball back to the *agent*, so a
@@ -702,6 +705,62 @@ function classifyNoExecutableTurnRun(
 }
 
 /**
+ * BLO-22436: the span a run was demonstrably executing.
+ *
+ * Used only to protect the no-executable-turn buckets from over-exclusion. A
+ * run sitting `queued` while a *different* run works the same issue is not a
+ * missing turn — the assignee had one, on the sibling row — so that overlap has
+ * to come back out of `noExecutableTurnMs` before it suppresses the trigger.
+ *
+ * Liveness matches `nonLiveExecutionHoldSince`: a `running` row counts until it
+ * goes silent past NON_LIVE_EXECUTION_SILENCE_MS, and one carrying a past
+ * `scheduledRetryAt` starts at that park boundary rather than at its preserved
+ * pre-park `startedAt`, for the reason `liveSegmentStartedAt` documents —
+ * otherwise a promoted row's live span would swallow its own park.
+ */
+function runLiveInterval(run: HeartbeatRunRow, now: Date): { start: number; end: number } | null {
+  const startedAt = coerceDate(run.startedAt);
+  if (!startedAt || Number.isNaN(startedAt.getTime())) return null;
+  const parkEndedAt = liveSegmentStartedAt(run, now);
+  const start = parkEndedAt && parkEndedAt.getTime() > startedAt.getTime() ? parkEndedAt : startedAt;
+
+  const lastSignal = latestDate(run.lastUsefulActionAt, run.lastOutputAt, startedAt);
+  let end: Date | null;
+  if (TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number])) {
+    end = coerceDate(run.finishedAt) ?? lastSignal;
+  } else if (run.status === "running") {
+    const silentFrom = lastSignal ? lastSignal.getTime() + NON_LIVE_EXECUTION_SILENCE_MS : now.getTime();
+    end = new Date(Math.min(now.getTime(), silentFrom));
+  } else {
+    // queued / scheduled_retry carrying a startedAt: a row that executed and has
+    // since re-parked. Its live span ended at its last signal.
+    end = lastSignal;
+  }
+  if (!end) return null;
+  return end.getTime() > start.getTime() ? { start: start.getTime(), end: end.getTime() } : null;
+}
+
+/** Milliseconds of `[start, end)` not covered by any span in `liveSpans`. */
+function msOutsideLiveSpans(start: number, end: number, liveSpans: { start: number; end: number }[]) {
+  if (end <= start) return 0;
+  const overlapping = liveSpans
+    .map((span) => ({ start: Math.max(span.start, start), end: Math.min(span.end, end) }))
+    .filter((span) => span.end > span.start)
+    .sort((a, b) => a.start - b.start);
+
+  let covered = 0;
+  let cursor = start;
+  for (const span of overlapping) {
+    if (span.start > cursor) cursor = span.start;
+    if (span.end > cursor) {
+      covered += span.end - cursor;
+      cursor = span.end;
+    }
+  }
+  return end - start - covered;
+}
+
+/**
  * BLO-23248/BLO-22331/BLO-23624: sums the portion of
  * `[attributableStartAt, attributableEndAt)` attributable to a
  * no-executable-turn run, walking `latestRuns` in chronological order and
@@ -750,6 +809,19 @@ function noExecutableTurnBreakdown(
   };
   let noExecutableTurnMs = 0;
 
+  // BLO-22436: subtract any span a *different* run was demonstrably executing.
+  // Without this, one stray `queued` sibling of a live run covers almost the
+  // whole episode — the segment below runs from that row's `createdAt` to
+  // `attributableEndAt` regardless of what else was happening — and the
+  // dominant-share test then suppresses `long_active_duration` outright. A
+  // freshly-enqueued run is the normal state of an actively-woken issue, so
+  // unguarded this desensitizes the trigger on exactly the issues that *are*
+  // running. Measured on the BLO-25722 overlap case: 6h 50m of a 7h episode
+  // excluded while a run was live throughout, `created` 1 → 0.
+  const liveSpans = chronological
+    .map((run) => runLiveInterval(run, now))
+    .filter((span): span is { start: number; end: number } => span !== null);
+
   for (let i = 0; i < chronological.length; i += 1) {
     const run = chronological[i]!;
     const classification = classifyNoExecutableTurnRun(run);
@@ -776,7 +848,7 @@ function noExecutableTurnBreakdown(
         segmentEnd = finishedAt.getTime() > segmentStart.getTime() ? finishedAt : segmentStart;
       }
     }
-    const segmentMs = segmentEnd.getTime() - segmentStart.getTime();
+    const segmentMs = msOutsideLiveSpans(segmentStart.getTime(), segmentEnd.getTime(), liveSpans);
     if (segmentMs <= 0) continue;
     mechanismMs[classification.mechanism] += segmentMs;
     noExecutableTurnMs += segmentMs;
@@ -2502,12 +2574,74 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       actorType: "system",
       actorId: "system",
       agentId: suppression.sourceIssue.assigneeAgentId,
-      action: "issue.productivity_review_suppressed",
+      action: PRODUCTIVITY_REVIEW_SUPPRESSED_ACTION,
       entityType: "issue",
       entityId: suppression.sourceIssue.id,
       details,
     });
     logger.info(details, "productivity review long_active_duration suppressed by pending approval gate");
+  }
+
+  /**
+   * BLO-24022: identity of the monitor wait a suppression is reporting.
+   *
+   * The reconcile re-evaluates every ~30s (`heartbeatSchedulerIntervalMs`) and re-reaches the same
+   * suppression decision each time, because nothing about the wait has changed — the monitor is
+   * still armed for the same future check. Keying on that wait lets us write one audit row per
+   * wait instead of one per tick.
+   *
+   * Deliberately excluded from the key:
+   * - `elapsedMs` — grows monotonically every tick. Including it would make every key unique and
+   *   defeat the dedupe entirely; it is the field that made these rows look like state changes.
+   * - `monitorWakeRequestedAt` — a wake claim expires after
+   *   `ISSUE_MONITOR_WAKE_CLAIM_TTL_MS` (5m) and is re-taken, which would re-open the same churn
+   *   at 12 rows/hour per issue. The claim does not change *which* wait we are suppressing for.
+   *
+   * `monitorLastTriggeredAt` IS in the key: on the just-fired branch `monitorNextCheckAt` is null
+   * (see `MonitorScheduledSuppression`), so it is the only field that distinguishes one fired
+   * window from the next.
+   */
+  function monitorSuppressionWindowKey(details: {
+    monitorNextCheckAt: string | null;
+    monitorScheduledBy: string | null;
+    monitorLastTriggeredAt: string | null;
+  }) {
+    return [
+      details.monitorNextCheckAt ?? "none",
+      details.monitorScheduledBy ?? "none",
+      details.monitorLastTriggeredAt ?? "none",
+    ].join("|");
+  }
+
+  async function latestMonitorScheduledSuppressionKey(
+    executor: DbOrTx,
+    input: { companyId: string; issueId: string },
+  ) {
+    const row = await executor
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, input.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.issueId),
+          eq(activityLog.action, PRODUCTIVITY_REVIEW_SUPPRESSED_ACTION),
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!row) return null;
+    const details = activityDetails(row.details);
+    // A different suppression reason (approval_pending, terminal source) is a real state change,
+    // so it must not be mistaken for an already-reported monitor wait.
+    if (details.suppressedBy !== "monitor_scheduled") return null;
+    const str = (value: unknown) => (typeof value === "string" ? value : null);
+    return monitorSuppressionWindowKey({
+      monitorNextCheckAt: str(details.monitorNextCheckAt),
+      monitorScheduledBy: str(details.monitorScheduledBy),
+      monitorLastTriggeredAt: str(details.monitorLastTriggeredAt),
+    });
   }
 
   async function recordMonitorScheduledSuppression(suppression: MonitorScheduledSuppression) {
@@ -2522,17 +2656,37 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       monitorLastTriggeredAt: suppression.monitorLastTriggeredAt?.toISOString() ?? null,
       elapsedMs: suppression.elapsedMs,
     };
+    // BLO-24022: only the first tick of a given monitor wait writes an audit row. Re-suppressing a
+    // wait already on record is not a state change, and emitting it every ~30s drowned the
+    // activity feed (46% of all company activity), which broke agent-health triage.
+    //
+    // Best-effort by design: this is a read-then-write without a lock, so two overlapping
+    // reconciles (see the note on the 30s scheduler overlapping itself) can both miss the existing
+    // row and write. That degrades to a small number of rows per wait rather than ~120/hour, which
+    // is the whole point; an advisory lock is not worth taking for an audit row.
+    const previousKey = await latestMonitorScheduledSuppressionKey(db, {
+      companyId: suppression.sourceIssue.companyId,
+      issueId: suppression.sourceIssue.id,
+    });
+    if (previousKey !== null && previousKey === monitorSuppressionWindowKey(details)) {
+      logger.debug(
+        details,
+        "productivity review long_active_duration suppression already recorded for this monitor wait",
+      );
+      return false;
+    }
     await logActivity(db, {
       companyId: suppression.sourceIssue.companyId,
       actorType: "system",
       actorId: "system",
       agentId: suppression.sourceIssue.assigneeAgentId,
-      action: "issue.productivity_review_suppressed",
+      action: PRODUCTIVITY_REVIEW_SUPPRESSED_ACTION,
       entityType: "issue",
       entityId: suppression.sourceIssue.id,
       details,
     });
     logger.info(details, "productivity review long_active_duration suppressed by scheduled monitor");
+    return true;
   }
 
   /**
@@ -3349,8 +3503,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       triggerReasons.push(formatRuntimeFailureTriggerClaim(runtimeFailureStreak, runtimeFailureUsageBasis));
     }
     if (noComment) {
+      // BLO-29535 (Ally suggestion on a38c12fe2): NOT "additional". Per
+      // `isNeverInvokedRun`'s own note, this population is mostly a *subset* of
+      // `isNeverExecutedRun`, so these runs are usually already inside the
+      // non-executing count the evidence block reports. The evidence block
+      // disambiguates via `nonExecutingAlsoNeverInvokedCount`; this prose reason
+      // carries no such field, so it has to say the overlap out loud or a reader
+      // summing the two counts double-counts every run that satisfies both.
       const neverInvokedNote = neverInvokedRunCount > 0
-        ? ` (${neverInvokedRunCount} additional run(s) in the sampled window never had an adapter created and are excluded, not counted toward this streak)`
+        ? ` (${neverInvokedRunCount} run(s) in the sampled window never had an adapter created and are excluded, not counted toward this streak; these mostly overlap the non-executing runs reported separately, so the two counts do not sum)`
         : "";
       triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment${neverInvokedNote}`);
     }
@@ -3620,8 +3781,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment streak (terminal, turn-executing runs): ${evidence.noCommentStreak}`,
       `- Runtime-failure streak (terminal, never-executed runs): ${evidence.runtimeFailureStreak}`,
-      `- Never-invoked runs excluded (terminal, no adapter ever created — \`usageJson\`/\`logStore\`/\`logRef\` null, \`logBytes\` 0, BLO-26165): ${evidence.neverInvokedRunCount}`,
-      `- Comment-policy-exempt runs that DID execute (terminal, \`issueCommentStatus: not_applicable\`, counted toward the streak — BLO-26165): ${evidence.commentExemptExecutedRunCount}`,
+      `- Never-invoked runs excluded (terminal, no adapter ever created — \`usageJson\`/\`logStore\`/\`logRef\` null, \`logBytes\` null or 0, BLO-26165): ${evidence.neverInvokedRunCount}`,
+      // BLO-29535 (Ally suggestion on a38c12fe2): "not excluded from the streak
+      // walk", NOT "counted toward the streak". This count is taken over every
+      // run in `noCommentEligibleRuns`, while `noCommentStreak` is only the
+      // prefix of that list before the first commented run — so the two numbers
+      // legitimately differ, and the old label invited a manager to read the
+      // larger one as the streak length.
+      `- Comment-policy-exempt runs that DID execute (terminal, \`issueCommentStatus: not_applicable\`, not excluded from the streak walk — BLO-26165): ${evidence.commentExemptExecutedRunCount}`,
       ...(evidence.nonExecutingRunCount > 0
         ? [
             // BLO-22436 (Ally suggestion on 37c1bd65): one parenthetical group,
@@ -3740,7 +3907,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- No-comment streak: ${evidence.noCommentStreak}`,
       `- Runtime-failure streak: ${evidence.runtimeFailureStreak}`,
       `- Never-invoked runs excluded (no adapter created): ${evidence.neverInvokedRunCount}`,
-      `- Comment-policy-exempt runs that DID execute (counted): ${evidence.commentExemptExecutedRunCount}`,
+      // BLO-29535: same wording fix as the description's evidence block — this
+      // count is every streak-eligible exempt run, not the streak prefix, and
+      // a bare "(counted)" sitting under "No-comment streak" read as "counted
+      // into that streak". The comment must tell the same story as the
+      // description it summarises.
+      `- Comment-policy-exempt runs that DID execute (not excluded from the streak walk): ${evidence.commentExemptExecutedRunCount}`,
       // BLO-22436 (Ally suggestion on 37c1bd65): the never-invoked count is
       // ambiguous on its own — it says nothing about *why* those runs could not
       // comment. Carry the non-executing count and its overlap here too, so the
@@ -4458,7 +4630,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       companyId: evidence.sourceIssue.companyId,
       actorType: "system",
       actorId: "system",
-      action: "issue.productivity_review_suppressed",
+      action: PRODUCTIVITY_REVIEW_SUPPRESSED_ACTION,
       entityType: "issue",
       entityId: evidence.sourceIssue.id,
       agentId: evidence.sourceAgent.id,

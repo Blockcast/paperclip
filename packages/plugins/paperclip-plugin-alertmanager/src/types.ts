@@ -94,13 +94,7 @@ export interface AlertmanagerPluginConfig {
    * Per-instance owner map. e.g. `{ team: { platform: "alice@blockcast.net" }}`.
    */
   ownerMap?: OwnerMap;
-  /**
-   * Exact agent name assigned when neither owner resolution nor an issue route
-   * produces an assignee. Required in practice: an instance whose
-   * `fallbackAgentName` is missing, unmatched, or ambiguous fails closed and
-   * creates no issue, because an ownerless alert issue is never actioned and
-   * auto-cancels unattended (BLO-27435 / BLO-27436 / BLO-27438).
-   */
+  /** Exact named agent used when owner and issue-route resolution produce no assignee. */
   fallbackAgentName?: string;
   /**
    * Per-instance issue route map. Matches alert labels and applies project,
@@ -187,6 +181,12 @@ export interface AlertmanagerWebhookPayload {
 export interface AlertStateRecord {
   paperclipIssueId: string;
   paperclipCompanyId: string;
+  /**
+   * Aggregate identity captured when this fingerprint first fired. Routing
+   * annotations are mutable, so resolution must not recompute this from a
+   * later payload and accidentally act on a different aggregate.
+   */
+  aggregateKey?: string;
   assigneeUserId: string | null;
   /**
    * Set when ownerMap routes to an agent via the `agent:<id>` value syntax.
@@ -218,6 +218,17 @@ export interface AlertStateRecord {
    * recomputable in the sweep because alert labels are not persisted.
    */
   escalationIntervalMs?: number | null;
+  /**
+   * BLO-29908: set when a resolve arrived while a run held the issue's
+   * execution lock, so the auto-cancel was withheld rather than evicting that
+   * run. Names the holding run; null once a resolve cancels cleanly.
+   *
+   * Diagnostic, not control state — nothing reconciles off it. It exists so
+   * that "this row is open even though its alert cleared" is answerable from
+   * the state row instead of only from the issue thread.
+   */
+  cancelWithheldForRunId?: string | null;
+  cancelWithheldAt?: string | null;
 }
 
 /**

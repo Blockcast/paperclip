@@ -21,22 +21,67 @@
 # the SHA-256 of the canonical full Deployment with that annotation removed.
 # The approval probe and the release must submit the same stamped manifest.
 #
-# The window is a ring of at most MAX_APPROVED_DIGESTS entries, newest first:
-# the digest being released plus the most recently approved ones. That keeps an
-# immediate rollback available without accepting every historical digest. Rolling
-# back past the window is deliberately an explicit act — re-run this script
-# naming that digest.
+# The window is a ring of at most MAX_APPROVED_DIGESTS entries: the digest being
+# released, then the digest the cluster is currently running, then the most
+# recently approved ones. That keeps an immediate rollback available without
+# accepting every historical digest. Rolling back past the window is deliberately
+# an explicit act — re-run this script naming that digest.
+#
+# The running digest is pinned ahead of the age-ordered fill rather than taking
+# its chances in it. A deploy that fails before its rollout lands still consumes
+# a slot permanently, so under plain newest-first ordering a run of consecutive
+# failures — exactly when a rollback is wanted — is what ages out the digest
+# actually serving traffic, and helm can then no longer roll back to it
+# (BLO-28483). Pinning reorders eviction only; the bound is unchanged, so
+# the maxApprovedApiDigests CEL variable does not move.
+#
+# "Currently running" means a rollout that has actually landed and is serving,
+# not merely one that was written to the pod template — a digest applied by a
+# failed deploy stays in spec.template forever, and pinning that would burn the
+# reserved slot on an image which never carried traffic. Once that has happened
+# the Deployment no longer names the last healthy digest at all, so the previous
+# ReplicaSet is consulted instead (BLO-31842); that read needs get+list on
+# apps/replicasets for the deploy identity, and says so in the log when it does
+# not have them, rather than degrading in silence.
 #
 # An approval holds an in-flight lock until its rollout actually lands, so two
-# releases cannot rotate the ring underneath each other. If a release fails and
-# will never complete, retire its lock explicitly:
+# releases cannot rotate the ring underneath each other. Retiring that lock —
+# whether automatically on abort or explicitly via the escape hatch below —
+# deliberately leaves the ring alone, so an abandoned digest keeps its slot until
+# it ages out normally. If a release fails and will never complete, retire its
+# lock explicitly:
 #
 #   PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT=sha256:<the stuck digest> \
 #     PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER=<the stuck 64-hex owner> \
 #     PAPERCLIP_DEPLOY_KUBECONFIG=... scripts/approve-paperclip-api-digest.sh ...
 #
 # The script retires its own lock automatically when it aborts after taking it,
-# so an inadmissible plan does not wedge the channel on its own.
+# so an inadmissible plan does not wedge the channel on its own. It cannot do
+# the same for a caller that fails AFTER this script exits 0 -- success
+# deliberately leaves the lock live for the next release to retire. A release
+# workflow closes that window by setting
+#
+#   PAPERCLIP_APPROVAL_LOCK_OWNER_OUT=/path/to/lock-owner.txt
+#
+# which receives the 64-hex owner of the lock this invocation minted, and only
+# that lock: a lock adopted from an earlier attempt is left unnamed, because
+# its rollout may still be running. A later step that knows the cluster was
+# never touched can then feed that owner back through
+# PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER above. No file is written when the
+# lock is not this invocation's to abandon.
+#
+# That later step retires the lock through this same script, in retire-only mode
+# (BLO-31666):
+#
+#   PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY=1 \
+#     PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT=sha256:<the digest it approved> \
+#     PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER=<the owner it was handed> \
+#     scripts/approve-paperclip-api-digest.sh
+#
+# which removes that one lock and approves nothing. It takes no positional
+# arguments, matches on digest AND owner so it can never retire a lock another
+# run took, and exits 0 without writing when no such lock is present -- "not
+# ours" and "already gone" are the same fact, and neither is an error.
 
 set -euo pipefail
 
@@ -57,6 +102,61 @@ LOCK_MARKER_ANNOTATION="paperclip.blockcast.net/approval-in-flight-rollout-marke
 LOCK_SERVER_PLAN_ANNOTATION="paperclip.blockcast.net/approval-in-flight-server-plan-sha256"
 LOCK_OWNER_ANNOTATION="paperclip.blockcast.net/approval-in-flight-owner"
 ROLLOUT_MARKER_ANNOTATION="paperclip.blockcast.net/approval-plan-sha256"
+
+# Retiring a lock means removing every annotation that constitutes it, and the
+# set has grown three times (uid, generation, server-plan). Two copies of this
+# list would drift on the fourth: a copy that forgets one key leaves a partial
+# lock behind, and a partial lock is worse than none -- the digest field is what
+# the next approval refuses on, so a retirement that clears the owner but keeps
+# the digest wedges the channel while reporting success. So it is written once
+# and used by both retirement paths: release_in_flight_lock (this invocation
+# aborting after it took the lock) and the retire-only mode below (a caller that
+# knows the cluster was never touched).
+#
+# The ring in .data is deliberately untouched by both. The digest is legitimately
+# approved, the window bound still holds, and dropping entries here could evict a
+# rollback target.
+read -r -d '' CLEAR_IN_FLIGHT_LOCK_JQ <<'CLEAR_JQ' || true
+del(.metadata.annotations[$digest_key])
+| del(.metadata.annotations[$plan_key])
+| del(.metadata.annotations[$uid_key])
+| del(.metadata.annotations[$generation_key])
+| del(.metadata.annotations[$marker_key])
+| del(.metadata.annotations[$server_plan_key])
+| del(.metadata.annotations[$owner_key])
+CLEAR_JQ
+
+# kubectl's stderr from the most recent clear_in_flight_lock call. Declared
+# here so it is readable under `set -u` even if the function never ran.
+CLEAR_IN_FLIGHT_LOCK_ERR=""
+
+# resourceVersion rides along inside the object read here, so `kubectl replace`
+# is rejected with a 409 if anyone else changed the transaction in between --
+# the same optimistic-concurrency guard the rotation write uses, for the same
+# reason. Retried from a fresh read rather than forced.
+clear_in_flight_lock() {
+  local json="$1"
+  local status=0
+  # `2>&1 >/dev/null` in that order: stderr is duplicated onto the command
+  # substitution's pipe first, then stdout is discarded. Capturing rather than
+  # discarding is what lets the retire-only loop tell a 409 (retrying may win)
+  # from an RBAC denial or a vanished ConfigMap (retrying cannot), the same
+  # distinction the rotation write makes further down this file.
+  CLEAR_IN_FLIGHT_LOCK_ERR="$(
+    jq \
+      --arg digest_key "$LOCK_DIGEST_ANNOTATION" \
+      --arg plan_key "$LOCK_PLAN_ANNOTATION" \
+      --arg uid_key "$LOCK_UID_ANNOTATION" \
+      --arg generation_key "$LOCK_GENERATION_ANNOTATION" \
+      --arg marker_key "$LOCK_MARKER_ANNOTATION" \
+      --arg server_plan_key "$LOCK_SERVER_PLAN_ANNOTATION" \
+      --arg owner_key "$LOCK_OWNER_ANNOTATION" \
+      "$CLEAR_IN_FLIGHT_LOCK_JQ" <<<"$json" \
+      | kubectl replace -f - 2>&1 >/dev/null
+  )" || status=$?
+  return "$status"
+}
+
 # Must stay in lockstep with the `maxApprovedApiDigests` CEL variable in
 # paperclip/paperclip-public-tools.yaml. The policy denies everything if the
 # list is longer, so a drift here is a hard outage, not a silent widening.
@@ -69,6 +169,13 @@ ROLLOUT_MARKER_ANNOTATION="paperclip.blockcast.net/approval-plan-sha256"
 # policy answers by denying every rollout.
 # scripts/test-apply-platform-sre-backup-rbac.sh asserts this equals the CEL bound.
 readonly MAX_APPROVED_DIGESTS=3
+
+# Retry bound shared by BOTH retirement paths: retire-only mode below, and
+# release_in_flight_lock on the abort path. Declared here rather than inside
+# retire-only mode because that block exits before the approval path ever runs,
+# so a declaration there leaves this unset -- and under `set -u` that aborts
+# cleanup_on_exit mid-retirement, turning a parity fix into a fresh wedge.
+readonly RETIRE_ATTEMPTS=3
 
 if [[ -n "${PAPERCLIP_MAX_APPROVED_DIGESTS:-}" \
       && "$PAPERCLIP_MAX_APPROVED_DIGESTS" != "$MAX_APPROVED_DIGESTS" ]]; then
@@ -84,19 +191,57 @@ usage() {
   exit 2
 }
 
-[[ $# -eq 2 ]] || usage
-DIGEST="$1"
-PLANNED_DEPLOYMENT="$2"
+# BLO-31666. A release that took a lock and then died BEFORE `helm upgrade` ever
+# executed knows something no other actor can know: the cluster was never
+# touched, so this lock names a rollout that will never happen. Nothing clears it
+# on its own -- the ring still lists the digest, so every subsequent production
+# deploy is refused at admission until a human retires it by hand. That is
+# BLO-31598, and it cost hours. This mode is the entry point for the cleanup step
+# that closes the window.
+#
+# It approves nothing. So it needs no plan manifest, no deploy credential, and no
+# admissibility probe: it is the removal half of the transaction and nothing else.
+# The lock is named entirely by the ABANDON pair validated below, which is why
+# this mode takes NO positional arguments -- a digest supplied in two places
+# could disagree with itself, and the resulting ambiguity is precisely what the
+# digest+owner pairing rule exists to eliminate.
+RETIRE_IN_FLIGHT_ONLY="${PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY:-}"
 
-if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-  echo "refusing to approve '${DIGEST}': not a well-formed lowercase sha256 digest" >&2
-  echo "pass the bare digest only — the repository is fixed inside the admission policy" >&2
+retire_only_usage() {
+  echo "usage: PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY=1 \\" >&2
+  echo "  PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT=sha256:<64 lowercase hex> \\" >&2
+  echo "  PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER=<64 lowercase hex> $0" >&2
+  echo "retire-only mode takes no positional arguments; it names the lock by env" >&2
+  echo >&2
+  echo "The owner must be the CURRENT one. An exact retry adopts the lock and" >&2
+  echo "rewrites that annotation, so if a deploy re-ran after a cleanup step" >&2
+  echo "already failed, the owner in that first run's log is stale and will be" >&2
+  echo "refused here as 'nothing to retire'. Take the owner from the most recent" >&2
+  echo "deploy's approval-step epilogue, which prints the lock it actually holds." >&2
   exit 2
-fi
+}
 
-if [[ ! -f "$PLANNED_DEPLOYMENT" ]]; then
-  echo "planned Deployment manifest not found: $PLANNED_DEPLOYMENT" >&2
-  exit 2
+if [[ -n "$RETIRE_IN_FLIGHT_ONLY" ]]; then
+  [[ $# -eq 0 ]] || retire_only_usage
+  # Defined so the shared validation below can reference them under `set -u`.
+  # Neither is meaningful in this mode: nothing is approved.
+  DIGEST=""
+  PLANNED_DEPLOYMENT=""
+else
+  [[ $# -eq 2 ]] || usage
+  DIGEST="$1"
+  PLANNED_DEPLOYMENT="$2"
+
+  if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "refusing to approve '${DIGEST}': not a well-formed lowercase sha256 digest" >&2
+    echo "pass the bare digest only — the repository is fixed inside the admission policy" >&2
+    exit 2
+  fi
+
+  if [[ ! -f "$PLANNED_DEPLOYMENT" ]]; then
+    echo "planned Deployment manifest not found: $PLANNED_DEPLOYMENT" >&2
+    exit 2
+  fi
 fi
 
 # Escape hatch for a release that will never complete: a rollout that failed and
@@ -123,6 +268,124 @@ if [[ -n "$ABANDON_IN_FLIGHT" && -z "$ABANDON_IN_FLIGHT_OWNER" ]] \
   echo "PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT and PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER must be set together" >&2
   exit 2
 fi
+
+# BLO-31666: retire-only mode executes here and exits, before anything that
+# needs a plan, a deploy credential, or the admission probe. Placed immediately
+# after the ABANDON pair is validated because that pair IS the whole input.
+if [[ -n "$RETIRE_IN_FLIGHT_ONLY" ]]; then
+  if [[ -z "$ABANDON_IN_FLIGHT" ]]; then
+    echo "retire-only mode requires the lock to retire to be named explicitly" >&2
+    retire_only_usage
+  fi
+  for dep in kubectl jq; do
+    command -v "$dep" >/dev/null 2>&1 || { echo "$dep is required" >&2; exit 2; }
+  done
+
+  # kubectl's stderr on the read below is the only thing that separates an
+  # approver Role missing `get` from a ConfigMap deleted out from under the run,
+  # and the operator reading it is about to clear a lock by hand. It goes to a
+  # file rather than a combined `2>&1` capture because kubectl writes warnings
+  # on the SUCCESS path too, and those would be spliced into the JSON parsed
+  # below. Same idiom as the admissibility probe's `server_plan_err`, created
+  # here because this mode exits before that one is set up.
+  if ! retire_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-retire-err.XXXXXX")"; then
+    echo "cannot create a temporary file for the retire read's error output" >&2
+    exit 1
+  fi
+  trap 'rm -f "$retire_err"' EXIT
+
+  for attempt in $(seq 1 "$RETIRE_ATTEMPTS"); do
+    # `get` is the approver's only read verb and it is scoped to this one name.
+    # A failure is fail-closed and must be surfaced: a caller that cannot read
+    # the lock cannot conclude anything about it, and reporting success here
+    # would leave the wedge in place while claiming it was cleared.
+    if ! retire_json="$(kubectl -n "$NAMESPACE" get configmap "$CONFIGMAP" -o json 2>"$retire_err")"; then
+      echo "cannot read ${NAMESPACE}/${CONFIGMAP} to retire the in-flight lock:" >&2
+      if [[ -s "$retire_err" ]]; then
+        sed 's/^/    /' "$retire_err" >&2
+      else
+        # kubectl killed by a signal, or dead before it wrote anything, would
+        # otherwise print a dangling colon and -- now that the bootstrap hint is
+        # gated on NotFound -- no guidance at all. The gate stays honest without
+        # restoring the red herring it was added to remove.
+        echo "    (kubectl produced no error output)" >&2
+      fi
+      # Gated on the cause: the bootstrap is only the answer for a ConfigMap
+      # that is not there. Printed blind, it sends an operator whose approver
+      # Role is missing `get` to re-run a bootstrap that is already in place --
+      # the one hint guaranteed not to help, on the path where they have the
+      # least time to spare. Same NotFound test as the server-plan probe.
+      if grep -qiE 'not[[:space:]]+found|notfound' "$retire_err"; then
+        echo "The approval ConfigMap is installed by the cluster-admin bootstrap;" >&2
+        echo "this script never creates it." >&2
+      fi
+      exit 1
+    fi
+
+    # Digest AND owner, together, exactly as the operator hatch matches. The
+    # owner is a per-invocation nonce, so this is what makes the retirement
+    # incapable of touching a lock some other run took -- and the digest alone
+    # could not: a configuration-only release legitimately reuses a digest.
+    if ! jq -e \
+        --arg digest_key "$LOCK_DIGEST_ANNOTATION" \
+        --arg digest "$ABANDON_IN_FLIGHT" \
+        --arg owner_key "$LOCK_OWNER_ANNOTATION" \
+        --arg owner "$ABANDON_IN_FLIGHT_OWNER" '
+          .metadata.annotations[$digest_key] == $digest and
+          .metadata.annotations[$owner_key] == $owner
+        ' <<<"$retire_json" >/dev/null; then
+      # Not ours, or already gone. Both are the same fact -- there is no lock
+      # this caller is entitled to retire -- and neither is an error. The caller
+      # is a cleanup step on an already-failing job; turning "nothing to do"
+      # into a second red step would bury the real failure underneath it.
+      echo "no in-flight approval lock matching ${ABANDON_IN_FLIGHT} owner ${ABANDON_IN_FLIGHT_OWNER}; nothing to retire"
+      exit 0
+    fi
+
+    if clear_in_flight_lock "$retire_json"; then
+      echo "Retired the in-flight approval lock on ${ABANDON_IN_FLIGHT} (owner ${ABANDON_IN_FLIGHT_OWNER})."
+      echo "The ring still lists that digest, so a corrected plan or a rollback is"
+      echo "admitted without an out-of-band edit."
+      exit 0
+    fi
+
+    # A conflict proves this write lost a race, so a fresh read may win the
+    # next one. Anything else -- an approver Role missing `update`, a deleted
+    # ConfigMap -- fails identically on all three attempts, and spending 3s to
+    # then report the generic "could not retire" below hides the actual cause
+    # from the operator who now has to clear the lock by hand. Same test, and
+    # same reasoning, as the rotation write's non-retriable bail.
+    if ! grep -qiE 'conflict|modified|latest version' <<<"$CLEAR_IN_FLIGHT_LOCK_ERR"; then
+      echo "cannot retire the in-flight approval lock on ${ABANDON_IN_FLIGHT} (owner ${ABANDON_IN_FLIGHT_OWNER}):" >&2
+      if [[ -n "$CLEAR_IN_FLIGHT_LOCK_ERR" ]]; then
+        printf '%s\n' "$CLEAR_IN_FLIGHT_LOCK_ERR" | sed 's/^/    /' >&2
+      else
+        # Empty is not a special case to skip: it matches none of the conflict
+        # vocabulary, so it arrives HERE, and printing the header alone would
+        # leave the dangling colon the read guard above exists to prevent.
+        echo "    (kubectl produced no error output)" >&2
+      fi
+      exit 1
+    fi
+    # No sleep after the final attempt: the loop is about to end, so it buys
+    # nothing and delays the exhaustion message below by a whole ceiling while
+    # a release is wedged. Spelled as an `if` because a BARE `(( … ))` as the
+    # loop body's last command is false on the final attempt, and `set -e`
+    # aborts the retirement there. Note the `(( … )) && sleep` spelling would
+    # NOT abort -- bash exempts the left side of an `&&` list from `set -e` --
+    # so the `if` is what makes the intent survive either rewrite.
+    if (( attempt < RETIRE_ATTEMPTS )); then
+      sleep "$attempt"
+    fi
+  done
+
+  echo "could not retire the in-flight approval lock on ${ABANDON_IN_FLIGHT} (owner ${ABANDON_IN_FLIGHT_OWNER})." >&2
+  echo "The next approval will refuse until it is retired. Re-run this mode, or pass" >&2
+  echo "PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT and PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER" >&2
+  echo "on the next approval." >&2
+  exit 1
+fi
+
 # Admissibility-probe pacing. Validated here, with the other operator-facing
 # env, so a typo fails before the ring is touched rather than mid-probe with an
 # in-flight lock held. The exhaustion message at the end of this script actively
@@ -179,6 +442,45 @@ if (( knob_status != 0 )); then
 fi
 require_bounded_positive_int PAPERCLIP_APPROVAL_PROBE_MAX_SLEEP_SECONDS \
   "$PROBE_MAX_SLEEP_SECONDS" "$PROBE_MAX_SLEEP_SECONDS_LIMIT" || exit 2
+
+# The lock-owner handoff path is validated here for a sharper reason than the
+# knobs above: it is the one operator-facing value whose failure would otherwise
+# land AFTER the ring write. emit_lock_owner runs immediately after the rotation
+# succeeds, so under `set -e` an unwritable path aborts there. That abort is
+# safe -- cleanup_on_exit retires the lock it just minted -- but it costs a
+# deploy, and it fails at a point in the run that reads like success. Proving
+# writability now costs nothing; discovering it later costs a release cycle.
+#
+# The target file is deliberately NOT created. Absent means "this invocation has
+# no lock it is entitled to abandon", so pre-creating an empty file here would
+# hand a consumer a path that exists with no owner in it. Probe a sibling temp
+# file instead: same directory, same mount, same permissions, no target.
+LOCK_OWNER_OUT="${PAPERCLIP_APPROVAL_LOCK_OWNER_OUT:-}"
+if [[ -n "$LOCK_OWNER_OUT" ]]; then
+  if [[ -d "$LOCK_OWNER_OUT" ]]; then
+    echo "PAPERCLIP_APPROVAL_LOCK_OWNER_OUT='${LOCK_OWNER_OUT}' is a directory, not a file" >&2
+    echo "name the file to write the in-flight lock owner to, or unset it" >&2
+    exit 2
+  fi
+  lock_owner_out_dir="$(dirname -- "$LOCK_OWNER_OUT")"
+  if [[ ! -d "$lock_owner_out_dir" ]]; then
+    echo "PAPERCLIP_APPROVAL_LOCK_OWNER_OUT='${LOCK_OWNER_OUT}': ${lock_owner_out_dir} is not a directory" >&2
+    echo "create it before this step, or unset the variable to skip the handoff" >&2
+    exit 2
+  fi
+  if [[ -e "$LOCK_OWNER_OUT" && ! -w "$LOCK_OWNER_OUT" ]]; then
+    echo "PAPERCLIP_APPROVAL_LOCK_OWNER_OUT='${LOCK_OWNER_OUT}' exists and is not writable" >&2
+    exit 2
+  fi
+  if ! lock_owner_probe="$(
+        mktemp "${lock_owner_out_dir}/.paperclip-lock-owner-probe.XXXXXX" 2>/dev/null)"; then
+    echo "PAPERCLIP_APPROVAL_LOCK_OWNER_OUT='${LOCK_OWNER_OUT}': ${lock_owner_out_dir} is not writable" >&2
+    echo "the approval would rotate the ring and then abort, costing a deploy; fix the path first" >&2
+    exit 2
+  fi
+  rm -f "$lock_owner_probe"
+fi
+
 if [[ -z "${PAPERCLIP_DEPLOY_KUBECONFIG:-}" \
       || ! -f "$PAPERCLIP_DEPLOY_KUBECONFIG" ]]; then
   echo "PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential used for the admission probe" >&2
@@ -317,6 +619,30 @@ advanced
 # END ROLLOUT_COMPLETE_JQ
 ROLLOUT_JQ
 
+# The health half of ROLLOUT_COMPLETE_JQ above: the controller has observed the
+# current generation, and every replica is updated to the current pod template,
+# ready, and available, with none unavailable. It deliberately carries none of
+# that predicate's lock-identity clauses — the rollout marker, the generation
+# nonce, the expected image — because it answers a different question: not "did
+# MY plan's rollout land?" but "is the template that is written also the one
+# serving traffic?".
+#
+# The condition lines are kept byte-identical to their counterparts above, and
+# scripts/approve-paperclip-api-digest.test.js compares the two blocks for set
+# equality over the health half -- in both directions, so neither predicate can
+# gain or lose a health condition without the other -- so "this rollout has
+# landed" has one definition in this file rather than two.
+read -r -d '' ROLLOUT_SERVING_JQ <<'SERVING_JQ' || true
+# BEGIN ROLLOUT_SERVING_JQ
+(.spec.replicas // 1) > 0 and
+(.status.observedGeneration // 0) >= (.metadata.generation // 1) and
+(.status.updatedReplicas // 0) == (.spec.replicas // 1) and
+(.status.readyReplicas // 0) == (.spec.replicas // 1) and
+(.status.availableReplicas // 0) == (.spec.replicas // 1) and
+(.status.unavailableReplicas // 0) == 0
+# END ROLLOUT_SERVING_JQ
+SERVING_JQ
+
 # The rollout nonce is read fresh inside the rotation loop, immediately before
 # the write that stores it — not once up front. A retry can lose a race to a
 # rollout that lands between attempts, and recording the pre-retry generation
@@ -356,8 +682,23 @@ observe_rollout_nonce() {
 # entries here could evict a rollback target.
 release_in_flight_lock() {
   local attempt json
-  for attempt in 1 2 3; do
-    json="$(kubectl -n "$NAMESPACE" get configmap "$CONFIGMAP" -o json 2>/dev/null)" || return 1
+  for attempt in $(seq 1 "$RETIRE_ATTEMPTS"); do
+    # Same argument as the retire-only read above, and it applies harder here:
+    # this path has LESS operator visibility, not more. Its failure surfaces as
+    # cleanup_on_exit's bare "could not retire the in-flight lock" with no cause,
+    # and unlike retire-only mode nobody is sitting at a terminal to re-run it
+    # with more logging. Written to a file rather than folded in with `2>&1`
+    # because kubectl warns on the SUCCESS path too, and those lines would be
+    # spliced into the JSON parsed just below.
+    if ! json="$(kubectl -n "$NAMESPACE" get configmap "$CONFIGMAP" -o json 2>"${release_err:-/dev/null}")"; then
+      echo "cannot read ${NAMESPACE}/${CONFIGMAP} to retire the in-flight lock:" >&2
+      if [[ -n "${release_err:-}" && -s "$release_err" ]]; then
+        sed 's/^/    /' "$release_err" >&2
+      else
+        echo "    (kubectl produced no error output)" >&2
+      fi
+      return 1
+    fi
     if ! jq -e \
         --arg digest_key "$LOCK_DIGEST_ANNOTATION" \
         --arg digest "$DIGEST" \
@@ -374,28 +715,75 @@ release_in_flight_lock() {
         ' <<<"$json" >/dev/null; then
       return 0
     fi
-    if jq \
-        --arg digest_key "$LOCK_DIGEST_ANNOTATION" \
-        --arg plan_key "$LOCK_PLAN_ANNOTATION" \
-        --arg uid_key "$LOCK_UID_ANNOTATION" \
-        --arg generation_key "$LOCK_GENERATION_ANNOTATION" \
-        --arg marker_key "$LOCK_MARKER_ANNOTATION" \
-        --arg server_plan_key "$LOCK_SERVER_PLAN_ANNOTATION" \
-        --arg owner_key "$LOCK_OWNER_ANNOTATION" '
-          del(.metadata.annotations[$digest_key])
-          | del(.metadata.annotations[$plan_key])
-          | del(.metadata.annotations[$uid_key])
-          | del(.metadata.annotations[$generation_key])
-          | del(.metadata.annotations[$marker_key])
-          | del(.metadata.annotations[$server_plan_key])
-          | del(.metadata.annotations[$owner_key])
-        ' <<<"$json" \
-        | kubectl replace -f - >/dev/null 2>&1; then
+    if clear_in_flight_lock "$json"; then
       return 0
     fi
-    sleep 1
+    # Same non-retriable test as retire-only mode's write bail, for the same
+    # reason and with the same argument as the read failure above: a conflict
+    # means this write lost a race and a fresh read may win the next one, while
+    # an approver Role missing `update` or a deleted ConfigMap fails identically
+    # on every attempt. Retrying those spends the very TERM grace period the flat
+    # pacing below exists to conserve, and still reports nothing -- the caller
+    # prints only the bare "could not retire the in-flight lock", with no
+    # operator present to re-run with more logging.
+    if ! grep -qiE 'conflict|modified|latest version' <<<"$CLEAR_IN_FLIGHT_LOCK_ERR"; then
+      echo "cannot retire the in-flight lock on ${DIGEST} (owner ${LOCK_OWNER_ID}):" >&2
+      if [[ -n "$CLEAR_IN_FLIGHT_LOCK_ERR" ]]; then
+        printf '%s\n' "$CLEAR_IN_FLIGHT_LOCK_ERR" | sed 's/^/    /' >&2
+      else
+        # Not an exotic case here: this loop runs inside a trap reached from
+        # `trap 'exit 143' TERM`, so kubectl signal-killed mid-`replace` is the
+        # EXPECTED teardown, and it writes nothing. An empty capture matches
+        # none of the conflict vocabulary, so it lands on this bail -- correctly,
+        # since nothing suggests a retry would win -- and without this branch the
+        # header would promise a cause and deliver a blank line, on the one path
+        # where the caller prints no cause of its own.
+        echo "    (kubectl produced no error output)" >&2
+      fi
+      return 1
+    fi
+    # Guarded rather than unconditional: the last attempt has nothing left to
+    # wait for. Spelled as an `if` because a BARE `(( ... ))` as the loop body's
+    # last command is false on the final attempt and `set -e` aborts there; the
+    # `(( ... )) && sleep` spelling would not abort (bash exempts the left side
+    # of an `&&` list), so the `if` is what survives either rewrite intact.
+    #
+    # Flat, where retire-only mode backs off linearly (`sleep "$attempt"`). With
+    # the bail above shared, the sleep is the only remaining asymmetry in the
+    # two loops' RETRY-CONTROL structure, and it is deliberate rather than an
+    # unfinished parity fix: this loop runs inside a trap reached from
+    # `trap 'exit 143' TERM`, so the runner's grace period is the whole budget
+    # and 2s of total sleep beats 3s. Retire-only mode has an operator at a
+    # terminal and no such deadline.
+    #
+    # Their MESSAGING differences are deliberate too, and are not a parity gap
+    # to close: this loop's caller (`cleanup_on_exit`) prints the operator
+    # guidance that retire-only mode prints itself, so a chatty success or
+    # exhaustion here would bury the real failure the cleanup is running after.
+    # `return` vs `exit` is structurally required for the same reason.
+    if (( attempt < RETIRE_ATTEMPTS )); then
+      sleep 1
+    fi
   done
   return 1
+}
+
+# A release workflow that sets this learns the owner id of the lock this
+# invocation minted, so a later step can retire it when the deploy dies after
+# the approval succeeded but before the cluster was ever touched (BLO-31598).
+# Success deliberately leaves the lock live for the next release to retire
+# after observing this plan marker roll out, so the owner is otherwise only
+# ever prose on stdout and the workflow cannot name it.
+#
+# Written ONLY for a lock this invocation created. An adopted lock belongs to a
+# rollout that may still be running, and retiring it would reopen the ring
+# underneath that rollout -- the same distinction lock_preserve_on_failure
+# encodes at the transfer below. Absent file therefore means "this invocation
+# has no lock it is entitled to abandon", which is the safe default.
+emit_lock_owner() {
+  [[ -n "${PAPERCLIP_APPROVAL_LOCK_OWNER_OUT:-}" ]] || return 0
+  [[ -n "$lock_owner_is_ours" ]] || return 0
+  (umask 077; printf '%s\n' "$LOCK_OWNER_ID" >"$PAPERCLIP_APPROVAL_LOCK_OWNER_OUT")
 }
 
 # Rotation is a read-modify-write, so the write MUST be guarded by the version
@@ -433,13 +821,262 @@ live_deployment_completed_digest() {
         "$ROLLOUT_COMPLETE_JQ" <<<"$live_json" >/dev/null
 }
 
+# The digest the cluster is actually serving right now, or empty when that cannot
+# be established. Only a digest of OUR repository counts: a sidecar's image is not
+# a rollback target for this Deployment. A multi-image pod template is likewise
+# refused rather than guessed at -- the completion predicate above already requires
+# every container to carry the same image, so disagreement means something outside
+# this channel's model is going on and pinning would be a guess.
+#
+# The pod template alone is NOT sufficient evidence, because it records what was
+# asked for rather than what is running. Nothing reverts spec.template after a
+# failed rollout, so a digest that was applied and never became ready sits there
+# indefinitely -- and pinning that would hold a slot for a digest which never
+# served traffic while the last healthy one aged out, reaching the very wedge
+# BLO-28483 exists to prevent by a different route. So the spec is believed only
+# once ROLLOUT_SERVING_JQ confirms the rollout of that spec has fully landed.
+#
+# Every failure path returns empty and succeeds. This is an availability
+# safeguard, not a gate: not being able to name the live digest must degrade to
+# the previous age-ordered behaviour, never fail an otherwise valid release.
+# Tightening the evidence therefore costs no availability -- a rollout in flight,
+# or one that never landed, simply goes unpinned.
+#
+# Declining to believe the spec is correct but not sufficient on its own, because
+# nothing then names the last healthy digest either and the ring is back to pure
+# age ordering -- the same wedge, one failure later (BLO-31842). The previous
+# ReplicaSet is the object that still names it, so a spec that fails the serving
+# gate falls back to serving_replicaset_image below.
+live_running_digest() {
+  local live_json image
+  live_json="$("${deploy_kubectl[@]}" -n "$DEPLOY_NAMESPACE" \
+    get deployment "$DEPLOYMENT" -o json 2>/dev/null)" || return 0
+  if jq -e "$ROLLOUT_SERVING_JQ" <<<"$live_json" >/dev/null 2>&1; then
+    image="$(jq -r '
+      [ .spec.template.spec.containers[]?.image // empty ] as $images
+      | if ($images | length) > 0 and (($images | unique | length) == 1)
+        then $images[0]
+        else ""
+        end
+    ' <<<"$live_json" 2>/dev/null)" || return 0
+  else
+    image="$(serving_replicaset_image "$live_json")" || return 0
+  fi
+  [[ "$image" == "${IMAGE_REPOSITORY}@sha256:"* ]] || return 0
+  printf '%s\n' "${image#*@}"
+}
+
+# The image carried by the one ReplicaSet of this Deployment that still has ready
+# pods, or empty. Reached only when the Deployment's own template has failed the
+# serving gate -- typically because a rollout was applied and never became ready,
+# which leaves spec.template naming a digest that never carried traffic while the
+# previous ReplicaSet keeps serving the one that did.
+#
+# EXACTLY ONE serving ReplicaSet is required, which is deliberately stricter than
+# "the newest one that has ready pods". Two ReplicaSets with ready pods means both
+# digests are serving and neither is "the running one"; naming the newer would pin
+# a half-rolled digest that is quite possibly the one about to fail. The two rules
+# only ever disagree in that case, and there the strict one is never worse -- for
+# either of the two ways to reach it:
+#
+#   - A roll still moving. The newer digest is usually the one being approved right
+#     now, which build_approval_ring already holds in slot 0 and discards as not
+#     distinct, so pinning it would be a no-op anyway.
+#   - A roll stalled part-way, which is reachable here rather than hypothetical.
+#     With maxSurge: 1 / maxUnavailable: 0 (values.yaml api.maxSurge) the old
+#     ReplicaSet scales 2->1 as soon as the first new pod goes ready, so a second
+#     new pod that never schedules parks the Deployment at old=1 ready / new=1
+#     ready indefinitely -- and deployment-api.yaml hard-enforces DoNotSchedule
+#     spread across nodes for pods of the SAME ReplicaSet (BLO-20901), so losing a
+#     node to capacity holds that surge pod Pending. Here the newer digest is the
+#     BROKEN one rather than the one being approved, so pinning it would be
+#     actively worse than pinning nothing.
+#
+# So do not "fix" the ambiguous case by taking the newest: in the first case that
+# buys nothing, and in the second it pins the digest that is currently failing.
+#
+# ReplicaSets are matched by the Deployment's own selector AND by an ownerReference
+# to its uid. The selector alone is server-side narrowing; the uid is what makes it
+# exact, so an overlapping selector elsewhere in the namespace cannot contribute a
+# rollback target for a different workload.
+#
+# A failed list is REPORTED rather than swallowed. This reader needs `get`/`list`
+# on apps/replicasets for the deploy identity, and as of 2026-09-04 the deploy SA
+# (system:serviceaccount:paperclip:paperclip-ci-deploy) holds them only through
+# RoleBinding/paperclip-ci-deploy-admin -> ClusterRole/admin, which carries a
+# deprecation annotation and whose removal is tracked at BLO-21598. The scoped
+# replacement Role/paperclip-ci-deploy grants apps/{deployments,statefulsets} and
+# no replicasets rule at all. So the day that cutover lands, this reader starts
+# returning empty on every release -- silently, with every stubbed unit test in
+# scripts/approve-paperclip-api-digest.test.js still green, because they stub
+# kubectl. The warning below is what makes that visible in the deploy log instead.
+# It stays a warning: this is still an availability safeguard, not a gate.
+serving_replicaset_image() {
+  local live_json="$1"
+  local selector uid rs_json rs_err rs_status state_dir state_dir_owned="" image=""
+
+  selector="$(jq -r '
+    [ (.spec.selector.matchLabels // {}) | to_entries[] | "\(.key)=\(.value)" ]
+    | join(",")
+  ' <<<"$live_json" 2>/dev/null)" || return 0
+  uid="$(jq -r '.metadata.uid // ""' <<<"$live_json" 2>/dev/null)" || return 0
+
+  # Warn-once markers and the stderr capture live in a directory the CALLER owns.
+  # Both properties matter and neither is available any other way: this function
+  # runs inside $( ), so a shell variable set here cannot survive back to the
+  # rotate loop that re-reads the digest on every 409, and a `local` path cannot
+  # be seen by the EXIT trap that clears the script's other temp files. A file in
+  # a directory the caller minted is visible to both. When no caller directory
+  # exists -- the extracted-function unit tests, which source this on its own --
+  # an ephemeral one is minted and removed before returning, so the markers are
+  # per-invocation there and nothing is left behind either way.
+  state_dir="${rs_state_dir:-}"
+  if [[ -z "$state_dir" || ! -d "$state_dir" ]]; then
+    state_dir="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-approve-rs.XXXXXX")" || return 0
+    state_dir_owned=1
+  fi
+
+  if [[ -z "$selector" || -z "$uid" ]]; then
+    # Not reachable against the Helm-rendered paperclip-api Deployment, which uses
+    # matchLabels. It is reachable for a selector written with matchExpressions
+    # only, and returning quietly there would be the same silent hollowing-out
+    # this reader's list-failure branch exists to prevent -- so it is stated too.
+    if [[ ! -e "${state_dir}/warned-selector" ]]; then
+      : >"${state_dir}/warned-selector"
+      echo "warning: Deployment/${DEPLOYMENT} exposes no matchLabels selector and uid pair, so the" >&2
+      echo "         ReplicaSet that last actually served traffic cannot be identified. The" >&2
+      echo "         approval ring falls back to pure age ordering and the rollback target can" >&2
+      echo "         age out (BLO-28483, BLO-31842)." >&2
+    fi
+  else
+    rs_err="${state_dir}/list-err"
+    : >"$rs_err"
+    rs_json="$("${deploy_kubectl[@]}" -n "$DEPLOY_NAMESPACE" \
+      get replicasets --selector "$selector" -o json 2>"$rs_err")" && rs_status=0 || rs_status=$?
+    if (( rs_status != 0 )); then
+      # Warned once per script run, not once per rotation: this reader is called
+      # again on every 409 retry, so an unwarned branch would print the same five
+      # lines up to MAX_ROTATE_ATTEMPTS times and bury the signal in its own noise.
+      if [[ ! -e "${state_dir}/warned-list" ]]; then
+        : >"${state_dir}/warned-list"
+        echo "warning: cannot list ReplicaSets in namespace ${DEPLOY_NAMESPACE}, so the digest that" >&2
+        echo "         last actually served traffic cannot be named. Deployment/${DEPLOYMENT} names a" >&2
+        echo "         digest whose rollout has not landed, so the approval ring falls back to pure" >&2
+        echo "         age ordering and the rollback target can age out (BLO-28483, BLO-31842)." >&2
+        echo "         The deploy identity needs get+list on apps/replicasets in this namespace." >&2
+        sed 's/^/         /' <"$rs_err" >&2
+      fi
+    else
+      image="$(jq -r --arg uid "$uid" '
+        [ .items[]?
+          | select(
+              [ (.metadata.ownerReferences // [])[]
+                | select(.kind == "Deployment" and .uid == $uid)
+              ] | length == 1
+            )
+          | select((.status.readyReplicas // 0) > 0)
+          | [ .spec.template.spec.containers[]?.image // empty ] as $images
+          | if ($images | length) > 0 and (($images | unique | length) == 1)
+            then $images[0]
+            else ""
+            end
+        ] as $serving
+        | if ($serving | length) == 1 then $serving[0] else "" end
+      ' <<<"$rs_json" 2>/dev/null)" || image=""
+    fi
+    rm -f "$rs_err"
+  fi
+
+  if [[ -n "$state_dir_owned" ]]; then
+    rm -rf "$state_dir"
+  fi
+  printf '%s\n' "$image"
+}
+
+# Build the approval window, newest-first, from the digest being released, the
+# digest currently running, and the existing list on stdin.
+#
+# A plain prepend-and-truncate evicts by age alone, which is exactly backwards
+# under the failure this window exists to cover. Every failed deploy approves a
+# digest that never reached the cluster and permanently consumes a slot, so a run
+# of consecutive failures -- precisely when a rollback is needed -- is what ages
+# the running digest out. Once it is gone, helm cannot roll back to the state
+# actually serving traffic, and a transient upgrade failure becomes a wedged
+# release that cannot self-heal (BLO-28483).
+#
+# So the running digest is pinned immediately behind the one being released,
+# ahead of the age-ordered fill. This REORDERS eviction; it does not widen the
+# window. The total stays bounded by $3, so the maxApprovedApiDigests CEL
+# variable in paperclip/paperclip-public-tools.yaml is untouched and cannot
+# drift. The cost is one historical slot, which is the correct trade: an older
+# digest is a convenience, the running one is the only guaranteed-good rollback
+# target.
+#
+# Extracted verbatim and exercised by scripts/approve-paperclip-api-digest.test.js,
+# so a rewrite fails that test rather than silently reverting the guarantee.
+build_approval_ring() {
+  local new_digest="$1" live_digest="$2" max="$3"
+  local -a ring=("$new_digest")
+  local entry
+
+  # Pin only a well-formed, distinct digest, and only when there is a slot for it
+  # after the released digest. A config-only release reusing the running digest
+  # lands in the "not distinct" branch and needs no pin -- it is already slot 1.
+  if (( max >= 2 )) \
+      && [[ "$live_digest" =~ ^sha256:[0-9a-f]{64}$ && "$live_digest" != "$new_digest" ]]; then
+    ring+=("$live_digest")
+  else
+    live_digest=""
+  fi
+
+  # Anything malformed already in the list is discarded rather than carried
+  # forward -- the policy would ignore it anyway, and leaving it in place would
+  # consume a slot in the window. Entries already placed above are dropped here so
+  # they cannot appear twice.
+  while IFS= read -r entry; do
+    (( ${#ring[@]} < max )) || break
+    [[ -n "$entry" ]] || continue
+    ring+=("$entry")
+  done < <(
+    sed $'s/^\r*//; s/\r*$//' \
+      | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+      | grep -E '^sha256:[0-9a-f]{64}$' \
+      | grep -Fxv "$new_digest" \
+      | { if [[ -n "$live_digest" ]]; then grep -Fxv "$live_digest"; else cat; fi } \
+      || true
+  )
+
+  printf '%s\n' "${ring[@]}"
+}
+
+# Render an approval window for operator output: one indented entry per line, or
+# an explicit marker when empty so a failure report never renders as a silent
+# blank line. Used by the read-back guards as well as the success path, because
+# on the failure paths the contents are the actionable part -- a bare count says
+# the window is wrong without saying what is in it to trim.
+format_digest_list() {
+  local list="$1"
+  if [[ -z "$list" ]]; then
+    echo "  (none)"
+    return 0
+  fi
+  printf '%s\n' "$list" | sed 's/^/  - /'
+}
+
 MAX_ROTATE_ATTEMPTS="${PAPERCLIP_APPROVAL_ROTATE_ATTEMPTS:-5}"
 replace_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-err.XXXXXX")"
 nonce_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-nonce.XXXXXX")"
 server_plan_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-server-plan.XXXXXX")"
 probe_attempts_log="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-probe-log.XXXXXX")"
+release_err="$(mktemp "${TMPDIR:-/tmp}/paperclip-approve-release-err.XXXXXX")"
+# Owned here rather than inside serving_replicaset_image so the EXIT trap can
+# clear it: that reader runs inside $( ), so a path it mints itself is invisible
+# to this shell. Holding it here also makes its warn-once markers span the whole
+# rotate loop instead of resetting on every 409 retry.
+rs_state_dir="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-approve-rs.XXXXXX")"
 lock_cleanup_armed=""
 lock_preserve_on_failure=""
+lock_owner_is_ours=""
 
 cleanup_on_exit() {
   local status=$?
@@ -453,13 +1090,25 @@ cleanup_on_exit() {
       echo "Retired this approval's in-flight lock; the ring still lists ${DIGEST}." >&2
       echo "A corrected plan or a rollback can be approved without an out-of-band edit." >&2
     else
+      # Both halves are printed, not just the digest. This branch is gated on
+      # lock_cleanup_armed, which is only set after LOCK_OWNER_ID is assigned,
+      # so the owner is guaranteed in scope here -- and the likeliest way to
+      # arrive is a read failure, which returns without retrying. Sending the
+      # operator to the cluster for a value we are holding would ask them to
+      # re-run the very read that just failed. The annotation query stays as
+      # the fallback for the case where this process's value is genuinely gone.
       echo "WARNING: could not retire the in-flight lock on ${DIGEST}." >&2
-      echo "The next approval will refuse until it is retired with" >&2
-      echo "PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT=${DIGEST} and the current" >&2
-      echo "PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER value." >&2
+      echo "The next approval will refuse until it is retired with both halves:" >&2
+      echo "  PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT=${DIGEST}" >&2
+      echo "  PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER=${LOCK_OWNER_ID}" >&2
+      echo "If that owner is refused as 'nothing to retire', a later run adopted the" >&2
+      echo "lock and rewrote it; read the current one from the cluster instead:" >&2
+      echo "  kubectl -n ${NAMESPACE} get configmap ${CONFIGMAP} \\" >&2
+      echo "    -o jsonpath='{.metadata.annotations.${LOCK_OWNER_ANNOTATION//./\\.}}'" >&2
     fi
   fi
-  rm -f "$replace_err" "$nonce_err" "$server_plan_err" "$probe_attempts_log"
+  rm -f "$replace_err" "$nonce_err" "$server_plan_err" "$probe_attempts_log" "$release_err"
+  rm -rf "$rs_state_dir"
   exit "$status"
 }
 trap cleanup_on_exit EXIT
@@ -548,25 +1197,15 @@ for attempt in $(seq 1 "$MAX_ROTATE_ATTEMPTS"); do
 
   current_raw="$(jq -r --arg key "$DATA_KEY" '.data[$key] // ""' <<<"$current_json")"
 
-  # Keep only well-formed digests, drop the one being approved wherever it already
-  # sits, then prepend it. Anything malformed already in the list is discarded here
-  # rather than carried forward — the policy would ignore it anyway, and leaving it
-  # in place would consume a slot in the window.
-  mapfile -t existing < <(
-    printf '%s\n' "$current_raw" \
-      | sed $'s/^\r*//; s/\r*$//' \
-      | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-      | grep -E '^sha256:[0-9a-f]{64}$' \
-      | grep -Fxv "$DIGEST" \
-      || true
-  )
+  # Read the running digest fresh on every rotation attempt: a 409 sends us back
+  # through here, and a rollout that landed in the meantime changes what the
+  # rollback target is.
+  live_digest="$(live_running_digest)"
 
-  approved=("$DIGEST")
-  for entry in "${existing[@]:-}"; do
-    [[ -n "$entry" ]] || continue
-    (( ${#approved[@]} < MAX_APPROVED_DIGESTS )) || break
-    approved+=("$entry")
-  done
+  mapfile -t approved < <(
+    printf '%s\n' "$current_raw" \
+      | build_approval_ring "$DIGEST" "$live_digest" "$MAX_APPROVED_DIGESTS"
+  )
 
   payload=$(printf '%s\n' "${approved[@]}")
 
@@ -627,13 +1266,31 @@ for attempt in $(seq 1 "$MAX_ROTATE_ATTEMPTS"); do
     # while the original rollout may still be running.
     lock_cleanup_armed=""
     lock_preserve_on_failure=yes
+    lock_owner_is_ours=""
   else
     lock_cleanup_armed=yes
     lock_preserve_on_failure=""
+    lock_owner_is_ours=yes
   fi
   if printf '%s\n' "$replacement_json" \
       | kubectl replace -f - >/dev/null 2>"$replace_err"; then
     rotated=yes
+    # Only after the write landed: before it, no lock with this owner exists.
+    #
+    # Deliberately fatal under `set -e`, matching this file's fail-fast
+    # convention. The minted branch just armed lock_cleanup_armed and cleared
+    # lock_preserve_on_failure, so aborting here reaches cleanup_on_exit's
+    # release_in_flight_lock: the lock is retired, the ring still lists DIGEST,
+    # and the run fails visibly. That is self-healing, and it is what the next
+    # approval needs.
+    #
+    # Warning and carrying on would instead exit 0 with the ring rotated and a
+    # live lock nothing can name -- an absent owner file means "no lock this run
+    # is entitled to abandon", so a cleanup step correctly declines to touch it.
+    # That is the BLO-31598 wedge reintroduced, and silently. The path was proven
+    # writable during env validation, so reaching here at all means something
+    # changed mid-run (revoked mount, full disk).
+    emit_lock_owner
     break
   fi
 
@@ -646,6 +1303,7 @@ for attempt in $(seq 1 "$MAX_ROTATE_ATTEMPTS"); do
   # later exact-match retry cannot retire a lock acquired by another process.
   lock_cleanup_armed=""
   lock_preserve_on_failure=""
+  lock_owner_is_ours=""
   echo "approval ring changed underneath us; retrying (${attempt}/${MAX_ROTATE_ATTEMPTS})" >&2
   sleep $(( attempt ))
 done
@@ -657,31 +1315,44 @@ if [[ -z "$rotated" ]]; then
 fi
 
 echo "Approving ${DIGEST} for harbor.blockcast.net/paperclip/paperclip"
-echo "Approval window (newest first, max ${MAX_APPROVED_DIGESTS}):"
-printf '  - %s\n' "${approved[@]}"
 
 # Read back rather than trusting the replace exit code. The digest and its
 # transaction lock must be one observed resource version before any probe.
 verify_json="$(kubectl -n "$NAMESPACE" get configmap "$CONFIGMAP" -o json)"
 verify_raw="$(jq -r --arg key "$DATA_KEY" '.data[$key] // ""' <<<"$verify_json")"
-verify_count=$(printf '%s\n' "$verify_raw" \
+# Normalise once. The count, the absence test, and every operator-facing report
+# below all read this same list, so they cannot disagree about what the cluster
+# holds -- previously each derived its own view from verify_raw.
+verify_digests="$(printf '%s\n' "$verify_raw" \
   | sed $'s/^\r*//; s/\r*$//' \
   | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-  | grep -Ec '^sha256:[0-9a-f]{64}$' || true)
+  | grep -E '^sha256:[0-9a-f]{64}$' \
+  || true)"
+verify_count=$(printf '%s' "$verify_digests" | grep -c . || true)
 
-if ! printf '%s\n' "$verify_raw" \
-  | sed $'s/^\r*//; s/\r*$//' \
-  | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-  | grep -Fxq "$DIGEST"; then
+if ! printf '%s\n' "$verify_digests" | grep -Fxq "$DIGEST"; then
   echo "approval did not persist: ${DIGEST} is absent from ${NAMESPACE}/${CONFIGMAP}" >&2
+  echo "the window holds ${verify_count} entries, as persisted:" >&2
+  format_digest_list "$verify_digests" >&2
   exit 1
 fi
 
 if (( verify_count > MAX_APPROVED_DIGESTS )); then
   echo "approval window is ${verify_count} entries, over the ${MAX_APPROVED_DIGESTS} the policy accepts;" >&2
-  echo "the admission policy will now deny every rollout until this is trimmed" >&2
+  echo "the admission policy will now deny every rollout until this is trimmed." >&2
+  echo "The window, as persisted:" >&2
+  format_digest_list "$verify_digests" >&2
   exit 1
 fi
+
+# Report the window that was READ BACK, not the one just built. On the exact-retry
+# path the replacement only re-owns the lock and never rewrites .data, so the
+# locally-built ring is not what the cluster holds. That gap was cosmetic while
+# the window was a plain age-ordered list; now that a slot is reserved for the
+# running digest, an operator reading "the rollback target is pinned" off a list
+# that was never persisted would be misled at exactly the wrong moment.
+echo "Approval window (newest first, max ${MAX_APPROVED_DIGESTS}), as persisted:"
+format_digest_list "$verify_digests"
 
 if ! jq -e \
     --arg digest_key "$LOCK_DIGEST_ANNOTATION" \

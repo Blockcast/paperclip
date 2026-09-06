@@ -972,6 +972,8 @@ export type {
   GitWorktreeBranchIncoherenceEvidence,
   GitWorktreeInProgressOperation,
   HeartbeatRun,
+  HeartbeatRunRetrySuccessor,
+  HeartbeatRunRetrySuccessorState,
   HeartbeatRunEvent,
   HeartbeatRunStatusPhase,
   AgentRuntimeState,
@@ -1344,7 +1346,12 @@ export {
   type ResourceMembershipUpdateResult,
 } from "./types/resource-memberships.js";
 
-export { workspaceRuntimeControlTargetSchema } from "./validators/execution-workspace.js";
+export {
+  collectBranchTemplateProblems,
+  EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS,
+  executionWorkspaceStrategySchema,
+  workspaceRuntimeControlTargetSchema,
+} from "./validators/execution-workspace.js";
 export {
   findWorkspaceCommandDefinition,
   listWorkspaceCommandDefinitions,
@@ -1409,6 +1416,7 @@ export type { ServerGitInfo, ServerGitLocalChanges, ServerInfoSnapshot } from ".
 
 export {
   getClosedIsolatedExecutionWorkspaceMessage,
+  isClosedExecutionWorkspace,
   isClosedIsolatedExecutionWorkspace,
 } from "./execution-workspace-guards.js";
 
@@ -1509,6 +1517,7 @@ export {
   skillTestAgentKeyScopeSchema,
   createAgentKeySchema,
   agentMineInboxQuerySchema,
+  agentMeRecoveryActionsQuerySchema,
   wakeAgentSchema,
   resetAgentSessionSchema,
   testAdapterEnvironmentSchema,

@@ -140,6 +140,54 @@ describe("issue validators", () => {
     ).toBe(false);
   });
 
+  it("lets a restored recovery resolution omit sourceIssueStatus to leave the source issue unchanged", () => {
+    // PEN-2756: the disposal path for a beacon on a row whose status is already
+    // correct — a live `in_progress` run, or a board-approved `backlog` park.
+    // Neither status is in the enum, so before this the only resolutions available
+    // asserted something false and the cheapest correct action was to leave the
+    // beacon active forever.
+    const parsed = resolveIssueRecoveryActionSchema.parse({ outcome: "restored" });
+    expect(parsed.outcome).toBe("restored");
+    expect(parsed.sourceIssueStatus).toBeUndefined();
+
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({
+        outcome: "restored",
+        resolutionNote: "PR merged 4h11m after the beacon fired; run is still live.",
+      }).success,
+    ).toBe(true);
+  });
+
+  it("confines the leave-unchanged path to restored outcomes", () => {
+    // `blocked` must still land the row on `blocked` (the route additionally
+    // requires a real first-class blocker), and the board-only outcomes must still
+    // say where the row lands rather than retire the premise mid-flight.
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({ outcome: "blocked" }).success,
+    ).toBe(false);
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({ outcome: "false_positive" }).success,
+    ).toBe(false);
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({ outcome: "cancelled" }).success,
+    ).toBe(false);
+  });
+
+  it("still refuses statuses the resolver must never assert", () => {
+    // `in_progress` and `backlog` stay out of the enum. Omission, not widening, is
+    // how a row in either state is disposed — a resolver that wrote `in_progress`
+    // would claim execution state it cannot verify and would route the write
+    // through issue-update side effects purely to clear an unrelated beacon.
+    for (const sourceIssueStatus of ["in_progress", "backlog"]) {
+      expect(
+        resolveIssueRecoveryActionSchema.safeParse({
+          outcome: "restored",
+          sourceIssueStatus,
+        }).success,
+      ).toBe(false);
+    }
+  });
+
   it("rejects recovery outcomes that are not supported by the source-scoped resolution endpoint", () => {
     expect(
       resolveIssueRecoveryActionSchema.safeParse({

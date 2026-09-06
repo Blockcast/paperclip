@@ -10,7 +10,7 @@
 // script and sourcing it, so a rename or a rewrite fails this test rather than
 // silently leaving it asserting against a copy.
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -262,4 +262,1719 @@ test("valid knobs pass validation and the script proceeds to the deploy credenti
   assert.equal(result.status, 2);
   assert.match(result.stderr, /PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential/);
   assert.doesNotMatch(result.stderr, /is not a positive integer/);
+});
+
+// --- Approval window eviction order (BLO-28483) ---------------------------
+//
+// The window is bounded and was ordered purely by age, which is backwards under
+// the failure it exists to cover: a deploy that fails before its rollout lands
+// still consumes a slot forever, so a run of consecutive failures ages out the
+// digest actually serving traffic. helm then cannot roll back to the running
+// state and a transient upgrade failure becomes a permanently wedged release.
+// The fix pins the running digest behind the one being released. These tests
+// hold that guarantee, and the control below proves they can actually fail.
+
+const RING_FUNCTION_NAME = "build_approval_ring";
+const ringSource = extractShellFunction(RING_FUNCTION_NAME);
+
+// Read the bound out of the script for the same reason the knobs are: a test
+// asserting against a hard-coded 3 would go quietly green if the constant and
+// the CEL variable it must match were ever moved together.
+function shellReadonly(name) {
+  const m = script.match(new RegExp(`^readonly ${name}=(\\d+)$`, "m"));
+  assert.ok(m, `could not read ${name} out of ${scriptPath}`);
+  return Number(m[1]);
+}
+
+const MAX_APPROVED_DIGESTS = shellReadonly("MAX_APPROVED_DIGESTS");
+
+// Distinct, well-formed, lowercase-hex digests keyed by a short label.
+function digest(label) {
+  const hex = label.toString(16).padStart(2, "0");
+  return `sha256:${hex.repeat(32).slice(0, 64)}`;
+}
+
+// Runs the shipping ring builder. `liveDigest` of "" is the pre-fix behaviour:
+// the running digest could not be established, so ordering falls back to age.
+function ringFor(newDigest, liveDigest, existing, max = MAX_APPROVED_DIGESTS) {
+  const harness = [
+    "set -euo pipefail",
+    ringSource,
+    `printf '%s' "$1" | ${RING_FUNCTION_NAME} "$2" "$3" "$4"`,
+  ].join("\n");
+  const result = spawnSync(
+    "bash",
+    ["-c", harness, "harness", existing.join("\n"), newDigest, liveDigest, String(max)],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, `ring harness failed: ${result.stderr}`);
+  return result.stdout.trim().split("\n").filter(Boolean);
+}
+
+test("the digest being released is first and the running digest is pinned right behind it", () => {
+  const live = digest(0xaa);
+  const ring = ringFor(digest(0x11), live, [digest(0x22), live, digest(0x33)]);
+  assert.equal(ring[0], digest(0x11));
+  assert.equal(ring[1], live);
+  assert.ok(ring.length <= MAX_APPROVED_DIGESTS);
+});
+
+test("the running digest survives an unbounded run of deploys that never land", () => {
+  const live = digest(0xaa);
+  // The live ring as it stood on 2026-09-04: a dead slot holding a digest that
+  // was approved and never applied, the running digest, and one older entry.
+  let ring = [digest(0x6c), live, digest(0x68)];
+  for (let i = 0; i < 25; i += 1) {
+    ring = ringFor(digest(0x10 + i), live, ring);
+    assert.ok(
+      ring.includes(live),
+      `the running digest was evicted after ${i + 1} consecutive deploys — rollback is now impossible`,
+    );
+    assert.ok(ring.length <= MAX_APPROVED_DIGESTS, `window grew to ${ring.length}`);
+  }
+});
+
+test("CONTROL: without the pin the running digest is evicted in two deploys", () => {
+  // Guards the test above from going hollow. This is the pre-fix ordering, and
+  // it reproduces the exact arithmetic BLO-28483 was filed on: with one slot
+  // already consumed by a digest that never ran, the running digest is two
+  // failed deploys away from eviction. If this ever passes, the pin has stopped
+  // being load-bearing and the regression test above proves nothing.
+  const live = digest(0xaa);
+  let ring = [digest(0x6c), live, digest(0x68)];
+  ring = ringFor(digest(0x10), "", ring);
+  assert.ok(ring.includes(live), "still present after one deploy");
+  ring = ringFor(digest(0x11), "", ring);
+  assert.ok(!ring.includes(live), "pre-fix ordering must evict the running digest on the second deploy");
+});
+
+test("a config-only release reusing the running digest does not duplicate it", () => {
+  const live = digest(0xaa);
+  const ring = ringFor(live, live, [digest(0x22), digest(0x33)]);
+  assert.equal(ring[0], live);
+  assert.equal(ring.filter((entry) => entry === live).length, 1);
+  assert.ok(ring.length <= MAX_APPROVED_DIGESTS);
+});
+
+test("a running digest already in the window is pinned rather than duplicated", () => {
+  const live = digest(0xaa);
+  const ring = ringFor(digest(0x11), live, [live, digest(0x22)]);
+  assert.equal(ring.filter((entry) => entry === live).length, 1);
+  assert.equal(ring[1], live);
+});
+
+test("an unestablished running digest degrades to newest-first, never to a failure", () => {
+  const ring = ringFor(digest(0x11), "", [digest(0x22), digest(0x33), digest(0x44)]);
+  assert.deepEqual(ring, [digest(0x11), digest(0x22), digest(0x33)]);
+});
+
+test("a malformed running digest is ignored rather than pinned", () => {
+  const ring = ringFor(digest(0x11), "not-a-digest", [digest(0x22), digest(0x33)]);
+  assert.deepEqual(ring, [digest(0x11), digest(0x22), digest(0x33)]);
+});
+
+test("malformed entries are discarded rather than consuming a slot", () => {
+  const live = digest(0xaa);
+  const ring = ringFor(digest(0x11), live, ["", "  ", "sha256:nope", "garbage", live, digest(0x22)]);
+  assert.deepEqual(ring, [digest(0x11), live, digest(0x22)]);
+  for (const entry of ring) {
+    assert.match(entry, /^sha256:[0-9a-f]{64}$/);
+  }
+});
+
+test("the window never exceeds the bound the admission policy enforces", () => {
+  const live = digest(0xaa);
+  const crowded = Array.from({ length: 12 }, (_, index) => digest(0x30 + index));
+  const ring = ringFor(digest(0x11), live, [...crowded, live]);
+  assert.equal(ring.length, MAX_APPROVED_DIGESTS);
+});
+
+test("an empty window yields just the released digest and the running one", () => {
+  const live = digest(0xaa);
+  assert.deepEqual(ringFor(digest(0x11), live, []), [digest(0x11), live]);
+  assert.deepEqual(ringFor(digest(0x11), "", []), [digest(0x11)]);
+});
+
+test("a one-slot window still releases, dropping the pin rather than overflowing", () => {
+  // Defensive: the pin must never be able to push the window past the bound, so
+  // a hypothetical max of 1 keeps only the digest being released.
+  assert.deepEqual(ringFor(digest(0x11), digest(0xaa), [digest(0x22)], 1), [digest(0x11)]);
+});
+
+// The ring builder being correct proves nothing unless the script actually hands
+// it the running digest, so the reader on the other side of that seam is
+// exercised too — against a stubbed kubectl, since it is the one part that talks
+// to a cluster. Its contract is narrow: name the digest when it can be
+// established beyond doubt, otherwise say nothing and succeed. It must never
+// fail a release to protect a rollback target.
+
+const READER_FUNCTION_NAME = "live_running_digest";
+const readerSource = extractShellFunction(READER_FUNCTION_NAME);
+const REPLICASET_READER_FUNCTION_NAME = "serving_replicaset_image";
+const replicaSetReaderSource = extractShellFunction(REPLICASET_READER_FUNCTION_NAME);
+
+function shellAssign(name) {
+  const m = script.match(new RegExp(`^${name}="([^"]+)"$`, "m"));
+  assert.ok(m, `could not read ${name} out of ${scriptPath}`);
+  return m[1];
+}
+
+const IMAGE_REPOSITORY = shellAssign("IMAGE_REPOSITORY");
+
+// The reader's health gate lives in a jq block, not in the function body, so it
+// has to be lifted out of the script and injected alongside it — same reason as
+// everything else here: a rewrite of the predicate must fail this test rather
+// than leave it asserting against a copy that no longer ships.
+function extractJqBlock(name) {
+  const m = script.match(new RegExp(`^# BEGIN ${name}$\\n([\\s\\S]*?)^# END ${name}$`, "m"));
+  assert.ok(m, `could not read the ${name} jq block out of ${scriptPath}`);
+  return m[1];
+}
+
+const SERVING_JQ = extractJqBlock("ROLLOUT_SERVING_JQ");
+
+// `deployment` of null makes the stub exit non-zero, standing in for "no such
+// Deployment" or an unreachable apiserver.
+//
+// `replicaSets` covers the second object this reader consults. It defaults to an
+// empty list — a SUCCESSFUL list that names nothing — so every case written
+// before the ReplicaSet fallback existed keeps exercising what it was written to
+// exercise: "the spec is not believed, and nothing else names a digest either".
+// `null` is the distinct case where the list call itself fails, which is what the
+// deploy identity losing its apps/replicasets grant looks like (BLO-31842).
+//
+// `repeat` drives the reader more than once inside ONE shell, which is what the
+// rotate loop does on every 409: the reader is re-read per attempt. Combined with
+// `callerOwnedStateDir` — the caller minting the state directory, as the script
+// does at its own top level — that is the only way to observe warn-once, because
+// the reader runs inside $( ) and a subshell variable could never have carried
+// the flag. TMPDIR is redirected into the case's own directory so what the reader
+// leaves behind can be counted rather than assumed.
+function readerRunFor(
+  deployment,
+  { replicaSets = [], repeat = 1, callerOwnedStateDir = false } = {},
+) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-live-digest-"));
+  const tmpRoot = path.join(dir, "tmp");
+  mkdirSync(tmpRoot);
+  const deploymentFixture = path.join(dir, "deployment.json");
+  const replicaSetFixture = path.join(dir, "replicasets.json");
+  const argsLog = path.join(dir, "args.log");
+  writeFileSync(deploymentFixture, deployment === null ? "" : JSON.stringify(deployment));
+  writeFileSync(
+    replicaSetFixture,
+    replicaSets === null ? "" : JSON.stringify({ items: replicaSets }),
+  );
+  const harness = [
+    "set -euo pipefail",
+    `export TMPDIR=${JSON.stringify(tmpRoot)}`,
+    `DEPLOY_NAMESPACE=paperclip`,
+    `DEPLOYMENT=paperclip-api`,
+    `IMAGE_REPOSITORY=${JSON.stringify(IMAGE_REPOSITORY)}`,
+    "read -r -d '' ROLLOUT_SERVING_JQ <<'SERVING_JQ' || true",
+    SERVING_JQ.replace(/\n$/, ""),
+    "SERVING_JQ",
+    // Dispatches on the resource the reader asked for, so the two objects cannot
+    // be confused for each other, and records the argv so a test can assert the
+    // label selector was actually derived and passed rather than assumed.
+    `fake_kubectl() {`,
+    `  printf '%s\\n' "$*" >> ${JSON.stringify(argsLog)}`,
+    `  case "$*" in`,
+    `    *replicasets*)`,
+    `      if [[ ! -s ${JSON.stringify(replicaSetFixture)} ]]; then`,
+    `        echo 'Error from server (Forbidden): replicasets.apps is forbidden' >&2`,
+    `        return 1`,
+    `      fi`,
+    `      cat ${JSON.stringify(replicaSetFixture)}`,
+    `      ;;`,
+    `    *)`,
+    `      [[ -s ${JSON.stringify(deploymentFixture)} ]] || return 1`,
+    `      cat ${JSON.stringify(deploymentFixture)}`,
+    `      ;;`,
+    `  esac`,
+    `}`,
+    "deploy_kubectl=(fake_kubectl)",
+    replicaSetReaderSource,
+    readerSource,
+    // Mints and clears the state directory exactly as the script's own top level
+    // and EXIT trap do, so leftover-file accounting measures the reader rather
+    // than the harness.
+    ...(callerOwnedStateDir
+      ? ['rs_state_dir="$(mktemp -d "${TMPDIR}/paperclip-approve-rs.XXXXXX")"']
+      : []),
+    ...Array.from({ length: repeat }, () => READER_FUNCTION_NAME),
+    ...(callerOwnedStateDir ? ['rm -rf "$rs_state_dir"'] : []),
+  ].join("\n");
+  const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  assert.equal(result.status, 0, `reader must always succeed; stderr: ${result.stderr}`);
+  return {
+    digest: result.stdout.trim(),
+    digests: result.stdout.trim().split("\n").filter(Boolean),
+    stderr: result.stderr,
+    leftoverTempFiles: readdirSync(tmpRoot),
+    argv: existsSync(argsLog) ? readFileSync(argsLog, "utf8").trim().split("\n") : [],
+  };
+}
+
+function runningDigestFor(deployment, options) {
+  return readerRunFor(deployment, options).digest;
+}
+
+// A Deployment whose rollout has fully landed. Fixtures default to that shape so
+// a case which only cares about the image does not have to restate six status
+// fields, and `status` overrides merge over the healthy defaults.
+//
+// `unavailableReplicas` is deliberately ABSENT from the healthy default, because
+// that is the shape the apiserver actually returns: the live paperclip-api
+// Deployment omits the field entirely while healthy (observed 2026-09-04 at
+// generation 560, replicas 2/2/2). The predicate's `// 0` default is what makes
+// that read as "none unavailable" rather than as missing data, so the common
+// fixture exercises that path rather than a shape production never produces.
+// `metadata.uid` and `spec.selector` are on the default fixture because the
+// ReplicaSet fallback needs both to run at all, and a fixture missing them would
+// make every fallback-path case pass for the wrong reason — bailing out before
+// the list rather than on what the list contained.
+const DEPLOYMENT_UID = "3f0a5f6e-1c4b-4d2a-9a77-0b6c1f2e3d40";
+const DEPLOYMENT_SELECTOR = {
+  "app.kubernetes.io/name": "paperclip",
+  "app.kubernetes.io/component": "api",
+};
+
+function deploymentWith({
+  images = [],
+  replicas = 2,
+  generation = 7,
+  status = {},
+  uid = DEPLOYMENT_UID,
+  selector = { matchLabels: DEPLOYMENT_SELECTOR },
+} = {}) {
+  return {
+    metadata: { generation, uid },
+    spec: {
+      replicas,
+      selector,
+      template: { spec: { containers: images.map((image) => ({ image })) } },
+    },
+    status: {
+      observedGeneration: generation,
+      updatedReplicas: replicas,
+      readyReplicas: replicas,
+      availableReplicas: replicas,
+      ...status,
+    },
+  };
+}
+
+// A ReplicaSet as the apiserver returns it, owned by the Deployment fixture
+// above. `readyReplicas` of 0 is written as an ABSENT field by default, matching
+// what a never-ready ReplicaSet actually looks like on the live cluster —
+// observed 2026-09-04 across the 7 scaled-down paperclip-api ReplicaSets.
+function replicaSetWith({ name, images = [], ready = 0, uid = DEPLOYMENT_UID } = {}) {
+  return {
+    metadata: {
+      name,
+      ownerReferences: [{ kind: "Deployment", name: "paperclip-api", uid }],
+    },
+    spec: { template: { spec: { containers: images.map((image) => ({ image })) } } },
+    status: ready > 0 ? { readyReplicas: ready } : {},
+  };
+}
+
+function deploymentWithImages(...images) {
+  return deploymentWith({ images });
+}
+
+test("the running digest is read off a single-container Deployment", () => {
+  const live = digest(0xaa);
+  assert.equal(runningDigestFor(deploymentWithImages(`${IMAGE_REPOSITORY}@${live}`)), live);
+});
+
+test("identical images across containers still name the running digest", () => {
+  const live = digest(0xaa);
+  const image = `${IMAGE_REPOSITORY}@${live}`;
+  assert.equal(runningDigestFor(deploymentWithImages(image, image)), live);
+});
+
+test("an unreachable or absent Deployment yields no digest and still succeeds", () => {
+  assert.equal(runningDigestFor(null), "");
+});
+
+test("a tag-pinned image is not mistaken for a digest", () => {
+  assert.equal(runningDigestFor(deploymentWithImages(`${IMAGE_REPOSITORY}:latest`)), "");
+});
+
+test("an image from another repository is never pinned", () => {
+  const live = digest(0xaa);
+  assert.equal(runningDigestFor(deploymentWithImages(`ghcr.io/someone/else@${live}`)), "");
+});
+
+test("containers disagreeing on their image yield no digest rather than a guess", () => {
+  const images = [`${IMAGE_REPOSITORY}@${digest(0xaa)}`, `${IMAGE_REPOSITORY}@${digest(0xbb)}`];
+  assert.equal(runningDigestFor(deploymentWithImages(...images)), "");
+});
+
+test("a Deployment with no containers yields no digest", () => {
+  // Built healthy on purpose: with no status the health gate would refuse this
+  // anyway, and the test would pass without ever reaching the container check.
+  assert.equal(runningDigestFor(deploymentWith({ images: [] })), "");
+});
+
+// The pod template records what was ASKED for. Nothing reverts spec.template
+// after a failed rollout, so believing it on its own pins a digest that never
+// carried traffic -- burning the reserved slot and letting the last healthy
+// digest age out, which is the BLO-28483 wedge reached from the other side.
+// These cases are the reason the reader gates on rollout status at all.
+
+test("a rollout applied but never made ready is not pinned as the running digest", () => {
+  const applied = digest(0xbb);
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({
+        images: [`${IMAGE_REPOSITORY}@${applied}`],
+        status: { readyReplicas: 0, availableReplicas: 0, unavailableReplicas: 2 },
+      }),
+    ),
+    "",
+  );
+});
+
+test("a rollout still in flight yields no digest rather than a half-rolled one", () => {
+  // maxSurge brings a new pod up before the old one leaves, so the template
+  // already names the new digest while the old one is still serving. Neither is
+  // unambiguously the running digest, so name neither.
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({
+        images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+        status: { updatedReplicas: 1, readyReplicas: 1, availableReplicas: 1 },
+      }),
+    ),
+    "",
+  );
+});
+
+test("a pod template the controller has not observed yet is not believed", () => {
+  // spec.template was just patched, so status still describes the previous one.
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({
+        images: [`${IMAGE_REPOSITORY}@${digest(0xdd)}`],
+        generation: 8,
+        status: { observedGeneration: 7 },
+      }),
+    ),
+    "",
+  );
+});
+
+test("a Deployment scaled to zero has nothing serving and yields no digest", () => {
+  assert.equal(
+    runningDigestFor(deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xee)}`], replicas: 0 })),
+    "",
+  );
+});
+
+test("a landed rollout that omits unavailableReplicas is still read as serving", () => {
+  // The shape production actually returns; see deploymentWith.
+  const live = digest(0xaa);
+  const deployment = deploymentWith({ images: [`${IMAGE_REPOSITORY}@${live}`] });
+  assert.ok(
+    !Object.hasOwn(deployment.status, "unavailableReplicas"),
+    "this test is only meaningful while the healthy fixture omits unavailableReplicas",
+  );
+  assert.equal(runningDigestFor(deployment), live);
+});
+
+// Refusing to believe an unlanded spec is only half the guarantee. Nothing
+// reverts spec.template, so after a rollout that never became ready the
+// Deployment permanently names a digest that never carried traffic, the serving
+// gate above correctly declines to pin it -- and then NOTHING names the digest
+// that is still serving, so the ring is back to pure age ordering. That is the
+// BLO-28483 wedge reached one failure later. The previous ReplicaSet is the only
+// object that still names the last-healthy digest, so these cases cover reading
+// it (BLO-31842).
+
+const NEVER_READY = { readyReplicas: 0, availableReplicas: 0, unavailableReplicas: 2 };
+
+test("a never-ready rollout falls back to the digest the serving ReplicaSet carries", () => {
+  const applied = digest(0xbb);
+  const serving = digest(0xaa);
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${applied}`], status: NEVER_READY }),
+      {
+        replicaSets: [
+          replicaSetWith({ name: "paperclip-api-new", images: [`${IMAGE_REPOSITORY}@${applied}`] }),
+          replicaSetWith({
+            name: "paperclip-api-old",
+            images: [`${IMAGE_REPOSITORY}@${serving}`],
+            ready: 2,
+          }),
+        ],
+      },
+    ),
+    serving,
+  );
+});
+
+test("the ReplicaSet list is narrowed by the Deployment's own selector", () => {
+  const run = readerRunFor(
+    deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+  );
+  const listed = run.argv.filter((line) => line.includes("replicasets"));
+  assert.equal(listed.length, 1, `expected exactly one ReplicaSet list; got ${run.argv.join(" | ")}`);
+  for (const [key, value] of Object.entries(DEPLOYMENT_SELECTOR)) {
+    assert.ok(
+      listed[0].includes(`${key}=${value}`),
+      `selector label ${key}=${value} was not passed to kubectl: ${listed[0]}`,
+    );
+  }
+});
+
+test("a landed rollout is answered from the Deployment and never consults ReplicaSets", () => {
+  // The fallback is for the failure case only; reaching for ReplicaSets on the
+  // happy path would make every release depend on a grant it does not need.
+  const run = readerRunFor(deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`] }));
+  assert.equal(run.argv.filter((line) => line.includes("replicasets")).length, 0);
+});
+
+test("two ReplicaSets with ready pods are ambiguous and yield no digest", () => {
+  // A rollout genuinely in flight: both digests are serving and neither is "the
+  // running one". Naming the newer would pin a half-rolled digest.
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`], status: NEVER_READY }),
+      {
+        replicaSets: [
+          replicaSetWith({
+            name: "paperclip-api-new",
+            images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+            ready: 1,
+          }),
+          replicaSetWith({
+            name: "paperclip-api-old",
+            images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+            ready: 1,
+          }),
+        ],
+      },
+    ),
+    "",
+  );
+});
+
+test("a serving ReplicaSet owned by a different Deployment is never pinned", () => {
+  // An overlapping label selector elsewhere in the namespace must not be able to
+  // contribute a rollback target for this workload.
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+      {
+        replicaSets: [
+          replicaSetWith({
+            name: "someone-elses-rs",
+            images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+            ready: 2,
+            uid: "99999999-9999-4999-8999-999999999999",
+          }),
+        ],
+      },
+    ),
+    "",
+  );
+});
+
+test("a serving ReplicaSet from another repository is never pinned", () => {
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+      {
+        replicaSets: [
+          replicaSetWith({
+            name: "paperclip-api-old",
+            images: [`ghcr.io/someone/else@${digest(0xaa)}`],
+            ready: 2,
+          }),
+        ],
+      },
+    ),
+    "",
+  );
+});
+
+test("a serving ReplicaSet whose containers disagree yields no digest rather than a guess", () => {
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+      {
+        replicaSets: [
+          replicaSetWith({
+            name: "paperclip-api-old",
+            images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`, `${IMAGE_REPOSITORY}@${digest(0xdd)}`],
+            ready: 2,
+          }),
+        ],
+      },
+    ),
+    "",
+  );
+});
+
+test("no ReplicaSet with ready pods yields no digest and still succeeds", () => {
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+      {
+        replicaSets: [
+          replicaSetWith({ name: "paperclip-api-new", images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`] }),
+        ],
+      },
+    ),
+    "",
+  );
+});
+
+// As of 2026-09-04 the deploy identity holds apps/replicasets get+list only
+// through the deprecated RoleBinding/paperclip-ci-deploy-admin -> ClusterRole/
+// admin; the scoped Role/paperclip-ci-deploy that is meant to replace it has no
+// replicasets rule at all (BLO-21598). So this is not a hypothetical failure
+// mode: on the day that cutover lands, every release takes this path. It has to
+// stay non-fatal AND stop being silent, or the guarantee is hollowed out with
+// this very file still green.
+test("a failed ReplicaSet list degrades to no digest without failing the release", () => {
+  assert.equal(
+    runningDigestFor(
+      deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+      { replicaSets: null },
+    ),
+    "",
+  );
+});
+
+test("a failed ReplicaSet list warns, naming the grant and carrying kubectl's reason", () => {
+  const run = readerRunFor(
+    deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+    { replicaSets: null },
+  );
+  assert.match(run.stderr, /cannot list ReplicaSets/);
+  assert.match(run.stderr, /apps\/replicasets/);
+  assert.match(run.stderr, /Forbidden/);
+});
+
+test("the happy path stays quiet — no warning when nothing is wrong", () => {
+  const run = readerRunFor(deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`] }));
+  assert.equal(run.stderr.trim(), "");
+});
+
+// A selector the reader cannot turn into a label query is the OTHER way this
+// fallback silently stops working, and it is the one that leaves no trace at the
+// apiserver: no call is made, so nothing appears in an audit log either. The
+// reader still degrades to empty-and-succeed — this is an availability safeguard,
+// not a gate — but it now says so, on the same principle as the list-failure
+// branch below it. Not reachable against the Helm-rendered paperclip-api
+// Deployment, which uses matchLabels.
+test("a selector the reader cannot use warns instead of degrading silently", () => {
+  const run = readerRunFor(
+    deploymentWith({
+      images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`],
+      status: NEVER_READY,
+      selector: {
+        matchExpressions: [
+          { key: "app.kubernetes.io/name", operator: "In", values: ["paperclip"] },
+        ],
+      },
+    }),
+    {
+      replicaSets: [
+        replicaSetWith({ name: "paperclip-api-old", images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`], ready: 2 }),
+      ],
+    },
+  );
+  assert.equal(run.digest, "");
+  assert.match(run.stderr, /no matchLabels selector/);
+  assert.match(run.stderr, /BLO-31842/);
+  // No ReplicaSet call is attempted, so the warning is the only evidence there is.
+  assert.equal(
+    run.argv.filter((line) => line.includes("replicasets")).length,
+    0,
+    "a selector that cannot be built must not reach the apiserver",
+  );
+});
+
+// The rotate loop re-reads the running digest on EVERY 409 retry, so an unguarded
+// warning prints its five lines up to MAX_ROTATE_ATTEMPTS times and buries itself.
+// The guard has to be a file: the reader runs inside $( ), so a variable set there
+// never survives back to the loop. Driving the reader repeatedly against one
+// caller-owned state directory is what distinguishes a real guard from a variable
+// that happens to look like one.
+test("a repeated ReplicaSet list failure warns once, not once per rotation", () => {
+  const run = readerRunFor(
+    deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+    { replicaSets: null, repeat: 5, callerOwnedStateDir: true },
+  );
+  assert.equal(
+    run.stderr.match(/cannot list ReplicaSets/g)?.length,
+    1,
+    `warned more than once across 5 rotations:\n${run.stderr}`,
+  );
+  // The reader still ran all five times — the guard suppresses the message, not
+  // the work, so a rotation that would now succeed still gets a fresh read.
+  assert.equal(run.argv.filter((line) => line.includes("replicasets")).length, 5);
+});
+
+// Every temp path this reader mints has to be reclaimed on the paths it takes.
+// The one it cannot reclaim from a trap is the one it creates itself, because
+// $( ) hides it from the caller's EXIT trap — so the caller owns it instead, and
+// the no-caller case cleans up after itself.
+test("the ReplicaSet reader leaves no temp files behind, caller-owned or not", () => {
+  for (const callerOwnedStateDir of [true, false]) {
+    for (const replicaSets of [null, []]) {
+      const run = readerRunFor(
+        deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
+        { replicaSets, repeat: 2, callerOwnedStateDir },
+      );
+      assert.deepEqual(
+        run.leftoverTempFiles,
+        [],
+        `leftover temp files (callerOwned=${callerOwnedStateDir}, list=${replicaSets === null ? "forbidden" : "empty"})`,
+      );
+    }
+  }
+});
+
+// The caller-owned directory only survives the run if the EXIT trap clears it;
+// the harness above mints and clears its own, so it cannot observe the script's.
+// Asserted against the shipping source instead, for the same reason every other
+// constant here is read out of the script rather than restated.
+test("the script's EXIT trap clears the ReplicaSet reader's state directory", () => {
+  assert.match(
+    script,
+    /^rs_state_dir="\$\(mktemp -d /m,
+    "the reader's state directory must be minted at script scope, not inside the reader",
+  );
+  const cleanup = extractShellFunction("cleanup_on_exit");
+  assert.match(
+    cleanup,
+    /rm -rf "\$rs_state_dir"/,
+    "cleanup_on_exit must clear the reader's state directory",
+  );
+});
+
+// Split a jq predicate block into the condition lines of its top-level
+// conjunction. ROLLOUT_COMPLETE_JQ opens with a `def advanced: … ;` helper whose
+// body is control flow rather than conditions; jq definitions end in `;` and
+// condition lines never do, so the conjunction is everything after the last one.
+function jqConditions(block) {
+  const lines = block
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+  const endOfDefs = lines.reduce((at, line, index) => (line.endsWith(";") ? index : at), -1);
+  return lines.slice(endOfDefs + 1).map((line) => line.replace(/ and$/, ""));
+}
+
+// The clauses ROLLOUT_COMPLETE_JQ carries that ROLLOUT_SERVING_JQ deliberately
+// does not. Each establishes that MY plan's rollout landed, not that whatever
+// template is written is the one serving: the expected image and its structural
+// precondition, the rollout marker, and the generation advance. Everything else
+// in the completion predicate is a rollout-health condition, and the drift test
+// below requires it to appear in the serving predicate too.
+const LOCK_IDENTITY_CONDITIONS = [
+  '(.spec.template.spec.containers | type == "array" and length > 0)',
+  "(.spec.template.spec.containers | all(.image == $image))",
+  '(.spec.template.metadata.annotations[$marker_key] // "") == $marker',
+  "advanced",
+];
+
+// The reader's health gate and the in-flight lock's completion predicate must
+// agree on what "this rollout has landed" means. They are separate jq programs
+// because they answer different questions -- the lock also proves plan identity
+// and generation advance -- so nothing but this test stops one from being
+// tightened while the other silently keeps the old reading.
+//
+// The comparison is set equality over the health half, in BOTH directions. The
+// reverse direction is the load-bearing one: a health condition added to the
+// completion predicate alone would silently make the reader the weaker of the
+// two definitions, so it would pin a digest the lock itself would not call
+// landed -- the exact failure this gate was introduced to close, reintroduced
+// by drift rather than by code.
+test("the serving predicate does not drift from the completion predicate", () => {
+  const serving = jqConditions(SERVING_JQ);
+  const complete = jqConditions(extractJqBlock("ROLLOUT_COMPLETE_JQ"));
+
+  assert.ok(
+    serving.length >= 6,
+    `expected the serving predicate to carry the rollout-health conditions, got ${serving.length}`,
+  );
+
+  // Keep the classification honest: a lock-only clause that no longer exists
+  // must not sit here silently exempting a condition name from the comparison.
+  for (const condition of LOCK_IDENTITY_CONDITIONS) {
+    assert.ok(
+      complete.includes(condition),
+      `LOCK_IDENTITY_CONDITIONS in this test lists \`${condition}\` as lock-only, but ` +
+        "ROLLOUT_COMPLETE_JQ no longer carries it — update the classification",
+    );
+  }
+
+  const completeHealth = complete.filter((condition) => !LOCK_IDENTITY_CONDITIONS.includes(condition));
+
+  for (const condition of serving) {
+    assert.ok(
+      completeHealth.includes(condition),
+      `ROLLOUT_SERVING_JQ requires \`${condition}\` but ROLLOUT_COMPLETE_JQ no longer does — ` +
+        "the two definitions of a landed rollout have drifted apart",
+    );
+  }
+
+  for (const condition of completeHealth) {
+    assert.ok(
+      serving.includes(condition),
+      `ROLLOUT_COMPLETE_JQ requires \`${condition}\` but ROLLOUT_SERVING_JQ does not — ` +
+        "the reader would pin a digest the lock's own predicate would not call landed. " +
+        "Add it to ROLLOUT_SERVING_JQ, or to LOCK_IDENTITY_CONDITIONS in this test if it " +
+        "proves plan identity rather than rollout health",
+    );
+  }
+});
+
+const FORMATTER_FUNCTION_NAME = "format_digest_list";
+const formatterSource = extractShellFunction(FORMATTER_FUNCTION_NAME);
+
+// The list reaches the formatter exactly as it does in the script: through a
+// command substitution (which strips trailing newlines) and then double-quoted,
+// so a multi-line window is one argument rather than several.
+function formatDigestList(list) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-digest-list-"));
+  const fixture = path.join(dir, "window.txt");
+  writeFileSync(fixture, list);
+  const harness = [
+    "set -euo pipefail",
+    formatterSource,
+    `window="$(cat ${JSON.stringify(fixture)})"`,
+    `${FORMATTER_FUNCTION_NAME} "$window"`,
+  ].join("\n");
+  const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  assert.equal(result.status, 0, `formatter must always succeed; stderr: ${result.stderr}`);
+  return result.stdout;
+}
+
+// The read-back guards print this on their failure paths, where the contents are
+// the actionable part. An empty window must not render as a blank line, or the
+// "did not persist" report would say nothing at all about what the cluster holds.
+test("the digest-list formatter indents each entry and marks an empty window", () => {
+  const a = digest(0xaa);
+  const b = digest(0xbb);
+
+  assert.equal(formatDigestList(`${a}\n${b}`), `  - ${a}\n  - ${b}\n`);
+  assert.equal(formatDigestList(a), `  - ${a}\n`);
+  assert.equal(formatDigestList(""), "  (none)\n");
+});
+
+
+// --- in-flight lock owner handoff (BLO-31598) -------------------------------
+//
+// Production deploys wedged when an approval succeeded and the job then died at
+// the pending-migration pre-flight, before helm touched the cluster. The lock
+// that approval took can never self-clear — its rollout never happened — and the
+// owner id needed to retire it existed only as prose on stdout, so no workflow
+// step could name it. emit_lock_owner is the handoff that closes that gap.
+//
+// The safety property is the one worth guarding: it must stay SILENT for a lock
+// adopted from an earlier attempt, because that rollout may still be running and
+// retiring its lock would reopen the approval ring underneath it.
+const OWNER_FN = "emit_lock_owner";
+const emitOwnerSource = extractShellFunction(OWNER_FN);
+
+// Runs the real shipping function against a scratch path and reports what the
+// caller would observe: whether a file appeared, its contents, and its mode.
+function emitOwner({ ours, outPathSet = true, ownerId = "a".repeat(64) }) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-lock-owner-"));
+  const outPath = path.join(dir, "lock-owner.txt");
+  const harness = [
+    "set -euo pipefail",
+    `LOCK_OWNER_ID=${ownerId}`,
+    `lock_owner_is_ours=${ours ? "yes" : '""'}`,
+    outPathSet ? `PAPERCLIP_APPROVAL_LOCK_OWNER_OUT=${JSON.stringify(outPath)}` : "",
+    emitOwnerSource,
+    OWNER_FN,
+    `if [ -e ${JSON.stringify(outPath)} ]; then`,
+    `  printf 'WROTE %s' "$(cat ${JSON.stringify(outPath)})"`,
+    "else",
+    "  printf 'NOFILE'",
+    "fi",
+  ].filter(Boolean).join("\n");
+  const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  assert.equal(result.status, 0, `emit_lock_owner harness failed: ${result.stderr}`);
+  const observed = result.stdout.trim();
+  // Mode is read here rather than via `stat -c %a`, which is GNU-only syntax and
+  // fails the harness outright on BSD/macOS — asserting the umask, not the
+  // platform's stat flags.
+  if (observed === "NOFILE") return observed;
+  return `${observed} ${(statSync(outPath).mode & 0o777).toString(8)}`;
+}
+
+test("a lock this invocation minted hands its owner to the workflow", () => {
+  const ownerId = "b".repeat(64);
+  assert.equal(emitOwner({ ours: true, ownerId }), `WROTE ${ownerId} 600`);
+});
+
+// The safety-critical case. An adopted lock belongs to a rollout that may still
+// be live; naming its owner would invite a caller to abandon it.
+test("a lock adopted from an earlier attempt is never named", () => {
+  assert.equal(emitOwner({ ours: false }), "NOFILE");
+});
+
+test("the handoff is opt-in and silently absent when unrequested", () => {
+  assert.equal(emitOwner({ ours: true, outPathSet: false }), "NOFILE");
+});
+
+// The flag is only meaningful if it tracks the script's own provenance split.
+// These assert against the shipping source, so deleting either assignment — and
+// thereby letting an adopted lock be reported as ours — fails here.
+test("ownership is cleared on exactly the branches that inherit or lose the lock", () => {
+  const adopted = script.slice(script.indexOf("lock_preserve_on_failure=yes"));
+  assert.match(
+    adopted.slice(0, 200),
+    /lock_owner_is_ours=""/,
+    "the adopted-lock branch must disown the lock, or an inherited lock can be abandoned",
+  );
+  const conflict = script.slice(script.indexOf("# A conflict proves this write did not land"));
+  assert.match(
+    conflict.slice(0, 400),
+    /lock_owner_is_ours=""/,
+    "a conflicting write did not land, so no lock with our owner exists",
+  );
+});
+
+// Emitting before the write would name a lock that does not exist if the replace
+// then fails, sending a cleanup step to abandon another process's transaction.
+//
+// Located by indentation rather than by the exact call text, so this ordering
+// assertion survives a change to the call's FORM (a guard, a redirect) and fails
+// only when the call actually MOVES, which is the property it exists to pin.
+const emitCallLineIndex = script
+  .split("\n")
+  .findIndex((line) => new RegExp(`^ {4}${OWNER_FN}\\b`).test(line));
+
+test("the owner is emitted only after the ring write actually lands", () => {
+  assert.notEqual(emitCallLineIndex, -1, `${OWNER_FN} is never called from the rotate loop`);
+  const lines = script.split("\n");
+  const rotatedLineIndex = lines.findIndex((line) => line.includes("rotated=yes"));
+  assert.notEqual(rotatedLineIndex, -1, "rotated=yes not found in the rotate loop");
+  assert.ok(
+    emitCallLineIndex > rotatedLineIndex,
+    `${OWNER_FN} must be called after the successful kubectl replace, not before it`,
+  );
+});
+
+// The emit call is deliberately BARE, so under `set -e` a write failure five
+// lines after the rotation aborts the run. That is only correct because the
+// abort is self-healing: the minted branch armed lock_cleanup_armed, so
+// cleanup_on_exit retires the lock rather than stranding it.
+//
+// Ally flagged the earlier `||` guard on #1638 because the comment justifying it
+// asserted the opposite — that aborting there holds the lock — which is false and
+// which its own next sentence contradicted. So this executes the real
+// cleanup_on_exit against the real flag values instead of reading the source:
+// a rationale that claims self-healing is worth nothing if the cleanup it names
+// stops firing, and only running it catches that.
+const cleanupSource = extractShellFunction("cleanup_on_exit");
+
+// Shaped like the real thing (`SecureRandom.hex(32)`), so an assertion that the
+// warning reproduces it verbatim cannot pass on a truncated or reformatted echo.
+const CLEANUP_LOCK_OWNER_ID = "a".repeat(63) + "9";
+
+function runCleanup({ armed, preserve, status, releaseFails = false }) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-cleanup-"));
+  const harness = [
+    "set -uo pipefail",
+    `lock_cleanup_armed=${armed ? "yes" : '""'}`,
+    `lock_preserve_on_failure=${preserve ? "yes" : '""'}`,
+    "DIGEST=sha256:feedface",
+    // cleanup_on_exit rm -f's these; point them at unused paths in a scratch dir.
+    ...["replace_err", "nonce_err", "server_plan_err", "probe_attempts_log", "release_err", "rs_state_dir"].map(
+      (name) => `${name}=${JSON.stringify(path.join(dir, name))}`,
+    ),
+    // The failed-retirement branch names the cluster coordinates of the owner
+    // annotation, so the harness has to carry them or `set -u` aborts the
+    // cleanup before it reaches the branch under test. Real values, not
+    // placeholders: the assertion below reads the command it prints.
+    "NAMESPACE=paperclip-release-approvals",
+    "CONFIGMAP=paperclip-api-approved-images",
+    "LOCK_OWNER_ANNOTATION=paperclip.blockcast.net/approval-in-flight-owner",
+    // The warning prints the owner it is holding rather than only telling the
+    // operator where to look it up, so the harness must carry one. A real
+    // 64-hex value, because the assertion below reads it back out of stderr.
+    `LOCK_OWNER_ID=${CLEANUP_LOCK_OWNER_ID}`,
+    // Stubbed so the test observes the DECISION to retire, with no cluster.
+    releaseFails
+      ? "release_in_flight_lock() { return 1; }"
+      : 'release_in_flight_lock() { echo "RELEASED" >&2; return 0; }',
+    cleanupSource,
+    // cleanup_on_exit reads $?, so set it exactly as the trap would.
+    `( exit ${status} )`,
+    "cleanup_on_exit",
+  ].join("\n");
+  const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  return { status: result.status, released: /RELEASED/.test(result.stderr), stderr: result.stderr };
+}
+
+test("aborting after the ring rotated retires the lock this run minted", () => {
+  const result = runCleanup({ armed: true, preserve: false, status: 1 });
+  assert.equal(result.released, true, "a minted lock must be retired on failure, not stranded");
+  assert.equal(result.status, 1, "cleanup must preserve the failing exit status");
+  assert.match(result.stderr, /Retired this approval's in-flight lock/);
+});
+
+// The other half of the safety split: an adopted lock belongs to a rollout that
+// may still be live, so failure must leave it alone.
+test("aborting after adopting an earlier attempt's lock leaves it alone", () => {
+  const result = runCleanup({ armed: false, preserve: true, status: 1 });
+  assert.equal(result.released, false, "an inherited lock must survive this run's failure");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Preserved the adopted in-flight lock/);
+});
+
+// Success deliberately leaves the lock live for the next release to retire after
+// observing this plan marker roll out.
+test("a successful run leaves its lock live for the next release", () => {
+  const result = runCleanup({ armed: true, preserve: false, status: 0 });
+  assert.equal(result.released, false, "success must not retire the lock it is handing forward");
+  assert.equal(result.status, 0);
+});
+
+// The cleanup above only runs if the emit failure actually propagates. Reading
+// the call site for an absent `||` would be the same presence-assertion Ally
+// showed passing on mutated code, so run the REAL call statement under real
+// `set -e` with a failing emit and observe whether the shell stops.
+const emitStatement = (() => {
+  const lines = script.split("\n");
+  const collected = [lines[emitCallLineIndex]];
+  for (let i = emitCallLineIndex + 1; i < lines.length; i += 1) {
+    const joined = collected[collected.length - 1].trimEnd();
+    const next = lines[i].trim();
+    if (!joined.endsWith("\\") && !next.startsWith("||") && !next.startsWith("&&")) break;
+    collected.push(lines[i]);
+  }
+  return collected.map((line) => line.replace(/^ {4}/, "")).join("\n");
+})();
+
+test("a failed handoff aborts the run instead of exiting 0 with an unnamed lock", () => {
+  const harness = [
+    "set -euo pipefail",
+    "LOCK_OWNER_OUT=/dev/null",
+    `${OWNER_FN}() { return 1; }`,
+    emitStatement,
+    'echo "CONTINUED"',
+  ].join("\n");
+  const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  assert.doesNotMatch(
+    result.stdout,
+    /CONTINUED/,
+    `a failed ${OWNER_FN} must abort so cleanup_on_exit retires the lock; the call ran on past it:\n${emitStatement}`,
+  );
+  assert.notEqual(result.status, 0, "the run must fail visibly rather than report success");
+});
+
+// --- handoff path validation ------------------------------------------------
+//
+// Ally flagged this on #1638: the handoff path was the only operator-facing
+// value in the script with no up-front validation, in a file that states the
+// opposite convention outright ("Validated here, with the other operator-facing
+// env, so a typo fails before the ring is touched"). The failure it produced was
+// not a wedge — cleanup_on_exit still retires the lock — but it cost a deploy and
+// aborted at a point in the script that reads like success.
+function runWithOwnerOut(outPath) {
+  return runWithKnobs({ PAPERCLIP_APPROVAL_LOCK_OWNER_OUT: outPath });
+}
+
+test("an unwritable handoff path is rejected before the approval ring is touched", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-owner-out-"));
+  const cases = [
+    // The realistic one: a workflow that has not created the directory yet.
+    [path.join(dir, "missing-dir", "lock-owner.txt"), /is not a directory/],
+    // A path that names the directory itself.
+    [dir, /is a directory, not a file/],
+  ];
+  for (const [outPath, expected] of cases) {
+    const result = runWithOwnerOut(outPath);
+    assert.equal(result.status, 2, `${outPath} should exit 2, got ${result.status}`);
+    assert.match(result.stderr, /PAPERCLIP_APPROVAL_LOCK_OWNER_OUT=/);
+    assert.match(result.stderr, expected, `got: ${result.stderr}`);
+  }
+});
+
+// The whole safety property of the handoff is that an ABSENT file means "this
+// invocation has no lock it is entitled to abandon". Validating by creating the
+// target would hand a consumer a path that exists with no owner in it, so the
+// probe must not leave the target behind.
+test("validating the handoff path does not create the target file", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-owner-out-"));
+  const outPath = path.join(dir, "lock-owner.txt");
+  const result = runWithOwnerOut(outPath);
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential/);
+  assert.doesNotMatch(result.stderr, /PAPERCLIP_APPROVAL_LOCK_OWNER_OUT/);
+  assert.equal(existsSync(outPath), false, "validation must not pre-create the handoff target");
+  assert.deepEqual(
+    readdirSync(dir).filter((name) => name.includes("probe")),
+    [],
+    "the writability probe must clean up after itself",
+  );
+});
+
+// The probe's FAILURE branch is the realistic production case — a read-only
+// mount — and the only one of the four with non-trivial logic, so it is worth
+// exercising rather than trusting. Root defeats the mode bits and would write
+// happily, so these skip rather than assert a falsehood when running as root.
+const runsAsRoot = typeof process.geteuid === "function" && process.geteuid() === 0;
+
+test("an unwritable parent directory is rejected before the approval ring is touched", { skip: runsAsRoot && "mode bits do not constrain root" }, () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-owner-ro-"));
+  chmodSync(dir, 0o500);
+  try {
+    const result = runWithOwnerOut(path.join(dir, "lock-owner.txt"));
+    assert.equal(result.status, 2, `got: ${result.stderr}`);
+    assert.match(result.stderr, /PAPERCLIP_APPROVAL_LOCK_OWNER_OUT=/);
+    assert.match(result.stderr, /is not writable/, `got: ${result.stderr}`);
+  } finally {
+    chmodSync(dir, 0o700);
+  }
+});
+
+test("an existing but unwritable target is rejected", { skip: runsAsRoot && "mode bits do not constrain root" }, () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-owner-ro-target-"));
+  const outPath = path.join(dir, "lock-owner.txt");
+  writeFileSync(outPath, "");
+  chmodSync(outPath, 0o400);
+  const result = runWithOwnerOut(outPath);
+  assert.equal(result.status, 2, `got: ${result.stderr}`);
+  assert.match(result.stderr, /exists and is not writable/, `got: ${result.stderr}`);
+});
+
+test("an unset handoff path skips validation entirely", () => {
+  const result = runWithKnobs({});
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /PAPERCLIP_DEPLOY_KUBECONFIG must name the deploy credential/);
+  assert.doesNotMatch(result.stderr, /PAPERCLIP_APPROVAL_LOCK_OWNER_OUT/);
+});
+
+// Review of #1646 read the span between the ring write and the workflow
+// publishing `lock_owner` to `$GITHUB_OUTPUT` as a residual wedge: the
+// admissibility probe alone budgets ~286s, and an operator cancelling in there
+// was thought to leave a live lock the cleanup step cannot name.
+//
+// It does not, and the reason is entirely mechanical: INT and TERM are trapped
+// into a non-zero `exit`, which runs the EXIT trap, which is `cleanup_on_exit`
+// -- and the arm at the ring write is still set, because nothing disarms it
+// until the handoff has succeeded. So the script retires its own lock before the
+// step shell exits. `runCleanup` above already proves the armed+failure branch
+// retires; what was untested is the two facts that make a CANCELLATION reach it.
+//
+// Both are asserted on real source offsets rather than on text presence, because
+// the way this window reopens is a disarm migrating into that span, and that
+// would leave every other test in this file green.
+test("nothing disarms the cleanup between the ring write and the probe", () => {
+  const armIndex = script.indexOf("lock_cleanup_armed=yes");
+  assert.notEqual(armIndex, -1, "the arming site moved or was renamed");
+  const emitIndex = script.indexOf("    emit_lock_owner", armIndex);
+  assert.notEqual(emitIndex, -1, "the owner handoff no longer follows the arming site");
+
+  // The span has to be measured from the END of the rotation loop, not from the
+  // emit call. The loop's own tail DOES disarm -- deliberately, so that a later
+  // exact-match retry cannot retire a lock another process took -- and that line
+  // sits textually after the emit while being on a path that never emitted: the
+  // successful write `break`s straight past it. Slicing from the emit would
+  // therefore flag a correct disarm, which is the failure this test had on its
+  // first run. From `done` onwards, everything executes unconditionally on the
+  // path that minted a lock, so a disarm in THIS span is the real regression.
+  const loopEnd = script.indexOf("\ndone\n", emitIndex);
+  assert.notEqual(loopEnd, -1, "the rotation loop's end moved");
+  const probeIndex = script.indexOf('for attempt in $(seq 1 "$PROBE_ATTEMPTS")', loopEnd);
+  assert.notEqual(probeIndex, -1, "the admissibility probe moved");
+
+  const disarms = script
+    .slice(loopEnd, probeIndex)
+    .split("\n")
+    .filter((line) => line.trim() === 'lock_cleanup_armed=""');
+  assert.deepEqual(
+    disarms,
+    [],
+    "a disarm here would let a cancellation during the probe strand a live lock",
+  );
+});
+
+// Exercises release_in_flight_lock's read failure directly, with kubectl stubbed
+// rather than mocked away, so the branch runs as written. Without this the
+// empty-stderr guard could be deleted and every other test here stays green --
+// which is exactly how the dangling-colon regression it fixes got shipped.
+function runRelease({ stderrText }) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-release-"));
+  const errFile = path.join(dir, "release_err");
+  const fn = script.slice(
+    script.indexOf("release_in_flight_lock() {"),
+    script.indexOf("\nemit_lock_owner() {"),
+  );
+  const harness = [
+    "set -uo pipefail",
+    "NAMESPACE=paperclip-release-approvals",
+    "CONFIGMAP=paperclip-api-approved-images",
+    "RETIRE_ATTEMPTS=1",
+    `release_err=${JSON.stringify(errFile)}`,
+    // Fails, writing exactly what the case under test needs it to write.
+    `kubectl() { ${stderrText ? `printf '%s\\n' ${JSON.stringify(stderrText)} >&2; ` : ""}return 1; }`,
+    fn,
+    "release_in_flight_lock",
+  ].join("\n");
+  const r = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  return { status: r.status, stderr: r.stderr };
+}
+
+test("the retirement loop and its trailing-sleep guard cannot drift apart", () => {
+  // Sugg 1's actual point: the bound was spelled `1 2 3` while the guard it
+  // paces reads a named constant, so changing one silently desynchronises them.
+  // Asserted on the extracted function, and on the two bounds referring to the
+  // SAME identifier -- a presence check for "RETIRE_ATTEMPTS" would pass on a
+  // loop still hardcoded to `1 2 3` with the constant used only in the guard.
+  const fn = script.slice(
+    script.indexOf("release_in_flight_lock() {"),
+    script.indexOf("\nemit_lock_owner() {"),
+  );
+  const loop = fn.match(/for attempt in \$\(seq 1 "\$(\w+)"\); do/);
+  assert.ok(loop, "the retirement loop must take its bound from a named constant, not `1 2 3`");
+  const guard = fn.match(/if \(\( attempt < (\w+) \)\); then/);
+  // "not a bare `(( … ))`" rather than "not `(( … )) && sleep`": the `&&`
+  // spelling does NOT abort under `set -e` (bash exempts the left side of an
+  // `&&` list), as the guarded comment now says. A BARE `(( … ))` as the loop
+  // body's last command is the rewrite that actually breaks, so that is the
+  // form this assertion exists to exclude -- the `if` resists both.
+  assert.ok(guard, "the trailing sleep must be guarded by an explicit `if`, not a bare `(( … ))`");
+  assert.equal(
+    guard[1],
+    loop[1],
+    `guard bound ${guard[1]} must be the loop bound ${loop[1]} -- two names is the drift this prevents`,
+  );
+  // And that name must resolve on the approval path. Declared inside retire-only
+  // mode it would be unset here, and `set -u` would abort cleanup_on_exit
+  // mid-retirement -- turning this parity fix into a fresh wedge.
+  const decl = new RegExp(`^readonly ${loop[1]}=\\d+$`, "m");
+  assert.match(script, decl, `${loop[1]} must be declared at top level, reachable from cleanup_on_exit`);
+  const declIndex = script.search(decl);
+  assert.ok(
+    declIndex < script.indexOf("release_in_flight_lock() {"),
+    "the declaration must precede the function that reads it",
+  );
+});
+
+test("the retirement bound is actually SET on the approval path, not just spelled at column 0", () => {
+  // The assertion above is structural, and there is one mutation it cannot see:
+  // moving the declaration inside `if [[ -n "$RETIRE_IN_FLIGHT_ONLY" ]]` carries
+  // it at column 0, so `^readonly …` still matches and the offset check still
+  // passes -- while the approval path, which never enters that block, leaves it
+  // unset. That IS the wedge the comment at the declaration describes. So run
+  // it: execute the script's real declaration region with
+  // PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY unset, then call the real
+  // release_in_flight_lock under `set -u` and see whether the loop bound
+  // resolves.
+  //
+  // The region is cut at the read of that env var -- the landmark BEFORE every
+  // retire-only-conditional site in the file -- so a declaration moved into any
+  // of them falls out of what gets executed here. Everything above it is
+  // comments, constant assignments and function definitions; the one `exit` is
+  // guarded on PAPERCLIP_MAX_APPROVED_DIGESTS, which this harness leaves unset.
+  const landmark = 'RETIRE_IN_FLIGHT_ONLY="${PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY:-}"';
+  const landmarkIndex = script.indexOf(landmark);
+  assert.notEqual(landmarkIndex, -1, "retire-only mode's env read moved; this harness cuts the script there");
+  const declarations = script.slice(0, landmarkIndex);
+  const fn = script.slice(
+    script.indexOf("release_in_flight_lock() {"),
+    script.indexOf("\nemit_lock_owner() {"),
+  );
+
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-bound-"));
+  const harness = [
+    declarations,
+    // The declarations set -e; keep -u (the whole point) but drop -e so an
+    // unbound expansion surfaces as a message to assert on rather than a bare
+    // non-zero exit that a missing message would also produce.
+    "set +e",
+    "set -uo pipefail",
+    `release_err=${JSON.stringify(path.join(dir, "release_err"))}`,
+    // Fails on the read, which is the shortest path through the loop. The `for`
+    // expands the bound BEFORE this ever runs, so an unset bound aborts first.
+    "kubectl() { printf 'boom\\n' >&2; return 1; }",
+    fn,
+    "release_in_flight_lock",
+  ].join("\n");
+  const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+
+  assert.doesNotMatch(
+    result.stderr,
+    /unbound variable/,
+    `the retirement loop's bound must resolve with PAPERCLIP_APPROVAL_RETIRE_IN_FLIGHT_ONLY unset; got: ${result.stderr}`,
+  );
+  // Positive control: prove the loop body actually ran. Without this the test
+  // would also pass on a script whose loop never iterates at all.
+  assert.match(
+    result.stderr,
+    /cannot read paperclip-release-approvals\/paperclip-api-approved-images/,
+    "the loop must have entered and reached the read, not been skipped",
+  );
+});
+
+test("a read failure with no stderr still explains itself", () => {
+  // kubectl killed by a signal, or dead before it wrote: the old code printed
+  // "cannot read ...:" and then nothing at all after the colon.
+  const result = runRelease({ stderrText: "" });
+  assert.equal(result.status, 1, "an unreadable ConfigMap must fail closed");
+  assert.match(
+    result.stderr,
+    /\(kubectl produced no error output\)/,
+    "an empty stderr must say so rather than leaving a dangling colon",
+  );
+  assert.doesNotMatch(
+    result.stderr,
+    /to retire the in-flight lock:\s*$/,
+    "the message must not end at the colon it promises to expand on",
+  );
+});
+
+test("a read failure WITH stderr passes the cause through", () => {
+  // The other direction: the guard must not swallow a real cause. Without this
+  // row, replacing the sed with an unconditional placeholder would pass.
+  const result = runRelease({ stderrText: 'Error from server (Forbidden): configmaps is forbidden' });
+  assert.match(result.stderr, /Forbidden/, "the real kubectl cause must survive");
+  assert.doesNotMatch(
+    result.stderr,
+    /\(kubectl produced no error output\)/,
+    "the placeholder must not appear when kubectl did write a cause",
+  );
+});
+
+test("a failed retirement names where the owner still exists, not a dead end", () => {
+  // The Important finding this replaces: the operator is handed the wedge on
+  // exactly this path, and every source the old text pointed at is empty of the
+  // owner -- LOCK_OWNER_ID reaches stdout only in the success epilogue, past
+  // this window entirely. Retire-only mode refuses to run without the owner, so
+  // "re-run with ABANDON_IN_FLIGHT_OWNER" without saying where to get it is not
+  // a recovery path.
+  const result = runCleanup({ armed: true, preserve: false, status: 1, releaseFails: true });
+  assert.equal(result.released, false, "this test needs the retirement to have FAILED");
+  // First: the owner this process is holding, verbatim. The likeliest way to
+  // reach this branch is a read failure, which returns WITHOUT retrying -- so a
+  // message that only pointed at the cluster would be telling the operator to
+  // re-run the read that just failed.
+  assert.match(
+    CLEANUP_LOCK_OWNER_ID,
+    /^[0-9a-f]{64}$/,
+    "the fixture owner must be a real 64-hex id; a short or empty one would make the check below vacuous",
+  );
+  assert.ok(
+    result.stderr.includes(`PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT_OWNER=${CLEANUP_LOCK_OWNER_ID}`),
+    "the warning must hand over the owner it is holding, not only where to look it up",
+  );
+  assert.ok(
+    result.stderr.includes("PAPERCLIP_APPROVAL_ABANDON_IN_FLIGHT=sha256:feedface"),
+    "both halves are required by the pairing rule, so both must be printed",
+  );
+  // Second: the cluster query survives as the fallback. An exact retry adopts
+  // the lock and rewrites the annotation, which makes this process's value
+  // stale -- that is the case the annotation read exists to cover, and dropping
+  // it while adding the interpolation would trade one dead end for another.
+  assert.match(
+    result.stderr,
+    /kubectl -n paperclip-release-approvals get configmap paperclip-api-approved-images/,
+    "the warning must keep the cluster read that recovers a rewritten owner",
+  );
+  assert.match(
+    result.stderr,
+    /approval-in-flight-owner/,
+    "the warning must name the owner annotation specifically, not just the ConfigMap",
+  );
+});
+
+test("a signal is routed into the cleanup rather than killing the script outright", () => {
+  // Without these three lines a SIGTERM kills bash with no trap, the lock stays
+  // live, and the cleanup step in docker.yml cannot name it -- which is exactly
+  // the residual the review described. They are the whole reason it is a
+  // SIGKILL-only window and not a cancellation-shaped one.
+  for (const wiring of ["trap cleanup_on_exit EXIT", "trap 'exit 130' INT", "trap 'exit 143' TERM"]) {
+    assert.ok(script.includes(wiring), `missing trap wiring: ${wiring}`);
+  }
+
+  // Presence alone is the failure mode the sibling test above deliberately
+  // avoids. A second EXIT trap installed after this one silently displaces
+  // cleanup_on_exit and leaves every assertion here green -- and that is not
+  // hypothetical: this same script installs `trap 'rm -f "$retire_err"' EXIT`
+  // in retire-only mode. It is harmless only because that mode always exits
+  // first, a property nothing asserted until now. So assert on real source
+  // offsets: cleanup_on_exit must be the LAST EXIT trap in the file, and the
+  // retire-only trap that precedes it must sit on a path that has already
+  // exited.
+  const exitTraps = [...script.matchAll(/^[ \t]*trap[ \t]+(.+?)[ \t]+EXIT[ \t]*$/gm)];
+  assert.ok(exitTraps.length >= 1, "no EXIT trap found at all");
+  const lastTrap = exitTraps[exitTraps.length - 1];
+  assert.equal(
+    lastTrap[1],
+    "cleanup_on_exit",
+    `the last EXIT trap must be cleanup_on_exit, found ${lastTrap[1]} -- ` +
+      "a trap installed after it displaces the lock retirement entirely",
+  );
+
+  // And the statuses those traps synthesise do land in the retire branch: the
+  // branch keys on "non-zero", so 143/130 must behave exactly like any failure.
+  for (const status of [143, 130]) {
+    const result = runCleanup({ armed: true, preserve: false, status });
+    assert.equal(result.released, true, `exit ${status} must retire the lock it minted`);
+    assert.equal(result.status, status, "the cleanup must not swallow the signal's status");
+  }
+});
+
+// Exercises release_in_flight_lock's WRITE failure with the REAL
+// clear_in_flight_lock in the loop and only kubectl stubbed, so the bail runs as
+// written and CLEAR_IN_FLIGHT_LOCK_ERR is proven to be populated by the script's
+// own capture rather than by the harness. Ally's suggestion at 4b80791e: without
+// this branch a non-retriable write burns every attempt and returns 1 with no
+// cause, on the path with the LEAST operator visibility -- the caller prints
+// only the bare "could not retire the in-flight lock" and nobody is at a
+// terminal to re-run it with more logging.
+function runReleaseWrite({ stderrText, attempts = 3, writeSucceeds = false }) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-release-write-"));
+  const countFile = path.join(dir, "replace_count");
+  const sleepLog = path.join(dir, "sleeps");
+  // Sliced out of the shipping script, not restated: this carries the annotation
+  // constants, the shared jq program, and the `2>&1 >/dev/null` capture. Losing
+  // that redirection order fails this test instead of silently blinding the bail.
+  const clearRegion = script.slice(
+    script.indexOf('LOCK_DIGEST_ANNOTATION="'),
+    script.indexOf("\n# Must stay in lockstep with the `maxApprovedApiDigests`"),
+  );
+  const fn = script.slice(
+    script.indexOf("release_in_flight_lock() {"),
+    script.indexOf("\nemit_lock_owner() {"),
+  );
+  // Heredoc body and terminator sit at column 0 deliberately; indenting them
+  // here would make the generated bash unparseable rather than failing loudly.
+  // Flags match the shipping script's `set -euo pipefail` (`:82`) so what runs
+  // here runs under production's error handling; all three cases behave
+  // identically either way, so the fidelity is free. It is NOT extra mutation
+  // coverage for the trailing-sleep guard below: bash exempts the left side of
+  // an `&&` list from `set -e`, so rewriting the guard as `(( ... )) && sleep 1`
+  // does not abort and this harness passes with it either way (measured).
+  const harness = `set -euo pipefail
+NAMESPACE=paperclip-release-approvals
+CONFIGMAP=paperclip-api-approved-images
+RETIRE_ATTEMPTS=${attempts}
+DIGEST=sha256:deadbeef
+PLAN_SHA256=plan-abc
+PLAN_MARKER=marker-xyz
+LOCK_OWNER_ID=owner-nonce-1
+${clearRegion}
+# get returns a lock whose digest+plan+marker+owner all match this invocation,
+# so the loop gets past the ownership guard and actually attempts the write.
+# replace fails with the text under test, counting its attempts on the way.
+kubectl() {
+  if [[ "\${1:-}" == "-n" ]]; then shift 2; fi
+  case "\${1:-}" in
+    get)
+cat <<'JSON'
+{"metadata":{"annotations":{
+"paperclip.blockcast.net/approval-in-flight-digest":"sha256:deadbeef",
+"paperclip.blockcast.net/approval-in-flight-plan-sha256":"plan-abc",
+"paperclip.blockcast.net/approval-in-flight-rollout-marker":"marker-xyz",
+"paperclip.blockcast.net/approval-in-flight-owner":"owner-nonce-1"
+}}}
+JSON
+      ;;
+    replace)
+      echo x >>${JSON.stringify(countFile)}
+      # Drains the manifest jq pipes in, as the real \`kubectl replace -f -\`
+      # does. Not cosmetic: the write is a \`jq | kubectl\` pipeline under
+      # \`pipefail\`, so a stub that exits without reading kills jq with EPIPE
+      # and fails the pipeline on jq's status. The failing branch below cannot
+      # show that -- it fails the pipeline itself either way -- so the bug only
+      # surfaces on the succeeding branch, as a success reported as status 1.
+      cat >/dev/null
+${
+  writeSucceeds
+    ? "      return 0"
+    : `      printf '%s\\n' ${JSON.stringify(stderrText)} >&2
+      return 1`
+}
+      ;;
+  esac
+}
+# Records the argument rather than discarding it. A bare \`sleep() { :; }\` still
+# keeps the retriable case from spending real time, but it also discards the
+# only remaining behavioural difference between this loop and retire-only mode's
+# -- flat \`sleep 1\` here vs linear \`sleep "$attempt"\` there -- so every
+# collapse of one into the other passed (Ally, at 24e5b345: all four measured
+# 62/62 green). The recorded arguments are what the exhaustion tests assert.
+sleep() { printf '%s\\n' "$*" >>${JSON.stringify(sleepLog)}; }
+${fn}
+release_in_flight_lock`;
+  const r = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  const writes = existsSync(countFile)
+    ? readFileSync(countFile, "utf8").split("\n").filter(Boolean).length
+    : 0;
+  const sleeps = existsSync(sleepLog)
+    ? readFileSync(sleepLog, "utf8").split("\n").filter(Boolean)
+    : [];
+  return { status: r.status, stderr: r.stderr, writes, sleeps };
+}
+
+test("a non-retriable retirement write bails once and reports the cause", () => {
+  // An approver Role missing `update` fails identically on all three attempts.
+  const r = runReleaseWrite({ stderrText: 'Error from server (Forbidden): configmaps "x" is forbidden' });
+  assert.equal(r.writes, 1, "a non-retriable write must not be retried -- it fails the same way every time");
+  assert.equal(r.status, 1, "the retirement must report failure");
+  // The bail's whole point is not spending the pacing it skips. Counting writes
+  // alone would still pass if the bail moved below the sleep.
+  assert.deepEqual(r.sleeps, [], "bailing at the first attempt must not sleep at all");
+  assert.match(
+    r.stderr,
+    /cannot retire the in-flight lock on sha256:deadbeef \(owner owner-nonce-1\)/,
+    "the operator must be told WHICH lock could not be retired, by digest and owner",
+  );
+  // Indented under its header, matching the read guard's convention. The bare
+  // /Forbidden/ this replaces passed with `sed 's/^/    /'` deleted (Ally,
+  // sugg 2); the anchored form is what makes the indentation load-bearing.
+  assert.match(
+    r.stderr,
+    /^ {4}Error from server \(Forbidden\)/m,
+    "kubectl's actual cause must reach stderr indented -- this is the whole point of the capture",
+  );
+});
+
+test("a conflicting retirement write is still retried to exhaustion", () => {
+  // The safety half: a 409 means this write lost a race, so a fresh read may win
+  // the next one. Inverting the bail's polarity would make this case bail at 1.
+  const r = runReleaseWrite({
+    stderrText: "Operation cannot be fulfilled on configmaps: the object has been modified",
+  });
+  assert.equal(r.writes, 3, "a conflict must consume every attempt, not bail on the first");
+  assert.equal(r.status, 1, "exhausting the attempts still reports failure");
+  // FLAT, and asserted by argument rather than by count: `:747-756` spends ten
+  // lines defending this flatness against the "helpful parity fix" that would
+  // spell it `sleep "$attempt"` like retire-only mode's, and until the stub
+  // recorded its argument that defence was enforced by nothing. ["1","1"] is
+  // the 2s the comment itself cites as beating retire-only's 3s; the third
+  // attempt records nothing because the trailing-sleep guard skips it.
+  assert.deepEqual(
+    r.sleeps,
+    ["1", "1"],
+    "this loop paces flat -- it runs inside a trap reached from `trap 'exit 143' TERM`, so the runner's grace period is the whole budget",
+  );
+  assert.doesNotMatch(
+    r.stderr,
+    /cannot retire the in-flight lock on/,
+    "the non-retriable message must not fire on a retriable conflict",
+  );
+});
+
+test("a retirement write that succeeds returns at the first attempt without sleeping", () => {
+  // The control for the two pacing assertions: they pin what an EXHAUSTED loop
+  // spends, and would still pass if the sleep had migrated above the success
+  // check and started charging every caller. A succeeding retirement is the
+  // common case on this path, and it must cost nothing.
+  const r = runReleaseWrite({ writeSucceeds: true });
+  assert.equal(r.writes, 1, "a succeeding write must not be repeated");
+  assert.equal(r.status, 0, "a retired lock must report success");
+  assert.deepEqual(r.sleeps, [], "the success path must not sleep");
+});
+
+test("a retirement write with no stderr still explains itself", () => {
+  // The empty capture is not an exotic case on THIS path: the loop runs inside a
+  // trap reached from `trap 'exit 143' TERM`, so kubectl signal-killed mid-
+  // `replace` is the expected teardown. An empty capture matches none of the
+  // conflict vocabulary, so it takes the non-retriable bail -- which is correct
+  // (nothing proves a retry would win) but must not print a header promising a
+  // cause and then a blank line. Same guard, and same reason, as the read path's
+  // above.
+  const r = runReleaseWrite({ stderrText: "" });
+  assert.equal(r.writes, 1, "an empty stderr proves no race, so it must not be retried");
+  assert.equal(r.status, 1, "the retirement must still report failure");
+  assert.match(
+    r.stderr,
+    /\(kubectl produced no error output\)/,
+    "an empty stderr must say so rather than leaving a dangling colon",
+  );
+  assert.doesNotMatch(
+    r.stderr,
+    /\(owner owner-nonce-1\):\s*$/,
+    "the message must not end at the colon it promises to expand on",
+  );
+});
+
+// Exercises RETIRE-ONLY mode's write bail the same way `runReleaseWrite` does
+// the release path's: the real loop, the real `clear_in_flight_lock`, only
+// kubectl stubbed. Ally's finding at 31219d45: the release half of this change
+// is mutation-covered and this half was not, so deleting retire-only's empty
+// guard -- or inverting its non-retriable test -- left the suite fully green.
+// That mattered more than a normal coverage gap because the change's own thesis
+// is that the two bails now fail IDENTICALLY, and that claim lived only in a
+// comment; the first divergence would have been silent.
+//
+// Driven rather than string-asserted, and driven through the real function
+// rather than by presetting CLEAR_IN_FLIGHT_LOCK_ERR, so the variable is proven
+// populated by the script's own `2>&1 >/dev/null` capture -- the same standard
+// the release harness sets, for the same reason.
+function runRetireOnlyWrite({ stderrText, attempts = 3, writeSucceeds = false }) {
+  const dir = mkdtempSync(path.join(tmpdir(), "paperclip-retire-write-"));
+  const countFile = path.join(dir, "replace_count");
+  const sleepLog = path.join(dir, "sleeps");
+  // Retire-only mode is top-level script, not a function, so there is nothing
+  // to source: the loop is sliced out between two anchors that bracket it.
+  // The start anchor is the read-error tempfile's trap, which is unique to this
+  // mode -- anchoring on `for attempt in` would silently slice the release
+  // function's identically-spelled loop if the two ever swap order. The end
+  // anchor stops BEFORE the `fi` closing `if [[ -n "$RETIRE_IN_FLIGHT_ONLY" ]]`,
+  // whose opening half is not in the slice.
+  const retireStart = script.indexOf(`trap 'rm -f "$retire_err"' EXIT`);
+  assert.notEqual(retireStart, -1, "retire-only mode's read-error trap must exist to anchor this slice");
+  const retireEnd = script.indexOf("\nfi\n\n# Admissibility-probe pacing.");
+  assert.notEqual(retireEnd, -1, "the retire-only block must still end before the probe-pacing constants");
+  const retireRegion = script.slice(script.indexOf("\n", retireStart), retireEnd);
+  // Carries the annotation constants and the real clear_in_flight_lock, exactly
+  // as runReleaseWrite slices them.
+  const clearRegion = script.slice(
+    script.indexOf('LOCK_DIGEST_ANNOTATION="'),
+    script.indexOf("\n# Must stay in lockstep with the `maxApprovedApiDigests`"),
+  );
+  // `retire_err` is normally the mktemp above the slice; the loop only ever
+  // reads it on the READ failure path, which this harness never takes.
+  const harness = `set -euo pipefail
+NAMESPACE=paperclip-release-approvals
+CONFIGMAP=paperclip-api-approved-images
+RETIRE_ATTEMPTS=${attempts}
+ABANDON_IN_FLIGHT=sha256:cafe
+ABANDON_IN_FLIGHT_OWNER=owner-9
+retire_err=${JSON.stringify(path.join(dir, "retire_err"))}
+: >"$retire_err"
+${clearRegion}
+# get returns a lock whose digest and owner both match, so the loop clears the
+# ownership guard and actually attempts the write; replace fails with the text
+# under test, counting its attempts.
+kubectl() {
+  if [[ "\${1:-}" == "-n" ]]; then shift 2; fi
+  case "\${1:-}" in
+    get)
+cat <<'JSON'
+{"metadata":{"annotations":{
+"paperclip.blockcast.net/approval-in-flight-digest":"sha256:cafe",
+"paperclip.blockcast.net/approval-in-flight-owner":"owner-9"
+}}}
+JSON
+      ;;
+    replace)
+      echo x >>${JSON.stringify(countFile)}
+      # Drains the manifest, for the reason spelled out in \`runReleaseWrite\`:
+      # the write is a \`jq | kubectl\` pipeline under \`pipefail\`, so a stub
+      # that exits without reading fails it on jq's EPIPE status.
+      cat >/dev/null
+${
+  writeSucceeds
+    ? "      return 0"
+    : `      printf '%s\\n' ${JSON.stringify(stderrText)} >&2
+      return 1`
+}
+      ;;
+  esac
+}
+# Records the argument, for the reason spelled out in \`runReleaseWrite\`: this
+# loop's linear backoff is the mirror half of the pair that a discarding stub
+# left unasserted, so the exhaustion test below pins ["1","2"] against that
+# harness's ["1","1"].
+sleep() { printf '%s\\n' "$*" >>${JSON.stringify(sleepLog)}; }
+${retireRegion}`;
+  const r = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+  const writes = existsSync(countFile)
+    ? readFileSync(countFile, "utf8").split("\n").filter(Boolean).length
+    : 0;
+  const sleeps = existsSync(sleepLog)
+    ? readFileSync(sleepLog, "utf8").split("\n").filter(Boolean)
+    : [];
+  return { status: r.status, stderr: r.stderr, writes, sleeps };
+}
+
+test("retire-only mode's non-retriable write bails once and reports the cause", () => {
+  const r = runRetireOnlyWrite({ stderrText: 'Error from server (Forbidden): configmaps "x" is forbidden' });
+  assert.equal(r.writes, 1, "a non-retriable write must not be retried -- it fails the same way every time");
+  assert.equal(r.status, 1, "the retirement must report failure");
+  assert.deepEqual(r.sleeps, [], "bailing at the first attempt must not spend the backoff it skips");
+  assert.match(
+    r.stderr,
+    /cannot retire the in-flight approval lock on sha256:cafe \(owner owner-9\)/,
+    "the operator must be told WHICH lock could not be retired, by digest and owner",
+  );
+  // Indented, matching the read guard directly above it in the same block. Both
+  // write paths gained `sed 's/^/    /'` in this pass and neither was asserted,
+  // so either could have been dropped with the suite green (Ally, sugg 2).
+  assert.match(
+    r.stderr,
+    /^ {4}Error from server \(Forbidden\)/m,
+    "kubectl's cause must reach stderr indented under its header, as the read guard does",
+  );
+});
+
+test("retire-only mode's conflicting write is still retried to exhaustion", () => {
+  // The polarity half: inverting the bail's `!` makes this bail at one attempt.
+  const r = runRetireOnlyWrite({
+    stderrText: "Operation cannot be fulfilled on configmaps: the object has been modified",
+  });
+  assert.equal(r.writes, 3, "a conflict must consume every attempt, not bail on the first");
+  assert.equal(r.status, 1, "exhausting the attempts still reports failure");
+  // LINEAR, and the mirror of the release loop's ["1","1"] above. Asserting the
+  // arguments rather than the attempt count is what makes the two loops'
+  // pacing a tested difference instead of a commented one: with a discarding
+  // stub, spelling this `sleep 1` -- or `sleep 0` -- left the suite green.
+  // 3s total, the number `:751-753` names as the cost retire-only mode can
+  // afford because it has an operator at a terminal and no grace-period clock.
+  assert.deepEqual(
+    r.sleeps,
+    ["1", "2"],
+    "retire-only mode backs off linearly -- it has no runner grace period to spend, unlike `release_in_flight_lock`",
+  );
+  assert.doesNotMatch(
+    r.stderr,
+    /cannot retire the in-flight approval lock on/,
+    "the non-retriable message must not fire on a retriable conflict",
+  );
+  assert.match(
+    r.stderr,
+    /could not retire the in-flight approval lock on sha256:cafe/,
+    "exhaustion must still print this mode's own operator guidance",
+  );
+});
+
+test("retire-only mode's succeeding write exits 0 at the first attempt without sleeping", () => {
+  // Same control as the release path's. Retire-only mode `exit 0`s where the
+  // release loop `return 0`s, so this also pins that the success exit survives
+  // the slice -- a mode that retired the lock and then exited non-zero would
+  // fail the deploy step that called it.
+  const r = runRetireOnlyWrite({ writeSucceeds: true });
+  assert.equal(r.writes, 1, "a succeeding write must not be repeated");
+  assert.equal(r.status, 0, "a retired lock must exit 0");
+  assert.deepEqual(r.sleeps, [], "the success path must not spend the backoff");
+});
+
+test("retire-only mode's write with no stderr still explains itself", () => {
+  // Same guard, same reason, as the release path's: an empty capture matches
+  // none of the conflict vocabulary, so it lands on the non-retriable bail --
+  // correctly -- and must not print a header promising a cause and then a blank
+  // line. This is the case Ally measured as deletable with 59/59 still green.
+  const r = runRetireOnlyWrite({ stderrText: "" });
+  assert.equal(r.writes, 1, "an empty stderr proves no race, so it must not be retried");
+  assert.equal(r.status, 1, "the retirement must still report failure");
+  assert.match(
+    r.stderr,
+    /\(kubectl produced no error output\)/,
+    "an empty stderr must say so rather than leaving a dangling colon",
+  );
+  assert.doesNotMatch(
+    r.stderr,
+    /\(owner owner-9\):\s*$/,
+    "the message must not end at the colon it promises to expand on",
+  );
 });

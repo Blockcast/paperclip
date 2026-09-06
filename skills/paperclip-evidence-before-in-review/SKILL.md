@@ -57,6 +57,8 @@ Source of truth: `server/src/services/evidence-shapes.ts` (`DEFAULT_EVIDENCE_REG
 
 Either satisfies the shape — you don't need both, and you don't need a merged PR, just an open one pointing at real code. A draft PR is fine.
 
+For `done`, a commit URL is not accepted merely because it has GitHub URL syntax. The disposition gate resolves each agent-authored commit URL through the GitHub App API; a missing commit fails closed and a temporary GitHub failure remains retryable. A local SHA, including one validated with `--revision HEAD`, is not remote evidence. Prefer a PR URL or an explicit pushed commit URL, and verify the URL resolves before citing it.
+
 ```markdown
 Implementation complete: https://github.com/Blockcast/paperclip/pull/774
 ```

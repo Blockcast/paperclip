@@ -1,0 +1,98 @@
+name: Stack package tests
+
+# `pr.yml`, which owns every vitest lane in this repo, is gated on
+# `on.pull_request.branches: [master]`. A PR based on a stack branch therefore
+# draws no Actions workflow at all -- its only checks are `review` and
+# `security-review`, both App-provided, neither of which runs vitest. On such a
+# PR "green" means a reviewer looked and a scan ran. It carries no claim that
+# the code compiles or that its own tests pass.
+#
+# That gap is not hypothetical (PEN-2491). Commit 14e54f1 on a stack PR added
+# 126 lines of regression tests AND silently reverted the 59-line fix those
+# tests cover. Both checks reported success; `mergeStateStatus` was CLEAN.
+# Re-running that same tree with the package's tests actually executing yields
+# 10 failures -- a plaintext token printing in the clear directly beneath its
+# own redaction marker.
+#
+# Scope, deliberately narrow. This closes the *review-time* half only, and it
+# is NOT sufficient on its own: as of this commit the merge gate is still open,
+# and it is #1472 rather than this file that closes it.
+#
+# The reason the merge gate is open is project selection, not a `paths:`
+# filter. pr.yml's `general_tests` runs `pnpm test:run:general`, i.e.
+# scripts/run-vitest-stable.mjs, which selects work with `--project <name>` off
+# its own `nonServerProjects` list. `@paperclipai/mcp-gateway` appears neither
+# in that list nor in `vitest.config.ts` `projects`, so `general_tests`
+# executes zero mcp-gateway tests -- on `pull_request` and on `merge_group`
+# alike. Absence of a paths filter is necessary but not sufficient; the
+# enumeration is the gate. Wiring the package into both lists is the sibling
+# fix (#1472), which must land first: until it does, a master-targeting change
+# to this package still reaches the merge queue with its suites unexecuted.
+#
+# What this file adds is the signal during intermediate stack review, which is
+# exactly where the silent revert above survived.
+#
+# Why a separate workflow rather than dropping `branches:` from pr.yml:
+# `on.pull_request.branches` is workflow-level, not job-level, so relaxing it
+# there would put ~20 check runs on every intermediate PR in every stack and
+# lean on the arc-light saturation that file already documents. One
+# paths-filtered job, skipped outright on the base pr.yml owns, buys the
+# missing signal at a fraction of that cost. Base-unrestricted,
+# paths-filtered workflows are established practice here -- see
+# graphify-staleness.yml and the docker-*-bot workflows.
+#
+# The paths list is a security-sensitive allowlist, not an attempt at coverage.
+# `packages/mcp-gateway/**` is on it because it holds the agent-facing k8s MCP
+# secret scrubber. Adding a package is one line.
+
+on:
+  pull_request:
+    paths:
+      - "packages/mcp-gateway/**"
+
+permissions:
+  contents: read
+
+jobs:
+  mcp_gateway:
+    name: Stack tests (mcp-gateway)
+    # pr.yml owns master-targeting PRs and merge-queue candidates; this lane
+    # exists for the stack-review path its `branches: [master]` gate excludes.
+    # mcp-gateway joins pr.yml's `general_tests` selection via #1472, so once
+    # that lands, running the same suites here would duplicate an existing
+    # lane. Before it lands, a master-targeting mcp-gateway PR has no vitest
+    # lane at all -- that hole is #1472's to close, not this workflow's, which
+    # is why #1472 is a hard prerequisite rather than a sibling nicety.
+    if: github.base_ref != 'master'
+    runs-on: arc-paperclip-general
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Package-local invocation is deliberate: it does not depend on the
+      # package being wired into the root `vitest.config.ts` `projects` array or
+      # into `nonServerProjects` in scripts/run-vitest-stable.mjs. Repairing
+      # those two lists is PEN-2491's sibling fix (#1472); this lane stays
+      # correct whether or not that has landed, and cannot be silently
+      # de-selected by a future edit to either list. That independence is about
+      # *this lane's* reliability only -- it does not substitute for #1472's
+      # merge-time coverage, which no `pull_request`-triggered job can provide.
+      - name: Run mcp-gateway tests
+        run: pnpm --filter @paperclipai/mcp-gateway exec vitest run
+
+      - name: Typecheck mcp-gateway
+        run: pnpm --filter @paperclipai/mcp-gateway exec tsc --noEmit

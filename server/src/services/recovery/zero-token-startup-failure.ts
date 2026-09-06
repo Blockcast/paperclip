@@ -19,6 +19,10 @@ export const ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES = new Set<string>([
   "startup_error_pre_model",
 ]);
 
+// A missing configured skill is deterministic and must not consume the
+// one-shot session reset retry reserved for structural startup wedges.
+export const DETERMINISTIC_SKILL_FAILURE_ERROR_CODE = "skill_not_found";
+
 const LEGACY_SESSION_UNAVAILABLE_ERROR_RE = /\bsession\s+unavailable\b/i;
 const OPENCODE_ADAPTER_TYPES = new Set(["opencode_local", "opencode_k8s"]);
 
@@ -111,6 +115,7 @@ export function isZeroTokenStartupFailureRun(
   if (!run) return false;
   if (!run.status || !UNSUCCESSFUL_TERMINAL_STATUSES.has(run.status)) return false;
   const errorCode = typeof run.errorCode === "string" ? run.errorCode.trim() : "";
+  if (errorCode === DETERMINISTIC_SKILL_FAILURE_ERROR_CODE) return false;
   const isLegacySessionUnavailable =
     OPENCODE_ADAPTER_TYPES.has(readAdapterType(run.adapterType) ?? "") &&
     isLegacySessionUnavailableAdapterFailure(run);

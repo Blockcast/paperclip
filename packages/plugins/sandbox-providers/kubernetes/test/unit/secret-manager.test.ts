@@ -49,6 +49,52 @@ describe("createPerRunSecret", () => {
     expect(body.metadata.ownerReferences[0].controller).toBe(true);
   });
 
+  it("adopts a same-run Secret after a 409 and restores its owner reference", async () => {
+    const create = vi.fn().mockRejectedValue({ code: 409 });
+    const read = vi.fn().mockResolvedValue({
+      metadata: {
+        resourceVersion: "7",
+        labels: {
+          "paperclip.io/run-id": "r-abcd",
+          "paperclip.io/managed-by": "paperclip-k8s-plugin",
+        },
+      },
+    });
+    const replace = vi.fn().mockResolvedValue({});
+    const clients = { core: { createNamespacedSecret: create, readNamespacedSecret: read, replaceNamespacedSecret: replace } };
+
+    await createPerRunSecret(clients as never, baseInput);
+
+    expect(read).toHaveBeenCalledWith({ namespace: "paperclip-acme", name: "r-abcd-env" });
+    expect(replace).toHaveBeenCalledWith(expect.objectContaining({
+      namespace: "paperclip-acme",
+      name: "r-abcd-env",
+      body: expect.objectContaining({ metadata: expect.objectContaining({ resourceVersion: "7" }) }),
+    }));
+    const replacement = replace.mock.calls[0][0].body;
+    expect(replacement.metadata.ownerReferences[0].uid).toBe(baseInput.ownerUid);
+  });
+
+  it("rejects a 409 Secret belonging to another run", async () => {
+    const clients = {
+      core: {
+        createNamespacedSecret: vi.fn().mockRejectedValue({ statusCode: 409 }),
+        readNamespacedSecret: vi.fn().mockResolvedValue({
+          metadata: {
+            labels: {
+              "paperclip.io/run-id": "other-run",
+              "paperclip.io/managed-by": "paperclip-k8s-plugin",
+            },
+          },
+        }),
+        replaceNamespacedSecret: vi.fn(),
+      },
+    };
+
+    await expect(createPerRunSecret(clients as never, baseInput)).rejects.toThrow(/unexpected Paperclip identity/);
+    expect(clients.core.replaceNamespacedSecret).not.toHaveBeenCalled();
+  });
+
   it("throws if adapterEnv contains BOOTSTRAP_TOKEN", async () => {
     const clients = { core: { createNamespacedSecret: vi.fn() } };
     await expect(

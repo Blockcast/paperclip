@@ -17,6 +17,10 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import {
+  HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC,
+  renderMetrics,
+} from "../services/metrics.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -155,6 +159,9 @@ describeEmbeddedPostgres("opencode_k8s timer no-work suppression", () => {
       reason: "no_in_flight_work",
       status: "skipped",
     });
+    expect((await renderMetrics()).body).toContain(
+      `${HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC}{reason="no_in_flight_work"}`,
+    );
 
     const agent = await db
       .select({ lastHeartbeatAt: agents.lastHeartbeatAt })
@@ -171,6 +178,56 @@ describeEmbeddedPostgres("opencode_k8s timer no-work suppression", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakeupsAfterImmediateRetry).toHaveLength(1);
+  });
+
+  it.each([
+    ["idle_circuit_breaker", "consecutiveTimerIdleRuns", "idleAutoPauseAfter"],
+    ["adapter_failed_circuit_breaker", "consecutiveAdapterFailedRuns", "adapterFailedAutoPauseAfter"],
+  ] as const)("persists and counts the %s exclusion", async (reason, stateKey, policyKey) => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const now = new Date("2026-05-25T20:30:00.000Z");
+    const heartbeat = heartbeatService(db);
+
+    await seedOpencodeK8sTimerAgent({
+      companyId,
+      agentId,
+      lastHeartbeatAt: new Date("2026-05-25T20:28:00.000Z"),
+    });
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { enabled: true, intervalSec: 60, [policyKey]: 2 } } })
+      .where(eq(agents.id, agentId));
+    await db.insert(agentRuntimeState).values({
+      agentId,
+      companyId,
+      adapterType: "opencode_k8s",
+      stateJson: { [stateKey]: 2 },
+    });
+
+    expect(await heartbeat.tickTimers(now)).toMatchObject({ checked: 1, enqueued: 0, skipped: 1 });
+    const [skip] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(skip).toMatchObject({ reason, status: "skipped" });
+    expect(skip?.payload).toMatchObject({
+      heartbeatSkip: { reason, threshold: 2 },
+    });
+    expect((await renderMetrics()).body).toContain(
+      `${HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC}{reason="${reason}"}`,
+    );
+
+    expect(await heartbeat.tickTimers(new Date("2026-05-25T20:30:10.000Z"))).toMatchObject({
+      checked: 1,
+      enqueued: 0,
+      skipped: 0,
+    });
+    const skipsAfterImmediateRetry = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(skipsAfterImmediateRetry).toHaveLength(1);
   });
 
   it("queues opencode_k8s timer ticks when the agent has assigned live work", async () => {

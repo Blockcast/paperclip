@@ -158,7 +158,10 @@ export function githubAppCredentialsConfigured(): boolean {
  * Return a cached or freshly-minted installation access token, or null when
  * creds are absent or the GitHub API call fails.
  */
-export async function getInstallationTokenResult(nowMs: number = Date.now()): Promise<GitHubInstallationTokenResult> {
+export async function getInstallationTokenResult(
+  nowMs: number = Date.now(),
+  options: { signal?: AbortSignal } = {},
+): Promise<GitHubInstallationTokenResult> {
   if (cachedInstallationToken && cachedInstallationToken.expiresAtMs - TOKEN_REFRESH_SKEW_MS > nowMs) {
     return { ok: true, token: cachedInstallationToken.token };
   }
@@ -177,6 +180,7 @@ export async function getInstallationTokenResult(nowMs: number = Date.now()): Pr
     res = await ghFetch(url, {
       method: "POST",
       headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${jwt}` },
+      signal: options.signal,
     });
   } catch {
     return { ok: false, retryable: true, reason: "github_app_token_fetch_failed" };
@@ -209,6 +213,30 @@ export type ReviewerEvidenceResult =
 export type PullRequestGateResult =
   | { state: "open" | "closed"; merged: boolean }
   | { error: string };
+
+export type GitHubCommitEvidenceResult =
+  | { found: true }
+  | { found: false }
+  | { error: string };
+
+export async function githubHasCommitEvidence(input: {
+  repoFullName: string;
+  sha: string;
+}): Promise<GitHubCommitEvidenceResult> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return { error: tokenResult.reason };
+  try {
+    const res = await ghFetch(
+      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/commits/${input.sha}`,
+      { headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` } },
+    );
+    if (res.ok) return { found: true };
+    const classified = await classifyGithubHttpFailure("commit", res);
+    return classified.retryable ? { error: classified.reason } : { found: false };
+  } catch {
+    return { error: "commit_fetch_failed" };
+  }
+}
 
 export async function githubGetPullRequestGate(input: {
   repoFullName: string;
@@ -627,6 +655,77 @@ export async function githubListIssueCommentsWithTimestamps(input: {
       if (page === GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES) return null;
     }
     return comments;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch the submitted-review history for the comment-review gate.
+ *
+ * Ally emits its consolidated review as a `pull_request_review` in the
+ * `COMMENTED` state, not as an issue comment (BLO-29711). `COMMENTED` reviews
+ * are invisible to GitHub's `reviewDecision`, which is exactly why the gate
+ * exists — but they live on `/pulls/{n}/reviews`, so a gate reading only
+ * `/issues/{n}/comments` never observes one. `githubHasReviewerEvidenceForPr`
+ * already reads both surfaces for the same reason.
+ *
+ * `PENDING` reviews are skipped: an unsubmitted draft is visible only to its
+ * creator and carries no `submitted_at`.
+ *
+ * `DISMISSED` reviews are skipped too, and the contrast with
+ * `githubHasReviewerEvidenceForPr` — which deliberately *accepts* them — is the
+ * point rather than an inconsistency (BLO-29711). That function asks whether a
+ * review run happened; a dismissed review still happened. This one supplies the
+ * verdict a merge gate is computed from, and dismissal is precisely an
+ * authorized actor withdrawing a verdict from operation, by hand or via branch
+ * protection's `dismiss_stale_reviews`. GitHub keeps the body but stops counting
+ * it toward `reviewDecision`, so reading it here re-animates a retraction, in
+ * both directions: a dismissed *blocking* review wedges a PR whose only escape
+ * hatch is the dismissal being ignored, and a dismissed *clean* review
+ * dispositions findings it no longer vouches for. Not theoretical —
+ * `Blockcast/paperclip#937` carries six DISMISSED head-attested Ally reviews.
+ *
+ * Returns null on any unreadable page so callers leave the prior status
+ * untouched rather than publishing a verdict from partial history.
+ */
+export async function githubListPrReviewsWithTimestamps(input: {
+  repoFullName: string;
+  prNumber: number;
+}): Promise<Array<{ login: string | null; body: string; createdAt: string }> | null> {
+  const token = await getInstallationToken();
+  if (!token) return null;
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  const reviews: Array<{ login: string | null; body: string; createdAt: string }> = [];
+
+  try {
+    for (let page = 1; page <= GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES; page += 1) {
+      const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
+      const response = await ghFetch(url, { headers });
+      if (!response.ok) return null;
+      const batch = (await response.json()) as Array<{
+        user?: { login?: string | null } | null;
+        body?: string | null;
+        state?: string | null;
+        submitted_at?: string | null;
+      }>;
+
+      for (const review of batch) {
+        const state = (review.state ?? "").toUpperCase();
+        if (state === "PENDING" || state === "DISMISSED") continue;
+        if (typeof review.submitted_at !== "string") continue;
+        reviews.push({
+          login: review.user?.login ?? null,
+          body: review.body ?? "",
+          createdAt: review.submitted_at,
+        });
+      }
+
+      if (batch.length < 100) return reviews;
+      if (page === GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES) return null;
+    }
+    return reviews;
   } catch {
     return null;
   }

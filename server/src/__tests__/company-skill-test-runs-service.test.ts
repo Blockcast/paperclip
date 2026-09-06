@@ -159,6 +159,85 @@ describeEmbeddedPostgres("companySkillService skill test runs", () => {
     expect(issue?.hiddenAt).toBeInstanceOf(Date);
   });
 
+  it("never stores the subject agent's credentials in the run snapshot (PEN-2839 write path)", async () => {
+    const { companyId, skillId, agentId } = await seedSkillAndAgent();
+    const secret = "sk-door10-must-not-persist";
+    const upstream = "https://svc-account@k8s-mcp-admin.internal:8443/mcp";
+    await db
+      .update(agents)
+      .set({
+        adapterConfig: {
+          model: "gpt-5.4",
+          env: { OPENAI_API_KEY: secret },
+          mcpServers: { k8s: { url: upstream } },
+        },
+      })
+      .where(eq(agents.id, agentId));
+
+    const run = await svc.createTestRun(
+      companyId,
+      skillId,
+      { content: "test this skill", agentId },
+      { type: "user", userId: "local-board" },
+      runDeps(companyId),
+    );
+
+    // `agents.getById` hands the service layer the raw row — redaction of this
+    // material otherwise only happens at the route layer — so without the fix
+    // the column is credential material at rest.
+    const stored = await db
+      .select({ snapshot: companySkillTestRuns.agentConfigSnapshot })
+      .from(companySkillTestRuns)
+      .where(eq(companySkillTestRuns.id, run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(JSON.stringify(stored?.snapshot ?? {})).not.toContain(secret);
+  });
+
+  it("withholds the agent config pair from an already-persisted raw snapshot (PEN-2839 read projection)", async () => {
+    // The half a write-path fix cannot reach: rows written before it landed
+    // still hold the pair in the clear, and this endpoint is gated by
+    // `assertCompanyAccess` alone — which admits any same-company agent, a
+    // weaker entitlement than the `agent_config:read` that `GET /agents/:id`
+    // requires for the same material. Written directly to the column so the
+    // test exercises the read path rather than re-testing the write path.
+    const { companyId, skillId, agentId } = await seedSkillAndAgent();
+    const secret = "sk-door10-persisted-before-the-fix";
+    const upstream = "https://svc-account@k8s-mcp-admin.internal:8443/mcp";
+    const run = await svc.createTestRun(
+      companyId,
+      skillId,
+      { content: "test this skill", agentId },
+      { type: "user", userId: "local-board" },
+      runDeps(companyId),
+    );
+    await db
+      .update(companySkillTestRuns)
+      .set({
+        agentConfigSnapshot: {
+          agentId,
+          name: "Tester",
+          adapterConfig: { env: { OPENAI_API_KEY: secret }, mcpServers: { k8s: { url: upstream } } },
+          runtimeConfig: { mcpServers: { k8s: { url: upstream } } },
+        },
+      })
+      .where(eq(companySkillTestRuns.id, run.id));
+
+    const detail = await svc.getTestRunDetail(companyId, skillId, run.id);
+    const listed = await svc.listTestRuns(companyId, skillId, {});
+
+    for (const [label, served] of [["detail", detail], ["list", listed]] as const) {
+      const body = JSON.stringify(served ?? {});
+      expect(body, `${label} disclosed the credential`).not.toContain(secret);
+      expect(body, `${label} disclosed the MCP upstream`).not.toContain("k8s-mcp-admin.internal");
+    }
+    // Withheld, not merely masked: the topology residue a redactor deliberately
+    // keeps diagnosable is itself the reconnaissance surface here (PEN-2777).
+    expect(detail?.agentConfigSnapshot.adapterConfig).toEqual({});
+    expect(detail?.agentConfigSnapshot.runtimeConfig).toEqual({});
+    // The fields anything actually reads survive.
+    expect(detail?.agentConfigSnapshot.name).toBe("Tester");
+  });
+
   it("appends the built-in default template while keeping the input snapshot clean", async () => {
     const { companyId, skillId, agentId } = await seedSkillAndAgent();
     const run = await svc.createTestRun(

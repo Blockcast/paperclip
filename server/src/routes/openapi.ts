@@ -10,6 +10,7 @@ import {
   updateAgentInstructionsBundleSchema,
   upsertAgentInstructionsFileSchema,
   createAgentKeySchema,
+  agentMeRecoveryActionsQuerySchema,
   builtInAgentEmptyMutationSchema,
   builtInAgentProvisionSchema,
   generateSummarySlotSchema,
@@ -1537,6 +1538,20 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/agents/me/recovery-actions",
+  tags: ["agents"],
+  summary: "List recovery actions the current agent OWNS (defaults to active + escalated)",
+  description:
+    "Owner-scoped view of recovery beacons. Distinct from inbox-lite, which carries " +
+    "`activeRecoveryAction` only for issues the agent is the ASSIGNEE of — a beacon " +
+    "routinely names this agent as owner on a row assigned to someone else, and those " +
+    "obligations appear only here.",
+  request: { query: agentMeRecoveryActionsQuerySchema },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/agents/me/connections/{connectionId}/token",
   tags: ["tools"],
@@ -2956,7 +2971,8 @@ registry.registerPath({
   method: "post",
   path: "/api/approvals/{id}/withdraw",
   tags: ["approvals"],
-  summary: "Withdraw an approval request (requesting agent or board)",
+  summary:
+    "Withdraw an undecided approval request (requesting agent or board). Accepts `pending` and `revision_requested`; a decision note already written by the board is preserved and the withdrawal reason is recorded as an approval comment.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(withdrawApprovalSchema),
@@ -3192,6 +3208,23 @@ registry.registerPath({
     query: z.object({
       weeks: z.string().optional(),
       threshold: z.string().optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/recovery-actions",
+  tags: ["dashboard"],
+  summary: "List issue recovery actions",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      ownerAgentId: z.string().uuid().optional(),
+      kind: z.string().optional(),
+      status: z.string().optional(),
+      limit: z.string().optional(),
     }),
   },
   responses: { 200: r.ok(), 401: r.unauthorized },

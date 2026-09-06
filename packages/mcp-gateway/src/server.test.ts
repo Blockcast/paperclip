@@ -4,6 +4,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
+import ts from "typescript";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MCP_SESSION_HEADER } from "./session-keepalive.js";
 import { buildInitializeReplayHeaders, createGatewayServer, loadGatewayConfig, type GatewayState } from "./server.js";
@@ -1878,5 +1879,158 @@ describe("upstream resilience: timeout + circuit breaker", () => {
       expect(res.status).toBe(200);
     }
     expect(gateway.state.breaker.stateOf("k8s-admin")).toBe("closed");
+  });
+});
+
+/**
+ * PEN-2370 ask 3 — a control that closes the class rather than the spelling.
+ *
+ * This module's recurring failure is not any one leak: it is that a SECOND
+ * path to the client keeps appearing beside the one that scrubs. The scrubber
+ * was wired into `writeResponse`, whose comment claimed it covered every
+ * response — while the aggregate `tools/list` reply, assembled by spreading
+ * upstream tool records, was written straight to the socket and reached agents
+ * unscrubbed. Six earlier fixes each closed the spelling an observer had
+ * probed; none made the next bypass fail.
+ *
+ * So the invariant is asserted against the source itself, and it is an
+ * allowlist of exactly one: a body may reach the client through `writeResponse`
+ * and nowhere else. Adding a body-bearing write anywhere in `server.ts` fails
+ * here, whether or not anyone remembers the scrubber exists.
+ *
+ * The scan is over the AST, not over source text, and it deliberately matches
+ * MORE than today's single call site. A text scan is a denylist of spellings —
+ * which is the exact failure mode this suite exists to close — and the first
+ * version of it was blind to three bypasses that all still leak:
+ *
+ *   - `res.end(\n  body,\n)` — the argument starts on the next line, so a
+ *     per-line regex never sees it.
+ *   - `response.end(body)` — same call, receiver renamed.
+ *   - `res.write(body)` — a body-bearing exit that is not `end` at all.
+ *
+ * So the predicate is: any call to a member named `end` or `write`, on any
+ * receiver, spelled with dot or bracket access, carrying at least one
+ * argument. That is broad on purpose. It fails CLOSED — a legitimate new
+ * `.write()` on some non-response object trips it and costs one reviewer a
+ * conversation, whereas a miss costs a fleet-wide credential leak — and the
+ * breadth is the point: the allowlist is "one exit", not "one spelling".
+ *
+ * A bodyless `res.end()` is not in scope: it carries nothing to disclose.
+ */
+
+/** A call that hands at least one argument to `.end()`/`.write()`. */
+interface BodyBearingWrite {
+  line: number;
+  text: string;
+  node: ts.CallExpression;
+}
+
+function parseServerSource(source: string): ts.SourceFile {
+  return ts.createSourceFile("server.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+}
+
+/** The member name being called, for `a.end()` and `a["end"]()` alike. */
+function calledMemberName(expression: ts.LeftHandSideExpression): string | null {
+  if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
+  if (ts.isElementAccessExpression(expression) && ts.isStringLiteralLike(expression.argumentExpression)) {
+    return expression.argumentExpression.text;
+  }
+  return null;
+}
+
+function findBodyBearingWrites(sourceFile: ts.SourceFile): BodyBearingWrite[] {
+  const found: BodyBearingWrite[] = [];
+
+  function visit(node: ts.Node): void {
+    if (ts.isCallExpression(node)) {
+      const member = calledMemberName(node.expression);
+      if ((member === "end" || member === "write") && node.arguments.length > 0) {
+        found.push({
+          line: sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1,
+          // Collapsed so a multiline call still reports as one readable line.
+          text: node.getText(sourceFile).replace(/\s+/g, " "),
+          node,
+        });
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return found;
+}
+
+/** The first call to a free function named `name` within `root`, if any. */
+function findCallTo(root: ts.Node, name: string): ts.CallExpression | null {
+  let found: ts.CallExpression | null = null;
+
+  function visit(node: ts.Node): void {
+    if (found) return;
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name) {
+      found = node;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(root);
+  return found;
+}
+
+describe("PEN-2370: response bodies have exactly one exit", () => {
+  const source = fs.readFileSync(new URL("./server.ts", import.meta.url), "utf8");
+  const sourceFile = parseServerSource(source);
+
+  it("writes a response body in exactly one place", () => {
+    const writes = findBodyBearingWrites(sourceFile);
+
+    expect(
+      writes.map(({ line, text }) => `${line}: ${text}`),
+      "every response body must leave through writeResponse, so that it passes the scrubber on the "
+        + "way out — see this suite's comment. If this is a legitimate non-response `.write()`/`.end()`, "
+        + "that judgement belongs in review, not in a widened regex.",
+    ).toHaveLength(1);
+  });
+
+  it("puts that one exit inside writeResponse, downstream of the scrubber", () => {
+    const writeResponse = sourceFile.statements.find(
+      (statement): statement is ts.FunctionDeclaration =>
+        ts.isFunctionDeclaration(statement) && statement.name?.text === "writeResponse",
+    );
+    expect(writeResponse, "writeResponse must exist for the single exit to live inside it").toBeDefined();
+
+    const [exit] = findBodyBearingWrites(sourceFile);
+    expect(exit, "there must be a body-bearing write to place").toBeDefined();
+
+    // Containment by source position: the exit is lexically inside writeResponse.
+    expect(exit!.node.getStart(sourceFile)).toBeGreaterThan(writeResponse!.getStart(sourceFile));
+    expect(exit!.node.getEnd()).toBeLessThan(writeResponse!.getEnd());
+
+    // ...and the scrubber runs ahead of it in the same function, so the value
+    // being written cannot be the unscrubbed one.
+    const scrub = findCallTo(writeResponse!, "scrubResponseBody");
+    expect(scrub, "writeResponse must call scrubResponseBody").not.toBeNull();
+    expect(scrub!.getStart(sourceFile)).toBeLessThan(exit!.node.getStart(sourceFile));
+  });
+
+  // Fixtures for the detector itself. Without these the guard could silently
+  // stop detecting anything — a scan that matches nothing also reports "one
+  // exit is fine" once the real call site drifts out of its predicate.
+  it("counts a body-bearing exit however it is spelled", () => {
+    const bypasses: Record<string, string> = {
+      "argument on the next line": "res.end(\n  body,\n);",
+      "receiver renamed": "response.end(body);",
+      "write instead of end": "res.write(body);",
+      "bracket access": 'res["end"](body);',
+      "chained off an expression": "getRes(req).end(body);",
+    };
+
+    for (const [label, snippet] of Object.entries(bypasses)) {
+      expect(findBodyBearingWrites(parseServerSource(snippet)), label).toHaveLength(1);
+    }
+  });
+
+  it("does not count a bodyless end, which carries nothing to disclose", () => {
+    expect(findBodyBearingWrites(parseServerSource("res.end();\nres.end();"))).toHaveLength(0);
   });
 });
