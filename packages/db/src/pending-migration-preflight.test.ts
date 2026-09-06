@@ -267,12 +267,16 @@ describe("selectGuardedPendingIndexes", () => {
 });
 
 describe("decidePreflightBlocker", () => {
+  // A genuinely registered migration. The function is pure and never reads the
+  // file, but this suite is about a registry hole, so a fixture naming an
+  // unregistered migration would invite exactly the misreading it warns about.
   const spec: PrecreateRequiredIndex = {
-    migration: "0217_heartbeat_runs_queued_age_idx.sql",
-    name: "heartbeat_runs_queued_age_idx",
+    migration: "0209_heartbeat_runs_recovery_dispatch_index.sql",
+    name: "heartbeat_runs_recovery_dispatch_idx",
     table: "heartbeat_runs",
     createStatement:
-      "CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_queued_age_idx ON heartbeat_runs USING btree (agent_id)",
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_recovery_dispatch_idx " +
+      "ON heartbeat_runs USING btree (agent_id, created_at, id)",
   };
 
   const absent = { exists: false, usable: false } as const;
@@ -343,19 +347,48 @@ describe("guarded migrations gate their raise on table population", () => {
     // correct while the migrations keep this shape, so pin the shape here.
     //
     // Keyed on the two remediations rather than on branch syntax: the family
-    // spells the same logic as both `IF/ELSE` (0217) and `IF/ELSIF` (0205),
-    // and an `ELSE`-matching detector silently passes on five of the eight
-    // files. The mismatch raise is identifiable by its `DROP INDEX
-    // CONCURRENTLY` hint, which appears exactly once per file.
+    // spells the same logic as both `IF/ELSE` (0209) and `IF/ELSIF` (0205) —
+    // four registered files use `ELSIF`, three use `ELSE`, and 0236 uses
+    // neither — so an `ELSE`-matching detector silently passes on five of the
+    // eight. The mismatch raise is identifiable by its `DROP INDEX
+    // CONCURRENTLY` hint.
+    //
+    // Comments are stripped before searching, and the hint is asserted unique.
+    // Both matter: 0237 mentions `DROP INDEX CONCURRENTLY` in prose 61 lines
+    // ahead of its real HINT, so searching the raw text anchors on the comment
+    // and leaves 0237's whole structural branch inside the guard window. The
+    // uniqueness assertion means any future second occurrence fails loudly
+    // here rather than silently shifting that window again.
     for (const spec of PRECREATE_REQUIRED_INDEXES) {
       const contents = await readFile(`${migrationsDir}/${spec.migration}`, "utf8");
+      // Offsets below are all into `sql`, never into `contents`.
+      const sql = contents
+        .split("\n")
+        .filter((line) => !/^\s*--/.test(line))
+        .join("\n");
 
-      const structuralHint = contents.indexOf("DROP INDEX CONCURRENTLY");
-      expect(structuralHint, `${spec.migration} has no mismatch remediation`).toBeGreaterThan(-1);
+      const hints = [...sql.matchAll(/DROP INDEX CONCURRENTLY/g)];
+      expect(
+        hints.length,
+        `${spec.migration} has no unique mismatch remediation to anchor on`,
+      ).toBe(1);
+      const structuralHint = hints[0].index;
 
-      const emptinessChecks = [...contents.matchAll(/EXISTS \(SELECT 1 FROM/g)].map(
-        (match) => match.index,
-      );
+      // Deliberately looser than the single-line form the files use today, so
+      // an emptiness gate reformatted across lines or written `SELECT *` is
+      // still seen rather than silently dropping out of the guard window.
+      //
+      // Anchored on the spec's own table, which is what makes the looseness
+      // safe: every one of these files opens with a multiline
+      // `EXISTS (\n SELECT 1\n FROM pg_index ...)` structural probe, and a
+      // pattern ending at a bare `FROM` matches that too — it sits ahead of
+      // the hint and would fail the ordering assertion on all eight files. An
+      // emptiness check is by definition a check on the guarded table.
+      const emptinessChecks = [
+        ...sql.matchAll(
+          new RegExp(`EXISTS\\s*\\(\\s*SELECT\\s+\\S+\\s+FROM\\s+"?${spec.table}"?`, "g"),
+        ),
+      ].map((match) => match.index);
       expect(
         emptinessChecks.length,
         `${spec.migration} lost its empty-table guard; the pre-flight exemption assumes one`,
@@ -373,8 +406,10 @@ describe("guarded migrations gate their raise on table population", () => {
 
       // And the absent-index path really does build the index itself, inline
       // and without CONCURRENTLY — which is what makes an empty table need no
-      // operator at all.
-      expect(contents, `${spec.migration} no longer builds its index inline`).toMatch(
+      // operator at all. Checked against `sql` so a commented-out example
+      // cannot satisfy it; the required quote already rules out the unquoted
+      // `CREATE INDEX CONCURRENTLY` inside the hint text.
+      expect(sql, `${spec.migration} no longer builds its index inline`).toMatch(
         /CREATE (?:UNIQUE )?INDEX "/,
       );
     }
