@@ -1015,11 +1015,11 @@ describe("retired context supersede", () => {
  *     `Prior Findings Dispositioned` entry can name the finding to retire it,
  *     and the only exit is a fresh commit.
  *
- * Measured over the 68 Ally consolidated reviews on the 25 most recent
- * `Blockcast/paperclip` pull requests: this fix flips exactly 7, every one of
- * them `true` → `false`, every one of them yielding zero finding identities.
- * Zero flips in the other direction, and all 40 reviews carrying real findings
- * still block.
+ * The corpus measurement behind the narrowing, and the two candidate fixes it
+ * rules out, live with the clause itself in
+ * `ally-review-detection.ts:hasActionablePrReviewFeedback`. Kept in one place
+ * deliberately: both copies were accurate, which is exactly why they would
+ * drift.
  *
  * The bodies below are the load-bearing lines of five real reviews, verbatim.
  * They are trimmed to the counted buckets plus the exact `Recommended Action`
@@ -1122,15 +1122,56 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
   // `still-present` is the ledger verb for "this prior finding still stands",
   // and `classifyPriorDisposition` already returns `blocks` for it. The
   // contract says such a finding is mirrored into the current buckets, which
-  // would make a count non-zero and block here anyway — these two cases pin the
-  // defence for when that mirroring is omitted, which the precedence fix would
-  // otherwise turn from a heuristic red into a deterministic green.
+  // would make a count non-zero and block before this signal is ever reached —
+  // and across the whole measured corpus that mirroring did hold, so the cases
+  // below never fire on a real body today. They pin the defence for the one
+  // occasion it would matter: a review that asserts a live finding and forgets
+  // to tally it. That is a contract violation, so the guard has to be a
+  // positive signal rather than something the surrounding prose can veto.
   it("still blocks a 0/0 review whose ledger asserts a prior finding is still-present", () => {
     const body = [
       dispositioningReview(CURRENT_HEAD, OLD_HEAD, "still-present"),
       "### Recommended Action",
       "1. No Critical issues to fix before merge.",
     ].join("\n");
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  // The case above passes for the wrong reason if `still-present` is only a
+  // carve-out inside the clean-declaration test: that shape suppresses the
+  // early `return false` and then lets the prose fallback decide, and the
+  // boilerplate it uses happens to supply the fallback's own trigger tokens.
+  // These strip the tokens away, so nothing but a positive `blocks` signal can
+  // carry them. All three returned `false` before that promotion.
+  const inertShapes: Array<[string, string[]]> = [
+    [
+      "a Recommended Action carrying none of the fallback's tokens",
+      ["### Recommended Action", "1. Nothing to address.", "2. Merge when CI is green."],
+    ],
+    ["no Recommended Action section at all", []],
+  ];
+
+  for (const [label, trailer] of inertShapes) {
+    it(`still blocks a still-present ledger entry under ${label}`, () => {
+      const body = [
+        dispositioningReview(CURRENT_HEAD, OLD_HEAD, "still-present"),
+        ...trailer,
+      ].join("\n");
+
+      expect(hasActionablePrReviewFeedback(body)).toBe(true);
+    });
+  }
+
+  it("still blocks a still-present ledger entry when no counted bucket is declared", () => {
+    // The widest of the inert shapes, and the worst: with no bucket at all
+    // `extractAllyReportedFindingRefs` returns null — "identities unknown" — so
+    // the carry-forward cannot enumerate what to retire either. The assertion
+    // in the ledger is the only signal the body carries.
+    const body = reviewBody(CURRENT_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — still-present — re-checked against this head.`,
+    ]);
 
     expect(hasActionablePrReviewFeedback(body)).toBe(true);
   });
