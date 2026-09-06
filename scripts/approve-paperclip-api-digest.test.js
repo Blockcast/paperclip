@@ -1656,7 +1656,7 @@ function runReleaseWrite({ stderrText, attempts = 3, writeSucceeds = false }) {
   );
   // Heredoc body and terminator sit at column 0 deliberately; indenting them
   // here would make the generated bash unparseable rather than failing loudly.
-  // Flags match the shipping script's `set -euo pipefail` (`:82`) so what runs
+  // Flags match the shipping script's `set -euo pipefail` (`:86`) so what runs
   // here runs under production's error handling; all three cases behave
   // identically either way, so the fidelity is free. It is NOT extra mutation
   // coverage for the trailing-sleep guard below: bash exempts the left side of
@@ -1723,7 +1723,7 @@ release_in_flight_lock`;
     : [];
   // stdout as well as stderr: the two loops' MESSAGING asymmetry -- this one
   // silent on both success and exhaustion, retire-only mode chatty -- is the
-  // other half of what `:755-759` defends at length against a parity fix, and
+  // other half of what `:759-763` defends at length against a parity fix, and
   // until both harnesses captured stdout it was asserted by nothing. Every
   // direction of that fix is now a failure: adding an `echo` here on either
   // path, or deleting retire-only's.
@@ -1761,7 +1761,7 @@ test("a conflicting retirement write is still retried to exhaustion", () => {
   });
   assert.equal(r.writes, 3, "a conflict must consume every attempt, not bail on the first");
   assert.equal(r.status, 1, "exhausting the attempts still reports failure");
-  // FLAT, and asserted by argument rather than by count: `:747-756` spends ten
+  // FLAT, and asserted by argument rather than by count: `:751-760` spends ten
   // lines defending this flatness against the "helpful parity fix" that would
   // spell it `sleep "$attempt"` like retire-only mode's, and until the stub
   // recorded its argument that defence was enforced by nothing. ["1","1"] is
@@ -1777,7 +1777,7 @@ test("a conflicting retirement write is still retried to exhaustion", () => {
     /cannot retire the in-flight lock on/,
     "the non-retriable message must not fire on a retriable conflict",
   );
-  // The EXHAUSTION half of the silence `:757-758` requires, which the success
+  // The EXHAUSTION half of the silence `:761-762` requires, which the success
   // test's assertion cannot reach: that comment forbids a chatty success *or
   // exhaustion*, and exhaustion is where the temptation is stronger, because
   // the loop has just given up and so has something to report. It reports it on
@@ -1802,7 +1802,7 @@ test("a retirement write that succeeds returns at the first attempt, silently an
   // The SILENT half of the messaging asymmetry, and the more surprising one --
   // a parity fix reading retire-only mode's three chatty success lines would
   // "correct" this loop by ADDING output, which is the direction the retire-only
-  // assertion below cannot catch. `:755-759` argues this silence is required,
+  // assertion below cannot catch. `:759-763` argues this silence is required,
   // not merely tolerated: the caller (`cleanup_on_exit`) prints the operator
   // guidance itself, and this loop only ever runs after a deploy has already
   // failed, so a success line here would bury the failure the cleanup exists to
@@ -1963,7 +1963,7 @@ test("retire-only mode's conflicting write is still retried to exhaustion", () =
   // arguments rather than the attempt count is what makes the two loops'
   // pacing a tested difference instead of a commented one: with a discarding
   // stub, spelling this `sleep 1` -- or `sleep 0` -- left the suite green.
-  // 3s total, the number `:751-753` names as the cost retire-only mode can
+  // 3s total, the number `:755-757` names as the cost retire-only mode can
   // afford because it has an operator at a terminal and no grace-period clock.
   assert.deepEqual(
     r.sleeps,
@@ -1992,7 +1992,7 @@ test("retire-only mode's succeeding write exits 0 at the first attempt, telling 
   assert.equal(r.status, 0, "a retired lock must exit 0");
   assert.deepEqual(r.sleeps, [], "the success path must not spend the backoff");
   // The CHATTY half, and the output this mode exists to produce: an operator
-  // ran it by hand and the three lines at `:342-344` are the only report they
+  // ran it by hand and the three lines at `:346-348` are the only report they
   // get. Until the harness captured stdout, silencing all three "for parity
   // with `release_in_flight_lock`" left the suite green.
   assert.match(
@@ -2028,5 +2028,130 @@ test("retire-only mode's write with no stderr still explains itself", () => {
     r.stderr,
     /\(owner owner-9\):\s*$/,
     "the message must not end at the colon it promises to expand on",
+  );
+});
+
+// The `:NNN` citations sprinkled through the comments above name lines in the
+// shipping script, and until now nothing checked them. That is not hypothetical
+// drift: when the BLO-31842 ReplicaSet work inserted four lines into the
+// script's header comment, all seven citations in this file went stale by
+// exactly +4 in one commit, silently. The worst of them then pointed a reader
+// at the "nothing to retire" branch's `exit 0` instead of the three success
+// lines the assertion beside it is actually about -- so the comment read as if
+// it were pinning a completely different code path.
+//
+// Every OTHER cross-file reference here is already mechanical -- the function
+// body by name via extractShellFunction(), the numeric defaults and limits by
+// pattern via shellDefault()/shellLimit() -- which left the line citations as
+// the one convention in this suite held together by nothing but care. This
+// stack's whole thesis is that its comments are checkable, so they are checked.
+//
+// Pinned by the range's FIRST LINE, matched against that one line rather than
+// searched for across the range. Searching a range is what a first attempt at
+// this did, and it is too weak twice over: a citation ten lines wide still
+// "contains" its anchor after a four-line shift, so it tolerates exactly the
+// drift this exists to catch; and a spanning `[\s\S]*` pattern happily matches
+// an earlier occurrence elsewhere in the script and then reports a confidently
+// wrong line number -- the very defect being fixed. An exact first-line match
+// admits neither. `contains` additionally holds the rest of the range to the
+// content the citing comment claims is there.
+const LINE_CITATIONS = [
+  {
+    cite: "86",
+    startsWith: /^set -euo pipefail$/,
+    claim: "the shipping script's error-handling flags, mirrored by the harness",
+  },
+  {
+    cite: "346-348",
+    startsWith: /^\s*echo "Retired the in-flight approval lock on /,
+    contains: /ring still lists that digest[\s\S]*without an out-of-band edit/,
+    claim: "retire-only mode's three operator-facing success lines",
+  },
+  {
+    cite: "751-760",
+    startsWith: /^\s*# Flat, where retire-only mode backs off linearly/,
+    claim: "the ten lines defending the release loop's flat backoff",
+  },
+  {
+    cite: "755-757",
+    startsWith: /^\s*# `trap 'exit 143' TERM`, so the runner's grace period/,
+    contains: /2s of total sleep beats 3s/,
+    claim: "the 3s figure retire-only mode can afford and the release loop cannot",
+  },
+  {
+    cite: "759-763",
+    startsWith: /^\s*# Their MESSAGING differences are deliberate too/,
+    claim: "the messaging-asymmetry defence against a parity fix",
+  },
+  {
+    cite: "761-762",
+    startsWith: /^\s*# guidance that retire-only mode prints itself, so a chatty success or/,
+    contains: /exhaustion here would bury/,
+    claim: "the clause forbidding a chatty success OR exhaustion",
+  },
+];
+
+const scriptLines = script.split("\n");
+
+function citedRange(cite) {
+  const [start, end = start] = cite.split("-").map(Number);
+  return scriptLines.slice(start - 1, end).join("\n");
+}
+
+test("every line citation in this file still points at the content it claims", () => {
+  // Reports EVERY drifted citation in one run, rather than failing on the
+  // first. Drift arrives all at once -- BLO-31842 shifted all seven of these by
+  // +4 in a single commit, changing nothing about them -- so failing one at a
+  // time would turn one mechanical repair into seven fix-and-rerun cycles.
+  const problems = [];
+  for (const { cite, startsWith, contains, claim } of LINE_CITATIONS) {
+    const start = Number(cite.split("-")[0]);
+    if (!startsWith.test(scriptLines[start - 1] ?? "")) {
+      // Report WHERE it moved to. Every matching line is listed rather than
+      // just the first: if the anchor is no longer unique, that ambiguity is
+      // itself the thing to fix, and silently naming one of several would be
+      // the same confidently-wrong answer this test exists to prevent.
+      const at = scriptLines
+        .map((line, i) => (startsWith.test(line) ? i + 1 : 0))
+        .filter(Boolean);
+      problems.push(
+        at.length === 0
+          ? `  :${cite} claims to point at ${claim}, which is no longer anywhere in the script -- it is dangling, so drop it or repoint it at whatever replaced that code`
+          : `  :${cite} no longer points at ${claim} -- that content now starts at :${at.join(" or :")}`,
+      );
+      continue;
+    }
+    if (contains && !contains.test(citedRange(cite))) {
+      problems.push(
+        `  :${cite} starts in the right place, but the rest of the range no longer holds ${claim} -- the citing comment describes content that is not there any more`,
+      );
+    }
+  }
+  assert.deepEqual(
+    problems,
+    [],
+    `line citations have drifted from the script:\n${problems.join("\n")}\nUpdate the comments that cite them, and this table, to match.`,
+  );
+});
+
+test("no line citation can be added to this file without being pinned", () => {
+  // The completeness half, and the one that makes the pinning durable: without
+  // it a NEW citation is unpinned by default and the convention rots again from
+  // the next comment onward. Scans this file's own source, so the two sets are
+  // derived from the same place a reader looks.
+  const testSource = readFileSync(fileURLToPath(import.meta.url), "utf8");
+  const found = new Set(
+    [...testSource.matchAll(/`:(\d+(?:-\d+)?)`/g)].map((m) => m[1]),
+  );
+  const pinned = new Set(LINE_CITATIONS.map((c) => c.cite));
+  assert.deepEqual(
+    [...found].filter((c) => !pinned.has(c)).sort(),
+    [],
+    "a `:NNN` citation was added without a LINE_CITATIONS entry -- add one naming the phrase it points at",
+  );
+  assert.deepEqual(
+    [...pinned].filter((c) => !found.has(c)).sort(),
+    [],
+    "a LINE_CITATIONS entry no longer matches any citation in the file -- remove it rather than leaving it pinning nothing",
   );
 });
