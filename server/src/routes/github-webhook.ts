@@ -3948,9 +3948,20 @@ function isActionableReviewFeedbackContext(context: ResolvedEventContext): boole
 // Recomputed from the review body when the context predates
 // `reviewActionability` (synthetic/older contexts), so the reason is available
 // on the same inputs the boolean used rather than only on fresh deliveries.
+// The reason/predicate pair is projected straight out of the classifier's
+// non-actionable variant rather than widened to `string`. This is the boundary
+// where the value becomes a published contract (log field, response field,
+// `contextSnapshot` key), so it is the boundary that has to hold the taxonomy:
+// a reason added to the classifier, or a typo in a hand-built decision, must
+// fail to compile here rather than ship a name nothing documents.
+type PrReviewFeedbackSuppression = Pick<
+  Extract<PrReviewActionabilityDecision, { actionable: false }>,
+  "reason" | "predicate"
+>;
+
 function resolveReviewFeedbackSuppression(
   context: ResolvedEventContext,
-): { reason: string; predicate: string } | null {
+): PrReviewFeedbackSuppression | null {
   if (context.wakeReason !== "github_pr_review_submitted") return null;
   const decision =
     context.reviewActionability ?? classifyPrReviewActionability(context.reviewBody, context.reviewState);
@@ -6626,3 +6637,9 @@ export const __test_isReviewGateEscalationProducer = isReviewGateEscalationProdu
 export const __test_buildReviewGateEscalationExternalKey = buildReviewGateEscalationExternalKey;
 export const __test_buildReviewGateEscalationComment = buildReviewGateEscalationComment;
 export const __test_wakeIdempotencySuffix = wakeIdempotencySuffix;
+
+// Exported so the frr#61 truncation fixtures pin their bucket offsets to the
+// real clamp instead of a copied `4096`. The assertions stay valid either way,
+// but a retuned clamp would silently stop them reproducing the past-the-clamp
+// shape their comments claim — the regression would pass while testing nothing.
+export const __test_REVIEW_BODY_MAX_BYTES = REVIEW_BODY_MAX_BYTES;
