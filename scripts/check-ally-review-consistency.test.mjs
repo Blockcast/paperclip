@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
@@ -9,6 +10,7 @@ import {
   ALLY_USER_REVIEWER_ID,
   ALLY_USER_REVIEWER_LOGIN,
   allyReviewLane,
+  applyBaseline,
   assertHeadSha,
   assertPrListComplete,
   attestedHead,
@@ -25,6 +27,8 @@ import {
   isMainModule,
   isRequiredApprovalPair,
   operativeAllyReviews,
+  parseBaseline,
+  violationFingerprint,
 } from "./check-ally-review-consistency.mjs";
 
 const HEAD = "ff1c72dbfd18014c838cf1373b1640dd17378f3e";
@@ -809,5 +813,211 @@ describe("a falsy head would otherwise silently pass a maximal violation", () =>
     for (const head of [undefined, null, ""]) {
       assert.deepEqual(findPrViolations({ number: 9, headSha: head, reviews }), []);
     }
+  });
+});
+
+const REAL_I1_1525 =
+  "I1 PR #1525 @05325ee7: 2 operative Ally App reviews (COMMENTED/5043498525, COMMENTED/5059936287) — expected at most 1 in the app lane";
+const REAL_I3_1525 =
+  "I3 PR #1525 @05325ee7: Ally App review 5059936287 is not canonical — expected one consolidated-review heading and one Reviewed head attestation";
+
+function entry(overrides = {}) {
+  return {
+    fingerprint: "I1:1525:05325ee7:5043498525,5059936287",
+    pr: 1525,
+    issue: "PEN-2847",
+    note: "known",
+    ...overrides,
+  };
+}
+
+describe("violationFingerprint", () => {
+  it("pins code, PR, head and review IDs", () => {
+    assert.equal(violationFingerprint(REAL_I1_1525), "I1:1525:05325ee7:5043498525,5059936287");
+    assert.equal(violationFingerprint(REAL_I3_1525), "I3:1525:05325ee7:5059936287");
+  });
+
+  it("ignores the prose, so rewording a message does not move it out from under its baseline", () => {
+    const reworded = REAL_I1_1525.replace(
+      "— expected at most 1 in the app lane",
+      "— only one operative review is permitted per lane, see BLO-19778",
+    );
+    assert.equal(violationFingerprint(reworded), violationFingerprint(REAL_I1_1525));
+  });
+
+  it("changes when the PR is pushed to, so a baselined PR coming back to life is re-audited", () => {
+    const pushed = REAL_I1_1525.replace("@05325ee7", "@deadbeef");
+    assert.notEqual(violationFingerprint(pushed), violationFingerprint(REAL_I1_1525));
+  });
+
+  it("changes when a third review joins the same head, so an escalation is not suppressed", () => {
+    const escalated = REAL_I1_1525.replace(
+      "2 operative Ally App reviews (COMMENTED/5043498525, COMMENTED/5059936287)",
+      "3 operative Ally App reviews (COMMENTED/5043498525, COMMENTED/5059936287, COMMENTED/5099999999)",
+    );
+    assert.notEqual(violationFingerprint(escalated), violationFingerprint(REAL_I1_1525));
+  });
+
+  it("distinguishes invariants and PRs that otherwise share a head", () => {
+    assert.notEqual(violationFingerprint(REAL_I1_1525), violationFingerprint(REAL_I3_1525));
+    assert.notEqual(
+      violationFingerprint(REAL_I1_1525),
+      violationFingerprint(REAL_I1_1525.replace("PR #1525", "PR #1526")),
+    );
+  });
+
+  it("is stable across the real violation shapes this guard emits", () => {
+    const reviews = [
+      appReview({ id: 4911401804, state: "COMMENTED", body: canonicalBody() }),
+      appReview({ id: 4913256943, state: "COMMENTED", body: "no heading, no attestation" }),
+    ];
+    const fingerprints = findPrViolations({ number: 1316, headSha: HEAD, reviews }).map(
+      violationFingerprint,
+    );
+    assert.equal(new Set(fingerprints).size, fingerprints.length, "every violation gets a distinct key");
+    for (const fingerprint of fingerprints) {
+      assert.match(fingerprint, /^I[0-9a-z]+:1316:[0-9a-f]{8}:[\d,]+$/);
+    }
+  });
+});
+
+describe("parseBaseline", () => {
+  it("accepts a well-formed document", () => {
+    assert.deepEqual(parseBaseline(JSON.stringify({ entries: [entry()] })), [entry()]);
+  });
+
+  it("accepts an empty baseline — the state this guard should converge to", () => {
+    assert.deepEqual(parseBaseline({ entries: [] }), []);
+  });
+
+  it("rejects a document with no entries array rather than treating it as empty", () => {
+    for (const doc of [{}, { entries: null }, { entries: {} }]) {
+      assert.throws(() => parseBaseline(doc), /must contain an "entries" array/);
+    }
+  });
+
+  it("rejects invalid JSON", () => {
+    assert.throws(() => parseBaseline("{nope"), /is not valid JSON/);
+  });
+
+  for (const field of ["fingerprint", "note", "issue"]) {
+    it(`requires a non-empty ${field} so every suppression is attributable`, () => {
+      assert.throws(
+        () => parseBaseline({ entries: [entry({ [field]: "  " })] }),
+        new RegExp(`needs a non-empty "${field}"`),
+      );
+      assert.throws(
+        () => parseBaseline({ entries: [entry({ [field]: undefined })] }),
+        new RegExp(`needs a non-empty "${field}"`),
+      );
+    });
+  }
+
+  it("requires an integer pr", () => {
+    assert.throws(() => parseBaseline({ entries: [entry({ pr: "1525" })] }), /needs an integer "pr"/);
+  });
+
+  it("rejects a malformed fingerprint instead of letting it match nothing forever", () => {
+    for (const fingerprint of ["I1:1525", "nonsense", "I1:1525:zzzz:1", "I1::05325ee7:1"]) {
+      assert.throws(
+        () => parseBaseline({ entries: [entry({ fingerprint })] }),
+        /malformed "fingerprint"/,
+      );
+    }
+  });
+
+  it("rejects an entry whose pr disagrees with its fingerprint", () => {
+    assert.throws(
+      () => parseBaseline({ entries: [entry({ pr: 1304 })] }),
+      /fingerprint names PR #1525 but "pr" says 1304/,
+    );
+  });
+
+  it("rejects duplicate fingerprints", () => {
+    assert.throws(() => parseBaseline({ entries: [entry(), entry()] }), /repeats fingerprint/);
+  });
+});
+
+describe("applyBaseline", () => {
+  it("suppresses a baselined violation", () => {
+    const { failing, suppressed } = applyBaseline([REAL_I1_1525], [entry()]);
+    assert.deepEqual(failing, []);
+    assert.equal(suppressed.length, 1);
+    assert.equal(suppressed[0].entry.issue, "PEN-2847");
+  });
+
+  it("fails a violation that is not baselined — the whole point of the ratchet", () => {
+    const { failing } = applyBaseline([REAL_I1_1525, REAL_I3_1525], [entry()]);
+    assert.equal(failing.length, 1);
+    assert.equal(failing[0].violation, REAL_I3_1525);
+    assert.equal(failing[0].fingerprint, "I3:1525:05325ee7:5059936287");
+  });
+
+  it("does not let a baselined PR suppress a different violation on itself", () => {
+    const newFinding =
+      "I2a PR #1525 @05325ee7: Ally App review 5043498525 is APPROVED but its body reports a Critical/Important finding";
+    assert.equal(applyBaseline([newFinding], [entry()]).failing.length, 1);
+  });
+
+  it("does not let a baselined PR suppress the same violation on another PR", () => {
+    const elsewhere = REAL_I1_1525.replace("PR #1525", "PR #1600");
+    assert.equal(applyBaseline([elsewhere], [entry()]).failing.length, 1);
+  });
+
+  it("re-fails a baselined violation once the PR is pushed to", () => {
+    const pushed = REAL_I1_1525.replace("@05325ee7", "@0a1b2c3d");
+    assert.equal(applyBaseline([pushed], [entry()]).failing.length, 1);
+  });
+
+  it("with an empty baseline every violation fails, exactly as before the ratchet", () => {
+    const { failing } = applyBaseline([REAL_I1_1525, REAL_I3_1525], []);
+    assert.equal(failing.length, 2);
+  });
+
+  it("reports an entry that matches nothing without failing the run", () => {
+    const { failing, staleEntries } = applyBaseline([], [entry()]);
+    assert.deepEqual(failing, []);
+    assert.equal(staleEntries.length, 1);
+    assert.equal(staleEntries[0].pr, 1525);
+  });
+
+  it("treats a clean repo with a clean baseline as a pass", () => {
+    assert.deepEqual(applyBaseline([], []), { failing: [], suppressed: [], staleEntries: [] });
+  });
+});
+
+describe("the committed baseline", () => {
+  const raw = readFileSync(
+    new URL("./ally-review-consistency-baseline.json", import.meta.url),
+    "utf8",
+  );
+
+  it("parses under the same validation the guard applies at runtime", () => {
+    assert.ok(parseBaseline(raw).length > 0);
+  });
+
+  it("suppresses exactly the violation set measured on 2026-09-01 and nothing else", () => {
+    const measured = [
+      REAL_I1_1525,
+      REAL_I3_1525,
+      "I1 PR #1360 @6a7e86b8: 2 operative Ally App reviews (COMMENTED/5002830694, COMMENTED/5003133252) — expected at most 1 in the app lane",
+      "I1 PR #1316 @0110ccd1: 2 operative Ally App reviews (COMMENTED/4911401804, COMMENTED/4913256943) — expected at most 1 in the app lane",
+      "I3 PR #1316 @0110ccd1: Ally App review 4913256943 is not canonical — expected one consolidated-review heading and one Reviewed head attestation",
+      "I1 PR #1304 @61360b5a: 2 operative Ally App reviews (COMMENTED/5062643059, COMMENTED/5062648138) — expected at most 1 in the app lane",
+    ];
+    const { failing, suppressed, staleEntries } = applyBaseline(measured, parseBaseline(raw));
+    assert.deepEqual(failing, [], "the run goes green on the state that pinned it red");
+    assert.equal(suppressed.length, measured.length);
+    assert.deepEqual(staleEntries, [], "no entry suppresses something that is not happening");
+  });
+
+  it("still fails on a new violation alongside the baselined set", () => {
+    const withNewFinding = [
+      REAL_I1_1525,
+      "I1 PR #1601 @abcdef12: 2 operative Ally App reviews (COMMENTED/5111111111, COMMENTED/5222222222) — expected at most 1 in the app lane",
+    ];
+    const { failing } = applyBaseline(withNewFinding, parseBaseline(raw));
+    assert.equal(failing.length, 1);
+    assert.match(failing[0].violation, /PR #1601/);
   });
 });

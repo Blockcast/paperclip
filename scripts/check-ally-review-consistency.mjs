@@ -60,6 +60,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -446,6 +447,154 @@ export function findViolations(prs) {
   return (prs ?? []).flatMap((pr) => findPrViolations(pr));
 }
 
+/**
+ * The ratchet.
+ *
+ * This guard audits every open PR forever, so a single abandoned PR carrying a
+ * duplicate Ally review holds the run red permanently. Measured over the 40
+ * scheduled runs before 2026-09-01: 39 failures, 1 success, with a byte-identical
+ * six-violation set on every failing run, pinned by four PRs last touched between
+ * 1 and 20 days earlier. A check whose output is a constant carries the same
+ * information as no check: a seventh violation appearing on a live PR would move
+ * the run from red to red and change nothing downstream. The invariants were still
+ * computed correctly the whole time — what was lost was the ability to *signal*.
+ * See PEN-2847.
+ *
+ * So known violations are recorded in a baseline and suppressed, and anything not
+ * in the baseline fails the run. The load-bearing detail is what a baseline entry
+ * is keyed on: the fingerprint pins the invariant code, the PR number, the head
+ * SHA, *and* the exact set of review IDs named in the violation. That makes an
+ * entry expire on its own the moment anything real changes —
+ *
+ *   - the PR is pushed to     → new head → no entry matches → red
+ *   - a third review lands    → new ID set → no entry matches → red
+ *   - a different invariant   → new code → no entry matches → red
+ *   - any other PR regresses  → never baselined → red
+ *
+ * — which is a sharper liveness test than the obvious alternative of scoping the
+ * audit to PRs updated within N days. That alternative was measured against this
+ * repo before it was rejected: #1525 sits at `mergeable_state: behind`, inside any
+ * plausible allow-list, and was updated 2 days before filing, inside any plausible
+ * window. It would have stayed in scope and the run would have stayed red. A PR
+ * that could actually merge on a bad attestation is one that is *moving*, and a
+ * moving PR breaks its own baseline entry. Staleness is a proxy for that; the head
+ * SHA measures it directly.
+ *
+ * A baseline entry is a suppression of a real finding, so each one must name the
+ * PR and the issue that owns its disposition, and a malformed entry throws rather
+ * than being skipped — a baseline that silently ignores its own bad rows is the
+ * fail-open shape `assertPrListComplete` and `assertHeadSha` already guard against
+ * one layer up.
+ */
+export const BASELINE_PATH = "scripts/ally-review-consistency-baseline.json";
+
+/**
+ * A violation reduced to the tokens that identify *which* violation it is,
+ * discarding the prose.
+ *
+ * Every push site in `findPrViolations` emits the same structured prefix —
+ * `${code} PR #${number} @${shortHead}: ` — and names the review IDs it is
+ * complaining about in the tail. Those four things are the finding's identity;
+ * the explanatory sentence after them is not, and rewording a message must not
+ * silently move a violation out from under its baseline entry.
+ *
+ * Review IDs are 9-10 digits and PR numbers are 4, so the digit-run floor
+ * separates them without needing to parse each message shape individually. If a
+ * future message shape defeats this scraping the fingerprint changes and the run
+ * goes red — the safe direction.
+ */
+export function violationFingerprint(violation) {
+  const text = String(violation ?? "");
+  const code = /^(\S+)\s/.exec(text)?.[1] ?? "?";
+  const pr = /\bPR #(\d+)\b/.exec(text)?.[1] ?? "?";
+  const head = /\B@([0-9a-f]{6,40})\b/.exec(text)?.[1]?.toLowerCase() ?? "?";
+  const ids = [...new Set(Array.from(text.matchAll(/\b\d{6,}\b/g), (m) => m[0]))].sort();
+  return `${code}:${pr}:${head}:${ids.join(",")}`;
+}
+
+/**
+ * Validates the baseline document and returns its entries.
+ *
+ * Throws on anything malformed. An entry that cannot be understood is a
+ * suppression nobody can audit, and silently dropping it would let a typo'd
+ * fingerprint read as "this violation is known" when nothing is known at all.
+ */
+export function parseBaseline(raw, path = BASELINE_PATH) {
+  let doc;
+  try {
+    doc = typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch (error) {
+    throw new Error(`${path} is not valid JSON: ${error.message}`);
+  }
+  const entries = doc?.entries;
+  if (!Array.isArray(entries)) {
+    throw new Error(`${path} must contain an "entries" array (got ${JSON.stringify(doc?.entries)}).`);
+  }
+
+  const seen = new Set();
+  for (const [index, entry] of entries.entries()) {
+    const where = `${path} entries[${index}]`;
+    for (const field of ["fingerprint", "note", "issue"]) {
+      if (typeof entry?.[field] !== "string" || entry[field].trim() === "") {
+        throw new Error(`${where} needs a non-empty "${field}" — every suppression must be attributable.`);
+      }
+    }
+    if (!Number.isInteger(entry.pr)) {
+      throw new Error(`${where} needs an integer "pr" (got ${JSON.stringify(entry?.pr)}).`);
+    }
+    if (!/^[A-Za-z0-9]+:\d+:[0-9a-f]{6,40}:[\d,]*$/.test(entry.fingerprint)) {
+      throw new Error(
+        `${where} has a malformed "fingerprint" (${JSON.stringify(entry.fingerprint)}); ` +
+          `expected code:pr:head:ids as produced by violationFingerprint().`,
+      );
+    }
+    if (String(entry.fingerprint.split(":")[1]) !== String(entry.pr)) {
+      throw new Error(
+        `${where} fingerprint names PR #${entry.fingerprint.split(":")[1]} but "pr" says ${entry.pr}.`,
+      );
+    }
+    if (seen.has(entry.fingerprint)) {
+      throw new Error(`${where} repeats fingerprint ${entry.fingerprint}.`);
+    }
+    seen.add(entry.fingerprint);
+  }
+  return entries;
+}
+
+/**
+ * Splits live violations into the ones that fail the run and the ones a baseline
+ * entry accounts for, and reports entries that matched nothing.
+ *
+ * A stale entry is deliberately *not* fatal. Baselined PRs get merged, closed and
+ * force-pushed as a matter of course, and making that turn the run red would
+ * reintroduce exactly the permanently-red failure this ratchet exists to cure —
+ * this time triggered by the guard's own bookkeeping. It is reported so the entry
+ * can be pruned, and pruning it is a no-op for the verdict.
+ */
+export function applyBaseline(violations, entries) {
+  const byFingerprint = new Map((entries ?? []).map((entry) => [entry.fingerprint, entry]));
+  const matched = new Set();
+  const failing = [];
+  const suppressed = [];
+
+  for (const violation of violations ?? []) {
+    const fingerprint = violationFingerprint(violation);
+    const entry = byFingerprint.get(fingerprint);
+    if (entry) {
+      matched.add(fingerprint);
+      suppressed.push({ violation, entry });
+    } else {
+      failing.push({ violation, fingerprint });
+    }
+  }
+
+  return {
+    failing,
+    suppressed,
+    staleEntries: (entries ?? []).filter((entry) => !matched.has(entry.fingerprint)),
+  };
+}
+
 function gh(args) {
   return execFileSync("gh", args, {
     encoding: "utf8",
@@ -526,25 +675,53 @@ function fetchOpenPrs(repo) {
   }));
 }
 
+function loadBaseline() {
+  const path = resolve(fileURLToPath(new URL(".", import.meta.url)), "ally-review-consistency-baseline.json");
+  return parseBaseline(readFileSync(path, "utf8"), BASELINE_PATH);
+}
+
 function main() {
   const repo = process.env.ALLY_REVIEW_REPO || "Blockcast/paperclip";
   const prs = fetchOpenPrs(repo);
   const violations = findViolations(prs);
+  const { failing, suppressed, staleEntries } = applyBaseline(violations, loadBaseline());
 
-  if (violations.length > 0) {
-    console.error(
-      `Ally review-consistency guard FAILED for ${repo} (${violations.length} violation(s)):\n`,
+  for (const entry of staleEntries) {
+    console.log(
+      `::warning title=Stale ally-review-consistency baseline entry::` +
+        `${BASELINE_PATH} still suppresses ${entry.fingerprint} (PR #${entry.pr}, ${entry.issue}) but no ` +
+        `current violation matches it — the finding is resolved or the PR moved. Remove the entry.`,
     );
-    for (const violation of violations) console.error(`  ${violation}`);
+  }
+
+  if (suppressed.length > 0) {
+    console.log(`Suppressed by ${BASELINE_PATH} (${suppressed.length} known violation(s)):\n`);
+    for (const { violation, entry } of suppressed) {
+      console.log(`  [${entry.issue}] ${violation}`);
+    }
+    console.log("");
+  }
+
+  if (failing.length > 0) {
+    console.error(
+      `Ally review-consistency guard FAILED for ${repo} (${failing.length} unbaselined violation(s)):\n`,
+    );
+    for (const { violation, fingerprint } of failing) {
+      console.error(`  ${violation}`);
+      console.error(`    fingerprint: ${fingerprint}`);
+    }
     console.error(
       "\nA violation means a PR may present as reviewed or approved without a single " +
-        "operative attestation backing its current head. See BLO-19778.",
+        "operative attestation backing its current head. See BLO-19778.\n" +
+        `Fix the PR, or — only if the finding is genuinely accepted — add its fingerprint to ` +
+        `${BASELINE_PATH} with the PR number, the owning issue, and a note. A baseline entry is ` +
+        `pinned to the head SHA and review IDs above, so it expires the moment the PR is touched.`,
     );
     process.exit(1);
   }
 
   console.log(
-    `Ally review-consistency guard passed: no attestation conflicts found across ${prs.length} open PR(s) in ${repo}.`,
+    `Ally review-consistency guard passed: no unbaselined attestation conflicts found across ${prs.length} open PR(s) in ${repo}.`,
   );
 }
 
