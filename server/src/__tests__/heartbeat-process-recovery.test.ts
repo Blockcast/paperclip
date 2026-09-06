@@ -5544,8 +5544,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   // rather than a duplicate of the test above -- it clears `checkoutRunId` and
   // `executionRunId` and moves the issue out of the `in_progress` arm where the
   // escalation lives, so before the fix the `todo` arm's bare `succeeded` skip
-  // swallowed it and nothing ever re-evaluated the issue again. Measured on
-  // Ally: BLO-30577, BLO-31052 and BLO-31216 sat `todo` for 3-8 days this way.
+  // swallowed it and nothing ever re-evaluated the issue again. Measured
+  // instance: BLO-31052, `todo` since 09-01 carrying a required handoff and no
+  // recovery action. Note this arm reaches only issues with NO existing
+  // recovery action -- an already-`escalated` one is reused per BLO-30743, so
+  // BLO-30577 stays skipped by design.
   it("escalates an exhausted successful-run handoff after checkout-restore returns the issue to todo", async () => {
     const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
       status: "todo",

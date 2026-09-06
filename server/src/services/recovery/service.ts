@@ -8448,8 +8448,18 @@ export function recoveryService(
           // escalation below lives. The bare skip this replaces therefore made
           // that state a permanent, silent strand — nothing else re-evaluates a
           // `todo` issue, and the two cases are indistinguishable from status
-          // alone. Measured on Ally: BLO-30577, BLO-31052 and BLO-31216 sat
-          // `todo` for 3-8 days, each carrying handoff evidence no arm read.
+          // alone. Measured instance: BLO-31052, `todo` since 09-01 carrying
+          // `successfulRunHandoff.required` with no recovery action.
+          //
+          // Scope, stated so nobody reads this as the fix for BLO-31913: of the
+          // seven issues stranded on Ally, this arm reaches ONE. Four carry no
+          // handoff record at all, so there is no evidence to read, and their
+          // mechanism is still unidentified. BLO-30577 carries the right
+          // evidence and is still skipped, because its recovery action is
+          // already `escalated` and `shouldReuseStrandedRecoveryAction` reuses
+          // it — correctly, per BLO-30743 — so `escalateStrandedAssignedIssue`
+          // returns null below. A budget-exhausted escalation needs an owner
+          // decision, not another sweep.
           //
           // Discriminate on the evidence the platform already recorded rather
           // than on status: `successfulRunHandoffRecoveryEvidence` is non-null
