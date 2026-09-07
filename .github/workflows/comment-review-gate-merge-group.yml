@@ -1,0 +1,59 @@
+name: Comment-review gate (merge queue)
+
+# Writes the comment-shaped Ally review gate's verdict onto the merge-queue
+# candidate commit. See scripts/mirror-comment-review-gate-to-merge-group.mjs
+# for the full rationale and BLO-26602 for the issue.
+#
+# The short version: the gate posts its verdict on the PULL REQUEST head, driven
+# by `pull_request`, `pull_request_review` and Ally's `issue_comment`. A
+# `gh-readonly-queue/*` ref generates none of those, and `merge_group` appears
+# zero times in the server -- so nothing has ever written this context on a
+# queue head. Until something does, marking the context required would make
+# every queue entry wait the full 6h `checkResponseTimeout` and eject, since the
+# queue runs ALLGREEN and a merge_group run cannot be re-run. This workflow is
+# that missing writer, and it is the prerequisite for the required-check step,
+# not a replacement for it.
+#
+# DELIBERATELY NOT MARKED REQUIRED BY THIS CHANGE. Landing the writer is
+# observe-only: it adds a status to queue heads and changes no merge behaviour.
+# Requiring it is a separate, human, branch-protection action that should happen
+# only once this has been seen writing real verdicts on real queue refs.
+
+on:
+  merge_group:
+    types:
+      - checks_requested
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  mirror:
+    # The merge-queue candidate is the sole landing candidate and must not queue
+    # behind the pull-request backlog that saturates arc-light -- same reasoning
+    # as every merge_group job in pr.yml.
+    runs-on: arc-merge-queue
+    # The job itself is three API calls, but ARC runners start cold and the
+    # checkout dominates. 10 matches the floor the rest of this repo settled on
+    # rather than inventing a tighter budget for one job.
+    timeout-minutes: 10
+    steps:
+      # Checks out master, NOT the queue candidate, and that is deliberate: this
+      # job holds `statuses: write`, so running the candidate's copy of the
+      # script would let a diff under review rewrite the thing that reports on
+      # it. Same posture as commitperclip-review.yml. The values file read for
+      # the context name comes from master for the same reason.
+      - name: Checkout base branch (never queue-candidate code)
+        uses: actions/checkout@v6
+        with:
+          ref: master
+
+      - name: Mirror the gate verdict onto the queue head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: node ./scripts/mirror-comment-review-gate-to-merge-group.mjs
