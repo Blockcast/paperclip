@@ -353,9 +353,17 @@ describe("BLO-31036 — a fence abandoned by a dead process stops wedging its ag
     // the 15-minute horizon must still produce, so shortening the constant now
     // breaks a test instead of silently widening who gets stolen from.
     //
-    // Deliberately not paired with a 16-minute case: `pastBackstop()` at 20 min
-    // already covers the reclaim side, and a two-sided pin one minute apart
-    // would make the suite fail on clock skew rather than on a real change.
+    // No 16-minute counterpart, because `pastBackstop()` at 20 min already pins
+    // the reclaim side; a second reclaim case one minute over the line would
+    // add nothing.
+    //
+    // Note which side actually carries timing risk, since it is the opposite of
+    // the intuition: `updated_at` is stamped once at seed time, so elapsed test
+    // time only ever makes the fence *older* relative to `now()` at query time.
+    // That pushes a refusal case toward reclaim (breaking it) and a reclaim case
+    // further into reclaim (harmless). So the ~60s of headroom — 14 min plus
+    // elapsed must stay under 15 — lives in THIS case. A 16-minute case would
+    // have had no budget to lose at all.
     await seedFence({
       phase: "firing",
       firingToken: "token-just-inside-backstop",
