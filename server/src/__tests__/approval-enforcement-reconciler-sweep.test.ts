@@ -88,6 +88,16 @@ describeEmbeddedPostgres("reconcileApprovalEnforcement", () => {
      * test seeding two companies must give the second one its own prefix.
      */
     issuePrefix?: string;
+    /**
+     * Leave `approvals.requested_by_agent_id` null — the board/system-filed
+     * shape. Nullable in the schema and not rare: 6.8% of approved cards in the
+     * origin company. See the null-requester tests below.
+     */
+    nullRequester?: boolean;
+    /** Filing user recorded on the card, if any. */
+    requestedByUserId?: string;
+    /** Also seed a `role: "ceo"` agent, the fallback owner. */
+    withCeo?: boolean;
   }) {
     const companyId = randomUUID();
     await db.insert(companies).values({
@@ -138,22 +148,34 @@ describeEmbeddedPostgres("reconcileApprovalEnforcement", () => {
       : { title: "Raise the cap", exact_changes: [assertionEntry] };
 
     const approvalId = randomUUID();
+    let ceoAgentId: string | null = null;
+    if (options.withCeo) {
+      ceoAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: ceoAgentId,
+        companyId,
+        name: "CeoAgent",
+        role: "ceo",
+      });
+    }
+
     await db.insert(approvals).values({
       id: approvalId,
       companyId,
       type: "budget_override_required",
       status: "approved",
-      requestedByAgentId: agentId,
+      requestedByAgentId: options.nullRequester ? null : agentId,
+      ...(options.requestedByUserId ? { requestedByUserId: options.requestedByUserId } : {}),
       payload,
       decidedAt: options.decidedAt ?? new Date(Date.now() - 24 * 60 * 60 * 1000),
     });
 
-    return { companyId, agentId, policyId, approvalId };
+    return { companyId, agentId, policyId, approvalId, ceoAgentId };
   }
 
   function driftIssuesFor(companyId: string, approvalId: string) {
     return db
-      .select({ id: issues.id, title: issues.title, description: issues.description, status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .select({ id: issues.id, title: issues.title, description: issues.description, status: issues.status, assigneeAgentId: issues.assigneeAgentId, responsibleUserId: issues.responsibleUserId })
       .from(issues)
       .where(
         and(
@@ -183,8 +205,93 @@ describeEmbeddedPostgres("reconcileApprovalEnforcement", () => {
     expect(raised[0]?.description).toContain("budget_policies.amount");
   });
 
-  it("stays silent when the decided figure has actually been applied", async () => {
-    const { companyId, approvalId } = await seed({ enforcedCents: DECIDED_CENTS });
+  // ---------------------------------------------------------------------------
+  // Null-requester routing (BLO-24631, CEO ruling 2026-09-07).
+  //
+  // `approvals.requested_by_agent_id` is nullable and board/system-filed cards
+  // are exactly the null case. Passing that null through produced an UNASSIGNED
+  // todo row; heartbeat work selection is by assignee, so it had no wake path,
+  // and the dedupe path then matched it forever — the reconciler reporting the
+  // drift as tracked while the enforcement gap stayed open. These assert the
+  // raised issue is *reachable*, not merely that it exists.
+  // ---------------------------------------------------------------------------
+
+  it("routes a null-requester drift issue to the ceo-role agent so it is reachable", async () => {
+    const { companyId, approvalId, ceoAgentId } = await seed({
+      enforcedCents: PRE_APPROVAL_CENTS,
+      nullRequester: true,
+      withCeo: true,
+      issuePrefix: "NRQ",
+    });
+
+    const result = await reconcileApprovalEnforcement(db);
+
+    expect(result.drifted).toBe(1);
+    expect(result.raised).toBe(1);
+
+    const raised = await driftIssuesFor(companyId, approvalId);
+    expect(raised).toHaveLength(1);
+    // The assertion this whole branch exists for: an unassigned row is created,
+    // counted in `raised`, and then never worked by anyone.
+    expect(raised[0]?.assigneeAgentId).not.toBeNull();
+    expect(raised[0]?.assigneeAgentId).toBe(ceoAgentId);
+    expect(raised[0]?.status).toBe("todo");
+  });
+
+  it("records a filing user as responsibleUserId while still assigning an agent", async () => {
+    const filingUserId = "user-board-filer";
+    const { companyId, approvalId, ceoAgentId } = await seed({
+      enforcedCents: PRE_APPROVAL_CENTS,
+      nullRequester: true,
+      withCeo: true,
+      requestedByUserId: filingUserId,
+      issuePrefix: "NRU",
+    });
+
+    const result = await reconcileApprovalEnforcement(db);
+    expect(result.raised).toBe(1);
+
+    const raised = await driftIssuesFor(companyId, approvalId);
+    // Provenance is recorded, but the human is never the *sole* owner: that
+    // queue is visible and not actionable (~100 days deep at ~2.4 closes/day).
+    expect(raised[0]?.responsibleUserId).toBe(filingUserId);
+    expect(raised[0]?.assigneeAgentId).toBe(ceoAgentId);
+  });
+
+  it("raises nothing, rather than an unreachable row, when no owner can be resolved", async () => {
+    // No requesting agent and no ceo-role agent. Failing loudly leaves the drift
+    // un-deduped so a later pass retries it; creating the row would permanently
+    // mask the gap behind "open issue already tracks it".
+    const { companyId, approvalId } = await seed({
+      enforcedCents: PRE_APPROVAL_CENTS,
+      nullRequester: true,
+      withCeo: false,
+      issuePrefix: "NRX",
+    });
+
+    const result = await reconcileApprovalEnforcement(db);
+
+    expect(result.drifted).toBe(1);
+    expect(result.raised).toBe(0);
+    expect(await driftIssuesFor(companyId, approvalId)).toHaveLength(0);
+  });
+
+  it("still routes to the requesting agent when one exists", async () => {
+    // Guards the unchanged step-1 behaviour against the fallback swallowing it.
+    const { companyId, approvalId, agentId, ceoAgentId } = await seed({
+      enforcedCents: PRE_APPROVAL_CENTS,
+      withCeo: true,
+      issuePrefix: "NRP",
+    });
+
+    await reconcileApprovalEnforcement(db);
+
+    const raised = await driftIssuesFor(companyId, approvalId);
+    expect(raised[0]?.assigneeAgentId).toBe(agentId);
+    expect(raised[0]?.assigneeAgentId).not.toBe(ceoAgentId);
+  });
+
+  it("stays silent when the decided figure has actually been applied", async () => {    const { companyId, approvalId } = await seed({ enforcedCents: DECIDED_CENTS });
 
     const result = await reconcileApprovalEnforcement(db);
 
