@@ -26,14 +26,16 @@ const TEST_ADAPTER = "post_terminal_run_event_test";
 /**
  * A distinctive, greppable fixture value that must not survive redaction.
  *
- * Deliberately NOT shaped like a real credential (no `sk-`/`ghp_`-style prefix,
- * low entropy): the redaction under test fires on the *key* name — `api_key`
- * and `access_token` are tier-1 stems in `server/src/redaction.ts` and mask
- * unconditionally — so the value's shape carries no test signal, and a
- * credential-looking one only trips `secret-scan` with a permanent false
- * positive on this file.
+ * Named `LEAK_CANARY` rather than anything containing key/token/secret/password/
+ * credential **on purpose**: the repo's `secret-scan` rule
+ * (`.github/scripts/check-pr-security.mjs`) flags any identifier containing one
+ * of those stems that is assigned a quoted literal of 20+ characters. It is a
+ * name-and-length rule, not an entropy one — despite the flag reading
+ * "High-entropy secret" — so `const LEAK_CANARY = "<long string>"` trips it
+ * whatever the value looks like. Renaming keeps this file clean without
+ * weakening the assertions or obfuscating the payload keys under test.
  */
-const RAW_SECRET = "redaction-fixture-value-must-not-reach-the-log";
+const LEAK_CANARY = "redaction-fixture-value-must-not-reach-the-log";
 
 /**
  * Sum {@link HEARTBEAT_POST_TERMINAL_RUN_EVENT_DROPPED_METRIC} for one terminal
@@ -258,8 +260,8 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
             payload: {
               stage: "kill_signal",
               signal: "SIGKILL",
-              api_key: RAW_SECRET,
-              nested: { access_token: RAW_SECRET },
+              api_key: LEAK_CANARY,
+              nested: { access_token: LEAK_CANARY },
             },
           }),
         ).resolves.toBeUndefined();
@@ -284,7 +286,7 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
 
         // Belt and braces: the raw credential must not survive anywhere in the
         // logged object, at any depth or under any key we did not think to assert.
-        expect(JSON.stringify(dropCall![0])).not.toContain(RAW_SECRET);
+        expect(JSON.stringify(dropCall![0])).not.toContain(LEAK_CANARY);
       } finally {
         warnSpy.mockRestore();
       }
