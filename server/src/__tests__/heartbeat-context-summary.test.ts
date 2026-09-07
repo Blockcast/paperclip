@@ -2463,3 +2463,165 @@ describe("summarizeHeartbeatRunListResultJson", () => {
     ).toBeNull();
   });
 });
+
+// BLO-23395: PR #1092 sat evicted from the merge queue for 9h13m unnoticed
+// because an un-stageable rebase evicts a queue entry with zero merge_group
+// runs, no failing check, and no comment. `github_pr_merge_queue_evicted` is
+// the wake that closes that gap; these cover the three things that have to
+// hold for it to be useful rather than misleading.
+describe("merge-queue eviction wake (BLO-23395)", () => {
+  const evictionNotice = [
+    "<!-- paperclip:merge-queue-eviction -->",
+    "**Blockcast/paperclip#1092 was removed from the merge queue without merging.**",
+    "Cause: `conflict_unstageable` (0 merge_group runs for this attempt). Refs: BLO-23395",
+  ].join("\n");
+
+  it("surfaces the eviction notice body from the contextSnapshot", () => {
+    // Ally review #1220: the webhook writes githubMergeQueueEvictionBody so
+    // "the woken agent doesn't have to fetch githubEventUrl just to learn
+    // why". That goal is only met once something reads the key.
+    expect(
+      derivePaperclipPrReview({
+        wakeReason: "github_pr_merge_queue_evicted",
+        githubPrNumber: 1092,
+        githubRepoFullName: "Blockcast/paperclip",
+        githubEvent: "issue_comment",
+        prRole: "author",
+        githubMergeQueueEvictionBody: evictionNotice,
+      }),
+    ).toMatchObject({
+      wakeReason: "github_pr_merge_queue_evicted",
+      prNumber: 1092,
+      mergeQueueEvictionBody: evictionNotice,
+    });
+  });
+
+  it("renders an eviction directive with the cause inline, and never the false-findings text", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "BLO-23395",
+        title: "Merge-queue silent eviction has no alert",
+        workMode: null,
+        description: null,
+      },
+      prReview: {
+        wakeReason: "github_pr_merge_queue_evicted",
+        prNumber: 1092,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+        prAuthorLogin: "allyblockcast[bot]",
+        mergeQueueEvictionBody: evictionNotice,
+      },
+    });
+
+    expect(markdown).toContain("GitHub merge-queue eviction directive:");
+    expect(markdown).toContain("was REMOVED from the merge queue without being merged");
+    expect(markdown).toContain("The eviction notice:");
+    expect(markdown).toContain("conflict_unstageable");
+    // No review exists on this wake. It must never reach the review-feedback
+    // directive, which would tell the author a reviewer posted findings and
+    // to push a follow-up commit (the BLO-19522/BLO-20886 damage path).
+    expect(markdown).not.toContain("GitHub PR review feedback directive:");
+    expect(markdown).not.toContain("just posted findings");
+    // Nor the generic author-lifecycle directive, which is true but useless
+    // here -- it says only that no review findings are recorded.
+    expect(markdown).not.toContain("GitHub PR event directive:");
+  });
+
+  it("does not tell the woken agent to rebase a third party's PR (BLO-20886)", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_merge_queue_evicted",
+        prNumber: 1092,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+        // "author-directed" means the PR is owned by this agent's ISSUE; the
+        // PR itself can have a human author, linked only by a BLO- ref.
+        prAuthorLogin: "kkroo",
+        mergeQueueEvictionBody: evictionNotice,
+      },
+    });
+
+    expect(markdown).toContain("GitHub merge-queue eviction directive:");
+    expect(markdown).toContain("NOT by you");
+    expect(markdown).toContain("Do NOT push to its branch or re-enqueue it");
+    expect(markdown).not.toContain("and re-enqueue.");
+  });
+
+  it("points at the event URL when the notice body was not captured", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_merge_queue_evicted",
+        prNumber: 1092,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+        prAuthorLogin: "allyblockcast[bot]",
+        eventUrl: "https://github.com/Blockcast/paperclip/pull/1092#issuecomment-1",
+      },
+    });
+
+    expect(markdown).toContain("GitHub merge-queue eviction directive:");
+    expect(markdown).toContain("eviction notice body was not captured");
+    expect(markdown).toContain("#issuecomment-1");
+  });
+
+  it("drops a cross-PR eviction body on coalesce (BLO-19118)", () => {
+    // The key is registered in GITHUB_PR_CONTEXT_KEYS, so a wake naming a
+    // different PR cannot inherit PR #1092's eviction cause and render it as
+    // PR #1220's.
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1",
+        wakeReason: "github_pr_merge_queue_evicted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1092,
+        githubMergeQueueEvictionBody: evictionNotice,
+        prRole: "author",
+      },
+      {
+        issueId: "issue-1",
+        wakeReason: "github_pr_review_submitted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1220,
+        githubPrReviewBody: "0 Critical / 2 Important.",
+        githubPrReviewAuthorLogin: "allyblockcast[bot]",
+        prRole: "author",
+      },
+    );
+
+    expect(merged.githubPrNumber).toBe(1220);
+    expect(merged.githubMergeQueueEvictionBody).toBeUndefined();
+  });
+
+  it("does not inherit a previous eviction's cause on a same-PR re-eviction", () => {
+    // A PR can be evicted more than once (failing check, fix, then an
+    // un-stageable rebase). Each eviction wake owns the notice block, same
+    // rule as BLO-22229's review-content block -- otherwise a wake whose
+    // notice comment was not captured renders the PRIOR eviction's cause.
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1",
+        wakeReason: "github_pr_merge_queue_evicted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1092,
+        githubMergeQueueEvictionBody: "Cause: `check_failure` (1 failing merge_group run).",
+        prRole: "author",
+      },
+      {
+        issueId: "issue-1",
+        wakeReason: "github_pr_merge_queue_evicted",
+        githubRepoFullName: "Blockcast/paperclip",
+        githubPrNumber: 1092,
+        prRole: "author",
+      },
+    );
+
+    expect(merged.githubMergeQueueEvictionBody).toBeUndefined();
+  });
+});

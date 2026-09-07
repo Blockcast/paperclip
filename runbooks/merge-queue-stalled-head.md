@@ -87,6 +87,32 @@ false eviction). It retries the timeline a few times with a short delay
 first; if the removal still hasn't appeared, it logs a warning and exits
 without posting anything, rather than risk a false notice.
 
+The same holds for a missing `added_to_merge_queue` — the *enqueue* side —
+and this is the case an operator is most likely to trip over (Ally review
+#1220, 5th pass). Timeline replication is one event stream, so the lag that
+hides a dequeue can equally hide the enqueue that preceded it. The detector
+applies the same bounded retry and then **declines to classify**; it does
+*not* fall back to an unbounded `merge_group` lookup. That fallback used to
+exist and was a misclassification vector: `filterMergeGroupRunsForPr` matches
+on PR number, not on time, so an unbounded sample surfaces a *previous*
+attempt's runs and an un-stageable eviction gets reported as `check_failure`
+or `manual` — a confidently wrong cause. `ghMergeGroupRuns` now *requires* a
+bounded `--created` range so that path cannot be reintroduced by a caller
+passing nothing, and `buildRunSearchWindow` throws rather than emitting a
+1970-epoch bound from a `null` `dequeuedAt`.
+
+**Operator consequence:** a declined classification means **no comment and no
+wake for that eviction** — the detector is deliberately choosing a missed
+notification (recoverable) over a wrong cause (not). It is not silent about
+it: the workflow run logs which side was missing. If you find a PR sitting
+evicted with no notice, check that run, then replay by hand once the timeline
+has caught up:
+
+```bash
+gh workflow run merge-queue-eviction-detector.yml \
+  --repo Blockcast/paperclip -f pr_number=<PR> -f comment=true
+```
+
 It then enumerates `merge_group` runs created inside that window
 (`buildRunSearchWindow`, `gh run list --created <window>`), and classifies
 the eviction:
@@ -122,6 +148,30 @@ recognizes that marker (from the `github-actions[bot]` login only — see
 `@ally` review comment does, so the PR author's Paperclip agent is notified
 directly rather than needing a human to notice a GitHub-side artifact. This
 closes the gap for an agent-authored PR, which has no human watching it.
+
+The webhook inlines that comment as `githubMergeQueueEvictionBody`, and the
+woken agent's prompt renders it under a dedicated **"GitHub merge-queue
+eviction directive"** (`heartbeat.ts`) — so the cause is in the prompt and the
+agent does not have to fetch `githubEventUrl` to learn why it was woken. Three
+properties of that directive are load-bearing and covered by tests in
+`server/src/__tests__/heartbeat-context-summary.test.ts`:
+
+- `github_pr_merge_queue_evicted` is deliberately **absent** from
+  `AUTHOR_REVIEW_CONTENT_WAKE_REASONS`. No review exists on this wake, so it
+  must never reach the review-feedback directive's "a reviewer just posted
+  findings on YOUR pull request … push a follow-up commit" text
+  (BLO-19522/BLO-20886). The eviction branch runs ahead of that check.
+- The key is registered in `GITHUB_PR_CONTEXT_KEYS`, so the BLO-19118 cross-PR
+  scrub drops it when a coalesced wake names a **different** PR — otherwise
+  PR #A's eviction cause could render as PR #B's.
+- Each eviction wake owns the key outright (same rule as BLO-22229's
+  review-content block), so a **re-eviction** of the same PR whose notice
+  comment wasn't captured cannot render the *previous* eviction's cause.
+
+"Author-directed" here means the PR is owned by this agent's *issue*; the PR
+itself may have a different author. In that case the directive drops the
+"rebase and re-enqueue" instruction and asks the agent to report on the PR
+instead — pushing to a third party's branch is the BLO-20886 damage path.
 
 ### A fourth eviction cause the detector already gets right, but a human probe won't: `REBASE`-unstageable history
 

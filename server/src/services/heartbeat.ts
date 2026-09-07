@@ -8253,6 +8253,7 @@ const GITHUB_PR_CONTEXT_KEYS = [
   "githubPrReviewRequestBody",
   "githubPrReviewRequestAuthorLogin",
   "githubReviewFeedbackActionable",
+  "githubMergeQueueEvictionBody",
   "prRole",
   "reviewKind",
 ] as const;
@@ -8276,6 +8277,17 @@ const GITHUB_PR_REVIEW_CONTENT_KEYS = [
   "githubReviewFeedbackActionable",
   "githubReviewFeedbackCommentId",
 ] as const;
+
+// BLO-23395: the same instance-ownership rule as BLO-22229 above, for
+// merge-queue evictions. A PR can be evicted from the queue more than once
+// (a failing check, then a fix, then an un-stageable rebase), and each
+// `github_pr_merge_queue_evicted` wake carries the notice for exactly one of
+// those evictions. Without this, an eviction wake whose notice comment could
+// not be captured would inherit the PREVIOUS eviction's body and the
+// directive would state a cause that belongs to a different eviction — the
+// stale-content failure this key was added to avoid, not create.
+const GITHUB_PR_MERGE_QUEUE_EVICTION_WAKE_REASONS = new Set(["github_pr_merge_queue_evicted"]);
+const GITHUB_PR_MERGE_QUEUE_EVICTION_KEYS = ["githubMergeQueueEvictionBody"] as const;
 
 function readGithubPrIdentity(contextSnapshot: Record<string, unknown>) {
   const raw = contextSnapshot.githubPrNumber;
@@ -8450,6 +8462,15 @@ export function mergeCoalescedContextSnapshot(
     incomingWakeReason !== null && GITHUB_PR_REVIEW_INSTANCE_WAKE_REASONS.has(incomingWakeReason);
   if (isNewReviewInstance) {
     for (const key of GITHUB_PR_REVIEW_CONTENT_KEYS) {
+      if (!(key in incoming)) delete merged[key];
+    }
+  }
+  // BLO-23395: each merge-queue-eviction wake owns its notice body outright,
+  // for the same reason a review-instance wake owns the review-content block.
+  const isNewMergeQueueEviction =
+    incomingWakeReason !== null && GITHUB_PR_MERGE_QUEUE_EVICTION_WAKE_REASONS.has(incomingWakeReason);
+  if (isNewMergeQueueEviction) {
+    for (const key of GITHUB_PR_MERGE_QUEUE_EVICTION_KEYS) {
       if (!(key in incoming)) delete merged[key];
     }
   }
@@ -9134,6 +9155,13 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
     reviewAuthorLogin: readNonEmptyString(contextSnapshot.githubPrReviewAuthorLogin),
     requestCommentBody: readNonEmptyString(contextSnapshot.githubPrReviewRequestBody),
     requestCommentAuthorLogin: readNonEmptyString(contextSnapshot.githubPrReviewRequestAuthorLogin),
+    // BLO-23395: the eviction-notice comment posted by
+    // .github/workflows/merge-queue-eviction-detector.yml, inlined by the
+    // webhook on a `github_pr_merge_queue_evicted` wake. Surfacing it here is
+    // what lets the directive state WHY the queue dropped the PR
+    // (conflict/un-stageable vs. failing check vs. manual dequeue) instead of
+    // sending the woken agent to fetch `githubEventUrl` to find out.
+    mergeQueueEvictionBody: readNonEmptyString(contextSnapshot.githubMergeQueueEvictionBody),
     // BLO-9293: the PR author login from the signed webhook (`pull_request.user.login`).
     // Used by the reviewer-output gate to anchor an intentional self-review skip:
     // Ally reviews every PR including ones it authored itself, and GitHub forbids
@@ -10592,6 +10620,46 @@ export function buildPaperclipTaskMarkdown(input: {
       );
       if (prReview.requestCommentBody) {
         lines.push("", "The request comment:", fenceTaskText(prReview.requestCommentBody));
+      }
+    } else if (prReview.wakeReason === "github_pr_merge_queue_evicted") {
+      // BLO-23395: PR #1092 sat evicted from the merge queue for 9h13m
+      // unnoticed. This wake is what closes that gap, so the directive has to
+      // say what happened and what to do — the generic author-lifecycle
+      // directive below would tell the agent only that no review findings
+      // exist, which is true and useless here.
+      //
+      // Deliberately NOT added to AUTHOR_REVIEW_CONTENT_WAKE_REASONS: no
+      // review exists on this wake, so it must never reach the
+      // review-feedback directive's "a reviewer just posted findings"
+      // string. This branch is placed ahead of that allowlist check so the
+      // eviction gets its own text either way, and it renders the notice body
+      // inline so the agent does not have to fetch `githubEventUrl` just to
+      // learn the cause.
+      //
+      // BLO-20886: the wake is author-directed by construction (the webhook
+      // stamps `prRole: "author"` on every PR-shaped wake), but "author-
+      // directed" only means the PR is owned by this agent's ISSUE — the PR
+      // itself can have been authored by someone else, linked only because it
+      // references that issue. Telling that agent to rebase and re-enqueue a
+      // third party's branch is the #953 damage path, so drop the remediation
+      // instruction in that case and route it as a comment instead.
+      const evictionThirdPartyAuthor = resolveThirdPartyPrAuthor(prReview);
+      lines.push(
+        "",
+        "GitHub merge-queue eviction directive:",
+        `Pull request #${prReview.prNumber} was REMOVED from the merge queue without being merged. It is NOT going to land on its own: nothing re-enqueues it, and no failing check may exist to explain the removal (an un-stageable rebase evicts a queue entry with zero \`merge_group\` runs, which is why this notification exists at all).`,
+        "No review has been submitted by this event — do not read it as review findings.",
+        evictionThirdPartyAuthor
+          ? `This PR was authored by ${quoteTaskScalar(evictionThirdPartyAuthor)}, NOT by you — it is linked to you only because it references your issue. Do NOT push to its branch or re-enqueue it. Confirm state with \`gh pr view ${prReview.prNumber} --repo ${prReview.repoFullName ?? "<owner>/<repo>"} --json state,mergeable,mergeStateStatus,mergedAt\`, then say on the PR (or on your issue) that it was evicted and is not landing, so its author can act.`
+          : `Confirm current state, then act: \`gh pr view ${prReview.prNumber} --repo ${prReview.repoFullName ?? "<owner>/<repo>"} --json state,mergeable,mergeStateStatus,mergedAt\`. If the cause below is a conflict or un-stageable rebase, rebase the branch (on a REBASE-method queue do NOT merge the base branch in — that makes it less landable, see runbooks/merge-queue-stalled-head.md) and re-enqueue. If it is a failing check, fix the check first. If it was a manual dequeue, find out why before re-enqueueing.`,
+      );
+      if (prReview.mergeQueueEvictionBody) {
+        lines.push("", "The eviction notice:", fenceTaskText(prReview.mergeQueueEvictionBody));
+      } else if (prReview.eventUrl) {
+        lines.push(
+          "",
+          `The eviction notice body was not captured on this wake; read it at ${prReview.eventUrl}.`,
+        );
       }
     } else if (prReview.prRole === "author" && !AUTHOR_REVIEW_CONTENT_WAKE_REASONS.has(prReview.wakeReason)) {
       // BLO-20886 generalizes the BLO-19522 branch above. That branch names one

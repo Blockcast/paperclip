@@ -138,10 +138,27 @@ export function selectLatestQueueAttemptWindow(timelineEvents, { now }) {
  * Formats a `gh run list --created` range around the attempt window, with a
  * buffer on each side for clock skew between the queue staging a run and the
  * timeline event landing.
+ *
+ * Ally review #1220 (5th pass): throws rather than silently emitting a
+ * 1970-epoch bound. `selectLatestQueueAttemptWindow` can legitimately return
+ * `dequeuedAt: null`, and `new Date(null).getTime()` is `0` -- so the old
+ * version turned "no removal observed yet" into a range ending in 1970, which
+ * matches no runs and reads as a genuine zero-run (`conflict_unstageable`)
+ * result. `main` guards this case, but the two are exported independently and
+ * a caller that skips the guard must fail loudly, not classify from a bogus
+ * window.
  */
 export function buildRunSearchWindow({ enqueuedAt, dequeuedAt }, bufferMs = WINDOW_BUFFER_MS) {
-  const since = new Date(new Date(enqueuedAt).getTime() - bufferMs).toISOString();
-  const until = new Date(new Date(dequeuedAt).getTime() + bufferMs).toISOString();
+  const enqueuedMs = new Date(enqueuedAt).getTime();
+  const dequeuedMs = new Date(dequeuedAt).getTime();
+  if (!Number.isFinite(enqueuedMs) || !Number.isFinite(dequeuedMs) || dequeuedAt === null) {
+    throw new TypeError(
+      `buildRunSearchWindow requires a complete attempt window; got enqueuedAt=${JSON.stringify(enqueuedAt)} ` +
+        `dequeuedAt=${JSON.stringify(dequeuedAt)}`,
+    );
+  }
+  const since = new Date(enqueuedMs - bufferMs).toISOString();
+  const until = new Date(dequeuedMs + bufferMs).toISOString();
   return `${since}..${until}`;
 }
 
@@ -223,18 +240,30 @@ function ghTimeline(repo, prNumber) {
 }
 
 function ghMergeGroupRuns(repo, createdRange) {
+  // Ally review #1220: bounding by the specific queue attempt's time window
+  // (rather than an unbounded newest-500 sample) is what keeps this correct
+  // on a busy repo -- the run this PR actually cares about can't fall off
+  // the end of a window it's known to have run inside.
+  //
+  // Ally review #1220 (5th pass): the range is REQUIRED, not optional. An
+  // unbounded lookup can surface a previous queue attempt's runs, which
+  // `filterMergeGroupRunsForPr` cannot tell apart from this attempt's (it
+  // filters on PR number, not on time), so it reports another attempt's
+  // outcome as this eviction's cause. `main` declines to classify rather
+  // than fall back to one; keep that the only behaviour by refusing here
+  // too, so the unbounded path cannot be reintroduced by a caller passing
+  // nothing.
+  if (typeof createdRange !== "string" || createdRange.length === 0) {
+    throw new TypeError("ghMergeGroupRuns requires a bounded --created range");
+  }
   const args = [
     "gh", "run", "list",
     "--repo", repo,
     "--event", "merge_group",
     "--limit", String(RUN_LIST_LIMIT),
     "--json", "databaseId,headBranch,status,conclusion,createdAt",
+    "--created", createdRange,
   ];
-  // Ally review #1220: bounding by the specific queue attempt's time window
-  // (rather than an unbounded newest-500 sample) is what keeps this correct
-  // on a busy repo -- the run this PR actually cares about can't fall off
-  // the end of a window it's known to have run inside.
-  if (createdRange) args.push("--created", createdRange);
   const out = run(args);
   return JSON.parse(out);
 }
@@ -336,15 +365,43 @@ async function main() {
   // anchored to has no observed removal yet -- the /timeline endpoint may
   // simply not have replicated the dequeue that triggered this run. Retry a
   // few times before declining to classify; never fabricate a timestamp.
+  //
+  // Ally review #1220 (5th pass): the retry must also cover a missing
+  // *enqueue* (`attemptWindow === null`), not just a missing removal. Timeline
+  // replication lag is one event stream, so the same lag that hides the
+  // dequeue can hide the `added_to_merge_queue` that preceded it. The old
+  // condition was `attemptWindow && attemptWindow.dequeuedAt === null`, which
+  // is false on entry when the window is null -- so a real `dequeued` trigger
+  // with a lagging timeline skipped both the retry and the guard below and
+  // fell through to an UNBOUNDED `merge_group` lookup. A previous queue
+  // attempt's runs then matched `filterMergeGroupRunsForPr`'s PR-number
+  // filter, and an un-stageable eviction was reported as `check_failure` or
+  // `manual` -- exactly the cross-attempt contamination the windowed path was
+  // introduced to fix.
   for (
     let attempt = 0;
-    attemptWindow && attemptWindow.dequeuedAt === null && attempt < DEQUEUE_REPLICATION_RETRIES;
+    attempt < DEQUEUE_REPLICATION_RETRIES && (attemptWindow === null || attemptWindow.dequeuedAt === null);
     attempt += 1
   ) {
     await new Promise((resolve) => setTimeout(resolve, DEQUEUE_REPLICATION_RETRY_DELAY_MS));
     attemptWindow = selectLatestQueueAttemptWindow(ghTimeline(repo, prNumber), { now: triggeredAt });
   }
-  if (attemptWindow && attemptWindow.dequeuedAt === null) {
+  if (attemptWindow === null) {
+    // No `added_to_merge_queue` event ever became visible, so there is no
+    // attempt to bound the run lookup to. Declining is the only sound
+    // outcome: classifying from an unbounded lookup would draw on whichever
+    // earlier attempt's runs happen to still be in range and report a cause
+    // that belongs to a different attempt. A missed notification is
+    // recoverable (re-run the workflow manually once the timeline catches
+    // up); a confidently wrong cause is not.
+    console.error(
+      `${repo}#${prNumber} has no observed added_to_merge_queue event after ${DEQUEUE_REPLICATION_RETRIES} retries; ` +
+        "declining to classify rather than classifying from an unbounded lookup that could report a previous " +
+        "attempt's outcome. Re-run manually once the timeline has caught up.",
+    );
+    return;
+  }
+  if (attemptWindow.dequeuedAt === null) {
     console.error(
       `${repo}#${prNumber}'s queue attempt enqueued at ${attemptWindow.enqueuedAt} still has no observed ` +
         `removed_from_merge_queue event after ${DEQUEUE_REPLICATION_RETRIES} retries; declining to classify ` +
@@ -353,20 +410,7 @@ async function main() {
     return;
   }
 
-  let allRuns;
-  if (attemptWindow) {
-    allRuns = ghMergeGroupRuns(repo, buildRunSearchWindow(attemptWindow));
-  } else {
-    // No added_to_merge_queue event on this PR's timeline at all -- can't
-    // bound the search to a specific attempt. Fall back to an unbounded
-    // (but still capped) lookup; hitting the cap here is treated as
-    // truncation below, same as the windowed path.
-    console.error(
-      `warning: no added_to_merge_queue event found on ${repo}#${prNumber}'s timeline; ` +
-        "falling back to an unbounded merge_group run lookup",
-    );
-    allRuns = ghMergeGroupRuns(repo, null);
-  }
+  const allRuns = ghMergeGroupRuns(repo, buildRunSearchWindow(attemptWindow));
   const truncated = allRuns.length >= RUN_LIST_LIMIT;
 
   const mergeGroupRuns = filterMergeGroupRunsForPr(allRuns, { base: pr.baseRefName, prNumber });

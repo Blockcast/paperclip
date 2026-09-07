@@ -182,6 +182,41 @@ test("buildRunSearchWindow buffers the window by 5 minutes on each side", () => 
   assert.equal(range, "2026-08-08T09:19:35.000Z..2026-08-08T14:00:45.000Z");
 });
 
+test("buildRunSearchWindow throws on an incomplete window instead of emitting a 1970 bound (Ally review #1220, 5th pass)", () => {
+  // `selectLatestQueueAttemptWindow` legitimately returns `dequeuedAt: null`
+  // for "enqueue found, no removal observed yet", and `new Date(null)` is the
+  // epoch -- so the old implementation produced a range ending in 1970, which
+  // matches no runs and reads as a genuine zero-run result, i.e. a false
+  // `conflict_unstageable`. Failing loudly is the only safe behaviour for a
+  // caller that skipped main()'s guard.
+  assert.throws(
+    () => buildRunSearchWindow({ enqueuedAt: "2026-08-08T09:24:35.000Z", dequeuedAt: null }),
+    /complete attempt window/,
+  );
+  assert.throws(
+    () => buildRunSearchWindow({ enqueuedAt: "not-a-date", dequeuedAt: "2026-08-08T13:55:45.000Z" }),
+    /complete attempt window/,
+  );
+});
+
+test("a null attempt window is never classifiable: selectLatestQueueAttemptWindow -> buildRunSearchWindow refuses (Ally review #1220, 5th pass)", () => {
+  // The missing-*enqueue* case. A real `dequeued` trigger whose timeline has
+  // not replicated the `added_to_merge_queue` yet yields a null window; the
+  // detector used to skip both the replication retry and the guard and fall
+  // through to an UNBOUNDED merge_group lookup, where a PREVIOUS attempt's
+  // runs match the PR-number filter and the eviction is reported as
+  // `check_failure`/`manual` instead of `conflict_unstageable`. There is no
+  // window to search, and this asserts the type-level fact that makes the
+  // unbounded fallback unreachable: nothing downstream can build a range
+  // from `null`.
+  const window = selectLatestQueueAttemptWindow(
+    [{ event: "removed_from_merge_queue", created_at: "2026-08-08T13:55:45Z" }],
+    { now: Date.parse("2026-08-08T14:00:00Z") },
+  );
+  assert.equal(window, null);
+  assert.throws(() => buildRunSearchWindow(window ?? { enqueuedAt: null, dequeuedAt: null }), TypeError);
+});
+
 test("extractPaperclipIdentifiers finds a ref in the branch name when title/body carry none (Ally review #1220, 4th pass)", () => {
   // The webhook's issue_comment handler has no branch name to fall back on;
   // this is the detector's own safety net -- embed the ref straight into the

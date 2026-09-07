@@ -62,6 +62,17 @@ jobs:
       - name: Resolve trigger timestamp
         id: trigger_time
         if: github.event_name == 'pull_request'
+        # Ally review #1220 (5th pass): this step is an OPTIMISATION, not a
+        # prerequisite -- the script documents and implements a `Date.now()`
+        # fallback when `--triggered-at` is missing or unparseable. Without
+        # continue-on-error a transient `gh api` failure (rate limit, 5xx)
+        # exits non-zero under the default `bash -e`, fails the job, and the
+        # classify/notify step below never runs. That is a silent total loss
+        # of the notification for that eviction -- precisely the BLO-23395
+        # failure class this workflow exists to close, since a dequeued PR is
+        # not a surface anyone is watching for a red workflow run. Degrade to
+        # the designed fallback instead of losing the alert.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
