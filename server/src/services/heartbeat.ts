@@ -153,6 +153,7 @@ import {
   documentAnnotationThreads,
   documentRevisions,
   issueDocuments,
+  environmentLeases,
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -421,6 +422,9 @@ import {
   recordExternalLifecycleRunSilenceGap,
   recordPrReviewQueueWait,
   setAgentLivenessMetrics,
+  setReleasePendingExternalRuntimeReservationMetrics,
+  setOrphanedEnvironmentLeaseMetrics,
+  setOrphanedRuntimeResourceMetricsRefreshSuccess,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
@@ -12028,6 +12032,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         failureReason: `${failedLeases.length} environment lease(s) left unreleased`,
       };
     }
+
+    // A runtime driver can silently skip a row (for example when its
+    // environment disappeared from the provider inventory) without
+    // returning an error. Verify the database state so callers never count
+    // an active lease as successfully released just because the provider
+    // returned an empty result.
+    let remainingActiveLease: { id: string } | undefined;
+    try {
+      remainingActiveLease = await db
+        .select({ id: environmentLeases.id })
+        .from(environmentLeases)
+        .where(
+          and(
+            eq(environmentLeases.heartbeatRunId, input.runId),
+            eq(environmentLeases.status, "active"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0]);
+    } catch (err) {
+      logger.warn(
+        { err, runId: input.runId },
+        "failed to verify environment lease release for heartbeat run",
+      );
+      return {
+        fullyReleased: false,
+        failureReason: `environment lease release verification failed: ${describeRecoveryError(err)}`,
+      };
+    }
+    if (remainingActiveLease) {
+      logger.warn(
+        { leaseId: remainingActiveLease.id, runId: input.runId },
+        "environment lease remains active after release attempt for heartbeat run",
+      );
+      return {
+        fullyReleased: false,
+        failureReason: "one or more environment leases remain active after release",
+      };
+    }
+
     return { fullyReleased: true, failureReason: null };
   }
 
@@ -22726,9 +22770,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cleanedRunIds;
   }
 
+  // BLO-21460 (Ally important 1): per-row failures in the two reconcilers below
+  // are counted here rather than thrown, so one bad row cannot strand the rest
+  // of the backlog or unwind the heartbeat tick. A non-zero count clears the
+  // `paperclip_orphaned_runtime_resource_metrics_refresh_success` gauge, which
+  // is the arm PaperclipRuntimeResourceReconciliationStuck pages on — so a
+  // partial sweep is still loudly visible without costing the ~10 later
+  // kube-independent stages of the same tick.
+  type RuntimeResourceReconciliationFailures = { failedRowCount: number };
+
   async function reconcileReleasePendingExternalRuntimeReservations(
     jobRunStatuses: Map<string, AgentJobRunStatus> | null,
     ambiguousRunIds: ReadonlySet<string> = new Set(),
+    onlyRunId?: string,
+    failures: RuntimeResourceReconciliationFailures = { failedRowCount: 0 },
   ) {
     const pending = await db
       .select({
@@ -22740,6 +22795,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(
         and(
           isNull(externalRuntimeReservations.releasedAt),
+          onlyRunId ? eq(externalRuntimeReservations.runId, onlyRunId) : undefined,
           or(
             eq(externalRuntimeReservations.state, "release_pending"),
             and(
@@ -22783,71 +22839,218 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ),
       );
     for (const { reservation, runStatus } of pending) {
-      if (activeRunExecutions.has(reservation.runId)) continue;
-      if (ambiguousRunIds.has(reservation.runId)) continue;
-      const observed = jobRunStatuses?.get(reservation.runId) ?? null;
-      const launchedIdentityMatches = Boolean(
-        reservation.jobName
-        && reservation.jobUid
-        && observed?.name === reservation.jobName
-        && observed.uid === reservation.jobUid,
-      );
-      if (observed && reservation.jobName && !launchedIdentityMatches) {
-        logger.error(
-          { reservationId: reservation.id, runId: reservation.runId, observed },
-          "refusing reservation release because observed Job identity does not match",
+      // BLO-21460 (Ally important 1): isolate per-row failures. The release
+      // write below can reject on transient pool or serialization errors, and
+      // a deterministic single-row failure would otherwise abort the rest of
+      // this pass's backlog on every pass. Worse, the throw escapes
+      // reapOrphanedRuns to the terminal catch in index.ts, skipping the ~10
+      // later kube-independent stages of the tick chain. Report partial
+      // failure through the freshness gauge instead of unwinding.
+      try {
+        if (activeRunExecutions.has(reservation.runId)) continue;
+        if (ambiguousRunIds.has(reservation.runId)) continue;
+        const observed = jobRunStatuses?.get(reservation.runId) ?? null;
+        const launchedIdentityMatches = Boolean(
+          reservation.jobName
+          && reservation.jobUid
+          && observed?.name === reservation.jobName
+          && observed.uid === reservation.jobUid,
         );
-        continue;
-      }
-      if (observed?.phase === "active") continue;
+        if (observed && reservation.jobName && !launchedIdentityMatches) {
+          logger.error(
+            { reservationId: reservation.id, runId: reservation.runId, observed },
+            "refusing reservation release because observed Job identity does not match",
+          );
+          continue;
+        }
+        if (observed?.phase === "active") continue;
 
-      let terminalOrMissing = launchedIdentityMatches;
-      const jobName = reservation.jobName ?? reservation.expectedJobName;
-      const isolationSetupGraceActive =
-        !jobName &&
-        (reservation.isolationMode === "shared" || reservation.isolationMode === "workspace") &&
-        Date.now() - new Date(reservation.updatedAt).getTime() < EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS;
-      if (isolationSetupGraceActive) continue;
-      // Both bundled external adapters await onMeta before createNamespacedJob.
-      // onMeta persists expectedJobName, so no name is durable proof that Job
-      // creation was never crossed, even if the dispatcher crashed afterward.
-      if (!jobName && externalRuntimeReservationCanRelease(reservation, null, true)) {
-        terminalOrMissing = true;
-      }
-      if (!terminalOrMissing && jobName) {
-        const exact = await readAgentJobRunStatusByName(jobName);
-        terminalOrMissing = Boolean(
-          exact
-          && exact.phase !== "active"
-          && (
-            !reservation.jobUid
-            || exact.phase === "missing"
-            || exact.uid === reservation.jobUid
-          ),
-        );
-      }
-      if (!terminalOrMissing) continue;
+        let terminalOrMissing = launchedIdentityMatches;
+        const jobName = reservation.jobName ?? reservation.expectedJobName;
+        const isolationSetupGraceActive =
+          !jobName &&
+          (reservation.isolationMode === "shared" || reservation.isolationMode === "workspace") &&
+          Date.now() - new Date(reservation.updatedAt).getTime() < EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS;
+        if (isolationSetupGraceActive) continue;
+        // Both bundled external adapters await onMeta before createNamespacedJob.
+        // onMeta persists expectedJobName, so no name is durable proof that Job
+        // creation was never crossed, even if the dispatcher crashed afterward.
+        if (!jobName && externalRuntimeReservationCanRelease(reservation, null, true)) {
+          terminalOrMissing = true;
+        }
+        if (!terminalOrMissing && jobName) {
+          const exact = await readAgentJobRunStatusByName(jobName);
+          terminalOrMissing = Boolean(
+            exact
+            && exact.phase !== "active"
+            && (
+              !reservation.jobUid
+              || exact.phase === "missing"
+              || exact.uid === reservation.jobUid
+            ),
+          );
+        }
+        if (!terminalOrMissing) continue;
 
-      const terminalPrelaunchOrphan =
-        reservation.state === "reserved" || reservation.state === "launching";
-      const released = await releaseExternalRuntimeReservation(db, {
-        runId: reservation.runId,
-        reason:
-          reservation.releaseReason ??
-          (terminalPrelaunchOrphan ? "terminal_prelaunch_orphan" : "job_terminal_or_missing"),
-      });
-      if (released && terminalPrelaunchOrphan) {
+        const terminalPrelaunchOrphan =
+          reservation.state === "reserved" || reservation.state === "launching";
+        const released = await releaseExternalRuntimeReservation(db, {
+          runId: reservation.runId,
+          reason:
+            reservation.releaseReason ??
+            (terminalPrelaunchOrphan ? "terminal_prelaunch_orphan" : "job_terminal_or_missing"),
+        });
+        if (released && terminalPrelaunchOrphan) {
+          logger.warn(
+            {
+              reservationId: reservation.id,
+              runId: reservation.runId,
+              runStatus,
+              reservationState: reservation.state,
+            },
+            "released prelaunch external-runtime reservation left behind by terminal run",
+          );
+        }
+      } catch (error) {
+        failures.failedRowCount += 1;
         logger.warn(
           {
             reservationId: reservation.id,
             runId: reservation.runId,
-            runStatus,
-            reservationState: reservation.state,
+            error: error instanceof Error ? error.message : String(error),
           },
-          "released prelaunch external-runtime reservation left behind by terminal run",
+          "reconcileReleasePendingExternalRuntimeReservations: skipping reservation after per-row failure",
         );
       }
     }
+  }
+
+  // BLO-21460: environment leases have no DB trigger tying them to
+  // heartbeat_runs.status (unlike external-runtime reservations — see the
+  // migration 0128 trigger) and, before this ticket, no reconciliation path
+  // at all independent of the run's own finalize `finally` block. A lease
+  // left `active` by a crash between `setRunStatus(...cancelled)` and that
+  // block never gets a second chance without this sweep.
+  async function reconcileOrphanedEnvironmentLeases(
+    failures: RuntimeResourceReconciliationFailures = { failedRowCount: 0 },
+  ) {
+    const orphanedRows = await db
+      .select({
+        runId: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        adapterType: agents.adapterType,
+        status: heartbeatRuns.status,
+        error: heartbeatRuns.error,
+      })
+      .from(environmentLeases)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
+      .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+      .where(
+        and(
+          eq(environmentLeases.status, "active"),
+          inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+        ),
+      );
+
+    const uniqueRuns = new Map<string, (typeof orphanedRows)[number]>();
+    for (const row of orphanedRows) uniqueRuns.set(row.runId, row);
+
+    let releasedRunCount = 0;
+    for (const run of uniqueRuns.values()) {
+      // BLO-21460 (Ally important 1): same per-row isolation as the
+      // reservation sweep above — one rejecting row must not strand the
+      // remaining orphaned leases, nor unwind the whole heartbeat tick.
+      try {
+        // A run finalizing right now in this process releases its own leases
+        // in its `finally` block; racing it here risks acting on a status
+        // snapshot from just before that block runs. Let it win.
+        if (activeRunExecutions.has(run.runId)) continue;
+        if (hasExternalLifecycle(run.adapterType)) {
+          // Background Job deletion does not prove that the Job or its
+          // run-labelled pods have stopped. Reuse the same fail-closed probe as
+          // cancellation: an active or unobservable external runtime keeps the
+          // lease until a later reconciliation pass can prove quiescence.
+          const externalRuntimeQuiesced = await confirmStaleKilledJobQuiesced({ id: run.runId });
+          if (!externalRuntimeQuiesced) continue;
+        }
+        const releaseResult = await releaseEnvironmentLeasesForRun({
+          runId: run.runId,
+          companyId: run.companyId,
+          agentId: run.agentId,
+          status: run.status,
+          failureReason: run.error ?? undefined,
+        });
+        if (releaseResult.fullyReleased) releasedRunCount += 1;
+      } catch (error) {
+        failures.failedRowCount += 1;
+        logger.warn(
+          {
+            runId: run.runId,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          "reconcileOrphanedEnvironmentLeases: skipping run after per-row failure",
+        );
+      }
+    }
+
+    return releasedRunCount;
+  }
+
+  // BLO-21460: observability for the backlog reconciliation could NOT clear
+  // this pass. Measured AFTER reconcileReleasePendingExternalRuntimeReservations
+  // / reconcileOrphanedEnvironmentLeases run (see reapOrphanedRuns), so a
+  // healthy fleet reads 0 on both gauges; a sustained non-zero reading means
+  // reconciliation itself is stuck (scheduler down, kube API unreachable) and
+  // capacity is leaking, not that a normal in-flight resource exists.
+  async function refreshOrphanedRuntimeResourceMetrics(now = new Date()) {
+    const [releasePendingSnapshot] = await db
+      .select({
+        count: sql<number>`count(*)`,
+        oldestUpdatedAt: sql<Date | null>`min(${externalRuntimeReservations.updatedAt})`,
+      })
+      .from(externalRuntimeReservations)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, externalRuntimeReservations.runId))
+      .where(
+        and(
+          isNull(externalRuntimeReservations.releasedAt),
+          or(
+            eq(externalRuntimeReservations.state, "release_pending"),
+            and(
+              inArray(externalRuntimeReservations.state, ["reserved", "launching", "launched"]),
+              inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+            ),
+          ),
+        ),
+      );
+    const releasePendingOldestMs = releasePendingSnapshot?.oldestUpdatedAt
+      ? new Date(releasePendingSnapshot.oldestUpdatedAt).getTime()
+      : now.getTime();
+    setReleasePendingExternalRuntimeReservationMetrics({
+      count: Number(releasePendingSnapshot?.count ?? 0),
+      oldestAgeSeconds: Math.max(0, (now.getTime() - releasePendingOldestMs) / 1000),
+    });
+
+    const [orphanedLeaseSnapshot] = await db
+      .select({
+        count: sql<number>`count(*)`,
+        oldestAcquiredAt: sql<Date | null>`min(${environmentLeases.acquiredAt})`,
+      })
+      .from(environmentLeases)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
+      .where(
+        and(
+          eq(environmentLeases.status, "active"),
+          inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+        ),
+      );
+    const orphanedLeaseOldestMs = orphanedLeaseSnapshot?.oldestAcquiredAt
+      ? new Date(orphanedLeaseSnapshot.oldestAcquiredAt).getTime()
+      : now.getTime();
+    setOrphanedEnvironmentLeaseMetrics({
+      active: Number(orphanedLeaseSnapshot?.count ?? 0),
+      oldestAgeSeconds: Math.max(0, (now.getTime() - orphanedLeaseOldestMs) / 1000),
+    });
   }
 
   async function cleanupManagedJobsWithoutRun(now: Date, inventory?: Awaited<ReturnType<typeof listManagedAgentJobs>>) {
@@ -23281,7 +23484,68 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const cleanedTerminalJobRunIds = await cleanupTerminalExternalLifecycleJobs(jobRunStatuses, now);
     reaped.push(...cleanedTerminalJobRunIds);
-    await reconcileReleasePendingExternalRuntimeReservations(jobRunStatuses, ambiguousExternalRunIds);
+    // BLO-21460: the two reconcilers below can throw (both reach the kube API
+    // via confirmStaleKilledJobQuiesced). The backlog refresh must still run,
+    // because prom-client gauges retain their last value: skipping it leaves
+    // all four series frozen at their previous — normally healthy `0` —
+    // reading while the process stays up, so `up`-based arms of
+    // PaperclipRuntimeResourceReconciliationStuck cannot compensate and the
+    // alert goes blind during exactly the outage it exists to catch. Refresh
+    // in `finally`, and publish the freshness gauge so a stale 0 is
+    // distinguishable from a measured 0.
+    //
+    // The freshness gauge reports the whole pass, not just the refresh: a
+    // sweep that threw early can leave a genuinely-empty backlog measuring 0
+    // while reconciliation is broken, which reads healthy on the count arms.
+    //
+    // BLO-21460 (Ally important 1): the error is NOT re-raised. Each loop now
+    // isolates its own rows, so reaching this catch means the sweep failed
+    // structurally (e.g. the initial backlog SELECT rejected) rather than on
+    // one row. Propagating it escaped reapOrphanedRuns to the terminal catch
+    // in index.ts and skipped every later stage of the tick —
+    // promoteDueScheduledRetries, resumeQueuedRuns,
+    // reconcileStrandedAssignedIssues, reconcileIssueGraphLiveness,
+    // reconcileTaskWatchdogs, scanSilentActiveRuns,
+    // reconcileProductivityReviews, reconcileResolvedBlockerDependents,
+    // reconcileFailedWakeDispatches and the BLO-21995 reviewer-wake replay —
+    // none of which needs the kube API or these tables. The freshness gauge
+    // below is the designed signal for this failure, so swallowing here loses
+    // no alerting while keeping nine unrelated recovery passes alive.
+    let reconciliationSweepSucceeded = false;
+    const reconciliationFailures: RuntimeResourceReconciliationFailures = { failedRowCount: 0 };
+    try {
+      await reconcileReleasePendingExternalRuntimeReservations(
+        jobRunStatuses,
+        ambiguousExternalRunIds,
+        undefined,
+        reconciliationFailures,
+      );
+      await reconcileOrphanedEnvironmentLeases(reconciliationFailures);
+      reconciliationSweepSucceeded = reconciliationFailures.failedRowCount === 0;
+    } catch (error) {
+      reconciliationSweepSucceeded = false;
+      logger.error(
+        { error: error instanceof Error ? error.message : String(error) },
+        "reapOrphanedRuns: runtime-resource reconciliation sweep failed; backlog gauges will read stale and the freshness arm will page",
+      );
+    } finally {
+      try {
+        await refreshOrphanedRuntimeResourceMetrics(now);
+        setOrphanedRuntimeResourceMetricsRefreshSuccess(reconciliationSweepSucceeded);
+        if (reconciliationFailures.failedRowCount > 0) {
+          logger.warn(
+            { failedRowCount: reconciliationFailures.failedRowCount },
+            "reapOrphanedRuns: runtime-resource reconciliation completed with per-row failures; backlog may not have drained",
+          );
+        }
+      } catch (error) {
+        setOrphanedRuntimeResourceMetricsRefreshSuccess(false);
+        logger.warn(
+          { error: error instanceof Error ? error.message : String(error) },
+          "reapOrphanedRuns: orphaned runtime-resource backlog refresh failed; gauges are stale",
+        );
+      }
+    }
     const liveJobRunIds =
       jobRunStatuses !== null
         ? new Set(
@@ -35653,10 +35917,78 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cancelledRuns.length;
   }
 
+  // BLO-21460: cancellation must idempotently release the run's external
+  // runtime reservation and ephemeral environment lease even when the
+  // process that issued `setRunStatus(..., "cancelled")` crashes before
+  // reaching that cleanup, or when a caller retries cancel on a run that is
+  // already terminal. Both underlying releases are themselves idempotent
+  // (`releaseEnvironmentLeasesForRun` only touches `status = 'active'` rows;
+  // `reconcileReleasePendingExternalRuntimeReservations` only touches
+  // `released_at IS NULL` rows and re-verifies the Job is gone/terminal
+  // before releasing), so calling this repeatedly for the same run is safe
+  // and is exactly how retry/recovery is expected to work — see the
+  // 2026-08-03 incident this ticket follows up. Scoped to a single run
+  // (`onlyRunId`) rather than a full `reapOrphanedRuns` sweep so a cancel
+  // reconciles its own resources without paying for (or racing) a
+  // namespace-wide reservation/Job inventory scan.
+  async function releaseCancelledRunRuntimeResources(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId">,
+    agent: Pick<typeof agents.$inferSelect, "adapterType"> | null,
+    status: string,
+    failureReason?: string | null,
+    options: { externalRuntimeQuiesced?: boolean } = {},
+  ) {
+    // Background Job deletion does not prove that the pod has stopped. Keep
+    // the lease held until the exact Job and its run-labelled pods are
+    // quiescent; the periodic reconciler will retry this path if observation
+    // is unavailable.
+    if (agent && hasExternalLifecycle(agent.adapterType) && options.externalRuntimeQuiesced === false) {
+      logger.warn(
+        { runId: run.id },
+        "cancelRun: retaining environment lease until external-runtime Job quiesces",
+      );
+      return;
+    }
+    await releaseEnvironmentLeasesForRun({
+      runId: run.id,
+      companyId: run.companyId,
+      agentId: run.agentId,
+      status,
+      failureReason: failureReason ?? undefined,
+    });
+
+    if (agent && hasExternalLifecycle(agent.adapterType)) {
+      try {
+        await reconcileReleasePendingExternalRuntimeReservations(null, undefined, run.id);
+      } catch (error) {
+        logger.warn(
+          { runId: run.id, error: error instanceof Error ? error.message : String(error) },
+          "cancelRun: external-runtime reservation reconciliation failed (will retry on next sweep or cancel)",
+        );
+      }
+    }
+  }
+
   async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
     const run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
-    if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
+    if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) {
+      // Already terminal — most likely a repeated cancel call, or a retry
+      // after a crash between the first call's status update and its
+      // cleanup. Heal any leftover reservation/lease instead of no-op'ing:
+      // this is the only path a stuck resource from a *previous* cancel gets
+      // another chance before the next reconciliation sweep.
+      if (HEARTBEAT_RUN_TERMINAL_STATUSES.includes(run.status as (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number])) {
+        const terminalAgent = await getAgent(run.agentId);
+        const externalRuntimeQuiesced = !terminalAgent || !hasExternalLifecycle(terminalAgent.adapterType)
+          ? true
+          : await confirmStaleKilledJobQuiesced(run);
+        await releaseCancelledRunRuntimeResources(run, terminalAgent, run.status, run.error, {
+          externalRuntimeQuiesced,
+        });
+      }
+      return run;
+    }
     const agent = await getAgent(run.agentId);
     const errorCode = options.errorCode ?? "cancelled";
     const resultJson = agent
@@ -35709,7 +36041,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         message: options.eventMessage ?? "run cancelled",
         ...(options.eventPayload ? { payload: options.eventPayload } : {}),
       });
-      await releaseIssueExecutionAndPromote(cancelled);
       if (agent && hasExternalLifecycle(agent.adapterType)) {
         // BLO-20815: additive-only telemetry (see finalizeExternalLifecycleTerminalRun).
         recordExternalLifecycleRunSilenceGap({
@@ -35729,11 +36060,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // before dispatching another run: the dispatcher may release the terminal
     // run's reservation, which is the durable name/UID identity required for
     // safe deletion. Best-effort.
+    let externalRuntimeQuiesced = true;
     if (agent && hasExternalLifecycle(agent.adapterType)) {
+      externalRuntimeQuiesced = false;
       try {
         const deleted = await deleteExactExternalRuntimeJob(run);
+        // "mismatch" also covers the benign no-reservation case. Let the
+        // independent Job/pod probe decide quiescence rather than treating
+        // that result as an automatic failure.
+        externalRuntimeQuiesced = await confirmStaleKilledJobQuiesced(run);
         logger.info(
-          { runId: run.id, deletionResult: deleted },
+          { runId: run.id, deletionResult: deleted, externalRuntimeQuiesced },
           "cancelRun: cascaded Job deletion for external-lifecycle adapter",
         );
       } catch (error) {
@@ -35742,10 +36079,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "cancelRun: cascade Job delete failed (run still finalized as cancelled)",
         );
       }
+
+      await releaseCancelledRunRuntimeResources(cancelled ?? run, agent, "cancelled", reason, {
+        externalRuntimeQuiesced,
+      });
+    } else {
+      await releaseCancelledRunRuntimeResources(cancelled ?? run, agent, "cancelled", reason);
+    }
+
+    if (cancelled) {
+      // BLO-21460: release this run's issue execution lock even while the
+      // runtime drains, but do NOT promote a successor into an environment the
+      // cancelled Job still occupies. `releaseIssueExecutionAndPromote` ends in
+      // `startNextQueuedRunForAgent`, so it dispatches rather than merely
+      // unlocking — running it before the quiescence probe raced a successor
+      // against the surviving Job, and the gate below could not retract it.
+      // On non-quiescence the reconciler retries cleanup and a later
+      // scheduling tick promotes the deferred wake.
+      await releaseIssueExecutionAndPromote(cancelled, {
+        suppressPromotion: !externalRuntimeQuiesced,
+      });
     }
 
     await finalizeAgentStatus(run.agentId, "cancelled");
-    await startNextQueuedRunForAgent(run.agentId);
+    // A still-running external Job keeps the agent's execution environment
+    // occupied. Dispatch only after quiescence; the reconciler will retry
+    // cleanup and the next scheduling tick can then promote queued work.
+    if (externalRuntimeQuiesced) {
+      await startNextQueuedRunForAgent(run.agentId);
+    }
     return cancelled;
   }
 
@@ -35800,8 +36162,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           processGroupId: run.processGroupId,
         });
       }
-      await releaseIssueExecutionAndPromote(run);
-
       // Mirrors the cascade in cancelRunInternal — bulk agent cancel must
       // also release the k8s Job slot for external-lifecycle runs.
       if (agent && hasExternalLifecycle(agent.adapterType)) {
@@ -35818,6 +36178,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
       }
+
+      // BLO-21460: same idempotent lease + reservation release as
+      // cancelRunInternal — see releaseCancelledRunRuntimeResources.
+      let externalRuntimeQuiesced = true;
+      if (agent && hasExternalLifecycle(agent.adapterType)) {
+        externalRuntimeQuiesced = false;
+        try {
+          externalRuntimeQuiesced = await confirmStaleKilledJobQuiesced(run);
+        } catch (error) {
+          // Fail closed for THIS run and keep cancelling the rest. The
+          // reachable rejection source is the probe's DB read — its two kube
+          // reads (readAgentJobRunStatusByName, listManagedAgentPods) already
+          // swallow their own errors and return null, which is what makes the
+          // probe fail closed one layer down. An unhandled rejection here
+          // aborted the whole loop after earlier runs were already marked
+          // `cancelled`, leaving every later run with neither Job deletion nor
+          // lease/reservation release.
+          logger.warn(
+            { runId: run.id, error: error instanceof Error ? error.message : String(error) },
+            "cancelActiveForAgent: runtime quiescence probe failed; retaining resources and continuing bulk cancellation",
+          );
+        }
+      }
+      await releaseCancelledRunRuntimeResources(run, agent, "cancelled", reason, {
+        externalRuntimeQuiesced,
+      });
+      // BLO-21460: same ordering as cancelRunInternal — unlock the issue, but
+      // only dispatch a successor once the cancelled Job is confirmed gone.
+      await releaseIssueExecutionAndPromote(run, {
+        suppressPromotion: !externalRuntimeQuiesced,
+      });
     }
 
     return runs.length;
@@ -36311,6 +36702,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     reapOrphanedRuns,
+    reconcileOrphanedEnvironmentLeases,
+    refreshOrphanedRuntimeResourceMetrics,
     resumeRunningExternalRuntimeRuns,
 
     /**
