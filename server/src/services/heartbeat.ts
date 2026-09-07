@@ -724,6 +724,15 @@ const MAX_SWEPT_ISSUE_LOCK_RELEASES = 1;
 const TASK_SCOPE_COALESCIBLE_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
+/**
+ * BLO-32553: the terminal-status union, named so it can be threaded through
+ * `readTerminalRunStatus` into `recordHeartbeatPostTerminalRunEventDropped`.
+ * That callsite is what makes the metric's mirrored label list in `metrics.ts`
+ * a compile-time constraint: adding a sixth status here without adding it to
+ * `KNOWN_HEARTBEAT_POST_TERMINAL_RUN_STATUSES` is a type error rather than a
+ * silent collapse to the "unknown" label.
+ */
+type HeartbeatRunTerminalStatus = (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number];
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const OPEN_ROUTINE_EXECUTION_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
@@ -15595,14 +15604,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   /**
    * BLO-32553: return the run's status if it is terminal, else null.
    *
-   * Reads the row rather than trusting an in-memory snapshot: a run can be
-   * terminalized by another process (cancel route, recovery sweep) while this
-   * process still holds a `currentRun` captured as "running". Called only from
-   * the late-event branch of `onAdapterEvent`, which is unreachable until
-   * adapter execution has settled, so this adds no query to the per-event
-   * hot path.
+   * Reads the row rather than trusting the in-memory `currentRun` snapshot,
+   * which was captured while the run was still "running" and is therefore
+   * useless for this question.
+   *
+   * Scope, stated precisely because the obvious reading is wrong: this is
+   * called only from the late-event branch of `onAdapterEvent`, which is
+   * unreachable until adapter execution has settled. So it does NOT observe a
+   * run terminalized by another process (cancel route, recovery sweep) *while*
+   * `execute()` is still running — those events take the fast path and are
+   * still appended. Covering that would need a status read per event on the
+   * hot path; it is a pre-existing gap, not one this guard closes.
+   *
+   * The return type is the terminal-status union rather than `string` so the
+   * value can be handed to `recordHeartbeatPostTerminalRunEventDropped`
+   * without widening its label domain.
    */
-  async function readTerminalRunStatus(runId: string): Promise<string | null> {
+  async function readTerminalRunStatus(runId: string): Promise<HeartbeatRunTerminalStatus | null> {
     const [row] = await db
       .select({ status: heartbeatRuns.status })
       .from(heartbeatRuns)
@@ -28676,9 +28694,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const eventType = event.eventType.trim();
         if (!eventType) return;
         if (adapterExecutionSettled) {
-          const terminalStatus = await readTerminalRunStatus(currentRun.id);
-          if (terminalStatus) {
+          // Neither the status read nor the sanitization below may reject. Both
+          // touch the DB (`readTerminalRunStatus` selects the run;
+          // `getCurrentUserRedactionOptions` reads instance settings), and the
+          // caller on this path is by definition a continuation that outlived
+          // `adapter.execute` — so there may be nothing awaiting this promise
+          // and an escaping rejection would be an unhandled one.
+          //
+          // A read failure is treated as a drop rather than as "not terminal":
+          // the event is already outside the `onEvent` contract, and appending
+          // on an unverifiable status risks the runtime-status resurrection
+          // described above, which nothing else clears. Passing `null` to the
+          // counter collapses to its "unknown" label, so a read failure stays
+          // distinguishable from a confirmed post-terminal drop.
+          let terminalStatus: HeartbeatRunTerminalStatus | null = null;
+          let statusReadError: unknown = null;
+          try {
+            terminalStatus = await readTerminalRunStatus(currentRun.id);
+          } catch (error) {
+            statusReadError = error;
+          }
+          if (terminalStatus || statusReadError) {
             recordHeartbeatPostTerminalRunEventDropped(terminalStatus);
+            // This log is the substitute for the row that is deliberately not
+            // written, so it must not be a *less* redacted substitute than the
+            // storage path. Mirror `appendRunEvent`'s four sanitizations in the
+            // same order: adapter-supplied message/payload are exactly the
+            // threat model those helpers exist for (secrets, size, user PII).
+            let sanitizedMessage: string | null = null;
+            let sanitizedPayload: Record<string, unknown> | null = null;
+            let sanitizationError: unknown = null;
+            try {
+              const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+              sanitizedMessage = event.message
+                ? redactCurrentUserText(event.message, currentUserRedactionOptions)
+                : null;
+              const boundedPayload = event.payload
+                ? boundHeartbeatRunEventPayloadForStorage(event.payload)
+                : null;
+              sanitizedPayload = boundedPayload
+                ? redactCurrentUserValue(redactEventPayload(boundedPayload), currentUserRedactionOptions)
+                : null;
+            } catch (error) {
+              // Sanitization failed, so nothing adapter-supplied is safe to log.
+              // Drop the message/payload rather than fall back to the raw values.
+              sanitizationError = error;
+              sanitizedMessage = null;
+              sanitizedPayload = null;
+            }
             logger.warn(
               {
                 runId: currentRun.id,
@@ -28688,10 +28751,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 eventType,
                 stream: event.stream ?? null,
                 level: event.level ?? null,
-                message: event.message ?? null,
-                payload: event.payload ?? null,
+                message: sanitizedMessage,
+                payload: sanitizedPayload,
+                ...(statusReadError ? { err: statusReadError } : {}),
+                ...(sanitizationError ? { sanitizationErr: sanitizationError } : {}),
               },
-              "dropped adapter run event delivered after the run reached a terminal status (BLO-32553)",
+              statusReadError
+                ? "dropped adapter run event after failing to read the run's status (BLO-32553)"
+                : "dropped adapter run event delivered after the run reached a terminal status (BLO-32553)",
             );
             return;
           }
