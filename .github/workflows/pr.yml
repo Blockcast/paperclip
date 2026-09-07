@@ -364,6 +364,14 @@ jobs:
         run: node --test ./scripts/check-comment-review-gate-census.test.mjs
         timeout-minutes: 1
 
+      - name: Test comment-review-gate merge-queue mirror
+        if: ${{ !cancelled() }}
+        # Guards the no-`pending` invariant in particular: a pending required
+        # status on a queue ref waits the full 6h checkResponseTimeout and
+        # ejects the entry, which is the outage BLO-26602 exists to avoid.
+        run: node --test ./scripts/mirror-comment-review-gate-to-merge-group.test.mjs
+        timeout-minutes: 1
+
       - name: Test CODEOWNERS guard
         if: ${{ !cancelled() }}
         run: node --test ./scripts/check-codeowners.test.mjs
