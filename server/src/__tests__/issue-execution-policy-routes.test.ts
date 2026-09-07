@@ -605,6 +605,87 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  /**
+   * The yield is a *post-commit* side effect: the issue row — including the armed
+   * `monitorNextCheckAt` — is already durable by the time `cancelRun` is awaited. So a
+   * rejection there must not reach Express's error middleware, or the caller reads a 500
+   * for a monitor that IS armed, concludes it is not, and re-arms into a live monitor.
+   *
+   * This case exists because nothing else in this file can fail if the `.catch()` is
+   * removed: the suite's `cancelRun` double always resolves, so the two tests above pass
+   * either way — the one at :592 only asserts the yield was *attempted*. The throw is not
+   * hypothetical; `heartbeat-process-recovery.test.ts` pins
+   * `rejects.toThrow("db update unavailable")` on the same call at the service level.
+   */
+  it("still returns 200 when the post-commit external-wait yield rejects", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      checkoutRunId: "run-1",
+      executionRunId: "run-1",
+      createdByUserId: "local-board",
+      identifier: "PAP-1006",
+      title: "External review monitor",
+      executionPolicy: null,
+      executionState: null,
+      monitorAttemptCount: 0,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      monitorNotes: null,
+      monitorScheduledBy: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockHeartbeatService.cancelRun.mockRejectedValueOnce(new Error("db update unavailable"));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        status: "in_review",
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: SCHEDULED_MONITOR_NEXT_CHECK_AT,
+            scheduledBy: "assignee",
+            notes: "Wait for external QA report.",
+            kind: "external_service",
+            serviceName: "github-actions",
+          },
+        },
+      });
+
+    // The rejection is absorbed at the yield rather than surfacing as a 500 …
+    expect(res.status).toBe(200);
+    // … the yield really was the call that rejected (guards against a vacuous pass if
+    // the gating predicate ever stops firing for this fixture) …
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+    // … the durable write still landed with the monitor armed …
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({
+        status: "in_review",
+        monitorNextCheckAt: new Date(SCHEDULED_MONITOR_NEXT_CHECK_AT),
+      }),
+    );
+    // … and no activity row claims a slot release that did not happen.
+    expect(
+      mockLogActivity.mock.calls.some(
+        (call) => (call[1] as { action?: string })?.action === "heartbeat.external_wait_yielded",
+      ),
+    ).toBe(false);
+  });
+
   it("does not yield the current run for a non-external monitor", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
