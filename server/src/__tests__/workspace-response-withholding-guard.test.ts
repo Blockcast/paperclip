@@ -2,6 +2,12 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import type { ExecutionWorkspace, ProjectWorkspace } from "@paperclipai/shared";
+import {
+  WITHHELD_WORKSPACE_RUNTIME_VIEWER,
+  publicExecutionWorkspace,
+  publicProjectWorkspace,
+} from "../routes/workspace-response.js";
 
 /**
  * PEN-2852 / PEN-2370 ask 3 criterion (b2) — a control that closes a CLASS rather than the nine
@@ -256,6 +262,33 @@ export function stripLiterals(expression: string): string {
 }
 
 /**
+ * Field reads that disclose as much as handing the row over, so `.`/`?.` before one of these is an
+ * escape rather than the scalar read the `continue` below assumes.
+ *
+ * This is a NAMED LIST, not a rule, and deliberately so. The general form — "any object-valued
+ * field" — is not decidable from the response text the scan sees, and guessing at it is what would
+ * produce the noise the docstring below warns about. These six names come from the boundary's own
+ * definition rather than from taste:
+ *
+ *   - `config` / `runtimeConfig` are the derived views the two masks null `workspaceRuntime` inside;
+ *   - `metadata` is what they are derived FROM, and `workspace-response.ts:17-20` states the
+ *     consequence outright: *"Withholding the derived view while answering with `metadata` is a
+ *     no-op: the same bytes leave one key over. Both exits must close together."* A guard that reads
+ *     `workspace.metadata` as innocuous fails exactly the property that module is built on;
+ *   - `workspaceRuntime` is the withheld payload itself, reachable in one more hop
+ *     (`workspace.config.workspaceRuntime` — already this module's idiom at `issues.ts:7524-7532`);
+ *   - `primaryWorkspace` and `workspaces` are whole embedded workspace rows on project responses.
+ *     `workspaces` is caught today anyway, but only INCIDENTALLY, because `workspaces` happens to be
+ *     one of the tracked nouns. Listing it here means that catch survives someone editing the noun
+ *     list, which is the sort of coupling that goes quiet rather than red.
+ *
+ * Keep this in step with the masks in `workspace-response.ts`: a field that starts being withheld
+ * there and is not added here is a field the guard reads as a scalar.
+ */
+const BOUNDARY_FIELD_READ =
+  /^\??\.\s*(config|runtimeConfig|metadata|workspaceRuntime|primaryWorkspace|workspaces)\b/;
+
+/**
  * True when `code` hands the whole value named `noun` to the response, rather than reading a field
  * off it. `project.pauseReason` and `project?.id` disclose one scalar; `project`, `...project` and
  * `{ project }` disclose the row and everything embedded in it.
@@ -263,15 +296,17 @@ export function stripLiterals(expression: string): string {
  * Without this the guard cannot be pointed at a module that merely *mentions* these rows: every
  * `res.json({ error: project.pauseReason … })` reads as a leak. Erring the other way — treating a
  * field read as an escape — is the safe direction in principle, but in practice it produces enough
- * noise that the guard gets switched off, which is not safe at all.
+ * noise that the guard gets switched off, which is not safe at all. `BOUNDARY_FIELD_READ` is the
+ * bounded exception: it re-arms that safe direction for the handful of names where "one field" and
+ * "the whole disclosure" are the same thing.
  */
 export function escapesAsWholeValue(code: string, noun: string): boolean {
-  // Two characters of lookahead, not one: `?` opens three different constructs and only two of
-  // them keep the row out of the response. The trailing characters are matched ZERO-WIDTH so the
-  // walk's `lastIndex` still advances by the noun alone — consuming them would step past a second
-  // occurrence lying within two characters of the first, and the first is precisely the kind that
-  // says `continue` below.
-  const occurrences = new RegExp(`\\b${noun}\\b\\s*(?=(.{0,2}))`, "g");
+  // Enough lookahead to read the FIELD NAME, not just the punctuation: the `.` branch below has to
+  // distinguish `workspace.status` from `workspace.metadata`, and those differ only after the dot.
+  // The trailing characters are matched ZERO-WIDTH so the walk's `lastIndex` still advances by the
+  // noun alone — consuming them would step past a second occurrence lying within the captured span,
+  // and the first is precisely the kind that says `continue`.
+  const occurrences = new RegExp(`\\b${noun}\\b\\s*(?=(.{0,24}))`, "g");
   let match: RegExpExecArray | null;
   while ((match = occurrences.exec(code)) !== null) {
     const next = match[1] ?? "";
@@ -280,6 +315,10 @@ export function escapesAsWholeValue(code: string, noun: string): boolean {
     // `issues.ts`, so reading it as a field access switches the guard off in the module it was
     // widened to cover.
     if (next.startsWith("??")) return true;
+    // Checked BEFORE the `continue` below, and covering `?.` as well as `.`: optional chaining
+    // discloses the same bytes as a plain read, so closing only the `.` spelling would leave the
+    // class open in the direction a nullable row is actually written.
+    if (BOUNDARY_FIELD_READ.test(next)) return true;
     // `.` is a field read; `?` is either optional chaining (`project?.id`) or a ternary TEST
     // (`project ? { … } : null`) — in both cases what reaches the response is decided elsewhere in
     // the expression, and that elsewhere is itself a site this scan sees.
@@ -435,13 +474,108 @@ describe("workspace response withholding guard (PEN-2852, PEN-2370 (b2))", () =>
 
   it("still sees a whole-value escape that follows a field read of the same noun", () => {
     // Guards the lookahead's implementation, not its policy. The scan walks occurrences with a
-    // sticky `lastIndex`, so widening the capture from one character to two would step PAST a
-    // second occurrence sitting within two characters of the first — and the first is exactly the
-    // kind that says `continue`. Matching the trailing characters in a zero-width lookahead keeps
-    // every occurrence reachable; consuming them does not. Anyone simplifying the lookahead away
-    // fails here rather than silently narrowing the guard.
+    // sticky `lastIndex`, so widening the capture beyond one character would step PAST a second
+    // occurrence sitting inside the captured span — and the first is exactly the kind that says
+    // `continue`. The capture is 24 characters wide (it has to reach the end of a field NAME, not
+    // just the dot), which makes that span large enough to swallow a whole second occurrence, so
+    // the zero-width match is doing more work here than when it was two. Matching the trailing
+    // characters in a lookahead keeps every occurrence reachable; consuming them does not. Anyone
+    // simplifying the lookahead away fails here rather than silently narrowing the guard.
     expect(escapesAsWholeValue("{ x: project.project }", "project")).toBe(true);
     expect(escapesAsWholeValue("{ x: workspace?.workspace }", "workspace")).toBe(true);
+  });
+
+  it("reads a field read of the boundary's OWN names as a whole-value escape", () => {
+    // `config` / `runtimeConfig` are derived views over `metadata`, so answering with any of the
+    // three discloses the same bytes one key over — `workspace-response.ts:17-20` says both exits
+    // must close together. Reading them as innocuous scalar field reads (which `next[0] === "."`
+    // did) means a handler can hand over the withheld payload with the guard green. No live site
+    // does this; the guard exists for the handler that has not been written yet, and
+    // `workspace.config.<field>` is already this module's idiom at `issues.ts:7524-7532`.
+    const locals = ["workspace"];
+    const leaks = [
+      "  res.json({ config: workspace.config });",
+      "  res.json({ metadata: workspace.metadata });",
+      "  res.json({ runtimeConfig: workspace.runtimeConfig });",
+      "  res.json({ rt: workspace.config.workspaceRuntime });",
+      // Optional chaining discloses the same bytes as the plain read. Closing only the `.` spelling
+      // would leave the class open in exactly the direction a nullable row is written.
+      "  res.json({ metadata: workspace?.metadata });",
+    ];
+    for (const leak of leaks) {
+      expect(
+        findUnwithheldWorkspaceResponses(collectResponseSites("synthetic.ts", leak), locals),
+        leak,
+      ).toHaveLength(1);
+    }
+
+    // `primaryWorkspace` hands over a whole embedded row and is NOT itself a tracked noun, so
+    // nothing else in the scan sees it.
+    expect(escapesAsWholeValue("{ primary: project.primaryWorkspace }", "project")).toBe(true);
+  });
+
+  it("does not read an ordinary scalar field off a workspace row as an escape", () => {
+    // The negative half of the case above. Widening the `.` branch is the direction that risks
+    // noise, and noise is what gets a guard switched off — so the shapes the guard is pointed at
+    // real modules to tolerate have to keep classifying clean.
+    expect(escapesAsWholeValue("{ error: project.pauseReason }", "project")).toBe(false);
+    expect(escapesAsWholeValue("{ status: workspace.status }", "workspace")).toBe(false);
+    expect(escapesAsWholeValue("{ name: workspace?.name }", "workspace")).toBe(false);
+
+    // The word boundary is load-bearing, not decoration: a field whose name merely BEGINS with a
+    // listed name is an ordinary scalar. Dropping `\b` from `BOUNDARY_FIELD_READ` — the obvious
+    // simplification — turns each of these into a violation and fails here.
+    expect(escapesAsWholeValue("{ at: workspace.configuredAt }", "workspace")).toBe(false);
+    expect(escapesAsWholeValue("{ v: workspace.metadataVersion }", "workspace")).toBe(false);
+    expect(escapesAsWholeValue("{ n: project.workspacesCount }", "project")).toBe(false);
+  });
+
+  it("lists every top-level field the masks actually withhold", () => {
+    // Keeps `BOUNDARY_FIELD_READ` honest against the module it claims to mirror, by BEHAVIOUR
+    // rather than by citation: mask a sentinel-bearing row, diff the top-level keys, and require
+    // the guard to treat a read of each changed key as an escape. A hand-maintained list drifts the
+    // moment the boundary widens — PEN-3073 proposes exactly that — and drift here is silent, since
+    // a guard that has stopped covering a field still passes. This fails instead.
+    const rawExecution = {
+      id: "ws-1",
+      config: { workspaceRuntime: { command: "invented-fixture" }, environmentId: "env-1" },
+      metadata: { config: { workspaceRuntime: { command: "invented-fixture" } } },
+      name: "ws",
+      status: "open",
+    } as unknown as ExecutionWorkspace;
+    const rawProject = {
+      id: "pws-1",
+      runtimeConfig: { workspaceRuntime: { command: "invented-fixture" } },
+      metadata: { runtimeConfig: { workspaceRuntime: { command: "invented-fixture" } } },
+      name: "pws",
+    } as unknown as ProjectWorkspace;
+
+    const changed = (raw: Record<string, unknown>, masked: Record<string, unknown>) =>
+      Object.keys(raw).filter((key) => raw[key] !== masked[key]);
+
+    const withheldKeys = [
+      ...changed(
+        rawExecution as unknown as Record<string, unknown>,
+        publicExecutionWorkspace(rawExecution, WITHHELD_WORKSPACE_RUNTIME_VIEWER) as unknown as Record<
+          string,
+          unknown
+        >,
+      ),
+      ...changed(
+        rawProject as unknown as Record<string, unknown>,
+        publicProjectWorkspace(rawProject, WITHHELD_WORKSPACE_RUNTIME_VIEWER) as unknown as Record<
+          string,
+          unknown
+        >,
+      ),
+    ];
+
+    // Guards the guard: if the masks stopped withholding anything the diff would be empty and every
+    // assertion below would pass vacuously.
+    expect(new Set(withheldKeys)).toEqual(new Set(["config", "metadata", "runtimeConfig"]));
+    for (const key of withheldKeys) {
+      expect(BOUNDARY_FIELD_READ.test(`.${key}`), key).toBe(true);
+    }
   });
 
   it("qualifies producers by receiver so a same-named method on another service is not tracked", () => {
