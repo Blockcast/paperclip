@@ -32,6 +32,7 @@ import {
   ensureCommandResolvable,
   resolveCommandForLogs,
   runChildProcess,
+  type ProcessLifecycleEvent,
   type RunProcessResult,
   type TerminalResultCleanupOptions,
 } from "./server-utils.js";
@@ -156,6 +157,7 @@ export interface AdapterExecutionTargetProcessOptions {
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+  onLifecycle?: (event: ProcessLifecycleEvent) => Promise<void>;
   terminalResultCleanup?: TerminalResultCleanupOptions;
   /**
    * Sandbox-only: factory from the Paperclip bridge handle that streams the
@@ -641,6 +643,7 @@ export async function runAdapterExecutionTargetProcess(
     graceSec: options.graceSec,
     onLog: options.onLog,
     onSpawn: options.onSpawn,
+    onLifecycle: options.onLifecycle,
     terminalResultCleanup: options.terminalResultCleanup,
     localProcessSandbox: target?.kind === "local" || !target ? options.localProcessSandbox : null,
     remoteExecution: adapterExecutionTargetToRemoteSpec(target),
