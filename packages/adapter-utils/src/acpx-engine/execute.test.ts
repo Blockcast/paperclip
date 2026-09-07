@@ -1992,7 +1992,10 @@ describe("ACPX runtime prepare progress (PEN-1995)", () => {
 
   it("keeps reporting while prepare is slow, and stops once it settles", async () => {
     const { ctx, stages } = collector();
-    let release: (() => void) | null = null;
+    // Definite-assignment, not `| null`: the executor assigns synchronously, but
+    // control-flow analysis cannot see that and narrows a nullable binding to
+    // `never` at the call site below.
+    let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
@@ -2008,10 +2011,19 @@ describe("ACPX runtime prepare progress (PEN-1995)", () => {
 
     // A stall must keep the run's last-output timestamp advancing; that is the
     // entire point of the ticker, so assert more than one tick actually lands.
-    while (stages().filter((stage) => stage === "waiting").length < 2) {
+    // Bounded, so a ticker regression fails here against the stages actually
+    // observed rather than as an opaque suite timeout.
+    const waitingTicks = () => stages().filter((stage) => stage === "waiting").length;
+    const deadlineMs = Date.now() + 5_000;
+    while (waitingTicks() < 2 && Date.now() < deadlineMs) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
-    release?.();
+    expect(
+      waitingTicks(),
+      `ticker did not keep reporting; observed stages: [${stages().join(", ")}]`,
+    ).toBeGreaterThanOrEqual(2);
+
+    release();
     await pending;
 
     expect(stages().at(0)).toBe("started");
@@ -2040,6 +2052,24 @@ describe("ACPX runtime prepare progress (PEN-1995)", () => {
     const settled = stages().length;
     await new Promise((resolve) => setTimeout(resolve, 40));
     expect(stages().length).toBe(settled);
+  });
+
+  // Regression guard for the `started` emit's `.catch()`. This is the first
+  // statement of the run and it is awaited ABOVE the block whose catch routes to
+  // `emitAcpxFailure`, so an unguarded rejection here would leave
+  // `executeAcpxEngine` as an unclassified throw -- the instrumentation becoming
+  // the reason the run died, with less evidence than the silent runs it exists
+  // to explain. Progress reporting must never be fatal.
+  it("survives a rejecting run-log write instead of failing the run", async () => {
+    const ctx = {
+      onLog: async () => {
+        throw new Error("RUN_LOG_WRITE_FAILED");
+      },
+    } as never;
+
+    await expect(
+      awaitRuntimePrepareWithProgress(ctx, async () => "runtime", fastDelays),
+    ).resolves.toBe("runtime");
   });
 
   // Wiring check, and the ordering claim that makes "silent at seq 1" mean one
