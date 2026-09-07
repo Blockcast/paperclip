@@ -1594,9 +1594,15 @@ export async function awaitSessionWithProgress<T>(
  *
  * Three corrections to the reasoning that first flagged it, since each is easy
  * to re-derive wrongly. The load is paid once per *process*, not per run: every
- * importer of this module is a server-side `acp.ts`, the executor closure is
- * memoised at module scope, and the worker awaits `adapter.execute` in-process
- * -- the per-run pod adapters (`claude_k8s`, `opencode_k8s`) never import it.
+ * importer of this module is a server-side `acp.ts`, the `await import(...)`
+ * resolves from the ESM module registry after the first load, and the worker
+ * awaits `adapter.execute` in-process -- the per-run pod adapters
+ * (`claude_k8s`, `opencode_k8s`) never import it. Credit the registry, not the
+ * executor memo: `createClaudeAcpExecutor`'s `let executor` is *function*-scoped
+ * (`packages/adapters/claude-local/src/server/acp.ts:180`) and is per-process
+ * only because that factory happens to be called at module scope
+ * (`.../server/execute.ts:98`). Construct a second executor and the memo is
+ * gone; the disk read is still paid once, because the registry caches it.
  * It is not I/O on the network mount either: the module is read from the
  * container image layer, whereas the mount that has been observed to wedge
  * backs the workspace and state directories this helper *does* bracket. And a
