@@ -739,5 +739,72 @@ describe.sequential("issue goal context routes", () => {
         expect(runtime.services[0].GRAFANA_API_TOKEN).toBe("***REDACTED***");
       });
     }
+
+    // PEN-2846 door #12b. The same `res.json` carries a *second* workspaceRuntime
+    // exit: `compactIssueProjectWorkspace` emitted `runtimeConfig` verbatim. That
+    // projection is a withholding boundary too — it omits `metadata` and
+    // `runtimeServices` — but `runtimeConfig` is a *view onto that omitted
+    // `metadata`* (`services/projects.ts` →
+    // `readProjectWorkspaceRuntimeConfig(row.metadata)`), so a slice of the
+    // dropped column crossed anyway. Same open `Record<string, unknown>` type,
+    // same `assertIssueReadAllowed` gate, same `paperclipGetIssue` reader.
+    //
+    // The secret is DELIBERATELY a different value from CONFIGURED_SECRET above,
+    // and no execution workspace is mocked into this test. Reusing that constant
+    // would let the already-merged execution-workspace mask satisfy the
+    // `not.toContain` assertion and the test would pass against the unfixed
+    // projection — the neighbouring-control trap this ticket flagged four times.
+    //
+    // Fixture values are invented; the real endpoint was never called.
+    it("masks configured workspaceRuntime values on project workspaces from GET /issues/:id", async () => {
+      const PROJECT_WORKSPACE_SECRET = "invented-project-workspace-fixture-value";
+      const runtimeConfig = {
+        workspaceRuntime: {
+          services: [
+            { name: "web", command: "pnpm dev", DEPLOY_TOKEN: PROJECT_WORKSPACE_SECRET },
+          ],
+        },
+        desiredState: "running",
+        serviceStates: null,
+      };
+      const projectWorkspace = {
+        id: "workspace-primary",
+        companyId: "company-1",
+        projectId: legacyProjectLinkedIssue.projectId,
+        name: "Main",
+        sourceType: "local_path",
+        cwd: "/tmp/company-1/project-1",
+        visibility: "default",
+        metadata: { runtimeConfig },
+        runtimeConfig,
+        isPrimary: true,
+        createdAt: new Date("2026-03-20T00:00:00Z"),
+        updatedAt: new Date("2026-03-20T00:00:00Z"),
+      };
+
+      mockIssueService.getById.mockResolvedValue({ ...legacyProjectLinkedIssue });
+      mockProjectService.getById.mockResolvedValueOnce({
+        ...(await mockProjectService.getById()),
+        workspaces: [structuredClone(projectWorkspace)],
+        primaryWorkspace: structuredClone(projectWorkspace),
+      });
+
+      const res = await request(createApp()).get("/api/issues/11111111-1111-4111-8111-111111111111");
+
+      expect(res.status).toBe(200);
+      expect(JSON.stringify(res.body)).not.toContain(PROJECT_WORKSPACE_SECRET);
+
+      // Both exits off this projection: the array and the primary alias.
+      for (const emitted of [res.body.project.workspaces[0], res.body.project.primaryWorkspace]) {
+        const runtime = emitted.runtimeConfig.workspaceRuntime;
+        // Names and structure survive so the config stays legible; values do not.
+        expect(Object.keys(runtime.services[0])).toEqual(["name", "command", "DEPLOY_TOKEN"]);
+        expect(runtime.services[0].name).toBe("web");
+        expect(runtime.services[0].DEPLOY_TOKEN).toBe("***REDACTED***");
+        // `desiredState` is enum-validated by the reader, so it must NOT be
+        // masked — this pins the fix to the open field instead of the whole object.
+        expect(emitted.runtimeConfig.desiredState).toBe("running");
+      }
+    });
   });
 });
