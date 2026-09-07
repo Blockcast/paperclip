@@ -104,3 +104,32 @@ export function withRecoveryModelProfileHint<T extends Record<string, unknown>>(
 export function recoveryAssigneeAdapterOverrides(_workClass: Extract<RecoveryModelProfileWorkClass, "status_only">) {
   return { modelProfile: RECOVERY_MODEL_PROFILE_KEY };
 }
+
+/**
+ * BLO-32566. The stranded-recovery wake sites pick their work class at runtime
+ * rather than passing a literal: a status-only wake cannot write an issue
+ * document, so once the newest run on the issue has been refused exactly that
+ * write, re-dispatching status-only guarantees the same 403 and the issue can
+ * never self-heal (only a recorded disposition clears the recovery action, and
+ * while it is active every wake on the issue is status-only).
+ *
+ * A named boolean helper rather than a fourth `withRecoveryModelProfileHint`
+ * overload accepting the union: the overloads exist so each work class gets a
+ * precise return type, and a union-accepting overload would hand every caller a
+ * union return in exchange for a widened public API on a *cost guard*. Branching
+ * here keeps each arm resolving against its own precise overload, and keeps the
+ * escalation rule stated in one place instead of at six call sites.
+ *
+ * `planning_only` is the minimum escalation that clears the trap — normal model
+ * with `allowDocumentUpdates: true`, while deliverable and annotation writes stay
+ * barred. It is the same escalation BLO-23197 chose for the successful-run-handoff
+ * lane, which deliberately scoped this lane out as follow-up.
+ */
+export function withStrandedRecoveryWakeWorkClass<T extends Record<string, unknown>>(
+  input: T,
+  escalateAfterRefusedDocumentWrite: boolean,
+) {
+  return escalateAfterRefusedDocumentWrite
+    ? withRecoveryModelProfileHint(input, "planning_only")
+    : withRecoveryModelProfileHint(input, "status_only");
+}
