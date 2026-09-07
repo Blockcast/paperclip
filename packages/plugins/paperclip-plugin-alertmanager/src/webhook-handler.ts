@@ -1436,24 +1436,34 @@ export async function handleFiring(
     //
     // Two series: an occurrence count of `1` (matching every other
     // `ctx.metrics.write` call site in this file) plus the hold age as its own
-    // series. The value is deliberately NOT the duration, for one reason that
-    // holds today and one that will:
+    // series. The value is deliberately NOT the duration:
     //
-    //   - Today `metrics.write` is neither a counter nor a gauge. The host
-    //     appends one `plugin_logs` row per call at `level: "metric"`, with the
-    //     value in `meta.value` (`server/src/services/plugin-host-services.ts`,
-    //     `metrics.write` -> `_logBuffer.push` -> a plain batch INSERT). Nothing
-    //     sums or last-values it, and nothing scrapes it — which is exactly why
-    //     AC3 of BLO-32113 (a Prometheus rule on fence age) cannot be met in
-    //     this layer and was split to BLO-32163. A duration in `meta.value`
-    //     would still be readable, but an occurrence would not be *countable*
-    //     without knowing that this one series means something different from
-    //     its ~20 neighbours.
-    //   - Once BLO-32163 routes these to a real Prometheus counter, every write
-    //     accumulates, and a single duration-valued series becomes a
-    //     monotonically climbing sum of hold ages: non-zero forever after the
-    //     first wedge, unable to distinguish "the reclaim is broken" from "one
-    //     wedge happened last month" — the only question it exists to answer.
+    //   - As of PEN-2799 the host publishes every `metrics.write` to the
+    //     prom-client counter `paperclip_plugin_metric_total{metric="..."}`
+    //     *before* appending the `plugin_logs` row at `level: "metric"`
+    //     (`server/src/services/plugin-host-services.ts` -> `recordPluginMetric`
+    //     in `server/src/services/metrics.ts`). Both still happen; the counter
+    //     is the scraped path, ordered first because that is what an alert rule
+    //     depends on. So both series below are real, monotonic, scraped
+    //     counters today — which makes the PromQL at the end of this comment
+    //     executable rather than aspirational.
+    //   - Because a counter accumulates every write, a single duration-valued
+    //     series would become a monotonically climbing sum of hold ages:
+    //     non-zero forever after the first wedge, unable to distinguish "the
+    //     reclaim is broken" from "one wedge happened last month" — the only
+    //     question it exists to answer. Splitting the count from the summed age
+    //     keeps both recoverable under `rate()`.
+    //
+    // Both names clear the host's drop gates: each satisfies
+    // PLUGIN_METRIC_NAME_REGEX and sits under the name-length bound, and this
+    // plugin mints 20 static names (no interpolation) against a
+    // PLUGIN_METRIC_NAME_BUDGET of 50, so neither can collapse into the shared
+    // `_overflow` series. Both values are non-negative, so neither trips
+    // `bad_value`.
+    //
+    // NB: AC3 of BLO-32113 asks for a Prometheus *rule* on fence age. The
+    // series it needs now exist and are scrapeable from here; authoring and
+    // deploying the rule itself remains BLO-32163.
     //
     // The count + summed-age pair is the standard Prometheus shape and reads
     // correctly under both:
