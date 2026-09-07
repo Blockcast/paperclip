@@ -16,6 +16,11 @@ import {
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { attentionService } from "../services/attention.js";
 import { recoveryService } from "../services/recovery/service.js";
+import {
+  RECOVERY_HORIZON_EXPIRED_METRIC,
+  __resetMetricsForTest,
+  renderMetrics,
+} from "../services/metrics.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -133,7 +138,7 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
 
     const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
 
-    expect(result).toMatchObject({ escalated: 1, announced: 1 });
+    expect(result).toMatchObject({ escalated: 1, announced: 1, neverDelivered: 1 });
     const action = await readAction(actionId);
     expect(action.status).not.toBe("active");
     expect(action.status).toBe("escalated");
@@ -145,9 +150,79 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     expect(comments).toHaveLength(1);
     expect(comments[0]!.body).toContain("Recovery wake horizon reached");
     expect(comments[0]!.body).toContain(pastHorizon.toISOString());
-    // The 0-attempt case is the one the ticket calls out: the window was spent without a
-    // single attempt, so the stranding was never actually worked.
-    expect(comments[0]!.body).toContain("never made a single wake attempt");
+    // PEN-3000: the 0-attempt case is the one the ticket calls out, but the reason matters
+    // and the old wording got it backwards. `attemptCount` counts DELIVERED wakes, not
+    // sweeps — every sweep reserves +1 and refunds it when `enqueueWakeup` returns null — so
+    // 0 does not mean "nothing was ever scheduled", it means every sweep in the window was
+    // refused by the wake channel. Assert the note says so, because an operator who reads
+    // "never scheduled" goes looking at the wrong layer.
+    expect(comments[0]!.body).toContain("no wake for this action ever reached the queue");
+    expect(comments[0]!.body).toContain("DELIVERED, not sweeps attempted");
+    expect(comments[0]!.body).not.toContain("never made a single wake attempt");
+  });
+
+  it("distinguishes a delivered-at-least-once expiry from a never-delivered one", async () => {
+    // PEN-3000: these two are different incidents with different responders and they used to
+    // render identically. `attemptCount > 0` means the owner WAS woken and recovery still did
+    // not converge — a genuine unresolvable stranding — so it must not claim the wake channel
+    // refused, and must not be counted in `neverDelivered`.
+    const seeded = await seed();
+    await insertAction(seeded, { attemptCount: 2 });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+    expect(result).toMatchObject({ escalated: 1, announced: 1, neverDelivered: 0 });
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, seeded.sourceIssueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.body).toContain("Attempts: 2 (budget 5)");
+    expect(comments[0]!.body).toContain("reassigning will NOT restore the wake budget");
+    expect(comments[0]!.body).not.toContain("no wake for this action ever reached the queue");
+  });
+
+  it("emits the horizon-expiry metric split by delivery, through the real sweep", async () => {
+    // PEN-3000 asked for exactly this discriminator: "an action reaching its horizon with
+    // attemptCount: 0 should be distinguishable in alerting from one that exhausted its
+    // budget — the first is a scheduler failure, the second is a genuine unresolvable
+    // stranding, and today they render identically."
+    //
+    // Asserted through `reconcileExpiredRecoveryWakeHorizons` rather than by calling the
+    // recorder directly, because the defect this guards against is the CALL SITE picking the
+    // wrong label — a direct recorder test would pass with the labels swapped.
+    //
+    // The counts are deliberately ASYMMETRIC (2 never-delivered vs 1 delivered). With one of
+    // each, both series read 1 and swapping the ternary at the call site is invisible —
+    // verified by mutation: the symmetric version of this test passed against an inverted
+    // ternary. Keep them unequal or this test stops holding the invariant it names.
+    __resetMetricsForTest();
+    const neverDeliveredA = await seed();
+    await insertAction(neverDeliveredA, { attemptCount: 0 });
+    const neverDeliveredB = await seed();
+    await insertAction(neverDeliveredB, { attemptCount: 0 });
+    const delivered = await seed();
+    await insertAction(delivered, { attemptCount: 3 });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+    expect(result).toMatchObject({ escalated: 3, neverDelivered: 2 });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 2`);
+    expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 1`);
+  });
+
+  it("seeds both delivery series at zero so an alert can fire before the first expiry", async () => {
+    // Without the zero-init an `absent()`/rate alert on never_delivered cannot distinguish
+    // "no expiry yet" from "not instrumented", which is the failure mode that let this go
+    // unmeasured. Same reason the backstop gauges are seeded.
+    __resetMetricsForTest();
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 0`);
+    expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 0`);
   });
 
   it("leaves an action whose horizon has not passed alone", async () => {
