@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { buildAdapterRunEventPayloadForPersistence } from "../services/heartbeat.js";
+import {
+  buildAdapterRunEventPayloadForPersistence,
+  shouldWriteRunRuntimeStatusForEvent,
+} from "../services/heartbeat.js";
 
 /**
  * PEN-3093 item 1 -- the server side of a post-terminal lifecycle event.
@@ -88,5 +91,77 @@ describe("buildAdapterRunEventPayloadForPersistence", () => {
       postAdapterSettle: true,
       adapterSettledAt: settledAt,
     });
+  });
+});
+
+/**
+ * PEN-3093, second review pass -- the marker alone was not enough.
+ *
+ * Marking the payload keeps the STORED row honest, but `appendRunEvent` also
+ * writes the run's live runtime-status entry, and that write was gated on
+ * `isHeartbeatRunRuntimeStatusActive(run.status)` alone. `run` there is a
+ * snapshot bound before `execute()` ran, so its `status` reads "running" even
+ * after the run terminalized: a marked post-terminal event still republished
+ * the run as live until the 90s TTL expired it. The half an operator actually
+ * watches was the half the marker never reached.
+ *
+ * The first case below is the regression. The rest pin the boundaries, so a
+ * later "simplification" back to the single `run.status` check fails here
+ * rather than in production.
+ */
+describe("shouldWriteRunRuntimeStatusForEvent", () => {
+  it("refuses a post-settle event even though the run snapshot still says running", () => {
+    // The exact production state: the snapshot is stale-live, and the only
+    // trustworthy signal that the run is over is the server's own settle
+    // observation.
+    expect(
+      shouldWriteRunRuntimeStatusForEvent({
+        runStatusSnapshot: "running",
+        adapterSettledAt: "2026-09-07T12:00:00.000Z",
+      }),
+    ).toBe(false);
+  });
+
+  it("still writes progress for an ordinary in-flight event", () => {
+    // Positive control: if this ever goes false, the live progress display is
+    // dead and the test above would pass for the wrong reason.
+    expect(
+      shouldWriteRunRuntimeStatusForEvent({
+        runStatusSnapshot: "running",
+        adapterSettledAt: null,
+      })
+    ).toBe(true);
+  });
+
+  it("treats an absent settle marker the same as an explicit null", () => {
+    expect(
+      shouldWriteRunRuntimeStatusForEvent({
+        runStatusSnapshot: "running",
+        adapterSettledAt: undefined,
+      }),
+    ).toBe(true);
+  });
+
+  it("refuses a terminal snapshot with no settle marker, as before", () => {
+    // The pre-existing half of the gate is unchanged: a caller that passes a
+    // genuinely terminal row (every `nextRunEventSeq` caller does) is still
+    // refused without needing a marker.
+    for (const status of ["succeeded", "failed", "cancelled", "timed_out", "interrupted"]) {
+      expect(
+        shouldWriteRunRuntimeStatusForEvent({
+          runStatusSnapshot: status,
+          adapterSettledAt: null,
+        }),
+      ).toBe(false);
+    }
+  });
+
+  it("refuses a post-settle event on a terminal snapshot too", () => {
+    expect(
+      shouldWriteRunRuntimeStatusForEvent({
+        runStatusSnapshot: "succeeded",
+        adapterSettledAt: "2026-09-07T12:00:00.000Z",
+      }),
+    ).toBe(false);
   });
 });
