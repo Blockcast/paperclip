@@ -133,12 +133,26 @@ export function hasAllyConsolidatedReviewHeading(body: string | null | undefined
 // reintroduces the brittleness this is widening away from.
 const MARKDOWN_EMPHASIS_RUN = "[*_`]{0,3}";
 
+// Emphasis and whitespace interleave freely around the SHA, so they are matched
+// as one bounded run rather than as an emphasis run that may be followed by
+// spaces. Allowing only the latter still dropped the form that closes the label
+// and wraps the SHA separately — `**Reviewed head:** \`<sha>\`` — because the
+// single permitted run was consumed by `**` and could not then cross the space
+// to reach the backtick. That is the same failure mode as BLO-31730 (a real
+// review made invisible by its own delimiters), one delimiter combination
+// further out, so the run is widened here instead of being enumerated.
+//
+// The run is length-bounded and the line is anchored at both ends, which is
+// what keeps this from reading a prose mention: widening the wrapper cannot
+// admit trailing text after the SHA, and the exactly-one rule below — not the
+// wrapper's tightness — is what stops a required check being set on a guess.
+const ATTESTATION_WRAPPER_RUN = "[*_`\\t ]{0,6}";
+
 // Indentation is bounded to agree with the heading pattern above — see
 // NOT_INDENTED_CODE.
 const REVIEWED_HEAD_ATTESTATION_PATTERN = new RegExp(
-  `(?:^|\\n)${NOT_INDENTED_CODE} {0,3}${MARKDOWN_EMPHASIS_RUN}[ \\t]{0,3}reviewed head:[ \\t]*` +
-    `${MARKDOWN_EMPHASIS_RUN}([0-9a-f]{40})${MARKDOWN_EMPHASIS_RUN}[ \\t]*` +
-    `${MARKDOWN_EMPHASIS_RUN}[ \\t]*(?=\\n|$)`,
+  `(?:^|\\n)${NOT_INDENTED_CODE} {0,3}${MARKDOWN_EMPHASIS_RUN}[ \\t]{0,3}reviewed head:` +
+    `${ATTESTATION_WRAPPER_RUN}([0-9a-f]{40})${ATTESTATION_WRAPPER_RUN}(?=\\n|$)`,
   "gi",
 );
 
