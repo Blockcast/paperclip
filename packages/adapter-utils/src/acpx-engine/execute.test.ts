@@ -2117,20 +2117,23 @@ describe("ACPX runtime prepare progress (PEN-1995)", () => {
 
     const at = (needle: string) => logs.findIndex((entry) => entry.text.includes(needle));
 
-    const preparedAt = at('"type":"acpx.runtime_prepare"');
+    // Match the *terminal* prepare tick explicitly. `at('"type":"acpx.runtime_-
+    // prepare"')` matches on type alone and would return the leading `started`
+    // tick, which is emitted before `buildRuntime` -- so an ordering assertion
+    // written against it would still pass with the emit moved above
+    // `buildRuntime`, i.e. it would pass in exactly the case this test exists to
+    // fail. There is deliberately no index for the `started` tick here.
+    const preparedTerminalAt = logs.findIndex(
+      (entry) => entry.text.includes('"type":"acpx.runtime_prepare"') && entry.text.includes('"stage":"prepared"'),
+    );
     const timeoutAt = at("Adapter execution timeout:");
     const handshakeAt = at('"type":"acpx.session_establish"');
 
     // Assert presence positively: a missing marker yields -1, which would other-
     // wise satisfy the < comparisons below and pass vacuously.
-    expect(preparedAt).toBeGreaterThanOrEqual(0);
+    expect(preparedTerminalAt).toBeGreaterThanOrEqual(0);
     expect(timeoutAt).toBeGreaterThanOrEqual(0);
     expect(handshakeAt).toBeGreaterThanOrEqual(0);
-
-    const preparedTerminalAt = logs.findIndex(
-      (entry) => entry.text.includes('"type":"acpx.runtime_prepare"') && entry.text.includes('"stage":"prepared"'),
-    );
-    expect(preparedTerminalAt).toBeGreaterThanOrEqual(0);
 
     expect(timeoutAt).toBeGreaterThan(preparedTerminalAt);
     expect(timeoutAt).toBeLessThan(handshakeAt);
