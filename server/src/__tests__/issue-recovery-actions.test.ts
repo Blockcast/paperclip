@@ -7932,6 +7932,73 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     /**
+     * Path B — the `assignee_fallback` branch (`attemptCount > 1`, owner != assignee, no new
+     * activity). This is the branch BLO-31836's reopen bar was specifically about: it exists to
+     * wake the **source assignee** when the upward owner has gone quiet, and it dispatched them
+     * status-only unconditionally. Asserted separately from Path A because the two differ in
+     * both the woken agent and the idempotency key, and only this one wakes the assignee.
+     */
+    it("assignee_fallback wake escalates to planning_only and targets the assignee", async () => {
+      const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+      // hasNewActivitySinceLastAttempt must be false: issue activity older than the action's
+      // last attempt. Both are pinned so the branch condition does not depend on wall clock.
+      await db
+        .update(issues)
+        .set({ lastActivityAt: new Date("2026-09-07T10:00:00.000Z") })
+        .where(eq(issues.id, sourceIssueId));
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "External lifecycle Job is missing while heartbeat run is still running",
+        errorCode: "job_missing",
+        resultJson: {
+          externalLifecycleRecovery: { adapterInvocationStarted: true },
+        },
+        contextSnapshot: { issueId: sourceIssueId },
+        statusOnlyDocumentWriteRefusedAt: new Date("2026-09-07T09:30:00.000Z"),
+        startedAt: new Date("2026-09-07T09:00:00.000Z"),
+        finishedAt: new Date("2026-09-07T09:30:00.000Z"),
+      });
+      // Owner is the manager, assignee is the coder -> ownerIsNonAssignee. `attemptCount` above
+      // 1 and a `lastAttemptAt` after the issue's activity put the sweep on Path B.
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        cause: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        returnOwnerAgentId: coderId,
+        attemptCount: 2,
+        lastAttemptAt: new Date("2026-09-07T11:00:00.000Z"),
+        fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:stale-fingerprint`,
+        evidence: {},
+        nextAction: "Wake the owner to re-drive the stranded issue.",
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      await recovery.reconcileStrandedAssignedIssues();
+
+      const fallback = enqueueWakeup.mock.calls
+        .find(([, opts]) => typeof (opts as any)?.idempotencyKey === "string"
+          && (opts as any).idempotencyKey.endsWith(":assignee_fallback"));
+      expect(fallback).toBeDefined();
+      // The assignee, not the owner -- that is what makes this branch the one the reopen bar named.
+      expect(fallback![0]).toBe(coderId);
+      expect((fallback![1] as any).contextSnapshot).toMatchObject({
+        suppressedNonAssigneeWake: true,
+        recoveryIntent: "planning_only",
+        allowDocumentUpdates: true,
+      });
+      expect((fallback![1] as any).contextSnapshot.modelProfile).toBeUndefined();
+    });
+
+    /**
      * The projection guard, asserted directly rather than only as a side effect of the cases
      * above. `getLatestIssueRun` is one of four `LatestIssueRun` producers; before this change
      * two of them hand-copied the column list instead of sharing `LATEST_ISSUE_RUN_COLUMNS`,
