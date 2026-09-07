@@ -29,6 +29,8 @@ import {
   __test_buildPrReviewerTaskKey,
   __test_buildPrReviewerWakeIdempotencyKey,
   __test_buildPrReviewFeedbackComment,
+  __test_buildReviewGateEscalationComment,
+  __test_buildReviewGateEscalationExternalKey,
   __test_classifyWorkflowRunSupersession,
   __test_commentsContainBackLinkMarker,
   __test_extractPaperclipIdentifiers,
@@ -42,12 +44,14 @@ import {
   __test_hasAllyConsolidatedReviewHeader,
   __test_idempotentWakeStatuses,
   __test_prReviewerWakeIdempotencyScope,
+  __test_readReviewGateEscalationHeadSha,
   __test_recordWorkflowRunSighting,
   __test_resolvePrCommentReviewGateWebhookTrigger,
   __test_resolveDependabotAlertContext,
   __test_resolveEventContext,
   __test_shouldFirePrReviewerWake,
   __test_verifyGithubSignature,
+  __test_wakeIdempotencySuffix,
   __resetWorkflowRunSupersessionTrackingForTest,
   derivePrReviewerWakeMaxConcurrency,
   githubWebhookRoutes,
@@ -1627,6 +1631,249 @@ describe("github-webhook pure helpers", () => {
       commentAuthorLogin: "allyblockcast[bot]",
     });
     expect(ctx ? __test_shouldFirePrReviewerWake(ctx) : true).toBe(false);
+  });
+
+  // -- BLO-32381: routing the review gate's terminal escalation -------------
+  //
+  // The gate's `sweep-stale-pending` recovery path has three terminal states:
+  // retry -> resolved, retry -> escalate, escalate -> post a PR comment and
+  // stop. State 3 computes the owning Paperclip issue and printed it ONLY to
+  // GitHub, where nothing in Paperclip watched. These tests cover the consumer
+  // that turns it into a wake + comment on the owning issue.
+  describe("review gate escalation routing (BLO-32381)", () => {
+    const ESCALATED_HEAD = "dcbcb6cab10f60118d2826c0ba5e18f482f9a147";
+
+    // The two marker forms, and why both are matched, are documented on
+    // readReviewGateEscalationHeadSha. (2) is the one the gate has emitted for
+    // every escalation to date, verified against live comments on
+    // onprem-k8s#2949 and #3133.
+    const legacyMarker = `<!-- review-gate:stale-escalation:${ESCALATED_HEAD} -->`;
+    const routingMarker = `<!-- paperclip:review-gate-escalation head=${ESCALATED_HEAD} -->`;
+
+    const escalationBody = (marker: string, extra: string[] = []): string =>
+      [
+        marker,
+        "",
+        `**Ally review is stuck on head \`${ESCALATED_HEAD.slice(0, 8)}\`.**`,
+        "",
+        "The gate posted an automatic review re-request 2h ago and still sees no Ally review.",
+        "",
+        "This will NOT retry again on its own.",
+        ...extra,
+      ].join("\n");
+
+    const escalationEvent = (body: string, prBody = "Closes BLO-31132") =>
+      __test_resolveEventContext("issue_comment", {
+        action: "created",
+        issue: {
+          number: 2949,
+          title: "Register data-pool scheduling headroom alerts",
+          body: prBody,
+          html_url: "https://github.com/Blockcast/onprem-k8s/pull/2949",
+          pull_request: { url: "https://api.github.com/repos/Blockcast/onprem-k8s/pulls/2949" },
+          user: { login: "allyblockcast[bot]" },
+        },
+        comment: {
+          id: 4900000001,
+          body,
+          html_url: "https://github.com/Blockcast/onprem-k8s/pull/2949#issuecomment-4900000001",
+          // The gate posts via the workflow's GITHUB_TOKEN, so the author is
+          // github-actions[bot] -- NOT the reviewer bot. Verified against the
+          // live escalation comments on #2949 and #3133.
+          user: { login: "github-actions[bot]", type: "Bot" },
+        },
+        repository: { full_name: "Blockcast/onprem-k8s" },
+      }, { prReviewerBotLogin: "allyblockcast[bot]" });
+
+    it("reads the head SHA from the marker the gate already emits today", () => {
+      // This is what makes the consumer independently useful: the fix works
+      // against escalations the gate emits RIGHT NOW, with no dependency on
+      // onprem-k8s#3229 (which needs a human review approval) landing first.
+      expect(__test_readReviewGateEscalationHeadSha(escalationBody(legacyMarker))).toBe(
+        ESCALATED_HEAD,
+      );
+    });
+
+    it("reads the head SHA from the explicit routing marker", () => {
+      expect(__test_readReviewGateEscalationHeadSha(escalationBody(routingMarker))).toBe(
+        ESCALATED_HEAD,
+      );
+    });
+
+    it("normalizes an uppercase head SHA so the dedup key is stable", () => {
+      // The (repo, pull, head) idempotency key is built from this value. If
+      // case survived, one escalation could dedup as two.
+      const upper = `<!-- paperclip:review-gate-escalation head=${ESCALATED_HEAD.toUpperCase()} -->`;
+      expect(__test_readReviewGateEscalationHeadSha(escalationBody(upper))).toBe(ESCALATED_HEAD);
+    });
+
+    it("does NOT treat the retry marker as an escalation (AC4: states 1 and 2 unchanged)", () => {
+      // The retry is state 2: the gate still has a re-request outstanding and
+      // resolves it on its own 29 times out of 30. Waking the assignee here
+      // would page them for a stall the automation is still handling, and would
+      // re-create the unbounded retry loop the 2h escalation threshold bounds.
+      const retry = `<!-- review-gate:stale-retry:${ESCALATED_HEAD} -->`;
+      expect(__test_readReviewGateEscalationHeadSha(escalationBody(retry))).toBeNull();
+      expect(escalationEvent(escalationBody(retry))).toBeNull();
+    });
+
+    it("ignores a marker that is not at literal byte 0", () => {
+      // A body that QUOTES the marker while discussing it -- which this repo's
+      // own issue comments and PR descriptions do -- must not be read as an
+      // escalation. Leading whitespace is the specific hazard: four spaces in
+      // Markdown is an indented code block, i.e. the canonical way to render
+      // "here is the marker".
+      expect(
+        __test_readReviewGateEscalationHeadSha(`Heads up:\n\n${legacyMarker}`),
+      ).toBeNull();
+      expect(
+        __test_readReviewGateEscalationHeadSha(`    ${legacyMarker}`),
+      ).toBeNull();
+    });
+
+    it("returns null for a marker carrying no readable head", () => {
+      // No head means no (repo, pull, head) key, so the notification cannot be
+      // idempotent. Refusing to classify it is deliberate: the alternative is
+      // an undedupable comment re-posted every 15 minutes by the sweep.
+      expect(
+        __test_readReviewGateEscalationHeadSha("<!-- paperclip:review-gate-escalation -->\n\nstuck"),
+      ).toBeNull();
+    });
+
+    it("resolves an escalation context with the reason and head the wake needs", () => {
+      const ctx = escalationEvent(escalationBody(legacyMarker, ["", "Owning issue(s): BLO-31132"]));
+      expect(ctx).toMatchObject({
+        wakeReason: "github_pr_review_gate_escalation",
+        prNumber: 2949,
+        repoFullName: "Blockcast/onprem-k8s",
+        // An issue_comment payload carries no pull_request.head.sha at all,
+        // which is exactly why the gate puts the head in the marker.
+        headSha: ESCALATED_HEAD,
+      });
+      expect(ctx?.owningIdentifiers).toEqual(["BLO-31132"]);
+      // `github_pr_` prefix is load-bearing: isPrWake and the heartbeat
+      // directive are both startsWith tests, so a reason without it silently
+      // renders no directive and drives no author wake.
+      expect(ctx?.wakeReason.startsWith("github_pr_")).toBe(true);
+    });
+
+    it("never classifies an escalation as a review REQUEST, even when the body carries @ally", () => {
+      // The dangerous coupling. Classifying an escalation as a request would
+      // dispatch a THIRD review pass -- re-arming the exact retry loop the
+      // escalation threshold exists to bound -- and would do it silently,
+      // because the request path writes no issue comment.
+      //
+      // The gate suppresses the `@author` mention when the author login is one
+      // the dispatcher reads as a request (`@allyblockcast[bot]` matches the
+      // mention pattern, and most PRs there are authored by that identity), so
+      // today no escalation body carries a matching mention. That is a property
+      // of the gate's wording, not of this predicate -- so assert the
+      // precedence directly against a body that DOES carry the mention.
+      const withMention = escalationBody(legacyMarker, ["", "@ally please look at this"]);
+      expect(__test_hasPrReviewerRequestMention(withMention)).toBe(true);
+
+      const ctx = escalationEvent(withMention);
+      expect(ctx?.wakeReason).toBe("github_pr_review_gate_escalation");
+      // And therefore no reviewer wake: shouldFirePrReviewerWake keys on
+      // wakeReason membership, which is what winning the ternary buys.
+      expect(ctx ? __test_shouldFirePrReviewerWake(ctx) : true).toBe(false);
+    });
+
+    it("lets a genuine Ally review on the same PR still be feedback, not an escalation", () => {
+      // Negative control for the precedence above: escalation must not swallow
+      // real review feedback. An Ally consolidated review that happens to quote
+      // the marker mid-body is feedback.
+      const ctx = escalationEvent(
+        [
+          "## Ally — Consolidated PR Review",
+          "",
+          "### Important Issues (1)",
+          "",
+          `I1: the marker \`${legacyMarker}\` is emitted too late.`,
+          "",
+          "### Recommended Action",
+          "",
+          "Fix I1 before merge.",
+        ].join("\n"),
+      );
+      expect(ctx?.wakeReason).toBe("github_pr_review_feedback");
+    });
+
+    it("scopes the wake idempotency key to the escalated head, not the comment or delivery", () => {
+      // AC2 is per (pull, head). Comment-scoping would let a redelivery re-wake
+      // for an already-handled head; the default repo+pr+reason `stable` key
+      // would collide two escalations on two DIFFERENT heads onto one key --
+      // and `stable` scope does not dedup on terminal statuses, so the second
+      // head's escalation would be the one lost.
+      const first = __test_wakeIdempotencySuffix(
+        { wakeReason: "github_pr_review_gate_escalation", headSha: ESCALATED_HEAD } as never,
+        "delivery-1",
+        new Set<string>(),
+      );
+      expect(first).toEqual({
+        suffix: `github_pr_review_gate_escalation:head:${ESCALATED_HEAD}`,
+        scope: "request",
+      });
+
+      // A later escalation on a NEW head must get a different key, or the first
+      // completed wake would gate the PR forever.
+      const laterHead = "ae3a4dbe83c9c0c5fb70d1bae25f206a3d28417b";
+      const second = __test_wakeIdempotencySuffix(
+        { wakeReason: "github_pr_review_gate_escalation", headSha: laterHead } as never,
+        "delivery-2",
+        new Set<string>(),
+      );
+      expect(second.suffix).not.toBe(first.suffix);
+
+      // A missing head degrades to `stable`, never `request`: two distinct
+      // events would collide on one key, and terminal dedup would drop the
+      // second permanently.
+      const headless = __test_wakeIdempotencySuffix(
+        { wakeReason: "github_pr_review_gate_escalation", headSha: null } as never,
+        "delivery-3",
+        new Set<string>(),
+      );
+      expect(headless.scope).toBe("stable");
+    });
+
+    it("keys the comment dedup on (repo, pull, head) and refuses to key without a head", () => {
+      expect(
+        __test_buildReviewGateEscalationExternalKey({
+          repoFullName: "Blockcast/onprem-k8s",
+          prNumber: 2949,
+          headSha: ESCALATED_HEAD,
+        } as never),
+      ).toBe(`github_pr_review_gate_escalation:Blockcast/onprem-k8s:2949:${ESCALATED_HEAD}`);
+
+      expect(
+        __test_buildReviewGateEscalationExternalKey({
+          repoFullName: "Blockcast/onprem-k8s",
+          prNumber: 2949,
+          headSha: null,
+        } as never),
+      ).toBeNull();
+    });
+
+    it("tells the reader to check commit STATUSES, which is why this state gets missed", () => {
+      // The escalation on #2949 was invisible for 7h50m because all 31
+      // check-runs were green while `review/ally-complete` sat pending. An
+      // agent woken by this comment that reads check-runs sees a clean PR and
+      // concludes the escalation was spurious, so the comment has to name the
+      // surface that actually carries the signal.
+      const body = __test_buildReviewGateEscalationComment({
+        repoFullName: "Blockcast/onprem-k8s",
+        prNumber: 2949,
+        headSha: ESCALATED_HEAD,
+        commentUrl: "https://github.com/Blockcast/onprem-k8s/pull/2949#issuecomment-4900000001",
+      } as never);
+      expect(body).toContain("status");
+      expect(body).toContain("Blockcast/onprem-k8s#2949");
+      expect(body).toContain(ESCALATED_HEAD);
+      // Must not read as review feedback: there are no findings, and telling an
+      // agent to push a commit to "address" a review that never landed is the
+      // BLO-20886/#953 damage path.
+      expect(body).toContain("not review feedback");
+    });
   });
 
   it("keeps a lowercase branch-only owner in the candidate identifiers (BLO-20886)", () => {
@@ -6665,6 +6912,256 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakesAfterDuplicate).toHaveLength(1);
+  });
+
+  // BLO-32381: the end-to-end proof for AC1 and AC2. The predicate tests above
+  // cover classification; this covers what the acceptance criteria actually
+  // name -- the owning issue RECEIVES the escalation, exactly once per
+  // (pull, head).
+  it("routes a review-gate escalation to the owning issue exactly once per (pull, head)", async () => {
+    const escalatedHead = "dcbcb6cab10f60118d2826c0ba5e18f482f9a147";
+    const { agentId, issueId } = await seedIssueWithIdentifier("BLO-31132", {
+      status: "in_progress",
+    });
+
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const payload = {
+      action: "created",
+      issue: {
+        number: 2949,
+        title: "Register data-pool scheduling headroom alerts",
+        body: "Closes BLO-31132",
+        html_url: "https://github.com/Blockcast/onprem-k8s/pull/2949",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/onprem-k8s/pulls/2949" },
+        user: { login: "allyblockcast[bot]" },
+      },
+      comment: {
+        id: 4900000001,
+        // The marker form the gate emits TODAY -- so this test exercises the
+        // path that is live now, not one that waits on onprem-k8s#3229.
+        body: [
+          `<!-- review-gate:stale-escalation:${escalatedHead} -->`,
+          "",
+          "**Ally review is stuck on head `dcbcb6ca`.**",
+          "",
+          "The gate posted an automatic review re-request 2h ago and still sees no Ally review.",
+          "",
+          "This will NOT retry again on its own. Someone has to look at why the reviewer is not responding.",
+          "",
+          "Owning issue(s): BLO-31132",
+        ].join("\n"),
+        html_url: "https://github.com/Blockcast/onprem-k8s/pull/2949#issuecomment-4900000001",
+        user: { login: "github-actions[bot]", type: "Bot" },
+      },
+      repository: { full_name: "Blockcast/onprem-k8s" },
+    };
+
+    const { body, signature } = signedRequest(payload);
+    const send = (deliveryId: string) =>
+      request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "issue_comment")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", deliveryId)
+        .set("content-type", "application/json")
+        .send(body);
+
+    const res = await send("delivery-escalation-1");
+    expect(res.status).toBe(200);
+    expect(res.body.wakes).toEqual([{ issueIdentifier: "BLO-31132", agentId }]);
+    expect(res.body.reviewGateEscalationComments).toEqual([
+      { issueIdentifier: "BLO-31132", commentId: expect.any(String) },
+    ]);
+
+    const escalationComments = await db
+      .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.issueId, issueId),
+        sql`${issueComments.metadata}->>'kind' = 'github_pr_review_gate_escalation'`,
+      ));
+    expect(escalationComments).toHaveLength(1);
+    expect(escalationComments[0]!.body).toContain("Review gate escalated");
+    expect(escalationComments[0]!.body).toContain(escalatedHead);
+    expect(escalationComments[0]!.metadata).toMatchObject({
+      kind: "github_pr_review_gate_escalation",
+      prNumber: 2949,
+      repoFullName: "Blockcast/onprem-k8s",
+      headSha: escalatedHead,
+    });
+
+    const wakes = await db
+      .select({ reason: agentWakeupRequests.reason, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]).toMatchObject({
+      reason: "github_pr_review_gate_escalation",
+      payload: expect.objectContaining({
+        issueId,
+        wakeCommentId: escalationComments[0]!.id,
+        prNumber: 2949,
+        repoFullName: "Blockcast/onprem-k8s",
+        headSha: escalatedHead,
+      }),
+    });
+
+    // AC2: the gate's sweep runs every 15 minutes. A re-run -- or a GitHub
+    // redelivery -- must not post a second comment for a head already routed.
+    // A DIFFERENT delivery id is used deliberately: delivery-level dedup would
+    // pass this vacuously, so this asserts the (pull, head) key is what holds.
+    const replay = await send("delivery-escalation-2");
+    expect(replay.status).toBe(200);
+
+    const commentsAfterReplay = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.issueId, issueId),
+        sql`${issueComments.metadata}->>'kind' = 'github_pr_review_gate_escalation'`,
+      ));
+    expect(commentsAfterReplay).toHaveLength(1);
+    expect(commentsAfterReplay[0]!.id).toBe(escalationComments[0]!.id);
+
+    const wakesAfterReplay = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakesAfterReplay).toHaveLength(1);
+  });
+
+  it("reports an escalation that resolved no owning issue instead of going quiet", async () => {
+    // AC3, consumer half. The gate always posts the PR comment; routing is what
+    // can fail. From Paperclip, "no owning issue" and "the gate never
+    // escalated" are indistinguishable -- both produce zero issue comments --
+    // and the silent reading is the expensive one, because it blames the gate
+    // for a missing PR link. So the delivery must still be observable.
+    const escalatedHead = "ae3a4dbe83c9c0c5fb70d1bae25f206a3d28417b";
+    const { agentId, issueId } = await seedIssueWithIdentifier("BLO-31132", {
+      status: "in_progress",
+    });
+
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const payload = {
+      action: "created",
+      issue: {
+        number: 3133,
+        // BLO-31132 appears ONLY as an unlabeled body mention, so it is matched
+        // but is not an OWNING reference -- the same shape as a `Related:` note.
+        title: "review-gate liveness exporter",
+        body: "Background: BLO-31132 hit this too. No closing keyword here.",
+        html_url: "https://github.com/Blockcast/onprem-k8s/pull/3133",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/onprem-k8s/pulls/3133" },
+        user: { login: "allyblockcast[bot]" },
+      },
+      comment: {
+        id: 4900000002,
+        body: [
+          `<!-- review-gate:stale-escalation:${escalatedHead} -->`,
+          "",
+          "**Ally review is stuck on head `ae3a4dbe`.**",
+          "",
+          "This will NOT retry again on its own.",
+        ].join("\n"),
+        html_url: "https://github.com/Blockcast/onprem-k8s/pull/3133#issuecomment-4900000002",
+        user: { login: "github-actions[bot]", type: "Bot" },
+      },
+      repository: { full_name: "Blockcast/onprem-k8s" },
+    };
+
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-escalation-unowned")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    // No owning reference -> no author wake, and the route says so by name
+    // rather than silently returning an empty wake list.
+    expect(res.body.wakes).toEqual([]);
+    expect(res.body.skipped).toContainEqual({
+      issueIdentifier: null,
+      reason: "no_owning_reference",
+    });
+    expect(res.body.reviewGateEscalationComments).toBeUndefined();
+
+    const escalationComments = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.issueId, issueId),
+        sql`${issueComments.metadata}->>'kind' = 'github_pr_review_gate_escalation'`,
+      ));
+    expect(escalationComments).toHaveLength(0);
+
+    const wakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes).toHaveLength(0);
+  });
+
+  it("does not route the gate's stale-RETRY comment to the owning issue (AC4)", async () => {
+    // States 1 and 2 unchanged. A retry means the gate still has a re-request
+    // outstanding and resolves it on its own 29 times out of 30; waking the
+    // assignee would page them for a stall the automation is still handling.
+    const { agentId, issueId } = await seedIssueWithIdentifier("BLO-31132", {
+      status: "in_progress",
+    });
+
+    const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+    const payload = {
+      action: "created",
+      issue: {
+        number: 2949,
+        title: "Register data-pool scheduling headroom alerts",
+        body: "Closes BLO-31132",
+        html_url: "https://github.com/Blockcast/onprem-k8s/pull/2949",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/onprem-k8s/pulls/2949" },
+        user: { login: "allyblockcast[bot]" },
+      },
+      comment: {
+        id: 4900000003,
+        body: [
+          "<!-- review-gate:stale-retry:dcbcb6cab10f60118d2826c0ba5e18f482f9a147 -->",
+          "",
+          "Re-requesting Ally review on head `dcbcb6ca` after 2h with no review.",
+        ].join("\n"),
+        html_url: "https://github.com/Blockcast/onprem-k8s/pull/2949#issuecomment-4900000003",
+        user: { login: "github-actions[bot]", type: "Bot" },
+      },
+      repository: { full_name: "Blockcast/onprem-k8s" },
+    };
+
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-retry-1")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.reviewGateEscalationComments).toBeUndefined();
+
+    const comments = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.issueId, issueId),
+        sql`${issueComments.metadata}->>'kind' = 'github_pr_review_gate_escalation'`,
+      ));
+    expect(comments).toHaveLength(0);
+
+    const wakes = await db
+      .select({ reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.some((w) => w.reason === "github_pr_review_gate_escalation")).toBe(false);
   });
 
   it("does not count same-number PR feedback cycles from other repos", async () => {
