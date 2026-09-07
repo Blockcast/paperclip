@@ -11943,7 +11943,12 @@ export function issueRoutes(
           persistBeforeTerminate: true,
           repairTerminalRelease: true,
         },
-      );
+      ).catch((err) => {
+        logger.warn(
+          { err, runId: actor.runId, issueId: issue.id },
+          "failed to yield run slot after persisting an external-service wait");
+        return null;
+      });
       if (yielded?.status === "cancelled" && yielded.errorCode === "external_wait_yield") {
         await logActivity(db, {
           companyId: issue.companyId,
