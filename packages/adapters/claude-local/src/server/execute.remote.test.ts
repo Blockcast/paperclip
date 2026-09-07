@@ -88,6 +88,46 @@ describe("claude remote execution", () => {
     }
   });
 
+  it("applies the local default timeout to legacy persisted zero", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-legacy-timeout-"));
+    cleanupDirs.push(rootDir);
+
+    await execute({
+      runId: "run-legacy-zero-timeout",
+      agent: {
+        id: "agent-legacy-zero-timeout",
+        companyId: "company-1",
+        name: "Legacy zero timeout",
+        adapterType: "claude_local",
+        adapterConfig: { timeoutSec: 0 },
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        engine: "cli",
+        command: "claude",
+        timeoutSec: 0,
+      },
+      context: {
+        paperclipWorkspace: {
+          cwd: rootDir,
+          source: "project_primary",
+        },
+      },
+      onLog: async () => {},
+    });
+
+    expect(runChildProcess).toHaveBeenCalledTimes(1);
+    const call = runChildProcess.mock.calls[0] as unknown as
+      | [string, string, string[], { timeoutSec: number }]
+      | undefined;
+    expect(call?.[3].timeoutSec).toBe(21_600);
+  });
+
   it.each([
     ["ccrotate path", "https://paperclip.blockcast.net/ccrotate"],
     ["penstock path", "https://paperclip.blockcast.net/penstock"],
