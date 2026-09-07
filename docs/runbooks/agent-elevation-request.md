@@ -142,6 +142,42 @@ to work around any of this.
    (the thing the Secret feeds), not the grant.
 4. Comment the result and the UTC timestamp on the originating issue.
 
+### The card must carry a branch and a default, or it will not clear
+
+This ask is the shape the board measures as *least* likely to be approved: the
+action after the decision is performed by a **human**, who has to leave
+Paperclip to run `break_glass_cli` and then `kubectl`. Standing CEO policy is
+that every board card must carry an explicit branch satisfiable entirely inside
+Paperclip, and must state what happens on silence. A branchless card is worse
+than no card — it is a work item with no owner.
+
+So, before you file:
+
+- **Prefer step 2 of the previous section.** The exact-scoped VAP clause is a PR
+  you open yourself. It needs no card at all, and it is the path the policy's own
+  denial message names. Only fall through to elevation for a genuine one-off.
+- **File once the precondition already holds.** A card is judged against the
+  state at decision time, not execution time — same-day cards are read in
+  minutes — so "approve this after X lands" is refused as premature. Never write
+  a self-rejecting branch ("if X has not happened, reject this"): the refusal
+  carries no information and burns the `idempotencyKey`.
+- **One ask per card.** Do not bundle the elevation with an unrelated in-channel
+  decision. The card is refused as a unit, so the decidable half dies with the
+  branchless half.
+- **Add both clauses to the payload**, adapted:
+
+  > *Branch:* if you judge the exact-scoped VAP clause sufficient instead, say
+  > so and I will open that PR and close this request — no elevation needed.
+  >
+  > *Default on silence:* absent a reply by `<ISO date>`, I record the write as
+  > not performed, leave BLO-`<n>` in `todo` with a `re-check not before` note,
+  > and take no further action on this card.
+
+- **Read the outcome carefully.** On `approved`/`rejected` an empty
+  `decisionNote` is a known platform defect, not a signal — look for the
+  reasoning in `paperclipListApprovalComments` and on the issue. Only on
+  `revision_requested` does the note persist.
+
 ## Request template
 
 Copy verbatim, replace every `<...>`. **The subject must be a human operator's
