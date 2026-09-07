@@ -1549,19 +1549,81 @@ export async function awaitSessionWithProgress<T>(
   start: () => Promise<T>,
   delays: { firstDelayMs?: number; maxDelayMs?: number } = {},
 ): Promise<T> {
+  const startedAtMs = Date.now();
+  return awaitPhaseWithProgress(
+    start,
+    async (stage) => {
+      await emitAcpxLog(ctx, {
+        type: "acpx.session_establish",
+        stage: stage === "settled" ? "established" : stage,
+        attempt: meta.attempt,
+        resume: meta.resume,
+        elapsedMs: Math.max(0, Date.now() - startedAtMs),
+        observedAt: new Date().toISOString(),
+      });
+    },
+    delays,
+  );
+}
+
+/**
+ * Await runtime preparation while emitting periodic elapsed-time progress.
+ *
+ * Everything the engine does before the handshake -- billing-identity
+ * resolution, workspace and state directory creation, skill installation, and
+ * the ancestor-bin walk that resolves the agent command -- runs before the run
+ * has emitted a byte of its own. `awaitSessionWithProgress` covers only the
+ * handshake that follows it, so a stall in this window still left the run log
+ * frozen at its pre-exec prefix: indistinguishable, at `lastOutputSeq: 1`,
+ * from a process that never started at all. Several of those steps are
+ * filesystem syscalls against a network mount, where a blocked call does not
+ * return on its own.
+ *
+ * Closing this window is what makes "silent at seq 1" mean one thing instead of
+ * two, which is the discriminator any decision taken against a silent run needs.
+ *
+ * Same non-terminating contract as the handshake ticker -- this reports, it does
+ * not bound. Payload carries only stage/elapsed metadata: never prompts,
+ * credentials, environment values, paths, or model output.
+ */
+export async function awaitRuntimePrepareWithProgress<T>(
+  ctx: AdapterExecutionContext,
+  start: () => Promise<T>,
+  delays: { firstDelayMs?: number; maxDelayMs?: number } = {},
+): Promise<T> {
+  const startedAtMs = Date.now();
+  return awaitPhaseWithProgress(
+    start,
+    async (stage) => {
+      await emitAcpxLog(ctx, {
+        type: "acpx.runtime_prepare",
+        stage: stage === "settled" ? "prepared" : stage,
+        elapsedMs: Math.max(0, Date.now() - startedAtMs),
+        observedAt: new Date().toISOString(),
+      });
+    },
+    delays,
+  );
+}
+
+/**
+ * Run `start()` while emitting `started`, backing-off `waiting`, and one
+ * terminal `settled`/`failed` progress tick.
+ *
+ * Shared by every phase that awaits an unbounded operation before the run
+ * produces output of its own; each caller names its own wire stages and owns
+ * its own payload. The cadence is the point: ticks arrive faster than the
+ * shortest staleness window that reads a run's last-output timestamp
+ * (`RUN_STALE_SILENCE_MS`, 15m -- three times the 5m tick ceiling), so a phase
+ * that is merely slow cannot be read as one whose process is gone.
+ */
+async function awaitPhaseWithProgress<T>(
+  start: () => Promise<T>,
+  emit: (stage: "started" | "waiting" | "settled" | "failed") => Promise<void>,
+  delays: { firstDelayMs?: number; maxDelayMs?: number },
+): Promise<T> {
   const firstDelayMs = Math.max(1, delays.firstDelayMs ?? ACP_ENGINE_SESSION_PROGRESS_FIRST_DELAY_MS);
   const maxDelayMs = Math.max(firstDelayMs, delays.maxDelayMs ?? ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS);
-  const startedAtMs = Date.now();
-  const emit = async (stage: "started" | "waiting" | "established" | "failed") => {
-    await emitAcpxLog(ctx, {
-      type: "acpx.session_establish",
-      stage,
-      attempt: meta.attempt,
-      resume: meta.resume,
-      elapsedMs: Math.max(0, Date.now() - startedAtMs),
-      observedAt: new Date().toISOString(),
-    });
-  };
 
   await emit("started");
 
@@ -1594,10 +1656,10 @@ export async function awaitSessionWithProgress<T>(
   const pending = start();
   scheduleNext();
   try {
-    const handle = await pending;
+    const value = await pending;
     stop();
-    await emit("established").catch(() => {});
-    return handle;
+    await emit("settled").catch(() => {});
+    return value;
   } catch (err) {
     stop();
     await emit("failed").catch(() => {});
@@ -2015,18 +2077,23 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
   const engine = resolveEngineSettings(deps);
 
   return async function executeAcpxEngine(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-    let billingIdentity: AcpxEngineBillingIdentity | null = null;
-    try {
-      billingIdentity = (await deps.resolveBillingIdentity?.(ctx)) ?? null;
-    } catch {
-      billingIdentity = null;
-    }
+    // Both awaits are inside the ticker: this is the whole window between the
+    // pre-exec prefix and the first byte the engine emits on its own, and it is
+    // where an unreturning filesystem call parks a run with nothing in the log.
+    const { prepared, billingIdentity } = await awaitRuntimePrepareWithProgress(ctx, async () => {
+      let identity: AcpxEngineBillingIdentity | null = null;
+      try {
+        identity = (await deps.resolveBillingIdentity?.(ctx)) ?? null;
+      } catch {
+        identity = null;
+      }
+      return { prepared: await buildRuntime({ ctx, engine }), billingIdentity: identity };
+    });
     const billingFields = {
       provider: billingIdentity?.provider ?? "acpx",
       ...(billingIdentity?.biller ? { biller: billingIdentity.biller } : {}),
       billingType: billingIdentity?.billingType ?? ("unknown" as const),
     };
-    const prepared = await buildRuntime({ ctx, engine });
     // State the effective wall-clock timeout and its source up front so a
     // later timeout is diagnosable from the run log alone. Goes to stderr:
     // the acpx stdout log stream carries JSON acpx.* event payloads and must

@@ -8,6 +8,7 @@ import type { AcpRuntimeOptions } from "acpx/runtime";
 import type { AdapterRuntimeMcpAccess } from "@paperclipai/adapter-utils";
 import { DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC } from "@paperclipai/adapter-utils/execution-target";
 import {
+  awaitRuntimePrepareWithProgress,
   awaitSessionWithProgress,
   createAcpxEngineExecutor,
   findAncestorBin,
@@ -1951,6 +1952,136 @@ describe("ACPX session establishment progress (PEN-1995)", () => {
     ]);
     for (const entry of lines) {
       expect(Object.keys(entry).filter((key) => !allowed.has(key))).toEqual([]);
+    }
+  });
+});
+
+describe("ACPX runtime prepare progress (PEN-1995)", () => {
+  function collector() {
+    const lines: Array<Record<string, unknown>> = [];
+    const ctx = {
+      onLog: async (_stream: "stdout" | "stderr", text: string) => {
+        for (const line of text.split("\n")) {
+          if (!line.trim()) continue;
+          try {
+            lines.push(JSON.parse(line) as Record<string, unknown>);
+          } catch {
+            // non-JSON prose lines are not part of this contract
+          }
+        }
+      },
+    } as never;
+    const stages = () =>
+      lines
+        .filter((entry) => entry.type === "acpx.runtime_prepare")
+        .map((entry) => entry.stage as string);
+    return { lines, ctx, stages };
+  }
+
+  const fastDelays = { firstDelayMs: 5, maxDelayMs: 10 };
+
+  it("brackets a normal prepare with started/prepared and reports elapsed", async () => {
+    const { ctx, lines, stages } = collector();
+
+    const prepared = await awaitRuntimePrepareWithProgress(ctx, async () => "runtime", fastDelays);
+
+    expect(prepared).toBe("runtime");
+    expect(stages()).toEqual(["started", "prepared"]);
+    expect(typeof lines[0]?.elapsedMs).toBe("number");
+  });
+
+  it("keeps reporting while prepare is slow, and stops once it settles", async () => {
+    const { ctx, stages } = collector();
+    let release: (() => void) | null = null;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const pending = awaitRuntimePrepareWithProgress(
+      ctx,
+      async () => {
+        await gate;
+        return "runtime";
+      },
+      fastDelays,
+    );
+
+    // A stall must keep the run's last-output timestamp advancing; that is the
+    // entire point of the ticker, so assert more than one tick actually lands.
+    while (stages().filter((stage) => stage === "waiting").length < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    release?.();
+    await pending;
+
+    expect(stages().at(0)).toBe("started");
+    expect(stages().at(-1)).toBe("prepared");
+
+    const settled = stages().length;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(stages().length).toBe(settled);
+  });
+
+  it("reports a failed prepare and rethrows", async () => {
+    const { ctx, stages } = collector();
+
+    await expect(
+      awaitRuntimePrepareWithProgress(
+        ctx,
+        async () => {
+          throw new Error("ACP_RUNTIME_PREPARE_FAILED");
+        },
+        fastDelays,
+      ),
+    ).rejects.toThrow("ACP_RUNTIME_PREPARE_FAILED");
+
+    expect(stages()).toEqual(["started", "failed"]);
+
+    const settled = stages().length;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(stages().length).toBe(settled);
+  });
+
+  // Wiring check, and the ordering claim that makes "silent at seq 1" mean one
+  // thing: preparation is the first window of the run, so its `started` tick
+  // must be the very first event the engine emits -- ahead of the handshake's.
+  it("routes the real executor's preparation through the ticker, ahead of the handshake", async () => {
+    const { logs } = await runExecutor({ agent: "claude" });
+
+    const events = logs
+      .filter((entry) => entry.stream === "stdout")
+      .flatMap((entry) => entry.text.split("\n"))
+      .filter((line) => line.trim().startsWith("{"))
+      .map((line) => {
+        try {
+          return JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      })
+      .filter((entry): entry is Record<string, unknown> => entry !== null);
+
+    const prepare = events.filter((entry) => entry.type === "acpx.runtime_prepare");
+    expect(prepare.map((entry) => entry.stage)).toEqual(["started", "prepared"]);
+    expect(typeof prepare[1]?.elapsedMs).toBe("number");
+
+    expect(events[0]?.type).toBe("acpx.runtime_prepare");
+    expect(events[0]?.stage).toBe("started");
+
+    const firstHandshake = events.findIndex((entry) => entry.type === "acpx.session_establish");
+    expect(firstHandshake).toBeGreaterThan(events.indexOf(prepare[1]!));
+  });
+
+  it("never emits prompt, credential, environment, or path material", async () => {
+    const { lines, ctx } = collector();
+
+    await awaitRuntimePrepareWithProgress(ctx, async () => "runtime", fastDelays);
+
+    expect(lines.length).toBeGreaterThan(0);
+    for (const entry of lines) {
+      // Exact key set, not an exclusion list: a payload field added later has
+      // to be re-justified here rather than inherited silently.
+      expect(Object.keys(entry).sort()).toEqual(["elapsedMs", "observedAt", "stage", "type"]);
     }
   });
 });
