@@ -203,10 +203,19 @@ def main():
               sorted((before_ac.get("env") or {}).keys()))
         return 0
 
-    write(args.out_dir, f"{args.agent_id}.before.json", before)
     if already:
         print(f"OK: {before.get('name')} already has {args.skill}; no PATCH sent")
         return 0
+
+    # Capture ONLY when a PATCH is about to be sent, and never clobber an earlier
+    # capture. Writing unconditionally would let a second run overwrite the
+    # pre-change state with a skill-present one, silently turning --rollback into
+    # a no-op that still prints ROLLBACK ROUND-TRIP OK.
+    before_path = os.path.join(args.out_dir, f"{args.agent_id}.before.json")
+    if os.path.exists(before_path):
+        print(f"NOTE: keeping the existing pre-change capture at {before_path}")
+    else:
+        write(args.out_dir, f"{args.agent_id}.before.json", before)
 
     status, patched = api(
         "PATCH", f"/api/agents/{args.agent_id}",
