@@ -5623,6 +5623,79 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(secondPass.issueIds).toEqual([]);
   });
 
+  // BLO-8050 gate on the BLO-31913 arm. The escalation test above and the
+  // deliberate-park guard below both discriminate on the handoff EVIDENCE;
+  // neither exercises the unblock gate, because both leave the run's
+  // `createdAt` at the schema default (wall clock) so no seeded unblock can
+  // ever precede it. That is why this needs its own test rather than a row on
+  // the BLO-8050 table at the bottom of this file: every row there is a
+  // `failed` run with an `errorCode`, and none reaches this branch, which
+  // requires a `succeeded` run carrying handoff markers on `contextSnapshot`.
+  //
+  // The failure mode being pinned: handoff evidence lives on the run's
+  // contextSnapshot and never expires, so an operator moving an escalated row
+  // back to `todo` would otherwise be met with an immediate re-flip to
+  // `blocked` on the very same pre-unblock run -- defeating the manual
+  // recovery exactly as BLO-7521 did. Deleting the guard at
+  // `recovery/service.ts` makes this test fail (escalated 1, issue `blocked`);
+  // without it the guard is unpinned and the suite stays green.
+  it("BLO-8050: skips the exhausted-handoff todo escalation when the run predates a manual unblock", async () => {
+    const { companyId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "succeeded",
+    });
+    const sourceRunId = randomUUID();
+    // Pin createdAt alongside the handoff markers: the fixture relies on the
+    // schema's defaultNow(), which would sort AFTER any unblock we seed here
+    // and silently make the gate untestable rather than failing loudly.
+    const handoffRunCreatedAt = new Date("2026-03-19T00:00:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        createdAt: handoffRunCreatedAt,
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    // Operator unblock recorded strictly AFTER the handoff run.
+    await db.insert(activityLog).values({
+      id: randomUUID(),
+      companyId,
+      actorType: "user",
+      actorId: "operator",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      details: { previousStatus: "blocked", status: "todo" },
+      createdAt: new Date("2026-03-19T01:00:00.000Z"),
+    });
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // Assert the branch-specific counter, not `escalated`: this arm increments
+    // `successfulRunHandoffEscalated`, so a test asserting only `escalated`
+    // would pass whether or not the guard fired.
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("todo");
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
+      .toHaveLength(0);
+  });
+
   // BLO-31913 regression guard, and the more important half of the pair: a
   // succeeded run on a `todo` issue is normally a DELIBERATE park -- the run
   // chose `todo` and recorded why, which is the disposition this fleet's own
@@ -12009,11 +12082,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.status).toBe("in_progress");
   });
 
-  // BLO-8050: generalize the BLO-7521 "operator-just-unblocked" gate to all
-  // six escalation callsites. Without these gates, an issue with a stale
+  // BLO-8050: generalize the BLO-7521 "operator-just-unblocked" gate across
+  // the escalation callsites. Without these gates, an issue with a stale
   // failing run gets re-flipped to `blocked` on the next sweep even though
   // the operator's unblock was supposed to grant a fresh run window.
   // Each row exercises one (status × escalation predicate) combination.
+  //
+  // Scope, because it is narrower than it looks: every row below seeds a
+  // `failed` run carrying an `errorCode`. The exhausted-successful-handoff
+  // arm (BLO-31913) needs a `succeeded` run with handoff markers on
+  // `contextSnapshot`, so no row here reaches it and its gate is pinned by
+  // its own test earlier in this file. Adding a row for it would also assert
+  // the wrong counter -- this table checks `escalated` /
+  // `zeroTokenStartupFailureBlocked`, while that arm increments
+  // `successfulRunHandoffEscalated`, so a naive row would pass either way.
+  // This table is therefore not the inventory of gated callsites; the grep in
+  // `latestRunPredatesLatestUnblock`'s docstring is.
   it.each([
     {
       label: "todo + non-retryable terminal run",

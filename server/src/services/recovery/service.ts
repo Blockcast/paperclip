@@ -2291,8 +2291,15 @@ export function recoveryService(
   // re-flips the issue back to `blocked` on the next sweep using stale
   // latestRun state, defeating the manual recovery path. BLO-7521 added the
   // first instance of this gate for stranded-recovery-origin issues; BLO-8050
-  // generalizes it to all six escalation callsites (todo and in_progress
-  // arms × non-retryable / zero-token / recovery-failed predicates).
+  // generalized it to every escalation callsite, and later work (e.g. the
+  // BLO-31913 exhausted-handoff arm) has kept adding them.
+  //
+  // Deliberately no count here: two earlier revisions of this comment pinned
+  // one ("all six escalation callsites") and both had drifted by the time
+  // anyone read them, which is how the BLO-31913 arm shipped without a gate.
+  // For the current inventory, ask the code:
+  //   grep -n 'await latestRunPredatesLatestUnblock' server/src/services/recovery/service.ts
+  // Any new escalation callsite MUST carry this gate.
   async function latestRunPredatesLatestUnblock(
     companyId: string,
     issueId: string,
