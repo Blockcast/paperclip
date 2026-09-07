@@ -40,6 +40,12 @@ chain** — there is no `ElevationGrant` reference anywhere in `server/src`.
    `variables.elevatedSubjects != '' && request.userInfo.username in
    variables.elevatedSubjects.split(',')`.
 
+   **The binding is namespace-scoped.** It matches only namespaces labelled
+   `bcast.id/protected-secrets: "true"`, with `parameterNotFoundAction: Deny`
+   and `validationActions: [Deny, Audit]`. Outside that label set the policy
+   never evaluates, and neither a policy clause nor an elevation grant is
+   needed. Read the label rather than a list — the set changes.
+
 Expiry is deliberately **not** checked in the policy — VAP CEL has no clock.
 Presence in `subjects` *is* the liveness signal; the controller removes the
 subject when the grant lapses. If the controller dies, the list freezes
@@ -107,20 +113,42 @@ its own denial message:
 
 So:
 
-1. **Check whether you already have access.** Some Paperclip subjects are
+1. **First, check whether the policy even covers your namespace.** It is bound
+   only to namespaces labelled `bcast.id/protected-secrets: "true"`:
+
+   ```bash
+   kubectl get ns <namespace> \
+     -o jsonpath='{.metadata.labels.bcast\.id/protected-secrets}'
+   ```
+
+   Empty output means the policy does not evaluate for that namespace and
+   nothing on this page applies — ordinary RBAC governs the write. As of
+   2026-09-07 six namespaces carry the label (`bc-elevation`, `cert-manager`,
+   `freeipa`, `paperclip`, `ssh-bastion`, `vault`), but read the label rather
+   than trusting that list.
+2. **Then check whether you already have access.** Some Paperclip subjects are
    already permitted by the policy. `system:serviceaccount:paperclip:paperclip`
    is in the broad allowlist; `paperclip-ci-deploy`, `figma-designer-bot`,
    `webflow-designer-bot`, and `github-app-token-rotator` have exact-scoped
    clauses. Confirm which SA will actually perform the write before asking for
    anything — an elevation request for an already-permitted subject is pure
    waste.
-2. **For a recurring automated write:** open a PR to `Blockcast/onprem-k8s`
+3. **For a recurring automated write:** open a PR to `Blockcast/onprem-k8s`
    adding an exact-scoped disjunct to `bc-protected-secret-write` — pin the
    SA username, the namespace, the operation set, the object name, and the
-   Secret type. Follow the five existing clauses. Scope it as narrowly as the
-   write genuinely needs; a bare username entry authorizes writing *any*
-   protected Secret in *every* covered namespace.
-3. **For a genuine one-off:** ask a human operator to perform the write under
+   Secret type. Follow the existing exact-scoped clauses (do not trust a count:
+   the denial message says "five", generation 17 carries more, and the number
+   drifts with every edit). Scope it as narrowly as the write genuinely needs;
+   a bare username entry authorizes writing *any* protected Secret in *every*
+   covered namespace.
+
+   **Get the CEL right before you merge.** The binding is
+   `validationActions: [Deny, Audit]` with `failurePolicy: Fail` and
+   `parameterNotFoundAction: Deny`, so a malformed disjunct does not degrade to
+   a warning — it breaks Secret writes across the whole covered namespace set.
+   The policy's own comment puts it plainly: a constraint that is "merely close
+   is an outage in the core app, not a warning."
+4. **For a genuine one-off:** ask a human operator to perform the write under
    their own elevation grant, using the request template below. The human is
    the subject; you are the requester. Post the outcome on the issue.
 
@@ -153,7 +181,7 @@ than no card — it is a work item with no owner.
 
 So, before you file:
 
-- **Prefer step 2 of the previous section.** The exact-scoped VAP clause is a PR
+- **Prefer step 3 of the previous section.** The exact-scoped VAP clause is a PR
   you open yourself. It needs no card at all, and it is the path the policy's own
   denial message names. Only fall through to elevation for a genuine one-off.
 - **File once the precondition already holds.** A card is judged against the
@@ -232,12 +260,34 @@ The named operator performs the write, then posts the result here.
 ## Expiry
 
 `ElevationGrant.spec.expiresAt` is the minimum `expires_at` among the two quorum
-rows. The **controller** enforces the ≤1h maximum at admission; the CRD schema
-itself does not cap the duration (its only validations are distinct approvers,
-no self-approval, and `expiresAt > grantedAt`). Both approvals must be active at
-the same time, so coordinate the two `grant` calls closely. When either row
-expires or is consumed, the controller removes the subject from
-`bc-active-elevations` on its next reconcile and the policy denies again.
+rows.
+
+The ≤1h maximum is real, but **it is not enforced at admission** — no object in
+the admission chain caps duration. It is enforced in the controller's own
+validation *before it creates the grant*:
+`bc-elevation-controller` `internal/validate/validate.go:15` defines
+`MaxDuration = time.Hour`, and `validate.go:45` rejects any grant whose
+`ExpiresAt` is after `mergedAt + MaxDuration`. `reconcile.go:248` calls
+`validate.Validate` for **every** source — magma-derived grants included, where
+`mergedAt` is the earliest of the two approval timestamps
+(`internal/source/magma.go:180`). A grant that fails is *skipped*, not rejected
+at admission: no `ElevationGrant` object is created, so the subject never
+reaches `bc-active-elevations` and never elevates. The failure is recorded as a
+`denied` audit event.
+
+This is why the approver's ConfigMap check (step 5 above) is sufficient and no
+separate window check is needed: an over-long grant cannot appear there.
+
+The CRD schema does not cap the duration — its only validations are distinct
+approvers, no self-approval, and `expiresAt > grantedAt`. Do **not** take the
+cap from the CRD's `expiresAt` description string; that text belongs to the same
+stale-description family flagged below, and `validate.go:13-14`'s own comment
+("re-checked at read time by the webhook") is stale for the same reason.
+
+Both approvals must be active at the same time, so coordinate the two `grant`
+calls closely. When either row expires or is consumed, the controller removes
+the subject from `bc-active-elevations` on its next reconcile and the policy
+denies again.
 
 There is no renewal path. A new window is a new request.
 
@@ -443,7 +493,63 @@ This is a third Paperclip ServiceAccount confirmed forbidden, alongside
 `bc-sa-paperclip` and `paperclip-k8s-mcp-ns-rw`. Working around it is
 prohibited.
 
-### 7. Follow-up issue
+### 7. The ≤1h cap is enforced by the controller, not by admission
+
+Verified in `Blockcast/bc-elevation-controller` source, not from the CRD
+description string (an earlier draft of this runbook took it from the CRD and
+was wrong about the plane):
+
+```go
+// internal/validate/validate.go:12-15
+// MaxDuration is the hard ceiling on how far in the future a grant may expire,
+// measured from the moment its config PR merged. ...
+const MaxDuration = time.Hour
+
+// internal/validate/validate.go:45
+if g.ExpiresAt.After(mergedAt.Add(MaxDuration)) {
+	return fmt.Errorf("expiresAt %s exceeds max grant duration %s after merge", ...)
+}
+```
+
+`internal/reconcile/reconcile.go:248` calls `validate.Validate` for every source
+entry, so magma-derived grants are covered; for those, `mergedAt` is the
+earliest approval timestamp (`internal/source/magma.go:180`). A violation is a
+skip (`res.Skipped[f.Name] = "invalid: " + err.Error()`) plus a `denied` audit
+event — the `ElevationGrant` is never created, so the subject never reaches
+`bc-active-elevations`.
+
+No duration cap exists anywhere in the admission chain: `bc-protected-secret-write`
+(generation 17) contains no duration logic, and the CRD's only
+`x-kubernetes-validations` are the three enumerated above.
+
+### 8. The policy binding is namespace-scoped
+
+```
+$ kubectl get validatingadmissionpolicybinding bc-protected-secret-write -o yaml
+spec:
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        bcast.id/protected-secrets: "true"
+  paramRef:
+    name: bc-active-elevations
+    namespace: bc-elevation
+    parameterNotFoundAction: Deny
+  validationActions: [Deny, Audit]
+
+$ kubectl get ns -l bcast.id/protected-secrets=true -o name   # 2026-09-07
+namespace/bc-elevation
+namespace/cert-manager
+namespace/freeipa
+namespace/paperclip
+namespace/ssh-bastion
+namespace/vault
+```
+
+Six namespaces at the date of this read. The label, not this list, is
+authoritative.
+
+### 9. Follow-up issue
 
 The negative result in §5 and the stale artifact descriptions noted in
 "Superseded recommendation" are tracked in **BLO-32633**
