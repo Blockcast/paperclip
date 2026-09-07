@@ -5596,12 +5596,31 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
     });
 
-    // The escalation must leave a live owner behind, not the BLO-27553
-    // `blocked`-with-no-blockers signature that has no wake path at all --
-    // trading a silent strand for a permanent one would be a worse outcome
-    // than the bug. `resolveStrandedEscalationStatus` owns that choice; this
-    // asserts the recovery action carries an owner whichever status it picks.
+    // Assert the disposition the issue ACTUALLY lands in, as the sibling
+    // `in_progress` test does. An earlier revision asserted only
+    // `recoveryAction.wakePolicy` here, which is a column on the recovery-action
+    // row rather than on the issue -- so it passed whatever status the issue
+    // ended up in, i.e. it did not test the one property its comment claimed.
+    // `resolveStrandedEscalationStatus` picks `blocked` here because the routed
+    // recovery owner is live; the owner assertion below is what makes that
+    // `blocked` + no-blockers shape a wake path rather than the BLO-27553
+    // permanent strand, so both halves are load-bearing together.
+    const escalatedIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(escalatedIssue?.status).toBe("blocked");
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
     expect(recoveryAction.wakePolicy).toMatchObject({ ownerAgentId: agentId });
+
+    // Non-recurrence for this shape: `blocked` is outside
+    // STRANDED_ASSIGNED_ISSUE_STATUSES, so the row leaves the sweep's status
+    // filter and a second pass must neither re-escalate nor re-fire the
+    // Slack-forwarded `needs_human_decision`. This pins the live-owner shape
+    // only -- the ownerless/wake-exhausted shape stays `todo` and re-enters
+    // this branch, bounded by `shouldReuseStrandedRecoveryAction` rather than
+    // by the status filter (see the arm's comment in recovery/service.ts).
+    const secondPass = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(secondPass.successfulRunHandoffEscalated).toBe(0);
+    expect(secondPass.escalated).toBe(0);
+    expect(secondPass.issueIds).toEqual([]);
   });
 
   // BLO-31913 regression guard, and the more important half of the pair: a
