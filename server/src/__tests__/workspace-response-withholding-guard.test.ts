@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -21,9 +21,12 @@ import {
  *
  * ⚠️ Scope, stated precisely so nobody reads more assurance into a green run than it earns:
  *
- *  - It covers the route modules listed in `COVERED_ROUTE_MODULES`. A workspace response added in a
- *    module outside that list is not caught. That is the honest limit of a file-scoped guard, and
- *    the reason this file lists its covered modules explicitly rather than globbing.
+ *  - It covers the route modules listed in `COVERED_ROUTE_MODULES`. That list no longer goes stale
+ *    silently: "requires every route module that can answer with workspace rows to be covered"
+ *    fails CI when a module outside the list starts binding workspace rows, so a NEW door is caught
+ *    even though the scan itself is file-scoped. What remains outside the check is a module that
+ *    obtains a workspace row without going through a workspace service — see
+ *    `moduleCanAnswerWithWorkspaceRows` for why that predicate is deliberately two-part.
  *  - It matches on the response ARGUMENT's identifier text. Renaming a raw workspace variable to
  *    something without "workspace" in it evades it — unless the value came from a tracked service,
  *    which is what the producer scan is for. It is built against the accidental new handler, not
@@ -120,6 +123,64 @@ export function collectWorkspaceBearingLocals(source: string, receivers: string[
     if (match[1]) names.add(match[1]);
   }
   return [...names];
+}
+
+/**
+ * The service factories that hand back rows carrying workspace runtime config. `projectService` is
+ * here because a project row embeds `workspaces[]` and `primaryWorkspace` — the noun the material
+ * travels under in `projects.ts` and `issues.ts`.
+ */
+const WORKSPACE_SERVICE_EXPORTS = ["executionWorkspaceService", "projectService"];
+
+/**
+ * Receivers in `source` bound to a workspace service, e.g. `const svc = executionWorkspaceService(db)`.
+ *
+ * Import aliases are resolved rather than assumed away. `issues.ts` does
+ * `import { executionWorkspaceService as executionWorkspaceServiceDirect }`, so a scan that grepped
+ * the canonical export name would have found nothing in the one module this series proved was
+ * leaking — a vacuous pass on the door we already know about. The local binding is what the call
+ * site uses, so the local binding is what this resolves.
+ */
+export function collectWorkspaceServiceReceivers(source: string): string[] {
+  const localNames = new Set<string>();
+  for (const exported of WORKSPACE_SERVICE_EXPORTS) {
+    // `{ foo }` binds `foo`; `{ foo as bar }` binds `bar`. Both spellings appear in these modules.
+    const imported = new RegExp(`\\b${exported}\\b(?:\\s+as\\s+([A-Za-z_$][\\w$]*))?`, "g");
+    let match: RegExpExecArray | null;
+    while ((match = imported.exec(source)) !== null) {
+      localNames.add(match[1] ?? exported);
+    }
+  }
+  const receivers = new Set<string>();
+  for (const local of localNames) {
+    const bound = new RegExp(`\\b(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${local}\\s*\\(`, "g");
+    let match: RegExpExecArray | null;
+    while ((match = bound.exec(source)) !== null) {
+      if (match[1]) receivers.add(match[1]);
+    }
+  }
+  return [...receivers];
+}
+
+/**
+ * Whether `source` can answer with a workspace row: it binds a workspace service AND binds that
+ * service's row-producing calls into locals.
+ *
+ * Both halves are load-bearing, and the second is what keeps this check honest. The obvious
+ * predicate — "the module imports a workspace service" — is WRONG, and `environments.ts` is the
+ * counter-example: it constructs `executionWorkspaceService` and calls
+ * `clearEnvironmentSelection(...)` inside a `Promise.all`, discarding the result, then answers with
+ * an environment row. Requiring it to be covered would put a permanent red on a module that
+ * discloses nothing, and a guard that cries wolf is a guard somebody deletes.
+ *
+ * Reusing `collectWorkspaceBearingLocals` rather than writing a second producer list is deliberate:
+ * one definition of "this call yields a workspace row", so the scan and this check cannot drift
+ * into disagreeing about what they are looking for.
+ */
+export function moduleCanAnswerWithWorkspaceRows(source: string): boolean {
+  const receivers = collectWorkspaceServiceReceivers(source);
+  if (receivers.length === 0) return false;
+  return collectWorkspaceBearingLocals(source, receivers).length > 0;
 }
 
 /**
@@ -643,6 +704,71 @@ describe("workspace response withholding guard (PEN-2852, PEN-2370 (b2))", () =>
       const source = readFileSync(path.join(ROUTES_DIR, module), "utf8");
       const locals = collectWorkspaceBearingLocals(source, MODULE_SCANS[module]!.producerReceivers);
       expect(locals.length, `${module} collected no workspace-bearing locals`).toBeGreaterThan(0);
+    }
+  });
+
+  /**
+   * The guard's own blind spot, closed.
+   *
+   * Every test above scans `COVERED_ROUTE_MODULES` — a hand-maintained list. A workspace response
+   * added in a module NOT on that list is not caught, and the list going stale is silent: the suite
+   * stays green while coverage shrinks. That is not hypothetical. It is the exact history of this
+   * ticket — `issues.ts` was door #13 *because* it was out of scope, and it stayed out of scope
+   * until a person went looking. This asks CI the question instead.
+   */
+  it("requires every route module that can answer with workspace rows to be covered", () => {
+    const uncovered = readdirSync(ROUTES_DIR)
+      .filter((file) => file.endsWith(".ts") && !COVERED_ROUTE_MODULES.includes(file))
+      .filter((file) => moduleCanAnswerWithWorkspaceRows(readFileSync(path.join(ROUTES_DIR, file), "utf8")));
+
+    expect(
+      uncovered,
+      "these route modules obtain workspace rows but are not in COVERED_ROUTE_MODULES — add them " +
+        "to the scan (and give them a MODULE_SCANS entry) rather than deleting this assertion",
+    ).toEqual([]);
+  });
+
+  it("detects an uncovered module even when it renames the service on import", () => {
+    // Positive control for the check above: without it, a green run cannot distinguish "no
+    // uncovered module answers with workspace rows" from "the detector resolves no receivers".
+    // The alias spelling is the one `issues.ts` actually uses, so this pins the case that matters.
+    const aliased = `
+      import { executionWorkspaceService as wsSvcDirect } from "../services/execution-workspaces.js";
+      export function newRoutes(db) {
+        const wsSvc = wsSvcDirect(db);
+        router.get("/thing/:id", async (req, res) => {
+          const workspace = await wsSvc.getById(req.params.id);
+          res.json(workspace);
+        });
+      }
+    `;
+    expect(collectWorkspaceServiceReceivers(aliased)).toContain("wsSvc");
+    expect(moduleCanAnswerWithWorkspaceRows(aliased)).toBe(true);
+  });
+
+  it("does not demand coverage from a module that only mutates through a workspace service", () => {
+    // The true negative that decides the shape of the check, pinned against the real file so a
+    // future edit to `environments.ts` that DOES answer with a workspace row flips it.
+    //
+    // `environments.ts` constructs `executionWorkspaceService` and `projectService`, so the naive
+    // "imports a workspace service" predicate would flag it. It calls only
+    // `clearEnvironmentSelection(...)` / `clearExecutionWorkspaceEnvironmentSelection(...)`,
+    // discards both results inside a `Promise.all`, and answers with an environment row.
+    const source = readFileSync(path.join(ROUTES_DIR, "environments.ts"), "utf8");
+    expect(collectWorkspaceServiceReceivers(source).length).toBeGreaterThan(0);
+    expect(moduleCanAnswerWithWorkspaceRows(source)).toBe(false);
+  });
+
+  it("resolves a workspace-service receiver in every covered module", () => {
+    // Guards the resolver itself. If `WORKSPACE_SERVICE_EXPORTS` were misspelled, or the alias
+    // branch broke, this file would resolve nothing everywhere — and the coverage check above
+    // would pass by finding no candidates rather than by finding no gaps.
+    for (const module of COVERED_ROUTE_MODULES) {
+      const source = readFileSync(path.join(ROUTES_DIR, module), "utf8");
+      expect(
+        collectWorkspaceServiceReceivers(source).length,
+        `${module} resolved no workspace-service receiver`,
+      ).toBeGreaterThan(0);
     }
   });
 

@@ -21,8 +21,9 @@ import { issueRoutes } from "../routes/issues.js";
 
 /**
  * PEN-2852 / PEN-2370 — the withholding boundary was wired into
- * `routes/execution-workspaces.ts` and `routes/projects.ts`. Its own guard says so, and names its
- * limit: *"A workspace response added in a THIRD module is not caught."*
+ * `routes/execution-workspaces.ts` and `routes/projects.ts`. Its own guard named that limit at the
+ * time: *"A workspace response added in a THIRD module is not caught."* (The guard now enforces its
+ * own module list, so that sentence no longer appears there — the limit was closed, not restated.)
  *
  * That third module already existed. `GET /api/issues/:id` answers with the same material under
  * FOUR different nouns, and it is the endpoint an agent reads most — every `paperclipGetIssue`
