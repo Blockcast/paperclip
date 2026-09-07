@@ -198,7 +198,7 @@ async function openConfiguredDb(configPath: string): Promise<{
       const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${embeddedHandle.port}/postgres`;
       await ensurePostgresDatabase(adminConnectionString, "paperclip");
       const connectionString = `postgres://paperclip:paperclip@127.0.0.1:${embeddedHandle.port}/paperclip`;
-      await applyPendingMigrations(connectionString);
+      await applyPendingMigrations(connectionString, { prepareOnlineIndexes: true });
       const db = createDb(connectionString) as ClosableDb;
       return {
         db,
@@ -216,7 +216,7 @@ async function openConfiguredDb(configPath: string): Promise<{
       throw new Error(`Config at ${configPath} does not define a database connection string.`);
     }
 
-    await applyPendingMigrations(connectionString);
+    await applyPendingMigrations(connectionString, { prepareOnlineIndexes: true });
     const db = createDb(connectionString) as ClosableDb;
     return {
       db,
@@ -261,14 +261,14 @@ export async function disableAllRoutinesInConfig(
       const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${embeddedHandle.port}/postgres`;
       await ensurePostgresDatabase(adminConnectionString, "paperclip");
       const connectionString = `postgres://paperclip:paperclip@127.0.0.1:${embeddedHandle.port}/paperclip`;
-      await applyPendingMigrations(connectionString);
+      await applyPendingMigrations(connectionString, { prepareOnlineIndexes: true });
       db = createDb(connectionString) as ClosableDb;
     } else {
       const connectionString = nonEmpty(config.database.connectionString);
       if (!connectionString) {
         throw new Error(`Config at ${configPath} does not define a database connection string.`);
       }
-      await applyPendingMigrations(connectionString);
+      await applyPendingMigrations(connectionString, { prepareOnlineIndexes: true });
       db = createDb(connectionString) as ClosableDb;
     }
 

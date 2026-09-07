@@ -7,6 +7,7 @@ export {
   resetPostgresDatabase,
   inspectMigrations,
   applyPendingMigrations,
+  type ApplyPendingMigrationsOptions,
   reconcilePendingMigrationHistory,
   type MigrationState,
   type MigrationHistoryReconcileResult,
@@ -25,12 +26,22 @@ export {
 } from "./pending-migration-preflight.js";
 export {
   ensurePendingConcurrentIndexes,
+  ensureConcurrentIndexesForMigration,
   PENDING_CONCURRENT_INDEXES,
   type ConcurrentIndexSpec,
   type ConcurrentIndexEnsureAction,
   type ConcurrentIndexEnsureResult,
   type EnsurePendingConcurrentIndexesOptions,
+  type EnsureConcurrentIndexesForMigrationOptions,
 } from "./concurrent-index-guard.js";
+export {
+  ensureOnlineIndexPrerequisites,
+  ONLINE_INDEX_PREREQUISITES,
+  type OnlineIndexPrerequisite,
+  type OnlineIndexPrecreationAction,
+  type OnlineIndexPrecreationResult,
+  type EnsureOnlineIndexPrerequisitesOptions,
+} from "./precreate-online-indexes.js";
 export {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
