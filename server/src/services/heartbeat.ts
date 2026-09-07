@@ -403,6 +403,7 @@ import {
   recordAgentZeroTokenCompletedRunStreak,
   recordCcrotateCapacityDeferred,
   recordHeartbeatTimerSchedulerExclusion,
+  recordHeartbeatPostTerminalRunEventDropped,
   recordConcurrentRunBlocked,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
@@ -15618,6 +15619,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   /**
+   * BLO-32553: return the run's status if it is terminal, else null.
+   *
+   * Reads the row rather than trusting an in-memory snapshot: a run can be
+   * terminalized by another process (cancel route, recovery sweep) while this
+   * process still holds a `currentRun` captured as "running". Called only from
+   * the late-event branch of `onAdapterEvent`, which is unreachable until
+   * adapter execution has settled, so this adds no query to the per-event
+   * hot path.
+   */
+  async function readTerminalRunStatus(runId: string): Promise<string | null> {
+    const [row] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    const status = row?.status ?? null;
+    return status && isHeartbeatRunTerminalStatus(status) ? status : null;
+  }
+
+  /**
    * Allocate the next event sequence and append the event under one owner
    * (BLO-19722).
    *
@@ -28346,6 +28366,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
 
     let seq = await nextRunEventSeq(run.id);
+    // BLO-32553: flipped in the `finally` that wraps adapter execution below.
+    // `onEvent` is only valid for the duration of `adapter.execute`; once that
+    // has settled (through every ccrotate retry), any further event is late by
+    // the adapter contract and must be checked against the run's real status
+    // before it is appended. Kept as a closure flag so the check costs nothing
+    // on the hot in-flight path.
+    let adapterExecutionSettled = false;
     let handle: RunLogHandle | null = null;
     let stdoutExcerpt = "";
     let stderrExcerpt = "";
@@ -28686,9 +28713,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       };
 
+      // BLO-32553: reject-and-count guard for events that arrive after the run
+      // has already terminalized.
+      //
+      // `onEvent` is contractually valid only for the duration of
+      // `adapter.execute`. An adapter that fires it from a detached continuation
+      // outliving execute() — the orphan-SIGKILL path — would otherwise append to
+      // a run at a terminal status. The damage is not just a stray row:
+      // `appendRunEvent`'s publish() gates its runtime-status write on
+      // `isHeartbeatRunRuntimeStatusActive(run.status)`, and `run.status` there is
+      // the stale in-memory `currentRun` snapshot taken while the run was still
+      // "running". A late append therefore passes that gate and resurrects the
+      // runtime status `setRunStatus` cleared on terminalization, leaving a
+      // phantom live run that nothing will clear again.
+      //
+      // Two tiers so the hot path pays nothing: the closure flag is free and
+      // false for every in-flight event, so only a genuinely late event reaches
+      // the status read. Note this deliberately does NOT throw — a rejected late
+      // event is therefore distinguishable at the adapter's callsite from a
+      // transport error, which does throw.
       const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
         const eventType = event.eventType.trim();
         if (!eventType) return;
+        if (adapterExecutionSettled) {
+          const terminalStatus = await readTerminalRunStatus(currentRun.id);
+          if (terminalStatus) {
+            recordHeartbeatPostTerminalRunEventDropped(terminalStatus);
+            logger.warn(
+              {
+                runId: currentRun.id,
+                agentId: currentRun.agentId,
+                companyId: currentRun.companyId,
+                terminalStatus,
+                eventType,
+                stream: event.stream ?? null,
+                level: event.level ?? null,
+                message: event.message ?? null,
+                payload: event.payload ?? null,
+              },
+              "dropped adapter run event delivered after the run reached a terminal status (BLO-32553)",
+            );
+            return;
+          }
+        }
         await appendRunEvent(currentRun, seq++, {
           eventType: eventType.slice(0, 120),
           stream: event.stream,
@@ -29277,6 +29344,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         throw adapterErr;
       } finally {
+        // BLO-32553: adapter execution has settled (returned or thrown, after
+        // every ccrotate retry). Anything `onEvent` delivers from here on is a
+        // late event from a continuation that outlived execute().
+        adapterExecutionSettled = true;
         if (branchClaimRenewalTimer) {
           clearInterval(branchClaimRenewalTimer);
         }
