@@ -3201,8 +3201,14 @@ export async function runChildProcess(
             terminalCleanupKillTimer = setTimeout(() => {
               terminalCleanupKillTimer = null;
               terminalCleanupSignal = "SIGKILL";
-              terminalCleanupForceKilled = true;
-              signalRunningProcess({ child, processGroupId }, "SIGKILL");
+              // `forceKilled` is surfaced as run evidence, so it must record a
+              // kill that actually landed rather than one that was merely
+              // attempted. `signalRunningProcess` reports false when the whole
+              // group is already gone (ESRCH) and the direct child has closed.
+              // `terminalCleanupSignal` stays unconditional on purpose: it
+              // describes the escalation this path decided on, which did
+              // happen, whereas `forceKilled` claims an effect on the process.
+              terminalCleanupForceKilled = signalRunningProcess({ child, processGroupId }, "SIGKILL");
             }, Math.max(1, opts.graceSec) * 1000);
           }, graceMs);
         };
