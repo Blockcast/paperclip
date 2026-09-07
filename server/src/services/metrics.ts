@@ -105,6 +105,33 @@ export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_de
 export const HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC =
   "paperclip_heartbeat_timer_scheduler_exclusion_total";
 
+/**
+ * BLO-32553: count of adapter run events dropped because they arrived after the
+ * run had already reached a terminal status.
+ *
+ * Labeled by the run's terminal status only. The event type is deliberately NOT
+ * a label: it is adapter-supplied and unbounded, so labeling on it would let any
+ * adapter mint arbitrary time series. The dropped event's type, message and
+ * payload are carried on the accompanying `logger.warn` instead, which is where
+ * the per-drop evidence lives.
+ */
+export const HEARTBEAT_POST_TERMINAL_RUN_EVENT_DROPPED_METRIC =
+  "paperclip_heartbeat_post_terminal_run_event_dropped_total";
+
+/**
+ * Bounded label domain for {@link HEARTBEAT_POST_TERMINAL_RUN_EVENT_DROPPED_METRIC}.
+ * Mirrors `HEARTBEAT_RUN_TERMINAL_STATUSES` in `heartbeat.ts` (including
+ * `interrupted`, which is what `isHeartbeatRunTerminalStatus` treats as terminal).
+ * Duplicated rather than imported to keep metrics.ts free of a heartbeat.ts import.
+ */
+export const KNOWN_HEARTBEAT_POST_TERMINAL_RUN_STATUSES = [
+  "succeeded",
+  "interrupted",
+  "failed",
+  "cancelled",
+  "timed_out",
+] as const;
+
 export const KNOWN_HEARTBEAT_TIMER_SCHEDULER_EXCLUSIONS = [
   "idle_circuit_breaker",
   "adapter_failed_circuit_breaker",
@@ -1576,6 +1603,7 @@ type HeartbeatRunFailedLabel =
 let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
 let heartbeatTimerSchedulerExclusion: Counter<"reason"> | null = null;
+let heartbeatPostTerminalRunEventDropped: Counter<"status"> | null = null;
 let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = null;
 let externalRuntimeReservationEvents: Counter<"event"> | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
@@ -1680,6 +1708,7 @@ function ensureRegistry(): {
   failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
   heartbeatTimerSchedulerExclusionCounter: Counter<"reason">;
+  heartbeatPostTerminalRunEventDroppedCounter: Counter<"status">;
   zeroTokenCompletedRunStreakGauge: Gauge<"agent_id" | "adapter">;
   externalRuntimeReservationEventsCounter: Counter<"event">;
   externalRuntimeReservationsActiveGauge: Gauge;
@@ -1730,6 +1759,7 @@ function ensureRegistry(): {
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
     || !heartbeatTimerSchedulerExclusion
+    || !heartbeatPostTerminalRunEventDropped
     || !agentZeroTokenCompletedRunStreak
     || !externalRuntimeReservationEvents
     || !externalRuntimeReservationsActive
@@ -1821,6 +1851,17 @@ function ensureRegistry(): {
         + "operational reason. Each increment has durable evidence in agent_wakeup_requests "
         + "or a scheduled_retry heartbeat run.",
       labelNames: ["reason"],
+      registers: [registry],
+    });
+    heartbeatPostTerminalRunEventDropped = new Counter({
+      name: HEARTBEAT_POST_TERMINAL_RUN_EVENT_DROPPED_METRIC,
+      help:
+        "Count of adapter run events dropped because they arrived after the run reached a "
+        + "terminal status, labeled by that terminal status (BLO-32553). Each increment has a "
+        + "matching logger.warn carrying the dropped event's type, message and payload. A "
+        + "non-zero rate means an adapter is emitting from a continuation that outlives "
+        + "execute() — expected only on the orphan-kill path.",
+      labelNames: ["status"],
       registers: [registry],
     });
     agentZeroTokenCompletedRunStreak = new Gauge({
@@ -2427,6 +2468,7 @@ function ensureRegistry(): {
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
     heartbeatTimerSchedulerExclusionCounter: heartbeatTimerSchedulerExclusion,
+    heartbeatPostTerminalRunEventDroppedCounter: heartbeatPostTerminalRunEventDropped,
     zeroTokenCompletedRunStreakGauge: agentZeroTokenCompletedRunStreak,
     externalRuntimeReservationEventsCounter: externalRuntimeReservationEvents,
     externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
@@ -2603,6 +2645,25 @@ export function recordCcrotateCapacityDeferred(
 export function recordHeartbeatTimerSchedulerExclusion(reason: string | null | undefined): string {
   const normalized = normalizeHeartbeatTimerSchedulerExclusion(reason);
   ensureRegistry().heartbeatTimerSchedulerExclusionCounter.inc({ reason: normalized });
+  return normalized;
+}
+
+/**
+ * BLO-32553: record that a run event was dropped for arriving post-terminalization.
+ *
+ * `status` is the run's terminal status and is bounded by
+ * `HEARTBEAT_RUN_TERMINAL_STATUSES`; anything unrecognized collapses to "unknown"
+ * so a caller cannot widen the label set.
+ */
+export function recordHeartbeatPostTerminalRunEventDropped(
+  status: string | null | undefined,
+): string {
+  const normalized =
+    typeof status === "string"
+      && (KNOWN_HEARTBEAT_POST_TERMINAL_RUN_STATUSES as readonly string[]).includes(status)
+      ? status
+      : "unknown";
+  ensureRegistry().heartbeatPostTerminalRunEventDroppedCounter.inc({ status: normalized });
   return normalized;
 }
 
@@ -3550,6 +3611,7 @@ export function __resetMetricsForTest(): void {
   heartbeatRunFailed = null;
   ccrotateCapacityDeferred = null;
   heartbeatTimerSchedulerExclusion = null;
+  heartbeatPostTerminalRunEventDropped = null;
   agentZeroTokenCompletedRunStreak = null;
   zeroTokenStreakAdapterByAgentId.clear();
   externalRuntimeReservationEvents = null;
