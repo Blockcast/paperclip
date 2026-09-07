@@ -36,13 +36,14 @@ function renderStatefulSet() {
 test("production image pins the standalone Penstock launcher and Caveman proxy", () => {
   assert.match(
     dockerfile,
-    /ARG PENSTOCK_RUNTIME_REF=7414e2ae4239630d64c0d765ec4340f3da997bf8/,
+    /ARG PENSTOCK_RUNTIME_REF=2823acc1b4d730a86aded6b228f748aa12f40f53/,
   );
   assert.match(
     dockerfile,
     /ARG PENSTOCK_RUNTIME_SHA256=fa6c923f78900919ec6fd3cbfe1c878078dab267e82e5faaa695d0c49f50f29e/,
   );
   assert.match(dockerfile, /--mount=type=secret,id=gh_token/);
+  assert.match(dockerfile, /--header @-/);
   assert.match(
     dockerfile,
     /raw\.githubusercontent\.com\/Blockcast\/penstock-llm-proxy-core\/\$\{PENSTOCK_RUNTIME_REF\}\/scripts\/penstock-agent-runtime\.mjs/,
@@ -56,6 +57,8 @@ test("production image pins the standalone Penstock launcher and Caveman proxy",
     dockerfile,
     /6781f31728c403805e2a93af5be9e9535e4b8b1607650d8e0fbbb4b5a9b8ae52/,
   );
+  assert.match(dockerfile, /SHA256 mismatch[\s\S]*expected[\s\S]*received/);
+  assert.doesNotMatch(dockerfile, /sha256sum --check --status/);
   assert.match(
     dockerfile,
     /COPY --from=penstock-agent-runtime \/opt\/penstock\/bin\/penstock-agent-runtime\.mjs/,
@@ -71,11 +74,20 @@ test("production image carries a pinned Ponytail tree without shared activation"
   );
   assert.match(
     dockerfile,
-    /ARG PONYTAIL_ARCHIVE_SHA256=5f6821b85ccc6b44d356e7331c18530884c5a703ba8022d11c3365c8a2cf7648/,
+    /ARG PONYTAIL_HOOKS_SHA256=dd0837e870a8b81eb45ef4adebfc413a48c6daf84329befd897640f731aa0e39/,
   );
+  assert.match(
+    dockerfile,
+    /git clone --no-tags https:\/\/github\.com\/dietrichgebert\/ponytail\.git/,
+  );
+  assert.match(dockerfile, /git -C \/tmp\/ponytail checkout --detach/);
+  assert.match(dockerfile, /hooks\/claude-codex-hooks\.json/);
+  assert.doesNotMatch(dockerfile, /PONYTAIL_ARCHIVE_SHA256|codeload\.github\.com/);
   assert.match(dockerfile, /COPY --from=ponytail-marketplace \/opt\/penstock\/ponytail/);
 
   const rendered = renderStatefulSet();
+  // Forward-looking chart-boundary guards: this PR packages the runtime in
+  // Docker and must not activate Ponytail in the shared seed volume.
   assert.doesNotMatch(rendered, /PONYTAIL_REF/);
   assert.doesNotMatch(rendered, /PONYTAIL_MARKETPLACE/);
   assert.doesNotMatch(rendered, /PONYTAIL_MARKER/);

@@ -10,10 +10,10 @@ Paperclip `claude_local` agent on Devbox. The runtime starts a short-lived
 Caveman proxy on loopback, points Claude at that proxy, and removes ambient
 provider credentials before either child is started.
 
-The first launch is Devbox-only. The Paperclip image and Helm changes package
-the same reviewed binaries for a later Kubernetes rollout, but they do not
-activate an agent or install Ponytail into the shared `/paperclip/.claude`
-volume.
+The first launch is Devbox-only. The Paperclip image packages the reviewed
+binaries for a later Kubernetes rollout, and the Helm contract test guards the
+shared-volume boundary; neither activates an agent or installs Ponytail into
+the shared `/paperclip/.claude` volume.
 
 ## Non-negotiable boundaries
 
@@ -42,15 +42,15 @@ Record these values before changing the host or Paperclip:
 | Disk | Devbox is below 85% and the retention policy is active |
 | Launcher | `scripts/penstock-agent-runtime.mjs` from the approved merged commit |
 | Caveman | Reviewed release and architecture-specific checksum |
-| Ponytail | Reviewed commit and archive checksum |
+| Ponytail | Reviewed commit and hook-manifest SHA256 |
 | Target | One Paperclip company ID and one agent ID |
 | Auth | A board-authenticated Paperclip session and a Penstock API key held outside the command line |
 
 The image's pinned values are the source of truth for packaged deployments.
 Inspect the `PENSTOCK_RUNTIME_REF`, `PENSTOCK_RUNTIME_SHA256`,
-`CAVEMAN_RELEASE`, and `PONYTAIL_REF` values in `Dockerfile` when preparing a
-host-local copy. Do not silently substitute a branch, `latest`, or an
-unverified download.
+`CAVEMAN_RELEASE`, `PONYTAIL_REF`, and `PONYTAIL_HOOKS_SHA256` values in
+`Dockerfile` when preparing a host-local copy. Do not silently substitute a
+branch, `latest`, or an unverified download.
 
 Lightweight host checks:
 
@@ -73,8 +73,11 @@ the Ponytail tree readable, not writable, by that user.
 Provisioning is an operator action after the gates pass. Fetch the launcher
 from the approved immutable commit using the authenticated GitHub mechanism
 already available on Devbox, then verify the SHA256 recorded in `Dockerfile`.
-Fetch Caveman and Ponytail by their pinned release/commit and verify their
-checksums before installing them. A failed checksum is a hard stop.
+Fetch Caveman by its pinned release and Ponytail by its pinned git commit;
+verify the Caveman checksums and the Ponytail hook-manifest SHA256 before
+installing them. A failed verification is a hard stop; the verification
+command prints the expected and received digest so an operator can distinguish
+a changed upstream artifact from a transient download failure.
 
 The resulting layout should be equivalent to:
 
@@ -180,8 +183,12 @@ The required shape is:
 
 `<agent-id>` is a placeholder, not a literal shared directory. Create the
 selected agent's `cwd` and `CLAUDE_CONFIG_DIR` with mode 0700 and ownership
-limited to the Paperclip execution user. If Claude state must not persist,
-omit `CLAUDE_CONFIG_DIR` and use the adapter's managed default instead.
+limited to the Paperclip execution user. Keep `CLAUDE_CONFIG_DIR` explicitly
+per-agent for this rollout. Do not omit it and rely on the adapter's managed
+default: Ponytail may otherwise resolve state under the shared
+`/paperclip/.claude` tree. If non-persistent state is required later, use an
+adapter-supported per-run private directory and verify its ownership before
+enabling it.
 
 The launcher receives Claude's normal Paperclip-generated CLI arguments. It
 adds the two Ponytail arguments as configured above, starts Caveman with
@@ -289,7 +296,7 @@ Attach or comment the following non-secret evidence on the rollout issue:
 
 - approved launcher commit and SHA256;
 - Caveman release, architecture, and SHA256;
-- Ponytail commit and archive SHA256;
+- Ponytail commit and hook-manifest SHA256;
 - company ID, selected agent ID, and config revision;
 - environment-test result and one smoke run ID;
 - confirmation that logs contained no credential values;
