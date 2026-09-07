@@ -132,6 +132,9 @@ export const KNOWN_HEARTBEAT_POST_TERMINAL_RUN_STATUSES = [
   "timed_out",
 ] as const;
 
+export type KnownHeartbeatPostTerminalRunStatus =
+  (typeof KNOWN_HEARTBEAT_POST_TERMINAL_RUN_STATUSES)[number];
+
 export const KNOWN_HEARTBEAT_TIMER_SCHEDULER_EXCLUSIONS = [
   "idle_circuit_breaker",
   "adapter_failed_circuit_breaker",
@@ -2651,12 +2654,18 @@ export function recordHeartbeatTimerSchedulerExclusion(reason: string | null | u
 /**
  * BLO-32553: record that a run event was dropped for arriving post-terminalization.
  *
- * `status` is the run's terminal status and is bounded by
- * `HEARTBEAT_RUN_TERMINAL_STATUSES`; anything unrecognized collapses to "unknown"
- * so a caller cannot widen the label set.
+ * `status` is the run's terminal status, narrowed to the mirrored label domain so
+ * a caller cannot widen the label set by construction — a new terminal status in
+ * `heartbeat.ts` that is not mirrored here fails to typecheck at the callsite
+ * instead of silently collapsing to "unknown".
+ *
+ * `null`/`undefined` is a meaningful input, not just defensive: the guard passes
+ * it when the status read itself failed, which records the drop under "unknown"
+ * and keeps it distinguishable from a confirmed terminal drop. The runtime
+ * membership check is retained for untyped (JS) callers.
  */
 export function recordHeartbeatPostTerminalRunEventDropped(
-  status: string | null | undefined,
+  status: KnownHeartbeatPostTerminalRunStatus | null | undefined,
 ): string {
   const normalized =
     typeof status === "string"

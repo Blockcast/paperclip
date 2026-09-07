@@ -9,6 +9,8 @@ import {
   HEARTBEAT_POST_TERMINAL_RUN_EVENT_DROPPED_METRIC,
 } from "../services/metrics.js";
 import { getHeartbeatRunRuntimeStatus } from "../services/heartbeat-run-runtime-status.ts";
+import { logger } from "../middleware/logger.js";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -20,6 +22,12 @@ vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => ({ track: vi.fn() 
 const { heartbeatService } = await import("../services/heartbeat.ts");
 
 const TEST_ADAPTER = "post_terminal_run_event_test";
+
+/**
+ * A value shaped like real credential material, so the sanitization assertion
+ * fails loudly if the raw payload ever reaches the log again.
+ */
+const RAW_SECRET = "sk-live-must-not-reach-the-log";
 
 /**
  * Sum {@link HEARTBEAT_POST_TERMINAL_RUN_EVENT_DROPPED_METRIC} for one terminal
@@ -189,29 +197,91 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
       expect(capturedOnEvent).toBeTypeOf("function");
       const droppedBefore = await droppedCount("succeeded");
 
-      // Fire the late, TRUTHFUL event the orphan path would emit. It must not
-      // throw: a rejected late event has to stay distinguishable at the adapter
-      // callsite from a transport error, which does throw.
+      // Fire the late, TRUTHFUL event the orphan path would emit, in the shape
+      // the real producer uses: #1279's `emitLifecycle({stage:"kill_signal"})`
+      // reaches the server as `adapter.process.lifecycle` with the stage on the
+      // payload (claude-local `onProcessLifecycle`, execute.ts:1082-1100), not
+      // as a bare `kill_signal` event type. The guard is deliberately
+      // event-type agnostic, but the test should exercise the real shape.
+      //
+      // It must not throw: a rejected late event has to stay distinguishable at
+      // the adapter callsite from a transport error, which does throw.
       await expect(
         capturedOnEvent!({
-          eventType: "kill_signal",
+          eventType: "adapter.process.lifecycle",
           stream: "system",
           level: "warn",
-          message: "SIGKILL delivered to orphaned process group",
-          payload: { signal: "SIGKILL", orphan: true },
+          message: "claude_local process kill_signal",
+          payload: { stage: "kill_signal", signal: "SIGKILL", processGroupId: 4242 },
         }),
       ).resolves.toBeUndefined();
 
       // The terminal run's event list is unchanged.
       const after = await readEvents(run!.id);
       expect(after).toEqual(before);
-      expect(after.map((e) => e.eventType)).not.toContain("kill_signal");
+      expect(after.map((e) => e.eventType)).not.toContain("adapter.process.lifecycle");
 
       // ...but the evidence is not lost: the drop was counted.
       expect(await droppedCount("succeeded")).toBe(droppedBefore + 1);
 
       // And the runtime status terminalization cleared was not resurrected.
       expect(getHeartbeatRunRuntimeStatus(run!.id)).toBeNull();
+    },
+    120_000,
+  );
+
+  it(
+    "sanitizes the dropped event's message and payload before logging them",
+    async () => {
+      const { agentId } = await seedAgent();
+
+      const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+      expect(run).not.toBeNull();
+      const finished = await waitForRunToFinish(heartbeat, run!.id);
+      expect(finished?.status).toBe("succeeded");
+      expect(capturedOnEvent).toBeTypeOf("function");
+
+      const warnSpy = vi.spyOn(logger, "warn");
+      try {
+        await expect(
+          capturedOnEvent!({
+            eventType: "adapter.process.lifecycle",
+            stream: "system",
+            level: "warn",
+            message: "claude_local process kill_signal",
+            payload: {
+              stage: "kill_signal",
+              signal: "SIGKILL",
+              api_key: RAW_SECRET,
+              nested: { access_token: RAW_SECRET },
+            },
+          }),
+        ).resolves.toBeUndefined();
+
+        const dropCall = warnSpy.mock.calls.find(
+          (call) => typeof call[1] === "string" && call[1].includes("BLO-32553"),
+        );
+        expect(dropCall, "the drop path must emit its logger.warn").toBeDefined();
+
+        const logged = dropCall![0] as { payload: Record<string, unknown> | null };
+
+        // The secret-bearing keys are masked exactly as the storage path would
+        // mask them. This is the regression this test exists for: the drop log is
+        // the substitute for the row that is not written, so it must not be a
+        // *less* redacted substitute.
+        expect(logged.payload).toMatchObject({
+          stage: "kill_signal",
+          signal: "SIGKILL",
+          api_key: REDACTED_EVENT_VALUE,
+          nested: { access_token: REDACTED_EVENT_VALUE },
+        });
+
+        // Belt and braces: the raw credential must not survive anywhere in the
+        // logged object, at any depth or under any key we did not think to assert.
+        expect(JSON.stringify(dropCall![0])).not.toContain(RAW_SECRET);
+      } finally {
+        warnSpy.mockRestore();
+      }
     },
     120_000,
   );
