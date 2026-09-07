@@ -8462,13 +8462,40 @@ export function recoveryService(
           // decision, not another sweep.
           //
           // Discriminate on the evidence the platform already recorded rather
-          // than on status: `successfulRunHandoffRecoveryEvidence` is non-null
-          // only when the disposition was missing, so a deliberate park is
-          // still skipped byte-for-byte as before. Escalation is terminal and
-          // the handoff attempt budget is already spent when `exhausted` is
-          // true, so this cannot re-dispatch in a loop.
+          // than on status: `isExhaustedSuccessfulRunHandoff` is non-null only
+          // when the disposition was missing, so a deliberate park is still
+          // skipped byte-for-byte as before.
+          //
+          // Recurrence bound, stated explicitly because the intuitive reading is
+          // wrong and an earlier revision of this comment asserted it: escalation
+          // is NOT terminal for this branch. `resolveStrandedEscalationStatus`
+          // deliberately writes `todo` rather than `blocked` whenever
+          // `hasNoRecoveryPath` — the BLO-27635/BLO-30743 design, which exists to
+          // avoid the wake-less `blocked`-with-no-blockers strand — and `todo` is
+          // a member of STRANDED_ASSIGNED_ISSUE_STATUSES, so such a row stays
+          // selectable and re-enters this same branch on the next sweep. What
+          // actually bounds it is `shouldReuseStrandedRecoveryAction`: once the
+          // action is ownerless or a standing `escalated` one with an unchanged
+          // owner, the reuse path makes `escalateStrandedAssignedIssue` return
+          // null at `unchangedWithoutWakeBudget` and this arm records `skipped`
+          // without re-firing the Slack-forwarded `needs_human_decision`. That
+          // guard is fingerprint-sensitive (`assigneeAgentId` is a fingerprint
+          // segment and escalation rewrites it), so convergence can cost one
+          // further escalation rather than being immediate. Where the escalation
+          // finds a live owner it writes `blocked`, which leaves the sweep's
+          // status filter outright — that is the shape the tests pin.
           const todoHandoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
           if (!todoHandoffEvidence || !todoHandoffEvidence.exhausted) {
+            result.skipped += 1;
+            continue;
+          }
+
+          if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
+            // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
+            // Every sibling branch in this `todo` arm carries this guard and this one
+            // needs it most: the handoff evidence lives on the run's contextSnapshot and
+            // never expires, so without this an operator moving the row back to `todo`
+            // is met with an immediate re-flip to `blocked` on the same pre-unblock run.
             result.skipped += 1;
             continue;
           }
