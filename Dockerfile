@@ -471,6 +471,64 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 # Pin to a release tag — bump deliberately, not via :latest.
 FROM ghcr.io/github/github-mcp-server:v1.0.3 AS github-mcp
 
+# The Penstock launcher is deliberately kept as a standalone Node script. The
+# private source is fetched by immutable commit with the same BuildKit secret
+# used by the existing private adapter vendor stage. The secret never lands in
+# an image layer, and the content digest prevents a refetch from silently
+# changing what a Paperclip `claude_local` run executes.
+FROM base AS penstock-agent-runtime
+USER root
+ARG PENSTOCK_RUNTIME_REF=7414e2ae4239630d64c0d765ec4340f3da997bf8
+ARG PENSTOCK_RUNTIME_SHA256=fa6c923f78900919ec6fd3cbfe1c878078dab267e82e5faaa695d0c49f50f29e
+RUN --mount=type=secret,id=gh_token \
+    set -eu; \
+    install -d -m 0755 /opt/penstock/bin; \
+    GH="$(cat /run/secrets/gh_token)"; \
+    curl --fail --location --retry 5 \
+      --header "Authorization: Bearer ${GH}" \
+      "https://raw.githubusercontent.com/Blockcast/penstock-llm-proxy-core/${PENSTOCK_RUNTIME_REF}/scripts/penstock-agent-runtime.mjs" \
+      -o /opt/penstock/bin/penstock-agent-runtime.mjs; \
+    printf '%s  %s\n' "${PENSTOCK_RUNTIME_SHA256}" /opt/penstock/bin/penstock-agent-runtime.mjs \
+      | sha256sum --check --status; \
+    chmod 0555 /opt/penstock/bin/penstock-agent-runtime.mjs
+
+# Caveman is a short-lived loopback proxy per Paperclip run. Install only the
+# proxy binary from the reviewed release and verify the architecture-specific
+# upstream checksum before it is copied into the production image.
+FROM base AS caveman-proxy
+USER root
+ARG CAVEMAN_RELEASE=bin-v1.1.6
+RUN set -eu; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) asset=caveman-proxy_linux_amd64; expected_sha256=5085c65788a569bf978868084bc849261a2acef8c334124d6fc7240a3f83a35c ;; \
+      arm64) asset=caveman-proxy_linux_arm64; expected_sha256=6781f31728c403805e2a93af5be9e9535e4b8b1607650d8e0fbbb4b5a9b8ae52 ;; \
+      *) echo "unsupported Caveman architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    curl --fail --location --retry 5 \
+      "https://github.com/JuliusBrussee/caveman/releases/download/${CAVEMAN_RELEASE}/${asset}" \
+      -o /usr/local/bin/caveman-proxy; \
+    printf '%s  %s\n' "${expected_sha256}" /usr/local/bin/caveman-proxy \
+      | sha256sum --check --status; \
+    chmod 0555 /usr/local/bin/caveman-proxy
+
+# Claude Code accepts a local marketplace directory. Bake Ponytail from the
+# reviewed commit rather than registering a moving GitHub branch at pod boot.
+FROM base AS ponytail-marketplace
+USER root
+ARG PONYTAIL_REF=0a4dd63ad4541f4f655c4108a295916f3c1d8fda
+ARG PONYTAIL_ARCHIVE_SHA256=5f6821b85ccc6b44d356e7331c18530884c5a703ba8022d11c3365c8a2cf7648
+RUN set -eu; \
+    curl --fail --location --retry 5 \
+      "https://codeload.github.com/dietrichgebert/ponytail/tar.gz/${PONYTAIL_REF}" \
+      -o /tmp/ponytail.tar.gz; \
+    printf '%s  %s\n' "${PONYTAIL_ARCHIVE_SHA256}" /tmp/ponytail.tar.gz \
+      | sha256sum --check --status; \
+    install -d -m 0755 /opt/penstock/ponytail; \
+    tar -xzf /tmp/ponytail.tar.gz --strip-components=1 -C /opt/penstock/ponytail; \
+    node -e "const fs=require('node:fs');const p=JSON.parse(fs.readFileSync('/opt/penstock/ponytail/.claude-plugin/plugin.json','utf8'));if(p.name!=='ponytail'||p.version!=='4.9.0'){process.exit(1)}"; \
+    chmod -R a+rX,go-w /opt/penstock/ponytail; \
+    rm -f /tmp/ponytail.tar.gz
+
 FROM base AS build
 WORKDIR /app
 COPY --from=deps /app /app
@@ -521,10 +579,15 @@ COPY --from=vendor /vendor/paperclip-adapter-opencode-k8s.tgz /tmp/paperclip-bun
 # falling back to whatever npm publishes today.
 COPY --from=vendor /vendor/adapter-utils.tgz /tmp/paperclip-bundled-adapters/
 COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
+COPY --from=penstock-agent-runtime /opt/penstock/bin/penstock-agent-runtime.mjs /opt/penstock/bin/penstock-agent-runtime.mjs
+COPY --from=caveman-proxy /usr/local/bin/caveman-proxy /usr/local/bin/caveman-proxy
+COPY --from=ponytail-marketplace /opt/penstock/ponytail /opt/penstock/ponytail
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
   npm install --prefix /opt/paperclip-bundled-adapters --omit=dev --no-save --legacy-peer-deps --cache /root/.npm /tmp/paperclip-bundled-adapters/*.tgz \
   && rm -rf /tmp/paperclip-bundled-adapters \
-  && chown -R node:node /opt/paperclip-bundled-adapters
+  && chown -R node:node /opt/paperclip-bundled-adapters \
+  && chmod 0555 /opt/penstock/bin/penstock-agent-runtime.mjs /usr/local/bin/caveman-proxy \
+  && chmod -R a+rX,go-w /opt/penstock/ponytail
 
 # Keep dependency trees in their own stable layer. Ordinary source edits only
 # replace the much smaller source/compiled payload and do not re-upload pnpm's
