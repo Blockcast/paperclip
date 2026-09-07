@@ -11,6 +11,8 @@ import {
   checkSharedDependencyConsistencyAfterRecheck,
   pluginLoader,
   SDK_NOT_INSTALLED_ERROR_MARKER,
+  SDK_STORE_CONSISTENCY_MIN_STABLE_MISMATCH_MS,
+  SDK_STORE_CONSISTENCY_RECHECK_DELAYS_MS,
   type PluginRuntimeServices,
 } from "../services/plugin-loader.js";
 import {
@@ -24,6 +26,21 @@ import {
 } from "./helpers/embedded-postgres.js";
 
 const SDK_PACKAGE = "@paperclipai/plugin-sdk";
+
+/**
+ * When `checkSharedDependencyConsistencyAfterRecheck` gives up on a problem
+ * that never changes: the first cumulative point on the recheck ladder at or
+ * past the min-stable window. Derived from the exported constants so retuning
+ * the ladder cannot leave a test asserting a stale hard-coded bound.
+ */
+function expectedRecheckFailClosedMs(): number {
+  let cumulative = 0;
+  for (const delayMs of SDK_STORE_CONSISTENCY_RECHECK_DELAYS_MS) {
+    cumulative += delayMs;
+    if (cumulative >= SDK_STORE_CONSISTENCY_MIN_STABLE_MISMATCH_MS) return cumulative;
+  }
+  return cumulative;
+}
 
 async function writeInstalledPackageVersion(
   installDir: string,
@@ -284,6 +301,49 @@ describe("checkSharedDependencyConsistency", () => {
 
     expect(problems).toEqual(["not_installed", "version_mismatch", "metadata_invalid"]);
     expect(new Set(problems).size).toBe(3);
+  });
+
+  it("treats an empty tree as CONGRUENT for a shared-store row, which resolves the SDK from an ancestor (the dev-checkout shape)", async () => {
+    // The nothing-installed verdict is scoped to install dirs the server owns
+    // (BLO-31857). A plugin row with `installDir IS NULL` — how
+    // local-filesystem and `cwd/node_modules` discovery persist a plugin that
+    // was never isolated — resolves the SDK by walking UP to the workspace
+    // root, so the shared `~/.paperclip/plugins` dir is routinely empty of it
+    // while the plugin imports it fine.
+    //
+    // Unscoped, the verdict fails that tree closed and breaks every
+    // non-isolated plugin, including a working dev checkout. Same tree, one
+    // flag, opposite verdict — the flag IS the fix, so this pins it.
+    const installDir = await tempInstallDir();
+
+    const sharedStore = await checkSharedDependencyConsistency(installDir, SDK_PACKAGE, {
+      requireInstalledInTree: false,
+    });
+    const serverOwned = await checkSharedDependencyConsistency(installDir, SDK_PACKAGE, {
+      requireInstalledInTree: true,
+    });
+
+    expect(sharedStore.consistent).toBe(true);
+    expect(sharedStore.problem).toBeNull();
+    expect(serverOwned.consistent).toBe(false);
+    expect(serverOwned.problem).toBe("not_installed");
+    // The observed states are identical; only the verdict differs.
+    expect(sharedStore.lockfileState).toBe("missing");
+    expect(sharedStore.installedState).toBe("missing");
+    expect(serverOwned.lockfileState).toBe("missing");
+    expect(serverOwned.installedState).toBe("missing");
+  });
+
+  it("defaults to requiring the SDK in-tree, so a new caller that omits the scope fails closed on an empty isolated dir", async () => {
+    // Isolated dirs are the majority shape going forward, so the strict
+    // reading is the default and the shared-store exception is opt-out. A
+    // caller that forgets the flag gets the safe answer for the common case.
+    const installDir = await tempInstallDir();
+
+    const withoutScope = await checkSharedDependencyConsistency(installDir, SDK_PACKAGE);
+
+    expect(withoutScope.problem).toBe("not_installed");
+    expect(withoutScope.consistent).toBe(false);
   });
 });
 
@@ -695,7 +755,14 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
     return { runtimeServices, startWorker, markError };
   }
 
-  async function insertReadyFixturePlugin(input: Awaited<ReturnType<typeof createFixturePluginPackage>>) {
+  async function insertReadyFixturePlugin(
+    input: Awaited<ReturnType<typeof createFixturePluginPackage>>,
+    // Null (the default) is a SHARED-STORE row, the shape local-filesystem and
+    // `cwd/node_modules` discovery persist. Pass a dir to model a server-owned
+    // isolated install, which is the only shape the nothing-installed verdict
+    // applies to (BLO-31857).
+    installDir: string | null = null,
+  ) {
     const [plugin] = await db.insert(plugins).values({
       pluginKey: input.manifest.id,
       packageName: input.packageName,
@@ -705,6 +772,7 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
       manifestJson: input.manifest as never,
       status: "ready",
       packagePath: input.packageRoot,
+      installDir,
     }).returning();
     if (!plugin) throw new Error("fixture plugin row not inserted");
     return plugin;
@@ -943,36 +1011,75 @@ describeEmbeddedPostgres("torn plugin store — activation fails closed", () => 
     expect(markError).not.toHaveBeenCalled();
   }, 20_000);
 
-  it("BLO-31857: refuses to spawn a worker when the install dir holds no SDK at all, with a message distinct from the torn-store one", async () => {
+  it("BLO-31857: ACTIVATES a shared-store plugin against a completely empty store, because it resolves the SDK from an ancestor (dev-checkout guard)", async () => {
+    // The companion outage guard to the test above, for the OTHER shape. A row
+    // with `installDir IS NULL` is not isolated: `activatePlugin` falls back to
+    // the shared `localPluginDir`, and the worker resolves the SDK by walking
+    // UP from the package to the workspace root. So an empty shared store is a
+    // working dev checkout, not a torn tree.
+    //
+    // If the nothing-installed verdict is ever un-scoped — applied to every
+    // install dir rather than only the ones the server npm-installed into —
+    // THIS is the test that fails, and its failure means every non-isolated
+    // plugin stops activating.
     const fixture = await createFixturePluginPackage();
-    // Empty install dir: no lockfile, no node_modules. Nothing settles it, so
-    // the recheck window elapses and the guard fails closed.
-    const installDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-plugin-store-"));
-    cleanupPaths.add(installDir);
+    const emptySharedDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-plugin-store-"));
+    cleanupPaths.add(emptySharedDir);
+
+    // Deliberately nothing written: no package-lock.json, no node_modules.
+    const { runtimeServices, startWorker, markError } = createRuntimeServices();
+    const plugin = await insertReadyFixturePlugin(fixture, null);
+
+    const loader = pluginLoader(db, { localPluginDir: emptySharedDir }, runtimeServices);
+    const startedAt = Date.now();
+    const result = await loader.loadSingle(plugin.id);
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(result.success).toBe(true);
+    expect(startWorker).toHaveBeenCalledTimes(1);
+    expect(markError).not.toHaveBeenCalled();
+    // And it must not pay the recheck ladder either: a congruent first read
+    // returns immediately, so a shared-store row is not delayed by a window
+    // that exists for a problem it cannot have.
+    expect(elapsedMs).toBeLessThan(SDK_STORE_CONSISTENCY_MIN_STABLE_MISMATCH_MS);
+  }, 20_000);
+
+  it("BLO-31857: refuses to spawn a worker when a SERVER-OWNED install dir holds no SDK at all, with a message distinct from the torn-store one", async () => {
+    const fixture = await createFixturePluginPackage();
+    // A shared store that is fine, and an isolated dir the server owns that is
+    // empty: no lockfile, no node_modules. The row points at the isolated dir,
+    // so the strict verdict applies and nothing settles it — the recheck
+    // window elapses and the guard fails closed.
+    const sharedDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-plugin-store-"));
+    cleanupPaths.add(sharedDir);
+    const emptyIsolatedDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-plugin-isolated-"));
+    cleanupPaths.add(emptyIsolatedDir);
 
     const { runtimeServices, startWorker, markError } = createRuntimeServices(
       vi.fn().mockImplementation(async () => {
         throw new Error("startWorker should not have been called for an empty plugin store");
       }),
     );
-    const plugin = await insertReadyFixturePlugin(fixture);
+    const plugin = await insertReadyFixturePlugin(fixture, emptyIsolatedDir);
 
-    const loader = pluginLoader(db, { localPluginDir: installDir }, runtimeServices);
+    const loader = pluginLoader(db, { localPluginDir: sharedDir }, runtimeServices);
     const startedAt = Date.now();
     const result = await loader.loadSingle(plugin.id);
     const elapsedMs = Date.now() - startedAt;
 
     expect(result.success).toBe(false);
     expect(result.error).toContain(SDK_NOT_INSTALLED_ERROR_MARKER);
-    // Must NOT borrow the torn-store marker: the startup isolation migration
-    // un-latches rows carrying that marker, which would revive this row into
-    // the same failure on the next boot instead of waiting for an install.
+    // Must NOT borrow the torn-store marker: that marker's un-latch rule keys
+    // off a relocation, which never repairs an empty tree. This marker gets its
+    // own re-probe rule instead.
     expect(result.error).not.toContain("Torn plugin store detected");
     expect(startWorker).not.toHaveBeenCalled();
     expect(markError).toHaveBeenCalledTimes(1);
-    // Still well under the 60s worker initialize timeout this guard exists to
-    // pre-empt, while leaving the boot-install race room to settle.
-    expect(elapsedMs).toBeGreaterThanOrEqual(10_000);
-    expect(elapsedMs).toBeLessThan(35_000);
+    // Derived from the ladder rather than hard-coded, so retuning the delays
+    // cannot leave a stale bound asserting the wrong thing. The recheck fails
+    // closed at the first cumulative delay past the min-stable window, and
+    // must stay well under the 60s worker initialize timeout it pre-empts.
+    expect(elapsedMs).toBeGreaterThanOrEqual(SDK_STORE_CONSISTENCY_MIN_STABLE_MISMATCH_MS);
+    expect(elapsedMs).toBeLessThan(expectedRecheckFailClosedMs() + 10_000);
   }, 45_000);
 });

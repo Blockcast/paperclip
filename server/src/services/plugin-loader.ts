@@ -109,8 +109,11 @@ const SDK_INSTALL_RACE_RETRY_DELAYS_MS = [500, 1500, 3500, 7500, 15500];
 // closed, so static-but-transient install snapshots get more than the observed
 // <5s reconciliation time while permanent mismatches still fail well below the
 // 60s worker initialize timeout.
-const SDK_STORE_CONSISTENCY_RECHECK_DELAYS_MS = SDK_INSTALL_RACE_RETRY_DELAYS_MS;
-const SDK_STORE_CONSISTENCY_MIN_STABLE_MISMATCH_MS = 10_000;
+//
+// Exported so tests can derive their timing bounds from the ladder rather than
+// hard-coding numbers copied out of it, which silently rot when it is retuned.
+export const SDK_STORE_CONSISTENCY_RECHECK_DELAYS_MS = SDK_INSTALL_RACE_RETRY_DELAYS_MS;
+export const SDK_STORE_CONSISTENCY_MIN_STABLE_MISMATCH_MS = 10_000;
 const SDK_INSTALL_RACE_PACKAGE_MARKER = "@paperclipai/plugin-sdk";
 const SDK_INSTALL_RACE_ERR_MARKER = "ERR_MODULE_NOT_FOUND";
 
@@ -274,6 +277,41 @@ export interface SharedDependencyConsistencyCheck {
   consistent: boolean;
   problem: "metadata_invalid" | "version_mismatch" | "not_installed" | null;
   diagnostic: string | null;
+}
+
+export interface SharedDependencyConsistencyScope {
+  /**
+   * Whether `packageName` has to be physically present inside `installDir`
+   * itself for the tree to be usable.
+   *
+   * True (the default) for an install dir the server owns — one it ran
+   * `npm install --prefix` into, i.e. every isolated plugin (BLO-20961). The
+   * worker imports the SDK from that tree and nothing above it provides one,
+   * so an empty dir cannot work and `(absent)/(absent)` is a real fault.
+   *
+   * False for a **shared-store** row — `installDir IS NULL` on the plugin
+   * record, which is how local-filesystem and `cwd/node_modules` discovery
+   * persist a plugin that was never isolated. Those resolve the SDK by walking
+   * *up* from the package, so the shared `~/.paperclip/plugins` dir is
+   * routinely empty of it while the plugin imports it fine from the workspace
+   * root. Rejecting `(absent)/(absent)` there fails a working dev checkout
+   * (BLO-31857), so the caller must opt out.
+   */
+  requireInstalledInTree?: boolean;
+}
+
+/**
+ * Whether `installDir` is a tree the server npm-installed into, and therefore
+ * one that must contain the SDK itself rather than inherit it from an ancestor.
+ *
+ * Shared by the activation guard and the startup un-latch so the two cannot
+ * drift into disagreeing about which rows the strict verdict applies to.
+ */
+function requiresSelfContainedSdkTree(
+  installDir: string | null | undefined,
+  sharedStoreDir: string,
+): boolean {
+  return !!installDir && installDir !== sharedStoreDir;
 }
 
 interface SharedDependencyVersionRead {
@@ -442,7 +480,8 @@ async function readLockfileVersion(
  *   boot-time install race that `SDK_INSTALL_RACE_RETRY_DELAYS_MS` already
  *   owns: the worker raises ERR_MODULE_NOT_FOUND and recovers on retry.
  *
- * `(absent)/(absent)` is the one absence that fails closed. Nothing is
+ * `(absent)/(absent)` is the one absence that fails closed, and only for an
+ * install dir the server owns (`scope.requireInstalledInTree`). Nothing is
  * recorded and nothing is installed, so there is no tree here for a worker to
  * import the SDK from — and unlike the two rows above, no other mechanism
  * covers it: it is not a version disagreement, and a guard that called it
@@ -451,11 +490,18 @@ async function readLockfileVersion(
  * safe, because every inconsistent result routes through
  * `checkSharedDependencyConsistencyAfterRecheck`, which returns as soon as the
  * problem clears and only fails closed on a mismatch stable past
- * `SDK_STORE_CONSISTENCY_MIN_STABLE_MISMATCH_MS`.
+ * `SDK_STORE_CONSISTENCY_MIN_STABLE_MISMATCH_MS`; if it does latch, the startup
+ * re-probe in `reconcileLegacyIsolatedInstallsAtStartup` clears the row once
+ * the install lands.
+ *
+ * A **shared-store** row must pass `requireInstalledInTree: false` — it
+ * resolves the SDK from an ancestor, so an empty dir there is normal. See
+ * `SharedDependencyConsistencyScope`.
  */
 export async function checkSharedDependencyConsistency(
   installDir: string,
   packageName: string = SDK_INSTALL_RACE_PACKAGE_MARKER,
+  { requireInstalledInTree = true }: SharedDependencyConsistencyScope = {},
 ): Promise<SharedDependencyConsistencyCheck> {
   const [lockfileRead, installedRead] = await Promise.all([
     readLockfileVersion(installDir, packageName),
@@ -469,7 +515,8 @@ export async function checkSharedDependencyConsistency(
     lockfileRead.state === "ok" &&
     installedRead.state === "ok" &&
     lockfileVersion !== installedVersion;
-  const notInstalled = lockfileRead.state === "missing" && installedRead.state === "missing";
+  const notInstalled =
+    requireInstalledInTree && lockfileRead.state === "missing" && installedRead.state === "missing";
   const consistent =
     !metadataInvalid &&
     !versionMismatch &&
@@ -509,15 +556,16 @@ function sharedDependencyProblemKey(check: SharedDependencyConsistencyCheck): st
 export async function checkSharedDependencyConsistencyAfterRecheck(
   installDir: string,
   packageName: string = SDK_INSTALL_RACE_PACKAGE_MARKER,
+  scope: SharedDependencyConsistencyScope = {},
 ): Promise<SharedDependencyConsistencyCheck> {
-  let check = await checkSharedDependencyConsistency(installDir, packageName);
+  let check = await checkSharedDependencyConsistency(installDir, packageName, scope);
   let previousProblemKey = sharedDependencyProblemKey(check);
   let previousProblemFirstSeenAt = Date.now();
   if (!previousProblemKey) return check;
 
   for (const delayMs of SDK_STORE_CONSISTENCY_RECHECK_DELAYS_MS) {
     await sleep(delayMs);
-    const next = await checkSharedDependencyConsistency(installDir, packageName);
+    const next = await checkSharedDependencyConsistency(installDir, packageName, scope);
     const nextProblemKey = sharedDependencyProblemKey(next);
     if (!nextProblemKey) return next;
     const now = Date.now();
@@ -550,9 +598,15 @@ export const TORN_STORE_ERROR_MARKER = "Torn plugin store detected";
  * `TORN_STORE_ERROR_MARKER`: `reconcileLegacyIsolatedInstallsAtStartup`
  * un-latches rows carrying that marker on the theory that relocating the
  * install dir resolves them, which is true of a version disagreement inside a
- * populated tree and false here. An empty tree needs an actual install, so a
- * row that failed this way must stay errored until that happens rather than be
- * revived into the same failure on the next boot (BLO-31857).
+ * populated tree and false here. An empty tree is fixed by an actual install,
+ * which does not move the dir.
+ *
+ * So this marker gets its own un-latch rule in that same function: the row is
+ * revived only when a fresh `checkSharedDependencyConsistency` re-probe reports
+ * the tree congruent, independent of whether `installDir` changed. That keeps a
+ * still-empty tree errored while letting a slow boot `npm install` — one that
+ * outran the activation recheck window — self-heal on the next boot instead of
+ * needing an operator (BLO-31857).
  */
 export const SDK_NOT_INSTALLED_ERROR_MARKER = "Plugin SDK is not installed";
 
@@ -1881,11 +1935,22 @@ export function pluginLoader(
    * Run `reconcileLegacyIsolatedInstall` across installed rows before
    * `loadAll()` selects by status.
    *
-   * Also un-latches rows the torn-store guard parked in `error`: `loadAll()`
+   * Also un-latches rows the SDK-store guards parked in `error`: `loadAll()`
    * only selects `status='ready'`, so a row refused once stays invisible to
    * every later boot even after the underlying cause is fixed. Only rows whose
-   * `lastError` came from that guard are revived, and only when the relocation
-   * actually moved them — an unrelated failure keeps its error and stays out.
+   * `lastError` came from one of those guards are revived — an unrelated
+   * failure keeps its error and stays out — and each marker has its own
+   * evidence that the cause is gone:
+   *
+   * - `TORN_STORE_ERROR_MARKER` (a version disagreement inside a populated
+   *   tree) is cleared when the relocation actually moved the row, which is
+   *   what repoints it away from the torn shared store.
+   * - `SDK_NOT_INSTALLED_ERROR_MARKER` (an empty tree) is cleared when a fresh
+   *   consistency **re-probe** reports the tree congruent, whether or not the
+   *   dir moved. An empty tree is fixed by an install, not a relocation, so a
+   *   relocation test would strand it forever; conversely a still-empty tree
+   *   must stay errored rather than be revived into the same failure
+   *   (BLO-31857).
    *
    * Best-effort per row: one plugin that cannot be reinstalled (npm offline,
    * yanked version) must not abort boot for every other plugin.
@@ -1896,10 +1961,44 @@ export function pluginLoader(
     for (const plugin of installed) {
       const latchedByTornStore =
         plugin.status === "error" && !!plugin.lastError?.includes(TORN_STORE_ERROR_MARKER);
-      if (plugin.status !== "ready" && !latchedByTornStore) continue;
+      const latchedByNotInstalled =
+        plugin.status === "error" && !!plugin.lastError?.includes(SDK_NOT_INSTALLED_ERROR_MARKER);
+      if (plugin.status !== "ready" && !latchedByTornStore && !latchedByNotInstalled) continue;
 
       try {
         const migrated = await reconcileLegacyIsolatedInstall(plugin);
+
+        // Re-probe before the relocation test below: an empty tree is repaired
+        // by an actual install (a boot `npm install` that outran the
+        // activation recheck window, or an operator repair), and neither moves
+        // the install dir.
+        if (latchedByNotInstalled) {
+          const probeDir = migrated.installDir ?? localPluginDir;
+          const reprobe = await checkSharedDependencyConsistency(
+            probeDir,
+            SDK_INSTALL_RACE_PACKAGE_MARKER,
+            { requireInstalledInTree: requiresSelfContainedSdkTree(migrated.installDir, localPluginDir) },
+          );
+          if (reprobe.consistent) {
+            await registry.updateStatus(migrated.id, { status: "ready", lastError: null });
+            log.info(
+              { pluginId: migrated.id, pluginKey: migrated.pluginKey, installDir: probeDir },
+              "plugin-loader: re-enabled plugin latched by a missing plugin SDK; the install has since landed",
+            );
+          } else {
+            log.warn(
+              {
+                pluginId: migrated.id,
+                pluginKey: migrated.pluginKey,
+                installDir: probeDir,
+                problem: reprobe.problem,
+              },
+              "plugin-loader: plugin still has no usable SDK tree; leaving it errored",
+            );
+          }
+          continue;
+        }
+
         if (migrated.installDir === plugin.installDir) continue;
 
         if (latchedByTornStore) {
@@ -2895,8 +2994,20 @@ export function pluginLoader(
       // box. If a resolvability gate is ever added here, verify it passes
       // against the current production layout FIRST — otherwise it tests the
       // probe rather than the tree.
+      //
+      // The nothing-installed verdict is scoped to install dirs the server
+      // owns (BLO-31857). A row with `installDir IS NULL` resolves the SDK by
+      // walking *up* from `cwd/node_modules` or the shared store to the
+      // workspace root, so its `pluginInstallDir` — the shared
+      // `localPluginDir` — is routinely empty of the SDK while the plugin
+      // imports it fine. That is a working dev checkout, not a torn tree, and
+      // failing it closed here would break every non-isolated plugin.
       // ------------------------------------------------------------------
-      const sdkConsistency = await checkSharedDependencyConsistencyAfterRecheck(pluginInstallDir);
+      const sdkConsistency = await checkSharedDependencyConsistencyAfterRecheck(
+        pluginInstallDir,
+        SDK_INSTALL_RACE_PACKAGE_MARKER,
+        { requireInstalledInTree: requiresSelfContainedSdkTree(activePlugin.installDir, localPluginDir) },
+      );
       if (!sdkConsistency.consistent) {
         throw new Error(formatSharedDependencyConsistencyError(sdkConsistency, pluginInstallDir));
       }
