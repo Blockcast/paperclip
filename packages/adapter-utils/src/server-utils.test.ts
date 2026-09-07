@@ -858,6 +858,117 @@ describe("runChildProcess", () => {
     expect(result.stdout).toContain('"type":"result"');
   });
 
+  it.skipIf(process.platform === "win32")(
+    "reports forceKilled=false when the terminal-cleanup SIGKILL lands on an empty process group",
+    async () => {
+      // PEN-3093: `forceKilled` is run evidence, so it must record a kill that
+      // landed -- not merely one that was attempted. Reaching the escalation
+      // with an already-gone group needs `close` held open while the group
+      // empties, which the `detached: true` descendant below arranges: it
+      // escapes the direct child's process group (so the group-directed SIGTERM
+      // and SIGKILL both miss it) while inheriting the direct child's stdout
+      // pipe (so the parent's stdout never EOFs and `close` cannot fire to
+      // clear the kill timer).
+      //
+      // Sequence: terminal result seen -> SIGTERM to the group kills the direct
+      // child -> the group is now empty but `close` is still pending -> the kill
+      // timer fires and `process.kill(-pgid)` throws ESRCH -> the direct-child
+      // fallback is skipped because the child has closed -> undelivered.
+      // Before the fix this reported `forceKilled: true`.
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        [
+          "-e",
+          [
+            "const { spawn } = require('node:child_process');",
+            // detached => own process group; inherit => holds stdout open.
+            "const child = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 2500)'], { detached: true, stdio: ['ignore', 'inherit', 'ignore'] });",
+            "child.unref();",
+            "process.stdout.write(`descendant:${child.pid}\\n`);",
+            "process.stdout.write(`${JSON.stringify({ type: 'result', result: 'done' })}\\n`);",
+            "setInterval(() => {}, 1000);",
+          ].join(" "),
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 0,
+          graceSec: 1,
+          onLog: async () => {},
+          terminalResultCleanup: {
+            graceMs: 100,
+            hasTerminalResult: ({ stdout }) => stdout.includes('"type":"result"'),
+          },
+        },
+      );
+
+      expect(result.timedOut).toBe(false);
+      // The escalation itself is still recorded -- `signal` describes what this
+      // path decided to send, which did happen. Only `forceKilled` claims an
+      // effect on a process, and nothing was there to receive it.
+      expect(result.terminalResultCleanup).toMatchObject({
+        kind: "terminal_result_cleanup",
+        terminalResultSeen: true,
+        signal: "SIGKILL",
+        forceKilled: false,
+      });
+
+      const descendantPid = Number.parseInt(result.stdout.match(/descendant:(\d+)/)?.[1] ?? "", 10);
+      expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+      if (isPidAlive(descendantPid)) {
+        try {
+          process.kill(descendantPid, "SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+    },
+    PROCESS_TREE_TEST_BUDGET_MS,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "reports forceKilled=true when the terminal-cleanup SIGKILL reaches a live process group",
+    async () => {
+      // Positive control for the test above: guards against "fixing" the false
+      // claim by hardcoding `forceKilled: false`. This child swallows SIGTERM
+      // and keeps its stdio open, so the group is still alive when the kill
+      // timer fires and the SIGKILL genuinely lands.
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        [
+          "-e",
+          [
+            "process.on('SIGTERM', () => {});",
+            "process.stdout.write(`${JSON.stringify({ type: 'result', result: 'done' })}\\n`);",
+            "setInterval(() => {}, 1000);",
+          ].join(" "),
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 0,
+          graceSec: 1,
+          onLog: async () => {},
+          terminalResultCleanup: {
+            graceMs: 100,
+            hasTerminalResult: ({ stdout }) => stdout.includes('"type":"result"'),
+          },
+        },
+      );
+
+      expect(result.timedOut).toBe(false);
+      expect(result.terminalResultCleanup).toMatchObject({
+        kind: "terminal_result_cleanup",
+        terminalResultSeen: true,
+        signal: "SIGKILL",
+        forceKilled: true,
+      });
+    },
+    PROCESS_TREE_TEST_BUDGET_MS,
+  );
+
   it.skipIf(process.platform === "win32")("does not clean up noisy runs that have no terminal output", async () => {
     const runId = randomUUID();
     let observed = "";

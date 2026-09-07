@@ -1652,6 +1652,31 @@ export function selectAgedPrReviewRunForFairDispatch(
 }
 
 /**
+ * Shapes an adapter runtime event's payload for persistence, marking it when it
+ * arrived after the adapter's execution had already settled.
+ *
+ * PEN-3093: an adapter's detached timers can outlive its `execute()`. The
+ * claude-local timeout grace timer is the known case -- it deliberately
+ * survives `child.on("close")` so a descendant that outlived the direct child
+ * still gets SIGKILLed, and it emits a truthful `kill_signal` when that kill
+ * lands (BLO-32477). By then the run has terminalized. Such an event is real
+ * evidence of a leaked process tree, so it is persisted rather than dropped --
+ * but it is marked, so a reader can tell it apart from the live run's stream
+ * instead of seeing an event that appears to postdate the run's own end.
+ */
+export function buildAdapterRunEventPayloadForPersistence(
+  payload: Record<string, unknown> | undefined,
+  adapterSettledAt: string | null,
+): Record<string, unknown> | undefined {
+  if (!adapterSettledAt) return payload;
+  return {
+    ...(payload ?? {}),
+    postAdapterSettle: true,
+    adapterSettledAt,
+  };
+}
+
+/**
  * Returns the opts to pass to `scheduleBoundedRetryForRun` for an automatic
  * retry, or undefined to use the default transient-failure opts. Called only
  * when `shouldScheduleAutomaticRunRetry` already returned true.
@@ -1659,6 +1684,20 @@ export function selectAgedPrReviewRunForFairDispatch(
 export function resolveAutomaticRunRetryOpts(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "contextSnapshot">,
 ) {
+  // NOTE: `errorCode === "timeout"` is the GENERIC code the finalizer sets for
+  // every adapter's `timed_out` outcome, and this branch sits ahead of the more
+  // specific ones below -- so any future adapter that times out inherits the
+  // 1-attempt cap without opting into it. That is latent today (only
+  // claude-local tags a timeout, via `resultJson.errorFamily`).
+  //
+  // Deliberately NOT narrowed to claude-local's `resultJson.timedOutBeforeOutput`
+  // evidence (PEN-3093, carried-over suggestion 2). It is feasible -- `resultJson`
+  // is a run column -- but it would make this generic resolver reach into one
+  // adapter's private result payload, and it would drop the cap for a
+  // claude-local timeout that DID produce output, changing live retry behaviour.
+  // The right fix is a more specific `errorCode` from the finalizer (e.g.
+  // `timeout_before_output`) so the policy stays keyed on the run's own
+  // vocabulary; that is a separate change with its own review.
   if (run.errorCode === "timeout") {
     return { maxAttempts: 1 };
   }
@@ -28615,16 +28654,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       };
 
+      // Set once the adapter's execution has settled on any path (returned,
+      // threw, or the retry loop broke out). The adapter's own timers can
+      // outlive that: the timeout grace timer deliberately survives
+      // `child.on("close")` so a descendant that outlived the direct child is
+      // still SIGKILLed, and it emits a truthful `kill_signal` when that kill
+      // lands (BLO-32477). By then the run has terminalized, so the event
+      // would either append to an already-terminal run or vanish into
+      // `emitLifecycle`'s `.catch`. That event is real evidence of a leaked
+      // process tree, so it is kept -- but marked, and logged, rather than
+      // persisted as if it were part of the live run.
+      let adapterExecutionSettledAt: string | null = null;
+
       const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
         const eventType = event.eventType.trim();
         if (!eventType) return;
+        const settledAt = adapterExecutionSettledAt;
+        if (settledAt) {
+          const stage = event.payload?.stage;
+          logger.warn(
+            {
+              runId: currentRun.id,
+              agentId: agent.id,
+              companyId: agent.companyId,
+              eventType,
+              stage: typeof stage === "string" ? stage : null,
+              adapterSettledAt: settledAt,
+            },
+            "adapter runtime event arrived after the adapter execution settled; persisting it with a post-terminal marker",
+          );
+        }
         await appendRunEvent(currentRun, seq++, {
           eventType: eventType.slice(0, 120),
           stream: event.stream,
           level: event.level,
           color: event.color,
           message: event.message,
-          payload: event.payload,
+          payload: buildAdapterRunEventPayloadForPersistence(event.payload, settledAt),
         });
       };
 
@@ -29206,6 +29272,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         throw adapterErr;
       } finally {
+        // The adapter's execution is over on every path that reaches here.
+        // Anything its detached timers emit from now on is post-terminal --
+        // see `onAdapterEvent`, which marks and logs such an event instead of
+        // letting it append silently or be swallowed upstream.
+        adapterExecutionSettledAt ??= new Date().toISOString();
         if (branchClaimRenewalTimer) {
           clearInterval(branchClaimRenewalTimer);
         }

@@ -482,9 +482,12 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
-  const persistedTimeoutSec = Object.prototype.hasOwnProperty.call(config, "timeoutSec")
-    ? asNumber(config.timeoutSec, 0)
-    : 0;
+  // `asNumber` already yields 0 for an absent or non-numeric `timeoutSec`, so
+  // an explicit `hasOwnProperty` branch would produce 0 either way. The rule
+  // that matters is the one below: a local target with no configured timeout
+  // gets the 6h default, while a remote target keeps the persisted 0 (no
+  // adapter-side bound -- the transport owns termination).
+  const persistedTimeoutSec = asNumber(config.timeoutSec, 0);
   const configuredTimeoutSec =
     !executionTargetIsRemote && persistedTimeoutSec === 0
       ? DEFAULT_CLAUDE_LOCAL_TIMEOUT_SEC
@@ -1093,6 +1096,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             payload: {
               stage: event.stage,
               observedAt: event.observedAt,
+              // Measured from `runAttempt` entry, NOT from the spawn call.
+              // Prompt construction, arg building and the runtime-command
+              // install check all happen after `attemptStartedAt` and before
+              // the child is spawned, so `spawn_attempted`/`spawned` carry that
+              // setup cost. These numbers get read forensically when a launch
+              // stalls (PEN-1990) -- treat them as time-since-attempt-start,
+              // not as spawn latency.
               elapsedMs: Number.isNaN(observedAtMs) ? Math.max(0, Date.now() - attemptStartedAt) : Math.max(0, observedAtMs - attemptStartedAt),
               ...(event.pid !== undefined ? { pid: event.pid } : {}),
               ...(event.processGroupId !== undefined ? { processGroupId: event.processGroupId } : {}),
