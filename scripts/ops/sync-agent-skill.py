@@ -23,6 +23,12 @@ Usage:
   sync-agent-skill.py <agent-id> --rollback [--out-dir DIR]
 `--rollback` and `--dry-run` are mutually exclusive and the script rejects the
 pair: rollback always sends a live PATCH, so there is no dry variant of it.
+
+`<agent-id>.before.json` is the ONLY thing `--rollback` can restore from, so
+pass an `--out-dir` on durable storage for a real rollout. The `/tmp` default
+is pod-local and dies with the pod: losing it between apply and rollback leaves
+the change applied with its undo unrecoverable. The script prints a NOTE when a
+capture lands somewhere ephemeral.
 Env:
   PAPERCLIP_API_URL, PAPERCLIP_API_KEY
 Exit 0 on "OK:", exit 1 on "FAIL:".
@@ -154,6 +160,7 @@ def do_rollback(args):
             if without_sync(before_ac).get(k) != without_sync(after_ac).get(k)
         )
         failures.append(f"non-skill adapterConfig keys changed during rollback: {changed}")
+
     # Absent and null are the same thing to every consumer of this key.
     if (sync_block(before_ac) or None) != (sync_block(after_ac) or None):
         failures.append(
@@ -161,7 +168,12 @@ def do_rollback(args):
         )
     if failures:
         print("FAIL: " + " | ".join(failures))
-        print("Stop the rollout. The same rewrite would hit every remaining agent.")
+        # The comparison is against the capture, so a legitimate unrelated edit
+        # landing between capture and rollback (a model bump, say) lands here
+        # too. Fail closed either way and let the operator tell them apart.
+        print("Stop the rollout and diff the keys named above against the capture: either this "
+              "rollback rewrote something it should not have, or an unrelated edit landed on this "
+              "agent since the capture was taken. Do not re-run until you know which.")
         return 1
 
     print(f"ROLLBACK ROUND-TRIP OK: {after.get('name')} ({args.agent_id}) "
@@ -226,6 +238,13 @@ def main():
         print(f"NOTE: keeping the existing pre-change capture at {before_path}")
     else:
         write(args.out_dir, f"{args.agent_id}.before.json", before)
+        # This file is the only thing --rollback can restore from. If it is on
+        # pod-local storage, a pod loss between apply and rollback leaves the
+        # change applied and its undo gone.
+        if os.path.realpath(before_path).startswith(("/tmp/", "/var/tmp/")):
+            print(f"NOTE: the capture at {before_path} is on ephemeral pod-local storage and is "
+                  f"the ONLY rollback source. Copy it somewhere durable (or paste it into the "
+                  f"issue) before proceeding to the next agent.")
 
     status, patched = api(
         "PATCH", f"/api/agents/{args.agent_id}",
