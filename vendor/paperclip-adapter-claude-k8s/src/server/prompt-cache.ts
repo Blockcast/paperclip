@@ -24,16 +24,28 @@ export interface ClaudePromptBundle {
 const DEFAULT_PAPERCLIP_INSTANCE_ID = "default";
 
 /**
- * A declared skill's source tree lost a file out from under the bundle-key walk.
+ * A declared skill's source tree is not usable as a skill at bundle-key time.
  *
- * BLO-32055: `company-skills.ts materializeRuntimeSkillFiles` refreshes a runtime
- * skill by `fs.rm(skillDir, {recursive:true})` -> `mkdir` -> per-file `writeFile`.
- * That is not atomic, so the rolling materialization sweep publishes a window in
- * which the directory exists and `SKILL.md` does not. `hashPathContents` below
- * walks that tree to derive the prompt-bundle cache key, and its `readFile` used
- * to be unguarded — so a sweep landing between the `readdir` and the `readFile`
- * threw a bare Node `ENOENT ... open '<...>/__runtime__/<slug>/SKILL.md'` out of
+ * Two producers, both instants of the one materialization race:
+ *   - BLO-32055 (branch A) — a file vanished mid-walk, raising `ENOENT`.
+ *   - BLO-32167 (branch B) — the walk completed cleanly over a tree with no
+ *     `SKILL.md`. Nothing throws; see `assertSkillEntrypointPresent`.
+ *
+ * BLO-32055: `company-skills.ts materializeRuntimeSkillFiles` used to refresh a
+ * runtime skill by `fs.rm(skillDir, {recursive:true})` -> `mkdir` -> per-file
+ * `writeFile`. That was not atomic, so the rolling materialization sweep
+ * published a window in which the directory exists and `SKILL.md` does not.
+ * `hashPathContents` below walks that tree to derive the prompt-bundle cache
+ * key, and its `readFile` used to be unguarded — so a sweep landing between the
+ * `readdir` and the `readFile` threw a bare Node
+ * `ENOENT ... open '<...>/__runtime__/<slug>/SKILL.md'` out of
  * `prepareClaudePromptBundle`, i.e. before the Claude CLI was ever spawned.
+ *
+ * (BLO-32167 has since made that publish atomic — staging tree, then rename —
+ * so both windows should now be closed at the writer. These guards remain as
+ * the observer-side backstop: the pod-local bundle copy is a separate snapshot
+ * on a different code path, and `materializeVersionSnapshot` still has the
+ * original non-atomic shape.)
  *
  * That is why the live instance carried `errorCode: adapter_failed` with both
  * `stdoutExcerpt` and `stderrExcerpt` null: there was no transcript, no result
@@ -202,6 +214,64 @@ async function hashPathContents(
   hash.update(`other:${relativePath}:${stat.mode}\n`);
 }
 
+/**
+ * The file whose presence makes a skill directory a *skill* rather than a
+ * directory. Claude will not load a skill without it.
+ */
+const SKILL_ENTRYPOINT_FILENAME = "SKILL.md";
+
+/**
+ * A catalog-backed skill source must contain a readable `SKILL.md` at its root.
+ *
+ * BLO-32167 — the second branch of the BLO-32055 race, and the one that raises
+ * no syscall error at all. `materializeRuntimeSkillFiles` used to publish
+ * `rm -rf` -> `mkdir` -> per-file `writeFile`, so a reader could sample the tree
+ * *after* the `mkdir` and *before* `SKILL.md` was written. `hashPathContents`
+ * handles that state perfectly happily: it `lstat`s a directory that exists,
+ * emits `dir:<path>`, `readdir`s an empty (or SKILL.md-less) listing, iterates
+ * nothing that fails, and returns. The `isMissingEntryError` guard added for
+ * branch A is never reached because nothing throws. A valid key is minted over
+ * an unusable tree, the bundle is cached under it, and the run proceeds
+ * *silently degraded* — which is BLO-7991's original harm (an agent behaves as
+ * though a declared skill does not exist), now with no failure for anyone to
+ * see. It is strictly more expensive than branch A's loud death.
+ *
+ * The primary fix is at the source: the materializer now publishes by rename,
+ * so this state should no longer be reachable from that writer. This assertion
+ * is the observer-side backstop, and it is not redundant — the pod-local copy of
+ * the bundle is a *separate* snapshot taken by a different code path, and the
+ * version-snapshot materializer has the same non-atomic shape. A backstop that
+ * costs one `stat` per catalog-backed skill is worth having on the layer that
+ * mints the cache key.
+ *
+ * Deliberately keyed on `SKILL.md` rather than on "the directory is empty".
+ * The write loop iterates `fileInventory` in order and `SKILL.md` need not be
+ * first, so the far commoner partial state is *some files, no entrypoint* — an
+ * emptiness test would walk straight past it. Asserting the positive shape is
+ * also the inversion BLO-31794 asks for generally: state what a valid tree must
+ * contain, rather than enumerating the ways it can be broken.
+ */
+async function assertSkillEntrypointPresent(entry: PaperclipSkillEntry): Promise<void> {
+  const entrypoint = path.join(entry.source, SKILL_ENTRYPOINT_FILENAME);
+  // `stat`, not `lstat`: a symlinked entrypoint that resolves to a real file is
+  // usable, and only the resolved target answers the question being asked.
+  const stat = await fs.stat(entrypoint).catch((err: unknown) => {
+    if (isMissingEntryError(err)) return null;
+    throw err;
+  });
+  if (stat?.isFile()) return;
+  throw new ClaudeSkillSourceUnavailableError({
+    skillKey: entry.key,
+    skillSource: entry.source,
+    missingPath: entrypoint,
+    // Only ever called for keys the caller resolved from a catalog row, so this
+    // is the transient class by construction: retryable, and self-healing on the
+    // next sweep. See the call site for why it is not called for anything else.
+    catalogBacked: true,
+    cause: null,
+  });
+}
+
 async function buildClaudePromptBundleKey(input: {
   skills: PaperclipSkillEntry[];
   instructionsContents: string | null;
@@ -235,6 +305,19 @@ async function buildClaudePromptBundleKey(input: {
         catalogBacked: input.catalogBackedSkillKeys?.has(entry.key) ?? true,
         cause: err,
       });
+    }
+    // BLO-32167. Only for keys KNOWN to be catalog-backed — never on the
+    // `?? true` default the branch-A classifier above uses. That default is
+    // correct there because it decides how to classify a fault that has already
+    // happened, and over-retrying beats permanently suppressing a self-healing
+    // one. Here the question is the opposite: whether to *manufacture* a fault.
+    // Erring toward manufacturing one would fail runs whose skill trees are
+    // legitimately shaped differently — bundled adapter skills in a read-only
+    // image path, which the sweep never rewrites and which no caller has told us
+    // about. That is the BLO-31794 over-suppression hazard, so this stays silent
+    // unless the caller positively identified the entry as catalog-backed.
+    if (input.catalogBackedSkillKeys?.has(entry.key)) {
+      await assertSkillEntrypointPresent(entry);
     }
   }
   return hash.digest("hex");
