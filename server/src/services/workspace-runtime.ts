@@ -19,7 +19,7 @@ import {
   type WorkspaceRuntimeDesiredState,
   type WorkspaceRuntimeServiceStateMap,
 } from "@paperclipai/shared";
-import { and, desc, eq, inArray, isNull, ne } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, notInArray } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { resolveHomeAwarePath, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
@@ -1353,6 +1353,47 @@ async function findGitWorktreeBranchContention(input: {
   });
 }
 
+// Non-terminal issues pointing at one execution workspace. A worktree holds a
+// single branch, so two or more claimants make it a shared resource and the
+// recorded branch is shared with them. Restoring it would move the worktree off
+// whichever claimant's branch is currently checked out, so safe repair refuses
+// and leaves the existing workspace-binding recovery path to route it (BLO-32628).
+async function findExecutionWorkspaceIssueClaimants(input: {
+  db: Db | null | undefined;
+  executionWorkspaceId: string | null;
+}): Promise<NonNullable<GitWorktreeBranchIncoherenceEvidence["workspaceClaimants"]> | null> {
+  if (!input.db || !input.executionWorkspaceId) return null;
+  const rows = await input.db
+    .select({
+      id: issues.id,
+      identifier: issues.identifier,
+      status: issues.status,
+    })
+    .from(issues)
+    .where(and(
+      eq(issues.executionWorkspaceId, input.executionWorkspaceId),
+      notInArray(issues.status, ["done", "cancelled"]),
+      isNull(issues.hiddenAt),
+    ))
+    .orderBy(issues.issueNumber)
+    .limit(10)
+    .catch(() => []);
+  return rows.map((row) => ({
+    issueId: row.id,
+    issueIdentifier: row.identifier ?? null,
+    status: row.status,
+  }));
+}
+
+function formatWorkspaceClaimantRefusal(
+  claimants: NonNullable<GitWorktreeBranchIncoherenceEvidence["workspaceClaimants"]>,
+) {
+  const names = claimants
+    .map((claimant) => claimant.issueIdentifier ?? claimant.issueId)
+    .join(", ");
+  return `execution workspace is claimed by ${claimants.length} non-terminal issues (${names}); restoring the recorded branch would move the worktree off another issue's branch`;
+}
+
 function executionWorkspaceUsesInheritedProjectRuntimeServices(
   row: typeof executionWorkspaces.$inferSelect,
 ) {
@@ -1568,14 +1609,55 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     ancestryVerdict === "ancestor" &&
     !sameHead &&
     registeredBranchMatchesHead;
+  const workspaceClaimants = await findExecutionWorkspaceIssueClaimants({
+    db: input.db ?? null,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+  });
+  const workspaceIsContended = (workspaceClaimants?.length ?? 0) > 1;
+  // `git checkout` refuses a branch that is already checked out in another
+  // linked worktree, so eligibility has to know about that before it promises a
+  // repair. Without this the run would report `eligible: true`, attempt the
+  // checkout, and fail with a bare "safe checkout failed" — strictly less
+  // diagnosable than the refusal it replaced.
+  const expectedBranchWorktreePath = expectedBranchExists
+    ? await findRegisteredGitWorktreeByBranch(input.repoRoot, input.expectedBranchName)
+    : null;
+  const expectedBranchHeldByOtherWorktree = expectedBranchWorktreePath
+    ? await resolvePathForWorktreeComparison(expectedBranchWorktreePath)
+      !== await resolvePathForWorktreeComparison(input.worktreePath)
+    : false;
+  // Ordinary stacked work — a sibling feature branch cut from the same base —
+  // leaves both branches as named local refs with neither an ancestor of the
+  // other. Ancestry is not load-bearing here: `refs/heads/<actualBranch>` keeps
+  // the checked-out commits reachable by construction, so restoring the recorded
+  // branch cannot orphan work whatever the verdict says. Ancestry stays
+  // load-bearing for the two branches above — the detached-HEAD case, where no
+  // ref preserves those commits, and the forward-adopt case, which rewrites the
+  // recorded branch rather than restoring it. A contended workspace is excluded:
+  // there the checked-out branch belongs to another claimant, so the mismatch is
+  // a workspace-binding defect for the recovery path, not a branch to restore.
+  const canCheckoutRecordedBranchOverDivergedBranch =
+    cleanliness === "clean" &&
+    expectedBranchExists &&
+    actualBranchExists === true &&
+    ancestryVerdict !== "ancestor" &&
+    !sameHead &&
+    registeredBranchMatchesHead &&
+    !workspaceIsContended &&
+    !expectedBranchHeldByOtherWorktree;
   const eligible =
-    canCheckoutRecordedBranch || canAdoptForwardActualBranch || canAttachRecordedBranchToDetachedHead;
+    canCheckoutRecordedBranch ||
+    canAdoptForwardActualBranch ||
+    canAttachRecordedBranchToDetachedHead ||
+    canCheckoutRecordedBranchOverDivergedBranch;
   const safeRepairReason = eligible
     ? canCheckoutRecordedBranch
       ? "clean worktree and expected branch points at the current HEAD"
       : canAdoptForwardActualBranch
         ? "clean worktree and checked-out branch is forward of the recorded branch"
-        : "clean detached worktree HEAD is forward of the recorded branch"
+        : canAttachRecordedBranchToDetachedHead
+          ? "clean detached worktree HEAD is forward of the recorded branch"
+          : "clean worktree can restore the recorded branch because the checked-out branch keeps its commits reachable"
     : cleanliness !== "clean"
       ? inProgressOperation
         ? `worktree is not clean and a git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is in progress`
@@ -1586,9 +1668,15 @@ async function inspectGitWorktreeBranchIncoherence(input: {
         ? "registered worktree branch does not match HEAD"
       : !expectedBranchExists
         ? "expected branch does not exist"
-        : !sameHead
-          ? "expected branch and current HEAD differ"
-          : "safe repair could not be proven";
+        : input.actualBranchName === null
+          ? "detached worktree HEAD is not provably forward of the recorded branch"
+          : workspaceIsContended && workspaceClaimants
+            ? formatWorkspaceClaimantRefusal(workspaceClaimants)
+            : expectedBranchHeldByOtherWorktree
+              ? `recorded branch is already checked out in another worktree at ${expectedBranchWorktreePath}`
+              : !sameHead
+                ? "expected branch and current HEAD differ"
+                : "safe repair could not be proven";
   const fingerprint = fingerprintWorkspaceBranchIncoherence({
     sourceIssueId: input.sourceIssue?.id ?? null,
     executionWorkspaceId: input.executionWorkspaceId ?? null,
@@ -1622,6 +1710,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     statusEntryCount: statusLines?.length ?? null,
     dirtyPathSample,
     contention,
+    workspaceClaimants,
     provenance: {
       expectedBranchRef: `refs/heads/${input.expectedBranchName}`,
       actualBranchRef,
@@ -2492,11 +2581,20 @@ export async function ensureGitWorktreeBranchCoherent(input: {
 
   evidence.safeRepair.succeeded = true;
   evidence.safeRepair.reason = "clean worktree checked out the recorded branch";
+  // A diverged sibling branch is the ordinary stacked-work shape. The checkout
+  // above moved HEAD off it, so name the ref and the commit it still points at:
+  // that is what makes the no-loss guarantee checkable by whoever reads this.
+  const divergedBranchPreserved =
+    currentBranch !== null &&
+    evidence.provenance.actualBranchExists === true &&
+    !evidence.provenance.sameHead;
   return {
     branchName: expectedBranchName,
     reconciledForward: false,
     warnings: [
-      `Execution workspace branch metadata was self-healed by checking out recorded branch "${expectedBranchName}" at ${input.worktreePath}.`,
+      divergedBranchPreserved
+        ? `${warningPrefix} The checked-out branch had diverged from the recorded branch, so Paperclip restored "${expectedBranchName}"; the diverged work is unchanged on "${currentBranch}"${evidence.provenance.actualHeadSha ? ` at ${formatShortSha(evidence.provenance.actualHeadSha)}` : ""} and can be checked out again.`
+        : `Execution workspace branch metadata was self-healed by checking out recorded branch "${expectedBranchName}" at ${input.worktreePath}.`,
     ],
   };
 }

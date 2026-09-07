@@ -626,7 +626,17 @@ async function expectContainedWorkspaceBranchFailure(input: {
       eligible: false,
       attempted: false,
       succeeded: false,
-      reason: "expected branch and current HEAD differ",
+      // BLO-32628: a single-claimant worktree in this same git state now
+      // self-heals, so containment here rests on two other refusals — both
+      // real, and which one fires depends on what the call site knows.
+      // Persisted restore passes the execution workspace id, so claimant
+      // contention is visible (source + same-workspace sibling). Fresh-worktree
+      // reuse passes `executionWorkspaceId: null`, so contention cannot be
+      // computed and the refusal falls to the git-level fact that the fixture's
+      // main checkout still holds the recorded branch.
+      reason: input.sourceExecutionWorkspaceId
+        ? expect.stringContaining("execution workspace is claimed by 2 non-terminal issues")
+        : expect.stringContaining("recorded branch is already checked out in another worktree"),
     }),
   });
   if (input.sourceExecutionWorkspaceId !== undefined) {

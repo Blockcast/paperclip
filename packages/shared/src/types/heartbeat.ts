@@ -42,6 +42,18 @@ export interface GitWorktreeBranchIncoherenceEvidence {
       issueIdentifier: string | null;
     } | null;
   } | null;
+  /**
+   * Non-terminal issues that reference this execution workspace. More than one
+   * claimant means the worktree is a shared resource, so restoring the recorded
+   * branch would move it off another issue's branch. Safe repair refuses in that
+   * case and routes to the workspace-binding recovery path instead. Optional so
+   * previously persisted evidence payloads stay valid.
+   */
+  workspaceClaimants?: {
+    issueId: string;
+    issueIdentifier: string | null;
+    status: string;
+  }[] | null;
   provenance: {
     expectedBranchRef: string;
     actualBranchRef: string | null;
