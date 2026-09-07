@@ -101,6 +101,25 @@ const WORKSPACE_BEARING_PRODUCERS = [
   "reconcileExecutionWorkspaceBranch",
 ];
 
+/**
+ * Names bound by a destructuring pattern's interior, e.g. `workspace, created` or `workspace: ws`.
+ *
+ * An identifier followed by `:` is a KEY, which binds nothing — its value is the binding, so
+ * `workspace: ws` yields `ws`. Every other identifier is taken, which handles plain bindings, rest
+ * elements (`...rest`) and nested patterns (`config: { workspaceRuntime }` yields `workspaceRuntime`)
+ * without a second parser. A default (`workspace = fallback`) also contributes the identifiers in
+ * its expression; that over-collects, in the same safe direction as the loose initializer match.
+ */
+function namesInDestructuringPattern(interior: string): string[] {
+  const names: string[] = [];
+  const token = /([A-Za-z_$][\w$]*)\s*(:)?/g;
+  let match: RegExpExecArray | null;
+  while ((match = token.exec(interior)) !== null) {
+    if (!match[2]) names.push(match[1]!);
+  }
+  return names;
+}
+
 /** Locals in `source` bound to a workspace-bearing service call, e.g. `const result = await svc.x()`. */
 export function collectWorkspaceBearingLocals(source: string, receivers: string[] = []): string[] {
   const names = new Set<string>();
@@ -110,17 +129,28 @@ export function collectWorkspaceBearingLocals(source: string, receivers: string[
   // caught too. Loose matching over-collects rather than under-collects: a spurious noun makes CI
   // demand a wrapper that was not strictly needed, which is the safe direction to be wrong in.
   //
+  // The binding is an identifier OR a destructuring pattern. Matching only the identifier would
+  // under-collect, and under-collection is not symmetric with the over-collection above: a module
+  // whose producer results are ALL destructured reports no locals, which
+  // `moduleCanAnswerWithWorkspaceRows` cannot distinguish from `environments.ts` — so the module
+  // drops out of the coverage check into the bucket documented as safe. `const { workspace, created }
+  // = await svc.create(...)` is the natural shape for the `create`/`update` producers listed above.
+  // The pattern body allows one level of nesting, so `{ config: { workspaceRuntime } }` — the same
+  // hole one level deeper, and the one that destructures the withheld field directly — is caught too.
+  //
   // `receivers` narrows the producer call to a named service. Empty means any receiver, which is
   // right for the two modules whose services are ALL workspace services. It does not transfer to a
   // module that talks to thirty of them — see `MODULE_SCANS`.
   const receiverPrefix = receivers.length > 0 ? `(?:${receivers.join("|")})\\s*\\.\\s*` : "";
   const pattern = new RegExp(
-    `\\b(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=[^;\\n]*\\b${receiverPrefix}(?:${producers})\\(`,
+    `\\b(?:const|let|var)\\s+(?:([A-Za-z_$][\\w$]*)|\\{((?:[^{}]|\\{[^{}]*\\})*)\\})\\s*=` +
+      `[^;\\n]*\\b${receiverPrefix}(?:${producers})\\(`,
     "g",
   );
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(source)) !== null) {
     if (match[1]) names.add(match[1]);
+    else if (match[2]) for (const name of namesInDestructuringPattern(match[2])) names.add(name);
   }
   return [...names];
 }
@@ -140,6 +170,12 @@ const WORKSPACE_SERVICE_EXPORTS = ["executionWorkspaceService", "projectService"
  * the canonical export name would have found nothing in the one module this series proved was
  * leaking — a vacuous pass on the door we already know about. The local binding is what the call
  * site uses, so the local binding is what this resolves.
+ *
+ * The import scan runs over the whole source rather than over import statements, so a mention of an
+ * export name in a comment or a type position also contributes a local name. That is deliberate and
+ * should not be "fixed" into something import-scoped: over-collecting a receiver can only DEMAND
+ * coverage, never excuse it, which is the same safe direction the loose initializer match above
+ * takes.
  */
 export function collectWorkspaceServiceReceivers(source: string): string[] {
   const localNames = new Set<string>();
@@ -175,7 +211,9 @@ export function collectWorkspaceServiceReceivers(source: string): string[] {
  *
  * Reusing `collectWorkspaceBearingLocals` rather than writing a second producer list is deliberate:
  * one definition of "this call yields a workspace row", so the scan and this check cannot drift
- * into disagreeing about what they are looking for.
+ * into disagreeing about what they are looking for. Note what that reuse means for a FALSE result:
+ * it says the module binds no producer result under any spelling the collector knows — identifier
+ * or destructuring pattern — not merely that the obvious spelling is absent.
  */
 export function moduleCanAnswerWithWorkspaceRows(source: string): boolean {
   const receivers = collectWorkspaceServiceReceivers(source);
@@ -195,7 +233,14 @@ export function moduleCanAnswerWithWorkspaceRows(source: string): boolean {
  * the service rather than the method name, and in this module it collects exactly three locals.
  */
 interface ModuleScan {
-  /** Service receivers whose results carry workspace material; empty = any receiver. */
+  /**
+   * Service receivers whose results carry workspace material; empty = any receiver.
+   *
+   * Where non-empty this must equal what `collectWorkspaceServiceReceivers` derives from the module
+   * — pinned below. A MISSING entry is the dangerous direction (the scan stops tracking a service
+   * and under-collects); a STALE entry is a dead alternation that quietly makes a false claim about
+   * the module. Both are drift, so the list is held to equality rather than to a superset.
+   */
   producerReceivers: string[];
   /**
    * Module-local wrappers that delegate to the shared boundary. Listing one here is a claim that it
@@ -208,7 +253,7 @@ const MODULE_SCANS: Record<string, ModuleScan> = {
   "execution-workspaces.ts": { producerReceivers: [], localWithholdingHelpers: [] },
   "projects.ts": { producerReceivers: [], localWithholdingHelpers: [] },
   "issues.ts": {
-    producerReceivers: ["projectsSvc", "executionWorkspacesSvc", "projectWorkspacesSvc"],
+    producerReceivers: ["projectsSvc", "executionWorkspacesSvc"],
     localWithholdingHelpers: [
       "compactIssueProjectWorkspace",
       "compactIssueExecutionWorkspace",
@@ -744,6 +789,53 @@ describe("workspace response withholding guard (PEN-2852, PEN-2370 (b2))", () =>
     `;
     expect(collectWorkspaceServiceReceivers(aliased)).toContain("wsSvc");
     expect(moduleCanAnswerWithWorkspaceRows(aliased)).toBe(true);
+  });
+
+  it("detects an uncovered module even when it destructures the producer result", () => {
+    // The other half of the resolver, and the more dangerous half. The alias test above pins how the
+    // SERVICE is named; this pins how its RESULT is bound. A destructured binding used to collect no
+    // locals at all, which did not merely hide one response site — it dropped the whole module out
+    // of the coverage check into the `environments.ts` bucket, the one with a written rationale
+    // saying the module is safe. `const { … } = await <svc>.<method>(` is an idiom already used in
+    // this directory, and `create`/`update` are `WORKSPACE_BEARING_PRODUCERS`.
+    const destructured = `
+      import { executionWorkspaceService } from "../services/execution-workspaces.js";
+      export function newRoutes(db) {
+        const wsSvc = executionWorkspaceService(db);
+        router.post("/thing", async (req, res) => {
+          const { workspace, created } = await wsSvc.create(req.body);
+          res.json({ workspace, created });
+        });
+      }
+    `;
+    expect(collectWorkspaceBearingLocals(destructured, ["wsSvc"])).toEqual(["workspace", "created"]);
+    expect(moduleCanAnswerWithWorkspaceRows(destructured)).toBe(true);
+
+    // The alias spelling inside the pattern binds the alias, since that is the name a response site
+    // can mention — a key binds nothing.
+    const renamed = destructured.replace("{ workspace, created }", "{ workspace: ws, created }");
+    expect(collectWorkspaceBearingLocals(renamed, ["wsSvc"])).toEqual(["ws", "created"]);
+
+    // One level deeper is the same hole, and it is the shape that destructures the withheld field
+    // itself. `config` is a key and binds nothing; `workspaceRuntime` is the local that a response
+    // site could then mention.
+    const nested = destructured.replace("{ workspace, created }", "{ config: { workspaceRuntime } }");
+    expect(collectWorkspaceBearingLocals(nested, ["wsSvc"])).toEqual(["workspaceRuntime"]);
+    expect(moduleCanAnswerWithWorkspaceRows(nested)).toBe(true);
+  });
+
+  it("holds each module's hand-maintained producerReceivers to what the module actually binds", () => {
+    // `producerReceivers` NARROWS the scan, so a missing entry silently stops it tracking a service.
+    // This commit's own resolver makes the list derivable, so the hand-maintained copy is checked
+    // against it rather than trusted — it had already drifted (`projectWorkspacesSvc` was listed and
+    // bound nowhere). Equality, not superset: a dead entry is a false claim about the module.
+    for (const [module, scan] of Object.entries(MODULE_SCANS)) {
+      if (scan.producerReceivers.length === 0) continue; // `[]` means "any receiver" — a different mode.
+      const source = readFileSync(path.join(ROUTES_DIR, module), "utf8");
+      expect(new Set(scan.producerReceivers), `${module} producerReceivers drifted`).toEqual(
+        new Set(collectWorkspaceServiceReceivers(source)),
+      );
+    }
   });
 
   it("does not demand coverage from a module that only mutates through a workspace service", () => {
