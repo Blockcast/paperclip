@@ -742,14 +742,36 @@ export const PLUGIN_METRIC_DROPPED_METRIC = "paperclip_plugin_metric_dropped_tot
  *   - `mimetype` — plugin-supplied and effectively open.
  * Their metrics still publish; they just publish without those labels. Adding
  * a key here is an explicit cardinality decision, not a convenience.
+ *
+ * `aggregate_key` and `phase` were added for BLO-32163, and the bound is
+ * argued rather than assumed:
+ *   - `phase` is the alertmanager aggregate lifecycle fence's phase column,
+ *     whose vocabulary is closed at four values (`active`, `firing`,
+ *     `cancelling`, `finalizing`). Trivially bounded.
+ *   - `aggregate_key` is `alert-aggregate:v1:["<alertname>",<dedupe-domain>]`
+ *     (see the alertmanager plugin's `aggregateKeyForAlert`), so its
+ *     cardinality is `alertname × dedupe-domain`. `alertname` is already
+ *     accepted above as bounded by the alert-rule registry, and
+ *     `dedupe-domain` is a rule-author opt-in label that is null on every
+ *     rule that does not set it. So this sits in the same order as a key the
+ *     list already admits, and is bounded by the rule registry — not by alert
+ *     *instances*, which is the axis that would actually be unbounded.
+ *
+ * It is load-bearing that `aggregate_key` be a label and not merely present in
+ * the metric name: a wedged-fence page has to name the wedged aggregate to be
+ * actionable, and `alertname` alone cannot do it — two aggregates of the same
+ * rule differing only by dedupe-domain are distinct fences that wedge
+ * independently.
  */
 export const PLUGIN_METRIC_PROMOTABLE_TAG_KEYS = [
   "action",
+  "aggregate_key",
   "alertname",
   "decision",
   "error_code",
   "event_type",
   "exit_code",
+  "phase",
   "scope",
   "severity",
   "source",
