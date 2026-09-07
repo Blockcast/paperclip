@@ -313,6 +313,27 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
     expect(result?.auth_base_url).toBe(REDACTED_EVENT_VALUE);
   });
 
+  // Ally review (#1219, exact head 1a7fc6e3): the detector
+  // `URL_CREDENTIAL_QUERY_RE` and its documented replacing sibling
+  // `URL_CREDENTIAL_PARAM_VALUE_RE` are reached by *different* keys, and the
+  // test above only covers the tiered one. A tiered key (`auth_base_url`)
+  // redacts the whole value via the detector; an untiered key (`url`,
+  // `endpoint`, `mcpServers.*.url`) instead takes the surgical in-place
+  // masker, whose alternation lacked `authentication` — so `?authentication=`
+  // round-tripped in cleartext on precisely the path PEN-2747 exists for,
+  // while the same URL spelled `?auth=` or `?token=` was masked. Mutation
+  // check: dropping `authentication` from the sibling alone leaves every
+  // other test in this file passing and fails only these two assertions.
+  it("masks an untiered key's URL credential in place, for query and fragment alike", () => {
+    const result = redactEventPayload({
+      url: "https://host.test/mcp?authentication=hunter2",
+      endpoint: "https://host.test/cb#authentication=hunter2",
+    });
+
+    expect(result?.url).toBe(`https://host.test/mcp?authentication=${REDACTED_EVENT_VALUE}`);
+    expect(result?.endpoint).toBe(`https://host.test/cb#authentication=${REDACTED_EVENT_VALUE}`);
+  });
+
   // CTO finding (#943 review, post-tiering): the URL branch returned "safe"
   // for any URL without `user:pass@` userinfo or a `?token=`-style query, so
   // a capability URL that embeds its credential directly in the path (a
