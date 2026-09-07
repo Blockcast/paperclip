@@ -1586,14 +1586,30 @@ export async function awaitSessionWithProgress<T>(
  * where the coverage actually starts. `acpx.runtime_prepare` begins inside
  * `executeAcpxEngine`; the adapter entry points reach that function through a
  * lazy `await import(...)` of this module (e.g.
- * `packages/adapters/claude-local/src/server/acp.ts`), and that module load --
- * itself disk I/O on the same mount -- happens before the first tick. The
- * memoised executor closure only caches within a process, so on per-run pods
- * that load is on every run's critical path. A run parked there is still silent
- * at its pre-exec prefix. Any liveness predicate built on "seq 1 means the
- * process is gone" therefore still inherits that residual window as a false
- * positive, which is the same shape as the precision failure that withdrew
- * #1462. Tracked separately rather than fixed here.
+ * `packages/adapters/claude-local/src/server/acp.ts`), so that module load
+ * happens before the first tick. That residual is now measured (PEN-3099):
+ * across 1,808 `claude_local` runs over 46 days the window containing it ran
+ * p50 637 ms, p99 16.7 s, max 2.1 min, and never once reached the 5 min tick
+ * ceiling, let alone `RUN_STALE_SILENCE_MS`.
+ *
+ * Three corrections to the reasoning that first flagged it, since each is easy
+ * to re-derive wrongly. The load is paid once per *process*, not per run: every
+ * importer of this module is a server-side `acp.ts`, the executor closure is
+ * memoised at module scope, and the worker awaits `adapter.execute` in-process
+ * -- the per-run pod adapters (`claude_k8s`, `opencode_k8s`) never import it.
+ * It is not I/O on the network mount either: the module is read from the
+ * container image layer, whereas the mount that has been observed to wedge
+ * backs the workspace and state directories this helper *does* bracket. And a
+ * run parked in the import is not byte-identical to one parked after it -- the
+ * `Adapter execution timeout:` line is emitted from this module using the
+ * result of `buildRuntime`, so its presence proves the import, the billing
+ * lookup and the prepare all returned.
+ *
+ * A liveness predicate keyed on that line's presence therefore does not inherit
+ * this residual; one keyed on a raw `seq <= 1` still does, which is the shape of
+ * the precision failure that withdrew #1462. Key it on the line and not on the
+ * byte count: the leading workspace-fallback line is conditional, so a healthy
+ * prefix is legitimately two or three lines.
  *
  * Same non-terminating contract as the handshake ticker -- this reports, it does
  * not bound. Payload carries only stage/elapsed metadata: never prompts,

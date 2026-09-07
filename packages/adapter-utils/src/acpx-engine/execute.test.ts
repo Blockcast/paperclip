@@ -2102,6 +2102,40 @@ describe("ACPX runtime prepare progress (PEN-1995)", () => {
     expect(firstHandshake).toBeGreaterThan(events.indexOf(prepare[1]!));
   });
 
+  // PEN-3099. The residual pre-import window is only *attributable* because the
+  // `Adapter execution timeout:` line is emitted from inside this module, using
+  // the result of `buildRuntime`. That makes its presence in a run log positive
+  // proof that the lazy `await import(...)`, the billing lookup and the prepare
+  // all returned -- which is what lets a liveness predicate tell a run parked in
+  // the import (line absent) from one parked in the handshake (line present),
+  // rather than reading both as an indistinguishable silence. Measured on 1,808
+  // production runs, 27 of 28 silent runs carried this line. Moving the emit
+  // above `buildRuntime` would destroy that discriminator without failing any
+  // other assertion here, so pin its position on both sides.
+  it("emits the timeout line between the prepare terminal and the handshake, so it proves prepare completed", async () => {
+    const { logs } = await runExecutor({ agent: "claude" });
+
+    const at = (needle: string) => logs.findIndex((entry) => entry.text.includes(needle));
+
+    const preparedAt = at('"type":"acpx.runtime_prepare"');
+    const timeoutAt = at("Adapter execution timeout:");
+    const handshakeAt = at('"type":"acpx.session_establish"');
+
+    // Assert presence positively: a missing marker yields -1, which would other-
+    // wise satisfy the < comparisons below and pass vacuously.
+    expect(preparedAt).toBeGreaterThanOrEqual(0);
+    expect(timeoutAt).toBeGreaterThanOrEqual(0);
+    expect(handshakeAt).toBeGreaterThanOrEqual(0);
+
+    const preparedTerminalAt = logs.findIndex(
+      (entry) => entry.text.includes('"type":"acpx.runtime_prepare"') && entry.text.includes('"stage":"prepared"'),
+    );
+    expect(preparedTerminalAt).toBeGreaterThanOrEqual(0);
+
+    expect(timeoutAt).toBeGreaterThan(preparedTerminalAt);
+    expect(timeoutAt).toBeLessThan(handshakeAt);
+  });
+
   it("never emits prompt, credential, environment, or path material", async () => {
     const { lines, ctx } = collector();
 
