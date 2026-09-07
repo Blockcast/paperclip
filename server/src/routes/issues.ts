@@ -7467,7 +7467,30 @@ export function issueRoutes(
       remoteProvider: workspace.remoteProvider,
       remoteWorkspaceRef: workspace.remoteWorkspaceRef,
       sharedWorkspaceKey: workspace.sharedWorkspaceKey,
-      runtimeConfig: workspace.runtimeConfig,
+      // PEN-2846 (door #12b): the second `workspaceRuntime` exit in this file.
+      // This projection is a withholding boundary too — it omits `metadata` and
+      // `runtimeServices` off the row rather than spreading it — but
+      // `runtimeConfig` is a *view onto that same omitted `metadata`*:
+      // `services/projects.ts` derives it via
+      // `readProjectWorkspaceRuntimeConfig(row.metadata)`, reading
+      // `metadata.runtimeConfig`. So passing it through verbatim handed back a
+      // slice of the column this projection drops.
+      //
+      // Only `workspaceRuntime` is open — an operator-authored
+      // `Record<string, unknown>` (`ProjectWorkspaceRuntimeConfig`), the same type
+      // and the same hazard as the execution-workspace side masked in
+      // `compactIssueExecutionWorkspace` below. `desiredState` and `serviceStates`
+      // are enum-validated on the way out of that reader, so they cross intact.
+      //
+      // Enumerated rather than spread so a field added to
+      // `ProjectWorkspaceRuntimeConfig` later has to be considered here first.
+      runtimeConfig: workspace.runtimeConfig
+        ? {
+            workspaceRuntime: maskWorkspaceRuntimeForRead(workspace.runtimeConfig.workspaceRuntime),
+            desiredState: workspace.runtimeConfig.desiredState,
+            serviceStates: workspace.runtimeConfig.serviceStates,
+          }
+        : null,
       isPrimary: workspace.isPrimary,
       createdAt: workspace.createdAt,
       updatedAt: workspace.updatedAt,
