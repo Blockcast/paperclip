@@ -100,24 +100,28 @@ function resolveProcessGroupId(child: ChildProcess) {
 }
 
 // Exported so the direct-child fallback branch can be unit-tested directly.
+// Returns whether the signal was actually delivered to a live target, so callers
+// can report a kill as evidence only when one really happened.
 export function signalRunningProcess(
   running: Pick<RunningProcess, "child" | "processGroupId">,
   signal: NodeJS.Signals,
-) {
+): boolean {
   if (process.platform !== "win32" && running.processGroupId && running.processGroupId > 0) {
     try {
       process.kill(-running.processGroupId, signal);
-      return;
+      return true;
     } catch {
-      // Fall back to the direct child signal if group signaling fails.
+      // Fall back to the direct child signal if group signaling fails. A throw
+      // here is usually ESRCH: the whole group is already gone.
     }
   }
   // Gate on real liveness: `child.killed` only means a signal was sent, not that
   // the process exited, so escalating on it would suppress a follow-up SIGKILL.
   // `exitCode`/`signalCode` are null until the child actually closes.
   if (running.child.exitCode === null && running.child.signalCode === null) {
-    running.child.kill(signal);
+    return running.child.kill(signal);
   }
+  return false;
 }
 
 export const runningProcesses = new Map<string, RunningProcess>();
@@ -3216,12 +3220,20 @@ export async function runChildProcess(
                 signalRunningProcess({ child, processGroupId }, "SIGTERM");
                 timeoutKillTimer = setTimeout(() => {
                   timeoutKillTimer = null;
+                  // Deliver first, then report. The grace timer deliberately
+                  // survives `close` (see the `close` handler) so a descendant
+                  // that outlived the direct child still gets SIGKILLed. On the
+                  // common graceful path the whole group is already gone, the
+                  // kill lands on nothing, and emitting `kill_signal` there
+                  // would forge evidence of a force-kill that never happened —
+                  // and append a run event after the run had terminalized.
+                  const delivered = signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                  if (!delivered) return;
                   emitLifecycle({
                     stage: "kill_signal",
                     observedAt: new Date().toISOString(),
                     signal: "SIGKILL",
                   });
-                  signalRunningProcess({ child, processGroupId }, "SIGKILL");
                 }, Math.max(1, opts.graceSec) * 1000);
               }, opts.timeoutSec * 1000)
             : null;
@@ -3336,6 +3348,13 @@ export async function runChildProcess(
 
         child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
           if (timeout) clearTimeout(timeout);
+          // `timeoutKillTimer` is deliberately NOT cleared here, unlike in the
+          // `error` handler. `close` only means the direct child's stdio closed;
+          // descendants spawned with their own stdio (`stdio: 'ignore'`) stay
+          // alive in the process group, and this pending timer is the only thing
+          // that SIGKILLs them — see the "keeps timeout escalation armed after
+          // the direct child exits" test. The `error` handler may clear it
+          // because a failed spawn leaves no process group to signal.
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
           if (childError) return;
