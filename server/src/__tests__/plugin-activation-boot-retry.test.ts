@@ -42,7 +42,9 @@ vi.mock("node:child_process", async (importOriginal) => {
 const { createDb, plugins } = await import("@paperclipai/db");
 const {
   pluginLoader,
+  classifyActivationLatch,
   TRANSIENT_RETRY_EXHAUSTED_MARKER,
+  SDK_INSTALL_RACE_RETRY_EXHAUSTED_MARKER,
   readBootActivationRetryCount,
 } = await import("../services/plugin-loader.js");
 const { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } = await import(
@@ -50,6 +52,88 @@ const { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } = aw
 );
 
 const RETRY_LIMIT_ENV = "PAPERCLIP_PLUGIN_BOOT_ACTIVATION_RETRY_LIMIT";
+
+const INITIALIZE_TIMEOUT_ERROR = new Error(
+  'Worker initialize failed for "fixture": RPC call "initialize" timed out after 60000ms',
+);
+/** A plugin rejecting its own `initialize` — same prefix, opposite meaning. */
+const FAILED_CLOSED_ERROR = new Error(
+  'Worker initialize failed for "fixture": plugin config invalid: missing apiKey',
+);
+const SDK_INSTALL_RACE_ERROR = new Error(
+  "ERR_MODULE_NOT_FOUND: Cannot find package '@paperclipai/plugin-sdk' imported from worker.js",
+);
+
+/**
+ * The eligibility predicate decides whether a boot may re-attempt a row, so it
+ * is asserted directly rather than only through its effect. The case that
+ * motivates this: spending a transient retry and *then* failing closed used to
+ * be recorded as transient, because the marker was keyed on whether a retry had
+ * been spent rather than on what the terminal failure was.
+ */
+describe("classifyActivationLatch — keys eligibility on the terminal error", () => {
+  it("marks a row eligible when the transient budget was spent and the terminal error is transient", () => {
+    const latch = classifyActivationLatch({
+      err: INITIALIZE_TIMEOUT_ERROR,
+      transientAttempt: 2,
+      sdkRaceAttempt: 0,
+    });
+
+    expect(latch.eligibleForBootReattempt).toBe(true);
+    expect(latch.suffix).toContain(TRANSIENT_RETRY_EXHAUSTED_MARKER);
+  });
+
+  it("does NOT revive a row that spent a transient retry and then failed closed", () => {
+    // Attempt 1 times out (transientAttempt -> 1), attempt 2 is rejected by the
+    // plugin itself. The row is genuinely broken: re-attempting it every boot
+    // would burn the budget on a fault no restart can fix.
+    const latch = classifyActivationLatch({
+      err: FAILED_CLOSED_ERROR,
+      transientAttempt: 1,
+      sdkRaceAttempt: 0,
+    });
+
+    expect(latch.eligibleForBootReattempt).toBe(false);
+    expect(latch.suffix).not.toContain(TRANSIENT_RETRY_EXHAUSTED_MARKER);
+    // The counter is still recorded — it is provenance, just not the verdict.
+    expect(latch.suffix).toContain("1 transient");
+  });
+
+  it("marks an SDK-install-race latch eligible so it is not left dead across boots", () => {
+    const latch = classifyActivationLatch({
+      err: SDK_INSTALL_RACE_ERROR,
+      transientAttempt: 0,
+      sdkRaceAttempt: 5,
+    });
+
+    expect(latch.eligibleForBootReattempt).toBe(true);
+    expect(latch.suffix).toContain(SDK_INSTALL_RACE_RETRY_EXHAUSTED_MARKER);
+  });
+
+  it("does not let an SDK-install-race latch claim the transient marker", () => {
+    // A worker that crashed at import matches both classifiers. The retry loop
+    // refuses to let one class borrow the other's attempts; so must the marker.
+    const latch = classifyActivationLatch({
+      err: SDK_INSTALL_RACE_ERROR,
+      transientAttempt: 1,
+      sdkRaceAttempt: 5,
+    });
+
+    expect(latch.suffix).toContain(SDK_INSTALL_RACE_RETRY_EXHAUSTED_MARKER);
+    expect(latch.suffix).not.toContain(TRANSIENT_RETRY_EXHAUSTED_MARKER);
+  });
+
+  it("leaves a first-attempt failed-closed row terminal", () => {
+    const latch = classifyActivationLatch({
+      err: FAILED_CLOSED_ERROR,
+      transientAttempt: 0,
+      sdkRaceAttempt: 0,
+    });
+
+    expect(latch.eligibleForBootReattempt).toBe(false);
+    expect(latch.suffix).toContain("failed closed");
+  });
+});
 
 /** The exact `lastError` an exhausted transient activation writes. */
 function transientLatchText(attempts = 2): string {
@@ -60,11 +144,20 @@ function transientLatchText(attempts = 2): string {
   );
 }
 
+/** The exact `lastError` an exhausted SDK-install-race activation writes. */
+function sdkRaceLatchText(attempts = 5): string {
+  return (
+    `Activation failed: ERR_MODULE_NOT_FOUND: Cannot find package ` +
+    `'@paperclipai/plugin-sdk' imported from worker.js ` +
+    `(${SDK_INSTALL_RACE_RETRY_EXHAUSTED_MARKER}: 0 transient and ${attempts} sdk-install-race retries spent)`
+  );
+}
+
 /** The `lastError` a plugin that threw from its own `initialize` writes. */
 const FAILED_CLOSED_LATCH_TEXT =
   `Activation failed: Worker initialize failed for "fixture": ` +
   `plugin config invalid: missing apiKey ` +
-  `(failed closed on first attempt; not classified as transient)`;
+  `(failed closed after 0 transient and 0 sdk-install-race retries; not classified as retryable contention)`;
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
@@ -266,6 +359,28 @@ describeEmbeddedPostgres("BLO-20410 — boot re-attempts a transiently-latched p
     const [after] = await db.select().from(plugins);
     expect(after?.status).toBe("error");
     expect(after?.lastError).toBe(latchText);
+  }, 60_000);
+
+  it("activates a plugin latched by an exhausted SDK-install-race budget", async () => {
+    // Same defect as the transient case, different contention class: the plugin
+    // lost a race against a concurrent @paperclipai/plugin-sdk install. By this
+    // boot the install has finished, so the row must be re-attempted rather
+    // than left for a human `/enable`.
+    const pluginKey = `paperclip.sdkrace_${randomUUID().slice(0, 8)}`;
+    const { installDir, packageName, manifest } = await seedPluginDir(pluginKey);
+    await insertLatchedRow(pluginKey, manifest, packageName, installDir, sdkRaceLatchText());
+
+    const { runtimeServices, startWorker, enable } = createRuntimeServices();
+    const loader = pluginLoader(db, { localPluginDir: installDir }, runtimeServices);
+    const result = await loader.loadAll();
+
+    expect(startWorker).toHaveBeenCalledTimes(1);
+    expect(result.succeeded).toBe(1);
+
+    const [after] = await db.select().from(plugins);
+    expect(after?.status).toBe("ready");
+    expect(after?.lastError).toBeNull();
+    expect(enable).not.toHaveBeenCalled();
   }, 60_000);
 
   it("leaves a plugin that failed closed on the first attempt latched", async () => {
