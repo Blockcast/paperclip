@@ -28775,7 +28775,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             statusReadError = error;
           }
           if (terminalStatus || statusReadError) {
-            recordHeartbeatPostTerminalRunEventDropped(terminalStatus);
             // This log is the substitute for the row that is deliberately not
             // written, so it must not be a *less* redacted substitute than the
             // storage path. Mirror `appendRunEvent`'s four sanitizations in the
@@ -28802,24 +28801,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sanitizedMessage = null;
               sanitizedPayload = null;
             }
-            logger.warn(
-              {
-                runId: currentRun.id,
-                agentId: currentRun.agentId,
-                companyId: currentRun.companyId,
-                terminalStatus,
-                eventType,
-                stream: event.stream ?? null,
-                level: event.level ?? null,
-                message: sanitizedMessage,
-                payload: sanitizedPayload,
-                ...(statusReadError ? { err: statusReadError } : {}),
-                ...(sanitizationError ? { sanitizationErr: sanitizationError } : {}),
-              },
-              statusReadError
-                ? "dropped adapter run event after failing to read the run's status (BLO-32553)"
-                : "dropped adapter run event delivered after the run reached a terminal status (BLO-32553)",
-            );
+            // The counter and the log are this path's only two reporting
+            // channels, and both can throw exactly where the AC's "not lost
+            // silently" clause needs them not to: `ensureRegistry()` constructs
+            // its counters on first call, and a logger transport can fail. They
+            // are guarded independently rather than inside one `try`, so a
+            // metrics failure is still reported — through the log, as
+            // `metricErr` — instead of suppressing the log along with itself.
+            let metricError: unknown = null;
+            try {
+              recordHeartbeatPostTerminalRunEventDropped(terminalStatus);
+            } catch (error) {
+              metricError = error;
+            }
+            try {
+              logger.warn(
+                {
+                  runId: currentRun.id,
+                  agentId: currentRun.agentId,
+                  companyId: currentRun.companyId,
+                  terminalStatus,
+                  // Truncated to match the storage path's `eventType.slice(0, 120)`
+                  // below. The log stands in for the row that is not written, so
+                  // an adapter must not be able to put a longer string through it
+                  // than storage would have accepted.
+                  eventType: eventType.slice(0, 120),
+                  stream: event.stream ?? null,
+                  level: event.level ?? null,
+                  message: sanitizedMessage,
+                  payload: sanitizedPayload,
+                  ...(statusReadError ? { err: statusReadError } : {}),
+                  ...(sanitizationError ? { sanitizationErr: sanitizationError } : {}),
+                  ...(metricError ? { metricErr: metricError } : {}),
+                },
+                statusReadError
+                  ? "dropped adapter run event after failing to read the run's status (BLO-32553)"
+                  : "dropped adapter run event delivered after the run reached a terminal status (BLO-32553)",
+              );
+            } catch {
+              // Both reporting channels have now failed, so there is nothing
+              // left that could record this drop. Rejecting instead would
+              // surface as an unhandled rejection in a continuation with nothing
+              // awaiting it — the precise failure this branch exists to avoid.
+              // The event is still correctly dropped; only its evidence is lost.
+            }
             return;
           }
         }

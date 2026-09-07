@@ -34,6 +34,13 @@ const TEST_ADAPTER = "post_terminal_run_event_test";
  * "High-entropy secret" — so `const LEAK_CANARY = "<long string>"` trips it
  * whatever the value looks like. Renaming keeps this file clean without
  * weakening the assertions or obfuscating the payload keys under test.
+ *
+ * The rule's separator is `[=:]`, so it matches an **object key** just as
+ * readily as an `=` assignment: `{ api_key: "<20+ chars>" }` would trip it too.
+ * This file stays clean only because every stem-bearing payload key
+ * (`api_key`, `access_token`) is assigned the `LEAK_CANARY` *identifier* rather
+ * than a quoted literal. Keep it that way — inlining the string at any of those
+ * keys re-plants the false positive this rename removed.
  */
 const LEAK_CANARY = "redaction-fixture-value-must-not-reach-the-log";
 
@@ -57,7 +64,12 @@ async function droppedCount(status?: string): Promise<number> {
 async function waitForRunToFinish(
   heartbeat: ReturnType<typeof heartbeatService>,
   runId: string,
-  timeoutMs = 20_000,
+  // 20s was observed to be too tight on a loaded host — a run took ~68s to
+  // finish and the poll gave up first, failing on `status === "running"` and
+  // reading as a guard bug rather than as a slow machine. The enclosing `it`
+  // timeout is 120s and this only polls, so waiting longer costs nothing when
+  // the host is healthy.
+  timeoutMs = 90_000,
 ) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -188,6 +200,44 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
       .orderBy(asc(heartbeatRunEvents.seq));
   }
 
+  /**
+   * Snapshot the run's events once the run has stopped producing them.
+   *
+   * `waitForRunToFinish` polls the run's *status*, but finalization writes that
+   * status **before** appending the terminal `lifecycle` event ("run succeeded")
+   * — `setRunStatus` then `appendRunEvent` in heartbeat.ts's finalize path. So a
+   * snapshot taken the instant the status flips can race the run's own last
+   * legitimate events, which makes the "event list unchanged" assertions below
+   * flaky rather than wrong: they would report a late-arriving *on-time* event
+   * as though the guard had let the late one through.
+   *
+   * Settles on quiescence rather than on one named event type, so anything
+   * appended after the terminal lifecycle row is covered too.
+   */
+  async function snapshotSettledEvents(
+    runId: string,
+    { quietMs = 500, timeoutMs = 20_000 } = {},
+  ) {
+    const deadline = Date.now() + timeoutMs;
+    let previousCount = -1;
+    let stableSince = Date.now();
+    for (;;) {
+      const events = await readEvents(runId);
+      if (events.length !== previousCount) {
+        previousCount = events.length;
+        stableSince = Date.now();
+      } else if (Date.now() - stableSince >= quietMs) {
+        return events;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `run ${runId} was still appending events after ${timeoutMs}ms (${events.length} so far)`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
   it(
     "drops a kill_signal delivered after the run reached a terminal status, and counts it",
     async () => {
@@ -199,7 +249,9 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
       expect(finished?.status).toBe("succeeded");
 
       // The on-time event persisted — this is the AC-3 no-regression anchor.
-      const before = await readEvents(run!.id);
+      // Snapshot only once the run has stopped emitting, so a late *on-time*
+      // event cannot be misread below as the guard letting the late one through.
+      const before = await snapshotSettledEvents(run!.id);
       expect(before.map((e) => e.eventType)).toContain("test.on_time");
 
       expect(capturedOnEvent).toBeTypeOf("function");
@@ -295,6 +347,78 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
   );
 
   it(
+    "drops the event and counts it under \"unknown\" when the status read itself fails",
+    async () => {
+      const { agentId } = await seedAgent();
+
+      const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+      expect(run).not.toBeNull();
+      const finished = await waitForRunToFinish(heartbeat, run!.id);
+      expect(finished?.status).toBe("succeeded");
+      expect(capturedOnEvent).toBeTypeOf("function");
+
+      const before = await snapshotSettledEvents(run!.id);
+      const unknownBefore = await droppedCount("unknown");
+      const succeededBefore = await droppedCount("succeeded");
+
+      // Force `readTerminalRunStatus` to throw. This is the only branch that
+      // produces the "unknown" label, and — being a failure path guarding a
+      // failure path — it is the one place a silent regression would not show
+      // up in any other assertion here.
+      //
+      // Armed only for the single `select({ status })` the guard issues, so an
+      // unrelated query racing this window cannot be hit: the flag is set
+      // immediately before the late event, the shape is matched, and the first
+      // match disarms it.
+      let armed = true;
+      const originalSelect = db.select.bind(db);
+      const selectSpy = vi
+        .spyOn(db, "select")
+        .mockImplementation(((fields?: Record<string, unknown>) => {
+          const isTerminalStatusRead =
+            !!fields
+            && typeof fields === "object"
+            && Object.keys(fields).length === 1
+            && "status" in fields;
+          if (armed && isTerminalStatusRead) {
+            armed = false;
+            throw new Error("simulated status read failure");
+          }
+          return fields === undefined
+            ? originalSelect()
+            : originalSelect(fields as never);
+        }) as never);
+
+      try {
+        // Still must not throw: the caller is a detached continuation, so an
+        // escaping rejection would be an unhandled one.
+        await expect(
+          capturedOnEvent!({
+            eventType: "adapter.process.lifecycle",
+            stream: "system",
+            level: "warn",
+            message: "claude_local process kill_signal",
+            payload: { stage: "kill_signal", signal: "SIGKILL" },
+          }),
+        ).resolves.toBeUndefined();
+      } finally {
+        selectSpy.mockRestore();
+      }
+
+      expect(armed, "the simulated failure must actually have fired").toBe(false);
+
+      // Unverifiable status is treated as a drop, not as "not terminal".
+      expect(await readEvents(run!.id)).toEqual(before);
+      // Counted under "unknown", so a read failure stays distinguishable from a
+      // confirmed post-terminal drop rather than being folded into it.
+      expect(await droppedCount("unknown")).toBe(unknownBefore + 1);
+      expect(await droppedCount("succeeded")).toBe(succeededBefore);
+      expect(getHeartbeatRunRuntimeStatus(run!.id)).toBeNull();
+    },
+    120_000,
+  );
+
+  it(
     "still persists on-time events in order, so the guard adds no on-path regression",
     async () => {
       const { agentId } = await seedAgent();
@@ -304,7 +428,10 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
       const finished = await waitForRunToFinish(heartbeat, run!.id);
       expect(finished?.status).toBe("succeeded");
 
-      const events = await readEvents(run!.id);
+      // Settled, so the ordering assertion covers the run's whole event stream
+      // including the terminal lifecycle row, not just the prefix that had
+      // landed by the time the status flipped.
+      const events = await snapshotSettledEvents(run!.id);
       const onTime = events.filter((e) => e.eventType === "test.on_time");
       expect(onTime).toHaveLength(1);
       expect(onTime[0]!.message).toBe("delivered while the adapter was still executing");
