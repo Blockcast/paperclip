@@ -397,7 +397,10 @@ export async function startServer(): Promise<StartedServer> {
       }
 
       logger.info({ pendingMigrations: state.pendingMigrations }, `Applying ${state.pendingMigrations.length} pending migrations for ${label}`);
-      await applyPendingMigrations(connectionString);
+      await applyPendingMigrations(connectionString, {
+        prepareOnlineIndexes: true,
+        log: (message) => logger.info({ migration: label }, message),
+      });
       return "applied (pending migrations)";
     }
 
@@ -410,7 +413,10 @@ export async function startServer(): Promise<StartedServer> {
     }
 
     logger.info({ pendingMigrations: state.pendingMigrations }, `Applying ${state.pendingMigrations.length} pending migrations for ${label}`);
-    await applyPendingMigrations(connectionString);
+    await applyPendingMigrations(connectionString, {
+      prepareOnlineIndexes: true,
+      log: (message) => logger.info({ migration: label }, message),
+    });
     return "applied (pending migrations)";
   }
   
