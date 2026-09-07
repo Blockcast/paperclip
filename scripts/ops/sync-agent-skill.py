@@ -21,6 +21,8 @@ must compare byte-identical.
 Usage:
   sync-agent-skill.py <agent-id> [--skill NAME] [--dry-run] [--out-dir DIR]
   sync-agent-skill.py <agent-id> --rollback [--out-dir DIR]
+`--rollback` and `--dry-run` are mutually exclusive and the script rejects the
+pair: rollback always sends a live PATCH, so there is no dry variant of it.
 Env:
   PAPERCLIP_API_URL, PAPERCLIP_API_KEY
 Exit 0 on "OK:", exit 1 on "FAIL:".
@@ -177,6 +179,14 @@ def main():
                         help="PATCH the paperclipSkillSync captured in <agent-id>.before.json back")
     parser.add_argument("--out-dir", default="/tmp/track-d")
     args = parser.parse_args()
+
+    # Reject rather than silently ignore: --rollback always sends a live PATCH,
+    # so accepting --dry-run beside it would perform the write the operator
+    # just asked not to perform. These two flags sit next to each other in the
+    # rollout procedure, so the combination is a realistic typo.
+    if args.rollback and args.dry_run:
+        parser.error("--rollback and --dry-run are mutually exclusive: "
+                     "--rollback always sends a live PATCH")
 
     if args.rollback:
         return do_rollback(args)

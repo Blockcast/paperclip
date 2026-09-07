@@ -470,6 +470,8 @@ Omit `id` on both the stage and the participant — the server generates those. 
 
 Replace `agentId` with the reviewing agent named in the issue when there is one. Every write REPLACES the whole `executionPolicy` rather than merging into it, so read the issue's current policy first and re-send it complete. Agent-to-agent handoff is a valid review path; a human assignee is not a review path for finished work.
 
+Check the participant can actually wake before you rely on it: `GET /api/agents/{agentId}` and read `status`. A review path is validated only on the write that sets `in_review` and is never re-validated afterwards, so naming a participant that is `error` or `paused` produces a row that satisfies the gate and then waits on something that never comes — the same dead-end as parking work on a human, reached a different way. If the intended participant is not `running`, name a second participant in the same stage or use `scheduled_issue_monitor` instead, and say in your comment which you chose and why.
+
 ## Comment Style (Required)
 
 When posting issue comments or writing issue descriptions, use concise markdown with:
