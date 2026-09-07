@@ -306,6 +306,7 @@ describe("isInfraClassStrandedFailure -- git transport", () => {
       usageJson: null,
       sessionIdBefore: null,
       scheduledRetryAttempt: 0,
+      statusOnlyDocumentWriteRefusedAt: null,
       createdAt: new Date(),
       finishedAt: new Date(),
     })).toBe(true);
@@ -324,6 +325,7 @@ describe("isInfraClassStrandedFailure -- git transport", () => {
       usageJson: { input_tokens: 10 },
       sessionIdBefore: null,
       scheduledRetryAttempt: 0,
+      statusOnlyDocumentWriteRefusedAt: null,
       createdAt: new Date(),
       finishedAt: new Date(),
     })).toBe(false);
@@ -342,6 +344,7 @@ describe("isInfraClassStrandedFailure -- git transport", () => {
       usageJson: null,
       sessionIdBefore: null,
       scheduledRetryAttempt: 0,
+      statusOnlyDocumentWriteRefusedAt: null,
       createdAt: new Date(),
       finishedAt: new Date(),
     })).toBe(true);

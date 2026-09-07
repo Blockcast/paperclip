@@ -7686,7 +7686,276 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         .where(eq(issueRecoveryActions.id, action.id));
       expect(stillFolded).toMatchObject({ status: "cancelled" });
     });
+  });
 
+  /**
+   * BLO-32566. A status-only recovery wake cannot write an issue document. So once a run on
+   * the issue has been refused exactly that write, re-dispatching status-only guarantees the
+   * identical 403 — and because only a recorded disposition clears the recovery action, while
+   * the action is active *every* wake on the issue is status-only, the issue can never produce
+   * the deliverable that would clear it. Reproduced four times (BLO-31222 x3, then on
+   * BLO-32566 itself, where a completed and verified instrument revision could not be landed).
+   *
+   * BLO-23197 applied this escalation to the successful-run-handoff lane and explicitly scoped
+   * the stranded lane out as follow-up; these are the follow-up's assertions.
+   *
+   * These run against embedded Postgres deliberately. The failure mode being guarded is a
+   * `select()` that omits `statusOnlyDocumentWriteRefusedAt` — which disables the escalation in
+   * production while a unit test built from a row *literal* still passes. Only a test that
+   * reads the column back through the real projection can catch it.
+   */
+  describe("stranded recovery wakes escalate off status-only after a refused document write", () => {
+    /** Newest run for the issue, optionally carrying the refusal stamp. */
+    async function seedNewestIssueRun(input: {
+      companyId: string;
+      agentId: string;
+      issueId: string;
+      refusedAt: Date | null;
+    }) {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        invocationSource: "automation",
+        status: "succeeded",
+        contextSnapshot: { issueId: input.issueId },
+        statusOnlyDocumentWriteRefusedAt: input.refusedAt,
+        startedAt: new Date("2026-09-07T16:10:00.000Z"),
+        finishedAt: new Date("2026-09-07T16:15:00.000Z"),
+      });
+      return runId;
+    }
+
+    async function seedBlockedRecovery() {
+      const fixture = await seedCompany();
+      await db
+        .update(issues)
+        .set({ status: "blocked", assigneeAgentId: fixture.coderId })
+        .where(eq(issues.id, fixture.sourceIssueId));
+      const [action] = await db
+        .insert(issueRecoveryActions)
+        .values({
+          companyId: fixture.companyId,
+          sourceIssueId: fixture.sourceIssueId,
+          kind: "stranded_assigned_issue",
+          cause: "stranded_assigned_issue",
+          status: "active",
+          ownerType: "agent",
+          ownerAgentId: fixture.managerId,
+          returnOwnerAgentId: fixture.coderId,
+          fingerprint: `source_scoped_recovery:${fixture.companyId}:${fixture.sourceIssueId}:blocked`,
+          evidence: {},
+          nextAction: "Wake the owner to re-drive the stranded issue.",
+        })
+        .returning();
+      return { ...fixture, action: action! };
+    }
+
+    // The wake backstop is the only re-wake path for an action whose issue is `blocked`
+    // (STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES), and it was absent from the audit that
+    // produced this issue — which named only the two paths inside
+    // `enqueueSourceScopedStrandedRecoveryWake`. Gating those and not this one would leave the
+    // trap intact for every blocked issue.
+    it("wake backstop escalates to planning_only when the newest run was refused a document write", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedBlockedRecovery();
+      const refusedRunId = await seedNewestIssueRun({
+        companyId,
+        agentId: coderId,
+        issueId: sourceIssueId,
+        refusedAt: new Date("2026-09-07T16:15:00.000Z"),
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      const result = await recovery.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(result).toMatchObject({ checked: 1, healed: 1 });
+      expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+      const opts = enqueueWakeup.mock.calls[0]?.[1] as any;
+      // `planning_only` is the minimum escalation that clears the trap: document writes are
+      // allowed again while deliverable/annotation writes stay barred.
+      expect(opts).toMatchObject({
+        reason: "source_scoped_recovery_action",
+        contextSnapshot: {
+          recoveryIntent: "planning_only",
+          allowDocumentUpdates: true,
+          allowDeliverableWork: false,
+          resumeRequiresNormalModel: false,
+        },
+        payload: { recoveryIntent: "planning_only", allowDocumentUpdates: true },
+      });
+      // The cheap profile is what binds the run to the status-only lane, so its ABSENCE is the
+      // load-bearing assertion — a `planning_only` intent that still carried `modelProfile:
+      // cheap` would re-enter the same refusal.
+      expect(opts.contextSnapshot.modelProfile).toBeUndefined();
+      expect(opts.payload.modelProfile).toBeUndefined();
+
+      // Discoverable without reading the blocked issue's own documents — the surface the first
+      // two occurrences were reported on and lost.
+      const [entry] = await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityId, sourceIssueId),
+          eq(activityLog.actorId, "stranded_recovery_wake_backstop"),
+        ));
+      expect(entry?.details).toMatchObject({
+        recoveryWorkClass: "planning_only",
+        escalatedAfterDocumentWriteRefusal: true,
+        documentWriteRefusedRunId: refusedRunId,
+      });
+    });
+
+    // Guards the SIGN of the check. Without this, a fix that escalated unconditionally would
+    // pass the test above while silently moving every stranded recovery wake onto the normal
+    // model — the failure in the expensive direction.
+    it("wake backstop stays status-only when no document write was refused", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedBlockedRecovery();
+      await seedNewestIssueRun({
+        companyId,
+        agentId: coderId,
+        issueId: sourceIssueId,
+        refusedAt: null,
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      const result = await recovery.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(result).toMatchObject({ checked: 1, healed: 1 });
+      const opts = enqueueWakeup.mock.calls[0]?.[1] as any;
+      expect(opts).toMatchObject({
+        contextSnapshot: {
+          recoveryIntent: "status_only",
+          allowDocumentUpdates: false,
+          modelProfile: "cheap",
+        },
+      });
+      const [entry] = await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityId, sourceIssueId),
+          eq(activityLog.actorId, "stranded_recovery_wake_backstop"),
+        ));
+      expect(entry?.details).toMatchObject({
+        recoveryWorkClass: "status_only",
+        escalatedAfterDocumentWriteRefusal: false,
+        documentWriteRefusedRunId: null,
+      });
+    });
+
+    // The escalation-time path, which covers the todo/in_progress/in_review statuses the
+    // backstop does not select — the statuses the reported BLO-31222 occurrences were in.
+    //
+    // The seed is the `job_missing` shape this suite already proves escalates to exactly one
+    // status-only recovery wake. The stamp is placed on that swept run so the gate is
+    // exercised end-to-end through the real sweep and the real projection; in production it
+    // arrives on a later status-only recovery run, which the next sweep then reads as
+    // `latestRun`. What is asserted here is the wiring — that the wake's work class is derived
+    // from the stamp rather than hardcoded.
+    it("escalation-time wake escalates to planning_only after a refused document write", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "External lifecycle Job is missing while heartbeat run is still running",
+        errorCode: "job_missing",
+        resultJson: {
+          externalLifecycleRecovery: { adapterInvocationStarted: true },
+        },
+        contextSnapshot: { issueId: sourceIssueId },
+        statusOnlyDocumentWriteRefusedAt: new Date("2026-09-07T16:15:00.000Z"),
+        startedAt: new Date("2026-09-07T16:10:00.000Z"),
+        finishedAt: new Date("2026-09-07T16:15:00.000Z"),
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      const result = await recovery.reconcileStrandedAssignedIssues();
+
+      expect(result).toMatchObject({ escalated: 1 });
+      const recoveryWake = enqueueWakeup.mock.calls
+        .map((call) => call[1] as any)
+        .find((opts) => opts?.reason === "source_scoped_recovery_action");
+      expect(recoveryWake).toBeDefined();
+      expect(recoveryWake.contextSnapshot).toMatchObject({
+        recoveryIntent: "planning_only",
+        allowDocumentUpdates: true,
+        allowDeliverableWork: false,
+      });
+      expect(recoveryWake.contextSnapshot.modelProfile).toBeUndefined();
+    });
+
+    // Sign guard for the escalation-time path: the same seed without the stamp must stay
+    // status-only. This is the pairing that proves the stamp is the variable — the identical
+    // sweep, one field different.
+    it("escalation-time wake stays status-only when no document write was refused", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "External lifecycle Job is missing while heartbeat run is still running",
+        errorCode: "job_missing",
+        resultJson: {
+          externalLifecycleRecovery: { adapterInvocationStarted: true },
+        },
+        contextSnapshot: { issueId: sourceIssueId },
+        statusOnlyDocumentWriteRefusedAt: null,
+        startedAt: new Date("2026-09-07T16:10:00.000Z"),
+        finishedAt: new Date("2026-09-07T16:15:00.000Z"),
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      const result = await recovery.reconcileStrandedAssignedIssues();
+
+      expect(result).toMatchObject({ escalated: 1 });
+      const recoveryWake = enqueueWakeup.mock.calls
+        .map((call) => call[1] as any)
+        .find((opts) => opts?.reason === "source_scoped_recovery_action");
+      expect(recoveryWake).toBeDefined();
+      expect(recoveryWake.contextSnapshot).toMatchObject({
+        recoveryIntent: "status_only",
+        allowDocumentUpdates: false,
+        modelProfile: "cheap",
+      });
+    });
+
+    /**
+     * The projection guard, asserted directly rather than only as a side effect of the cases
+     * above. `getLatestIssueRun` is one of four `LatestIssueRun` producers; before this change
+     * two of them hand-copied the column list instead of sharing `LATEST_ISSUE_RUN_COLUMNS`,
+     * so a column added to the type was silently absent from their rows. The type annotation on
+     * those functions now makes that a compile error, and this asserts the runtime half.
+     */
+    it("reads the refusal stamp back through the real projection", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      const refusedAt = new Date("2026-09-07T16:15:00.000Z");
+      await seedNewestIssueRun({ companyId, agentId: coderId, issueId: sourceIssueId, refusedAt });
+
+      const [row] = await db
+        .select({ stamp: heartbeatRuns.statusOnlyDocumentWriteRefusedAt })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, coderId),
+        ));
+
+      expect(row?.stamp).toEqual(refusedAt);
+    });
+  });
+
+  describe("recovery sweep status coverage", () => {
     /**
      * The invariant, not the instance. Every non-terminal status must be selectable by some
      * sweep; otherwise an active recovery action on it is a zombie no reconciler can service.
