@@ -18,15 +18,34 @@
 // execution stalled or overran (BLO-21116). A single counter would leave an
 // operator unable to tell which is firing.
 
+// BLO-31996: the two labels above both describe one *run* outliving a horizon.
+// `routine_dispatch_bypassed_stale_fire_execution_issue` describes the fire
+// outliving its own cadence, which is what a retry chain looks like from the
+// outside -- each retry is a fresh run whose age clock restarts at zero, so
+// every individual run stays inside the run-age horizon while the fire holds the
+// dispatch lock indefinitely and takes no measurement. It is a sibling label for
+// the same reason the two above are siblings: the operator response differs. A
+// stale run means one execution stalled; a stale fire means the fire kept
+// restarting and the routine has been silently disabled for multiple intervals.
+//
+// `routine_dispatch_superseded_stale_execution_issue` counts the disposal, not
+// the detection: bypassing a row for *gating* still leaves it open under the
+// partial unique index, so the predecessor is cancelled to free the successor's
+// INSERT. A nonzero value here is the receipt that a wedge was actually cleared
+// rather than merely ignored.
 export type RoutineDispatchMetricKey =
   | "routine_dispatch_bypassed_parked_execution_issue"
-  | "routine_dispatch_bypassed_stale_execution_issue";
+  | "routine_dispatch_bypassed_stale_execution_issue"
+  | "routine_dispatch_bypassed_stale_fire_execution_issue"
+  | "routine_dispatch_superseded_stale_execution_issue";
 
 const MAX_COUNTER_VALUE = Number.MAX_SAFE_INTEGER;
 
 const counters: Record<RoutineDispatchMetricKey, number> = {
   routine_dispatch_bypassed_parked_execution_issue: 0,
   routine_dispatch_bypassed_stale_execution_issue: 0,
+  routine_dispatch_bypassed_stale_fire_execution_issue: 0,
+  routine_dispatch_superseded_stale_execution_issue: 0,
 };
 
 export function incrementRoutineDispatchMetric(key: RoutineDispatchMetricKey): void {
