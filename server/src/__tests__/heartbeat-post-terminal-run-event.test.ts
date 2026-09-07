@@ -24,10 +24,16 @@ const { heartbeatService } = await import("../services/heartbeat.ts");
 const TEST_ADAPTER = "post_terminal_run_event_test";
 
 /**
- * A value shaped like real credential material, so the sanitization assertion
- * fails loudly if the raw payload ever reaches the log again.
+ * A distinctive, greppable fixture value that must not survive redaction.
+ *
+ * Deliberately NOT shaped like a real credential (no `sk-`/`ghp_`-style prefix,
+ * low entropy): the redaction under test fires on the *key* name — `api_key`
+ * and `access_token` are tier-1 stems in `server/src/redaction.ts` and mask
+ * unconditionally — so the value's shape carries no test signal, and a
+ * credential-looking one only trips `secret-scan` with a permanent false
+ * positive on this file.
  */
-const RAW_SECRET = "sk-live-must-not-reach-the-log";
+const RAW_SECRET = "redaction-fixture-value-must-not-reach-the-log";
 
 /**
  * Sum {@link HEARTBEAT_POST_TERMINAL_RUN_EVENT_DROPPED_METRIC} for one terminal
