@@ -1697,7 +1697,9 @@ export function resolveAutomaticRunRetryOpts(
   // claude-local timeout that DID produce output, changing live retry behaviour.
   // The right fix is a more specific `errorCode` from the finalizer (e.g.
   // `timeout_before_output`) so the policy stays keyed on the run's own
-  // vocabulary; that is a separate change with its own review.
+  // vocabulary; that is a separate change with its own review, tracked in
+  // PEN-3097. Anything that starts tagging a NON-claude-local timeout should
+  // land that first -- otherwise it silently inherits this cap.
   if (run.errorCode === "timeout") {
     return { maxAttempts: 1 };
   }

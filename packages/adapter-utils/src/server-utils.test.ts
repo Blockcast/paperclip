@@ -883,7 +883,22 @@ describe("runChildProcess", () => {
           [
             "const { spawn } = require('node:child_process');",
             // detached => own process group; inherit => holds stdout open.
-            "const child = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 2500)'], { detached: true, stdio: ['ignore', 'inherit', 'ignore'] });",
+            //
+            // The descendant's lifetime is bounded on BOTH sides, so this
+            // number is a balance, not a free parameter:
+            //  - It must outlast the kill timer (graceMs 100 + graceSec 1000
+            //    ~= 1.1s), or `close` fires first, cancels the timer, and the
+            //    assertion fails with `signal: "SIGTERM"` -- a red build that
+            //    is not a real regression.
+            //  - It must finish well inside PROCESS_TREE_TEST_BUDGET_MS (15s),
+            //    because this descendant holds the stdout pipe: `close` cannot
+            //    fire until it exits, and `runChildProcess` resolves INSIDE
+            //    `close`. Its exit is what ends the test, so raising it costs
+            //    real wall clock -- roughly 1:1.
+            // 8000 sits near the maximin of those two margins (~6.9s before,
+            // ~7s of budget after), up from 2500, which left only ~1.4s ahead
+            // of the kill timer.
+            "const child = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 8000)'], { detached: true, stdio: ['ignore', 'inherit', 'ignore'] });",
             "child.unref();",
             "process.stdout.write(`descendant:${child.pid}\\n`);",
             "process.stdout.write(`${JSON.stringify({ type: 'result', result: 'done' })}\\n`);",
