@@ -19,6 +19,7 @@ import {
   heartbeatRuns,
   routineRuns,
   executionWorkspaces,
+  externalRuntimeReservations,
   issueApprovals,
   issueAttachments,
   issueCreateIdempotencyKeys,
@@ -6508,6 +6509,28 @@ export function issueService(db: Db) {
     );
   }
 
+  // PEN-2074: a run that still holds an unreleased external runtime reservation is
+  // parked on an external wait, not finished with its resources. Treating it as
+  // reapable would clear the issue locks out from under the reservation and let a
+  // competing run start against state the parked run still owns.
+  async function hasActiveExternalRuntimeReservation(
+    runId: string,
+    dbOrTx: DbReader = db,
+  ): Promise<boolean> {
+    const activeReservation = await dbOrTx
+      .select({ id: externalRuntimeReservations.id })
+      .from(externalRuntimeReservations)
+      .where(
+        and(
+          eq(externalRuntimeReservations.runId, runId),
+          isNull(externalRuntimeReservations.releasedAt),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return activeReservation !== null;
+  }
+
   async function isTerminalOrMissingHeartbeatRun(runId: string, dbOrTx: DbReader = db) {
     const run = await dbOrTx
       .select({ status: heartbeatRuns.status })
@@ -6515,7 +6538,8 @@ export function issueService(db: Db) {
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run) return true;
-    return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+    if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+    return !(await hasActiveExternalRuntimeReservation(runId, dbOrTx));
   }
 
   async function cancelNeverStartedOwnerRun(
@@ -6796,12 +6820,16 @@ export function issueService(db: Db) {
       // runs FIRST when checkoutRunId is set, so a divergence here would make the
       // fix unreachable for the common shape (checkout and execution locks both
       // pointing at one never-started run).
-      const stale = isReapableHeartbeatRunRow(existingRun);
+      const externalWaitHeld = await hasActiveExternalRuntimeReservation(
+        input.expectedCheckoutRunId,
+        tx,
+      );
+      const stale = isReapableHeartbeatRunRow(existingRun) && !externalWaitHeld;
       const actorLive = actorRun?.status === "running";
       const sameAgentRetry =
         actorRun?.agentId === input.actorAgentId &&
         actorRun.retryOfRunId === input.expectedCheckoutRunId;
-      if ((!stale && !sameAgentRetry) || !actorLive) {
+      if ((!stale && (!sameAgentRetry || externalWaitHeld)) || !actorLive) {
         return { adopted: null, latest: lockedIssue };
       }
 
@@ -7149,11 +7177,24 @@ export function issueService(db: Db) {
     const checkoutRun = issue.checkoutRunId
       ? runById.get(issue.checkoutRunId) ?? null
       : null;
+    // PEN-2074 conflict resolution: the original PR added a reservation-aware guard
+    // at each of the three former call sites (clearExecutionRunIfTerminal and both
+    // limbs of the checkout cleanup). `master` has since collapsed those sites into
+    // this helper, so the guard is applied once here instead. A missing run row is
+    // still terminal — matching both the pre-existing `!executionRun ||` shape and
+    // the PR's own `if (run && ...)` guard, which skipped the check when the row
+    // was absent.
     const executionTerminal = Boolean(issue.executionRunId) && (
-      !executionRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status)
+      !executionRun || (
+        TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status) &&
+        !(await hasActiveExternalRuntimeReservation(executionRun.id, tx))
+      )
     );
     const checkoutTerminal = Boolean(issue.checkoutRunId) && (
-      !checkoutRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(checkoutRun.status)
+      !checkoutRun || (
+        TERMINAL_HEARTBEAT_RUN_STATUSES.has(checkoutRun.status) &&
+        !(await hasActiveExternalRuntimeReservation(checkoutRun.id, tx))
+      )
     );
 
     const clearExecution = (mode === "execution" || mode === "both") && executionTerminal;
