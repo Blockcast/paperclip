@@ -1677,6 +1677,39 @@ export function buildAdapterRunEventPayloadForPersistence(
 }
 
 /**
+ * Whether an appended run event is allowed to write the run's live
+ * runtime-status entry (the "this run is live, currently doing X" record that
+ * `publishHeartbeatRunRuntimeProgress` pushes to subscribers).
+ *
+ * PEN-3093: this is a predicate rather than an inline conjunction because the
+ * `run.status` half of it cannot decide the question on its own, and that was
+ * not visible while the two conditions sat side by side at the callsite. `run`
+ * there is a snapshot, and on the adapter path it is the one bound before
+ * `execute()` ran -- so its `status` still reads "running" long after the run
+ * terminalized. That gate is therefore *unconditionally* true for a
+ * post-settle event, not merely sometimes: left to itself it re-creates the
+ * runtime-status entry terminalization had just cleared and republishes the run
+ * as live until the 90s TTL expires it.
+ *
+ * `adapterSettledAt` is the server's own observation, so it is the half that
+ * can be trusted. Suppressing the write outright, rather than re-reading the
+ * run row, is deliberate: the adapter has finished either way, so there is no
+ * live progress to report even in the narrow window before the terminal status
+ * is written -- a re-read would still publish there.
+ *
+ * This governs the runtime *status* only. The `heartbeat.run.event` publish is
+ * unaffected: the event stream is an append-only record of what happened, and
+ * the row carries its own `postAdapterSettle` marker.
+ */
+export function shouldWriteRunRuntimeStatusForEvent(input: {
+  runStatusSnapshot: string;
+  adapterSettledAt: string | null | undefined;
+}): boolean {
+  if (input.adapterSettledAt) return false;
+  return isHeartbeatRunRuntimeStatusActive(input.runStatusSnapshot);
+}
+
+/**
  * Returns the opts to pass to `scheduleBoundedRetryForRun` for an automatic
  * retry, or undefined to use the default transient-failure opts. Called only
  * when `shouldScheduleAutomaticRunRetry` already returned true.
@@ -15529,6 +15562,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // transaction that allocated `seq`, so allocation and append share one
     // owner. Defaults to the pool, which is every pre-existing caller.
     executor: HeartbeatDbExecutor = db,
+    // PEN-3093: set only by the post-adapter-settle branch of
+    // `onAdapterEvent`. See `shouldWriteRunRuntimeStatusForEvent` for what it
+    // changes and why the `run.status` gate cannot decide it alone.
+    opts: { adapterSettledAt?: string | null } = {},
   ): Promise<{ publish: () => void }> {
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
@@ -15583,7 +15620,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           payload: sanitizedPayload ?? null,
         },
       });
-      if (progress && isHeartbeatRunRuntimeStatusActive(run.status)) {
+      // `progress` is checked here rather than inside the predicate so it
+      // narrows for the block below; the predicate carries the two conditions
+      // that were getting this wrong (PEN-3093).
+      if (
+        progress
+        && shouldWriteRunRuntimeStatusForEvent({
+          runStatusSnapshot: run.status,
+          adapterSettledAt: opts.adapterSettledAt ?? null,
+        })
+      ) {
         const status = setHeartbeatRunRuntimeStatus({
           companyId: run.companyId,
           issueId,
@@ -15653,6 +15699,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       message?: string;
       payload?: Record<string, unknown>;
     },
+    // PEN-3093: forwarded verbatim to `appendRunEvent`; see its own `opts`.
+    opts: { adapterSettledAt?: string | null } = {},
   ) {
     // BLO-19722: publish is deferred out of the transaction and invoked here,
     // after `db.transaction` has committed — see the comment on
@@ -15666,7 +15714,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .select({ maxSeq: sql<number | null>`max(${heartbeatRunEvents.seq})` })
         .from(heartbeatRunEvents)
         .where(eq(heartbeatRunEvents.runId, run.id));
-      const appended = await appendRunEvent(run, Number(row?.maxSeq ?? 0) + 1, event, tx);
+      const appended = await appendRunEvent(run, Number(row?.maxSeq ?? 0) + 1, event, tx, opts);
       // Test-only: the append has succeeded but the transaction has not
       // committed. Throwing here is the only way to reach the rollback-after-
       // successful-insert case, which is precisely the one where publishing
@@ -28664,36 +28712,58 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // lands (BLO-32477). By then the run has terminalized, so the event
       // would either append to an already-terminal run or vanish into
       // `emitLifecycle`'s `.catch`. That event is real evidence of a leaked
-      // process tree, so it is kept -- but marked, and logged, rather than
-      // persisted as if it were part of the live run.
+      // process tree, so it is kept -- but it must not be persisted as if it
+      // were part of the live run, which takes three things and not just the
+      // payload marker: the marker itself, a sequence allocated from the row
+      // rather than from this invocation's counter, and suppression of the
+      // runtime-status write that would otherwise republish the run as live.
+      // See the late branch of `onAdapterEvent` below.
       let adapterExecutionSettledAt: string | null = null;
 
       const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
         const eventType = event.eventType.trim();
         if (!eventType) return;
         const settledAt = adapterExecutionSettledAt;
-        if (settledAt) {
-          const stage = event.payload?.stage;
-          logger.warn(
-            {
-              runId: currentRun.id,
-              agentId: agent.id,
-              companyId: agent.companyId,
-              eventType,
-              stage: typeof stage === "string" ? stage : null,
-              adapterSettledAt: settledAt,
-            },
-            "adapter runtime event arrived after the adapter execution settled; persisting it with a post-terminal marker",
-          );
-        }
-        await appendRunEvent(currentRun, seq++, {
+        const runEvent = {
           eventType: eventType.slice(0, 120),
           stream: event.stream,
           level: event.level,
           color: event.color,
           message: event.message,
           payload: buildAdapterRunEventPayloadForPersistence(event.payload, settledAt),
-        });
+        };
+        if (settledAt) {
+          const stage = event.payload?.stage;
+          logger.warn(
+            {
+              runId: currentRun.id,
+              agentId: currentRun.agentId,
+              companyId: currentRun.companyId,
+              eventType,
+              stage: typeof stage === "string" ? stage : null,
+              adapterSettledAt: settledAt,
+            },
+            "adapter runtime event arrived after the adapter execution settled; persisting it with a post-terminal marker",
+          );
+          // Allocate the sequence from the row, not from `seq`. The closure
+          // counter is only correct while this invocation is the run's sole
+          // writer, and by now it is not: the outcome pipeline appends its own
+          // lifecycle events with `nextRunEventSeq` (e.g. the PR-review
+          // evidence event), which takes `max(seq) + 1` and so consumes the
+          // very number `seq++` would hand out next. A late event would land on
+          // a position another row already holds -- silently, since
+          // `heartbeat_run_events_run_seq_idx` is a plain index with no unique
+          // constraint (BLO-19722). `appendRunEventAtomicSeq` allocates under
+          // the per-run advisory lock instead. It costs a transaction, which is
+          // irrelevant on a path only a leaked process tree reaches.
+          //
+          // `adapterSettledAt` additionally suppresses the runtime-status
+          // write, so the marked event cannot republish the run as live --
+          // see `shouldWriteRunRuntimeStatusForEvent`.
+          await appendRunEventAtomicSeq(currentRun, runEvent, { adapterSettledAt: settledAt });
+          return;
+        }
+        await appendRunEvent(currentRun, seq++, runEvent);
       };
 
       const adapter = getServerAdapter(agent.adapterType);
