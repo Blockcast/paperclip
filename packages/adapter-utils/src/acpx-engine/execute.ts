@@ -1579,8 +1579,21 @@ export async function awaitSessionWithProgress<T>(
  * filesystem syscalls against a network mount, where a blocked call does not
  * return on its own.
  *
- * Closing this window is what makes "silent at seq 1" mean one thing instead of
- * two, which is the discriminator any decision taken against a silent run needs.
+ * Closing this window narrows "silent at seq 1" towards meaning one thing,
+ * which is the discriminator any decision taken against a silent run needs.
+ *
+ * ⚠️ It does NOT close it completely, and a consumer of this signal must know
+ * where the coverage actually starts. `acpx.runtime_prepare` begins inside
+ * `executeAcpxEngine`; the adapter entry points reach that function through a
+ * lazy `await import(...)` of this module (e.g.
+ * `packages/adapters/claude-local/src/server/acp.ts`), and that module load --
+ * itself disk I/O on the same mount -- happens before the first tick. The
+ * memoised executor closure only caches within a process, so on per-run pods
+ * that load is on every run's critical path. A run parked there is still silent
+ * at its pre-exec prefix. Any liveness predicate built on "seq 1 means the
+ * process is gone" therefore still inherits that residual window as a false
+ * positive, which is the same shape as the precision failure that withdrew
+ * #1462. Tracked separately rather than fixed here.
  *
  * Same non-terminating contract as the handshake ticker -- this reports, it does
  * not bound. Payload carries only stage/elapsed metadata: never prompts,
@@ -1613,9 +1626,14 @@ export async function awaitRuntimePrepareWithProgress<T>(
  * Shared by every phase that awaits an unbounded operation before the run
  * produces output of its own; each caller names its own wire stages and owns
  * its own payload. The cadence is the point: ticks arrive faster than the
- * shortest staleness window that reads a run's last-output timestamp
- * (`RUN_STALE_SILENCE_MS`, 15m -- three times the 5m tick ceiling), so a phase
- * that is merely slow cannot be read as one whose process is gone.
+ * shortest staleness window that reads a run's last-output timestamp, so a
+ * phase that is merely slow cannot be read as one whose process is gone. That
+ * window is `RUN_STALE_SILENCE_MS` (15m) in
+ * `server/src/services/issue-run-holding.ts`, three times the 5m tick ceiling
+ * here. The relationship is deliberately prose and not an assertion: this
+ * package is a dependency of the server, so importing that constant to test
+ * against would invert the layering. If the server ever tightens it below 15m,
+ * `ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS` has to come down with it.
  */
 async function awaitPhaseWithProgress<T>(
   start: () => Promise<T>,
@@ -1625,7 +1643,13 @@ async function awaitPhaseWithProgress<T>(
   const firstDelayMs = Math.max(1, delays.firstDelayMs ?? ACP_ENGINE_SESSION_PROGRESS_FIRST_DELAY_MS);
   const maxDelayMs = Math.max(firstDelayMs, delays.maxDelayMs ?? ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS);
 
-  await emit("started");
+  // Guarded like every sibling emit below, and for a sharper reason: this is the
+  // first statement of the run, and the prepare wrapper is awaited *above* the
+  // block whose catch routes to `emitAcpxFailure`. An unguarded rejection here
+  // would leave `executeAcpxEngine` via an unclassified throw before any
+  // `acpx.*` diagnostic exists -- making the instrumentation the reason the run
+  // died, with less evidence than the silent runs it exists to explain.
+  await emit("started").catch(() => {});
 
   let timer: NodeJS.Timeout | null = null;
   let delayMs = firstDelayMs;
