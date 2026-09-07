@@ -46,6 +46,7 @@ const {
   TRANSIENT_RETRY_EXHAUSTED_MARKER,
   SDK_INSTALL_RACE_RETRY_EXHAUSTED_MARKER,
   readBootActivationRetryCount,
+  isBootReattemptEligibleLatch,
 } = await import("../services/plugin-loader.js");
 const { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } = await import(
   "./helpers/embedded-postgres.js"
@@ -135,6 +136,71 @@ describe("classifyActivationLatch — keys eligibility on the terminal error", (
   });
 });
 
+/**
+ * `lastError` concatenates the plugin's own error text, so eligibility must be
+ * read from the region the loader writes rather than scanned for anywhere in
+ * the string. The forged-marker case is the one that used to be unbounded: the
+ * row latches with no re-attempt tag (suppressed when the latch is ineligible),
+ * so a substring scan saw eligible=true and a spent count of 0 on *every* boot
+ * — a fixed point that re-attempted forever and buried the budget-exhausted
+ * warning.
+ */
+describe("isBootReattemptEligibleLatch — reads only the suffix the loader writes", () => {
+  it("accepts exactly what classifyActivationLatch writes for each eligible class", () => {
+    for (const { err, transientAttempt, sdkRaceAttempt } of [
+      { err: INITIALIZE_TIMEOUT_ERROR, transientAttempt: 2, sdkRaceAttempt: 0 },
+      { err: SDK_INSTALL_RACE_ERROR, transientAttempt: 0, sdkRaceAttempt: 5 },
+    ]) {
+      const latch = classifyActivationLatch({ err, transientAttempt, sdkRaceAttempt });
+      expect(latch.eligibleForBootReattempt).toBe(true);
+      // Round-trip: pins the suffix format against its matching pattern, which
+      // would otherwise be free to drift apart silently.
+      expect(isBootReattemptEligibleLatch(`Activation failed: boom${latch.suffix}`)).toBe(true);
+    }
+  });
+
+  it("still accepts an eligible row carrying a re-attempt tag", () => {
+    expect(
+      isBootReattemptEligibleLatch(`${transientLatchText()} [boot-activation-retry 1/3]`),
+    ).toBe(true);
+  });
+
+  it("does NOT revive a failed-closed row whose plugin error text forges the marker", () => {
+    const latch = classifyActivationLatch({
+      err: new Error(`plugin config invalid (${TRANSIENT_RETRY_EXHAUSTED_MARKER})`),
+      transientAttempt: 0,
+      sdkRaceAttempt: 0,
+    });
+
+    expect(latch.eligibleForBootReattempt).toBe(false);
+    expect(
+      isBootReattemptEligibleLatch(
+        `Activation failed: plugin config invalid ` +
+          `(${TRANSIENT_RETRY_EXHAUSTED_MARKER})${latch.suffix}`,
+      ),
+    ).toBe(false);
+  });
+
+  it("does NOT revive a row whose plugin error text forges the whole suffix", () => {
+    // The real suffix is always appended last, so a forged copy can never be
+    // the trailing one — this is the same fail-safe the tag anchoring buys.
+    const latch = classifyActivationLatch({
+      err: FAILED_CLOSED_ERROR,
+      transientAttempt: 0,
+      sdkRaceAttempt: 0,
+    });
+
+    expect(
+      isBootReattemptEligibleLatch(`${transientLatchText()}${latch.suffix}`),
+    ).toBe(false);
+  });
+
+  it("does not revive a row with no latch provenance at all", () => {
+    expect(isBootReattemptEligibleLatch(null)).toBe(false);
+    expect(isBootReattemptEligibleLatch("Activation failed: boom")).toBe(false);
+  });
+});
+
 /** The exact `lastError` an exhausted transient activation writes. */
 function transientLatchText(attempts = 2): string {
   return (
@@ -157,7 +223,29 @@ function sdkRaceLatchText(attempts = 5): string {
 const FAILED_CLOSED_LATCH_TEXT =
   `Activation failed: Worker initialize failed for "fixture": ` +
   `plugin config invalid: missing apiKey ` +
-  `(failed closed after 0 transient and 0 sdk-install-race retries; not classified as retryable contention)`;
+  `(failed closed after 0 transient and 0 sdk-install-race retries spent; ` +
+  `not classified as retryable contention)`;
+
+/**
+ * A plugin that fails closed *and* embeds the eligibility marker in its own
+ * error text. The marker has to ride on the error itself, not merely on the
+ * seeded row: each latch rewrites `lastError` from the current failure, so a
+ * forgery present only in the seeded text is erased by the first re-latch and
+ * the loop stops on its own. This error reproduces the same forged row every
+ * time, which is what made the pre-fix behaviour a fixed point rather than one
+ * stray revival.
+ */
+const FORGED_MARKER_ERROR = new Error(
+  `Worker initialize failed for "fixture": plugin config invalid ` +
+    `(${TRANSIENT_RETRY_EXHAUSTED_MARKER})`,
+);
+
+/** Derived from the error above so the fixture cannot drift from the writer. */
+const FORGED_MARKER_LATCH_TEXT =
+  `Activation failed: ${FORGED_MARKER_ERROR.message} ` +
+  `(failed closed after 0 transient and 0 sdk-install-race retries spent; ` +
+  `not classified as retryable contention)`;
+
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
@@ -245,14 +333,18 @@ describeEmbeddedPostgres("BLO-20410 — boot re-attempts a transiently-latched p
     return { installDir, packageName, manifest };
   }
 
-  function createRuntimeServices(options: { startWorkerFails?: boolean } = {}) {
-    const startWorker = options.startWorkerFails
-      ? vi.fn().mockRejectedValue(
-          new Error(
-            'Worker initialize failed for "fixture": RPC call "initialize" timed out after 60000ms',
-          ),
-        )
-      : vi.fn().mockResolvedValue(undefined);
+  function createRuntimeServices(
+    options: { startWorkerFails?: boolean; startWorkerError?: Error } = {},
+  ) {
+    const startWorker = options.startWorkerError
+      ? vi.fn().mockRejectedValue(options.startWorkerError)
+      : options.startWorkerFails
+        ? vi.fn().mockRejectedValue(
+            new Error(
+              'Worker initialize failed for "fixture": RPC call "initialize" timed out after 60000ms',
+            ),
+          )
+        : vi.fn().mockResolvedValue(undefined);
     const markError = vi.fn(async (pluginId: string, error: string) => {
       // Stand in for the real lifecycle transition: the assertion under test is
       // what lands in the row, so the write has to actually happen.
@@ -407,6 +499,35 @@ describeEmbeddedPostgres("BLO-20410 — boot re-attempts a transiently-latched p
     expect(after?.lastError).toBe(FAILED_CLOSED_LATCH_TEXT);
   }, 60_000);
 
+  it("NEGATIVE CONTROL: a plugin cannot forge its own eligibility and retry forever", async () => {
+    const pluginKey = `paperclip.forged_${randomUUID().slice(0, 8)}`;
+    const { installDir, packageName, manifest } = await seedPluginDir(pluginKey);
+    await insertLatchedRow(pluginKey, manifest, packageName, installDir, FORGED_MARKER_LATCH_TEXT);
+
+    // Several boots, because the defect this guards was a *fixed point* rather
+    // than one wrong revival. The plugin fails closed every time, so the latch
+    // stays ineligible and the re-attempt tag is suppressed — meaning the spent
+    // count read back as 0 on every boot and the budget could never converge.
+    // The row was re-attempted on every boot forever and the `spent >= limit`
+    // "this is no longer contention" warning never fired. A single boot would
+    // not distinguish that from a row on its first legitimate re-attempt, so
+    // the loop and the unchanged-`lastError` assertion are both load-bearing.
+    for (let boot = 1; boot <= 3; boot += 1) {
+      const { runtimeServices, startWorker } = createRuntimeServices({
+        startWorkerError: FORGED_MARKER_ERROR,
+      });
+      const loader = pluginLoader(db, { localPluginDir: installDir }, runtimeServices);
+      await loader.loadAll();
+      expect(startWorker, `boot ${boot} must not re-attempt a forged latch`).not.toHaveBeenCalled();
+
+      const [row] = await db.select().from(plugins);
+      // Unchanged every boot: never revived, so no re-attempt tag was written
+      // and nothing re-latched over it.
+      expect(row?.status).toBe("error");
+      expect(row?.lastError).toBe(FORGED_MARKER_LATCH_TEXT);
+    }
+  }, 60_000);
+
   it("spends the re-attempt budget across boots and stops rather than retrying forever", async () => {
     process.env[RETRY_LIMIT_ENV] = "2";
 
@@ -425,9 +546,12 @@ describeEmbeddedPostgres("BLO-20410 — boot re-attempts a transiently-latched p
     }
 
     // Boots 1 and 2 re-attempt (3 in-activation attempts each: initial + 2
-    // retries); boots 3 and 4 find the budget spent and do not spawn at all.
-    expect(attemptsPerBoot[0]).toBeGreaterThan(0);
-    expect(attemptsPerBoot[1]).toBeGreaterThan(0);
+    // retries from TRANSIENT_ACTIVATION_RETRY_DELAYS_MS); boots 3 and 4 find
+    // the budget spent and do not spawn at all. Pinned exactly, because the
+    // interaction between the in-activation budget and the cross-boot budget is
+    // the subtle part and the one most likely to regress silently.
+    expect(attemptsPerBoot[0]).toBe(3);
+    expect(attemptsPerBoot[1]).toBe(3);
     expect(attemptsPerBoot[2]).toBe(0);
     expect(attemptsPerBoot[3]).toBe(0);
 

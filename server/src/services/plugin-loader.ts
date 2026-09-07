@@ -217,6 +217,19 @@ export interface ActivationLatchClassification {
 }
 
 /**
+ * The retry-budget tally every latch suffix carries. Kept beside its regex twin
+ * `RETRIES_SPENT_SOURCE` because `isBootReattemptEligibleLatch` matches the
+ * suffix this writes: if the two drift, eligibility silently stops recognising
+ * rows this function latched. `classifyActivationLatch` round-trips through the
+ * predicate in `plugin-activation-boot-retry.test.ts` to pin that.
+ */
+function formatRetriesSpent(transientAttempt: number, sdkRaceAttempt: number): string {
+  return `${transientAttempt} transient and ${sdkRaceAttempt} sdk-install-race retries spent`;
+}
+
+const RETRIES_SPENT_SOURCE = String.raw`\d+ transient and \d+ sdk-install-race retries spent`;
+
+/**
  * Decide what a failed activation records about *how* it got here, and whether
  * a later boot may re-attempt it.
  *
@@ -243,7 +256,7 @@ export function classifyActivationLatch(params: {
   sdkRaceAttempt: number;
 }): ActivationLatchClassification {
   const { err, transientAttempt, sdkRaceAttempt } = params;
-  const spent = `${transientAttempt} transient and ${sdkRaceAttempt} sdk-install-race retries spent`;
+  const spent = formatRetriesSpent(transientAttempt, sdkRaceAttempt);
 
   const terminalIsSdkRace = isSdkInstallRaceError(err);
   const terminalIsTransient = !terminalIsSdkRace && isTransientActivationRetryError(err);
@@ -274,11 +287,6 @@ const BOOT_REATTEMPT_ELIGIBLE_MARKERS = [
   SDK_INSTALL_RACE_RETRY_EXHAUSTED_MARKER,
 ] as const;
 
-export function isBootReattemptEligibleLatch(lastError: string | null | undefined): boolean {
-  const text = lastError ?? "";
-  return BOOT_REATTEMPT_ELIGIBLE_MARKERS.some((marker) => text.includes(marker));
-}
-
 /**
  * `loadAll()` selects `status='ready'`, so a row latched at `error` is invisible
  * to every subsequent boot — the in-activation retry above only ever covers the
@@ -301,6 +309,11 @@ export function resolveBootActivationRetryLimit(): number {
   const raw = process.env.PAPERCLIP_PLUGIN_BOOT_ACTIVATION_RETRY_LIMIT;
   if (!raw) return DEFAULT_BOOT_ACTIVATION_RETRY_LIMIT;
   const parsed = Number.parseInt(raw, 10);
+  // Deliberate: a malformed or negative value falls back to the default rather
+  // than to 0. `0` is the documented disable switch and disabling this pass
+  // restores the latch-forever behaviour BLO-20410 is about, so a typo must not
+  // be able to silently turn the recovery off. `Number.parseInt` is likewise
+  // permissive by design — "3abc" reads as 3 rather than disabling the pass.
   if (!Number.isFinite(parsed) || parsed < 0) {
     return DEFAULT_BOOT_ACTIVATION_RETRY_LIMIT;
   }
@@ -334,6 +347,42 @@ function stripBootActivationRetryTag(lastError: string): string {
 
 function formatBootActivationRetryTag(count: number, limit: number): string {
   return ` [${BOOT_ACTIVATION_RETRY_TAG} ${count}/${limit}]`;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Anchored for the same reason as `BOOT_ACTIVATION_RETRY_PATTERN`, and it is
+ * the more important of the two. `lastError` is
+ * `Activation failed: ${errorMessage}${latch.suffix}${bootRetryTag}` with
+ * `errorMessage` plugin-controlled and unsanitised, so a substring scan for the
+ * bare marker lets a plugin forge its own eligibility.
+ *
+ * A forged *tag* only spends the budget faster — fail-safe. A forged *marker*
+ * used to defeat the budget outright, because the two halves disagreed about
+ * which region of the string they trusted: eligibility scanned everything while
+ * the count read only the anchored tail. A plugin whose error text embedded the
+ * marker and then failed closed latched with no tag (`bootRetryTag` is
+ * suppressed when `eligibleForBootReattempt` is false), so the next boot read
+ * eligible=true, spent=0, re-attempted, failed closed, and dropped the tag
+ * again — a fixed point that re-attempted the row on every boot forever and
+ * buried the `spent >= limit` "this is no longer contention" warning the pass
+ * exists to surface.
+ *
+ * Both halves now read the same trusted region: strip the tag, then require the
+ * remainder to *end* with a suffix `classifyActivationLatch` actually writes.
+ * The real suffix is always appended after the plugin's message, so a forged
+ * copy can never be the trailing one.
+ */
+const BOOT_REATTEMPT_ELIGIBLE_SUFFIX_PATTERN = new RegExp(
+  ` \\((?:${BOOT_REATTEMPT_ELIGIBLE_MARKERS.map(escapeRegExp).join("|")}): ` +
+    `${RETRIES_SPENT_SOURCE}\\)$`,
+);
+
+export function isBootReattemptEligibleLatch(lastError: string | null | undefined): boolean {
+  return BOOT_REATTEMPT_ELIGIBLE_SUFFIX_PATTERN.test(stripBootActivationRetryTag(lastError ?? ""));
 }
 
 /**
