@@ -345,6 +345,32 @@ describe("BLO-31036 — a fence abandoned by a dead process stops wedging its ag
     expect((await readFence())?.firing_token).toBe("token-old-but-live");
   });
 
+  it("still refuses at 14 minutes, one minute inside the backstop", async () => {
+    // Pins the constant itself, not just its sign. The other two cases bracket
+    // it at 5 min (refused) and 20 min (reclaimed), which only constrains the
+    // horizon to somewhere in (5, 20) — it could be retuned to any value in
+    // that range with the suite still green. 14 minutes is the tightest refusal
+    // the 15-minute horizon must still produce, so shortening the constant now
+    // breaks a test instead of silently widening who gets stolen from.
+    //
+    // Deliberately not paired with a 16-minute case: `pastBackstop()` at 20 min
+    // already covers the reclaim side, and a two-sided pin one minute apart
+    // would make the suite fail on clock skew rather than on a real change.
+    await seedFence({
+      phase: "firing",
+      firingToken: "token-just-inside-backstop",
+      ownerInstanceId: SELF.instanceId,
+      ownerSlot: SELF.slot,
+      updatedAt: new Date(Date.now() - 14 * 60_000).toISOString(),
+    });
+    const { ctx } = mkCtx();
+
+    await expect(deliver(ctx, REFUSAL_FAST_WAIT)).rejects.toThrow(
+      AlertDeliveryIncompleteError,
+    );
+    expect((await readFence())?.firing_token).toBe("token-just-inside-backstop");
+  });
+
   it("still admits a claim over an idle or finalizing fence", async () => {
     // The pre-existing admission set must be unchanged by the steal clause.
     await seedFence({
@@ -621,8 +647,16 @@ describe("BLO-32113 — the startup sweep also reclaims on age, for aggregates t
 
   it("reclaims a stale fence owned by THIS instance id, which both identity arms exclude", async () => {
     // A fence stamped with the running process's own instance id is excluded by
-    // `IS DISTINCT FROM` in both the sweep and the steal. Restarting does not
-    // help while the id is reused across the restart.
+    // `IS DISTINCT FROM` in both the sweep and the steal, so while that process
+    // lives the age arm is the only thing that can reclaim it.
+    //
+    // Note what this case does NOT claim: a restart does drain it. Every
+    // restart mints a new id (`WORKER_INSTANCE_ID = randomUUID()` at module
+    // scope) while `WORKER_SLOT` is stable, so the old fence then satisfies both
+    // identity predicates. The state pinned here is the *live-process* window
+    // before any restart — which is exactly the window the per-claim backstop
+    // serves, and the reason a leak by a live process is not simply "wait for
+    // the next deploy".
     await seedFence({
       phase: "cancelling",
       resolutionToken: "resolution-token-self-stale",
