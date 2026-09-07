@@ -6816,6 +6816,14 @@ export function recoveryService(
   // increments land in whichever sweep happens to be open and the delta silently
   // misattributes — thread an explicit counter at that point instead of widening this one.
   let dependencyWaitEscalationSuppressedTotal = 0;
+  // BLO-32668: the two sub-tallies that replace the removed per-issue INFO line. Same
+  // snapshot/diff accounting and the same invariant as the total above.
+  // `DependencyReady` is the defect shape BLO-27463 cares about (reported
+  // `issue_dependencies_blocked` with its blockers already resolved); `Unclassified`
+  // is a suppression whose caller had no pre-lock readiness in hand, kept separate so
+  // an absent classification can never be read as a resolved-blocker defect.
+  let dependencyWaitEscalationSuppressedDependencyReadyTotal = 0;
+  let dependencyWaitEscalationSuppressedUnclassifiedTotal = 0;
 
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
@@ -6824,6 +6832,16 @@ export function recoveryService(
     comment?: string;
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
+    // BLO-32668: readiness for the dependency-wait gate below, read by the caller
+    // BEFORE this transaction opens. That gate is diagnostic-only and fires on the
+    // largest population this sweep sees (515 distinct issues per pass, measured
+    // 2026-09-07), so reading readiness inside the transaction cost one serialized
+    // round-trip per candidate per pass — held under the per-issue advisory lock — to
+    // label a row the gate is about to refuse anyway. Taking the caller's
+    // already-computed value keeps the classification and drops the lock-held query.
+    // `null`/omitted means the caller had none in hand and none is fetched: an
+    // unclassified suppression is strictly better than holding a lock to label one.
+    dependencyWaitReadiness?: IssueDependencyReadiness | null;
     expectedReviewStage?: {
       stageId: string;
       participantAgentId: string;
@@ -6987,24 +7005,24 @@ export function recoveryService(
       // regardless — it states the intent instead of encoding an assumption about an
       // upstream arm that may later narrow.
       if (input.recoveryOwnerAgentId == null && input.latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
-        // Diagnostic only, but worth the lock-held round-trip: `isDependencyReady`
-        // is what separates a still-blocked wait from the defect-shaped
-        // "dependency-blocked with nothing blocking it" arm, and that distinction is
-        // the visibility this gate trades the escalation for.
-        const readiness = await issuesSvc
-          .listDependencyReadiness(fresh.companyId, [fresh.id], tx)
-          .then((rows) => rows.get(fresh.id));
+        // `isDependencyReady` is what separates a still-blocked wait from the
+        // defect-shaped "dependency-blocked with nothing blocking it" arm, and that
+        // distinction is the visibility this gate trades the escalation for. It is
+        // kept, but as a pass-scoped tally rather than a per-issue emission.
+        //
+        // BLO-32668: this used to read readiness here — inside the transaction, under
+        // the per-issue advisory lock — and log one INFO line per suppressed issue.
+        // Both costs scale with a population that is large and growing (515 distinct
+        // issues per ~43 s pass; 2,758 log lines in 10 min, 300-600/min sustained,
+        // measured 2026-09-07), and neither bought anything the caller could not
+        // supply: the value is diagnostic-only, so a pre-lock read is as good, and the
+        // per-issue line said nothing the aggregate does not. The lock-held read was
+        // the worse of the two — it serialized a round-trip per candidate while
+        // holding a lock that checkout and adoption both contend on.
         dependencyWaitEscalationSuppressedTotal += 1;
-        logger.info(
-          {
-            issueId: fresh.id,
-            issueStatus: fresh.status,
-            latestRunId: input.latestRun?.id ?? null,
-            isDependencyReady: readiness?.isDependencyReady ?? null,
-            unresolvedBlockerCount: readiness?.unresolvedBlockerCount ?? null,
-          },
-          "skipping stranded escalation for dependency-wait terminal run",
-        );
+        const readiness = input.dependencyWaitReadiness ?? null;
+        if (readiness == null) dependencyWaitEscalationSuppressedUnclassifiedTotal += 1;
+        else if (readiness.isDependencyReady) dependencyWaitEscalationSuppressedDependencyReadyTotal += 1;
         return null;
       }
 
@@ -7826,6 +7844,10 @@ export function recoveryService(
 
   async function reconcileStrandedAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
     const dependencyWaitEscalationSuppressedAtSweepStart = dependencyWaitEscalationSuppressedTotal;
+    const dependencyWaitEscalationSuppressedDependencyReadyAtSweepStart =
+      dependencyWaitEscalationSuppressedDependencyReadyTotal;
+    const dependencyWaitEscalationSuppressedUnclassifiedAtSweepStart =
+      dependencyWaitEscalationSuppressedUnclassifiedTotal;
     const candidates = await db
       .select()
       .from(issues)
@@ -8672,10 +8694,22 @@ export function recoveryService(
             continue;
           }
           const failureSummary = summarizeRunFailureForIssueComment(latestRun);
+          // BLO-32668: unlike the `in_progress` lane below, this lane has no readiness
+          // preflight, so nothing has populated the memo yet. Read it here — once, and
+          // outside `escalateStrandedAssignedIssue`'s transaction — so the gate can
+          // classify the suppression without taking the round-trip under the per-issue
+          // advisory lock. Scoped to the dependency-blocked error code so no other
+          // `todo` escalation pays for a query it does not use.
+          if (assignmentContinuationClassification.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
+            dependencyReadiness ??= await issuesSvc
+              .listDependencyReadiness(issue.companyId, [issue.id])
+              .then((rows) => rows.get(issue.id) ?? null);
+          }
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "todo",
             latestRun,
+            dependencyWaitReadiness: dependencyReadiness,
             comment:
               "Paperclip detected a non-retryable failure on this assigned issue's latest run " +
               `(\`${assignmentContinuationClassification.errorCode}\`). Skipping automatic retries and moving it to ` +
@@ -9170,8 +9204,16 @@ export function recoveryService(
         // transaction and account the row as `dependencyWaitSkipped` (still blocked)
         // rather than as a suppressed defect.
         if (classification.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
+          // BLO-32668: still an unconditional fresh read — this value gates a real
+          // `continue` below, not just a diagnostic, so it deliberately does NOT reuse
+          // the `??=` memo (an earlier arm in this same iteration may have populated it
+          // at a different instant). It is *written back* to the memo so the
+          // dependency-wait gate in `escalateStrandedAssignedIssue` can classify its
+          // suppression from this read instead of repeating the same query for the same
+          // issue under the per-issue advisory lock.
           const readinessMap = await issuesSvc.listDependencyReadiness(issue.companyId, [issue.id]);
-          const readiness = readinessMap.get(issue.id);
+          const readiness = readinessMap.get(issue.id) ?? null;
+          dependencyReadiness = readiness;
           if (readiness && !readiness.isDependencyReady) {
             result.dependencyWaitSkipped += 1;
             result.skipped += 1;
@@ -9197,6 +9239,7 @@ export function recoveryService(
             issue,
             previousStatus: "in_progress",
             latestRun,
+            dependencyWaitReadiness: dependencyReadiness,
             comment:
               "Paperclip detected a non-retryable failure on this issue's continuation run " +
               `(\`${classification.errorCode}\`). Skipping automatic retries and moving it to \`blocked\` ` +
@@ -9291,6 +9334,31 @@ export function recoveryService(
 
     result.dependencyWaitEscalationSuppressed =
       dependencyWaitEscalationSuppressedTotal - dependencyWaitEscalationSuppressedAtSweepStart;
+
+    // BLO-32668: one line per pass, replacing one INFO line per suppressed issue. Emitted
+    // only when the population is non-empty so a quiet sweep stays quiet.
+    if (result.dependencyWaitEscalationSuppressed > 0) {
+      const dependencyReadySuppressed =
+        dependencyWaitEscalationSuppressedDependencyReadyTotal -
+        dependencyWaitEscalationSuppressedDependencyReadyAtSweepStart;
+      const unclassifiedSuppressed =
+        dependencyWaitEscalationSuppressedUnclassifiedTotal -
+        dependencyWaitEscalationSuppressedUnclassifiedAtSweepStart;
+      logger.info(
+        {
+          suppressed: result.dependencyWaitEscalationSuppressed,
+          // Reported `issue_dependencies_blocked` with blockers already resolved — the
+          // BLO-27463 defect shape. Non-zero here is the signal worth acting on.
+          dependencyReadySuppressed,
+          // Still genuinely blocked at the time the caller read readiness.
+          stillBlockedSuppressed:
+            result.dependencyWaitEscalationSuppressed - dependencyReadySuppressed - unclassifiedSuppressed,
+          unclassifiedSuppressed,
+          candidatesScanned: candidates.length,
+        },
+        "skipped stranded escalation for dependency-wait terminal runs",
+      );
+    }
 
     return result;
   }
