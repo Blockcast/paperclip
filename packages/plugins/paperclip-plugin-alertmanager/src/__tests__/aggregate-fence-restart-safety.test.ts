@@ -471,11 +471,26 @@ describe("BLO-32113 — a fence held past the abandonment backstop is reclaimed 
     expect(logger.error.mock.calls.map((c) => String(c[0])).join("\n")).toMatch(
       /held for \d+s/,
     );
+    // Two series, not one. The occurrence counts `1` like every other
+    // `ctx.metrics.write` call site; the age is its own series. A single
+    // duration-valued series would become a climbing sum once BLO-32163 routes
+    // these to a real counter, and could no longer answer "is the reclaim
+    // broken" — see the comment at the call site.
     const blocked = mocks.metrics.write.mock.calls.filter(
       (c: unknown[]) => c[0] === "alertmanager.aggregate.fence_blocked",
     );
     expect(blocked.length).toBeGreaterThan(0);
-    expect(Number(blocked[0][1])).toBeGreaterThanOrEqual(60);
+    expect(Number(blocked[0][1])).toBe(1);
+
+    const age = mocks.metrics.write.mock.calls.filter(
+      (c: unknown[]) => c[0] === "alertmanager.aggregate.fence_blocked_age_seconds",
+    );
+    expect(age.length).toBeGreaterThan(0);
+    expect(Number(age[0][1])).toBeGreaterThanOrEqual(60);
+    // Both series carry the same tags, or the ratio between them cannot be
+    // taken per-aggregate.
+    expect(age[0][2]).toEqual(blocked[0][2]);
+    expect(age[0][2]).toMatchObject({ aggregate_key: AGGREGATE_KEY, phase: "firing" });
   });
 });
 
@@ -566,6 +581,91 @@ describe("BLO-31036 — startup reconciliation drains fences no live process can
     expect(logger.error.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
       "reconciliation failed",
     );
+  });
+});
+
+/**
+ * BLO-32113, second half. The per-claim backstop only ever runs *on a delivery*,
+ * so it cannot help an aggregate whose alert has stopped firing — nothing
+ * arrives to trigger it. Identity alone cannot help either when the owner sits
+ * in a foreign slot that never restarts. That intersection — foreign slot AND
+ * no further deliveries — is the one state still wedged after the per-claim
+ * backstop, and it is closed by giving the startup sweep the same age arm.
+ *
+ * The two paths cover different triggers and neither is redundant: the sweep
+ * fires on process start, the backstop fires on delivery.
+ */
+describe("BLO-32113 — the startup sweep also reclaims on age, for aggregates that stopped firing", () => {
+  const pastBackstop = () => new Date(Date.now() - 20 * 60_000).toISOString();
+
+  it("reclaims a foreign slot's fence held past the backstop, which identity alone never drains", async () => {
+    // The residual the per-claim backstop cannot reach: wrong slot (so the
+    // identity arm skips it) and no further delivery (so the claim path never
+    // runs). Before the age arm this waited on a foreign process restarting,
+    // which may never happen.
+    await seedFence({
+      phase: "firing",
+      firingToken: "token-foreign-stale-and-quiet",
+      ownerInstanceId: FOREIGN_HOST.instanceId,
+      ownerSlot: FOREIGN_HOST.slot,
+      updatedAt: pastBackstop(),
+    });
+    const { ctx, logger } = mkCtx();
+
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toBe(1);
+    expect((await readFence())?.phase).toBe("active");
+    expect(logger.warn.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
+      "abandonment backstop",
+    );
+  });
+
+  it("reclaims a stale fence owned by THIS instance id, which both identity arms exclude", async () => {
+    // A fence stamped with the running process's own instance id is excluded by
+    // `IS DISTINCT FROM` in both the sweep and the steal. Restarting does not
+    // help while the id is reused across the restart.
+    await seedFence({
+      phase: "cancelling",
+      resolutionToken: "resolution-token-self-stale",
+      ownerInstanceId: SELF.instanceId,
+      ownerSlot: SELF.slot,
+      updatedAt: pastBackstop(),
+    });
+    const { ctx } = mkCtx();
+
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toBe(1);
+    expect((await readFence())?.phase).toBe("active");
+  });
+
+  it("still leaves a FRESH foreign fence alone, so the age arm is not 'steal anything'", async () => {
+    // The safety edge for the sweep, mirroring the per-claim case. This is the
+    // regression that would catch the age arm collapsing into an unconditional
+    // release.
+    await seedFence({
+      phase: "firing",
+      firingToken: "token-foreign-and-fresh",
+      ownerInstanceId: FOREIGN_HOST.instanceId,
+      ownerSlot: FOREIGN_HOST.slot,
+    });
+    const { ctx } = mkCtx();
+
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toBe(0);
+    expect((await readFence())?.firing_token).toBe("token-foreign-and-fresh");
+  });
+
+  it("leaves an `active` fence untouched however old it is", async () => {
+    // Age is only ever read together with the phase filter. An `active` row is
+    // the normal resting state and is old by definition; releasing on age alone
+    // would rewrite every idle aggregate on every boot.
+    await seedFence({
+      phase: "active",
+      ownerInstanceId: null,
+      ownerSlot: null,
+      updatedAt: new Date(Date.now() - 30 * 24 * 60 * 60_000).toISOString(),
+    });
+    const { ctx } = mkCtx();
+
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toBe(0);
+    expect((await readFence())?.phase).toBe("active");
   });
 });
 
