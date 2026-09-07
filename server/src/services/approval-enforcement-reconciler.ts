@@ -43,9 +43,9 @@
  *    must resolve to "missing", not to that company's amount — otherwise the
  *    sweep both leaks a cross-tenant figure and raises false drift from it.
  */
-import { and, eq, inArray, isNull, lte, notInArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, lte, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { approvals, budgetPolicies, issues } from "@paperclipai/db";
+import { agents, approvals, budgetPolicies, issues } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
 import { issueService } from "./issues.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
@@ -340,6 +340,7 @@ type ApprovalCandidate = {
   type: string;
   payload: unknown;
   requestedByAgentId: string | null;
+  requestedByUserId: string | null;
   decidedAt: Date | string | null;
 };
 
@@ -439,6 +440,52 @@ function buildDriftIssueBody(input: {
     .join("\n");
 }
 
+/**
+ * Resolve the agent that owns a drift issue whose approval has no requesting
+ * agent (BLO-24631, CEO ruling 2026-09-07).
+ *
+ * `approvals.requested_by_agent_id` is nullable — board- and system-filed cards
+ * are exactly the null case, and they are not rare: measured over 380 approved
+ * cards in the origin company, 26 (6.8%) have no requesting agent. Passing that
+ * null through to `assigneeAgentId` created an **unassigned** `todo` row, and
+ * heartbeat work selection is by assignee, so the issue had no wake path: it was
+ * raised, counted, and never worked. Worse, it then matched the dedupe path
+ * forever, so every later pass logged "drift persists, open issue already tracks
+ * it" and re-raised nothing — the reconciler reporting a drift as tracked while
+ * the enforcement gap stayed open, which is the exact silent-failure shape this
+ * file exists to detect, reproduced in its own output.
+ *
+ * `requested_by_user_id` is NOT a usable fallback: it is nullable too
+ * (schema/approvals.ts:14, and the two *separate* partial unique indexes at
+ * :38-45 each guarded on one column `IS NOT NULL` exist precisely because either
+ * may be null). Of the 380 cards above, 4 have BOTH null — and all 4 are
+ * `budget_override_required`, i.e. the budget class this reconciler checks
+ * first. Routing to the user column moves the null one column right and still
+ * strands the bullseye case. A human-only owner would also be visible but not
+ * actionable: that queue measures ~100 days deep at ~2.4 closes/day.
+ *
+ * The terminus is the CEO on remit grounds rather than convenience: a
+ * board-filed card has no owner inside the agent org, and the CEO is the org's
+ * interface to the board.
+ *
+ * Ordering mirrors the established escalation-owner lookups in
+ * `recovery/service.ts` and `productivity-review.ts` so the pick is stable
+ * across replicas when a company has more than one CEO-role row. Deliberately
+ * NOT gated on invokability or budget: unlike those call sites, which wake an
+ * agent immediately, this only needs an assignee the heartbeat can select
+ * later — and failing the lookup suppresses the issue entirely (see the caller),
+ * so a transiently over-budget CEO must not silence drift reporting.
+ */
+async function resolveDriftIssueOwnerAgentId(db: Db, companyId: string): Promise<string | null> {
+  const [owner] = await db
+    .select({ id: agents.id })
+    .from(agents)
+    .where(and(eq(agents.companyId, companyId), eq(agents.role, "ceo")))
+    .orderBy(asc(agents.createdAt), asc(agents.id))
+    .limit(1);
+  return owner?.id ?? null;
+}
+
 async function findOpenDriftIssue(db: Db, companyId: string, approvalId: string) {
   return db
     .select({ id: issues.id, identifier: issues.identifier })
@@ -533,6 +580,7 @@ export async function listCandidateApprovals(
       type: approvals.type,
       payload: approvals.payload,
       requestedByAgentId: approvals.requestedByAgentId,
+      requestedByUserId: approvals.requestedByUserId,
       decidedAt: approvals.decidedAt,
     })
     .from(approvals)
@@ -643,6 +691,25 @@ export async function reconcileApprovalEnforcement(
 
         const payloadRecord = asRecord(approval.payload);
         const approvalTitle = payloadRecord ? asNonEmptyString(payloadRecord.title) : null;
+
+        // The raised issue must be *reachable*. Heartbeat work selection is by
+        // assignee, so an unassigned row is created and then never worked while
+        // the dedupe path reports it as tracked forever. See
+        // `resolveDriftIssueOwnerAgentId` for why the user column is not a
+        // usable fallback.
+        const ownerAgentId =
+          approval.requestedByAgentId ??
+          (await resolveDriftIssueOwnerAgentId(db, approval.companyId));
+        if (!ownerAgentId) {
+          // Loud failure beats a silent unreachable row: skipping leaves the
+          // drift un-deduped, so the next pass retries it once an owner exists.
+          log.error(
+            { approvalId: approval.id, companyId: approval.companyId, driftCount: drifts.length },
+            "approval-enforcement reconciler: drift detected but no owner agent could be resolved (no requesting agent and no ceo-role agent in company); issue NOT raised (BLO-24631)",
+          );
+          continue;
+        }
+
         try {
           const created = await issueService(db).create(approval.companyId, {
             title: `Approved decision never reached enforcement: ${approvalTitle ?? approval.id}`,
@@ -655,7 +722,17 @@ export async function reconcileApprovalEnforcement(
             }),
             status: "todo",
             priority: "high",
-            assigneeAgentId: approval.requestedByAgentId ?? undefined,
+            assigneeAgentId: ownerAgentId,
+            // Provenance only. A human-filed card records its filer here and
+            // never as the sole assignee, which would be visible but not
+            // actionable. The trust flag is required: `create` otherwise
+            // discards an explicit `responsibleUserId` (issues.ts:561) so a
+            // client cannot assert an arbitrary responsible user. This sweep is
+            // the trusted server-side class — the value is read from
+            // `approvals.requested_by_user_id` in-process, never from a request
+            // body — matching `routines.ts` and `plugin-host-services.ts`.
+            responsibleUserId: approval.requestedByUserId ?? undefined,
+            trustExplicitResponsibleUserId: approval.requestedByUserId !== null,
             originKind: APPROVAL_ENFORCEMENT_DRIFT_ORIGIN_KIND,
             originId: approval.id,
             originFingerprint: approval.id,
@@ -665,6 +742,8 @@ export async function reconcileApprovalEnforcement(
             {
               approvalId: approval.id,
               issueId: created.id,
+              assigneeAgentId: ownerAgentId,
+              ownerFallback: approval.requestedByAgentId === null,
               driftCount: drifts.length,
               assertionCount: assertions.length,
             },
