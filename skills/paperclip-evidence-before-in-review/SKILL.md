@@ -239,6 +239,7 @@ Agents cannot read or grant elevation. Elevation is decided in magma tenants (`A
 ```json
 {
   "type": "request_board_approval",
+  "idempotencyKey": "elevation:<BLO-id>",
   "payload": {
     "title": "Elevation: <BLO-id> <one-line why>",
     "subject": "system:serviceaccount:paperclip:<sa-name>",
@@ -256,12 +257,12 @@ Agents cannot read or grant elevation. Elevation is decided in magma tenants (`A
 Rules:
 
 - Check first that you actually lack the capability, and say which call proved it. A `403` naming a missing grant is a capability gap, not a policy denial, and the two have different owners: a missing Paperclip grant is a board/CEO decision, while a Kubernetes admission denial is what this section is for.
+- `idempotencyKey` is a top-level field, a sibling of `type` and `payload`, not part of the payload. Derive it from the ask itself (`elevation:<BLO-id>`) so a retry, a resumed run, or a re-dispatch replays the original card instead of filing a duplicate. Before filing, check for one you already have open with `paperclipListApprovals` at `view=summary` — humans drain this queue by hand, and a stack of identical cards costs the reviewer more than the wait costs you.
 - `durationMinutes` is at most 60. `ElevationGrant.spec.expiresAt` is capped at one hour. Ask for less when less is enough.
 - `systemPrincipal` (`sp_<uuid>`) is the system-principal registration in magma tenants for `system:serviceaccount:paperclip:<sa-name>`. Two approvers must each run `approverCommand` with their own operator `mb_<uuid>` certificate. One approver is not a grant.
 - If you cannot find an `sp_<uuid>` for your subject, the registration may not exist. Say so in the request in plain words and ask for registration first. Whether Paperclip agent SAs are registered at all is unverified as of 2026-09-04; see the bc-elevation bridge notes in onprem-k8s `security/bc-elevation/source-of-truth.md`.
 - Give the card one ask and a branch it can satisfy inside Paperclip, and state what you do on silence. A card whose only satisfying action is a click somewhere else is a work item with no owner.
 - The approval record plus the audit of the write you performed are the evidence for `in_review`. The grant itself is not evidence.
-
 
 ## Anti-patterns
 
