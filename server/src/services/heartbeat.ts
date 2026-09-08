@@ -472,6 +472,8 @@ import {
 import { clearAgentTaskSessions } from "./recovery/session-reset.js";
 import {
   recoveryAssigneeAdapterOverrides,
+  RECOVERY_GUARD_CONTEXT_KEYS,
+  RECOVERY_WORK_CLASS_KEY,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { recoveryService, STALE_PRE_CLAIM_ISSUE_LOCK_MS } from "./recovery/service.js";
@@ -8473,6 +8475,32 @@ export function mergeCoalescedContextSnapshot(
       if (!(key in incoming)) delete merged[key];
     }
   }
+  // BLO-32634: same ownership idiom, applied to the recovery cost guard. A wake
+  // that DECLARES its run class (`withRecoveryModelProfileHint`, any of the three
+  // classes) owns the whole guard block: whatever it does not re-supply is
+  // cleared, not inherited.
+  //
+  // Without this, a monitor fire coalescing into a run row already stamped
+  // `status_only` kept the full tuple, and the monitor's own scheduled work was
+  // then write-refused by `isStatusOnlyCheapRecoveryContext` — the monitor could
+  // not do the thing it was armed to do. The scrub-only `normal_model` path could
+  // not displace it either, because deleting keys from the INCOMING snapshot says
+  // nothing to a spread that reads the EXISTING one.
+  //
+  // The narrower patch — dropping the block whenever it appears — fails in the
+  // expensive direction: a wake silent about run class would strip the guard off
+  // a genuinely status-only run and put it back on the normal model, unbounded.
+  // Keying on an explicit declaration is what keeps silence inheriting. It also
+  // makes the three classes mutually exclusive ACROSS a coalesce, which the
+  // spread alone did not: `planning_only` supplies no `modelProfile`, so an
+  // inherited `cheap` used to ride along beside `recoveryIntent: planning_only`
+  // as a tuple no caller can construct directly.
+  const declaresRecoveryWorkClass = readNonEmptyString(incoming[RECOVERY_WORK_CLASS_KEY]) !== null;
+  if (declaresRecoveryWorkClass) {
+    for (const key of RECOVERY_GUARD_CONTEXT_KEYS) {
+      if (!(key in incoming)) delete merged[key];
+    }
+  }
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
@@ -13347,7 +13375,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
         requestedByActorType: input.actorType,
         requestedByActorId: input.actorId,
-        contextSnapshot: {
+        // BLO-32634: a monitor fire is assignee-scheduled work, never a recovery
+        // wake — declare that explicitly rather than leaving the snapshot merely
+        // silent. Silence is inherited by `mergeCoalescedContextSnapshot`, so a
+        // fire landing on a run row stamped `status_only` used to come back
+        // guarded and have its own scheduled write refused.
+        contextSnapshot: withRecoveryModelProfileHint({
           issueId: claimed.id,
           source: isProviderQuotaReviewMonitor ? "issue.execution_review_recovery" : "issue.monitor",
           wakeReason,
@@ -13357,7 +13390,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...monitorMetadata,
           ...reviewRecoveryContext,
           manualTrigger: input.activitySource === "manual",
-        },
+        }, "normal_model"),
       }, monitorSuppression);
 
       // The wake was parked behind an unresolved blocker, so no turn ran. Keep
