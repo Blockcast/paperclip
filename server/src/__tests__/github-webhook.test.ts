@@ -45,6 +45,8 @@ import {
   __test_idempotentWakeStatuses,
   __test_prReviewerWakeIdempotencyScope,
   __test_readReviewGateEscalationHeadSha,
+  __test_isActionablePrReviewComment,
+  __test_isReviewGateEscalationProducer,
   __test_recordWorkflowRunSighting,
   __test_resolvePrCommentReviewGateWebhookTrigger,
   __test_resolveDependabotAlertContext,
@@ -1662,7 +1664,17 @@ describe("github-webhook pure helpers", () => {
         ...extra,
       ].join("\n");
 
-    const escalationEvent = (body: string, prBody = "Closes BLO-31132") =>
+    const escalationEvent = (
+      body: string,
+      prBody = "Closes BLO-31132",
+      // The gate posts via the workflow's GITHUB_TOKEN, so the author is
+      // github-actions[bot] -- NOT the reviewer bot. Verified against the
+      // live escalation comments on #2949 and #3133. Overridable so the
+      // author-guard tests can drive a non-producer identity through the
+      // identical body (BLO-32381 Important 1).
+      commentUser: Record<string, unknown> = { login: "github-actions[bot]", type: "Bot" },
+      options: Parameters<typeof __test_resolveEventContext>[2] = {},
+    ) =>
       __test_resolveEventContext("issue_comment", {
         action: "created",
         issue: {
@@ -1677,13 +1689,10 @@ describe("github-webhook pure helpers", () => {
           id: 4900000001,
           body,
           html_url: "https://github.com/Blockcast/onprem-k8s/pull/2949#issuecomment-4900000001",
-          // The gate posts via the workflow's GITHUB_TOKEN, so the author is
-          // github-actions[bot] -- NOT the reviewer bot. Verified against the
-          // live escalation comments on #2949 and #3133.
-          user: { login: "github-actions[bot]", type: "Bot" },
+          user: commentUser,
         },
         repository: { full_name: "Blockcast/onprem-k8s" },
-      }, { prReviewerBotLogin: "allyblockcast[bot]" });
+      }, { prReviewerBotLogin: "allyblockcast[bot]", ...options });
 
     it("reads the head SHA from the marker the gate already emits today", () => {
       // This is what makes the consumer independently useful: the fix works
@@ -1783,6 +1792,11 @@ describe("github-webhook pure helpers", () => {
       // Negative control for the precedence above: escalation must not swallow
       // real review feedback. An Ally consolidated review that happens to quote
       // the marker mid-body is feedback.
+      //
+      // NOTE this case does NOT exercise the `!reviewFeedback` conjunct -- the
+      // marker is mid-body, so readReviewGateEscalationHeadSha already returns
+      // null and the escalation branch is dead before the conjunct is read. The
+      // test below is the one that pins it.
       const ctx = escalationEvent(
         [
           "## Ally — Consolidated PR Review",
@@ -1797,6 +1811,172 @@ describe("github-webhook pure helpers", () => {
         ].join("\n"),
       );
       expect(ctx?.wakeReason).toBe("github_pr_review_feedback");
+    });
+
+    it("actionable review feedback beats a byte-0 escalation marker on the same body", () => {
+      // THE test for the `!reviewFeedback` conjunct (BLO-32381 Suggestion 1).
+      // Both predicates must be live simultaneously, which needs a body that is
+      // marker-led AND satisfies isActionablePrReviewComment. That second half
+      // does not require the reviewer-bot author: hasAllyConsolidatedReviewHeader
+      // is un-anchored, so an embedded review header qualifies the body on its
+      // own -- which is why this shape is reachable from the gate's own author.
+      const body = [
+        legacyMarker,
+        "",
+        "**Ally review is stuck.** Quoting the last review below for context:",
+        "",
+        "## Ally — Consolidated PR Review",
+        "",
+        "### Important Issues (1)",
+        "",
+        "- I1: the readiness probe points at the wrong port.",
+        "",
+        "### Recommended Action",
+        "",
+        "Fix I1 before merge.",
+      ].join("\n");
+
+      // Both halves of the conjunct are genuinely true here -- assert that
+      // directly, so this test cannot rot into the vacuous shape above.
+      expect(__test_readReviewGateEscalationHeadSha(body)).toBe(ESCALATED_HEAD);
+      expect(
+        __test_isActionablePrReviewComment(body, "github-actions[bot]", "allyblockcast[bot]"),
+      ).toBe(true);
+
+      // Feedback wins. Routing this as an escalation would drop real findings on
+      // the floor: the escalation path posts a "the reviewer is not responding"
+      // comment, which is the opposite of what happened.
+      expect(escalationEvent(body)?.wakeReason).toBe("github_pr_review_feedback");
+    });
+
+    // -- Important 1: the author guard ------------------------------------
+    //
+    // Without it this classifier is the only one in the issue_comment branch
+    // keyed on body alone, which turns "can comment on this PR" into "can mint
+    // a system comment on the owning Paperclip issue plus a full agent run".
+    // Per-head idempotency does not bound it: the head is read verbatim from the
+    // marker, so N fabricated SHAs are N keys, N comments and N wakes.
+    it("refuses an escalation marker from a human author", () => {
+      const suppressed: Array<Record<string, unknown>> = [];
+      const ctx = escalationEvent(
+        escalationBody(legacyMarker),
+        "Closes BLO-31132",
+        { login: "some-contributor", type: "User" },
+        { onSuppressedEscalationAuthor: (info) => suppressed.push({ ...info }) },
+      );
+      expect(ctx).toBeNull();
+      // And the refusal is VISIBLE. A silent drop here would reproduce this
+      // row's own defect from the other side: a real escalation going unrouted
+      // with no trace is exactly the silence BLO-32381 was opened about.
+      expect(suppressed).toHaveLength(1);
+      expect(suppressed[0]).toMatchObject({
+        headSha: ESCALATED_HEAD,
+        commentAuthorLogin: "some-contributor",
+        commentAuthorType: "User",
+        prNumber: 2949,
+      });
+    });
+
+    it("refuses an escalation marker from a bot that is not the gate", () => {
+      // `type: "Bot"` is necessary but NOT sufficient -- GitHub sets `type`, so
+      // a human cannot spoof it, but every App installed on the repo gets it.
+      const suppressed: Array<Record<string, unknown>> = [];
+      const ctx = escalationEvent(
+        escalationBody(routingMarker),
+        "Closes BLO-31132",
+        { login: "dependabot[bot]", type: "Bot" },
+        { onSuppressedEscalationAuthor: (info) => suppressed.push({ ...info }) },
+      );
+      expect(ctx).toBeNull();
+      expect(suppressed).toHaveLength(1);
+      expect(suppressed[0]).toMatchObject({ commentAuthorLogin: "dependabot[bot]" });
+    });
+
+    it("refuses an escalation marker from the reviewer bot itself", () => {
+      // Deliberate, and the least obvious of the three: the fleet drives this
+      // App and it is the credential the gate would most plausibly move to. But
+      // agents post PR comments through it and they quote this marker while
+      // discussing it (this repo's own review threads do exactly that), so a
+      // paste that happens to lead with the marker would route. Agents already
+      // hold direct Paperclip write access, so allowlisting the App buys no
+      // capability they lack while adding a live accidental-trigger path.
+      const suppressed: Array<Record<string, unknown>> = [];
+      const ctx = escalationEvent(
+        escalationBody(legacyMarker),
+        "Closes BLO-31132",
+        { login: "allyblockcast[bot]", type: "Bot" },
+        { onSuppressedEscalationAuthor: (info) => suppressed.push({ ...info }) },
+      );
+      expect(ctx).toBeNull();
+      expect(suppressed).toHaveLength(1);
+    });
+
+    it("does not report a suppressed author when there was no marker to suppress", () => {
+      // The callback must stay a signal. It fires only when a WELL-FORMED marker
+      // was dropped for its author -- not on every non-escalation comment, and
+      // not on a marker whose head is unreadable (that has its own refusal).
+      const suppressed: Array<Record<string, unknown>> = [];
+      escalationEvent(
+        "Just a normal PR comment with no marker at all.",
+        "Closes BLO-31132",
+        { login: "some-contributor", type: "User" },
+        { onSuppressedEscalationAuthor: (info) => suppressed.push({ ...info }) },
+      );
+      expect(suppressed).toHaveLength(0);
+    });
+
+    it("still accepts the real producer, so the guard did not close the live path", () => {
+      // Positive control for the three refusals above. Without this, a guard
+      // that rejected EVERYTHING would look identically green.
+      const suppressed: Array<Record<string, unknown>> = [];
+      const ctx = escalationEvent(
+        escalationBody(legacyMarker),
+        "Closes BLO-31132",
+        { login: "github-actions[bot]", type: "Bot" },
+        { onSuppressedEscalationAuthor: (info) => suppressed.push({ ...info }) },
+      );
+      expect(ctx?.wakeReason).toBe("github_pr_review_gate_escalation");
+      expect(suppressed).toHaveLength(0);
+    });
+
+    it("bounds the amplifier: N fabricated heads from a non-producer yield N refusals and no context", () => {
+      // The property that makes Important 1 a security finding rather than a
+      // hygiene one. Per-head idempotency cannot bound a forged marker, because
+      // the forger picks the head -- so the bound has to come from the author.
+      const suppressed: Array<Record<string, unknown>> = [];
+      const heads = [
+        "1111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222",
+        "3333333333333333333333333333333333333333",
+      ];
+      const contexts = heads.map((head) =>
+        escalationEvent(
+          escalationBody(`<!-- review-gate:stale-escalation:${head} -->`),
+          "Closes BLO-31132",
+          { login: "some-contributor", type: "User" },
+          { onSuppressedEscalationAuthor: (info) => suppressed.push({ ...info }) },
+        ),
+      );
+      expect(contexts).toEqual([null, null, null]);
+      expect(suppressed.map((s) => s.headSha)).toEqual(heads);
+    });
+
+    // -- Important 3: the head must be a full 40-hex SHA ------------------
+    it("refuses an abbreviated head in the routing marker (fails closed, not into a second key)", () => {
+      // The captured head IS the dedup key (buildReviewGateEscalationExternalKey)
+      // and the wake idempotency suffix, so two spellings of one head are two
+      // identities. The gate's own PROSE renders abbreviated heads
+      // (`dcbcb6ca`), so a producer emitting `head=dcbcb6ca` is a plausible
+      // migration bug -- and it would route the same escalation twice, which is
+      // precisely the AC2 property. Refusing it makes that bug visible.
+      const short = `<!-- paperclip:review-gate-escalation head=${ESCALATED_HEAD.slice(0, 8)} -->`;
+      expect(__test_readReviewGateEscalationHeadSha(escalationBody(short))).toBeNull();
+      expect(escalationEvent(escalationBody(short))).toBeNull();
+
+      // Both marker forms agree on the length, which is what lets the block
+      // comment claim (1) and (2) are interchangeable once #3229 lands.
+      const shortLegacy = `<!-- review-gate:stale-escalation:${ESCALATED_HEAD.slice(0, 8)} -->`;
+      expect(__test_readReviewGateEscalationHeadSha(escalationBody(shortLegacy))).toBeNull();
     });
 
     it("scopes the wake idempotency key to the escalated head, not the comment or delivery", () => {
@@ -6972,6 +7152,17 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(res.body.reviewGateEscalationComments).toEqual([
       { issueIdentifier: "BLO-31132", commentId: expect.any(String) },
     ]);
+    // BLO-32381 Important 2: `commentsRouted` alone cannot carry AC3, because a
+    // redelivery inserts nothing and would report the same `0` as "nobody could
+    // be told". On the FIRST delivery the two are distinguishable by
+    // construction; the replay below is where they diverge.
+    expect(res.body.reviewGateEscalationSummary).toEqual({
+      headSha: escalatedHead,
+      issuesResolved: 1,
+      commentsRouted: 1,
+      commentsDeduped: 0,
+      commentFailures: 0,
+    });
 
     const escalationComments = await db
       .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
@@ -7012,6 +7203,22 @@ describeEmbeddedPostgres("github-webhook route", () => {
     // pass this vacuously, so this asserts the (pull, head) key is what holds.
     const replay = await send("delivery-escalation-2");
     expect(replay.status).toBe(200);
+    // AND the replay is distinguishable from a failure to route. This is the
+    // whole of BLO-32381 Important 2: `commentsRouted: 0` here is byte-identical
+    // to the AC3 "no owning issue could be resolved" case, so the reading that
+    // matters is `issuesResolved: 1` with `commentsDeduped: 1` -- an owning
+    // issue WAS resolved and it already carries the escalation. Steady-state
+    // success, not silence.
+    expect(replay.body.reviewGateEscalationSummary).toEqual({
+      headSha: escalatedHead,
+      issuesResolved: 1,
+      commentsRouted: 0,
+      commentsDeduped: 1,
+      commentFailures: 0,
+    });
+    // The insert-only list is absent on the replay, which is exactly why it
+    // could not be the signal.
+    expect(replay.body.reviewGateEscalationComments).toBeUndefined();
 
     const commentsAfterReplay = await db
       .select({ id: issueComments.id })
@@ -7087,6 +7294,18 @@ describeEmbeddedPostgres("github-webhook route", () => {
       reason: "no_owning_reference",
     });
     expect(res.body.reviewGateEscalationComments).toBeUndefined();
+    // AC3's positive signal, and the counterpart to the replay assertion in the
+    // test above: `issuesResolved: 0` is what says "the gate escalated and
+    // nobody could be told". The two cases differ on THIS field and agree on
+    // `commentsRouted: 0`, which is why the insert count could not carry AC3
+    // alone (BLO-32381 Important 2).
+    expect(res.body.reviewGateEscalationSummary).toEqual({
+      headSha: escalatedHead,
+      issuesResolved: 0,
+      commentsRouted: 0,
+      commentsDeduped: 0,
+      commentFailures: 0,
+    });
 
     const escalationComments = await db
       .select({ id: issueComments.id })
