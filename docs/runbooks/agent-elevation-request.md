@@ -142,8 +142,8 @@ So:
    a bare username entry authorizes writing *any* protected Secret in *every*
    covered namespace.
 
-   **Get the CEL right before you merge.** The binding is
-   `validationActions: [Deny, Audit]` with `failurePolicy: Fail` and
+   **Get the CEL right before you merge.** The policy is `failurePolicy: Fail`
+   and the binding is `validationActions: [Deny, Audit]` with
    `parameterNotFoundAction: Deny`, so a malformed disjunct does not degrade to
    a warning — it breaks Secret writes across the whole covered namespace set.
    The policy's own comment puts it plainly: a constraint that is "merely close
@@ -476,7 +476,7 @@ Confirmed as intended behaviour by the controller's own tests
 
 Because a ServiceAccount's `request.userInfo.username` carries no `oidc:`
 prefix, no publishable grant can ever match one. Status: **resolved, negative
-result.** Follow-up filed — see §7.
+result.** Follow-up filed — see §9.
 
 ### 6. Agents cannot read grants (correct privilege separation)
 
