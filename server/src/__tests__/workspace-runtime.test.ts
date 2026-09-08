@@ -191,6 +191,9 @@ async function expectPersistedBranchMismatchRejected(input: {
   executionWorkspaceId: string;
   expectedAncestryVerdict: "diverged" | "unknown";
   expectedReason?: string;
+  // For refusals whose reason embeds a path or a claimant list, so an exact
+  // match is not stable across fixtures.
+  expectedReasonContains?: string;
 }) {
   let error: unknown = null;
   try {
@@ -248,6 +251,9 @@ async function expectPersistedBranchMismatchRejected(input: {
           attempted: false,
           succeeded: false,
           ...(input.expectedReason ? { reason: input.expectedReason } : {}),
+          ...(input.expectedReasonContains
+            ? { reason: expect.stringContaining(input.expectedReasonContains) }
+            : {}),
         }),
       }),
     },
@@ -2976,6 +2982,11 @@ describe("realizeExecutionWorkspace", () => {
       issueId: "issue-held-elsewhere",
       executionWorkspaceId: "execution-workspace-held-elsewhere",
       expectedAncestryVerdict: "diverged",
+      // Name this refusal specifically. Asserting only `eligible: false` would
+      // also hold for the pre-fix "expected branch and current HEAD differ"
+      // fall-through, so the assertion would not distinguish this guard from
+      // the gap it was added to close.
+      expectedReasonContains: "recorded branch is already checked out in another worktree at ",
     });
 
     // Nothing moved: both worktrees keep the branch they had.
