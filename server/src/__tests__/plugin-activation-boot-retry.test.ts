@@ -265,12 +265,23 @@ function sdkRaceLatchText(attempts = 5): string {
   );
 }
 
-/** The `lastError` a plugin that threw from its own `initialize` writes. */
+/**
+ * The `lastError` a plugin that threw from its own `initialize` writes.
+ *
+ * Derived from the writer rather than hand-copied. The hand-copied version
+ * drifted silently — it read `retries;` while `classifyActivationLatch` wrote
+ * `retries spent;` — and every server shard stayed green, because this text is
+ * only ever asserted against a row that was *seeded* with it, so the assertion
+ * compared the seeded value with itself. Composing it the way the loader does
+ * (`Activation failed: ${message}${suffix}`) makes that drift impossible.
+ */
 const FAILED_CLOSED_LATCH_TEXT =
-  `Activation failed: Worker initialize failed for "fixture": ` +
-  `plugin config invalid: missing apiKey ` +
-  `(failed closed after 0 transient and 0 sdk-install-race retries spent; ` +
-  `not classified as retryable contention)`;
+  `Activation failed: ${FAILED_CLOSED_ERROR.message}` +
+  classifyActivationLatch({
+    err: FAILED_CLOSED_ERROR,
+    transientAttempt: 0,
+    sdkRaceAttempt: 0,
+  }).suffix;
 
 /**
  * The `lastError` the *previous* release wrote for a contention latch — the
@@ -303,12 +314,14 @@ const FORGED_MARKER_ERROR = new Error(
     `(${TRANSIENT_RETRY_EXHAUSTED_MARKER})`,
 );
 
-/** Derived from the error above so the fixture cannot drift from the writer. */
+/** Derived from the error and the writer so the fixture cannot drift from either. */
 const FORGED_MARKER_LATCH_TEXT =
-  `Activation failed: ${FORGED_MARKER_ERROR.message} ` +
-  `(failed closed after 0 transient and 0 sdk-install-race retries spent; ` +
-  `not classified as retryable contention)`;
-
+  `Activation failed: ${FORGED_MARKER_ERROR.message}` +
+  classifyActivationLatch({
+    err: FORGED_MARKER_ERROR,
+    transientAttempt: 0,
+    sdkRaceAttempt: 0,
+  }).suffix;
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
