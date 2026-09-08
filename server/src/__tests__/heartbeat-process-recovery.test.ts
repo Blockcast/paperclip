@@ -6331,6 +6331,135 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(after.status).toBe("todo");
   });
 
+  // BLO-32668: this gate used to emit one INFO line per suppressed issue — 2,758 lines in
+  // 10 min at the measured population (515 distinct issues per ~43 s pass) — and to read
+  // readiness for the label *inside* its own transaction, under the per-issue advisory
+  // lock. Both are gone; the classification the line carried survives as a three-way
+  // partition of `dependencyWaitEscalationSuppressed` on the sweep result.
+  //
+  // The two tests below assert ATTRIBUTION, not just the total, because the total cannot
+  // catch the regression that matters. The gate now classifies from readiness its CALLER
+  // threads in (`dependencyWaitReadiness`), so if a refactor drops that argument on either
+  // lane, every suppression falls to the `...Unclassified` arm — the partition still sums,
+  // `dependencyWaitEscalationSuppressed` still reads 1 and keeps passing in all four places
+  // it is already asserted above, and the BLO-27463 defect signal silently reads zero
+  // forever with nothing red. An attribution assertion is the only thing that fails.
+  it("attributes a todo-lane dependency-wait suppression to the resolved-blocker arm (BLO-32668)", async () => {
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "cancelled",
+      retryReason: "assignment_recovery",
+      runErrorCode: "issue_dependencies_blocked",
+      runError:
+        "Latest retry failure: provider rate-limit/quota window — the provider advertised " +
+        "availability no earlier than 2026-08-13T01:17:00.262Z (surfaced as `issue_dependencies_blocked`).",
+    });
+
+    // No issueRelations row: nothing has ever blocked this issue, so readiness is restored
+    // and this is the defect shape — "dependency-blocked" with nothing blocking it.
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitEscalationSuppressed).toBe(1);
+    // The signal worth acting on, and the one the removed per-issue line used to carry.
+    expect(result.dependencyWaitEscalationSuppressedDependencyReady).toBe(1);
+    expect(result.dependencyWaitEscalationSuppressedStillBlocked).toBe(0);
+    // Non-zero here would mean the `todo` lane stopped threading its pre-lock readiness.
+    expect(result.dependencyWaitEscalationSuppressedUnclassified).toBe(0);
+    // The partition invariant the derived still-blocked arm depends on.
+    expect(
+      result.dependencyWaitEscalationSuppressedDependencyReady +
+        result.dependencyWaitEscalationSuppressedStillBlocked +
+        result.dependencyWaitEscalationSuppressedUnclassified,
+    ).toBe(result.dependencyWaitEscalationSuppressed);
+    expect(result.escalated).toBe(0);
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(actions).toHaveLength(0);
+  });
+
+  it("attributes an in_progress-lane dependency-wait suppression to the resolved-blocker arm (BLO-32668)", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+      runError:
+        "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const doneBlockerId = randomUUID();
+
+    // A blocker that has since completed: the sweep's own preflight reads readiness as
+    // restored, so this row falls through `dependencyWaitSkipped` to the gate. The gate
+    // must classify it from that preflight read rather than repeating the query under the
+    // per-issue advisory lock — which is what makes this the lane where the threading is
+    // load-bearing.
+    await db.insert(issues).values({
+      id: doneBlockerId,
+      companyId,
+      title: "Upstream work that already finished",
+      status: "done",
+      priority: "medium",
+      issueNumber: 26,
+      identifier: `${issuePrefix}-26`,
+      completedAt: new Date(Date.now() - 10 * 60 * 1000),
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: doneBlockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitSkipped).toBe(0);
+    expect(result.dependencyWaitEscalationSuppressed).toBe(1);
+    expect(result.dependencyWaitEscalationSuppressedDependencyReady).toBe(1);
+    expect(result.dependencyWaitEscalationSuppressedStillBlocked).toBe(0);
+    expect(result.dependencyWaitEscalationSuppressedUnclassified).toBe(0);
+    expect(
+      result.dependencyWaitEscalationSuppressedDependencyReady +
+        result.dependencyWaitEscalationSuppressedStillBlocked +
+        result.dependencyWaitEscalationSuppressedUnclassified,
+    ).toBe(result.dependencyWaitEscalationSuppressed);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+
+    // Suppression must still leave the issue dispatchable and unmoved.
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after.status).toBe("in_progress");
+    expect(after.assigneeAgentId).toBe(agentId);
+  });
+
+  // A sweep that suppresses nothing must report an all-zero partition, so a stale non-zero
+  // sub-tally can never leak across passes. The three counters backing these fields are
+  // closure-scoped and shared by every sweep on this service instance — they are reported
+  // as a snapshot/diff per pass, and this pins that the diff, not the running total, is
+  // what lands on the result.
+  it("reports an all-zero dependency-wait partition on a sweep that suppresses nothing (BLO-32668)", async () => {
+    await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "job_failed",
+      runError: "External lifecycle Job failed: BackoffLimitExceeded",
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitEscalationSuppressed).toBe(0);
+    expect(result.dependencyWaitEscalationSuppressedDependencyReady).toBe(0);
+    expect(result.dependencyWaitEscalationSuppressedStillBlocked).toBe(0);
+    expect(result.dependencyWaitEscalationSuppressedUnclassified).toBe(0);
+  });
+
   // Boundary for the gate above. `issue_dependencies_blocked` is a member of
   // NON_RETRYABLE_CONTINUATION_ERROR_CODES, so an `in_review` participant run carrying it
   // used to reach the review-participant escalation — reachable in production through the
