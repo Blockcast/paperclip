@@ -403,6 +403,7 @@ import {
   recordAgentZeroTokenCompletedRunStreak,
   recordCcrotateCapacityDeferred,
   recordHeartbeatTimerSchedulerExclusion,
+  recordHeartbeatPostTerminalRunEventDropped,
   recordConcurrentRunBlocked,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
@@ -578,27 +579,6 @@ export function redactDetectedSuccessfulRunProgressSummaryForBoard(
 
 const MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS = 100;
 const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
-/**
- * Top-level payload keys that storage bounding must never drop.
- *
- * PEN-3093: the bound keeps the first `MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS` keys
- * in `Object.entries` order, and that order is NOT insertion order --
- * integer-like keys ("0", "1", ...) are enumerated first, in ascending numeric
- * order, ahead of every string key regardless of when it was inserted. So
- * building the marked payload with its markers first is not sufficient: a
- * payload carrying >100 integer-like keys pushes both markers past the slice
- * and persists a post-terminal row stripped of the only thing distinguishing
- * it from an ordinary live-run event -- with `_truncated: true` set, so the
- * loss is silent. Measured: an object keyed `detail0..detail149` keeps the
- * markers, the same object keyed `0..149` does not.
- *
- * The exemption lives here, at the slice that destroys the marker, rather than
- * being expressed as key order at the callsite, because no object literal can
- * put a string key ahead of an integer-like one. Pinning does not change
- * `_truncated`/`_omittedKeys` accounting: entries are reordered, never added or
- * removed.
- */
-const RUN_EVENT_PAYLOAD_PINNED_KEYS = ["postAdapterSettle", "adapterSettledAt"] as const;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
@@ -744,6 +724,15 @@ const MAX_SWEPT_ISSUE_LOCK_RELEASES = 1;
 const TASK_SCOPE_COALESCIBLE_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
+/**
+ * BLO-32553: the terminal-status union, named so it can be threaded through
+ * `readTerminalRunStatus` into `recordHeartbeatPostTerminalRunEventDropped`.
+ * That callsite is what makes the metric's mirrored label list in `metrics.ts`
+ * a compile-time constraint: adding a sixth status here without adding it to
+ * `KNOWN_HEARTBEAT_POST_TERMINAL_RUN_STATUSES` is a type error rather than a
+ * silent collapse to the "unknown" label.
+ */
+type HeartbeatRunTerminalStatus = (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number];
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const OPEN_ROUTINE_EXECUTION_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
@@ -1682,93 +1671,6 @@ export function selectAgedPrReviewRunForFairDispatch(
 }
 
 /**
- * Shapes an adapter runtime event's payload for persistence, marking it when it
- * arrived after the adapter's execution had already settled.
- *
- * PEN-3093: an adapter's detached timers can outlive its `execute()`. The
- * claude-local timeout grace timer is the known case -- it deliberately
- * survives `child.on("close")` so a descendant that outlived the direct child
- * still gets SIGKILLed, and it emits a truthful `kill_signal` when that kill
- * lands (BLO-32477). By then the run has terminalized. Such an event is real
- * evidence of a leaked process tree, so it is persisted rather than dropped --
- * but it is marked, so a reader can tell it apart from the live run's stream
- * instead of seeing an event that appears to postdate the run's own end.
- *
- * The adapter's own copies of those two keys are dropped rather than shadowed,
- * on both paths. The marker is the server's statement about its own run, so an
- * adapter payload must not be able to forge it -- and because storage bounding
- * now pins those key names (`RUN_EVENT_PAYLOAD_PINNED_KEYS`), an adapter-supplied
- * copy left in place on the live path would be given precedence over the
- * adapter's real evidence during truncation. Stripping is unconditional so the
- * two mechanisms cannot combine that way.
- *
- * Key ORDER here is deliberately not load-bearing, and an earlier revision of
- * this comment claimed more than order can deliver. Storage bounding keeps the
- * first `MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS` keys in `Object.entries` order,
- * which enumerates integer-like keys ahead of every string key regardless of
- * insertion order -- so putting the markers first in the literal survives a
- * payload keyed `detail0..detail149` and is stripped by one keyed `0..149`,
- * silently, with `_truncated: true` set. Since the marker is the entire
- * justification for keeping this row instead of dropping it, losing it is worse
- * than losing the row. The survival guarantee therefore lives at the slice
- * itself (see `RUN_EVENT_PAYLOAD_PINNED_KEYS`), not in this object's shape.
- *
- * Bounding the payload before marking it does NOT work either -- bounding emits
- * `_truncated`/`_omittedKeys`, so a truncated payload comes back at 102 keys and
- * appended markers are sliced off exactly as before. Measured, not assumed.
- */
-export function buildAdapterRunEventPayloadForPersistence(
-  payload: Record<string, unknown> | undefined,
-  adapterSettledAt: string | null,
-): Record<string, unknown> | undefined {
-  const carriesMarkerKeys =
-    !!payload && ("postAdapterSettle" in payload || "adapterSettledAt" in payload);
-  // Identity on the overwhelmingly common path: an ordinary live-run event is
-  // neither cloned nor reshaped.
-  if (!adapterSettledAt && !carriesMarkerKeys) return payload;
-  const { postAdapterSettle: _forged, adapterSettledAt: _forgedAt, ...rest } = payload ?? {};
-  if (!adapterSettledAt) return rest;
-  return {
-    postAdapterSettle: true,
-    adapterSettledAt,
-    ...rest,
-  };
-}
-
-/**
- * Whether an appended run event is allowed to write the run's live
- * runtime-status entry (the "this run is live, currently doing X" record that
- * `publishHeartbeatRunRuntimeProgress` pushes to subscribers).
- *
- * PEN-3093: this is a predicate rather than an inline conjunction because the
- * `run.status` half of it cannot decide the question on its own, and that was
- * not visible while the two conditions sat side by side at the callsite. `run`
- * there is a snapshot, and on the adapter path it is the one bound before
- * `execute()` ran -- so its `status` still reads "running" long after the run
- * terminalized. That gate is therefore *unconditionally* true for a
- * post-settle event, not merely sometimes: left to itself it re-creates the
- * runtime-status entry terminalization had just cleared and republishes the run
- * as live until the 90s TTL expires it.
- *
- * `adapterSettledAt` is the server's own observation, so it is the half that
- * can be trusted. Suppressing the write outright, rather than re-reading the
- * run row, is deliberate: the adapter has finished either way, so there is no
- * live progress to report even in the narrow window before the terminal status
- * is written -- a re-read would still publish there.
- *
- * This governs the runtime *status* only. The `heartbeat.run.event` publish is
- * unaffected: the event stream is an append-only record of what happened, and
- * the row carries its own `postAdapterSettle` marker.
- */
-export function shouldWriteRunRuntimeStatusForEvent(input: {
-  runStatusSnapshot: string;
-  adapterSettledAt: string | null | undefined;
-}): boolean {
-  if (input.adapterSettledAt) return false;
-  return isHeartbeatRunRuntimeStatusActive(input.runStatusSnapshot);
-}
-
-/**
  * Returns the opts to pass to `scheduleBoundedRetryForRun` for an automatic
  * retry, or undefined to use the default transient-failure opts. Called only
  * when `shouldScheduleAutomaticRunRetry` already returned true.
@@ -1776,11 +1678,11 @@ export function shouldWriteRunRuntimeStatusForEvent(input: {
 export function resolveAutomaticRunRetryOpts(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "contextSnapshot">,
 ) {
-  // NOTE: `errorCode === "timeout"` is the GENERIC code the finalizer sets for
-  // every adapter's `timed_out` outcome, and this branch sits ahead of the more
-  // specific ones below -- so any future adapter that times out inherits the
-  // 1-attempt cap without opting into it. That is latent today (only
-  // claude-local tags a timeout, via `resultJson.errorFamily`).
+  // TODO(PEN-3097): `errorCode === "timeout"` is the GENERIC code the finalizer
+  // sets for every adapter's `timed_out` outcome, and this branch sits ahead of
+  // the more specific ones below -- so any future adapter that times out
+  // inherits the 1-attempt cap without opting into it. That is latent today
+  // (only claude-local tags a timeout, via `resultJson.errorFamily`).
   //
   // Deliberately NOT narrowed to claude-local's `resultJson.timedOutBeforeOutput`
   // evidence (PEN-3093, carried-over suggestion 2). It is feasible -- `resultJson`
@@ -4137,33 +4039,6 @@ function truncateRunEventString(value: string) {
   return `${value.slice(0, MAX_RUN_EVENT_PAYLOAD_STRING_CHARS)}\n[truncated ${omittedChars} chars]`;
 }
 
-/**
- * Moves `RUN_EVENT_PAYLOAD_PINNED_KEYS` to the front of the top-level payload's
- * entries so the key-count slice cannot drop them, preserving the relative
- * order of everything else.
- *
- * Only the top level (`depth === 0`) is reordered. The pinned names are the
- * server's markers on the payload it is persisting, so a nested object that
- * happens to carry the same key is an adapter's own data and gets no
- * precedence.
- */
-function orderRunEventEntriesForBounding(
-  entries: [string, unknown][],
-  depth: number,
-): [string, unknown][] {
-  if (depth !== 0 || entries.length <= MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS) return entries;
-  const pinned = entries.filter(([key]) =>
-    (RUN_EVENT_PAYLOAD_PINNED_KEYS as readonly string[]).includes(key),
-  );
-  if (pinned.length === 0) return entries;
-  return [
-    ...pinned,
-    ...entries.filter(
-      ([key]) => !(RUN_EVENT_PAYLOAD_PINNED_KEYS as readonly string[]).includes(key),
-    ),
-  ];
-}
-
 function boundRunEventValue(value: unknown, depth: number, seen: WeakSet<object>): unknown {
   if (typeof value === "string") {
     return truncateRunEventString(value);
@@ -4204,10 +4079,7 @@ function boundRunEventValue(value: unknown, depth: number, seen: WeakSet<object>
     return "[Circular]";
   }
   seen.add(value);
-  const entries = orderRunEventEntriesForBounding(
-    Object.entries(value as Record<string, unknown>),
-    depth,
-  );
+  const entries = Object.entries(value as Record<string, unknown>);
   if (depth >= MAX_RUN_EVENT_PAYLOAD_DEPTH) {
     const bounded = {
       _truncated: true,
@@ -15679,10 +15551,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // transaction that allocated `seq`, so allocation and append share one
     // owner. Defaults to the pool, which is every pre-existing caller.
     executor: HeartbeatDbExecutor = db,
-    // PEN-3093: set only by the post-adapter-settle branch of
-    // `onAdapterEvent`. See `shouldWriteRunRuntimeStatusForEvent` for what it
-    // changes and why the `run.status` gate cannot decide it alone.
-    opts: { adapterSettledAt?: string | null } = {},
   ): Promise<{ publish: () => void }> {
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
@@ -15737,16 +15605,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           payload: sanitizedPayload ?? null,
         },
       });
-      // `progress` is checked here rather than inside the predicate so it
-      // narrows for the block below; the predicate carries the two conditions
-      // that were getting this wrong (PEN-3093).
-      if (
-        progress
-        && shouldWriteRunRuntimeStatusForEvent({
-          runStatusSnapshot: run.status,
-          adapterSettledAt: opts.adapterSettledAt ?? null,
-        })
-      ) {
+      if (progress && isHeartbeatRunRuntimeStatusActive(run.status)) {
         const status = setHeartbeatRunRuntimeStatus({
           companyId: run.companyId,
           issueId,
@@ -15785,6 +15644,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   /**
+   * BLO-32553: return the run's status if it is terminal, else null.
+   *
+   * Reads the row rather than trusting the in-memory `currentRun` snapshot,
+   * which was captured while the run was still "running" and is therefore
+   * useless for this question.
+   *
+   * Scope, stated precisely because the obvious reading is wrong: this is
+   * called only from the late-event branch of `onAdapterEvent`, which is
+   * unreachable until adapter execution has settled. So it does NOT observe a
+   * run terminalized by another process (cancel route, recovery sweep) *while*
+   * `execute()` is still running — those events take the fast path and are
+   * still appended. Covering that would need a status read per event on the
+   * hot path; it is a pre-existing gap, not one this guard closes.
+   *
+   * The return type is the terminal-status union rather than `string` so the
+   * value can be handed to `recordHeartbeatPostTerminalRunEventDropped`
+   * without widening its label domain.
+   */
+  async function readTerminalRunStatus(runId: string): Promise<HeartbeatRunTerminalStatus | null> {
+    const [row] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    const status = row?.status ?? null;
+    return status && isHeartbeatRunTerminalStatus(status) ? status : null;
+  }
+
+  /**
    * Allocate the next event sequence and append the event under one owner
    * (BLO-19722).
    *
@@ -15816,8 +15703,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       message?: string;
       payload?: Record<string, unknown>;
     },
-    // PEN-3093: forwarded verbatim to `appendRunEvent`; see its own `opts`.
-    opts: { adapterSettledAt?: string | null } = {},
   ) {
     // BLO-19722: publish is deferred out of the transaction and invoked here,
     // after `db.transaction` has committed — see the comment on
@@ -15831,7 +15716,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .select({ maxSeq: sql<number | null>`max(${heartbeatRunEvents.seq})` })
         .from(heartbeatRunEvents)
         .where(eq(heartbeatRunEvents.runId, run.id));
-      const appended = await appendRunEvent(run, Number(row?.maxSeq ?? 0) + 1, event, tx, opts);
+      const appended = await appendRunEvent(run, Number(row?.maxSeq ?? 0) + 1, event, tx);
       // Test-only: the append has succeeded but the transaction has not
       // committed. Throwing here is the only way to reach the rollback-after-
       // successful-insert case, which is precisely the one where publishing
@@ -28515,6 +28400,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
 
     let seq = await nextRunEventSeq(run.id);
+    // BLO-32553: flipped in the `finally` that wraps adapter execution below.
+    // `onEvent` is only valid for the duration of `adapter.execute`; once that
+    // has settled (through every ccrotate retry), any further event is late by
+    // the adapter contract and must be checked against the run's real status
+    // before it is appended. Kept as a closure flag so the check costs nothing
+    // on the hot in-flight path.
+    let adapterExecutionSettled = false;
     let handle: RunLogHandle | null = null;
     let stdoutExcerpt = "";
     let stderrExcerpt = "";
@@ -28855,76 +28747,131 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       };
 
-      // Set once the adapter's execution has settled on any path (returned,
-      // threw, or the retry loop broke out). The adapter's own timers can
-      // outlive that: the timeout grace timer deliberately survives
-      // `child.on("close")` so a descendant that outlived the direct child is
-      // still SIGKILLed, and it emits a truthful `kill_signal` when that kill
-      // lands (BLO-32477). By then the run has terminalized, so the event
-      // would either append to an already-terminal run or vanish into
-      // `emitLifecycle`'s `.catch`. That event is real evidence of a leaked
-      // process tree, so it is kept -- but it must not be persisted as if it
-      // were part of the live run, which takes three things and not just the
-      // payload marker: the marker itself, a sequence allocated from the row
-      // rather than from this invocation's counter, and suppression of the
-      // runtime-status write that would otherwise republish the run as live.
-      // See the late branch of `onAdapterEvent` below.
-      let adapterExecutionSettledAt: string | null = null;
-
+      // BLO-32553: reject-and-count guard for events that arrive after the run
+      // has already terminalized.
+      //
+      // `onEvent` is contractually valid only for the duration of
+      // `adapter.execute`. An adapter that fires it from a detached continuation
+      // outliving execute() — the orphan-SIGKILL path — would otherwise append to
+      // a run at a terminal status. The damage is not just a stray row:
+      // `appendRunEvent`'s publish() gates its runtime-status write on
+      // `isHeartbeatRunRuntimeStatusActive(run.status)`, and `run.status` there is
+      // the stale in-memory `currentRun` snapshot taken while the run was still
+      // "running". A late append therefore passes that gate and resurrects the
+      // runtime status `setRunStatus` cleared on terminalization, leaving a
+      // phantom live run that nothing will clear again.
+      //
+      // Two tiers so the hot path pays nothing: the closure flag is free and
+      // false for every in-flight event, so only a genuinely late event reaches
+      // the status read. Note this deliberately does NOT throw — a rejected late
+      // event is therefore distinguishable at the adapter's callsite from a
+      // transport error, which does throw.
       const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
         const eventType = event.eventType.trim();
         if (!eventType) return;
-        const settledAt = adapterExecutionSettledAt;
-        const runEvent = {
+        if (adapterExecutionSettled) {
+          // Neither the status read nor the sanitization below may reject. Both
+          // touch the DB (`readTerminalRunStatus` selects the run;
+          // `getCurrentUserRedactionOptions` reads instance settings), and the
+          // caller on this path is by definition a continuation that outlived
+          // `adapter.execute` — so there may be nothing awaiting this promise
+          // and an escaping rejection would be an unhandled one.
+          //
+          // A read failure is treated as a drop rather than as "not terminal":
+          // the event is already outside the `onEvent` contract, and appending
+          // on an unverifiable status risks the runtime-status resurrection
+          // described above, which nothing else clears. Passing `null` to the
+          // counter collapses to its "unknown" label, so a read failure stays
+          // distinguishable from a confirmed post-terminal drop.
+          let terminalStatus: HeartbeatRunTerminalStatus | null = null;
+          let statusReadError: unknown = null;
+          try {
+            terminalStatus = await readTerminalRunStatus(currentRun.id);
+          } catch (error) {
+            statusReadError = error;
+          }
+          if (terminalStatus || statusReadError) {
+            // This log is the substitute for the row that is deliberately not
+            // written, so it must not be a *less* redacted substitute than the
+            // storage path. Mirror `appendRunEvent`'s four sanitizations in the
+            // same order: adapter-supplied message/payload are exactly the
+            // threat model those helpers exist for (secrets, size, user PII).
+            let sanitizedMessage: string | null = null;
+            let sanitizedPayload: Record<string, unknown> | null = null;
+            let sanitizationError: unknown = null;
+            try {
+              const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+              sanitizedMessage = event.message
+                ? redactCurrentUserText(event.message, currentUserRedactionOptions)
+                : null;
+              const boundedPayload = event.payload
+                ? boundHeartbeatRunEventPayloadForStorage(event.payload)
+                : null;
+              sanitizedPayload = boundedPayload
+                ? redactCurrentUserValue(redactEventPayload(boundedPayload), currentUserRedactionOptions)
+                : null;
+            } catch (error) {
+              // Sanitization failed, so nothing adapter-supplied is safe to log.
+              // Drop the message/payload rather than fall back to the raw values.
+              sanitizationError = error;
+              sanitizedMessage = null;
+              sanitizedPayload = null;
+            }
+            // The counter and the log are this path's only two reporting
+            // channels, and both can throw exactly where the AC's "not lost
+            // silently" clause needs them not to: `ensureRegistry()` constructs
+            // its counters on first call, and a logger transport can fail. They
+            // are guarded independently rather than inside one `try`, so a
+            // metrics failure is still reported — through the log, as
+            // `metricErr` — instead of suppressing the log along with itself.
+            let metricError: unknown = null;
+            try {
+              recordHeartbeatPostTerminalRunEventDropped(terminalStatus);
+            } catch (error) {
+              metricError = error;
+            }
+            try {
+              logger.warn(
+                {
+                  runId: currentRun.id,
+                  agentId: currentRun.agentId,
+                  companyId: currentRun.companyId,
+                  terminalStatus,
+                  // Truncated to match the storage path's `eventType.slice(0, 120)`
+                  // below. The log stands in for the row that is not written, so
+                  // an adapter must not be able to put a longer string through it
+                  // than storage would have accepted.
+                  eventType: eventType.slice(0, 120),
+                  stream: event.stream ?? null,
+                  level: event.level ?? null,
+                  message: sanitizedMessage,
+                  payload: sanitizedPayload,
+                  ...(statusReadError ? { err: statusReadError } : {}),
+                  ...(sanitizationError ? { sanitizationErr: sanitizationError } : {}),
+                  ...(metricError ? { metricErr: metricError } : {}),
+                },
+                statusReadError
+                  ? "dropped adapter run event after failing to read the run's status (BLO-32553)"
+                  : "dropped adapter run event delivered after the run reached a terminal status (BLO-32553)",
+              );
+            } catch {
+              // Both reporting channels have now failed, so there is nothing
+              // left that could record this drop. Rejecting instead would
+              // surface as an unhandled rejection in a continuation with nothing
+              // awaiting it — the precise failure this branch exists to avoid.
+              // The event is still correctly dropped; only its evidence is lost.
+            }
+            return;
+          }
+        }
+        await appendRunEvent(currentRun, seq++, {
           eventType: eventType.slice(0, 120),
           stream: event.stream,
           level: event.level,
           color: event.color,
           message: event.message,
-          payload: buildAdapterRunEventPayloadForPersistence(event.payload, settledAt),
-        };
-        if (settledAt) {
-          const stage = event.payload?.stage;
-          logger.warn(
-            {
-              runId: currentRun.id,
-              agentId: currentRun.agentId,
-              companyId: currentRun.companyId,
-              eventType,
-              stage: typeof stage === "string" ? stage : null,
-              adapterSettledAt: settledAt,
-            },
-            "adapter runtime event arrived after the adapter execution settled; persisting it with a post-terminal marker",
-          );
-          // Allocate the sequence from the row, not from `seq`. The closure
-          // counter is never synchronised with the row: it tracks only what
-          // THIS invocation has appended, while every other writer allocates
-          // with `nextRunEventSeq` -- `max(seq) + 1` -- and so consumes the
-          // very number `seq++` would hand out next. A collision lands on a
-          // position another row already holds, silently, since
-          // `heartbeat_run_events_run_seq_idx` is a plain index with no unique
-          // constraint (BLO-19722). `appendRunEventAtomicSeq` allocates under
-          // the per-run advisory lock instead. It costs a transaction, which is
-          // irrelevant on a path only a leaked process tree reaches.
-          //
-          // Post-settle this is a certainty rather than a race -- the outcome
-          // pipeline has already appended its own lifecycle events, so `seq` is
-          // known stale. But do not read that as "this invocation was the sole
-          // writer until it settled": it never was. The detached-handle
-          // reconciler re-sets a run to "running" and appends to it (see
-          // `DETACHED_PROCESS_ERROR_CODE`) from a sweep that runs on every
-          // replica, so it can write to a run whose adapter is still live in
-          // another process. The on-time `seq++` below therefore carries the
-          // same hazard in that mid-run window; it is far rarer and is
-          // deliberately not fixed here, but it is not safe by construction.
-          //
-          // `adapterSettledAt` additionally suppresses the runtime-status
-          // write, so the marked event cannot republish the run as live --
-          // see `shouldWriteRunRuntimeStatusForEvent`.
-          await appendRunEventAtomicSeq(currentRun, runEvent, { adapterSettledAt: settledAt });
-          return;
-        }
-        await appendRunEvent(currentRun, seq++, runEvent);
+          payload: event.payload,
+        });
       };
 
       const adapter = getServerAdapter(agent.adapterType);
@@ -29505,11 +29452,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         throw adapterErr;
       } finally {
-        // The adapter's execution is over on every path that reaches here.
-        // Anything its detached timers emit from now on is post-terminal --
-        // see `onAdapterEvent`, which marks and logs such an event instead of
-        // letting it append silently or be swallowed upstream.
-        adapterExecutionSettledAt ??= new Date().toISOString();
+        // BLO-32553: adapter execution has settled (returned or thrown, after
+        // every ccrotate retry). Anything `onEvent` delivers from here on is a
+        // late event from a continuation that outlived execute().
+        adapterExecutionSettled = true;
         if (branchClaimRenewalTimer) {
           clearInterval(branchClaimRenewalTimer);
         }

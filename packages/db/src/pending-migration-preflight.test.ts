@@ -20,11 +20,14 @@ import { readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import {
   PRECREATE_REQUIRED_INDEXES,
+  collectPreflightBlockers,
   decidePreflightBlocker,
   formatPreflightFailure,
   selectGuardedPendingIndexes,
+  type IndexProbe,
   type PrecreateRequiredIndex,
   type PreflightBlocker,
+  type PreflightProbes,
   type TablePopulation,
 } from "./pending-migration-preflight.js";
 
@@ -340,6 +343,223 @@ describe("decidePreflightBlocker", () => {
   });
 });
 
+describe("collectPreflightBlockers", () => {
+  const heartbeatSpecs = PRECREATE_REQUIRED_INDEXES.filter((spec) => spec.table === "heartbeat_runs");
+  const issuesSpecs = PRECREATE_REQUIRED_INDEXES.filter((spec) => spec.table === "issues");
+
+  // Both probes are reads with no effects, so their *verdict* is covered by
+  // `decidePreflightBlocker` above and what is left to pin is how many times
+  // each one is issued. That is invisible in the output by construction: a
+  // regression here changes no blocker, only round trips.
+  function recordingProbes(
+    indexFor: (name: string) => IndexProbe,
+    populationFor: (table: string) => TablePopulation = () => "populated",
+  ) {
+    const indexCalls: string[] = [];
+    const populationCalls: string[] = [];
+    return {
+      indexCalls,
+      populationCalls,
+      probes: {
+        index: async (name: string) => {
+          indexCalls.push(name);
+          return indexFor(name);
+        },
+        population: async (table: string) => {
+          populationCalls.push(table);
+          return populationFor(table);
+        },
+      },
+    };
+  }
+
+  it("skips the population probe entirely when every index is usable", async () => {
+    const { probes, indexCalls, populationCalls } = recordingProbes(() => ({ exists: true, usable: true }));
+
+    const blockers = await collectPreflightBlockers(PRECREATE_REQUIRED_INDEXES, probes);
+
+    expect(blockers).toEqual([]);
+    // Every index still probed — the short-circuit is per-spec, not a bail-out.
+    expect(indexCalls).toHaveLength(PRECREATE_REQUIRED_INDEXES.length);
+    // The point of the short-circuit: a fully-indexed database costs zero
+    // population round trips, not one per distinct table.
+    expect(populationCalls).toEqual([]);
+  });
+
+  it("still resolves population when an index is absent", async () => {
+    // The other direction. A short-circuit that skipped too eagerly would
+    // leave the absent-index path unable to tell an empty table from a
+    // populated one, which is the whole BLO-31746 exemption.
+    const { probes, populationCalls } = recordingProbes(
+      () => ({ exists: false, usable: false }),
+      () => "populated",
+    );
+
+    const blockers = await collectPreflightBlockers(heartbeatSpecs, probes);
+
+    expect(populationCalls).toEqual(["heartbeat_runs"]);
+    expect(blockers.map((blocker) => blocker.state)).toEqual(heartbeatSpecs.map(() => "absent"));
+  });
+
+  it("probes each distinct table once across specs that share it", async () => {
+    const { probes, populationCalls } = recordingProbes(() => ({ exists: false, usable: false }));
+
+    await collectPreflightBlockers(PRECREATE_REQUIRED_INDEXES, probes);
+
+    // Seven heartbeat_runs entries and two issues entries collapse to two
+    // probes. Asserted as a set-with-count so adding a registry entry on an
+    // existing table does not move this number.
+    expect(populationCalls.sort()).toEqual(["heartbeat_runs", "issues"]);
+    expect(heartbeatSpecs.length + issuesSpecs.length).toBe(PRECREATE_REQUIRED_INDEXES.length);
+  });
+
+  it("memoizes an empty table rather than re-probing it per spec", async () => {
+    // The exempting direction has to be memoized too, or the saving vanishes
+    // exactly on the fresh bootstrap this all exists for.
+    const { probes, populationCalls } = recordingProbes(
+      () => ({ exists: false, usable: false }),
+      () => "empty",
+    );
+
+    expect(await collectPreflightBlockers(heartbeatSpecs, probes)).toEqual([]);
+    expect(populationCalls).toEqual(["heartbeat_runs"]);
+  });
+
+  it("keeps a half-built index a blocker on every registered entry", async () => {
+    // A half-built index must not be short-circuited: it is not `usable`, so
+    // it falls through to the same decision path and still blocks.
+    //
+    // Deliberately asserts the verdict and *not* the probe counts. A half-built
+    // index reaches `decidePreflightBlocker` with `index.exists` true, which
+    // returns before reading `table` — so eliding its population probe too
+    // would be a legitimate further optimisation, and pinning the current count
+    // here would cement an incidental round trip as required behaviour. The
+    // equivalence test below is what protects this path.
+    const { probes } = recordingProbes(
+      () => ({ exists: true, usable: false }),
+      () => "empty",
+    );
+
+    const blockers = await collectPreflightBlockers(PRECREATE_REQUIRED_INDEXES, probes);
+
+    expect(blockers).toHaveLength(PRECREATE_REQUIRED_INDEXES.length);
+    for (const blocker of blockers) expect(blocker.state).toBe("build-incomplete");
+  });
+
+  it("mixes usable and absent indexes without cross-contaminating verdicts", async () => {
+    const [first, ...rest] = heartbeatSpecs;
+    const { probes, populationCalls } = recordingProbes(
+      (name) => ({ exists: name !== first.name, usable: name !== first.name }),
+      () => "populated",
+    );
+
+    const blockers = await collectPreflightBlockers(heartbeatSpecs, probes);
+
+    expect(blockers.map((blocker) => blocker.migration)).toEqual([first.migration]);
+    expect(rest.length).toBeGreaterThan(0);
+    expect(populationCalls).toEqual(["heartbeat_runs"]);
+  });
+
+  /**
+   * Probes unconditionally, exactly as the scan did before the short-circuit
+   * and the per-table memo were introduced. Kept deliberately naive: it is the
+   * oracle, so it must not share the optimisations it is checking.
+   */
+  async function referenceCollect(
+    guarded: readonly PrecreateRequiredIndex[],
+    probes: PreflightProbes,
+  ): Promise<readonly PreflightBlocker[]> {
+    const blockers: PreflightBlocker[] = [];
+    for (const spec of guarded) {
+      const index = await probes.index(spec.name);
+      const population = await probes.population(spec.table);
+      const blocker = decidePreflightBlocker(spec, index, population);
+      if (blocker) blockers.push(blocker);
+    }
+    return blockers;
+  }
+
+  it("agrees with an unconditionally-probing reference across the whole state space", async () => {
+    // The call-count tests above pin the *optimisation*; this pins the
+    // *equivalence*, which is the property that actually matters and the one a
+    // future refactor is most likely to break. They would all still pass if the
+    // short-circuit moved somewhere subtler than a `continue` and started
+    // eliding a probe whose value changed the verdict — this would not.
+    //
+    // `{ exists: false, usable: true }` is omitted on purpose: `probeIndex`
+    // cannot produce it (a row absent from `pg_index` yields both false), so
+    // asserting over it would pin behaviour for a state the system never has.
+    const indexStates: readonly IndexProbe[] = [
+      { exists: false, usable: false },
+      { exists: true, usable: false },
+      { exists: true, usable: true },
+    ];
+    const populations: readonly TablePopulation[] = ["absent", "empty", "populated"];
+
+    // Guards the guard, as at the per-spec test below. Over a *uniform* index
+    // state most cells are legitimately empty on both sides, so a reference
+    // that returned `[]` unconditionally would pass five of the nine. Only
+    // these four carry signal: absent×populated, and all three half-built rows
+    // (`decidePreflightBlocker` returns build-incomplete before reading
+    // `table`). Counting them makes the sweep fail loudly if a registry or
+    // decision-function change silently moves which cells assert anything.
+    let cellsWithSignal = 0;
+
+    for (const index of indexStates) {
+      for (const population of populations) {
+        const actual = await collectPreflightBlockers(
+          PRECREATE_REQUIRED_INDEXES,
+          recordingProbes(
+            () => index,
+            () => population,
+          ).probes,
+        );
+        const expected = await referenceCollect(
+          PRECREATE_REQUIRED_INDEXES,
+          recordingProbes(
+            () => index,
+            () => population,
+          ).probes,
+        );
+
+        expect(actual, `index=${JSON.stringify(index)} population=${population}`).toEqual(expected);
+        if (actual.length > 0) cellsWithSignal += 1;
+      }
+    }
+
+    expect(cellsWithSignal).toBe(4);
+  });
+
+  it("agrees with the reference when index state and population both vary per spec", async () => {
+    // The uniform sweep above cannot catch cross-contamination between specs,
+    // which is the failure mode a memo or a misplaced `continue` actually
+    // produces. Deterministic per-spec variation, so a failure is reproducible.
+    const indexStates: readonly IndexProbe[] = [
+      { exists: false, usable: false },
+      { exists: true, usable: false },
+      { exists: true, usable: true },
+    ];
+    const orderedNames = PRECREATE_REQUIRED_INDEXES.map((spec) => spec.name);
+    const indexFor = (name: string) => indexStates[orderedNames.indexOf(name) % indexStates.length];
+    const populationFor = (table: string): TablePopulation => (table === "issues" ? "empty" : "populated");
+
+    const actual = await collectPreflightBlockers(
+      PRECREATE_REQUIRED_INDEXES,
+      recordingProbes(indexFor, populationFor).probes,
+    );
+    const expected = await referenceCollect(
+      PRECREATE_REQUIRED_INDEXES,
+      recordingProbes(indexFor, populationFor).probes,
+    );
+
+    expect(actual).toEqual(expected);
+    // Guards the guard: a sweep that produced no blockers at all would agree
+    // with any reference, so this test has to be shown to be exercising both.
+    expect(actual.length).toBeGreaterThan(0);
+    expect(actual.length).toBeLessThan(PRECREATE_REQUIRED_INDEXES.length);
+  });
+});
+
 describe("guarded migrations gate their raise on table population", () => {
   it("gates only the absent-index path on emptiness, never the structural one", async () => {
     // `decidePreflightBlocker` exempts an empty table for an *absent* index and
@@ -348,10 +568,10 @@ describe("guarded migrations gate their raise on table population", () => {
     //
     // Keyed on the two remediations rather than on branch syntax: the family
     // spells the same logic as both `IF/ELSE` (0209) and `IF/ELSIF` (0205) —
-    // four registered files use `ELSIF`, three use `ELSE`, and 0236 uses
+    // four registered files use `ELSIF`, four use `ELSE`, and 0236 uses
     // neither — so an `ELSE`-matching detector silently passes on five of the
-    // eight. The mismatch raise is identifiable by its `DROP INDEX
-    // CONCURRENTLY` hint.
+    // nine (the four `ELSIF` files plus 0236). The mismatch raise is
+    // identifiable by its `DROP INDEX CONCURRENTLY` hint.
     //
     // Comments are stripped before searching, and the hint is asserted unique.
     // Both matter: 0237 mentions `DROP INDEX CONCURRENTLY` in prose 61 lines
@@ -382,8 +602,9 @@ describe("guarded migrations gate their raise on table population", () => {
       // safe: every one of these files opens with a multiline
       // `EXISTS (\n SELECT 1\n FROM pg_index ...)` structural probe, and a
       // pattern ending at a bare `FROM` matches that too — it sits ahead of
-      // the hint and would fail the ordering assertion on all eight files. An
-      // emptiness check is by definition a check on the guarded table.
+      // the hint and would fail the ordering assertion on every registered
+      // file. An emptiness check is by definition a check on the guarded
+      // table.
       const emptinessChecks = [
         ...sql.matchAll(
           new RegExp(`EXISTS\\s*\\(\\s*SELECT\\s+\\S+\\s+FROM\\s+"?${spec.table}"?`, "g"),
