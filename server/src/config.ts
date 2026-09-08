@@ -442,6 +442,18 @@ export const NUMERIC_SETTING_BOUNDS = {
     min: 1,
     max: TIMER_PERIOD_MINUTES_MAX,
   },
+  // BLO-24631. Hourly by default: enforced state (budget policies, permission
+  // grants, repo settings) changes rarely, and each pass is a couple of indexed
+  // reads plus one read per approved card carrying a machine-checkable
+  // assertion. The ceiling matters more than the cadence here — this reconciler
+  // is the thing that notices an approved decision never reached its enforcing
+  // object, so an unbounded period turns the detector itself into the silent
+  // failure it was built to catch.
+  approvalEnforcementReconcilerIntervalMinutes: {
+    fallback: 60,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
   heartbeatSchedulerIntervalMs: { fallback: 30_000, min: 10_000, max: 24 * 60 * 60_000 },
   recoveryActionMaxAttempts: { fallback: 5, min: 1, max: 1_000 },
   recoveryActionTimeoutMs: {
@@ -514,6 +526,7 @@ export const TIMER_SETTING_MS_FACTOR = {
   humanGatedDigestIntervalMinutes: 60_000,
   prReviewStateReconcilerIntervalMinutes: 60_000,
   approvalGateReconcilerIntervalMinutes: 60_000,
+  approvalEnforcementReconcilerIntervalMinutes: 60_000,
   heartbeatSchedulerIntervalMs: 1,
 } as const satisfies Partial<Record<keyof typeof NUMERIC_SETTING_BOUNDS, number>>;
 
@@ -927,13 +940,25 @@ export function loadConfig(): Config {
     process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_ENABLED !== undefined
       ? process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_ENABLED === "true"
       : true;
-  const approvalEnforcementReconcilerIntervalMinutes = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_INTERVAL_MINUTES) || 60,
+  const approvalEnforcementReconcilerIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.approvalEnforcementReconcilerIntervalMinutes,
+    "approvalEnforcementReconcilerIntervalMinutes",
   );
   // `0` is a valid, documented grace: report drift on the first pass after the
   // decision. It therefore has to survive parsing rather than be folded into
   // the 6h default the way `|| 6` would fold it.
+  //
+  // Deliberately NOT migrated to `resolveNumericSetting` alongside the interval
+  // above, though the review suggested it: that helper rejects any override
+  // `<= 0` as "not a finite positive number" (see its candidate loop) and falls
+  // through to the fallback, so the documented `0` would silently resolve to 6.
+  // The bound it would buy is real but smaller than it looks — `numericEnv`
+  // already rejects non-finite input, so `Infinity`/`1e999` cannot get through
+  // here, and this value is an elapsed-hours comparison rather than a timer
+  // delay, so it cannot overflow `setInterval`. A valid-zero bounded setting
+  // needs a resolver that separates "absent" from "zero"; until one exists,
+  // converting this trades a documented behaviour for a smaller guarantee.
   const approvalEnforcementReconcilerGraceHours = Math.max(
     0,
     numericEnv(process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_GRACE_HOURS, 6),

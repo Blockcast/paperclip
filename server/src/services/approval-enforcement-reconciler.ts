@@ -468,13 +468,19 @@ function buildDriftIssueBody(input: {
  * board-filed card has no owner inside the agent org, and the CEO is the org's
  * interface to the board.
  *
- * Ordering mirrors the established escalation-owner lookups in
- * `recovery/service.ts` and `productivity-review.ts` so the pick is stable
- * across replicas when a company has more than one CEO-role row. Deliberately
- * NOT gated on invokability or budget: unlike those call sites, which wake an
- * agent immediately, this only needs an assignee the heartbeat can select
- * later — and failing the lookup suppresses the issue entirely (see the caller),
- * so a transiently over-budget CEO must not silence drift reporting.
+ * The `(createdAt, id)` tie-break mirrors the established escalation-owner
+ * lookups in `recovery/service.ts` and `productivity-review.ts`, so the pick is
+ * stable across replicas when a company has more than one CEO-role row. Only
+ * the ordering is shared: those call sites select `inArray(role, ["cto","ceo"])`
+ * and this one matches `role = "ceo"` alone, because the CEO is the terminus on
+ * remit grounds — widening it to the engineering lane would re-point a
+ * board-filed card at an owner the ruling deliberately excluded. Read "mirrors"
+ * as covering the tie-break and not the role set.
+ *
+ * Deliberately NOT gated on invokability or budget: unlike those call sites,
+ * which wake an agent immediately, this only needs an assignee the heartbeat can
+ * select later — and failing the lookup suppresses the issue entirely (see the
+ * caller), so a transiently over-budget CEO must not silence drift reporting.
  */
 async function resolveDriftIssueOwnerAgentId(db: Db, companyId: string): Promise<string | null> {
   const [owner] = await db
