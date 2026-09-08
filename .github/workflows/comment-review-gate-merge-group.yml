@@ -14,10 +14,18 @@ name: Comment-review gate (merge queue)
 # that missing writer, and it is the prerequisite for the required-check step,
 # not a replacement for it.
 #
-# DELIBERATELY NOT MARKED REQUIRED BY THIS CHANGE. Landing the writer is
-# observe-only: it adds a status to queue heads and changes no merge behaviour.
-# Requiring it is a separate, human, branch-protection action that should happen
-# only once this has been seen writing real verdicts on real queue refs.
+# DELIBERATELY NOT MARKED REQUIRED BY THIS CHANGE. The status this writes gates
+# nothing until a human marks the context required in branch protection, which
+# is a separate action that should happen only once this has been seen writing
+# real verdicts on real queue refs.
+#
+# That is NOT the same as "changes no merge behaviour", and the distinction
+# matters: this is itself a merge_group check, so if the JOB fails the entry is
+# ejected under ALLGREEN whatever the status says. Adding a job to the queue is
+# adding a way for a queue entry to die. That is precisely why the script fails
+# OPEN on everything it can (see its FAILURE POSTURE header) and exits non-zero
+# only where no status could be written at all -- the cases where exiting 0
+# would just buy the same ejection six hours later.
 
 on:
   merge_group:
