@@ -10,10 +10,26 @@ const repoRoot = path.resolve(
   "../../../..",
 );
 const dockerfile = readFileSync(path.join(repoRoot, "Dockerfile"), "utf8");
+const agentDockerfile = readFileSync(
+  path.join(repoRoot, "Dockerfile.agent"),
+  "utf8",
+);
+const dockerWorkflow = readFileSync(
+  path.join(repoRoot, ".github/workflows/docker.yml"),
+  "utf8",
+);
 const runbook = readFileSync(
   path.join(repoRoot, "docs/runbooks/penstock-claude-local-rollout.md"),
   "utf8",
 );
+
+function dockerStage(name) {
+  const lines = dockerfile.split("\n");
+  const start = lines.findIndex((line) => line === `FROM base AS ${name}`);
+  assert.notEqual(start, -1, `Dockerfile stage ${name} is present`);
+  const end = lines.findIndex((line, index) => index > start && /^FROM /.test(line));
+  return lines.slice(start, end === -1 ? lines.length : end).join("\n");
+}
 
 function renderStatefulSet() {
   return execFileSync(
@@ -33,8 +49,37 @@ function renderStatefulSet() {
   );
 }
 
-test("production image pins the Caveman proxy", () => {
-  assert.match(dockerfile, /--mount=type=secret,id=gh_token/);
+test("production image packages the pinned launcher and Caveman proxy", () => {
+  const launcherStage = dockerStage("penstock-agent-runtime");
+  assert.match(
+    launcherStage,
+    /--mount=type=secret,id=penstock_runtime_token/,
+  );
+  assert.doesNotMatch(
+    launcherStage,
+    /--mount=type=secret,id=gh_token(?:[^_a-zA-Z0-9]|$)/,
+  );
+  assert.match(launcherStage, /test -s \/run\/secrets\/penstock_runtime_token/);
+  assert.match(
+    dockerfile,
+    /ARG PENSTOCK_RUNTIME_REF=2823acc1b4d730a86aded6b228f748aa12f40f53/,
+  );
+  assert.match(
+    dockerfile,
+    /ARG PENSTOCK_RUNTIME_SHA256=fa6c923f78900919ec6fd3cbfe1c878078dab267e82e5faaa695d0c49f50f29e/,
+  );
+  assert.match(
+    launcherStage,
+    /raw\.githubusercontent\.com\/Blockcast\/penstock-llm-proxy-core\//,
+  );
+  assert.match(
+    launcherStage,
+    /\$\{PENSTOCK_RUNTIME_REF\}\/scripts\/penstock-agent-runtime\.mjs/,
+  );
+  assert.match(
+    dockerfile,
+    /COPY --from=penstock-agent-runtime \/opt\/penstock\/bin\/penstock-agent-runtime\.mjs/,
+  );
   assert.match(dockerfile, /ARG CAVEMAN_RELEASE=bin-v1\.1\.6/);
   assert.match(
     dockerfile,
@@ -47,24 +92,38 @@ test("production image pins the Caveman proxy", () => {
   assert.match(dockerfile, /SHA256 mismatch[\s\S]*expected[\s\S]*received/);
   assert.doesNotMatch(dockerfile, /sha256sum --check --status/);
   assert.match(dockerfile, /COPY --from=caveman-proxy \/usr\/local\/bin\/caveman-proxy/);
-  assert.doesNotMatch(dockerfile, /PENSTOCK_API_KEY=/);
+  assert.doesNotMatch(dockerfile, /PENSTOCK_API_KEY\s*=\s*[^$\s]/);
+  assert.doesNotMatch(agentDockerfile, /PENSTOCK_API_KEY\s*=\s*[^$\s]/);
 });
 
-// BLO-32824. The `penstock-agent-runtime` stage was removed to restore a green
-// master build: it fetched the `Blockcast/*` private repo using the `gh_token`
-// BuildKit secret, which is `PAPERCLIP_BOARD_TOKEN` — a PAT provisioned for the
-// `kkroo/*` vendor clones and with no read on that org repo. Guard the defect
-// rather than the absence, so a re-land carrying a correctly-scoped credential
-// passes this unchanged.
-test("penstock launcher is never fetched with the kkroo-scoped vendor credential", () => {
-  const stage = dockerfile.match(
-    /FROM base AS penstock-agent-runtime[\s\S]*?(?=\nFROM |\n#|$)/,
+test("the Docker workflow keeps launcher credentials separate from vendor credentials", () => {
+  assert.match(
+    dockerWorkflow,
+    /gh_token=\$\{\{ secrets\.PAPERCLIP_BOARD_TOKEN \}\}/,
   );
-  if (!stage) return;
+  assert.match(
+    dockerWorkflow,
+    /penstock_runtime_token=\$\{\{ secrets\.PENSTOCK_RUNTIME_TOKEN \}\}/,
+  );
   assert.doesNotMatch(
-    stage[0],
-    /--mount=type=secret,id=gh_token(?![_a-zA-Z0-9])/,
-    "penstock-agent-runtime must not reuse gh_token (PAPERCLIP_BOARD_TOKEN): it cannot read Blockcast/penstock-llm-proxy-core, and GitHub answers 404 not 403 — see BLO-32824",
+    dockerWorkflow,
+    /penstock_runtime_token=\$\{\{ secrets\.PAPERCLIP_BOARD_TOKEN \}\}/,
+  );
+});
+
+test("the agent overlay carries every packaged Penstock runtime asset", () => {
+  assert.ok(
+    agentDockerfile.includes(
+      "COPY --from=server /opt/penstock/bin/penstock-agent-runtime.mjs /opt/penstock/bin/penstock-agent-runtime.mjs",
+    ),
+  );
+  assert.match(
+    agentDockerfile,
+    /COPY --from=server \/usr\/local\/bin\/caveman-proxy \/usr\/local\/bin\/caveman-proxy/,
+  );
+  assert.match(
+    agentDockerfile,
+    /COPY --from=server \/opt\/penstock\/ponytail \/opt\/penstock\/ponytail/,
   );
 });
 

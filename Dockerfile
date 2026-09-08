@@ -471,25 +471,44 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 # Pin to a release tag — bump deliberately, not via :latest.
 FROM ghcr.io/github/github-mcp-server:v1.0.3 AS github-mcp
 
-# BLO-32824: the `penstock-agent-runtime` stage was removed here to restore a
-# green master build. It fetched
-# `Blockcast/penstock-llm-proxy-core@${PENSTOCK_RUNTIME_REF}` over the
-# `gh_token` BuildKit secret, but `gh_token` is `PAPERCLIP_BOARD_TOKEN` — a PAT
-# provisioned for the private *`kkroo/*`* vendor clones (see the note in
-# `.github/workflows/docker-agent.yml`). It has no read on the `Blockcast` org
-# repo, and GitHub answers `404` rather than `403` for private content a
-# credential cannot see, so every master build failed with `curl: (22)`.
-# The pinned ref, the digest and the `--header @-` construction were all
-# verified correct — the credential is the only defect.
-#
-# To re-land: give the build a credential that can read the org repo (either
-# grant `PAPERCLIP_BOARD_TOKEN` read on `Blockcast/penstock-llm-proxy-core`, or
-# mint a `commitperclip`/`allyblockcast` installation token in `docker.yml` and
-# pass it as a SECOND BuildKit secret). Do not simply repoint `gh_token` at an
-# App token: that installation covers `Blockcast/*` but no `kkroo/*` repo, so
-# it would break the opencode-k8s vendor clone above. Nothing in-tree consumes
-# `/opt/penstock/bin/penstock-agent-runtime.mjs` yet, so removing it changes no
-# runtime behaviour.
+# BLO-32824: this stage previously reused `gh_token`, which is
+# `PAPERCLIP_BOARD_TOKEN` for the private `kkroo/*` vendor clone and cannot read
+# the Blockcast Penstock repository. Keep the launcher credential separate: an
+# absent or unreadable `PENSTOCK_RUNTIME_TOKEN` must fail the build rather than
+# silently producing an agent image without the runtime.
+
+# The Penstock launcher is deliberately kept as a standalone Node script. It is
+# fetched at an immutable core commit with a credential dedicated to that
+# private repository. Do not reuse `gh_token`: that secret is
+# `PAPERCLIP_BOARD_TOKEN`, which is scoped to the private `kkroo/*` vendor
+# clone. The launcher credential is mounted only for this build step, and the
+# content digest prevents a refetch from silently changing the executable.
+FROM base AS penstock-agent-runtime
+USER root
+ARG PENSTOCK_RUNTIME_REF=2823acc1b4d730a86aded6b228f748aa12f40f53
+ARG PENSTOCK_RUNTIME_SHA256=fa6c923f78900919ec6fd3cbfe1c878078dab267e82e5faaa695d0c49f50f29e
+RUN --mount=type=secret,id=penstock_runtime_token \
+    set -eu; \
+    test -s /run/secrets/penstock_runtime_token || { \
+      echo "penstock_runtime_token is required to package the pinned launcher" >&2; \
+      exit 1; \
+    }; \
+    verify_sha256() { \
+      expected="$1"; \
+      file="$2"; \
+      actual="$(sha256sum "${file}" | awk '{print $1}')"; \
+      if [ "${actual}" != "${expected}" ]; then \
+        echo "SHA256 mismatch for ${file}: expected ${expected}, received ${actual}" >&2; \
+        return 1; \
+      fi; \
+    }; \
+    install -d -m 0755 /opt/penstock/bin; \
+    { printf 'Authorization: Bearer '; cat /run/secrets/penstock_runtime_token; printf '\n'; } | \
+      curl --fail --location --retry 5 --header @- \
+      "https://raw.githubusercontent.com/Blockcast/penstock-llm-proxy-core/${PENSTOCK_RUNTIME_REF}/scripts/penstock-agent-runtime.mjs" \
+      -o /opt/penstock/bin/penstock-agent-runtime.mjs; \
+    verify_sha256 "${PENSTOCK_RUNTIME_SHA256}" /opt/penstock/bin/penstock-agent-runtime.mjs; \
+    chmod 0555 /opt/penstock/bin/penstock-agent-runtime.mjs
 
 # Caveman is a short-lived loopback proxy per Paperclip run. Install only the
 # proxy binary from the reviewed release and verify the architecture-specific
@@ -595,6 +614,7 @@ COPY --from=vendor /vendor/paperclip-adapter-opencode-k8s.tgz /tmp/paperclip-bun
 # falling back to whatever npm publishes today.
 COPY --from=vendor /vendor/adapter-utils.tgz /tmp/paperclip-bundled-adapters/
 COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
+COPY --from=penstock-agent-runtime /opt/penstock/bin/penstock-agent-runtime.mjs /opt/penstock/bin/penstock-agent-runtime.mjs
 COPY --from=caveman-proxy /usr/local/bin/caveman-proxy /usr/local/bin/caveman-proxy
 COPY --from=ponytail-marketplace /opt/penstock/ponytail /opt/penstock/ponytail
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
