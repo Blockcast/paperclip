@@ -33,21 +33,8 @@ function renderStatefulSet() {
   );
 }
 
-test("production image pins the standalone Penstock launcher and Caveman proxy", () => {
-  assert.match(
-    dockerfile,
-    /ARG PENSTOCK_RUNTIME_REF=2823acc1b4d730a86aded6b228f748aa12f40f53/,
-  );
-  assert.match(
-    dockerfile,
-    /ARG PENSTOCK_RUNTIME_SHA256=fa6c923f78900919ec6fd3cbfe1c878078dab267e82e5faaa695d0c49f50f29e/,
-  );
+test("production image pins the Caveman proxy", () => {
   assert.match(dockerfile, /--mount=type=secret,id=gh_token/);
-  assert.match(dockerfile, /--header @-/);
-  assert.match(
-    dockerfile,
-    /raw\.githubusercontent\.com\/Blockcast\/penstock-llm-proxy-core\/\$\{PENSTOCK_RUNTIME_REF\}\/scripts\/penstock-agent-runtime\.mjs/,
-  );
   assert.match(dockerfile, /ARG CAVEMAN_RELEASE=bin-v1\.1\.6/);
   assert.match(
     dockerfile,
@@ -59,12 +46,26 @@ test("production image pins the standalone Penstock launcher and Caveman proxy",
   );
   assert.match(dockerfile, /SHA256 mismatch[\s\S]*expected[\s\S]*received/);
   assert.doesNotMatch(dockerfile, /sha256sum --check --status/);
-  assert.match(
-    dockerfile,
-    /COPY --from=penstock-agent-runtime \/opt\/penstock\/bin\/penstock-agent-runtime\.mjs/,
-  );
   assert.match(dockerfile, /COPY --from=caveman-proxy \/usr\/local\/bin\/caveman-proxy/);
   assert.doesNotMatch(dockerfile, /PENSTOCK_API_KEY=/);
+});
+
+// BLO-32824. The `penstock-agent-runtime` stage was removed to restore a green
+// master build: it fetched the `Blockcast/*` private repo using the `gh_token`
+// BuildKit secret, which is `PAPERCLIP_BOARD_TOKEN` — a PAT provisioned for the
+// `kkroo/*` vendor clones and with no read on that org repo. Guard the defect
+// rather than the absence, so a re-land carrying a correctly-scoped credential
+// passes this unchanged.
+test("penstock launcher is never fetched with the kkroo-scoped vendor credential", () => {
+  const stage = dockerfile.match(
+    /FROM base AS penstock-agent-runtime[\s\S]*?(?=\nFROM |\n#|$)/,
+  );
+  if (!stage) return;
+  assert.doesNotMatch(
+    stage[0],
+    /--mount=type=secret,id=gh_token(?![_a-zA-Z0-9])/,
+    "penstock-agent-runtime must not reuse gh_token (PAPERCLIP_BOARD_TOKEN): it cannot read Blockcast/penstock-llm-proxy-core, and GitHub answers 404 not 403 — see BLO-32824",
+  );
 });
 
 test("production image carries a pinned Ponytail tree without shared activation", () => {
