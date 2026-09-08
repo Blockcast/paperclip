@@ -39,10 +39,22 @@ permissions:
 
 jobs:
   mirror:
-    # The merge-queue candidate is the sole landing candidate and must not queue
-    # behind the pull-request backlog that saturates arc-light -- same reasoning
-    # as every merge_group job in pr.yml.
-    runs-on: arc-merge-queue
+    # NOT arc-merge-queue. That pool is admission-gated to exactly ONE workflow:
+    # the runner's `merge_queue_job_gate` hook asserts GITHUB_WORKFLOW_REF equals
+    # `mergeQueueJobGate.expectedWorkflowRef`, pinned in onprem-k8s at
+    # `arc/arc-merge-queue-values.yaml` to `.github/workflows/pr.yml@refs/heads/master`.
+    # Any other workflow is refused BEFORE checkout, so no in-repo guard can save
+    # it. Measured on this PR's own first queue entry (run 34228985576, queue ref
+    # pr-1719-1efd24d1): "Set up runner" failed with `FATAL: merge-queue runner
+    # admission refused: workflow ref ... is not the protected queue workflow`,
+    # and under ALLGREEN that ejected the entry 2m40s after it was staged.
+    #
+    # arc-light is where the repo's other merge_group workflow already runs
+    # (commitperclip-review.yml), and it succeeded on that same queue ref -- so
+    # this is the precedented pool for a merge_group job that is not pr.yml,
+    # and it leaves the dedicated queue pool's exclusivity intact rather than
+    # asking a runner admin to widen it.
+    runs-on: arc-light
     # The job itself is three API calls, but ARC runners start cold and the
     # checkout dominates. 10 matches the floor the rest of this repo settled on
     # rather than inventing a tighter budget for one job.

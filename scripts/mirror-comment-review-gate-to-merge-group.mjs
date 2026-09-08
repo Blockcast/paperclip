@@ -272,7 +272,7 @@ export function failOpenVerdict(error) {
   const reason = String(error?.message ?? error ?? "unknown error").split("\n")[0];
   return {
     state: "success",
-    description: truncate(`Gate mirror failed (${reason}); passing open. See the merge-queue job log.`),
+    description: truncate(`Gate mirror failed; passing open, see the merge-queue job log (${reason}).`),
   };
 }
 
