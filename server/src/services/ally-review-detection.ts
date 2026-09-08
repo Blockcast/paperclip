@@ -205,8 +205,30 @@ export function extractAllyReviewedHeadSha(body: string | null | undefined): str
  * whoever changes Ally's emitting side must keep the prose attestation until
  * all four read the block; BLO-31730 was already one instance of two of these
  * parsers disagreeing, and this is the same hazard with more copies.
+ *
+ * Line-anchored and guarded like every prose pattern in this file, and for a
+ * sharper reason than they have. Fencing is not the only way to quote: an
+ * indented example, an inline-code mention, and a blockquoted prior review all
+ * survive withoutFencedCodeBlocks, and an unanchored opener reads each of them
+ * as a *second* block — which is the fail-closed two-blocks red. So the
+ * quoting forms this pattern must reject are the ones a reviewer reaches for
+ * when discussing the block format itself, on a parser whose own reviews are
+ * the likeliest place that discussion happens. Left unanchored, a review of
+ * this file wedges its own gate.
+ *
+ * Recoverable rather than a wedge — it fails closed and the unreadable check
+ * is scoped to the newest review, so one more readable review clears it — but
+ * the round trip would be a confusing one to debug, and the anchor is free.
+ *
+ * ⚠ A payload may not contain `-->`: the capture is non-greedy, so an
+ * embedded terminator truncates the JSON and the block reads `unreadable`. No
+ * current field can carry one; a future free-text field (a `reason`, a `file`
+ * holding a diff hunk or a regex) could, and would have to encode it.
  */
-const ALLY_VERDICT_BLOCK_PATTERN = /<!--[ \t]*ally-verdict:(\d+)([\s\S]*?)-->/g;
+const ALLY_VERDICT_BLOCK_PATTERN = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:(\d+)([\s\S]*?)-->`,
+  "gm",
+);
 
 /** The block schema this parser understands. A future shape must bump this. */
 const SUPPORTED_ALLY_VERDICT_VERSION = 1;
@@ -391,6 +413,27 @@ const PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp(
 const COUNTED_FINDINGS_BUCKET_PATTERN =
   /\b(Critical|Important)\s+Issues\b[*_]*\s*\((\d+)\)/gi;
 
+// The severities that block a merge, named once so the structured path and the
+// prose path cannot disagree about the vocabulary. The prose readers get this
+// bound for free from COUNTED_FINDINGS_BUCKET_PATTERN's alternation, which
+// enumerates the two blocking buckets and no others; the block reader has no
+// such pattern to inherit it from, so it consults this set explicitly.
+//
+// Naming it matters because the two paths acquire the bound by different
+// means. Ally's template mandates a third count, `suggestions`, so a block
+// reader that blocks on "any positive count" reds the *most common* review
+// shape — clean, with suggestions — while the prose reader it replaces calls
+// the same review clean. The divergence also reaches extractAllyReportedFindingRefs:
+// a `suggestions` ref can never be retired, because the ledger vocabulary only
+// ever dispositions Critical/Important, so the head would carry forever. That
+// is the unretirable trap BLO-31446/BLO-31947 exist for, and reintroducing it
+// through the new path would make this replacement worse than the prose
+// parsing it retires.
+//
+// A severity added here must be one Ally's ledger can name in a disposition,
+// or it re-opens the unretirable carry from the other direction.
+const BLOCKING_SEVERITIES: ReadonlySet<string> = new Set(["critical", "important"]);
+
 // Ally's disposition vocabulary is three words: `fixed` and
 // `no-longer-applicable` retire a prior finding, `still-present` asserts it
 // stands. That matches scripts/check-ally-review-consistency.mjs, which treats
@@ -541,6 +584,10 @@ export function extractAllyReportedFindingRefs(
   if (block.kind === "ok") {
     const refs: AllyFindingRef[] = [];
     for (const [severity, count] of block.verdict.findings) {
+      // Only the blocking severities have finding identities a ledger entry
+      // can retire. Minting a ref for `suggestions` would carry the head
+      // forever, since no disposition verb ever names one.
+      if (!BLOCKING_SEVERITIES.has(severity)) continue;
       for (let index = 1; index <= count; index += 1) refs.push({ severity, index });
     }
     return refs;
@@ -584,14 +631,16 @@ export function hasActionablePrReviewFeedback(body: string | null | undefined, s
   if (normalizedState === "changes_requested" || normalizedState === "changes-requested") return true;
   if (typeof body !== "string") return false;
 
-  // With a structured block, the counts decide and nothing else is consulted.
-  // This is the AC-3 half of BLO-32695: `blocking_finding` becomes reachable
-  // only from a finding Ally actually counted, never from prose that merely
-  // reads as actionable. The clauses below stay for block-less bodies, where
-  // dropping them would fail open.
+  // With a structured block, the blocking-severity counts decide and nothing
+  // else is consulted. This is the AC-3 half of BLO-32695: `blocking_finding`
+  // becomes reachable only from a finding Ally actually counted, never from
+  // prose that merely reads as actionable. The clauses below stay for
+  // block-less bodies, where dropping them would fail open.
   const block = parseAllyVerdictBlock(body);
   if (block.kind === "ok") {
-    for (const count of block.verdict.findings.values()) if (count > 0) return true;
+    for (const [severity, count] of block.verdict.findings) {
+      if (BLOCKING_SEVERITIES.has(severity) && count > 0) return true;
+    }
     return false;
   }
   // A block we cannot read is not evidence of a finding. Saying "carries an
