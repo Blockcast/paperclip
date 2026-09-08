@@ -14,11 +14,49 @@ const workflowDir = ".github/workflows";
 const actionPath = ".github/actions/setup-pnpm/action.yml";
 const wrapperRef = "./.github/actions/setup-pnpm";
 
-// Worst case for the wrapper is two attempts at (bootstrap + a 120s registry
-// stall) plus up to 25s of jittered backoff, ~5 minutes. A job budgeted below
-// this turns a degraded registry into a job timeout, which ejects a merge-queue
-// candidate exactly the same way but burns the runner for the full budget first.
-const MIN_TIMEOUT_MINUTES_FOR_RETRY = 10;
+// A job that sets up pnpm needs room for the wrapper's second attempt AND for
+// its own work. This floor used to be 10, derived from "two attempts at
+// (bootstrap + a 120s registry stall) plus up to 25s of jittered backoff, ~5
+// minutes". Measuring pr.yml's `policy` job over 75 runs (2026-09-04,
+// BLO-31690) showed that model mis-attributes where the time goes, and so
+// understates every case built on it:
+//
+//   - the retry fired in 0 of 75 runs -- the wrapper's `Setup pnpm (retry)`
+//     and back-off nodes both log `conclusion=skipped` -- and a SUCCESSFUL
+//     first attempt still took 254.5s (259s for the step as a whole), so the
+//     ~4.3m is one slow success rather than two attempts;
+//   - that 254.5s is almost entirely the bootstrap `npm ci` -- 243s of it,
+//     logged as "added 1 package in 4m" -- and only ~7s the `pnpm
+//     self-update` the old model treated as the expensive part. The bootstrap
+//     is not a cheap prelude to a 120s fetch; it IS the cost.
+//
+// Re-deriving the retry path on measured parts rather than assumed ones: a
+// first attempt that bootstraps (243s) and then loses its self-update to the
+// 120s fetch timeout is 363s, + up to 25s of backoff + a 259s slow-success
+// retry = ~10.8m for `Setup pnpm` alone. That floor is also why the 0-of-75
+// count above does not need 75 logs read to be sound: no observed step came
+// within half of it.
+//
+// So 15 does NOT buy full retry-path coverage, and this constant should not be
+// read as claiming it does: for `policy` that would be 10.8m pnpm + 4.6m p100
+// checkout + 4.8m gate work = ~20m. What 15 does buy is the observed
+// worst case -- a slow-but-successful setup plus the job's own work, which is
+// what both historical blowouts actually were -- with margin, and it is a
+// floor every other budgeted wrapper job in this repo already clears. Counted
+// 2026-09-04: 24 jobs reach for the wrapper, 23 declare a budget (the 24th is
+// listed in WRAPPER_JOBS_WITHOUT_A_BUDGET below), the next-lowest two declare
+// exactly 15, and `policy` was the lone outlier at 10 -- as well as the only
+// one observed dying at its cap. Closing the retry gap by raising budgets
+// further is the wrong lever;
+// the structural fix is baking the pinned pnpm into the ARC runner image so
+// the bootstrap stops being a registry round-trip at all (see the wrapper's
+// own header), and the residual is recorded at pr.yml's `policy` cap.
+//
+// The NAME is historical: it dates from the 10 derived above and still says
+// "for retry", but what the number now encodes is the measured slow-success
+// setup floor. Read it as that, not as a retry budget -- the two differ by
+// ~4m and the paragraph above is the reason.
+const MIN_TIMEOUT_MINUTES_FOR_RETRY = 15;
 
 // Direct calls are allowed at exactly these grandfathered sites. Keyed by
 // (workflow, ref) rather than matched as `@v\d+`, because a SHA pin -- the
@@ -108,7 +146,7 @@ test("no workflow reaches for pnpm/action-setup outside the grandfathered v4 sit
   }
 });
 
-test("every job that sets up pnpm has headroom for a second attempt", async () => {
+test("every job that sets up pnpm clears the measured setup floor", async () => {
   for (const { name, body } of await readWorkflows()) {
     const file = name.slice(name.lastIndexOf("/") + 1);
     for (const job of splitJobs(stripComments(body))) {
@@ -134,8 +172,12 @@ test("every job that sets up pnpm has headroom for a second attempt", async () =
       assert.ok(
         Number(declared[1]) >= MIN_TIMEOUT_MINUTES_FOR_RETRY,
         `${name} job "${job.name}" sets up pnpm with timeout-minutes: ${declared[1]}, ` +
-          `below the ${MIN_TIMEOUT_MINUTES_FOR_RETRY}m needed for the retry budget — a stalled ` +
-          `registry would time the job out instead of retrying (BLO-28813)`,
+          `below the ${MIN_TIMEOUT_MINUTES_FOR_RETRY}m floor. A slow-but-successful setup ` +
+          `alone measured 8.1m (worst observed checkout + pnpm combined, NOT the sum of ` +
+          `the two p100s), and on \`policy\`, the job this floor was measured against, ` +
+          `gate work adds up to 4.8m on top, so a budget under the floor leaves too little ` +
+          `for the job's own work — the job dies at its cap as an unattributable ` +
+          `\`cancelled\` (BLO-31690)`,
       );
     }
   }
