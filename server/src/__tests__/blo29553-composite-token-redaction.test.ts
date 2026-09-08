@@ -97,4 +97,122 @@ describe("BLO-29553: composite token redaction", () => {
       expect(redactSensitiveText(benign), `must not alter: ${benign}`).toBe(benign);
     }
   });
+
+  // `git rev-parse HEAD^{tree}` above carries no hint word, no `://` and no `.`,
+  // so `maybeContainsSecretText` short-circuits and no value-shape rule ever
+  // runs on it -- it is a prefilter control, not an over-redaction control.
+  // These carry a `.`, so they reach the rules the fixes touched.
+  it("does not redact benign dotted text that reaches the value-shape rules", () => {
+    for (const benign of [
+      // Every rule below is exercised; none may match.
+      "service.platform.retries.maxAttempts",
+      "example.com",
+      "packages/adapter-utils/src/command-redaction.ts",
+      "reconciled 4 rows in 0.42s across api.internal.svc.cluster.local",
+    ]) {
+      expect(redactSensitiveText(benign), `must not alter: ${benign}`).toBe(benign);
+    }
+  });
+
+  describe("AC1(a) composite shape family", () => {
+    // Enumerated deliberately rather than stated as an unbounded absolute: "no
+    // segment of any composite ever survives" is not provable over arbitrary
+    // input. This is the family named in the acceptance criteria -- 2..6
+    // dot-joined segments, a short (<8-char) middle segment, each embedded in a
+    // dotted run with 0..2 context segments on either side.
+    const contextSegment = (side: string, i: number) => `ctxsegment${side}${i}`;
+    const tokenSegment = (i: number) => `SEG${i}NOTAREALSEGMENT${i}`;
+    const SHORT_MIDDLE = "ab";
+
+    const cases: {
+      name: string;
+      input: string;
+      /** Segments that must not survive. The short middle is excluded: two
+       *  characters cannot be asserted absent from arbitrary text. */
+      mustNotSurvive: string[];
+    }[] = [];
+
+    for (const segmentCount of [2, 3, 4, 5, 6]) {
+      for (const shortMiddle of [false, true]) {
+        for (const leftContext of [0, 1, 2]) {
+          for (const rightContext of [0, 1, 2]) {
+            const tail: string[] = [];
+            for (let i = 1; i < segmentCount; i += 1) {
+              tail.push(shortMiddle && i === 1 ? SHORT_MIDDLE : tokenSegment(i));
+            }
+            const composite = [HEAD, ...tail].join(".");
+            const run: string[] = [];
+            for (let i = 0; i < leftContext; i += 1) run.push(contextSegment("L", i));
+            run.push(composite);
+            for (let i = 0; i < rightContext; i += 1) run.push(contextSegment("R", i));
+            cases.push({
+              name:
+                `${segmentCount} segments`
+                + `${shortMiddle ? ", short middle" : ""}`
+                + `, ${leftContext} left / ${rightContext} right context`,
+              input: `  - Token: ${run.join(".")}`,
+              mustNotSurvive: [HEAD, ...tail.filter((segment) => segment !== SHORT_MIDDLE)],
+            });
+          }
+        }
+      }
+    }
+
+    it.each(cases)("leaves no token segment for $name", ({ input, mustNotSurvive }) => {
+      for (const path of [redactSensitiveText, compactRunLogChunk]) {
+        const out = path(input);
+        // Non-vacuity guard: an absent segment must mean "redacted", never
+        // "truncated" or "blanked". compactRunLogChunk truncates long chunks.
+        expect(out, "surrounding structure must survive").toContain("- Token: ");
+        expect(out).not.toContain("paperclip truncated");
+        expect(out).toContain("***REDACTED***");
+        for (const segment of mustNotSurvive) {
+          expect(out, `${segment} survived ${path.name}(${input})`).not.toContain(segment);
+        }
+      }
+    });
+  });
+
+  // The two boundary cases Ally's review named. They are inside the family
+  // above, but pinned separately so a future edit to the generator cannot drop
+  // them silently -- each corresponds to one of the two fixes.
+  it("boundary: a >4-segment dotted run leaves no token segment (JWT tail cap)", () => {
+    // The tail repetition used to be `?`, capping JWT at four segments. In a
+    // longer run it consumed the leftmost four and stranded the rest.
+    const segments = [
+      "ctxsegmentL0",
+      "ctxsegmentL1",
+      HEAD,
+      PAYLOAD,
+      SIGNATURE,
+      "ctxsegmentR0",
+    ];
+    const out = compactRunLogChunk(`  - Token: ${segments.join(".")}`);
+    for (const segment of [HEAD, PAYLOAD, SIGNATURE]) {
+      expect(out, `${segment} must not survive a >4-segment dotted run`).not.toContain(segment);
+    }
+  });
+
+  it("boundary: a 2-segment composite leaves no token segment (JWT cannot start)", () => {
+    // JWT needs three segments, so this shape has no JWT match at all. Only a
+    // self-sufficient GitHub rule covers it.
+    const out = compactRunLogChunk(`  - Token: ${HEAD}.${PAYLOAD}`);
+    expect(out).not.toContain(HEAD);
+    expect(out).not.toContain(PAYLOAD);
+  });
+
+  it("boundary: a short middle segment leaves no token segment", () => {
+    // JWT stops at `ab`, stranding the signature. Same fix as above.
+    const out = compactRunLogChunk(`  - Token: ${HEAD}.ab.${SIGNATURE}`);
+    expect(out).not.toContain(HEAD);
+    expect(out).not.toContain(SIGNATURE);
+  });
+
+  it("redacts a composite fine-grained PAT in full", () => {
+    const composite = `${FINE_GRAINED_PAT}.${PAYLOAD}.${SIGNATURE}`;
+    const out = compactRunLogChunk(`  - Token: ${composite}`);
+    for (const segment of [FINE_GRAINED_PAT, PAYLOAD, SIGNATURE]) {
+      expect(out, `${segment} must not survive`).not.toContain(segment);
+    }
+  });
 });
