@@ -1462,13 +1462,37 @@ export async function handleFiring(
     // `bad_value`.
     //
     // NB: AC3 of BLO-32113 asks for a Prometheus *rule* on fence age. The
-    // series it needs now exist and are scrapeable from here; authoring and
-    // deploying the rule itself remains BLO-32163.
+    // series it needs are scrapeable from here; authoring and deploying the
+    // rule itself remains BLO-32163. Two things that rule's author needs which
+    // are not visible from the `metrics.write` calls below:
     //
-    // The count + summed-age pair is the standard Prometheus shape and reads
-    // correctly under both:
-    //   rate(fence_blocked)                      -> blocked deliveries/sec
-    //   rate(age_seconds) / rate(fence_blocked)  -> mean hold age
+    //   - `aggregate_key` and `phase` do NOT reach Prometheus. The host
+    //     promotes a tag to a label only if it is BOTH manifest-declared and
+    //     in PLUGIN_METRIC_PROMOTABLE_TAG_KEYS (`metrics.ts`); this plugin
+    //     declares `["alertname", "severity", "version"]` (`manifest.ts`) and
+    //     neither key is promotable in any case. So the scraped series is
+    //     dimensioned by `alertname` only. AC3's "naming the aggregate_key"
+    //     has to come from the `plugin_logs` metric row or the error thrown
+    //     below — both carry the full tag set — not from the rule's labels.
+    //   - Both series land on the SAME prom-client counter
+    //     (`paperclip_plugin_metric_total`), distinguished only by the `metric`
+    //     label. Prometheus matches binary operands on all labels by default,
+    //     so a bare `rate(age) / rate(count)` matches nothing and returns an
+    //     empty vector — no error, just a rule that can never fire, which is
+    //     the same invisible-failure class as the wedge itself. The division
+    //     needs an explicit `ignoring(metric)`:
+    //
+    //       rate(paperclip_plugin_metric_total{
+    //         metric="alertmanager.aggregate.fence_blocked"}[5m])
+    //       -> blocked deliveries/sec
+    //
+    //       rate(paperclip_plugin_metric_total{
+    //         metric="alertmanager.aggregate.fence_blocked_age_seconds"}[5m])
+    //         / ignoring(metric)
+    //       rate(paperclip_plugin_metric_total{
+    //         metric="alertmanager.aggregate.fence_blocked"}[5m])
+    //       -> mean hold age, seconds
+    //
     // Past the backstop this should be self-clearing, so a sustained non-zero
     // *rate* on the first series means the reclaim itself is not working.
     const heldMs = firingClaim.heldMs ?? null;
