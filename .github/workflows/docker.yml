@@ -166,6 +166,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Mint read-only Penstock runtime token
+        id: penstock-runtime-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.COMMITPERCLIP_APP_ID }}
+          private-key: ${{ secrets.COMMITPERCLIP_KEY }}
+          owner: Blockcast
+          repositories: penstock-llm-proxy-core
+          permission-contents: read
+
       # BuildKit cache is local to each StatefulSet ordinal. Ephemeral ARC
       # client IPs make Service session affinity ineffective between runs, so
       # route each build class to a stable cache owner. The ClusterIP remains a
@@ -318,7 +328,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           secrets: |
             gh_token=${{ secrets.PAPERCLIP_BOARD_TOKEN }}
-            penstock_runtime_token=${{ secrets.PENSTOCK_RUNTIME_TOKEN }}
+            penstock_runtime_token=${{ steps.penstock-runtime-token.outputs.token }}
 
       - name: Record built artifact
         run: |

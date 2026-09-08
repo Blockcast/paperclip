@@ -91,14 +91,15 @@ installing them. A failed verification is a hard stop; the verification
 command prints the expected and received digest so an operator can distinguish
 a changed upstream artifact from a transient download failure.
 
-The GitHub Actions build uses the same trust boundary: configure the
-repository secret `PENSTOCK_RUNTIME_TOKEN` before dispatching the Docker
-workflow. The workflow passes it as the BuildKit secret
-`penstock_runtime_token`; it never repoints or reuses `gh_token`. The token
-must have read-only Contents access to `Blockcast/penstock-llm-proxy-core`
-and no provider or Paperclip-control-plane privileges. Verify the secret is
-present before dispatching; the Dockerfile intentionally fails closed when it
-is absent.
+The GitHub Actions build uses the same trust boundary. It mints a short-lived
+GitHub App installation token from the existing `COMMITPERCLIP_KEY`, restricted
+to read-only Contents access on `Blockcast/penstock-llm-proxy-core`, and passes
+that token as the BuildKit secret `penstock_runtime_token`. It never repoints or
+reuses `gh_token`, and no long-lived Penstock repository token is required.
+Before dispatching, verify that `COMMITPERCLIP_KEY` and
+`COMMITPERCLIP_APP_ID` are configured and that the App installation can read
+the Penstock repository. Token minting and the Dockerfile both fail closed if
+that access is absent.
 
 The resulting layout should be equivalent to:
 
