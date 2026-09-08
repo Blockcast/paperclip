@@ -143,6 +143,15 @@ const REVIEWED_HEAD_ATTESTATION_PATTERN = new RegExp(
 );
 
 export function extractAllyReviewedHeadSha(body: string | null | undefined): string | null {
+  // The structured block wins outright when present: it says which tree was
+  // examined as a field, so no amount of prose around it can move the answer.
+  const block = parseAllyVerdictBlock(body);
+  if (block.kind === "ok") return block.verdict.head;
+  // An unreadable block attests nothing. Returning null here is safe *only*
+  // because evaluateCommentReviewGate detects the same unreadable block and
+  // reports it as its own failure outcome — without that, null would fall
+  // through to "nothing attests this head", which is a green.
+  if (block.kind === "unreadable") return null;
   const text = emittedReviewText(body);
   if (text === null) return null;
   const attestations = Array.from(
@@ -150,6 +159,178 @@ export function extractAllyReviewedHeadSha(body: string | null | undefined): str
     (match) => match[1]!.toLowerCase(),
   );
   return attestations.length === 1 ? attestations[0]! : null;
+}
+
+/**
+ * Ally's structured verdict block — the primary source, with the prose parsers
+ * below retained only as the fallback for a body that carries no block.
+ *
+ * Why a block at all (BLO-32695). Every prose pattern in this file was widened
+ * in response to a real review it could not read, each widening was correct,
+ * and the family still grew: BLO-29711, BLO-31730, BLO-31947, BLO-31446. The
+ * measurement that ended it was a single clean review — paperclip#1675 at
+ * 2026-09-07T15:41:42Z, 0 Critical / 0 Important — failing *four* independent
+ * patterns at once, for four unrelated reasons: a parenthetical after the
+ * attested SHA, a bolded ledger verb, a comma where a dash was required, and a
+ * hyphenated severity. Two separate clearing paths existed and prose
+ * formatting closed both, so the gate reported a finding Ally had already
+ * withdrawn. The space of English an author might write is unbounded; the
+ * space this file can enumerate is not.
+ *
+ * An HTML comment rather than a fenced block, deliberately. A fenced
+ * ```ally-verdict payload would be blanked by withoutFencedCodeBlocks before
+ * any parser saw it — the block would be invisible to exactly the predicates
+ * it exists to serve. The marker is read from *emitted* text for the same
+ * reason the retiring predicates are: a review quoted inside a fence must
+ * never retire a live finding, and fencing is how a body gets quoted.
+ *
+ * `ally-verdict:` is not a new token. The bundled github-pr-workflow skill
+ * already reserves it to the reviewer service and forbids ordinary agents from
+ * posting one (SKILL.md), so the marker namespace this reads was spoken for
+ * before it was parsed.
+ *
+ * ⚠ THE BLOCK MUST BE ADDITIVE, NOT A REPLACEMENT. Four independent readers
+ * parse the `Reviewed head:` attestation and only this one understands the
+ * block:
+ *
+ *   1. this module
+ *   2. `consolidatedReviewHead` in server/src/services/github-app-auth.ts
+ *   3. `ATTESTED_HEAD_RE` in scripts/check-ally-review-consistency.mjs
+ *   4. `HEAD_ATTESTATION_RE` in .github/scripts/sweep-stalled-ally-reviews.py
+ *
+ * A review carrying a block *and* the prose line reads identically to all
+ * four, so adding the block breaks nothing. A review carrying only a block
+ * would attest nothing to readers 2-4 — reader 2 would raise
+ * `pr_review_output_missing` and post a false "reviewer never finished". So
+ * whoever changes Ally's emitting side must keep the prose attestation until
+ * all four read the block; BLO-31730 was already one instance of two of these
+ * parsers disagreeing, and this is the same hazard with more copies.
+ */
+const ALLY_VERDICT_BLOCK_PATTERN = /<!--[ \t]*ally-verdict:(\d+)([\s\S]*?)-->/g;
+
+/** The block schema this parser understands. A future shape must bump this. */
+const SUPPORTED_ALLY_VERDICT_VERSION = 1;
+
+export interface AllyStructuredDisposition extends AllyFindingRef {
+  /** As written by Ally — abbreviated, so callers compare by prefix. */
+  head: string;
+  /** The verb as a discrete field, not a token cut out of a sentence. */
+  verb: string;
+}
+
+export interface AllyStructuredVerdict {
+  /** The full 40-hex head this review examined. */
+  head: string;
+  /** Per-severity finding counts, lowercased keys. */
+  findings: Map<string, number>;
+  dispositions: AllyStructuredDisposition[];
+}
+
+/**
+ * The outcome of looking for a structured block.
+ *
+ * `unreadable` is the fail-closed branch and is kept distinct from `absent`
+ * because the two must not be treated alike: `absent` means "no block, use the
+ * prose fallback", while `unreadable` means "Ally tried to tell us something
+ * machine-readable and we could not read it". Collapsing them would make a
+ * malformed block silently indistinguishable from a body that never carried
+ * one, which is the "no review exists" confusion BLO-32695 asks to end.
+ */
+export type AllyVerdictBlockParse =
+  | { kind: "absent" }
+  | { kind: "ok"; verdict: AllyStructuredVerdict }
+  | { kind: "unreadable"; reason: string };
+
+function asSeverityCounts(raw: unknown): Map<string, number> | null {
+  if (raw === undefined) return new Map();
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const counts = new Map<string, number>();
+  for (const [severity, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0) return null;
+    counts.set(severity.trim().toLowerCase(), value);
+  }
+  return counts;
+}
+
+function asDispositions(raw: unknown): AllyStructuredDisposition[] | null {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) return null;
+  const entries: AllyStructuredDisposition[] = [];
+  for (const item of raw) {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) return null;
+    const { head, severity, index, verb } = item as Record<string, unknown>;
+    if (typeof head !== "string" || !/^[0-9a-f]{7,40}$/i.test(head.trim())) return null;
+    if (typeof severity !== "string" || !severity.trim()) return null;
+    if (typeof verb !== "string" || !verb.trim()) return null;
+    if (typeof index !== "number" || !Number.isInteger(index) || index < 1) return null;
+    entries.push({
+      head: head.trim().toLowerCase(),
+      severity: severity.trim().toLowerCase(),
+      index,
+      verb: verb.trim().toLowerCase(),
+    });
+  }
+  return entries;
+}
+
+/**
+ * Ally's structured verdict for this body, if it carries one.
+ *
+ * Fails closed on every ambiguity AC-5 names, and for one reason each:
+ *
+ *   - Two or more blocks. Nothing picks a winner between conflicting verdicts,
+ *     and choosing by position would let an appended block override the real
+ *     one.
+ *   - An unsupported version. A shape this parser does not know cannot be
+ *     trusted field-by-field; reading it optimistically is how a schema change
+ *     turns into a silent green.
+ *   - Malformed JSON, or a missing/short `head`. A verdict that does not say
+ *     which tree it examined attests nothing, so it must not be able to clear
+ *     a head by default.
+ *
+ * Note the asymmetry with the prose fallback: an unreadable *block* is red,
+ * whereas an unreadable *body* with no block keeps the historical behavior.
+ * That is intentional. Every review posted before this shipped carries no
+ * block, so `absent` must stay non-blocking or the gate would red-wedge the
+ * whole open-PR population on arrival.
+ */
+export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerdictBlockParse {
+  const text = emittedReviewText(body);
+  if (text === null) return { kind: "absent" };
+  const blocks = [...text.matchAll(ALLY_VERDICT_BLOCK_PATTERN)];
+  if (blocks.length === 0) return { kind: "absent" };
+  if (blocks.length > 1) {
+    return { kind: "unreadable", reason: `${blocks.length} ally-verdict blocks; expected exactly one` };
+  }
+
+  const [, rawVersion, rawPayload] = blocks[0]!;
+  if (Number(rawVersion) !== SUPPORTED_ALLY_VERDICT_VERSION) {
+    return { kind: "unreadable", reason: `unsupported ally-verdict version ${rawVersion}` };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawPayload!.trim());
+  } catch {
+    return { kind: "unreadable", reason: "ally-verdict payload is not valid JSON" };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { kind: "unreadable", reason: "ally-verdict payload is not a JSON object" };
+  }
+
+  const { head, findings, dispositions } = parsed as Record<string, unknown>;
+  if (typeof head !== "string" || !/^[0-9a-f]{40}$/i.test(head.trim())) {
+    return { kind: "unreadable", reason: "ally-verdict block attests no complete head SHA" };
+  }
+  const counts = asSeverityCounts(findings);
+  if (!counts) return { kind: "unreadable", reason: "ally-verdict findings are not severity counts" };
+  const ledger = asDispositions(dispositions);
+  if (!ledger) return { kind: "unreadable", reason: "ally-verdict dispositions are malformed" };
+
+  return {
+    kind: "ok",
+    verdict: { head: head.trim().toLowerCase(), findings: counts, dispositions: ledger },
+  };
 }
 
 // Negation cues flip an otherwise-actionable bare phrase into a confirmation
@@ -283,6 +464,23 @@ export function classifyPriorDisposition(disposition: string): PriorDispositionK
 export function extractAllyPriorFindingDispositions(
   body: string | null | undefined,
 ): AllyPriorFindingDisposition[] {
+  // Structured dispositions carry head/severity/index/verb as discrete fields,
+  // so the four prose shapes that silently dropped whole ledger bullets
+  // (bolded verb, comma instead of a dash, hyphenated severity, a trailing
+  // parenthetical) cannot arise. The verb vocabulary is unchanged: a verb
+  // arriving as a field is still classified by classifyPriorDisposition, so an
+  // unknown one still fails closed rather than retiring anything.
+  const block = parseAllyVerdictBlock(body);
+  if (block.kind === "ok") {
+    return block.verdict.dispositions.map((entry) => ({
+      shortSha: entry.head,
+      severity: entry.severity,
+      index: entry.index,
+      disposition: entry.verb,
+      kind: classifyPriorDisposition(entry.verb),
+    }));
+  }
+  if (block.kind === "unreadable") return [];
   const text = emittedReviewText(body);
   if (text === null) return [];
   const entries: AllyPriorFindingDisposition[] = [];
@@ -337,6 +535,17 @@ export function extractAllyPriorFindingDispositions(
 export function extractAllyReportedFindingRefs(
   body: string | null | undefined,
 ): AllyFindingRef[] | null {
+  // Counts as fields, so the raw/stripped max below — which exists purely to
+  // stop a fence from swallowing a bucket — has nothing to guard against.
+  const block = parseAllyVerdictBlock(body);
+  if (block.kind === "ok") {
+    const refs: AllyFindingRef[] = [];
+    for (const [severity, count] of block.verdict.findings) {
+      for (let index = 1; index <= count; index += 1) refs.push({ severity, index });
+    }
+    return refs;
+  }
+  if (block.kind === "unreadable") return null;
   if (typeof body !== "string") return null;
 
   // Highest count seen per severity, across both readings. Findings are
@@ -374,6 +583,23 @@ export function hasActionablePrReviewFeedback(body: string | null | undefined, s
   const normalizedState = state?.trim().toLowerCase();
   if (normalizedState === "changes_requested" || normalizedState === "changes-requested") return true;
   if (typeof body !== "string") return false;
+
+  // With a structured block, the counts decide and nothing else is consulted.
+  // This is the AC-3 half of BLO-32695: `blocking_finding` becomes reachable
+  // only from a finding Ally actually counted, never from prose that merely
+  // reads as actionable. The clauses below stay for block-less bodies, where
+  // dropping them would fail open.
+  const block = parseAllyVerdictBlock(body);
+  if (block.kind === "ok") {
+    for (const count of block.verdict.findings.values()) if (count > 0) return true;
+    return false;
+  }
+  // A block we cannot read is not evidence of a finding. Saying "carries an
+  // unresolved finding" here would attribute a finding to a body whose verdict
+  // we failed to parse — the specific misreport BLO-32695 exists to stop. The
+  // gate reports the parse failure under its own outcome instead.
+  if (block.kind === "unreadable") return false;
+
   const text = body.trim();
   if (!text) return false;
 
