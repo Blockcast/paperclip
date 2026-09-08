@@ -131,6 +131,7 @@ import {
 import {
   recordBackstopCandidateSkipped,
   recordBackstopSweepCompleted,
+  recordRecoveryHorizonExpired,
   setBackstopDeferredCandidates,
 } from "../metrics.js";
 import {
@@ -11509,7 +11510,14 @@ export function recoveryService(
     now?: Date;
     limit?: number;
   }) {
-    const result = { checked: 0, escalated: 0, announced: 0, actionIds: [] as string[], issueIds: [] as string[] };
+    const result = {
+      checked: 0,
+      escalated: 0,
+      neverDelivered: 0,
+      announced: 0,
+      actionIds: [] as string[],
+      issueIds: [] as string[],
+    };
     const now = opts?.now ?? new Date();
 
     const expired = await recoveryActionsSvc.escalateExpiredWakeHorizons({
@@ -11525,6 +11533,16 @@ export function recoveryService(
       result.actionIds.push(action.id);
       result.issueIds.push(action.sourceIssueId);
 
+      // PEN-3000: `attemptCount` counts wakes that REACHED THE QUEUE, not sweeps — every
+      // sweep reserves +1 and refunds it when `enqueueWakeup` returned null, so the counter
+      // freezes at the delivered count. 0 therefore means no wake was ever delivered across
+      // the entire horizon, which is a wake-channel fault rather than an owner who was woken
+      // and did not converge. Those are different incidents with different responders and
+      // they render identically without this split.
+      const neverDelivered = action.attemptCount === 0;
+      if (neverDelivered) result.neverDelivered += 1;
+      recordRecoveryHorizonExpired(neverDelivered ? "never_delivered" : "delivered");
+
       logger.warn(
         {
           actionId: action.id,
@@ -11534,6 +11552,7 @@ export function recoveryService(
           ownerAgentId: action.ownerAgentId,
           attemptCount: action.attemptCount,
           maxAttempts: action.maxAttempts,
+          neverDelivered,
           timeoutAt: action.timeoutAt,
           runId: opts?.runId ?? null,
         },
@@ -11573,8 +11592,12 @@ export function recoveryService(
             `- Auto-recovery horizon: ${horizonAt}`,
             `- Cause: \`${action.cause}\``,
             action.attemptCount === 0
-              ? "- Note: this action never made a single wake attempt before its window closed, so the stranding it " +
-                "was opened to repair was never actually worked."
+              ? "- Note: no wake for this action ever reached the queue. `Attempts` counts wakes that were " +
+                "DELIVERED, not sweeps attempted — each sweep reserves an attempt and refunds it when the " +
+                "wake is not delivered — so 0 means every sweep across the whole window above was refused " +
+                "by the wake channel (provider-capacity deferral, an active tree pause hold, wake disabled, " +
+                "or cooldown). The stranding this action was opened to repair was therefore never worked, " +
+                "and this is a scheduler-side fault rather than an owner who was woken and could not resolve it."
               : "- Note: reassigning will NOT restore the wake budget — the horizon above is fixed for the life of " +
                 "the action, so a new owner does not get fresh attempts.",
             "- Next action: discharge or cancel this recovery action, or record an intentional manual resolution.",
