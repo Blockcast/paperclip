@@ -2291,15 +2291,32 @@ export function recoveryService(
   // re-flips the issue back to `blocked` on the next sweep using stale
   // latestRun state, defeating the manual recovery path. BLO-7521 added the
   // first instance of this gate for stranded-recovery-origin issues; BLO-8050
-  // generalized it to every escalation callsite, and later work (e.g. the
-  // BLO-31913 exhausted-handoff arm) has kept adding them.
+  // extended it to the branches it covered, and later work (e.g. the
+  // BLO-31913 exhausted-handoff arm) has kept adding them one at a time.
   //
-  // Deliberately no count here: two earlier revisions of this comment pinned
-  // one ("all six escalation callsites") and both had drifted by the time
-  // anyone read them, which is how the BLO-31913 arm shipped without a gate.
-  // For the current inventory, ask the code:
+  // The gate is NOT on every escalation callsite today, and no count is pinned
+  // here: two earlier revisions of this comment pinned one ("all six
+  // escalation callsites"), both had drifted by the time anyone read them, and
+  // that drift is how the BLO-31913 arm shipped ungated. Ask the code instead,
+  // and note it takes TWO greps — the must-be-gated set first, the is-gated set
+  // second, because an ungated callsite is by construction invisible to the
+  // second one alone:
+  //   grep -n 'await escalateStrandedAssignedIssue({' server/src/services/recovery/service.ts
   //   grep -n 'await latestRunPredatesLatestUnblock' server/src/services/recovery/service.ts
-  // Any new escalation callsite MUST carry this gate.
+  // Each grep also matches its own prescription line above, so subtract one
+  // from each before comparing. Diff the two before adding a callsite, and
+  // check YOUR OWN rather than inferring safety from the gated set's size.
+  // The sets differ today; which omissions are deliberate has not been
+  // audited, so treat an ungated callsite as unreviewed rather than as either
+  // intended or defective. In particular the direct sibling of the BLO-31913
+  // arm — the `in_progress` exhausted-handoff escalation, which reads the same
+  // `isExhaustedSuccessfulRunHandoff` evidence and increments the same
+  // `successfulRunHandoffEscalated` counter — carries no gate. An earlier
+  // review of that arm reasoned it was "not reachable by an unblock"; that
+  // reasoning does not hold against `getLatestUnblockedAt` above, which keys
+  // on any `issue.updated` carrying `previousStatus = 'blocked'` and does not
+  // filter on the resulting status, so `blocked` -> `in_progress` sets an
+  // unblock timestamp too.
   async function latestRunPredatesLatestUnblock(
     companyId: string,
     issueId: string,
