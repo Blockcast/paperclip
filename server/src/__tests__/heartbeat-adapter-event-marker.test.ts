@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  boundHeartbeatRunEventPayloadForStorage,
   buildAdapterRunEventPayloadForPersistence,
   shouldWriteRunRuntimeStatusForEvent,
 } from "../services/heartbeat.js";
@@ -91,6 +92,47 @@ describe("buildAdapterRunEventPayloadForPersistence", () => {
       postAdapterSettle: true,
       adapterSettledAt: settledAt,
     });
+  });
+
+  /**
+   * The marker is the *entire* justification for keeping this row rather than
+   * dropping it, so it has to survive the rest of the persistence path -- not
+   * just leave this function correct.
+   *
+   * `appendRunEvent` bounds the payload for storage after this function marks
+   * it (`heartbeat.ts`: `boundHeartbeatRunEventPayloadForStorage(event.payload)`),
+   * and that bounding keeps only the FIRST `MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS`
+   * keys in insertion order. Spreading the markers last -- which is what makes
+   * the anti-forge case above hold -- therefore also made them the first
+   * casualties of truncation. The two properties want opposite orderings, and
+   * only the anti-forge one was pinned.
+   *
+   * The failure mode is the bad one: not a lost row, but a post-terminal row
+   * that survives stripped of the marker, i.e. indistinguishable from an
+   * ordinary live-run event that appears to postdate its own run's end.
+   *
+   * This asserts the composition as production performs it, because neither
+   * function is wrong on its own.
+   */
+  it("keeps the marker through storage bounding on an over-wide payload", () => {
+    const settledAt = "2026-09-07T12:00:00.000Z";
+    // Over the 100-key storage bound, so truncation is guaranteed to bite.
+    const wide: Record<string, unknown> = { stage: "kill_signal" };
+    for (let index = 0; index < 150; index += 1) {
+      wide[`detail${index}`] = index;
+    }
+
+    const stored = boundHeartbeatRunEventPayloadForStorage(
+      buildAdapterRunEventPayloadForPersistence(wide, settledAt) ?? {},
+    );
+
+    expect(stored).toMatchObject({
+      postAdapterSettle: true,
+      adapterSettledAt: settledAt,
+    });
+    // Positive control: the bound still bit, so the assertion above is not
+    // passing because the payload happened to fit.
+    expect(stored).toMatchObject({ _truncated: true });
   });
 });
 

@@ -1672,16 +1672,39 @@ export function selectAgedPrReviewRunForFairDispatch(
  * evidence of a leaked process tree, so it is persisted rather than dropped --
  * but it is marked, so a reader can tell it apart from the live run's stream
  * instead of seeing an event that appears to postdate the run's own end.
+ *
+ * The markers go FIRST, and the adapter's own copies of those two keys are
+ * dropped rather than shadowed. Two properties pull in opposite directions here
+ * and both have to hold:
+ *
+ * - The marker is the server's statement about its own run, so an adapter
+ *   payload must not be able to forge it. Spreading the markers last would also
+ *   achieve that, which is why it was written that way first.
+ * - `appendRunEvent` bounds the payload for storage *after* this runs, and that
+ *   bounding keeps only the first `MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS` keys in
+ *   insertion order. Last position therefore made the markers the first
+ *   casualties of truncation, silently: an over-wide payload persisted a
+ *   post-terminal row stripped of the only thing distinguishing it from an
+ *   ordinary live-run event. Since the marker is the entire justification for
+ *   keeping the row instead of dropping it, losing it is worse than losing the
+ *   row.
+ *
+ * Deleting the adapter's keys decouples the anti-forge property from key order,
+ * so first position can serve the truncation one. Bounding the payload before
+ * marking it does NOT work -- bounding emits `_truncated`/`_omittedKeys`, so a
+ * truncated payload comes back at 102 keys and the appended markers are sliced
+ * off exactly as before. Measured, not assumed.
  */
 export function buildAdapterRunEventPayloadForPersistence(
   payload: Record<string, unknown> | undefined,
   adapterSettledAt: string | null,
 ): Record<string, unknown> | undefined {
   if (!adapterSettledAt) return payload;
+  const { postAdapterSettle: _forged, adapterSettledAt: _forgedAt, ...rest } = payload ?? {};
   return {
-    ...(payload ?? {}),
     postAdapterSettle: true,
     adapterSettledAt,
+    ...rest,
   };
 }
 

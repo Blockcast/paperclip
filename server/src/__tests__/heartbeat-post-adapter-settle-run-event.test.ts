@@ -169,6 +169,14 @@ describeEmbeddedPostgres("post-adapter-settle adapter run events (PEN-3093)", ()
    * measures a trailing lifecycle append instead of the late event -- which
    * makes it flaky in both directions, and would let the seq assertions below
    * pass or fail on scheduling rather than on the code under test.
+   *
+   * `quiesced` is returned rather than kept private because the timeout arm
+   * cannot honour the contract: on a host slow enough never to observe two
+   * equal-length reads it yields a baseline that is explicitly NOT quiescent.
+   * Returning those rows bare would push that failure downstream, where it
+   * resurfaces as a confusing seq or count comparison rather than as what it
+   * is. Callers assert `quiesced` first, so exhausting the deadline fails as
+   * "the helper never settled".
    */
   async function readEventsOnceQuiet(runId: string, timeoutMs = 15_000) {
     const deadline = Date.now() + timeoutMs;
@@ -176,10 +184,10 @@ describeEmbeddedPostgres("post-adapter-settle adapter run events (PEN-3093)", ()
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 400));
       const current = await readEvents(runId);
-      if (current.length === previous.length) return current;
+      if (current.length === previous.length) return { events: current, quiesced: true };
       previous = current;
     }
-    return previous;
+    return { events: previous, quiesced: false };
   }
 
   it(
@@ -192,7 +200,11 @@ describeEmbeddedPostgres("post-adapter-settle adapter run events (PEN-3093)", ()
       const finished = await waitForRunToFinish(heartbeat, run!.id);
       expect(finished?.status).toBe("succeeded");
 
-      const before = await readEventsOnceQuiet(run!.id);
+      const { events: before, quiesced } = await readEventsOnceQuiet(run!.id);
+      // Assert settlement before using the baseline: every assertion below is
+      // relative to it, so a non-quiescent read would misattribute a trailing
+      // append to the code under test.
+      expect(quiesced).toBe(true);
       // Negative control: the on-time event went through the same shaping call
       // and carries no marker.
       const onTime = before.find((event) => event.message === "claude_local process spawned");
@@ -216,12 +228,13 @@ describeEmbeddedPostgres("post-adapter-settle adapter run events (PEN-3093)", ()
       const after = await readEvents(run!.id);
 
       // (1) The evidence is kept, exactly once. Asserted on the late event
-      // itself rather than on `after.length`: an exact total count depends on
-      // `readEventsOnceQuiet` having reached true quiescence rather than caught
-      // a gap between two trailing outcome-pipeline appends, so a lifecycle
-      // event landing between `before` and `after` would fail the count with a
-      // red build that is not a regression. Uniqueness of the marked event is
-      // the property this actually needs and it cannot be broken by a later
+      // itself rather than on `after.length`: quiescence is established by two
+      // equal-length reads, which is the best signal available but still
+      // cannot rule out a further trailing outcome-pipeline append -- two
+      // equal reads can straddle a gap between two of them. So even with
+      // `quiesced` asserted above, an exact total count would fail on
+      // scheduling rather than on a regression. Uniqueness of the marked event
+      // is the property this actually needs and it cannot be broken by a later
       // append.
       const lateMatches = after.filter((event) => event.message === "claude_local process kill_signal");
       expect(lateMatches).toHaveLength(1);
@@ -263,7 +276,8 @@ describeEmbeddedPostgres("post-adapter-settle adapter run events (PEN-3093)", ()
       const finished = await waitForRunToFinish(heartbeat, run!.id);
       expect(finished?.status).toBe("succeeded");
 
-      const events = await readEventsOnceQuiet(run!.id);
+      const { events, quiesced } = await readEventsOnceQuiet(run!.id);
+      expect(quiesced).toBe(true);
       const onTime = events.filter((event) => event.message === "claude_local process spawned");
       expect(onTime).toHaveLength(1);
 
