@@ -230,6 +230,25 @@ type NoExecutableTurnGating = {
   currentBlockOpen: boolean;
 };
 
+// BLO-22887 AC2. Deliberately a STATE record, not a duration: the readiness
+// map carries blocker ids and counts, never the edge's own age, so there is no
+// honest "blocked for N hours" figure to compute from it — and inventing one
+// by scanning `issueRelations` or `latestRuns` was the defect that sank the
+// first attempt at this (PR #1361: an unbounded `latestRuns.find` against a
+// 100-run cap, so an older park silently read as absent). The line's job is to
+// tell a reviewer that the control plane independently classified this issue
+// as dependency-blocked while the elapsed split was calling the same wall-clock
+// "unattended". That disagreement is the whole finding; the arithmetic is not.
+type DependencyGating = {
+  unresolvedBlockerCount: number;
+  /** Subset that are `done` but whose execution workspace has not finalized. */
+  pendingFinalizeBlockerCount: number;
+  // The fired triggers an unresolved blocker does NOT excuse — i.e. the reason
+  // this review survived the suppression gate. Never empty on a rendered line:
+  // an all-closable set is suppressed before the body is built.
+  nonClosableTriggers: ProductivityReviewTrigger[];
+};
+
 type PullRequestEvidence = {
   title: string;
   url: string | null;
@@ -364,6 +383,21 @@ type ProductivityReviewEvidence = {
   // monitor-gated and unattended time. null when no run in the episode
   // classifies as one of those three mechanisms.
   noExecutableTurnGating: NoExecutableTurnGating | null;
+  // BLO-22887 AC2: the dependency-blocked bucket, reported alongside — never
+  // folded into — the monitor-gated/unattended split. Populated only on the
+  // generation path (`reconcileProductivityReviews`), from the readiness map
+  // that path already computes for BLO-22436's suppression gate;
+  // `collectEvidence` deliberately does not fetch it (see the note at the top
+  // of that function — its other caller must not see dependency state at all,
+  // and re-querying would put a second readiness round-trip on the
+  // continuation-hold path for a field that path never renders).
+  //
+  // Null whenever the source has no unresolved blocker, so the line's presence
+  // is itself a signal. Every blocked source that reaches the body builder is
+  // by construction one whose fired-trigger set is NOT dependency-closable —
+  // the closable case is suppressed outright at generation — i.e. exactly
+  // AC2's "still warranted on other grounds".
+  dependencyGating: DependencyGating | null;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -1092,6 +1126,27 @@ function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["mon
     return `${split} (no monitor armed during this episode; previous monitor lapsed at ${gating.priorLapseAt.toISOString()}, before it began)`;
   }
   return `${split} (no monitor armed during this episode)`;
+}
+
+// BLO-22887 AC2: the dependency-blocked bucket, rendered next to the elapsed
+// split rather than subtracted from it. Reports blocker state and says so —
+// see `DependencyGating` for why there is no honest span to report here, and
+// why claiming one would be worse than the bug this replaces.
+function formatDependencyGating(gating: NonNullable<ProductivityReviewEvidence["dependencyGating"]>) {
+  const blockers = `${gating.unresolvedBlockerCount} unresolved \`blockedBy\` ${
+    gating.unresolvedBlockerCount === 1 ? "blocker" : "blockers"
+  } at this evidence pass`;
+  const finalize = gating.pendingFinalizeBlockerCount > 0
+    ? ` (${gating.pendingFinalizeBlockerCount} \`done\` but awaiting workspace finalize)`
+    : "";
+  // Explains the line's own presence. Without it the line reads as a
+  // contradiction of BLO-22436's suppression — "blocked, so why am I looking
+  // at this?" — which is the question that makes a reviewer close a real
+  // high-churn or runtime-failure review as a false positive.
+  const survived = gating.nonClosableTriggers.length > 0
+    ? `; reviewed anyway because ${gating.nonClosableTriggers.map((trigger) => `\`${trigger}\``).join(", ")} fired, which an unresolved blocker does not excuse`
+    : "";
+  return `${blockers}${finalize}${survived} — blocker state at this pass, not a measured span: the elapsed figures above are wall-clock and are NOT reduced by this, so read their unattended portion as covering dependency-blocked time of unrecorded length`;
 }
 
 function isFreshPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEvidence {
@@ -3668,6 +3723,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       nonLiveHoldMs,
       monitorGating,
       noExecutableTurnGating,
+      // BLO-22887 AC2: always null here. Dependency readiness is not fetched on
+      // this path (see the header note); `reconcileProductivityReviews` fills
+      // this in from the map it already holds, and the continuation-hold
+      // caller leaves it null because it renders no body.
+      dependencyGating: null,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -3831,6 +3891,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ...(evidence.noExecutableTurnGating
         ? [`- No-executable-turn accounting: ${formatNoExecutableTurnGating(evidence.noExecutableTurnGating)}`]
         : []),
+      ...(evidence.dependencyGating
+        ? [`- Dependency accounting: ${formatDependencyGating(evidence.dependencyGating)}`]
+        : []),
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
@@ -3935,6 +3998,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         : []),
       ...(evidence.noExecutableTurnGating
         ? [`- No-executable-turn accounting: ${formatNoExecutableTurnGating(evidence.noExecutableTurnGating)}`]
+        : []),
+      ...(evidence.dependencyGating
+        ? [`- Dependency accounting: ${formatDependencyGating(evidence.dependencyGating)}`]
         : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
       `- Linked pull request: ${formatPullRequestEvidence(evidence.latestPullRequest)}`,
@@ -4741,7 +4807,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // (below) rather than filtering the candidate up front, since the trigger
     // is what determines whether the blocker is dispositive and evidence is
     // already collected for every other candidate that reaches this point.
-    const dependencyBlockedSourceIssueIds = new Set<string>();
+    const dependencyBlockedSourceIssueIds = new Map<
+      string,
+      { unresolvedBlockerCount: number; pendingFinalizeBlockerCount: number }
+    >();
     const candidateIdsByCompany = new Map<string, string[]>();
     for (const candidate of candidates) {
       const forCompany = candidateIdsByCompany.get(candidate.companyId) ?? [];
@@ -4751,8 +4820,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     for (const [candidateCompanyId, candidateIds] of candidateIdsByCompany) {
       const readiness = await issuesSvc.listDependencyReadiness(candidateCompanyId, candidateIds, db);
       for (const candidateId of candidateIds) {
-        if ((readiness.get(candidateId)?.unresolvedBlockerCount ?? 0) > 0) {
-          dependencyBlockedSourceIssueIds.add(candidateId);
+        const candidateReadiness = readiness.get(candidateId);
+        const unresolvedBlockerCount = candidateReadiness?.unresolvedBlockerCount ?? 0;
+        if (unresolvedBlockerCount > 0) {
+          // BLO-22887 AC2: the membership test below is unchanged (`.has`), but
+          // the counts ride along so the reported bucket costs no second
+          // readiness round-trip. Deliberately NOT the blocker ids: rendering
+          // raw uuids in a review body is noise, and the source issue's own
+          // `blockedBy` is one click away for a reviewer who needs them.
+          dependencyBlockedSourceIssueIds.set(candidateId, {
+            unresolvedBlockerCount,
+            pendingFinalizeBlockerCount: candidateReadiness?.pendingFinalizeBlockerIssueIds.length ?? 0,
+          });
         }
       }
     }
@@ -4801,6 +4880,21 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         await recordMonitorScheduledSuppression(evidence);
         result.monitorScheduledSuppressed += 1;
         continue;
+      }
+      // BLO-22887 AC2: attach the dependency bucket for the survivors of the
+      // gate above. Placed here rather than beside that gate only because this
+      // is where the union has narrowed to `ProductivityReviewEvidence` — the
+      // two suppression branches carry no body to render. Reaching this line
+      // while blocked means the fired set was NOT all-closable, so
+      // `nonClosableTriggers` is non-empty by construction.
+      const dependencyBlockers = dependencyBlockedSourceIssueIds.get(candidate.id);
+      if (dependencyBlockers) {
+        evidence.dependencyGating = {
+          ...dependencyBlockers,
+          nonClosableTriggers: evidence.firedTriggers.filter(
+            (trigger) => !isDependencyBlockedClosableTrigger(trigger),
+          ),
+        };
       }
       if (await findRecentResolvedProductivityReview(candidate.companyId, candidate.id, thresholds, now)) {
         result.snoozed += 1;

@@ -1513,6 +1513,123 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `high_churn`");
   });
 
+  // BLO-22887 AC2: the two cells above are the "still warranted on other
+  // grounds" case — BLO-22436 suppresses a dependency-blocked source whose
+  // fired set is entirely closable, so *every* blocked source that reaches the
+  // body builder is one a blocker does not excuse. Until now the body said
+  // nothing about the blocker at all, so a manager read `Elapsed accounting`'s
+  // unattended figure with no indication that the control plane independently
+  // classified the issue as dependency-blocked — the exact subsystem
+  // disagreement this issue was filed for. The line reports blocker STATE and
+  // says so: the readiness map carries no edge timestamps, so subtracting an
+  // unmeasured span from the wall-clock buckets would swap a known-wrong
+  // attribution for an invented one.
+  it("reports a dependency-blocked bucket alongside the elapsed split when a review still fires on a non-closable trigger (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("- Dependency accounting: 1 unresolved `blockedBy` blocker");
+    // Names the trigger that kept the review alive, so the line explains its
+    // own presence rather than reading as a contradiction of the suppression.
+    expect(review?.description).toContain("`high_churn`");
+    // The bucket is reported next to the elapsed split, never folded into it.
+    expect(review?.description).not.toContain("Dependency accounting: 0 ");
+  });
+
+  // BLO-22887 AC2 over-reporting guard, and the counterpart to BLO-22436's
+  // cell-3 regression guard: an accounting line that renders unconditionally
+  // would pass the cell above while telling every reviewer in the fleet that
+  // an unblocked issue is dependency-blocked. Keyed on *unresolved*, so a
+  // `done` blocker is a stronger control than no edge at all — the edge still
+  // exists, and readiness is what decides.
+  it("omits the dependency accounting line when the source issue's only blocker is resolved (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+      blockerStatus: "done",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+    expect(review?.description).not.toContain("Dependency accounting");
+  });
+
+  // BLO-22887 AC2: the refresh comment is what lands in the manager's
+  // notifications, and it already mirrors `Elapsed accounting` /
+  // `No-executable-turn accounting` for exactly that reason. A dependency
+  // bucket that appeared only in the description would leave the summary
+  // telling a different story from the artifact it summarises.
+  it("carries the dependency accounting line into the refresh comment (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const service = productivityReviewService(db);
+    // `high_churn` is the non-closable trigger keeping this review alive, and
+    // it reads a rolling 1h window — so the refresh has to land while the
+    // seeded runs are still inside it. Shorten the refresh interval to the
+    // hard floor and step 6 minutes rather than the 1h default, which would
+    // age the runs out and stop generating the review entirely.
+    const thresholds = { refreshIntervalMs: PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS };
+    await service.reconcileProductivityReviews({ now, companyId: seeded.companyId, thresholds });
+    const [review] = await listProductivityReviews(seeded.companyId);
+    const refreshed = await service.reconcileProductivityReviews({
+      now: new Date(now.getTime() + 6 * 60 * 1000),
+      companyId: seeded.companyId,
+      thresholds,
+    });
+
+    expect(refreshed.updated).toBe(1);
+    const refreshComments = await listRefreshComments(review!.id);
+    expect(refreshComments.length).toBeGreaterThan(0);
+    expect(refreshComments.at(-1)?.body).toContain("- Dependency accounting: 1 unresolved `blockedBy` blocker");
+  });
+
   // BLO-22436: once the blocker resolves (or the edge is removed), the same
   // issue is reviewable again, and its historical dependency-blocked
   // cancellations must be reported as their own line item — not folded into
