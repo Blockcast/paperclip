@@ -14,6 +14,15 @@
 
 - Blockcast/paperclip is a diverged fork (1020 ahead, 2609 behind upstream). Do not sync upstream as part of this plan; the upstream delta is dependencies and UI.
 - Work from `origin/master` of Blockcast/paperclip. The local checkout is on a stale branch; read code with `git show origin/master:<path>` and branch fresh.
+- **Repository root.** The steps below name the author's absolute checkout path
+  (`/Users/oramadan/src/github.com/blockcast/paperclip`, 32 times) because that is what was
+  actually run. They are kept verbatim so the record matches execution. To replay them anywhere
+  else, set the root once and substitute it wherever that literal appears:
+
+  ```bash
+  REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel)}"
+  ```
+
 - Every PR body must carry evidence per the user requirement: before/after JSON, exact `curl`/`gh` commands with output, pasted test output, and a 1440x900 screenshot for anything visible in the Paperclip UI. There is no staging Paperclip; use local `pnpm dev` plus a dev DB, or read-only production verification after the daily deploy.
 - Paths under CODEOWNERS (`.github/**`, `skills/**`, `package.json`, `pnpm-lock.yaml`, release scripts) need @kkroo approval. Name it on every PR that touches them.
 - Do not change `server/src/services/in-review-gate.ts`. Unlabeled issues keep the `warn` verdict; the flip to `block` is behind a flag and a measured rollout (Task B7).
