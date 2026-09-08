@@ -4896,43 +4896,130 @@ export function companySkillService(db: Db) {
     return skillDir;
   }
 
+  /**
+   * Bound on the retire-and-swap retry in `commit()` below. Not a tuning knob —
+   * it only exists so a pathological stream of concurrent publishers cannot spin
+   * the loop forever. Each extra iteration requires another writer to win the
+   * race inside the gap between two renames.
+   */
+  const DIRECTORY_SWAP_ATTEMPTS = 3;
+
+  /**
+   * Stage a directory's new contents beside it, then swap them in.
+   *
+   * BLO-32167. The swap must never leave `targetDir` observable in a
+   * half-written state, because several readers sample these trees concurrently
+   * and none of them can tell "still being written" from "this is all there is":
+   * `resolveExistingSkillDirectory` (the available-skills catalogue),
+   * `hashPathContents` in the claude-k8s adapter (the prompt-bundle cache key),
+   * and the per-run copy that snapshots a tree into a pod.
+   *
+   * Renaming the outgoing tree aside *before* renaming the new one in is what
+   * makes that true, and it is why no path in here ever removes `targetDir` in
+   * place — including the collision branch. The obvious alternative, `rm -rf`
+   * the old tree first, reintroduces the same defect from the other end: `rm` is
+   * itself a walk, so a reader landing mid-`rm` sees a shrinking directory and
+   * hashes it happily.
+   *
+   * The residual exposure is the single instant between the two renames, in
+   * which `targetDir` does not exist at all. That is deliberate: a *missing*
+   * source is the branch every reader already handles correctly (`ENOENT` ->
+   * `ClaudeSkillSourceUnavailableError` -> retryable
+   * `skill_materialization_pending` per BLO-32055 / #1669), whereas a *present
+   * but incomplete* source is the silent one. So this trades an unbounded window
+   * that fails silently for a one-syscall window that fails loudly and
+   * self-heals.
+   *
+   * "Unbounded" is not rhetorical: `materializeRuntimeSkillFiles` performs a
+   * database read per inventory entry, so the pre-BLO-32167 window there spanned
+   * N round-trips.
+   */
   async function createDirectoryReplacement(targetDir: string) {
     const parentDir = path.dirname(targetDir);
     const baseName = path.basename(targetDir);
     await fs.mkdir(parentDir, { recursive: true });
     const stagingDir = path.join(parentDir, `.${baseName}.tmp-${randomUUID()}`);
-    const previousDir = path.join(parentDir, `.${baseName}.old-${randomUUID()}`);
+    const previousDirPrefix = path.join(parentDir, `.${baseName}.old-${randomUUID()}`);
     await fs.rm(stagingDir, { recursive: true, force: true });
     await fs.mkdir(stagingDir, { recursive: true });
 
     return {
       stagingDir,
       async commit() {
-        let hasPrevious = false;
+        const retiredDirs: string[] = [];
         try {
-          await fs.rename(targetDir, previousDir);
-          hasPrevious = true;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        }
+          for (let attempt = 0; ; attempt += 1) {
+            const previousDir = `${previousDirPrefix}-${attempt}`;
+            let hasPrevious = false;
+            try {
+              await fs.rename(targetDir, previousDir);
+              hasPrevious = true;
+              retiredDirs.push(previousDir);
+            } catch (error) {
+              // Nothing published at this path yet — first materialization.
+              if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            }
 
-        try {
-          await fs.rename(stagingDir, targetDir);
-        } catch (error) {
-          if (hasPrevious) {
-            await fs.rename(previousDir, targetDir).catch(() => undefined);
+            try {
+              await fs.rename(stagingDir, targetDir);
+              return;
+            } catch (error) {
+              const code = (error as NodeJS.ErrnoException).code;
+              if (code !== "ENOTEMPTY" && code !== "EEXIST") {
+                if (hasPrevious) {
+                  await fs.rename(previousDir, targetDir).catch(() => undefined);
+                }
+                throw error;
+              }
+              // A concurrent publisher filled `targetDir` in the gap between our
+              // two renames (POSIX `rename` refuses to replace a non-empty
+              // directory). Retire *its* tree aside and swap again rather than
+              // clearing the path in place: an `fs.rm` here would expose exactly
+              // the shrinking directory this function exists to prevent, and it
+              // would do so in the one scenario the branch is reached at all.
+              if (attempt + 1 >= DIRECTORY_SWAP_ATTEMPTS) throw error;
+            }
           }
-          throw error;
-        }
-
-        if (hasPrevious) {
-          await fs.rm(previousDir, { recursive: true, force: true });
+        } finally {
+          // Every retired tree is off the live path by the time we get here.
+          for (const dir of retiredDirs) {
+            await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+          }
         }
       },
       async cleanup() {
         await fs.rm(stagingDir, { recursive: true, force: true });
       },
     };
+  }
+
+  /**
+   * Take a published directory out of service without exposing it half-emptied.
+   *
+   * BLO-32167, and the same argument as `createDirectoryReplacement` above:
+   * `fs.rm(dir, { recursive: true })` unlinks entries one at a time before the
+   * final `rmdir`, so a reader landing mid-walk sees the directory present with
+   * `SKILL.md` already gone. That is the present-but-incomplete state that
+   * raises no syscall error in any reader. Renaming the whole tree aside first
+   * makes the disappearance a single syscall, so a concurrent reader sees either
+   * the complete tree or `ENOENT`.
+   */
+  async function unpublishDirectory(targetDir: string) {
+    const retiredDir = path.join(
+      path.dirname(targetDir),
+      `.${path.basename(targetDir)}.old-${randomUUID()}`,
+    );
+    try {
+      await fs.rename(targetDir, retiredDir);
+    } catch (error) {
+      // Nothing published at this path — already out of service.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    // Unpublishing is the contract; reclaiming the bytes is best-effort. Callers
+    // throw a more informative error immediately after, which a failure to
+    // remove an already-retired tree must not mask.
+    await fs.rm(retiredDir, { recursive: true, force: true }).catch(() => undefined);
   }
 
   async function materializeCatalogManifestSkillFiles(
@@ -5241,76 +5328,16 @@ export function companySkillService(db: Db) {
     };
   }
 
-  /**
-   * Swap a fully-written staging tree into place under `skillDir`.
-   *
-   * BLO-32167. The publish must never leave `skillDir` observable in a
-   * half-written state, because several readers sample it concurrently and none
-   * of them can tell "still being written" from "this is all there is":
-   * `resolveExistingSkillDirectory` (the available-skills catalogue),
-   * `hashPathContents` in the claude-k8s adapter (the prompt-bundle cache key),
-   * and the per-run copy that snapshots the tree into a pod.
-   *
-   * Renaming the outgoing tree aside *before* renaming the new one in is what
-   * makes that true. The obvious alternative — `rm -rf` the old tree first —
-   * reintroduces the same defect from the other end: `rm` is itself a walk, so a
-   * reader landing mid-`rm` sees a shrinking directory and hashes it happily.
-   *
-   * The residual exposure is the single instant between the two renames, in
-   * which `skillDir` does not exist at all. That is deliberate: a *missing*
-   * source is the branch every reader already handles correctly (`ENOENT` ->
-   * `ClaudeSkillSourceUnavailableError` -> retryable `skill_materialization_pending`
-   * per BLO-32055 / #1669), whereas a *present but incomplete* source is the
-   * silent one. So this trades an unbounded window that fails silently for a
-   * one-syscall window that fails loudly and self-heals.
-   *
-   * "Unbounded" is not rhetorical: the write loop performs a database read per
-   * inventory entry, so the pre-BLO-32167 window spanned N round-trips.
-   */
-  async function publishStagedRuntimeSkillDir(stagingDir: string, skillDir: string) {
-    const retiredDir = path.resolve(
-      path.dirname(skillDir),
-      `.retired-${path.basename(skillDir)}-${process.pid}-${randomUUID()}`,
-    );
-    let retired = false;
-    try {
-      await fs.rename(skillDir, retiredDir);
-      retired = true;
-    } catch (error) {
-      // First materialization of this skill: nothing to retire.
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-
-    try {
-      await fs.rename(stagingDir, skillDir);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      // A concurrent materializer published between our two renames. Its tree is
-      // complete by construction, so this is a correctness-preserving collision
-      // rather than a corrupt state; ours is at least as fresh, so take the slot.
-      if (code !== "ENOTEMPTY" && code !== "EEXIST") {
-        if (retired) await fs.rename(retiredDir, skillDir).catch(() => {});
-        throw error;
-      }
-      await fs.rm(skillDir, { recursive: true, force: true });
-      await fs.rename(stagingDir, skillDir);
-    } finally {
-      if (retired) await fs.rm(retiredDir, { recursive: true, force: true }).catch(() => {});
-    }
-  }
-
   async function materializeRuntimeSkillFiles(companyId: string, skill: CompanySkill) {
     const runtimeRoot = path.resolve(resolveManagedSkillsRoot(companyId), "__runtime__");
     const runtimeName = buildSkillRuntimeName(skill.key, skill.slug);
     const skillDir = path.resolve(runtimeRoot, runtimeName);
-    // Sibling of the destination so the publish below is a rename (atomic, same
-    // filesystem) rather than a copy. Dot-prefixed because a runtime name never
-    // starts with a dot, so neither a staging nor a retired tree can be mistaken
-    // for a skill by anything that enumerates `__runtime__`.
-    const stagingDir = path.resolve(runtimeRoot, `.staging-${runtimeName}-${process.pid}-${randomUUID()}`);
-
-    await fs.mkdir(runtimeRoot, { recursive: true });
-    await fs.mkdir(stagingDir, { recursive: true });
+    // BLO-32167. Publishes via the shared `createDirectoryReplacement` primitive
+    // rather than writing into `skillDir` directly, so no reader can sample this
+    // tree without its `SKILL.md`. Its staging and retired siblings are
+    // dot-prefixed and a runtime name never starts with a dot, so neither can be
+    // mistaken for a skill by anything that enumerates `__runtime__`.
+    const replacement = await createDirectoryReplacement(skillDir);
 
     try {
       let wroteSkillFile = false;
@@ -5319,26 +5346,30 @@ export function companySkillService(db: Db) {
         const detail = await readFile(companyId, skill.id, normalizedPath).catch(() => null);
         const content = detail?.content ?? (normalizedPath === "SKILL.md" ? skill.markdown : null);
         if (content === null) continue;
-        const targetPath = path.resolve(stagingDir, entry.path);
+        const targetPath = path.resolve(replacement.stagingDir, entry.path);
         await fs.mkdir(path.dirname(targetPath), { recursive: true });
         await fs.writeFile(targetPath, content, "utf8");
         if (normalizedPath === "SKILL.md") wroteSkillFile = true;
       }
 
       if (!wroteSkillFile) {
-        // Deliberately still removes the published tree, exactly as before. A
-        // skill whose stored SKILL.md has gone must stop being served, and the
-        // callers rely on that: `resolveRuntimeSkillSource` would otherwise keep
-        // resolving the stale directory through `resolveExistingSkillDirectory`.
-        await fs.rm(skillDir, { recursive: true, force: true });
+        // Deliberately still takes the published tree out of service, exactly as
+        // before. A skill whose stored SKILL.md has gone must stop being served,
+        // and the callers rely on that: `resolveRuntimeSkillSource` would
+        // otherwise keep resolving the stale directory through
+        // `resolveExistingSkillDirectory`. It goes through
+        // `unpublishDirectory` because an in-place `fs.rm` would walk a tree
+        // that is *live and complete* at this point, leaving it observable
+        // without its entrypoint on the way down.
+        await unpublishDirectory(skillDir);
         throw unprocessable("Company skill could not be materialized because its stored SKILL.md copy is missing.");
       }
 
-      await publishStagedRuntimeSkillDir(stagingDir, skillDir);
+      await replacement.commit();
       return skillDir;
     } finally {
       // No-op on the success path — the staging tree was renamed away.
-      await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
+      await replacement.cleanup().catch(() => undefined);
     }
   }
 

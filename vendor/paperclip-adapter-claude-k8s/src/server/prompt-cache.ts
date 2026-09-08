@@ -42,10 +42,16 @@ const DEFAULT_PAPERCLIP_INSTANCE_ID = "default";
  * `prepareClaudePromptBundle`, i.e. before the Claude CLI was ever spawned.
  *
  * (BLO-32167 has since made that publish atomic — staging tree, then rename —
- * so both windows should now be closed at the writer. These guards remain as
- * the observer-side backstop: the pod-local bundle copy is a separate snapshot
- * on a different code path, and `materializeVersionSnapshot` still has the
- * original non-atomic shape.)
+ * so both windows should now be closed at the writer, for the `__runtime__`
+ * path and for the `__catalog__` / `__catalog_origins__` paths that share the
+ * same `createDirectoryReplacement` primitive. These guards remain as the
+ * observer-side backstop: the pod-local bundle copy is a separate snapshot on a
+ * different code path, and three writers deliberately keep the original
+ * `rm` -> `mkdir` -> per-file `writeFile` shape — `materializeVersionSnapshot`
+ * (content-addressed, guarded by a fingerprint early-return, so it rewrites far
+ * more rarely), `materializeCatalogSkillFiles`, and the fork/create path in
+ * `create`. The first two publish under `__catalog*`, which the new
+ * catalog-backed entrypoint assertion below does cover.)
  *
  * That is why the live instance carried `errorCode: adapter_failed` with both
  * `stdoutExcerpt` and `stderrExcerpt` null: there was no transcript, no result
