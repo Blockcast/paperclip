@@ -221,6 +221,25 @@ describe("BLO-32695 — the structured verdict block as the primary source", () 
     ).toMatchObject({ state: "failure", outcome: "blocking_finding" });
   });
 
+  it("reads an explicitly empty findings object as a stated zero, not an omission", () => {
+    // The boundary of the missing-`findings` tightening below, pinned from the
+    // permissive side so the fix cannot quietly grow into rejecting a review
+    // that legitimately found nothing. `{}` is Ally saying "I counted, the
+    // answer was nothing"; omitting the key entirely is Ally saying nothing at
+    // all. Only the second may clear no head.
+    const emptyCounts = `${verdictBlock({ head: PR1675_HEAD, findings: {} })}\n## Ally — Consolidated PR Review`;
+    const parsed = parseAllyVerdictBlock(emptyCounts);
+    expect(parsed.kind).toBe("ok");
+    expect(hasActionablePrReviewFeedback(emptyCounts)).toBe(false);
+    expect(
+      evaluateCommentReviewGate({
+        headSha: PR1675_HEAD,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: [allyComment(emptyCounts, "2026-09-07T15:41:42Z")],
+      }),
+    ).toMatchObject({ state: "success", outcome: "clean" });
+  });
+
   it("ignores a block inside a fence, so a quoted verdict cannot clear a head", () => {
     const quoted = [
       "## Ally — Consolidated PR Review",
@@ -374,6 +393,18 @@ describe("BLO-32695 — fail-closed on an unreadable block", () => {
       name: "non-integer finding counts",
       body: `${verdictBlock({ head: PR1675_HEAD, findings: { important: "two" } })}\n## Ally — Consolidated PR Review`,
       reason: /not severity counts/,
+    },
+    {
+      // The dangerous shape, and the reason it needs its own case: every other
+      // entry here is malformed in a way that is obvious on sight. This one is
+      // a *valid* block — good head, good version, parseable JSON — that simply
+      // never states what it found. Defaulting the absent counts to an empty
+      // map made it read as 0 Critical / 0 Important, i.e. a clean verdict, so
+      // a payload making no claim could clear a head. That is the fail-open
+      // direction BLO-29711 closed and AC-5 forbids re-opening.
+      name: "a valid head with no findings counts at all",
+      body: `${verdictBlock({ head: PR1675_HEAD })}\n## Ally — Consolidated PR Review`,
+      reason: /states no findings counts/,
     },
     {
       name: "a disposition missing its index",

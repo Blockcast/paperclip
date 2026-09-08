@@ -263,8 +263,16 @@ export type AllyVerdictBlockParse =
   | { kind: "ok"; verdict: AllyStructuredVerdict }
   | { kind: "unreadable"; reason: string };
 
+/**
+ * Note there is deliberately no `undefined` branch here, unlike
+ * `asDispositions`. A missing `findings` is rejected by the caller rather than
+ * defaulted to an empty map: defaulting is a fail-open path, because zero
+ * counts read as a clean verdict, so a block that never stated its counts
+ * would clear a head. The asymmetry is the contract's — `findings` is
+ * mandatory, `dispositions` is genuinely absent on a review that retires
+ * nothing.
+ */
 function asSeverityCounts(raw: unknown): Map<string, number> | null {
-  if (raw === undefined) return new Map();
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
   const counts = new Map<string, number>();
   for (const [severity, value] of Object.entries(raw as Record<string, unknown>)) {
@@ -309,6 +317,10 @@ function asDispositions(raw: unknown): AllyStructuredDisposition[] | null {
  *   - Malformed JSON, or a missing/short `head`. A verdict that does not say
  *     which tree it examined attests nothing, so it must not be able to clear
  *     a head by default.
+ *   - A missing `findings` object. Absent counts are not zero counts: zero is
+ *     a clean verdict, so defaulting would let a partial payload clear a head
+ *     it never made a claim about. An *empty* `findings` object still reads —
+ *     that is Ally stating counts, not omitting them.
  *
  * Note the asymmetry with the prose fallback: an unreadable *block* is red,
  * whereas an unreadable *body* with no block keeps the historical behavior.
@@ -343,6 +355,9 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
   const { head, findings, dispositions } = parsed as Record<string, unknown>;
   if (typeof head !== "string" || !/^[0-9a-f]{40}$/i.test(head.trim())) {
     return { kind: "unreadable", reason: "ally-verdict block attests no complete head SHA" };
+  }
+  if (findings === undefined) {
+    return { kind: "unreadable", reason: "ally-verdict block states no findings counts" };
   }
   const counts = asSeverityCounts(findings);
   if (!counts) return { kind: "unreadable", reason: "ally-verdict findings are not severity counts" };
