@@ -187,7 +187,12 @@ import {
 import { findWakeIdempotencyReceipt } from "../services/wake-idempotency.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
-import { maskWorkspaceRuntimeForRead, redactEventPayload, redactSensitiveText } from "../redaction.js";
+import {
+  maskWorkspaceRuntimeForRead,
+  maskWorkspaceRuntimeTextForRead,
+  redactEventPayload,
+  redactSensitiveText,
+} from "../redaction.js";
 import {
   createCompanySearchRateLimiter,
   type CompanySearchRateLimiter,
@@ -7515,9 +7520,18 @@ export function issueRoutes(
       status: service.status,
       lifecycle: service.lifecycle,
       reuseKey: service.reuseKey,
-      command: service.command,
-      cwd: service.cwd,
+      // `command`/`cwd` are the operator's own free text, copied onto this row
+      // from the `workspaceRuntime` entry that `compactIssueExecutionWorkspace`
+      // masks ~50 lines below. Emitting them here handed the same string back in
+      // cleartext in the same response body (PEN-2854, door #14). `command` runs
+      // through `sh -c`, so an inline `FOO_TOKEN=... npm run dev` is a normal
+      // idiom; `cwd` discloses host paths.
+      command: maskWorkspaceRuntimeTextForRead(service.command),
+      cwd: maskWorkspaceRuntimeTextForRead(service.cwd),
       port: service.port,
+      // `url` deliberately survives: `paperclipWaitForIssueWorkspaceService`
+      // returns it to the caller, and it is a generated local address rather
+      // than operator free text. `providerRef` is a pid.
       url: service.url,
       provider: service.provider,
       providerRef: service.providerRef,

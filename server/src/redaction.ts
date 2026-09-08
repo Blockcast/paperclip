@@ -867,6 +867,36 @@ export function maskWorkspaceRuntimeForRead(value: unknown): unknown {
 }
 
 /**
+ * Mask one operator-authored free-text scalar that was *promoted out of*
+ * `workspaceRuntime` onto a typed column (PEN-2854, door #14).
+ *
+ * `maskWorkspaceRuntimeForRead` above already elides `command`/`cwd` where the
+ * operator wrote them — inside the runtime config. But the same strings are
+ * copied onto the `workspace_runtime_services` row when the service starts
+ * (`resolveRuntimeServiceReuseIdentity` reads `input.service.command` /
+ * `.cwd` from that very entry, `services/workspace-runtime.ts`), and
+ * `compactIssueRuntimeService` in `routes/issues.ts` emitted them verbatim.
+ * So a single response carried a masked copy and a cleartext copy of the same
+ * string, eight lines apart. Being a typed column bounds the *key set*; it says
+ * nothing about the *value*, which is the reasoning error this helper exists to
+ * correct.
+ *
+ * This is deliberately **not** `maskWorkspaceRuntimeForRead`: these are two
+ * scalars, not a nested map, and reusing the walk would mean either forcing
+ * scalars through an object traversal or copying its body — the duplication
+ * PEN-2839 (#1581) was extracted to prevent.
+ *
+ * `null` passes through rather than becoming the sentinel. It carries nothing,
+ * it is the honest "no command configured" that callers branch on, and
+ * `scoreWorkspaceRuntimeServiceMatch` in `packages/shared/src/workspace-commands.ts`
+ * guards on truthiness before comparing — turning `null` into a string would
+ * change matching behaviour rather than only hiding a value.
+ */
+export function maskWorkspaceRuntimeTextForRead(value: string | null): string | null {
+  return value === null ? null : REDACTED_EVENT_VALUE;
+}
+
+/**
  * Approval payloads are a human-facing escalation channel (BLO-20810), so a
  * field the scanner actually blanked must read differently from one the
  * filer simply left empty — a bare `***REDACTED***` is ambiguous on its own.
