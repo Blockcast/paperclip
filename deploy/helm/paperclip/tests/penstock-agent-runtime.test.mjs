@@ -122,6 +122,12 @@ test("the Docker workflow keeps launcher credentials separate from vendor creden
     /penstock_runtime_token=\$\{\{ secrets\.PAPERCLIP_BOARD_TOKEN \}\}/,
   );
   assert.doesNotMatch(dockerWorkflow, /secrets\.PENSTOCK_RUNTIME_TOKEN/);
+
+  const runtimeBuild = dockerWorkflow.indexOf("- name: Build and push stable runtime image");
+  const tokenMint = dockerWorkflow.indexOf("- name: Mint read-only Penstock runtime token");
+  const consumingBuild = dockerWorkflow.indexOf("- name: Build and push\n", tokenMint);
+  assert.ok(runtimeBuild >= 0 && runtimeBuild < tokenMint);
+  assert.ok(tokenMint < consumingBuild);
 });
 
 test("the agent overlay carries every packaged Penstock runtime asset", () => {
