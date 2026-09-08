@@ -14,14 +14,18 @@
 
 - Blockcast/paperclip is a diverged fork (1020 ahead, 2609 behind upstream). Do not sync upstream as part of this plan; the upstream delta is dependencies and UI.
 - Work from `origin/master` of Blockcast/paperclip. The local checkout is on a stale branch; read code with `git show origin/master:<path>` and branch fresh.
-- **Repository root.** The steps below name the author's absolute checkout path
-  (`/Users/oramadan/src/github.com/blockcast/paperclip`, 32 times) because that is what was
-  actually run. They are kept verbatim so the record matches execution. To replay them anywhere
-  else, set the root once and substitute it wherever that literal appears:
+- **Repository root.** Executable steps below are parameterised on two variables so the runbook
+  replays outside the author's checkout. Set them once:
 
   ```bash
   REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel)}"
+  TRACK_D_WT="${TRACK_D_WT:-${REPO_ROOT}-track-d}"   # sibling worktree created in Track D Step 1
   ```
+
+  Every path in this repo or its Track D worktree is expressed through those two variables.
+  Literal absolute paths remain in exactly two places, because a variable would misdescribe
+  them: paths in the **magma** repo, which is a different repository; and the author's
+  `~/.claude` memory files, which are machine-specific and not replayable at all.
 
 - Every PR body must carry evidence per the user requirement: before/after JSON, exact `curl`/`gh` commands with output, pasted test output, and a 1440x900 screenshot for anything visible in the Paperclip UI. There is no staging Paperclip; use local `pnpm dev` plus a dev DB, or read-only production verification after the daily deploy.
 - Paths under CODEOWNERS (`.github/**`, `skills/**`, `package.json`, `pnpm-lock.yaml`, release scripts) need @kkroo approval. Name it on every PR that touches them.
@@ -100,7 +104,7 @@ Deviation from the brief, stated up front: the `### Prior Findings Dispositioned
 - [ ] **Step 1: Create the worktree and scratch dir**
 ```bash
 mkdir -p /tmp/track-a
-cd /Users/oramadan/src/github.com/blockcast/paperclip
+cd "$REPO_ROOT"
 git fetch origin master
 git worktree add /tmp/track-a/wt -b track-a-landing-log origin/master
 printf '# Track A landing log (2026-09-05)
@@ -148,7 +152,7 @@ for n in 1596 1585 1219 1150; do
 State at request time:
 - CI: \`verify\` green on head \`${head}\`
 - Ally consolidated review: zero Critical/Important findings at this head
-- Merge plan: \`gh pr merge ${n} --squash --auto\` (merge queue) immediately after your approval
+- Merge plan: \`gh pr merge ${n} --auto\` (merge queue) immediately after your approval
 
 Context: Track A of the 2026-09-05 Paperclip landing plan (20 clean PRs; 16 are merging now, these 4 wait on you).
 EOF
@@ -167,9 +171,10 @@ LOG=/tmp/track-a/wt/docs/superpowers/plans/2026-09-05-track-a-landing-log.md
 for n in 1588 1635 1627 1609 1605 1600 1595 1586 1584 1467 1418 1322 1309 1279 1195 1091; do
   pre="$(gh pr view "$n" -R Blockcast/paperclip --json mergeStateStatus --jq .mergeStateStatus)"
   echo "== PR $n pre-state $pre"
-  if [ "$pre" = "BEHIND" ]; then
-    gh pr update-branch "$n" -R Blockcast/paperclip || pre=DIRTY
-  fi
+  # BEHIND: deliberately no action. The merge queue rebases each entry onto the current base when
+  # it builds the merge_group ref, so BEHIND needs no pre-merge step. Never `gh pr update-branch`
+  # here (BLO-22300): it MERGES base into head, so the head becomes a merge commit, `rebaseable`
+  # flips to false, and the entry is silently evicted at head-of-queue with no build ever created.
   if [ "$pre" = "DIRTY" ]; then
     gh pr comment "$n" -R Blockcast/paperclip --body "Track A landing 2026-09-05: this PR conflicts with master (mergeStateStatus DIRTY). Not merged. A Paperclip issue assigned to Ally requests a rebase onto current master; once \`verify\` is green again it will be enqueued."
     cat > "/tmp/track-a/a1-dirty-$n.json" <<EOF
@@ -190,7 +195,7 @@ EOF
     continue
   fi
   gh pr checks "$n" -R Blockcast/paperclip --watch --fail-fast
-  gh pr merge "$n" -R Blockcast/paperclip --squash --auto
+  gh pr merge "$n" -R Blockcast/paperclip --auto
   for i in $(seq 1 45); do
     st="$(gh pr view "$n" -R Blockcast/paperclip --json state --jq .state)"
     [ "$st" = "MERGED" ] && break
@@ -221,14 +226,15 @@ for n in 1585 1596 1219 1150; do
         --jq '[.[] | select(.user.login=="kkroo" and .state=="APPROVED")] | length')"
   if [ "${ok:-0}" -lt 1 ]; then echo "PR $n: no kkroo approval yet, skip"; continue; fi
   pre="$(gh pr view "$n" -R Blockcast/paperclip --json mergeStateStatus --jq .mergeStateStatus)"
-  if [ "$pre" = "BEHIND" ]; then gh pr update-branch "$n" -R Blockcast/paperclip || pre=DIRTY; fi
+  # BEHIND: no action — the queue rebases on build. Never `gh pr update-branch` (BLO-22300): it
+  # merges base into head, flipping `rebaseable` to false, and the entry is silently evicted.
   if [ "$pre" = "DIRTY" ]; then
     gh pr comment "$n" -R Blockcast/paperclip --body "Track A landing 2026-09-05: conflicts with master (DIRTY) after @kkroo approval. Rebase requested via a Paperclip issue to Ally; re-approval will be requested on the new head."
     printf '| %s | yes | DIRTY | (not merged) | |
 ' "$n" >> "$LOG"; continue
   fi
   gh pr checks "$n" -R Blockcast/paperclip --watch --fail-fast
-  gh pr merge "$n" -R Blockcast/paperclip --squash --auto
+  gh pr merge "$n" -R Blockcast/paperclip --auto
   for i in $(seq 1 45); do
     [ "$(gh pr view "$n" -R Blockcast/paperclip --json state --jq .state)" = "MERGED" ] && break; sleep 60
   done
@@ -404,13 +410,14 @@ Run: the loop above  Expected per resolved PR: `attested` equals `head`, `critic
 LOG=/tmp/track-a/wt/docs/superpowers/plans/2026-09-05-track-a-landing-log.md
 for n in <resolved PR numbers from Step 5>; do
   pre="$(gh pr view "$n" -R Blockcast/paperclip --json mergeStateStatus --jq .mergeStateStatus)"
-  if [ "$pre" = "BEHIND" ]; then gh pr update-branch "$n" -R Blockcast/paperclip || pre=DIRTY; fi
+  # BEHIND: no action — the queue rebases on build. Never `gh pr update-branch` (BLO-22300): it
+  # merges base into head, flipping `rebaseable` to false, and the entry is silently evicted.
   if [ "$pre" = "DIRTY" ]; then
     gh pr comment "$n" -R Blockcast/paperclip --body "Track A 2026-09-05: findings closed but the branch now conflicts with master (DIRTY). Please rebase; the re-review ledger stays attached to this PR."
     sed -i '' "s/^| $n | \(.*\) | pending |\$/| $n | \1 | DIRTY after re-review |/" "$LOG"; continue
   fi
   gh pr checks "$n" -R Blockcast/paperclip --watch --fail-fast
-  gh pr merge "$n" -R Blockcast/paperclip --squash --auto
+  gh pr merge "$n" -R Blockcast/paperclip --auto
   for i in $(seq 1 45); do
     [ "$(gh pr view "$n" -R Blockcast/paperclip --json state --jq .state)" = "MERGED" ] && break; sleep 60
   done
@@ -483,15 +490,17 @@ for n in 1471 1463 1559 1613; do
   if [ "$n" = "1559" ] && [ "$(gh pr view 1585 -R Blockcast/paperclip --json state --jq .state)" != "MERGED" ]; then
     echo "PR 1559: waiting for #1585 to merge first"; continue
   fi
-  if gh pr update-branch "$n" -R Blockcast/paperclip; then
-    echo "PR $n: branch updated, waiting for verify"
-    gh pr checks "$n" -R Blockcast/paperclip --watch --fail-fast && echo "PR $n: GREEN" || echo "PR $n: STILL RED"
-  else
-    echo "PR $n: update-branch failed (conflict); STILL RED"
-  fi
+  # Re-run the failed checks at the EXISTING head. Do not `gh pr update-branch` to refresh the base
+  # (BLO-22300): it merges base into head, so the head becomes a merge commit and the PR is later
+  # evicted from the queue with no build. If a check only fails because the base is stale, that
+  # needs a squash-replay onto master (BLO-32317) — an authoring decision, routed, not done here.
+  gh run rerun --failed $(gh pr checks "$n" -R Blockcast/paperclip --json link,state \
+      --jq '[.[]|select(.state!="SUCCESS")|.link|capture("runs/(?<id>[0-9]+)").id]|first // empty') 2>/dev/null \
+    || echo "PR $n: no rerunnable failed run; inspect manually"
+  gh pr checks "$n" -R Blockcast/paperclip --watch --fail-fast && echo "PR $n: GREEN" || echo "PR $n: STILL RED"
 done
 ```
-Run: the loop above  Expected: one `GREEN` or `STILL RED` line per PR. `pr.yml` triggers on the default `pull_request` types, so `update-branch` re-runs `verify` without a `/test` comment.
+Run: the loop above  Expected: one `GREEN` or `STILL RED` line per PR. Re-running the failed run re-reports `verify` on the existing head without a `/test` comment. Note this does **not** refresh the base — that is deliberate: `gh pr update-branch` would, and it is prohibited on this repo (BLO-22300). A check that can only pass on a newer base is `STILL RED` here and needs a squash-replay, routed to the authoring lane.
 
 - [ ] **Step 4: Merge every PR that went GREEN**
 ```bash
@@ -510,12 +519,12 @@ for n in <GREEN PR numbers from Step 3>; do
     ok="$(gh api "repos/Blockcast/paperclip/pulls/$n/reviews" --paginate --jq '[.[] | select(.user.login=="kkroo" and .state=="APPROVED")] | length')"
     if [ "${ok:-0}" -lt 1 ] && [ "$n" != "1613" ]; then
       gh pr edit "$n" -R Blockcast/paperclip --add-reviewer kkroo
-      gh pr comment "$n" -R Blockcast/paperclip --body "@kkroo approval requested: CODEOWNED paths, \`verify\` now green after rebase. Will enqueue with \`gh pr merge $n --squash --auto\` on approval. Track A 2026-09-05."
+      gh pr comment "$n" -R Blockcast/paperclip --body "@kkroo approval requested: CODEOWNED paths, \`verify\` now green after rebase. Will enqueue with \`gh pr merge $n --auto\` on approval. Track A 2026-09-05."
       printf '| %s | %s | GREEN | awaiting kkroo approval |
 ' "$n" "$(cut -f1 "/tmp/track-a/a3-$n-failed.tsv" | paste -sd, -)" >> "$LOG"; continue
     fi
   fi
-  gh pr merge "$n" -R Blockcast/paperclip --squash --auto
+  gh pr merge "$n" -R Blockcast/paperclip --auto
   for i in $(seq 1 45); do
     [ "$(gh pr view "$n" -R Blockcast/paperclip --json state --jq .state)" = "MERGED" ] && break; sleep 60
   done
@@ -731,7 +740,7 @@ gh pr create -R Blockcast/paperclip --base master --head track-a-landing-log \
   --title "docs(plans): Track A landing log 2026-09-05" \
   --body-file docs/superpowers/plans/2026-09-05-track-a-landing-log.md
 ```
-Run: `gh pr view --json url,files -R Blockcast/paperclip --jq '{url, files: [.files[].path]}'`  Expected: exactly one file, `docs/superpowers/plans/2026-09-05-track-a-landing-log.md`; no CODEOWNED path, so no kkroo approval is required. Enqueue it with `gh pr merge --squash --auto` after `verify` is green.
+Run: `gh pr view --json url,files -R Blockcast/paperclip --jq '{url, files: [.files[].path]}'`  Expected: exactly one file, `docs/superpowers/plans/2026-09-05-track-a-landing-log.md`; no CODEOWNED path, so no kkroo approval is required. Enqueue it with `gh pr merge --auto` after `verify` is green.
 
 - [ ] **Step 9: PR evidence**
 The log PR body is the evidence. It must contain:
@@ -1840,7 +1849,7 @@ Expected: `kkroo` appears under reviewRequests.
 
 - [ ] **Step 4: Request Ally review and land**
 
-Post a PR comment whose first byte is `<!-- paperclip:review-request -->` followed by `@ally` and the focus: "evidence gate truth shapes; check fail-closed paths in evidence-truth.ts and the durable-shape change in issues.ts". When Ally's canonical review is clean at the current head and `verify` is green: `gh pr merge <n> -R Blockcast/paperclip --squash --auto`.
+Post a PR comment whose first byte is `<!-- paperclip:review-request -->` followed by `@ally` and the focus: "evidence gate truth shapes; check fail-closed paths in evidence-truth.ts and the durable-shape change in issues.ts". When Ally's canonical review is clean at the current head and `verify` is green: `gh pr merge <n> -R Blockcast/paperclip --auto`.
 
 - [ ] **Step 5: Deploy and verify in production, read-only**
 
@@ -1929,14 +1938,35 @@ For each open, non-draft PR in each repo, run:
 
 1. author.login is exactly "allyblockcast[bot]" or "allyblockcast". Any other author: skip, reason "human-authored".
 2. No label named "do-not-merge" or "review-gate-override". Otherwise skip, reason "label".
-3. Every entry in statusCheckRollup has conclusion "SUCCESS" or "NEUTRAL" or "SKIPPED". Any "PENDING", "IN_PROGRESS", "FAILURE", "CANCELLED", "TIMED_OUT", or "ACTION_REQUIRED": skip, reason "checks:<state>".
+3. Every entry in statusCheckRollup is passing, by the exact reading below. Anything else: skip, reason "checks:<name>=<state>". This criterion fails CLOSED — an unrecognised, empty, or missing state is a STOP, never a pass ([BLO-26572](https://paperclip.blockcast.net/BLO/issues/BLO-26572), fleet-binding: only `success` is a passing CI verdict, and ABSENT is a stop).
+
+   a. **The rollup must be non-empty.** If statusCheckRollup is `[]`, skip, reason "checks:absent". Do not phrase this test as "every entry is passing" without the emptiness guard first: that predicate is vacuously TRUE on an empty rollup, so a head with no checks at all would read as fully green. Absent checks are the commonest failure shape on this repo, not the rarest.
+
+   b. **Read the right field per entry type.** `statusCheckRollup` mixes two shapes and they do not share a field:
+      - `__typename == "CheckRun"` → read `.conclusion` (`.state` is null).
+      - `__typename == "StatusContext"` → read `.state` (`.conclusion` is null).
+
+      Reading `.conclusion` alone is a live defect, not a style preference: `gate/ally-comment-findings` is a **StatusContext**, so it reports `conclusion: null` / `state: "FAILURE"`. A predicate that only inspects `.conclusion` sees `null` on the single most load-bearing gate — a value in neither the accept list nor the reject list, i.e. undefined behaviour exactly where a wrong answer merges unreviewed code. An in-flight `CheckRun` is the same trap from the other side: `gh` returns `conclusion: ""` (empty string) while `status` is `queued`/`in_progress`, which is likewise in neither list. Treat `null` and `""` as a STOP.
+
+   c. **Require `SUCCESS`, with a named closed allowlist — never a conclusion-class blanket.** Every entry must be `SUCCESS` except entries whose **name** appears in this list, which are the only non-success results measured benign on `Blockcast/paperclip`:
+
+      | name | permitted state | why |
+      |---|---|---|
+      | `Storybook visual regression` | `SKIPPED` | path-filtered; skips on every PR that touches no story files |
+      | `security-review` | `NEUTRAL` or `SUCCESS` | advisory reviewer check; reports `neutral` when it has no finding to raise |
+
+      Allowlist by **name**, not by conclusion class. Accepting `SKIPPED`/`NEUTRAL` for *any* entry — the shape this criterion had before 2026-09-08 — lets a genuine gate go quiet and still pass: a `skipped` `verify`, or a findings gate that reports `neutral`, is indistinguishable from these two benign cases. Adding a row here is a deliberate edit with a stated reason, not a run-time judgment.
+
+   d. **`gate/ally-comment-findings` must be present and `SUCCESS`.** Its absence is a stop under (a); it is never allowlistable. Then read its **description**, because `success` is ambiguous on this repo: *"reports no unresolved findings"* means reviewed and clean (a pass), while *"No Ally consolidated-review comment attests to reviewing this head"* means **nobody reviewed this head** — a stop, reason "review:missing". `review/ally-complete` does not exist on this repo; `review/ally-comment` is retired and carries no verdict. Do not wait on either.
+
+   **Do not simplify (a)–(d) into "every check-run must be SUCCESS".** Measured 2026-09-08 across the four most recently landed Track A PRs (#1418, #1309, #1219, #1467): all four carry `Storybook visual regression=skipped` and two carry `security-review=neutral`. A blanket all-SUCCESS predicate therefore matches **zero** PRs on this repo and silently converts the routine into a no-op — which fails safe, but is indistinguishable from a routine that is working.
 4. A canonical Ally review exists at the CURRENT head. Search reviews and comments for a body that contains exactly one line "## Ally — Consolidated PR Review" and exactly one line matching "Reviewed head: <40-hex>" where the hex equals headRefOid. That body must have no "### Critical Issues (N)" or "### Important Issues (N)" with N above 0, and no line matching "- **prior:...** — still-present —". Otherwise skip, reason "review:<stale-head|blocking|missing>".
 5. mergeStateStatus is "CLEAN" or "BEHIND". "BLOCKED": go to the CODEOWNERS step. "DIRTY", "UNSTABLE", "UNKNOWN": skip, reason "merge-state:<value>".
 
 ## Actions
 
-- CLEAN and all five hold: \`gh pr merge <n> -R <repo> --squash --delete-branch\`. Record "merged".
-- BEHIND and all other four hold: \`gh pr update-branch <n> -R <repo>\`. Do NOT merge on this fire; checks must re-run on the updated head. Record "updated-branch".
+- CLEAN and all five hold: \`gh pr merge <n> -R <repo> --auto --delete-branch\`. Record "merged". \`--auto\` is required, not optional: on a merge-queue repo it hands the PR to the queue, and the queue owns the strategy. Never pass \`--squash\` or \`--merge\` — \`Blockcast/paperclip\`'s sole \`master\` rule is \`merge_queue\` with \`merge_method: REBASE\` (ruleset 20487141), so naming a strategy here requests one the repo does not use. Never \`--admin\`.
+- BEHIND and all other four hold: **no action — enqueue exactly as for CLEAN.** Record "merged". \`BEHIND\` needs no pre-merge step, because the queue rebases each entry onto the current base when it builds the \`merge_group\` ref. **Never \`gh pr update-branch\` on this repo** ([BLO-22300](https://paperclip.blockcast.net/BLO/issues/BLO-22300)): plain \`update-branch\` *merges* base into head rather than rebasing, so the head becomes a merge commit, \`rebaseable\` flips to \`false\`, and the entry is **silently evicted at head-of-queue with no build ever created** — a failure that emits no error and looks identical to a PR still waiting its turn. If a branch genuinely needs relinearizing, squash-replay it onto master (\`git merge --squash\`, then \`--force-with-lease\`) per [BLO-32317](https://paperclip.blockcast.net/BLO/issues/BLO-32317); that is a human/authoring decision and is out of scope for this routine.
 - BLOCKED and the other four hold: read .github/CODEOWNERS at the repo default branch. If any changed file matches an owned pattern, post ONE comment whose first line is exactly "<!-- landing-routine:codeowner-request -->" naming the owner and the files, unless a comment with that first line already exists on the PR. Record "codeowner-review-requested". If no owned path matches, record "blocked:unknown" and do nothing.
 
 ## Hard limits
@@ -2190,7 +2220,7 @@ Ownership note: Task B8 (Track B) documents `review:ally-clean` and `deploy:land
 ### Task D1: Desired-skill sync script and live rollout to six agents
 
 **Files:**
-- Create: `/Users/oramadan/src/github.com/blockcast/paperclip-track-d/scripts/ops/add-desired-skill.py` (new git worktree of `origin/master`)
+- Create: `$TRACK_D_WT/scripts/ops/add-desired-skill.py` (new git worktree of `origin/master`)
 - Create: `/tmp/track-d/<agent-id>.before.json`, `/tmp/track-d/<agent-id>.after.json`, `/tmp/track-d/<agent-id>.run.json` (evidence, not committed)
 - Test: live round-trip assertions inside the script, plus heartbeat run-log grep
 
@@ -2200,12 +2230,12 @@ Ownership note: Task B8 (Track B) documents `review:ally-clean` and `deploy:land
 
 - [ ] **Step 1: Create a clean worktree from origin/master**
 ```bash
-cd /Users/oramadan/src/github.com/blockcast/paperclip
+cd "$REPO_ROOT"
 git fetch origin master
-git worktree add /Users/oramadan/src/github.com/blockcast/paperclip-track-d -b track-d/skill-propagation origin/master
-mkdir -p /tmp/track-d /Users/oramadan/src/github.com/blockcast/paperclip-track-d/scripts/ops
+git worktree add $TRACK_D_WT -b track-d/skill-propagation origin/master
+mkdir -p /tmp/track-d $TRACK_D_WT/scripts/ops
 ```
-Run: `git -C /Users/oramadan/src/github.com/blockcast/paperclip-track-d log --oneline -1`  Expected: one line, the current `origin/master` head.
+Run: `git -C $TRACK_D_WT log --oneline -1`  Expected: one line, the current `origin/master` head.
 
 - [ ] **Step 2: Preflight the API and capture Players Engineer before-state**
 ```bash
@@ -2218,7 +2248,7 @@ Run: the two commands above.  Expected: `env-ok`, then JSON with `"name": "Playe
 
 - [ ] **Step 3: Write the script**
 ```bash
-cat > /Users/oramadan/src/github.com/blockcast/paperclip-track-d/scripts/ops/add-desired-skill.py <<'PY'
+cat > $TRACK_D_WT/scripts/ops/add-desired-skill.py <<'PY'
 #!/usr/bin/env python3
 """Add one desired skill to a Paperclip agent's adapterConfig.paperclipSkillSync.
 
@@ -2369,19 +2399,19 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
 PY
-chmod +x /Users/oramadan/src/github.com/blockcast/paperclip-track-d/scripts/ops/add-desired-skill.py
+chmod +x $TRACK_D_WT/scripts/ops/add-desired-skill.py
 ```
-Run: `python3 -m py_compile /Users/oramadan/src/github.com/blockcast/paperclip-track-d/scripts/ops/add-desired-skill.py && echo compiled`  Expected: `compiled`.
+Run: `python3 -m py_compile $TRACK_D_WT/scripts/ops/add-desired-skill.py && echo compiled`  Expected: `compiled`.
 
 - [ ] **Step 4: Dry run on Players Engineer**
 ```bash
-python3 /Users/oramadan/src/github.com/blockcast/paperclip-track-d/scripts/ops/add-desired-skill.py 0b4ec33c-ba4a-40e8-9afb-72d37b0a8c58 --dry-run
+python3 $TRACK_D_WT/scripts/ops/add-desired-skill.py 0b4ec33c-ba4a-40e8-9afb-72d37b0a8c58 --dry-run
 ```
 Run: the command above.  Expected: `DRY-RUN paperclipSkillSync -> {"desiredSkills": ["paperclipai/paperclip/paperclip-evidence-before-in-review"]}` then `DRY-RUN env keys unchanged: [...]`, and `/tmp/track-d/0b4ec33c-ba4a-40e8-9afb-72d37b0a8c58.before.json` exists.
 
 - [ ] **Step 5: Apply on Players Engineer**
 ```bash
-python3 /Users/oramadan/src/github.com/blockcast/paperclip-track-d/scripts/ops/add-desired-skill.py 0b4ec33c-ba4a-40e8-9afb-72d37b0a8c58
+python3 $TRACK_D_WT/scripts/ops/add-desired-skill.py 0b4ec33c-ba4a-40e8-9afb-72d37b0a8c58
 ```
 Run: the command above.  Expected: exit 0 and one line starting `OK: Players Engineer (0b4ec33c-...) desiredSkills=['paperclipai/paperclip/paperclip-evidence-before-in-review'] envKeys=[...] unchanged`. If the line starts `FAIL: PATCH returned 400`, the body names the rejected field; stop and paste it into the tracking comment before touching other agents.
 
@@ -2409,12 +2439,12 @@ curl -sS "$PAPERCLIP_API_URL/api/heartbeat-runs/$RUN_ID/log?offset=0&limitBytes=
   -H "Authorization: Bearer $PAPERCLIP_API_KEY" > /tmp/track-d/$AGENT.run.json
 grep -o 'paperclip-evidence-before-in-review' /tmp/track-d/$AGENT.run.json | wc -l
 ```
-Run: the commands above.  Expected: the loop ends on a terminal status (not `queued`/`running`) and the final count is `1` or more. The skill name appears in the SessionStart skill list inside the first ~20KB of the log. If the count is `0`: run `grep -o -i 'skill[^"\\]\{0,120\}' /tmp/track-d/$AGENT.run.json | head -20`. A line containing `not found` or `unsupported` means the adapter did not sync it; find the route with `git -C /Users/oramadan/src/github.com/blockcast/paperclip-track-d grep -n 'agents/:id/skills' -- server/src/routes/agents.ts`, call it, and read `supported` and `warnings` from the `AgentSkillSnapshot`. Do not continue to Step 8 until the count is nonzero.
+Run: the commands above.  Expected: the loop ends on a terminal status (not `queued`/`running`) and the final count is `1` or more. The skill name appears in the SessionStart skill list inside the first ~20KB of the log. If the count is `0`: run `grep -o -i 'skill[^"\\]\{0,120\}' /tmp/track-d/$AGENT.run.json | head -20`. A line containing `not found` or `unsupported` means the adapter did not sync it; find the route with `git -C $TRACK_D_WT grep -n 'agents/:id/skills' -- server/src/routes/agents.ts`, call it, and read `supported` and `warnings` from the `AgentSkillSnapshot`. Do not continue to Step 8 until the count is nonzero.
 
 - [ ] **Step 8: Apply to the remaining five agents**
 ```bash
 for A in 386c81e8-e454-41ba-8e1d-7bb692331185 d2ade02d-112c-4da2-b61f-2301254a154c 5b6342f5-d2b8-456d-adf6-fe27a08e3eea e6a0f265-8499-40bb-b2af-cb49d330b86f c0bccc75-a449-4ece-a789-ce40bdd8e785; do
-  python3 /Users/oramadan/src/github.com/blockcast/paperclip-track-d/scripts/ops/add-desired-skill.py "$A" || { echo "STOP at $A"; break; }
+  python3 $TRACK_D_WT/scripts/ops/add-desired-skill.py "$A" || { echo "STOP at $A"; break; }
 done
 ls /tmp/track-d/*.after.json | wc -l
 ```
@@ -2441,7 +2471,7 @@ Run: the commands above.  Expected: `200`, a terminal status, and a count of `1`
 
 - [ ] **Step 10: Commit the script**
 ```bash
-cd /Users/oramadan/src/github.com/blockcast/paperclip-track-d
+cd $TRACK_D_WT
 git add scripts/ops/add-desired-skill.py
 git commit -m "chore(ops): add-desired-skill.py for auditable paperclipSkillSync edits
 
@@ -2455,8 +2485,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ### Task D2: Skill doc edits (in_review review path, privileged access)
 
 **Files:**
-- Modify: `/Users/oramadan/src/github.com/blockcast/paperclip-track-d/skills/paperclip/SKILL.md:441` (insert after the rule #1 paragraph)
-- Modify: `/Users/oramadan/src/github.com/blockcast/paperclip-track-d/skills/paperclip-evidence-before-in-review/SKILL.md:223-232` (after `### 4.`, before `## Anti-patterns`). The label table and shape sections belong to Task B8; do not edit them here.
+- Modify: `$TRACK_D_WT/skills/paperclip/SKILL.md:441` (insert after the rule #1 paragraph)
+- Modify: `$TRACK_D_WT/skills/paperclip-evidence-before-in-review/SKILL.md:223-232` (after `### 4.`, before `## Anti-patterns`). The label table and shape sections belong to Task B8; do not edit them here.
 - Create: `/tmp/track-d/assert_skill_docs.sh` (grep assertions, the "test" for this task)
 - Create: `/tmp/track-d/insert_skill_docs.py` (marker-based insertion)
 
@@ -2469,7 +2499,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 cat > /tmp/track-d/assert_skill_docs.sh <<'SH'
 #!/usr/bin/env bash
 set -u
-ROOT=/Users/oramadan/src/github.com/blockcast/paperclip-track-d
+ROOT=$TRACK_D_WT
 P=$ROOT/skills/paperclip/SKILL.md
 E=$ROOT/skills/paperclip-evidence-before-in-review/SKILL.md
 fail=0
@@ -2492,14 +2522,14 @@ Run: the commands above.  Expected: six `MISSING/COUNT:` lines and `FAIL`, exit 
 
 - [ ] **Step 2: Verify PATCH /api/issues accepts executionPolicy**
 ```bash
-cd /Users/oramadan/src/github.com/blockcast/paperclip-track-d
+cd $TRACK_D_WT
 git grep -n 'executionPolicy' -- packages/shared/src/validators/issue.ts | head -5
 ```
 Run: the command above.  Expected: at least one line inside `updateIssueSchema` (or a schema it spreads). If there is NO match in the update schema but there is one in `createIssueSchema`, change the sentence "send it on the `PATCH /api/issues/{issueId}` that moves the issue to `in_review`" in Step 6's block to "set it at `POST /api/issues` when you create the issue; existing issues cannot gain a policy through PATCH". If there is no match anywhere, keep the paragraph, drop the JSON block, and add the sentence "Ask your manager to set the policy when the issue is created; PATCH does not accept it today."
 
 - [ ] **Step 3: Confirm this task does not collide with Task B8**
 ```bash
-cd /Users/oramadan/src/github.com/blockcast/paperclip-track-d
+cd $TRACK_D_WT
 git fetch origin
 git show origin/master:skills/paperclip-evidence-before-in-review/SKILL.md | grep -n '^## Anti-patterns\|^### 4\.' 
 git show origin/master:skills/paperclip-evidence-before-in-review/SKILL.md | grep -c 'review:ally-clean'
@@ -2508,7 +2538,7 @@ Run: the commands above.  Expected: the two anchor headings print with line numb
 
 - [ ] **Step 4: Verify the approval request route and type**
 ```bash
-cd /Users/oramadan/src/github.com/blockcast/paperclip-track-d
+cd $TRACK_D_WT
 git grep -n 'request_board_approval' -- packages/shared/src server/src/routes | head -8
 git grep -n 'router.post("/companies/:companyId/approvals' -- server/src/routes | head -3
 ```
@@ -2521,7 +2551,7 @@ cat > /tmp/track-d/insert_skill_docs.py <<'PY'
 """Insert Track D text into the two skill files using unique markers."""
 import sys
 
-ROOT = "/Users/oramadan/src/github.com/blockcast/paperclip-track-d"
+ROOT = "$TRACK_D_WT"
 P = f"{ROOT}/skills/paperclip/SKILL.md"
 E = f"{ROOT}/skills/paperclip-evidence-before-in-review/SKILL.md"
 
@@ -2558,7 +2588,7 @@ open(E, "w").write(body)
 print("inserted")
 PY
 ```
-Run: `cd /Users/oramadan/src/github.com/blockcast/paperclip-track-d && grep -n '^### 4\. Only THEN transition to in_review$\|^## Anti-patterns$' skills/paperclip-evidence-before-in-review/SKILL.md`  Expected: exactly one line for each heading. If either heading text differs, copy the file's exact heading into the matching marker string in the script before Step 8.
+Run: `cd $TRACK_D_WT && grep -n '^### 4\. Only THEN transition to in_review$\|^## Anti-patterns$' skills/paperclip-evidence-before-in-review/SKILL.md`  Expected: exactly one line for each heading. If either heading text differs, copy the file's exact heading into the matching marker string in the script before Step 8.
 
 - [ ] **Step 6: Write the rule #1 block (skills/paperclip/SKILL.md)**
 ````bash
@@ -2643,7 +2673,7 @@ Run: the commands above.  Expected: `inserted` then six `ok:` lines and `PASS`, 
 
 - [ ] **Step 9: Check the diff for accidental changes**
 ```bash
-cd /Users/oramadan/src/github.com/blockcast/paperclip-track-d
+cd $TRACK_D_WT
 git diff --stat
 git diff -- skills/paperclip/SKILL.md | grep -c '^-[^-]'
 git diff -- skills/paperclip-evidence-before-in-review/SKILL.md | grep -c '^-[^-]'
@@ -2652,7 +2682,7 @@ Run: the commands above.  Expected: two files changed and `0` removed lines in e
 
 - [ ] **Step 10: Commit**
 ```bash
-cd /Users/oramadan/src/github.com/blockcast/paperclip-track-d
+cd $TRACK_D_WT
 git add skills/paperclip/SKILL.md skills/paperclip-evidence-before-in-review/SKILL.md
 git commit -m "docs(skills): in_review review path and privileged-access request
 
@@ -2680,7 +2710,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 - [ ] **Step 1: Push and open the PR with evidence body**
 ```bash
-cd /Users/oramadan/src/github.com/blockcast/paperclip-track-d
+cd $TRACK_D_WT
 git push -u origin track-d/skill-propagation
 {
   echo "## Why"
@@ -2727,7 +2757,7 @@ B=$(gh pr list -R Blockcast/paperclip --state open --search "truth-checked revie
 [ -n "$B" ] && gh pr diff -R Blockcast/paperclip "$B" -- skills/paperclip-evidence-before-in-review/SKILL.md | grep -n '^@@'
 gh pr diff -R Blockcast/paperclip "$PR" -- skills/paperclip-evidence-before-in-review/SKILL.md | grep -n '^@@'
 ```
-Run: the commands above.  Expected: B's hunks (if B is open) sit in the label table and the shape sections above `### 4.`; this PR's single hunk sits between `### 4.` and `## Anti-patterns`. No shared line ranges, so either PR may land first and the other rebases cleanly with `gh pr update-branch`. There is no ordering dependency between Track B and Track D.
+Run: the commands above.  Expected: B's hunks (if B is open) sit in the label table and the shape sections above `### 4.`; this PR's single hunk sits between `### 4.` and `## Anti-patterns`. No shared line ranges, so either PR may land first and the other is rebased by the merge queue when it builds — no `gh pr update-branch` (BLO-22300). There is no ordering dependency between Track B and Track D.
 
 - [ ] **Step 4: Merge after kkroo approval**
 ```bash
@@ -2735,9 +2765,9 @@ PR=$(gh pr view -R Blockcast/paperclip track-d/skill-propagation --json number -
 gh pr view -R Blockcast/paperclip "$PR" --json reviews -q '[.reviews[] | select(.state=="APPROVED") | .author.login] | unique'
 gh pr view -R Blockcast/paperclip "$PR" --json mergeStateStatus -q .mergeStateStatus
 ```
-Run: the commands above.  Expected: `["kkroo"]` and `CLEAN` or `BEHIND`. If `BEHIND`: `gh pr update-branch -R Blockcast/paperclip "$PR"` and wait for `verify` again. Then:
+Run: the commands above.  Expected: `["kkroo"]` and `CLEAN` or `BEHIND`. `BEHIND` needs no action — the queue rebases the entry onto current base when it builds. Do **not** `gh pr update-branch` (BLO-22300: it merges base into head, flipping `rebaseable` to false and causing silent eviction). Then:
 ```bash
-gh pr merge -R Blockcast/paperclip "$PR" --squash --auto
+gh pr merge -R Blockcast/paperclip "$PR" --auto
 ```
 Expected: the PR enters the merge queue (ruleset "Merge Queue Capacity Guard") and merges within one queue cycle. If `["kkroo"]` is empty, ping kkroo in the PR comment with the three-file summary and stop; do not self-merge a CODEOWNED change.
 
@@ -2777,8 +2807,8 @@ Run: the command above, then attach the PNGs by editing the comment in the brows
 
 - [ ] **Step 8: Remove the worktree**
 ```bash
-cd /Users/oramadan/src/github.com/blockcast/paperclip
-git worktree remove /Users/oramadan/src/github.com/blockcast/paperclip-track-d
+cd "$REPO_ROOT"
+git worktree remove $TRACK_D_WT
 git branch -D track-d/skill-propagation
 ```
 Run: `git worktree list`  Expected: the track-d path is gone.
@@ -2799,7 +2829,7 @@ Run: `git worktree list`  Expected: the track-d path is gone.
 ### Task E1: Agent elevation request runbook
 
 **Files:**
-- Create: `/Users/oramadan/src/github.com/blockcast/paperclip/docs/runbooks/agent-elevation-request.md`
+- Create: `$REPO_ROOT/docs/runbooks/agent-elevation-request.md`
 - Read-only reference: `/Users/oramadan/src/github.com/blockcast/magma/orc8r/cloud/go/services/tenants/protos/approvals.proto`
 - Read-only reference: `/Users/oramadan/src/github.com/blockcast/magma/orc8r/cloud/go/services/tenants/servicers/protected/approvals_servicer.go:212-232`
 - Read-only reference: `/Users/oramadan/src/github.com/blockcast/magma/orc8r/cloud/go/tools/break_glass_cli/handlers/grant.go`, `list.go`
@@ -2811,7 +2841,7 @@ Run: `git worktree list`  Expected: the track-d path is gone.
 
 - [ ] **Step 1: Branch from origin/master**
 ```bash
-cd /Users/oramadan/src/github.com/blockcast/paperclip
+cd "$REPO_ROOT"
 git fetch origin master
 git checkout -b docs/agent-elevation-request-runbook origin/master
 ```
@@ -2883,7 +2913,7 @@ Run: the block above.  Expected: HTTP 201 and a JSON body containing `"identifie
 
 - [ ] **Step 5: Write the runbook**
 ```bash
-cd /Users/oramadan/src/github.com/blockcast/paperclip
+cd "$REPO_ROOT"
 cat > docs/runbooks/agent-elevation-request.md <<'MD'
 # Agent-requested admin elevation (BLO-30652 chain)
 
@@ -3038,7 +3068,7 @@ Run: `grep -c "<Step" docs/runbooks/agent-elevation-request.md`  Expected: `0`.
 
 - [ ] **Step 6: Commit**
 ```bash
-cd /Users/oramadan/src/github.com/blockcast/paperclip
+cd "$REPO_ROOT"
 git add docs/runbooks/agent-elevation-request.md
 git commit -m "docs(runbooks): add agent elevation request runbook and withdraw the TokenReview read-extension"
 ```
@@ -3047,14 +3077,14 @@ Run: the block above.  Expected: one file changed, commit hash printed.
 - [ ] **Step 7: Open the PR and enqueue merge**
 `docs/runbooks/**` is not in CODEOWNERS, so Ally review plus the `verify` check is sufficient.
 ```bash
-cd /Users/oramadan/src/github.com/blockcast/paperclip
+cd "$REPO_ROOT"
 git push -u origin docs/agent-elevation-request-runbook
 gh pr create -R Blockcast/paperclip --base master \
   --title "docs(runbooks): agent elevation request runbook (BLO-30652 chain)" \
   --body-file /tmp/e1-pr-body.md
-gh pr merge --squash --auto -R Blockcast/paperclip
+gh pr merge --auto -R Blockcast/paperclip
 ```
-Run: the block above after writing `/tmp/e1-pr-body.md` per Step 8.  Expected: PR URL printed; `gh pr merge` prints `Pull request #<n> will be automatically merged via squash when all requirements are met`. If `gh pr merge` reports BEHIND, run `gh pr update-branch <n> -R Blockcast/paperclip` and re-run the merge command.
+Run: the block above after writing `/tmp/e1-pr-body.md` per Step 8.  Expected: PR URL printed; `gh pr merge` prints that the PR will be automatically merged when all requirements are met. The queue owns the strategy (`merge_method: REBASE`), so the message names the repo's method, not `squash`. If `gh pr merge` reports BEHIND, that is not an error and needs no action — the queue rebases onto current base when it builds. Do **not** run `gh pr update-branch` (BLO-22300).
 
 - [ ] **Step 8: PR evidence**
 Write `/tmp/e1-pr-body.md` with, in this order:
