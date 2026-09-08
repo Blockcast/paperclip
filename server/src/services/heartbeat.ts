@@ -28817,16 +28817,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "adapter runtime event arrived after the adapter execution settled; persisting it with a post-terminal marker",
           );
           // Allocate the sequence from the row, not from `seq`. The closure
-          // counter is only correct while this invocation is the run's sole
-          // writer, and by now it is not: the outcome pipeline appends its own
-          // lifecycle events with `nextRunEventSeq` (e.g. the PR-review
-          // evidence event), which takes `max(seq) + 1` and so consumes the
-          // very number `seq++` would hand out next. A late event would land on
-          // a position another row already holds -- silently, since
+          // counter is never synchronised with the row: it tracks only what
+          // THIS invocation has appended, while every other writer allocates
+          // with `nextRunEventSeq` -- `max(seq) + 1` -- and so consumes the
+          // very number `seq++` would hand out next. A collision lands on a
+          // position another row already holds, silently, since
           // `heartbeat_run_events_run_seq_idx` is a plain index with no unique
           // constraint (BLO-19722). `appendRunEventAtomicSeq` allocates under
           // the per-run advisory lock instead. It costs a transaction, which is
           // irrelevant on a path only a leaked process tree reaches.
+          //
+          // Post-settle this is a certainty rather than a race -- the outcome
+          // pipeline has already appended its own lifecycle events, so `seq` is
+          // known stale. But do not read that as "this invocation was the sole
+          // writer until it settled": it never was. The detached-handle
+          // reconciler re-sets a run to "running" and appends to it (see
+          // `DETACHED_PROCESS_ERROR_CODE`) from a sweep that runs on every
+          // replica, so it can write to a run whose adapter is still live in
+          // another process. The on-time `seq++` below therefore carries the
+          // same hazard in that mid-run window; it is far rarer and is
+          // deliberately not fixed here, but it is not safe by construction.
           //
           // `adapterSettledAt` additionally suppresses the runtime-status
           // write, so the marked event cannot republish the run as live --

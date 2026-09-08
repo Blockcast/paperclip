@@ -215,9 +215,18 @@ describeEmbeddedPostgres("post-adapter-settle adapter run events (PEN-3093)", ()
 
       const after = await readEvents(run!.id);
 
-      // (1) The evidence is kept.
-      expect(after).toHaveLength(before.length + 1);
-      const late = after.find((event) => event.message === "claude_local process kill_signal");
+      // (1) The evidence is kept, exactly once. Asserted on the late event
+      // itself rather than on `after.length`: an exact total count depends on
+      // `readEventsOnceQuiet` having reached true quiescence rather than caught
+      // a gap between two trailing outcome-pipeline appends, so a lifecycle
+      // event landing between `before` and `after` would fail the count with a
+      // red build that is not a regression. Uniqueness of the marked event is
+      // the property this actually needs and it cannot be broken by a later
+      // append.
+      const lateMatches = after.filter((event) => event.message === "claude_local process kill_signal");
+      expect(lateMatches).toHaveLength(1);
+      expect(after.length).toBeGreaterThanOrEqual(before.length + 1);
+      const late = lateMatches[0];
       expect(late).toBeDefined();
       expect(late!.payload).toMatchObject({
         stage: "kill_signal",
@@ -230,10 +239,16 @@ describeEmbeddedPostgres("post-adapter-settle adapter run events (PEN-3093)", ()
       expect(getHeartbeatRunRuntimeStatus(run!.id)).toBeNull();
 
       // (3) It did not land on a sequence another row already holds, and it
-      // sorted last rather than into the middle of the finished run's stream.
+      // sorted after the finished run's stream rather than into the middle of
+      // it. Compared against the maximum `before` sequence, not against
+      // `max(after)`: a trailing outcome-pipeline append landing after this
+      // event would legitimately take a higher number, which would fail a
+      // `max(after)` assertion without the defect being present. "Above
+      // everything that already existed" is the property that matters, and it
+      // is the one the stale closure counter violated.
       const seqs = after.map((event) => event.seq);
       expect(new Set(seqs).size).toBe(seqs.length);
-      expect(late!.seq).toBe(Math.max(...seqs));
+      expect(late!.seq).toBeGreaterThan(Math.max(...before.map((event) => event.seq)));
     },
     180_000,
   );
