@@ -17,6 +17,7 @@ import {
   heartbeatRuns,
   issueInboxArchives,
   issueReadStates,
+  issueRelations,
   issues,
   pluginManagedResources,
   plugins,
@@ -315,10 +316,20 @@ export function nextCronTickInTimeZone(expression: string, timeZone: string, aft
 // jitter margin. Non-schedule triggers (webhook/api) have no cadence to derive
 // from and fall back to the run-age horizon.
 //
-// The gap is measured between the next two ticks after `now` rather than from
-// stored state, so it needs no migration and self-corrects when a cron is
-// edited. Irregular expressions (`0 0,1 * * *`) yield whichever gap the sample
-// lands in; that is acceptable because this is a safety bound, not a schedule.
+// Sampled forward from `now` rather than read from stored state, so it needs no
+// migration and self-corrects when a cron is edited.
+//
+// Ally review, BLO-31996: take the MINIMUM gap over several consecutive ticks,
+// not the first one. A single sample is whichever gap the sampling instant
+// happens to land in, and for a common weekday cron that is off by 3x in the
+// dangerous direction: `0 9 * * 1-5` sampled any time before Friday's tick
+// yields Fri->Mon = 72h, so a Thursday wedge would hold the lock until the
+// following Tuesday. The minimum tracks the cadence that actually applies for
+// most of the week. Erring short is the safe direction here because the horizon
+// only ever makes the gate MORE willing to release a fire, and genuinely
+// in-flight work is protected by the separate started-and-young waiver rather
+// than by this number.
+const ROUTINE_FIRE_AGE_HORIZON_SAMPLE_TICKS = 6;
 export function deriveRoutineFireAgeHorizonMs(
   trigger: Pick<RoutineTriggerRow, "kind" | "cronExpression" | "timezone"> | null | undefined,
   now: Date,
@@ -327,12 +338,20 @@ export function deriveRoutineFireAgeHorizonMs(
     return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
   }
   try {
-    const firstTick = nextCronTickInTimeZone(trigger.cronExpression, trigger.timezone, now);
-    if (!firstTick) return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
-    const secondTick = nextCronTickInTimeZone(trigger.cronExpression, trigger.timezone, firstTick);
-    if (!secondTick) return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
-    const intervalMs = secondTick.getTime() - firstTick.getTime();
-    if (!Number.isFinite(intervalMs) || intervalMs <= 0) return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
+    let cursor = nextCronTickInTimeZone(trigger.cronExpression, trigger.timezone, now);
+    if (!cursor) return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
+    let intervalMs: number | null = null;
+    for (let i = 0; i < ROUTINE_FIRE_AGE_HORIZON_SAMPLE_TICKS; i += 1) {
+      const next = nextCronTickInTimeZone(trigger.cronExpression, trigger.timezone, cursor);
+      if (!next) break;
+      const gapMs = next.getTime() - cursor.getTime();
+      cursor = next;
+      if (!Number.isFinite(gapMs) || gapMs <= 0) continue;
+      if (intervalMs === null || gapMs < intervalMs) intervalMs = gapMs;
+    }
+    // No usable gap at all (a cron that fires once and never again) means there
+    // is no cadence to bound against, so keep the flat fallback.
+    if (intervalMs === null) return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
     return Math.max(
       ROUTINE_FIRE_AGE_HORIZON_FLOOR_MS,
       intervalMs - ROUTINE_FIRE_AGE_HORIZON_JITTER_MS,
@@ -1604,11 +1623,19 @@ export function routineService(
     // and took no measurement at all.
     const fireAgeMs = params.now.getTime() - params.issueCreatedAt.getTime();
     const parked = params.runStatus === "scheduled_retry";
-    const staleFire = fireAgeMs > params.fireAgeHorizonMs;
-    const metric = staleFire
-      ? "routine_dispatch_bypassed_stale_fire_execution_issue"
-      : parked
-        ? "routine_dispatch_bypassed_parked_execution_issue"
+    // Ally review, BLO-31996: `parked` is tested FIRST, so the new label can
+    // only ever claim rows that previously counted as `..._stale_...`. The
+    // other order looked more informative and silently regressed an existing
+    // signal: a quota-parked row's fire is old too once the park outlives one
+    // cadence, so `staleFire`-first would shadow the provider-quota label in
+    // precisely the sustained-quota case it was added for -- and the longer the
+    // quota outage, the more completely the signal disappears. Strictly
+    // additive beats more-precise-but-regressive for a counter an alert reads.
+    const staleFire = !parked && fireAgeMs > params.fireAgeHorizonMs;
+    const metric = parked
+      ? "routine_dispatch_bypassed_parked_execution_issue"
+      : staleFire
+        ? "routine_dispatch_bypassed_stale_fire_execution_issue"
         : "routine_dispatch_bypassed_stale_execution_issue";
     incrementRoutineDispatchMetric(metric);
     logger.warn(
@@ -1621,16 +1648,18 @@ export function routineService(
         runPhaseStartedAt: (params.runStartedAt ?? params.runCreatedAt).toISOString(),
         fireCreatedAt: params.issueCreatedAt.toISOString(),
         fireAgeMs,
-        horizonMs: staleFire
-          ? params.fireAgeHorizonMs
-          : parked
-            ? ROUTINE_LIVE_SCHEDULED_RETRY_HORIZON_MS
+        // Same precedence as the counter above, so a log line and the metric it
+        // accompanies can never name different horizons for the same bypass.
+        horizonMs: parked
+          ? ROUTINE_LIVE_SCHEDULED_RETRY_HORIZON_MS
+          : staleFire
+            ? params.fireAgeHorizonMs
             : ROUTINE_LIVE_RUN_AGE_HORIZON_MS,
       },
-      staleFire
-        ? "routine dispatch bypassing execution issue whose fire outlived its own cadence for skip_if_active/coalesce_if_active gating"
-        : parked
-          ? "routine dispatch bypassing long-parked execution issue for skip_if_active/coalesce_if_active gating"
+      parked
+        ? "routine dispatch bypassing long-parked execution issue for skip_if_active/coalesce_if_active gating"
+        : staleFire
+          ? "routine dispatch bypassing execution issue whose fire outlived its own cadence for skip_if_active/coalesce_if_active gating"
           : "routine dispatch bypassing long-lived execution issue for skip_if_active/coalesce_if_active gating",
     );
   }
@@ -1651,12 +1680,26 @@ export function routineService(
     options?: {
       observeBypass?: boolean;
       trigger?: Pick<RoutineTriggerRow, "kind" | "cronExpression" | "timezone"> | null;
+      // Ally review, BLO-31996: the instant BOTH the gate and the supersede
+      // measure the fire age from. It must be one value shared by the two, not
+      // one each. `dispatchRoutineRun`'s `triggeredAt` is NOT usable for this:
+      // it is `triggeredAtOverride ?? new Date()`, and the scheduled path
+      // passes the cron tick -- in the catch-up loop, a historical missed tick,
+      // up to MAX_CATCH_UP_RUNS of them. Measuring the gate from wall clock and
+      // the supersede from an earlier `triggeredAt` makes the cancel set a
+      // strict SUBSET of the bypass set, so a predecessor between the two
+      // cutoffs is bypassed but not cancelled -- and then the successor's
+      // INSERT hits `issues_open_routine_execution_uq`, the catch re-runs this
+      // function, still finds nothing live, and rethrows. The run errors and no
+      // measurement is taken: strictly worse than the wedge it replaces, on
+      // exactly the catch-up-after-a-stall path this change exists to recover.
+      now?: Date;
     },
   ) {
     const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
     const originKind = origin?.kind ?? "routine_execution";
     const originId = origin?.id ?? routine.id;
-    const now = new Date();
+    const now = options?.now ?? new Date();
     const fireAgeHorizonMs = deriveRoutineFireAgeHorizonMs(options?.trigger, now);
     const issueCondition = and(
       eq(issues.companyId, routine.companyId),
@@ -1756,11 +1799,26 @@ export function routineService(
   // `blocked` with `blockedBy: []`, which is where the strands in this routine's
   // history came from.
   //
-  // Scoped to exactly the index predicate plus the fire-age bound. The caller
-  // must only invoke this when `findLiveExecutionIssue` returned null -- the
-  // fire-age filter alone is NOT sufficient protection for in-flight work,
-  // because a legitimately long-running fire is old by definition and would
-  // match. See the call site's guard.
+  // Scoped to the unique-index predicate plus the fire-age bound, and narrowed
+  // further per Ally review (BLO-31996) because the index predicate alone is
+  // WIDER than this change's stated intent: `OPEN_ISSUE_STATUSES` also admits
+  // `in_review`, and `blocked` admits rows with a real unresolved dependency.
+  // Both have a wake path that is not a heartbeat run, so `!activeIssue` says
+  // nothing about whether they are dead, and cancelling them would be a
+  // behaviour change in the unsafe direction -- previously they produced a loud
+  // 23505 with the row preserved. Two exclusions below; `in_progress` is
+  // deliberately NOT excluded, because a row held by a dead run is the exact
+  // wedge this exists to clear.
+  //
+  // The caller must only invoke this when `findLiveExecutionIssue` returned
+  // null -- the fire-age filter alone is NOT sufficient protection for
+  // in-flight work, because a legitimately long-running fire is old by
+  // definition and would match. See the call site's guard.
+  //
+  // Statuses that keep their own wake path and must survive a supersede. A
+  // routine execution parked here is waiting on a reviewer, an approval, or a
+  // pending interaction, none of which are heartbeat runs.
+  const SUPERSEDE_PROTECTED_STATUSES = ["in_review"];
   async function supersedeStaleExecutionIssues(input: {
     routine: typeof routines.$inferSelect;
     executor: Db;
@@ -1787,12 +1845,38 @@ export function routineService(
           eq(issues.originKind, input.originKind),
           eq(issues.originId, input.originId),
           inArray(issues.status, OPEN_ISSUE_STATUSES),
+          not(inArray(issues.status, SUPERSEDE_PROTECTED_STATUSES)),
           visibleIssueCondition(),
           // Mirrors the unique index predicate: a row with no execution run is
           // not blocking the successor's INSERT and may simply be a fire that
           // has not been dispatched yet, so it must not be cancelled.
           isNotNull(issues.executionRunId),
           lte(issues.createdAt, fireAgeCutoff),
+          // A row with a genuine unresolved blocker edge is dependency-parked,
+          // not wedged: it self-drains via `issue_blockers_resolved_sweep` when
+          // the blocker closes. Only the edge-less `blocked` row -- the
+          // BLO-27553 zero-wake-path strand this change targets -- is retired.
+          // `cancelled` blockers do not count as resolved, matching the
+          // dependency semantics used everywhere else.
+          //
+          // The self-join is written as raw SQL rather than with drizzle's
+          // `alias()` on purpose: interpolating an aliased table into a `sql`
+          // fragment emits only the alias NAME, so the join reads
+          // `join "supersede_blocker"` -- a table that does not exist. That is
+          // a runtime 42P01 inside the dispatch transaction, not a type error,
+          // so it compiles clean and only shows up when the supersede actually
+          // matches. Aliasing here is mandatory, not cosmetic: an unaliased
+          // second `issues` in the subquery would shadow the outer UPDATE
+          // target and make `issues.id` below self-correlate.
+          sql`not exists (
+            select 1
+            from ${issueRelations}
+            join ${issues} as supersede_blocker
+              on supersede_blocker.id = ${issueRelations.issueId}
+            where ${issueRelations.relatedIssueId} = ${issues.id}
+              and ${issueRelations.type} = 'blocks'
+              and supersede_blocker.status <> 'done'
+          )`,
           ...(fingerprintCondition ? [fingerprintCondition] : []),
         ),
       )
@@ -1811,6 +1895,65 @@ export function routineService(
         },
         "cancelled routine execution issue whose fire outlived its cadence so the successor fire can dispatch",
       );
+      // Ally review, BLO-31996: a `logger.warn` plus an activity row leaves the
+      // disposal invisible on the row a reviewer is actually looking at. Same
+      // receipt principle as BLO-27572.
+      //
+      // Best-effort, and a bare try/catch does NOT deliver that inside a
+      // transaction: a failed statement aborts the whole thing, so every later
+      // statement raises 25P02 and the catch merely hides which one broke. The
+      // dispatch then dies on the successor INSERT with an error naming neither
+      // the comment nor the routine. `rollback to savepoint` is the one
+      // statement that restores a usable transaction -- same reasoning, and the
+      // same measured behaviour, as the guard in
+      // `pr-review-duplicate-issue-guard.ts`. Failing to explain a cancellation
+      // must not roll back the cancellation, or the wedge returns.
+      //
+      // The actor carries NO `runId`: `issue_comments.created_by_run_id` is FK
+      // to `heartbeat_runs`, and `supersededByRunId` is a `routine_runs` id.
+      // Passing it violated that FK on every supersede that actually fired --
+      // caught only because the two DB-backed regression tests below exercise
+      // the path. The routine run is named in the body instead.
+      const commentSavepoint = sql.raw("routine_supersede_comment");
+      let savepointOpen = false;
+      try {
+        await input.executor.execute(sql`savepoint ${commentSavepoint}`);
+        savepointOpen = true;
+        await issueSvc.addComment(
+          row.id,
+          [
+            "Cancelled: this routine fire outlived its own cadence and was superseded.",
+            "",
+            `- Fire created: \`${row.createdAt.toISOString()}\``,
+            `- Fire-age horizon: \`${Math.round(input.fireAgeHorizonMs / 1000)}s\``,
+            `- Superseded by routine run: \`${input.supersededByRunId}\``,
+            "",
+            "A scheduled fire is a point-in-time probe, so once its replacement is due it can no",
+            "longer take a useful measurement — and while it stayed open it held the single-owner",
+            "dispatch lock and suppressed the next fire. It is cancelled rather than left `blocked`",
+            "so it does not become a zero-wake-path strand.",
+          ].join("\n"),
+          {},
+          { authorType: "system" },
+          input.executor,
+        );
+        await input.executor.execute(sql`release savepoint ${commentSavepoint}`);
+      } catch (err) {
+        logger.warn({ err, issueId: row.id }, "failed to comment on superseded routine execution issue");
+        if (savepointOpen) {
+          try {
+            await input.executor.execute(sql`rollback to savepoint ${commentSavepoint}`);
+          } catch (rollbackErr) {
+            // Nothing left to try: this is the only statement that could have
+            // restored the transaction, so the failure surfaces on the caller's
+            // next statement rather than being silently carried forward.
+            logger.warn(
+              { err: rollbackErr, issueId: row.id },
+              "failed to roll back superseded-issue comment savepoint",
+            );
+          }
+        }
+      }
       try {
         await logActivity(input.executor, {
           companyId: input.routine.companyId,
@@ -2139,10 +2282,18 @@ export function routineService(
         // would report a bypass that never happened and turn the counter into
         // a "this routine has old open issues" gauge.
         const gatesOnActiveIssue = input.routine.concurrencyPolicy !== "always_enqueue";
+        // Ally review, BLO-31996: ONE instant, derived once, shared by the gate
+        // and the supersede below. Deliberately not `triggeredAt`, which on the
+        // scheduled path is the cron tick and in the catch-up loop a historical
+        // one -- see the `now` option on `findLiveExecutionIssue`. The horizon
+        // is derived from this same instant for the same reason: two
+        // derivations can disagree on an irregular cron even given one clock.
+        const dispatchNow = new Date();
+        const fireAgeHorizonMs = deriveRoutineFireAgeHorizonMs(input.trigger ?? null, dispatchNow);
         const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,
-        }, { observeBypass: gatesOnActiveIssue, trigger: input.trigger ?? null });
+        }, { observeBypass: gatesOnActiveIssue, trigger: input.trigger ?? null, now: dispatchNow });
         if (activeIssue && gatesOnActiveIssue) {
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
           if (manualRunnerUserId) {
@@ -2189,8 +2340,11 @@ export function routineService(
             originKind: issueOriginKind,
             originId: issueOriginId,
             dispatchFingerprint,
-            fireAgeHorizonMs: deriveRoutineFireAgeHorizonMs(input.trigger ?? null, triggeredAt),
-            now: triggeredAt,
+            // Same horizon and same instant the gate above used. If these two
+            // ever diverge again, the cancel set stops matching the bypass set
+            // and dispatch hard-errors on 23505 instead of recovering.
+            fireAgeHorizonMs,
+            now: dispatchNow,
             supersededByRunId: createdRun.id,
           });
         }
@@ -2234,7 +2388,7 @@ export function routineService(
           const existingIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
             kind: issueOriginKind,
             id: issueOriginId,
-          }, { trigger: input.trigger ?? null });
+          }, { trigger: input.trigger ?? null, now: dispatchNow });
           if (!existingIssue) throw error;
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
           if (manualRunnerUserId) {

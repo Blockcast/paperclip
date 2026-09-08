@@ -15,8 +15,10 @@ import {
   folders,
   heartbeatRuns,
   instanceSettings,
+  issueComments,
   issueInboxArchives,
   issueReadStates,
+  issueRelations,
   issues,
   projectWorkspaces,
   projects,
@@ -67,6 +69,13 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       process.env.PAPERCLIP_SECRETS_PROVIDER = originalSecretsProviderEnv;
     }
     await db.delete(activityLog);
+    // Before `issues`: `issue_comments.issue_id` has no ON DELETE CASCADE, so
+    // once the supersede path writes its explanatory comment the `issues`
+    // delete below raises an FK violation, this hook aborts partway, and every
+    // later table -- including `instance_settings` -- is left populated. That
+    // surfaces as ~30 unrelated tests failing on a duplicate singleton key,
+    // which points nowhere near the actual cause.
+    await db.delete(issueComments);
     await db.delete(issueInboxArchives);
     await db.delete(issueReadStates);
     await db.delete(secretAccessEvents);
@@ -1916,6 +1925,20 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     const [predecessor] = await db.select().from(issues).where(eq(issues.id, stranded.issue.id));
     expect(predecessor.status).toBe("cancelled");
     expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(1);
+
+    // The explanatory comment is written inside a savepoint the supersede rolls
+    // back on failure, so a broken comment no longer fails the dispatch -- which
+    // means nothing else here would notice it silently vanishing. Assert it
+    // lands. The first version of this code passed the `routine_runs` id as the
+    // comment's `runId`, violating the `heartbeat_runs` FK on every supersede
+    // that actually fired; only a DB-backed assertion catches that class.
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, stranded.issue.id));
+    expect(comments).toHaveLength(1);
+    expect(comments[0].body).toContain("outlived its own cadence");
+    expect(comments[0].createdByRunId).toBeNull();
   });
 
   // The dangerous path for the supersede: `always_enqueue` leaves
@@ -1952,6 +1975,132 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     const [predecessor] = await db.select().from(issues).where(eq(issues.id, running.issue.id));
     expect(predecessor.status).not.toBe("cancelled");
+    expect(predecessor.cancelledAt).toBeNull();
+    expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(0);
+  });
+
+  // Ally review, BLO-31996 -- regression test for the clock-divergence defect,
+  // and for the reason it was invisible to an otherwise green suite.
+  //
+  // Every other dispatch case here calls `runRoutine(..., { source: "schedule" })`,
+  // which passes `trigger: null` and no `triggeredAtOverride`. So `triggeredAt`
+  // equals wall clock and the horizon is always the flat fallback -- neither
+  // production input to the new code is exercised at all. This case drives
+  // `tickScheduledTriggers`, which supplies BOTH: a real schedule trigger (so
+  // the horizon is derived from the cron) and a historical `nextRunAt` as
+  // `triggeredAtOverride` (so `triggeredAt` is a past cron tick, not now).
+  //
+  // The original bug: the gate measured fire age from wall clock while the
+  // supersede measured it from `triggeredAt`, making the cancel set a strict
+  // subset of the bypass set. A predecessor whose `createdAt` fell BETWEEN the
+  // two cutoffs was bypassed by the gate but not cancelled, so the successor's
+  // INSERT hit `issues_open_routine_execution_uq`, the catch re-ran the gate,
+  // still found nothing live, and rethrew -- the run erroring with no
+  // measurement taken, strictly worse than the wedge it replaced. Catch-up
+  // after a stall is precisely when this fires, which is the scenario this
+  // whole change exists to recover.
+  //
+  // Hourly cron => horizon 1h - 60s jitter = 59m. With the tick 3h in the past:
+  //   buggy supersede cutoff = triggeredAt - 59m = now - 3h59m
+  //   gate (and fixed) cutoff = now - 59m
+  // A predecessor created 2h ago sits inside that window: older than the gate
+  // cutoff (so bypassed), younger than the buggy supersede cutoff (so NOT
+  // cancelled under the old code).
+  it("supersedes a predecessor when the fire is dispatched from a historical cron tick, not wall clock", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "coalesce_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const { trigger } = await svc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 * * * *",
+      timezone: "UTC",
+    }, {});
+
+    const wedged = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "queued",
+      runStartedAt: new Date(Date.now() - 10 * 60 * 1000),
+      issueCreatedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      bindExecutionRun: true,
+    });
+
+    // A tick three hours in the past becomes `triggeredAtOverride`, so
+    // `triggeredAt !== now` exactly as it is in a real catch-up burst.
+    await db
+      .update(routineTriggers)
+      .set({ nextRunAt: new Date(Date.now() - 3 * 60 * 60 * 1000) })
+      .where(eq(routineTriggers.id, trigger.id));
+
+    resetRoutineDispatchMetrics();
+    await svc.tickScheduledTriggers(new Date());
+
+    // Under the divergent clocks this row survived, the INSERT hit 23505, and
+    // dispatch threw instead of producing a fire.
+    const [predecessor] = await db.select().from(issues).where(eq(issues.id, wedged.issue.id));
+    expect(predecessor.status).toBe("cancelled");
+    expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(1);
+
+    const runs = await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id));
+    expect(runs.some((run) => run.status === "issue_created")).toBe(true);
+    // The failure mode is an errored run, so assert no run recorded a failure
+    // rather than only asserting the happy row exists.
+    expect(runs.filter((run) => run.status === "failed")).toHaveLength(0);
+  });
+
+  // Ally review, BLO-31996: the supersede predicate must not reach a row that
+  // has its own wake path. A `blocked` row with a GENUINE unresolved blocker
+  // edge is dependency-parked, not wedged -- it self-drains when the blocker
+  // closes -- so cancelling it would be a behaviour change in the unsafe
+  // direction. Contrast with the edge-less `blocked` row above, which has no
+  // wake path at all (BLO-27553) and is exactly what this change retires.
+  it("does not supersede a stale predecessor that has a genuine unresolved blocker edge", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "coalesce_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const dependencyParked = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "queued",
+      runStartedAt: new Date(Date.now() - YOUNG_RETRY_AGE_MS),
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      bindExecutionRun: true,
+    });
+
+    const blocker = await issueSvc.create(companyId, {
+      title: "Real blocker",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blocker.id,
+      relatedIssueId: dependencyParked.issue.id,
+      type: "blocks",
+    });
+    await db
+      .update(issues)
+      .set({ status: "blocked" })
+      .where(eq(issues.id, dependencyParked.issue.id));
+
+    resetRoutineDispatchMetrics();
+    await svc.runRoutine(routine.id, { source: "schedule" });
+
+    const [predecessor] = await db.select().from(issues).where(eq(issues.id, dependencyParked.issue.id));
+    expect(predecessor.status).toBe("blocked");
     expect(predecessor.cancelledAt).toBeNull();
     expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(0);
   });

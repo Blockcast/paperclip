@@ -80,4 +80,50 @@ describe("deriveRoutineFireAgeHorizonMs", () => {
     );
     expect(horizon).toBeGreaterThan(0);
   });
+
+  // Ally review, BLO-31996: an irregular cron has more than one gap, and a
+  // single forward sample returns whichever one the sampling instant happens to
+  // land in. Taking the minimum over several consecutive ticks makes the result
+  // independent of when it is called -- which matters because it is called at
+  // an arbitrary dispatch time, not at a tick boundary.
+  describe("irregular cron expressions", () => {
+    // The motivating case, and the one that is off by 3x in the dangerous
+    // direction: a weekday-only cron sampled before Friday's tick sees
+    // Fri -> Mon = 72h. A fire wedged on Thursday would then hold the dispatch
+    // lock until the following Tuesday.
+    it("uses the weekday interval for a weekday-only cron regardless of sampling day", () => {
+      const weekday = { kind: "schedule", cronExpression: "0 9 * * 1-5", timezone: "UTC" } as const;
+      // Thursday, Friday pre-tick (the 72h trap), and Saturday.
+      for (const sampledAt of [
+        new Date("2026-09-03T00:00:00.000Z"),
+        new Date("2026-09-04T00:00:00.000Z"),
+        new Date("2026-09-05T00:00:00.000Z"),
+      ]) {
+        expect(deriveRoutineFireAgeHorizonMs(weekday, sampledAt)).toBe(24 * HOUR_MS - JITTER_MS);
+      }
+    });
+
+    // Two ticks an hour apart then a 23h gap: the tightest cadence is the one
+    // that governs, and the answer must not depend on where the sample lands.
+    it("uses the shortest gap for a bunched cron regardless of sampling hour", () => {
+      const bunched = { kind: "schedule", cronExpression: "0 0,1 * * *", timezone: "UTC" } as const;
+      for (const sampledAt of [
+        new Date("2026-09-05T00:30:00.000Z"),
+        new Date("2026-09-05T12:00:00.000Z"),
+      ]) {
+        expect(deriveRoutineFireAgeHorizonMs(bunched, sampledAt)).toBe(HOUR_MS - JITTER_MS);
+      }
+    });
+
+    // A regular cadence must be unaffected by the multi-sample change: every
+    // gap is identical, so the minimum is that gap.
+    it("is unchanged for a regular cadence", () => {
+      expect(
+        deriveRoutineFireAgeHorizonMs(
+          { kind: "schedule", cronExpression: "23 */6 * * *", timezone: "UTC" },
+          now,
+        ),
+      ).toBe(6 * HOUR_MS - JITTER_MS);
+    });
+  });
 });
