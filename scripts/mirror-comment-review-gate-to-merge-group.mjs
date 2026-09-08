@@ -45,11 +45,18 @@
  *      `checkResponseTimeout`.
  *   2. KEY GENUINELY ABSENT from the values file. That is how the gate is
  *      switched off, so no-op and exit 0.
- *   3. CONTEXT KNOWN, MIRROR FAILED (transient `gh` 5xx, secondary rate limit,
- *      malformed API JSON, unparseable queue ref). We know what to post under,
- *      so post `success` naming the mirror failure. That turns an ejection into
- *      a visible-but-harmless status, which is the same fail-open posture as
- *      above and keeps the script strictly no worse than today's behaviour.
+ *   3. CONTEXT KNOWN, MIRROR FAILED (transient `gh` 5xx or secondary rate limit
+ *      that outlived its retries, malformed API JSON, unparseable queue ref).
+ *      We know what to post under, so post `success` naming the mirror failure.
+ *      That turns an ejection into a visible-but-harmless status, which is the
+ *      same fail-open posture as above and keeps the script strictly no worse
+ *      than today's behaviour.
+ *
+ *      Every `gh` call — both reads and the write — goes through `withRetry`
+ *      first. That matters most for the READS: they are the only path where a
+ *      one-off blip converts a decisively BLOCKING verdict into `success`,
+ *      whereas a failed write merely costs a re-stage. Class 3 is the floor
+ *      after retries are exhausted, not the first response to a 5xx.
  *
  * The context name is read from the deployed Helm values rather than hardcoded.
  * This issue was itself stranded for weeks because the context was renamed
@@ -286,51 +293,88 @@ function sleepSync(ms) {
 }
 
 /**
- * The one call with no fail-open available: if we cannot post, we cannot
- * announce that we cannot post. Retry the transient shapes (`gh` 5xx, secondary
- * rate limit) before giving up, since giving up costs a re-stage.
+ * Retries the transient `gh` shapes (5xx, secondary rate limit) before giving
+ * up. Both the reads and the write need this, for asymmetric reasons:
+ *
+ *   - the WRITE has no fail-open available — if we cannot post, we cannot
+ *     announce that we cannot post — and giving up costs a re-stage;
+ *   - the READS have a fail-open, and that is exactly the problem. A single
+ *     transient 5xx on either read lands in the class-3 catch and mirrors a
+ *     genuinely BLOCKING verdict as `success`. Giving up on a read therefore
+ *     costs strictly more than giving up on the write: a defeated gate rather
+ *     than a delayed one.
+ *
+ * This narrows how often class 3 fires; it does not remove it. Fail-open after
+ * exhausted retries is still the terminal behaviour, because the alternative on
+ * a queue ref is an ejection that cannot be re-run.
  */
-function postStatus({ repo, sha, context, verdict, attempts = 3 }) {
+export function withRetry(label, fn, { attempts = 3, delayMs = 2000 } = {}) {
   for (let attempt = 1; ; attempt += 1) {
     try {
-      execFileSync(
-        "gh",
-        [
-          "api",
-          "-X",
-          "POST",
-          `repos/${repo}/statuses/${sha}`,
-          "-f",
-          `state=${verdict.state}`,
-          "-f",
-          `context=${context}`,
-          "-f",
-          `description=${verdict.description}`,
-        ],
-        { encoding: "utf8", stdio: ["ignore", "ignore", "inherit"] },
-      );
-      return;
+      return fn();
     } catch (error) {
       if (attempt >= attempts) throw error;
-      console.log(`::warning::Posting ${context} on ${sha.slice(0, 8)} failed (attempt ${attempt}/${attempts}); retrying.`);
-      sleepSync(2000 * attempt);
+      console.log(`::warning::${label} failed (attempt ${attempt}/${attempts}); retrying.`);
+      if (delayMs > 0) sleepSync(delayMs * attempt);
     }
   }
 }
 
+/**
+ * Exported so a test can assert what actually reaches GitHub. The no-`pending`
+ * invariant is proven inside `mirrorVerdict`; this is the seam that proves the
+ * proven verdict is the one posted.
+ */
+export function buildStatusArgs({ repo, sha, context, verdict }) {
+  return [
+    "api",
+    "-X",
+    "POST",
+    `repos/${repo}/statuses/${sha}`,
+    "-f",
+    `state=${verdict.state}`,
+    "-f",
+    `context=${context}`,
+    "-f",
+    `description=${verdict.description}`,
+  ];
+}
+
+function postStatus({ repo, sha, context, verdict, attempts = 3 }) {
+  withRetry(
+    `Posting ${context} on ${sha.slice(0, 8)}`,
+    () =>
+      execFileSync("gh", buildStatusArgs({ repo, sha, context, verdict }), {
+        encoding: "utf8",
+        stdio: ["ignore", "ignore", "inherit"],
+      }),
+    { attempts },
+  );
+}
+
 /** Everything between "we know the context" and "we know the verdict". */
-function determineVerdict({ repo, headRef, context }) {
+function determineVerdict({ repo, headRef, context, attempts = 3 }) {
   const prNumber = parsePrNumberFromQueueRef(headRef);
   if (!prNumber) {
     throw new Error(`could not parse a PR number out of merge_group head_ref ${headRef}`);
   }
 
-  const prHeadSha = ghRaw(["api", `repos/${repo}/pulls/${prNumber}`, "--jq", ".head.sha"]);
+  const prHeadSha = withRetry(
+    `Reading head SHA for PR #${prNumber}`,
+    () => ghRaw(["api", `repos/${repo}/pulls/${prNumber}`, "--jq", ".head.sha"]),
+    { attempts },
+  );
+  // Deliberately outside the retry: a well-formed response carrying a malformed
+  // SHA is not transient, so retrying it only delays the same failure.
   if (!/^[0-9a-f]{40}$/.test(prHeadSha)) {
     throw new Error(`unexpected head SHA for PR #${prNumber}: ${prHeadSha}`);
   }
 
-  const statuses = gh(["api", `repos/${repo}/statuses/${prHeadSha}`, "--paginate"]);
+  const statuses = withRetry(
+    `Reading statuses for ${prHeadSha.slice(0, 8)}`,
+    () => gh(["api", `repos/${repo}/statuses/${prHeadSha}`, "--paginate"]),
+    { attempts },
+  );
   return {
     prNumber,
     prHeadSha,

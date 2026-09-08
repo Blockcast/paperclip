@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   GateContextError,
+  buildStatusArgs,
   failOpenVerdict,
   isMainModule,
   mirrorVerdict,
@@ -12,6 +13,7 @@ import {
   readGateContext,
   selectLatestStatus,
   truncate,
+  withRetry,
 } from "./mirror-comment-review-gate-to-merge-group.mjs";
 
 const CONTEXT = "gate/ally-comment-findings";
@@ -251,6 +253,90 @@ describe("truncate", () => {
 
   it("marks truncation visibly", () => {
     assert.equal(truncate("abcdef", 4), "abc…");
+  });
+});
+
+describe("withRetry", () => {
+  const opts = { attempts: 3, delayMs: 0 };
+
+  it("returns the value without retrying when the call succeeds", () => {
+    let calls = 0;
+    const value = withRetry("read", () => {
+      calls += 1;
+      return "ok";
+    }, opts);
+    assert.equal(value, "ok");
+    assert.equal(calls, 1);
+  });
+
+  // The defect this guards: a transient 5xx on a READ used to land in the
+  // class-3 catch and mirror a blocking verdict as `success`.
+  it("survives a transient failure and returns the eventual value", () => {
+    let calls = 0;
+    const value = withRetry("read", () => {
+      calls += 1;
+      if (calls < 3) throw new Error("HTTP 502");
+      return "ok";
+    }, opts);
+    assert.equal(value, "ok");
+    assert.equal(calls, 3);
+  });
+
+  it("rethrows the last error once attempts are exhausted, so class 3 is still the floor", () => {
+    let calls = 0;
+    assert.throws(
+      () => withRetry("read", () => {
+        calls += 1;
+        throw new Error(`HTTP 502 #${calls}`);
+      }, opts),
+      /HTTP 502 #3/,
+    );
+    assert.equal(calls, 3);
+  });
+});
+
+describe("buildStatusArgs", () => {
+  function argOf(args, key) {
+    const index = args.findIndex((arg) => typeof arg === "string" && arg.startsWith(`${key}=`));
+    return index === -1 ? null : args[index].slice(key.length + 1);
+  }
+
+  it("posts to the queue head under the configured context", () => {
+    const args = buildStatusArgs({
+      repo: "Blockcast/paperclip",
+      sha: SHA,
+      context: CONTEXT,
+      verdict: { state: "success", description: "clean" },
+    });
+    assert.deepEqual(args.slice(0, 4), ["api", "-X", "POST", `repos/Blockcast/paperclip/statuses/${SHA}`]);
+    assert.equal(argOf(args, "context"), CONTEXT);
+  });
+
+  // The no-`pending` invariant is proven inside mirrorVerdict; this proves the
+  // verdict that was proven is the one that reaches GitHub.
+  it("carries the verdict's own state through to the wire", () => {
+    for (const state of ["success", "failure"]) {
+      const args = buildStatusArgs({
+        repo: "o/r",
+        sha: SHA,
+        context: CONTEXT,
+        verdict: { state, description: "d" },
+      });
+      assert.equal(argOf(args, "state"), state);
+    }
+  });
+
+  it("never puts pending on the wire for any verdict this module produces", () => {
+    const verdicts = [
+      mirrorVerdict(status({ state: "failure" }), { prNumber: 1, prHeadSha: SHA }),
+      mirrorVerdict(status({ state: "pending" }), { prNumber: 1, prHeadSha: SHA }),
+      mirrorVerdict(null, { prNumber: 1, prHeadSha: SHA }),
+      failOpenVerdict(new Error("boom")),
+    ];
+    for (const verdict of verdicts) {
+      const args = buildStatusArgs({ repo: "o/r", sha: SHA, context: CONTEXT, verdict });
+      assert.notEqual(argOf(args, "state"), "pending");
+    }
   });
 });
 
