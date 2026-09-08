@@ -76,7 +76,12 @@
 // infrastructural, while this one must decline to EMIT when it cannot prove a
 // kill. Folding them together would put those two defaults in one control flow.
 
-const TIMEOUT_PATTERN = /^The action '(.+)' has timed out after (\d+) minutes?\.$/;
+// The budget group accepts a fraction because `timeout-minutes: 0.5` renders as
+// `has timed out after 0.5 minutes.` — an integer-only group misses it. Nothing
+// in .github/workflows uses a sub-minute bound today, and a miss is fail-safe,
+// but the whole point of BLO-32670 was re-sizing these budgets, so a later edge
+// tightening one below a minute is the expected direction of travel.
+const TIMEOUT_PATTERN = /^The action '(.+)' has timed out after (\d+(?:\.\d+)?) minutes?\.$/;
 
 /**
  * Escape a workflow-command message. `%`, CR and LF are the three characters
@@ -141,7 +146,13 @@ export function classifyStepKills({ annotations = null, steps = [] } = {}) {
     // elapsed time: GitHub has already told us it killed something, and
     // dropping the annotation because we could not enrich it would reintroduce
     // exactly the silence this script exists to break.
-    const step = stepList.find(
+    // `findLast`, not `find`: if two steps ever share a name, the later one is
+    // the one whose timestamps belong to the kill just reported — the same
+    // "prefer the later attempt" instinct selectCurrentJob already encodes.
+    // `policy` has no duplicate step names today; this only decides which
+    // elapsed time the annotation quotes, and quoting the wrong one would
+    // undercut the number the annotation exists to be trusted for.
+    const step = stepList.findLast(
       (candidate) => candidate?.name === name && candidate?.conclusion === "failure",
     );
     kills.push({
@@ -189,6 +200,12 @@ export function renderAnnotations({ kills, degraded }) {
   return lines;
 }
 
+// A hung connection would otherwise be bounded only by the step's
+// `timeout-minutes: 3`, spending three minutes of the job's ceiling on a run
+// that is already red. Bound it in the script instead. An abort throws, which
+// the callers already funnel into a `degraded` warning, so this stays fail-safe.
+const REQUEST_TIMEOUT_MS = 20_000;
+
 async function githubJson(pathname, token, repository) {
   const response = await fetch(`https://api.github.com/repos/${repository}${pathname}`, {
     headers: {
@@ -196,11 +213,42 @@ async function githubJson(pathname, token, repository) {
       authorization: `Bearer ${token}`,
       "x-github-api-version": "2022-11-28",
     },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!response.ok) {
     throw new Error(`GET ${pathname} failed: ${response.status} ${response.statusText}`);
   }
   return response.json();
+}
+
+// Bounded for the same reason the jobs loop is: a pathological response must
+// not spin here forever.
+const MAX_ANNOTATION_PAGES = 5;
+
+/**
+ * Read every annotation on a check run, not just the first page.
+ *
+ * The default page size is 30. Every `policy` step carries `if: !cancelled()`,
+ * so a red run keeps executing all ~60 steps and each failing one contributes
+ * at least `Process completed with exit code 1.` — so past ~30 failing steps
+ * the runner's timeout line can fall off page 1. That would both miss the kill
+ * AND trip the propagation retry below, whose `some(level === "failure")` test
+ * would be evaluated over a truncated page: four wasted seconds and a warning
+ * claiming no failure annotation exists, on precisely the run where it did.
+ */
+export async function fetchAnnotations(jobId, token, repository) {
+  const all = [];
+  for (let page = 1; page <= MAX_ANNOTATION_PAGES; page += 1) {
+    const payload = await githubJson(
+      `/check-runs/${jobId}/annotations?per_page=100&page=${page}`,
+      token,
+      repository,
+    );
+    const batch = Array.isArray(payload) ? payload : [];
+    all.push(...batch);
+    if (batch.length < 100) break;
+  }
+  return all;
 }
 
 /**
@@ -279,7 +327,7 @@ async function main() {
       // `checks: read`, a DIFFERENT scope from the `actions: read` the jobs
       // call above needs, so this can 403 on its own while the jobs call
       // succeeds.
-      annotations = await githubJson(`/check-runs/${job.id}/annotations`, token, repository);
+      annotations = await fetchAnnotations(job.id, token, repository);
       degraded = null;
     } catch (error) {
       annotations = null;
