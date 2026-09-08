@@ -304,11 +304,34 @@ describe("sanitizeRecord value-shape gate (BLO-20810)", () => {
       apiKey: "https://hooks.slack.test/services/T000/B000/signed-webhook-value",
       base_url: "https://example.test/callback?token=abc123def456",
       backup_base_url: "https://example.test/callback?password=hunter2",
+      auth_base_url: "https://example.test/callback?authentication=hunter2",
     });
 
     expect(result?.apiKey).toBe(REDACTED_EVENT_VALUE);
     expect(result?.base_url).toBe(REDACTED_EVENT_VALUE);
     expect(result?.backup_base_url).toBe(REDACTED_EVENT_VALUE);
+    expect(result?.auth_base_url).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  // Ally review (#1219, exact head 1a7fc6e3): the detector
+  // `URL_CREDENTIAL_QUERY_RE` and its documented replacing sibling
+  // `URL_CREDENTIAL_PARAM_VALUE_RE` are reached by *different* keys, and the
+  // test above only covers the tiered one. A tiered key (`auth_base_url`)
+  // redacts the whole value via the detector; an untiered key (`url`,
+  // `endpoint`, `mcpServers.*.url`) instead takes the surgical in-place
+  // masker, whose alternation lacked `authentication` — so `?authentication=`
+  // round-tripped in cleartext on precisely the path PEN-2747 exists for,
+  // while the same URL spelled `?auth=` or `?token=` was masked. Mutation
+  // check: dropping `authentication` from the sibling alone leaves every
+  // other test in this file passing and fails only these two assertions.
+  it("masks an untiered key's URL credential in place, for query and fragment alike", () => {
+    const result = redactEventPayload({
+      url: "https://host.test/mcp?authentication=hunter2",
+      endpoint: "https://host.test/cb#authentication=hunter2",
+    });
+
+    expect(result?.url).toBe(`https://host.test/mcp?authentication=${REDACTED_EVENT_VALUE}`);
+    expect(result?.endpoint).toBe(`https://host.test/cb#authentication=${REDACTED_EVENT_VALUE}`);
   });
 
   // CTO finding (#943 review, post-tiering): the URL branch returned "safe"

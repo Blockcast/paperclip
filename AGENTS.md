@@ -249,16 +249,21 @@ merge API, and the MCP `create_or_update_file`/`push_files` tools, which are
 thin wrappers over the same endpoints) default `commit.author` to the
 *authenticated* identity whenever the caller doesn't supply one — so **every
 agent's commit made through that path is stamped `allyblockcast[bot]`**,
-regardless of which agent actually wrote it. `git push` reads
-`user.name`/`user.email` from the checkout's *local* git config instead, so
-it is not subject to this server-side default — but that only produces a
-correctly-attributed commit if the local config actually holds your own
-per-agent identity (e.g. `<agentnamekey>@paperclip.blockcast.net`). It is not
-guaranteed to: **a 2026-08-10 sweep of 71 checkouts under `/paperclip/work`
-found 11 with local config already stamped to the shared App identity and 18
-with no local identity set at all (BLO-23894)**. `policy` failing on a
-commit you made with `git push` is therefore not proof of a REST/MCP write —
-check `git config user.email` in the checkout first.
+regardless of which agent actually wrote it. The `git` write path is not
+subject to that server-side default, and since BLO-29050 it no longer depends
+on a checkout's local config either: **every run's adapter process is launched
+with `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`
+already set to the acting agent's identity** (`applyAgentGitIdentityToRuntimeConfig`
+in `server/src/services/git-checkout-identity.ts`, wired at dispatch in
+`heartbeat.ts`; landed `a54de973a`, 2026-08-23). Git gives those four variables
+precedence over local, global, and system config, and child processes inherit
+them — so a commit made from *any* directory carries your identity, including an
+ad-hoc `git clone` you made yourself, with no `git config` run by you.
+
+`policy` failing on a commit you made with `git` is therefore not proof of a
+REST/MCP write, but the diagnostic is the **commit**, not the config: read
+`git log -1 --pretty='%an <%ae>'`. A local `user.email` that disagrees is
+cosmetic — it loses to the environment.
 
 This is a controlled, reproduced finding (BLO-21416), not a hunch — do not
 re-derive it or re-file it as a fresh misattribution report:
@@ -268,13 +273,27 @@ re-derive it or re-file it as a fresh misattribution report:
   `push_files` tools to land commits — they have no `author` field in their
   schema, so there is no way to override the App stamp through them, and using
   them silently erases your authorship.
-- **Verify your checkout's local identity before you push, don't assume it.**
-  Run `git config user.email`. If it is unset or equals
-  `290875700+allyblockcast[bot]@users.noreply.github.com` or
-  `allyblockcast[bot]@users.noreply.github.com`, set it yourself:
-  `git config user.email "<agentnamekey>@paperclip.blockcast.net"` and
-  `git config user.name "<YourAgentName>"`. This is a known, unfixed
-  provisioning gap (BLO-23894), not a hypothetical.
+- **Do not hand-set a per-checkout identity — it is provisioned for you, and
+  your write would lose anyway.** The environment overlay above beats
+  `git config --local`, `--global` and `--system`, so `git config user.email`
+  reporting nothing (or someone else's address) is **not** a defect and needs no
+  repair: verified 2026-09-05 on a fresh `git init` with no identity in any
+  config file, and again with a conflicting local `user.email` set, both of
+  which committed as the acting agent. If you genuinely need a *different*
+  author for one commit, two per-invocation overrides reach it and no config
+  file does. `git commit --author="Name <addr>"` moves **only** the author,
+  leaving you as committer — usually what you want, since it records who wrote
+  the change without disclaiming who ran it. The environment form moves both,
+  but you must override the **names as well as the addresses**:
+  `GIT_AUTHOR_NAME=… GIT_AUTHOR_EMAIL=… GIT_COMMITTER_NAME=… GIT_COMMITTER_EMAIL=… git commit …`.
+  Setting only the two `*_EMAIL` variables leaves `GIT_AUTHOR_NAME` in the
+  environment still winning, which silently yields the mismatched pair
+  `CTO <someone@example.com>` — your name against their address, which is worse
+  than either endpoint (verified 2026-09-06). `-c user.email=…` reaches
+  neither. Earlier revisions of this file called
+  this "a known, unfixed provisioning gap (BLO-23894)" and told you to run
+  `git config` by hand — that was true of the 2026-08-10 sweep (71 checkouts:
+  11 App-stamped, 18 with no identity) and was fixed by BLO-29050.
 - If you must create a commit via the raw API (no local checkout available),
   use `gh api` directly and pass an explicit author, e.g.:
   ```bash
@@ -298,10 +317,12 @@ re-derive it or re-file it as a fresh misattribution report:
   the bare `allyblockcast[bot]@users.noreply.github.com`.** That bare form is
   the `graphify-reindex` bot's own legitimate `git push` identity, verified
   against real PRs (#789, #944) — widening the match would flag its
-  commits. If your checkout's local `user.email` shows the bare form, that
-  is still a misconfigured checkout (see above): fix the local config; do
-  not ask the gate to catch it, it cannot distinguish the two cases by email
-  alone.
+  commits. If a *commit* shows the bare form, that is the `graphify-reindex`
+  bot's own identity, not a misconfigured checkout — diagnose it with
+  `git log -1 --pretty='%an <%ae>'`, not with `git config user.email`, which
+  no longer decides authorship (see above) and so cannot tell you anything
+  about what the gate saw. Do not ask the gate to catch it; it cannot
+  distinguish the two cases by email alone.
 - CI enforces this going forward on every `paperclip` PR
   (`scripts/check-commit-author-attribution.mjs`, wired into `pr.yml`); an
   on-demand cross-repo audit mode (`--audit-merged`) covers

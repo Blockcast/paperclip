@@ -421,6 +421,19 @@ const EXTERNAL_WAIT_RESUME_WAKE_REASONS = new Set([
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON = "execution_review_participant_recovery";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
 const STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+
+export type BackstopSweepCompletionPath = "page_drained" | "cursor_wrap";
+
+export function backstopSweepCompletionPath(input: {
+  useCursor: boolean;
+  cursorBeforeQuery: string | null;
+  cursorWasReset: boolean;
+  candidateLimitSkipped: number;
+}): BackstopSweepCompletionPath | null {
+  if (!input.useCursor || !input.cursorBeforeQuery || input.candidateLimitSkipped > 0) return null;
+  return input.cursorWasReset ? "cursor_wrap" : "page_drained";
+}
+
 // A persisted claim gives a process that dies after the review-stage transaction commits a
 // bounded retry lease. It deliberately does not spend another recovery-action attempt: that
 // attempt was already reserved by the escalation which failed to dispatch its wake.
@@ -2307,8 +2320,32 @@ export function recoveryService(
   // re-flips the issue back to `blocked` on the next sweep using stale
   // latestRun state, defeating the manual recovery path. BLO-7521 added the
   // first instance of this gate for stranded-recovery-origin issues; BLO-8050
-  // generalizes it to all six escalation callsites (todo and in_progress
-  // arms × non-retryable / zero-token / recovery-failed predicates).
+  // extended it to the branches it covered, and later work (e.g. the
+  // BLO-31913 exhausted-handoff arm) has kept adding them one at a time.
+  //
+  // The gate is NOT on every escalation callsite today, and no count is pinned
+  // here: two earlier revisions of this comment pinned one ("all six
+  // escalation callsites"), both had drifted by the time anyone read them, and
+  // that drift is how the BLO-31913 arm shipped ungated. Ask the code instead,
+  // and note it takes TWO greps — the must-be-gated set first, the is-gated set
+  // second, because an ungated callsite is by construction invisible to the
+  // second one alone:
+  //   grep -n 'await escalateStrandedAssignedIssue({' server/src/services/recovery/service.ts
+  //   grep -n 'await latestRunPredatesLatestUnblock' server/src/services/recovery/service.ts
+  // Each grep also matches its own prescription line above, so subtract one
+  // from each before comparing. Diff the two before adding a callsite, and
+  // check YOUR OWN rather than inferring safety from the gated set's size.
+  // The sets differ today; which omissions are deliberate has not been
+  // audited, so treat an ungated callsite as unreviewed rather than as either
+  // intended or defective. In particular the direct sibling of the BLO-31913
+  // arm — the `in_progress` exhausted-handoff escalation, which reads the same
+  // `isExhaustedSuccessfulRunHandoff` evidence and increments the same
+  // `successfulRunHandoffEscalated` counter — carries no gate. An earlier
+  // review of that arm reasoned it was "not reachable by an unblock"; that
+  // reasoning does not hold against `getLatestUnblockedAt` above, which keys
+  // on any `issue.updated` carrying `previousStatus = 'blocked'` and does not
+  // filter on the resulting status, so `blocked` -> `in_progress` sets an
+  // unblock timestamp too.
   async function latestRunPredatesLatestUnblock(
     companyId: string,
     issueId: string,
@@ -8550,7 +8587,81 @@ export function recoveryService(
         }
 
         if (latestRun.status === "succeeded") {
-          result.skipped += 1;
+          // BLO-31913: a succeeded run on a `todo` issue is usually a deliberate
+          // park — the run chose `todo` and recorded why — so the default here
+          // stays "skip". The exception is a run that succeeded WITHOUT
+          // recording a disposition: checkout-restore puts the issue back to
+          // `todo` and clears `checkoutRunId`/`executionRunId`, which moves it
+          // out of the `in_progress` arm where the successful-run-handoff
+          // escalation below lives. The bare skip this replaces therefore made
+          // that state a permanent, silent strand — nothing else re-evaluates a
+          // `todo` issue, and the two cases are indistinguishable from status
+          // alone. Measured instance: BLO-31052, `todo` since 09-01 carrying
+          // `successfulRunHandoff.required` with no recovery action.
+          //
+          // Scope, stated so nobody reads this as the fix for BLO-31913: of the
+          // seven issues stranded on Ally, this arm reaches ONE. Four carry no
+          // handoff record at all, so there is no evidence to read, and their
+          // mechanism is still unidentified. BLO-30577 carries the right
+          // evidence and is still skipped, because its recovery action is
+          // already `escalated` and `shouldReuseStrandedRecoveryAction` reuses
+          // it — correctly, per BLO-30743 — so `escalateStrandedAssignedIssue`
+          // returns null below. A budget-exhausted escalation needs an owner
+          // decision, not another sweep.
+          //
+          // Discriminate on the evidence the platform already recorded rather
+          // than on status: `isExhaustedSuccessfulRunHandoff` is non-null only
+          // when the disposition was missing, so a deliberate park is still
+          // skipped byte-for-byte as before.
+          //
+          // Recurrence bound, stated explicitly because the intuitive reading is
+          // wrong and an earlier revision of this comment asserted it: escalation
+          // is NOT terminal for this branch. `resolveStrandedEscalationStatus`
+          // deliberately writes `todo` rather than `blocked` whenever
+          // `hasNoRecoveryPath` — the BLO-27635/BLO-30743 design, which exists to
+          // avoid the wake-less `blocked`-with-no-blockers strand — and `todo` is
+          // a member of STRANDED_ASSIGNED_ISSUE_STATUSES, so such a row stays
+          // selectable and re-enters this same branch on the next sweep. What
+          // actually bounds it is `shouldReuseStrandedRecoveryAction`: once the
+          // action is ownerless or a standing `escalated` one with an unchanged
+          // owner, the reuse path makes `escalateStrandedAssignedIssue` return
+          // null at `unchangedWithoutWakeBudget` and this arm records `skipped`
+          // without re-firing the Slack-forwarded `needs_human_decision`. That
+          // guard is fingerprint-sensitive (`assigneeAgentId` is a fingerprint
+          // segment and escalation rewrites it), so convergence can cost one
+          // further escalation rather than being immediate. Where the escalation
+          // finds a live owner it writes `blocked`, which leaves the sweep's
+          // status filter outright — that is the shape the tests pin.
+          const todoHandoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
+          if (!todoHandoffEvidence || !todoHandoffEvidence.exhausted) {
+            result.skipped += 1;
+            continue;
+          }
+
+          if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
+            // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
+            // Every sibling branch in this `todo` arm carries this guard and this one
+            // needs it most: the handoff evidence lives on the run's contextSnapshot and
+            // never expires, so without this an operator moving the row back to `todo`
+            // is met with an immediate re-flip to `blocked` on the same pre-unblock run.
+            result.skipped += 1;
+            continue;
+          }
+
+          const updated = await escalateStrandedAssignedIssue({
+            expectedLockOwnerState: adoptionHandoverLockGuard,
+            issue,
+            previousStatus: "todo",
+            latestRun,
+            recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+            successfulRunHandoffEvidence: todoHandoffEvidence,
+          });
+          if (updated) {
+            result.successfulRunHandoffEscalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
           continue;
         }
 
@@ -11259,8 +11370,11 @@ export function recoveryService(
         .limit(RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT);
     };
 
-    let candidateRows = await queryCandidates(useCursor ? resolvedDependencyWakeBackstopCandidateCursor : null);
+    const cursorBeforeQuery = resolvedDependencyWakeBackstopCandidateCursor;
+    let cursorWasReset = false;
+    let candidateRows = await queryCandidates(useCursor ? cursorBeforeQuery : null);
     if (useCursor && candidateRows.length === 0 && resolvedDependencyWakeBackstopCandidateCursor) {
+      cursorWasReset = true;
       resolvedDependencyWakeBackstopCandidateCursor = null;
       candidateRows = await queryCandidates(null);
     }
@@ -11280,6 +11394,11 @@ export function recoveryService(
       logger.warn(
         {
           processed: candidates.length,
+          // Rows remaining BEYOND this page, i.e. deferred to the next tick of
+          // this rotating sweep -- not dropped. `count(*) over()` is evaluated
+          // after the cursor predicate, so this shrinks by `limit` each tick
+          // until the sweep-completion tick logs below.
+          deferredToNextTick: result.candidateLimitSkipped,
           skipped: result.candidateLimitSkipped,
           limit: RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT,
           nextCursor: useCursor ? resolvedDependencyWakeBackstopCandidateCursor : null,
@@ -11287,6 +11406,30 @@ export function recoveryService(
           blockerIssueId: opts?.blockerIssueId ?? null,
         },
         "issue graph liveness backstop deferred resolved dependency wake candidates past page limit",
+      );
+    } else if (backstopSweepCompletionPath({
+      useCursor,
+      cursorBeforeQuery,
+      cursorWasReset,
+      candidateLimitSkipped: result.candidateLimitSkipped,
+    })) {
+      // Sweep-completion signal (BLO-29722). Without this line the drain tick is
+      // silent, so a healthy rotating sweep and a permanently starved tail emit
+      // byte-identical logs -- only the WARN above, forever, at a pinned cursor.
+      // That ambiguity is what made this loop read as starving ~939 candidates
+      // when it was in fact completing a 3-page sweep every ~75s. An operator
+      // (or an alert) can now assert that this line appears at least once per
+      // sweep interval; its absence, with the WARN still firing, is the real
+      // starvation signature.
+      logger.info(
+        {
+          processed: candidates.length,
+          limit: RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT,
+          sweptFromCursor: cursorBeforeQuery,
+          completionPath: cursorWasReset ? "cursor_wrap" : "page_drained",
+          source,
+        },
+        "issue graph liveness backstop completed resolved dependency wake candidate sweep",
       );
     }
 
@@ -12163,8 +12306,11 @@ export function recoveryService(
         .limit(STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT);
     };
 
-    let candidateRows = await queryCandidates(strandedRecoveryWakeBackstopCandidateCursor);
+    const cursorBeforeQuery = strandedRecoveryWakeBackstopCandidateCursor;
+    let cursorWasReset = false;
+    let candidateRows = await queryCandidates(cursorBeforeQuery);
     if (candidateRows.length === 0 && strandedRecoveryWakeBackstopCandidateCursor) {
+      cursorWasReset = true;
       strandedRecoveryWakeBackstopCandidateCursor = null;
       candidateRows = await queryCandidates(null);
     }
@@ -12181,11 +12327,33 @@ export function recoveryService(
       logger.warn(
         {
           processed: candidates.length,
+          // Deferred to the next tick of this rotating sweep, not dropped. See
+          // the sibling comment in the resolved-dependency backstop above.
+          deferredToNextTick: result.candidateLimitSkipped,
           skipped: result.candidateLimitSkipped,
           limit: STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT,
           nextCursor: strandedRecoveryWakeBackstopCandidateCursor,
         },
         "stranded recovery wake backstop deferred candidates past page limit",
+      );
+    } else if (backstopSweepCompletionPath({
+      useCursor: true,
+      cursorBeforeQuery,
+      cursorWasReset,
+      candidateLimitSkipped: result.candidateLimitSkipped,
+    })) {
+      // Sweep-completion signal (BLO-29722), same rationale as the sibling
+      // backstop: this loop's 2-page sweep previously logged only its first
+      // page, so 45 consecutive identical WARN lines at a pinned cursor were
+      // indistinguishable from a starved tail. They were a healthy sweep.
+      logger.info(
+        {
+          processed: candidates.length,
+          limit: STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT,
+          sweptFromCursor: cursorBeforeQuery,
+          completionPath: cursorWasReset ? "cursor_wrap" : "page_drained",
+        },
+        "stranded recovery wake backstop completed candidate sweep",
       );
     }
 

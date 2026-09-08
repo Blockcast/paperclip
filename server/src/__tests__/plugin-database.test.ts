@@ -283,6 +283,31 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     return packageRoot;
   }
 
+  /**
+   * An isolated plugin install dir with the SDK physically installed, for
+   * tests that drive `loadSingle` but are not about the plugin store.
+   *
+   * Without an explicit `localPluginDir`, `pluginLoader` falls back to the real
+   * `~/.paperclip/plugins`, and activation then runs its torn-store guard
+   * against whatever happens to be on the developer's or runner's disk. That
+   * made this suite depend on ambient state it never set up: the guard treated
+   * a completely empty store as congruent, so activation passed while no SDK
+   * existed anywhere. It now fails closed on that shape (BLO-31857), which is
+   * the correct behaviour and correctly exposed this fixture as vacuous.
+   */
+  async function createSdkPopulatedPluginStore(): Promise<string> {
+    const installDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-plugin-store-"));
+    packageRoots.push(installDir);
+    const sdkDir = path.join(installDir, "node_modules", "@paperclipai", "plugin-sdk");
+    await mkdir(sdkDir, { recursive: true });
+    await writeFile(
+      path.join(sdkDir, "package.json"),
+      JSON.stringify({ name: "@paperclipai/plugin-sdk", version: "2026.817.0" }),
+      "utf8",
+    );
+    return installDir;
+  }
+
   function llmWikiManifest(): PaperclipPluginManifestV1 {
     return {
       id: llmWikiPluginKey,
@@ -637,6 +662,7 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     const loader = pluginLoader(db, {
       enableLocalFilesystem: false,
       enableNpmDiscovery: false,
+      localPluginDir: await createSdkPopulatedPluginStore(),
     }, {
       workerManager,
       eventBus: {

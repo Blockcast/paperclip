@@ -33,6 +33,27 @@ jobs:
     # 2 x (bootstrap + 120s fetch) + backoff ~= 5m, so the real work needs the
     # headroom above it.
     timeout-minutes: 10
+    # BLO-32682: the step-kill classifier at the end of this job reads the run's
+    # own step conclusions and annotations back off the Actions API, and
+    # `pr.yml` declares no workflow-level `permissions:`. Under a restricted
+    # default-permissions preset every scope is `none`, both calls 403, and the
+    # classifier degrades to a warning on every red run.
+    permissions:
+      # A job-level block REPLACES the workflow-level one rather than merging
+      # into it (see the same note on `verify` below), so `contents: read` is
+      # listed deliberately and FIRST — without it the `actions/checkout` step
+      # immediately below loses repo access and every step in this job fails,
+      # which would turn a legibility fix into an outage on the gate every
+      # other job `needs:`. scripts/__tests__/policy-step-kill-classifier.test.mjs
+      # pins all three entries against exactly that mistake.
+      contents: read
+      # `/actions/runs/{id}/jobs` — this job's own step conclusions and their
+      # start/finish timestamps.
+      actions: read
+      # `/check-runs/{id}/annotations` — a DIFFERENT scope from `actions: read`,
+      # and the only source of the "has timed out after N minutes" line that
+      # says a step was killed by the clock rather than by an assertion.
+      checks: read
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
 
@@ -166,10 +187,13 @@ jobs:
       # 21.8s local to 32-73s on CI. Keep this bound honest by re-measuring
       # rather than by analogy -- but if you add a test here that waits on a new
       # budget, it lands on the bound directly, so check the total.
+      # BLO-32670: 3, not 1. Measured p100 53s across 58 sampled runs (p50 24s)
+      # — 88% of the old one-minute bound, the tightest margin of all 41
+      # bounded steps in this job. It had not tripped yet; it was next.
       - name: Test pending-migration pre-flight phase budgets (BLO-31254)
         if: ${{ !cancelled() }}
         run: node --test ./scripts/check-pending-migration-preflight-phases.test.js
-        timeout-minutes: 1
+        timeout-minutes: 3
 
       # BLO-29008: executes the two-tier convergence gate's shell against
       # recorded cluster states. The gate fails OPEN if its string accumulation
@@ -180,10 +204,20 @@ jobs:
         run: node --test ./scripts/check-docker-two-tier-convergence.test.js
         timeout-minutes: 1
 
+      # BLO-32670: 3, not 1. This suite forks 150 short-lived `bash` processes
+      # across its 96 tests, because it exercises the shipping backoff function
+      # by sourcing it rather than by asserting against a copy. That makes its
+      # wall time track runner CPU contention rather than its own work: ~9s on
+      # an idle host, 44s p100 across 58 sampled runs, and 73s observed on
+      # 2026-09-07 — which tripped the old one-minute bound and failed `policy`
+      # on a PR whose diff touched only `server/src/services/recovery/*`.
+      # Sizing an ~9s task at 60s reads as 7x headroom; against a p100 that is
+      # already 5x the median it was not. The bound still catches a hang, far
+      # inside the 10m job cap — it is no longer a duration tripwire.
       - name: Test approval admissibility-probe backoff (BLO-28471)
         if: ${{ !cancelled() }}
         run: node --test ./scripts/approve-paperclip-api-digest.test.js
-        timeout-minutes: 1
+        timeout-minutes: 3
 
       - name: Test pnpm setup retry wrapper (BLO-28813)
         if: ${{ !cancelled() }}
@@ -208,6 +242,11 @@ jobs:
       - name: Test policy node-test timeouts
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/policy-node-test-timeouts.test.mjs
+        timeout-minutes: 1
+
+      - name: Test policy step-kill classifier (BLO-32682)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/policy-step-kill-classifier.test.mjs
         timeout-minutes: 1
 
       - name: Test @penstock publish-drift comparison
@@ -344,7 +383,10 @@ jobs:
         # blocks against a stubbed `gh` and asserts the exit codes.
         if: ${{ !cancelled() }}
         run: node --test ./scripts/skill-bounded-pr-check-polling.test.mjs
-        timeout-minutes: 1
+        # BLO-32670: 3, not 1. Measured p100 53s across 58 sampled runs against
+        # a p50 of 7s — a 7.6x spread, the widest in this job, because the
+        # fenced blocks fork a stubbed `gh` per case.
+        timeout-minutes: 3
 
       # BLO-31405: the chart render suite deliberately does NOT run here. It has
       # its own `helm_chart` job below; see the comment there before adding it
@@ -502,6 +544,47 @@ jobs:
           path: pnpm-lock.yaml
           retention-days: 1
           if-no-files-found: error
+
+      # BLO-32682: when a step above is killed by its `timeout-minutes`, GitHub
+      # emits only `##[error]The action '<step>' has timed out after 1 minutes.`
+      # — no test output, no elapsed time, nothing saying the kill was a
+      # DURATION kill. In the checks UI that is indistinguishable from "your
+      # diff broke this test", which is what sent the author of #1707 hunting in
+      # the wrong file. BLO-32670 re-budgeted the three steps most likely to
+      # trip it; it did not make the remaining case legible, and any step can
+      # still be killed under sufficient load.
+      #
+      # Last step in the job on purpose: it reads the step conclusions back off
+      # the API, so it can only classify steps that have already finished.
+      #
+      # Gated on `failure()` so the overwhelmingly common green run pays
+      # nothing — no API calls at all. Written `!cancelled() && failure()`
+      # rather than a bare `failure()` because every policy step after the first
+      # bounded test step must continue past a test failure, which
+      # scripts/__tests__/policy-node-test-timeouts.test.mjs asserts by matching
+      # the leading `!cancelled()`.
+      #
+      # Keep the phrase "node<space>--test" out of this comment block: that
+      # suite splits the job on `- name:`, so a trailing comment lands in the
+      # PREVIOUS step's slice, and it selects test steps by substring — a
+      # comment mentioning the runner would make the upload step above look
+      # like an unbounded test step.
+      - name: Classify step-timeout kills as duration kills, not test failures
+        if: ${{ !cancelled() && failure() }}
+        # Annotations only. This step decides which WORDING explains a red that
+        # has already happened, and must never be able to change the outcome —
+        # `policy` fails on the step conclusions themselves either way.
+        continue-on-error: true
+        # Bounded well inside the 10-minute job ceiling: it makes a handful of
+        # API calls on a pool that is, by construction, busy enough to have just
+        # killed a step.
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # `github.job` is the YAML key, which is the job's DISPLAY name only
+          # while this job declares no `name:`. The test pins that pairing.
+          POLICY_JOB_NAME: ${{ github.job }}
+        run: node ./scripts/classify-policy-step-kills.mjs
 
   # The chart tests under deploy/helm/paperclip/tests/ were never wired into any
   # workflow -- 21 assertions about the manifests we actually ship (Penstock

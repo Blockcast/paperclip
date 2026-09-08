@@ -105,6 +105,12 @@ export interface Config {
   strandedRecoveryHandBackMaxPerPass: number;
   strandedRecoveryHandBackIntervalMinutes: number;
   strandedBlockedIssueReconcilerIntervalMinutes: number;
+  // Approval-enforcement reconciler (BLO-24631): re-reads the object that
+  // enforces an approved decision and raises when it disagrees with what was
+  // decided. Worker-tier only, same rationale as the reconcilers above.
+  approvalEnforcementReconcilerEnabled: boolean;
+  approvalEnforcementReconcilerIntervalMinutes: number;
+  approvalEnforcementReconcilerGraceHours: number;
   // Isolation-workspace reaper (BLO-31222): removes aged per-execution-workspace
   // scratch under `data/k8s-isolation/workspaces`, which had no retention path of
   // any kind and reached 406.7 GiB on a CephFS volume that ran out of headroom.
@@ -271,6 +277,20 @@ function detectTailnetBindHost(): string | undefined {
 }
 
 /**
+ * Numeric env var where `0` is a meaningful value. `Number(x) || fallback`
+ * cannot express this: it folds an explicit `0` into the fallback, so an
+ * operator who configures zero silently gets the default instead. Only an
+ * unset, blank, or non-finite value falls back here.
+ */
+function numericEnv(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) return fallback;
+  const trimmed = raw.trim();
+  if (trimmed === "") return fallback;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+/**
  * Configured PR reviewer agents, purely env-derived (no config-file input).
  *
  * Split out of loadConfig() so callers on hot paths can read it without paying
@@ -422,6 +442,18 @@ export const NUMERIC_SETTING_BOUNDS = {
     min: 1,
     max: TIMER_PERIOD_MINUTES_MAX,
   },
+  // BLO-24631. Hourly by default: enforced state (budget policies, permission
+  // grants, repo settings) changes rarely, and each pass is a couple of indexed
+  // reads plus one read per approved card carrying a machine-checkable
+  // assertion. The ceiling matters more than the cadence here — this reconciler
+  // is the thing that notices an approved decision never reached its enforcing
+  // object, so an unbounded period turns the detector itself into the silent
+  // failure it was built to catch.
+  approvalEnforcementReconcilerIntervalMinutes: {
+    fallback: 60,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
   heartbeatSchedulerIntervalMs: { fallback: 30_000, min: 10_000, max: 24 * 60 * 60_000 },
   recoveryActionMaxAttempts: { fallback: 5, min: 1, max: 1_000 },
   recoveryActionTimeoutMs: {
@@ -494,6 +526,7 @@ export const TIMER_SETTING_MS_FACTOR = {
   humanGatedDigestIntervalMinutes: 60_000,
   prReviewStateReconcilerIntervalMinutes: 60_000,
   approvalGateReconcilerIntervalMinutes: 60_000,
+  approvalEnforcementReconcilerIntervalMinutes: 60_000,
   heartbeatSchedulerIntervalMs: 1,
 } as const satisfies Partial<Record<keyof typeof NUMERIC_SETTING_BOUNDS, number>>;
 
@@ -896,6 +929,40 @@ export function loadConfig(): Config {
     NUMERIC_SETTING_BOUNDS.approvalGateReconcilerIntervalMinutes,
     "approvalGateReconcilerIntervalMinutes",
   );
+  // Approval-enforcement reconciler (BLO-24631). Enabled by default: an
+  // approved decision that never reaches its enforcing object is invisible to
+  // everyone involved — the board reads it as approved, the requester reads it
+  // as resolved — so detection has to be on by default to be worth anything.
+  // 60m interval: enforced state changes rarely and each pass is a couple of
+  // indexed reads. 6h grace after `decidedAt` so a freshly-approved decision
+  // that simply has not been applied *yet* is not reported as drift.
+  const approvalEnforcementReconcilerEnabled =
+    process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_ENABLED !== undefined
+      ? process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_ENABLED === "true"
+      : true;
+  const approvalEnforcementReconcilerIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.approvalEnforcementReconcilerIntervalMinutes,
+    "approvalEnforcementReconcilerIntervalMinutes",
+  );
+  // `0` is a valid, documented grace: report drift on the first pass after the
+  // decision. It therefore has to survive parsing rather than be folded into
+  // the 6h default the way `|| 6` would fold it.
+  //
+  // Deliberately NOT migrated to `resolveNumericSetting` alongside the interval
+  // above, though the review suggested it: that helper rejects any override
+  // `<= 0` as "not a finite positive number" (see its candidate loop) and falls
+  // through to the fallback, so the documented `0` would silently resolve to 6.
+  // The bound it would buy is real but smaller than it looks — `numericEnv`
+  // already rejects non-finite input, so `Infinity`/`1e999` cannot get through
+  // here, and this value is an elapsed-hours comparison rather than a timer
+  // delay, so it cannot overflow `setInterval`. A valid-zero bounded setting
+  // needs a resolver that separates "absent" from "zero"; until one exists,
+  // converting this trades a documented behaviour for a smaller guarantee.
+  const approvalEnforcementReconcilerGraceHours = Math.max(
+    0,
+    numericEnv(process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_GRACE_HOURS, 6),
+  );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -999,6 +1066,9 @@ export function loadConfig(): Config {
     strandedRecoveryHandBackMaxPerPass,
     strandedRecoveryHandBackIntervalMinutes,
     strandedBlockedIssueReconcilerIntervalMinutes,
+    approvalEnforcementReconcilerEnabled,
+    approvalEnforcementReconcilerIntervalMinutes,
+    approvalEnforcementReconcilerGraceHours,
     isolationWorkspaceReaperEnabled,
     isolationWorkspaceReaperIntervalMinutes,
     isolationWorkspaceReaperMaxAgeDays,
