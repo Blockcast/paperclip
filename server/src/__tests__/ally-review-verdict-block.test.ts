@@ -234,6 +234,106 @@ describe("BLO-32695 — the structured verdict block as the primary source", () 
 });
 
 /**
+ * The block path must block on the same two severities the prose path does.
+ *
+ * The prose readers get that bound for free from COUNTED_FINDINGS_BUCKET_PATTERN,
+ * whose alternation enumerates Critical and Important and nothing else. The
+ * block reader has no such pattern to inherit it from, so a reader written as
+ * "any positive count blocks" diverges — and diverges on the *most common*
+ * review shape rather than an edge case, because Ally's own template mandates a
+ * third count, `suggestions`. The first clean-with-suggestions review posted
+ * under the new format would have gone red.
+ *
+ * All three consequences ride on the same payload, so one case pins them:
+ * the merge gate, the author wake (github-webhook routes on the same
+ * predicate), and the carry ledger — where a `suggestions` ref is *unretirable*,
+ * since the disposition vocabulary only ever names Critical/Important, so
+ * isFullyDispositioned could never clear the head. That last one is the
+ * BLO-31446/BLO-31947 trap this row exists to close, and inheriting it through
+ * the new path would have made the replacement worse than the prose parsing it
+ * retires.
+ */
+describe("BLO-32695 — the block path blocks on the prose path's severities", () => {
+  const cleanWithSuggestions = `${verdictBlock({
+    head: PR1675_HEAD,
+    findings: { critical: 0, important: 0, suggestions: 2 },
+    dispositions: [],
+  })}\n## Ally — Consolidated PR Review\nReviewed head: ${PR1675_HEAD}`;
+
+  it("does not treat a non-blocking severity as actionable feedback", () => {
+    expect(hasActionablePrReviewFeedback(cleanWithSuggestions)).toBe(false);
+  });
+
+  it("mints no finding refs for it, so the head cannot carry unretirably", () => {
+    expect(extractAllyReportedFindingRefs(cleanWithSuggestions)).toEqual([]);
+  });
+
+  it("resolves it to clean/success rather than a false blocking_finding", () => {
+    expect(
+      evaluateCommentReviewGate({
+        headSha: PR1675_HEAD,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: [allyComment(cleanWithSuggestions, "2026-09-07T15:41:42Z")],
+      }),
+    ).toMatchObject({ state: "success", outcome: "clean" });
+  });
+
+  it("still blocks when a blocking severity is positive alongside suggestions", () => {
+    const blocking = `${verdictBlock({
+      head: PR1675_HEAD,
+      findings: { critical: 0, important: 1, suggestions: 3 },
+      dispositions: [],
+    })}\n## Ally — Consolidated PR Review\nReviewed head: ${PR1675_HEAD}`;
+
+    expect(hasActionablePrReviewFeedback(blocking)).toBe(true);
+    // Only the blocking severity contributes an identity to retire.
+    expect(extractAllyReportedFindingRefs(blocking)).toEqual([
+      { severity: "important", index: 1 },
+    ]);
+  });
+});
+
+/**
+ * The opener is line-anchored, so only a *real* block counts.
+ *
+ * Fencing is not the only way to quote, and withoutFencedCodeBlocks strips only
+ * fenced spans. An unanchored opener reads an indented example, an inline-code
+ * mention, or a blockquoted predecessor as a second block — and two blocks is
+ * the fail-closed `unreadable_verdict` red. The trigger is self-referential:
+ * the reviews most likely to quote this marker are reviews *of this parser*, so
+ * unanchored, a review of this file wedges its own gate.
+ *
+ * A ≤3-space indent is deliberately still a match. That is a paragraph in
+ * Markdown, not a code block, so the comment really is live HTML — the same
+ * ` {0,3}` bound every other line-anchored pattern here uses.
+ */
+describe("BLO-32695 — quoted mentions do not mint a phantom second block", () => {
+  const real = verdictBlock(PR1675_VERDICT);
+  const body = (quoted: string) =>
+    `${real}\n\n## Ally — Consolidated PR Review\nReviewed head: ${PR1675_HEAD}\n\n${quoted}`;
+
+  const cases: Array<[string, string]> = [
+    ["a 4-space-indented documentation example", `    ${real}`],
+    ["an inline-code mention", `The marker is \`${real}\` in full.`],
+    ["a blockquoted prior review", `> ${real}`],
+    ["a mid-line mention", `As emitted, ${real} sits at the top.`],
+  ];
+
+  for (const [name, quoted] of cases) {
+    it(`reads past ${name} and still parses the one real block`, () => {
+      const parsed = parseAllyVerdictBlock(body(quoted));
+      expect(parsed.kind).toBe("ok");
+      expect(parsed.kind === "ok" && parsed.verdict.head).toBe(PR1675_HEAD);
+    });
+  }
+
+  it("keeps a second genuine block unreadable, so the fail-closed path survives", () => {
+    const parsed = parseAllyVerdictBlock(body(real));
+    expect(parsed.kind).toBe("unreadable");
+  });
+});
+
+/**
  * AC-5. Every one of these is a *tightening*: the block is unreadable, so the
  * verdict must not be `success`. None of them can affect a PR today, because
  * no review in the corpus carries a block at all — a body without one takes

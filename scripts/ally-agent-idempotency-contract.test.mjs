@@ -285,6 +285,47 @@ test("Step 4 emits the structured verdict block the gate reads first", () => {
     assert.match(template, new RegExp(`"${field}"`),
       `the block must carry a "${field}" field`);
   }
+
+  // The parser's opener is line-anchored (`^` plus the NOT_INDENTED_CODE
+  // lookahead), so that a quoted mention cannot mint a phantom second block.
+  // That puts a requirement on the producer that a prose reading of the
+  // template would not reveal: indent the marker four spaces and every review
+  // parses as `absent`, silently falling back to the prose path this row
+  // retires. Asserted here because the failure is invisible on both sides.
+  assert.match(template, /(?:^|\n) {0,3}<!--[ \t]*ally-verdict:1/,
+    "the block must start at the beginning of a line, indented at most three"
+    + " spaces — the parser's opener is line-anchored and will not see it otherwise");
+});
+
+test("the template's severity counts are all severities the gate can act on", () => {
+  const { template } = step4Template();
+
+  // BLOCKING_SEVERITIES in ally-review-detection.ts. A count outside this set
+  // is reported but never blocks, and — the sharper half — never mints a
+  // finding ref, because the disposition vocabulary cannot name one and the
+  // head could never be fully dispositioned.
+  const BLOCKING = new Set(["critical", "important"]);
+
+  const findings = /"findings"\s*:\s*\{([^}]*)\}/.exec(template);
+  assert.ok(findings, "Step 4's template must spell out the findings counts");
+  const keys = [...findings[1].matchAll(/"([a-z-]+)"\s*:/g)].map((m) => m[1]);
+
+  assert.ok(keys.length > 0, "the findings object must name its severities");
+  for (const key of BLOCKING) {
+    assert.ok(keys.includes(key), `the template must emit a "${key}" count`);
+  }
+
+  // Deliberately not an equality check: `suggestions` is emitted on purpose and
+  // must stay non-blocking. What this pins is that adding a *new* key is a
+  // decision, not an accident — the reviewer has to come here and say whether
+  // it blocks. Getting that wrong in the permissive direction reds a clean
+  // review; getting it wrong in the other direction drops a real finding.
+  const known = new Set([...BLOCKING, "suggestions"]);
+  const unknown = keys.filter((key) => !known.has(key));
+  assert.deepEqual(unknown, [],
+    `unrecognized severity count(s) ${unknown.join(", ")} — decide whether each`
+    + " blocks by adding it to BLOCKING_SEVERITIES, or record it here as"
+    + " non-blocking; leaving it unlisted means the gate silently ignores it");
 });
 
 test("the verdict block is additive, never a replacement for the prose line", () => {
