@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   classifyStepKills,
+  fetchAnnotations,
   renderAnnotations,
   selectCurrentJob,
   stepElapsedSeconds,
@@ -321,6 +322,116 @@ test("the timeout pattern is anchored to a single-line message", () => {
   });
 
   assert.deepEqual(verdict.kills, []);
+});
+
+test("a sub-minute budget is matched, and reported as its real second count", () => {
+  // `timeout-minutes: 0.5` renders as `has timed out after 0.5 minutes.`. An
+  // integer-only group misses it, which is fail-safe but silent — and BLO-32670
+  // was an exercise in re-sizing exactly these budgets, so a later edit
+  // tightening one below a minute is the expected direction of travel.
+  const verdict = classifyStepKills({
+    annotations: [
+      {
+        annotation_level: "failure",
+        message: "The action 'Cheap lint gate' has timed out after 0.5 minutes.",
+      },
+    ],
+    steps: [],
+  });
+
+  assert.deepEqual(verdict.kills, [
+    { name: "Cheap lint gate", budgetMinutes: 0.5, elapsedSeconds: null },
+  ]);
+  assert.match(killAnnotationFor(verdict)[0], /30s budget/, "0.5 minutes is 30 seconds, not 0");
+});
+
+test("duplicate step names attribute the timestamps of the LATER attempt", () => {
+  // `policy` has no duplicate step names today, so this only decides which
+  // elapsed time the annotation quotes. It is worth pinning because quoting the
+  // earlier attempt's duration would undercut the one number the annotation
+  // exists to be trusted for.
+  const name = "Test approval admissibility-probe backoff (BLO-28471)";
+  const verdict = classifyStepKills({
+    annotations: KILLED_JOB_ANNOTATIONS,
+    steps: [
+      { name, conclusion: "failure", started_at: "2026-09-07T19:00:00Z", completed_at: "2026-09-07T19:00:05Z" },
+      { name, conclusion: "failure", started_at: "2026-09-07T19:18:15Z", completed_at: "2026-09-07T19:19:28Z" },
+    ],
+  });
+
+  assert.equal(verdict.kills[0].elapsedSeconds, 73, "the later attempt is the one that was killed");
+});
+
+// ---------------------------------------------------------------------------
+// Annotation paging. The default page size is 30; `policy` keeps executing all
+// ~60 of its steps on a red run because every one carries `if: !cancelled()`,
+// and each failing step contributes at least one failure-level annotation. A
+// single-page read can therefore drop the timeout line off the end on precisely
+// the run this script exists for.
+// ---------------------------------------------------------------------------
+
+test("annotations are read past the first page, at the same size the jobs call uses", async () => {
+  const requested = [];
+  const originalFetch = globalThis.fetch;
+  // Page 1 full (100), page 2 short (1) — the terminating condition.
+  const pages = [
+    Array.from({ length: 100 }, () => ({
+      annotation_level: "failure",
+      message: "Process completed with exit code 1.",
+    })),
+    [
+      {
+        annotation_level: "failure",
+        message: "The action 'Late step' has timed out after 3 minutes.",
+      },
+    ],
+  ];
+
+  globalThis.fetch = async (url) => {
+    requested.push(String(url));
+    const page = Number(new URL(String(url)).searchParams.get("page"));
+    return { ok: true, status: 200, statusText: "OK", json: async () => pages[page - 1] ?? [] };
+  };
+
+  try {
+    const annotations = await fetchAnnotations(4242, "token", "Blockcast/paperclip");
+
+    assert.equal(annotations.length, 101, "both pages are concatenated");
+    assert.equal(requested.length, 2, "paging stops on the first short page");
+    for (const url of requested) {
+      assert.match(url, /[?&]per_page=100(&|$)/, "must not fall back to the 30-item default");
+    }
+    // The point of paging: a timeout line sitting past item 30 is still found.
+    assert.deepEqual(classifyStepKills({ annotations, steps: [] }).kills, [
+      { name: "Late step", budgetMinutes: 3, elapsedSeconds: null },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("annotation paging is bounded rather than trusting the server to terminate", async () => {
+  // A pathological response that never returns a short page must not spin here
+  // forever — the same reasoning as MAX_JOB_PAGES on the jobs loop.
+  let calls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => Array.from({ length: 100 }, () => ({ annotation_level: "notice", message: "x" })),
+    };
+  };
+
+  try {
+    const annotations = await fetchAnnotations(1, "token", "Blockcast/paperclip");
+    assert.ok(calls <= 5, `paging must be bounded, made ${calls} requests`);
+    assert.equal(annotations.length, calls * 100);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 // ---------------------------------------------------------------------------
