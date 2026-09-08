@@ -7854,6 +7854,22 @@ export function recoveryService(
       // `issue_dependencies_blocked` with its blockers already resolved — a real defect
       // that must stay observable without being escalated up the org chain.
       dependencyWaitEscalationSuppressed: 0,
+      // BLO-32668: the classification the removed per-issue INFO line used to carry,
+      // as a partition of `dependencyWaitEscalationSuppressed`. These three always sum
+      // to it. Exposed on the result rather than only logged: the defect signal this
+      // gate exists to provide is `...DependencyReady` being non-zero, and a signal
+      // that can only be recovered by scraping log lines is one no test can assert and
+      // no metric can read.
+      //
+      // Reported `issue_dependencies_blocked` with its blockers already resolved — the
+      // BLO-27463 defect shape, and the only one of the three worth acting on.
+      dependencyWaitEscalationSuppressedDependencyReady: 0,
+      // Still genuinely blocked when the caller read readiness: expected, not a defect.
+      dependencyWaitEscalationSuppressedStillBlocked: 0,
+      // The caller held no readiness for this issue, so the gate refused without
+      // classifying. Kept distinct from both arms above so an absent classification can
+      // never be miscounted as a resolved-blocker defect.
+      dependencyWaitEscalationSuppressedUnclassified: 0,
       providerQuotaMonitored: 0,
       recentProgressExempted: 0,
       skipped: 0,
@@ -8583,12 +8599,20 @@ export function recoveryService(
             continue;
           }
           const failureSummary = summarizeRunFailureForIssueComment(latestRun);
-          // BLO-32668: unlike the `in_progress` lane below, this lane has no readiness
-          // preflight, so nothing has populated the memo yet. Read it here — once, and
-          // outside `escalateStrandedAssignedIssue`'s transaction — so the gate can
-          // classify the suppression without taking the round-trip under the per-issue
-          // advisory lock. Scoped to the dependency-blocked error code so no other
-          // `todo` escalation pays for a query it does not use.
+          // BLO-32668: populate the readiness the dependency-wait gate classifies from,
+          // here — outside `escalateStrandedAssignedIssue`'s transaction — so the gate
+          // does not take that round-trip under the per-issue advisory lock. Scoped to
+          // the dependency-blocked error code so no other `todo` escalation pays for a
+          // query it does not use.
+          //
+          // `??=`, not `=`, and that is load-bearing: `dependencyReadiness` is scoped to
+          // this loop iteration and two earlier arms may already have filled it for this
+          // same issue — the `dependencyBlockedStrand` arm and the review-participant
+          // `participantDependencyRefusalExpired` arm, both of which fall through without
+          // `continue`. Reusing their value is correct and is the point: same issue, same
+          // iteration, and the gate's use of it is diagnostic-only, so a second query
+          // would buy a fresher timestamp for a label and nothing else. Do not "fix" this
+          // to `=` — that reinstates exactly the per-candidate query this change removed.
           if (assignmentContinuationClassification.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
             dependencyReadiness ??= await issuesSvc
               .listDependencyReadiness(issue.companyId, [issue.id])
@@ -9223,26 +9247,31 @@ export function recoveryService(
 
     result.dependencyWaitEscalationSuppressed =
       dependencyWaitEscalationSuppressedTotal - dependencyWaitEscalationSuppressedAtSweepStart;
+    result.dependencyWaitEscalationSuppressedDependencyReady =
+      dependencyWaitEscalationSuppressedDependencyReadyTotal -
+      dependencyWaitEscalationSuppressedDependencyReadyAtSweepStart;
+    result.dependencyWaitEscalationSuppressedUnclassified =
+      dependencyWaitEscalationSuppressedUnclassifiedTotal -
+      dependencyWaitEscalationSuppressedUnclassifiedAtSweepStart;
+    // Derived rather than tallied: the gate increments the total plus at most one of the
+    // two sub-counters, so "neither sub-counter fired" is exactly the still-blocked arm.
+    // This subtraction cannot go negative even with sweeps interleaved — the gate's three
+    // increments are one synchronous block with no `await` between them, so every snapshot
+    // window captures a suppression's total and its sub-tally together or captures neither.
+    result.dependencyWaitEscalationSuppressedStillBlocked =
+      result.dependencyWaitEscalationSuppressed -
+      result.dependencyWaitEscalationSuppressedDependencyReady -
+      result.dependencyWaitEscalationSuppressedUnclassified;
 
     // BLO-32668: one line per pass, replacing one INFO line per suppressed issue. Emitted
     // only when the population is non-empty so a quiet sweep stays quiet.
     if (result.dependencyWaitEscalationSuppressed > 0) {
-      const dependencyReadySuppressed =
-        dependencyWaitEscalationSuppressedDependencyReadyTotal -
-        dependencyWaitEscalationSuppressedDependencyReadyAtSweepStart;
-      const unclassifiedSuppressed =
-        dependencyWaitEscalationSuppressedUnclassifiedTotal -
-        dependencyWaitEscalationSuppressedUnclassifiedAtSweepStart;
       logger.info(
         {
           suppressed: result.dependencyWaitEscalationSuppressed,
-          // Reported `issue_dependencies_blocked` with blockers already resolved — the
-          // BLO-27463 defect shape. Non-zero here is the signal worth acting on.
-          dependencyReadySuppressed,
-          // Still genuinely blocked at the time the caller read readiness.
-          stillBlockedSuppressed:
-            result.dependencyWaitEscalationSuppressed - dependencyReadySuppressed - unclassifiedSuppressed,
-          unclassifiedSuppressed,
+          dependencyReadySuppressed: result.dependencyWaitEscalationSuppressedDependencyReady,
+          stillBlockedSuppressed: result.dependencyWaitEscalationSuppressedStillBlocked,
+          unclassifiedSuppressed: result.dependencyWaitEscalationSuppressedUnclassified,
           candidatesScanned: candidates.length,
         },
         "skipped stranded escalation for dependency-wait terminal runs",
