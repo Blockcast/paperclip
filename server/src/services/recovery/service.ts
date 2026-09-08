@@ -2661,6 +2661,20 @@ export function recoveryService(
    * that something broke, and an open PR does not refute that -- widening this to them
    * would suppress recovery from real faults.
    *
+   * BLO-32679 measured the cost of that scoping and it is larger than "an edge case", so
+   * the numbers are recorded here rather than left to be re-derived. Company `aaced805`,
+   * 2026-09-08, 70 live `stranded_assigned_issue` actions on one assignee: `latestRun`
+   * had failed on **70 of 70**, so nothing in the live population could reach this
+   * predicate, and **38 of those 70** were on rows carrying a fresh webhook-written open
+   * PR -- i.e. rows this predicate would have exempted had it been asked. Error codes on
+   * the 38: `job_failed` 22, `adapter_failed` 12, `k8s_pod_schedule_failed` 4. None of
+   * the three is an assertion about attendance, and `job_failed`
+   * (`BackoffLimitExceeded`) is frequently the sweep's OWN `issue_continuation_needed`
+   * retry giving up -- so the sweep can supply the disqualifier that voids the
+   * exemption. Two tests in the PEN-2791 block pin this behaviour on the failed arm;
+   * the ruling on whether to keep it is on BLO-32679, and if it lands the honoured way
+   * this paragraph and those two assertions move together.
+   *
    * Bounded on `updatedAt` because an open PR proves a wake arrives when the PR next
    * MOVES, not that one arrives on a schedule -- see `openPullRequestAttendanceGraceMs`
    * for why the bound is days rather than the monitor's hours, and why it must exist.

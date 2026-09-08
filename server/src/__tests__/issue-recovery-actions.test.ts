@@ -2019,6 +2019,41 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       return seeded;
     }
 
+    // The same row, except its continuation retry died on infrastructure instead of
+    // exiting 0. This is the population the exemption does NOT currently reach, because
+    // it is consulted only under `latestRun?.status === "succeeded"` -- see the
+    // "Deliberately consulted ONLY on the succeeded-run gate" note on
+    // `hasOpenPullRequestWakePath`. Seeded here so that scoping is pinned by a test
+    // rather than resting on the comment alone; BLO-32679 carries the pending ruling on
+    // whether it should stay.
+    //
+    // `job_failed` specifically, because that is the sweep's own retry giving up:
+    // `reconcileStrandedAssignedIssues` issues the `issue_continuation_needed`
+    // continuation, the lifecycle Job exhausts its backoff, and the resulting
+    // `latestRun.status = "failed"` is what disqualifies the row. Note the error code is
+    // NOT in `isInfraClassStrandedFailure`, so `infraClassCause` reads false on it.
+    async function seedSeizableFailedContinuationRow() {
+      const seeded = await seedCompany();
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "failed",
+        error: "BackoffLimitExceeded: Job has reached the specified backoff limit",
+        errorCode: "job_failed",
+        startedAt: new Date(Date.now() - 45 * 60_000),
+        finishedAt: new Date(Date.now() - 40 * 60_000),
+        contextSnapshot: {
+          issueId: seeded.sourceIssueId,
+          retryReason: "issue_continuation_needed",
+          source: "issue.productive_terminal_continuation_recovery",
+        },
+      });
+      return seeded;
+    }
+
     // Built through the real producer, not hand-written literals: the predicate filters
     // on the webhook's metadata source and system source-trust, so if either constant
     // moves, this seeding moves with it and a stale filter fails loudly instead of
@@ -2149,6 +2184,49 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       // other side.
       const result = await sweep();
 
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    // BLO-32679. These two pin the boundary of the exemption on the OTHER axis: not
+    // "which PRs count" but "which runs let the question be asked at all".
+    it("escalates the failed-continuation shape when no pull request is recorded (control)", async () => {
+      const { sourceIssueId } = await seedSeizableFailedContinuationRow();
+
+      const result = await sweep();
+
+      // Establishes the row is genuinely at risk, so the next test measures the
+      // exemption's reach rather than a row that was never seizable.
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("still escalates a fresh webhook-written open pull request when the latest run failed", async () => {
+      const { companyId, sourceIssueId } = await seedSeizableFailedContinuationRow();
+      const fields = await insertPullRequestWorkProduct({
+        companyId,
+        issueId: sourceIssueId,
+        prNumber: 2434,
+      });
+      // Guard the guard, as above: an open status is what makes this a test of the
+      // exemption and not of a terminal PR.
+      expect(fields.status).toBe("ready_for_review");
+
+      const result = await sweep();
+
+      // CURRENT, DELIBERATE behaviour, not an aspiration: the work product satisfies
+      // every clause of `hasOpenPullRequestWakePath`, but the predicate is never
+      // consulted because the gate above it requires a succeeded run. Measured
+      // 2026-09-08 on company `aaced805`: 38 of 70 live `stranded_assigned_issue`
+      // actions were on rows matching this exact shape -- fresh webhook-written open
+      // PR, `latestRunStatus: failed` (22 `job_failed`, 12 `adapter_failed`, 4
+      // `k8s_pod_schedule_failed`), 70/70 of the population failed so 0 were eligible.
+      //
+      // Flip these two assertions to `0` / `"in_progress"` if the BLO-32679 ruling
+      // honours the PR path independently of run status; that is the whole diff on the
+      // test side.
       expect(result.escalated).toBe(1);
       const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
       expect(updated?.status).toBe("blocked");
