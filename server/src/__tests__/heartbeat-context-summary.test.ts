@@ -2508,6 +2508,19 @@ describe("mergeCoalescedContextSnapshot", () => {
       resumeRequiresNormalModel: false,
     });
   });
+
+  // Same hazard as the GitHub-key case above, pinned for the guard block: a
+  // clear implemented against `existing` rather than `merged` would strip the
+  // guard off the still-queued run row this snapshot came from.
+  it("does not mutate the caller's existing snapshot when dropping the guard block", () => {
+    const existing = statusOnlyRecoveryRunContext();
+
+    mergeCoalescedContextSnapshot(existing, monitorWakeContext());
+
+    expect(existing.recoveryIntent).toBe("status_only");
+    expect(existing.modelProfile).toBe("cheap");
+    expect(existing.resumeRequiresNormalModel).toBe(true);
+  });
 });
 
 describe("summarizeHeartbeatRunContextSnapshot", () => {
