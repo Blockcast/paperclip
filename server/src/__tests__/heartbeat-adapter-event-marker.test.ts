@@ -102,17 +102,14 @@ describe("buildAdapterRunEventPayloadForPersistence", () => {
    * `appendRunEvent` bounds the payload for storage after this function marks
    * it (`heartbeat.ts`: `boundHeartbeatRunEventPayloadForStorage(event.payload)`),
    * and that bounding keeps only the FIRST `MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS`
-   * keys in insertion order. Spreading the markers last -- which is what makes
-   * the anti-forge case above hold -- therefore also made them the first
-   * casualties of truncation. The two properties want opposite orderings, and
-   * only the anti-forge one was pinned.
+   * keys. The failure mode is the bad one: not a lost row, but a post-terminal
+   * row that survives stripped of the marker, i.e. indistinguishable from an
+   * ordinary live-run event that appears to postdate its own run's end -- and
+   * `_truncated: true` is set either way, so nothing reveals the loss.
    *
-   * The failure mode is the bad one: not a lost row, but a post-terminal row
-   * that survives stripped of the marker, i.e. indistinguishable from an
-   * ordinary live-run event that appears to postdate its own run's end.
-   *
-   * This asserts the composition as production performs it, because neither
-   * function is wrong on its own.
+   * These assert the composition as production performs it, because neither
+   * function is wrong on its own. The two key shapes are NOT redundant: see the
+   * integer-like case below.
    */
   it("keeps the marker through storage bounding on an over-wide payload", () => {
     const settledAt = "2026-09-07T12:00:00.000Z";
@@ -133,6 +130,61 @@ describe("buildAdapterRunEventPayloadForPersistence", () => {
     // Positive control: the bound still bit, so the assertion above is not
     // passing because the payload happened to fit.
     expect(stored).toMatchObject({ _truncated: true });
+  });
+
+  /**
+   * The case above passes on key order alone; this one cannot, and that is the
+   * whole point of it.
+   *
+   * `Object.entries` enumerates integer-like keys ("0", "1", ...) first, in
+   * ascending numeric order, ahead of every string key no matter when it was
+   * inserted. So a payload keyed `0..149` pushes both markers past the slice
+   * even though the marked object lists them first -- measured: the
+   * `detail<i>` fixture above keeps the markers and this one, differing only in
+   * key shape, did not. That is why the survival guarantee is pinned at the
+   * slice (`RUN_EVENT_PAYLOAD_PINNED_KEYS`) rather than expressed as key order,
+   * which no object literal can control.
+   *
+   * A payload keyed by array-ish indices is not exotic: any adapter spreading
+   * an array or an index-keyed map into a payload produces exactly this shape.
+   */
+  it("keeps the marker when the payload's own keys are integer-like", () => {
+    const settledAt = "2026-09-07T12:00:00.000Z";
+    const wide: Record<string, unknown> = { stage: "kill_signal" };
+    for (let index = 0; index < 150; index += 1) {
+      wide[String(index)] = index;
+    }
+
+    const stored = boundHeartbeatRunEventPayloadForStorage(
+      buildAdapterRunEventPayloadForPersistence(wide, settledAt) ?? {},
+    );
+
+    expect(stored).toMatchObject({
+      postAdapterSettle: true,
+      adapterSettledAt: settledAt,
+    });
+    expect(stored).toMatchObject({ _truncated: true });
+    // Pinning must reorder, never drop or duplicate: the bound still keeps
+    // exactly its budget of payload keys plus the two truncation markers, and
+    // still accounts for every omitted key (153 composed keys - 100 kept).
+    expect(Object.keys(stored)).toHaveLength(102);
+    expect(stored._omittedKeys).toBe(53);
+  });
+
+  /**
+   * Because storage bounding now pins these key names, an adapter-supplied copy
+   * left in place on the LIVE path would be handed precedence over the
+   * adapter's real evidence during truncation -- and would persist a payload
+   * asserting a post-terminal marker on a run that had not settled. Stripping
+   * is therefore unconditional, not only done when marking.
+   */
+  it("strips adapter-supplied marker keys even while the adapter is live", () => {
+    const stored = buildAdapterRunEventPayloadForPersistence(
+      { stage: "first_output", postAdapterSettle: true, adapterSettledAt: "1999-01-01T00:00:00.000Z" },
+      null,
+    );
+
+    expect(stored).toEqual({ stage: "first_output" });
   });
 });
 

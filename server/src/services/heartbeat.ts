@@ -578,6 +578,27 @@ export function redactDetectedSuccessfulRunProgressSummaryForBoard(
 
 const MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS = 100;
 const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
+/**
+ * Top-level payload keys that storage bounding must never drop.
+ *
+ * PEN-3093: the bound keeps the first `MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS` keys
+ * in `Object.entries` order, and that order is NOT insertion order --
+ * integer-like keys ("0", "1", ...) are enumerated first, in ascending numeric
+ * order, ahead of every string key regardless of when it was inserted. So
+ * building the marked payload with its markers first is not sufficient: a
+ * payload carrying >100 integer-like keys pushes both markers past the slice
+ * and persists a post-terminal row stripped of the only thing distinguishing
+ * it from an ordinary live-run event -- with `_truncated: true` set, so the
+ * loss is silent. Measured: an object keyed `detail0..detail149` keeps the
+ * markers, the same object keyed `0..149` does not.
+ *
+ * The exemption lives here, at the slice that destroys the marker, rather than
+ * being expressed as key order at the callsite, because no object literal can
+ * put a string key ahead of an integer-like one. Pinning does not change
+ * `_truncated`/`_omittedKeys` accounting: entries are reordered, never added or
+ * removed.
+ */
+const RUN_EVENT_PAYLOAD_PINNED_KEYS = ["postAdapterSettle", "adapterSettledAt"] as const;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
@@ -1673,34 +1694,40 @@ export function selectAgedPrReviewRunForFairDispatch(
  * but it is marked, so a reader can tell it apart from the live run's stream
  * instead of seeing an event that appears to postdate the run's own end.
  *
- * The markers go FIRST, and the adapter's own copies of those two keys are
- * dropped rather than shadowed. Two properties pull in opposite directions here
- * and both have to hold:
+ * The adapter's own copies of those two keys are dropped rather than shadowed,
+ * on both paths. The marker is the server's statement about its own run, so an
+ * adapter payload must not be able to forge it -- and because storage bounding
+ * now pins those key names (`RUN_EVENT_PAYLOAD_PINNED_KEYS`), an adapter-supplied
+ * copy left in place on the live path would be given precedence over the
+ * adapter's real evidence during truncation. Stripping is unconditional so the
+ * two mechanisms cannot combine that way.
  *
- * - The marker is the server's statement about its own run, so an adapter
- *   payload must not be able to forge it. Spreading the markers last would also
- *   achieve that, which is why it was written that way first.
- * - `appendRunEvent` bounds the payload for storage *after* this runs, and that
- *   bounding keeps only the first `MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS` keys in
- *   insertion order. Last position therefore made the markers the first
- *   casualties of truncation, silently: an over-wide payload persisted a
- *   post-terminal row stripped of the only thing distinguishing it from an
- *   ordinary live-run event. Since the marker is the entire justification for
- *   keeping the row instead of dropping it, losing it is worse than losing the
- *   row.
+ * Key ORDER here is deliberately not load-bearing, and an earlier revision of
+ * this comment claimed more than order can deliver. Storage bounding keeps the
+ * first `MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS` keys in `Object.entries` order,
+ * which enumerates integer-like keys ahead of every string key regardless of
+ * insertion order -- so putting the markers first in the literal survives a
+ * payload keyed `detail0..detail149` and is stripped by one keyed `0..149`,
+ * silently, with `_truncated: true` set. Since the marker is the entire
+ * justification for keeping this row instead of dropping it, losing it is worse
+ * than losing the row. The survival guarantee therefore lives at the slice
+ * itself (see `RUN_EVENT_PAYLOAD_PINNED_KEYS`), not in this object's shape.
  *
- * Deleting the adapter's keys decouples the anti-forge property from key order,
- * so first position can serve the truncation one. Bounding the payload before
- * marking it does NOT work -- bounding emits `_truncated`/`_omittedKeys`, so a
- * truncated payload comes back at 102 keys and the appended markers are sliced
- * off exactly as before. Measured, not assumed.
+ * Bounding the payload before marking it does NOT work either -- bounding emits
+ * `_truncated`/`_omittedKeys`, so a truncated payload comes back at 102 keys and
+ * appended markers are sliced off exactly as before. Measured, not assumed.
  */
 export function buildAdapterRunEventPayloadForPersistence(
   payload: Record<string, unknown> | undefined,
   adapterSettledAt: string | null,
 ): Record<string, unknown> | undefined {
-  if (!adapterSettledAt) return payload;
+  const carriesMarkerKeys =
+    !!payload && ("postAdapterSettle" in payload || "adapterSettledAt" in payload);
+  // Identity on the overwhelmingly common path: an ordinary live-run event is
+  // neither cloned nor reshaped.
+  if (!adapterSettledAt && !carriesMarkerKeys) return payload;
   const { postAdapterSettle: _forged, adapterSettledAt: _forgedAt, ...rest } = payload ?? {};
+  if (!adapterSettledAt) return rest;
   return {
     postAdapterSettle: true,
     adapterSettledAt,
@@ -4110,6 +4137,33 @@ function truncateRunEventString(value: string) {
   return `${value.slice(0, MAX_RUN_EVENT_PAYLOAD_STRING_CHARS)}\n[truncated ${omittedChars} chars]`;
 }
 
+/**
+ * Moves `RUN_EVENT_PAYLOAD_PINNED_KEYS` to the front of the top-level payload's
+ * entries so the key-count slice cannot drop them, preserving the relative
+ * order of everything else.
+ *
+ * Only the top level (`depth === 0`) is reordered. The pinned names are the
+ * server's markers on the payload it is persisting, so a nested object that
+ * happens to carry the same key is an adapter's own data and gets no
+ * precedence.
+ */
+function orderRunEventEntriesForBounding(
+  entries: [string, unknown][],
+  depth: number,
+): [string, unknown][] {
+  if (depth !== 0 || entries.length <= MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS) return entries;
+  const pinned = entries.filter(([key]) =>
+    (RUN_EVENT_PAYLOAD_PINNED_KEYS as readonly string[]).includes(key),
+  );
+  if (pinned.length === 0) return entries;
+  return [
+    ...pinned,
+    ...entries.filter(
+      ([key]) => !(RUN_EVENT_PAYLOAD_PINNED_KEYS as readonly string[]).includes(key),
+    ),
+  ];
+}
+
 function boundRunEventValue(value: unknown, depth: number, seen: WeakSet<object>): unknown {
   if (typeof value === "string") {
     return truncateRunEventString(value);
@@ -4150,7 +4204,10 @@ function boundRunEventValue(value: unknown, depth: number, seen: WeakSet<object>
     return "[Circular]";
   }
   seen.add(value);
-  const entries = Object.entries(value as Record<string, unknown>);
+  const entries = orderRunEventEntriesForBounding(
+    Object.entries(value as Record<string, unknown>),
+    depth,
+  );
   if (depth >= MAX_RUN_EVENT_PAYLOAD_DEPTH) {
     const bounded = {
       _truncated: true,
