@@ -103,12 +103,25 @@ test("the Docker workflow keeps launcher credentials separate from vendor creden
   );
   assert.match(
     dockerWorkflow,
-    /penstock_runtime_token=\$\{\{ secrets\.PENSTOCK_RUNTIME_TOKEN \}\}/,
+    /uses: actions\/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2\.2\.2/,
+  );
+  assert.match(dockerWorkflow, /app-id: \$\{\{ vars\.COMMITPERCLIP_APP_ID \}\}/);
+  assert.match(
+    dockerWorkflow,
+    /private-key: \$\{\{ secrets\.COMMITPERCLIP_KEY \}\}/,
+  );
+  assert.match(dockerWorkflow, /owner: Blockcast/);
+  assert.match(dockerWorkflow, /repositories: penstock-llm-proxy-core/);
+  assert.match(dockerWorkflow, /permission-contents: read/);
+  assert.match(
+    dockerWorkflow,
+    /penstock_runtime_token=\$\{\{ steps\.penstock-runtime-token\.outputs\.token \}\}/,
   );
   assert.doesNotMatch(
     dockerWorkflow,
     /penstock_runtime_token=\$\{\{ secrets\.PAPERCLIP_BOARD_TOKEN \}\}/,
   );
+  assert.doesNotMatch(dockerWorkflow, /secrets\.PENSTOCK_RUNTIME_TOKEN/);
 });
 
 test("the agent overlay carries every packaged Penstock runtime asset", () => {
