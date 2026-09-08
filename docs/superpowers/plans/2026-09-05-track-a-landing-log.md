@@ -158,20 +158,56 @@ precedent and not on judgement: `Storybook visual regression = skipped` and
 `security-review = neutral` are the state at head of **every** PR in this batch that has
 already landed through the queue.
 
+#### How criterion 2 must be *implemented* — a field-shape trap worth its own note
+
+Criterion 2 above reads "every check-run at head `success`", which is correct as a policy but
+under-specifies the read. `gh pr view --json statusCheckRollup` returns **two entry shapes that
+do not share a field**, and getting this wrong silently disables the most important gate:
+
+| `__typename` | field carrying the verdict | the other field |
+|---|---|---|
+| `CheckRun` | `.conclusion` | `.state` is `null` |
+| `StatusContext` | `.state` | `.conclusion` is `null` |
+
+`gate/ally-comment-findings` is a **`StatusContext`**. Measured at `#1685` head
+`44f539c61b341d3320fc8885109aacd8eacf17c7` on 2026-09-08 it returns
+`{conclusion: null, state: "FAILURE"}`. So a predicate written against `.conclusion` alone sees
+`null` on the findings gate — a value in neither the accept list nor the reject list, i.e.
+**undefined behaviour precisely where a wrong answer merges unreviewed code**. An in-flight
+`CheckRun` is the same trap mirrored: `gh` reports `conclusion: ""` while `status` is
+`queued`/`in_progress`, also in neither list.
+
+Two consequences for any implementation:
+
+- Read `.state` for `StatusContext` and `.conclusion` for `CheckRun`; treat `null` and `""` as a
+  **stop**, not as an unknown to be skipped over.
+- Guard emptiness *before* the "every entry passes" test. That test is vacuously TRUE on an empty
+  rollup, so a head with no checks at all reads as fully green — the `ABSENT` case BLO-26572 names
+  as a stop, arriving through a quantifier rather than through a status value.
+
+The same defect existed in the reusable `Land clean-reviewed PRs` routine in the companion plan
+document and was corrected on 2026-09-08 in this PR: that routine accepted `NEUTRAL`/`SKIPPED`
+for *any* entry (so a `skipped` `verify` would have passed), read only `.conclusion`, and had no
+emptiness guard. Its allowlist is now keyed on check **name** rather than conclusion class.
+Note that the naive repair — "require every check-run to be `SUCCESS`" — is **unsatisfiable
+here**: all four of the most recently landed PRs (#1418, #1309, #1219, #1467) carry
+`Storybook visual regression = skipped`, so a blanket predicate matches zero PRs and turns the
+routine into a no-op that is indistinguishable from one that is working.
+
 ### Final dispositions — the 11
 
 | PR | disposition | merge SHA / unmet criterion | owner |
 |---|---|---|---|
-| 1195 | **MERGED** 2026-09-07T21:11:31Z | `8ddfca080` | — |
-| 1279 | **MERGED** 2026-09-07T17:58:40Z | `a32d5a5e2` | — |
-| 1586 | **MERGED** 2026-09-07T22:33:26Z | `2ebf80098` | — |
-| 1467 | **MERGED** 2026-09-08T01:19:06Z | `79f85d056` | — |
-| 1219 | **MERGED** 2026-09-08T09:40:57Z | `70a9df918` | — |
-| 1309 | **MERGED** 2026-09-08T10:41:08Z | `a589aea8b` | — |
-| 1418 | **MERGED** 2026-09-08T17:40:44Z | `b9ec8590c` | — |
-| 1150 | OPEN — passes 1–4 at `31a2c99f1` | **criterion 5**: no `APPROVED` from kkroo; every review on it is `allyblockcast[bot]` / `COMMENTED` | **kkroo** |
-| 1596 | OPEN | **criterion 3**: `gate/ally-comment-findings` **ABSENT** at `09ce54c88` — only the retired `review/ally-comment` is present, so the head is unattested, not clean. Then criterion 5 | **Ally**, then kkroo |
-| 1585 | OPEN | **criterion 3**: same shape at `00b36ef46`. Then criterion 5 | **Ally**, then kkroo |
+| 1195 | **MERGED** 2026-09-07T21:11:31Z | `8ddfca0809c1d21366c1c54f588ff5a77664b2ca` | — |
+| 1279 | **MERGED** 2026-09-07T17:58:40Z | `a32d5a5e2fe88225f76c9effd168daa88e801563` | — |
+| 1586 | **MERGED** 2026-09-07T22:33:26Z | `2ebf80098065336c3264462bb983eb16acdcbca9` | — |
+| 1467 | **MERGED** 2026-09-08T01:19:06Z | `79f85d056e27c61f6d86ef6b30a810c78d6ae51b` | — |
+| 1219 | **MERGED** 2026-09-08T09:40:57Z | `70a9df918d2d250d5dfb536c15069e5015739b34` | — |
+| 1309 | **MERGED** 2026-09-08T10:41:08Z | `a589aea8bb990d11d5d987216b8dc4089b74a4a2` | — |
+| 1418 | **MERGED** 2026-09-08T17:40:44Z | `b9ec8590c0cb4cf0eae539ce9e8591473765ecb9` | — |
+| 1150 | OPEN — passes 1–4 at `31a2c99f15ab4344271c5080b167969e2bdb707c` | **criterion 5**: no `APPROVED` from kkroo; every review on it is `allyblockcast[bot]` / `COMMENTED` | **kkroo** |
+| 1596 | OPEN | **criterion 3**: `gate/ally-comment-findings` **ABSENT** at `09ce54c8867eed6a36ad6cc621fed5e5cc9a57a4` — only the retired `review/ally-comment` is present, so the head is unattested, not clean. Then criterion 5 | **Ally**, then kkroo |
+| 1585 | OPEN | **criterion 3**: same shape at `00b36ef46de4f0581d2e95378c724fe47b32aac4`. Then criterion 5 | **Ally**, then kkroo |
 | 1595 | OPEN | **criteria 2, 3 and 4**: `verify` and `General tests (server 3/4)` are `failure`; gate is `failure` ("carries an unresolved finding"); and the branch has a merge commit (parents `[1,1,1,1,1,1,1,2]`) needing squash-replay linearization | **Ally**, then a linearization pass |
 
 Each of the seven landed PRs has a corresponding `gh-readonly-queue/master/pr-<n>-*` build under
@@ -201,13 +237,13 @@ strength of having measured it.
 ### A4 — deploy not dispatched, and why
 
 The stale slot cleared on its own: run `34019412658`, which had been `waiting` ~33h on
-environment `paperclip-production` pinned to the 44-commits-stale `9e84e8e24`, went `cancelled`
+environment `paperclip-production` pinned to the 44-commits-stale `9e84e8e242e32cb9d1df1da50469880380641432`, went `cancelled`
 at 2026-09-08T16:22:32Z, and the associated board card auto-closed. No `waiting` run remains, so
 the fleet-wide deploy mutex is free.
 
 **The deploy is still blocked, on the image rather than on the slot.** `Docker` /
 `build-and-push` on `master` has failed **8 consecutive times** (runs #1680–#1687), cleanly
-bisected: last green `a589aea8b` at 2026-09-08T10:41:10Z (#1679), first red `34345a998` at
+bisected: last green `a589aea8bb990d11d5d987216b8dc4089b74a4a2` at 2026-09-08T10:41:10Z (#1679), first red `34345a9983979ba96afd4f37bb32de7668a636c7` at
 11:45:46Z (#1680). The cause is
 [PR #1711](https://github.com/Blockcast/paperclip/pull/1711), which added a Dockerfile stage
 fetching from the private `Blockcast/penstock-llm-proxy-core` using a credential scoped to
@@ -215,7 +251,7 @@ fetching from the private `Blockcast/penstock-llm-proxy-core` using a credential
 [BLO-32824](https://paperclip.blockcast.net/BLO/issues/BLO-32824); the fix is
 [#1723](https://github.com/Blockcast/paperclip/pull/1723), still open.
 
-Dispatching at the last-green `a589aea8b` would ship a SHA pinned before six of the seven
+Dispatching at the last-green `a589aea8bb990d11d5d987216b8dc4089b74a4a2` would ship a SHA pinned before six of the seven
 merges, so it was not done. The deploy waits for a green master build.
 
 **Merges did not stop when the image broke.** Seven further pushes landed on `master` after the
