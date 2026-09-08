@@ -1994,6 +1994,181 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     expect(leftovers).toEqual([path.basename(publishedDir)]);
   });
 
+  // BLO-32167 review follow-up. `createDirectoryReplacement.commit()` retires the
+  // outgoing tree aside and then renames staging in — but POSIX `rename` refuses
+  // to replace a NON-EMPTY directory, so a concurrent publisher that fills the
+  // destination in the gap between those two renames sends us down a second
+  // branch. That branch used to clear the path with `fs.rm(targetDir, {
+  // recursive: true })`, which is a walk: it unlinks entries one at a time
+  // before the final `rmdir`, so a reader landing mid-`rm` sees the directory
+  // present with `SKILL.md` already gone. That is precisely the silent state
+  // this change exists to eliminate, reintroduced in the one scenario the branch
+  // is reachable at all.
+  //
+  // The collision is produced for real rather than by throwing a fake error: the
+  // competing tree is created inside the `fs.rename` call, so the kernel raises
+  // the genuine `ENOTEMPTY`.
+  it("resolves a concurrent-publish collision without clearing the live directory in place (BLO-32167)", async () => {
+    const companyId = randomUUID();
+    const skillKey = `company/${companyId}/collision-publish`;
+    const missingSkillDir = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-collision-publish-")), "gone");
+    cleanupDirs.add(path.dirname(missingSkillDir));
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companySkills).values({
+      id: randomUUID(),
+      companyId,
+      key: skillKey,
+      slug: "collision-publish",
+      name: "Collision Publish",
+      description: null,
+      markdown: "# Collision Publish\n\nMaterialized from DB.\n",
+      sourceType: "local_path",
+      sourceLocator: missingSkillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { sourceKind: "local_path" },
+    });
+    await db.insert(agents).values({
+      id: randomUUID(),
+      companyId,
+      name: "Runner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: { paperclipSkillSync: { desiredSkills: [skillKey] } },
+    });
+
+    const first = await svc.listRuntimeSkillEntries(companyId);
+    const publishedDir = first.find((candidate) => candidate.key === skillKey)!.source;
+
+    const realRename = fs.rename;
+    const realRm = fs.rm;
+    const removedPaths: string[] = [];
+    let injected = false;
+
+    const rmSpy = vi.spyOn(fs, "rm").mockImplementation(async (target, ...rest) => {
+      removedPaths.push(String(target));
+      return (realRm as never)(target, ...rest);
+    });
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (!injected && String(to) === publishedDir) {
+        injected = true;
+        // Stand in for the concurrent materializer: publish a complete competing
+        // tree into the slot we just vacated, so the real `rename` below fails
+        // with a real ENOTEMPTY.
+        await (realRm as never)(publishedDir, { recursive: true, force: true });
+        await fs.mkdir(publishedDir, { recursive: true });
+        await fs.writeFile(path.join(publishedDir, "SKILL.md"), "# Competing Publisher\n", "utf8");
+      }
+      return (realRename as never)(from, to);
+    });
+
+    try {
+      const second = await svc.listRuntimeSkillEntries(companyId);
+      expect(second.find((candidate) => candidate.key === skillKey)).toMatchObject({
+        key: skillKey,
+        sourceStatus: "available",
+      });
+    } finally {
+      renameSpy.mockRestore();
+      rmSpy.mockRestore();
+    }
+
+    // Vacuity guard: if the collision branch is never reached the assertions
+    // below would pass against the ordinary happy path and mean nothing.
+    expect(injected).toBe(true);
+
+    // The finding itself. Everything torn down must be a retired sibling, never
+    // the live published path — a `.<name>.old-*` tree is off the path a reader
+    // can reach, so removing it walks nothing observable.
+    expect(removedPaths.filter((target) => target === publishedDir)).toEqual([]);
+
+    // And the collision is genuinely resolved in our favour, not left to the
+    // competing tree.
+    await expect(fs.readFile(path.join(publishedDir, "SKILL.md"), "utf8")).resolves.toContain("Collision Publish");
+    expect(await fs.readdir(path.dirname(publishedDir))).toEqual([path.basename(publishedDir)]);
+  });
+
+  // BLO-32167 review follow-up. The other uncovered error branch: when the swap
+  // fails for a reason that is NOT a collision, the outgoing tree must be
+  // renamed back. Otherwise a transient rename failure would leave the published
+  // path absent — self-healing on the next sweep, but a working skill destroyed
+  // by a failure that changed nothing.
+  it("restores the previous runtime tree when the swap fails (BLO-32167)", async () => {
+    const companyId = randomUUID();
+    const skillKey = `company/${companyId}/rollback-publish`;
+    const missingSkillDir = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rollback-publish-")), "gone");
+    cleanupDirs.add(path.dirname(missingSkillDir));
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companySkills).values({
+      id: randomUUID(),
+      companyId,
+      key: skillKey,
+      slug: "rollback-publish",
+      name: "Rollback Publish",
+      description: null,
+      markdown: "# Rollback Publish\n\nMaterialized from DB.\n",
+      sourceType: "local_path",
+      sourceLocator: missingSkillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { sourceKind: "local_path" },
+    });
+    await db.insert(agents).values({
+      id: randomUUID(),
+      companyId,
+      name: "Runner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: { paperclipSkillSync: { desiredSkills: [skillKey] } },
+    });
+
+    const first = await svc.listRuntimeSkillEntries(companyId);
+    const publishedDir = first.find((candidate) => candidate.key === skillKey)!.source;
+
+    const realRename = fs.rename;
+    let injected = false;
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (!injected && String(to) === publishedDir) {
+        injected = true;
+        // Not ENOTEMPTY/EEXIST: this is the non-collision branch, which must
+        // roll back rather than retry.
+        const error = new Error("EACCES: permission denied, rename") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return (realRename as never)(from, to);
+    });
+
+    try {
+      await svc.listRuntimeSkillEntries(companyId).catch(() => null);
+    } finally {
+      renameSpy.mockRestore();
+    }
+
+    expect(injected).toBe(true);
+
+    // The tree that was working before the failed swap is still serving, and no
+    // retired or staging sibling was orphaned by the rollback.
+    await expect(fs.readFile(path.join(publishedDir, "SKILL.md"), "utf8")).resolves.toContain("Rollback Publish");
+    expect(await fs.readdir(path.dirname(publishedDir))).toEqual([path.basename(publishedDir)]);
+  });
+
   it("falls back to stored markdown when reading SKILL.md from a missing local source", async () => {
     const companyId = randomUUID();
     const skillId = randomUUID();
