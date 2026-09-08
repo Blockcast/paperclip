@@ -43,6 +43,7 @@ const SETTINGS = {
   // branch through a rebase. The `config.ts` offender list going red is what
   // surfaced it — the first live proof the guard bites on a real regression.
   approvalGateReconcilerIntervalMinutes: "PAPERCLIP_APPROVAL_GATE_RECONCILER_INTERVAL_MINUTES",
+  terminalGateReconcilerIntervalMinutes: "PAPERCLIP_TERMINAL_GATE_RECONCILER_INTERVAL_MINUTES",
   heartbeatSchedulerIntervalMs: "HEARTBEAT_SCHEDULER_INTERVAL_MS",
   recoveryActionMaxAttempts: "RECOVERY_ACTION_MAX_ATTEMPTS",
   recoveryActionTimeoutMs: "RECOVERY_ACTION_TIMEOUT_MS",
