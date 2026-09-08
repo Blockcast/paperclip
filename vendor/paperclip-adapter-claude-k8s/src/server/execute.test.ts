@@ -2,7 +2,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
 import { ApiException } from "@kubernetes/client-node";
 import type { Writable } from "node:stream";
-import { readFile } from "node:fs/promises";
+import { readFile, mkdir, writeFile, stat, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 
 // This suite doesn't exercise per-agent mcp.json layering (that's covered in
@@ -88,6 +90,7 @@ const {
   isK8s404,
   buildPartialRunError,
   classifyOrphan,
+  cleanupJob,
   describePodTerminatedError,
   describeTruncationCause,
   extractContainerLogDiagnostic,
@@ -1670,5 +1673,86 @@ describe("execute: per-agent creation mutex prevents TOCTOU race", () => {
     // Let A complete so the promises settle cleanly.
     resolveAgentAList({ items: [] });
     await Promise.allSettled([pA, pB]);
+  });
+});
+
+// BLO-32734: the pod log's lifetime must not be gated on the Job delete
+// succeeding.  Before the fix the unlink was sequenced *after*
+// deleteNamespacedJob inside one try, so every already-deleted Job (TTL
+// reaped, deleted externally, or reaped by a prior reattach — all normal)
+// threw past the unlink and leaked the log onto the shared PVC.  >=20,480
+// orphaned .pod.ndjson files had accumulated over ~1 month, unreported,
+// because the swallowing catch names the Job and never the file.
+describe("cleanupJob pod-log reaping", () => {
+  const tmpRoot = path.join(os.tmpdir(), "blo-32734-cleanup");
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  async function makePodLog(name: string): Promise<string> {
+    await mkdir(tmpRoot, { recursive: true });
+    const p = path.join(tmpRoot, name);
+    await writeFile(p, '{"type":"system"}\n', "utf-8");
+    return p;
+  }
+
+  const exists = async (p: string): Promise<boolean> =>
+    await stat(p).then(() => true, () => false);
+
+  afterEach(async () => {
+    await rm(tmpRoot, { recursive: true, force: true });
+  });
+
+  it("removes the pod log when the Job delete succeeds", async () => {
+    const podLogPath = await makePodLog("ok.pod.ndjson");
+    mockBatchDeleteJob.mockResolvedValueOnce({});
+
+    await cleanupJob("ns", "job-ok", vi.fn(), undefined, podLogPath);
+
+    expect(await exists(podLogPath)).toBe(false);
+  });
+
+  it("still removes the pod log when the Job delete 404s (the regression)", async () => {
+    const podLogPath = await makePodLog("gone.pod.ndjson");
+    mockBatchDeleteJob.mockRejectedValueOnce(
+      new ApiException(404, "jobs.batch \"job-gone\" not found", {}, {}),
+    );
+    const onLog = vi.fn();
+
+    await cleanupJob("ns", "job-gone", onLog, undefined, podLogPath);
+
+    expect(await exists(podLogPath)).toBe(false);
+    // The Job-delete failure is still reported — the fix decouples the two
+    // steps, it does not silence the first one.
+    expect(onLog).toHaveBeenCalledWith(
+      "stderr",
+      expect.stringContaining("failed to cleanup job job-gone"),
+    );
+  });
+
+  it("still removes the pod log when the Job delete fails for any other reason", async () => {
+    const podLogPath = await makePodLog("boom.pod.ndjson");
+    mockBatchDeleteJob.mockRejectedValueOnce(new Error("connection refused"));
+
+    await cleanupJob("ns", "job-boom", vi.fn(), undefined, podLogPath);
+
+    expect(await exists(podLogPath)).toBe(false);
+  });
+
+  it("is silent when there is no pod log to remove", async () => {
+    mockBatchDeleteJob.mockResolvedValueOnce({});
+    const onLog = vi.fn();
+
+    await cleanupJob("ns", "job-none", onLog, undefined, path.join(tmpRoot, "absent.pod.ndjson"));
+
+    // ENOENT is the normal case (the pod may never have written one) and must
+    // not produce a warning, or every clean run would emit noise.
+    expect(onLog).not.toHaveBeenCalledWith("stderr", expect.stringContaining("pod log"));
+  });
+
+  it("does nothing when podLogPath is undefined", async () => {
+    mockBatchDeleteJob.mockResolvedValueOnce({});
+    await expect(cleanupJob("ns", "job-undef", vi.fn(), undefined, undefined)).resolves.toBeUndefined();
   });
 });

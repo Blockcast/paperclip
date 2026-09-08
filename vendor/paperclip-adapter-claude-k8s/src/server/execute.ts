@@ -1289,9 +1289,40 @@ export function describeTruncationCause(
 }
 
 /**
- * Delete Job and its pods. Best-effort — failures are logged but not thrown.
+ * Reap the on-disk pod log for a finished run.  Best-effort: a missing file is
+ * the normal case (the pod may never have written one), so ENOENT is silent.
+ * Any other failure is surfaced, because a log we failed to delete for a real
+ * reason accumulates on the shared PVC and nothing else reports it.
  */
-async function cleanupJob(
+async function reapPodLogFile(
+  podLogPath: string | undefined,
+  onLog: AdapterExecutionContext["onLog"],
+): Promise<void> {
+  if (!podLogPath) return;
+  try {
+    await fs.unlink(podLogPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return;
+    const msg = err instanceof Error ? err.message : String(err);
+    await onLog("stderr", `[paperclip] Warning: failed to remove pod log ${podLogPath}: ${msg}\n`);
+  }
+}
+
+/**
+ * Delete Job and its pods, then reap the run's pod log.  Best-effort —
+ * failures are logged but not thrown.
+ *
+ * The two steps are deliberately independent (BLO-32734).  The Job delete
+ * routinely fails with a 404: by the time cleanup runs the Job has often
+ * already been removed by its own `ttlSecondsAfterFinished`, deleted
+ * externally, or reaped by a prior reattach — the SIGTERM handler above
+ * documents that we *intentionally* leave Jobs alive across restarts for the
+ * orphan-reattach path to pick up.  Sequencing the unlink after the delete
+ * inside a single `try` meant every one of those threw past the unlink into
+ * the catch, leaking the pod log permanently.  The warning names the Job, so
+ * the leaked *file* appeared in no log line and the accumulation was silent.
+ */
+export async function cleanupJob(
   namespace: string,
   jobName: string,
   onLog: AdapterExecutionContext["onLog"],
@@ -1305,13 +1336,13 @@ async function cleanupJob(
       namespace,
       body: { propagationPolicy: "Background" },
     });
-    if (podLogPath) {
-      try { await fs.unlink(podLogPath); } catch { /* non-fatal */ }
-    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     await onLog("stderr", `[paperclip] Warning: failed to cleanup job ${jobName}: ${msg}\n`);
   }
+  // Unconditional: the pod log's lifetime is not a function of whether the
+  // Kubernetes Job could be deleted.  They are unrelated resources.
+  await reapPodLogFile(podLogPath, onLog);
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
