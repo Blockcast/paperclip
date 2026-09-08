@@ -21,6 +21,7 @@ import {
   projectWorkspaces,
   projects,
   workspaceRuntimeServices,
+  type Db,
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import {
@@ -29,6 +30,7 @@ import {
   cleanupExecutionWorkspaceArtifacts,
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
+  ensureGitWorktreeBranchCoherent,
   ensureRuntimeServicesForRun,
   executeProcessForTests,
   isProcessGroupAliveForTests,
@@ -323,6 +325,128 @@ async function expectPersistedBranchMismatchRepaired(input: {
 
   expect(realized?.warnings.join("\n")).toContain(input.actualBranch);
   return { realized, actualBranchShaBefore };
+}
+
+// BLO-32628: the ordinary stacked-work shape — a clean worktree on a named
+// sibling branch that has genuinely diverged from the recorded branch. The
+// divergence is real git history rather than a stubbed ancestry verdict, so the
+// eligibility path under test runs the same `merge-base` checks production does;
+// stubbing the verdict would let these pass while the real check still refused.
+async function createCleanDivergedSiblingRepo(input: {
+  expectedBranch: string;
+  actualBranch: string;
+  // Leave the recorded branch checked out in the main worktree, so the
+  // held-elsewhere fact is true alongside whatever else the test is exercising.
+  holdRecordedBranchInMainWorktree?: boolean;
+}) {
+  const repoRoot = await createTempRepo();
+  const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", input.expectedBranch);
+
+  await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+  await runGit(repoRoot, ["branch", input.expectedBranch]);
+  await runGit(repoRoot, ["worktree", "add", "-b", input.actualBranch, worktreePath, "HEAD"]);
+
+  await runGit(repoRoot, ["checkout", input.expectedBranch]);
+  await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
+  await runGit(repoRoot, ["add", "recorded.txt"]);
+  await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+  if (input.holdRecordedBranchInMainWorktree !== true) {
+    await runGit(repoRoot, ["checkout", "main"]);
+  }
+
+  await fs.writeFile(path.join(worktreePath, "actual.txt"), "actual branch work\n", "utf8");
+  await runGit(worktreePath, ["add", "actual.txt"]);
+  await runGit(worktreePath, ["commit", "-m", "Add actual branch work"]);
+
+  await expect(execFileAsync(
+    "git",
+    ["merge-base", "--is-ancestor", input.expectedBranch, input.actualBranch],
+    { cwd: repoRoot },
+  )).rejects.toMatchObject({ code: 1 });
+  await expect(execFileAsync(
+    "git",
+    ["merge-base", "--is-ancestor", input.actualBranch, input.expectedBranch],
+    { cwd: repoRoot },
+  )).rejects.toMatchObject({ code: 1 });
+
+  return { repoRoot, worktreePath };
+}
+
+type ClaimantRow = { id: string; identifier: string | null; status: string };
+
+interface ClaimantQueryChain {
+  from: () => ClaimantQueryChain;
+  where: () => ClaimantQueryChain;
+  orderBy: () => ClaimantQueryChain;
+  limit: (count: number) => Promise<ClaimantRow[]>;
+  then: (
+    resolve: (rows: { companyId: string | null }[]) => unknown,
+    reject?: (error: unknown) => unknown,
+  ) => Promise<unknown>;
+}
+
+// Drizzle-shaped stub for the claimant lookup in
+// `inspectGitWorktreeBranchIncoherence`. Only the database is faked; the git
+// state in every caller below is real. A rejecting lookup cannot be produced
+// against a live Postgres without breaking every other query in the path, and
+// the fail-closed posture is precisely what needs proving.
+//
+// The claimant query is the only one that calls `.limit()`; `readIssueCompanyId`
+// awaits the builder directly, so `then` resolves empty and branch contention
+// short-circuits to null. That keeps the claimant lookup the only database fact
+// these tests depend on.
+//
+// `limit` honours its argument rather than returning the whole fixture. Postgres
+// would, and a stub that ignores it makes the production limit unobservable:
+// the saturation assertion below then passes whether or not the query reads the
+// extra row it needs to tell "exactly N" from "at least N".
+function createClaimantLookupDb(
+  outcome: { kind: "reject" } | { kind: "rows"; rows: ClaimantRow[] },
+): Db {
+  const chain: ClaimantQueryChain = {
+    from: () => chain,
+    where: () => chain,
+    orderBy: () => chain,
+    limit: (count: number) => (outcome.kind === "reject"
+      ? Promise.reject(new Error("claimant lookup unavailable"))
+      : Promise.resolve(outcome.rows.slice(0, count))),
+    then: (resolve, reject) => Promise.resolve([]).then(resolve, reject),
+  };
+  return { select: () => chain } as unknown as Db;
+}
+
+function claimantRow(identifier: string): ClaimantRow {
+  return { id: randomUUID(), identifier, status: "in_progress" };
+}
+
+// Drives the real eligibility computation and returns the thrown validation
+// failure, whose `resultJson.workspaceValidation` is the evidence payload the
+// stranded row would carry.
+async function captureBranchCoherenceRefusal(input: {
+  db: Db | null;
+  repoRoot: string;
+  worktreePath: string;
+  expectedBranch: string;
+}) {
+  let error: unknown = null;
+  try {
+    await ensureGitWorktreeBranchCoherent({
+      db: input.db,
+      repoRoot: input.repoRoot,
+      worktreePath: input.worktreePath,
+      expectedBranchName: input.expectedBranch,
+      sourceIssue: {
+        id: "issue-branch-coherence",
+        identifier: "PAP-462",
+        title: "Refuse an unprovable safe repair",
+      },
+      executionWorkspaceId: "execution-workspace-branch-coherence",
+      enableWorkspaceBranchReconcileForward: true,
+    });
+  } catch (err) {
+    error = err;
+  }
+  return error;
 }
 
 async function createClonedRepoWithRemote() {
@@ -3124,6 +3248,199 @@ describe("realizeExecutionWorkspace", () => {
     // The dirty file survives the refusal.
     expect(existsSync(path.join(worktreePath, "uncommitted.txt"))).toBe(true);
   }, 15_000);
+
+  // BLO-32628: `git bisect start` is the one interrupted operation that reads
+  // clean AND stays on a named branch, so neither `cleanliness` nor
+  // `actualBranchExists` screens it out — every conjunct of the new eligibility
+  // branch holds. The checkout would succeed and orphan nothing, so this is not
+  // a no-loss problem; it would leave live bisect state pointing at a branch the
+  // worktree is no longer on, for the next run to inherit silently.
+  it("keeps a clean diverged worktree ineligible while a git bisect is in progress", async () => {
+    const expectedBranch = "PAP-463-bisect-recorded";
+    const actualBranch = "PAP-463-bisect-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+
+    // Start a bisect and mark nothing, which is the state that reads clean.
+    await runGit(worktreePath, ["bisect", "start"]);
+
+    // Guard the fixture: without all three of these the test would be proving
+    // something other than the conjunct it was added for.
+    expect(existsSync(path.join(repoRoot, ".git", "worktrees", expectedBranch, "BISECT_LOG")))
+      .toBe(true);
+    await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"]))
+      .resolves.toBe("");
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+
+    await expectPersistedBranchMismatchRejected({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      issueId: "issue-bisect-diverged",
+      executionWorkspaceId: "execution-workspace-bisect-diverged",
+      expectedAncestryVerdict: "diverged",
+      expectedReason: "a git bisect is in progress in this worktree",
+    });
+
+    // The worktree keeps both its branch and its bisect state.
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+    expect(existsSync(path.join(repoRoot, ".git", "worktrees", expectedBranch, "BISECT_LOG")))
+      .toBe(true);
+  }, 20_000);
+
+  // BLO-32628: the claimant lookup used to swallow query errors and return `[]`,
+  // so `workspaceIsContended` computed `(0 > 1) === false` and the contention
+  // conjunct PASSED — a database error enabled exactly the repair the guard
+  // exists to prevent. `cleanliness` forty lines up resolves to "unknown" when
+  // `git status` fails and then refuses; this now takes the same posture.
+  it("refuses safe repair on a clean diverged worktree when the claimant lookup fails", async () => {
+    const expectedBranch = "PAP-464-lookup-recorded";
+    const actualBranch = "PAP-464-lookup-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb({ kind: "reject" }),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "clean",
+          workspaceClaimantLookup: "failed",
+          workspaceClaimants: null,
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            attempted: false,
+            succeeded: false,
+            reason: "execution workspace claimant lookup failed, so contention could not be ruled out",
+          }),
+        }),
+      },
+    });
+    // Nothing moved, so the refusal is a refusal and not a failed attempt.
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+
+    // The control that makes the assertion load-bearing: the SAME git state with
+    // a lookup that answers instead of failing repairs successfully. So the
+    // lookup outcome is the only thing refusing above — not the git state.
+    await expect(captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb({ kind: "rows", rows: [claimantRow("PAP-464")] }),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    })).resolves.toBeNull();
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(expectedBranch);
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+  }, 20_000);
+
+  // BLO-32628: the claimant query takes one row past its sample limit so a
+  // saturated result reads as "at least N" rather than rendering the cap as an
+  // exact count. A refusal message that looks precise and is wrong at scale is
+  // the same diagnosability defect as omitting the fact altogether.
+  it("reports a saturated claimant sample as a lower bound rather than an exact count", async () => {
+    const expectedBranch = "PAP-465-saturated-recorded";
+    const actualBranch = "PAP-465-saturated-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb({
+        kind: "rows",
+        // One more than the sample limit, which is what the extra selected row
+        // detects. Twelve would read identically, and that is the point.
+        rows: Array.from({ length: 11 }, (_unused, index) => claimantRow(`PAP-5${index}`)),
+      }),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          workspaceClaimantLookup: "ok",
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            reason: expect.stringContaining("claimed by at least 10 non-terminal issues"),
+          }),
+        }),
+      },
+    });
+    // The sample is capped even though the query read one row past the cap.
+    const validation = (error as { resultJson: { workspaceValidation: { workspaceClaimants: unknown[] } } })
+      .resultJson.workspaceValidation;
+    expect(validation.workspaceClaimants).toHaveLength(10);
+  }, 20_000);
+
+  // BLO-32628 / AC 4: eligibility checks several independent facts but only the
+  // first failing one reaches `safeRepair.reason`. Here contention and
+  // held-elsewhere are BOTH true and contention wins, so before
+  // `expectedBranchWorktreePath` was recorded unconditionally the held-elsewhere
+  // fact was absent from the payload entirely and that combination was not
+  // diagnosable from the evidence alone.
+  it("records the worktree holding the recorded branch even when contention refuses first", async () => {
+    const expectedBranch = "PAP-466-both-recorded";
+    const actualBranch = "PAP-466-both-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+      holdRecordedBranchInMainWorktree: true,
+    });
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb({
+        kind: "rows",
+        rows: [claimantRow("PAP-466"), claimantRow("PAP-467")],
+      }),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          // Contention wins the ordering...
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            reason: expect.stringContaining("claimed by 2 non-terminal issues"),
+          }),
+          // ...and the losing precondition is still on the payload.
+          expectedBranchWorktreePath: expect.any(String),
+        }),
+      },
+    });
+
+    // The recorded path really is the main checkout holding the branch. Compare
+    // through realpath: the payload keeps git's own path and the fixture root
+    // can reach the same directory through a symlinked temp dir.
+    const heldPath = (error as {
+      resultJson: { workspaceValidation: { expectedBranchWorktreePath: string } };
+    }).resultJson.workspaceValidation.expectedBranchWorktreePath;
+    expect(await fs.realpath(heldPath)).toBe(await fs.realpath(repoRoot));
+  }, 20_000);
 
   it("classifies persisted git worktree branch incoherence as unknown when the recorded branch was deleted", async () => {
     const repoRoot = await createTempRepo();
