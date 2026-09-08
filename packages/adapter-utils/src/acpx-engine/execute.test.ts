@@ -1860,9 +1860,27 @@ describe("ACPX session establishment progress (PEN-1995)", () => {
       fastDelays,
     );
 
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    const waitingWhileStalled = stages().filter((stage) => stage === "waiting").length;
-    expect(waitingWhileStalled).toBeGreaterThanOrEqual(2);
+    // Wait on the ticks themselves, not on wall-clock. A fixed sleep asserts a
+    // rate the runner is under no obligation to deliver: at firstDelay 5ms /
+    // maxDelay 10ms a 60ms sleep should see ~6 ticks, but on a loaded CI shard
+    // it saw 1 and failed, reporting a healthy ticker as broken. Polling to a
+    // bounded deadline keeps the assertion honest in the failing direction: a
+    // ticker that stops rescheduling never reaches 2 and still fails here.
+    //
+    // The deadline must stay well under vitest's 5s testTimeout. At 5s exactly
+    // the two race and the timeout wins, so a genuine ticker regression aborts
+    // the test before the expect() runs and reports an opaque "Test timed out"
+    // with no observed stages -- verified by breaking the reschedule. Budget is
+    // ~1000x the 10ms tick ceiling; nothing but a real regression reaches it.
+    const waitingTicks = () => stages().filter((stage) => stage === "waiting").length;
+    const deadlineMs = Date.now() + 2_000;
+    while (waitingTicks() < 2 && Date.now() < deadlineMs) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(
+      waitingTicks(),
+      `ticker did not keep reporting; observed stages: [${stages().join(", ")}]`,
+    ).toBeGreaterThanOrEqual(2);
     expect(stages()).not.toContain("established");
 
     release();
@@ -2011,10 +2029,12 @@ describe("ACPX runtime prepare progress (PEN-1995)", () => {
 
     // A stall must keep the run's last-output timestamp advancing; that is the
     // entire point of the ticker, so assert more than one tick actually lands.
-    // Bounded, so a ticker regression fails here against the stages actually
-    // observed rather than as an opaque suite timeout.
+    // Bounded well under vitest's 5s testTimeout so a ticker regression fails
+    // against the stages actually observed; at 5s exactly the timeout wins the
+    // race and reports "Test timed out" with no stages. See the session-side
+    // sibling above for the same budget and the same reason.
     const waitingTicks = () => stages().filter((stage) => stage === "waiting").length;
-    const deadlineMs = Date.now() + 5_000;
+    const deadlineMs = Date.now() + 2_000;
     while (waitingTicks() < 2 && Date.now() < deadlineMs) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
