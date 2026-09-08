@@ -211,8 +211,18 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
    * flaky rather than wrong: they would report a late-arriving *on-time* event
    * as though the guard had let the late one through.
    *
-   * Settles on quiescence rather than on one named event type, so anything
-   * appended after the terminal lifecycle row is covered too.
+   * Settles on quiescence rather than on one named event type, so the on-time
+   * anchor below is read after the run's own last legitimate event.
+   *
+   * NOTE: quiescence bounds the *run's* emissions, not the server's terminal
+   * bookkeeping. `heartbeat.ts` appends "run scratch cleaned" from the scratch
+   * cleanup path (`heartbeat.ts:30649`), gated on
+   * `isHeartbeatRunTerminalStatus` — i.e. post-terminal is that event's
+   * precondition, not a violation of it — and it lands whenever filesystem
+   * cleanup finishes, which is unbounded relative to any quiet window. So do
+   * NOT build "the event list is unchanged" assertions on this helper; use
+   * {@link expectNoAdapterEventAppended}, which asserts the invariant the
+   * guard actually provides.
    */
   async function snapshotSettledEvents(
     runId: string,
@@ -236,6 +246,44 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
+  }
+
+  /**
+   * Assert the guard's actual contract: no *adapter-sourced* event reached the
+   * terminal run, and nothing already recorded was mutated or reordered.
+   *
+   * Deliberately not `expect(after).toEqual(before)`. That asserts the run's
+   * event list never grows post-terminalization, which is a stronger invariant
+   * than this codebase holds and than the guard claims: the server's own
+   * cleanup path legitimately appends "run scratch cleaned" *because* the run
+   * is terminal (see {@link snapshotSettledEvents}). Whole-list equality
+   * therefore fails on a correct guard whenever filesystem cleanup happens to
+   * finish inside the assertion window — which is what red-lit
+   * `General tests (server 1/4)` at head `7e89048` with a spurious `seq: 5`
+   * "run scratch cleaned" row. The distinction is trusted producer (the
+   * server's ordered finalize path) vs untrusted one (an out-of-band adapter
+   * continuation); only the latter is what `onAdapterEvent` guards.
+   */
+  function expectNoAdapterEventAppended(
+    before: Awaited<ReturnType<typeof readEvents>>,
+    after: Awaited<ReturnType<typeof readEvents>>,
+  ) {
+    // Nothing already recorded was rewritten, dropped, or reordered. A prefix
+    // check is sound because `readEvents` orders by `seq` and seq only ever
+    // increases, so a legitimate late append can land at the tail and nowhere
+    // else.
+    expect(after.slice(0, before.length)).toEqual(before);
+    // The exact late row we fired must be absent — named explicitly so a
+    // failure here reads as "the guard leaked" rather than as a diff.
+    expect(after.map((e) => e.eventType)).not.toContain("adapter.process.lifecycle");
+    // And no adapter-sourced row of ANY type exists, since the guard is
+    // event-type agnostic. Sound because TEST_ADAPTER's execute() emits exactly
+    // one event (`test.on_time`) and never calls `onMeta` — so the server's own
+    // `adapter.invoke` row (heartbeat.ts:28663) is never written here either,
+    // and any `adapter.*` row would have to be a leak. If you teach the fake
+    // adapter to call `onMeta`, this assertion needs the expected rows excluded
+    // rather than deleting it.
+    expect(after.filter((e) => e.eventType.startsWith("adapter."))).toEqual([]);
   }
 
   it(
@@ -276,10 +324,9 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
         }),
       ).resolves.toBeUndefined();
 
-      // The terminal run's event list is unchanged.
-      const after = await readEvents(run!.id);
-      expect(after).toEqual(before);
-      expect(after.map((e) => e.eventType)).not.toContain("adapter.process.lifecycle");
+      // The terminal run gained no adapter-sourced event, and its existing
+      // rows are untouched.
+      expectNoAdapterEventAppended(before, await readEvents(run!.id));
 
       // ...but the evidence is not lost: the drop was counted.
       expect(await droppedCount("succeeded")).toBe(droppedBefore + 1);
@@ -366,10 +413,14 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
       // failure path — it is the one place a silent regression would not show
       // up in any other assertion here.
       //
-      // Armed only for the single `select({ status })` the guard issues, so an
-      // unrelated query racing this window cannot be hit: the flag is set
-      // immediately before the late event, the shape is matched, and the first
-      // match disarms it.
+      // Safe because the window is empty, NOT because the shape is selective:
+      // the flag is set immediately before the late event and the first match
+      // disarms it, and no other work runs in between. The shape check is only
+      // a cheap narrowing — `select({ status })` is not unique to the guard
+      // (heartbeat.ts has 7 single-key `{ status }` selects: :15625 the guard's
+      // own, plus :16656, :20469, :26262, :30205, :32039, :33257). If you ever
+      // add concurrent work to this window, this spy WILL hit the wrong query;
+      // key it on the run id, don't just tighten the field list.
       let armed = true;
       const originalSelect = db.select.bind(db);
       const selectSpy = vi
@@ -408,7 +459,7 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
       expect(armed, "the simulated failure must actually have fired").toBe(false);
 
       // Unverifiable status is treated as a drop, not as "not terminal".
-      expect(await readEvents(run!.id)).toEqual(before);
+      expectNoAdapterEventAppended(before, await readEvents(run!.id));
       // Counted under "unknown", so a read failure stays distinguishable from a
       // confirmed post-terminal drop rather than being folded into it.
       expect(await droppedCount("unknown")).toBe(unknownBefore + 1);
