@@ -10,10 +10,11 @@ Paperclip `claude_local` agent on Devbox. The runtime starts a short-lived
 Caveman proxy on loopback, points Claude at that proxy, and removes ambient
 provider credentials before either child is started.
 
-The first launch is Devbox-only. The Paperclip image packages the reviewed
-binaries for a later Kubernetes rollout, and the Helm contract test guards the
-shared-volume boundary; neither activates an agent or installs Ponytail into
-the shared `/paperclip/.claude` volume.
+The first launch is Devbox-only. The Paperclip server image packages the
+reviewed binaries, and `Dockerfile.agent` copies the same three assets into the
+actual Kubernetes agent overlay. The Helm contract test guards the
+shared-volume boundary; neither image activates an agent or installs Ponytail
+into the shared `/paperclip/.claude` volume.
 
 ## Non-negotiable boundaries
 
@@ -31,6 +32,11 @@ the shared `/paperclip/.claude` volume.
   container.
 - Keep Caveman's listener on `127.0.0.1`; do not expose a port, SSH forward, or
   shared proxy endpoint.
+- The production Docker build requires the repository secret
+  `PENSTOCK_RUNTIME_TOKEN` to fetch the private launcher. Keep it separate from
+  `PAPERCLIP_BOARD_TOKEN`, which remains reserved for the `kkroo/*` vendor
+  source. A missing secret must fail the build; do not substitute a provider
+  key or a broadly scoped token.
 
 # 1. Gate and inventory
 
@@ -51,6 +57,12 @@ Inspect the `PENSTOCK_RUNTIME_REF`, `PENSTOCK_RUNTIME_SHA256`,
 `CAVEMAN_RELEASE`, `PONYTAIL_REF`, and `PONYTAIL_HOOKS_SHA256` values in
 `Dockerfile` when preparing a host-local copy. Do not silently substitute a
 branch, `latest`, or an unverified download.
+
+For Kubernetes, verify both image layers after the server build: the server
+image must contain `/opt/penstock/bin/penstock-agent-runtime.mjs`,
+`/usr/local/bin/caveman-proxy`, and `/opt/penstock/ponytail/`, and the matching
+`Dockerfile.agent` overlay must contain the same paths. Building only the
+server image does not update the image used by `claude_k8s` Jobs.
 
 Lightweight host checks:
 
@@ -78,6 +90,15 @@ verify the Caveman checksums and the Ponytail hook-manifest SHA256 before
 installing them. A failed verification is a hard stop; the verification
 command prints the expected and received digest so an operator can distinguish
 a changed upstream artifact from a transient download failure.
+
+The GitHub Actions build uses the same trust boundary: configure the
+repository secret `PENSTOCK_RUNTIME_TOKEN` before dispatching the Docker
+workflow. The workflow passes it as the BuildKit secret
+`penstock_runtime_token`; it never repoints or reuses `gh_token`. The token
+must have read-only Contents access to `Blockcast/penstock-llm-proxy-core`
+and no provider or Paperclip-control-plane privileges. Verify the secret is
+present before dispatching; the Dockerfile intentionally fails closed when it
+is absent.
 
 The resulting layout should be equivalent to:
 

@@ -318,6 +318,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           secrets: |
             gh_token=${{ secrets.PAPERCLIP_BOARD_TOKEN }}
+            penstock_runtime_token=${{ secrets.PENSTOCK_RUNTIME_TOKEN }}
 
       - name: Record built artifact
         run: |
