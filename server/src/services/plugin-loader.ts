@@ -381,8 +381,50 @@ const BOOT_REATTEMPT_ELIGIBLE_SUFFIX_PATTERN = new RegExp(
     `${RETRIES_SPENT_SOURCE}\\)$`,
 );
 
+/**
+ * The suffix the *previous* release wrote, honoured for one re-attempt so the
+ * rows this pass exists to rescue are actually rescued by the deploy that ships
+ * it.
+ *
+ * Without this, eligibility recognises only suffixes written by the new
+ * `classifyActivationLatch`, so every row latched by the currently-deployed
+ * build stays dead and a human `/enable` remains the only way back for exactly
+ * the cohort in BLO-20410 (including `lucitra.plugin-secrets`). The pass would
+ * cover only failures that happen *after* the rollout — inverting its headline
+ * outcome on the one boot an operator will be watching.
+ *
+ * The cost is real and bounded, and both halves matter:
+ *
+ * - The legacy format is keyed on the retry *counter*, not on the terminal
+ *   error, so it cannot distinguish "exhausted transient retries" from "hit one
+ *   transient blip, retried, then failed closed". Honouring it therefore
+ *   re-attempts some genuinely-broken rows — the case
+ *   `classifyActivationLatch` was rewritten to exclude.
+ * - That re-attempt can happen **at most once per row, ever**. The revive pass
+ *   writes its tag *before* re-activating, and every subsequent latch rewrites
+ *   `lastError` from the current failure through `classifyActivationLatch`,
+ *   which always appends one of its three new-format suffixes — including on
+ *   the failed-closed branch. So the legacy suffix can never be the trailing
+ *   region again, and the correct terminal-error keying takes over permanently
+ *   from the first re-attempt onward.
+ *
+ * Anchored identically to the pattern above, and for the same reason: a plugin
+ * that embeds this text in its own error message forges one re-attempt, not an
+ * unbounded loop, because the real suffix is appended after the message and
+ * becomes the trailing one.
+ *
+ * Delete one release after the rollout that introduces the new format — by then
+ * no unrescued row can still carry it.
+ */
+const LEGACY_BOOT_REATTEMPT_ELIGIBLE_SUFFIX_PATTERN =
+  / \(after \d+ transient and \d+ sdk-install-race retries\)$/;
+
 export function isBootReattemptEligibleLatch(lastError: string | null | undefined): boolean {
-  return BOOT_REATTEMPT_ELIGIBLE_SUFFIX_PATTERN.test(stripBootActivationRetryTag(lastError ?? ""));
+  const withoutTag = stripBootActivationRetryTag(lastError ?? "");
+  return (
+    BOOT_REATTEMPT_ELIGIBLE_SUFFIX_PATTERN.test(withoutTag) ||
+    LEGACY_BOOT_REATTEMPT_ELIGIBLE_SUFFIX_PATTERN.test(withoutTag)
+  );
 }
 
 /**

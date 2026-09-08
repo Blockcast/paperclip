@@ -199,6 +199,52 @@ describe("isBootReattemptEligibleLatch — reads only the suffix the loader writ
     expect(isBootReattemptEligibleLatch(null)).toBe(false);
     expect(isBootReattemptEligibleLatch("Activation failed: boom")).toBe(false);
   });
+
+  it("revives a row latched by the previous release's suffix format", () => {
+    // The rows this pass exists to rescue are latched *now*, by the deployed
+    // build, in a format the new pattern does not match. Without this the first
+    // boot after the rollout rescues nothing and a human `/enable` is still the
+    // only way back for them.
+    expect(isBootReattemptEligibleLatch(legacyLatchText())).toBe(true);
+    expect(isBootReattemptEligibleLatch(`${legacyLatchText()} [boot-activation-retry 1/3]`)).toBe(
+      true,
+    );
+  });
+
+  it("stops honouring the legacy suffix as soon as the row has been re-latched", () => {
+    // This is what bounds the legacy allowance to one re-attempt per row. Every
+    // latch rewrites `lastError` through classifyActivationLatch, which always
+    // appends one of its own suffixes — including on the failed-closed branch —
+    // so the legacy suffix can never be the trailing region a second time. A
+    // row that spent a transient retry and then failed closed is exactly the
+    // case the legacy format cannot distinguish, so it is the one to pin.
+    const latch = classifyActivationLatch({
+      err: FAILED_CLOSED_ERROR,
+      transientAttempt: 1,
+      sdkRaceAttempt: 0,
+    });
+
+    expect(latch.eligibleForBootReattempt).toBe(false);
+    expect(isBootReattemptEligibleLatch(`${legacyLatchText()}${latch.suffix}`)).toBe(false);
+  });
+
+  it("does NOT revive a row whose plugin error text forges the legacy suffix twice over", () => {
+    // Same fail-safe as the forged new-format suffix: a plugin embedding the
+    // legacy text in its own message buys one re-attempt, not a fixed point,
+    // because the real suffix is appended after the message.
+    const latch = classifyActivationLatch({
+      err: new Error(`plugin config invalid (after 9 transient and 9 sdk-install-race retries)`),
+      transientAttempt: 0,
+      sdkRaceAttempt: 0,
+    });
+
+    expect(
+      isBootReattemptEligibleLatch(
+        `Activation failed: plugin config invalid ` +
+          `(after 9 transient and 9 sdk-install-race retries)${latch.suffix}`,
+      ),
+    ).toBe(false);
+  });
 });
 
 /** The exact `lastError` an exhausted transient activation writes. */
@@ -225,6 +271,23 @@ const FAILED_CLOSED_LATCH_TEXT =
   `plugin config invalid: missing apiKey ` +
   `(failed closed after 0 transient and 0 sdk-install-race retries spent; ` +
   `not classified as retryable contention)`;
+
+/**
+ * The `lastError` the *previous* release wrote for a contention latch — the
+ * format every row latched by the currently-deployed build still carries.
+ *
+ * Copied verbatim from that release rather than derived, deliberately: it is a
+ * frozen on-disk format this build must keep reading, so a helper that tracked
+ * the current writer would stop testing the thing that matters the moment the
+ * writer changed again.
+ */
+function legacyLatchText(transient = 1, sdkRace = 0): string {
+  return (
+    `Activation failed: Worker initialize failed for "fixture": ` +
+    `RPC call "initialize" timed out after 60000ms ` +
+    `(after ${transient} transient and ${sdkRace} sdk-install-race retries)`
+  );
+}
 
 /**
  * A plugin that fails closed *and* embeds the eligibility marker in its own
@@ -429,6 +492,28 @@ describeEmbeddedPostgres("BLO-20410 — boot re-attempts a transiently-latched p
     // so the row is indistinguishable from one that never failed.
     expect(after?.lastError).toBeNull();
     // Recovery must not have gone through the operator route.
+    expect(enable).not.toHaveBeenCalled();
+  }, 60_000);
+
+  it("activates a plugin latched by the previous release's suffix, with no /enable call", async () => {
+    // The BLO-20410 cohort — including `lucitra.plugin-secrets` — is latched in
+    // this format right now. If the first boot after the rollout skips it, the
+    // deploy that ships this fix rescues nothing and the manual verification on
+    // the issue reads as the fix not working.
+    const pluginKey = `paperclip.legacy_${randomUUID().slice(0, 8)}`;
+    const { installDir, packageName, manifest } = await seedPluginDir(pluginKey);
+    await insertLatchedRow(pluginKey, manifest, packageName, installDir, legacyLatchText());
+
+    const { runtimeServices, startWorker, enable } = createRuntimeServices();
+    const loader = pluginLoader(db, { localPluginDir: installDir }, runtimeServices);
+    const result = await loader.loadAll();
+
+    expect(startWorker).toHaveBeenCalledTimes(1);
+    expect(result.succeeded).toBe(1);
+
+    const [after] = await db.select().from(plugins);
+    expect(after?.status).toBe("ready");
+    expect(after?.lastError).toBeNull();
     expect(enable).not.toHaveBeenCalled();
   }, 60_000);
 
