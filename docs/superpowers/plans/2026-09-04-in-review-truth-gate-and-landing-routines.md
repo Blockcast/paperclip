@@ -457,8 +457,17 @@ Paste into the log PR (A4 Step 8):
 ```bash
 cd /tmp/track-a
 for n in 1471 1463 1559 1613; do
-  gh pr checks "$n" -R Blockcast/paperclip --json name,state,link \
-    --jq '.[] | select(.state=="FAILURE") | "\(.name)\t\(.link)"' > "a3-$n-failed.tsv"
+  # NB: `gh pr checks` has NO `--json` flag (verified 2026-09-08 against the installed gh) — an
+  # earlier revision of this step used one and would have failed with "unknown flag: --json".
+  # Read failing checks off the REST check-runs surface instead, and name the terminal-failure
+  # conclusions explicitly rather than negating success: a null conclusion means still-running,
+  # which is not a failure to collect logs for.
+  head="$(gh api "repos/Blockcast/paperclip/pulls/$n" --jq '.head.sha')"
+  gh api "repos/Blockcast/paperclip/commits/$head/check-runs" \
+    --jq '.check_runs[]
+          | select(.conclusion == "failure" or .conclusion == "timed_out"
+                   or .conclusion == "cancelled" or .conclusion == "action_required")
+          | "\(.name)\t\(.details_url)"' > "a3-$n-failed.tsv"
   while IFS=$'\t' read -r name link; do
     run="$(printf '%s' "$link" | sed -nE 's#.*/actions/runs/([0-9]+).*#\1#p')"
     echo "PR $n failing check: $name run=$run"
@@ -494,9 +503,17 @@ for n in 1471 1463 1559 1613; do
   # (BLO-22300): it merges base into head, so the head becomes a merge commit and the PR is later
   # evicted from the queue with no build. If a check only fails because the base is stale, that
   # needs a squash-replay onto master (BLO-32317) — an authoring decision, routed, not done here.
-  gh run rerun --failed $(gh pr checks "$n" -R Blockcast/paperclip --json link,state \
-      --jq '[.[]|select(.state!="SUCCESS")|.link|capture("runs/(?<id>[0-9]+)").id]|first // empty') 2>/dev/null \
-    || echo "PR $n: no rerunnable failed run; inspect manually"
+  # NB: `gh pr checks` has no `--json` flag; resolve the run id off the REST check-runs surface.
+  head="$(gh api "repos/Blockcast/paperclip/pulls/$n" --jq '.head.sha')"
+  rid="$(gh api "repos/Blockcast/paperclip/commits/$head/check-runs" \
+          --jq '[.check_runs[]
+                 | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")
+                 | .details_url | capture("runs/(?<id>[0-9]+)").id] | first // empty')"
+  if [ -n "$rid" ]; then
+    gh run rerun --failed "$rid" -R Blockcast/paperclip
+  else
+    echo "PR $n: no failed run to re-run; inspect manually"
+  fi
   gh pr checks "$n" -R Blockcast/paperclip --watch --fail-fast && echo "PR $n: GREEN" || echo "PR $n: STILL RED"
 done
 ```
