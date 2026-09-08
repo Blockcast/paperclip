@@ -2921,6 +2921,11 @@ describe("realizeExecutionWorkspace", () => {
     await expect(execFileAsync("git", ["merge-base", "--is-ancestor", actualBranch, expectedBranch], { cwd: repoRoot }))
       .rejects.toMatchObject({ code: 1 });
 
+    // Read the sibling tip BEFORE the repair. The no-loss guarantee is that this
+    // exact commit still resolves afterwards, so it has to be captured here —
+    // comparing the ref to itself after the fact would assert nothing.
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
+
     const { realized } = await expectPersistedBranchMismatchRepaired({
       repoRoot,
       worktreePath,
@@ -2932,6 +2937,8 @@ describe("realizeExecutionWorkspace", () => {
 
     // The sibling's commit is still on its own branch, and the file it added is
     // gone from the restored worktree — proof the checkout really moved HEAD.
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
     await expect(readGit(repoRoot, ["log", "-1", "--format=%s", actualBranch]))
       .resolves.toBe("Add actual branch work");
     expect(existsSync(path.join(worktreePath, "actual.txt"))).toBe(false);
@@ -2992,6 +2999,10 @@ describe("realizeExecutionWorkspace", () => {
     await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
     await runGit(repoRoot, ["add", "recorded.txt"]);
     await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+    // Release the recorded branch so the git-level "already checked out
+    // elsewhere" refusal cannot fire: the detached-HEAD refusal must be the only
+    // thing keeping this ineligible, or the test proves nothing about ancestry.
+    await runGit(repoRoot, ["checkout", "main"]);
 
     // Commit on the detached HEAD: no ref keeps these commits reachable, which
     // is exactly why ancestry stays load-bearing for this shape.
@@ -3075,6 +3086,11 @@ describe("realizeExecutionWorkspace", () => {
     await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
     await runGit(repoRoot, ["add", "recorded.txt"]);
     await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+    // Release the recorded branch so the git-level "already checked out
+    // elsewhere" refusal cannot fire. Without this the worktree would be
+    // ineligible for two independent reasons and the test could not show that
+    // the cleanliness guard is the one doing the work.
+    await runGit(repoRoot, ["checkout", "main"]);
 
     await fs.writeFile(path.join(worktreePath, "actual.txt"), "actual branch work\n", "utf8");
     await runGit(worktreePath, ["add", "actual.txt"]);
@@ -7108,6 +7124,108 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
     await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.not.toBe("");
   }, 20_000);
+
+  // BLO-32628: isolates the claimant-contention guard. Every other contended
+  // fixture in the repo — the dirty-quarantine ones above and the
+  // branch-containment suite — ALSO leaves the recorded branch checked out in
+  // the main worktree, so the git-level refusal fires there too and neither can
+  // prove this guard bites. Here the recorded branch is free and the tree is
+  // clean, so contention is the only thing left that can refuse; dropping the
+  // second claimant must flip the very same git state to a successful repair.
+  it("refuses safe repair on a clean diverged worktree that two non-terminal issues claim", async () => {
+    const expectedBranch = "PAP-460-contended-recorded";
+    const actualBranch = "PAP-460-contended-sibling";
+    const repoRoot = await createTempRepo();
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, "HEAD"]);
+
+    await runGit(repoRoot, ["checkout", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
+    await runGit(repoRoot, ["add", "recorded.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+    // Release the recorded branch: this is what makes the test load-bearing.
+    await runGit(repoRoot, ["checkout", "main"]);
+
+    await fs.writeFile(path.join(worktreePath, "actual.txt"), "actual branch work\n", "utf8");
+    await runGit(worktreePath, ["add", "actual.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add actual branch work"]);
+
+    // Captured before either attempt: the no-loss guarantee is about this exact
+    // commit surviving, so it must be read while the sibling is still the tip.
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
+
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-460",
+      claimant: "none",
+    });
+
+    const siblingIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: siblingIssueId,
+      companyId: ids.companyId,
+      projectId: ids.projectId,
+      projectWorkspaceId: ids.projectWorkspaceId,
+      title: "Same-workspace sibling",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: ids.agentId,
+      identifier: "PAP-461",
+      executionWorkspaceId: ids.sourceWorkspaceId,
+    });
+
+    await expect(restoreDirtyQuarantine({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      ids,
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "clean",
+          provenance: expect.objectContaining({
+            ancestryVerdict: "diverged",
+            actualBranchExists: true,
+          }),
+          workspaceClaimants: expect.arrayContaining([
+            expect.objectContaining({ issueIdentifier: "PAP-460", status: "in_progress" }),
+            expect.objectContaining({ issueIdentifier: "PAP-461", status: "in_progress" }),
+          ]),
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            attempted: false,
+            succeeded: false,
+            reason: expect.stringContaining("execution workspace is claimed by 2 non-terminal issues"),
+          }),
+        }),
+      },
+    });
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+
+    // Same git state, one claimant: the repair runs and restores the branch.
+    await db.delete(issues).where(eq(issues.id, siblingIssueId));
+    const realized = await restoreDirtyQuarantine({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      ids,
+    });
+    expect(realized?.branchName).toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(expectedBranch);
+    // The sibling ref still resolves to the commit captured before the repair.
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+  }, 30_000);
 });
 
 describeEmbeddedPostgres("workspace runtime service control persistence", () => {
