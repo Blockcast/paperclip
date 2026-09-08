@@ -43,6 +43,13 @@ const SETTINGS = {
   // branch through a rebase. The `config.ts` offender list going red is what
   // surfaced it — the first live proof the guard bites on a real regression.
   approvalGateReconcilerIntervalMinutes: "PAPERCLIP_APPROVAL_GATE_RECONCILER_INTERVAL_MINUTES",
+  // Second live catch by the same ratchet (BLO-24631): this site was written as
+  // `Math.max(1, Number(env) || 60)` and the offender list went red on the PR
+  // that introduced it, before it ever reached master. The `Math.max` floor is
+  // what made it look safe — it bounds the setting from below and does nothing
+  // at all about `Infinity`, which is the direction that matters.
+  approvalEnforcementReconcilerIntervalMinutes:
+    "PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_INTERVAL_MINUTES",
   heartbeatSchedulerIntervalMs: "HEARTBEAT_SCHEDULER_INTERVAL_MS",
   recoveryActionMaxAttempts: "RECOVERY_ACTION_MAX_ATTEMPTS",
   recoveryActionTimeoutMs: "RECOVERY_ACTION_TIMEOUT_MS",
