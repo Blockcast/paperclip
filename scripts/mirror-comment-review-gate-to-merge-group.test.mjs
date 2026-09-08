@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  GateContextError,
+  failOpenVerdict,
   isMainModule,
   mirrorVerdict,
   parsePrNumberFromQueueRef,
@@ -47,14 +50,122 @@ describe("parsePrNumberFromQueueRef", () => {
 });
 
 describe("readGateContext", () => {
-  it("reads the context the deployment actually ships", () => {
-    const values = ['githubApp:', `  prCommentReviewGateStatusContext: "${CONTEXT}"`, ""].join("\n");
-    assert.equal(readGateContext(values), CONTEXT);
+  const shipped = (value) => ["githubApp:", `  prCommentReviewGateStatusContext: ${value}`, ""].join("\n");
+
+  // The bug this replaced a single regex to fix: every spelling below is valid
+  // YAML and a routine reformat of a deploy file produces them, but only the
+  // first one used to parse. The rest returned "" and were routed to the
+  // deliberate no-op branch -- switching the merge-queue writer off with a
+  // reassuring log line and no failure signal.
+  it("reads every one-line YAML spelling of the value", () => {
+    const spellings = [
+      `"${CONTEXT}"`,
+      `'${CONTEXT}'`,
+      CONTEXT,
+      `"${CONTEXT}" # BLO-29711`,
+      `'${CONTEXT}'  # BLO-29711`,
+      `${CONTEXT} # BLO-29711`,
+      `  ${CONTEXT}  `,
+    ];
+    for (const spelling of spellings) {
+      assert.deepEqual(
+        readGateContext(shipped(spelling)),
+        { present: true, context: CONTEXT },
+        `failed to read: ${spelling}`,
+      );
+    }
   });
 
-  it("treats an empty context as the gate being switched off", () => {
-    assert.equal(readGateContext('  prCommentReviewGateStatusContext: ""'), "");
-    assert.equal(readGateContext("githubApp: {}"), "");
+  // Regression guard for the real file rather than a synthetic one. This test
+  // runs on every PR, so a values-file reformat fails a re-runnable PR check
+  // instead of a merge-queue entry that cannot be re-run.
+  it("reads the context out of the values file the deployment actually ships", () => {
+    const values = readFileSync(
+      new URL("../deploy/helm/paperclip/values.blockcast.yaml", import.meta.url),
+      "utf8",
+    );
+    const resolved = readGateContext(values);
+    assert.equal(resolved.present, true);
+    assert.ok(resolved.context.length > 0, "shipped values must name a non-empty gate context");
+  });
+
+  it("is not confused by the retired-contexts key sitting next to it", () => {
+    const values = [
+      "githubApp:",
+      '  prCommentReviewGateStatusContext: "gate/ally-comment-findings"',
+      '  prCommentReviewGateRetiredStatusContexts: "review/ally-comment"',
+      "",
+    ].join("\n");
+    assert.equal(readGateContext(values).context, "gate/ally-comment-findings");
+  });
+
+  it("distinguishes the key being absent from the gate being switched off", () => {
+    assert.deepEqual(readGateContext("githubApp: {}"), { present: false, context: "" });
+    assert.deepEqual(readGateContext(shipped('""')), { present: true, context: "" });
+    assert.deepEqual(readGateContext(shipped("''")), { present: true, context: "" });
+  });
+
+  // "Switched off" and "I cannot read this" must not share an encoding: once
+  // the context is required, silently reading the second as the first is the 6h
+  // checkResponseTimeout ejection this whole script exists to prevent.
+  it("refuses to guess when the key is present but unreadable", () => {
+    const unreadable = [
+      "", // `key:` with no value -- YAML null, but also a half-finished edit
+      "   ",
+      '"gate/unterminated',
+      "[gate/ally-comment-findings]",
+      "&anchor",
+      "|",
+    ];
+    for (const value of unreadable) {
+      assert.throws(
+        () => readGateContext(shipped(value)),
+        GateContextError,
+        `should have refused: ${JSON.stringify(value)}`,
+      );
+    }
+  });
+
+  it("refuses to first-match when the key appears twice", () => {
+    const values = [shipped(`"${CONTEXT}"`), shipped('"gate/somewhere-else"')].join("\n");
+    assert.throws(() => readGateContext(values), GateContextError);
+  });
+
+  it("keeps a '#' that is not a comment", () => {
+    assert.equal(readGateContext(shipped("gate/a#b")).context, "gate/a#b");
+  });
+
+  it("treats a commented-out key as absent", () => {
+    assert.deepEqual(
+      readGateContext(`githubApp:\n  # prCommentReviewGateStatusContext: "${CONTEXT}"\n`),
+      { present: false, context: "" },
+    );
+  });
+
+  it("rejects non-text input rather than reporting the gate as off", () => {
+    assert.throws(() => readGateContext(undefined), GateContextError);
+  });
+});
+
+describe("failOpenVerdict", () => {
+  // Class 3 in the script header: the context is known but the mirror failed
+  // (gh 5xx, secondary rate limit, malformed API JSON). A crash here would
+  // eject the queue entry, which is neither of the two outcomes the script
+  // promises, so an unexpected error becomes a visible-but-harmless status.
+  it("passes open and names the failure", () => {
+    const verdict = failOpenVerdict(new Error("gh: HTTP 502"));
+    assert.equal(verdict.state, "success");
+    assert.match(verdict.description, /gh: HTTP 502/);
+  });
+
+  it("never emits pending, and stays inside GitHub's 140-character limit", () => {
+    const verdict = failOpenVerdict(new Error("x".repeat(400)));
+    assert.notEqual(verdict.state, "pending");
+    assert.ok(verdict.description.length <= 140, `got ${verdict.description.length}`);
+  });
+
+  it("survives a thrown non-Error", () => {
+    assert.equal(failOpenVerdict(undefined).state, "success");
   });
 });
 
