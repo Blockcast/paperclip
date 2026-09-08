@@ -162,6 +162,16 @@ If either pipeline errors out (model unavailable, tool failure, etc.), continue 
 Merge findings from both pipelines into one consolidated review. Follow this structure:
 
 ```markdown
+<!-- ally-verdict:1
+{
+  "head": "<full 40-character lowercase HEAD_SHA>",
+  "findings": { "critical": <n>, "important": <n>, "suggestions": <n> },
+  "dispositions": [
+    { "head": "<prior head, 7-40 hex>", "severity": "<severity>", "index": <n>, "verb": "<verb>" }
+  ]
+}
+-->
+
 ## 🔍 Automated Review — PR #<N> @ <sha-short>
 
 Reviewed head: <full 40-character lowercase HEAD_SHA>
@@ -194,6 +204,14 @@ Reviewed head: <full 40-character lowercase HEAD_SHA>
 **Dedup rule**: if both pipelines flag the same line for similar reasons, merge into one bullet with both `[pipeline]` tags. Don't double-count.
 
 **`Reviewed head:` is mandatory, in every state.** It is the immutable attestation Step 2 reads, and it is the *only* thing that makes the skip work — the heading's `<sha-short>` is not a substitute. Emit the full 40-character lowercase SHA on its own line. Omit it and Step 2 counts zero forever, so every wake re-reviews the same head; that is one of the two ways this guard has previously gone inert, and it is invisible until duplicate reviews pile up.
+
+**The `ally-verdict:1` block is mandatory, and it is ADDITIVE — it never replaces the `Reviewed head:` line.** It is the machine-readable source the comment-review gate reads first (`parseAllyVerdictBlock` in `server/src/services/ally-review-detection.ts`, BLO-32695). Prose parsing survives only as the fallback for bodies posted before the block existed, and that fallback is why the family of parser widenings kept growing: one clean review of paperclip#1675 (2026-09-07T15:41:42Z, 0 Critical / 0 Important, two findings explicitly retired) defeated **four** independent prose patterns at once — a parenthetical after the attested SHA, a bolded ledger verb, a comma where a dash was required, and a hyphenated severity — so the gate published a finding you had already withdrawn. Fields, not sentences, is the exit.
+
+Three rules bind:
+
+- **Emit exactly one block per review.** Two blocks, an unknown version, malformed JSON, or a `head` that is not a complete 40-hex SHA all resolve to a *fail-closed* `unreadable_verdict` red. That red is scoped to your newest review only, so posting one more readable review always clears it — but it is a red, not a green.
+- **Keep the prose `Reviewed head:` line.** Four independent readers parse that line and only the gate understands the block: this module, `consolidatedReviewHead` in `server/src/services/github-app-auth.ts`, `ATTESTED_HEAD_RE` in `scripts/check-ally-review-consistency.mjs`, and `HEAD_ATTESTATION_RE` in `.github/scripts/sweep-stalled-ally-reviews.py`. Drop the prose and readers 2–4 attest nothing — reader 2 raises `pr_review_output_missing` and posts a false "reviewer never finished".
+- **`findings` counts what you actually found; `dispositions` retires prior findings by name.** `blocking_finding` is now reachable only from a counted finding, so a zero-count block plus your usual "Recommended Action" boilerplate no longer reads as actionable. Verb vocabulary is unchanged — an unrecognised verb still fails closed rather than retiring anything.
 
 **Severity rule**: trust the higher of the two pipelines' severities. If pr-review-toolkit's `code-reviewer` sub-agent marks something Critical and codex marks the same thing Suggestion, treat it as Critical.
 

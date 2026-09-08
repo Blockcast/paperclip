@@ -382,11 +382,21 @@ export function evaluateCommentReviewGate(input: {
         commentCreatedAt: new Date(toEpochMs(forHead.comment.createdAt)).toISOString(),
       };
     }
+    // Name the source that decided this, because "clean" from a counted
+    // structured block and "clean" from the prose fallback are different
+    // claims with different failure modes, and the whole point of BLO-32695
+    // is being able to tell which one you are looking at. Without this the
+    // gate description is identical either way, so a silent regression back
+    // onto the prose path — the exact thing this change retires — would be
+    // invisible on the PR.
+    const source =
+      parseAllyVerdictBlock(forHead.comment.body).kind === "ok"
+        ? "its structured ally-verdict block"
+        : "prose fallback parsing (no ally-verdict block)";
     return {
       state: "success",
       outcome: "clean",
-      reason:
-        "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
+      reason: `Ally's most recent consolidated-review comment for this head reports no unresolved findings, per ${source}.`,
     };
   }
 
