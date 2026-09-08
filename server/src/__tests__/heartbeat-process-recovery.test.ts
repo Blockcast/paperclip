@@ -5637,8 +5637,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   // back to `todo` would otherwise be met with an immediate re-flip to
   // `blocked` on the very same pre-unblock run -- defeating the manual
   // recovery exactly as BLO-7521 did. Deleting the guard at
-  // `recovery/service.ts` makes this test fail (escalated 1, issue `blocked`);
-  // without it the guard is unpinned and the suite stays green.
+  // `recovery/service.ts` makes this test fail (successfulRunHandoffEscalated
+  // 1, issue `blocked`) -- that branch-specific counter, not `escalated`, is
+  // the one this arm increments; see the note at the assertions below.
+  // Without it the guard is unpinned and the suite stays green.
   it("BLO-8050: skips the exhausted-handoff todo escalation when the run predates a manual unblock", async () => {
     const { companyId, issueId, runId } = await seedStrandedIssueFixture({
       status: "todo",
