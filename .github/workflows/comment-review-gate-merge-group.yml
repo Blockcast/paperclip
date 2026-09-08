@@ -56,4 +56,23 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
           MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
-        run: node ./scripts/mirror-comment-review-gate-to-merge-group.mjs
+        # The checkout above is master, so on the very queue entry that lands
+        # this change master does not have the script yet: the workflow file
+        # comes from the queue ref (which carries the diff) while the code
+        # comes from master (which does not). Without this guard the job would
+        # exit non-zero, and under `mergingStrategy: ALLGREEN` that ejects the
+        # entry -- so this change could never merge itself. The guard is not
+        # only a bootstrap shim: it is the right steady-state behaviour too,
+        # because deliberately running master's copy means "master has no
+        # copy" must be a no-op rather than a failure (a revert of the script
+        # would otherwise wedge the queue). Consequence to expect: the first
+        # real verdict lands on the NEXT entry queued after this merges, not
+        # on this one.
+        run: |
+          set -euo pipefail
+          script=./scripts/mirror-comment-review-gate-to-merge-group.mjs
+          if [ ! -f "$script" ]; then
+            echo "::notice::$script is not on master yet; nothing to mirror."
+            exit 0
+          fi
+          node "$script"
