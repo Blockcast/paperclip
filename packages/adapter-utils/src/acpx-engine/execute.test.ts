@@ -1867,11 +1867,15 @@ describe("ACPX session establishment progress (PEN-1995)", () => {
     // bounded deadline keeps the assertion honest in the failing direction: a
     // ticker that stops rescheduling never reaches 2 and still fails here.
     //
-    // The deadline must stay well under vitest's 5s testTimeout. At 5s exactly
-    // the two race and the timeout wins, so a genuine ticker regression aborts
-    // the test before the expect() runs and reports an opaque "Test timed out"
-    // with no observed stages -- verified by breaking the reschedule. Budget is
-    // ~1000x the 10ms tick ceiling; nothing but a real regression reaches it.
+    // The deadline must stay well under the test timeout. Two of those apply and
+    // the tighter one binds: vitest's 5s default locally, and 30s in CI, which
+    // runs adapter-utils in the `general-workspaces-b` lane with
+    // --testTimeout=30000 (scripts/run-vitest-stable.mjs). Design against the 5s.
+    // At 5s exactly the two race and the timeout wins, so a genuine ticker
+    // regression aborts the test before the expect() runs and reports an opaque
+    // "Test timed out" with no observed stages -- verified by breaking the
+    // reschedule. Budget is 2s against a 10ms tick ceiling, i.e. ~200x; nothing
+    // but a real regression reaches it.
     const waitingTicks = () => stages().filter((stage) => stage === "waiting").length;
     const deadlineMs = Date.now() + 2_000;
     while (waitingTicks() < 2 && Date.now() < deadlineMs) {
@@ -2029,10 +2033,11 @@ describe("ACPX runtime prepare progress (PEN-1995)", () => {
 
     // A stall must keep the run's last-output timestamp advancing; that is the
     // entire point of the ticker, so assert more than one tick actually lands.
-    // Bounded well under vitest's 5s testTimeout so a ticker regression fails
-    // against the stages actually observed; at 5s exactly the timeout wins the
-    // race and reports "Test timed out" with no stages. See the session-side
-    // sibling above for the same budget and the same reason.
+    // Bounded well under the tighter of the two test timeouts that apply (5s
+    // vitest default locally, 30s in CI's workspaces-b lane) so a ticker
+    // regression fails against the stages actually observed; at 5s exactly the
+    // timeout wins the race and reports "Test timed out" with no stages. See the
+    // session-side sibling above for the same budget and the same reason.
     const waitingTicks = () => stages().filter((stage) => stage === "waiting").length;
     const deadlineMs = Date.now() + 2_000;
     while (waitingTicks() < 2 && Date.now() < deadlineMs) {
