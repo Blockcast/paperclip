@@ -1111,11 +1111,20 @@ function readProviderCapacityResetAt(
 ): ProviderCapacityResetRead | null {
   const resultJson = parseObject(run.resultJson);
 
-  const family = readNonEmptyString(resultJson.errorFamily);
-  if (!family || !PROVIDER_CAPACITY_THROTTLE_FAMILIES.has(family)) return null;
-
   const bounds = readCapacityResetBounds(run);
 
+  // The explicit branch is gated by the server-written provenance marker, which
+  // carries its OWN throttle family and is stripped from adapter-supplied
+  // resultJson before persistence. That is strictly stronger evidence than the
+  // adapter-reachable top-level `errorFamily`, so requiring the top-level copy
+  // as well added no trust and cost reachability: the external-lifecycle
+  // reconciler (PEN-3129) cannot write that field, because it would move the
+  // run into `readTransientRecoveryContractFromRun`'s unconditional-retry arm
+  // and authorize retrying possibly non-idempotent external work. Gating the
+  // provenance branch on it therefore silently suppressed every 429 the Job
+  // reconciler recovered, which is the population that most needs naming — the
+  // strand comment there reads `job_failed` / `BackoffLimitExceeded`, the exact
+  // infrastructure-shaped text this function exists to replace.
   const provenance = readProviderCapacityResetProvenance(resultJson);
   const explicit = provenance
     ? canonicalizeCapacityResetInstant(resultJson.providerCapacityResetAt, bounds)
@@ -1127,6 +1136,13 @@ function readProviderCapacityResetAt(
       advertisedResetAt: provenance?.advertisedResetAt ?? null,
     };
   }
+
+  // The fallback reads a bare adapter-supplied `retryNotBefore` with no server
+  // marker behind it, so the top-level family stays its trust boundary: without
+  // it, any adapter could relabel an ordinary failure as a self-healing
+  // capacity window in a comment other agents read.
+  const family = readNonEmptyString(resultJson.errorFamily);
+  if (!family || !PROVIDER_CAPACITY_THROTTLE_FAMILIES.has(family)) return null;
 
   const advertised =
     canonicalizeCapacityResetInstant(resultJson.retryNotBefore, bounds) ??

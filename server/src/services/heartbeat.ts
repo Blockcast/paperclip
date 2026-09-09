@@ -188,6 +188,7 @@ import {
   taskKeysMatch,
 } from "./pr-review-duplicate-issue-guard.js";
 import { readOrphanedRunTerminalResult } from "./orphaned-run-terminal-result.js";
+import { findTerminalResultEventInRunLogTail } from "./run-log-terminal-result.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   deleteAgentJobExact,
@@ -21911,6 +21912,91 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  /**
+   * Keep the scan bounded: the terminal event is the last thing the agent
+   * writes, so a trailing window always suffices, and a runaway transcript must
+   * not balloon reconciler memory. `logBytes` is only written back on finalize
+   * (PEN-2106) and so is null for exactly the still-running rows this reads —
+   * hence a forward scan that retains only the trailing window, rather than a
+   * seek the size hint cannot support.
+   */
+  const EXTERNAL_LIFECYCLE_TERMINAL_RESULT_TAIL_BYTES = 256 * 1024;
+  const EXTERNAL_LIFECYCLE_TERMINAL_RESULT_MAX_SCAN_BYTES = 8 * 1024 * 1024;
+  const EXTERNAL_LIFECYCLE_TERMINAL_RESULT_CHUNK_BYTES = 256 * 1024;
+
+  /**
+   * PEN-3129: recover the provider's own refusal for a Job the reconciler is
+   * about to book as `job_failed`.
+   *
+   * Agent Jobs carry `backoffLimit: 0`, so Kubernetes reports every non-zero
+   * exit as `BackoffLimitExceeded` — the same label for a 429 refusal, an OOM,
+   * a crash, and a clean `exit(1)`. `externalLifecycleTerminalOutcome` takes
+   * only the Job status, so the provider verdict is not lost through an
+   * oversight; it is unreachable by construction. It does survive in the run's
+   * own durable log, which is what this reads.
+   *
+   * Deliberately narrow: only a 429 qualifies. That is the provider saying the
+   * subscription window is exhausted. A 529 means the server is overloaded and
+   * a 5xx/timeout is transient — attributing either to a capacity window would
+   * assert something the provider never said, and this value is interpolated
+   * into an issue comment other agents act on.
+   *
+   * Returns the narrow structured verdict only; no transcript text escapes, and
+   * the caller persists none.
+   */
+  async function readExternalLifecycleProviderCapacityRefusal(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "logStore" | "logRef" | "logBytes">,
+    fallbackNowMs: number,
+  ) {
+    if (run.logStore !== "local_file" || !run.logRef) return null;
+
+    let tail = "";
+    try {
+      let offset = 0;
+      let scanned = 0;
+      while (scanned < EXTERNAL_LIFECYCLE_TERMINAL_RESULT_MAX_SCAN_BYTES) {
+        const limitBytes = Math.min(
+          EXTERNAL_LIFECYCLE_TERMINAL_RESULT_CHUNK_BYTES,
+          EXTERNAL_LIFECYCLE_TERMINAL_RESULT_MAX_SCAN_BYTES - scanned,
+        );
+        const chunk = await runLogStore.read(
+          { store: "local_file", logRef: run.logRef },
+          { offset, limitBytes },
+        );
+        scanned += Buffer.byteLength(chunk.content, "utf8");
+        tail = (tail + chunk.content).slice(-EXTERNAL_LIFECYCLE_TERMINAL_RESULT_TAIL_BYTES);
+        // `nextOffset` is undefined once the store served the final byte; the
+        // `<= offset` guard keeps a misbehaving store from looping forever.
+        if (chunk.nextOffset == null || chunk.nextOffset <= offset) break;
+        offset = chunk.nextOffset;
+      }
+    } catch (err) {
+      // Never block finalization on a log read. Without a verdict the run keeps
+      // exactly the Job-level fields it has always had.
+      logger.warn(
+        { err, runId: run.id },
+        "failed to read run log while recovering external-lifecycle provider verdict",
+      );
+      return null;
+    }
+
+    const terminal = findTerminalResultEventInRunLogTail(tail);
+    if (!terminal) return null;
+
+    // Key on `is_error`, NOT on `subtype`. A capacity refusal is emitted as
+    // `{"subtype":"success","is_error":true,"api_error_status":429}` — the
+    // subtype describes the shape of the turn, not its outcome, so reading it
+    // as the verdict scores a refusal as a success.
+    if (terminal.event.is_error !== true) return null;
+
+    const statusEvidence = readProviderCapacityResetStatusEvidence(terminal.event);
+    if (statusEvidence?.statusCode !== 429) return null;
+
+    const emittedAtMs = terminal.emittedAtMs ?? fallbackNowMs;
+    const horizon = resolveProviderCapacityHorizon({ resultJson: terminal.event }, emittedAtMs);
+    return { statusEvidence, horizon, emittedAtMs };
+  }
+
   function externalLifecycleTerminalOutcome(
     jobStatus: AgentJobRunStatus | null,
     preserveRecordedOutcome = false,
@@ -22272,6 +22358,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
+    // PEN-3129: the Job label alone cannot say why the pod exited, so recover
+    // the provider's own refusal from the run's durable log before booking it.
+    //
+    // Read AFTER the container-diagnostics override, and only while the code is
+    // still `job_failed`: an OOM or a 137 is a different, already-named cause,
+    // and a pod killed for memory must not also be reported as throttled.
+    //
+    // This adds a DIMENSION; it deliberately does not relabel. `errorCode` is a
+    // census and consumer key here in a way `scheduledRetryReason` is not — it
+    // gates container diagnostics capture, retry admission, stranded-issue
+    // routing, an alerting gauge's label set and a dashboard series — so moving
+    // its value would silently corrupt all of them. Notably it is NOT paired
+    // with a top-level `errorFamily` write: that field short-circuits
+    // `shouldScheduleAutomaticRunRetry` above the `job_failed` arm, which would
+    // authorize an unconditional retry of possibly non-idempotent external work
+    // without the `adapterInvocationStarted === false` proof that arm exists to
+    // require. Retry admission, every metric bucket and the census stay
+    // bit-identical; only the run's recoverable explanation changes.
+    const providerCapacityRefusal = terminalOutcome.errorCode === "job_failed"
+      ? await readExternalLifecycleProviderCapacityRefusal(input.run, input.now.getTime())
+      : null;
+    const providerCapacityParkAt =
+      providerCapacityRefusal?.horizon.kind === "usable"
+        ? providerCapacityRefusal.horizon.at
+        : providerCapacityRefusal?.horizon.kind === "over_horizon"
+          ? providerCapacityRefusal.horizon.parkAt
+          : null;
+
     const terminalClaimToken = randomUUID();
     let resultJson = mergeRunStopMetadataForAgent(
       { adapterType: input.adapterType, adapterConfig: parseObject(input.adapterConfig) },
@@ -22279,6 +22393,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       {
         resultJson: {
           ...parseObject(input.run.resultJson),
+          // The paired server-provenance discriminator, written only by this
+          // server path — same contract as the adapter-owner finalize path, so
+          // the recovery reader trusts exactly one shape from exactly one
+          // writer. No transcript text is persisted: the instant, the observed
+          // status and its field, and where the horizon came from.
+          ...(providerCapacityParkAt
+            ? {
+                providerCapacityResetAt: providerCapacityParkAt.toISOString(),
+                providerCapacityResetProvenance: {
+                  source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
+                  errorFamily: "rate_limit_exhausted",
+                  observedStatusCode: providerCapacityRefusal?.statusEvidence.statusCode ?? null,
+                  observedStatusField: providerCapacityRefusal?.statusEvidence.field ?? null,
+                  observedCause: "rate_limit_exhausted",
+                  horizonSource: "server_run_log_terminal_result",
+                  // BLO-18285: an over-cap park is OUR checkpoint, not the
+                  // instant the provider named. Record what it actually asked
+                  // for, or the run says only "park at +cap" and the reason it
+                  // is not a verbatim park is unrecoverable.
+                  ...(providerCapacityRefusal?.horizon.kind === "over_horizon"
+                    ? {
+                        advertisedResetAt:
+                          providerCapacityRefusal.horizon.advertisedAt.toISOString(),
+                        horizonCapMs: PROVIDER_CAPACITY_MAX_HORIZON_MS,
+                      }
+                    : {}),
+                },
+              }
+            : {}),
           externalLifecycleRecovery: {
             terminalClaimToken,
             reason: terminalOutcome.recoveryReason,
@@ -22299,6 +22442,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 }
               : {}),
             ...(containerDiagnostics ? { containerDiagnostics } : {}),
+            // Recorded even when no horizon parsed: "the provider refused this
+            // with a 429" is the fact the Job label destroyed, and it is worth
+            // having on the row whether or not the refusal named a reset.
+            ...(providerCapacityRefusal
+              ? {
+                  providerRefusalStatusCode:
+                    providerCapacityRefusal.statusEvidence.statusCode,
+                  providerRefusalHorizon: providerCapacityRefusal.horizon.kind,
+                }
+              : {}),
           },
         },
         errorCode: terminalOutcome.errorCode,
