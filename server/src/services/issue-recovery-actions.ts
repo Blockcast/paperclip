@@ -22,11 +22,15 @@ export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const 
  * new budget (BLO-18996), it keeps the handoff comment grant open, and it keeps the
  * owner able to check the issue out. What it does NOT do is wake anyone:
  *
- *   - `escalateExpiredWakeHorizons` is the ONLY writer of `escalated`, and it sets it
- *     exactly when `maxAttempts !== null && timeoutAt !== null && timeoutAt <= now`.
- *     `strandedRecoveryWakeAttemptsExhausted` returns true for precisely that condition.
- *     (`upsertSourceScoped` only ever *preserves* an existing `escalated` — it never
- *     creates one — so there is no second way in.)
+ *   - Three writers set `escalated`, and each does so only on a bound that
+ *     `strandedRecoveryWakeAttemptsExhausted` already reports as exhausted:
+ *     `escalateExpiredWakeHorizons` on `maxAttempts !== null && timeoutAt !== null &&
+ *     timeoutAt <= now`, and `retireAndReleaseWakeAttempt` / `retireWakeAction` on the
+ *     attempt budget (BLO-19124). (`upsertSourceScoped` never creates one — it only
+ *     preserves, or lifts an `attempt_budget` retirement when the OWNER changes, which
+ *     returns the row to `active` with a fresh budget rather than making a new way in.)
+ *     This bullet read "`escalateExpiredWakeHorizons` is the ONLY writer" until BLO-19124
+ *     added the other two; the premise changed, the conclusion below did not.
  *   - So every `escalated` action is already wake-exhausted.
  *     `reconcileStrandedRecoveryWakeBackstop` selects it and then always drops it at
  *     `exhaustedSkipped`. Should a later re-upsert ever null out `maxAttempts`, the
