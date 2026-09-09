@@ -61,8 +61,8 @@ describe("PEN-1198 audit dependency remediation", () => {
     );
     expect(overrides["jsdom>undici"]).toBe(">=7.29.0 <8");
     expect(overrides["js-yaml"]).toBe(">=4.3.1 <5");
-    expect(overrides.multer).toBe(">=2.2.0 <3");
-    expect(serverPackageJson.dependencies.multer).toBe("^2.2.0");
+    expect(overrides.multer).toBe(">=2.3.0 <3");
+    expect(serverPackageJson.dependencies.multer).toBe("^2.3.0");
   });
 
   it("documents the advisories that the patched ranges address", () => {
@@ -84,10 +84,11 @@ describe("PEN-1198 audit dependency remediation", () => {
       ]),
     });
     expect(remediations.multer).toMatchObject({
-      patchedRange: ">=2.2.0 <3",
+      patchedRange: ">=2.3.0 <3",
       advisories: expect.arrayContaining([
         "GHSA-72gw-mp4g-v24j",
         "GHSA-3p4h-7m6x-2hcm",
+        "GHSA-qfvm-cv95-jqjf",
       ]),
     });
     expect(remediations["js-yaml"]).toMatchObject({
