@@ -23144,6 +23144,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return resumed;
   }
 
+  /**
+   * A reservation the owning adapter has just re-armed for an in-run retry:
+   * `rearmExternalRuntimeReservationForRetry` clears the Job identity and puts
+   * the row back into `launching`. While that shape is fresh, the terminal Job
+   * the reaper can see belongs to the attempt the owner already consumed, not
+   * to the run's future.
+   */
+  function isReplacementPendingReservation(
+    reservation: Pick<
+      typeof externalRuntimeReservations.$inferSelect,
+      "state" | "jobName" | "jobUid" | "launchedAt" | "updatedAt"
+    >,
+    now: Date,
+  ) {
+    const updatedAt = new Date(reservation.updatedAt).getTime();
+    return (
+      reservation.state === "launching" &&
+      reservation.jobName === null &&
+      reservation.jobUid === null &&
+      reservation.launchedAt === null &&
+      Number.isFinite(updatedAt) &&
+      now.getTime() - updatedAt < EXTERNAL_LIFECYCLE_STALE_MS
+    );
+  }
+
+  /**
+   * BLO-33019: fresh-read counterpart of `replacementPendingRunIds`. True when
+   * the run's live reservation shows the owner has moved past the terminal
+   * Job the reaper is looking at: either re-armed (identity cleared) or already
+   * launched a replacement under a different Job name/UID. False when there is
+   * no active reservation (the owner released it and the run's own finalizer
+   * decides) or when the reservation still names this exact Job.
+   */
+  async function isTerminalExternalJobConsumedByOwner(
+    runId: string,
+    jobStatus: AgentJobRunStatus,
+    now: Date,
+  ) {
+    const reservation = await getActiveExternalRuntimeReservation(db, runId);
+    if (!reservation) return false;
+    if (isReplacementPendingReservation(reservation, now)) return true;
+    const terminalName = readNonEmptyString(jobStatus.name);
+    const terminalUid = readNonEmptyString(jobStatus.uid);
+    if (reservation.jobName && terminalName && reservation.jobName !== terminalName) return true;
+    if (reservation.jobUid && terminalUid && reservation.jobUid !== terminalUid) return true;
+    return false;
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -23263,17 +23311,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     const replacementPendingRunIds = new Set(
       activeReservations
-        .filter((reservation) => {
-          const updatedAt = new Date(reservation.updatedAt).getTime();
-          return (
-            reservation.state === "launching" &&
-            reservation.jobName === null &&
-            reservation.jobUid === null &&
-            reservation.launchedAt === null &&
-            Number.isFinite(updatedAt) &&
-            now.getTime() - updatedAt < EXTERNAL_LIFECYCLE_STALE_MS
-          );
-        })
+        .filter((reservation) => isReplacementPendingReservation(reservation, now))
         .map((reservation) => reservation.runId),
     );
 
@@ -23561,7 +23599,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // The cleared reservation identity is durable proof that the owner
             // consumed this terminal attempt and is preparing its replacement.
             // Normal terminal Jobs remain immediately authoritative.
-            if (replacementPendingRunIds.has(run.id)) {
+            //
+            // BLO-33019: `replacementPendingRunIds` is built from the reservation
+            // snapshot taken at the top of this pass. The re-arm routinely lands
+            // AFTER that snapshot -- the owner classifies the 429 while this loop
+            // is still walking other running runs -- so the snapshot alone missed
+            // 79% of in-run retries on 2026-09-09 (3387 runs finalized job_failed
+            // with the owner's "retrying inside the same heartbeat run" event
+            // seconds earlier). Re-read the reservation for this run right before
+            // treating the terminal Job as authoritative.
+            if (
+              replacementPendingRunIds.has(run.id) ||
+              await isTerminalExternalJobConsumedByOwner(run.id, jobStatus, now)
+            ) {
               logger.debug(
                 { runId: run.id, jobName: jobStatus.name ?? persistedJobName, jobPhase: jobStatus.phase },
                 "reapOrphanedRuns: deferring terminal external Job to active adapter owner",
