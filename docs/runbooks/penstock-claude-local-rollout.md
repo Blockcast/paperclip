@@ -32,11 +32,12 @@ into the shared `/paperclip/.claude` volume.
   container.
 - Keep Caveman's listener on `127.0.0.1`; do not expose a port, SSH forward, or
   shared proxy endpoint.
-- The production Docker build requires the repository secret
-  `PENSTOCK_RUNTIME_TOKEN` to fetch the private launcher. Keep it separate from
-  `PAPERCLIP_BOARD_TOKEN`, which remains reserved for the `kkroo/*` vendor
-  source. A missing secret must fail the build; do not substitute a provider
-  key or a broadly scoped token.
+- The production Docker build mints a short-lived GitHub App installation token
+  from `COMMITPERCLIP_KEY` and `COMMITPERCLIP_APP_ID`, restricted to read-only
+  Contents access on `Blockcast/penstock-llm-proxy-core`. Keep that credential
+  flow separate from `PAPERCLIP_BOARD_TOKEN`, which remains reserved for the
+  `kkroo/*` vendor source. Missing or unauthorized App credentials must fail the
+  build; do not substitute a provider key or a broadly scoped token.
 
 # 1. Gate and inventory
 
