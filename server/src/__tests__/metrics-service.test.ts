@@ -390,6 +390,49 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
   });
 
   it.each([
+    ["job_failed"],
+    ["job_missing"],
+    ["adapter_failed"],
+    ["claude_transient_upstream"],
+    ["external_lifecycle_stale_killed"],
+  ])(
+    "BLO-17953: retains source identifiers for %s execution-pod failures",
+    async (errorCode) => {
+      const labels = recordHeartbeatRunFailed({
+        agentId: "agent-a",
+        issueId: "issue-a",
+        adapter: "claude_k8s",
+        errorCode,
+        invocationSource: "github_pr_review_submitted",
+        isolationMode: "run",
+      });
+      expect(labels.agent_id).toBe("agent-a");
+      expect(labels.issue_id).toBe("issue-a");
+      expect(labels.error_code).toBe(errorCode);
+    },
+  );
+
+  it.each([
+    ["rate_limit_exhausted"],
+    ["issue_dependencies_blocked"],
+    ["pr_review_output_missing"],
+  ])(
+    "BLO-17953: still collapses source identifiers for non-execution-pod code %s",
+    async (errorCode) => {
+      const labels = recordHeartbeatRunFailed({
+        agentId: "agent-a",
+        issueId: "issue-a",
+        adapter: "claude_k8s",
+        errorCode,
+        invocationSource: "github_pr_review_submitted",
+        isolationMode: "run",
+      });
+      expect(labels.agent_id).toBe(UNKNOWN_AGENT_ID);
+      expect(labels.issue_id).toBe("none");
+    },
+  );
+
+  it.each([
     ["workspace", "workspace"],
     ["shared", "shared"],
     ["not-a-mode", UNKNOWN_ISOLATION_MODE],

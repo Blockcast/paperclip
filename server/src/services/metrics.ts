@@ -1500,6 +1500,45 @@ const knownIsolationModeSet: ReadonlySet<string> = new Set(KNOWN_ISOLATION_MODES
 export const UNKNOWN_REASON = "other";
 export const UNKNOWN_AGENT_ID = "unknown";
 
+/**
+ * BLO-17953: bounded allow-list of *execution-pod terminal* error codes that
+ * retain `agent_id`/`issue_id` on `paperclip_heartbeat_run_failed_total`.
+ *
+ * These labels used to be retained for `k8s_pod_schedule_failed` alone, which
+ * made every per-issue alert on any other code structurally unable to fire:
+ * measured over 13h in `isolation_mode="run"`, `k8s_pod_schedule_failed` was 0%
+ * `issue_id="none"` while `job_failed` (769 events, the largest single bucket)
+ * and every other code were 100% `issue_id="none"` *and* 100%
+ * `agent_id="unknown"`. The attribution is not missing upstream — the persisted
+ * run row carries `contextSnapshot.issueId` — it was dropped here.
+ *
+ * The guard itself is kept, not removed: retaining these labels on *every*
+ * terminal failure would grow one counter series per historical issue for the
+ * process lifetime. Membership is therefore restricted to codes that mean "this
+ * issue's execution pod died and its work was lost", which is the population the
+ * repeated-failure monitors need to attribute.
+ *
+ * Deliberately excluded: `rate_limit_exhausted` and `issue_dependencies_blocked`
+ * are provider-capacity and dependency parks rather than pod failures, and are
+ * high-volume (608 and 34 events over the same 13h) — admitting them would
+ * inflate cardinality without serving any per-issue alert.
+ *
+ * Cardinality cost, measured over a live 4h window: 451 execution-class failed
+ * runs resolved to 147 distinct issues across 12 agents.
+ */
+export const EXECUTION_POD_TERMINAL_ERROR_CODES = [
+  "k8s_pod_schedule_failed",
+  "job_failed",
+  "job_missing",
+  "adapter_failed",
+  "claude_transient_upstream",
+  "external_lifecycle_stale_killed",
+] as const;
+
+const executionPodTerminalErrorCodeSet: ReadonlySet<string> = new Set(
+  EXECUTION_POD_TERMINAL_ERROR_CODES,
+);
+
 const knownReasonSet: ReadonlySet<string> = new Set(KNOWN_BLOCKED_REASONS);
 
 /**
@@ -2765,11 +2804,15 @@ export interface RecordHeartbeatRunFailedInput {
 export function recordHeartbeatRunFailed(
   input: RecordHeartbeatRunFailedInput,
 ): Record<HeartbeatRunFailedLabel, string> {
-  // Per-issue labels are intentionally limited to the retry-loop failure this
-  // monitor needs. Keeping them on every terminal failure would retain one
-  // Prometheus counter series per historical issue for the process lifetime.
+  // Per-issue labels are limited to execution-pod terminal failures (see
+  // EXECUTION_POD_TERMINAL_ERROR_CODES). Retaining them on every terminal
+  // failure would keep one Prometheus counter series per historical issue for
+  // the process lifetime.
   const isolationMode = normalizeIsolationMode(input.isolationMode);
-  const retainSourceIds = input.errorCode === "k8s_pod_schedule_failed" && isolationMode === "run";
+  const retainSourceIds =
+    isolationMode === "run" &&
+    typeof input.errorCode === "string" &&
+    executionPodTerminalErrorCodeSet.has(input.errorCode);
   const labels = {
     agent_id: retainSourceIds && typeof input.agentId === "string" && input.agentId.length > 0
       ? input.agentId
