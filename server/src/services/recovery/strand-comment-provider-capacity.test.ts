@@ -539,6 +539,107 @@ describe("summarizeRunFailureForIssueComment — provider capacity 429", () => {
     );
   });
 
+  // PEN-3129. The BLO-18278 wording above only fires when the run carries a
+  // server-parsed capacity horizon. A pod refused with 429 by our own capacity
+  // router carries none — the reconciler never saw a provider response, only a
+  // Kubernetes `Failed` condition — so every one of those strands still read as
+  // an infrastructure fault. Measured 2026-09-08: 257 of 1000 runs booked
+  // `job_failed`, 59 of them simultaneously carrying
+  // `scheduledRetryReason: "ccrotate_capacity"`. The reconciler now records the
+  // pod's own terminal verdict, and these pin what the comment may say off it.
+  describe("PEN-3129 — pod-reported provider verdict, no advertised horizon", () => {
+    function podVerdictRun(providerFamily: string) {
+      return run({
+        errorCode: "job_failed",
+        error:
+          "External lifecycle Job failed: BackoffLimitExceeded: Job has reached the specified backoff limit.",
+        resultJson: {
+          externalLifecycleRecovery: {
+            reason: "job_failed",
+            jobReason: "BackoffLimitExceeded",
+            podTerminalVerdict: {
+              apiErrorStatus: 429,
+              subtype: "error_during_execution",
+              isError: true,
+              terminalReason: "api_error",
+              providerFamily,
+            },
+          },
+        },
+      });
+    }
+
+    it("names the provider refusal instead of the Kubernetes label", () => {
+      const summary = summarizeRunFailureForIssueComment(
+        podVerdictRun("rate_limit_exhausted"),
+        SWEEP_WHILE_OPEN,
+      );
+      expect(summary).toContain("provider rate-limit/capacity refusal");
+      expect(summary).toContain("not a broken runtime");
+      // The errorCode is still quoted verbatim: it did not change, and the
+      // reader must be able to join this comment to the run row and to every
+      // metric bucket that still keys on it.
+      expect(summary).toContain("`job_failed`");
+      // …but the useless half of the old text is gone.
+      expect(summary).not.toContain("Job has reached the specified backoff limit");
+    });
+
+    it("claims no reset instant, because none was advertised on this path", () => {
+      const summary = summarizeRunFailureForIssueComment(
+        podVerdictRun("rate_limit_exhausted"),
+        SWEEP_WHILE_OPEN,
+      );
+      // The BLO-18278 vocabulary must not leak here: promising a window that
+      // nothing advertised is the same misdiagnosis this fixes, inverted.
+      expect(summary).not.toContain("advertised a capacity reset at");
+      expect(summary).not.toContain("waiting on that reset");
+      expect(summary).not.toContain("self-healing");
+      expect(summary).toContain("advertised no reset instant");
+    });
+
+    it("distinguishes a transient upstream fault from a capacity refusal", () => {
+      const summary = summarizeRunFailureForIssueComment(
+        podVerdictRun("transient_upstream"),
+        SWEEP_WHILE_OPEN,
+      );
+      expect(summary).toContain("transient provider upstream fault");
+      expect(summary).not.toContain("rate-limit/capacity refusal");
+    });
+
+    it("falls through to the generic summary when the pod reported no family", () => {
+      // `providerFamily: null` is what an ordinary agent-side `exit(1)` records.
+      // It must NOT be dressed up as a provider fault.
+      const summary = summarizeRunFailureForIssueComment(
+        podVerdictRun(null as unknown as string),
+        SWEEP_WHILE_OPEN,
+      );
+      expect(summary).toContain("job_failed");
+      expect(summary).toContain("BackoffLimitExceeded");
+      expect(summary).not.toContain("provider");
+    });
+
+    it("prefers the server-parsed horizon when the run has one", () => {
+      // Both signals present: the advertised instant is strictly better
+      // evidence, so the BLO-18278 branch must keep precedence.
+      const summary = summarizeRunFailureForIssueComment(
+        run({
+          errorCode: "job_failed",
+          resultJson: {
+            errorFamily: "rate_limit_exhausted",
+            providerCapacityResetAt: RESET_ISO,
+            providerCapacityResetProvenance: SERVER_429_PROVENANCE,
+            externalLifecycleRecovery: {
+              podTerminalVerdict: { providerFamily: "rate_limit_exhausted" },
+            },
+          },
+        }),
+        SWEEP_WHILE_OPEN,
+      );
+      expect(summary).toContain(`advertised a capacity reset at ${RESET_ISO}`);
+      expect(summary).not.toContain("advertised no reset instant");
+    });
+  });
+
   it("returns null when there is no run", () => {
     expect(summarizeRunFailureForIssueComment(null)).toBeNull();
   });

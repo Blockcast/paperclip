@@ -188,6 +188,13 @@ import {
   taskKeysMatch,
 } from "./pr-review-duplicate-issue-guard.js";
 import { readOrphanedRunTerminalResult } from "./orphaned-run-terminal-result.js";
+import {
+  RUN_LOG_TERMINAL_RESULT_MAX_SCAN_BYTES,
+  RUN_LOG_TERMINAL_RESULT_SCAN_CHUNK_BYTES,
+  RUN_LOG_TERMINAL_RESULT_TAIL_BYTES,
+  parseTerminalResultEventFromRunLogTail,
+  summarizePodTerminalVerdict,
+} from "./run-log-terminal-result.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   deleteAgentJobExact,
@@ -22098,6 +22105,76 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  /**
+   * PEN-3129: the agent's own terminal verdict for a Job that Kubernetes only
+   * describes as `BackoffLimitExceeded`.
+   *
+   * `backoffLimit: 0` means that label is produced identically by a provider 429
+   * refusal, an OOM, a crash and a clean `exit(1)`, and
+   * `externalLifecycleTerminalOutcome` cannot tell them apart because its only
+   * input is the Job status. The pod said why, one line before it exited, and
+   * that line is durable in the run log — so read it.
+   *
+   * Reads the run log rather than the pod artifact
+   * (`readOrphanedRunTerminalResult`): the artifact is unlinked by the adapter's
+   * `cleanupJob` `finally`, so it is present only for the orphan case that
+   * reader serves, whereas the run log is written by this server, survives the
+   * pod, and is mirrored to object storage on finalize.
+   *
+   * Best-effort and never throws: a null result leaves the run record exactly as
+   * it was before this existed.
+   */
+  async function readPodTerminalVerdictForFailedJob(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "logStore" | "logRef" | "logBytes">,
+  ) {
+    if (!run.logStore || !run.logRef) return null;
+    try {
+      // PEN-2106: `logBytes` is only written back on finalize, so it is null for
+      // runs finalized by this reconciler. Treat it as an advisory hint and let
+      // the store clamp — it stat()s the real file — rather than gating on it.
+      const sizeHint = Number(run.logBytes ?? 0);
+      const offset = Number.isFinite(sizeHint) && sizeHint > RUN_LOG_TERMINAL_RESULT_TAIL_BYTES
+        ? sizeHint - RUN_LOG_TERMINAL_RESULT_TAIL_BYTES
+        : 0;
+      let tail = "";
+      let cursor = offset;
+      let scanned = 0;
+      // A hintless read starts at 0 and must walk forward to reach the end,
+      // keeping only the trailing window. Byte-budgeted like the stale-run
+      // evidence tail in `recovery/service.ts`, so a multi-megabyte transcript
+      // costs a bounded number of reads and a bounded amount of memory.
+      while (scanned < RUN_LOG_TERMINAL_RESULT_MAX_SCAN_BYTES) {
+        const limitBytes = Math.min(
+          RUN_LOG_TERMINAL_RESULT_SCAN_CHUNK_BYTES,
+          RUN_LOG_TERMINAL_RESULT_MAX_SCAN_BYTES - scanned,
+        );
+        const result = await runLogStore.read(
+          { store: run.logStore as "local_file", logRef: run.logRef },
+          { offset: cursor, limitBytes },
+        );
+        scanned += Buffer.byteLength(result.content, "utf8");
+        tail = (tail + result.content).slice(-RUN_LOG_TERMINAL_RESULT_TAIL_BYTES);
+        // `nextOffset` is undefined once the store has served the final byte;
+        // the `<= cursor` guard keeps a misbehaving store from looping forever.
+        if (result.nextOffset == null || result.nextOffset <= cursor) break;
+        cursor = result.nextOffset;
+      }
+      const event = parseTerminalResultEventFromRunLogTail(tail);
+      if (!event) return null;
+      return summarizePodTerminalVerdict(event, {
+        isRateLimitExhausted: (resultJson) => isRateLimitExhausted(resultJson),
+        isHintlessTransientUpstreamFault: (resultJson) =>
+          isHintlessTransientUpstreamFault(resultJson),
+      });
+    } catch (error) {
+      logger.warn(
+        { runId: run.id, error: error instanceof Error ? error.message : String(error) },
+        "failed-Job pod terminal verdict read failed; finalizing without it",
+      );
+      return null;
+    }
+  }
+
   async function finalizeExternalLifecycleTerminalRun(input: {
     run: typeof heartbeatRuns.$inferSelect;
     adapterType: string;
@@ -22272,6 +22349,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
+    // PEN-3129: attribute a still-generic `job_failed`. Read AFTER the container
+    // classification above, and only when it declined to name a cause: an
+    // `oom_killed`/`exit_137` pod already has its true reason, and attaching a
+    // provider verdict to it would suggest the provider refused a run the
+    // kubelet killed.
+    const podTerminalVerdict = terminalOutcome.errorCode === "job_failed"
+      ? await readPodTerminalVerdictForFailedJob(input.run)
+      : null;
+
     const terminalClaimToken = randomUUID();
     let resultJson = mergeRunStopMetadataForAgent(
       { adapterType: input.adapterType, adapterConfig: parseObject(input.adapterConfig) },
@@ -22299,6 +22385,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 }
               : {}),
             ...(containerDiagnostics ? { containerDiagnostics } : {}),
+            // PEN-3129: the pod's own terminal verdict, recorded as a DIMENSION
+            // beside the Kubernetes label rather than replacing it.
+            //
+            // Nested here, and named `providerFamily` rather than `errorFamily`,
+            // on purpose. `readHeartbeatRunErrorFamily` reads
+            // `resultJson.errorFamily` at the TOP level, and
+            // `shouldScheduleAutomaticRunRetry` consults it — via
+            // `readTransientRecoveryContractFromRun` — at a line that sits ABOVE
+            // the `job_failed` branch and returns true unconditionally. Writing
+            // this verdict where that reader can see it would therefore
+            // authorize an unconditional retry of a run that may have already
+            // done non-idempotent work (shared workspace, comments, pushed
+            // commits), bypassing the `adapterInvocationStarted === false` proof
+            // that branch exists to require. The stale-kill path carries an
+            // explicit guard comment about the same ordering hazard; the
+            // `job_failed` branch has no such protection, so the containment is
+            // here instead.
+            ...(podTerminalVerdict ? { podTerminalVerdict } : {}),
           },
         },
         errorCode: terminalOutcome.errorCode,

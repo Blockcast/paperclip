@@ -1134,6 +1134,32 @@ function readProviderCapacityResetAt(
   return advertised ? { resetAt: advertised, is429Capacity: false, advertisedResetAt: null } : null;
 }
 
+/**
+ * PEN-3129: the provider family the pod itself reported before it exited, for a
+ * run Kubernetes could only describe as `BackoffLimitExceeded`.
+ *
+ * Agent Jobs set `backoffLimit: 0`, so that condition is emitted identically for
+ * a 429 refusal, an OOM, a crash and a clean `exit(1)`, and the external-
+ * lifecycle reconciler has nothing but the Job status to name a cause with. It
+ * now records the pod's own terminal verdict alongside the Kubernetes label
+ * (`heartbeat.ts` `readPodTerminalVerdictForFailedJob`), and this reads it so
+ * the strand comment can say what actually happened. Without it the comment
+ * reads `job_failed` — External lifecycle Job failed: BackoffLimitExceeded,
+ * which has twice sent an investigation at the cluster for a provider throttle
+ * (PEN-938, PEN-3128).
+ *
+ * Deliberately narrow: it reports the family only, never a reset instant. A
+ * `job_failed` run has no server-parsed capacity horizon — the reconciler never
+ * saw a provider response — so there is nothing here that could honestly be
+ * turned into "waiting until <instant>", and `readProviderCapacityResetAt`
+ * above remains the only source of one.
+ */
+function readPodTerminalProviderFamily(run: NonNullable<LatestIssueRun>): string | null {
+  const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
+  const verdict = parseObject(recovery.podTerminalVerdict);
+  return readNonEmptyString(verdict.providerFamily);
+}
+
 export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Date.now()) {
   if (!run) return null;
 
@@ -1219,6 +1245,26 @@ export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Da
           `but the provider only ever advertised it as an estimate and a throttle can be ` +
           `extended past it — recheck current provider capacity before either waiting on this ` +
           `window or diagnosing a different blocker.`;
+  }
+
+  // PEN-3129: no server-parsed capacity horizon, but the pod's own terminal
+  // event said the provider refused it. Report that instead of the Kubernetes
+  // label, and report only that: there is no advertised instant to wait on, so
+  // this says what happened and where to look, and makes no claim about when
+  // capacity returns or whether a retry was scheduled. `errorCode` is quoted
+  // verbatim so the reader can still join this comment to the run row and to
+  // every metric bucket, none of which changed.
+  const podTerminalProviderFamily = readPodTerminalProviderFamily(run);
+  if (podTerminalProviderFamily) {
+    const cause = podTerminalProviderFamily === "rate_limit_exhausted"
+      ? "a provider rate-limit/capacity refusal reported by the agent process itself"
+      : "a transient provider upstream fault reported by the agent process itself";
+    const suffix = errorCode ? ` (surfaced as \`${errorCode}\`)` : "";
+    return ` Latest retry failure: ${cause}${suffix}. The Kubernetes Job condition names no cause — ` +
+      `agent Jobs run \`backoffLimit: 0\`, so \`BackoffLimitExceeded\` means only "the one permitted ` +
+      `pod exited non-zero" — so diagnose this as a provider capacity fault, not a broken runtime. ` +
+      `The provider advertised no reset instant on this path, so nothing here says when capacity ` +
+      `returns; check current provider capacity.`;
   }
 
   // Prefer the JSON `"message": "..."` field if the error body is a JSON
