@@ -352,6 +352,164 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(new Set(reservationIds)).toEqual(new Set([reservation.id]));
   }, 120_000);
 
+  it("does not finalize a run whose reservation is re-armed after the reaper's reservation snapshot", async () => {
+    // The first test above re-arms BEFORE reapOrphanedRuns starts, so the
+    // pass-start reservation snapshot already carries the cleared identity.
+    // In production the re-arm routinely lands DURING the pass: the owner
+    // classifies the 429 and clears the Job identity while the reaper is still
+    // walking other running runs off a snapshot taken seconds earlier. On
+    // 2026-09-09 that window turned 3387 in-run retries into terminal
+    // `job_failed` runs in one day. The reaper must re-read the reservation
+    // before it treats a terminal Job as authoritative.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const jobName = "agent-claude-external-runtime-retry-late-rearm";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "External Runtime Late Rearm Co",
+      issuePrefix: "ERL",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Claude K8s",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          enabled: true,
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: {},
+    });
+
+    // Gate A: attempt 1 has launched its Job but has not yet returned the 429.
+    let releaseAttemptOne!: () => void;
+    const attemptOneGate = new Promise<void>((resolve) => { releaseAttemptOne = resolve; });
+    let markAttemptOneLaunched!: () => void;
+    const attemptOneLaunched = new Promise<void>((resolve) => { markAttemptOneLaunched = resolve; });
+    // Gate C: attempt 2 (the replacement) is held until the reaper has decided.
+    let releaseAttemptTwo!: () => void;
+    const attemptTwoGate = new Promise<void>((resolve) => { releaseAttemptTwo = resolve; });
+    let markAttemptTwoStarted!: () => void;
+    const attemptTwoStarted = new Promise<void>((resolve) => { markAttemptTwoStarted = resolve; });
+
+    mockAdapterExecute.mockImplementation(async (ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> => {
+      const attempt = mockAdapterExecute.mock.calls.length;
+      if (attempt === 2) {
+        markAttemptTwoStarted();
+        await attemptTwoGate;
+      }
+      await ctx.onMeta?.({ adapterType: "claude_k8s", command: `kubectl job/${jobName}` });
+      await ctx.onExternalRuntimeLaunched?.({ jobName, jobUid: `job-uid-${attempt}` });
+      if (attempt === 1) {
+        markAttemptOneLaunched();
+        await attemptOneGate;
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "provider throttled before progress",
+          resultJson: { api_error_status: 429, retry_after_seconds: 2 },
+          usage: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 },
+          provider: "test",
+          model: "test-model",
+        };
+      }
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "replacement Job completed",
+        resultJson: { ok: true },
+        usage: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const execution = heartbeat.__test_executeRunForTesting(runId);
+    await attemptOneLaunched;
+    const launchedReservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, runId))
+      .then((rows) => rows[0]);
+    expect(launchedReservation).toMatchObject({ state: "launched", jobName, jobUid: "job-uid-1" });
+
+    // Gate B: the Job-status read happens AFTER the reaper's reservation
+    // snapshot. Hold it there, let attempt 1 return its 429 so executeRun
+    // re-arms the reservation, and only then hand the reaper the terminal Job.
+    let releaseJobStatus!: () => void;
+    const jobStatusGate = new Promise<void>((resolve) => { releaseJobStatus = resolve; });
+    let markSnapshotTaken!: () => void;
+    const snapshotTaken = new Promise<void>((resolve) => { markSnapshotTaken = resolve; });
+    mockListAgentJobRunStatuses.mockImplementation(async () => {
+      markSnapshotTaken();
+      await jobStatusGate;
+      return new Map([
+        [runId, {
+          phase: "failed" as const,
+          reason: "BackoffLimitExceeded",
+          message: "Job has reached the specified backoff limit",
+          name: jobName,
+          uid: "job-uid-1",
+        }],
+      ]);
+    });
+
+    const reapPass = heartbeat.reapOrphanedRuns();
+    await snapshotTaken;
+    releaseAttemptOne();
+    await attemptTwoStarted;
+    const rearmedReservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, runId))
+      .then((rows) => rows[0]);
+    expect(rearmedReservation).toMatchObject({ state: "launching", jobName: null, jobUid: null });
+    releaseJobStatus();
+    const reaped = await reapPass;
+
+    const runDuringRetry = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(reaped).not.toContain(runId);
+    expect(runDuringRetry).toMatchObject({ status: "running", errorCode: null });
+
+    releaseAttemptTwo();
+    await execution;
+
+    const run = await db
+      .select({ status: heartbeatRuns.status, error: heartbeatRuns.error })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
+    expect(run).toMatchObject({ status: "succeeded", error: null });
+  }, 120_000);
+
   it("defers a workspace-scope contender without failing or invoking its adapter", async () => {
     // BLO-16842 repurposed this case. Pre-fix, a concurrency-enabled k8s agent's
     // plain coding runs all shared the single `agent-shared:<agentId>` writer key,
