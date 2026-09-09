@@ -5102,6 +5102,65 @@ function readProviderCapacityResetStatusEvidence(
   return null;
 }
 
+/**
+ * BLO-32578: classify a k8s startup provider-capacity 429 from the run's own
+ * pod artifact.
+ *
+ * Why this exists. `externalLifecycleTerminalOutcome` builds the terminal
+ * verdict from the Job phase alone, so a `phase: "failed"` Job is recorded
+ * `job_failed` before anything reads what the agent actually said. When the
+ * claude SDK exits 1 on a capacity 429 the container dies in ~4s, the Job
+ * (backoffLimit 0) goes `BackoffLimitExceeded`, and the 429 — which is sitting
+ * in the pod artifact as a terminal `result` event — never reaches a
+ * classifier. `classifyAgentJobFailureErrorCode` cannot help: it reads
+ * container exit codes only, never the log. Net effect measured 2026-09-07/09:
+ * 3,206 `job_failed` runs in ~31h, none parked, each one re-queued immediately
+ * into the same closed window.
+ *
+ * Reclassifying the error code is sufficient and is deliberately the whole
+ * change. `readHeartbeatRunErrorFamily` maps `rate_limit_exhausted` to the
+ * rate-limit family, so `readTransientRecoveryContractFromRun` answers before
+ * `shouldScheduleAutomaticRunRetry` ever reaches the `job_failed` branch — the
+ * `adapterInvocationStarted === false` gate there is NOT loosened. That gate
+ * exists because a failed Job may have performed non-idempotent work, and it
+ * must keep protecting every genuine job failure; a startup 429 is provably
+ * zero-turn, so it earns its retry on its own classification instead.
+ *
+ * The horizon is not primarily about how long to sleep. `capacityDrivenTransientPark`
+ * in `promoteScheduledRetryRun` keys on a non-null `retryNotBefore`, and that is
+ * the only thing standing between a promoted park and a dispatch into a still
+ * -empty pool (promotion never enters `wakeup()`, so the wake-time penstock gate
+ * never runs). Without a horizon this would park flat-90s and re-dispatch blind;
+ * with one it re-probes capacity for free and re-defers while the pool is closed.
+ * The advertised instant is not honoured verbatim either way — `clampTransientRetryHorizon`
+ * applies read-side, which is the BLO-23438 protection against a sliding
+ * advertisement freezing the fleet (tonight's slid 23:59 → 02:29 → 03:29 →
+ * 00:29 → 04:49 → 04:09 while capacity returned within minutes each time).
+ *
+ * Gating mirrors the mid-run path at the finalization call site rather than
+ * inventing a second policy: a model-authored horizon and an over-cap
+ * advertisement each need an observed 429, a machine-authored one does not.
+ */
+export function classifyPodArtifactProviderCapacityFailure(
+  classifierInput: Record<string, unknown> | null | undefined,
+  now = Date.now(),
+): { errorCode: "rate_limit_exhausted"; retryNotBefore: string | null } | null {
+  if (!classifierInput) return null;
+  if (!isRateLimitExhausted(classifierInput)) return null;
+
+  const statusEvidence = readProviderCapacityResetStatusEvidence(classifierInput);
+  const observed429 = statusEvidence?.statusCode === 429;
+  const horizon = resolveProviderCapacityHorizon({ resultJson: classifierInput }, now);
+  const at =
+    horizon.kind === "usable" && (horizon.machineAuthored || observed429)
+      ? horizon.at
+      : horizon.kind === "over_horizon" && observed429
+        ? horizon.parkAt
+        : null;
+
+  return { errorCode: "rate_limit_exhausted", retryNotBefore: at?.toISOString() ?? null };
+}
+
 // Mirror of the recovery reader's instant guard. Adapters that hand back a
 // structured `retryNotBefore` (claude-local/codex-local) skip the prose parser
 // above, so before this they reached recovery carrying no provenance at all and
@@ -22272,6 +22331,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
+    // BLO-32578: the Job phase said "failed"; ask the agent what actually
+    // happened before settling for `job_failed`. See
+    // `classifyPodArtifactProviderCapacityFailure` for why this reclassification
+    // is sufficient on its own and why it does not touch the
+    // `adapterInvocationStarted` retry gate.
+    //
+    // Ordered AFTER the container classification and skipped when that fired:
+    // an OOM kill or a 137 is a real container fault and a truthful verdict
+    // about the pod, so it outranks anything the transcript says. Fail-closed
+    // everywhere else — absent, empty, unreadable, or no-result-event artifact,
+    // or a terminal event that is not a capacity 429, all leave `job_failed`
+    // exactly as it was.
+    let providerCapacityRetryNotBefore: string | null = null;
+    if (terminalOutcome.errorCode === "job_failed" && !containerFailureCode) {
+      const recovered = await readOrphanedRunTerminalResult({
+        companyId: input.run.companyId,
+        agentId: input.run.agentId,
+        runId: input.run.id,
+      });
+      const capacityFailure =
+        recovered.outcome === "found"
+          ? classifyPodArtifactProviderCapacityFailure(recovered.classifierInput)
+          : null;
+      if (capacityFailure) {
+        providerCapacityRetryNotBefore = capacityFailure.retryNotBefore;
+        terminalOutcome = {
+          ...terminalOutcome,
+          errorCode: capacityFailure.errorCode,
+          error:
+            "Provider capacity refused the run before it began (429); the Job failed at startup and was reclassified from its own terminal result",
+          recoveryReason: capacityFailure.errorCode,
+        };
+        await appendRunEvent(input.run, await nextRunEventSeq(input.run.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "info",
+          message:
+            "Reclassified a failed external-lifecycle Job as a provider capacity refusal from the run's own terminal result",
+          // Deliberately no transcript text: the verdict and the horizon only.
+          payload: {
+            errorCode: capacityFailure.errorCode,
+            retryNotBefore: capacityFailure.retryNotBefore,
+          },
+        });
+      }
+    }
+
     const terminalClaimToken = randomUUID();
     let resultJson = mergeRunStopMetadataForAgent(
       { adapterType: input.adapterType, adapterConfig: parseObject(input.adapterConfig) },
@@ -22279,6 +22385,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       {
         resultJson: {
           ...parseObject(input.run.resultJson),
+          // BLO-32578: top level, because that is where the readers look —
+          // `readHeartbeatRunErrorFamily` reads `errorFamily` and
+          // `readTransientRetryNotBeforeFromRun` reads `retryNotBefore`. The
+          // family is redundant with the reclassified `errorCode` (which that
+          // reader also maps) and is written anyway so the contract survives a
+          // row that loses its code, matching what the mid-run path persists.
+          ...(terminalOutcome.errorCode === "rate_limit_exhausted"
+            ? {
+                errorFamily: "rate_limit_exhausted",
+                ...(providerCapacityRetryNotBefore
+                  ? { retryNotBefore: providerCapacityRetryNotBefore }
+                  : {}),
+              }
+            : {}),
           externalLifecycleRecovery: {
             terminalClaimToken,
             reason: terminalOutcome.recoveryReason,

@@ -37,9 +37,29 @@ const TERMINAL_RESULT_TAIL_BYTES = 256 * 1024;
 /** Pod-written sibling of the server's own `<runId>.ndjson` run log. */
 const POD_LOG_SUFFIX = ".pod.ndjson";
 
+/**
+ * BLO-32578: the exact keys of the terminal event that the heartbeat's failure
+ * classifiers read — `isRateLimitExhausted` (status + text) and
+ * `resolveProviderCapacityHorizon` (text only). Narrowing to this list, rather
+ * than handing back the whole event, is what keeps the module's no-transcript
+ * -content promise intact: a caller cannot reach `usage`, tool output, or the
+ * session id through it.
+ *
+ * `classifierInput` is nonetheless derived from agent-visible output and MUST
+ * NOT be logged or persisted verbatim. Callers pass it to a classifier and keep
+ * the verdict.
+ */
+const CLASSIFIER_EVENT_KEYS = ["api_error_status", "result", "message", "error", "summary"] as const;
+
 export type OrphanedRunTerminalResult =
   | { outcome: "absent"; reason: "no_artifact" | "empty_artifact" | "no_result_event" | "unreadable" }
-  | { outcome: "found"; succeeded: boolean; subtype: string | null; artifactPath: string };
+  | {
+      outcome: "found";
+      succeeded: boolean;
+      subtype: string | null;
+      artifactPath: string;
+      classifierInput: Record<string, unknown>;
+    };
 
 function runLogBasePath() {
   return process.env.RUN_LOG_BASE_PATH ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs");
@@ -101,6 +121,17 @@ function readOptionalString(value: unknown) {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+/** Copies only {@link CLASSIFIER_EVENT_KEYS}, and only when present, so the
+ *  shape handed to a classifier matches the `resultJson` it would have seen on
+ *  the mid-run path without carrying anything else out of the transcript. */
+function narrowToClassifierInput(event: Record<string, unknown>) {
+  const narrowed: Record<string, unknown> = {};
+  for (const key of CLASSIFIER_EVENT_KEYS) {
+    if (key in event) narrowed[key] = event[key];
+  }
+  return narrowed;
+}
+
 /**
  * Reads the last `{"type":"result"}` event from a run's pod-written artifact.
  *
@@ -158,6 +189,7 @@ export async function readOrphanedRunTerminalResult(input: {
       succeeded: resultEventReportsSuccess(record),
       subtype: readOptionalString(record.subtype),
       artifactPath,
+      classifierInput: narrowToClassifierInput(record),
     };
   }
   return { outcome: "absent", reason: "no_result_event" };
