@@ -93,6 +93,7 @@ test("production image packages the pinned launcher and Caveman proxy", () => {
   assert.doesNotMatch(dockerfile, /sha256sum --check --status/);
   assert.match(dockerfile, /COPY --from=caveman-proxy \/usr\/local\/bin\/caveman-proxy/);
   assert.doesNotMatch(dockerfile, /PENSTOCK_API_KEY\s*=\s*[^$\s]/);
+  assert.doesNotMatch(dockerfile, /PENSTOCK_RUNTIME_TOKEN/);
   assert.doesNotMatch(agentDockerfile, /PENSTOCK_API_KEY\s*=\s*[^$\s]/);
 });
 
