@@ -504,12 +504,24 @@ for n in 1471 1463 1559 1613; do
   # evicted from the queue with no build. If a check only fails because the base is stale, that
   # needs a squash-replay onto master (BLO-32317) — an authoring decision, routed, not done here.
   # NB: `gh pr checks` has no `--json` flag; resolve the run id off the REST check-runs surface.
+  # Select only explicit TERMINAL FAILURE conclusions — the same closed predicate as Step 2. Do not
+  # write this as "anything that is not success/skipped/neutral": a queued or in-progress check-run
+  # reports `conclusion: null`, which satisfies that negation, so the selector would capture a
+  # RUNNING workflow's id and call `gh run rerun --failed` on it. That call fails ("cannot rerun a
+  # run that is in progress") and, under `set -e`, aborts the whole loop — a non-terminal PR must be
+  # a wait/stop state here, not a retry target.
   head="$(gh api "repos/Blockcast/paperclip/pulls/$n" --jq '.head.sha')"
   rid="$(gh api "repos/Blockcast/paperclip/commits/$head/check-runs" \
           --jq '[.check_runs[]
-                 | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")
+                 | select(.conclusion == "failure" or .conclusion == "timed_out"
+                          or .conclusion == "cancelled" or .conclusion == "action_required")
                  | .details_url | capture("runs/(?<id>[0-9]+)").id] | first // empty')"
-  if [ -n "$rid" ]; then
+  pending="$(gh api "repos/Blockcast/paperclip/commits/$head/check-runs" \
+          --jq '[.check_runs[] | select(.status != "completed")] | length')"
+  if [ "${pending:-0}" -gt 0 ]; then
+    echo "PR $n: $pending check-run(s) still running at $head; not terminal, skipping retry"
+    continue
+  elif [ -n "$rid" ]; then
     gh run rerun --failed "$rid" -R Blockcast/paperclip
   else
     echo "PR $n: no failed run to re-run; inspect manually"
@@ -1977,6 +1989,12 @@ For each open, non-draft PR in each repo, run:
    d. **`gate/ally-comment-findings` must be present and `SUCCESS`.** Its absence is a stop under (a); it is never allowlistable. Then read its **description**, because `success` is ambiguous on this repo: *"reports no unresolved findings"* means reviewed and clean (a pass), while *"No Ally consolidated-review comment attests to reviewing this head"* means **nobody reviewed this head** — a stop, reason "review:missing". `review/ally-complete` does not exist on this repo; `review/ally-comment` is retired and carries no verdict. Do not wait on either.
 
    **Do not simplify (a)–(d) into "every check-run must be SUCCESS".** Measured 2026-09-08 across the four most recently landed Track A PRs (#1418, #1309, #1219, #1467): all four carry `Storybook visual regression=skipped` and two carry `security-review=neutral`. A blanket all-SUCCESS predicate therefore matches **zero** PRs on this repo and silently converts the routine into a no-op — which fails safe, but is indistinguishable from a routine that is working.
+
+   > ⚠ **OPEN POLICY QUESTION — routed to the CTO on [BLO-32573](https://paperclip.blockcast.net/BLO/issues/BLO-32573), 2026-09-09. Do not re-litigate this in review; it is not the author's to settle.**
+   >
+   > Ally has flagged this allowlist twice ( `9807587`, `33caa1bf` ) as conflicting with the fleet-binding [BLO-26572](https://paperclip.blockcast.net/BLO/issues/BLO-26572) rule that only `success` passes, and recommends *"remove them from the repo's required CI verdict"* instead. That remedy is **measured unavailable**: `repos/Blockcast/paperclip/rules/branches/master` returns exactly one rule, `merge_queue` — there is **no `required_status_checks` rule at all**, so no context on this repo is formally "required" and there is nothing to remove from. The genuine tension is that the CEO's scope note ([BLO-22762](https://paperclip.blockcast.net/BLO/issues/BLO-22762)) defines the rule as covering *"the repo's REQUIRED CI VERDICT"*, and this repo declares none — its real gate is the merge queue's own `grouping_strategy: ALLGREEN` build on the `merge_group` ref, which runs **after** `--auto` hands the PR over and which this routine cannot bypass.
+   >
+   > Both readings are defensible and the author has an interest in the permissive one, so it is held open rather than resolved here. Until the CTO rules, this criterion stays as written — the stricter-than-BLO-26572 parts (empty-rollup stop, `null`/`""` stop, findings-gate description read) are unaffected either way.
 4. A canonical Ally review exists at the CURRENT head. Search reviews and comments for a body that contains exactly one line "## Ally — Consolidated PR Review" and exactly one line matching "Reviewed head: <40-hex>" where the hex equals headRefOid. That body must have no "### Critical Issues (N)" or "### Important Issues (N)" with N above 0, and no line matching "- **prior:...** — still-present —". Otherwise skip, reason "review:<stale-head|blocking|missing>".
 5. mergeStateStatus is "CLEAN" or "BEHIND". "BLOCKED": go to the CODEOWNERS step. "DIRTY", "UNSTABLE", "UNKNOWN": skip, reason "merge-state:<value>".
 
