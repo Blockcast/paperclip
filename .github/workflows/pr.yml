@@ -548,6 +548,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm run test:multer-security-override
 
+      - name: Test js-yaml security override
+        if: ${{ !cancelled() }}
+        run: pnpm run test:js-yaml-security-override
+
       - name: Verify release package bootstrap for changed manifests
         if: ${{ !cancelled() }}
         run: |

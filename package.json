@@ -47,6 +47,7 @@
     "test:ip-address-security-override": "node --test scripts/ip-address-security-override.test.js",
     "test:browserslist-security-override": "node --test scripts/browserslist-security-override.test.js",
     "test:multer-security-override": "node --test scripts/multer-security-override.test.js",
+    "test:js-yaml-security-override": "node --test scripts/js-yaml-security-override.test.js",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
     "docs:dev": "cd docs && npx mintlify dev",
     "smoke:hermes-gateway-join": "./scripts/smoke/hermes-gateway-join.sh",
@@ -124,10 +125,11 @@
         ]
       },
       "js-yaml": {
-        "patchedRange": ">=4.3.1 <5",
+        "patchedRange": ">=4.3.2 <5",
         "advisories": [
           "GHSA-h67p-54hq-rp68",
-          "GHSA-5p4m-2wfm-xmqj"
+          "GHSA-5p4m-2wfm-xmqj",
+          "GHSA-2883-xcg3-v3hh"
         ]
       },
       "esbuild": {
@@ -168,7 +170,7 @@
       "@tootallnate/once": "^2.0.1",
       "form-data": ">=4.0.6",
       "@babel/core": ">=7.29.7 <8",
-      "js-yaml": ">=4.3.1 <5",
+      "js-yaml": ">=4.3.2 <5",
       "esbuild": ">=0.28.1 <0.29",
       "@connectrpc/connect-node>undici": ">=6.27.0 <7",
       "jsdom>undici": ">=7.29.0 <8",
