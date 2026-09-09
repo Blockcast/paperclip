@@ -7019,6 +7019,23 @@ export function recoveryService(
         // per-issue line said nothing the aggregate does not. The lock-held read was
         // the worse of the two — it serialized a round-trip per candidate while
         // holding a lock that checkout and adoption both contend on.
+        //
+        // On the `?? null` below: from the two wired lanes it is unreachable, not a
+        // real fallback. `listIssueDependencyReadinessMap` pre-seeds a default
+        // `IssueDependencyReadiness` for every id it is asked about before it queries
+        // `issueRelations` (`services/issues.ts`), so `.get(issue.id)` never returns
+        // `undefined` for an id in the request. `...Unclassified` is therefore fed
+        // only by call sites that omit `dependencyWaitReadiness` entirely — it is
+        // structurally dead from `todo` and `in_progress`. Kept as defence-in-depth so
+        // that a future lane which forgets to thread readiness degrades into its own
+        // bucket instead of being miscounted as a resolved-blocker defect.
+        //
+        // INVARIANT: these three increments must stay one synchronous block. The
+        // still-blocked arm is not counted here; it is *derived* by subtraction at the
+        // end of the pass, which is only non-negative because no sweep can observe a
+        // suppression that has been totalled but not yet classified. Inserting an
+        // `await` between the total and the classification would make
+        // `...StillBlocked` go negative silently.
         dependencyWaitEscalationSuppressedTotal += 1;
         const readiness = input.dependencyWaitReadiness ?? null;
         if (readiness == null) dependencyWaitEscalationSuppressedUnclassifiedTotal += 1;
@@ -7902,10 +7919,26 @@ export function recoveryService(
       // BLO-27463 defect shape, and the only one of the three worth acting on.
       dependencyWaitEscalationSuppressedDependencyReady: 0,
       // Still genuinely blocked when the caller read readiness: expected, not a defect.
+      //
+      // Read this bucket as "still-blocked waits that reached the gate", NOT as "all
+      // still-blocked waits". Only the `todo` lane can feed it: the `in_progress` lane
+      // `continue`s into `dependencyWaitSkipped` whenever `!isDependencyReady`, so a
+      // still-blocked `in_progress` row is accounted there and never reaches the gate.
+      // A `stillBlockedSuppressed: 0` in the aggregate line is consistent with many
+      // still-blocked waits in the same pass.
       dependencyWaitEscalationSuppressedStillBlocked: 0,
       // The caller held no readiness for this issue, so the gate refused without
       // classifying. Kept distinct from both arms above so an absent classification can
       // never be miscounted as a resolved-blocker defect.
+      //
+      // The partition is best-effort by design, and this is the arm that shows it. The
+      // recovery-action call sites pass `recoveryOwnerAgentId: action.ownerAgentId ??
+      // null`; when that resolves to a real owner the gate does not fire at all, but
+      // when it resolves to `null` the gate fires with no readiness threaded and the
+      // suppression lands here rather than in a labelled arm. The two lanes carrying
+      // the 515-row bulk are wired, which is what the BLO-27463 signal needs; a
+      // non-zero value here means some other lane reached the gate, and is a prompt to
+      // thread readiness through it rather than a defect in itself.
       dependencyWaitEscalationSuppressedUnclassified: 0,
       providerQuotaMonitored: 0,
       recentProgressExempted: 0,
@@ -9369,6 +9402,9 @@ export function recoveryService(
     // This subtraction cannot go negative even with sweeps interleaved — the gate's three
     // increments are one synchronous block with no `await` between them, so every snapshot
     // window captures a suppression's total and its sub-tally together or captures neither.
+    // That "one synchronous block" is a constraint on the gate, not a property of this
+    // expression; it is recorded as an INVARIANT comment at the increment site, and this
+    // subtraction is what breaks if it is ever violated.
     result.dependencyWaitEscalationSuppressedStillBlocked =
       result.dependencyWaitEscalationSuppressed -
       result.dependencyWaitEscalationSuppressedDependencyReady -
