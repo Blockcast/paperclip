@@ -16,10 +16,55 @@ function nodeTestSteps() {
   return policySteps().filter((step) => step.includes("node --test"));
 }
 
-function assertTimeouts(steps) {
+// BLO-32670. GitHub Actions accepts fractional minutes. Matching only `(\d+)`
+// makes `timeout-minutes: 1.5` read as declaring no bound at all, so the guard
+// rejects such a step with the exact opposite of what its author wrote. Parse
+// the fraction and let the numeric comparisons below do the work.
+const TIMEOUT_MINUTES = String.raw`timeout-minutes: (\d+(?:\.\d+)?)`;
+
+function timeoutMinutes(text, indent) {
+  return Number(text.match(new RegExp(`\\n {${indent}}${TIMEOUT_MINUTES}\\n`))?.[1]);
+}
+
+// Sizing is per-step evidence and belongs with the step; this reads only the
+// ceiling that every step bound has to sit under.
+function policyJobCap() {
+  const cap = timeoutMinutes(jobRegion("policy"), 4);
+  assert.ok(cap > 0, "policy must declare a job-level timeout-minutes");
+  return cap;
+}
+
+function stepName(step) {
+  return step.split("\n")[0].trim();
+}
+
+// BLO-32670. This used to assert the literal `timeout-minutes: 1` on every
+// step, which made the bound a fixed number rather than a sufficient one: a
+// step whose measured p100 outgrew 60s could not be right-sized without failing
+// this test, so the only in-repo remedy was to leave it as a tripwire. It fired
+// exactly that way on 2026-09-07, red-lining a PR that had not touched the
+// script under test. The invariant worth gating is the one already written for
+// the chart render step below — that a bound EXISTS and sits under the job cap.
+//
+// `bound < cap` is a ceiling, not a guarantee of attributability at every value
+// under it: a bound close to the cap is still reached only after earlier steps
+// have spent part of the job budget, so the job cap kills it first and the
+// failure is a bare `cancelled` again. It holds here because the real bounds are
+// 1-3m against a 10m cap. Summing the bounds against the cap would be the wrong
+// stronger rule — bounds are per-step worst cases and every step is expected to
+// run, so that sum exceeds any sane cap by design.
+function assertTimeouts(steps, cap = policyJobCap()) {
   assert.ok(steps.length > 0, "policy must contain node --test steps");
   for (const step of steps) {
-    assert.match(step, /\n        timeout-minutes: 1\n/, "each policy node --test step must have a one-minute bound");
+    const bound = timeoutMinutes(step, 8);
+    assert.ok(
+      bound > 0,
+      `policy node --test step "${stepName(step)}" must declare a step-level timeout-minutes`,
+    );
+    assert.ok(
+      bound < cap,
+      `"${stepName(step)}" bound ${bound}m must sit below the ${cap}m policy job cap`,
+    );
   }
 }
 
@@ -28,8 +73,78 @@ test("every policy node --test step has a step-level timeout", () => {
 });
 
 test("the timeout guard fails when a node --test bound is removed", () => {
-  const mutated = nodeTestSteps().map((step) => step.replace("\n        timeout-minutes: 1\n", "\n"));
-  assert.throws(() => assertTimeouts(mutated), /one-minute bound/);
+  const mutated = nodeTestSteps().map((step) =>
+    step.replace(new RegExp(`\\n {8}${TIMEOUT_MINUTES}\\n`), "\n"),
+  );
+  assert.throws(() => assertTimeouts(mutated), /must declare a step-level timeout-minutes/);
+});
+
+test("the timeout guard fails when a node --test bound reaches the job cap", () => {
+  const cap = policyJobCap();
+  const mutated = nodeTestSteps().map((step) =>
+    step.replace(new RegExp(`\\n {8}${TIMEOUT_MINUTES}\\n`), `\n        timeout-minutes: ${cap}\n`),
+  );
+  assert.throws(() => assertTimeouts(mutated, cap), /must sit below the/);
+});
+
+// BLO-32670. Three of the 41 bounded steps in `policy` measured a p100 above
+// 50% of the old 60s budget over 58 sampled runs; the other 38 were all at or
+// under 25%. These three are the fork-heavy ones — they shell out per case, so
+// their wall time tracks runner CPU contention rather than their own work,
+// which is why they inflate while their neighbours (dominated by deliberate
+// sleeps) barely move. Against the in-band contention barometer — this job's
+// own unbounded `Checkout repository` step, which ranges 47s to 280s on the
+// same runners — they correlate at r ~= 0.35 and run 2.3x slower in the
+// high-load tercile, where trivial steps sit at r ~= 0.05 and 1.0x.
+//
+// Pinned as a floor, not an exact value, so raising one further stays a
+// one-line change. What must fail loudly is a revert to 1: that reads as
+// harmless cleanup, restores the tripwire, and the next red `policy` again
+// lands on whichever PR happens to be in the contention window.
+const CONTENTION_SENSITIVE_FLOOR_MINUTES = 3;
+const CONTENTION_SENSITIVE_STEPS = [
+  "Test approval admissibility-probe backoff (BLO-28471)",
+  "Test pending-migration pre-flight phase budgets (BLO-31254)",
+  "Test bounded PR-check polling skills",
+];
+
+function assertContentionFloor(steps) {
+  for (const name of CONTENTION_SENSITIVE_STEPS) {
+    const step = steps.find((candidate) => stepName(candidate) === name);
+    assert.ok(step, `policy must still contain the contention-sensitive step "${name}"`);
+    const bound = timeoutMinutes(step, 8);
+    assert.ok(
+      bound >= CONTENTION_SENSITIVE_FLOOR_MINUTES,
+      `"${name}" is fork-heavy and measured a p100 above 50% of a one-minute budget, so its bound must stay at or above ${CONTENTION_SENSITIVE_FLOOR_MINUTES}m — found ${bound}m`,
+    );
+  }
+}
+
+// BLO-32670. The floor and the `bound < cap` ceiling are coupled constraints: a
+// policy job cap at or below the floor makes them jointly unsatisfiable. Without
+// this the collision surfaces as a per-step "must sit below the 3m policy job
+// cap" failure, which reads as a problem with whichever step is checked first
+// rather than with the pair of rules. #1642 is the PR that sizes that cap, so
+// name the collision here instead of letting it land on a step.
+test("the contention floor and the policy job cap stay jointly satisfiable", () => {
+  const cap = policyJobCap();
+  assert.ok(
+    CONTENTION_SENSITIVE_FLOOR_MINUTES < cap,
+    `the ${CONTENTION_SENSITIVE_FLOOR_MINUTES}m contention floor cannot coexist with a ${cap}m policy job cap — raise the cap, or re-measure the floor and lower it`,
+  );
+});
+
+test("fork-heavy policy steps keep a bound sized against their measured p100", () => {
+  assertContentionFloor(policySteps());
+});
+
+test("the contention floor fails when a fork-heavy step is re-tightened to one minute", () => {
+  const mutated = policySteps().map((step) =>
+    CONTENTION_SENSITIVE_STEPS.includes(stepName(step))
+      ? step.replace(new RegExp(`\\n {8}${TIMEOUT_MINUTES}\\n`), "\n        timeout-minutes: 1\n")
+      : step,
+  );
+  assert.throws(() => assertContentionFloor(mutated), /must stay at or above/);
 });
 
 test("policy continues after a bounded test failure unless cancelled", () => {
@@ -88,20 +203,20 @@ test("the chart render suite runs in exactly one job, and that job is helm_chart
 
 // BLO-29182 observed this exact invocation hang, and its fix bounded the copy
 // that used to live in `policy`. Removing that copy has to carry the bound with
-// it, or the one `node --test` step known to hang is unbounded again — a hung
-// step would burn the whole job budget instead of failing attributably. The
-// margin (4 min against a 73s p100) lives in the workflow comment; the
-// invariant worth gating is only that a step bound exists and is under the cap.
+// it, or the one `node --test` step known to hang is unbounded again, and burns
+// the whole job budget instead of failing as itself. The margin (4 min against a
+// 73s p100) lives in the workflow comment; the invariant worth gating is only
+// that a step bound exists and is under the cap.
 test("the chart render step is bounded, and inside its job's budget (BLO-29182)", () => {
   const region = jobRegion("helm_chart");
-  const jobCap = Number(region.match(/\n    timeout-minutes: (\d+)\n/)?.[1]);
+  const jobCap = timeoutMinutes(region, 4);
   assert.ok(jobCap > 0, "helm_chart must declare a job-level timeout-minutes");
   const step = region
     .split("\n      - name: ")
     .slice(1)
     .find((candidate) => candidate.includes(CHART_SUITE));
   assert.ok(step, `helm_chart must contain the ${CHART_SUITE} step`);
-  const stepBound = Number(step.match(/\n        timeout-minutes: (\d+)\n/)?.[1]);
+  const stepBound = timeoutMinutes(step, 8);
   assert.ok(stepBound > 0, "the chart render step must declare a step-level timeout-minutes");
   assert.ok(stepBound < jobCap, `step bound ${stepBound}m must sit below the ${jobCap}m job cap`);
 });

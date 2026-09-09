@@ -282,6 +282,18 @@ jobs:
             type=raw,value=buildcache-${{ steps.target.outputs.full }}-k8s-vendored
             type=raw,value=latest-k8s-vendored,enable=${{ github.ref == 'refs/heads/master' && github.event_name != 'workflow_dispatch' }}
 
+      # Mint this immediately before the consuming build so the one-hour App
+      # token is not spent while a missing stable runtime image is prepared.
+      - name: Mint read-only Penstock runtime token
+        id: penstock-runtime-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.COMMITPERCLIP_APP_ID }}
+          private-key: ${{ secrets.COMMITPERCLIP_KEY }}
+          owner: Blockcast
+          repositories: penstock-llm-proxy-core
+          permission-contents: read
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@v7
@@ -318,6 +330,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           secrets: |
             gh_token=${{ secrets.PAPERCLIP_BOARD_TOKEN }}
+            penstock_runtime_token=${{ steps.penstock-runtime-token.outputs.token }}
 
       - name: Record built artifact
         run: |
@@ -805,6 +818,12 @@ jobs:
             fi
             # Surfaced in the run summary so retiring a lock is never a silent
             # side effect of a deploy someone skim-approved.
+            #
+            # Keep this AFTER both shape checks above. It interpolates
+            # operator-supplied input into the run log, so emitting it before
+            # validation would let `::stop-commands::` or `::add-mask::` inside
+            # `abandon_in_flight` take effect as workflow commands. The position
+            # is the protection; nothing about the echo itself enforces it.
             echo "::warning::retiring stranded in-flight approval ${ABANDON_IN_FLIGHT} (owner ${ABANDON_IN_FLIGHT_OWNER}) before approving ${DIGEST}"
           fi
 

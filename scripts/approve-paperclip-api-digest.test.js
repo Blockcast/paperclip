@@ -484,6 +484,10 @@ function readerRunFor(
   const deploymentFixture = path.join(dir, "deployment.json");
   const replicaSetFixture = path.join(dir, "replicasets.json");
   const argsLog = path.join(dir, "args.log");
+  // Kept OUTSIDE tmpRoot on purpose: tmpRoot is what leftoverTempFiles counts,
+  // so a log written into it would be indistinguishable from a file the reader
+  // failed to reclaim.
+  const residueLog = path.join(dir, "state-dir-residue.log");
   writeFileSync(deploymentFixture, deployment === null ? "" : JSON.stringify(deployment));
   writeFileSync(
     replicaSetFixture,
@@ -527,6 +531,22 @@ function readerRunFor(
       ? ['rs_state_dir="$(mktemp -d "${TMPDIR}/paperclip-approve-rs.XXXXXX")"']
       : []),
     ...Array.from({ length: repeat }, () => READER_FUNCTION_NAME),
+    // Listed BEFORE the teardown below, which is the only moment the directory's
+    // contents are observable at all. leftoverTempFiles cannot see them: on this
+    // path the directory is torn down by the teardown, and on the no-caller path
+    // the reader tears down its own, so by the time readdirSync(tmpRoot) runs
+    // every per-invocation temp file is gone whether the reader reclaimed it or
+    // not. That is why an assertion on leftoverTempFiles alone passes with the
+    // reader's `rm -f` lines deleted -- measured on both of them (BLO-32395).
+    //
+    // A directory the reader has wrongly removed reads as its own sentinel
+    // rather than crashing the harness under `set -e`, so that failure names
+    // itself instead of arriving as a bare non-zero exit.
+    ...(callerOwnedStateDir
+      ? [
+          `if [[ -d "$rs_state_dir" ]]; then ( cd "$rs_state_dir" && ls -A ); else echo '<caller-owned-state-dir-removed-by-reader>'; fi > ${JSON.stringify(residueLog)}`,
+        ]
+      : []),
     ...(callerOwnedStateDir ? ['rm -rf "$rs_state_dir"'] : []),
   ].join("\n");
   const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
@@ -536,6 +556,12 @@ function readerRunFor(
     digests: result.stdout.trim().split("\n").filter(Boolean),
     stderr: result.stderr,
     leftoverTempFiles: readdirSync(tmpRoot),
+    // null rather than [] when there is no caller-owned directory to inspect, so
+    // a case that asserts on the residue in the wrong mode fails loudly instead
+    // of matching an empty array for the wrong reason.
+    stateDirResidue: callerOwnedStateDir
+      ? readFileSync(residueLog, "utf8").split("\n").filter(Boolean).sort()
+      : null,
     argv: existsSync(argsLog) ? readFileSync(argsLog, "utf8").trim().split("\n") : [],
   };
 }
@@ -1327,6 +1353,18 @@ test("a repeated jq abort warns once, not once per rotation", () => {
 // The stderr capture is a temp file like every other one this reader mints, and
 // the abort path is the one that writes to it. It has to be reclaimed on that
 // path too, caller-owned directory or not.
+//
+// Asserted against the state directory's OWN contents, listed before teardown,
+// not against leftoverTempFiles. The outside-the-directory view cannot fail:
+// jq-err is minted inside state_dir, and state_dir is removed on both paths --
+// by the reader itself when it minted one, by the harness teardown when the
+// caller owns it -- so the file is gone from tmpRoot's point of view whether or
+// not the reader's `rm -f` reclaimed it first. Measured, not supposed: deleting
+// that `rm -f` from the shipping reader left this suite at 96/96 before this
+// case was rewritten (BLO-32395). The warn-once marker is expected to survive,
+// so the assertion names the exact residue rather than merely excluding jq-err
+// -- a not-includes check would still pass if the reader started leaving some
+// other file behind.
 test("the jq stderr capture leaves no temp file behind", () => {
   for (const callerOwnedStateDir of [true, false]) {
     const run = readerRunFor(neverReadyDeployment(digest(0xbb)), {
@@ -1347,6 +1385,15 @@ test("the jq stderr capture leaves no temp file behind", () => {
       [],
       `leftover temp files after a jq abort (callerOwned=${callerOwnedStateDir})`,
     );
+    if (callerOwnedStateDir) {
+      // warned-jq only: the list succeeded, so no warned-list, and the selector
+      // resolved, so no warned-selector. Both stderr captures are reclaimed.
+      assert.deepEqual(
+        run.stateDirResidue,
+        ["warned-jq"],
+        "after a jq abort the state directory must hold only the warn-once marker, with both stderr captures reclaimed",
+      );
+    }
   }
 });
 
@@ -1410,9 +1457,18 @@ test("a repeated ReplicaSet list failure warns once, not once per rotation", () 
 // The one it cannot reclaim from a trap is the one it creates itself, because
 // $( ) hides it from the caller's EXIT trap — so the caller owns it instead, and
 // the no-caller case cleans up after itself.
+//
+// The leftoverTempFiles half pins the DIRECTORY: on the no-caller path it is the
+// only thing that catches a reader which mints an ephemeral state_dir and never
+// removes it. The residue half pins the FILES INSIDE it, and had to be added for
+// the same reason as on the jq case above — list-err lives inside state_dir, so
+// deleting the reader's `rm -f` for it left this suite green (BLO-32395). Two
+// different claims, so both are asserted rather than one standing in for the
+// other.
 test("the ReplicaSet reader leaves no temp files behind, caller-owned or not", () => {
   for (const callerOwnedStateDir of [true, false]) {
     for (const replicaSets of [null, []]) {
+      const listForbidden = replicaSets === null;
       const run = readerRunFor(
         deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
         { replicaSets, repeat: 2, callerOwnedStateDir },
@@ -1420,8 +1476,20 @@ test("the ReplicaSet reader leaves no temp files behind, caller-owned or not", (
       assert.deepEqual(
         run.leftoverTempFiles,
         [],
-        `leftover temp files (callerOwned=${callerOwnedStateDir}, list=${replicaSets === null ? "forbidden" : "empty"})`,
+        `leftover temp files (callerOwned=${callerOwnedStateDir}, list=${listForbidden ? "forbidden" : "empty"})`,
       );
+      if (callerOwnedStateDir) {
+        // A forbidden list warns once and never reaches the jq branch, so the
+        // marker is the whole residue. An empty list takes the jq branch and it
+        // SUCCEEDS -- an empty $serving is a decline, not an abort -- so nothing
+        // warns and the residue is empty. Both stderr captures are reclaimed
+        // either way, which is the claim.
+        assert.deepEqual(
+          run.stateDirResidue,
+          listForbidden ? ["warned-list"] : [],
+          `state directory residue (list=${listForbidden ? "forbidden" : "empty"}): both stderr captures must be reclaimed, leaving only whatever warn-once marker that path sets`,
+        );
+      }
     }
   }
 });

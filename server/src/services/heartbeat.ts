@@ -403,6 +403,7 @@ import {
   recordAgentZeroTokenCompletedRunStreak,
   recordCcrotateCapacityDeferred,
   recordHeartbeatTimerSchedulerExclusion,
+  recordHeartbeatPostTerminalRunEventDropped,
   recordConcurrentRunBlocked,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
@@ -723,6 +724,15 @@ const MAX_SWEPT_ISSUE_LOCK_RELEASES = 1;
 const TASK_SCOPE_COALESCIBLE_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
+/**
+ * BLO-32553: the terminal-status union, named so it can be threaded through
+ * `readTerminalRunStatus` into `recordHeartbeatPostTerminalRunEventDropped`.
+ * That callsite is what makes the metric's mirrored label list in `metrics.ts`
+ * a compile-time constraint: adding a sixth status here without adding it to
+ * `KNOWN_HEARTBEAT_POST_TERMINAL_RUN_STATUSES` is a type error rather than a
+ * silent collapse to the "unknown" label.
+ */
+type HeartbeatRunTerminalStatus = (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number];
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const OPEN_ROUTINE_EXECUTION_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
@@ -6418,10 +6428,10 @@ export function buildK8sRunIsolationDescriptor(input: {
   // no lock-ordering or retry fix available and no configuration in which the
   // race closes.
   //
-  // Grep the three symbols named above rather than trusting line numbers. An
-  // earlier draft of this very comment cited absolute lines and its own +3-line
-  // edit silently moved them onto a different cancel branch; each symbol
-  // resolves to exactly one definition site, so the numbers bought nothing.
+  // Grep `executionRunClaimCondition`, `allowsIssueInteractionWake` and
+  // `issueLockRequired` rather than trusting line numbers. Each resolves to
+  // exactly one definition site, and a line number cited from inside the file
+  // it points into goes stale on the next edit to that same file.
   //
   // This is still strictly better than the behavior it replaces, which is why
   // it ships: the pre-fix run did not get an exclusive workspace either, it got
@@ -15615,6 +15625,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(heartbeatRunEvents)
       .where(eq(heartbeatRunEvents.runId, runId));
     return Number(row?.maxSeq ?? 0) + 1;
+  }
+
+  /**
+   * BLO-32553: return the run's status if it is terminal, else null.
+   *
+   * Reads the row rather than trusting the in-memory `currentRun` snapshot,
+   * which was captured while the run was still "running" and is therefore
+   * useless for this question.
+   *
+   * Scope, stated precisely because the obvious reading is wrong: this is
+   * called only from the late-event branch of `onAdapterEvent`, which is
+   * unreachable until adapter execution has settled. So it does NOT observe a
+   * run terminalized by another process (cancel route, recovery sweep) *while*
+   * `execute()` is still running — those events take the fast path and are
+   * still appended. Covering that would need a status read per event on the
+   * hot path; it is a pre-existing gap, not one this guard closes.
+   *
+   * The return type is the terminal-status union rather than `string` so the
+   * value can be handed to `recordHeartbeatPostTerminalRunEventDropped`
+   * without widening its label domain.
+   */
+  async function readTerminalRunStatus(runId: string): Promise<HeartbeatRunTerminalStatus | null> {
+    const [row] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    const status = row?.status ?? null;
+    return status && isHeartbeatRunTerminalStatus(status) ? status : null;
   }
 
   /**
@@ -28346,6 +28384,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
 
     let seq = await nextRunEventSeq(run.id);
+    // BLO-32553: flipped in the `finally` that wraps adapter execution below.
+    // `onEvent` is only valid for the duration of `adapter.execute`; once that
+    // has settled (through every ccrotate retry), any further event is late by
+    // the adapter contract and must be checked against the run's real status
+    // before it is appended. Kept as a closure flag so the check costs nothing
+    // on the hot in-flight path.
+    let adapterExecutionSettled = false;
     let handle: RunLogHandle | null = null;
     let stdoutExcerpt = "";
     let stderrExcerpt = "";
@@ -28686,9 +28731,123 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       };
 
+      // BLO-32553: reject-and-count guard for events that arrive after the run
+      // has already terminalized.
+      //
+      // `onEvent` is contractually valid only for the duration of
+      // `adapter.execute`. An adapter that fires it from a detached continuation
+      // outliving execute() — the orphan-SIGKILL path — would otherwise append to
+      // a run at a terminal status. The damage is not just a stray row:
+      // `appendRunEvent`'s publish() gates its runtime-status write on
+      // `isHeartbeatRunRuntimeStatusActive(run.status)`, and `run.status` there is
+      // the stale in-memory `currentRun` snapshot taken while the run was still
+      // "running". A late append therefore passes that gate and resurrects the
+      // runtime status `setRunStatus` cleared on terminalization, leaving a
+      // phantom live run that nothing will clear again.
+      //
+      // Two tiers so the hot path pays nothing: the closure flag is free and
+      // false for every in-flight event, so only a genuinely late event reaches
+      // the status read. Note this deliberately does NOT throw — a rejected late
+      // event is therefore distinguishable at the adapter's callsite from a
+      // transport error, which does throw.
       const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
         const eventType = event.eventType.trim();
         if (!eventType) return;
+        if (adapterExecutionSettled) {
+          // Neither the status read nor the sanitization below may reject. Both
+          // touch the DB (`readTerminalRunStatus` selects the run;
+          // `getCurrentUserRedactionOptions` reads instance settings), and the
+          // caller on this path is by definition a continuation that outlived
+          // `adapter.execute` — so there may be nothing awaiting this promise
+          // and an escaping rejection would be an unhandled one.
+          //
+          // A read failure is treated as a drop rather than as "not terminal":
+          // the event is already outside the `onEvent` contract, and appending
+          // on an unverifiable status risks the runtime-status resurrection
+          // described above, which nothing else clears. Passing `null` to the
+          // counter collapses to its "unknown" label, so a read failure stays
+          // distinguishable from a confirmed post-terminal drop.
+          let terminalStatus: HeartbeatRunTerminalStatus | null = null;
+          let statusReadError: unknown = null;
+          try {
+            terminalStatus = await readTerminalRunStatus(currentRun.id);
+          } catch (error) {
+            statusReadError = error;
+          }
+          if (terminalStatus || statusReadError) {
+            // This log is the substitute for the row that is deliberately not
+            // written, so it must not be a *less* redacted substitute than the
+            // storage path. Mirror `appendRunEvent`'s four sanitizations in the
+            // same order: adapter-supplied message/payload are exactly the
+            // threat model those helpers exist for (secrets, size, user PII).
+            let sanitizedMessage: string | null = null;
+            let sanitizedPayload: Record<string, unknown> | null = null;
+            let sanitizationError: unknown = null;
+            try {
+              const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+              sanitizedMessage = event.message
+                ? redactCurrentUserText(event.message, currentUserRedactionOptions)
+                : null;
+              const boundedPayload = event.payload
+                ? boundHeartbeatRunEventPayloadForStorage(event.payload)
+                : null;
+              sanitizedPayload = boundedPayload
+                ? redactCurrentUserValue(redactEventPayload(boundedPayload), currentUserRedactionOptions)
+                : null;
+            } catch (error) {
+              // Sanitization failed, so nothing adapter-supplied is safe to log.
+              // Drop the message/payload rather than fall back to the raw values.
+              sanitizationError = error;
+              sanitizedMessage = null;
+              sanitizedPayload = null;
+            }
+            // The counter and the log are this path's only two reporting
+            // channels, and both can throw exactly where the AC's "not lost
+            // silently" clause needs them not to: `ensureRegistry()` constructs
+            // its counters on first call, and a logger transport can fail. They
+            // are guarded independently rather than inside one `try`, so a
+            // metrics failure is still reported — through the log, as
+            // `metricErr` — instead of suppressing the log along with itself.
+            let metricError: unknown = null;
+            try {
+              recordHeartbeatPostTerminalRunEventDropped(terminalStatus);
+            } catch (error) {
+              metricError = error;
+            }
+            try {
+              logger.warn(
+                {
+                  runId: currentRun.id,
+                  agentId: currentRun.agentId,
+                  companyId: currentRun.companyId,
+                  terminalStatus,
+                  // Truncated to match the storage path's `eventType.slice(0, 120)`
+                  // below. The log stands in for the row that is not written, so
+                  // an adapter must not be able to put a longer string through it
+                  // than storage would have accepted.
+                  eventType: eventType.slice(0, 120),
+                  stream: event.stream ?? null,
+                  level: event.level ?? null,
+                  message: sanitizedMessage,
+                  payload: sanitizedPayload,
+                  ...(statusReadError ? { err: statusReadError } : {}),
+                  ...(sanitizationError ? { sanitizationErr: sanitizationError } : {}),
+                  ...(metricError ? { metricErr: metricError } : {}),
+                },
+                statusReadError
+                  ? "dropped adapter run event after failing to read the run's status (BLO-32553)"
+                  : "dropped adapter run event delivered after the run reached a terminal status (BLO-32553)",
+              );
+            } catch {
+              // Both reporting channels have now failed, so there is nothing
+              // left that could record this drop. Rejecting instead would
+              // surface as an unhandled rejection in a continuation with nothing
+              // awaiting it — the precise failure this branch exists to avoid.
+              // The event is still correctly dropped; only its evidence is lost.
+            }
+            return;
+          }
+        }
         await appendRunEvent(currentRun, seq++, {
           eventType: eventType.slice(0, 120),
           stream: event.stream,
@@ -29277,6 +29436,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         throw adapterErr;
       } finally {
+        // BLO-32553: adapter execution has settled (returned or thrown, after
+        // every ccrotate retry). Anything `onEvent` delivers from here on is a
+        // late event from a continuation that outlived execute().
+        adapterExecutionSettled = true;
         if (branchClaimRenewalTimer) {
           clearInterval(branchClaimRenewalTimer);
         }

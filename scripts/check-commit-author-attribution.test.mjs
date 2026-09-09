@@ -155,22 +155,55 @@ test("GRANDFATHERED_OFFENSE_SHAS is a non-empty set of full 40-char lowercase he
   }
 });
 
+/**
+ * Pin a fixture commit's identity in the ENVIRONMENT, not via `git config`.
+ *
+ * Every agent run carries a per-run `GIT_AUTHOR_*`/`GIT_COMMITTER_*` overlay
+ * (`applyAgentGitIdentityToRuntimeConfig`, BLO-29050) that outranks the local,
+ * global and system config files. A fixture that selects its author with
+ * `git config user.email <x>` therefore commits as the *acting agent* instead
+ * of `<x>`, so no fixture below can produce an App-attributed commit at all.
+ *
+ * That failed silently in the worst possible pattern: the four tests asserting
+ * an offense IS found failed, while the two asserting NO offense is found
+ * passed for the wrong reason — verified by mutation, they stayed green in a
+ * pod with grandfathering entirely disabled. And none of it is visible in CI,
+ * where GitHub runners carry no overlay and `git config` still decides.
+ * Setting the identity in the environment is correct in both places, so each
+ * `git` helper below defaults every invocation to `base@example.com` and takes
+ * a per-call override; nothing here relies on `git config` for identity.
+ */
+function asAuthor(email, name = "Test") {
+  return {
+    GIT_AUTHOR_NAME: name,
+    GIT_AUTHOR_EMAIL: email,
+    GIT_COMMITTER_NAME: name,
+    GIT_COMMITTER_EMAIL: email,
+  };
+}
 
 test("findLocalRangeOffenses reads non-merge commits from a real git range and flags App-attributed ones", () => {
   const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-"));
   try {
-    const git = (args) => execFileSync("git", args, { cwd: repoRoot, encoding: "utf8" });
+    const git = (args, env) =>
+      execFileSync("git", args, {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: { ...process.env, ...asAuthor("base@example.com"), ...env },
+      });
     git(["init", "-q"]);
-    git(["config", "user.name", "Test"]);
-    git(["config", "user.email", "base@example.com"]);
-    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"], asAuthor("base@example.com"));
     const base = git(["rev-parse", "HEAD"]).trim();
 
-    git(["config", "user.email", "platformsreengineer@paperclip.blockcast.net"]);
-    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "agent commit", "-q"]);
+    git(
+      ["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "agent commit", "-q"],
+      asAuthor("platformsreengineer@paperclip.blockcast.net"),
+    );
 
-    git(["config", "user.email", APP_NOREPLY_EMAIL]);
-    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "api-path commit", "-q"]);
+    git(
+      ["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "api-path commit", "-q"],
+      asAuthor(APP_NOREPLY_EMAIL),
+    );
     const head = git(["rev-parse", "HEAD"]).trim();
 
     const offenses = findLocalRangeOffenses({ repoRoot, base, head });
@@ -184,18 +217,22 @@ test("findLocalRangeOffenses reads non-merge commits from a real git range and f
 test("findLocalRangeOffenses excludes merge commits via --no-merges", () => {
   const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-merge-"));
   try {
-    const git = (args) => execFileSync("git", args, { cwd: repoRoot, encoding: "utf8" });
+    const git = (args, env) =>
+      execFileSync("git", args, {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: { ...process.env, ...asAuthor("base@example.com"), ...env },
+      });
+    const asApp = asAuthor(APP_NOREPLY_EMAIL);
     git(["init", "-q", "-b", "main"]);
-    git(["config", "user.name", "Test"]);
-    git(["config", "user.email", APP_NOREPLY_EMAIL]);
-    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"], asApp);
     const base = git(["rev-parse", "HEAD"]).trim();
 
     git(["checkout", "-q", "-b", "feature"]);
-    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "feature work", "-q"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "feature work", "-q"], asApp);
     git(["checkout", "-q", "main"]);
-    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "unrelated main work", "-q"]);
-    git(["-c", "commit.gpgsign=false", "merge", "--no-ff", "-m", "Merge branch feature", "feature", "-q"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "unrelated main work", "-q"], asApp);
+    git(["-c", "commit.gpgsign=false", "merge", "--no-ff", "-m", "Merge branch feature", "feature", "-q"], asApp);
     const head = git(["rev-parse", "HEAD"]).trim();
 
     const offenses = findLocalRangeOffenses({ repoRoot, base, head });
@@ -212,15 +249,17 @@ test("findLocalRangeOffenses grandfathers an App-attributed commit whose sha is 
   const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-allowlist-"));
   try {
     const git = (args, env) =>
-      execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", env: { ...process.env, ...env } });
+      execFileSync("git", args, {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: { ...process.env, ...asAuthor("base@example.com"), ...env },
+      });
     git(["init", "-q"]);
-    git(["config", "user.name", "Test"]);
-    git(["config", "user.email", "base@example.com"]);
-    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"], asAuthor("base@example.com"));
     const base = git(["rev-parse", "HEAD"]).trim();
 
-    git(["config", "user.email", APP_NOREPLY_EMAIL]);
     git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "pre-cutoff api-path commit", "-q"], {
+      ...asAuthor(APP_NOREPLY_EMAIL),
       GIT_AUTHOR_DATE: "2026-08-05T16:46:12Z",
       GIT_COMMITTER_DATE: "2026-08-06T01:15:46Z",
     });
@@ -237,17 +276,19 @@ test("findLocalRangeOffenses still flags an App-attributed commit whose sha is n
   const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-not-allowlisted-"));
   try {
     const git = (args, env) =>
-      execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", env: { ...process.env, ...env } });
+      execFileSync("git", args, {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: { ...process.env, ...asAuthor("base@example.com"), ...env },
+      });
     git(["init", "-q"]);
-    git(["config", "user.name", "Test"]);
-    git(["config", "user.email", "base@example.com"]);
-    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"], asAuthor("base@example.com"));
     const base = git(["rev-parse", "HEAD"]).trim();
 
-    git(["config", "user.email", APP_NOREPLY_EMAIL]);
     // Backdated to well before the cutoff — under the old date-cutoff design
     // this alone would have cleared the gate. It must not, now.
     git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "backdated api-path commit", "-q"], {
+      ...asAuthor(APP_NOREPLY_EMAIL),
       GIT_AUTHOR_DATE: "2020-01-01T00:00:00Z",
       GIT_COMMITTER_DATE: "2020-01-01T00:00:00Z",
     });
@@ -269,16 +310,18 @@ test("findLocalRangeOffenses keeps grandfathering a registered patch across a me
   const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-allowlist-merge-"));
   try {
     const git = (args, env) =>
-      execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", env: { ...process.env, ...env } });
+      execFileSync("git", args, {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: { ...process.env, ...asAuthor("base@example.com"), ...env },
+      });
     git(["init", "-q", "-b", "main"]);
-    git(["config", "user.name", "Test"]);
-    git(["config", "user.email", "base@example.com"]);
-    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"], asAuthor("base@example.com"));
     const base = git(["rev-parse", "HEAD"]).trim();
 
     git(["checkout", "-q", "-b", "feature"]);
-    git(["config", "user.email", APP_NOREPLY_EMAIL]);
     git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "pre-cutoff api-path commit", "-q"], {
+      ...asAuthor(APP_NOREPLY_EMAIL),
       GIT_AUTHOR_DATE: "2026-08-05T16:46:12Z",
       GIT_COMMITTER_DATE: "2026-08-06T01:15:46Z",
     });
@@ -286,10 +329,15 @@ test("findLocalRangeOffenses keeps grandfathering a registered patch across a me
 
     // Base moves forward after the cutoff; the feature branch is updated via a merge.
     git(["checkout", "-q", "main"]);
-    git(["config", "user.email", "base@example.com"]);
-    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "unrelated main work", "-q"]);
+    git(
+      ["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "unrelated main work", "-q"],
+      asAuthor("base@example.com"),
+    );
     git(["checkout", "-q", "feature"]);
-    git(["-c", "commit.gpgsign=false", "merge", "--no-ff", "-m", "Merge branch main into feature", "main", "-q"]);
+    git(
+      ["-c", "commit.gpgsign=false", "merge", "--no-ff", "-m", "Merge branch main into feature", "main", "-q"],
+      asAuthor("base@example.com"),
+    );
     const head = git(["rev-parse", "HEAD"]).trim();
 
     // The pinned commit's own sha is unchanged by the merge — still present
@@ -310,24 +358,28 @@ test("findLocalRangeOffenses carries a registered grandfather through a rebase (
   const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-allowlist-rebase-"));
   try {
     const git = (args, env) =>
-      execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", env: { ...process.env, ...env } });
+      execFileSync("git", args, {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: { ...process.env, ...asAuthor("base@example.com"), ...env },
+      });
     git(["init", "-q", "-b", "main"]);
-    git(["config", "user.name", "Test"]);
-    git(["config", "user.email", "base@example.com"]);
-    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"], asAuthor("base@example.com"));
     const base = git(["rev-parse", "HEAD"]).trim();
 
     git(["checkout", "-q", "-b", "feature"]);
-    git(["config", "user.email", APP_NOREPLY_EMAIL]);
     git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "pre-cutoff api-path commit", "-q"], {
+      ...asAuthor(APP_NOREPLY_EMAIL),
       GIT_AUTHOR_DATE: "2026-08-05T16:46:12Z",
       GIT_COMMITTER_DATE: "2026-08-06T01:15:46Z",
     });
     const pinnedSha = git(["rev-parse", "HEAD"]).trim();
 
     git(["checkout", "-q", "main"]);
-    git(["config", "user.email", "base@example.com"]);
-    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "unrelated main work", "-q"]);
+    git(
+      ["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "unrelated main work", "-q"],
+      asAuthor("base@example.com"),
+    );
     git(["checkout", "-q", "feature"]);
     git(["-c", "commit.gpgsign=false", "rebase", "main", "-q"]);
     const rebasedHead = git(["rev-parse", "HEAD"]).trim();

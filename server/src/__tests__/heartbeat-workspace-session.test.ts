@@ -3143,18 +3143,31 @@ describe("K8s session isolation metadata", () => {
     });
     expect(isolation?.storage.workspace).toBe("persistent");
     // BLO-31443: keeping the *workspace* persistent must not leak into the
-    // sibling storage classes. These three are the ones that would move if
-    // someone later widened `usesEphemeralWorkspace` to cover them too.
+    // sibling storage classes. `usesEphemeralWorkspace` has exactly two
+    // readers in the descriptor — `workspaceRoot` and `storage.workspace`,
+    // deliberately coupled so the mount tracks the path — and within
+    // `storage` it is read by `workspace` alone. So widening that predicate
+    // cannot move these three: `home` and `session` take the local
+    // `persistent` const, `cache` keys off `isolationMode === "shared"`.
+    // That is exactly why they are asserted here — they are the containment
+    // check on the line above, pinning that the persistence stayed where it
+    // was put rather than spreading. Moving any of them would take a
+    // different edit, in a different expression.
     expect(isolation?.storage.home).toBe("ephemeral");
     expect(isolation?.storage.session).toBe("ephemeral");
     expect(isolation?.storage.cache).toBe("ephemeral");
   });
 
   // BLO-31443: a DIFFERENT invariant from the storage classes above, split out
-  // so a failure here is not misread as the widening regression. `homeRoot` and
-  // `sessionRoot` never consult `usesEphemeralWorkspace` -- they key purely off
-  // `isolationMode` -- so that widening cannot move them. What these pin is the
-  // ephemeral root LAYOUT, which is worth catching if it ever changes silently.
+  // so a failure here is not misread as the widening regression. The split is
+  // NOT about which predicate is consulted — the two readers of
+  // `usesEphemeralWorkspace` are `workspaceRoot` and `storage.workspace`, and
+  // neither the storage trio above nor the two roots below is one of them, so
+  // both groups are equally immune to that widening. It is about which
+  // PROPERTY is pinned: above, the storage *class* attached to each root;
+  // here, the ephemeral root LAYOUT. Both derive from `isolationMode`, and a
+  // layout change is worth catching on its own rather than as a confusing
+  // second failure in the storage test.
   it("keeps the sibling roots under the per-run ephemeral root when the worktree is pinned", () => {
     const isolation = buildPrecomputedIdentityDescriptor();
     expect(isolation?.homeRoot).toBe("/runtime-cache/paperclip-runs/run-1/home");

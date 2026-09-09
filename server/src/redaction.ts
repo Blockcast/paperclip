@@ -157,7 +157,7 @@ const URI_CREDENTIAL_RE = /\b([a-z][a-z0-9+.-]*:\/\/)([^\s:/@]*):([^\s/@]+)@/gi;
  * the synthesized-`?` re-test `looksLikeCredentialValue` does.
  */
 const URL_CREDENTIAL_PARAM_VALUE_RE =
-  /([?&#](?:token|sig|signature|api[-_]?key|access[-_]?token|auth|passwd|password|credential|x-amz-signature)=)[^&\s#]+/gi;
+  /([?&#](?:token|sig|signature|api[-_]?key|access[-_]?token|authentication|auth|passwd|password|credential|x-amz-signature)=)[^&\s#]+/gi;
 
 const SECRET_TEXT_HINTS = [
   "api",
@@ -401,7 +401,7 @@ const OPAQUE_VALUE_SCHEME_PREFIX_RE = /^(?:bearer|basic|token)\s+/i;
 const URL_LIKE_VALUE_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 const PEM_BLOCK_RE = /-----BEGIN [A-Z0-9 ]+-----/;
 const URL_USERINFO_RE = /:\/\/[^/\s@]+:[^/\s@]+@/;
-const URL_CREDENTIAL_QUERY_RE = /[?&](?:token|sig|signature|api[-_]?key|access[-_]?token|auth|passwd|password|credential|x-amz-signature)=/i;
+const URL_CREDENTIAL_QUERY_RE = /[?&](?:token|sig|signature|api[-_]?key|access[-_]?token|authentication|auth|passwd|password|credential|x-amz-signature)=/i;
 const KNOWN_SECRET_PREFIX_RE = /^(?:sk-|sk_live_|pk_live_|ghp_|gho_|ghu_|ghs_|ghr_|xox[baprs]-|AKIA|glpat-|gsk_)/i;
 const JWT_LIKE_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 const MIN_OPAQUE_TOKEN_LENGTH = 20;

@@ -471,6 +471,99 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 # Pin to a release tag — bump deliberately, not via :latest.
 FROM ghcr.io/github/github-mcp-server:v1.0.3 AS github-mcp
 
+# BLO-32824: this stage previously reused `gh_token`, which is
+# `PAPERCLIP_BOARD_TOKEN` for the private `kkroo/*` vendor clone and cannot read
+# the Blockcast Penstock repository. Keep the launcher credential separate: an
+# absent or unreadable `penstock_runtime_token` must fail the build rather than
+# silently producing an agent image without the runtime.
+
+# The Penstock launcher is deliberately kept as a standalone Node script. It is
+# fetched at an immutable core commit with a credential dedicated to that
+# private repository. Do not reuse `gh_token`: that secret is
+# `PAPERCLIP_BOARD_TOKEN`, which is scoped to the private `kkroo/*` vendor
+# clone. The launcher credential is mounted only for this build step, and the
+# content digest prevents a refetch from silently changing the executable.
+FROM base AS penstock-agent-runtime
+USER root
+ARG PENSTOCK_RUNTIME_REF=2823acc1b4d730a86aded6b228f748aa12f40f53
+ARG PENSTOCK_RUNTIME_SHA256=fa6c923f78900919ec6fd3cbfe1c878078dab267e82e5faaa695d0c49f50f29e
+RUN --mount=type=secret,id=penstock_runtime_token \
+    set -eu; \
+    test -s /run/secrets/penstock_runtime_token || { \
+      echo "penstock_runtime_token is required to package the pinned launcher" >&2; \
+      exit 1; \
+    }; \
+    verify_sha256() { \
+      expected="$1"; \
+      file="$2"; \
+      actual="$(sha256sum "${file}" | awk '{print $1}')"; \
+      if [ "${actual}" != "${expected}" ]; then \
+        echo "SHA256 mismatch for ${file}: expected ${expected}, received ${actual}" >&2; \
+        return 1; \
+      fi; \
+    }; \
+    install -d -m 0755 /opt/penstock/bin; \
+    { printf 'Authorization: Bearer '; cat /run/secrets/penstock_runtime_token; printf '\n'; } | \
+      curl --fail --location --retry 5 --header @- \
+      "https://raw.githubusercontent.com/Blockcast/penstock-llm-proxy-core/${PENSTOCK_RUNTIME_REF}/scripts/penstock-agent-runtime.mjs" \
+      -o /opt/penstock/bin/penstock-agent-runtime.mjs; \
+    verify_sha256 "${PENSTOCK_RUNTIME_SHA256}" /opt/penstock/bin/penstock-agent-runtime.mjs; \
+    chmod 0555 /opt/penstock/bin/penstock-agent-runtime.mjs
+
+# Caveman is a short-lived loopback proxy per Paperclip run. Install only the
+# proxy binary from the reviewed release and verify the architecture-specific
+# upstream checksum before it is copied into the production image.
+FROM base AS caveman-proxy
+USER root
+ARG CAVEMAN_RELEASE=bin-v1.1.6
+RUN set -eu; \
+    verify_sha256() { \
+      expected="$1"; \
+      file="$2"; \
+      actual="$(sha256sum "${file}" | awk '{print $1}')"; \
+      if [ "${actual}" != "${expected}" ]; then \
+        echo "SHA256 mismatch for ${file}: expected ${expected}, received ${actual}" >&2; \
+        return 1; \
+      fi; \
+    }; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) asset=caveman-proxy_linux_amd64; expected_sha256=5085c65788a569bf978868084bc849261a2acef8c334124d6fc7240a3f83a35c ;; \
+      arm64) asset=caveman-proxy_linux_arm64; expected_sha256=6781f31728c403805e2a93af5be9e9535e4b8b1607650d8e0fbbb4b5a9b8ae52 ;; \
+      *) echo "unsupported Caveman architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    curl --fail --location --retry 5 \
+      "https://github.com/JuliusBrussee/caveman/releases/download/${CAVEMAN_RELEASE}/${asset}" \
+      -o /usr/local/bin/caveman-proxy; \
+    verify_sha256 "${expected_sha256}" /usr/local/bin/caveman-proxy; \
+    chmod 0555 /usr/local/bin/caveman-proxy
+
+# Claude Code accepts a local marketplace directory. Bake Ponytail from the
+# reviewed commit rather than registering a moving GitHub branch at pod boot.
+FROM base AS ponytail-marketplace
+USER root
+ARG PONYTAIL_REF=0a4dd63ad4541f4f655c4108a295916f3c1d8fda
+ARG PONYTAIL_HOOKS_SHA256=dd0837e870a8b81eb45ef4adebfc413a48c6daf84329befd897640f731aa0e39
+RUN set -eu; \
+    verify_sha256() { \
+      expected="$1"; \
+      file="$2"; \
+      actual="$(sha256sum "${file}" | awk '{print $1}')"; \
+      if [ "${actual}" != "${expected}" ]; then \
+        echo "SHA256 mismatch for ${file}: expected ${expected}, received ${actual}" >&2; \
+        return 1; \
+      fi; \
+    }; \
+    git clone --no-tags https://github.com/dietrichgebert/ponytail.git /tmp/ponytail; \
+    git -C /tmp/ponytail checkout --detach "${PONYTAIL_REF}"; \
+    test "$(git -C /tmp/ponytail rev-parse HEAD)" = "${PONYTAIL_REF}"; \
+    install -d -m 0755 /opt/penstock/ponytail; \
+    git -C /tmp/ponytail archive --format=tar "${PONYTAIL_REF}" \
+      | tar -x -C /opt/penstock/ponytail; \
+    verify_sha256 "${PONYTAIL_HOOKS_SHA256}" /opt/penstock/ponytail/hooks/claude-codex-hooks.json; \
+    node -e "const fs=require('node:fs');const p=JSON.parse(fs.readFileSync('/opt/penstock/ponytail/.claude-plugin/plugin.json','utf8'));if(p.name!=='ponytail'||p.version!=='4.9.0'){console.error('unexpected Ponytail plugin identity');process.exit(1)}"; \
+    chmod -R a+rX,go-w /opt/penstock/ponytail; \
+    rm -rf /tmp/ponytail
+
 FROM base AS build
 WORKDIR /app
 COPY --from=deps /app /app
@@ -521,6 +614,9 @@ COPY --from=vendor /vendor/paperclip-adapter-opencode-k8s.tgz /tmp/paperclip-bun
 # falling back to whatever npm publishes today.
 COPY --from=vendor /vendor/adapter-utils.tgz /tmp/paperclip-bundled-adapters/
 COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
+COPY --from=penstock-agent-runtime /opt/penstock/bin/penstock-agent-runtime.mjs /opt/penstock/bin/penstock-agent-runtime.mjs
+COPY --from=caveman-proxy /usr/local/bin/caveman-proxy /usr/local/bin/caveman-proxy
+COPY --from=ponytail-marketplace /opt/penstock/ponytail /opt/penstock/ponytail
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
   npm install --prefix /opt/paperclip-bundled-adapters --omit=dev --no-save --legacy-peer-deps --cache /root/.npm /tmp/paperclip-bundled-adapters/*.tgz \
   && rm -rf /tmp/paperclip-bundled-adapters \
