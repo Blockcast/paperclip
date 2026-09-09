@@ -1488,7 +1488,7 @@ export async function handleFiring(
     //
     // Both names clear the host's drop gates: each satisfies
     // PLUGIN_METRIC_NAME_REGEX and sits under the name-length bound, and this
-    // plugin mints 20 static names (no interpolation) against a
+    // plugin mints 21 static names (no interpolation) against a
     // PLUGIN_METRIC_NAME_BUDGET of 50, so neither can collapse into the shared
     // `_overflow` series. Both values are non-negative, so neither trips
     // `bad_value`.
@@ -1503,9 +1503,15 @@ export async function handleFiring(
     //     in PLUGIN_METRIC_PROMOTABLE_TAG_KEYS (`metrics.ts`); this plugin
     //     declares `["alertname", "severity", "version"]` (`manifest.ts`) and
     //     neither key is promotable in any case. So the scraped series is
-    //     dimensioned by `alertname` only. AC3's "naming the aggregate_key"
-    //     has to come from the `plugin_logs` metric row or the error thrown
-    //     below — both carry the full tag set — not from the rule's labels.
+    //     dimensioned by `tag_alertname` only — promoted tags publish under the
+    //     host's `tag_` prefix (`pluginMetricTagLabel` =
+    //     PLUGIN_METRIC_TAG_LABEL_PREFIX + key, `metrics.ts`), and the counter's
+    //     label set is built through exactly that mapper, so a rule matching a
+    //     bare `alertname` hits the same empty-vector trap as the bare
+    //     `rate(age) / rate(count)` described below. AC3's "naming the
+    //     aggregate_key" has to come from the `plugin_logs` metric row or the
+    //     error thrown below — both carry the full tag set — not from the
+    //     rule's labels.
     //   - Both series land on the SAME prom-client counter
     //     (`paperclip_plugin_metric_total`), distinguished only by the `metric`
     //     label. Prometheus matches binary operands on all labels by default,
