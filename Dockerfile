@@ -474,7 +474,7 @@ FROM ghcr.io/github/github-mcp-server:v1.0.3 AS github-mcp
 # BLO-32824: this stage previously reused `gh_token`, which is
 # `PAPERCLIP_BOARD_TOKEN` for the private `kkroo/*` vendor clone and cannot read
 # the Blockcast Penstock repository. Keep the launcher credential separate: an
-# absent or unreadable `PENSTOCK_RUNTIME_TOKEN` must fail the build rather than
+# absent or unreadable `penstock_runtime_token` must fail the build rather than
 # silently producing an agent image without the runtime.
 
 # The Penstock launcher is deliberately kept as a standalone Node script. It is
