@@ -61,8 +61,8 @@ describe("PEN-1198 audit dependency remediation", () => {
     );
     expect(overrides["jsdom>undici"]).toBe(">=7.29.0 <8");
     expect(overrides["js-yaml"]).toBe(">=4.3.1 <5");
-    expect(overrides.multer).toBe(">=2.2.0 <3");
-    expect(serverPackageJson.dependencies.multer).toBe("^2.2.0");
+    expect(overrides.multer).toBe(">=2.3.0 <3");
+    expect(serverPackageJson.dependencies.multer).toBe("^2.3.0");
   });
 
   it("documents the advisories that the patched ranges address", () => {
@@ -84,10 +84,14 @@ describe("PEN-1198 audit dependency remediation", () => {
       ]),
     });
     expect(remediations.multer).toMatchObject({
-      patchedRange: ">=2.2.0 <3",
+      patchedRange: ">=2.3.0 <3",
       advisories: expect.arrayContaining([
         "GHSA-72gw-mp4g-v24j",
         "GHSA-3p4h-7m6x-2hcm",
+        // BLO-32910: GHSA-535w-7cp7-47q4 (CVE-2026-82333) raised the floor
+        // from 2.2.0 to 2.3.0. The two advisories above are still addressed —
+        // 2.3.0 is above their 2.2.0 patch — so this stays one entry.
+        "GHSA-535w-7cp7-47q4",
       ]),
     });
     expect(remediations["js-yaml"]).toMatchObject({

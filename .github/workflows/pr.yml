@@ -503,6 +503,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm run test:browserslist-security-override
 
+      - name: Test multer security override
+        if: ${{ !cancelled() }}
+        run: pnpm run test:multer-security-override
+
       - name: Verify release package bootstrap for changed manifests
         if: ${{ !cancelled() }}
         run: |
