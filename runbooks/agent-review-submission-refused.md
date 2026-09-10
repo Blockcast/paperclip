@@ -89,6 +89,18 @@ explicitly.
 The `--body-file` path could not be read. Almost always a workspace problem
 (wrong cwd, cleaned temp dir), not a review problem.
 
+### `unparsable-request-body`
+
+Only reachable via `gh api .../pulls/{n}/reviews --input <file>`, where the file
+is the whole JSON request payload rather than raw Markdown. It means the file is
+not a JSON object, or its `body` member exists but is not a string, so the
+review text cannot be located and its attestation cannot be checked.
+
+A payload with **no** `body` member at all is fine and is allowed —
+`{"event":"APPROVE"}` is a valid review that carries no comment and therefore
+attests nothing. Have the agent emit a well-formed payload, or use
+`--body-file` with Markdown.
+
 ## Do not
 
 - **Do not disable or bypass the guard to get a review posted.** There is no
