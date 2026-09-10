@@ -1,20 +1,26 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import express from "express";
+import type { Express } from "express";
 import request from "supertest";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createApp } from "../app.js";
 
 /**
  * BLO-32164. `/healthz` is the endpoint every Kubernetes probe targets, and it
  * used to have no handler at all — requests fell through to the SPA catch-all,
  * which answered 200 with the UI shell after a synchronous `readFileSync` of
- * index.html. These tests pin the three properties that made that accident
+ * index.html. These tests pin the properties that made that accident
  * expensive, so the route cannot silently regress into a dependency again:
  *
+ *   0. it actually answers the probe contract when the real app is booted,
  *   1. it is declared before any middleware that could block or slow it,
  *   2. its handler acquires nothing (no db, no fs, not even async), and
  *   3. the path it declares still matches the path the chart actually probes.
+ *
+ * (0) runs against the real `createApp`; (1), (2) and (3) read `app.ts` as
+ * text, because ordering and dependency-freedom are properties of the
+ * declaration that a live request cannot observe once the app is assembled.
  *
  * (3) is the one that matters most: the original defect was not a bug in any
  * single file, it was code and chart disagreeing about a string.
@@ -30,19 +36,74 @@ function indexOfOrFail(haystack: string, needle: string): number {
 }
 
 describe("/healthz probe route", () => {
-  it("responds 200 without touching a database", async () => {
-    // The handler is intentionally trivial enough to restate here; the
-    // structural assertions below are what bind it to the real app.
-    const app = express();
-    app.get("/healthz", (_req, res) => {
-      res.status(200).set("Cache-Control", "no-store").json({ status: "ok" });
-    });
+  // Booted once: this is the real `createApp`, not a stand-in. An earlier
+  // revision asserted the 200 against a miniature Express app declared inside
+  // the test, which restated the handler rather than exercising it — it would
+  // have passed just as happily with the production route deleted. `db` is a
+  // bare stub because nothing on this path may touch it; if that ever stops
+  // being true, these tests fail loudly, which is the point.
+  let app: Express;
 
-    const res = await request(app).get("/healthz");
+  beforeAll(async () => {
+    app = await createApp({} as never, {
+      uiMode: "none",
+      serverPort: 0,
+      storageService: {} as never,
+      // Private + local_trusted is what turns the hostname guard ON, which the
+      // reachability test below depends on.
+      deploymentMode: "local_trusted",
+      deploymentExposure: "private",
+      allowedHostnames: [],
+      bindHost: "127.0.0.1",
+      authReady: false,
+      companyDeletionEnabled: false,
+    } as never);
+  }, 120_000);
+
+  afterAll(async () => {
+    await (app?.locals?.paperclipShutdown as undefined | (() => Promise<void>))?.();
+  });
+
+  it("answers 200 with the probe contract through the real application stack", async () => {
+    // Allowlisted Host, matching what the chart sends today, so this test
+    // isolates one question — does the production route answer correctly —
+    // rather than also depending on the guard-bypass tested below.
+    const res = await request(app).get("/healthz").set("Host", "127.0.0.1:3100");
 
     expect(res.status).toBe(200);
+    // Asserting the body and the header, not just the status, is what
+    // distinguishes "the route answered" from "the SPA catch-all answered with
+    // the UI shell" — the original BLO-32164 defect, which was also a 200.
     expect(res.body).toEqual({ status: "ok" });
     expect(res.headers["cache-control"]).toBe("no-store");
+  });
+
+  it("answers before the private-hostname guard can reject the probe", async () => {
+    // The chart currently sends `Host: 127.0.0.1:3100` to satisfy the
+    // allowlist. Being mounted ahead of the guard is what makes that header
+    // unnecessary, so probe success cannot depend on the chart and the
+    // allowlist agreeing.
+    const probe = await request(app).get("/healthz").set("Host", "not-allowlisted.example");
+
+    expect(probe.status).toBe(200);
+    expect(probe.body).toEqual({ status: "ok" });
+
+    // Control. Without this the assertion above is vacuous: it would pass just
+    // as well if the guard were disabled entirely rather than bypassed. Match
+    // the guard's own message, because an unmatched or unauthenticated path
+    // also answers 403 here — the status alone would not identify the guard.
+    const blocked = await request(app).get("/api/health").set("Host", "not-allowlisted.example");
+
+    expect(blocked.status).toBe(403);
+    expect(blocked.body?.error).toContain("not-allowlisted.example");
+    expect(blocked.body?.error).toContain("is not allowed for this Paperclip instance");
+
+    // Second control: the same path with an allowlisted Host gets *past* the
+    // guard and fails later, on the stubbed database. That pins the 403 above
+    // to the hostname specifically rather than to a blanket rejection.
+    const allowed = await request(app).get("/api/health").set("Host", "127.0.0.1:3100");
+
+    expect(allowed.status).not.toBe(403);
   });
 
   it("is declared ahead of logging, the hostname guard and actor resolution", () => {
