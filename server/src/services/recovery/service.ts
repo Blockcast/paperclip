@@ -4225,15 +4225,21 @@ export function recoveryService(
     // All three columns are written together by persistRunProcessMetadata, so
     // any one of them present means the hook DID run and the block is real
     // evidence. Requiring all three would let a partial row print the
-    // "never reports metadata" claim while showing a recorded value.
+    // non-diagnostic label over a value that was actually recorded, hiding the
+    // very instrumentation defect the label is meant to leave visible.
     const processMetadataRecorded =
       input.run.processPid !== null ||
       input.run.processGroupId !== null ||
       input.run.processStartedAt !== null ||
       hasInMemoryHandle;
+    // The empty branch is keyed on the VALUES, so it also catches a failed
+    // metadata write and an adapter that was never instrumented. We have not
+    // established this adapter's capability here, so the text must not claim
+    // one — it says the absence carries no signal AND that it cannot identify
+    // the cause, rather than asserting the benign explanation.
     const processMetadataLine = processMetadataRecorded
       ? `- Process metadata: pid \`${input.run.processPid ?? "unknown"}\`, process group \`${input.run.processGroupId ?? "unknown"}\`, in-memory handle \`${hasInMemoryHandle ? "yes" : "no"}\``
-      : "- Process metadata: none recorded. NOT DIAGNOSTIC — this adapter never reports process metadata to paperclip (it spawns its own client), so the absence is structural and says nothing about whether the process is alive.";
+      : "- Process metadata: none recorded. NOT DIAGNOSTIC — paperclip records pid/process group only when it spawned the process itself, so on an adapter that spawns its own client these columns are expected to be empty and say nothing about whether the process is alive. This branch is keyed on the absent values rather than on a capability established for this adapter, so it cannot tell that expected case apart from an instrumentation gap (a failed metadata write, or a new adapter that was never wired up). Treat the absence as evidence in neither direction, and if this adapter is supposed to report process metadata, investigate the gap separately.";
     // Same hook writes processStartedAt, so "unknown" there is the same
     // non-signal rather than a process that failed to start.
     const processStartedAtLine = input.run.processStartedAt

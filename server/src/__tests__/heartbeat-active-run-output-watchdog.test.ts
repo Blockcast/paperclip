@@ -1471,6 +1471,43 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     // The specific phrasing that read as evidence of a dead process.
     expect(wrapper!.description).not.toContain("pid `unknown`");
     expect(wrapper!.description).not.toContain("in-memory handle `no`");
+    // Ally review on #1739: the branch is keyed on the VALUES, so a failed
+    // metadata write and an uninstrumented new adapter land here too. It must
+    // therefore not assert an adapter capability it has not established, and
+    // must say out loud that it cannot separate the two causes — otherwise an
+    // instrumentation regression reads as expected behaviour.
+    expect(wrapper!.description).toContain(
+      "cannot tell that expected case apart from an instrumentation gap",
+    );
+    expect(wrapper!.description).not.toContain("this adapter never reports");
+    expect(wrapper!.description).not.toContain("absence is structural");
+  });
+
+  // Ally review on #1739: a PARTIALLY instrumented run must not be laundered
+  // into the "nothing was recorded" branch. persistRunProcessMetadata writes
+  // pid/group/startedAt together, so any one of them present proves the hook
+  // ran — printing the non-diagnostic label over a real recorded value would
+  // hide exactly the instrumentation defect this wording exists to preserve.
+  it("treats a partially recorded process row as real evidence (PEN-2432)", async () => {
+    const t0 = new Date("2026-05-24T12:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now: t0,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      agentAdapterType: "claude_local",
+    });
+    // Only the process group survived the write. Same adapter as the all-null
+    // test above, so this pins the VALUE keying rather than the adapter type.
+    await db
+      .update(heartbeatRuns)
+      .set({ processPid: null, processGroupId: 4200, processStartedAt: null })
+      .where(eq(heartbeatRuns.id, runId));
+
+    await heartbeat.scanSilentActiveRuns({ now: t0, companyId });
+    const [wrapper] = await getStaleRunWrappers(companyId);
+
+    expect(wrapper!.description).toContain("process group `4200`");
+    expect(wrapper!.description).not.toContain("Process metadata: none recorded");
+    expect(wrapper!.description).not.toContain("NOT DIAGNOSTIC");
   });
 
   it("still renders real process metadata when the adapter recorded it (PEN-2432)", async () => {

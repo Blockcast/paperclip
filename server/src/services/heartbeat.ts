@@ -15711,6 +15711,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     publish();
   }
 
+  // INVARIANT (PEN-2432): pid / processGroupId / processStartedAt are written
+  // together, in this one update, and only from the onSpawn path — i.e. only
+  // when paperclip spawned the process itself. Readers use "any one of the
+  // three is non-null" to mean "the hook ran"; note processGroupId alone may
+  // legitimately be null, so it cannot carry that signal on its own. If a
+  // future change writes these columns from anywhere else, or splits them
+  // across updates, update the non-diagnostic branch in
+  // server/src/services/recovery/service.ts that depends on this.
   async function persistRunProcessMetadata(
     runId: string,
     meta: { pid: number; processGroupId: number | null; startedAt: string },
