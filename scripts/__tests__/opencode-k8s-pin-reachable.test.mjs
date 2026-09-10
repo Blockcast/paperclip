@@ -103,3 +103,24 @@ test("the guard probes the same repo the vendor stage clones", () => {
   assert.equal(ADAPTER_REPO, "kkroo/paperclip-adapter-opencode-k8s");
   assert.match(dockerfile, new RegExp(`clone https://github\\.com/${ADAPTER_REPO}\\.git`));
 });
+
+test("the guard is wired into BOTH a PR gate and a schedule", () => {
+  // A guard wired nowhere is inert, and these two surfaces catch DIFFERENT
+  // things — dropping either silently reopens half the hole.
+  const invocation = /node \.\/scripts\/check-opencode-k8s-pin-reachable\.mjs/;
+
+  // Pre-merge: stops someone pinning an already-unreachable commit.
+  const pr = readFileSync(new URL("../../.github/workflows/pr.yml", import.meta.url), "utf8");
+  assert.match(pr, invocation, "pr.yml must run the reachability guard");
+
+  // Scheduled: the pin rots retroactively from another repo with no commit
+  // here, so no push/PR/merge_group trigger can observe it. This is the only
+  // surface that catches the case that actually broke the deploy path.
+  const monitor = readFileSync(
+    new URL("../../.github/workflows/adapter-pin-drift-monitor.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(monitor, invocation, "the drift monitor must run the reachability guard");
+  assert.match(monitor, /^\s*- cron: /m, "the drift monitor must be scheduled, not only manual");
+  assert.match(monitor, /ref: master/, "it must check master, not the default checkout");
+});
