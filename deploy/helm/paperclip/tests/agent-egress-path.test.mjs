@@ -268,3 +268,143 @@ test("the Blockcast overlay renders the PATH the chart now derives", () => {
     "/paperclip/.local/bin:/paperclip/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
   );
 });
+
+// --- The second door: the github MCP server (PEN-3152) --------------------
+//
+// The `gh` tests above turn on PATH ordering, because `gh` is resolved by name.
+// The MCP door is reached differently and so fails differently: the seeded
+// `.mcp.json` names an ABSOLUTE command, so PATH is irrelevant and the
+// equivalent question is whether that absolute path is the scrubbing wrapper or
+// the image server. PEN-3152 was filed because it was the latter — the wrapper
+// existed and injected a token, and no scrubber sat on the path.
+//
+// Same discipline as above: read both halves out of the render, and never
+// restate the value under test.
+//
+// One asymmetry worth naming rather than fixing here: the `gh` door's
+// reachability follows `persistence.mountPath` (see the test above), whereas
+// both the MCP wrapper's inner exec and the seeded command hardcode
+// `/paperclip/.local/bin`. That coupling predates PEN-3152 — the wrapper it
+// replaced hardcoded the same path — and the two halves hardcode it
+// consistently, so it holds at the default mountPath. The assertions below pin
+// the current reality; they are not an endorsement of the hardcode.
+
+// One wrapper's heredoc body, lifted from the rendered seed script. Asserts
+// rather than returning empty, so deleting a wrapper fails loudly.
+function extractWrapperBody(rendered, name) {
+  const lines = rendered.split("\n");
+  const startIdx = lines.findIndex(
+    (line) => line.trim() === `cat > "\${LOCAL_BIN}/${name}" <<'EOF'`,
+  );
+  assert.notEqual(startIdx, -1, `seed script no longer writes a ${name} wrapper`);
+  const body = [];
+  for (let i = startIdx + 1; i < lines.length; i += 1) {
+    if (lines[i].trim() === "EOF") return body.join("\n");
+    body.push(lines[i].trim());
+  }
+  throw new Error(`${name} wrapper heredoc is not terminated`);
+}
+
+// The `github` upstream's command as the seeded .mcp.json carries it.
+function seededMcpGitHubCommand(rendered) {
+  const match = /"github":\s*\{\s*"command":\s*"([^"]+)"/.exec(rendered);
+  assert.notEqual(match, null, "the seeded mcpServers block no longer has a github command");
+  return match[1];
+}
+
+test("the seeded github MCP upstream dials the scrubbing wrapper, not the image server", () => {
+  const rendered = render("templates/statefulset.yaml");
+  const command = seededMcpGitHubCommand(rendered);
+
+  // The whole control rests on this indirection. Pointing the seed at
+  // /usr/local/bin/github-mcp-server restores the PEN-3152 gap exactly, while
+  // leaving every wrapper assertion in this file green.
+  assert.equal(command, "/paperclip/.local/bin/github-mcp-server");
+
+  // ...and the thing it names must be a wrapper the seed actually writes.
+  assert.ok(
+    rendered.includes(`cat > "\${LOCAL_BIN}/${path.basename(command)}" <<'EOF'`),
+    `the seed does not write a ${path.basename(command)} wrapper for the mcp.json command to reach`,
+  );
+});
+
+test("the rendered github-mcp-server wrapper execs the scrub runtime inside the token wrapper", () => {
+  const body = extractWrapperBody(render("templates/statefulset.yaml"), "github-mcp-server");
+
+  const tokenAt = body.indexOf("paperclip-github-token-env");
+  const runtimeAt = body.indexOf("github-mcp-egress-runtime.js");
+  assert.notEqual(tokenAt, -1, "the MCP wrapper no longer injects the seat token");
+  assert.notEqual(runtimeAt, -1, "the MCP wrapper no longer execs the egress scrub runtime");
+
+  // Ordering is load-bearing in one direction only. The token wrapper must be
+  // OUTERMOST so the real server still inherits GITHUB_PERSONAL_ACCESS_TOKEN;
+  // putting the scrub outside it would start the server unauthenticated and
+  // fail every tool call, which is the shape that gets a security control
+  // reverted rather than fixed.
+  assert.ok(runtimeAt > tokenAt, `scrub runtime must run inside the token wrapper: ${body}`);
+
+  // The CLI runtime rewrites argv and the MCP runtime rewrites JSON-RPC frames;
+  // they are not interchangeable. Pointing this wrapper at the CLI runtime
+  // yields a process that starts, scrubs nothing, and looks plausible.
+  assert.ok(
+    !body.includes("github-cli-egress-runtime.js"),
+    "the MCP wrapper must not exec the CLI runtime",
+  );
+});
+
+test("the rendered MCP wrapper hands the real server to the scrub runtime as its target, with args after it", () => {
+  // Execute the wrapper the chart actually renders, with each absolute path
+  // replaced by a stub, so this fails if the exec chain is reordered — a
+  // runtime that received `stdio` as its target and the server path as an
+  // argument would still "run", and would scrub nothing.
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "gh-mcp-egress-"));
+  const stubs = path.join(base, "stubs");
+  fs.mkdirSync(stubs, { recursive: true });
+
+  const body = extractWrapperBody(render("templates/statefulset.yaml"), "github-mcp-server");
+  const execLine = body.split("\n").find((line) => line.startsWith("exec "));
+  assert.ok(execLine, `no exec line in the MCP wrapper: ${body}`);
+
+  // Stand-ins, each preserving the real component's argv contract: token-env
+  // and node both exec their remaining argv; the runtime reports what it got.
+  const tokenEnv = writeExecutable(stubs, "token-env", '#!/bin/sh\nexec "$@"\n');
+  const node = writeExecutable(stubs, "node", '#!/bin/sh\nexec "$@"\n');
+  const runtime = writeExecutable(
+    stubs,
+    "runtime",
+    '#!/bin/sh\nprintf "args=%s\\n" "$*"\n',
+  );
+
+  const rewritten = execLine
+    .replace("/paperclip/.local/bin/paperclip-github-token-env", tokenEnv)
+    .replace("/usr/local/bin/node", node)
+    .replace(/\S*github-mcp-egress-runtime\.js/, runtime);
+
+  // The rewrite must have consumed every path this host lacks, or the
+  // assertions below would be testing a line that cannot run for the wrong
+  // reason.
+  assert.ok(
+    !rewritten.includes("/paperclip/.local/bin/paperclip-github-token-env"),
+    `token-env path not substituted: ${rewritten}`,
+  );
+  assert.ok(
+    !rewritten.includes("github-mcp-egress-runtime.js"),
+    `runtime path not substituted: ${rewritten}`,
+  );
+
+  // "$@" in the wrapper takes the mcp.json args; $0 is supplied separately.
+  const result = spawnSync("/bin/sh", ["-c", rewritten, "sh", "stdio"], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  // The real server must be the runtime's target, with the mcp.json args after
+  // it — which is the argv contract github-mcp-egress-runtime.js reads as
+  // process.argv[2] (target) and slice(3) (args).
+  assert.equal(
+    result.stdout.trim(),
+    "args=/usr/local/bin/github-mcp-server stdio",
+    `unexpected argv threading: ${result.stdout}`,
+  );
+});
+
