@@ -432,6 +432,8 @@ describeEmbeddedPostgres("recovery observability report", () => {
       status: "escalated",
       ownerAgentId: managerId,
       sourceIssueIdentifier: "SRC-1",
+      nonDeliverySweepCount: 0,
+      retiringBound: null,
     });
 
     const resolved = await service.listActions(companyId, { status: "resolved" });
