@@ -33,6 +33,10 @@ describe("findMissingHookCommandPaths", () => {
     // in an HTTP handler, so token count is a direct multiplier on how long the
     // API event loop blocks. Before the cap, a 10 MB body measured ~4 s of
     // blocking (BLO-28872 review). Assert the ceiling, not just "it returns".
+    //
+    // Note the shape that exercises the cap changed with BLO-29505: 5000
+    // space-separated tokens are now *one* simple command, so only argv[0] is
+    // ever stat'd. The chained form below is the one the cap still binds.
     const calls: string[] = [];
     const command = Array.from({ length: 5000 }, (_, i) => `/x${i}.sh`).join(" ");
     findMissingHookCommandPaths(command, {
@@ -42,8 +46,24 @@ describe("findMissingHookCommandPaths", () => {
       },
     });
     expect(calls.length).toBeLessThanOrEqual(64);
-    // Non-vacuous: without the cap this would be 5000.
     expect(calls.length).toBeGreaterThan(0);
+  });
+
+  it("bounds stats when every token is its own simple command", () => {
+    // The mutation-verified case for MAX_AUDITED_TOKENS after BLO-29505: 5000
+    // `&&`-chained commands are 5000 argv[0]s, so without the word cap this
+    // would be 5000 synchronous stats on the API event loop.
+    const calls: string[] = [];
+    const command = Array.from({ length: 5000 }, (_, i) => `node /x${i}.js`).join(" && ");
+    findMissingHookCommandPaths(command, {
+      fileExists: (p) => {
+        calls.push(p);
+        return false;
+      },
+    });
+    expect(calls.length).toBeLessThanOrEqual(64);
+    // Non-vacuous: without the cap this would be 5000.
+    expect(calls.length).toBeGreaterThan(1);
   });
 
   it("flags the exact BLO-28782 production command", () => {
@@ -104,6 +124,172 @@ describe("findMissingHookCommandPaths", () => {
     );
     expect(missing).toEqual(["/app/a.js", "/app/b.sh"]);
   });
+});
+
+// BLO-29505 Part A. Every row here was a *false positive* before the fix: the
+// audit flagged any absolute script-extension token regardless of argv
+// position, so a command that legitimately *creates* its `--out` target warned
+// on a correct configuration. The assertion is `[]` in both filesystem states —
+// whether or not the output path exists is irrelevant, because an output path
+// is never stat'd.
+describe("findMissingHookCommandPaths — argument-position paths are not commands", () => {
+  const argumentPositionCases: {
+    command: string;
+    /** The real script, which exists. */
+    script: string;
+    /** The argument-position path that must never be stat'd. */
+    argument: string;
+  }[] = [
+    {
+      command: "python3 /app/hook.py --out /var/run/state.py",
+      script: "/app/hook.py",
+      argument: "/var/run/state.py",
+    },
+    {
+      command: "node /app/build.js --emit /app/dist/bundle.js",
+      script: "/app/build.js",
+      argument: "/app/dist/bundle.js",
+    },
+    {
+      command: "bash /app/run.sh --template /srv/tpl/new.sh",
+      script: "/app/run.sh",
+      argument: "/srv/tpl/new.sh",
+    },
+  ];
+
+  for (const { command, script, argument } of argumentPositionCases) {
+    it(`yields no finding for \`${command}\``, () => {
+      expect(findMissingHookCommandPaths(command, fsWith(script))).toEqual([]);
+      // …and identically when the output path happens to exist already.
+      expect(findMissingHookCommandPaths(command, fsWith(script, argument))).toEqual([]);
+    });
+
+    it(`never stats the argument-position path of \`${command}\``, () => {
+      const stated: string[] = [];
+      findMissingHookCommandPaths(command, {
+        fileExists: (p) => {
+          stated.push(p);
+          return true;
+        },
+      });
+      expect(stated).toEqual([script]);
+      expect(stated).not.toContain(argument);
+    });
+  }
+
+  it("still flags the script when it is the missing one", () => {
+    // Non-vacuous control for the rows above: narrowing to command position
+    // must not make the check silent on the case it exists to catch.
+    expect(
+      findMissingHookCommandPaths(
+        "python3 /app/hook.py --out /var/run/state.py",
+        fsWith("/var/run/state.py"),
+      ),
+    ).toEqual(["/app/hook.py"]);
+  });
+});
+
+// BLO-29505 Part B. All ten rows passed *silently* before the fix — no warning
+// at all. Two root causes: `split(/\s+/)` shredded a quoted path containing a
+// space, and shell metacharacters disqualified the token they were glued to
+// instead of splitting it. Each row now asserts an explicit expectation; no row
+// is left implicitly silent.
+describe("findMissingHookCommandPaths — previously silent recall gaps", () => {
+  const recallCases: { label: string; command: string; expected: string[] }[] = [
+    {
+      label: "quoted path containing a space",
+      command: `bash "/paperclip/my scripts/relogin.sh"`,
+      expected: ["/paperclip/my scripts/relogin.sh"],
+    },
+    {
+      label: "case-variant extension",
+      command: "node /app/GONE.JS",
+      expected: ["/app/GONE.JS"],
+    },
+    {
+      label: "extensionless wrapper binary",
+      command: "exec /app/bin/relogin",
+      expected: ["/app/bin/relogin"],
+    },
+    {
+      label: "interpreters outside the old extension list",
+      command: "ruby /app/gone.rb && perl /app/gone.pl",
+      expected: ["/app/gone.rb", "/app/gone.pl"],
+    },
+    {
+      label: "semicolon glued to the token",
+      command: "node /app/gone.js; echo done",
+      expected: ["/app/gone.js"],
+    },
+    {
+      label: "&& glued to the token",
+      command: "node /app/gone.js&&echo ok",
+      expected: ["/app/gone.js"],
+    },
+    {
+      label: "wrapped in a subshell",
+      command: "(node /app/gone.js)",
+      expected: ["/app/gone.js"],
+    },
+    {
+      label: "piped into another command",
+      command: "bash /app/gone.sh|tee /tmp/x",
+      expected: ["/app/gone.sh"],
+    },
+    {
+      label: "redirect glued to the token",
+      command: "node /app/gone.js>/tmp/out",
+      expected: ["/app/gone.js"],
+    },
+    {
+      label: "literal ~ mid-path behind an env assignment",
+      command: "FOO=1 bash /app/my~dir/gone.sh",
+      expected: ["/app/my~dir/gone.sh"],
+    },
+  ];
+
+  for (const { label, command, expected } of recallCases) {
+    it(`flags ${label}: \`${command}\``, () => {
+      expect(findMissingHookCommandPaths(command, fsWith())).toEqual(expected);
+    });
+  }
+
+  it("does not treat a redirect target as a command", () => {
+    // `>/tmp/out` is written by the command, so its absence is not a finding —
+    // the row above must be flagging the script and nothing else.
+    expect(findMissingHookCommandPaths("node /app/gone.js>/tmp/out", fsWith())).not.toContain(
+      "/tmp/out",
+    );
+  });
+
+  it("resolves the script behind an absolute env wrapper", () => {
+    expect(
+      findMissingHookCommandPaths("/usr/bin/env node /app/gone.js", fsWith("/usr/bin/env")),
+    ).toEqual(["/app/gone.js"]);
+  });
+});
+
+// Documented skips: these stay silent on purpose. Asserting them keeps the
+// module header's stated limits honest — if a later change starts flagging one,
+// a test fails rather than an operator getting a warning we cannot stand behind.
+describe("findMissingHookCommandPaths — documented deliberate skips", () => {
+  const skipCases: { label: string; command: string }[] = [
+    { label: "bare argv[0] resolved via PATH", command: "ccrotate refresh-one" },
+    { label: "relative path (cwd-dependent)", command: "node ./scripts/hook.js" },
+    { label: "unquoted $VAR interpolation", command: "node $PAPERCLIP_HOME/cli/hook.js" },
+    { label: "leading ~ (tilde expansion)", command: "bash ~/scripts/hook.sh" },
+    { label: "glob in the path", command: "bash /app/*/hook.sh" },
+    { label: "brace expansion", command: "bash /app/{a,b}/hook.sh" },
+    { label: "command substitution", command: "bash $(which hook.sh)" },
+    { label: "inner command of bash -c", command: `bash -c "node /app/gone.js"` },
+    { label: "second operand of an interpreter", command: "node /app/ok.js /app/gone.js" },
+  ];
+
+  for (const { label, command } of skipCases) {
+    it(`stays silent for ${label}: \`${command}\``, () => {
+      expect(findMissingHookCommandPaths(command, fsWith("/app/ok.js"))).toEqual([]);
+    });
+  }
 });
 
 describe("auditHookCommands", () => {
