@@ -282,6 +282,16 @@ describe("findMissingHookCommandPaths — documented deliberate skips", () => {
     { label: "brace expansion", command: "bash /app/{a,b}/hook.sh" },
     { label: "command substitution", command: "bash $(which hook.sh)" },
     { label: "inner command of bash -c", command: `bash -c "node /app/gone.js"` },
+    // An absolute path inside a `-c` string is a *command string*, not a
+    // filename. Statting it would report `/app/gone.sh --force` missing — a
+    // path with a space and a flag in it, which is a false positive of exactly
+    // the kind this change removes.
+    { label: "absolute path inside a bash -c string", command: `bash -c "/app/gone.sh --force"` },
+    { label: "absolute path inside a sh -c string", command: `sh -c '/app/gone.sh && echo ok'` },
+    { label: "node -e inline code", command: `node -e "require('/app/gone.js')"` },
+    { label: "python3 -m module", command: "python3 -m /app/gone.py" },
+    { label: "perl -e inline code", command: `perl -e '/app/gone.pl'` },
+    { label: "--eval= attached form", command: `node --eval="/app/gone.js"` },
     { label: "second operand of an interpreter", command: "node /app/ok.js /app/gone.js" },
   ];
 
