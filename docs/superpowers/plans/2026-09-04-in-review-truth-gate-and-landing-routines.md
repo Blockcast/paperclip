@@ -846,8 +846,7 @@ function review(opts: {
     lines.push("- **prior:731ced5 important 1; correctness** — still-present — the null check is still missing");
   }
   lines.push("### Suggestions (0)", "### Recommended Action", "Land as-is.");
-  return lines.join("
-");
+  return lines.join("\n");
 }
 
 describe("ally-review-verdict", () => {
@@ -873,8 +872,7 @@ describe("ally-review-verdict", () => {
     expect(canonicalReviewHead(review({ headings: 2 }))).toBeNull();
   });
   it("returns null head when there is no attestation line", () => {
-    expect(canonicalReviewHead("## Ally — Consolidated PR Review
-### Critical Issues (0)")).toBeNull();
+    expect(canonicalReviewHead("## Ally — Consolidated PR Review\n### Critical Issues (0)")).toBeNull();
   });
   it("rejects when headSha is missing", () => {
     expect(isAllyCleanAtHead(review({}), null)).toBe(false);
@@ -1255,7 +1253,9 @@ git commit -m "feat(evidence): accept external truth detections and a flag-gated
 
 **Interfaces:**
 - Consumes: `isAllyLogin`, `isAllyCleanAtHead` from B1; `EvidenceShape` from B2.
-- Produces: `type TruthProbe = (input: TruthProbeInput) => Promise<TruthProbeResult>`; `interface TruthProbeInput { workProducts: Array<{ type: string; metadata: Record<string, unknown> | null }>; commentText: string }`; `interface TruthProbeResult { detections: Partial<Record<EvidenceShape, boolean>>; diagnostics: string[] }`; `interface PrRef { repoFullName: string; prNumber: number }`; `extractPrRefs(text: string): PrRef[]`; `prRefsFromWorkProducts(workProducts): PrRef[]`; `interface GithubTruthDeps { fetchHeadSha; listReviews; listComments; getPullRequestGate }`; `buildGithubTruthProbe(deps: GithubTruthDeps): TruthProbe`.
+- Produces: `type TruthProbe = (input: TruthProbeInput) => Promise<TruthProbeResult>`; `interface TruthProbeInput { workProducts: Array<{ type: string; metadata: Record<string, unknown> | null }>; commentText: string }`; `interface TruthProbeResult { detections: Partial<Record<EvidenceShape, boolean>>; diagnostics: string[] }`; `interface PrRef { repoFullName: string; prNumber: number }`; `extractPrRefs(text: string): PrRef[]`; `prRefsFromWorkProducts(workProducts): PrRef[]`; `interface GithubTruthDeps { allowedRepoFullNames; fetchHeadSha; listReviews; listComments; getPullRequestGate }`; `buildGithubTruthProbe(deps: GithubTruthDeps): TruthProbe`.
+
+> ⚠ **`allowedRepoFullNames` is a security boundary, not a convenience filter.** `extractPrRefs` parses *any* `github.com/<owner>/<repo>/pull/<n>` URL out of free-text comment bodies, and `prRefsFromWorkProducts` trusts whatever `repoFullName` a work product carries. Without the allowlist, an issue could satisfy `review:ally-clean` and `deploy:landed` by citing a merged, cleanly-reviewed PR from an unrelated repository — the gate would fetch it, find a real Ally approval at its real head, and pass. The filter therefore runs **before any GitHub call**, and an all-out-of-scope ref list returns **no detections** rather than an empty pass.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1282,6 +1282,7 @@ const WP = [{ type: "pull_request", metadata: { repoFullName: "Blockcast/papercl
 
 function deps(over: Partial<GithubTruthDeps> = {}): GithubTruthDeps {
   return {
+    allowedRepoFullNames: ["Blockcast/paperclip"],
     fetchHeadSha: async () => HEAD,
     listReviews: async () => [{ login: "allyblockcast[bot]", body: CLEAN }],
     listComments: async () => [],
@@ -1350,6 +1351,40 @@ describe("buildGithubTruthProbe", () => {
     }))({ workProducts: two, commentText: "" });
     expect(r.detections["deploy:landed"]).toBeUndefined();
     expect(r.detections["review:ally-clean"]).toBe(true);
+  });
+  it("a merged, Ally-clean PR in an UNRELATED repo yields no detections and makes no GitHub call", async () => {
+    // The stubs below would all report "merged and clean" if they were ever reached.
+    let called = 0;
+    const probe = buildGithubTruthProbe(deps({
+      fetchHeadSha: async () => { called += 1; return HEAD; },
+      getPullRequestGate: async () => { called += 1; return { state: "closed", merged: true }; },
+    }));
+    const foreign = [{ type: "pull_request", metadata: { repoFullName: "attacker/other-repo", prNumber: 1 } }];
+    const r = await probe({ workProducts: foreign, commentText: "" });
+    expect(r.detections).toEqual({});
+    expect(r.diagnostics).toEqual(["github-truth-probe-rejected-repo:attacker/other-repo#1"]);
+    expect(called).toBe(0);
+  });
+  it("rejects an unrelated repo cited only as a URL in comment text", async () => {
+    const r = await buildGithubTruthProbe(deps())({
+      workProducts: [],
+      commentText: "landed https://github.com/attacker/other-repo/pull/7",
+    });
+    expect(r.detections).toEqual({});
+    expect(r.diagnostics).toEqual(["github-truth-probe-rejected-repo:attacker/other-repo#7"]);
+  });
+  it("allowlist matching is case-insensitive", async () => {
+    const r = await buildGithubTruthProbe(deps())({
+      workProducts: [{ type: "pull_request", metadata: { repoFullName: "blockcast/PAPERCLIP", prNumber: 1588 } }],
+      commentText: "",
+    });
+    expect(r.detections["deploy:landed"]).toBe(true);
+  });
+  it("keeps in-scope refs and drops out-of-scope ones in a mixed list", async () => {
+    const mixed = [...WP, { type: "pull_request", metadata: { repoFullName: "attacker/other-repo", prNumber: 2 } }];
+    const r = await buildGithubTruthProbe(deps())({ workProducts: mixed, commentText: "" });
+    expect(r.detections["deploy:landed"]).toBe(true);
+    expect(r.diagnostics).toEqual(["github-truth-probe-rejected-repo:attacker/other-repo#2"]);
   });
 });
 ```
@@ -1431,6 +1466,13 @@ export function prRefsFromWorkProducts(workProducts: TruthWorkProduct[]): PrRef[
 }
 
 export interface GithubTruthDeps {
+  /**
+   * Repositories whose PRs may satisfy `review:ally-clean` / `deploy:landed`.
+   * SECURITY: without this, any issue could cite a merged, Ally-clean PR from an
+   * unrelated public repository and pass the gate on someone else's work. Refs
+   * outside this set are dropped BEFORE any GitHub call is made.
+   */
+  allowedRepoFullNames: readonly string[];
   fetchHeadSha: (ref: PrRef) => Promise<string | null>;
   listReviews: (ref: PrRef) => Promise<Array<{ login: string | null; body: string }> | null>;
   listComments: (ref: PrRef) => Promise<Array<{ login: string | null; body: string }> | null>;
@@ -1440,11 +1482,22 @@ export interface GithubTruthDeps {
 }
 
 export function buildGithubTruthProbe(deps: GithubTruthDeps): TruthProbe {
+  // GitHub repo names are case-insensitive; compare normalized.
+  const allowed = new Set(deps.allowedRepoFullNames.map((r) => r.toLowerCase()));
   return async ({ workProducts, commentText }) => {
     const diagnostics: string[] = [];
     let refs = prRefsFromWorkProducts(workProducts);
     if (refs.length === 0) refs = extractPrRefs(commentText);
     if (refs.length === 0) return { detections: {}, diagnostics: ["no-pull-request-work-product"] };
+
+    // Fail closed on out-of-scope repositories, before any network call.
+    const inScope = refs.filter((ref) => {
+      if (allowed.has(ref.repoFullName.toLowerCase())) return true;
+      diagnostics.push(`github-truth-probe-rejected-repo:${ref.repoFullName}#${ref.prNumber}`);
+      return false;
+    });
+    if (inScope.length === 0) return { detections: {}, diagnostics };
+    refs = inScope;
 
     let allMerged = true;
     let allClean = true;
@@ -1484,11 +1537,13 @@ export function buildGithubTruthProbe(deps: GithubTruthDeps): TruthProbe {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `pnpm exec vitest run server/src/services/evidence-truth.test.ts`
-Expected: PASS, 11 tests.
+Expected: PASS, 15 tests.
 
 - [ ] **Step 5: Mutation check, then commit**
 
 Change `if (allMerged)` to `if (true)`; confirm "open PR → deploy:landed absent" FAILS; restore.
+
+Then mutate the security boundary specifically: make the allowlist filter a no-op (`const inScope = refs;`) and confirm **"a merged, Ally-clean PR in an UNRELATED repo yields no detections and makes no GitHub call"** FAILS; restore. A passing suite with that filter removed would mean the allowlist is untested.
 
 ```bash
 git add server/src/services/evidence-truth.ts server/src/services/evidence-truth.test.ts
@@ -1512,15 +1567,9 @@ Append to `server/src/__tests__/evidence-gate-wiring.test.ts` (use the file's ex
 ```ts
 it("runEvidenceGate merges truth-probe detections and diagnostics", async () => {
   const fetch = async () => ({
-    description: "Do it.
-## Done when
-- a
-",
+    description: "Do it.\n## Done when\n- a\n",
     labels: [],
-    comments: [{ body: "| Criterion | Status | Evidence |
-|---|---|---|
-| a | ✅ | x |
-https://github.com/Blockcast/paperclip/pull/1588", authorAgentId: "agent-1", authorUserId: null, createdAt: new Date("2026-09-05T00:00:00Z") }],
+    comments: [{ body: "| Criterion | Status | Evidence |\n|---|---|---|\n| a | ✅ | x |\nhttps://github.com/Blockcast/paperclip/pull/1588", authorAgentId: "agent-1", authorUserId: null, createdAt: new Date("2026-09-05T00:00:00Z") }],
     workProducts: [],
   });
   const truth = async () => ({ detections: { "review:ally-clean": true, "deploy:landed": true }, diagnostics: ["probe-ran"] });
@@ -1531,14 +1580,9 @@ https://github.com/Blockcast/paperclip/pull/1588", authorAgentId: "agent-1", aut
 
 it("runEvidenceGate without a probe leaves truth shapes missing (warn)", async () => {
   const fetch = async () => ({
-    description: "Do it.
-## Done when
-- a
-",
+    description: "Do it.\n## Done when\n- a\n",
     labels: [],
-    comments: [{ body: "| Criterion | Status | Evidence |
-|---|---|---|
-| a | ✅ | x |", authorAgentId: "agent-1", authorUserId: null, createdAt: new Date("2026-09-05T00:00:00Z") }],
+    comments: [{ body: "| Criterion | Status | Evidence |\n|---|---|---|\n| a | ✅ | x |", authorAgentId: "agent-1", authorUserId: null, createdAt: new Date("2026-09-05T00:00:00Z") }],
     workProducts: [],
   });
   const record = await runEvidenceGate(fetch, "issue-1", new Date("2026-09-05T00:01:00Z"));
@@ -1582,9 +1626,7 @@ After the operator-override early return and before `const evaluation = evaluate
     const commentText = data.comments
       .filter((c) => c.authorAgentId !== null)
       .map((c) => c.body)
-      .join("
-
-");
+      .join("\n\n");
     const probed = await truth({
       workProducts: data.workProducts.map((wp) => ({ type: wp.type, metadata: wp.metadata })),
       commentText,
@@ -1648,6 +1690,12 @@ Next to `DURABLE_LANDING_SHAPES` (line 2176):
 const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact", "deploy:landed"] as const;
 
 const githubTruthProbe: TruthProbe = buildGithubTruthProbe({
+  // Only PRs in repositories this control plane actually owns may satisfy the
+  // gate. Adding a repo is a deliberate edit here, never a run-time inference.
+  allowedRepoFullNames: (process.env.PAPERCLIP_EVIDENCE_ALLOWED_REPOS ?? "Blockcast/paperclip")
+    .split(",")
+    .map((r) => r.trim())
+    .filter((r) => r.length > 0),
   fetchHeadSha: (ref) => githubFetchPrHeadSha(ref),
   listReviews: (ref) => githubListPrReviewsWithTimestamps(ref),
   listComments: (ref) => githubListIssueCommentsWithTimestamps(ref),
@@ -2009,6 +2057,25 @@ For each open, non-draft PR in each repo, run:
    > The question for whoever owns it: are `Storybook visual regression=SKIPPED` and `security-review=NEUTRAL` accepted as passing verdicts on this repo? If **yes**, record that decision here as a stated policy with an owner and a date, and the `policy-hold` reason becomes a pass by reference to that decision — still not an exception invented by the routine. If **no**, the two checks should stop emitting non-success verdicts, and until they do this routine correctly merges nothing.
 4. A canonical Ally review exists at the CURRENT head. Search reviews and comments for a body that contains exactly one line "## Ally — Consolidated PR Review" and exactly one line matching "Reviewed head: <40-hex>" where the hex equals headRefOid. That body must have no "### Critical Issues (N)" or "### Important Issues (N)" with N above 0, and no line matching "- **prior:...** — still-present —". Otherwise skip, reason "review:<stale-head|blocking|missing>".
 5. mergeStateStatus is "CLEAN" or "BEHIND". "BLOCKED": go to the CODEOWNERS step. "DIRTY", "UNSTABLE", "UNKNOWN": skip, reason "merge-state:<value>".
+
+## Pre-merge revalidation (MANDATORY — the candidate test alone is not sufficient)
+
+Every criterion above is bound to a specific head. The candidate pass reads `headRefOid`, checks, review bodies and merge state in **one** `gh pr view`; `gh pr merge` happens later, after the CODEOWNERS read and after every earlier PR in the fire. **A push landing in that window makes the decision apply to a head nobody evaluated.**
+
+Nothing else catches this on `Blockcast/paperclip`:
+
+- `--auto` waits only for signals the repo declares **required**, and this repo declares none — `rules/branches/master` returns a single `merge_queue` rule with no `required_status_checks`. So the platform re-validates nothing on the agent's behalf.
+- The merge queue's `ALLGREEN` build *does* re-run CI on the `merge_group` ref, so criterion 3 is re-checked by the queue. **Criterion 4 is not.** No machinery anywhere re-reads the Ally attestation, so a push after evaluation yields exactly the failure Ally's own gate exists to prevent: a head merged with a review that attests a different commit.
+
+So, immediately before each `gh pr merge`, with no intervening steps:
+
+    HEAD_AT_EVAL="<headRefOid captured during the candidate test>"
+    HEAD_NOW=$(gh pr view <n> -R <repo> --json headRefOid --jq .headRefOid)
+    [ "$HEAD_NOW" = "$HEAD_AT_EVAL" ] || { echo "skip <n> head-moved:${HEAD_AT_EVAL}->${HEAD_NOW}"; continue; }
+
+1. If the head changed, **skip**, reason `head-moved:<old>-><new>`. Do not re-evaluate and merge in the same pass — re-evaluating here would reintroduce the same window one level down. Let the next fire pick it up as an ordinary candidate.
+2. If the head is unchanged, re-run criteria **3, 4 and 5** against this second read before enqueueing. An unchanged head does not by itself mean the gates still hold: a check can go red, a review can be dismissed, or `mergeStateStatus` can move to `DIRTY` with no new commit. Re-read, do not assume.
+3. Record the head you merged in the receipt (`merged:<n>@<40-hex>`), so a later audit can prove which commit the decision was made against rather than inferring it from timestamps.
 
 ## Actions
 
@@ -2596,9 +2663,19 @@ Run: the commands above.  Expected: a validator line listing `request_board_appr
 cat > /tmp/track-d/insert_skill_docs.py <<'PY'
 #!/usr/bin/env python3
 """Insert Track D text into the two skill files using unique markers."""
+import os
 import sys
 
-ROOT = "$TRACK_D_WT"
+# The heredoc below is quoted (<<'PY'), so the shell performs NO expansion here:
+# writing ROOT = "$TRACK_D_WT" would store that string literally and target a
+# directory actually named "$TRACK_D_WT". Read the value from the environment,
+# and fail loudly if it is unset or does not point at a real worktree.
+try:
+    ROOT = os.environ["TRACK_D_WT"]
+except KeyError:
+    sys.exit("TRACK_D_WT is not exported; run: export TRACK_D_WT=...")
+if not os.path.isdir(ROOT):
+    sys.exit(f"TRACK_D_WT does not resolve to a directory: {ROOT!r}")
 P = f"{ROOT}/skills/paperclip/SKILL.md"
 E = f"{ROOT}/skills/paperclip-evidence-before-in-review/SKILL.md"
 
@@ -2618,19 +2695,17 @@ def replace_once(path, old, new):
     open(path, "w").write(body.replace(old, new, 1))
 
 
-insert_after(P, "Never ask a human to do what an agent _could_ do. Rule number 1.
-",
-             open("/tmp/track-d/block_rule1.md").read())
-insert_after(E, "### 4. Only THEN transition to in_review
-", "")
+insert_after(
+    P,
+    "Never ask a human to do what an agent _could_ do. Rule number 1.\n",
+    open("/tmp/track-d/block_rule1.md").read(),
+)
+insert_after(E, "### 4. Only THEN transition to in_review\n", "")
 body = open(E).read()
-anchor = "
-## Anti-patterns
-"
+anchor = "\n## Anti-patterns\n"
 if body.count(anchor) != 1:
     sys.exit("Anti-patterns heading not unique")
-body = body.replace(anchor, "
-" + open("/tmp/track-d/block_priv.md").read() + anchor, 1)
+body = body.replace(anchor, "\n" + open("/tmp/track-d/block_priv.md").read() + anchor, 1)
 open(E, "w").write(body)
 print("inserted")
 PY
@@ -2678,15 +2753,16 @@ Run: `grep -c 'typed_execution_state_current_participant' /tmp/track-d/block_rul
 cat > /tmp/track-d/block_priv.md <<'MD'
 ### Requesting privileged access
 
-Agents cannot read or grant elevation. Elevation is decided in magma tenants (`ApprovalsService`) by two distinct human approvers and enforced by the `bc-protected-secret-write` ValidatingAdmissionPolicy, which reads the `bc-elevation/bc-active-elevations` ConfigMap. Your Kubernetes subject is `system:serviceaccount:paperclip:<sa-name>`. When a task needs a write that the policy denies: do not retry, do not hand the issue to a human assignee, and do not ask for a permanent RBAC change. File a `request_board_approval` approval with the payload below, add the approval as a first-class blocker, and keep the issue `in_progress`.
+Agents cannot read or grant elevation. Elevation is decided in magma tenants (`ApprovalsService`) by two distinct human approvers and enforced by the `bc-protected-secret-write` ValidatingAdmissionPolicy, which reads the `bc-elevation/bc-active-elevations` ConfigMap. Your Kubernetes subject is `system:serviceaccount:paperclip:<sa-name>`. When a task needs a write that the policy denies: do not retry, do not hand the issue to a human assignee, and do not ask for a permanent RBAC change. File a `request_board_approval` approval with the payload below, link it to the issue, and leave the issue `in_review` with that pending approval as its review path.
 
 `POST /api/companies/{companyId}/approvals`
 
 ```json
 {
   "type": "request_board_approval",
-  "title": "Elevation: <BLO-id> <one-line why>",
+  "issueIds": ["<this issue's UUID>"],
   "payload": {
+    "title": "Elevation: <BLO-id> <one-line why>",
     "subject": "system:serviceaccount:paperclip:<sa-name>",
     "systemPrincipal": "sp_<uuid>",
     "verb": "<create|update|patch|delete>",
@@ -2701,6 +2777,10 @@ Agents cannot read or grant elevation. Elevation is decided in magma tenants (`A
 
 Rules:
 
+- **`title` goes inside `payload`, not at the root.** `createApprovalSchema` (`packages/shared/src/validators/approval.ts:82`) accepts only `type`, `requestedByAgentId`, `payload`, `issueIds` and `idempotencyKey` at the root; a root-level `title` is stripped, and `approvalPayloadSchema` then rejects the request for a missing `payload.title`. The failure is a validation error at file time, not a silent degradation.
+- **Link the approval to the issue; do NOT put it in `blockedByIssueIds`.** That field takes *issue* UUIDs — an approval id is not an issue id, so the write is rejected and the issue is left with neither a blocker nor a wake path. Link it either by passing `issueIds` at creation (above, one call) or afterwards with `POST /api/issues/{issueId}/approvals` body `{"approvalId": "<uuid>"}` (`server/src/routes/issues.ts:10197`).
+- **Then leave the issue `in_review`.** A linked *pending* approval is one of the five recognised review paths (`linked_pending_approval`), so this is a real wake path rather than a park. Setting `in_review` with no review path returns `422 invalid_issue_disposition`, `missing: review_path`.
+- ⚠ **That path decays the moment the card is decided.** Approve, reject, or a bulk clear to `revision_requested` all retire it, and `revision_requested` emits no wake at all — so the row silently loses its only review path exactly when the gate resolves. **In the same run that you learn the card was decided, re-establish a path** (act on the decision, or move the row to `todo` with an explicit `re-check not before <date>`). Do not leave a decided card as an issue's sole review path.
 - `durationMinutes` is at most 60. `ElevationGrant.spec.expiresAt` is capped at one hour. Ask for less when less is enough.
 - `systemPrincipal` (`sp_<uuid>`) is your SA's system-principal registration in magma tenants. Two approvers must each run `approverCommand` with their own operator `mb_<uuid>` certificate. One approver is not a grant.
 - If you cannot find an `sp_<uuid>` for `system:serviceaccount:paperclip:<sa-name>`, the registration may not exist. Say so in the request in plain words and ask for registration first. Whether Paperclip agent SAs are registered at all is unverified as of 2026-09-04; see the bc-elevation bridge notes in onprem-k8s `security/bc-elevation/source-of-truth.md`.
@@ -2713,10 +2793,13 @@ Run: `grep -c 'system:serviceaccount:paperclip:<sa-name>' /tmp/track-d/block_pri
 
 - [ ] **Step 8: Apply the insertions and run the assertions**
 ```bash
+# Both scripts read TRACK_D_WT from the environment (their heredocs are quoted,
+# so nothing was expanded at write time). Export it or both abort.
+export TRACK_D_WT="${TRACK_D_WT:?set TRACK_D_WT to the Track D worktree path}"
 python3 /tmp/track-d/insert_skill_docs.py
 /tmp/track-d/assert_skill_docs.sh
 ```
-Run: the commands above.  Expected: `inserted` then six `ok:` lines and `PASS`, exit 0. If a `marker not unique` or `replace target not unique` error prints, open the named file at the marker and fix the marker string in `/tmp/track-d/insert_skill_docs.py`; do not hand-edit the skill files.
+Run: the commands above.  Expected: `inserted` then six `ok:` lines and `PASS`, exit 0. If either script exits with `TRACK_D_WT is not exported` or an unbound-variable error, the `export` line above was skipped — re-run it in the same shell. If a `marker not unique` or `replace target not unique` error prints, open the named file at the marker and fix the marker string in `/tmp/track-d/insert_skill_docs.py`; do not hand-edit the skill files.
 
 - [ ] **Step 9: Check the diff for accidental changes**
 ```bash
