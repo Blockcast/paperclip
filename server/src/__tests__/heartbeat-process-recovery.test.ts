@@ -11893,16 +11893,43 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
     expect(results.every((result) => result.status === "fulfilled")).toBe(true);
 
+    // BLO-19124: this race spends the entire per-owner wake budget — 8 concurrent reserves
+    // against `defaultRecoveryActionMaxAttempts` — and reaching that budget is now TERMINAL:
+    // the wake path retires the row to `escalated` and stamps the bound that retired it.
+    //
+    // The invariant this test exists to protect is DEDUPE (one row, not eight), and that is
+    // unchanged. Only the query needed widening: `escalated` still holds
+    // `issue_recovery_actions_active_source_uq`, so counting both active statuses is still
+    // counting exactly the rows the uniqueness constraint governs, whereas filtering on
+    // `active` alone reads a correctly-retired row as a missing one. The budget is also
+    // still not over-spendable by the race — `attemptCount` is asserted below unchanged.
     const actions = await db
       .select()
       .from(issueRecoveryActions)
       .where(and(
         eq(issueRecoveryActions.companyId, companyId),
         eq(issueRecoveryActions.sourceIssueId, issueId),
-        eq(issueRecoveryActions.status, "active"),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
       ));
     expect(actions).toHaveLength(1);
     expect(actions[0]?.attemptCount).toBe(Math.min(8, defaultRecoveryActionMaxAttempts));
+    // Pin WHICH bound retired it. The creation-anchored horizon is hours out here, so the
+    // budget is the only bound that can have fired — which makes this the one assertion that
+    // fails if the wake path ever goes back to hardcoding the bound on a disjunctive gate.
+    //
+    // Keyed on the OBSERVED attempt count, not on config. How many of the 8 concurrent
+    // reserves actually land is scheduling-dependent (measured 4, 6 and 7 on three runs of
+    // this suite against a budget of 5), so "was the budget exhausted?" is only answerable
+    // from the row itself. Both regimes are asserted rather than one being skipped, so the
+    // branch cannot rot into a silent no-op, and the pairing — retired iff the budget was
+    // reached — holds whichever way the race falls.
+    if ((actions[0]?.attemptCount ?? 0) >= defaultRecoveryActionMaxAttempts) {
+      expect(actions[0]?.status).toBe("escalated");
+      expect(actions[0]?.retiringBound).toBe("attempt_budget");
+    } else {
+      expect(actions[0]?.status).toBe("active");
+      expect(actions[0]?.retiringBound).toBeNull();
+    }
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
   });
 
