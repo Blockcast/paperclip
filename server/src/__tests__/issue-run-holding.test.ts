@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES } from "../services/issue-execution-lock.js";
 import {
   RUN_STALE_SILENCE_MS,
   SCHEDULED_RETRY_HOLD_GRACE_MS,
@@ -258,6 +259,46 @@ describe("isIssueHeldByForeignScheduledRetry", () => {
         ...armed,
         scheduledRetryAt: new Date(NOW + 4 * 60_000).toISOString(),
       }),
+    ).toBe(true);
+  });
+
+  // BLO-29965 review round 2. Twice now a reviewer has proposed aligning this
+  // predicate with `isReapableHeartbeatRunRow` — "fail open for a retry that
+  // never started". Applying that verbatim turns this guard into a constant
+  // `false` and silently reverts the whole fix, so the divergence is pinned
+  // here rather than defended in a PR comment nobody reads next time.
+  //
+  // Why: a parked retry has `startedAt == null` BY CONSTRUCTION, always. All
+  // four writers of that status are fresh INSERTs and none sets the column (the
+  // continuation, ccrotate-capacity and dependency-blocked ladders in
+  // heartbeat.ts, plus provider-quota recovery in recovery/service.ts), no
+  // UPDATE ever moves an existing row into `scheduled_retry`, and
+  // `heartbeat_runs.started_at` carries no database default. So "never started"
+  // does not select an unusual retry — it selects EVERY retry.
+  //
+  // The two predicates answer deliberately different questions:
+  //   - checkout    — "may a run that has DELIBERATELY ASKED for this row adopt
+  //                   the lock?" Permissive: a parked retry owns no worktree,
+  //                   and refusing here made WIP monotonic (BLO-20321).
+  //   - this guard  — "may we SPONTANEOUSLY OFFER this row to a sibling that
+  //                   asked for nothing?" Restrictive: that offer is the
+  //                   measured generator of duplicate work.
+  // Withholding never blocks recovery: explicit checkout, recovery actions and
+  // monitor wakes all bypass the inbox, the holder's own retry fails open by
+  // run id, and any strand is bounded by SCHEDULED_RETRY_HOLD_GRACE_MS.
+  it("does NOT consult startedAt — every parked retry has none, so gating on it would disable the guard", () => {
+    // The canonical parked-retry row shape, as the three INSERT sites write it.
+    const parkedRetryRow = { status: "scheduled_retry", startedAt: null };
+
+    // Checkout's side: this row is reclaimable-when-never-started, so a run that
+    // explicitly asks for it may adopt the lock.
+    expect(ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES).toContain(parkedRetryRow.status);
+    expect(parkedRetryRow.startedAt).toBeNull();
+
+    // Self-selection's side: the very same row is still withheld from a sibling.
+    // If these two ever agree, the guard is dead — see the comment above.
+    expect(
+      isIssueHeldByForeignScheduledRetry({ ...armed, scheduledRetryAt: new Date(NOW + 4 * 60_000) }),
     ).toBe(true);
   });
 });
