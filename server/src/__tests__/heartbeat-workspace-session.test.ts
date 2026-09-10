@@ -4844,6 +4844,36 @@ describe("BLO-23144 issue workspaceStrategy overlay merges field-wise", () => {
     expect(mergeStrategy({ type: "git_worktree", runScope: "per_run" }, null)).toBeNull();
   });
 
+  it("gives an override that switches type a clean slate, not the old type's fields", () => {
+    // Field-wise inheritance is only meaningful between two descriptions of the
+    // same strategy type. Without the type guard the merge is type-blind, so a
+    // switch to project_primary would still carry git_worktree's
+    // worktreeParentDir and runScope; parseExecutionWorkspaceStrategy whitelists
+    // fields without cross-checking them against `type`, so nothing downstream
+    // would reject the nonsense. Raised by review on PR #1693.
+    const strategy = mergeStrategy(
+      { type: "git_worktree", runScope: "per_run", worktreeParentDir: "/x" },
+      { type: "project_primary" },
+    );
+
+    expect(strategy).toEqual({ type: "project_primary" });
+  });
+
+  it("still inherits by omission when the override keeps the same type", () => {
+    // The type guard must not swallow the BLO-23144 fix itself: an overlay that
+    // names the same type, or omits `type` entirely, still inherits runScope.
+    expect(
+      mergeStrategy(
+        { type: "git_worktree", runScope: "per_run" },
+        { type: "git_worktree", baseRef: "release" },
+      ),
+    ).toMatchObject({ runScope: "per_run", baseRef: "release" });
+
+    expect(
+      mergeStrategy({ type: "git_worktree", runScope: "per_run" }, { baseRef: "release" }),
+    ).toMatchObject({ type: "git_worktree", runScope: "per_run", baseRef: "release" });
+  });
+
   it("does not resurrect a base strategy the mode gate deleted", () => {
     // buildExecutionWorkspaceAdapterConfig removes workspaceStrategy outside
     // isolated_workspace. With no own key on the base there is nothing to
