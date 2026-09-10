@@ -42,6 +42,9 @@
  *     prefixes and pass-through wrappers (`exec`, `env`, `nohup`, `command`);
  *   - plus, when argv[0] names a known interpreter (`bash`, `node`, `python3`,
  *     `ruby`, …), the first non-flag argument — that argument *is* the script.
+ *     Options that consume the following word (`node --require /pre.js`,
+ *     `python3 -X utf8`) have that operand consumed too, so it is not mistaken
+ *     for the script and the real script is still reached.
  *
  * Nothing else is stat'd. This is the correction for BLO-29505 Part A: the
  * previous implementation flagged **any** absolute token carrying a script-like
@@ -86,7 +89,14 @@
  *     than a script — `bash -c '…'`, `node -e '…'`, `python3 -m pkg` — and
  *     likewise anything inside `eval` or a `$(…)` substitution. Not parsed; the
  *     operand is deliberately not stat'd, because a command *string* is not a
- *     filename;
+ *     filename. Seeing one of these ends script resolution for that command,
+ *     so a script written after it is not audited either;
+ *   - the operand of an option that takes a *value* — `python3 -X utf8`,
+ *     `perl -I /opt/lib`. Consumed so it cannot be mistaken for the script, but
+ *     never stat'd: python does not open `utf8`, and perl ignores a missing
+ *     `-I` directory. Options outside the modelled per-interpreter sets are
+ *     treated as taking no operand, so an unmodelled `--opt value` form still
+ *     shadows the script;
  *   - the second and later arguments of an interpreter — only the first non-flag
  *     argument is treated as the script.
  *
@@ -204,9 +214,74 @@ const CODE_TAKING_OPTIONS = new Set([
   "--module",
 ]);
 
+/** `--require=/app/pre.js` -> `--require`; `-X` -> `-X`. */
+function optionName(option: string): string {
+  const equals = option.indexOf("=");
+  return equals === -1 ? option : option.slice(0, equals);
+}
+
 function takesCodeOperand(option: string): boolean {
-  const name = option.includes("=") ? option.slice(0, option.indexOf("=")) : option;
+  const name = optionName(option);
   return CODE_TAKING_OPTIONS.has(name) || CODE_TAKING_OPTIONS.has(name.toLowerCase());
+}
+
+/**
+ * Interpreter families, for options whose meaning depends on which binary is
+ * parsing them. This dispatch is not decoration: the same spelling means
+ * opposite things across interpreters, and guessing either way is a defect.
+ *
+ *   - `-r` is a module **path** to node (`--require`) but **code** to php.
+ *   - `-I` is an include **directory** to perl and ruby, but *isolated mode* —
+ *     a flag taking no operand at all — to python.
+ *   - `-X` is python's implementation option; `-x` is a different flag. Case is
+ *     significant, so these sets are matched case-sensitively.
+ */
+const NODE_LIKE_INTERPRETER = /^(?:node|nodejs|bun|deno|tsx|ts-node)(?:\d+(?:\.\d+)*)?$/;
+const PYTHON_LIKE_INTERPRETER = /^python(?:\d+(?:\.\d+)*)?$/;
+const INCLUDE_DIR_INTERPRETER = /^(?:perl|ruby)(?:\d+(?:\.\d+)*)?$/;
+
+/**
+ * Node preload/loader options whose operand is a module **path** resolved
+ * before the script runs. Node exits non-zero when an absolute one is missing,
+ * so the operand is audited — and then the scan *continues* to the script.
+ */
+const NODE_PATH_OPERAND_OPTIONS = new Set([
+  "-r",
+  "--require",
+  "--import",
+  "--loader",
+  "--experimental-loader",
+]);
+
+/**
+ * Options whose operand is a **value**, not a path: python's `-X key=value`,
+ * `-W filter`, `-Q arg`, and perl/ruby's `-I dir`. The operand is consumed so
+ * it is never mistaken for the script, and never stat'd — python does not open
+ * a file called `utf8`, and perl tolerates a missing `-I` directory silently,
+ * so flagging either would be a false positive.
+ */
+const PYTHON_VALUE_OPERAND_OPTIONS = new Set(["-X", "-W", "-Q", "--check-hash-based-pycs"]);
+const INCLUDE_DIR_OPERAND_OPTIONS = new Set(["-I"]);
+
+/**
+ * How the word *after* `option` is consumed, given the interpreter parsing it.
+ * `null` means the option is a plain flag that consumes nothing, so the next
+ * word may still be the script.
+ *
+ * Before this existed, every `-flag` was skipped and the next word was taken as
+ * the script, so `python3 -X utf8 /app/hook.py` resolved `utf8` and stopped,
+ * and `node --require /pre.js /app/hook.js` resolved the preload and stopped —
+ * in both cases leaving a dead hook script unaudited (BLO-29505 review).
+ */
+function separateOperandKind(interpreter: string, name: string): "path" | "value" | null {
+  if (NODE_LIKE_INTERPRETER.test(interpreter) && NODE_PATH_OPERAND_OPTIONS.has(name)) return "path";
+  if (PYTHON_LIKE_INTERPRETER.test(interpreter) && PYTHON_VALUE_OPERAND_OPTIONS.has(name)) {
+    return "value";
+  }
+  if (INCLUDE_DIR_INTERPRETER.test(interpreter) && INCLUDE_DIR_OPERAND_OPTIONS.has(name)) {
+    return "value";
+  }
+  return null;
 }
 
 /**
@@ -374,9 +449,11 @@ function basenameOf(value: string): string {
 /**
  * The absolute literal paths one simple command must be able to execute: its
  * argv[0], plus the script argument when argv[0] is an interpreter, plus any
- * absolute pass-through wrapper ahead of them.
+ * absolute pass-through wrapper ahead of them, plus the operand of a node
+ * preload option (`--require`), which node resolves before the script.
  *
- * Each word contributes at most one path, so the stat count across a whole
+ * Each word contributes at most one path — an option's operand is consumed by
+ * the option rather than examined again — so the stat count across a whole
  * command is bounded by the word cap rather than by anything here.
  */
 function resolveCommandPositionPaths(words: ShellWord[]): string[] {
@@ -404,14 +481,38 @@ function resolveCommandPositionPaths(words: ShellWord[]): string[] {
   if (isAbsoluteLiteral(argv0)) paths.push(argv0.value);
 
   if (!argv0.expandable && isScriptInterpreter(basenameOf(argv0.value))) {
-    for (let j = i + 1; j < words.length; j++) {
+    const interpreter = basenameOf(argv0.value);
+    let j = i + 1;
+
+    while (j < words.length) {
       const argument = words[j];
+
       if (!argument.expandable && argument.value.startsWith("-")) {
-        // `-c`/`-e`/`-m` mean the operand is code, not a path. Stop rather than
-        // stat a command string as a filename.
+        const name = optionName(argument.value);
+        const kind = separateOperandKind(interpreter, name);
+
+        if (kind !== null) {
+          if (name.length < argument.value.length) {
+            // `--require=/app/pre.js` carries its operand in the same word, so
+            // the following word is still a script candidate.
+            const inline = argument.value.slice(name.length + 1);
+            if (kind === "path" && inline.startsWith("/")) paths.push(inline);
+            j++;
+          } else {
+            const operand = words[j + 1];
+            if (kind === "path" && operand && isAbsoluteLiteral(operand)) paths.push(operand.value);
+            j += 2;
+          }
+          continue;
+        }
+
+        // `-c`/`-e`/`-m` mean the operand is code or a module, not a path. Stop
+        // rather than stat a command string as a filename.
         if (takesCodeOperand(argument.value)) return paths;
+        j++;
         continue;
       }
+
       if (isAbsoluteLiteral(argument)) paths.push(argument.value);
       // Only the first operand is the script; later ones are its arguments.
       break;
