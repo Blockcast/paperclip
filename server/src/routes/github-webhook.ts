@@ -97,6 +97,7 @@ import {
   pullRequestExternalId,
 } from "../services/pull-request-work-products.js";
 import { matchesTaskKey, normalizePrReviewRepoFullName } from "../services/pr-review-duplicate-issue-guard.js";
+import { withPrIssueBackLinkLock } from "../services/pr-issue-backlink-lock.js";
 import {
   activateGithubReviewGateDelivery,
   enqueueGithubReviewGateDelivery,
@@ -4940,19 +4941,22 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           .filter((m): m is typeof m & { identifier: string } => Boolean(m.identifier))
           .map((m) => ({ identifier: m.identifier, issuePrefix: prefixByCompany.get(m.companyId) ?? "" }));
         if (entries.length > 0) {
-          const existing = await githubListIssueCommentBodies({
-            repoFullName: context.repoFullName,
-            prNumber: context.prNumber,
-          });
-          // null => no creds / couldn't read: skip the write (never blind-post).
-          if (existing !== null && !commentsContainBackLinkMarker(existing)) {
+          const repoFullName = context.repoFullName;
+          const prNumber = context.prNumber;
+          // The marker only makes this idempotent if the read and the post are
+          // atomic against a concurrent delivery of the same event; hold the
+          // per-PR lock across both. See pr-issue-backlink-lock.ts.
+          backLinked = await withPrIssueBackLinkLock(db, { repoFullName, prNumber }, async () => {
+            const existing = await githubListIssueCommentBodies({ repoFullName, prNumber });
+            // null => no creds / couldn't read: skip the write (never blind-post).
+            if (existing === null || commentsContainBackLinkMarker(existing)) return [];
             const posted = await githubPostIssueComment({
-              repoFullName: context.repoFullName,
-              prNumber: context.prNumber,
+              repoFullName,
+              prNumber,
               body: buildIssueBackLinkBody(config.publicBaseUrl, entries),
             });
-            if (posted) backLinked = entries.map((e) => e.identifier);
-          }
+            return posted ? entries.map((e) => e.identifier) : [];
+          });
         }
       } catch (err) {
         logger.warn(
