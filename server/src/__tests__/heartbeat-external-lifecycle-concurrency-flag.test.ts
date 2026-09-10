@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildK8sRunIsolationDescriptor,
   resolveExternalLifecycleConcurrency,
   resolveHeartbeatPolicyForRuntimeConfig,
   resolveK8sRunIsolationIdentity,
@@ -91,6 +92,7 @@ describe("resolveK8sRunIsolationIdentity: concurrency-aware run isolation (BLO-1
     expect(resolveK8sRunIsolationIdentity({ ...base, effectiveMaxConcurrentRuns: 1 })).toEqual({
       isolationMode: "shared",
       isolationKey: "agent-shared:agent-abc",
+      reservationKey: "agent-shared:agent-abc",
     });
   });
 
@@ -98,6 +100,7 @@ describe("resolveK8sRunIsolationIdentity: concurrency-aware run isolation (BLO-1
     expect(resolveK8sRunIsolationIdentity({ ...base, effectiveMaxConcurrentRuns: 2 })).toEqual({
       isolationMode: "run",
       isolationKey: "run:run-123",
+      reservationKey: "run:run-123",
     });
   });
 
@@ -109,7 +112,7 @@ describe("resolveK8sRunIsolationIdentity: concurrency-aware run isolation (BLO-1
         persistedExecutionWorkspaceId: "ws-9",
         effectiveMaxConcurrentRuns: 3,
       }),
-    ).toEqual({ isolationMode: "workspace", isolationKey: "workspace:ws-9" });
+    ).toEqual({ isolationMode: "workspace", isolationKey: "workspace:ws-9", reservationKey: "workspace:ws-9" });
   });
 
   it("uses per-run isolation when workspace intent has no persisted workspace id yet", () => {
@@ -120,7 +123,7 @@ describe("resolveK8sRunIsolationIdentity: concurrency-aware run isolation (BLO-1
         persistedExecutionWorkspaceId: null,
         effectiveMaxConcurrentRuns: 2,
       }),
-    ).toEqual({ isolationMode: "run", isolationKey: "run:run-123" });
+    ).toEqual({ isolationMode: "run", isolationKey: "run:run-123", reservationKey: "run:run-123" });
   });
 
   it("still uses run isolation for a stateless PR review regardless of concurrency", () => {
@@ -130,7 +133,7 @@ describe("resolveK8sRunIsolationIdentity: concurrency-aware run isolation (BLO-1
         statelessPrReview: true,
         effectiveMaxConcurrentRuns: 1,
       }),
-    ).toEqual({ isolationMode: "run", isolationKey: "run:run-123" });
+    ).toEqual({ isolationMode: "run", isolationKey: "run:run-123", reservationKey: "run:run-123" });
   });
 
   it("returns null for non-k8s adapters even under concurrency", () => {
@@ -155,7 +158,7 @@ describe("resolveK8sRunIsolationIdentity: concurrency-aware run isolation (BLO-1
         persistedWorkspaceExplicitlySelected: true,
         effectiveMaxConcurrentRuns: 3,
       }),
-    ).toEqual({ isolationMode: "workspace", isolationKey: "workspace:ws-shared-9" });
+    ).toEqual({ isolationMode: "workspace", isolationKey: "workspace:ws-shared-9", reservationKey: "workspace:ws-shared-9" });
   });
 
   it("keeps legacy shared isolation for explicit shared_workspace reuse when concurrency is disabled", () => {
@@ -167,7 +170,7 @@ describe("resolveK8sRunIsolationIdentity: concurrency-aware run isolation (BLO-1
         persistedWorkspaceExplicitlySelected: true,
         effectiveMaxConcurrentRuns: 1,
       }),
-    ).toEqual({ isolationMode: "shared", isolationKey: "agent-shared:agent-abc" });
+    ).toEqual({ isolationMode: "shared", isolationKey: "agent-shared:agent-abc", reservationKey: "agent-shared:agent-abc" });
   });
 
   it("still hands anonymous concurrent siblings distinct run: keys when no workspace was explicitly reused", () => {
@@ -179,7 +182,7 @@ describe("resolveK8sRunIsolationIdentity: concurrency-aware run isolation (BLO-1
         persistedWorkspaceExplicitlySelected: false,
         effectiveMaxConcurrentRuns: 3,
       }),
-    ).toEqual({ isolationMode: "run", isolationKey: "run:run-123" });
+    ).toEqual({ isolationMode: "run", isolationKey: "run:run-123", reservationKey: "run:run-123" });
   });
 });
 
@@ -228,8 +231,19 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
       effectiveMaxConcurrentRuns: 2,
     });
 
-    expect(first).toEqual({ isolationMode: "workspace", isolationKey: `workspace-tree:${treeKey}` });
-    expect(second!.isolationKey).toBe(first!.isolationKey);
+    expect(first).toEqual({
+      isolationMode: "workspace",
+      isolationKey: "workspace:fresh-uuid-A",
+      reservationKey: `workspace-tree:${treeKey}`,
+    });
+    // The reservation keys collide, so the second run serializes...
+    expect(second!.reservationKey).toBe(first!.reservationKey);
+    // ...while each run keeps its OWN private filesystem identity. That second
+    // assertion is the whole point of the two-key split: `isolationKey` derives
+    // `tmpRoot` and gates saved-session resume, and `sessionRoot` here is keyed
+    // by the per-run `randomUUID()`, so sharing it would let run B resume a
+    // session that was never written under run B's own session root.
+    expect(second!.isolationKey).not.toBe(first!.isolationKey);
   });
 
   // AC1, via the mechanism the ticket described. Reachable because
@@ -249,9 +263,15 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
 
     expect(identityFor("run-A")).toEqual({
       isolationMode: "run",
-      isolationKey: `workspace-tree:${treeKey}`,
+      isolationKey: "run:run-A",
+      reservationKey: `workspace-tree:${treeKey}`,
     });
-    expect(identityFor("run-B")!.isolationKey).toBe(identityFor("run-A")!.isolationKey);
+    expect(identityFor("run-B")!.reservationKey).toBe(identityFor("run-A")!.reservationKey);
+    // `run` mode gives each run an ephemeral `/runtime-cache/paperclip-runs/
+    // <runId>/session` with `storage.session: "ephemeral"`, so the private key
+    // must stay per-run or run B is handed a session id whose transcript is not
+    // on its disk.
+    expect(identityFor("run-B")!.isolationKey).not.toBe(identityFor("run-A")!.isolationKey);
   });
 
   // AC2 negative control -- BLO-16842 sibling concurrency must survive. Two runs
@@ -273,7 +293,7 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
       effectiveMaxConcurrentRuns: 2,
     });
 
-    expect(left!.isolationKey).not.toBe(right!.isolationKey);
+    expect(left!.reservationKey).not.toBe(right!.reservationKey);
   });
 
   // One issue can hold trees in several repos of a multi-repo project, and those
@@ -294,7 +314,7 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
       effectiveMaxConcurrentRuns: 2,
     });
 
-    expect(paperclip!.isolationKey).not.toBe(onprem!.isolationKey);
+    expect(paperclip!.reservationKey).not.toBe(onprem!.reservationKey);
   });
 
   // AC3. A stateless PR review must stay fully run-scoped and ephemeral, so it is
@@ -310,7 +330,7 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
         perIssueWorkspaceTreeKey: treeKey,
         effectiveMaxConcurrentRuns: 2,
       }),
-    ).toEqual({ isolationMode: "run", isolationKey: "run:run-A" });
+    ).toEqual({ isolationMode: "run", isolationKey: "run:run-A", reservationKey: "run:run-A" });
   });
 
   // AC4 lower bound. `agent-shared:<agentId>` is already STRICTER than per-tree
@@ -328,7 +348,7 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
         perIssueWorkspaceTreeKey: treeKey,
         effectiveMaxConcurrentRuns: 1,
       }),
-    ).toEqual({ isolationMode: "shared", isolationKey: "agent-shared:agent-abc" });
+    ).toEqual({ isolationMode: "shared", isolationKey: "agent-shared:agent-abc", reservationKey: "agent-shared:agent-abc" });
   });
 
   // AC2, the other direction -- and this one is a REGRESSION GUARD, not a
@@ -355,10 +375,11 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
     expect(identityFor("run-A", "issue-7")).toEqual({
       isolationMode: "workspace",
       isolationKey: "workspace:shared-ws-1",
+      reservationKey: "workspace:shared-ws-1",
     });
     // ...so two runs of DIFFERENT issues sharing one workspace still collide.
-    expect(identityFor("run-B", "issue-8")!.isolationKey).toBe(
-      identityFor("run-A", "issue-7")!.isolationKey,
+    expect(identityFor("run-B", "issue-8")!.reservationKey).toBe(
+      identityFor("run-A", "issue-7")!.reservationKey,
     );
   });
 
@@ -381,7 +402,7 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
       effectiveMaxConcurrentRuns: 2,
     });
 
-    expect(perRun).toEqual({ isolationMode: "workspace", isolationKey: "workspace:ws-9" });
+    expect(perRun).toEqual({ isolationMode: "workspace", isolationKey: "workspace:ws-9", reservationKey: "workspace:ws-9" });
     expect(omitted).toEqual(perRun);
   });
 
@@ -418,55 +439,149 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
   // `isolationKey` is not read only by the reservation: it is also stamped onto
   // persisted session params and gates saved-session resume
   // (`sessionParamsMatchIsolation`, consumed at the `isolation_mismatch`
-  // requeue). Making the key stable across runs of one issue therefore FLIPS
-  // that guard from reject to accept, where a `run:<runId>` key could never
-  // match a previous run's stamp.
+  // requeue). So the tree key must NOT reach it -- only `reservationKey`.
   //
-  // That is intended, not incidental, and it is the pairing BLO-31282 already
-  // implies: such a run works in a DURABLE per-issue worktree, so the tree its
-  // session refers to really is the same one next run. Pinned here so the
-  // coupling stays a decision -- if a future change wants the reservation key
-  // to move without moving session scope, the two need separating and this
-  // assertion is where that shows up.
-  it("lets a same-issue run resume a session stamped by an earlier run", () => {
-    const descriptorFor = (runId: string, perIssueWorkspaceTreeKey: string | null) => {
-      const identity = resolveK8sRunIsolationIdentity({
-        ...base,
+  // The first draft of BLO-31443 widened `isolationKey` itself, which flipped
+  // that guard from reject to ACCEPT in exactly the branches where it has to
+  // reject. Both branches that take the substitution keep a per-run
+  // `sessionRoot`: `run` mode roots it at
+  // `/runtime-cache/paperclip-runs/<runId>/session` with `storage.session:
+  // "ephemeral"`, and the non-explicit `workspace` branch roots it at a
+  // `persistedExecutionWorkspaceId` that is a fresh `randomUUID()` per run. A
+  // shared key would therefore hand run B run A's `sessionId` against a session
+  // directory that has never contained it.
+  //
+  // This test builds BOTH descriptors through `buildK8sRunIsolationDescriptor`
+  // rather than hand-writing their roots. The draft version of this test
+  // asserted a literal `sessionRoot: "/s"` for both runs, which gave them one
+  // session directory by construction -- assuming away the very thing that made
+  // the shared key wrong, so it passed over the defect.
+  it("never lets a same-issue run resume a session stamped by an earlier run", () => {
+    const descriptorFor = (runId: string, perIssueWorkspaceTreeKey: string | null) =>
+      buildK8sRunIsolationDescriptor({
+        adapterType: "claude_k8s",
         runId,
-        isWorkspaceIsolated: false,
-        persistedExecutionWorkspaceId: null,
-        perIssueWorkspaceTreeKey,
-        effectiveMaxConcurrentRuns: 2,
-      })!;
-      return {
-        ...identity,
-        workspaceRoot: "/w",
-        homeRoot: "/h",
-        sessionRoot: "/s",
-        cacheRoot: "/c",
-        tmpRoot: "/t",
-        storage: {
-          workspace: "persistent" as const,
-          home: "ephemeral" as const,
-          session: "ephemeral" as const,
-          cache: "ephemeral" as const,
+        companyId: "company-1",
+        agentId: base.agentId,
+        taskKey: "issue-7",
+        statelessPrReview: false,
+        executionWorkspace: {
+          cwd: "/paperclip/worktrees/issue-7",
+          source: "task_session",
+          strategy: "git_worktree",
         },
-        sessionScope: { taskKey: "issue-7", isolationKey: identity.isolationKey },
-      };
-    };
+        persistedExecutionWorkspaceId: null,
+        effectiveExecutionWorkspaceMode: "isolated_workspace",
+        isolationIdentity: resolveK8sRunIsolationIdentity({
+          ...base,
+          runId,
+          isWorkspaceIsolated: false,
+          persistedExecutionWorkspaceId: null,
+          perIssueWorkspaceTreeKey,
+          effectiveMaxConcurrentRuns: 2,
+        }),
+      })!;
     const stampOf = (runId: string, tree: string | null) =>
       scopeSessionParamsToIsolation({ sessionId: `session-from-${runId}` }, descriptorFor(runId, tree));
 
-    // With a tree key, run B accepts the session run A stamped -- both runs of
-    // one issue resolve to one key.
-    expect(
-      sessionParamsMatchIsolation(stampOf("run-A", treeKey), descriptorFor("run-B", treeKey)),
-    ).toBe(true);
+    const runA = descriptorFor("run-A", treeKey);
+    const runB = descriptorFor("run-B", treeKey);
 
-    // Control -- the pre-BLO-31443 behavior this changes. Without a tree key
-    // each run stamps its own `run:<runId>`, so run B rejects run A's session.
+    // The premise: with a tree key the two runs really do share one WORKSPACE
+    // (that is the fix) while their SESSION storage stays per-run and ephemeral.
+    expect(runB.workspaceRoot).toBe(runA.workspaceRoot);
+    expect(runB.sessionRoot).not.toBe(runA.sessionRoot);
+    expect(runA.storage.session).toBe("ephemeral");
+
+    // So run B must reject run A's session, tree key or not. Accepting it would
+    // resume a transcript that is not under run B's `sessionRoot`.
+    expect(
+      sessionParamsMatchIsolation(stampOf("run-A", treeKey), runB),
+    ).toBe(false);
+
+    // Unchanged from before the tree key existed -- the guard is keyed on the
+    // run's private identity in both cases.
     expect(
       sessionParamsMatchIsolation(stampOf("run-A", null), descriptorFor("run-B", null)),
     ).toBe(false);
+
+    // ...and the reservation key still collides, which is what serializes them.
+    expect(runB.isolationKey).not.toBe(runA.isolationKey);
+    expect(
+      resolveK8sRunIsolationIdentity({
+        ...base,
+        runId: "run-B",
+        isWorkspaceIsolated: false,
+        persistedExecutionWorkspaceId: null,
+        perIssueWorkspaceTreeKey: treeKey,
+        effectiveMaxConcurrentRuns: 2,
+      })!.reservationKey,
+    ).toBe(`workspace-tree:${treeKey}`);
+  });
+
+  // `tmpRoot` is a hash of `isolationKey`, and Chromium appends its singleton
+  // socket path to it. Two same-issue runs must not share it: the reservation
+  // serializes them in the normal case, but the deferral is a retry rather than
+  // a mutex, so a shared tmp dir would be a second, unguarded collision.
+  it("keeps tmpRoot per-run for two same-issue runs", () => {
+    const tmpRootFor = (runId: string) =>
+      buildK8sRunIsolationDescriptor({
+        adapterType: "claude_k8s",
+        runId,
+        companyId: "company-1",
+        agentId: base.agentId,
+        taskKey: "issue-7",
+        statelessPrReview: false,
+        executionWorkspace: {
+          cwd: "/paperclip/worktrees/issue-7",
+          source: "task_session",
+          strategy: "git_worktree",
+        },
+        persistedExecutionWorkspaceId: null,
+        effectiveExecutionWorkspaceMode: "isolated_workspace",
+        isolationIdentity: resolveK8sRunIsolationIdentity({
+          ...base,
+          runId,
+          isWorkspaceIsolated: false,
+          persistedExecutionWorkspaceId: null,
+          perIssueWorkspaceTreeKey: treeKey,
+          effectiveMaxConcurrentRuns: 2,
+        }),
+      })!.tmpRoot;
+
+    expect(tmpRootFor("run-B")).not.toBe(tmpRootFor("run-A"));
+  });
+
+  // AC3 regression guard, asserted on the real descriptor rather than on the
+  // key alone: a stateless PR review stays fully ephemeral and run-scoped.
+  it("keeps a stateless PR review on an ephemeral per-run workspace", () => {
+    const descriptor = buildK8sRunIsolationDescriptor({
+      adapterType: "claude_k8s",
+      runId: "run-A",
+      companyId: "company-1",
+      agentId: base.agentId,
+      taskKey: null,
+      statelessPrReview: true,
+      executionWorkspace: {
+        cwd: "/paperclip/worktrees/issue-7",
+        source: "task_session",
+        strategy: "git_worktree",
+      },
+      persistedExecutionWorkspaceId: null,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+      isolationIdentity: resolveK8sRunIsolationIdentity({
+        ...base,
+        runId: "run-A",
+        statelessPrReview: true,
+        isWorkspaceIsolated: false,
+        persistedExecutionWorkspaceId: null,
+        perIssueWorkspaceTreeKey: treeKey,
+        effectiveMaxConcurrentRuns: 2,
+      }),
+    })!;
+
+    expect(descriptor.workspaceRoot).toBe("/runtime-cache/paperclip-runs/run-A/workspace");
+    expect(descriptor.storage.workspace).toBe("ephemeral");
+    expect(descriptor.isolationKey).toBe("run:run-A");
   });
 });
