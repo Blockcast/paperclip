@@ -20,12 +20,23 @@
   ```bash
   REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel)}"
   TRACK_D_WT="${TRACK_D_WT:-${REPO_ROOT}-track-d}"   # sibling worktree created in Track D Step 1
+
+  # Operator-local prerequisites. These are NOT derivable from this checkout, so they are
+  # required rather than defaulted: `:?` aborts immediately if unset, which is deliberate.
+  # A replay that silently fell back to a wrong path would read and edit another operator's
+  # working tree, so failing closed is the only safe behaviour here.
+  MAGMA_ROOT="${MAGMA_ROOT:?set to your local blockcast/magma checkout, e.g. ~/src/github.com/blockcast/magma}"
+  CLAUDE_MEMORY_FILE="${CLAUDE_MEMORY_FILE:?set to your Claude Code memory file for the magma project — the directory name encodes the absolute checkout path, so it differs per machine and cannot be derived here}"
   ```
 
-  Every path in this repo or its Track D worktree is expressed through those two variables.
-  Literal absolute paths remain in exactly two places, because a variable would misdescribe
-  them: paths in the **magma** repo, which is a different repository; and the author's
-  `~/.claude` memory files, which are machine-specific and not replayable at all.
+  Every path in this repo or its Track D worktree is expressed through `REPO_ROOT` /
+  `TRACK_D_WT`; every path outside it is expressed through `MAGMA_ROOT` /
+  `CLAUDE_MEMORY_FILE`. **No literal absolute path remains in any command in this
+  document.** The two operator-local variables are prerequisites, not conveniences: the
+  `magma` repo is a different repository, and the Claude Code memory file is machine-specific
+  and not replayable at all — a second operator's equivalent file will have different
+  contents, so the Track E steps that edit it are a template for that operator's own memory,
+  not a reproducible edit.
 
 - Every PR body must carry evidence per the user requirement: before/after JSON, exact `curl`/`gh` commands with output, pasted test output, and a 1440x900 screenshot for anything visible in the Paperclip UI. There is no staging Paperclip; use local `pnpm dev` plus a dev DB, or read-only production verification after the daily deploy.
 - Paths under CODEOWNERS (`.github/**`, `skills/**`, `package.json`, `pnpm-lock.yaml`, release scripts) need @kkroo approval. Name it on every PR that touches them.
@@ -1977,24 +1988,25 @@ For each open, non-draft PR in each repo, run:
 
       Reading `.conclusion` alone is a live defect, not a style preference: `gate/ally-comment-findings` is a **StatusContext**, so it reports `conclusion: null` / `state: "FAILURE"`. A predicate that only inspects `.conclusion` sees `null` on the single most load-bearing gate — a value in neither the accept list nor the reject list, i.e. undefined behaviour exactly where a wrong answer merges unreviewed code. An in-flight `CheckRun` is the same trap from the other side: `gh` returns `conclusion: ""` (empty string) while `status` is `queued`/`in_progress`, which is likewise in neither list. Treat `null` and `""` as a STOP.
 
-   c. **Require `SUCCESS`, with a named closed allowlist — never a conclusion-class blanket.** Every entry must be `SUCCESS` except entries whose **name** appears in this list, which are the only non-success results measured benign on `Blockcast/paperclip`:
+   c. **Require `SUCCESS`. There is no allowlist and no exception.** Every entry must read `SUCCESS`. Any other value — `FAILURE`, `CANCELLED`, `TIMED_OUT`, `ACTION_REQUIRED`, `PENDING`, `QUEUED`, `IN_PROGRESS`, `SKIPPED`, `NEUTRAL`, `STALE`, `null`, `""`, or anything unrecognised — is a **STOP**. This is the fleet-binding [BLO-26572](https://paperclip.blockcast.net/BLO/issues/BLO-26572) rule applied without carve-out: only `success` is a passing CI verdict.
 
-      | name | permitted state | why |
-      |---|---|---|
-      | `Storybook visual regression` | `SKIPPED` | path-filtered; skips on every PR that touches no story files |
-      | `security-review` | `NEUTRAL` or `SUCCESS` | advisory reviewer check; reports `neutral` when it has no finding to raise |
+      **Two states stop the routine without meaning the code is broken, and they are recorded differently so the distinction is not lost.** On `Blockcast/paperclip`, `Storybook visual regression` reports `SKIPPED` on every PR touching no story files, and `security-review` reports `NEUTRAL` when it has no finding to raise. Neither is a failure. But neither is `SUCCESS`, and **the routine does not get to decide that a non-success verdict is benign** — that is a policy call about what this repo's CI means, and it does not belong inside an agent merge predicate.
 
-      Allowlist by **name**, not by conclusion class. Accepting `SKIPPED`/`NEUTRAL` for *any* entry — the shape this criterion had before 2026-09-08 — lets a genuine gate go quiet and still pass: a `skipped` `verify`, or a findings gate that reports `neutral`, is indistinguishable from these two benign cases. Adding a row here is a deliberate edit with a stated reason, not a run-time judgment.
+      So: when the *only* non-`SUCCESS` entries are in a non-failed state (`SKIPPED` or `NEUTRAL`), skip the PR with reason `policy-hold:<name>=<state>` rather than `checks:<name>=<state>`. Both are skips and neither merges. The separate reason exists so the receipt distinguishes *"CI says this is broken"* from *"CI returned a verdict this routine is not authorised to interpret"*, and so the held set is countable by whoever owns the policy call. **Do not add an allowlist back.** If these checks are genuinely advisory, the fix is a stated policy decision recorded outside this routine (see the block below) — never an exception encoded in the predicate.
 
-   d. **`gate/ally-comment-findings` must be present and `SUCCESS`.** Its absence is a stop under (a); it is never allowlistable. Then read its **description**, because `success` is ambiguous on this repo: *"reports no unresolved findings"* means reviewed and clean (a pass), while *"No Ally consolidated-review comment attests to reviewing this head"* means **nobody reviewed this head** — a stop, reason "review:missing". `review/ally-complete` does not exist on this repo; `review/ally-comment` is retired and carries no verdict. Do not wait on either.
+   d. **`gate/ally-comment-findings` must be present and `SUCCESS`.** Its absence is a stop under (a). A `SKIPPED` or `NEUTRAL` on *this* context is **never** a `policy-hold` — it is a hard `checks:` stop, because a findings gate that declines to answer is the one case where a quiet gate and a clean gate are indistinguishable. Then read its **description**, because `success` is ambiguous on this repo: *"reports no unresolved findings"* means reviewed and clean (a pass), while *"No Ally consolidated-review comment attests to reviewing this head"* means **nobody reviewed this head** — a stop, reason "review:missing". `review/ally-complete` does not exist on this repo; `review/ally-comment` is retired and carries no verdict. Do not wait on either.
 
-   **Do not simplify (a)–(d) into "every check-run must be SUCCESS".** Measured 2026-09-08 across the four most recently landed Track A PRs (#1418, #1309, #1219, #1467): all four carry `Storybook visual regression=skipped` and two carry `security-review=neutral`. A blanket all-SUCCESS predicate therefore matches **zero** PRs on this repo and silently converts the routine into a no-op — which fails safe, but is indistinguishable from a routine that is working.
-
-   > ⚠ **OPEN POLICY QUESTION — routed to the CTO on [BLO-32573](https://paperclip.blockcast.net/BLO/issues/BLO-32573), 2026-09-09. Do not re-litigate this in review; it is not the author's to settle.**
+   > ⚠ **This predicate currently matches ZERO PRs on `Blockcast/paperclip`, and that is the intended state, not a defect.**
    >
-   > Ally has flagged this allowlist twice ( `9807587`, `33caa1bf` ) as conflicting with the fleet-binding [BLO-26572](https://paperclip.blockcast.net/BLO/issues/BLO-26572) rule that only `success` passes, and recommends *"remove them from the repo's required CI verdict"* instead. That remedy is **measured unavailable**: `repos/Blockcast/paperclip/rules/branches/master` returns exactly one rule, `merge_queue` — there is **no `required_status_checks` rule at all**, so no context on this repo is formally "required" and there is nothing to remove from. The genuine tension is that the CEO's scope note ([BLO-22762](https://paperclip.blockcast.net/BLO/issues/BLO-22762)) defines the rule as covering *"the repo's REQUIRED CI VERDICT"*, and this repo declares none — its real gate is the merge queue's own `grouping_strategy: ALLGREEN` build on the `merge_group` ref, which runs **after** `--auto` hands the PR over and which this routine cannot bypass.
+   > Measured 2026-09-08 across the four most recently landed Track A PRs (#1418, #1309, #1219, #1467): all four carry `Storybook visual regression=skipped` and two carry `security-review=neutral`. Under (c) every one of them is a `policy-hold` skip. So **the routine merges nothing on this repo until the policy question below is answered.** That is the correct failure direction — but it is stated here explicitly because a silently no-op routine is indistinguishable from a working one, and anyone enabling this routine needs to know it will report holds rather than merges.
    >
-   > Both readings are defensible and the author has an interest in the permissive one, so it is held open rather than resolved here. Until the CTO rules, this criterion stays as written — the stricter-than-BLO-26572 parts (empty-rollup stop, `null`/`""` stop, findings-gate description read) are unaffected either way.
+   > **The earlier resolution of this — a named `SKIPPED`/`NEUTRAL` allowlist inside criterion (c) — was removed on 2026-09-10 and must not be reinstated.** Ally flagged it three times (`9807587`, `33caa1bf`, `ff540b07`) as conflicting with [BLO-26572](https://paperclip.blockcast.net/BLO/issues/BLO-26572), and the objection is correct on its own terms: whether a non-success verdict is benign is a policy call about this repo's CI, and encoding it as an exception in an agent merge predicate is exactly the thing that rule forbids. The author had an interest in the permissive reading, which per [BLO-22818](https://paperclip.blockcast.net/BLO/issues/BLO-22818) is precisely when to take the strict one.
+   >
+   > **OPEN POLICY QUESTION — routed to the CTO on [BLO-32573](https://paperclip.blockcast.net/BLO/issues/BLO-32573), 2026-09-09; still open. Do not re-litigate it in review, and do not "fix" it by loosening (c).**
+   >
+   > Ally's recommended remedy was *"remove them from the repo's required CI verdict"*. That is **measured unavailable**: `repos/Blockcast/paperclip/rules/branches/master` returns exactly one rule, `merge_queue` — there is **no `required_status_checks` rule at all**, so no context on this repo is formally "required" and there is nothing to remove them from. The genuine tension is that the CEO's scope note ([BLO-22762](https://paperclip.blockcast.net/BLO/issues/BLO-22762)) defines the rule as covering *"the repo's REQUIRED CI VERDICT"*, and this repo declares none — its real gate is the merge queue's own `grouping_strategy: ALLGREEN` build on the `merge_group` ref, which runs **after** `--auto` hands the PR over and which this routine cannot bypass.
+   >
+   > The question for whoever owns it: are `Storybook visual regression=SKIPPED` and `security-review=NEUTRAL` accepted as passing verdicts on this repo? If **yes**, record that decision here as a stated policy with an owner and a date, and the `policy-hold` reason becomes a pass by reference to that decision — still not an exception invented by the routine. If **no**, the two checks should stop emitting non-success verdicts, and until they do this routine correctly merges nothing.
 4. A canonical Ally review exists at the CURRENT head. Search reviews and comments for a body that contains exactly one line "## Ally — Consolidated PR Review" and exactly one line matching "Reviewed head: <40-hex>" where the hex equals headRefOid. That body must have no "### Critical Issues (N)" or "### Important Issues (N)" with N above 0, and no line matching "- **prior:...** — still-present —". Otherwise skip, reason "review:<stale-head|blocking|missing>".
 5. mergeStateStatus is "CLEAN" or "BEHIND". "BLOCKED": go to the CODEOWNERS step. "DIRTY", "UNSTABLE", "UNKNOWN": skip, reason "merge-state:<value>".
 
@@ -2865,9 +2877,9 @@ Run: `git worktree list`  Expected: the track-d path is gone.
 
 **Files:**
 - Create: `$REPO_ROOT/docs/runbooks/agent-elevation-request.md`
-- Read-only reference: `/Users/oramadan/src/github.com/blockcast/magma/orc8r/cloud/go/services/tenants/protos/approvals.proto`
-- Read-only reference: `/Users/oramadan/src/github.com/blockcast/magma/orc8r/cloud/go/services/tenants/servicers/protected/approvals_servicer.go:212-232`
-- Read-only reference: `/Users/oramadan/src/github.com/blockcast/magma/orc8r/cloud/go/tools/break_glass_cli/handlers/grant.go`, `list.go`
+- Read-only reference: `${MAGMA_ROOT}/orc8r/cloud/go/services/tenants/protos/approvals.proto`
+- Read-only reference: `${MAGMA_ROOT}/orc8r/cloud/go/services/tenants/servicers/protected/approvals_servicer.go:212-232`
+- Read-only reference: `${MAGMA_ROOT}/orc8r/cloud/go/tools/break_glass_cli/handlers/grant.go`, `list.go`
 - Test: none (docs only). Verification is the command steps below.
 
 **Interfaces:**
@@ -2884,14 +2896,14 @@ Run: the block above.  Expected: `Switched to a new branch 'docs/agent-elevation
 
 - [ ] **Step 2: Verify the subject-kind category for admin_elevation**
 ```bash
-cd /Users/oramadan/src/github.com/blockcast/magma
+cd ${MAGMA_ROOT}
 grep -rn "ListSystemPrincipals\|system_principal" orc8r/cloud/go/services/tenants/protos/*.proto
 ```
 Run: the block above.  Expected (verified 2026-09-05): zero matches for `ListSystemPrincipals`; matches only in `approvals.proto` at line 38 (`subject_ref is the SystemPrincipal sp_uuid` for break_glass), line 74 (`subject_kind='oidc_user'` for admin_elevation), and lines 112-113 (`subject_kind: 'system_principal' | 'oidc_user'`). Conclusion: no system-principal list RPC exists, and `admin_elevation` never uses `system_principal`. Do NOT file "Register Paperclip agent SAs as magma system principals". Paste this output into the runbook `## Verification log` in Step 5.
 
 - [ ] **Step 3: Verify subject_ref accepts a k8s ServiceAccount username**
 ```bash
-cd /Users/oramadan/src/github.com/blockcast/magma
+cd ${MAGMA_ROOT}
 sed -n 220,223p orc8r/cloud/go/services/tenants/servicers/protected/approvals_servicer.go
 ```
 Run: the block above.  Expected (verified 2026-09-05):
@@ -3133,7 +3145,7 @@ Write `/tmp/e1-pr-body.md` with, in this order:
 ### Task E2: Correct the memory record
 
 **Files:**
-- Modify: `/Users/oramadan/.claude/projects/-Users-oramadan-src-github-com-blockcast-magma/memory/project_paperclip_human_gate_structural_gaps.md:25-31`
+- Modify: `${CLAUDE_MEMORY_FILE}:25-31`
 - Test: `grep` assertions below.
 
 **Interfaces:**
@@ -3142,7 +3154,7 @@ Write `/tmp/e1-pr-body.md` with, in this order:
 
 - [ ] **Step 1: Confirm the current text to replace**
 ```bash
-sed -n 25,31p /Users/oramadan/.claude/projects/-Users-oramadan-src-github-com-blockcast-magma/memory/project_paperclip_human_gate_structural_gaps.md
+sed -n 25,31p ${CLAUDE_MEMORY_FILE}
 ```
 Run: the block above.  Expected: item 3 beginning `3. **bc-elevation bridge is half-built.**` and ending `Both MCP SAs are forbidden from listing ElevationGrants.` If the line range has shifted, locate it with `grep -n "bc-elevation bridge is half-built"` and use those lines instead.
 
@@ -3169,7 +3181,7 @@ Replace the whole item 3 block (lines from Step 1) with exactly:
 ```
 Run:
 ```bash
-f=/Users/oramadan/.claude/projects/-Users-oramadan-src-github-com-blockcast-magma/memory/project_paperclip_human_gate_structural_gaps.md
+f=${CLAUDE_MEMORY_FILE}
 grep -c "TokenReview read-extension\" was WRONG" "$f"; grep -c "never implemented though spec'd" "$f"; grep -c "onprem-k8s#3060" "$f"
 ```
 Expected: `1`, `0`, `1`.
@@ -3177,7 +3189,7 @@ Expected: `1`, `0`, `1`.
 - [ ] **Step 3: Commit**
 The memory directory is not a git repository (verified 2026-09-05: `git -C <dir> rev-parse --is-inside-work-tree` → `fatal: not a git repository`). There is no commit. Persistence check instead:
 ```bash
-sed -n 1,6p /Users/oramadan/.claude/projects/-Users-oramadan-src-github-com-blockcast-magma/memory/project_paperclip_human_gate_structural_gaps.md
+sed -n 1,6p ${CLAUDE_MEMORY_FILE}
 ```
 Run: the block above.  Expected: frontmatter intact, `name: project-paperclip-human-gate-structural-gaps` on line 2. The MEMORY.md index line ("half-built bc-elevation bridge") stays accurate and is not edited.
 
