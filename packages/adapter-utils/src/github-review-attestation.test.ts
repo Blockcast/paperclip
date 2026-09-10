@@ -40,7 +40,7 @@ function bodyAttesting(sha: string): string {
 }
 
 function makeIo(
-  overrides: Partial<ReviewAttestationGuardIo> = {},
+  overrides: Partial<ReviewAttestationGuardIo> & { reachability?: CommitReachability } = {},
 ): ReviewAttestationGuardIo & {
   reachabilityCalls: Array<{ repo: string; sha: string }>;
 } {
@@ -48,11 +48,14 @@ function makeIo(
   return {
     reachabilityCalls,
     readText: overrides.readText ?? (() => bodyAttesting(MEDIAMTX_HEAD)),
+    // `reachability` sets the verdict while keeping the recorder, so a test can
+    // assert both the outcome and that the resolver was actually consulted.
+    // Pass `resolveCommitReachability` only to assert it was NOT called.
     resolveCommitReachability:
       overrides.resolveCommitReachability ??
       (async (repo, sha) => {
         reachabilityCalls.push({ repo, sha });
-        return "reachable" as CommitReachability;
+        return overrides.reachability ?? "reachable";
       }),
     resolveDefaultRepo: overrides.resolveDefaultRepo ?? (async () => null),
   };
@@ -318,7 +321,7 @@ describe("evaluateReviewSubmission", () => {
   });
 
   it("asks about the attested SHA in the argv-named repository", async () => {
-    const io = makeIo({ readText: () => bodyAttesting(PIM_2864_HEAD) });
+    const io = makeIo({ readText: () => bodyAttesting(PIM_2864_HEAD), reachability: "reachable" });
 
     await evaluateReviewSubmission(crossRepoArgv, io);
 
@@ -465,6 +468,112 @@ describe("evaluateReviewSubmission", () => {
     );
 
     expect(refusal?.reason).toBe("unreachable-attestation");
+  });
+});
+
+// `gh api --input` points at a whole JSON request payload, not Markdown. Its
+// newlines are `\n` escapes, so scanning the file as Markdown finds no
+// line-anchored attestation, reports `absent`, and skips the reachability
+// check — which let the original fail-open defect through in a second shape.
+describe("evaluateReviewSubmission with a --input JSON request payload", () => {
+  const apiArgv = [
+    "api",
+    "repos/Blockcast/mediamtx/pulls/33/reviews",
+    "--method",
+    "POST",
+    "--input",
+    "/tmp/review-request.json",
+  ];
+
+  function requestPayload(body?: unknown): string {
+    const payload: Record<string, unknown> = {
+      event: "APPROVE",
+      commit_id: MEDIAMTX_HEAD,
+    };
+    if (body !== undefined) payload.body = body;
+    return JSON.stringify(payload);
+  }
+
+  it("parses --input as a JSON request payload rather than Markdown", () => {
+    expect(parseReviewSubmission(apiArgv)).toEqual({
+      repo: "Blockcast/mediamtx",
+      repoSource: "argv-api-path",
+      pullNumber: 33,
+      body: { kind: "json-request-file", path: "/tmp/review-request.json" },
+    });
+  });
+
+  it("decodes the JSON body and refuses a cross-repository attestation", async () => {
+    const io = makeIo({
+      readText: () => requestPayload(bodyAttesting(PIM_2864_HEAD)),
+      reachability: "unreachable",
+    });
+
+    const refusal = await evaluateReviewSubmission(apiArgv, io);
+
+    expect(refusal?.reason).toBe("unreachable-attestation");
+    // The resolver must actually have been consulted — the bug was that it
+    // never was, so the submission sailed through.
+    expect(io.reachabilityCalls).toEqual([
+      { repo: "Blockcast/mediamtx", sha: PIM_2864_HEAD },
+    ]);
+  });
+
+  it("allows a JSON body whose attestation resolves in the target repo", async () => {
+    const io = makeIo({
+      readText: () => requestPayload(bodyAttesting(MEDIAMTX_HEAD)),
+      reachability: "reachable",
+    });
+
+    expect(await evaluateReviewSubmission(apiArgv, io)).toBeNull();
+    expect(io.reachabilityCalls).toEqual([
+      { repo: "Blockcast/mediamtx", sha: MEDIAMTX_HEAD },
+    ]);
+  });
+
+  it("refuses a malformed attestation carried inside the JSON body", async () => {
+    const resolveCommitReachability = vi.fn(async () => "reachable" as CommitReachability);
+    const io = makeIo({
+      readText: () => requestPayload(bodyAttesting(MALFORMED_MARKER)),
+      resolveCommitReachability,
+    });
+
+    expect((await evaluateReviewSubmission(apiArgv, io))?.reason).toBe("malformed-attestation");
+    expect(resolveCommitReachability).not.toHaveBeenCalled();
+  });
+
+  // `{"event":"APPROVE"}` is a valid review with no comment. It attests
+  // nothing, so there is nothing to check — not an error.
+  it("allows a request payload with no body member", async () => {
+    const resolveCommitReachability = vi.fn(async () => "reachable" as CommitReachability);
+    const io = makeIo({ readText: () => requestPayload(), resolveCommitReachability });
+
+    expect(await evaluateReviewSubmission(apiArgv, io)).toBeNull();
+    expect(resolveCommitReachability).not.toHaveBeenCalled();
+  });
+
+  it("refuses a payload that is not a JSON object with a string body", async () => {
+    for (const raw of ["not json at all", "[1,2,3]", '{"body":42}', '"just a string"']) {
+      const io = makeIo({ readText: () => raw });
+      expect((await evaluateReviewSubmission(apiArgv, io))?.reason, raw).toBe(
+        "unparsable-request-body",
+      );
+    }
+  });
+
+  // A non-review endpoint must stay untouched, or every `gh api --input` call
+  // in the fleet would start being parsed as a review payload.
+  it("ignores --input against a non-review endpoint", async () => {
+    const resolveCommitReachability = vi.fn(async () => "reachable" as CommitReachability);
+    const io = makeIo({ resolveCommitReachability });
+
+    expect(
+      await evaluateReviewSubmission(
+        ["api", "repos/Blockcast/mediamtx/issues/33/comments", "--input", "/tmp/x.json"],
+        io,
+      ),
+    ).toBeNull();
+    expect(resolveCommitReachability).not.toHaveBeenCalled();
   });
 });
 

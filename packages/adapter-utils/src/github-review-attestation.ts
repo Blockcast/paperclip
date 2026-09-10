@@ -59,6 +59,22 @@
 /** How the target repository was determined, for diagnostics in the refusal. */
 export type ReviewTargetSource = "argv-flag" | "argv-url" | "argv-api-path" | "resolved-default";
 
+/**
+ * Where the authored review text came from.
+ *
+ * The distinction between `file` and `json-request-file` is load-bearing.
+ * `gh pr review --body-file x.md` and `gh api ... -F body=@x.md` both point at
+ * raw Markdown, but `gh api ... --input x.json` points at a whole JSON request
+ * payload whose `body` member holds the Markdown — with newlines encoded as
+ * `\n` escapes. Scanning that file as Markdown finds no line-anchored
+ * attestation at all, reports `absent`, and skips the reachability check, so
+ * the JSON form silently bypassed the guard entirely.
+ */
+export type ReviewBodySource =
+  | { kind: "inline"; text: string }
+  | { kind: "file"; path: string }
+  | { kind: "json-request-file"; path: string };
+
 export interface ReviewSubmission {
   /** "owner/name", or null when argv does not name it (`gh pr review` with no
    *  --repo relies on the checkout's remote, which argv cannot tell us). */
@@ -67,7 +83,7 @@ export interface ReviewSubmission {
   /** The pull request number, when argv carries it. */
   pullNumber: number | null;
   /** Inline body text, or a path to read it from. */
-  body: { kind: "inline"; text: string } | { kind: "file"; path: string } | null;
+  body: ReviewBodySource | null;
 }
 
 export type ReviewAttestation =
@@ -104,7 +120,8 @@ export interface ReviewAttestationRefusal {
     | "ambiguous-attestation"
     | "unreachable-attestation"
     | "unresolved-target"
-    | "unreadable-body";
+    | "unreadable-body"
+    | "unparsable-request-body";
   message: string;
 }
 
@@ -226,7 +243,7 @@ function parsePrReview(rest: readonly string[]): ReviewSubmission {
 function parseApiReview(rest: readonly string[]): ReviewSubmission | null {
   let path: string | null = null;
   let method: string | null = null;
-  let body: ReviewSubmission["body"] = null;
+  let body: ReviewBodySource | null = null;
 
   for (let i = 0; i < rest.length; i += 1) {
     const arg = rest[i]!;
@@ -234,7 +251,7 @@ function parseApiReview(rest: readonly string[]): ReviewSubmission | null {
     const fused = splitFused(arg);
     if (fused) {
       if (fused.flag === "--method" || fused.flag === "-X") method = fused.value;
-      else if (fused.flag === "--input") body = { kind: "file", path: fused.value };
+      else if (fused.flag === "--input") body = { kind: "json-request-file", path: fused.value };
       else if (isFieldFlag(fused.flag)) {
         const parsed = parseBodyField(fused.value);
         if (parsed) body = parsed;
@@ -253,7 +270,7 @@ function parseApiReview(rest: readonly string[]): ReviewSubmission | null {
     if (arg === "--input") {
       const value = rest[i + 1];
       if (value !== undefined) {
-        body = { kind: "file", path: value };
+        body = { kind: "json-request-file", path: value };
         i += 1;
       }
       continue;
@@ -293,7 +310,7 @@ function isFieldFlag(flag: string): boolean {
 
 /** Pull the review text out of a `key=value` field expression. Only the `body`
  *  key carries the authored review; `event` and `commit_id` are metadata. */
-function parseBodyField(expression: string): ReviewSubmission["body"] {
+function parseBodyField(expression: string): ReviewBodySource | null {
   const equals = expression.indexOf("=");
   if (equals < 0) return null;
   if (expression.slice(0, equals) !== "body") return null;
@@ -398,6 +415,34 @@ export function inspectReviewAttestation(body: string): ReviewAttestation {
 // -- the guard ---------------------------------------------------------------
 
 /**
+ * Pull the authored Markdown out of a `gh api --input` request payload.
+ *
+ * `no-body` is a legitimate shape, not an error: `{"event":"APPROVE"}` is a
+ * valid review submission that carries no comment and therefore attests
+ * nothing. `unparsable` covers a file that is not a JSON object, or whose
+ * `body` member is present but not a string — the request would be rejected by
+ * GitHub anyway, and refusing costs nothing while guessing could let an
+ * unverified attestation through in a shape nobody anticipated.
+ */
+function decodeJsonRequestBody(
+  raw: string,
+): { kind: "text"; text: string } | { kind: "no-body" } | { kind: "unparsable" } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { kind: "unparsable" };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { kind: "unparsable" };
+  }
+  const body = (parsed as Record<string, unknown>).body;
+  if (typeof body === "string") return { kind: "text", text: body };
+  if (body === undefined) return { kind: "no-body" };
+  return { kind: "unparsable" };
+}
+
+/**
  * Decide whether a `gh` invocation may post its review.
  *
  * Returns null to allow. A non-null refusal must abort the invocation: the
@@ -422,13 +467,32 @@ export async function evaluateReviewSubmission(
   } else {
     // `-` is stdin, which the runtime rejects before reaching here.
     if (submission.body.path === "-") return null;
+    let raw: string;
     try {
-      text = io.readText(submission.body.path);
+      raw = io.readText(submission.body.path);
     } catch {
       return {
         reason: "unreadable-body",
         message: `cannot read review body ${submission.body.path}; refusing to post a review whose attestation cannot be checked`,
       };
+    }
+
+    if (submission.body.kind === "json-request-file") {
+      const decoded = decodeJsonRequestBody(raw);
+      if (decoded.kind === "unparsable") {
+        return {
+          reason: "unparsable-request-body",
+          message: attestationRefusalMessage(
+            `${submission.body.path} is not a JSON object with a string "body"`,
+            "The review text cannot be located, so its attestation cannot be checked.",
+          ),
+        };
+      }
+      // A review with no comment body attests nothing; nothing to check.
+      if (decoded.kind === "no-body") return null;
+      text = decoded.text;
+    } else {
+      text = raw;
     }
   }
 
