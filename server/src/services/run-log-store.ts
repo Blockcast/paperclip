@@ -21,6 +21,15 @@ export interface RunLogReadOptions {
 export interface RunLogReadResult {
   content: string;
   nextOffset?: number;
+  /**
+   * Total size of the log at the instant it was served, when the backing store
+   * can say. Both backends already compute it to clamp the range; surfacing it
+   * lets a reader seek to the END of a log instead of walking it from byte
+   * zero. `heartbeatRuns.logBytes` cannot serve that purpose: it is only
+   * written back on finalize (PEN-2106), so it is null for exactly the
+   * still-running rows a tail reader cares about.
+   */
+  totalBytes?: number;
 }
 
 export interface RunLogFinalizeSummary {
@@ -98,7 +107,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     if (!stat) return null;
     const start = Math.max(0, Math.min(offset, stat.size));
     const end = Math.max(start, Math.min(start + limitBytes - 1, stat.size - 1));
-    if (start > end) return { content: "", nextOffset: start };
+    if (start > end) return { content: "", nextOffset: start, totalBytes: stat.size };
 
     const chunks: Buffer[] = [];
     try {
@@ -117,7 +126,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     }
     const content = Buffer.concat(chunks).toString("utf8");
     const nextOffset = end + 1 < stat.size ? end + 1 : undefined;
-    return { content, nextOffset };
+    return { content, nextOffset, totalBytes: stat.size };
   }
 
   async function readS3Range(
@@ -132,7 +141,8 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     const total = head.contentLength ?? 0;
     const start = Math.max(0, Math.min(offset, total));
     const end = Math.max(start, Math.min(start + limitBytes - 1, total - 1));
-    if (start > end || total === 0) return { content: "", nextOffset: start < total ? start : undefined };
+    if (start > end || total === 0)
+      return { content: "", nextOffset: start < total ? start : undefined, totalBytes: total };
 
     const result = await s3.provider.getObject({ objectKey: key, range: { start, end } });
     const chunks: Buffer[] = [];
@@ -143,7 +153,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     });
     const content = Buffer.concat(chunks).toString("utf8");
     const nextOffset = end + 1 < total ? end + 1 : undefined;
-    return { content, nextOffset };
+    return { content, nextOffset, totalBytes: total };
   }
 
   async function sha256File(filePath: string): Promise<string> {

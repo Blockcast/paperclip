@@ -115,3 +115,97 @@ export function findTerminalResultEventInRunLogTail(
   }
   return null;
 }
+
+/** The single range read `readRunLogTerminalTail` needs from a log store. */
+export type RunLogRangeReader = (range: {
+  offset: number;
+  limitBytes: number;
+}) => Promise<{ content: string; nextOffset?: number; totalBytes?: number }>;
+
+export type RunLogTailRead =
+  /** `tail` is the true end of the log. */
+  | { kind: "tail"; tail: string; scannedBytes: number }
+  /**
+   * A size-less store forced a forward walk and the scan cap was reached with
+   * bytes still unread, so the window held is a PREFIX of the log, not its
+   * tail. Distinguished from `tail` because the terminal event lives at the
+   * END: a caller that treats a prefix as a tail reports "no verdict found"
+   * from bytes that could not have contained one.
+   */
+  | { kind: "truncated"; scannedBytes: number };
+
+export const RUN_LOG_TERMINAL_TAIL_BYTES = 256 * 1024;
+export const RUN_LOG_TERMINAL_MAX_SCAN_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Reads the trailing window of a durable run log, where the terminal event is.
+ *
+ * Seeks to the end when the store reports a size, which is why this exists as
+ * its own function: the original inline version walked FORWARD from byte zero
+ * and stopped at a scan cap, so for any log larger than the cap it retained the
+ * last 256 KiB *of the cap* — a window that by construction cannot hold the
+ * terminal event. It returned null and the caller kept its generic diagnosis,
+ * silently, and worst for the longest runs. Durable logs do exceed 8 MiB in
+ * production (12.9 MiB observed), so that was live, not theoretical.
+ *
+ * Memory stays bounded at one window regardless of log size, and the store is
+ * read at most twice for the seek path.
+ */
+export async function readRunLogTerminalTail(
+  read: RunLogRangeReader,
+  opts: { tailBytes?: number; maxScanBytes?: number } = {},
+): Promise<RunLogTailRead> {
+  const tailBytes = Math.max(1, opts.tailBytes ?? RUN_LOG_TERMINAL_TAIL_BYTES);
+  const maxScanBytes = Math.max(tailBytes, opts.maxScanBytes ?? RUN_LOG_TERMINAL_MAX_SCAN_BYTES);
+
+  const first = await read({ offset: 0, limitBytes: tailBytes });
+  let scannedBytes = Buffer.byteLength(first.content, "utf8");
+
+  if (typeof first.totalBytes === "number" && Number.isFinite(first.totalBytes)) {
+    // Whole log already in hand.
+    if (first.totalBytes <= tailBytes) {
+      return { kind: "tail", tail: first.content, scannedBytes };
+    }
+
+    const seeked = await read({
+      offset: first.totalBytes - tailBytes,
+      limitBytes: tailBytes,
+    });
+    scannedBytes += Buffer.byteLength(seeked.content, "utf8");
+    let tail = seeked.content;
+    let cursor = seeked.nextOffset ?? null;
+
+    // The pod can append between the two reads, so follow whatever landed after
+    // the window, still retaining only the trailing window. Bounded in practice
+    // because this runs after the pod is terminal.
+    while (cursor != null && scannedBytes < maxScanBytes) {
+      const chunk = await read({ offset: cursor, limitBytes: tailBytes });
+      const chunkBytes = Buffer.byteLength(chunk.content, "utf8");
+      scannedBytes += chunkBytes;
+      tail = (tail + chunk.content).slice(-tailBytes);
+      if (chunkBytes === 0 || chunk.nextOffset == null || chunk.nextOffset <= cursor) break;
+      cursor = chunk.nextOffset;
+    }
+    return { kind: "tail", tail, scannedBytes };
+  }
+
+  // Size-less store: walk forward retaining the trailing window. Reaching the
+  // cap with bytes outstanding is reported, never passed off as a tail.
+  let tail = first.content;
+  let offset = first.nextOffset ?? null;
+  while (offset != null) {
+    if (scannedBytes >= maxScanBytes) return { kind: "truncated", scannedBytes };
+    const chunk = await read({
+      offset,
+      limitBytes: Math.min(tailBytes, maxScanBytes - scannedBytes),
+    });
+    const chunkBytes = Buffer.byteLength(chunk.content, "utf8");
+    scannedBytes += chunkBytes;
+    tail = (tail + chunk.content).slice(-tailBytes);
+    // `nextOffset` is undefined once the store served the final byte; the
+    // `<= offset` guard keeps a misbehaving store from looping forever.
+    if (chunkBytes === 0 || chunk.nextOffset == null || chunk.nextOffset <= offset) break;
+    offset = chunk.nextOffset;
+  }
+  return { kind: "tail", tail, scannedBytes };
+}

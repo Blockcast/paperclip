@@ -6,7 +6,11 @@
 // The cases below pin the two framings that make this non-trivial, and the two
 // ways a naive reader scores a refusal as a success.
 import { describe, expect, it } from "vitest";
-import { findTerminalResultEventInRunLogTail } from "../services/run-log-terminal-result.js";
+import {
+  findTerminalResultEventInRunLogTail,
+  readRunLogTerminalTail,
+  type RunLogRangeReader,
+} from "../services/run-log-terminal-result.js";
 
 /** One durable-run-log envelope. The agent's stream-json rides inside `chunk`. */
 function envelope(stream: "stdout" | "stderr" | "system", chunk: string, ts: string, seq: number) {
@@ -134,5 +138,149 @@ describe("findTerminalResultEventInRunLogTail", () => {
     // Unknown emission time is reported as unknown, never as "now" — the caller
     // decides what to fall back to.
     expect(found?.emittedAtMs).toBeNull();
+  });
+});
+
+/**
+ * A byte-range store standing in for `runLogStore`, with the same clamping and
+ * `nextOffset` contract as the local-file and S3 backends.
+ *
+ * `reportsSize` models the one axis that decides the read strategy: a store
+ * that can say how big the log is lets the reader seek to the end, and one that
+ * cannot forces a forward walk.
+ */
+function fakeRangeStore(body: string, opts: { reportsSize?: boolean } = {}) {
+  const reportsSize = opts.reportsSize ?? true;
+  const buf = Buffer.from(body, "utf8");
+  const reads: { offset: number; limitBytes: number }[] = [];
+  const read: RunLogRangeReader = async ({ offset, limitBytes }) => {
+    reads.push({ offset, limitBytes });
+    const start = Math.max(0, Math.min(offset, buf.length));
+    const end = Math.min(start + limitBytes, buf.length);
+    const nextOffset = end < buf.length ? end : undefined;
+    return {
+      content: buf.subarray(start, end).toString("utf8"),
+      ...(nextOffset === undefined ? {} : { nextOffset }),
+      ...(reportsSize ? { totalBytes: buf.length } : {}),
+    };
+  };
+  return { read, reads };
+}
+
+describe("readRunLogTerminalTail", () => {
+  const TAIL = 1024;
+
+  /** Filler large enough to push the terminal event past any scan cap. */
+  function padTo(bytes: number) {
+    const line = `${envelope("stdout", "noise\n", "2026-09-08T21:00:00.000Z", 1)}\n`;
+    return line.repeat(Math.ceil(bytes / line.length));
+  }
+
+  it("returns the whole log when it is smaller than the tail window", async () => {
+    const body = `${envelope("stdout", `${JSON.stringify(REFUSAL_EVENT)}\n`, "2026-09-08T21:55:56.000Z", 4)}\n`;
+    const store = fakeRangeStore(body);
+    const result = await readRunLogTerminalTail(store.read, { tailBytes: TAIL });
+
+    expect(result.kind).toBe("tail");
+    expect(findTerminalResultEventInRunLogTail((result as { tail: string }).tail)?.event).toMatchObject({
+      api_error_status: 429,
+    });
+    // One read: the first already served the entire log.
+    expect(store.reads).toHaveLength(1);
+  });
+
+  // The regression this function was extracted for. The previous inline reader
+  // walked forward from byte zero and stopped at its scan cap, so for a log
+  // bigger than the cap it held the last window OF THE CAP and the terminal
+  // event — which is always at the very end — was never in the bytes examined.
+  // Production durable logs do exceed 8 MiB (12.9 MiB observed), and the miss
+  // was silent: the run simply kept its generic `job_failed`.
+  it("finds the terminal event in a log far larger than the scan cap", async () => {
+    const maxScanBytes = 4 * TAIL;
+    const body = `${padTo(maxScanBytes * 6)}${envelope(
+      "stdout",
+      `${JSON.stringify(REFUSAL_EVENT)}\n`,
+      "2026-09-08T21:55:56.000Z",
+      99,
+    )}\n`;
+    expect(Buffer.byteLength(body, "utf8")).toBeGreaterThan(maxScanBytes);
+
+    const store = fakeRangeStore(body);
+    const result = await readRunLogTerminalTail(store.read, { tailBytes: TAIL, maxScanBytes });
+
+    expect(result.kind).toBe("tail");
+    const found = findTerminalResultEventInRunLogTail((result as { tail: string }).tail);
+    expect(found?.event).toMatchObject({ type: "result", is_error: true, api_error_status: 429 });
+    // Seeked rather than walked: two reads regardless of how large the log is,
+    // and the scan cap is never approached.
+    expect(store.reads).toHaveLength(2);
+    expect(store.reads[1]!.offset).toBe(Buffer.byteLength(body, "utf8") - TAIL);
+    expect(result.scannedBytes).toBeLessThanOrEqual(2 * TAIL);
+  });
+
+  it("keeps memory bounded to one window on a large log", async () => {
+    const body = `${padTo(40 * TAIL)}${envelope("stdout", `${JSON.stringify(REFUSAL_EVENT)}\n`, "2026-09-08T21:55:56.000Z", 7)}\n`;
+    const result = await readRunLogTerminalTail(fakeRangeStore(body).read, { tailBytes: TAIL });
+
+    expect(result.kind).toBe("tail");
+    expect(Buffer.byteLength((result as { tail: string }).tail, "utf8")).toBeLessThanOrEqual(TAIL);
+  });
+
+  it("still reaches the end when the log grows between the size probe and the seek", async () => {
+    const head = padTo(8 * TAIL);
+    const appended = `${envelope("stdout", `${JSON.stringify(REFUSAL_EVENT)}\n`, "2026-09-08T21:55:56.000Z", 12)}\n`;
+    const buf = Buffer.from(`${head}${appended}`, "utf8");
+    // Reports the pre-append size on the first read, then serves the grown
+    // file — the pod can still be flushing when the reconciler reads.
+    const staleSize = Buffer.byteLength(head, "utf8");
+    let call = 0;
+    const read: RunLogRangeReader = async ({ offset, limitBytes }) => {
+      call += 1;
+      const start = Math.max(0, Math.min(offset, buf.length));
+      const end = Math.min(start + limitBytes, buf.length);
+      const nextOffset = end < buf.length ? end : undefined;
+      return {
+        content: buf.subarray(start, end).toString("utf8"),
+        ...(nextOffset === undefined ? {} : { nextOffset }),
+        totalBytes: call === 1 ? staleSize : buf.length,
+      };
+    };
+
+    const result = await readRunLogTerminalTail(read, { tailBytes: TAIL });
+    expect(result.kind).toBe("tail");
+    expect(findTerminalResultEventInRunLogTail((result as { tail: string }).tail)?.event).toMatchObject({
+      api_error_status: 429,
+    });
+  });
+
+  it("reports `truncated` rather than passing a prefix off as the tail", async () => {
+    const maxScanBytes = 4 * TAIL;
+    const body = `${padTo(maxScanBytes * 4)}${envelope("stdout", `${JSON.stringify(REFUSAL_EVENT)}\n`, "2026-09-08T21:55:56.000Z", 21)}\n`;
+    // A store that cannot report a size leaves no option but a forward walk.
+    const store = fakeRangeStore(body, { reportsSize: false });
+    const result = await readRunLogTerminalTail(store.read, { tailBytes: TAIL, maxScanBytes });
+
+    // The distinction that matters: NOT `{kind:"tail"}` with an unparseable
+    // window, which the caller would report as "the provider said nothing".
+    expect(result.kind).toBe("truncated");
+    expect(result.scannedBytes).toBeGreaterThanOrEqual(maxScanBytes);
+  });
+
+  it("walks to EOF on a size-less store when the log fits inside the cap", async () => {
+    const body = `${padTo(3 * TAIL)}${envelope("stdout", `${JSON.stringify(REFUSAL_EVENT)}\n`, "2026-09-08T21:55:56.000Z", 31)}\n`;
+    const result = await readRunLogTerminalTail(fakeRangeStore(body, { reportsSize: false }).read, {
+      tailBytes: TAIL,
+      maxScanBytes: 64 * TAIL,
+    });
+
+    expect(result.kind).toBe("tail");
+    expect(findTerminalResultEventInRunLogTail((result as { tail: string }).tail)?.event).toMatchObject({
+      api_error_status: 429,
+    });
+  });
+
+  it("handles an empty log without looping", async () => {
+    const result = await readRunLogTerminalTail(fakeRangeStore("").read, { tailBytes: TAIL });
+    expect(result).toEqual({ kind: "tail", tail: "", scannedBytes: 0 });
   });
 });
