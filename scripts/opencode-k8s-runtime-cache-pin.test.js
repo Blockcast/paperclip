@@ -33,3 +33,22 @@ test("Dockerfile pins opencode_k8s and runs its security and execution regressio
   // than trusting a reviewer to spot it.
   assert.doesNotMatch(dockerfile, /OPENCODE_K8S_REF=87a865ded22d3ac4655b1c3fa1ad47473f23e7d8/);
 });
+
+test("the server-side Dockerfile pin assertion stays in sync with the Dockerfile", () => {
+  // BLO-33204: the pin is asserted in TWO suites. On the first re-pin attempt this
+  // one was updated and server/src/__tests__/docker-opencode-runtime-pin.test.ts was
+  // not, so the two suites asserted opposite things about the same line and CI went
+  // red after the fix was otherwise complete. Compare them directly rather than
+  // relying on whoever moves the pin next to remember there is a second copy.
+  const serverPinTest = readFileSync(
+    new URL("../server/src/__tests__/docker-opencode-runtime-pin.test.ts", import.meta.url),
+    "utf8",
+  );
+  const mirrored = serverPinTest.match(/ARG OPENCODE_K8S_REF=([0-9a-f]{40})/);
+  assert.ok(mirrored, "server pin test no longer asserts an ARG OPENCODE_K8S_REF pin");
+  assert.equal(
+    mirrored[1],
+    opencodeRefMatch?.[1],
+    "server pin test expects a different OPENCODE_K8S_REF than the Dockerfile pins",
+  );
+});
