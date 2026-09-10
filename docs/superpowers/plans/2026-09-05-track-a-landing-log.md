@@ -26,23 +26,23 @@ finding-disposition lands a branch that will not merge.
 | 1635 | no | MERGED 2026-09-04T10:01:40Z | — | merged before this run |
 | 1627 | no | MERGED 2026-09-04T08:56:55Z | — | merged before this run |
 | 1322 | no | MERGED 2026-09-05T05:58:22Z | — | merged before this run |
-| 1609 | no | MERGED 2026-09-06T04:46:52Z | `ad4664bd` | merged as `30c23389`, which is the current `master` tip |
-| 1588 | no | CLEAN, `verify` success | `83c4d70d` | **enqueued** (merge queue) — first, per plan |
-| 1605 | no | CLEAN, `verify` success | `d134fd9c` | **enqueued** |
-| 1600 | no | CLEAN, `verify` success | `529d300b` | **enqueued** |
-| 1595 | no | CLEAN, `verify` success | `42665671` | **enqueued** |
-| 1586 | no | CLEAN, `verify` success | `6a6f1a08` | **enqueued** |
-| 1584 | no | CLEAN, `verify` success | `3e8e6ddc` | **enqueued** |
-| 1596 | **yes** | CLEAN, `verify` success | `09ce54c8` | held — awaiting @kkroo (CODEOWNED); review already requested |
-| 1585 | **yes** | CLEAN, `verify` success | `00b36ef4` | held — awaiting @kkroo (CODEOWNED); review already requested |
-| 1467 | no | DIRTY, no `verify` at head | `b79f74ea` | rebase — [BLO-32247](https://paperclip.blockcast.net/BLO/issues/BLO-32247) |
-| 1418 | no | DIRTY, no `verify` at head | `4a9c840a` | rebase — [BLO-32249](https://paperclip.blockcast.net/BLO/issues/BLO-32249) |
-| 1309 | no | DIRTY, no `verify` at head | `61c45424` | rebase — [BLO-32250](https://paperclip.blockcast.net/BLO/issues/BLO-32250) |
-| 1279 | no | DIRTY | `0d2081fa` | rebase — [BLO-32251](https://paperclip.blockcast.net/BLO/issues/BLO-32251) |
-| 1219 | **yes** | DIRTY | `6f3aa374` | rebase + @kkroo — [BLO-32252](https://paperclip.blockcast.net/BLO/issues/BLO-32252) |
-| 1195 | no | DIRTY | `4338f176` | rebase — [BLO-32253](https://paperclip.blockcast.net/BLO/issues/BLO-32253) |
-| 1150 | **yes** | DIRTY | `62004b23` | rebase + @kkroo — [BLO-32254](https://paperclip.blockcast.net/BLO/issues/BLO-32254) |
-| 1091 | no | DIRTY, no `verify` at head | `a5583c27` | superseded post-commit — **closed, not rebased** (the same identity closed it at 05:23:43Z, "closing as superseded"); [BLO-32255](https://paperclip.blockcast.net/BLO/issues/BLO-32255) is resolved |
+| 1609 | no | MERGED 2026-09-06T04:46:52Z | `ad4664bd0a407f3d71ea8c4c935ac80e05c3cc33` | merged as `30c23389316b4b6cce44d28f68d79af12b7c4c02`, which is the current `master` tip |
+| 1588 | no | CLEAN, `verify` success | `83c4d70df4156a72f6996bec2b7667e653b392d5` | **enqueued** (merge queue) — first, per plan |
+| 1605 | no | CLEAN, `verify` success | `d134fd9c908e5b4239723a484541f03419d1e936` | **enqueued** |
+| 1600 | no | CLEAN, `verify` success | `529d300b76b8a4bcd9c7d2da63d57300708852d4` | **enqueued** |
+| 1595 | no | CLEAN, `verify` success | `42665671673a7873296334006ad675f7d2c8f617` | **enqueued** |
+| 1586 | no | CLEAN, `verify` success | `6a6f1a08758d3bd9e5d3dac34e68c76bcac3bc9e` | **enqueued** |
+| 1584 | no | CLEAN, `verify` success | `3e8e6ddc2cc42a6722e41cb69f8e86efd64619d8` | **enqueued** |
+| 1596 | **yes** | CLEAN, `verify` success | `09ce54c8867eed6a36ad6cc621fed5e5cc9a57a4` | held — awaiting @kkroo (CODEOWNED); review already requested |
+| 1585 | **yes** | CLEAN, `verify` success | `00b36ef46de4f0581d2e95378c724fe47b32aac4` | held — awaiting @kkroo (CODEOWNED); review already requested |
+| 1467 | no | DIRTY, no `verify` at head | `b79f74eaabc12afe7b5e579afd19ec962ba20e1e` | rebase — [BLO-32247](https://paperclip.blockcast.net/BLO/issues/BLO-32247) |
+| 1418 | no | DIRTY, no `verify` at head | `4a9c840a740c555fd46eb08ae2e22d898c2ad0d2` | rebase — [BLO-32249](https://paperclip.blockcast.net/BLO/issues/BLO-32249) |
+| 1309 | no | DIRTY, no `verify` at head | `61c454245432aa3c7c56bedb8b634154489bc726` | rebase — [BLO-32250](https://paperclip.blockcast.net/BLO/issues/BLO-32250) |
+| 1279 | no | DIRTY | `0d2081fa089c5b1027f2f3349aa8738569e55c6b` | rebase — [BLO-32251](https://paperclip.blockcast.net/BLO/issues/BLO-32251) |
+| 1219 | **yes** | DIRTY | `6f3aa37464b1aa2bb5c70a7e49a5550a9c03e1f1` | rebase + @kkroo — [BLO-32252](https://paperclip.blockcast.net/BLO/issues/BLO-32252) |
+| 1195 | no | DIRTY | `4338f176dacb66efcd3635ca7c2c7cfb84684d84` | rebase — [BLO-32253](https://paperclip.blockcast.net/BLO/issues/BLO-32253) |
+| 1150 | **yes** | DIRTY | `62004b2331b4af0f8d99f78f53689f947d12765b` | rebase + @kkroo — [BLO-32254](https://paperclip.blockcast.net/BLO/issues/BLO-32254) |
+| 1091 | no | DIRTY, no `verify` at head | `a5583c27bc8df1600ca20868a6f94639262234de` | superseded post-commit — **closed, not rebased** (the same identity closed it at 05:23:43Z, "closing as superseded"); [BLO-32255](https://paperclip.blockcast.net/BLO/issues/BLO-32255) is resolved |
 
 4 already merged · 6 enqueued · 2 held on CODEOWNER · 8 rebase-blocked = 20.
 
@@ -52,6 +52,15 @@ Each was verified before enqueue against three independent gates:
 
 1. **CI (CEO ruling BLO-26572)** — every check-run at head `success`/`neutral`/`skipped`;
    zero `failure`, zero `PENDING`, and `verify` present (never `ABSENT`).
+
+   > **Superseded 2026-09-10, and recorded rather than rewritten.** This is what the gate
+   > *was* when these six were enqueued on 2026-09-06, so it stays as the historical record.
+   > But accepting `neutral`/`skipped` is exactly the reading Ally flagged three times as
+   > conflicting with [BLO-26572](https://paperclip.blockcast.net/BLO/issues/BLO-26572), and
+   > the reusable routine no longer contains it — criterion 3(c) of the plan document now
+   > requires `SUCCESS` with no allowlist and records `SKIPPED`/`NEUTRAL` as a
+   > `policy-hold:<name>=<state>` skip. Do not copy the line above into a new routine.
+
 2. **Ally review at the exact head** — the latest `## Ally — Consolidated PR Review` for each
    PR carries a single `Reviewed head:` line equal to the *current* `headRefOid`, with
    `### Critical Issues (0)` and `### Important Issues (0)`. No stale-head attestation was
@@ -77,14 +86,14 @@ strategy.
 
 | PR | author | head | Ally crit/imp at head | disposition |
 |---|---|---|---|---|
-| 1455 | app/allyblockcast | `de3f2cb3` | 0 / 1 | rebase-blocked; findings deferred to post-rebase re-review |
-| 1361 | app/allyblockcast | `b0e94e77` | 0 / 1 | rebase-blocked; findings deferred |
-| 1360 | app/allyblockcast | `bfe400dd` | 0 / 0 | rebase-blocked (already finding-clean) |
-| 1277 | app/allyblockcast | `1f4b2290` | 0 / 1 | rebase-blocked; findings deferred |
-| 1229 | **kkroo** | `77e52202` | 0 / 1 | **not merged — human-authored**; Track A bars agent merge. Needs @kkroo |
-| 1141 | app/allyblockcast | `0d8852ff` | 0 / 1 | rebase-blocked; findings deferred |
-| 1126 | app/allyblockcast | `2739ce09` | 0 / 1 | rebase-blocked; findings deferred |
-| 1220 | app/allyblockcast | `c8e9268a` | 0 / 3 | rebase-blocked; findings deferred |
+| 1455 | app/allyblockcast | `de3f2cb37a82c4b9ac92062066153d1d4ed882cd` | 0 / 1 | rebase-blocked; findings deferred to post-rebase re-review |
+| 1361 | app/allyblockcast | `b0e94e77a7229a374b272e305a52cb11e67c1ff8` | 0 / 1 | rebase-blocked; findings deferred |
+| 1360 | app/allyblockcast | `bfe400dd2f309aabe74a670e7d636333c22bfa30` | 0 / 0 | rebase-blocked (already finding-clean) |
+| 1277 | app/allyblockcast | `1f4b2290dfde243a7a348779cf4358abf1d14f41` | 0 / 1 | rebase-blocked; findings deferred |
+| 1229 | **kkroo** | `77e52202b1a27844da274bb6d25c063efd2d9ad3` | 0 / 1 | **not merged — human-authored**; Track A bars agent merge. Needs @kkroo |
+| 1141 | app/allyblockcast | `0d8852ff7b68c1a46dcc33615ec93f5fcab5a135` | 0 / 1 | rebase-blocked; findings deferred |
+| 1126 | app/allyblockcast | `2739ce0944088fd8f2febe7bdfd5d3b6167c7abb` | 0 / 1 | rebase-blocked; findings deferred |
+| 1220 | app/allyblockcast | `c8e9268adff2e57d7b6d1d1180d70a015a06c095` | 0 / 3 | rebase-blocked; findings deferred |
 
 ### Why the findings were deliberately *not* dispositioned at these heads
 
@@ -108,8 +117,8 @@ fix. Two clusters will re-conflict with each other and must be sequenced, not pa
 |---|---|---|---|
 | 1471 | MERGED 2026-09-05T16:42:05Z | — | landed before this run |
 | 1613 | MERGED 2026-09-05T13:01:05Z | — | landed before this run (kkroo-authored) |
-| 1463 | OPEN, DIRTY, `review` = failure | `9fa22e6c` | rebase-blocked *and* red; two blockers |
-| 1559 | OPEN, UNSTABLE, `review` = failure | `8ba99632` | red gate; `#1585` must land first (same guard script) |
+| 1463 | OPEN, DIRTY, `review` = failure | `9fa22e6c869b100d0b630495c3233cae6827e8ca` | rebase-blocked *and* red; two blockers |
+| 1559 | OPEN, UNSTABLE, `review` = failure | `8ba996328cf0b75d909346dc3d0fcdb65348e86b` | red gate; `#1585` must land first (same guard script) |
 
 ## A4 — production deploy
 
@@ -205,14 +214,33 @@ routine into a no-op that is indistinguishable from one that is working.
 | 1219 | **MERGED** 2026-09-08T09:40:57Z | `70a9df918d2d250d5dfb536c15069e5015739b34` | — |
 | 1309 | **MERGED** 2026-09-08T10:41:08Z | `a589aea8bb990d11d5d987216b8dc4089b74a4a2` | — |
 | 1418 | **MERGED** 2026-09-08T17:40:44Z | `b9ec8590c0cb4cf0eae539ce9e8591473765ecb9` | — |
-| 1150 | OPEN — passes 1–4 at `31a2c99f15ab4344271c5080b167969e2bdb707c` | **criterion 5**: no `APPROVED` from kkroo; every review on it is `allyblockcast[bot]` / `COMMENTED` | **kkroo** |
+| 1585 | **MERGED** 2026-09-09T22:54:18Z | `d0613f40f2e52267a7d94b4fb3019f5a491d2155` | — |
+| 1150 | **MERGED** 2026-09-09T23:49:23Z | `3e85318c0f454d42d5e60cbfbcc11935a66d2078` | — |
 | 1596 | OPEN | **criterion 3**: `gate/ally-comment-findings` **ABSENT** at `09ce54c8867eed6a36ad6cc621fed5e5cc9a57a4` — only the retired `review/ally-comment` is present, so the head is unattested, not clean. Then criterion 5 | **Ally**, then kkroo |
-| 1585 | OPEN | **criterion 3**: same shape at `00b36ef46de4f0581d2e95378c724fe47b32aac4`. Then criterion 5 | **Ally**, then kkroo |
-| 1595 | OPEN | **criteria 2, 3 and 4**: `verify` and `General tests (server 3/4)` are `failure`; gate is `failure` ("carries an unresolved finding"); and the branch has a merge commit (parents `[1,1,1,1,1,1,1,2]`) needing squash-replay linearization | **Ally**, then a linearization pass |
+| 1595 | OPEN | **criteria 1, 2, 3 and 4**: `mergeStateStatus: DIRTY` / `mergeable: false` at `06b2cb20811d3dd46b44a12f6fc7bfad1014abae`; `verify` and `General tests (server 3/4)` are `failure`; gate is `failure` ("carries an unresolved finding"); and the branch has a merge commit (parents `[1,1,1,1,1,1,1,2]`) needing squash-replay linearization | **Ally**, then a linearization pass |
 
-Each of the seven landed PRs has a corresponding `gh-readonly-queue/master/pr-<n>-*` build under
-`actions/runs?event=merge_group` — the positive proof that the queue rebased and built the entry
-rather than silently evicting it. All seven are present.
+**9 of the 11 have landed.** Every one has a corresponding `gh-readonly-queue/master/pr-<n>-*`
+build under `actions/runs?event=merge_group` — the positive proof that the queue rebased and
+built the entry rather than silently evicting it — and every merge SHA returns `behind_by: 0`
+against `master`, i.e. is a true ancestor.
+
+> **Update 2026-09-09 22:54Z / 23:49Z — #1585 and #1150 landed, and criterion 5 was satisfied by
+> a merge rather than by a review.** Both were held on criterion 5 (no `APPROVED` review from
+> kkroo). kkroo resolved them by **enqueueing them directly**, not by approving: `merged_by` is
+> `kkroo` (`type: User`) on both, and neither carries an `APPROVED` review at any head — every
+> review on both is still `allyblockcast[bot]` / `COMMENTED`.
+>
+> This is worth recording precisely, because it is the case the fleet rules single out. A human
+> org-admin merging on their own repo is **explicitly not** an agent decision and is not governed
+> by [BLO-26572](https://paperclip.blockcast.net/BLO/issues/BLO-26572). It also does **not**
+> retroactively authorise an executor to merge #1596 on the same reasoning: per that ruling's own
+> wording, *precedent is not authorization*. Criterion 5 therefore still binds #1596 and it was
+> **not** merged here. The two landings are recorded as resolved-by-owner, not as evidence that
+> the criterion was optional.
+>
+> Both went through the queue rather than around it — `pr-1585-b649fc74` and `pr-1150-d0613f40`
+> queue builds are present and green, so this was a normal enqueue by an identity that satisfies
+> the gate, not an `--admin` bypass.
 
 **No PR was evicted for carrying a merge commit**, because criterion 4 was applied with the
 parent-count check rather than `rebaseable` alone. **`gh pr update-branch` was never invoked
@@ -225,14 +253,20 @@ gate, and a merge commit. Never diagnose a `BEHIND` PR from the `BEHIND` reading
 
 ### The CODEOWNERS gate is requested, not required
 
-Worth recording because it is counter-intuitive and it is the only thing holding #1150. The sole
-rule on `master` is `merge_queue` — there is no `pull_request` rule, no
-`required_approving_review_count`, and no `required_status_checks`. Consistent with that, all
-four open PRs read `reviewDecision: null` rather than `REVIEW_REQUIRED`; the CODEOWNERS entry
-*requests* kkroo but no ruleset enforces the request. Criterion 5 was nonetheless applied as
-written, and #1150 was **not** merged. Whether the criterion should bind where no ruleset
-enforces it is a routing decision for the issue owner, not one for the executor to take on the
-strength of having measured it.
+Worth recording because it is counter-intuitive, and because it is now the only thing standing
+between #1596 and the queue. The sole rule on `master` is `merge_queue` — there is no
+`pull_request` rule, no `required_approving_review_count`, and no `required_status_checks`.
+Consistent with that, all four open PRs read `reviewDecision: null` rather than
+`REVIEW_REQUIRED`; the CODEOWNERS entry *requests* kkroo but no ruleset enforces the request.
+Criterion 5 was nonetheless applied as written, and neither #1150 nor #1596 was merged by the
+executor. Whether the criterion should bind where no ruleset enforces it is a routing decision
+for the issue owner, not one for the executor to take on the strength of having measured it.
+
+> **Resolved in practice for #1150 and #1585, but not as a matter of policy** (see the update
+> above). kkroo enqueued both on 2026-09-09 without posting an `APPROVED` review, so criterion 5
+> was never satisfied on its own terms — it was made moot by the owner acting directly. The
+> question of whether the criterion binds an *executor* where no ruleset enforces it is still
+> open, and #1596 is still held on it.
 
 ### A4 — deploy not dispatched, and why
 
@@ -296,3 +330,65 @@ query found the `PR` workflow `in_progress` on that exact branch since `2026-09-
 the run was simply outside the recency window of the unfiltered listing. The queue is slow, not
 stuck. Recording it because "I did not find a run" is not "no run exists", and the difference
 would have turned a slow queue into a fabricated incident.
+
+## Re-measurement 2026-09-10 ~07:5xZ — 9 of 11 landed, and my own deploy card's premise expired
+
+Measured with `master` at `ac3386b9667cf0f422d18f42130399c659bcfcac`.
+
+**#1585 and #1150 landed overnight** (see the update under *Final dispositions*), taking the row
+to **9 of 11**. Both went through the merge queue with green `gh-readonly-queue` builds, and both
+merge SHAs return `behind_by: 0` against `master`. Two remain open: **#1596** on criterion 5
+(kkroo) and **#1595** on criteria 1–4 (`DIRTY`, two failing checks, failing findings gate, and a
+mid-branch merge commit needing squash-replay under
+[BLO-32317](https://paperclip.blockcast.net/BLO/issues/BLO-32317)).
+
+### The pending deploy carries 7 of the 9 merges, not all of them
+
+Board card `6ab6ee30-01fc-41f1-b765-e29e9125ffed` asks for one click on the
+`paperclip-production` gate of Docker run **`34324444180`** (target
+`52cfc6dfb0865e7b069076c15c303d47766404fe`, `waiting` since 2026-09-09T07:33:19Z, still the sole
+`waiting` run and so still holding the fleet deploy mutex). Its `build-and-push` is `success`, so
+the artifact exists and the run is parked purely on the human gate.
+
+That card's load-bearing argument was *"it already contains every merge this row landed."* **That
+is no longer true.** The run was dispatched at 07:33Z on 09-09; #1585 merged at 22:54Z and #1150
+at 23:49Z, roughly 15h later. Measured against the target:
+
+| merge | vs `52cfc6dfb…` | in the pending deploy? |
+|---|---|---|
+| #1195 #1279 #1586 #1467 #1219 #1309 #1418 | `status: ahead`, `behind_by: 0` | **yes** — ancestors |
+| #1585 `d0613f40f…` | `status: behind`, `ahead_by: 0`, `behind_by: 44` | **no** |
+| #1150 `3e85318c0…` | `status: behind`, `ahead_by: 0`, `behind_by: 45` | **no** |
+
+**This is the [BLO-22455](https://paperclip.blockcast.net/BLO/issues/BLO-22455) rot pattern
+happening to my own escalation.** The card was accurate when filed and decayed while correctly
+not being polled — a "human-only gate" is a classification made at a moment in time, not a
+durable property. The correction was posted as a comment on the still-pending card rather than by
+withdrawing and re-filing, which would have burned the idempotency key for no gain.
+
+**The recommendation is unchanged: approve `34324444180`.** Rejecting it to pick up two more
+commits would destroy a built, green artifact and spend a second human click, and the two missing
+PRs are `.github/**` (#1585) and `skills/**` (#1150) — neither is server runtime code. Approving
+it satisfies this row's ancestry criterion for 7 of the 9; the remaining two will land in
+production on the next deploy at a newer `master`. **Stated plainly so it is not overclaimed: that
+leaves this row's A4 acceptance criterion — "every merge from this row as an ancestor" — only
+partly met by this deploy, and closing it needs one further deploy that nobody needs to click
+early.** No dispatch was attempted: standing-grant condition 3 forbids dispatching while any run
+is `waiting`, and one is.
+
+### Production is unchanged, and today's master image is red again
+
+Production remains `66d67f18819175ecbeeef2e1918f1fca634ae49b` on **both** tiers —
+`StatefulSet/paperclip` and `Deployment/paperclip-api` carry the same pod-template
+`paperclip.blockcast.net/deployed-commit`, so there is still no
+[BLO-24821](https://paperclip.blockcast.net/BLO/issues/BLO-24821) divergence. **None of the nine
+merges is deployed.**
+
+The [BLO-32824](https://paperclip.blockcast.net/BLO/issues/BLO-32824) image break was fixed by
+[#1723](https://github.com/Blockcast/paperclip/pull/1723) (merged 2026-09-08T23:55:19Z), which is
+why `34324444180` built green. But `Docker` on `master` is failing again: run **#1708**
+(`c9a6ff973`, 2026-09-10T05:01:15Z) failed at `build-and-push`, with #1709 (`ac3386b96`) still
+`in_progress` at time of writing. That is **not** a Track A blocker — the pending deploy has its
+own green image — but it does mean a re-dispatch at current `master` could fail to build, which is
+a second, independent reason not to reject the incumbent. Not diagnosed here and not this row's;
+recorded so the next reader does not assume a re-dispatch is free.
