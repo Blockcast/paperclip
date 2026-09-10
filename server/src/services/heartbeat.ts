@@ -18094,6 +18094,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         resumeAt: Date | null;
         penstockProvider?: string;
         penstockModel?: string;
+        penstockProbePath?: string;
         penstockRetryAfterSeconds?: number | null;
       } | null = null;
       const penstockCapacity = await checkPenstockAvailabilityForAgent({
@@ -18109,6 +18110,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           resumeAt: penstockCapacity.resumeAt,
           penstockProvider: penstockCapacity.provider,
           penstockModel: penstockCapacity.model,
+          penstockProbePath: penstockCapacity.probePath,
           penstockRetryAfterSeconds: penstockCapacity.retryAfterSeconds,
         };
         recordCcrotateCapacityDeferred({
@@ -18237,6 +18239,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           model: capacity.penstockModel,
           reason: capacity.reason,
           retryAfterSeconds: capacity.penstockRetryAfterSeconds,
+          probePath: capacity.penstockProbePath,
           advertisedResumeAtIso: capacity.resumeAt ? capacity.resumeAt.toISOString() : null,
           clampedFromIso: capacityRetryPlan.clampedFromIso,
           // Set once for the chain. `resolveCapacityEscalation` already echoed
@@ -32458,6 +32461,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 model: gateResult.model,
                 reason: gateResult.reason,
                 retryAfterSeconds: gateResult.retryAfterSeconds,
+                probePath: gateResult.probePath,
                 advertisedResumeAtIso: advertisedResumeAtIso,
                 clampedFromIso: capacityRetryPlan.clampedFromIso,
                 // First hop of a fresh chain by construction — this is the
