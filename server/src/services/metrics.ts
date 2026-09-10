@@ -1738,6 +1738,95 @@ export const AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC = "paperclip_agent_heartbea
  */
 export const AGENT_ERROR_DURATION_SECONDS_METRIC = "paperclip_agent_status_error_duration_seconds";
 
+/**
+ * Bounded bucket set for the free-text `agents.errorReason` (BLO-22498).
+ *
+ * WHY A BUCKET AND NOT THE RAW STRING
+ * -----------------------------------
+ * `errorReason` is not a repo-defined enum: for this condition it is verbatim
+ * text from the opencode CLI, arriving via the session-recovery path in
+ * `packages/adapters/opencode-local/src/server/execute.ts` and landing in the
+ * column as `finalizeAgentStatus`'s `failureReason`. Putting that on a label
+ * would mint a new series per distinct upstream phrasing — the exact
+ * cardinality failure BLO-28616 catalogued (343 alert rows / 334 distinct
+ * pods). So it is collapsed to this fixed set, same idiom as
+ * {@link KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES}.
+ *
+ * `other` vs `none` are kept distinct deliberately: `other` means "in error
+ * for a reason we have not triaged into a bucket", `none` means "in error
+ * with no reason recorded at all". Conflating them would hide which is
+ * growing.
+ */
+export const AGENT_ERROR_REASON_SESSION_UNAVAILABLE = "session_unavailable";
+export const AGENT_ERROR_REASON_OTHER = "other";
+export const AGENT_ERROR_REASON_NONE = "none";
+
+export const KNOWN_AGENT_ERROR_REASON_BUCKETS = [
+  AGENT_ERROR_REASON_SESSION_UNAVAILABLE,
+  AGENT_ERROR_REASON_OTHER,
+  AGENT_ERROR_REASON_NONE,
+] as const;
+
+export type AgentErrorReasonBucket = (typeof KNOWN_AGENT_ERROR_REASON_BUCKETS)[number];
+
+/**
+ * Collapse a raw `agents.errorReason` into a {@link
+ * KNOWN_AGENT_ERROR_REASON_BUCKETS} member.
+ *
+ * The `session_unavailable` match is a case-insensitive SUBSTRING test, not
+ * equality. That is deliberate and load-bearing: the upstream text is not
+ * ours, and observed forms wrap the phrase in surrounding context rather than
+ * being exactly `"Session unavailable"`. An equality check would read as
+ * working — the series would exist and sit at a plausible 0 — while silently
+ * classifying every real occurrence as `other`. That failure is invisible on
+ * a dashboard, which is why the test pins a wrapped form and not just the
+ * bare phrase.
+ */
+export function classifyAgentErrorReason(
+  errorReason: string | null | undefined,
+): AgentErrorReasonBucket {
+  if (typeof errorReason !== "string") return AGENT_ERROR_REASON_NONE;
+  const trimmed = errorReason.trim();
+  if (trimmed.length === 0) return AGENT_ERROR_REASON_NONE;
+  return trimmed.toLowerCase().includes("session unavailable")
+    ? AGENT_ERROR_REASON_SESSION_UNAVAILABLE
+    : AGENT_ERROR_REASON_OTHER;
+}
+
+/**
+ * Count of agents currently in `status = 'error'`, bucketed by
+ * {@link classifyAgentErrorReason} (BLO-22498).
+ *
+ * This is the reason-resolved companion to
+ * {@link AGENT_ERROR_DURATION_SECONDS_METRIC}, which carries only `agent_id`
+ * and therefore cannot answer "are we in the BLO-18012 condition, or is some
+ * unrelated agent merely errored". BLO-22498's acceptance criteria require
+ * that distinction explicitly, so a generic error count cannot satisfy the
+ * panel.
+ *
+ * Every bucket is published on every pass, including empty ones, so an
+ * idle-healthy fleet reads an explicit `0` rather than dropping the series.
+ * A missing series and a healthy one look identical on a Grafana panel and on
+ * most `absent()`-less alert expressions — the zero-fill is what makes
+ * "recovered" distinguishable from "exporter broke".
+ */
+export const AGENT_ERROR_REASON_AGENTS_METRIC = "paperclip_agent_status_error_agents";
+
+/**
+ * Seconds the OLDEST agent in each {@link classifyAgentErrorReason} bucket has
+ * continuously held `status = 'error'`, 0 when the bucket is empty
+ * (BLO-22498).
+ *
+ * Max-within-bucket rather than a per-agent series so BLO-18012's bound
+ * ("time-to-recovery <= 2 min") is a direct single-series comparison instead
+ * of a `max()` the panel has to reconstruct. Inherits the `updatedAt`-as-
+ * proxy caveat documented on {@link AGENT_ERROR_DURATION_SECONDS_METRIC}: an
+ * unrelated write to a still-errored row understates the age, never
+ * overstates it, so this is a lower bound on true time-in-error.
+ */
+export const AGENT_ERROR_REASON_OLDEST_AGE_METRIC =
+  "paperclip_agent_status_error_oldest_age_seconds";
+
 let registry: Registry | null = null;
 let concurrentRunBlocked: Counter<"agent_id" | "reason" | "isolation_mode"> | null = null;
 let isolatedRunStarted: Counter<"agent_id" | "isolation_mode"> | null = null;
@@ -1845,6 +1934,8 @@ let gbrainRecallTotal: Counter<"status"> | null = null;
 let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
 let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
 let agentErrorDuration: Gauge<"agent_id"> | null = null;
+let agentErrorReasonAgents: Gauge<"error_reason"> | null = null;
+let agentErrorReasonOldestAge: Gauge<"error_reason"> | null = null;
 let projectPrimaryWorkspaceFallback: Counter | null = null;
 let backstopDeferredCandidates: Gauge<"source"> | null = null;
 let backstopSweepCompleted: Counter<"source"> | null = null;
@@ -1899,6 +1990,8 @@ function ensureRegistry(): {
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
   agentErrorDurationGauge: Gauge<"agent_id">;
+  agentErrorReasonAgentsGauge: Gauge<"error_reason">;
+  agentErrorReasonOldestAgeGauge: Gauge<"error_reason">;
   projectPrimaryWorkspaceFallbackCounter: Counter;
   backstopDeferredCandidatesGauge: Gauge<"source">;
   backstopSweepCompletedCounter: Counter<"source">;
@@ -1949,6 +2042,8 @@ function ensureRegistry(): {
     || !agentHeartbeatAge
     || !agentHeartbeatInterval
     || !agentErrorDuration
+    || !agentErrorReasonAgents
+    || !agentErrorReasonOldestAge
     || !projectPrimaryWorkspaceFallback
     || !backstopDeferredCandidates
     || !backstopSweepCompleted
@@ -2579,6 +2674,44 @@ function ensureRegistry(): {
       labelNames: ["agent_id"],
       registers: [registry],
     });
+    agentErrorReasonAgents = new Gauge({
+      name: AGENT_ERROR_REASON_AGENTS_METRIC,
+      help:
+        "Count of agents currently in status='error', bucketed by a bounded error_reason "
+        + "label (session_unavailable | other | none) collapsed from the free-text "
+        + "agents.errorReason (BLO-22498). The reason-resolved companion to "
+        + AGENT_ERROR_DURATION_SECONDS_METRIC
+        + ", which carries only agent_id and so cannot distinguish the BLO-18012 "
+        + "'Session unavailable' condition from any unrelated errored agent. Fleet-wide and "
+        + "recomputed from the committed agents table on every heartbeat scheduler tick, so "
+        + "it is restart-safe and replica-invariant: aggregate across replicas with "
+        + "`max by (error_reason)`, NEVER a bare sum, or a second replica doubles the count. "
+        + "Every bucket publishes on every pass including empty ones, so a recovered fleet "
+        + "reads an explicit 0 instead of the series vanishing -- absent and healthy are "
+        + "indistinguishable on a panel, and that ambiguity is the whole failure this closes.",
+      labelNames: ["error_reason"],
+      registers: [registry],
+    });
+    agentErrorReasonOldestAge = new Gauge({
+      name: AGENT_ERROR_REASON_OLDEST_AGE_METRIC,
+      help:
+        "Seconds the OLDEST agent in each error_reason bucket has continuously held "
+        + "status='error', 0 when the bucket is empty (BLO-22498). Max-within-bucket so "
+        + "BLO-18012's <=120s time-to-recovery bound is a direct single-series comparison "
+        + "rather than one the panel reconstructs. Same replica-invariance and zero-fill "
+        + "contract as "
+        + AGENT_ERROR_REASON_AGENTS_METRIC
+        + ". Inherits the updatedAt-as-proxy caveat from "
+        + AGENT_ERROR_DURATION_SECONDS_METRIC
+        + ": an unrelated write to a still-errored row understates the age, so this is a "
+        + "lower bound on true time-in-error and can only under-report a bound breach.",
+      labelNames: ["error_reason"],
+      registers: [registry],
+    });
+    for (const bucket of KNOWN_AGENT_ERROR_REASON_BUCKETS) {
+      agentErrorReasonAgents.set({ error_reason: bucket }, 0);
+      agentErrorReasonOldestAge.set({ error_reason: bucket }, 0);
+    }
     projectPrimaryWorkspaceFallback = new Counter({
       name: PROJECT_PRIMARY_WORKSPACE_FALLBACK_METRIC,
       help:
@@ -2674,6 +2807,8 @@ function ensureRegistry(): {
     agentHeartbeatAgeGauge: agentHeartbeatAge,
     agentHeartbeatIntervalGauge: agentHeartbeatInterval,
     agentErrorDurationGauge: agentErrorDuration,
+    agentErrorReasonAgentsGauge: agentErrorReasonAgents,
+    agentErrorReasonOldestAgeGauge: agentErrorReasonOldestAge,
     projectPrimaryWorkspaceFallbackCounter: projectPrimaryWorkspaceFallback,
     backstopDeferredCandidatesGauge: backstopDeferredCandidates,
     backstopSweepCompletedCounter: backstopSweepCompleted,
@@ -3693,12 +3828,32 @@ export function setAgentLivenessMetrics(
     heartbeatAgeSeconds: number | null;
     heartbeatIntervalSeconds: number | null;
     errorDurationSeconds: number;
+    /**
+     * Raw `agents.errorReason`, collapsed to a bounded bucket here rather
+     * than by the caller so the classification lives next to the label set it
+     * feeds and cannot drift from it (BLO-22498). Only consulted for entries
+     * actually in `error` — see the aggregation below.
+     */
+    errorReason?: string | null;
   }>,
 ): void {
   const metrics = ensureRegistry();
   metrics.agentHeartbeatAgeGauge.reset();
   metrics.agentHeartbeatIntervalGauge.reset();
   metrics.agentErrorDurationGauge.reset();
+
+  // Zero every bucket up front, then accumulate. `reset()` alone would DELETE
+  // the series for a bucket that is currently empty, and an absent series is
+  // indistinguishable from a healthy one on a Grafana panel — the precise
+  // ambiguity BLO-22498 exists to remove. Recovery must render as a line
+  // returning to 0, not as a line that stops existing.
+  const bucketCounts = new Map<AgentErrorReasonBucket, number>();
+  const bucketOldestAge = new Map<AgentErrorReasonBucket, number>();
+  for (const bucket of KNOWN_AGENT_ERROR_REASON_BUCKETS) {
+    bucketCounts.set(bucket, 0);
+    bucketOldestAge.set(bucket, 0);
+  }
+
   for (const entry of entries) {
     if (typeof entry.agentId !== "string" || entry.agentId.length === 0) continue;
     if (entry.heartbeatEnabled && entry.heartbeatExpected) {
@@ -3712,9 +3867,31 @@ export function setAgentLivenessMetrics(
         );
       }
     }
-    metrics.agentErrorDurationGauge.set(
-      { agent_id: entry.agentId },
-      Number.isFinite(entry.errorDurationSeconds) ? Math.max(0, entry.errorDurationSeconds) : 0,
+    const errorDurationSeconds = Number.isFinite(entry.errorDurationSeconds)
+      ? Math.max(0, entry.errorDurationSeconds)
+      : 0;
+    metrics.agentErrorDurationGauge.set({ agent_id: entry.agentId }, errorDurationSeconds);
+
+    // `errorDurationSeconds > 0` is the in-error predicate, matching how the
+    // caller derives it (0 for every non-error status). Deliberately NOT
+    // keyed on `errorReason` being present: an agent in `error` with no
+    // reason recorded belongs in the `none` bucket, not omitted from the
+    // count. Note the boundary case this accepts — an agent that entered
+    // `error` in the same millisecond as this pass reads 0 and is missed
+    // until the next tick, which under-reports for at most one scrape
+    // interval and never invents a breach.
+    if (errorDurationSeconds > 0) {
+      const bucket = classifyAgentErrorReason(entry.errorReason);
+      bucketCounts.set(bucket, (bucketCounts.get(bucket) ?? 0) + 1);
+      bucketOldestAge.set(bucket, Math.max(bucketOldestAge.get(bucket) ?? 0, errorDurationSeconds));
+    }
+  }
+
+  for (const bucket of KNOWN_AGENT_ERROR_REASON_BUCKETS) {
+    metrics.agentErrorReasonAgentsGauge.set({ error_reason: bucket }, bucketCounts.get(bucket) ?? 0);
+    metrics.agentErrorReasonOldestAgeGauge.set(
+      { error_reason: bucket },
+      bucketOldestAge.get(bucket) ?? 0,
     );
   }
 }
@@ -3863,6 +4040,8 @@ export function __resetMetricsForTest(): void {
   agentHeartbeatAge = null;
   agentHeartbeatInterval = null;
   agentErrorDuration = null;
+  agentErrorReasonAgents = null;
+  agentErrorReasonOldestAge = null;
   projectPrimaryWorkspaceFallback = null;
   backstopDeferredCandidates = null;
   backstopSweepCompleted = null;
