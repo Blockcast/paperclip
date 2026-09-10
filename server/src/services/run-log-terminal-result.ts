@@ -148,8 +148,10 @@ export const RUN_LOG_TERMINAL_MAX_SCAN_BYTES = 8 * 1024 * 1024;
  * silently, and worst for the longest runs. Durable logs do exceed 8 MiB in
  * production (12.9 MiB observed), so that was live, not theoretical.
  *
- * Memory stays bounded at one window regardless of log size, and the store is
- * read at most twice for the seek path.
+ * Memory stays bounded at one window regardless of log size. A store that
+ * reports a size is read twice in the common case — the size probe, then either
+ * the seek or a revalidation of the end — plus one read per append that landed
+ * after the probe.
  */
 export async function readRunLogTerminalTail(
   read: RunLogRangeReader,
@@ -162,22 +164,36 @@ export async function readRunLogTerminalTail(
   let scannedBytes = Buffer.byteLength(first.content, "utf8");
 
   if (typeof first.totalBytes === "number" && Number.isFinite(first.totalBytes)) {
-    // Whole log already in hand.
-    if (first.totalBytes <= tailBytes) {
-      return { kind: "tail", tail: first.content, scannedBytes };
-    }
+    let tail: string;
+    let cursor: number | null;
 
-    const seeked = await read({
-      offset: first.totalBytes - tailBytes,
-      limitBytes: tailBytes,
-    });
-    scannedBytes += Buffer.byteLength(seeked.content, "utf8");
-    let tail = seeked.content;
-    let cursor = seeked.nextOffset ?? null;
+    if (first.totalBytes <= tailBytes) {
+      // The whole log AS OF THE SIZE PROBE is in hand — but the probe is not a
+      // seal. Both backends stat/HEAD for the size before serving the range and
+      // clamp the range to that size, so a pod flushing its terminal event in
+      // between lands past this window, and the store reports no `nextOffset`
+      // because it did serve everything the probe knew about. Returning here
+      // would therefore drop exactly the event this reader exists to find, and
+      // silently: an unparseable window is indistinguishable from "the provider
+      // said nothing". Re-probe from the end of what we read instead, so the
+      // small-log case follows growth on the same loop the seeked case uses.
+      tail = first.content;
+      cursor = first.totalBytes;
+    } else {
+      const seeked = await read({
+        offset: first.totalBytes - tailBytes,
+        limitBytes: tailBytes,
+      });
+      scannedBytes += Buffer.byteLength(seeked.content, "utf8");
+      tail = seeked.content;
+      cursor = seeked.nextOffset ?? null;
+    }
 
     // The pod can append between the two reads, so follow whatever landed after
     // the window, still retaining only the trailing window. Bounded in practice
-    // because this runs after the pod is terminal.
+    // because this runs after the pod is terminal. A store with nothing new to
+    // serve answers with an empty chunk and terminates the loop on the first
+    // pass, which is what keeps the no-growth case to one extra read.
     while (cursor != null && scannedBytes < maxScanBytes) {
       const chunk = await read({ offset: cursor, limitBytes: tailBytes });
       const chunkBytes = Buffer.byteLength(chunk.content, "utf8");
