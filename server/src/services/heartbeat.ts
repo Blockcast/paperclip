@@ -497,7 +497,7 @@ import {
   redactCurrentUserValue,
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
-import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import { isPlainObject, redactEventPayload, redactSensitiveText } from "../redaction.js";
 import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
@@ -4114,6 +4114,106 @@ export function sanitizeRunLogChunkForStorage(
   maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS,
 ) {
   return compactRunLogChunk(redactCurrentUserText(chunk, currentUserRedactionOptions), maxChars);
+}
+
+/**
+ * Depth bound for the `resultJson` scrub. Adapter results are shallow in
+ * practice; the cap only exists so a pathological nesting cannot turn a write
+ * into unbounded recursion. Beyond it the subtree is dropped rather than
+ * persisted unscrubbed — failing closed, because the whole point of this
+ * traversal is that nothing reaches the column unfiltered.
+ */
+const MAX_RESULT_JSON_SCRUB_DEPTH = 24;
+
+/**
+ * PEN-3153: `resultJson` used to reach the database with no secret scrub on the
+ * path. `stdoutExcerpt`/`stderrExcerpt` and run-event payloads written in the
+ * same `UPDATE` were both scrubbed; `resultJson` was not, so it was the least
+ * protected column in the row — and a durable one, reaching backups, exports
+ * and the `result_summary`/`result_result` generated columns.
+ *
+ * The scrub has to run server-side, not in the adapters: no package under
+ * `packages/adapters/` imports `server/src/redaction.ts`, which is the
+ * structural reason the gap existed at all. A fix inside one adapter recreates
+ * it for the next one, so this sits downstream of the single `adapter.execute`
+ * call site and again at the persistence chokepoint.
+ *
+ * ## Why per-string-leaf, and not the two obvious alternatives
+ *
+ * Both readier primitives corrupt control metadata that this table's own
+ * correctness depends on. `resultJson.externalLifecycleRecovery
+ * .terminalClaimToken` is a `randomUUID()` that decides which caller owns a
+ * terminal transition (`setRunStatusIfCurrentStatus` compares the patch's token
+ * against the stored one and refuses the write when they differ):
+ *
+ *  - `redactEventPayload`/`sanitizeRecord` classify by KEY NAME, and `token` is
+ *    a Tier-1 stem, so `terminalClaimToken` is masked unconditionally.
+ *  - `redactSensitiveText(JSON.stringify(resultJson))` masks it too:
+ *    `JSON_SECRET_FIELD_TEXT_RE` matches `"<secret-ish-key>": "<value>"` in the
+ *    serialized text, so serializing puts the key name inside the string being
+ *    scrubbed and reintroduces key-name masking through the back door.
+ *
+ * Either one rewrites both sides of that comparison to `***REDACTED***`, which
+ * makes them compare EQUAL — inverting the guard so every racing reconciler
+ * pass believes it won the claim. Scrubbing each string leaf on its own keeps
+ * key names out of the scrubbed text, so the UUID survives (it matches no
+ * credential shape) while credential material inside `stdout`/`stderr`/`result`
+ * prose is still masked.
+ */
+function scrubResultJsonValueForStorage(value: unknown, depth = 0): unknown {
+  if (typeof value === "string") return redactSensitiveText(value);
+  if (depth >= MAX_RESULT_JSON_SCRUB_DEPTH) return null;
+  if (Array.isArray(value)) {
+    return value.map((entry) => scrubResultJsonValueForStorage(entry, depth + 1));
+  }
+  if (isPlainObject(value)) {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      out[key] = scrubResultJsonValueForStorage(entry, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Secret-scrub a `resultJson` object on its way to the column. Returns the
+ * input unchanged for anything that is not a plain object or array — notably a
+ * drizzle `SQL` fragment, which several callers pass instead of a value and
+ * which must reach the driver verbatim.
+ */
+export function sanitizeRunResultJsonForStorage<T>(resultJson: T): T {
+  if (!isPlainObject(resultJson) && !Array.isArray(resultJson)) return resultJson;
+  return scrubResultJsonValueForStorage(resultJson) as T;
+}
+
+/**
+ * PEN-3153: the `error` column was identity-redacted (`redactCurrentUserText`)
+ * but never secret-scrubbed, so it was in the same condition as `resultJson`.
+ * The CTO ruling on PEN-3149 keeps `error` company-readable on purpose — it is
+ * machine-authored and load-bearing for triage — so this masks credential
+ * shapes only and leaves the diagnosis intact. Non-strings (drizzle `SQL`
+ * fragments built by the stage-exit branch) pass through untouched.
+ */
+function sanitizeRunErrorForStorage<T>(error: T): T {
+  return typeof error === "string" ? (redactSensitiveText(error) as unknown as T) : error;
+}
+
+/**
+ * Persistence chokepoint for the two free-text-bearing run columns. Applied
+ * inside the status writers rather than at their ~33 call sites, so a new write
+ * path cannot forget it.
+ */
+function sanitizeRunPatchForStorage<T extends Record<string, unknown> | undefined>(patch: T): T {
+  if (!patch) return patch;
+  const hasResultJson = Object.prototype.hasOwnProperty.call(patch, "resultJson");
+  const hasError = Object.prototype.hasOwnProperty.call(patch, "error");
+  if (!hasResultJson && !hasError) return patch;
+  return {
+    ...patch,
+    ...(hasResultJson ? { resultJson: sanitizeRunResultJsonForStorage(patch.resultJson) } : {}),
+    ...(hasError ? { error: sanitizeRunErrorForStorage(patch.error) } : {}),
+  };
 }
 
 const SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE =
@@ -14689,8 +14789,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function setRunStatus(
     runId: string,
     status: string,
-    patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    patchInput?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
+    // PEN-3153: scrub here rather than at the call sites. `resultJson` and
+    // `error` are the two free-text-bearing columns and ~33 write sites touch
+    // one of them; a per-site fix is the same shape of mistake as a per-adapter
+    // fix. Both status writers funnel their whole patch through this.
+    const patch = sanitizeRunPatchForStorage(patchInput);
     // BLO-16998: the finalize UPDATE can lose a deadlock (40P01), hit the role
     // statement_timeout (57014), or time out waiting on a row lock (55P03) under
     // bloat/contention. Unretried, the throw leaves the run stuck in `running`
@@ -14799,9 +14904,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string,
     expectedStatus: string,
     status: string,
-    patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
+    patchInput: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
     label: string,
   ) {
+    // PEN-3153: same chokepoint as `setRunStatus`. This is also the terminal
+    // finalize path, so it is where adapter `resultJson` actually lands.
+    const patch = sanitizeRunPatchForStorage(patchInput);
     // Pipeline retirement records cancellation intent while holding the issue
     // lock. A natural adapter completion may race that marker; terminalization
     // must give the persisted stage-exit decision precedence rather than erase
@@ -18231,19 +18339,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // and `retryNotBefore: 08:00Z` against a `scheduledRetryAt` four days
         // out, which is two decisions wearing one row and reads like a
         // scheduler bug rather than a second, later denial.
-        const nextResultJson = applyCcrotateCapacityDecision(parseObject(dueRun.resultJson), {
-          retryAtIso: nextDueAt.toISOString(),
-          provider: capacity.penstockProvider,
-          model: capacity.penstockModel,
-          reason: capacity.reason,
-          retryAfterSeconds: capacity.penstockRetryAfterSeconds,
-          advertisedResumeAtIso: capacity.resumeAt ? capacity.resumeAt.toISOString() : null,
-          clampedFromIso: capacityRetryPlan.clampedFromIso,
-          // Set once for the chain. `resolveCapacityEscalation` already echoed
-          // back the stored origin when the row had one, so passing it here is
-          // idempotent — it only takes effect on the first hop.
-          firstDeferredAtIso: capacityEscalation.firstDeferredAtIso,
-        });
+        // PEN-3153: `capacity.reason` is upstream-provider text and this write
+        // is a direct UPDATE, so the status writers never see it.
+        const nextResultJson = sanitizeRunResultJsonForStorage(
+          applyCcrotateCapacityDecision(parseObject(dueRun.resultJson), {
+            retryAtIso: nextDueAt.toISOString(),
+            provider: capacity.penstockProvider,
+            model: capacity.penstockModel,
+            reason: capacity.reason,
+            retryAfterSeconds: capacity.penstockRetryAfterSeconds,
+            advertisedResumeAtIso: capacity.resumeAt ? capacity.resumeAt.toISOString() : null,
+            clampedFromIso: capacityRetryPlan.clampedFromIso,
+            // Set once for the chain. `resolveCapacityEscalation` already echoed
+            // back the stored origin when the row had one, so passing it here is
+            // idempotent — it only takes effect on the first hop.
+            firstDeferredAtIso: capacityEscalation.firstDeferredAtIso,
+          }),
+        );
         const rescheduled = await db
           .update(heartbeatRuns)
           .set({
@@ -29977,8 +30089,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } as Record<string, unknown>)
           : null;
 
-      const adapterResultJsonForPersistence = stripAdapterProviderCapacityResetMetadata(
-        adapterResult.resultJson,
+      // PEN-3153: secret-scrub adapter-sourced result content once, here,
+      // downstream of the single `adapter.execute` call site. Both the success
+      // branch and the failure branch that dumps raw `proc.stdout`/`proc.stderr`
+      // (`adapters/process/execute.ts`, `claude-local`) return through this same
+      // value, so one call covers every adapter and both branches.
+      const adapterResultJsonForPersistence = sanitizeRunResultJsonForStorage(
+        stripAdapterProviderCapacityResetMetadata(adapterResult.resultJson),
       );
       const persistedResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {
@@ -32450,23 +32567,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             errorCode: "rate_limit_exhausted",
             // Shared with the promotion-time re-defer (BLO-24011) so the two
             // writers cannot drift in which fields describe the current park.
-            resultJson: applyCcrotateCapacityDecision(
-              {},
-              {
-                retryAtIso: resumeAtIso,
-                provider: gateResult.provider,
-                model: gateResult.model,
-                reason: gateResult.reason,
-                retryAfterSeconds: gateResult.retryAfterSeconds,
-                advertisedResumeAtIso: advertisedResumeAtIso,
-                clampedFromIso: capacityRetryPlan.clampedFromIso,
-                // First hop of a fresh chain by construction — this is the
-                // insert path — so the escalation clock starts here rather than
-                // at the first re-defer. Same instant the park was computed
-                // from, so the origin and the first hop cannot disagree
-                // (BLO-28919).
-                firstDeferredAtIso: capacityDeferredAt.toISOString(),
-              },
+            // PEN-3153: `reason` here is upstream-provider text off the
+            // penstock availability gate, and this is an INSERT, so neither the
+            // adapter boundary nor the status writers see it.
+            resultJson: sanitizeRunResultJsonForStorage(
+              applyCcrotateCapacityDecision(
+                {},
+                {
+                  retryAtIso: resumeAtIso,
+                  provider: gateResult.provider,
+                  model: gateResult.model,
+                  reason: gateResult.reason,
+                  retryAfterSeconds: gateResult.retryAfterSeconds,
+                  advertisedResumeAtIso: advertisedResumeAtIso,
+                  clampedFromIso: capacityRetryPlan.clampedFromIso,
+                  // First hop of a fresh chain by construction — this is the
+                  // insert path — so the escalation clock starts here rather
+                  // than at the first re-defer. Same instant the park was
+                  // computed from, so the origin and the first hop cannot
+                  // disagree (BLO-28919).
+                  firstDeferredAtIso: capacityDeferredAt.toISOString(),
+                },
+              ),
             ),
             contextSnapshot: retryContextSnapshot,
           })
