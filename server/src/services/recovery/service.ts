@@ -5732,12 +5732,30 @@ export function recoveryService(
     // re-trips this same gate before any enqueue — so the delivered-wake ceiling is unchanged
     // at exactly `maxAttempts`, and `timeoutAt` still bounds wall-clock independently.
     if (strandedRecoveryWakeAttemptsExhausted(input.action)) {
+      // BLO-19124: `strandedRecoveryWakeAttemptsExhausted` is DISJUNCTIVE — true for the
+      // attempt budget OR for `timeoutAt <= now` — so the bound cannot be hardcoded here.
+      // It was, and that mislabelled the dominant population rather than an edge case: no
+      // production row has ever reached the budget (0 of 245; the distribution caps at 4
+      // against a budget of 5) while every observed retirement came from the horizon. A
+      // fixed `attempt_budget` therefore reported wall-clock retirements as budget
+      // retirements, inverting this ticket's own central finding — that wall-clock, not
+      // attempts, is the binding constraint. `retiringBound` is written with `coalesce`, so
+      // the first writer wins PERMANENTLY, and `escalateExpiredWakeHorizons` cannot correct
+      // it afterwards because that sweep is gated on `status = 'active'` and this row is
+      // already `escalated`. The mislabel is unrecoverable, which is why it is discriminated
+      // at the call site instead of being repaired downstream.
+      //
+      // The comparison is `>`, not the backstop's `>=`, because this call site reads a row
+      // whose attempt is ALREADY RESERVED (`attemptAlreadyReserved` defaults to true).
+      // Using `>=` here would attribute the last legitimate wake to the budget.
+      const attemptBudgetReached = input.action.maxAttempts !== null &&
+        input.action.attemptCount > input.action.maxAttempts;
       const retireAndRefund = () => recoveryActionsSvc.retireAndReleaseWakeAttempt({
         companyId: input.issue.companyId,
         actionId: input.action.id,
         expectedOwnerAgentId: reservedOwnerAgentId,
         expectedAttemptCount: reservedAttemptCount,
-        retiringBound: "attempt_budget",
+        retiringBound: attemptBudgetReached ? "attempt_budget" : "timeout_horizon",
       });
       try {
         await retireAndRefund();
