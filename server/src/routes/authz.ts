@@ -199,6 +199,66 @@ export async function actorCanReadAgentConfig(
   return decision.allowed;
 }
 
+type RunTranscriptReadDecider = {
+  decide: (input: {
+    actor: Request["actor"];
+    action: "runs:read_transcript";
+    resource: { type: "agent"; companyId: string; agentId: string | null };
+  }) => Promise<AuthorizationDecision>;
+};
+
+/**
+ * `decision` is present whenever the authorization service actually ran, so a
+ * route can render the named boundary vocabulary. It is absent for the two
+ * cases decided without it: a human operator (allowed), and the fail-closed
+ * company-boundary case, which callers are expected to have already turned into
+ * a 404 (see `hasCompanyAccess`) — the check is repeated here so a future
+ * caller that forgets cannot fall open.
+ */
+export type RunTranscriptReadOutcome = {
+  allowed: boolean;
+  decision: AuthorizationDecision | null;
+};
+
+/**
+ * Shared "may this actor see a run's TRANSCRIPT?" test (PEN-3142).
+ *
+ * Run *state* — status, exit/park reason, the retry edge, watchdog decisions,
+ * `lastActivityAt`, error text, workspace operations — stays company-readable
+ * and must not be routed through here. This gate covers transcript *content*
+ * only: the `GET /heartbeat-runs/:runId/log` body, and the `message` /
+ * `payload` of `GET /heartbeat-runs/:runId/events`.
+ *
+ * Same shape as `actorCanReadAgentConfig` above, and for the same reason:
+ * human board members of the company keep the read, agent actors get own-run
+ * plus manager chain from the decider and otherwise need an explicit
+ * `runs:read_transcript` grant, so peers cannot read each other's transcripts.
+ * The run log has carried vendor credential material across several incidents
+ * (PEN-2328 → PEN-2370 → PEN-3139) and the scrub protecting it is write-time
+ * only, which is why standing company-wide peer read was withdrawn.
+ *
+ * It lives here, taking the run's owning agent rather than a whole run row, so
+ * BOTH transcript routes call one definition. `/log` and `/events` carry the
+ * same material with opposite halves of the control pair — `/log` had the
+ * audit and no projection, `/events` the projection and no audit — and PEN-2777
+ * (see `actorCanReadAgentConfig`) was exactly this gate existing on one sibling
+ * path and not the other.
+ */
+export async function decideRunTranscriptRead(
+  req: Request,
+  access: RunTranscriptReadDecider,
+  run: { companyId: string; agentId: string | null },
+): Promise<RunTranscriptReadOutcome> {
+  if (!hasCompanyAccess(req, run.companyId)) return { allowed: false, decision: null };
+  if (req.actor.type === "board") return { allowed: true, decision: null };
+  const decision = await access.decide({
+    actor: req.actor,
+    action: "runs:read_transcript",
+    resource: { type: "agent", companyId: run.companyId, agentId: run.agentId },
+  });
+  return { allowed: decision.allowed, decision };
+}
+
 /**
  * Preferred way to fetch a company-scoped resource by id inside a route
  * handler. Wraps the two-step pattern described on `hasCompanyAccess` so

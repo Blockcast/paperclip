@@ -999,6 +999,11 @@ export const PERMISSION_KEYS = [
   "tasks:override_execution_stage",
   "pipelines:write",
   "joins:approve",
+  // PEN-3142: run *transcript* read (the `/log` body and the message/payload of
+  // `/events`). Run *state* stays company-readable and needs no grant. Held by
+  // recovery/ops roles that root-cause failure classes across reporting lines —
+  // own-run and manager-chain reads are allowed without it.
+  "runs:read_transcript",
 ] as const;
 export type PermissionKey = (typeof PERMISSION_KEYS)[number];
 

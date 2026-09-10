@@ -3984,6 +3984,12 @@ const heartbeatRunSqlAsciiSafeColumns = {
 const heartbeatRunLogAccessColumns = {
   id: heartbeatRuns.id,
   companyId: heartbeatRuns.companyId,
+  // PEN-3142: the transcript decision is scoped to the run's OWNING AGENT
+  // (own-run / manager chain), so the log-access lookup has to carry it. Still
+  // a narrow projection — deliberately not `heartbeatRunSafeColumns`, which
+  // would pull `stdoutExcerpt` / `resultJson` into a path that only needs
+  // enough to authorize and locate the log.
+  agentId: heartbeatRuns.agentId,
   logStore: heartbeatRuns.logStore,
   logRef: heartbeatRuns.logRef,
 } as const;

@@ -717,23 +717,70 @@ those providers are enabled.
 
 Agent env vars now support secret references. By default, secret values are stored with local encryption and only secret refs are persisted in agent config.
 
-## Heartbeat Run Log Access Auditing
+## Heartbeat Run Transcript Access and Auditing
 
-`GET /api/heartbeat-runs/:runId/log` emits a company-scoped `activity_log` entry
-with action `heartbeat.run_log_accessed` for both allowed and denied company
-access checks. The audit row records the actor type/id, company id, heartbeat run
-id, timestamp (`activity_log.created_at`), access result, requested byte window,
-and log store type. It deliberately does not record transcript content, log
-chunks, log references/paths, environment values, or credential material.
+### Who may read a run transcript
+
+Run *transcript content* — the `GET /api/heartbeat-runs/:runId/log` body, and the
+`message` / `payload` of `GET /api/heartbeat-runs/:runId/events` — is scoped to
+the run's owning agent, that agent's manager chain, human board members of the
+company, and any principal holding the `runs:read_transcript` grant (PEN-3142,
+implementing the decision on PEN-3140). Company-wide peer read was withdrawn
+because the run log has carried vendor credential material across several
+incidents and the scrub protecting it runs only at write time.
+
+Run *state* is unchanged and stays company-readable: `GET
+/api/heartbeat-runs/:runId` (status, exit/park reason, retry edge, error text,
+`lastActivityAt`), watchdog decisions, and
+`GET /api/heartbeat-runs/:runId/workspace-operations`.
+
+The two transcript routes deny differently, on purpose:
+
+- `/log` returns **403** with the decider's named boundary reason in the error
+  details. Its entire body is transcript, so there is nothing left to return.
+  A cross-tenant caller still gets the pre-existing **404** — that is the case
+  where the run's existence is itself the secret.
+- `/events` returns **200** with the event envelope (`seq`, `eventType`,
+  `stream`, `level`, `color`, `createdAt`) and `message` / `payload` set to
+  `null`, plus `withheldFields: ["message", "payload"]` so a client can tell
+  "not entitled" from "the event carried no content". `seq` — the pagination
+  cursor every consumer depends on — is always readable.
+
+Withholding on `/events` covers **every** event type rather than a classified
+subset. Adapters supply their own `eventType` string, and the in-repo
+`lifecycle` emitters already carry agent-written prose and adapter failure text,
+so a type allowlist would rest on a convention nothing enforces.
+
+### Access auditing
+
+Both transcript routes emit a company-scoped `activity_log` entry for allowed
+and denied reads:
+
+| route | action |
+|---|---|
+| `GET /api/heartbeat-runs/:runId/log` | `heartbeat.run_log_accessed` |
+| `GET /api/heartbeat-runs/:runId/events` | `heartbeat.run_events_accessed` |
+
+**Both actions exist and a consumer needs both.** They are separately reachable
+paths over the same material; wiring an alert or digest to one and not the other
+reproduces the blindness that got this audit rejected as a standalone
+compensating control on PEN-3140.
+
+The audit row records the actor type/id, company id, heartbeat run id, timestamp
+(`activity_log.created_at`), access result, and the requested window (byte
+offset/limit for `/log`; `afterSeq`/`limit`/`eventCount` for `/events`), plus the
+log store type for `/log`. It deliberately does not record transcript content,
+log chunks, log references/paths, environment values, or credential material.
 
 Incident response can inspect these events through the company activity API or
-activity UI filtered by action/entity/run. Use `action = heartbeat.run_log_accessed`,
-`entity_type = heartbeat_run`, and `entity_id = <runId>` to isolate a run's access
-history. The event `details.result` value is `allowed` when content was eligible
-to be read and `denied` when the company access check rejected the request.
-Retention follows the deployment's normal `activity_log` database retention and
-backup policy; Paperclip does not currently apply a separate shorter retention
-window for these access-audit rows.
+activity UI filtered by action/entity/run. Use one of the two actions above,
+`entity_type = heartbeat_run`, and `entity_id = <runId>` to isolate a run's
+access history. The event `details.result` value is `allowed` when content was
+eligible to be read and `denied` when an access check rejected the request —
+which now includes a same-company caller that lacks transcript entitlement, not
+only a cross-company one. Retention follows the deployment's normal
+`activity_log` database retention and backup policy; Paperclip does not
+currently apply a separate shorter retention window for these access-audit rows.
 
 - Default local key path: `~/.paperclip/instances/default/secrets/master.key`
 - Override key material directly: `PAPERCLIP_SECRETS_MASTER_KEY`

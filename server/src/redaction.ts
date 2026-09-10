@@ -776,6 +776,65 @@ export function withholdAgentConfigKeys(
 }
 
 /**
+ * The two run-event fields that carry transcript content (PEN-3142).
+ *
+ * `message` and `payload` are the only fields `appendRunEvent` fills from
+ * caller-supplied material; the rest of the row (`id`, `runId`, `agentId`,
+ * `seq`, `eventType`, `stream`, `level`, `color`, `createdAt`) is an envelope
+ * the server writes, and it stays readable so a company peer can still watch
+ * the *shape* of a run.
+ */
+const WITHHELD_RUN_EVENT_CONTENT_KEYS = ["message", "payload"] as const;
+
+/**
+ * Entitlement filter for `GET /heartbeat-runs/:runId/events`, and a sibling in
+ * kind to {@link withholdAgentConfigKeys}: it decides what the caller may
+ * *see*, not what is *secret*. `redactEventPayload` still runs first and does
+ * the secret-scanning job.
+ *
+ * WITHHELDS EVERY EVENT'S CONTENT, NOT A CLASSIFIED SUBSET — this is the whole
+ * design, and an eventType allowlist was considered and rejected:
+ *
+ *  - `heartbeat.ts` accepts an adapter-chosen `eventType` (length-clamped only)
+ *    and writes that event's `message`/`payload` verbatim, so the type space is
+ *    open and an adapter can self-declare any label, including `lifecycle`.
+ *  - `lifecycle` is not state-only even from in-repo emitters. It carries the
+ *    agent-written `issue-continuation-summary` document body through
+ *    `nextAction`, and it promotes the adapter's own failure text into
+ *    `message` on the terminal-decision paths.
+ *
+ * So a type allowlist would make the security property depend on a convention
+ * no test enforces, and would reopen silently the first time someone routes
+ * output through an allowlisted label. Withholding by default inverts that: a
+ * new event type is withheld until someone deliberately widens this.
+ *
+ * Run STATE is unaffected. Everything the PEN-3140 decision holds
+ * company-readable — status, exit/park reason, the retry edge, watchdog
+ * decisions, `lastActivityAt`, error text, workspace operations — is served by
+ * `GET /heartbeat-runs/:runId` and `/workspace-operations`, not from here.
+ *
+ * `null` rather than a `REDACTED_EVENT_VALUE` sentinel, for the reason given on
+ * `withholdAgentConfigKeys`: that sentinel means "a scanner blanked this", and
+ * both columns are already nullable, so an unentitled read is shaped exactly
+ * like an event that genuinely carried no content. `withheldFields` is what
+ * tells the two apart — without it a client cannot distinguish "not entitled"
+ * from "empty", which is the ambiguity that makes a filter look like a bug.
+ *
+ * Read projection only: nothing here rewrites a stored row.
+ */
+export function withholdRunEventTranscriptContent(
+  event: Record<string, unknown>,
+): Record<string, unknown> & { withheldFields: string[] } {
+  const out: Record<string, unknown> = { ...event };
+  const withheldFields: string[] = [];
+  for (const key of WITHHELD_RUN_EVENT_CONTENT_KEYS) {
+    if (out[key] !== null && out[key] !== undefined) withheldFields.push(key);
+    out[key] = null;
+  }
+  return { ...out, withheldFields };
+}
+
+/**
  * `commands` / `services` / `jobs` are the three arrays `listWorkspaceCommandDefinitions`
  * (`packages/shared/src/workspace-commands.ts`) reads command entries out of. The
  * identity set below is the subset of an entry's keys that same parser reads into a
