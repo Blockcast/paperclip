@@ -98,8 +98,10 @@ export type RecoveryActionListItem = {
   cause: string;
   nextAction: string;
   attemptCount: number;
+  nonDeliverySweepCount: number;
   maxAttempts: number | null;
   timeoutAt: Date | null;
+  retiringBound: string | null;
   lastAttemptAt: Date | null;
   outcome: string | null;
   createdAt: Date;
@@ -223,8 +225,10 @@ export function recoveryObservabilityService(db: Db) {
         cause: issueRecoveryActions.cause,
         nextAction: issueRecoveryActions.nextAction,
         attemptCount: issueRecoveryActions.attemptCount,
+        nonDeliverySweepCount: issueRecoveryActions.nonDeliverySweepCount,
         maxAttempts: issueRecoveryActions.maxAttempts,
         timeoutAt: issueRecoveryActions.timeoutAt,
+        retiringBound: issueRecoveryActions.retiringBound,
         lastAttemptAt: issueRecoveryActions.lastAttemptAt,
         outcome: issueRecoveryActions.outcome,
         createdAt: issueRecoveryActions.createdAt,

@@ -167,9 +167,28 @@ const restorableCheckoutPromotion = and(
   )`,
 );
 
+/**
+ * BLO-29913 — `started_at` is part of the promotion, so undoing the promotion
+ * must clear it.
+ *
+ * `checkoutStartedAtForCurrentRow` stamps `started_at = now()` on exactly the
+ * transition this function reverses: it writes the clock only when checkout
+ * actually promotes a queue-tier row, and preserves the existing value when the
+ * row was already `in_progress`. The restore is therefore symmetric — it can
+ * only fire while `checkout_restore_status` is set, which is only true for a
+ * promotion that stamped the clock in the first place, so this never discards a
+ * timestamp some other writer owns.
+ *
+ * Leaving it set is the load-bearing half of the bug. `long_active_duration`
+ * measures wall-clock from `issues.started_at` to now, so a row restored to
+ * `todo` with a stale `started_at` keeps accruing active duration in a queue
+ * tier it is no longer being worked in, and mints a productivity review at 6h
+ * for an episode that ended when the run died.
+ */
 const restoreCheckoutPromotionSet = () => ({
   status: sql`${issues.checkoutRestoreStatus}`,
   checkoutRestoreStatus: null,
+  startedAt: null,
   updatedAt: new Date(),
 });
 

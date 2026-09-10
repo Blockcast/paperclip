@@ -172,7 +172,7 @@ type AggregateMemberResolution = {
  */
 type AggregateFiringClaim =
   | { ok: true; token: string }
-  | { ok: false; blockingPhase: string | null };
+  | { ok: false; blockingPhase: string | null; heldMs?: number | null };
 
 function q(ns: string, table: string): string {
   return `${ns}.${table}`;
@@ -404,6 +404,28 @@ async function upsertAggregateMember(
 }
 
 /**
+ * How long a `firing`/`cancelling` fence may be held before the next claim for
+ * that aggregate reclaims it regardless of who owns it (BLO-32113).
+ *
+ * This is a backstop against an unreclaimable fence, not a lease: nothing
+ * renews it, and the identity rules in `beginAggregateFiring` are tried first
+ * and handle every ordinary case. It exists because identity-based reclaim has
+ * one blind spot it cannot close by construction — a fence leaked by a process
+ * that is still running — and in that state no automatic path can ever recover
+ * the aggregate.
+ *
+ * 15 minutes is not a new number: it is the horizon this file already calls
+ * wedged (see `assertFiringGeneration`, which is a SELECT specifically so it
+ * cannot bump `updated_at` and hide a fence from the
+ * `updated_at < now() - interval '15 minutes'` detector). A legitimate hold
+ * covers one delivery's issue RPCs and clears in the sub-second range; the
+ * contention wait budget above is 3s. So this is ~300x the wait budget and
+ * orders of magnitude beyond any healthy hold — a delivery still holding at 15
+ * minutes is pathological whether or not its process is alive.
+ */
+const AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS = 15 * 60_000;
+
+/**
  * Firing claims the aggregate fence before it mutates member state or touches
  * the issue. A resolver may only begin finalization while the fence is active;
  * once it is cancelling, a new firing fails its delivery and retries after the
@@ -442,6 +464,46 @@ async function beginAggregateFiring(
   //
   // A live sibling delivery in *this* process shares WORKER_INSTANCE_ID and is
   // therefore excluded, as is any owner in another slot.
+  //
+  // Those two exclusions are also the identity steal's blind spot, and BLO-32113
+  // measured it in production: a fence leaked by a process that is still alive
+  // — same instance id, or an owner in a slot that never restarts — matched
+  // NEITHER this steal NOR `reconcileAbandonedAggregateFences`, because both
+  // required `owner_instance_id IS DISTINCT FROM` the running process. It was
+  // then unreclaimable by any automatic path, and the only drain was the
+  // board-user recovery route. Four aggregates sat that way while every delivery
+  // for them 502'd (`ArgoAppOutOfSyncTooLong`,
+  // `HeartbeatRunQueueAgentOldestQueuedHigh`, `BlockcastdImageDriftDetected`,
+  // `LLMProxyProviderAuthenticationFailed`: 25 distinct fingerprints retried
+  // ~50x each, none ever succeeding).
+  //
+  // The third disjunct is the backstop for that, and it closes the half that
+  // matters most: an aggregate that keeps firing recovers on its very next
+  // delivery, with no restart and no human. It cannot close the other half on
+  // its own, because it only ever runs *on a delivery* — an aggregate whose
+  // alert has stopped firing delivers nothing. `reconcileAbandonedAggregateFences`
+  // carries the same age clause for exactly that case; between them no fence
+  // stays held, but the two cover different triggers and neither is redundant.
+  //
+  // It is NOT a lease, and it does
+  // not weaken the rule above it: identity remains the ordinary reclaim path and
+  // is tried first. This only admits a fence whose hold has already exceeded
+  // AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS — a duration this file already treats
+  // as pathological, since `assertFiringGeneration` is deliberately a SELECT so
+  // that it cannot bump `updated_at` and hide a fence from the wedged-fence
+  // detector's `updated_at < now() - interval '15 minutes'`. That detector
+  // defines the condition; nothing acted on it. This is the actor.
+  //
+  // Stealing from a possibly-live owner is already this design's accepted
+  // posture, not a new one: the comment above admits same-slot/different-instance
+  // on "strong evidence of death, NOT proof of it", and rests correctness on the
+  // generation instead. A backstop steal is safe by exactly that argument. A
+  // holder that resumes after losing the race cannot attach a member
+  // (`upsertAggregateMember`), cannot complete (`finishAggregateFiring`), and
+  // cannot mutate the issue (the `firingFence(...)` share lock, BLO-31049); it
+  // fails loudly and Alertmanager retries. So an over-eager backstop costs one
+  // retry, while the current behaviour costs every alert in the aggregate
+  // indefinitely.
   const result = await ctx.db.execute(
     `INSERT INTO ${fences}
        (company_id, aggregate_key, phase, firing_token, owner_instance_id, owner_slot)
@@ -458,8 +520,20 @@ async function beginAggregateFiring(
           ${fences}.phase IN ('firing', 'cancelling')
           AND ${fences}.owner_slot = $5
           AND ${fences}.owner_instance_id IS DISTINCT FROM $4
+        )
+        OR (
+          ${fences}.phase IN ('firing', 'cancelling')
+          AND ${fences}.updated_at
+              < now() - ($6::bigint * interval '1 millisecond')
         )`,
-    [companyId, aggregateKey, token, WORKER_INSTANCE_ID, WORKER_SLOT],
+    [
+      companyId,
+      aggregateKey,
+      token,
+      WORKER_INSTANCE_ID,
+      WORKER_SLOT,
+      AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS,
+    ],
   );
   if (result.rowCount > 0) return { ok: true, token };
   // Read back the phase that actually refused the claim. The upsert admits
@@ -468,14 +542,23 @@ async function beginAggregateFiring(
   // what makes the wedge diagnosable from the delivery error alone; reporting a
   // fixed phase here sent a six-day production investigation (PEN-2581) after
   // `finalizing`, which is the one phase that cannot produce this failure.
-  const rows = await ctx.db.query<{ phase: string }>(
-    `SELECT phase
+  const rows = await ctx.db.query<{ phase: string; held_ms: number | string | null }>(
+    `SELECT phase,
+            EXTRACT(EPOCH FROM (now() - updated_at)) * 1000 AS held_ms
        FROM ${fences}
       WHERE company_id = $1
         AND aggregate_key = $2`,
     [companyId, aggregateKey],
   );
-  return { ok: false, blockingPhase: rows[0]?.phase ?? null };
+  const heldMsRaw = rows[0]?.held_ms;
+  const heldMs = heldMsRaw === null || heldMsRaw === undefined
+    ? null
+    : Math.round(Number(heldMsRaw));
+  return {
+    ok: false,
+    blockingPhase: rows[0]?.phase ?? null,
+    heldMs: heldMs !== null && Number.isFinite(heldMs) ? heldMs : null,
+  };
 }
 
 /**
@@ -634,13 +717,30 @@ async function claimAggregateFiringWaiting(
  * held after the owner dies" an invariant rather than a property of alerts that
  * happen to repeat.
  *
- * Release is justified by identity, never by age:
+ * Release is justified by identity:
  *   - `owner_instance_id IS DISTINCT FROM` this process — never touches a fence
  *     held by a live sibling delivery in this same process. A delivery can
  *     arrive while setup is still running, so this exclusion is load-bearing.
  *   - same `owner_slot`, or NULL. NULL means the row was written before this
  *     column existed, i.e. by a strictly older image, which the running process
  *     has by definition replaced.
+ *
+ * ...or by age, past `AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS` (BLO-32113). The
+ * identity arm alone leaves one state with no automatic drain: a fence leaked
+ * by a live process in a *foreign* slot, whose alert then stops firing. It
+ * matches neither this sweep (wrong slot) nor the per-claim backstop in
+ * `beginAggregateFiring` (that only ever runs on a delivery, and a stopped
+ * alert delivers nothing), so it waits on that foreign slot restarting — which
+ * may never happen. The age disjunct is what makes the invariant hold for
+ * aggregates that do not fire again.
+ *
+ * The age arm does not weaken the exclusion above it. That exclusion protects a
+ * live sibling delivery in *this* process, and this sweep runs only from
+ * `setup()` (see `worker.ts`) — a fence this process owns cannot already be 15
+ * minutes old when the process is seconds old, so the two arms do not overlap
+ * in practice. Safety does not rest on that timing argument either way: as with
+ * the per-claim backstop, a stolen holder is refused at every mutation site by
+ * the `firing_token` generation, so an over-eager release costs one retry.
  *
  * Deliberately non-fatal: a failed sweep leaves fences wedged, which the
  * per-claim steal can still recover. Throwing here would prevent the worker
@@ -660,15 +760,25 @@ export async function reconcileAbandonedAggregateFences(
            owner_slot = NULL,
            updated_at = now()
        WHERE phase IN ('firing', 'cancelling')
-         AND owner_instance_id IS DISTINCT FROM $1
-         AND (owner_slot IS NULL OR owner_slot = $2)`,
-      [WORKER_INSTANCE_ID, WORKER_SLOT],
+         AND (
+           (
+             owner_instance_id IS DISTINCT FROM $1
+             AND (owner_slot IS NULL OR owner_slot = $2)
+           )
+           OR updated_at < now() - ($3::bigint * interval '1 millisecond')
+         )`,
+      [
+        WORKER_INSTANCE_ID,
+        WORKER_SLOT,
+        AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS,
+      ],
     );
     if (result.rowCount > 0) {
       ctx.logger.warn(
         `paperclip-plugin-alertmanager: released ${result.rowCount} aggregate lifecycle fence(s) ` +
-          `abandoned by a previous occupant of slot ${WORKER_SLOT}. Each of these was refusing ` +
-          `every firing delivery for its aggregate until now.`,
+          `abandoned by a previous occupant of slot ${WORKER_SLOT}, or held past the ` +
+          `${AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS}ms abandonment backstop by any owner. Each of ` +
+          `these was refusing every firing delivery for its aggregate until now.`,
       );
     }
     return result.rowCount;
@@ -1353,13 +1463,111 @@ export async function handleFiring(
     fenceWedgedMemo,
   );
   if (!firingClaim.ok) {
+    // Surface the wedge as a metric so it is detectable as a *cause* rather
+    // than inferred hours later from the webhook delivery ratio (BLO-32113).
+    //
+    // Two series: an occurrence count of `1` (matching every other
+    // `ctx.metrics.write` call site in this file) plus the hold age as its own
+    // series. The value is deliberately NOT the duration:
+    //
+    //   - As of PEN-2799 the host publishes every `metrics.write` to the
+    //     prom-client counter `paperclip_plugin_metric_total{metric="..."}`
+    //     *before* appending the `plugin_logs` row at `level: "metric"`
+    //     (`server/src/services/plugin-host-services.ts` -> `recordPluginMetric`
+    //     in `server/src/services/metrics.ts`). Both still happen; the counter
+    //     is the scraped path, ordered first because that is what an alert rule
+    //     depends on. So both series below are real, monotonic, scraped
+    //     counters today — which makes the PromQL at the end of this comment
+    //     executable rather than aspirational.
+    //   - Because a counter accumulates every write, a single duration-valued
+    //     series would become a monotonically climbing sum of hold ages:
+    //     non-zero forever after the first wedge, unable to distinguish "the
+    //     reclaim is broken" from "one wedge happened last month" — the only
+    //     question it exists to answer. Splitting the count from the summed age
+    //     keeps both recoverable under `rate()`.
+    //
+    // Both names clear the host's drop gates: each satisfies
+    // PLUGIN_METRIC_NAME_REGEX and sits under the name-length bound, and this
+    // plugin mints 21 static names (no interpolation) against a
+    // PLUGIN_METRIC_NAME_BUDGET of 50, so neither can collapse into the shared
+    // `_overflow` series. Both values are non-negative, so neither trips
+    // `bad_value`.
+    //
+    // NB: AC3 of BLO-32113 asks for a Prometheus *rule* on fence age. The
+    // series it needs are scrapeable from here; authoring and deploying the
+    // rule itself remains BLO-32163. Two things that rule's author needs which
+    // are not visible from the `metrics.write` calls below:
+    //
+    //   - `aggregate_key` and `phase` do NOT reach Prometheus. The host
+    //     promotes a tag to a label only if it is BOTH manifest-declared and
+    //     in PLUGIN_METRIC_PROMOTABLE_TAG_KEYS (`metrics.ts`); this plugin
+    //     declares `["alertname", "severity", "version"]` (`manifest.ts`) and
+    //     neither key is promotable in any case. So the scraped series is
+    //     dimensioned by `tag_alertname` only — promoted tags publish under the
+    //     host's `tag_` prefix (`pluginMetricTagLabel` =
+    //     PLUGIN_METRIC_TAG_LABEL_PREFIX + key, `metrics.ts`), and the counter's
+    //     label set is built through exactly that mapper, so a rule matching a
+    //     bare `alertname` hits the same empty-vector trap as the bare
+    //     `rate(age) / rate(count)` described below. AC3's "naming the
+    //     aggregate_key" has to come from the `plugin_logs` metric row or the
+    //     error thrown below — both carry the full tag set — not from the
+    //     rule's labels.
+    //   - Both series land on the SAME prom-client counter
+    //     (`paperclip_plugin_metric_total`), distinguished only by the `metric`
+    //     label. Prometheus matches binary operands on all labels by default,
+    //     so a bare `rate(age) / rate(count)` matches nothing and returns an
+    //     empty vector — no error, just a rule that can never fire, which is
+    //     the same invisible-failure class as the wedge itself. The division
+    //     needs an explicit `ignoring(metric)`:
+    //
+    //       rate(paperclip_plugin_metric_total{
+    //         metric="alertmanager.aggregate.fence_blocked"}[5m])
+    //       -> blocked deliveries/sec
+    //
+    //       rate(paperclip_plugin_metric_total{
+    //         metric="alertmanager.aggregate.fence_blocked_age_seconds"}[5m])
+    //         / ignoring(metric)
+    //       rate(paperclip_plugin_metric_total{
+    //         metric="alertmanager.aggregate.fence_blocked"}[5m])
+    //       -> mean hold age, seconds
+    //
+    // Past the backstop this should be self-clearing, so a sustained non-zero
+    // *rate* on the first series means the reclaim itself is not working.
+    const heldMs = firingClaim.heldMs ?? null;
+    const metricTags = {
+      alertname,
+      aggregate_key: aggregateKey,
+      phase: firingClaim.blockingPhase ?? "unknown",
+    };
+    try {
+      await ctx.metrics.write("alertmanager.aggregate.fence_blocked", 1, metricTags);
+      // Skipped rather than zero-filled when the age is unknown (the fence row
+      // vanished between the refused upsert and the read-back, which implies it
+      // was released). A zero would drag the mean down and misreport a wedge as
+      // brief; omitting it leaves the ratio honest, at the cost of one
+      // occurrence counted without an age.
+      if (heldMs !== null) {
+        await ctx.metrics.write(
+          "alertmanager.aggregate.fence_blocked_age_seconds",
+          Math.round(heldMs / 1000),
+          metricTags,
+        );
+      }
+    } catch (metricErr) {
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record blocked-fence metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
     throw new Error(
       `Alertmanager aggregate ${aggregateKey} is held in phase ` +
         `'${firingClaim.blockingPhase ?? "unknown"}' by a delivery in progress; ` +
+        (heldMs === null ? "" : `held for ${Math.round(heldMs / 1000)}s; `) +
         `retrying firing delivery. A fence abandoned by a dead process is released ` +
-        `automatically by its slot's next worker; if this persists, the holder is ` +
-        `either live or in another slot, and an operator can release it via the ` +
-        `plugin's recover-aggregate-firing route.`,
+        `automatically by its slot's next worker, and any fence held past the ` +
+        `abandonment backstop is reclaimed by the next claim regardless of owner. ` +
+        `So this should clear on its own; if it persists past that backstop the ` +
+        `reclaim itself is failing, and an operator can force it via the plugin's ` +
+        `recover-aggregate-firing route.`,
     );
   }
   const firingToken = firingClaim.token;
