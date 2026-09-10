@@ -382,7 +382,8 @@ export function buildExecutionWorkspaceAdapterConfig(input: {
  *
  * A non-object overlay value (`null`, a string, an array) still replaces
  * wholesale: that is an explicit clear/reset, and merging into it is not
- * meaningful.
+ * meaningful. So does an overlay that switches `type`: field-wise inheritance
+ * only makes sense between two descriptions of the same strategy type.
  */
 export function resolveOverlaidWorkspaceStrategy(input: {
   baseConfig: Record<string, unknown>;
@@ -402,6 +403,19 @@ export function resolveOverlaidWorkspaceStrategy(input: {
   if (!isPlainRecord(baseValue) || !isPlainRecord(overlayValue)) {
     return { present: true, value: overlayValue };
   }
+  // The field-wise merge is only meaningful while both layers describe the
+  // *same* strategy type. Each `type` has its own field set, so an overlay that
+  // switches type would otherwise inherit the previous type's leftovers — a
+  // `project_primary` strategy still carrying `worktreeParentDir` and
+  // `runScope`. `parseExecutionWorkspaceStrategy` whitelists fields without
+  // cross-checking them against `type`, so nothing downstream would reject it.
+  // A type switch is a fresh start, exactly as the pre-BLO-23144 wholesale
+  // replace gave it; only same-type overlays inherit by omission. An overlay
+  // that omits `type` is not a switch — it inherits the base type, which is the
+  // BLO-23144 case this whole function exists for.
+  const switchesType = Object.hasOwn(overlayValue, "type")
+    && overlayValue.type !== baseValue.type;
+  if (switchesType) return { present: true, value: overlayValue };
   return { present: true, value: { ...baseValue, ...overlayValue } };
 }
 
