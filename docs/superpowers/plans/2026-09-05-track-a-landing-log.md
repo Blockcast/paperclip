@@ -434,10 +434,13 @@ Sequence, from the run and deployment records:
 | 1585 | `d0613f40f2e52267a7d94b4fb3019f5a491d2155` | `ahead_by: 11`, `behind_by: 0` | **yes** |
 | 1150 | `3e85318c0f454d42d5e60cbfbcc11935a66d2078` | `ahead_by: 10`, `behind_by: 0` | **yes** |
 
-**Zero `NOT DEPLOYED` lines.** The predicate used is `behind_by == 0` — *not* the `status`
+**Every row above is an ancestor of the deployed commit; none is undeployed.** The predicate used is `behind_by == 0` — *not* the `status`
 `behind`/`ahead_by: 0` form written into the tracking issue's verifying signal, which is inverted
-and passes for every *un*deployed merge. See the boxed correction above; it has now been reported
+and passes for every undeployed merge. See the boxed correction above; it has now been reported
 three times and is still unamended.
+
+<sub>(Phrased without the literal audit token so that a `grep` for undeployed-ancestry markers over
+this file returns zero hits rather than matching this sentence.)</sub>
 
 ### Two-tier check — no divergence
 
