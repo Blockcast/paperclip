@@ -4919,8 +4919,24 @@ function retryAfterDelayMs(value: unknown): number | null {
 // Parsing it here, server-side, is deliberately where the fix goes: it is the
 // one point every adapter's output funnels through, so it covers the k8s
 // bundles we do not build without duplicating the local adapters' parser.
+//
+// BLO-32578: `reset(s) by <ISO>` is a second Penstock wording, not a variant of
+// the first. Its live subscription-capacity refusal reads
+//
+//   API Error: Request rejected (429) · All Claude subscription capacity for
+//   this tenant is rate-limited; the connected accounts reset by
+//   2026-09-07T19:00:00.000Z but seats rotate on this tenant, so capacity may
+//   return sooner
+//
+// which shares no phrase with `capacity may reset at` — note it says "may
+// return sooner", so even the `may` alternative above does not reach it. The
+// horizon was therefore dropped on every subscription-capacity 429 while being
+// parsed on every BYOS one, and the run took the flat 90s hop into a window
+// that stayed closed until BackoffLimitExceeded. The trailing ISO group is what
+// keeps the alternative narrow: unrelated prose ("connection reset by peer",
+// "the accounts reset by tomorrow") carries no timestamp and still returns null.
 const PROVIDER_CAPACITY_RESET_AT_PATTERN =
-  /(?:\b(?:resume_at|retry_not_before|retryNotBefore)\b[\\'"\s]*[:=][\\'"\s]*|\b(?:capacity\s+)?may\s+reset\s+at\s+)(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/i;
+  /(?:\b(?:resume_at|retry_not_before|retryNotBefore)\b[\\'"\s]*[:=][\\'"\s]*|\b(?:capacity\s+)?may\s+reset\s+at\s+|\breset(?:s)?\s+by\s+)(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/i;
 const PROVIDER_CAPACITY_RETRY_IN_PATTERN = /\bretry\s+in\s+(\d+(?:\.\d+)?)\s*(?:s\b|secs?\b|seconds?\b)/i;
 const PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE = "server_parse_provider_capacity_horizon";
 

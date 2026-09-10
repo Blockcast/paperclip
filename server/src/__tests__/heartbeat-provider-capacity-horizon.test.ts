@@ -89,6 +89,17 @@ const BLO_18285_OVER_CAP_MESSAGE = (resetIso: string) =>
   `unavailable; capacity may reset at ${resetIso}; retry in ${OVER_CAP_RETRY_SECONDS}s`;
 const BLO_18285_OVER_CAP_ERROR_MESSAGE = BLO_18285_OVER_CAP_MESSAGE(BLO_18285_OVER_CAP_RESET_ISO);
 
+// BLO-32578: Penstock's SUBSCRIPTION-capacity refusal, verbatim from run
+// a367c11a-6fd9-4629-8c7a-e79631a1d1c2's terminal result record. Pinned as a
+// literal rather than paraphrased because the whole defect was a wording the
+// pattern did not anticipate: it shares no phrase with the BYOS message above,
+// and its only `may` is "may return sooner", so the `may reset at` alternative
+// cannot reach it either.
+const BLO_32578_SUBSCRIPTION_CAPACITY_MESSAGE = (resetIso: string) =>
+  `API Error: Request rejected (429) · All Claude subscription capacity for this tenant is ` +
+  `rate-limited; the connected accounts reset by ${resetIso} but seats rotate on this tenant, ` +
+  `so capacity may return sooner`;
+
 describe("parseProviderCapacityResetHorizon", () => {
   const now = Date.parse("2026-07-26T18:50:31.000Z");
   const resetIso = "2026-07-26T21:29:59.782Z";
@@ -148,6 +159,40 @@ describe("parseProviderCapacityResetHorizon", () => {
   it("returns null for unrelated failures", () => {
     expect(parseProviderCapacityResetHorizon({ errorMessage: "TypeError: x is not a function" }, now)).toBeNull();
     expect(parseProviderCapacityResetHorizon({ resultJson: null, errorMessage: null }, now)).toBeNull();
+  });
+
+  // BLO-32578. This is the assertion that fails on master: the subscription
+  // wording parsed to null, so a 429 that named its horizon to the millisecond
+  // was indistinguishable from a provider that said nothing.
+  it("recovers the horizon from Penstock's `reset by <ISO>` subscription wording", () => {
+    expect(
+      parseProviderCapacityResetHorizon(
+        { errorMessage: BLO_32578_SUBSCRIPTION_CAPACITY_MESSAGE(resetIso) },
+        now,
+      )?.toISOString(),
+    ).toBe(resetIso);
+    // Where it actually arrives: the SDK puts the API error text in `result`,
+    // and on claude_k8s that record is the ONLY surface carrying it — the
+    // kubelet log tail is null or truncated to the git-clone banner.
+    expect(
+      parseProviderCapacityResetHorizon(
+        { resultJson: { result: BLO_32578_SUBSCRIPTION_CAPACITY_MESSAGE(resetIso) } },
+        now,
+      )?.toISOString(),
+    ).toBe(resetIso);
+  });
+
+  // The ISO group is the whole guard on how wide `reset by` is. Without a
+  // timestamp the phrase is ordinary prose that must not sideline an issue,
+  // and "connection reset by peer" is a real string in this codebase.
+  it("does not read `reset by` prose that names no instant", () => {
+    for (const text of [
+      "connection reset by peer",
+      "the connected accounts reset by tomorrow",
+      "capacity may return sooner",
+    ]) {
+      expect(parseProviderCapacityResetHorizon({ errorMessage: text }, now)).toBeNull();
+    }
   });
 });
 
