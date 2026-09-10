@@ -1,6 +1,6 @@
 import type { WorktreeRunExecutionActivationState } from "./instance-settings.js";
 import type { issueRecoveryActionService } from "./issue-recovery-actions.js";
-import { isIssueHeldByForeignRun } from "./issue-run-holding.js";
+import { isIssueHeldByForeignRun, isIssueHeldByForeignScheduledRetry } from "./issue-run-holding.js";
 import type { issueService } from "./issues.js";
 
 export const AGENT_INBOX_LITE_STATUS_FILTER = "todo,in_progress,blocked";
@@ -20,6 +20,7 @@ type AgentInboxLiteInput = {
   worktreeActivation: WorktreeRunExecutionActivationState;
   nowMs?: number;
   onWithheldForeignRun?: (issue: InboxIssue) => void;
+  onWithheldForeignScheduledRetry?: (issue: InboxIssue) => void;
 };
 
 // Keep the inbox query, worktree gate, and foreign-run suppression together.
@@ -36,6 +37,7 @@ export async function loadAgentInboxLite({
   worktreeActivation,
   nowMs = Date.now(),
   onWithheldForeignRun,
+  onWithheldForeignScheduledRetry,
 }: AgentInboxLiteInput) {
   const rows = await issuesSvc.list(companyId, {
     assigneeAgentId: agentId,
@@ -61,8 +63,23 @@ export async function loadAgentInboxLite({
         callerRunId,
         nowMs,
       });
-      if (held) onWithheldForeignRun?.(issue);
-      return !held;
+      if (held) {
+        onWithheldForeignRun?.(issue);
+        return false;
+      }
+      // BLO-29965: the row can also be attended by a SIBLING RUN PARKED ON A
+      // SCHEDULED RETRY, which holds the execution lock but is absent from
+      // `activeRun`. Kept as a separate check with its own audit callback so a
+      // withheld row says which of the two liveness paths withheld it — a lost
+      // claim must be distinguishable, not merged into the running-run case.
+      const retryHeld = isIssueHeldByForeignScheduledRetry({
+        scheduledRetryAt: issue.scheduledRetryAt,
+        scheduledRetryRunId: issue.scheduledRetryRunId,
+        callerRunId,
+        nowMs,
+      });
+      if (retryHeld) onWithheldForeignScheduledRetry?.(issue);
+      return !retryHeld;
     })
     .map((issue) => ({
       id: issue.id,

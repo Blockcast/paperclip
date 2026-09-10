@@ -26,6 +26,25 @@
  */
 export const RUN_STALE_SILENCE_MS = 15 * 60 * 1000;
 
+/**
+ * BLO-29965: how long past its own `scheduledRetryAt` a parked run still counts
+ * as holding its issue for self-selection.
+ *
+ * A retry is NOT dispatched at its due time. BLO-28863 measured scheduled
+ * retries dispatching 25–74 min after their own `scheduledRetryAt`, so a
+ * horizon that has just passed says nothing about whether the retry is dead —
+ * it is usually merely late and about to run. Releasing at the due instant
+ * would reopen this issue's race precisely in the window where it is most
+ * likely to fire.
+ *
+ * The bound exists at all because a retry that never fires must not strand the
+ * row forever: past this grace we stop deferring and let the issue be picked
+ * again. 2h sits comfortably above the measured worst-case lateness while
+ * keeping the strand bounded. Capping the retry horizon itself is BLO-28919 and
+ * deliberately not done here.
+ */
+export const SCHEDULED_RETRY_HOLD_GRACE_MS = 2 * 60 * 60 * 1000;
+
 /** The fields needed to judge whether a run is still holding its issue. */
 export type ActiveRunSignals = {
   id: string;
@@ -85,4 +104,58 @@ export function isIssueHeldByForeignRun(input: {
   if (!callerRunId) return false; // fail open — see above
   if (activeRun.id === callerRunId) return false; // the caller *is* the holder
   return isRunHoldingIssue(activeRun, nowMs);
+}
+
+/**
+ * BLO-29965: whether an issue must be withheld because a *different* run of
+ * this agent is parked on a still-live scheduled retry for it.
+ *
+ * This is the hole {@link isIssueHeldByForeignRun} above cannot see, and it is
+ * not a nuance — it is the measured mechanism behind two duplicate-work
+ * incidents:
+ *
+ *   - 2026-08-23, `penstock-llm-proxy-core` #1503 vs #1504: two runs of one
+ *     agent independently derived the same hotfix on a red `main`, and one
+ *     run's `git push` to the other's branch was rejected non-fast-forward.
+ *   - 2026-09-03, BLO-31354 / `paperclip` #1612: run A parked at 01:52Z on
+ *     `scheduledRetryReason: ccrotate_capacity` with `scheduledRetryAt`
+ *     02:22:54Z; run B woke at 02:18Z — 4 min before A's retry — read the row
+ *     as unattended and started the same fix. A's retry then pushed at
+ *     02:33Z and B's push was rejected.
+ *
+ * A `scheduled_retry` run HOLDS the issue execution lock: it is the complement
+ * of terminal, so `checkout()` 409s naming it (see `issue-execution-lock.ts`).
+ * `isRunHoldingIssue` nevertheless answers only `status === "running"`, and the
+ * parked run is frequently not in `activeRun` at all — that projection is
+ * hydrated from `issues.executionRunId`, which an autonomous retry chain never
+ * set. So the guard that exists to stop self-selection collisions was blind to
+ * the entire retry ladder, and the row was offered to a sibling.
+ *
+ * Unlike a `queued` run — which owns no worktree and which dispatch cancels if
+ * a running sibling claims the issue first — a parked retry is a *continuation
+ * of work already begun*. It carries context and it will resume.
+ *
+ * Fails OPEN on every uncertainty, because the mirror failure is worse than the
+ * one being fixed: withholding an issue we cannot *prove* is foreign hides an
+ * agent's own work from its own inbox, which it reads as "no work" and exits —
+ * trading a duplicated run for a silent strand. So we defer only when the retry
+ * is armed, provably owned by another run, and not lapsed past
+ * {@link SCHEDULED_RETRY_HOLD_GRACE_MS}.
+ */
+export function isIssueHeldByForeignScheduledRetry(input: {
+  scheduledRetryAt: Date | string | null | undefined;
+  scheduledRetryRunId: string | null | undefined;
+  callerRunId: string | null | undefined;
+  nowMs: number;
+}): boolean {
+  const { scheduledRetryAt, scheduledRetryRunId, callerRunId, nowMs } = input;
+  // No armed retry, or no identifiable holder: nothing we can prove is foreign.
+  if (!scheduledRetryRunId) return false;
+  const dueMs = toMs(scheduledRetryAt);
+  if (dueMs == null) return false;
+  if (!callerRunId) return false; // fail open — same discipline as above
+  if (scheduledRetryRunId === callerRunId) return false; // the caller's own retry
+  // Lapsed well past its horizon: stop deferring so a dead retry cannot strand
+  // the row forever.
+  return nowMs <= dueMs + SCHEDULED_RETRY_HOLD_GRACE_MS;
 }
