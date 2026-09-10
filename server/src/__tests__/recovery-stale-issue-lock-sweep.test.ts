@@ -2680,7 +2680,57 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       expect(row?.checkoutRunId).toBeNull();
     });
 
-    it("restores a promotion whose pre-checkout status was blocked", async () => {
+    // BLO-33144: a `blocked` marker is only restored verbatim when an edge can
+    // actually wake the row again. `checkout` accepts `blocked` in
+    // `expectedStatuses` and the recovery path writes `blocked` on stranded
+    // rows, so the marker is minted far more often than real dependency
+    // blocking — measured on the 2026-09-10 cohort, 141 of 141 rows carrying a
+    // `blocked` marker had zero blocker edges. Restoring those verbatim turns a
+    // loud row into a silent permanent one, because the heartbeat skips
+    // `blocked` (BLO-27553).
+    async function seedBlocker(input: {
+      companyId: string;
+      blockedIssueId: string;
+      blockerStatus: string;
+    }) {
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId: input.companyId,
+        title: "Blocker",
+        status: input.blockerStatus,
+        priority: "high",
+      });
+      await db.insert(issueRelations).values({
+        companyId: input.companyId,
+        issueId: blockerId,
+        relatedIssueId: input.blockedIssueId,
+        type: "blocks",
+      });
+      return blockerId;
+    }
+
+    it("restores a promotion whose pre-checkout status was blocked, when a live blocker edge still exists", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+        checkoutRestoreStatus: "blocked",
+      });
+      // The edge is what makes `blocked` a real waiting state: when this
+      // blocker reaches `done`, issue_blockers_resolved_sweep wakes the row.
+      await seedBlocker({ companyId, blockedIssueId: issueId, blockerStatus: "todo" });
+
+      await heartbeatService(db).sweepStaleIssueLocks();
+
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("blocked");
+      expect(row?.startedAt).toBeNull();
+    });
+
+    it("lands a blocked marker with no blocker edge in todo rather than stranding it", async () => {
       const { companyId, agentId, failedRunId } = await seed();
       const issueId = await seedStrandedPromotion({
         companyId,
@@ -2693,8 +2743,50 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       await heartbeatService(db).sweepStaleIssueLocks();
 
       const row = await readRow(issueId);
-      expect(row?.status).toBe("blocked");
+      // `blocked` here would have no wake path of any kind: the heartbeat skips
+      // it and there is no edge for the resolved sweep to fire on. `todo` keeps
+      // it in inbox-lite and re-dispatchable.
+      expect(row?.status).toBe("todo");
       expect(row?.startedAt).toBeNull();
+      expect(row?.assigneeAgentId).toBe(agentId);
+    });
+
+    it("lands a blocked marker whose only blocker is cancelled in todo", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+        checkoutRestoreStatus: "blocked",
+      });
+      // A cancelled blocker never reaches `done`, so "every blocker done" is
+      // unreachable and the resolved sweep can never fire. Worse than no edge:
+      // it reads as a live dependency on every triage surface.
+      await seedBlocker({ companyId, blockedIssueId: issueId, blockerStatus: "cancelled" });
+
+      await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect((await readRow(issueId))?.status).toBe("todo");
+    });
+
+    it("lands a blocked marker whose blockers are all done in todo", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+        checkoutRestoreStatus: "blocked",
+      });
+      // The resolved sweep fires on the TRANSITION to all-done, which already
+      // happened while this row was `in_progress`. Restoring `blocked` now
+      // would wait for an event that has been and gone.
+      await seedBlocker({ companyId, blockedIssueId: issueId, blockerStatus: "done" });
+
+      await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect((await readRow(issueId))?.status).toBe("todo");
     });
 
     it("does not demote a row holding a dispatchable monitor with a future check", async () => {
@@ -2740,6 +2832,191 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       const row = await readRow(issueId);
       expect(row?.status).toBe("in_progress");
       expect(row?.startedAt?.getTime()).toBe(startedAt.getTime());
+    });
+  });
+
+  // BLO-33144: the reconciliation half. BLO-29913 stops NEW strands but is
+  // forward-only — the candidate scan requires a non-null lock column, and on
+  // an already-stranded row an earlier pass nulled both without restoring. So
+  // the fixed sweep can never select the accumulated cohort (measured
+  // 2026-09-10: 225 of 225 drainable rows had both lock columns NULL).
+  describe("stranded promotion drain (BLO-33144)", () => {
+    async function seedLockFreeStrand(input: {
+      companyId: string;
+      agentId: string;
+      startedAt?: Date;
+      checkoutRestoreStatus?: string | null;
+      monitorNextCheckAt?: Date | null;
+      status?: string;
+    }) {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: input.companyId,
+        title: "Lock-free stranded promotion",
+        status: input.status ?? "in_progress",
+        priority: "high",
+        assigneeAgentId: input.agentId,
+        // The defining shape: no lock left for the sweep's scan to find.
+        checkoutRunId: null,
+        executionRunId: null,
+        checkoutRestoreStatus:
+          "checkoutRestoreStatus" in input ? input.checkoutRestoreStatus : "todo",
+        startedAt: input.startedAt ?? new Date(Date.now() - 40 * 60 * 60 * 1000),
+        monitorNextCheckAt: input.monitorNextCheckAt ?? null,
+      });
+      return issueId;
+    }
+
+    function readRow(issueId: string) {
+      return db
+        .select({
+          status: issues.status,
+          startedAt: issues.startedAt,
+          checkoutRestoreStatus: issues.checkoutRestoreStatus,
+          assigneeAgentId: issues.assigneeAgentId,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+    }
+
+    it("drains a row whose lock columns an earlier pass already cleared", async () => {
+      const { companyId, agentId } = await seed();
+      const issueId = await seedLockFreeStrand({ companyId, agentId });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      // Nothing to clear — this row is invisible to the lock scan entirely,
+      // which is the whole reason it needed its own pass.
+      expect(result.cleared).toBe(0);
+      expect(result.restoredStrandedPromotions).toBe(1);
+      expect(result.restoredStrandedPromotionIssueIds).toContain(issueId);
+
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("todo");
+      // The load-bearing half: long_active_duration measures from startedAt.
+      expect(row?.startedAt).toBeNull();
+      expect(row?.checkoutRestoreStatus).toBeNull();
+      expect(row?.assigneeAgentId).toBe(agentId);
+    });
+
+    it("is idempotent — a second pass restores nothing", async () => {
+      const { companyId, agentId } = await seed();
+      await seedLockFreeStrand({ companyId, agentId });
+
+      const first = await heartbeatService(db).sweepStaleIssueLocks();
+      expect(first.restoredStrandedPromotions).toBe(1);
+
+      // The restore clears the marker, so the shared guard no longer matches.
+      const second = await heartbeatService(db).sweepStaleIssueLocks();
+      expect(second.restoredStrandedPromotions).toBe(0);
+      expect(second.restoredStrandedPromotionIssueIds).toEqual([]);
+    });
+
+    it("skips a lock-free row holding a dispatchable monitor with a future check", async () => {
+      const { companyId, agentId } = await seed();
+      const startedAt = new Date(Date.now() - 40 * 60 * 60 * 1000);
+      const monitorNextCheckAt = new Date(Date.now() + 60 * 60 * 1000);
+      const issueId = await seedLockFreeStrand({
+        companyId,
+        agentId,
+        startedAt,
+        monitorNextCheckAt,
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      // Attended: `in_progress` is the state the monitor needs to fire, so the
+      // promotion is deferred rather than cancelled (BLO-29554).
+      expect(result.restoredStrandedPromotions).toBe(0);
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("in_progress");
+      expect(row?.startedAt?.getTime()).toBe(startedAt.getTime());
+      expect(row?.checkoutRestoreStatus).toBe("todo");
+      expect(row?.monitorNextCheckAt?.getTime()).toBe(monitorNextCheckAt.getTime());
+    });
+
+    it("skips a lock-free row carrying no promotion marker", async () => {
+      const { companyId, agentId } = await seed();
+      const startedAt = new Date(Date.now() - 40 * 60 * 60 * 1000);
+      const issueId = await seedLockFreeStrand({
+        companyId,
+        agentId,
+        startedAt,
+        checkoutRestoreStatus: null,
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect(result.restoredStrandedPromotions).toBe(0);
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("in_progress");
+      expect(row?.startedAt?.getTime()).toBe(startedAt.getTime());
+    });
+
+    it("leaves a row held by a live run to the lock sweep", async () => {
+      const { companyId, agentId, runningRunId } = await seed();
+      const issueId = randomUUID();
+      const startedAt = new Date(Date.now() - 40 * 60 * 60 * 1000);
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Live run holds this",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        executionRunId: runningRunId,
+        executionLockedAt: new Date(),
+        checkoutRestoreStatus: "todo",
+        startedAt,
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      // The drain only ever selects both-columns-NULL rows, so the two passes
+      // are disjoint and neither can demote a row out from under a live run.
+      expect(result.restoredStrandedPromotionIssueIds).not.toContain(issueId);
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("in_progress");
+      expect(row?.startedAt?.getTime()).toBe(startedAt.getTime());
+    });
+
+    it("drains a blocked marker with no edge to todo, and keeps one with a live edge blocked", async () => {
+      const { companyId, agentId } = await seed();
+      const strandedId = await seedLockFreeStrand({
+        companyId,
+        agentId,
+        checkoutRestoreStatus: "blocked",
+      });
+      const genuinelyBlockedId = await seedLockFreeStrand({
+        companyId,
+        agentId,
+        checkoutRestoreStatus: "blocked",
+      });
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId,
+        title: "Blocker",
+        status: "todo",
+        priority: "high",
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: genuinelyBlockedId,
+        type: "blocks",
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect(result.restoredStrandedPromotions).toBe(2);
+      // This is the case that makes the drain safe to run at all: without it,
+      // the drain would mint a row with no wake path of any kind.
+      expect((await readRow(strandedId))?.status).toBe("todo");
+      expect((await readRow(genuinelyBlockedId))?.status).toBe("blocked");
     });
   });
 });
