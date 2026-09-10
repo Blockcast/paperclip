@@ -141,6 +141,28 @@ export function isIssueHeldByForeignRun(input: {
  * trading a duplicated run for a silent strand. So we defer only when the retry
  * is armed, provably owned by another run, and not lapsed past
  * {@link SCHEDULED_RETRY_HOLD_GRACE_MS}.
+ *
+ * DO NOT gate this on the retry run's `startedAt`, however tempting the symmetry
+ * with `isReapableHeartbeatRunRow` looks — it would revert this fix to a no-op.
+ * A parked retry has `startedAt == null` BY CONSTRUCTION, always. All four
+ * writers of that status are fresh INSERTs and not one of them sets the column
+ * — the continuation, ccrotate-capacity and dependency-blocked ladders in
+ * `heartbeat.ts` plus provider-quota recovery in `recovery/service.ts` — no
+ * UPDATE path ever transitions an existing row *into* `scheduled_retry`, and
+ * `heartbeat_runs.started_at` is a plain nullable timestamp with no database
+ * default. So "only defer to retries that actually started" defers to none of
+ * them.
+ *
+ * The asymmetry with checkout is deliberate, not drift. `checkout()` asks *may a
+ * run that deliberately asked for this row adopt the lock?* and answers yes — a
+ * parked retry owns no worktree, and refusing made WIP monotonic (BLO-20321).
+ * This predicate asks *may we spontaneously offer this row to a sibling that
+ * asked for nothing?* and answers no, because that offer is the measured
+ * generator of the duplicate work above. Withholding never blocks recovery:
+ * explicit checkout, recovery actions and monitor wakes all bypass the inbox,
+ * the holder's own retry fails open by run id, and the strand is bounded by the
+ * grace window. Pinned by "does NOT consult startedAt" in
+ * `issue-run-holding.test.ts`.
  */
 export function isIssueHeldByForeignScheduledRetry(input: {
   scheduledRetryAt: Date | string | null | undefined;
