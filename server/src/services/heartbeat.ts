@@ -36738,8 +36738,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         store: run.logStore,
         logRef: run.logRef,
         ...result,
-        // Run-log chunks are already redacted before they are appended to the store.
-        // Rewriting the full chunk again on every poll creates avoidable string copies.
+        // Chunks are sanitized on the write path (`sanitizeRunLogChunkForStorage`)
+        // before they are appended, so re-rewriting the full chunk on every poll
+        // would only add string copies.
+        //
+        // PEN-3139: be precise about what that sanitizing is, because this
+        // comment reads as a stronger guarantee than it is. It is
+        // username/home-directory rewriting, base64-image stripping,
+        // truncation, and `redactSensitiveText` — a *best-effort* scrub that is
+        // mostly name-anchored (`KEY=`, `--flag`, `"field":`, `user:pass@`) plus
+        // a list of named vendor credential shapes. It is defence in depth over
+        // unstructured text, and it is not complete: an unrecognized
+        // high-entropy value with no secret-shaped name beside it survives it.
+        // Do not treat "already redacted" as an authorization boundary — who may
+        // read a transcript is decided by the route's access check, not here.
         content: result.content,
       };
     },
