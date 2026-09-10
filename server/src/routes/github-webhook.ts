@@ -64,10 +64,16 @@ import {
 } from "../services/paperclip-identifiers.js";
 import {
   githubFetchPrHeadSha,
+  githubListPullRequestCommits,
   githubReviewerIdentityMatches,
   githubListIssueCommentBodies,
   githubPostIssueComment,
 } from "../services/github-app-auth.js";
+import {
+  buildForeignCommitNoticeBody,
+  foreignCommitNoticeIdempotencyKey,
+  selectForeignCommits,
+} from "../services/foreign-commit-notice.js";
 import {
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
@@ -173,6 +179,17 @@ export interface GithubWebhookConfig {
    * behavior is verified without contacting GitHub.
    */
   runPrCommentReviewGateCheck?: typeof runPrCommentReviewGateCheck;
+  /**
+   * Lists a PR's commits with their git-author identity, for the foreign-commit
+   * notice (BLO-19528). Production uses the GitHub App lookup; route tests
+   * supply a deterministic seam so the notice is verified without contacting
+   * GitHub. When unset and App creds are absent, the notice self-gates off.
+   */
+  listPullRequestCommits?: typeof githubListPullRequestCommits;
+  /**
+   * Gate for the foreign-commit notice (BLO-19528). Defaults to enabled.
+   */
+  notifyForeignCommits?: boolean;
   /**
    * Absolute public origin of this Paperclip deployment (PAPERCLIP_PUBLIC_URL),
    * used to build the absolute issue URL posted back onto PRs (BLO-13353). When
@@ -4962,6 +4979,117 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     }
 
+    // Foreign-commit notice (BLO-19528). When another agent pushes to a branch
+    // whose linked issue is assigned to somebody else, tell the assignee. The
+    // hazard is silent drift: on trafficcontrol#1292 a teammate's commit landed
+    // on the CTO's branch and the CTO's next status comment still described a
+    // PR it believed it solely authored -- the same drift that earlier nearly
+    // caused a force-push over that teammate's work.
+    //
+    // Trigger is `pull_request.synchronize`, not `push`. synchronize fires once
+    // per push to a PR branch and is already a subscribed, handled event here,
+    // so this needs no new webhook subscription and is inherently PR-scoped.
+    //
+    // Scoped to OWNING identifiers (BLO-20886): a PR that merely mentions an
+    // issue in a `Related:` line must not wake that issue's assignee.
+    //
+    // Best-effort throughout: any failure is logged and never breaks the wake
+    // path, mirroring the back-link and work-product blocks above.
+    let foreignCommitNotices = 0;
+    const foreignCommitAction = readStringField(payload, "action");
+    const foreignCommitRepo = context.repoFullName;
+    const foreignCommitPrNumber = context.prNumber;
+    const foreignCommitPrUrl = context.prUrl ?? null;
+    if (
+      config.notifyForeignCommits !== false &&
+      eventName === "pull_request" &&
+      (foreignCommitAction === "synchronize" || foreignCommitAction === "opened") &&
+      foreignCommitRepo !== null &&
+      foreignCommitPrNumber !== null &&
+      matched.length > 0
+    ) {
+      const owning = context.owningIdentifiers ?? context.identifiers;
+      const owningMatched = matched.filter(
+        (issue) => issue.identifier && owning.includes(issue.identifier),
+      );
+
+      if (owningMatched.length > 0) {
+        try {
+          const listCommits = config.listPullRequestCommits ?? githubListPullRequestCommits;
+          const commitsResult = await listCommits({
+            repoFullName: foreignCommitRepo,
+            prNumber: foreignCommitPrNumber,
+          });
+
+          if ("error" in commitsResult) {
+            logger.warn(
+              {
+                reason: commitsResult.error,
+                prNumber: foreignCommitPrNumber,
+                repoFullName: foreignCommitRepo,
+              },
+              "foreign-commit notice: PR commit listing failed (non-fatal)",
+            );
+          } else {
+            const companyIds = Array.from(new Set(owningMatched.map((i) => i.companyId)));
+            const roster = await db
+              .select({ id: agents.id, name: agents.name, companyId: agents.companyId })
+              .from(agents)
+              .where(inArray(agents.companyId, companyIds));
+
+            for (const issue of owningMatched) {
+              const selection = selectForeignCommits({
+                commits: commitsResult.commits,
+                assigneeAgentId: issue.assigneeAgentId,
+                agents: roster.filter((a) => a.companyId === issue.companyId),
+              });
+
+              for (const foreign of selection.notify) {
+                const idempotencyKey = foreignCommitNoticeIdempotencyKey({
+                  repoFullName: foreignCommitRepo,
+                  prNumber: foreignCommitPrNumber,
+                  sha: foreign.sha,
+                });
+                const inserted = await db
+                  .insert(issueComments)
+                  .values({
+                    companyId: issue.companyId,
+                    issueId: issue.id,
+                    authorType: "system",
+                    idempotencyKey,
+                    body: buildForeignCommitNoticeBody({
+                      commit: foreign,
+                      repoFullName: foreignCommitRepo,
+                      prNumber: foreignCommitPrNumber,
+                      prUrl: foreignCommitPrUrl,
+                    }),
+                    metadata: {
+                      kind: "github_foreign_commit_notice",
+                      source: "github",
+                      idempotencyKey,
+                      repoFullName: foreignCommitRepo,
+                      prNumber: foreignCommitPrNumber,
+                      commitSha: foreign.sha,
+                      committingAgentId: foreign.agentId,
+                      deliveryId,
+                    } as never,
+                  })
+                  .onConflictDoNothing()
+                  .returning({ id: issueComments.id })
+                  .then((rows) => rows[0] ?? null);
+                if (inserted) foreignCommitNotices += 1;
+              }
+            }
+          }
+        } catch (err) {
+          logger.warn(
+            { err, prNumber: foreignCommitPrNumber, repoFullName: foreignCommitRepo },
+            "foreign-commit notice failed (non-fatal)",
+          );
+        }
+      }
+    }
+
     if (matched.length === 0) {
       respond(200, {
         ok: true,
@@ -5367,6 +5495,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       reviewerRunsCancelled,
       ...(workProductsUpserted > 0 ? { workProductsUpserted } : {}),
       ...(backLinked.length ? { backLinked } : {}),
+      ...(foreignCommitNotices > 0 ? { foreignCommitNotices } : {}),
       ...(escalated.length ? { escalated } : {}),
     });
   });

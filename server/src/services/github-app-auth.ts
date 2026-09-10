@@ -506,6 +506,85 @@ const REVIEWER_EVIDENCE_MAX_PAGES = 10;
  * unresolved required head returns `{found:false}` and never accepts arbitrary
  * review evidence.
  */
+/** One PR commit, reduced to the fields foreign-commit detection decides on (BLO-19528). */
+export type GitHubPullRequestCommit = {
+  sha: string;
+  authorEmail: string | null;
+  authorName: string | null;
+  parentCount: number;
+};
+
+export type GitHubPullRequestCommitsResult =
+  | { commits: GitHubPullRequestCommit[] }
+  | { error: string };
+
+/** Cap on `/pulls/{n}/commits` pages. GitHub itself truncates this endpoint at 250 commits. */
+export const GITHUB_PR_COMMITS_MAX_PAGES = 3;
+
+/**
+ * List a PR's commits with their **git author** identity (BLO-19528).
+ *
+ * Reads `commit.author.email`, not `author.login`: every agent pod pushes with
+ * the same shared App credential, so the login names the App for all of them
+ * alike, while the git author email is provisioned per agent (BLO-23894).
+ *
+ * `parents.length` is carried through so the caller can exclude merge/squash
+ * commits, which the GitHub merge API creates and legitimately App-attributes.
+ */
+export async function githubListPullRequestCommits(input: {
+  repoFullName: string;
+  prNumber: number;
+}): Promise<GitHubPullRequestCommitsResult> {
+  const token = await getInstallationToken();
+  if (!token) return { error: "no_token" };
+
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  const commits: GitHubPullRequestCommit[] = [];
+
+  for (let page = 1; page <= GITHUB_PR_COMMITS_MAX_PAGES; page += 1) {
+    const url =
+      `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/commits`
+      + `?per_page=100&page=${page}`;
+    let res: Response;
+    try {
+      res = await ghFetch(url, { headers });
+    } catch {
+      return { error: "pr_commits_fetch_failed" };
+    }
+    if (!res.ok) {
+      const classified = await classifyGithubHttpFailure("pr_commits", res);
+      return { error: classified.reason };
+    }
+
+    let batch: Array<Record<string, unknown>>;
+    try {
+      batch = (await res.json()) as Array<Record<string, unknown>>;
+    } catch {
+      return { error: "pr_commits_parse_failed" };
+    }
+    if (!Array.isArray(batch)) return { error: "pr_commits_unexpected_shape" };
+
+    for (const entry of batch) {
+      const sha = typeof entry.sha === "string" ? entry.sha : null;
+      if (!sha) continue;
+      const commit = entry.commit as Record<string, unknown> | undefined;
+      const author = commit?.author as Record<string, unknown> | undefined;
+      const parents = Array.isArray(entry.parents) ? entry.parents : [];
+      commits.push({
+        sha,
+        authorEmail: typeof author?.email === "string" ? author.email : null,
+        authorName: typeof author?.name === "string" ? author.name : null,
+        parentCount: parents.length,
+      });
+    }
+
+    if (batch.length < 100) break;
+  }
+
+  return { commits };
+}
+
 export async function githubHasReviewerEvidenceForPr(input: {
   repoFullName: string;
   prNumber: number;
