@@ -25,6 +25,10 @@ The launcher owns the short-lived Caveman process and temporary files. The
 adapter owns the Kubernetes Job and cleanup. Ponytail changes the selected
 agent's behavior; it is not a provider credential or a shared transport.
 
+The adapter/provider scope is deliberately limited to `claude_k8s` and
+`opencode_k8s` using the reviewed Penstock launcher. The native `claude_local`
+adapter is not part of this rollout.
+
 ## Hard boundaries
 
 - Use only `claude_k8s` or `opencode_k8s`. Do not configure the retired local
