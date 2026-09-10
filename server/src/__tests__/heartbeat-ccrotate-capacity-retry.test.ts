@@ -86,6 +86,7 @@ function denyingGate(resumeAt: Date | null): PenstockAvailabilityGate {
         provider: "anthropic",
         reason: "penstock.model_capacity_unavailable",
         model: "claude-test",
+        probePath: "capacity",
         resumeAt,
         retryAfterSeconds: null,
       };
@@ -121,6 +122,7 @@ function denyingGateAtBarrier(expectedChecks: number): PenstockAvailabilityGate 
         provider: "anthropic",
         reason: "penstock.model_capacity_unavailable",
         model: "claude-sonnet-5[1m]",
+        probePath: "capacity",
         resumeAt: new Date("2026-07-14T11:00:00.000Z"),
         retryAfterSeconds: 300,
       };
@@ -143,6 +145,7 @@ function denyingGateWithRetryAfter(retryAfterSeconds: number): PenstockAvailabil
         provider: "anthropic",
         reason: "penstock.model_capacity_unavailable",
         model: "claude-sonnet-5[1m]",
+        probePath: "capacity",
         resumeAt: new Date(Date.now() + retryAfterSeconds * 1000),
         retryAfterSeconds,
       };
@@ -578,6 +581,11 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     expect(resultJson.retryNotBefore).toBe(retryRun!.scheduledRetryAt!.toISOString());
     // The provider's claim stays legible under its own key.
     expect(resultJson.penstockAdvertisedResumeAt).toBe(resumeAt.toISOString());
+    // BLO-29900 AC4, asserted through the real insert path rather than through
+    // applyCcrotateCapacityDecision alone: a parked row states which probe
+    // denied it, so a 429 from the cheap GET is distinguishable from a 429 the
+    // fallback paid provider quota for.
+    expect(resultJson.penstockProbePath).toBe("capacity");
 
     // The wake is NOT recorded as a terminal `skipped` drop.
     const skipped = await db
@@ -696,6 +704,9 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     // reinstate the long park on its next failure.
     const resultJson = (row?.resultJson ?? {}) as Record<string, unknown>;
     expect(resultJson.retryNotBefore).toBe(row!.scheduledRetryAt!.toISOString());
+    // BLO-29900 AC4 on the *re-defer* write, which is a second, separate call
+    // site from the insert above and rewrites the whole decision-key set.
+    expect(resultJson.penstockProbePath).toBe("capacity");
   });
 
   it("leaves a hintless transient_failure park on its own path", async () => {
