@@ -7,6 +7,15 @@ The 2026-09-06 sections below were measured against the live GitHub API on
 **2026-09-06 ~05:0x–05:1xZ**, with `master` at `30c23389316b4b6cce44d28f68d79af12b7c4c02`.
 The execution section at the end carries its own, later measurement window.
 
+> **Current status (2026-09-10T17:1xZ) — 9 of 11 landed and all nine are in production**
+> at `ac3386b9667cf0f422d18f42130399c659bcfcac`, both tiers agreeing, every merge
+> `behind_by: 0`. Two remain open: **#1596** (criterion 5, kkroo) and **#1595** (an authoring
+> decision on 27 conflicting files under
+> [BLO-32317](https://paperclip.blockcast.net/BLO/issues/BLO-32317)). Jump to
+> *RESOLVED 2026-09-10T12:17:34Z* at the end for the deploy proof. **This document is a log:
+> the dated sections below are preserved as written, including the readings that later turned
+> out to be wrong — the corrections are recorded in place rather than by editing history.**
+
 ## Headline
 
 The plan's PR classification was written on 2026-09-04/05 and had **rotted by execution time**.
@@ -392,3 +401,72 @@ why `34324444180` built green. But `Docker` on `master` is failing again: run **
 own green image — but it does mean a re-dispatch at current `master` could fail to build, which is
 a second, independent reason not to reject the incumbent. Not diagnosed here and not this row's;
 recorded so the next reader does not assume a re-dispatch is free.
+
+## RESOLVED 2026-09-10T12:17:34Z — production is at `ac3386b96`, and all nine merges are deployed
+
+**A4 is closed, and not the way I recommended.** Measured 2026-09-10T17:1xZ.
+
+Sequence, from the run and deployment records:
+
+| when (UTC) | what |
+|---|---|
+| 09-10T11:22:38Z | run `34324444180` **cancelled** — never approved, never rejected |
+| 09-10T11:28:00Z | approval-gate reconciler ([BLO-29359](https://paperclip.blockcast.net/BLO/issues/BLO-29359)) closed card `6ab6ee30` as `cancelled`: *"the gate it pointed at died undecided"* |
+| 09-10T11:23:14Z | `kkroo` dispatched `34471017388` at `ac3386b96` — `deploy` **failed** at the *Approve exact deploy plan at admission time* step (12:00:20Z) |
+| 09-10T12:15:25Z | `kkroo` re-dispatched `34475702360` at the same SHA — all four jobs `success` |
+| 09-10T12:17:34Z | deployment `6371413779` created; production moves to `ac3386b96` |
+
+**kkroo took the *original* A4 plan — cancel the stale incumbent and re-dispatch at a newer SHA — over the revised recommendation I posted on the card, which argued for approving `34324444180` as-is.** Recorded plainly because the outcome is *strictly better than what I advised*: the deploy I recommended carried 7 of the 9 merges, and this one carries all 9. My argument rested on two premises that were each true when written and both decayed — that rejecting would "destroy a built green artifact" (the artifact was cancelled anyway, so there was nothing left to preserve) and that `Docker` on `master` was red so a rebuild might fail (it built green on the second attempt, and `master` is green again now at `7e7ae85de`, run `34503075423`). The first dispatch *did* fail — so the risk I named was real — but it was recoverable by retrying, which I had treated as a reason not to try at all.
+
+### Ancestry proof — 9 of 9, `behind_by: 0`
+
+`gh api repos/Blockcast/paperclip/compare/<merge-sha>...ac3386b9667cf0f422d18f42130399c659bcfcac`:
+
+| PR | merge SHA | vs deployed | ancestor? |
+|---|---|---|---|
+| 1195 | `8ddfca0809c1d21366c1c54f588ff5a77664b2ca` | `ahead_by: 104`, `behind_by: 0` | **yes** |
+| 1279 | `a32d5a5e2fe88225f76c9effd168daa88e801563` | `ahead_by: 107`, `behind_by: 0` | **yes** |
+| 1586 | `2ebf80098065336c3264462bb983eb16acdcbca9` | `ahead_by: 103`, `behind_by: 0` | **yes** |
+| 1467 | `79f85d056e27c61f6d86ef6b30a810c78d6ae51b` | `ahead_by: 102`, `behind_by: 0` | **yes** |
+| 1219 | `70a9df918d2d250d5dfb536c15069e5015739b34` | `ahead_by: 92`, `behind_by: 0` | **yes** |
+| 1309 | `a589aea8bb990d11d5d987216b8dc4089b74a4a2` | `ahead_by: 89`, `behind_by: 0` | **yes** |
+| 1418 | `b9ec8590c0cb4cf0eae539ce9e8591473765ecb9` | `ahead_by: 66`, `behind_by: 0` | **yes** |
+| 1585 | `d0613f40f2e52267a7d94b4fb3019f5a491d2155` | `ahead_by: 11`, `behind_by: 0` | **yes** |
+| 1150 | `3e85318c0f454d42d5e60cbfbcc11935a66d2078` | `ahead_by: 10`, `behind_by: 0` | **yes** |
+
+**Zero `NOT DEPLOYED` lines.** The predicate used is `behind_by == 0` — *not* the `status`
+`behind`/`ahead_by: 0` form written into the tracking issue's verifying signal, which is inverted
+and passes for every *un*deployed merge. See the boxed correction above; it has now been reported
+three times and is still unamended.
+
+### Two-tier check — no divergence
+
+    kubectl -n paperclip get sts paperclip     -o jsonpath='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/deployed-commit}'
+    kubectl -n paperclip get deploy paperclip-api -o jsonpath='{.spec.template.metadata.annotations.paperclip\.blockcast\.net/deployed-commit}'
+
+Both return `ac3386b9667cf0f422d18f42130399c659bcfcac`. `StatefulSet/paperclip` and
+`Deployment/paperclip-api` agree, so there is no
+[BLO-24821](https://paperclip.blockcast.net/BLO/issues/BLO-24821) divergence.
+
+Production is `ahead_by: 0`, `behind_by: 10` against `master` `7e7ae85dee9dbba9914d232414263b3254507669` — ordinary drift from ten commits merged after the deploy, none of them Track A.
+
+### `/api/health` still cannot serve this signal
+
+Re-measured this run. The whole body is:
+
+```json
+{"status":"ok","deploymentMode":"authenticated","deploymentExposure":"private",
+ "bootstrapStatus":"ready","bootstrapInviteActive":false,
+ "auth":{"emailPasswordEnabled":false,"oidcProviders":["dex"]},
+ "publicUrl":"https://paperclip.blockcast.net"}
+```
+
+There is **no `fullSha` field**, so the acceptance criterion's "`/api/health` `fullSha` equals the
+deployed commit" clause is unusable as written — third measurement, unchanged. The pod-template
+`deployed-commit` annotation above is the working substitute and is what this log cites.
+
+### Deploy slot state
+
+`gh api "repos/Blockcast/paperclip/actions/runs?status=waiting"` → `total_count: 0`. The slot is
+**empty**: `34019412658` (the originally-named stale run) and `34324444180` are both terminal, so
+the fleet deploy mutex is released. I dispatched nothing on this row in any run.
