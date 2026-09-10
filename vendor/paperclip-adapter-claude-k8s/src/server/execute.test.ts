@@ -1261,6 +1261,147 @@ describe("execute: job creation", () => {
     expect(mockBatchCreateJob).toHaveBeenCalled();
   });
 
+  // ── BLO-27155: a worker restart must reattach, not recreate ──────────────
+  //
+  // `resumeRunningExternalRuntimeRuns()` re-executes an in-flight run from its
+  // persisted reservation after the worker process restarts.  The Job name is
+  // deterministic per (agentId, runId), so that re-execution's create always
+  // collides with the run's OWN still-live Job — the concurrency guard above
+  // deliberately `continue`s past it ("Ignoring current lifecycle Job … during
+  // concurrency admission"), so admission proceeds *while that Job is live*.
+  //
+  // The 409 used to be fatal, and worse, its catch block deleted all three run
+  // Secrets — which are mounted into the live pod.  So a restart did not merely
+  // fail the run, it dismantled a still-running Job's inputs.  These cases drive
+  // the real execute() path rather than the `jobAdoptionVerdict` helper, which
+  // is unit-tested separately in job-adopt.test.ts.
+
+  // Re-applies this block's beforeEach defaults.  Needed because these cases
+  // call execute() twice — once to learn the deterministic Job name, then again
+  // to drive the collision — and the first call must not leak call history or a
+  // spent one-shot rejection into the second.
+  function armJobCreationDefaults() {
+    vi.resetAllMocks();
+    mockReadSkillEntries.mockResolvedValue([]);
+    mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+    mockBatchCreateJob.mockResolvedValue({ metadata: { uid: "job-uid-1" } });
+    mockBatchDeleteJob.mockResolvedValue({});
+    mockCoreCreateSecret.mockResolvedValue({});
+    mockCoreDeleteSecret.mockResolvedValue({});
+    mockCoreReadSecret.mockResolvedValue({ metadata: { resourceVersion: "1" } });
+    mockCoreReplaceSecret.mockResolvedValue({});
+  }
+
+  /**
+   * The Job name is deterministic per (agentId, runId) but is built inside
+   * `buildJobManifest`, which does not export it.  Rather than reproduce the
+   * `ac-<agentSlug>-<runSlug>-<shortHash>` formula here — where it would
+   * silently drift from job-manifest.ts and make these tests pass against a
+   * name the adapter no longer builds — read it back from the adapter's own
+   * create call, then re-arm for the real assertion.
+   */
+  async function deterministicJobName(ctx: AdapterExecutionContext = makeCtx()): Promise<string> {
+    await execute(ctx);
+    const name = mockBatchCreateJob.mock.calls[0]?.[0]?.body?.metadata?.name as string | undefined;
+    expect(name, "probe execute() should have reached createNamespacedJob").toBeTruthy();
+    armJobCreationDefaults();
+    return name as string;
+  }
+
+  /** A prompt over the 256 KiB threshold, so all three Secrets are staged. */
+  const restartCtx = (over: Record<string, unknown>) =>
+    makeCtx({
+      context: { paperclipTaskMarkdown: "x".repeat(300 * 1024) },
+      ...over,
+    } as unknown as Partial<AdapterExecutionContext>);
+
+  it("adopts this run's own live Job on 409 and reattaches to the SAME uid", async () => {
+    const jobName = await deterministicJobName();
+    // Deliberately not "job-uid-1": the assertion below is that the run keeps
+    // the uid it was launched with, rather than acquiring a freshly created one.
+    const liveUid = "live-uid-from-before-the-restart";
+    mockBatchCreateJob.mockRejectedValueOnce(alreadyExists409());
+    mockBatchReadJob.mockResolvedValue(
+      makeJob({ name: jobName, uid: liveUid, runId: "run-test-001", agentId: "agent-abc" }),
+    );
+    const onExternalRuntimeLaunched = vi.fn().mockResolvedValue(undefined);
+
+    const result = await execute(
+      restartCtx({
+        externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName, jobUid: liveUid },
+        onExternalRuntimeLaunched,
+      }),
+    );
+
+    expect(result.errorCode).not.toBe("k8s_job_create_failed");
+    // Reattach means the same object: no second create, no duplicate Job.
+    expect(mockBatchCreateJob).toHaveBeenCalledTimes(1);
+    expect(onExternalRuntimeLaunched).toHaveBeenCalledWith({ jobName, jobUid: liveUid });
+    // Deliberately NOT asserting that no Secret is ever deleted in this case.
+    // Once the run reattaches it owns that Job's lifecycle again — it waits for
+    // it, streams its logs, and the terminal `finally` then deletes the Job and
+    // its Secrets exactly as it would for a Job this execution had created.
+    // Gating that terminal cleanup on adoption would leak a Job and three
+    // Secrets on every successful reattach. What must never delete an adopted
+    // object is the two *abort* paths, which the next case isolates.
+  });
+
+  it("still fails closed when the colliding Job is not the one this run launched", async () => {
+    // BLO-17291 AC-3: a same-name object that is not this exact object is never
+    // adopted. Adopting here would attach the run to work it does not own.
+    const jobName = await deterministicJobName();
+    mockBatchCreateJob.mockRejectedValueOnce(alreadyExists409());
+    mockBatchReadJob.mockResolvedValue(
+      makeJob({ name: jobName, uid: "a-different-objects-uid", runId: "run-test-001", agentId: "agent-abc" }),
+    );
+
+    const result = await execute(
+      restartCtx({
+        externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName, jobUid: "the-uid-we-launched" },
+      }),
+    );
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+  });
+
+  it("does NOT tear down an ADOPTED Job's Secrets when the launch ack throws", async () => {
+    // The dangerous edge. Those Secrets are mounted into a running pod, so
+    // deleting them converts a recoverable stall into lost work. Leaking a Job
+    // is recoverable by the existing reapers; deleting a live one is not.
+    const jobName = await deterministicJobName();
+    const liveUid = "live-uid-from-before-the-restart";
+    mockBatchCreateJob.mockRejectedValueOnce(alreadyExists409());
+    mockBatchReadJob.mockResolvedValue(
+      makeJob({ name: jobName, uid: liveUid, runId: "run-test-001", agentId: "agent-abc" }),
+    );
+
+    await execute(
+      restartCtx({
+        externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName, jobUid: liveUid },
+        onExternalRuntimeLaunched: vi.fn().mockRejectedValue(new Error("reservation ack failed")),
+      }),
+    );
+
+    expect(mockCoreDeleteSecret).not.toHaveBeenCalled();
+    expect(mockBatchDeleteJob).not.toHaveBeenCalled();
+  });
+
+  it("DOES tear down a Job it created itself when the launch ack throws", async () => {
+    // Negative control for the case above: without it, that assertion passes
+    // just as well if cleanup had been deleted outright rather than made
+    // conditional on adoption.
+    await execute(
+      restartCtx({
+        onExternalRuntimeLaunched: vi.fn().mockRejectedValue(new Error("reservation ack failed")),
+      }),
+    );
+
+    expect(mockBatchDeleteJob).toHaveBeenCalled();
+    expect(mockCoreDeleteSecret).toHaveBeenCalled();
+  });
+
   it("acknowledges the created Job identity before continuing", async () => {
     const onExternalRuntimeLaunched = vi.fn().mockResolvedValue(undefined);
 

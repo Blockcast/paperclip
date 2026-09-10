@@ -700,6 +700,92 @@ export async function createOrAdoptRunSecret(
   }
 }
 
+export type JobAdoptionVerdict =
+  | { adopt: true; jobUid: string }
+  | { adopt: false; reason: string };
+
+/**
+ * Decide whether a `createNamespacedJob` 409 is this run reattaching to its own
+ * still-live Job, or a genuine collision that must stay fatal.
+ *
+ * Why this exists (BLO-27155).  When the worker process restarts, in-flight
+ * runs are re-executed from their persisted reservation, which carries the Job
+ * identity (`ctx.externalRuntime`).  The Job name is deterministic per
+ * (agentId, runId), so that re-execution's create *always* collides with the
+ * run's own live Job.  The 409 was fatal — and, worse, the failure path deleted
+ * the three run Secrets, which are mounted into the live pod.  So a worker
+ * restart did not merely fail the run: it dismantled a still-running Job's
+ * inputs, converting a recoverable stall into lost work.  Adopting is what
+ * turns that into the reattach the reservation already expects.
+ *
+ * Why this gate is stricter than `createOrAdoptRunSecret`'s.  That one tolerates
+ * missing labels, because a Secret written by an older adapter build must still
+ * be reclaimable and its name already encodes the run identity.  Here something
+ * far stronger is available — a server-assigned UID persisted at launch — so
+ * there is no need to infer identity from a name.  Every condition below is
+ * therefore *required*, not merely "not contradicted":
+ *
+ *   - no persisted identity => refuse.  Without it, "our own live Job" and "a
+ *     same-named Job from an earlier attempt" are indistinguishable, and they
+ *     want opposite handling.
+ *   - UID mismatch          => refuse.  This is the BLO-17291 AC-3 guarantee:
+ *     a same-name object that is not this exact object is never touched.
+ *   - name mismatch         => refuse.  Cross-checked against the reservation
+ *     because the two genuinely can disagree — an adapter-type change
+ *     re-prefixes the Job name while the reservation holds the old one
+ *     (BLO-28865).
+ *   - run-id label mismatch => refuse.  Compared against the *sanitized* runId,
+ *     because that is what job-manifest.ts writes.  An unlabelled Job is
+ *     already fatal to the concurrency guard above and stays fatal here.
+ *
+ * Pure, so the fail-closed matrix is testable without a cluster; the caller
+ * does the I/O.
+ */
+export function jobAdoptionVerdict(
+  existing: k8s.V1Job | null | undefined,
+  expected: {
+    jobName: string;
+    runId: string;
+    identity: { jobName?: string | null; jobUid?: string | null } | null | undefined;
+  },
+): JobAdoptionVerdict {
+  const persistedName = expected.identity?.jobName;
+  const persistedUid = expected.identity?.jobUid;
+  if (!persistedName || !persistedUid) {
+    return { adopt: false, reason: "run has no persisted external-runtime Job identity" };
+  }
+  if (persistedName !== expected.jobName) {
+    return {
+      adopt: false,
+      reason: `reservation holds Job name ${persistedName}, but this execution builds ${expected.jobName}`,
+    };
+  }
+  const meta = existing?.metadata;
+  if (!meta?.uid) {
+    return { adopt: false, reason: "existing Job could not be read, or carries no UID" };
+  }
+  if (meta.name !== expected.jobName) {
+    return { adopt: false, reason: `existing Job is named ${meta.name}, not ${expected.jobName}` };
+  }
+  if (meta.uid !== persistedUid) {
+    return {
+      adopt: false,
+      reason: `existing Job UID ${meta.uid} is not this run's launched UID ${persistedUid}`,
+    };
+  }
+  const expectedRunIdLabel = sanitizeLabelValue(expected.runId);
+  const actualRunIdLabel = meta.labels?.[RUN_ID_LABEL];
+  if (!expectedRunIdLabel || actualRunIdLabel !== expectedRunIdLabel) {
+    return {
+      adopt: false,
+      reason:
+        `existing Job ${RUN_ID_LABEL}=${actualRunIdLabel ?? "<none>"} `
+        + `does not match run ${expectedRunIdLabel ?? "<unlabelable>"}`,
+    };
+  }
+  return { adopt: true, jobUid: meta.uid };
+}
+
 /**
  * Returns true when the heartbeat-run status indicates the run was explicitly
  * cancelled and the K8s Job must be torn down.
@@ -1773,54 +1859,90 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     // Create the Job
     let createdJobUid: string | undefined;
+    // Set when the Job below already existed and is provably this run's own
+    // live Job (worker-restart reattach, BLO-27155).  It gates the two abort
+    // paths that follow: an object we adopted rather than created must never be
+    // torn down by them, because it is carrying live work.
+    let adoptedExistingJob = false;
     try {
       const created = await batchApi.createNamespacedJob({ namespace, body: job });
       createdJobUid = created.metadata?.uid;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await onLog("stderr", `[paperclip] Failed to create K8s Job: ${msg}\n`);
-      if (promptSecret) {
+      let verdict: JobAdoptionVerdict = { adopt: false, reason: "create failed with a non-409 error" };
+      if (isK8s409(err)) {
+        let existing: k8s.V1Job | null = null;
         try {
-          await coreApi.deleteNamespacedSecret({ name: promptSecret.name, namespace: promptSecret.namespace });
-        } catch { /* best-effort */ }
+          existing = await batchApi.readNamespacedJob({ name: jobName, namespace });
+        } catch (readErr) {
+          // Leave `existing` null and let the verdict refuse: a 409 we cannot
+          // corroborate by reading is exactly the case that must fail closed.
+          const readMsg = readErr instanceof Error ? readErr.message : String(readErr);
+          await onLog("stderr", `[paperclip] Job ${jobName} already exists but could not be read: ${readMsg}\n`);
+        }
+        verdict = jobAdoptionVerdict(existing, { jobName, runId, identity: currentJobIdentity });
       }
-      if (envSecret) {
-        try {
-          await coreApi.deleteNamespacedSecret({ name: envSecret.name, namespace: envSecret.namespace });
-        } catch { /* best-effort */ }
+
+      if (verdict.adopt) {
+        createdJobUid = verdict.jobUid;
+        adoptedExistingJob = true;
+        await onLog(
+          "stdout",
+          `[paperclip] Reattached to existing Job ${jobName} (uid ${verdict.jobUid}): this run's launched Job is still live, so it is adopted rather than recreated.\n`,
+        );
+      } else {
+        const msg = err instanceof Error ? err.message : String(err);
+        const why = isK8s409(err) ? ` (not adoptable: ${verdict.reason})` : "";
+        await onLog("stderr", `[paperclip] Failed to create K8s Job: ${msg}${why}\n`);
+        if (promptSecret) {
+          try {
+            await coreApi.deleteNamespacedSecret({ name: promptSecret.name, namespace: promptSecret.namespace });
+          } catch { /* best-effort */ }
+        }
+        if (envSecret) {
+          try {
+            await coreApi.deleteNamespacedSecret({ name: envSecret.name, namespace: envSecret.namespace });
+          } catch { /* best-effort */ }
+        }
+        if (mcpConfigSecret) {
+          try {
+            await coreApi.deleteNamespacedSecret({ name: mcpConfigSecret.name, namespace: mcpConfigSecret.namespace });
+          } catch { /* best-effort */ }
+        }
+        return {
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          errorMessage: `Failed to create Kubernetes Job: ${msg}`,
+          errorCode: "k8s_job_create_failed",
+        };
       }
-      if (mcpConfigSecret) {
-        try {
-          await coreApi.deleteNamespacedSecret({ name: mcpConfigSecret.name, namespace: mcpConfigSecret.namespace });
-        } catch { /* best-effort */ }
-      }
-      return {
-        exitCode: null,
-        signal: null,
-        timedOut: false,
-        errorMessage: `Failed to create Kubernetes Job: ${msg}`,
-        errorCode: "k8s_job_create_failed",
-      };
     }
     if (!createdJobUid || !onExternalRuntimeLaunched) {
-      await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
-      if (promptSecret) {
-        await coreApi.deleteNamespacedSecret({
-          name: promptSecret.name,
-          namespace: promptSecret.namespace,
-        }).catch(() => undefined);
-      }
-      if (envSecret) {
-        await coreApi.deleteNamespacedSecret({
-          name: envSecret.name,
-          namespace: envSecret.namespace,
-        }).catch(() => undefined);
-      }
-      if (mcpConfigSecret) {
-        await coreApi.deleteNamespacedSecret({
-          name: mcpConfigSecret.name,
-          namespace: mcpConfigSecret.namespace,
-        }).catch(() => undefined);
+      // Only tear down what this execution actually created.  An adopted Job is
+      // live and its Secrets are mounted into a running pod; deleting either
+      // here would destroy work that is still progressing, which is the failure
+      // this whole change exists to stop.  Leaking a Job is recoverable by the
+      // existing reapers — deleting a live one is not.
+      if (!adoptedExistingJob) {
+        await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
+        if (promptSecret) {
+          await coreApi.deleteNamespacedSecret({
+            name: promptSecret.name,
+            namespace: promptSecret.namespace,
+          }).catch(() => undefined);
+        }
+        if (envSecret) {
+          await coreApi.deleteNamespacedSecret({
+            name: envSecret.name,
+            namespace: envSecret.namespace,
+          }).catch(() => undefined);
+        }
+        if (mcpConfigSecret) {
+          await coreApi.deleteNamespacedSecret({
+            name: mcpConfigSecret.name,
+            namespace: mcpConfigSecret.namespace,
+          }).catch(() => undefined);
+        }
       }
       return {
         exitCode: null,
@@ -1835,24 +1957,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     try {
       await onExternalRuntimeLaunched({ jobName, jobUid: createdJobUid });
     } catch (err) {
-      await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
-      if (promptSecret) {
-        await coreApi.deleteNamespacedSecret({
-          name: promptSecret.name,
-          namespace: promptSecret.namespace,
-        }).catch(() => undefined);
-      }
-      if (envSecret) {
-        await coreApi.deleteNamespacedSecret({
-          name: envSecret.name,
-          namespace: envSecret.namespace,
-        }).catch(() => undefined);
-      }
-      if (mcpConfigSecret) {
-        await coreApi.deleteNamespacedSecret({
-          name: mcpConfigSecret.name,
-          namespace: mcpConfigSecret.namespace,
-        }).catch(() => undefined);
+      // Same reasoning as above.  Re-acking an adopted Job re-asserts an
+      // identity the server already persisted, so a throw here means we could
+      // not confirm ownership — which is the least safe moment to delete a
+      // live in-cluster object, not the most.
+      if (!adoptedExistingJob) {
+        await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
+        if (promptSecret) {
+          await coreApi.deleteNamespacedSecret({
+            name: promptSecret.name,
+            namespace: promptSecret.namespace,
+          }).catch(() => undefined);
+        }
+        if (envSecret) {
+          await coreApi.deleteNamespacedSecret({
+            name: envSecret.name,
+            namespace: envSecret.namespace,
+          }).catch(() => undefined);
+        }
+        if (mcpConfigSecret) {
+          await coreApi.deleteNamespacedSecret({
+            name: mcpConfigSecret.name,
+            namespace: mcpConfigSecret.namespace,
+          }).catch(() => undefined);
+        }
       }
       return {
         exitCode: null,
