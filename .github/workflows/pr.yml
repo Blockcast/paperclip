@@ -161,6 +161,31 @@ jobs:
         run: node --test ./scripts/check-docker-retire-in-flight-lock.test.js
         timeout-minutes: 1
 
+      # BLO-33027: pins the negative admission probe that ends the deploy job.
+      # It is the only production-side evidence that
+      # ValidatingAdmissionPolicy/paperclip-api-image-approval is EVALUATED
+      # rather than merely installed — as of 2026-09-09 the policy had zero
+      # samples in apiserver_validating_admission_policy_check_total while five
+      # other policies reported into the same family, so every other link in
+      # the enforcement story (a kind-cluster CEL assertion, a drift gauge on
+      # the Binding) is off-cluster or indirect.
+      #
+      # Executable rather than render-level, for its neighbour's reason: a probe
+      # whose verdict logic is inverted, or which credits any non-zero kubectl
+      # exit as "denied", would sail through a grep-based test while reporting a
+      # green receipt forever — exactly the false confidence the step removes.
+      # So this extracts the step's real shell and runs it against a stubbed
+      # apiserver over the whole verdict matrix: admitted, denied-by-policy,
+      # denied-by-another-policy, the same policy's other validation, a
+      # storage-layer conflict, and an unreachable server. It also asserts the
+      # probe mutates only the container image, that a generation change
+      # outranks any verdict, and that the live Deployment's container env never
+      # reaches the step log or the job summary.
+      - name: Validate production admission denial receipt probe (BLO-33027)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-docker-admission-denial-receipt.test.js
+        timeout-minutes: 2
+
       # Asserts the pre-flight runs BEFORE helm upgrade and fails closed. Both
       # are load-bearing: running it after the rollout starts reports the
       # problem only once the 30-minute timeout has already burned, and an
