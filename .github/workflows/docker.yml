@@ -1244,11 +1244,24 @@ jobs:
       #
       # No RBAC is added, widened, or bound for this. It runs as the
       # pre-existing deploy identity: KUBECONFIG_PAPERCLIP_CI_DEPLOY ->
-      # ServiceAccount paperclip/paperclip-ci-deploy, via RoleBinding
-      # paperclip-ci-deploy-admin -> ClusterRole/admin, created 2026-04-30 —
-      # which already holds create/update/patch on deployments.apps here
-      # because that is exactly what `helm upgrade` and the plan reconcile
-      # above require. This moves the venue of the proof, not the bar.
+      # ServiceAccount paperclip/paperclip-ci-deploy. The authoritative grant is
+      # onprem-k8s paperclip/ci-deploy-rbac.yaml, where RoleBinding
+      # paperclip-ci-deploy -> Role/paperclip-ci-deploy carries
+      #   apiGroups: ["apps"], resources: ["deployments","statefulsets"],
+      #   verbs: ["get","list","watch","create","update","patch","delete"]
+      # in this namespace — because that is exactly what `helm upgrade` and the
+      # plan reconcile above require. So the probe's `replace` needs nothing
+      # this identity does not already hold; it moves the venue of the proof,
+      # not the bar.
+      #
+      # Cite the SCOPED Role above, not the older RoleBinding
+      # paperclip-ci-deploy-admin -> ClusterRole/admin. That binding still
+      # exists but carries a blockcast.net/deprecation annotation (BLO-20052):
+      # it is superseded by the scoped Role and is kept live only until a real
+      # CI deploy is verified green against it. Useful side effect: the can-i
+      # lines below run as the deploy identity on every release, which is
+      # precisely the verification that binding is waiting on — so this step
+      # helps retire it rather than depending on it.
       #
       # REPORTS, DOES NOT GATE, and `continue-on-error` is load-bearing rather
       # than laziness. Two independent reasons:
