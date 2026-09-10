@@ -73,10 +73,12 @@ export interface ReviewSubmission {
 export type ReviewAttestation =
   /** No line intends to attest. Nothing for this guard to check. */
   | { kind: "absent" }
-  /** Exactly one attesting line, token is exactly 40 lowercase hex. */
+  /** Exactly one attesting line, token is exactly 40 lowercase hex, and the
+   *  line ends after it. */
   | { kind: "well-formed"; sha: string }
-  /** Exactly one attesting line, token is not a SHA. The fail-closed defect. */
-  | { kind: "malformed"; raw: string }
+  /** Exactly one attesting line that the consumer will not accept. The
+   *  fail-closed defect: `detail` says which way it is broken. */
+  | { kind: "malformed"; raw: string; detail: "not-a-sha" | "trailing-content" }
   /** Several attesting lines. The consumer requires exactly one and returns
    *  null otherwise, so this is the malformed case by another route. */
   | { kind: "ambiguous"; raw: string[] };
@@ -342,14 +344,27 @@ const MARKDOWN_EMPHASIS_RUN = "[*_`]{0,3}";
 // producer's question is "did this body try to attest?", not "did it succeed?".
 // The token run excludes emphasis characters so a backticked SHA yields the
 // SHA rather than the delimiters.
+//
+// Group 2 deliberately captures the REST OF THE LINE. Validating only the
+// token is not enough: the consumer requires the line to end after optional
+// delimiters and whitespace, so `Reviewed head: <40-hex> and some prose` has a
+// perfectly good token and still matches the consumer's pattern nowhere. That
+// shape would attest no head and livelock the gate, which is the exact defect
+// this guard exists to refuse — so the whole line has to be checked, not just
+// the token it contains.
 const ATTESTATION_CANDIDATE_PATTERN = new RegExp(
   `(?:^|\\n)${NOT_INDENTED_CODE} {0,3}${MARKDOWN_EMPHASIS_RUN}[ \\t]{0,3}reviewed head:[ \\t]*` +
-    `${MARKDOWN_EMPHASIS_RUN}([^\\s*_\`]*)`,
+    `${MARKDOWN_EMPHASIS_RUN}([^\\s*_\`]*)([^\\n]*)`,
   "gi",
 );
 
 /** Exactly 40 lowercase hex, and nothing else. */
 const WELL_FORMED_SHA_PATTERN = /^[0-9a-f]{40}$/;
+
+// What the consumer tolerates after the SHA, and nothing more: an unbalanced
+// emphasis run and trailing whitespace, then end of line. Mirrors the tail of
+// REVIEWED_HEAD_ATTESTATION_PATTERN in ally-review-detection.ts.
+const ACCEPTED_ATTESTATION_TRAILER_PATTERN = /^[*_`]{0,3}[ \t]*[*_`]{0,3}[ \t]*$/;
 
 /**
  * Classify a review body's `Reviewed head:` attestation.
@@ -359,17 +374,24 @@ const WELL_FORMED_SHA_PATTERN = /^[0-9a-f]{40}$/;
  */
 export function inspectReviewAttestation(body: string): ReviewAttestation {
   const emitted = withoutFencedCodeBlocks(body);
-  const candidates = Array.from(
-    emitted.matchAll(ATTESTATION_CANDIDATE_PATTERN),
-    (match) => match[1] ?? "",
-  );
+  const candidates = Array.from(emitted.matchAll(ATTESTATION_CANDIDATE_PATTERN), (match) => ({
+    token: match[1] ?? "",
+    trailer: match[2] ?? "",
+  }));
 
   if (candidates.length === 0) return { kind: "absent" };
-  if (candidates.length > 1) return { kind: "ambiguous", raw: candidates };
+  if (candidates.length > 1) {
+    return { kind: "ambiguous", raw: candidates.map((candidate) => candidate.token) };
+  }
 
-  const raw = candidates[0]!;
-  const normalized = raw.toLowerCase();
-  if (!WELL_FORMED_SHA_PATTERN.test(normalized)) return { kind: "malformed", raw };
+  const { token, trailer } = candidates[0]!;
+  const normalized = token.toLowerCase();
+  if (!WELL_FORMED_SHA_PATTERN.test(normalized)) {
+    return { kind: "malformed", raw: token, detail: "not-a-sha" };
+  }
+  if (!ACCEPTED_ATTESTATION_TRAILER_PATTERN.test(trailer)) {
+    return { kind: "malformed", raw: `${token}${trailer}`, detail: "trailing-content" };
+  }
   return { kind: "well-formed", sha: normalized };
 }
 
@@ -414,11 +436,16 @@ export async function evaluateReviewSubmission(
   if (attestation.kind === "absent") return null;
 
   if (attestation.kind === "malformed") {
+    const detail =
+      attestation.detail === "not-a-sha"
+        ? `"Reviewed head: ${attestation.raw}" is not a 40-character hex commit SHA ` +
+          `(${attestation.raw.length} characters)`
+        : `the attestation line does not end after the SHA: ` +
+          `"Reviewed head: ${attestation.raw}"`;
     return {
       reason: "malformed-attestation",
       message: attestationRefusalMessage(
-        `"Reviewed head: ${attestation.raw}" is not a 40-character hex commit SHA ` +
-          `(${attestation.raw.length} characters)`,
+        detail,
         "A malformed attestation can never match any head, so the review would be " +
           "permanently unable to satisfy the review gate.",
       ),
