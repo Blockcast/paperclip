@@ -341,6 +341,46 @@ export async function createApp(
     }
   });
 
+  // Kubernetes probe endpoint (BLO-32164). Every probe in the chart —
+  // liveness, readiness and startup, on both the API Deployment and the worker
+  // StatefulSet — targets `/healthz`, but until this route existed **nothing
+  // declared it**. The request fell through to the SPA catch-all near the
+  // bottom of this file, which answered 200 with the UI shell. That accident
+  // held for a long time and hid three sharp edges:
+  //
+  //   1. Every probe did a synchronous `fs.readFileSync(index.html)` plus the
+  //      `applyUiBranding` string pass, on the event loop, on the exact path
+  //      that is expected to answer within 5-10s. Blocking disk work is the
+  //      worst possible thing to put on a liveness path: under image-fs
+  //      pressure that read is unbounded, so the probe could fail for a
+  //      reason that has nothing to do with whether the process is healthy.
+  //   2. A build serving no `ui-dist` skips the catch-all entirely, so every
+  //      probe would 404 and CrashLoop the pod for an unrelated reason. This
+  //      was recorded as a "latent landmine" in values.yaml under BLO-19722
+  //      and is now closed: this route does not depend on the UI existing.
+  //   3. The probe's semantics were undocumented and accidental. They are now
+  //      explicit, and deliberately UNCHANGED: this answers exactly one
+  //      question — "can the event loop service a request right now" — and
+  //      says nothing about database or heartbeat health.
+  //
+  // Deliberately NOT adding a DB check here. BLO-32164 originally attributed
+  // the probe failures to `/health`'s pool queries queueing behind the
+  // recovery sweep, but `/health` is mounted under `/api` and the kubelet
+  // never calls it; measured 2026-09-10, `/api/health` took 13.19s while
+  // `/healthz` answered in 6ms in the same second. Putting a query here would
+  // import that 13s stall onto the liveness path and start killing the
+  // singleton worker for pool saturation — turning a latency problem into an
+  // availability one. Readiness gating on the database belongs in `/api/health`.
+  //
+  // Mounted here, beside /metrics and ahead of httpLogger, the hostname guard
+  // and actorMiddleware, so a probe cannot be failed by auth, by log volume,
+  // or by the `Host: 127.0.0.1:3100` header the chart currently has to send to
+  // satisfy the private-hostname allowlist. The response carries no
+  // information, so exposing it unauthenticated costs nothing.
+  app.get("/healthz", (_req, res) => {
+    res.status(200).set("Cache-Control", "no-store").json({ status: "ok" });
+  });
+
   // Respect the operator's `TRUST_PROXY` env var (see middleware/trust-proxy.ts).
   // Default is unset → Express trusts nothing, which is the only safe choice
   // when the server may be reachable without a known reverse proxy in front.
