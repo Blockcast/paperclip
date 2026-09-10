@@ -180,6 +180,16 @@ const SECRET_TEXT_HINTS = [
   "ghu_",
   "ghs_",
   "ghr_",
+  // PEN-3139: `redactSensitiveText` returns early when no hint matches, so this
+  // gate has to admit a bare vendor credential before the value-shaped patterns
+  // in `redactCommandText` ever see it. Keep in step with `COMMAND_SECRET_HINTS`
+  // in `@paperclipai/adapter-utils` — the two gates are in series, and widening
+  // only one leaves the pair reading green while still passing the credential.
+  "akia",
+  "asia",
+  "aiza",
+  "xox",
+  "github_pat_",
 ] as const;
 export const REDACTED_EVENT_VALUE = "***REDACTED***";
 
