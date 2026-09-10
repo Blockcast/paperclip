@@ -6361,6 +6361,15 @@ export function buildK8sRunIsolationDescriptor(input: {
     input.effectiveExecutionWorkspaceMode === "operator_branch" ||
     input.executionWorkspace.source === "task_session" ||
     input.executionWorkspace.strategy === "git_worktree";
+  // BLO-31443: `perIssueWorkspaceTreeKey: null` is deliberate. The tree key only
+  // ever reaches `reservationKey` (`withTreeScopedReservationKey`), and
+  // `AdapterRunIsolationDescriptor` has no reservation field — so a descriptor
+  // cannot carry reservation semantics, stale or otherwise. Reservations bind
+  // `reservationKey` off the identity directly, never a descriptor.
+  //
+  // This fallback is NOT production-faithful in one respect: `isWorkspaceIsolated`
+  // above is wider than the `workspaceIsolationRequested` production feeds the
+  // same resolver, so the two can disagree on `isolationMode` for equal input.
   const isolationIdentity = input.isolationIdentity ?? resolveK8sRunIsolationIdentity({
     adapterType: input.adapterType,
     runId: input.runId,
@@ -6370,6 +6379,7 @@ export function buildK8sRunIsolationDescriptor(input: {
     persistedExecutionWorkspaceId: input.persistedExecutionWorkspaceId,
     persistedWorkspaceExplicitlySelected: input.persistedWorkspaceExplicitlySelected,
     effectiveMaxConcurrentRuns: input.effectiveMaxConcurrentRuns ?? 1,
+    perIssueWorkspaceTreeKey: null,
   });
   if (!isolationIdentity) return null;
   const { isolationMode, isolationKey } = isolationIdentity;
