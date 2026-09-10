@@ -424,6 +424,37 @@ const STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
 
 export type BackstopSweepCompletionPath = "page_drained" | "cursor_wrap";
 
+/**
+ * Serializes overlapping invocations of a sweep that carries a mutable cursor across an
+ * `await` (BLO-29763).
+ *
+ * Each backstop cursor is a single closure variable read before the candidate query and
+ * written after it. Two overlapping invocations -- the periodic driver overlapping itself
+ * when a tick runs long, or an on-demand sweep from `routes/instance-settings.ts` landing
+ * mid-tick -- would both read the same cursor value, rescan the same page, and advance the
+ * cursor only one page, leaving the next page unvisited for that cycle. That defers rather
+ * than starves (the next wrap re-covers it) but it makes sweep coverage non-deterministic
+ * and is indistinguishable from a logging gap in the logs.
+ *
+ * A promise tail makes concurrent entry a queued no-op instead of a racer: call N+1 starts
+ * only after call N has settled, so the read-modify-write is never interleaved. Rejections
+ * are swallowed on the tail only -- the caller still receives them -- so one failing sweep
+ * cannot wedge every later invocation.
+ */
+export function serializeSweepInvocations<Args extends unknown[], Result>(
+  impl: (...args: Args) => Promise<Result>,
+): (...args: Args) => Promise<Result> {
+  let tail: Promise<void> = Promise.resolve();
+  return (...args: Args) => {
+    const run = tail.then(() => impl(...args));
+    tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+}
+
 export function backstopSweepCompletionPath(input: {
   useCursor: boolean;
   cursorBeforeQuery: string | null;
@@ -2116,9 +2147,6 @@ export function recoveryService(
   const runLogStore = getRunLogStore();
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
   let strandedRecoveryWakeBackstopCandidateCursor: string | null = null;
-  let resolvedDependencyWakeBackstopTail = Promise.resolve();
-  let strandedRecoveryWakeBackstopTail = Promise.resolve();
-  let strandedRecoveryHandBackTail = Promise.resolve();
 
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -12727,27 +12755,21 @@ export function recoveryService(
     return result;
   }
 
-  function reconcileResolvedDependencyWakeBackstop(opts?: ResolvedDependencyWakeBackstopOptions) {
-    const run = resolvedDependencyWakeBackstopTail.then(() => reconcileResolvedDependencyWakeBackstopImpl(opts));
-    resolvedDependencyWakeBackstopTail = run.then(() => undefined, () => undefined);
-    return run;
-  }
+  const reconcileResolvedDependencyWakeBackstop = serializeSweepInvocations(
+    reconcileResolvedDependencyWakeBackstopImpl,
+  );
 
-  function reconcileStrandedRecoveryWakeBackstop(opts?: Parameters<typeof reconcileStrandedRecoveryWakeBackstopImpl>[0]) {
-    const run = strandedRecoveryWakeBackstopTail.then(() => reconcileStrandedRecoveryWakeBackstopImpl(opts));
-    strandedRecoveryWakeBackstopTail = run.then(() => undefined, () => undefined);
-    return run;
-  }
+  const reconcileStrandedRecoveryWakeBackstop = serializeSweepInvocations(
+    reconcileStrandedRecoveryWakeBackstopImpl,
+  );
 
   /**
    * Serialized like its sibling backstops: two overlapping passes would both read the same
    * pre-hand-back budget count and could spend the per-issue budget twice on one row.
    */
-  function reconcileStrandedRecoveryHandBacks(opts?: Parameters<typeof reconcileStrandedRecoveryHandBacksImpl>[0]) {
-    const run = strandedRecoveryHandBackTail.then(() => reconcileStrandedRecoveryHandBacksImpl(opts));
-    strandedRecoveryHandBackTail = run.then(() => undefined, () => undefined);
-    return run;
-  }
+  const reconcileStrandedRecoveryHandBacks = serializeSweepInvocations(
+    reconcileStrandedRecoveryHandBacksImpl,
+  );
 
   async function reconcileIssueGraphLiveness(opts?: {
     runId?: string | null;

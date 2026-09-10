@@ -1299,6 +1299,36 @@ describe("backstop metrics (BLO-29763)", () => {
     body = (await renderMetrics()).body;
     expect(body).toContain(`${BACKSTOP_DEFERRED_CANDIDATES_METRIC}{source="issue_graph_liveness.backstop"} 0`);
   });
+
+  it("keeps every backstop series bounded to source/reason with no per-issue or per-agent label", async () => {
+    // AC5. These three series are recorded once per candidate, so an `issue_id` or
+    // `agent_id` label would make their cardinality track the backlog rather than a fixed
+    // enum. Assert the label set off the rendered exposition rather than the registration
+    // call, so a label added anywhere downstream is caught too.
+    setBackstopDeferredCandidates("issue_graph_liveness.backstop", 3);
+    recordBackstopSweepCompleted("issue_graph_liveness.backstop");
+    recordBackstopCandidateSkipped("issue_graph_liveness.backstop", "live_path");
+    const body = (await renderMetrics()).body;
+
+    const labelSets = body
+      .split("\n")
+      .filter((line) =>
+        [
+          BACKSTOP_DEFERRED_CANDIDATES_METRIC,
+          BACKSTOP_SWEEP_COMPLETED_METRIC,
+          BACKSTOP_CANDIDATES_SKIPPED_METRIC,
+        ].some((metric) => line.startsWith(`${metric}{`)),
+      )
+      .map((line) =>
+        [...(line.match(/\{(.*)\}/)?.[1].matchAll(/([a-zA-Z_][a-zA-Z0-9_]*)=/g) ?? [])]
+          .map((match) => match[1])
+          .sort()
+          .join(","),
+      );
+
+    expect(labelSets.length).toBeGreaterThan(0);
+    expect([...new Set(labelSets)].sort()).toEqual(["reason,source", "source"]);
+  });
 });
 
 describe("github review request suppression causes (BLO-20526 reviewer lock contention)", () => {
