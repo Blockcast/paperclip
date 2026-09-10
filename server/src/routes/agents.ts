@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { REDACTED_EVENT_VALUE, isPlainObject, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, isPlainObject, redactAgentConfigPayload, redactEventPayload, withholdRunEventTranscriptContent } from "../redaction.js";
 import { diffAgentAdapterSecretBindings } from "../services/agent-secret-bindings.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
@@ -62,7 +62,7 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
-import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { assertBoard, assertCompanyAccess, assertInstanceAdmin, decideRunTranscriptRead, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
@@ -388,6 +388,45 @@ export function agentRoutes(
         offset: opts.offset,
         limitBytes: opts.limitBytes,
         logStore: run.logStore,
+      },
+    });
+  }
+
+  /**
+   * PEN-3142: `/events` had a read-side projection and no access audit, while
+   * `/log` had the audit and no projection. Each transcript path now has both.
+   *
+   * Deliberately a distinct action from `heartbeat.run_log_accessed` rather than
+   * a reuse: the two paths are separately reachable and a forensic reader needs
+   * to know which one a caller used. Both action names are documented together
+   * in `doc/DEVELOPING.md` so whoever finally gives this audit a consumer
+   * cannot wire up one and stay blind to the other — being blind to `/events`
+   * is exactly why the audit was rejected as a compensating control on
+   * PEN-3140.
+   */
+  async function logRunEventsAccessAudit(
+    req: Request,
+    run: { id: string; companyId: string },
+    result: "allowed" | "denied",
+    opts: { afterSeq: number; limit: number; eventCount: number | null },
+  ) {
+    const actor = getRunLogAuditActor(req);
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: run.id,
+      action: "heartbeat.run_events_accessed",
+      entityType: "heartbeat_run",
+      entityId: run.id,
+      details: {
+        result,
+        actorSource: actor.actorSource,
+        actorRunId: actor.actorRunId,
+        afterSeq: opts.afterSeq,
+        limit: opts.limit,
+        eventCount: opts.eventCount,
       },
     });
   }
@@ -4982,14 +5021,40 @@ export function agentRoutes(
 
     const afterSeq = Number(req.query.afterSeq ?? 0);
     const limit = Number(req.query.limit ?? 200);
-    const events = await heartbeat.listEvents(runId, Number.isFinite(afterSeq) ? afterSeq : 0, Number.isFinite(limit) ? limit : 200);
+    const normalizedAfterSeq = Number.isFinite(afterSeq) ? afterSeq : 0;
+    const normalizedLimit = Number.isFinite(limit) ? limit : 200;
+
+    // PEN-3142: run STATE stays company-readable, so this route keeps returning
+    // 200 with the full event envelope (`seq` — which is the pagination cursor
+    // every consumer depends on — plus `eventType`, `stream`, `level`, `color`,
+    // `createdAt`). Only the transcript-bearing `message` / `payload` are
+    // withheld from a caller that is neither the run's owner, in its manager
+    // chain, a human operator, nor a `runs:read_transcript` grant holder.
+    //
+    // Withholding rather than 403 is the PEN-2777 shape the decision cites:
+    // withhold the sensitive field, leave the resource readable. `/log` gets a
+    // 403 instead because its entire body is transcript — there is no envelope
+    // left to return.
+    const transcriptAccess = await decideRunTranscriptRead(req, access, run);
+
+    const events = await heartbeat.listEvents(runId, normalizedAfterSeq, normalizedLimit);
+    await logRunEventsAccessAudit(
+      req,
+      run,
+      transcriptAccess.allowed ? "allowed" : "denied",
+      { afterSeq: normalizedAfterSeq, limit: normalizedLimit, eventCount: events.length },
+    );
+
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-    const redactedEvents = events.map((event) =>
-      redactCurrentUserValue({
+    const redactedEvents = events.map((event) => {
+      const scanned = redactCurrentUserValue({
         ...event,
         payload: redactEventPayload(event.payload),
-      }, currentUserRedactionOptions),
-    );
+      }, currentUserRedactionOptions);
+      return transcriptAccess.allowed
+        ? scanned
+        : withholdRunEventTranscriptContent(scanned as Record<string, unknown>);
+    });
     res.json(redactedEvents);
   });
 
@@ -5018,6 +5083,28 @@ export function agentRoutes(
     } catch (error) {
       await logRunLogAccessAudit(req, run, "denied", { offset: normalizedOffset, limitBytes });
       throw error;
+    }
+
+    // PEN-3142: the whole response body is transcript, so an unentitled
+    // same-company caller gets a 403 rather than a withheld projection.
+    //
+    // 403 and not 404: the run's EXISTENCE is company-readable by design
+    // (`GET /heartbeat-runs/:runId` stays open, per the decision's run-state
+    // carve-out), so there is no existence oracle left to protect here and a
+    // 404 would only mislead. The cross-tenant 404 above is untouched — that is
+    // the case where existence is the secret. The named boundary vocabulary
+    // from the decider travels in the error details so a client can tell
+    // "wrong tenant" (404), "not entitled to the transcript"
+    // (403 `deny_missing_grant`), and "no such run" (404) apart.
+    const transcriptAccess = await decideRunTranscriptRead(req, access, run);
+    if (!transcriptAccess.allowed) {
+      await logRunLogAccessAudit(req, run, "denied", { offset: normalizedOffset, limitBytes });
+      throw forbidden(
+        transcriptAccess.decision?.explanation ?? "Run transcript access is not permitted for this actor.",
+        transcriptAccess.decision
+          ? authorizationDeniedDetails(transcriptAccess.decision)
+          : { reason: "deny_company_boundary" as const },
+      );
     }
 
     await logRunLogAccessAudit(req, run, "allowed", { offset: normalizedOffset, limitBytes });

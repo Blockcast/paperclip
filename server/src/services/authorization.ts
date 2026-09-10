@@ -1102,6 +1102,20 @@ export function authorizationService(db: Db) {
         : lowTrustDeny("Agent is outside this low-trust boundary.");
     }
 
+    // PEN-3142: a low-trust agent keeps its OWN run transcripts (and those of
+    // agents explicitly named in its boundary) and nothing else. Kept beside
+    // `agent:read` rather than in the blanket deny above because a run's
+    // transcript is scoped to one agent, so the boundary can answer it — and
+    // denying outright would lock a low-trust agent out of its own run log.
+    if (input.action === "runs:read_transcript") {
+      if (input.resource.type !== "agent") {
+        return lowTrustDeny("Low-trust run transcript access is missing an agent resource.");
+      }
+      return agentWithinLowTrustBoundary(boundary, input.actorAgentId, input.resource.agentId)
+        ? lowTrustAllow("Allowed inside the low-trust agent boundary.")
+        : lowTrustDeny("Run owner is outside this low-trust boundary.");
+    }
+
     if (input.action === "project:read") {
       const projectId =
         input.resource.type === "issue"
@@ -2507,6 +2521,37 @@ export function authorizationService(db: Db) {
         direct: "skills:create",
         suggest: "skills:suggest-changes",
       });
+    }
+
+    // PEN-3142: run transcript read. Deliberately decided BEFORE the generic
+    // `permissionKey` fallback below so the two relational allows come first and
+    // the grant stays a pure escape hatch: an agent reads its own runs, a
+    // manager reads its reports' runs, and anything else needs
+    // `runs:read_transcript`. Unlike `run:recover_stranded`, the grant alone IS
+    // sufficient here — that is the point of the escape hatch, so this action
+    // stays mapped in `permissionForAction` and the fallback handles it.
+    //
+    // Scoped to the run's OWNING AGENT, not the run id: the resource a
+    // transcript belongs to is the agent that produced it, which is what makes
+    // `isManagerOf` the right question.
+    if (input.action === "runs:read_transcript" && input.resource.type === "agent") {
+      if (input.resource.agentId && input.resource.agentId === actorAgentId) {
+        return allow({
+          action: input.action,
+          reason: "allow_self",
+          explanation: "Allowed because the actor owns the run whose transcript it is reading.",
+        });
+      }
+      if (
+        input.resource.agentId &&
+        await isManagerOf(companyId, actorAgentId, input.resource.agentId)
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_manager_chain",
+          explanation: "Allowed because the actor manages the run's owning agent in the reporting chain.",
+        });
+      }
     }
 
     if (permissionKey) {

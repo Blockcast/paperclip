@@ -3911,4 +3911,165 @@ describeEmbeddedPostgres("authorization service", () => {
       resource: { type: "company", companyId: company.id },
     })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
   });
+
+  // PEN-3142. The four allow/deny arms of run-transcript read, pinned against
+  // the real service. The route tests stub `access.decide`, so a stub there can
+  // express combinations this service cannot emit — these fix what the service
+  // actually decides.
+  //
+  // `engineer` roles throughout: `canCreateAgentsLegacy` would let a ceo/cto
+  // through on other actions and could mask which branch fired.
+  describe("run transcript read (PEN-3142)", () => {
+    const decideTranscript = (
+      db: ReturnType<typeof createDb>,
+      companyId: string,
+      actorAgentId: string,
+      runOwnerAgentId: string | null,
+    ) =>
+      authorizationService(db).decide({
+        actor: { type: "agent", agentId: actorAgentId, companyId, source: "agent_jwt" },
+        action: "runs:read_transcript",
+        resource: { type: "agent", companyId, agentId: runOwnerAgentId },
+      });
+
+    it("allows an agent to read its own run transcript", async () => {
+      const company = await createCompany(db, "TranscriptSelf");
+      const agent = await createAgent(db, company.id, { role: "engineer" });
+
+      await expect(decideTranscript(db, company.id, agent.id, agent.id)).resolves.toMatchObject({
+        allowed: true,
+        reason: "allow_self",
+      });
+    });
+
+    it("allows a manager to read an indirect report's run transcript", async () => {
+      const company = await createCompany(db, "TranscriptChain");
+      const manager = await createAgent(db, company.id, { role: "engineer" });
+      const mid = await createAgent(db, company.id, { role: "engineer", reportsTo: manager.id });
+      const leaf = await createAgent(db, company.id, { role: "engineer", reportsTo: mid.id });
+
+      await expect(decideTranscript(db, company.id, manager.id, leaf.id)).resolves.toMatchObject({
+        allowed: true,
+        reason: "allow_manager_chain",
+      });
+    });
+
+    // The load-bearing arm. This is the read the pre-change gate allowed on
+    // `hasCompanyAccess` alone, on a channel whose only scrub runs at write
+    // time (PEN-3139).
+    it("denies a same-company peer with no grant and no management relation", async () => {
+      const company = await createCompany(db, "TranscriptPeer");
+      const actor = await createAgent(db, company.id, { role: "engineer" });
+      const peer = await createAgent(db, company.id, { role: "engineer" });
+
+      await expect(decideTranscript(db, company.id, actor.id, peer.id)).resolves.toMatchObject({
+        allowed: false,
+        reason: "deny_missing_grant",
+      });
+    });
+
+    // The escape hatch the decision requires: a recovery/ops role can hold
+    // transcript read without reopening it company-wide. Unlike
+    // `run:recover_stranded`, the grant alone IS sufficient here — no
+    // management relation is also required — which is what lets an incident
+    // investigation follow a failure class across reporting lines. The audit
+    // sizing for this change found that every out-of-chain transcript read in
+    // the sampled window was exactly that: one root-cause investigation
+    // against agents outside the investigator's subtree.
+    it("allows an out-of-chain peer that holds runs:read_transcript", async () => {
+      const company = await createCompany(db, "TranscriptGrant");
+      const actor = await createAgent(db, company.id, { role: "engineer" });
+      const peer = await createAgent(db, company.id, { role: "engineer" });
+      await grantAgentPermission(db, company.id, actor.id, "runs:read_transcript");
+
+      await expect(decideTranscript(db, company.id, actor.id, peer.id)).resolves.toMatchObject({
+        allowed: true,
+      });
+    });
+
+    // A run row always carries an owning agent, so a null owner means the
+    // caller lost it somewhere between the query and the decision. Fail closed
+    // rather than letting a missing id read as "no relation to check".
+    it("denies when the run's owning agent is unknown", async () => {
+      const company = await createCompany(db, "TranscriptNullOwner");
+      const actor = await createAgent(db, company.id, { role: "engineer" });
+
+      await expect(decideTranscript(db, company.id, actor.id, null)).resolves.toMatchObject({
+        allowed: false,
+      });
+    });
+
+    // Low-trust agents keep their own transcripts and nothing else. Denying
+    // outright would lock one out of its own run log; allowing on company
+    // membership would make the preset weaker than the standard path. Both arms
+    // asserted, because a self-only allow is the whole claim — a bare peer-deny
+    // would also pass if the action were blanket-denied under the preset.
+    it("confines a low-trust agent to its own run transcript", async () => {
+      const company = await createCompany(db, "TranscriptLowTrust");
+      const project = await createProject(db, company.id, "TranscriptLowTrust");
+      const peer = await createAgent(db, company.id, { role: "engineer" });
+      const actor = await createAgent(db, company.id, {
+        role: "engineer",
+        permissions: {
+          trustPreset: LOW_TRUST_REVIEW_PRESET,
+          authorizationPolicy: {
+            // `companyId` + a concrete scope are both required: without them
+            // the preset resolves to `missing_low_trust_boundary_scope` and
+            // every action denies as `deny_policy_restricted` before reaching
+            // the transcript branch, so the assertions below would pass for
+            // the wrong reason.
+            trustBoundary: {
+              mode: LOW_TRUST_REVIEW_PRESET,
+              companyId: company.id,
+              projectIds: [project.id],
+            },
+          },
+        },
+      });
+
+      // `allow_self`, not `allow_low_trust_boundary`: a low-trust *deny*
+      // short-circuits, but a low-trust *allow* only short-circuits for the
+      // action allowlist at the `decideLowTrustAccess` call site, and
+      // `runs:read_transcript` is deliberately not on it. So clearing the
+      // boundary is necessary but not sufficient — the standard own-run /
+      // manager-chain / grant rules still have to allow it too, which is
+      // strictly tighter than letting the boundary decide alone.
+      await expect(decideTranscript(db, company.id, actor.id, actor.id)).resolves.toMatchObject({
+        allowed: true,
+        reason: "allow_self",
+      });
+      await expect(decideTranscript(db, company.id, actor.id, peer.id)).resolves.toMatchObject({
+        allowed: false,
+        reason: "deny_low_trust_boundary",
+      });
+    });
+
+    // ...and the grant does not buy its way out of the preset: a low-trust
+    // agent holding `runs:read_transcript` is still confined. Without this, the
+    // escape hatch above would silently be a preset bypass.
+    it("does not let a runs:read_transcript grant escape the low-trust boundary", async () => {
+      const company = await createCompany(db, "TranscriptLowTrustGrant");
+      const project = await createProject(db, company.id, "TranscriptLowTrustGrant");
+      const peer = await createAgent(db, company.id, { role: "engineer" });
+      const actor = await createAgent(db, company.id, {
+        role: "engineer",
+        permissions: {
+          trustPreset: LOW_TRUST_REVIEW_PRESET,
+          authorizationPolicy: {
+            trustBoundary: {
+              mode: LOW_TRUST_REVIEW_PRESET,
+              companyId: company.id,
+              projectIds: [project.id],
+            },
+          },
+        },
+      });
+      await grantAgentPermission(db, company.id, actor.id, "runs:read_transcript");
+
+      await expect(decideTranscript(db, company.id, actor.id, peer.id)).resolves.toMatchObject({
+        allowed: false,
+        reason: "deny_low_trust_boundary",
+      });
+    });
+  });
 });
