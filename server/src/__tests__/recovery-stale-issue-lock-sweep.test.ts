@@ -2843,7 +2843,8 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
   describe("stranded promotion drain (BLO-33144)", () => {
     async function seedLockFreeStrand(input: {
       companyId: string;
-      agentId: string;
+      agentId: string | null;
+      assigneeUserId?: string | null;
       startedAt?: Date;
       checkoutRestoreStatus?: string | null;
       monitorNextCheckAt?: Date | null;
@@ -2857,6 +2858,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
         status: input.status ?? "in_progress",
         priority: "high",
         assigneeAgentId: input.agentId,
+        assigneeUserId: input.assigneeUserId ?? null,
         // The defining shape: no lock left for the sweep's scan to find.
         checkoutRunId: null,
         executionRunId: null,
@@ -2875,6 +2877,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
           startedAt: issues.startedAt,
           checkoutRestoreStatus: issues.checkoutRestoreStatus,
           assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
           monitorNextCheckAt: issues.monitorNextCheckAt,
         })
         .from(issues)
@@ -2954,6 +2957,51 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       const row = await readRow(issueId);
       expect(row?.status).toBe("in_progress");
       expect(row?.startedAt?.getTime()).toBe(startedAt.getTime());
+    });
+
+    it("leaves an ownerless row loud rather than laundering it into a silent strand", async () => {
+      const { companyId } = await seed();
+      const startedAt = new Date(Date.now() - 40 * 60 * 60 * 1000);
+      const issueId = await seedLockFreeStrand({
+        companyId,
+        agentId: null,
+        assigneeUserId: null,
+        startedAt,
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      // Heartbeat selection is by assignee, so restoring this to `todo` would
+      // put it in no inbox at all — the mirror of the blocked-with-no-edge
+      // strand, and quieter, because it would read as a healthy actionable row
+      // (BLO-30095). `in_progress` with a live `startedAt` at least stays
+      // anomalous, and the marker is preserved so a later restore is possible
+      // once the row has an owner.
+      expect(result.restoredStrandedPromotions).toBe(0);
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("in_progress");
+      expect(row?.startedAt?.getTime()).toBe(startedAt.getTime());
+      expect(row?.checkoutRestoreStatus).toBe("todo");
+    });
+
+    it("drains a row whose only owner is a user, since their inbox is a real wake path", async () => {
+      const { companyId } = await seed();
+      const issueId = await seedLockFreeStrand({
+        companyId,
+        agentId: null,
+        assigneeUserId: "user_wake_path",
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect(result.restoredStrandedPromotions).toBe(1);
+      expect(result.restoredStrandedPromotionIssueIds).toContain(issueId);
+
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("todo");
+      expect(row?.startedAt).toBeNull();
+      expect(row?.checkoutRestoreStatus).toBeNull();
+      expect(row?.assigneeUserId).toBe("user_wake_path");
     });
 
     it("leaves a row held by a live run to the lock sweep", async () => {
