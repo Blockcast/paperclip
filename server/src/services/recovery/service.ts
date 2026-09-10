@@ -80,6 +80,7 @@ import {
   lockIssueOwnership,
   releaseIssueRunOwnership,
   restoreCheckoutPromotedStatus,
+  restoreStrandedCheckoutPromotions,
   type IssueLockOwnerState,
 } from "../issue-checkout-status.js";
 import {
@@ -13149,6 +13150,11 @@ export function recoveryService(
       // log line below.
       skippedByConcurrentLockChange: 0,
       skippedByConcurrentLockChangeIssueIds: [] as string[],
+      // BLO-33144: promotions restored by the reconciliation pass at the end of
+      // this sweep, which are disjoint from `issueIds` above — those had a lock
+      // to clear, these had none left.
+      restoredStrandedPromotions: 0,
+      restoredStrandedPromotionIssueIds: [] as string[],
     };
 
     const candidates = await db
@@ -14046,6 +14052,42 @@ export function recoveryService(
       logger.warn(
         { cleared: result.cleared, issueIds: result.issueIds },
         "swept stale issue lock columns",
+      );
+    }
+
+    // BLO-33144: drain the promotions whose locks an EARLIER pass already
+    // cleared without restoring.
+    //
+    // The candidate scan above requires a non-null lock column, so it cannot
+    // see these rows at all — that is not a tuning gap, it is the selection
+    // criterion. Before BLO-29913 every pass of this sweep nulled both lock
+    // columns and left the status alone, minting exactly the shape that is now
+    // permanently outside its own reach. The fix stops new ones; this clears
+    // the accumulated ones, and keeps clearing any that a future gap produces.
+    //
+    // Runs here rather than as its own sweeper so it cannot drift onto a
+    // different cadence from the pass that produces its input, and so both the
+    // startup and periodic call sites get it without wiring.
+    try {
+      result.restoredStrandedPromotionIssueIds =
+        await restoreStrandedCheckoutPromotions(db);
+      result.restoredStrandedPromotions =
+        result.restoredStrandedPromotionIssueIds.length;
+      if (result.restoredStrandedPromotions > 0) {
+        logger.warn(
+          {
+            restored: result.restoredStrandedPromotions,
+            issueIds: result.restoredStrandedPromotionIssueIds,
+          },
+          "restored checkout promotions stranded by an earlier lock sweep",
+        );
+      }
+    } catch (err) {
+      // Never let reconciliation failure mask a successful lock clear: stale
+      // ownership blocks every later run, the drain only costs visibility.
+      logger.error(
+        { err },
+        "stranded checkout-promotion reconciliation failed",
       );
     }
 
