@@ -185,8 +185,50 @@ describe("readRunLogTerminalTail", () => {
     expect(findTerminalResultEventInRunLogTail((result as { tail: string }).tail)?.event).toMatchObject({
       api_error_status: 429,
     });
-    // One read: the first already served the entire log.
-    expect(store.reads).toHaveLength(1);
+    // Two reads: the first served the entire log, the second confirms nothing
+    // was appended after the size probe. The second answers empty and stops the
+    // walk, so a small log costs one extra range read and never loops.
+    expect(store.reads).toHaveLength(2);
+    expect(store.reads[1]!.offset).toBe(Buffer.byteLength(body, "utf8"));
+  });
+
+  // Sibling of the seek-path growth test below, and the one that is easy to
+  // miss: here the log is SMALLER than the tail window, so there is no seek to
+  // race and the store reports no `nextOffset` — it served everything the size
+  // probe knew about. Both backends stat/HEAD before serving and clamp to that
+  // size, so an event flushed in between is invisible unless the end is
+  // re-probed. Returning `first.content` on this path dropped exactly the
+  // terminal event this reader exists to recover.
+  it("still reaches the end when a log smaller than the window grows after the size probe", async () => {
+    const head = `${envelope("stdout", "starting\n", "2026-09-08T21:55:50.000Z", 1)}\n`;
+    const appended = `${envelope("stdout", `${JSON.stringify(REFUSAL_EVENT)}\n`, "2026-09-08T21:55:56.000Z", 2)}\n`;
+    const buf = Buffer.from(`${head}${appended}`, "utf8");
+    const staleSize = Buffer.byteLength(head, "utf8");
+    expect(buf.length).toBeLessThan(TAIL); // the whole log fits the window
+
+    // Reports the pre-append size on the first read and clamps that read to it,
+    // exactly as `readLocalRange` does with a stat that precedes the stream.
+    let call = 0;
+    const read: RunLogRangeReader = async ({ offset, limitBytes }) => {
+      call += 1;
+      const size = call === 1 ? staleSize : buf.length;
+      const start = Math.max(0, Math.min(offset, size));
+      const end = Math.min(start + limitBytes, size);
+      const nextOffset = end < size ? end : undefined;
+      return {
+        content: buf.subarray(start, end).toString("utf8"),
+        ...(nextOffset === undefined ? {} : { nextOffset }),
+        totalBytes: size,
+      };
+    };
+
+    const result = await readRunLogTerminalTail(read, { tailBytes: TAIL });
+    expect(result.kind).toBe("tail");
+    expect(findTerminalResultEventInRunLogTail((result as { tail: string }).tail)?.event).toMatchObject({
+      type: "result",
+      is_error: true,
+      api_error_status: 429,
+    });
   });
 
   // The regression this function was extracted for. The previous inline reader
