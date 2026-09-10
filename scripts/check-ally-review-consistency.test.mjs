@@ -28,6 +28,7 @@ import {
   isRequiredApprovalPair,
   operativeAllyReviews,
   parseBaseline,
+  sameLaneBodyRelation,
   violationFingerprint,
 } from "./check-ally-review-consistency.mjs";
 
@@ -499,6 +500,109 @@ function requiredApprovalPair(app = {}, user = {}) {
     },
   ];
 }
+
+describe("sameLaneBodyRelation", () => {
+  const at = (id, body) => ({ id, user: { id: ALLY_APP_REVIEWER_ID }, body });
+
+  it("reports resubmit when every body is identical", () => {
+    assert.equal(sameLaneBodyRelation([at(1, "same"), at(2, "same")]), "resubmit");
+  });
+
+  it("treats whitespace-only differences as the same body", () => {
+    const body = canonicalBody();
+    for (const variant of [`${body}\n`, `${body}  `, `\n${body}`, `\n  ${body}\n\n`]) {
+      assert.equal(
+        sameLaneBodyRelation([at(1, body), at(2, variant)]),
+        "resubmit",
+        `expected resubmit for variant ${JSON.stringify(variant)}`,
+      );
+    }
+  });
+
+  it("reports recompute when the bodies differ in substance", () => {
+    assert.equal(sameLaneBodyRelation([at(1, "first pass"), at(2, "second pass")]), "recompute");
+  });
+
+  it("reports mixed when three reviews carry two identical and one distinct body", () => {
+    assert.equal(
+      sameLaneBodyRelation([at(1, "same"), at(2, "same"), at(3, "other")]),
+      "mixed",
+    );
+  });
+
+  it("declines to classify when any body is empty", () => {
+    // An empty body is an attestation defect (I3). Calling it a resubmit would
+    // assert a mechanism the evidence does not carry.
+    for (const empty of [null, "", undefined, "   ", "\n\n", "\t "]) {
+      assert.equal(
+        sameLaneBodyRelation([at(1, empty), at(2, empty)]),
+        null,
+        `expected no classification for body ${JSON.stringify(empty)}`,
+      );
+    }
+    assert.equal(sameLaneBodyRelation([at(1, "present"), at(2, "")]), null);
+  });
+
+  it("declines to classify a non-duplicate set", () => {
+    assert.equal(sameLaneBodyRelation([]), null);
+    assert.equal(sameLaneBodyRelation(undefined), null);
+    assert.equal(sameLaneBodyRelation([at(1, "solo")]), null);
+  });
+});
+
+describe("I1 names the mechanism a same-lane duplicate implies", () => {
+  // The real review IDs from paperclip#1220, so the fingerprint below carries a
+  // populated ID list rather than an empty one.
+  const DUPLICATE_IDS = [5124949902, 5124950225];
+
+  function duplicatePr(bodies) {
+    return {
+      number: 1220,
+      headSha: HEAD,
+      reviews: bodies.map((body, i) => appReview({ id: DUPLICATE_IDS[i] ?? 5124950000 + i, body })),
+    };
+  }
+
+  it("calls identical bodies a repeated submit", () => {
+    const violation = findPrViolations(duplicatePr([canonicalBody(), canonicalBody()])).find((v) =>
+      v.startsWith("I1"),
+    );
+    assert.match(violation, /bodies are identical/);
+    assert.match(violation, /submit step is at-least-once/);
+  });
+
+  it("calls differing bodies a double-compute needing exclusion, not idempotency", () => {
+    // paperclip#1220: two reviews 10 s apart carried different bodies, so a
+    // timing threshold misfiles this case as a retry.
+    const violation = findPrViolations(
+      duplicatePr([canonicalBody(HEAD, "first pass"), canonicalBody(HEAD, "second pass")]),
+    ).find((v) => v.startsWith("I1"));
+    assert.match(violation, /bodies differ/);
+    assert.match(violation, /exclusion, not submit idempotency/);
+  });
+
+  it("omits the clause rather than guessing when a body is empty", () => {
+    const violation = findPrViolations(duplicatePr(["", ""])).find((v) => v.startsWith("I1"));
+    assert.doesNotMatch(violation, /bodies are identical|bodies differ/);
+  });
+
+  it("does not perturb the I1 fingerprint the baseline suppresses on", () => {
+    // violationFingerprint harvests every 6+ digit token out of the message, so
+    // a count or account id in the classification clause would change an I1
+    // fingerprint and silently void its baseline entry.
+    const identical = findPrViolations(duplicatePr([canonicalBody(), canonicalBody()])).find((v) =>
+      v.startsWith("I1"),
+    );
+    const differing = findPrViolations(
+      duplicatePr([canonicalBody(HEAD, "a"), canonicalBody(HEAD, "b")]),
+    ).find((v) => v.startsWith("I1"));
+    const bodiless = findPrViolations(duplicatePr(["", ""])).find((v) => v.startsWith("I1"));
+
+    assert.equal(violationFingerprint(identical), "I1:1220:ff1c72db:5124949902,5124950225");
+    assert.equal(violationFingerprint(identical), violationFingerprint(differing));
+    assert.equal(violationFingerprint(identical), violationFingerprint(bodiless));
+  });
+});
 
 describe("duplicateBodyAcrossIdentities", () => {
   const at = (id, uid, body) => ({ id, user: { id: uid }, body });
