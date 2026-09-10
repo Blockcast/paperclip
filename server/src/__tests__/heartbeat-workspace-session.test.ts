@@ -2987,6 +2987,7 @@ describe("K8s session isolation metadata", () => {
     })).toEqual({
       isolationMode: "workspace",
       isolationKey: "workspace:planned-workspace-1",
+      reservationKey: "workspace:planned-workspace-1",
     });
   });
 
@@ -3062,6 +3063,7 @@ describe("K8s session isolation metadata", () => {
     })).toEqual({
       isolationMode: "run",
       isolationKey: "run:run-1",
+      reservationKey: "run:run-1",
     });
   });
 
