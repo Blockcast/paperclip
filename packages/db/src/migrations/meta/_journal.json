@@ -1632,6 +1632,13 @@
       "when": 1788560120000,
       "tag": "0240_approval_enforcement_drift_index",
       "breakpoints": true
+    },
+    {
+      "idx": 241,
+      "version": "7",
+      "when": 1788560180000,
+      "tag": "0241_issue_recovery_action_delivery_bounds",
+      "breakpoints": true
     }
   ]
 }
