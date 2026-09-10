@@ -179,6 +179,34 @@ function isScriptInterpreter(basename: string): boolean {
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /**
+ * Interpreter options whose operand is **code or a module name**, not a script
+ * path: `bash -c`, `node -e`, `python3 -m`, `perl -e`, `php -r`, `pwsh -Command`.
+ *
+ * Without this, `bash -c "/app/relogin.sh --force"` would stat the whole quoted
+ * command string as if it were a filename and report
+ * `/app/relogin.sh --force` missing — a false positive of exactly the kind this
+ * change exists to remove. Seeing one of these stops script resolution for the
+ * command entirely, which is why "the inner command of `bash -c`" is listed as
+ * a deliberate skip rather than something we half-parse.
+ */
+const CODE_TAKING_OPTIONS = new Set([
+  "-c",
+  "-e",
+  "-p",
+  "-m",
+  "-r",
+  "--eval",
+  "--print",
+  "--command",
+  "--module",
+]);
+
+function takesCodeOperand(option: string): boolean {
+  const name = option.includes("=") ? option.slice(0, option.indexOf("=")) : option;
+  return CODE_TAKING_OPTIONS.has(name) || CODE_TAKING_OPTIONS.has(name.toLowerCase());
+}
+
+/**
  * Characters that make the shell rewrite a word before exec, so the text we see
  * is not the path that will be opened. Checked only where they appear
  * *unquoted*; `~` additionally only counts at the start of a word, because
@@ -375,9 +403,14 @@ function resolveCommandPositionPaths(words: ShellWord[]): string[] {
   if (!argv0.expandable && isScriptInterpreter(basenameOf(argv0.value))) {
     for (let j = i + 1; j < words.length; j++) {
       const argument = words[j];
-      // Skip options; stop at the first operand, script or not.
-      if (!argument.expandable && argument.value.startsWith("-")) continue;
+      if (!argument.expandable && argument.value.startsWith("-")) {
+        // `-c`/`-e`/`-m` mean the operand is code, not a path. Stop rather than
+        // stat a command string as a filename.
+        if (takesCodeOperand(argument.value)) return paths;
+        continue;
+      }
       if (isAbsoluteLiteral(argument)) paths.push(argument.value);
+      // Only the first operand is the script; later ones are its arguments.
       break;
     }
   }
