@@ -482,6 +482,27 @@ export async function restoreCheckoutPromotedStatuses(
  * caller-supplied id to mis-scope, and reconciliation has to span every company
  * to do its job.
  *
+ * An owner is required, and that is the same lesson as the `blocked` split
+ * above arriving from the other side (BLO-30095). Heartbeat selection is BY
+ * ASSIGNEE, so a `todo` row with neither an agent nor a user owner is returned
+ * by no inbox and nothing can ever select it again — the mirror of the
+ * `blocked`-with-no-edge strand, and quieter, because the row reads as a
+ * healthy actionable issue on every triage surface. The `in_progress` row it
+ * would replace is at least anomalous: it keeps `started_at` accruing and shows
+ * up in any status-shaped sweep. So an ownerless row is left loud rather than
+ * laundered into a silent one, and the promotion marker is left intact so a
+ * later restore is still possible once it has an owner. A *user* assignee is a
+ * real wake path — the row lands in that user's inbox — so only rows with
+ * neither are skipped. Measured 2026-09-10 on the cohort this drain exists for:
+ * 0 of 264 `in_progress` rows had neither owner, so this guard costs nothing
+ * today and exists because the drain is permanent and estate-wide.
+ *
+ * Scoped to this pass rather than the shared guard on purpose: the two
+ * run-context forms are driven by an actor that just held the row, and one of
+ * them (`issueService.release()`) strips the assignee deliberately as a
+ * hand-back to the pool. Only this pass selects rows nobody has any context
+ * for.
+ *
  * @returns the ids actually restored.
  */
 export async function restoreStrandedCheckoutPromotions(
@@ -494,6 +515,7 @@ export async function restoreStrandedCheckoutPromotions(
       and(
         isNull(issues.checkoutRunId),
         isNull(issues.executionRunId),
+        sql`(${issues.assigneeAgentId} is not null or ${issues.assigneeUserId} is not null)`,
         restorableCheckoutPromotion,
       ),
     )
