@@ -35217,6 +35217,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * `errorDurationSeconds` is unaffected -- every agent still gets an entry,
    * so `paperclip_agent_status_error_duration_seconds` keeps its full series
    * set. Only the age/interval gauges are gated.
+   *
+   * BLO-22498 additionally derives the reason-bucketed aggregate pair
+   * (`paperclip_agent_status_error_agents` /
+   * `..._error_oldest_age_seconds`) from this SAME roster snapshot rather
+   * than adding a second `agents` scan. That was a deliberate call, not
+   * convenience: a separate reconcile pass would be a second reader of the
+   * same table on its own cadence, free to disagree with these gauges about
+   * how many agents are in `error` at a given instant. Sharing one snapshot
+   * makes the count and the per-agent durations arithmetically consistent by
+   * construction, and costs nothing — the reason column rides along in a
+   * query that already runs.
    */
   async function publishAgentLivenessGauges(now: Date) {
     try {
@@ -35227,6 +35238,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           name: agents.name,
           reportsTo: agents.reportsTo,
           status: agents.status,
+          // BLO-22498: bucketed into a bounded error_reason label inside
+          // setAgentLivenessMetrics. Never published raw — it is free text
+          // from the adapter CLI, so a label would be unbounded cardinality.
+          errorReason: agents.errorReason,
           runtimeConfig: agents.runtimeConfig,
           lastHeartbeatAt: agents.lastHeartbeatAt,
           updatedAt: agents.updatedAt,
@@ -35268,6 +35283,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           heartbeatAgeSeconds,
           heartbeatIntervalSeconds: policy.enabled ? policy.intervalSec : null,
           errorDurationSeconds,
+          errorReason: row.errorReason,
         };
       });
 
