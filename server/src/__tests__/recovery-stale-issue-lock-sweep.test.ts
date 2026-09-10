@@ -2611,4 +2611,135 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .then((rows) => rows[0]);
     expect(row?.checkoutRunId).toBe(runningRunId);
   });
+
+  // BLO-29913: the sweep is the last writer that can restore a checkout
+  // promotion, because clearing the lock columns is exactly what makes every
+  // other (run-context-scoped) restore call site unable to reach the row again.
+  describe("checkout promotion restore (BLO-29913)", () => {
+    async function seedStrandedPromotion(input: {
+      companyId: string;
+      agentId: string;
+      lockRunId: string;
+      startedAt: Date;
+      checkoutRestoreStatus?: string | null;
+      monitorNextCheckAt?: Date | null;
+    }) {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: input.companyId,
+        title: "Stranded checkout promotion",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: input.agentId,
+        checkoutRunId: input.lockRunId,
+        executionRunId: null,
+        checkoutRestoreStatus:
+          "checkoutRestoreStatus" in input ? input.checkoutRestoreStatus : "todo",
+        startedAt: input.startedAt,
+        monitorNextCheckAt: input.monitorNextCheckAt ?? null,
+      });
+      return issueId;
+    }
+
+    function readRow(issueId: string) {
+      return db
+        .select({
+          status: issues.status,
+          startedAt: issues.startedAt,
+          checkoutRestoreStatus: issues.checkoutRestoreStatus,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+    }
+
+    it("restores the queue-tier status, clears startedAt, and preserves the assignee", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt: new Date(Date.now() - 40 * 60 * 60 * 1000),
+      });
+
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.sweepStaleIssueLocks();
+
+      expect(result.cleared).toBe(1);
+      const row = await readRow(issueId);
+      // Demoted back to the tier checkout promoted it from...
+      expect(row?.status).toBe("todo");
+      // ...with the long_active_duration clock stopped...
+      expect(row?.startedAt).toBeNull();
+      expect(row?.checkoutRestoreStatus).toBeNull();
+      // ...and still in its owner's queue rather than released to the pool.
+      expect(row?.assigneeAgentId).toBe(agentId);
+      expect(row?.checkoutRunId).toBeNull();
+    });
+
+    it("restores a promotion whose pre-checkout status was blocked", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+        checkoutRestoreStatus: "blocked",
+      });
+
+      await heartbeatService(db).sweepStaleIssueLocks();
+
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("blocked");
+      expect(row?.startedAt).toBeNull();
+    });
+
+    it("does not demote a row holding a dispatchable monitor with a future check", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const startedAt = new Date(Date.now() - 40 * 60 * 60 * 1000);
+      const monitorNextCheckAt = new Date(Date.now() + 60 * 60 * 1000);
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt,
+        monitorNextCheckAt,
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      // The stale lock is still released — only the promotion is retained, so
+      // the monitor keeps the `in_progress` status it needs in order to fire.
+      expect(result.cleared).toBe(1);
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("in_progress");
+      expect(row?.startedAt?.getTime()).toBe(startedAt.getTime());
+      expect(row?.checkoutRestoreStatus).toBe("todo");
+      expect(row?.checkoutRunId).toBeNull();
+    });
+
+    it("leaves a deliberate in_progress write alone when no promotion marker is present", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const startedAt = new Date(Date.now() - 40 * 60 * 60 * 1000);
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt,
+        // Any explicit status write clears the marker, so its absence means the
+        // `in_progress` is owned by a writer other than checkout.
+        checkoutRestoreStatus: null,
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect(result.cleared).toBe(1);
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("in_progress");
+      expect(row?.startedAt?.getTime()).toBe(startedAt.getTime());
+    });
+  });
 });

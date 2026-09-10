@@ -13659,6 +13659,38 @@ export function recoveryService(
             .then((rows) => rows[0] ?? null);
 
           if (!deferred) {
+            // BLO-29913: the sweep is the LAST writer that can ever restore this
+            // row, so it has to do it here.
+            //
+            // Clearing the lock columns is what makes the restore unreachable
+            // from anywhere else. Every other `restoreCheckoutPromotedStatus`
+            // call site takes its issue ids from run context — a finalizer's
+            // `candidateIssueIds`, a superseded capacity retry's released ids —
+            // and this sweep exists precisely for runs whose finalizer never ran
+            // (pod OOM, adapter auth failure, provider throttle before first
+            // token). Once both lock columns are NULL there is no run left to
+            // carry the row back to any of those call sites, so the promotion
+            // survives forever: `in_progress`, `checkout_restore_status` still
+            // set, no live run, no monitor. That is the exact shape of the
+            // stranded rows this fixes, and `restorableCheckoutPromotion` was
+            // already written to match it — its NOT EXISTS clause documents the
+            // both-columns-NULL case as restorable. Nothing was calling it.
+            //
+            // Deliberately placed on the no-promotion exit. When the loop above
+            // promotes a deferred wake it has just queued a replacement
+            // execution path for this issue, and demoting the status out from
+            // under it is the failure mode the `suppressPromotion` handling in
+            // the run finalizer already guards against. Rows whose deferred
+            // wakes were all skipped fall through to here with no replacement,
+            // which is the case that does need restoring.
+            //
+            // The call re-evaluates `restorableCheckoutPromotion` itself, so an
+            // armed dispatchable monitor still declines the demotion and a row
+            // with no promotion marker is a no-op.
+            await restoreCheckoutPromotedStatus(tx, {
+              issueId: updated.id,
+              companyId: updated.companyId,
+            });
             return {
               updated,
               promotedRunId: null,
