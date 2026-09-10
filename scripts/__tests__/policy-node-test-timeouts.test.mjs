@@ -4,16 +4,61 @@ import { test } from "node:test";
 
 const workflow = readFileSync(new URL("../../.github/workflows/pr.yml", import.meta.url), "utf8");
 
+// BLO-31482. A chunk runs to the next `- name:`, so it swallows the blank line
+// and comment block that a reader would attribute to the step BELOW it. That is
+// invisible until a comment happens to contain text the filters match on:
+// writing "this step is a `node --test` invocation" above one step pulled its
+// PREDECESSOR into scope, and the guard then reported an unbounded step whose
+// name had nothing to do with the edit. Trailing comment and blank lines are
+// therefore not part of the step. This cannot hide a bound — `timeout-minutes`
+// is matched at 8-space indent with no `#`, so a commented-out one never
+// counted anyway.
+function stripTrailingComments(step) {
+  const lines = step.split("\n");
+  while (lines.length > 1) {
+    const last = lines[lines.length - 1].trim();
+    if (last !== "" && !last.startsWith("#")) break;
+    lines.pop();
+  }
+  // Re-terminate: `timeoutMinutes` matches `\n {8}timeout-minutes: N\n`, so a
+  // step whose bound is its last line needs the trailing newline back or the
+  // strip would read every such step as unbounded.
+  return `${lines.join("\n")}\n`;
+}
+
 function policySteps() {
   const start = workflow.indexOf("\n  policy:\n");
   const end = workflow.indexOf("\n  helm_chart:\n", start);
   assert.notEqual(start, -1, "pr.yml must define policy");
   assert.notEqual(end, -1, "pr.yml must define helm_chart after policy");
-  return workflow.slice(start, end).split("\n      - name: ").slice(1);
+  return workflow.slice(start, end).split("\n      - name: ").slice(1).map(stripTrailingComments);
 }
 
-function nodeTestSteps() {
-  return policySteps().filter((step) => step.includes("node --test"));
+// BLO-31482. This used to be `step.includes("node --test")`, which scoped the
+// guard to how a step is *spelled* rather than to what it is. Three steps in
+// `policy` therefore carried no bound at all, and two of them — `Test
+// ip-address security override` and `Test browserslist security override` —
+// were `node --test` invocations the whole time, hidden behind a pnpm script
+// alias. The filter was already missing steps its own stated intent covered.
+//
+// So match on either: the literal invocation (keeps every step the old rule
+// held, including the seven `Validate *`-named ones), or a `Test ` name
+// (catches the pnpm-aliased and Python ones). Union, never replacement — a
+// name-only rule would have dropped those seven.
+//
+// Setup steps are deliberately NOT in scope, and that is a measurement rather
+// than an oversight. Over 59 sampled `policy` runs `Checkout repository` ranges
+// 47s-266s (p90 170s) and `Set up Python` 24s-76s: a bound loose enough not to
+// flake on those is ~5-6m against a 10m job cap, which buys almost no
+// attribution while adding a new way to red-line an innocent PR. They keep the
+// job cap until one of them is measured actually hanging, not merely slow.
+// BLO-31482's option 2 — a bound on every step with an allowance table —
+// reintroduces the allowlist machinery #1620 removed, and nothing yet justifies
+// it.
+function boundedTestSteps() {
+  return policySteps().filter(
+    (step) => step.includes("node --test") || stepName(step).startsWith("Test "),
+  );
 }
 
 // BLO-32670. GitHub Actions accepts fractional minutes. Matching only `(\d+)`
@@ -54,12 +99,12 @@ function stepName(step) {
 // stronger rule — bounds are per-step worst cases and every step is expected to
 // run, so that sum exceeds any sane cap by design.
 function assertTimeouts(steps, cap = policyJobCap()) {
-  assert.ok(steps.length > 0, "policy must contain node --test steps");
+  assert.ok(steps.length > 0, "policy must contain bounded test steps");
   for (const step of steps) {
     const bound = timeoutMinutes(step, 8);
     assert.ok(
       bound > 0,
-      `policy node --test step "${stepName(step)}" must declare a step-level timeout-minutes`,
+      `policy test step "${stepName(step)}" must declare a step-level timeout-minutes`,
     );
     assert.ok(
       bound < cap,
@@ -68,23 +113,52 @@ function assertTimeouts(steps, cap = policyJobCap()) {
   }
 }
 
-test("every policy node --test step has a step-level timeout", () => {
-  assertTimeouts(nodeTestSteps());
+test("every policy test step has a step-level timeout", () => {
+  assertTimeouts(boundedTestSteps());
 });
 
-test("the timeout guard fails when a node --test bound is removed", () => {
-  const mutated = nodeTestSteps().map((step) =>
-    step.replace(new RegExp(`\\n {8}${TIMEOUT_MINUTES}\\n`), "\n"),
-  );
-  assert.throws(() => assertTimeouts(mutated), /must declare a step-level timeout-minutes/);
-});
-
-test("the timeout guard fails when a node --test bound reaches the job cap", () => {
+// BLO-31482. Per step, not all-at-once. Stripping every bound in one mutation
+// passes as long as *some* step is covered, so it cannot distinguish a guard
+// that sees 46 steps from one that sees 43 — which is exactly the gap that let
+// three steps sit unbounded under a green gate. Deleting one bound at a time
+// and requiring the failure to name that step is what makes coverage per-step.
+test("the timeout guard fails when any single test step loses its bound", () => {
+  const steps = boundedTestSteps();
   const cap = policyJobCap();
-  const mutated = nodeTestSteps().map((step) =>
+  for (const [index, target] of steps.entries()) {
+    const name = stepName(target);
+    const mutated = steps.map((step, at) =>
+      at === index ? step.replace(new RegExp(`\\n {8}${TIMEOUT_MINUTES}\\n`), "\n") : step,
+    );
+    assert.throws(
+      () => assertTimeouts(mutated, cap),
+      new RegExp(`"${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" must declare`),
+      `dropping the bound from "${name}" must fail the guard, naming that step`,
+    );
+  }
+});
+
+test("the timeout guard fails when a test step bound reaches the job cap", () => {
+  const cap = policyJobCap();
+  const mutated = boundedTestSteps().map((step) =>
     step.replace(new RegExp(`\\n {8}${TIMEOUT_MINUTES}\\n`), `\n        timeout-minutes: ${cap}\n`),
   );
   assert.throws(() => assertTimeouts(mutated, cap), /must sit below the/);
+});
+
+// BLO-31482. The widened filter must be a superset of the old one, not a
+// replacement for it. Seven in-scope steps are named `Validate *` rather than
+// `Test *`, so a name-only rule would silently drop them while the suite stayed
+// green — the same class of regression this issue exists to close.
+test("widening the filter did not drop any node --test step from scope", () => {
+  const covered = new Set(boundedTestSteps().map(stepName));
+  for (const step of policySteps()) {
+    if (!step.includes("node --test")) continue;
+    assert.ok(
+      covered.has(stepName(step)),
+      `"${stepName(step)}" runs node --test and must stay in the timeout guard's scope`,
+    );
+  }
 });
 
 // BLO-32670. Three of the 41 bounded steps in `policy` measured a p100 above

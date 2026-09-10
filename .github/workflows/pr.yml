@@ -367,9 +367,13 @@ jobs:
         with:
           python-version: "3.10"
 
+      # BLO-31482. Measured p100 2s over 59 sampled `policy` runs (median 1s).
+      # Single interpreter, no subprocess use, so it is not one of the
+      # fork-heavy shapes BLO-32670 had to raise to 3m.
       - name: Test stalled-Ally-review sweep decision logic (BLO-28203)
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s .github/scripts -p 'test_sweep_*.py' -v
+        timeout-minutes: 1
 
       - name: Validate Designer fast-uri security floor
         if: ${{ !cancelled() }}
@@ -495,13 +499,19 @@ jobs:
         if: ${{ !cancelled() }}
         run: node ./scripts/release-package-map.mjs check
 
+      # BLO-31482. Both of these ARE `node --test` invocations — the pnpm alias
+      # is the only reason the old gate's `step.includes("node --test")` filter
+      # could not see them. Measured p100 4s and 5s over 59 sampled `policy`
+      # runs; neither test file spawns a child process.
       - name: Test ip-address security override
         if: ${{ !cancelled() }}
         run: pnpm run test:ip-address-security-override
+        timeout-minutes: 1
 
       - name: Test browserslist security override
         if: ${{ !cancelled() }}
         run: pnpm run test:browserslist-security-override
+        timeout-minutes: 1
 
       - name: Test multer security override
         if: ${{ !cancelled() }}
