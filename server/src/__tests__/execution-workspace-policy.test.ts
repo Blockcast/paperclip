@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildExecutionWorkspaceAdapterConfig,
   defaultIssueExecutionWorkspaceSettingsForProject,
+  executionWorkspaceUsesGitWorktree,
   gateProjectExecutionWorkspacePolicy,
   isUnrunnableWorktreeCombo,
   issueExecutionWorkspaceModeForPersistedWorkspace,
@@ -355,5 +356,132 @@ describe("execution workspace policy helpers", () => {
         true,
       ),
     ).toEqual({ enabled: true, defaultMode: "isolated_workspace" });
+  });
+});
+
+// BLO-31443: this predicate decides whether a run gets a per-issue tree key, so
+// it decides whether the writer reservation follows the TREE or the RUN. It is
+// deliberately mode-INDEPENDENT: "a worktree exists" and "workspace isolation
+// was requested" are different questions, and realization
+// (`realizeExecutionWorkspace`) branches solely on `workspaceStrategy.type`
+// without ever consulting the mode. A mode-gated reading here would drop the
+// tree key for runs that really do share a worktree, silently restoring the
+// same-issue collision this row closed.
+describe("executionWorkspaceUsesGitWorktree (BLO-31443)", () => {
+  const base = {
+    projectPolicy: null,
+    issueSettings: null,
+    legacyUseProjectWorkspace: null,
+  } as const;
+
+  it("follows an agent-level worktree strategy under isolated_workspace", () => {
+    expect(
+      executionWorkspaceUsesGitWorktree({
+        ...base,
+        agentConfig: { workspaceStrategy: { type: "git_worktree" } },
+        mode: "isolated_workspace",
+      }),
+    ).toBe(true);
+  });
+
+  it("is false when no layer supplies a worktree strategy", () => {
+    expect(
+      executionWorkspaceUsesGitWorktree({
+        ...base,
+        agentConfig: { workspaceStrategy: { type: "project_primary" } },
+        mode: "isolated_workspace",
+      }),
+    ).toBe(false);
+  });
+
+  // Divergence route 1: the mode gate is itself gated on `hasWorkspaceControl`
+  // (a project policy, issue overrides, or an explicit
+  // `legacyUseProjectWorkspace: false`). With none of those, a non-isolated mode
+  // strips NOTHING and the agent-level worktree survives -- so a mode-derived
+  // reading would call this run un-isolated while it works in a real worktree.
+  it("keeps an agent-level worktree in a non-isolated mode when no layer has workspace control", () => {
+    const untouched = buildExecutionWorkspaceAdapterConfig({
+      ...base,
+      agentConfig: { workspaceStrategy: { type: "git_worktree" } },
+      mode: "shared_workspace",
+    });
+    expect(untouched.workspaceStrategy).toEqual({ type: "git_worktree" });
+
+    expect(
+      executionWorkspaceUsesGitWorktree({
+        ...base,
+        agentConfig: { workspaceStrategy: { type: "git_worktree" } },
+        mode: "shared_workspace",
+      }),
+    ).toBe(true);
+  });
+
+  // Divergence route 2: with workspace control present the mode gate DOES strip
+  // the agent-level strategy, but the issue `adapterConfig` overlay is applied
+  // after that strip and re-introduces one, and realization honours it. Reading
+  // only the policy layers here is a false negative: the run would work in a
+  // real shared worktree while being keyed as if it had a private tree.
+  it("honours an issue adapterConfig overlay that re-introduces a worktree in a NON-isolated mode", () => {
+    const controlled = {
+      agentConfig: { workspaceStrategy: { type: "git_worktree" } },
+      projectPolicy: { enabled: true, defaultMode: "shared_workspace" } as const,
+      issueSettings: null,
+      mode: "shared_workspace",
+      legacyUseProjectWorkspace: null,
+    } as const;
+
+    // Precondition: the mode gate really did drop the agent-level strategy, so
+    // the assertion below is exercising the overlay and not a leftover.
+    expect(
+      buildExecutionWorkspaceAdapterConfig(controlled).workspaceStrategy,
+    ).toBeUndefined();
+    expect(executionWorkspaceUsesGitWorktree(controlled)).toBe(false);
+
+    expect(
+      executionWorkspaceUsesGitWorktree({
+        ...controlled,
+        issueAdapterConfig: { workspaceStrategy: { type: "git_worktree" } },
+      }),
+    ).toBe(true);
+  });
+
+  // Overlay precedence runs the other way too: an issue that pins
+  // `project_primary` gets no worktree even though the agent asked for one, and
+  // must therefore keep a run-unique reservation key.
+  it("lets an issue adapterConfig overlay veto an agent-level worktree", () => {
+    expect(
+      executionWorkspaceUsesGitWorktree({
+        ...base,
+        agentConfig: { workspaceStrategy: { type: "git_worktree" } },
+        mode: "isolated_workspace",
+        issueAdapterConfig: { workspaceStrategy: { type: "project_primary" } },
+      }),
+    ).toBe(false);
+  });
+
+  // `resolveOverlaidWorkspaceStrategy` merges two plain records rather than
+  // replacing, so an overlay that sets only `baseRef` must leave the inherited
+  // `type` -- and hence the tree keying -- intact.
+  it("keeps the inherited type when the overlay sets an unrelated field", () => {
+    expect(
+      executionWorkspaceUsesGitWorktree({
+        ...base,
+        agentConfig: { workspaceStrategy: { type: "git_worktree" } },
+        mode: "isolated_workspace",
+        issueAdapterConfig: { workspaceStrategy: { baseRef: "origin/release" } },
+      }),
+    ).toBe(true);
+  });
+
+  // Matches `realizeExecutionWorkspace`, which treats every value other than
+  // the exact string `git_worktree` as `project_primary`.
+  it("treats an unrecognised strategy type as not-a-worktree", () => {
+    expect(
+      executionWorkspaceUsesGitWorktree({
+        ...base,
+        agentConfig: { workspaceStrategy: { type: "cloud_sandbox" } },
+        mode: "isolated_workspace",
+      }),
+    ).toBe(false);
   });
 });
