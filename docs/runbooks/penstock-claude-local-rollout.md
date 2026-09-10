@@ -1,329 +1,292 @@
 ---
-title: Penstock Claude Local Rollout
-summary: Controlled Devbox activation for one Paperclip Claude agent
+title: Penstock Kubernetes Agent Rollout
+summary: Controlled Caveman and Ponytail rollout for claude_k8s and opencode_k8s
 ---
 
-# Purpose
+# Scope
 
-This runbook activates the Penstock-routed Claude runtime for exactly one
-Paperclip `claude_local` agent on Devbox. The runtime starts a short-lived
-Caveman proxy on loopback, points Claude at that proxy, and removes ambient
-provider credentials before either child is started.
+This runbook covers the Kubernetes-only rollout of the Penstock agent launcher
+and Ponytail for Paperclip's `claude_k8s` and `opencode_k8s` adapters. It does
+not activate either feature fleet-wide, install a plugin into a shared volume,
+or authorize a live payment. The first deployment is one non-production Job.
 
-The first launch is Devbox-only. The Paperclip server image packages the
-reviewed binaries, and `Dockerfile.agent` copies the same three assets into the
-actual Kubernetes agent overlay. The Helm contract test guards the
-shared-volume boundary; neither image activates an agent or installs Ponytail
-into the shared `/paperclip/.claude` volume.
+The path for one run is:
 
-## Non-negotiable boundaries
+```text
+Paperclip worker
+  -> adapter Job
+  -> /opt/penstock/bin/penstock-agent-runtime.mjs
+  -> 127.0.0.1:<ephemeral-port>/health/ready
+  -> /usr/local/bin/caveman-proxy
+  -> https://api.penstock.run
+```
 
-- Do not proceed while `BLO-26540` or `BLO-26695` is unresolved.
-- Do not install packages or write runtime state while Devbox is above the
-  documented filesystem threshold. The acceptance target is below 85% for
-  seven days under normal activity.
-- Configure one named agent. Do not bulk-patch a company or an adapter type.
-- Store `PENSTOCK_API_KEY` as a Paperclip `secret_ref`. Never put its value in
-  an adapter payload, shell history, command argument, image layer, dotfile,
-  comment, or runbook.
-- Load Ponytail with the selected agent's `extraArgs`:
-  `--plugin-dir /opt/penstock/ponytail` (or the approved host-local equivalent).
-  Do not run `claude plugin install ... --scope user` from the shared seed
-  container.
-- Keep Caveman's listener on `127.0.0.1`; do not expose a port, SSH forward, or
-  shared proxy endpoint.
-- The production Docker build mints a short-lived GitHub App installation token
-  from `COMMITPERCLIP_KEY` and `COMMITPERCLIP_APP_ID`, restricted to read-only
-  Contents access on `Blockcast/penstock-llm-proxy-core`. Keep that credential
-  flow separate from `PAPERCLIP_BOARD_TOKEN`, which remains reserved for the
-  `kkroo/*` vendor source. Missing or unauthorized App credentials must fail the
-  build; do not substitute a provider key or a broadly scoped token.
+The launcher owns the short-lived Caveman process and temporary files. The
+adapter owns the Kubernetes Job and cleanup. Ponytail changes the selected
+agent's behavior; it is not a provider credential or a shared transport.
 
-# 1. Gate and inventory
+## Hard boundaries
 
-Record these values before changing the host or Paperclip:
+- Use only `claude_k8s` or `opencode_k8s`. Do not configure the retired local
+  adapter path in this rollout.
+- Configure one named non-production agent and pause it during changes. Do not
+  bulk-patch a company, adapter type, or fleet default.
+- `PENSTOCK_API_KEY` is a worker-only Kubernetes Secret binding. It must not be
+  in `env.extra`, the API Deployment, an adapter payload, a command argument,
+  an image layer, a checked-in file, or a log.
+- Caveman must bind to IPv4 loopback only. Do not expose, forward, or share its
+  listener between Jobs.
+- Keep Caveman in `mode: record` for this rollout. Compression or retention
+  changes require a separate measured review and recovery test.
+- Do not claim an Anthropic canary until the Penstock allocation is verified
+  for the selected org, provider, and BYOS node. A prior attempt failed closed
+  with `allocation_missing` for `org_penstock` / `anthropic` on
+  `blockcast-sfo12`; that is an allocation gate, not a reason to add a raw
+  provider key.
+- Do not treat a green image build as activation. Image packaging, adapter
+  configuration, readiness, one canary, and cleanup evidence are separate
+  gates.
+
+## 1. Preflight and pinned assets
+
+Record the following before changing the release or agent:
 
 | Item | Required evidence |
 | --- | --- |
-| Blockers | `BLO-26540` and `BLO-26695` are `done` |
-| Disk | Devbox is below 85% and the retention policy is active |
-| Launcher | `scripts/penstock-agent-runtime.mjs` from the approved merged commit |
-| Caveman | Reviewed release and architecture-specific checksum |
-| Ponytail | Reviewed commit and hook-manifest SHA256 |
-| Target | One Paperclip company ID and one agent ID |
-| Auth | A board-authenticated Paperclip session and a Penstock API key held outside the command line |
+| Adapter code | The OpenCode adapter change is merged and the Claude adapter vendor update is included in the image source |
+| Image | The exact server and agent image digests to test; both contain the runtime assets |
+| Launcher | `PENSTOCK_RUNTIME_REF` and `PENSTOCK_RUNTIME_SHA256` from `Dockerfile` |
+| Caveman | `CAVEMAN_RELEASE`, architecture-specific checksum, and `caveman-proxy version` output |
+| Ponytail | `PONYTAIL_REF`, plugin identity, and `PONYTAIL_HOOKS_SHA256` |
+| Secret | Worker Secret name/key and a successful non-secret reference check |
+| Target | One company, one agent, one environment, and one provider allocation |
+| Canary | A non-production namespace or explicitly labeled test Job |
 
-The image's pinned values are the source of truth for packaged deployments.
-Inspect the `PENSTOCK_RUNTIME_REF`, `PENSTOCK_RUNTIME_SHA256`,
-`CAVEMAN_RELEASE`, `PONYTAIL_REF`, and `PONYTAIL_HOOKS_SHA256` values in
-`Dockerfile` when preparing a host-local copy. Do not silently substitute a
-branch, `latest`, or an unverified download.
+The current packaging pins are intentionally inspectable in `Dockerfile`:
 
-For Kubernetes, verify both image layers after the server build: the server
-image must contain `/opt/penstock/bin/penstock-agent-runtime.mjs`,
-`/usr/local/bin/caveman-proxy`, and `/opt/penstock/ponytail/`, and the matching
-`Dockerfile.agent` overlay must contain the same paths. Building only the
-server image does not update the image used by `claude_k8s` Jobs.
+```text
+PENSTOCK_RUNTIME_REF=9878ca2499ea8a8e24ec7d8bcf3222db65ac014a
+CAVEMAN_RELEASE=bin-v1.1.6
+PONYTAIL_REF=0a4dd63ad4541f4f655c4108a295916f3c1d8fda
+```
 
-Lightweight host checks:
+The launcher path is:
+
+```text
+/opt/penstock/bin/penstock-agent-runtime.mjs
+```
+
+The Caveman path is:
+
+```text
+/usr/local/bin/caveman-proxy
+```
+
+The packaged Ponytail paths are adapter-specific:
+
+| Adapter | `ponytailPluginPath` | Loading mechanism |
+| --- | --- | --- |
+| `claude_k8s` | `/opt/penstock/ponytail` | Claude `--plugin-dir` |
+| `opencode_k8s` | `/opt/penstock/ponytail/.opencode/plugins/ponytail.mjs` | Generated OpenCode config `plugin` entry |
+
+Verify the exact image layers before creating an agent config:
 
 ```sh
-df -h /
-node --version             # Node.js 22 or newer
-claude --version
-test -x /opt/penstock/bin/penstock-agent-runtime.mjs
-test -x /usr/local/bin/caveman-proxy
-test -f /opt/penstock/ponytail/.claude-plugin/plugin.json
+kubectl -n <test-namespace> run asset-check --rm -i --restart=Never \
+  --image=<exact-agent-image> --command -- sh -c '
+    test -x /opt/penstock/bin/penstock-agent-runtime.mjs &&
+    test -x /usr/local/bin/caveman-proxy &&
+    test -f /opt/penstock/ponytail/.claude-plugin/plugin.json &&
+    test -f /opt/penstock/ponytail/.opencode/plugins/ponytail.mjs
+  '
 ```
 
-If the paths differ on Devbox, use one versioned, root-owned runtime directory
-and carry the same paths into the agent configuration below. Make the launcher
-and Caveman executable but non-writable by the Paperclip execution user. Make
-the Ponytail tree readable, not writable, by that user.
+Use an image digest, not `latest` or a mutable branch tag. If the test image
+does not contain all four paths, stop and fix the image/overlay build.
 
-# 2. Provision the host-local runtime
+## 2. Bind the worker-only Secret
 
-Provisioning is an operator action after the gates pass. Fetch the launcher
-from the approved immutable commit using the authenticated GitHub mechanism
-already available on Devbox, then verify the SHA256 recorded in `Dockerfile`.
-Fetch Caveman by its pinned release and Ponytail by its pinned git commit;
-verify the Caveman checksums and the Ponytail hook-manifest SHA256 before
-installing them. A failed verification is a hard stop; the verification
-command prints the expected and received digest so an operator can distinguish
-a changed upstream artifact from a transient download failure.
+The Helm chart's `worker.extraEnv` is the only approved location for the
+shared Penstock org credential. The chart rejects `PENSTOCK_API_KEY` in the
+shared `env.extra` block because that block is rendered on the API Deployment.
 
-The GitHub Actions build uses the same trust boundary. It mints a short-lived
-GitHub App installation token from the existing `COMMITPERCLIP_KEY`, restricted
-to read-only Contents access on `Blockcast/penstock-llm-proxy-core`, and passes
-that token as the BuildKit secret `penstock_runtime_token`. It never repoints or
-reuses `gh_token`, and no long-lived Penstock repository token is required.
-Before dispatching, verify that `COMMITPERCLIP_KEY` and
-`COMMITPERCLIP_APP_ID` are configured and that the App installation can read
-the Penstock repository. Token minting and the Dockerfile both fail closed if
-that access is absent.
+Create or verify the Secret out of band, without printing its value:
 
-The resulting layout should be equivalent to:
-
-```text
-/opt/penstock/bin/penstock-agent-runtime.mjs   0555
-/usr/local/bin/caveman-proxy                   0555
-/opt/penstock/ponytail/                        read-only tree
+```sh
+kubectl -n paperclip get secret paperclip-penstock-org-key \
+  -o jsonpath='{.data.token}' | base64 -d | wc -c
 ```
 
-Do not place `PENSTOCK_API_KEY` in any of these paths. The launcher creates a
-0600 temporary Caveman config and 0700 temporary runtime directory for each
-run, and removes both during cleanup.
+The production values shape is:
 
-# 3. Create the Paperclip secret
-
-Use the board UI at **Company Settings -> Secrets**, or the documented board
-route:
-
-```text
-POST /api/companies/{companyId}/secrets
+```yaml
+worker:
+  extraEnv:
+    - name: PENSTOCK_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: paperclip-penstock-org-key
+          key: token
 ```
 
-Create one managed secret with:
+Apply the Helm change only to the test release first. Confirm:
+
+```sh
+helm template paperclip deploy/helm/paperclip \
+  -f deploy/helm/paperclip/values.blockcast.yaml \
+  --namespace paperclip > /tmp/paperclip-rendered.yaml
+grep -n 'PENSTOCK_API_KEY' /tmp/paperclip-rendered.yaml
+```
+
+The reference may appear in the worker StatefulSet, but must not appear in the
+API Deployment. Do not attach the rendered file to an issue if it contains
+other secret references.
+
+The adapter's inheritance policy admits the exact name `PENSTOCK_API_KEY` and
+denies adjacent `PENSTOCK_*` names. The Job should therefore receive the
+Secret reference through `valueFrom`; the resolved value must never be visible
+in the adapter configuration or Job manifest.
+
+## 3. Configure one test agent
+
+Pause the selected agent and merge these fields into its existing
+`adapterConfig`. Preserve its current model, workspace, permissions, service
+account, and other settings. Do not replace the whole object blindly.
+
+Claude example:
 
 ```json
 {
-  "name": "penstock-anthropic-api-key",
-  "key": "PENSTOCK_API_KEY",
-  "value": "<supplied through the authenticated secret-entry flow>"
-}
-```
-
-Enter the value through a protected prompt or approved vault integration. Do
-not put the value in a JSON file tracked by Git, a command argument, or a
-clipboard shared with the agent. Record only the returned Paperclip secret ID;
-the API never needs the plaintext again for this configuration.
-
-Before continuing, confirm that the secret is active and company-scoped. The
-agent binding will use:
-
-```json
-{
-  "type": "secret_ref",
-  "secretId": "<paperclip-secret-id>",
-  "version": "latest"
-}
-```
-
-# 4. Configure one `claude_local` agent
-
-Pause the selected agent while editing its configuration. Read its current
-`adapterConfig` first and merge the fields below; `PATCH /api/agents/{id}`
-persists the effective adapter configuration, so replacing the object blindly
-can remove an existing prompt, workspace, or permission policy.
-
-The required shape is:
-
-```json
-{
-  "adapterType": "claude_local",
+  "adapterType": "claude_k8s",
   "adapterConfig": {
-    "engine": "cli",
-    "command": "/opt/penstock/bin/penstock-agent-runtime.mjs",
-    "cwd": "/opt/paperclip/workspaces/<agent-id>",
-    "extraArgs": [
-      "--plugin-dir",
-      "/opt/penstock/ponytail"
-    ],
+    "agentCommand": "/opt/penstock/bin/penstock-agent-runtime.mjs",
+    "ponytailPluginPath": "/opt/penstock/ponytail",
+    "ponytailDefaultMode": "full",
     "env": {
-      "PENSTOCK_API_KEY": {
-        "type": "secret_ref",
-        "secretId": "<paperclip-secret-id>",
-        "version": "latest"
-      },
-      "PENSTOCK_PROVIDER": {
-        "type": "plain",
-        "value": "anthropic"
-      },
-      "PENSTOCK_BASE_URL": {
-        "type": "plain",
-        "value": "https://api.penstock.run"
-      },
-      "PENSTOCK_AGENT_COMMAND": {
-        "type": "plain",
-        "value": "/usr/local/bin/claude"
-      },
-      "PENSTOCK_CAVEMAN_COMMAND": {
-        "type": "plain",
-        "value": "/usr/local/bin/caveman-proxy"
-      },
-      "PONYTAIL_DEFAULT_MODE": {
-        "type": "plain",
-        "value": "full"
-      },
-      "CLAUDE_CONFIG_DIR": {
-        "type": "plain",
-        "value": "/opt/paperclip/agents/<agent-id>/.claude"
-      }
+      "PENSTOCK_BASE_URL": "https://api.penstock.run",
+      "PENSTOCK_PROVIDER": "anthropic",
+      "PENSTOCK_CAVEMAN_COMMAND": "/usr/local/bin/caveman-proxy"
     }
   }
 }
 ```
 
-`<agent-id>` is a placeholder, not a literal shared directory. Create the
-selected agent's `cwd` and `CLAUDE_CONFIG_DIR` with mode 0700 and ownership
-limited to the Paperclip execution user. Keep `CLAUDE_CONFIG_DIR` explicitly
-per-agent for this rollout. Do not omit it and rely on the adapter's managed
-default: Ponytail may otherwise resolve state under the shared
-`/paperclip/.claude` tree. If non-persistent state is required later, use an
-adapter-supported per-run private directory and verify its ownership before
-enabling it.
+OpenCode example:
 
-The launcher receives Claude's normal Paperclip-generated CLI arguments. It
-adds the two Ponytail arguments as configured above, starts Caveman with
-`serve`, validates `/health/ready` and its identity response, then sets
-Claude's provider base URL to the ephemeral loopback listener. The Penstock
-key is therefore available only in the child process environment for that run.
-
-After the patch, verify the returned configuration shows one target agent and
-the secret reference object, never a resolved value. Keep the agent paused
-until the environment test is ready.
-
-# 5. Prove the runtime and perform one smoke run
-
-First use Paperclip's **Test Environment** action for the selected agent. With
-the wrapper command above, this action proves the working directory and
-executable resolution and confirms the explicit CLI engine. The generic
-`claude_local` environment probe deliberately skips its normal Claude hello
-probe when `command` is not named `claude`; it does not start Caveman or prove
-that Caveman accepts the `.json` config. A passing result here is necessary but
-not sufficient.
-
-Before resuming the agent, run this one-time, no-provider-credential smoke on
-Devbox. It is specifically required because the launcher uses a `.json` config
-path and the real Caveman binary, rather than the launcher test double, must
-accept that path:
-
-```sh
-set -eu
-CAVEMAN=/usr/local/bin/caveman-proxy
-ROOT="$(mktemp -d)"
-PID=""
-cleanup() {
-  if [ -n "${PID}" ] && kill -0 "${PID}" 2>/dev/null; then
-    kill "${PID}" 2>/dev/null || true
-    wait "${PID}" 2>/dev/null || true
-  fi
-  rm -rf "${ROOT}"
+```json
+{
+  "adapterType": "opencode_k8s",
+  "adapterConfig": {
+    "agentCommand": "/opt/penstock/bin/penstock-agent-runtime.mjs",
+    "ponytailPluginPath": "/opt/penstock/ponytail/.opencode/plugins/ponytail.mjs",
+    "ponytailDefaultMode": "full",
+    "env": {
+      "PENSTOCK_BASE_URL": "https://api.penstock.run",
+      "PENSTOCK_PROVIDER": "openai",
+      "PENSTOCK_CAVEMAN_COMMAND": "/usr/local/bin/caveman-proxy"
+    }
+  }
 }
-trap cleanup EXIT INT TERM
-mkdir -m 700 "${ROOT}/home"
-
-for attempt in 1 2 3; do
-  PORT="$(node -e 'const net=require("node:net");const s=net.createServer();s.listen(0,"127.0.0.1",()=>{const p=s.address().port;s.close(()=>console.log(p));});')"
-  CONFIG="${ROOT}/caveman.json"
-  cat > "${CONFIG}" <<EOF
-{"mode":"record","listen":"127.0.0.1:${PORT}","providers":{"anthropic":{"base_url":"https://api.penstock.run"},"openai":{"base_url":"https://api.penstock.run"}}}
-EOF
-  : > "${ROOT}/caveman.log"
-  CAVEMAN_CONFIG="${CONFIG}" CAVEMAN_HOME="${ROOT}/home" \
-    "${CAVEMAN}" serve >"${ROOT}/caveman.log" 2>&1 &
-  PID=$!
-  for tick in $(seq 1 150); do
-    BODY="$(curl --noproxy '*' --silent --show-error --connect-timeout 1 --max-time 1 \
-      "http://127.0.0.1:${PORT}/health/ready" 2>/dev/null || true)"
-    if printf '%s' "${BODY}" | jq -e \
-      '.ok == true and .service == "caveman-proxy" and .schema == "caveman.proxy.health.v1" and .billing == "byok" and (.adapters | numbers) > 0' \
-      >/dev/null 2>&1; then
-      echo "real Caveman accepted caveman.json and passed readiness"
-      exit 0
-    fi
-    if ! kill -0 "${PID}" 2>/dev/null; then break; fi
-    sleep 0.1
-  done
-  kill "${PID}" 2>/dev/null || true
-  wait "${PID}" 2>/dev/null || true
-  PID=""
-done
-cat "${ROOT}/caveman.log" >&2
-exit 1
 ```
 
-Record the successful attempt, binary version, architecture, config path
-extension, and readiness response shape. Do not attach the full log if it
-contains provider routing details; confirm only that it contains no secrets.
+Do not add `PENSTOCK_API_KEY` to either object. The worker environment is
+resolved by the adapter's allowlist and forwarded as a Secret-backed Job env
+entry. `PENSTOCK_PROVIDER` must match a verified Penstock allocation. For
+OpenCode, the launcher receives `PENSTOCK_AGENT_COMMAND=opencode` by default;
+for Claude it receives `PENSTOCK_AGENT_COMMAND=claude`. `PONYTAIL_DEFAULT_MODE`
+may be supplied as a non-secret environment preference; the adapter's
+`ponytailDefaultMode` field is the preferred per-agent form and an explicit
+environment value wins.
 
-After that smoke passes, resume the agent and run one non-destructive, small
-task. Capture the Paperclip run ID and config revision. Check the run metadata
-and logs for:
+The adapters reject launcher values containing arguments or shell syntax. Keep
+all native CLI arguments in the adapter's existing `extraArgs` field. The
+Claude adapter passes the plugin directory with `--plugin-dir`; the OpenCode
+adapter writes the `.mjs` path into the generated OpenCode config.
 
-- `PENSTOCK_BASE_URL=https://api.penstock.run` at the configuration level;
-- an ephemeral `127.0.0.1` Caveman route at runtime;
-- no Penstock key, provider key, or Paperclip token in stdout, stderr, command
-  arguments, or the persisted config;
-- successful cleanup after both success and an intentionally cancelled test.
+## 4. Readiness and smoke checks
 
-Do not use a production-mutating prompt for the first run. A provider request
-may still incur normal billing; set the agent/company budget before resuming.
+Run the Paperclip environment test for the selected agent. This checks Job
+creation prerequisites and image/executable resolution; it does not by itself
+prove that the real Caveman binary accepted the generated configuration.
 
-# 6. Rollback
+Before resuming heartbeats, run one non-destructive test Job. Confirm the
+launcher reaches `GET http://127.0.0.1:<ephemeral-port>/health/ready` and that
+the response satisfies every field below:
 
-1. Pause the selected agent and wait for any active run to terminate.
-2. Restore the prior `adapterConfig` using the recorded config revision, or
-   patch `command` back to the ordinary Claude executable and remove the
-   Penstock env bindings and Ponytail `extraArgs`.
-3. Confirm no new run starts, then remove only the host-local runtime files if
-   they are no longer needed.
-4. Leave the Paperclip secret record intact for audit, or rotate/disable it
-   through the Secrets UI if the key may have reached an unintended process.
+```json
+{
+  "ok": true,
+  "service": "caveman-proxy",
+  "schema": "caveman.proxy.health.v1",
+  "billing": "byok",
+  "adapters": 1
+}
+```
 
-Never delete a shared `/paperclip/.claude` tree as part of this rollback.
+`adapters` may be greater than one; it must be a positive safe integer. A
+redirect, a non-loopback address, missing identity field, or non-`byok`
+billing value is a hard failure.
 
-# Evidence record
+Capture only non-secret evidence:
 
-Attach or comment the following non-secret evidence on the rollout issue:
+- Paperclip run ID, image digest, adapter type, provider, and config revision;
+- readiness response shape and the ephemeral loopback port (not credentials);
+- the launcher/Caveman/Ponytail versions and checksums;
+- proof that the plugin loaded at the adapter-specific path;
+- successful completion cleanup and a separately cancelled-run cleanup;
+- confirmation that logs, arguments, Job YAML, and persisted config contain no
+  Penstock key, provider key, Paperclip token, or secret value.
 
-- approved launcher commit and SHA256;
-- Caveman release, architecture, and SHA256;
-- Ponytail commit and hook-manifest SHA256;
-- company ID, selected agent ID, and config revision;
-- environment-test result and one smoke run ID;
-- confirmation that logs contained no credential values;
+The launcher creates a 0700 temporary runtime directory, a 0600
+`caveman.json`, and a temporary Caveman home for each run. It removes them on
+success, child failure, proxy failure, and signal cancellation. Do not claim
+that this removes Paperclip's own transcript or run-log retention.
+
+## 5. Provider allocation gate
+
+Before any provider request, verify an allocation for the exact tuple:
+
+```text
+org:      <Penstock org>
+provider: <anthropic or openai>
+node:     <BYOS node or managed route>
+```
+
+A canary with an unallocated provider is not a valid wiring test and must not
+be retried with a raw upstream key. Resolve the allocation or choose a
+provider with a documented, verified allocation, then record the allocation
+check ID and timestamp. Keep the canary task small and non-mutating; normal
+provider billing may still apply.
+
+## 6. Cleanup and rollback
+
+After the canary:
+
+1. Pause the test agent and wait for the Job to terminate.
+2. Confirm completed and cancelled Jobs, their per-run Secrets, and temporary
+   runtime files are cleaned according to the adapter policy.
+3. Restore the previous `adapterConfig` from its recorded revision, or remove
+   only the launcher/plugin fields.
+4. Leave the worker Secret managed and auditable; rotate or disable it through
+   the approved secret process if exposure is suspected.
+5. Do not delete the shared `/paperclip` or any shared Claude/OpenCode config
+   tree as part of rollback.
+
+No production heartbeat may be resumed if the canary leaves a Job, Secret,
+temporary file, provider credential, or log-redaction finding unresolved.
+
+## Evidence checklist
+
+Attach non-secret evidence to the rollout issue:
+
+- exact image digests and the four asset-path checks;
+- adapter type and selected agent/company IDs;
+- worker Secret name and key only, never its value;
+- provider allocation tuple and verification timestamp;
+- readiness identity response and run IDs;
+- adapter-specific Ponytail load confirmation;
+- cleanup/cancellation results and secret-free log review;
 - rollback revision and operator.
 
-Do not attach secret values, raw secret payloads, provider cookies, or complete
-environment dumps.
+Do not attach environment dumps, raw Secret objects, provider cookies,
+`caveman.json`, prompt contents, or complete unredacted logs.

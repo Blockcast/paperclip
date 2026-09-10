@@ -1,4 +1,6 @@
 {{- include "paperclip.validateGithubReviewGate" . }}
+{{- include "paperclip.validateSharedEnvExtra" . }}
+{{- include "paperclip.validateWorkerExtraEnv" . }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -944,6 +946,9 @@ spec:
             {{- end }}
             {{- end }}
             {{- with .Values.env.extra }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.worker.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           livenessProbe:

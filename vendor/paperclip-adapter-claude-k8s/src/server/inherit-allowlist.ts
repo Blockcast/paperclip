@@ -130,6 +130,9 @@ export const AGENT_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
   "PAPERCLIP_CODEX_PROVIDERS",
   "PAPERCLIP_CODEX_USE_HOST_HOME",
   "PAPERCLIP_OPENCODE_MODEL_ALLOWLIST",
+  // The Penstock launcher reads this exact Secret-backed value. Keep the
+  // exception narrow; adjacent PENSTOCK_* names remain default-deny.
+  "PENSTOCK_API_KEY",
 
   // --- Toolchain cache locations ----------------------------------------
   // Non-secret paths. Inheriting these is in practice INERT: buildEnvVars()

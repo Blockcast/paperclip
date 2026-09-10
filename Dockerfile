@@ -378,10 +378,10 @@ WORKDIR /vendor
 # Bumped 2026-08-08 to 6dca020 (#56/#58): retain those fixes and restore the
 # PEN-1305 shell-command parser on the current adapter line. The vendor build
 # runs the upstream env-guard and execute suites against this exact tree.
-# Bumped 2026-08-08 to ed03316 (#60): reattach to an exact persisted lifecycle
-# Job after worker recovery instead of recreating its prompt Secret and Job.
-# Running and terminal Jobs are both recovered by name, UID, and run label.
-ARG OPENCODE_K8S_REF=ed0331690432d3c37cd7ed190ca1066c840b30c3
+# Bumped 2026-09-09 to 87a865d: add optional Caveman/Penstock and Ponytail
+# launcher wiring plus server-side credential-inheritance hardening while
+# retaining the persisted lifecycle recovery above.
+ARG OPENCODE_K8S_REF=87a865ded22d3ac4655b1c3fa1ad47473f23e7d8
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
@@ -485,8 +485,8 @@ FROM ghcr.io/github/github-mcp-server:v1.0.3 AS github-mcp
 # content digest prevents a refetch from silently changing the executable.
 FROM base AS penstock-agent-runtime
 USER root
-ARG PENSTOCK_RUNTIME_REF=2823acc1b4d730a86aded6b228f748aa12f40f53
-ARG PENSTOCK_RUNTIME_SHA256=fa6c923f78900919ec6fd3cbfe1c878078dab267e82e5faaa695d0c49f50f29e
+ARG PENSTOCK_RUNTIME_REF=9878ca2499ea8a8e24ec7d8bcf3222db65ac014a
+ARG PENSTOCK_RUNTIME_SHA256=961f38a5901fe5f775188d99ca542781f8dddec42f1e2ad0100a62b6bf409324
 RUN --mount=type=secret,id=penstock_runtime_token \
     set -eu; \
     test -s /run/secrets/penstock_runtime_token || { \
@@ -560,6 +560,8 @@ RUN set -eu; \
     git -C /tmp/ponytail archive --format=tar "${PONYTAIL_REF}" \
       | tar -x -C /opt/penstock/ponytail; \
     verify_sha256 "${PONYTAIL_HOOKS_SHA256}" /opt/penstock/ponytail/hooks/claude-codex-hooks.json; \
+    test -f /opt/penstock/ponytail/.claude-plugin/plugin.json; \
+    test -f /opt/penstock/ponytail/.opencode/plugins/ponytail.mjs; \
     node -e "const fs=require('node:fs');const p=JSON.parse(fs.readFileSync('/opt/penstock/ponytail/.claude-plugin/plugin.json','utf8'));if(p.name!=='ponytail'||p.version!=='4.9.0'){console.error('unexpected Ponytail plugin identity');process.exit(1)}"; \
     chmod -R a+rX,go-w /opt/penstock/ponytail; \
     rm -rf /tmp/ponytail

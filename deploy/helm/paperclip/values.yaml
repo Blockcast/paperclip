@@ -124,6 +124,12 @@ worker:
   # deploy that rolled the api and left the worker on older code reported
   # `success` and every tier-level signal read green (BLO-28920).
   deployedCommit: ""
+  # -- Additional environment variables for the worker StatefulSet only. These
+  # values are intentionally not merged into env.extra, because env.extra is
+  # rendered on both the API and worker tiers. Keep provider credentials here
+  # as Secret-backed valueFrom entries; literal credential values are rejected
+  # by policy and must never live in this file.
+  extraEnv: []
 
 # -- Kubernetes Service exposing the HTTP UI/API.
 service:
