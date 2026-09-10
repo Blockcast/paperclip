@@ -308,6 +308,42 @@ describe("readRunLogTerminalTail", () => {
     expect(result.scannedBytes).toBeGreaterThanOrEqual(maxScanBytes);
   });
 
+  // The same rule on the seeked path, and the one that is easy to leave out
+  // because the seek "already found the end": the size probe is a snapshot, not
+  // a seal. If the log keeps growing while the reader follows the appended
+  // ranges, the cap can run out with the cursor still live — and the window then
+  // held is an intermediate slice, neither the prefix the size-less walk keeps
+  // nor the end. Falling out of the loop into `{kind:"tail"}` would hand the
+  // caller a middle-of-log window labelled as the provider's last word, which is
+  // the exact silent misclassification this reader exists to remove.
+  it("reports `truncated` when growth outruns the scan cap on the seeked path", async () => {
+    const maxScanBytes = 4 * TAIL;
+    // Grows by more than it serves on every read, so `nextOffset` is never
+    // absent and only the cap can end the walk.
+    let size = 8 * TAIL;
+    const offsets: number[] = [];
+    const read: RunLogRangeReader = async ({ offset, limitBytes }) => {
+      offsets.push(offset);
+      const start = Math.max(0, Math.min(offset, size));
+      const end = Math.min(start + limitBytes, size);
+      const served = end - start;
+      size += 2 * limitBytes; // the pod is still flushing
+      return {
+        content: "x".repeat(Math.max(0, served)),
+        ...(end < size ? { nextOffset: end } : {}),
+        totalBytes: size,
+      };
+    };
+
+    const result = await readRunLogTerminalTail(read, { tailBytes: TAIL, maxScanBytes });
+
+    expect(result.kind).toBe("truncated");
+    expect(result.scannedBytes).toBeGreaterThanOrEqual(maxScanBytes);
+    // It did seek and then follow appends, rather than stopping at the probe —
+    // otherwise this would pass for the wrong reason.
+    expect(offsets.length).toBeGreaterThan(2);
+  });
+
   it("walks to EOF on a size-less store when the log fits inside the cap", async () => {
     const body = `${padTo(3 * TAIL)}${envelope("stdout", `${JSON.stringify(REFUSAL_EVENT)}\n`, "2026-09-08T21:55:56.000Z", 31)}\n`;
     const result = await readRunLogTerminalTail(fakeRangeStore(body, { reportsSize: false }).read, {
