@@ -82,8 +82,11 @@
  *   - relative paths (`node ./scripts/hook.js`) — cwd-dependent at spawn time;
  *   - any word carrying unquoted `$`, backtick, glob, brace, or a leading `~` —
  *     the shell rewrites it before exec;
- *   - the inner command of `bash -c '…'`, `eval`, or a `$(…)` substitution — not
- *     parsed;
+ *   - the operand of an interpreter option that takes code or a module rather
+ *     than a script — `bash -c '…'`, `node -e '…'`, `python3 -m pkg` — and
+ *     likewise anything inside `eval` or a `$(…)` substitution. Not parsed; the
+ *     operand is deliberately not stat'd, because a command *string* is not a
+ *     filename;
  *   - the second and later arguments of an interpreter — only the first non-flag
  *     argument is treated as the script.
  *
