@@ -188,7 +188,11 @@ import {
   taskKeysMatch,
 } from "./pr-review-duplicate-issue-guard.js";
 import { readOrphanedRunTerminalResult } from "./orphaned-run-terminal-result.js";
-import { findTerminalResultEventInRunLogTail } from "./run-log-terminal-result.js";
+import {
+  findTerminalResultEventInRunLogTail,
+  readRunLogTerminalTail,
+  type RunLogTailRead,
+} from "./run-log-terminal-result.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   deleteAgentJobExact,
@@ -21913,18 +21917,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   /**
-   * Keep the scan bounded: the terminal event is the last thing the agent
-   * writes, so a trailing window always suffices, and a runaway transcript must
-   * not balloon reconciler memory. `logBytes` is only written back on finalize
-   * (PEN-2106) and so is null for exactly the still-running rows this reads —
-   * hence a forward scan that retains only the trailing window, rather than a
-   * seek the size hint cannot support.
-   */
-  const EXTERNAL_LIFECYCLE_TERMINAL_RESULT_TAIL_BYTES = 256 * 1024;
-  const EXTERNAL_LIFECYCLE_TERMINAL_RESULT_MAX_SCAN_BYTES = 8 * 1024 * 1024;
-  const EXTERNAL_LIFECYCLE_TERMINAL_RESULT_CHUNK_BYTES = 256 * 1024;
-
-  /**
    * PEN-3129: recover the provider's own refusal for a Job the reconciler is
    * about to book as `job_failed`.
    *
@@ -21933,7 +21925,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * a crash, and a clean `exit(1)`. `externalLifecycleTerminalOutcome` takes
    * only the Job status, so the provider verdict is not lost through an
    * oversight; it is unreachable by construction. It does survive in the run's
-   * own durable log, which is what this reads.
+   * own durable log, which is what this reads — see `readRunLogTerminalTail`
+   * for why the read seeks to the end rather than walking from byte zero.
    *
    * Deliberately narrow: only a 429 qualifies. That is the provider saying the
    * subscription window is exhausted. A 529 means the server is overloaded and
@@ -21949,27 +21942,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     fallbackNowMs: number,
   ) {
     if (run.logStore !== "local_file" || !run.logRef) return null;
+    const logRef = run.logRef;
 
-    let tail = "";
+    let tailRead: RunLogTailRead;
     try {
-      let offset = 0;
-      let scanned = 0;
-      while (scanned < EXTERNAL_LIFECYCLE_TERMINAL_RESULT_MAX_SCAN_BYTES) {
-        const limitBytes = Math.min(
-          EXTERNAL_LIFECYCLE_TERMINAL_RESULT_CHUNK_BYTES,
-          EXTERNAL_LIFECYCLE_TERMINAL_RESULT_MAX_SCAN_BYTES - scanned,
-        );
-        const chunk = await runLogStore.read(
-          { store: "local_file", logRef: run.logRef },
-          { offset, limitBytes },
-        );
-        scanned += Buffer.byteLength(chunk.content, "utf8");
-        tail = (tail + chunk.content).slice(-EXTERNAL_LIFECYCLE_TERMINAL_RESULT_TAIL_BYTES);
-        // `nextOffset` is undefined once the store served the final byte; the
-        // `<= offset` guard keeps a misbehaving store from looping forever.
-        if (chunk.nextOffset == null || chunk.nextOffset <= offset) break;
-        offset = chunk.nextOffset;
-      }
+      tailRead = await readRunLogTerminalTail((range) =>
+        runLogStore.read({ store: "local_file", logRef }, range),
+      );
     } catch (err) {
       // Never block finalization on a log read. Without a verdict the run keeps
       // exactly the Job-level fields it has always had.
@@ -21980,7 +21959,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return null;
     }
 
-    const terminal = findTerminalResultEventInRunLogTail(tail);
+    if (tailRead.kind === "truncated") {
+      // A prefix is not a tail. The terminal event sits at the END of the log,
+      // so parsing what the capped walk happened to hold would report "no
+      // provider verdict" from bytes that could not have contained one. Say
+      // the read was inconclusive instead of implying the provider was silent.
+      logger.warn(
+        { runId: run.id, scannedBytes: tailRead.scannedBytes },
+        "run log scan reached its cap before EOF; skipping provider-verdict recovery",
+      );
+      return null;
+    }
+
+    const terminal = findTerminalResultEventInRunLogTail(tailRead.tail);
     if (!terminal) return null;
 
     // Key on `is_error`, NOT on `subtype`. A capacity refusal is emitted as
