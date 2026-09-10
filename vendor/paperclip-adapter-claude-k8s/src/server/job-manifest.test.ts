@@ -950,7 +950,8 @@ describe("buildJobManifest", () => {
 
       const { job } = buildJobManifest({ ctx, selfPod });
       const command = job.spec?.template?.spec?.containers[0]?.command?.join(" ") ?? "";
-      const boundedGit = `git -C '${workspaceRoot}' -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15`;
+      const wallClockSeconds = 60;
+      const boundedGit = `timeout ${wallClockSeconds} git -C '${workspaceRoot}' -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15`;
 
       expect(command).toContain(`fetch --no-tags --quiet origin`);
       // Fetch only after origin points at upstream — fetching earlier would pull
@@ -959,7 +960,7 @@ describe("buildJobManifest", () => {
       // Guarded, and in a subshell: `a && b || true` would parse as
       // `(a && b) || true` and swallow failures of the unguarded security
       // commands earlier in the chain.
-      expect(command).toContain(`(git -C '${workspaceRoot}' -c http.lowSpeedLimit=1000`);
+      expect(command).toContain(`(timeout ${wallClockSeconds} git -C '${workspaceRoot}' -c http.lowSpeedLimit=1000`);
       expect(command).toContain("config paperclip.originFetchFailed");
 
       // `fetch` restores refs/remotes/origin/<branch> but not the symbolic
@@ -978,19 +979,36 @@ describe("buildJobManifest", () => {
 
       // Both calls in this block reach the network — `set-head -a` queries the
       // remote for its default branch even when the tracking refs are already
-      // local — so the bound must be on both, not just the fetch.
+      // local — so the bounds must be on both, not just the fetch.
       expect(command).toContain(`${boundedGit} fetch --no-tags --quiet origin`);
       expect(command).toContain(`${boundedGit} remote set-head origin -a`);
 
-      // The guard against future drift is the *invariant* "every network-reaching
-      // git call carries the bound", not a count of how often the bound appears.
-      // Counting the bound asserts the inverse of what it looks like it asserts:
-      // a third call added WITHOUT the bound leaves the count at 2 and passes
-      // silently — exactly the regression worth catching — while a correctly
-      // bounded one pushes it to 3 and fails, training the next reader to bump
-      // the literal instead of reading the block.
+      // Each breadcrumb reports the failed call's exit code, so the two bounds
+      // are distinguishable after the fact rather than both being described as
+      // a stalled transfer. The splice is `'…'"$?"'…'`: closing the single
+      // quotes is what makes `$?` expand at all, and re-opening them is what
+      // keeps the backticks in the remedy text from becoming command
+      // substitution.
+      expect(command).toContain(`config paperclip.originFetchFailed 'best-effort fetch failed (exit '"$?"'; 124`);
+      expect(command).toContain(`config paperclip.originHeadUnset 'origin/HEAD could not be resolved (exit '"$?"'; 124`);
+
+      // The guard against future drift is the *invariant* "every
+      // network-reaching git call carries both bounds", not a count of how
+      // often either bound appears. Counting asserts the inverse of what it
+      // looks like it asserts: a third call added WITHOUT a bound leaves the
+      // count at 2 and passes silently — exactly the regression worth catching
+      // — while a correctly bounded one pushes it to 3 and fails, training the
+      // next reader to bump the literal instead of reading the block.
+      //
+      // The two bounds are tracked separately rather than folded into one
+      // boolean because they fail independently and the remedies differ: the
+      // rate bound is curl-only and catches a stalled transfer, the wall-clock
+      // bound is transport-agnostic and catches a hanging connect. A call
+      // carrying one and not the other is a real gap, and the assertion that
+      // fires should say which one is missing.
       const boundFlags = ["-c http.lowSpeedLimit=1000", "-c http.lowSpeedTime=15"];
       const gitPrefix = `git -C '${workspaceRoot}'`;
+      const wallClockPrefix = `timeout ${wallClockSeconds} `;
       // Deny-list, deliberately, because the two sets are not symmetric: the
       // verbs this block uses that stay local are enumerable, the ones that can
       // reach a remote are not. An allowlist of network verbs fails OPEN — an
@@ -1005,10 +1023,15 @@ describe("buildJobManifest", () => {
         /^\s*remote\s+(add|remove|rename|set-url)\b/.test(args);
       const reachesNetwork = (args: string) => !staysLocal(args);
 
-      const invocations = command
-        .split(gitPrefix)
+      const segments = command.split(gitPrefix);
+      const invocations = segments
         .slice(1)
-        .map((tail) => {
+        .map((tail, index) => {
+          // The wall-clock bound is a WRAPPER, so it sits before the `git`
+          // token and never appears in `tail`. Splitting on the prefix makes
+          // `segments[index]` exactly the text that ran up to this call, so its
+          // last characters are where the wrapper would be if present.
+          const wallClockBounded = segments[index].endsWith(wallClockPrefix);
           // One invocation ends at the next shell separator.
           const raw = tail.split(/&&|\|\||[;|)]/, 1)[0] ?? "";
           // Peel every leading `-c <key>=<value>` so boundedness is a question
@@ -1020,7 +1043,7 @@ describe("buildJobManifest", () => {
             flags.push(`-c ${m[1]}`);
             rest = rest.slice(m[0].length);
           }
-          return { args: rest, bounded: boundFlags.every((flag) => flags.includes(flag)) };
+          return { args: rest, rateBounded: boundFlags.every((flag) => flags.includes(flag)), wallClockBounded };
         });
 
       const networkCalls = invocations.filter((i) => reachesNetwork(i.args));
@@ -1058,14 +1081,34 @@ describe("buildJobManifest", () => {
         )
         .map((call) => call.slice(0, 60));
       expect(unclassifiedGitCalls).toEqual([]);
+      // Same treatment for the wall-clock wrapper, and for the same reason: the
+      // boundedness check below reads the wrapper off the text preceding a
+      // `git -C '<root>'` call, so a `timeout` spelled any other way — a
+      // different duration, `timeout -k`, or a wrapper around something that is
+      // not a run-workspace git call — would be admitted here while satisfying
+      // nothing. Classify every one and let anything unrecognised fail, so that
+      // adding a wrapper is a decision a human makes rather than one the parser
+      // makes silently by not matching.
+      const unclassifiedWallClockWrappers = [...command.matchAll(/(?<![-.`\w])timeout\b/g)]
+        .map((m) => command.slice(m.index))
+        .filter((call) => !call.startsWith(`${wallClockPrefix}${gitPrefix} `))
+        .map((call) => call.slice(0, 60));
+      expect(unclassifiedWallClockWrappers).toEqual([]);
       // The real guard: no unbounded network call, however this block grows.
       // Needs no edit when a third bounded call is legitimately added, and the
       // scope check above is what guarantees "every call" really means every
-      // call rather than every call written in one particular style.
-      expect(networkCalls.filter((i) => !i.bounded).map((i) => i.args.trim())).toEqual([]);
-      // ...and nothing that stays local pays the bound, so the bound tracks the
+      // call rather than every call written in one particular style. Asserted
+      // per bound so a failure names which one is missing — the two catch
+      // different failures and are not substitutes.
+      expect(networkCalls.filter((i) => !i.rateBounded).map((i) => i.args.trim())).toEqual([]);
+      expect(networkCalls.filter((i) => !i.wallClockBounded).map((i) => i.args.trim())).toEqual([]);
+      // ...and nothing that stays local pays either bound, so both track the
       // set of network calls in both directions.
-      expect(invocations.filter((i) => i.bounded && !reachesNetwork(i.args)).map((i) => i.args.trim())).toEqual([]);
+      expect(
+        invocations
+          .filter((i) => (i.rateBounded || i.wallClockBounded) && !reachesNetwork(i.args))
+          .map((i) => i.args.trim()),
+      ).toEqual([]);
       // Deliberate change-tripwire, NOT a boundedness check: the two calls above
       // are the whole network surface of run-workspace setup today. A third one
       // is a decision worth a human reading this block. Which edit is correct
