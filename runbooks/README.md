@@ -18,6 +18,13 @@ platform cannot resolve automatically. Each runbook should be:
   which nothing re-drives: decide re-review vs accept without double-posting a
   review. Trigger: alert `PaperclipPrReviewWakeTerminalFailed`, or
   `max by (error_code, scope) (paperclip_agent_wakeup_terminal_failed_unresolved{scope="pr_review"}) > 0`.
+- [`agent-review-submission-refused.md`](agent-review-submission-refused.md) —
+  an agent's PR review was refused by the `gh` egress guard and never posted,
+  because its `Reviewed head:` attestation is malformed or names a commit that
+  does not exist in the target repository. Covers how to tell cross-repository
+  contamination from a benign force-push, and why there is deliberately no
+  bypass. Trigger: agent stderr or run log carrying
+  `paperclip-github-egress: refusing to submit PR review:` with exit 65.
 - [`clear-polluted-ssh-workspace.md`](clear-polluted-ssh-workspace.md) —
   recover a stranded SSH-driven run whose workspace import is failing on a
   sibling task's leftover scratch state. Trigger: blocked issue auto-comment
