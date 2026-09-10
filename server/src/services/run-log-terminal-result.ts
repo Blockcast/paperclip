@@ -126,11 +126,12 @@ export type RunLogTailRead =
   /** `tail` is the true end of the log. */
   | { kind: "tail"; tail: string; scannedBytes: number }
   /**
-   * A size-less store forced a forward walk and the scan cap was reached with
-   * bytes still unread, so the window held is a PREFIX of the log, not its
-   * tail. Distinguished from `tail` because the terminal event lives at the
-   * END: a caller that treats a prefix as a tail reports "no verdict found"
-   * from bytes that could not have contained one.
+   * The scan cap was reached with bytes still unread, so the window held sits
+   * somewhere in the MIDDLE of the log: a PREFIX when a size-less store forced
+   * a forward walk, an intermediate slice when growth outran a seeked read.
+   * Distinguished from `tail` because the terminal event lives at the END —
+   * a caller that treats either as a tail reports "no verdict found" from
+   * bytes that could not have contained one.
    */
   | { kind: "truncated"; scannedBytes: number };
 
@@ -194,7 +195,14 @@ export async function readRunLogTerminalTail(
     // because this runs after the pod is terminal. A store with nothing new to
     // serve answers with an empty chunk and terminates the loop on the first
     // pass, which is what keeps the no-growth case to one extra read.
-    while (cursor != null && scannedBytes < maxScanBytes) {
+    while (cursor != null) {
+      // Same rule as the size-less walk below, and it has to be stated here
+      // too: exhausting the cap with the cursor still live means the window in
+      // hand is an intermediate slice — growth outran the scan — so it is
+      // neither the prefix nor the end. Falling out of the loop and answering
+      // `tail` would assert the one thing we cannot know, which is the failure
+      // this reader exists to remove rather than relocate.
+      if (scannedBytes >= maxScanBytes) return { kind: "truncated", scannedBytes };
       const chunk = await read({ offset: cursor, limitBytes: tailBytes });
       const chunkBytes = Buffer.byteLength(chunk.content, "utf8");
       scannedBytes += chunkBytes;

@@ -21960,10 +21960,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (tailRead.kind === "truncated") {
-      // A prefix is not a tail. The terminal event sits at the END of the log,
-      // so parsing what the capped walk happened to hold would report "no
-      // provider verdict" from bytes that could not have contained one. Say
-      // the read was inconclusive instead of implying the provider was silent.
+      // A window that is not the end is not a tail — whether it is the prefix a
+      // size-less walk kept or the intermediate slice a seeked read was left
+      // holding when growth outran the cap. The terminal event sits at the END
+      // of the log, so parsing either would report "no provider verdict" from
+      // bytes that could not have contained one. Say the read was inconclusive
+      // instead of implying the provider was silent.
       logger.warn(
         { runId: run.id, scannedBytes: tailRead.scannedBytes },
         "run log scan reached its cap before EOF; skipping provider-verdict recovery",
