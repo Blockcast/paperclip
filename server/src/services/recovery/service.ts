@@ -13341,7 +13341,16 @@ export function recoveryService(
     // candidate scan. The in-transaction revalidation below reads the memo
     // synchronously — issuing a k8s metrics call inside `db.transaction` would
     // hold a Postgres transaction open across a network round-trip.
-    const busySparedByRunId = new Map<string, boolean>();
+    //
+    // BLO-30245: the memo records ONLY what the probe saw — "this pod was busy
+    // when we asked" — never the derived spare decision. One run can hold locks
+    // on several candidates, `silentMs` is re-derived per candidate, and the
+    // candidates are walked sequentially, so the ceiling is the one input that
+    // can change between two reads of the same memo. Both read sites therefore
+    // evaluate it themselves. Folding it into the memoized value let a run
+    // probed at 2h58m answer a later candidate at 3h03m from the memo and keep
+    // that lock past the advertised bound for the rest of the invocation.
+    const podBusyAtProbeByRunId = new Map<string, boolean>();
     const isBusySparedRunningHolder = async (runId: string | null, lockedAt: Date | null) => {
       if (!runId) return false;
       const basis = runningLockStaleBasis(runId, lockedAt);
@@ -13350,21 +13359,28 @@ export function recoveryService(
       // Only holders that have actually crossed the sweeper's bound matter here;
       // anything younger is kept by the bound itself and must not cost a probe.
       if (silentMs < STALE_RUNNING_ISSUE_LOCK_MS) return false;
-      const memoized = busySparedByRunId.get(runId);
-      if (memoized !== undefined) return memoized;
       // Past the shared ceiling a busy pod is a CPU-burning zombie and loses its
       // lock regardless, exactly as the reaper kills it regardless — so the
       // BLO-19941 reclamation guarantee still has a bound.
-      const spared = silentMs < AGENT_POD_BUSY_MAX_STALE_MS
-        && (await probeAgentPodActivity(runId)) === "busy";
-      busySparedByRunId.set(runId, spared);
-      if (spared) {
+      //
+      // Evaluated BEFORE the memo so a holder that crossed the ceiling mid-loop
+      // cannot be answered from an earlier in-band spare. Deliberately does NOT
+      // write the memo: a past-ceiling candidate learns nothing about the pod,
+      // and `runningLockStaleBasis` falls back to the per-issue lock timestamp
+      // when a run has stamped no activity at all, so a later candidate of the
+      // same run can legitimately be in-band and is still owed its one probe.
+      if (silentMs >= AGENT_POD_BUSY_MAX_STALE_MS) return false;
+      const memoized = podBusyAtProbeByRunId.get(runId);
+      if (memoized !== undefined) return memoized;
+      const podBusy = (await probeAgentPodActivity(runId)) === "busy";
+      podBusyAtProbeByRunId.set(runId, podBusy);
+      if (podBusy) {
         logger.info(
           { runId, silentMs, staleBoundMs: STALE_RUNNING_ISSUE_LOCK_MS, ceilingMs: AGENT_POD_BUSY_MAX_STALE_MS },
           "sweepStaleIssueLocks: keeping issue lock — holder pod is executing a live subprocess (BLO-30087)",
         );
       }
-      return spared;
+      return podBusy;
     };
 
     for (const issue of candidates) {
@@ -13530,14 +13546,31 @@ export function recoveryService(
         const currentRunningLockSilent = (runId: string | null, lockedAt: Date | null) => {
           const basis = currentRunningLockStaleBasis(runId, lockedAt);
           if (!basis) return false;
-          if (Date.now() - basis.getTime() < STALE_RUNNING_ISSUE_LOCK_MS) return false;
+          const silentMs = Date.now() - basis.getTime();
+          if (silentMs < STALE_RUNNING_ISSUE_LOCK_MS) return false;
           // BLO-30087: mirror of the busy-pod spare in the pre-transaction scan.
           // Reads the memo rather than probing, so this stays synchronous and no
           // k8s round-trip happens while this transaction holds `issues` and
           // `heartbeat_runs` FOR UPDATE. Safe to key by runId alone: the
           // concurrent-bump bailouts above already guarantee
           // currentIssue.executionRunId === issue.executionRunId here.
-          if (runId && busySparedByRunId.get(runId) === true) return false;
+          //
+          // BLO-30245: the ceiling is re-derived here rather than inherited from
+          // the memo. The memo says only that the pod was busy WHEN PROBED; this
+          // revalidation necessarily runs later than that probe, so it has to
+          // re-ask whether the holder is still inside the band. Without this the
+          // pre-transaction hoist would only relocate the overshoot: a holder
+          // that crossed the ceiling mid-loop now reaches this transaction
+          // (where before it was filtered out earlier), and a memoized `true`
+          // would spare it here instead — one layer further down, where the
+          // hoist cannot see it.
+          if (
+            silentMs < AGENT_POD_BUSY_MAX_STALE_MS
+            && runId
+            && podBusyAtProbeByRunId.get(runId) === true
+          ) {
+            return false;
+          }
           return true;
         };
         const currentExecutionLockExpired = currentPreClaimLockExpired(
