@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -80,6 +80,11 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     // BLO-30087: back to "no positive busy evidence" so a busy-pod case cannot
     // leak into the pre-existing cases, which all assume silence == dead.
     mockProbeAgentPodActivity.mockImplementation(async () => "unknown");
+    // BLO-30245: reset the CALL HISTORY too, not just the implementation.
+    // Without this the count accumulates across cases, so any probe-count
+    // assertion silently measures every earlier test as well and its verdict
+    // depends on execution order.
+    mockProbeAgentPodActivity.mockClear();
   });
 
   afterAll(async () => {
@@ -1707,28 +1712,33 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       expect(result.issueIds).toEqual([issueId]);
     });
 
-    // Why the in-transaction revalidation does NOT need to re-check the busy
-    // ceiling — reviewed and asserted rather than left to inference.
+    // Why the in-transaction revalidation's `=== true` arm is still a no-op —
+    // reviewed and asserted rather than left to inference.
     //
-    // `currentRunningLockSilent` reads the memoized busy verdict without
-    // re-deriving the ceiling, which reads like a hole: a holder probed at 2h30m
-    // could be past the 3h ceiling by the time the transaction revalidates, and
-    // a memoized "spared" would then preserve a zombie's lock. It cannot,
-    // because being spared and reaching the transaction are mutually exclusive:
+    // `currentRunningLockSilent` reads the memoized busy verdict rather than
+    // probing, which reads like a hole: a holder probed at 2h30m could be past
+    // the 3h ceiling by the time the transaction revalidates, and a memoized
+    // "busy" would then preserve a zombie's lock. Two independent guards stop
+    // it, and it is worth being precise about which does what, because
+    // BLO-30245 turned on exactly this distinction.
     //
-    //   executionLockExpired = isPreClaimLockExpired(...) || runningLockSilent
-    //   runningLockSilent    = isRunningLockSilent(...) && !isBusySparedRunningHolder(...)
+    // 1. A holder spared inside the band never gets here at all:
     //
-    // and a non-cleanable `running` holder that is not expired hits `continue`
-    // before `db.transaction` is ever opened. So a `running` holder only reaches
-    // the transaction when the busy spare returned FALSE, which means the memo
-    // for that run is `false` or absent exactly when the branch is evaluated.
-    // The `=== true` arm is defensive, not load-bearing.
+    //      executionLockExpired = isPreClaimLockExpired(...) || runningLockSilent
+    //      runningLockSilent    = isRunningLockSilent(...) && !isBusySparedRunningHolder(...)
     //
-    // That guarantee lives in the ordering of two guards ~150 lines apart, and
-    // nothing enforced it. This case does: let a spared holder into the
-    // transaction and the branch stops being a no-op and becomes the bug it is
-    // mistaken for.
+    //    and a non-cleanable `running` holder that is not expired hits
+    //    `continue` before `db.transaction` is ever opened.
+    // 2. A holder PAST the ceiling does now reach this transaction — the
+    //    BLO-30245 hoist returns false early so the lock can be reclaimed — so
+    //    guard 1 no longer covers it. What covers it is that the revalidation
+    //    re-derives the ceiling itself before consulting the memo.
+    //
+    // Guard 1 alone was the original argument, and it was load-bearing: the
+    // moment the hoist let a past-ceiling holder through, the `=== true` arm
+    // stopped being a no-op and became the very bug it is mistaken for, one
+    // layer below where the hoist could see it. Hence guard 2. This case pins
+    // guard 1; the BLO-30245 mid-invocation case below pins guard 2.
     it("never lets a spared busy holder reach the sweep transaction", async () => {
       const { companyId, agentId } = await seed();
       // Spared: busy pod, inside the band.
@@ -1780,6 +1790,237 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       expect(row).toEqual({
         checkoutRunId: busy.wedgedRunId,
         executionRunId: busy.wedgedRunId,
+      });
+    });
+
+    // BLO-30245: one run can hold execution locks on SEVERAL candidates, and the
+    // loop derives `silentMs` per candidate from a live clock while `runById` is
+    // a pre-loop snapshot. The busy verdict is memoized per run to hold the
+    // probe to one k8s round-trip per invocation — so the memo is necessarily
+    // read at points where the holder's silence has moved on from where it was
+    // probed. These cases pin the ceiling as the authority at every read site,
+    // rather than something baked once into the memoized value.
+    describe("multi-issue holders crossing the ceiling (BLO-30245)", () => {
+      // One `running` holder, N issues, all locked by it. Distinct from
+      // seedWedgedRunningIssue, which mints a fresh holder per issue and so can
+      // never exercise a shared memo.
+      async function seedOneHolderManyIssues(input: {
+        companyId: string;
+        agentId: string;
+        silentFor: number;
+        issueCount: number;
+      }) {
+        const wedgedRunId = randomUUID();
+        const silentSince = new Date(Date.now() - input.silentFor);
+        await db.insert(heartbeatRuns).values({
+          id: wedgedRunId,
+          companyId: input.companyId,
+          agentId: input.agentId,
+          status: "running",
+          invocationSource: "assignment",
+          startedAt: silentSince,
+          lastOutputAt: silentSince,
+          lastUsefulActionAt: silentSince,
+        });
+        const issueIds: string[] = [];
+        for (let index = 0; index < input.issueCount; index += 1) {
+          const issueId = randomUUID();
+          issueIds.push(issueId);
+          await db.insert(issues).values({
+            id: issueId,
+            companyId: input.companyId,
+            title: `Lock ${index} held by one multi-issue holder`,
+            status: "in_progress",
+            priority: "high",
+            assigneeAgentId: input.agentId,
+            checkoutRunId: wedgedRunId,
+            executionRunId: wedgedRunId,
+            executionLockedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+          });
+        }
+        return { wedgedRunId, issueIds };
+      }
+
+      async function stillLockedIssueIds(issueIds: string[]) {
+        const rows = await db
+          .select({ id: issues.id, executionRunId: issues.executionRunId })
+          .from(issues)
+          .where(inArray(issues.id, issueIds));
+        return rows
+          .filter((row) => row.executionRunId !== null)
+          .map((row) => row.id)
+          .sort();
+      }
+
+      it("clears every lock of a holder already past the busy ceiling, without probing", async () => {
+        // The unconditional half of the acceptance criterion: a holder that was
+        // already past the ceiling when the sweep opened loses EVERY lock, with
+        // no dependence on which candidate is visited first.
+        const { companyId, agentId } = await seed();
+        const { issueIds } = await seedOneHolderManyIssues({
+          companyId,
+          agentId,
+          silentFor: AGENT_POD_BUSY_MAX_STALE_MS + 10 * 60 * 1000,
+          issueCount: 2,
+        });
+        mockProbeAgentPodActivity.mockImplementation(async () => "busy");
+
+        const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+        expect(result.cleared).toBe(2);
+        expect([...result.issueIds].sort()).toEqual([...issueIds].sort());
+        expect(await stillLockedIssueIds(issueIds)).toEqual([]);
+        // The ceiling settles this outright, so it must not cost a k8s call:
+        // past the bound no pod state can spare the lock.
+        expect(mockProbeAgentPodActivity).not.toHaveBeenCalled();
+      });
+
+      it("spares every lock of an in-band busy holder, probing exactly once", async () => {
+        // The other half: memoization is preserved, not removed. Hoisting the
+        // ceiling must not turn the spare into a per-issue k8s round-trip.
+        const { companyId, agentId } = await seed();
+        const { wedgedRunId, issueIds } = await seedOneHolderManyIssues({
+          companyId,
+          agentId,
+          silentFor: SILENT_INSIDE_WINDOW_MS,
+          issueCount: 2,
+        });
+        mockProbeAgentPodActivity.mockImplementation(async () => "busy");
+
+        const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+        expect(result.cleared).toBe(0);
+        expect(await stillLockedIssueIds(issueIds)).toEqual([...issueIds].sort());
+        expect(mockProbeAgentPodActivity).toHaveBeenCalledTimes(1);
+        expect(mockProbeAgentPodActivity).toHaveBeenCalledWith(wedgedRunId);
+      });
+
+      it("clears the lock of a holder that crosses the busy ceiling mid-invocation", async () => {
+        // The bug. Pre-fix the memo was read BEFORE the ceiling was evaluated,
+        // so a run probed `busy` at 2h58m answered a later candidate at 3h03m
+        // straight from the memo and kept that lock for the rest of the
+        // invocation — past the bound the sweeper advertises.
+        //
+        // Only the clock moves between the two candidates: they share one
+        // holder, and `runById` is a pre-loop snapshot. So advancing it from
+        // inside the probe mock lands the crossing precisely between them. The
+        // probe fires exactly once (the sole memo miss) and the first
+        // candidate's `silentMs` is already computed when it fires, so that
+        // candidate is legitimately in-band and keeps its lock. `silentMs` is
+        // re-derived per candidate, which is what makes the second one differ.
+        //
+        // Note this asserts the PRECISE criterion, not the loose reading of it:
+        // for a mid-loop crossing only the post-crossing candidates can clear.
+        // "every candidate" holds unconditionally in the already-past-ceiling
+        // case above, which is why both cases are needed.
+        const { companyId, agentId } = await seed();
+        const realNow = Date.now.bind(Date);
+        let clockOffsetMs = 0;
+        // vi.spyOn over Date.now, not fake timers: this suite drives real
+        // Postgres I/O, and `new Date()` does not route through Date.now in V8,
+        // so the service's own `clearedAt` stamps stay truthful.
+        const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow() + clockOffsetMs);
+        try {
+          const { issueIds } = await seedOneHolderManyIssues({
+            companyId,
+            agentId,
+            silentFor: AGENT_POD_BUSY_MAX_STALE_MS - 2 * 60 * 1000,
+            issueCount: 2,
+          });
+          mockProbeAgentPodActivity.mockImplementation(async () => {
+            // Crossing the ceiling between candidate one and candidate two.
+            clockOffsetMs = 5 * 60 * 1000;
+            return "busy";
+          });
+
+          const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+          // Caught by re-deriving the ceiling, not by spending a second probe.
+          expect(mockProbeAgentPodActivity).toHaveBeenCalledTimes(1);
+          // Pre-fix this is 0: the memo spared both candidates.
+          expect(result.cleared).toBe(1);
+          // The candidates query has no ORDER BY (see the pre-transaction scan),
+          // so which issue is visited first is unspecified. Assert the
+          // partition, never the identity: one keeps its lock, the other loses
+          // it, and they are not the same issue.
+          const stillLocked = await stillLockedIssueIds(issueIds);
+          expect(stillLocked).toHaveLength(1);
+          expect(issueIds).toContain(stillLocked[0]);
+          expect(result.issueIds).toHaveLength(1);
+          expect(stillLocked).not.toContain(result.issueIds[0]);
+        } finally {
+          // This suite has no restoreAllMocks in afterEach; leaking a shifted
+          // clock would corrupt every later case.
+          nowSpy.mockRestore();
+        }
+      });
+
+      it("still spares an in-band candidate of a holder whose other candidate is past the ceiling", async () => {
+        // Two candidates of ONE holder on opposite sides of the ceiling inside a
+        // single invocation. Reachable because `runningLockStaleBasis` falls back
+        // to the PER-ISSUE lock timestamp when a `running` holder has stamped no
+        // activity at all — the mid-claim shape — so `silentMs` stops being a
+        // property of the run alone.
+        //
+        // This pins the decision NOT to memoize the past-ceiling early return.
+        // Recording "not busy" there would poison the memo for the in-band
+        // candidate and clear a lock the ceiling never authorised clearing: the
+        // reported bug with its sign flipped, losing a live holder's workspace
+        // instead of over-holding a dead one. Order-independent by construction
+        // — whichever candidate the (unordered) query yields first, the
+        // past-ceiling one clears, the in-band one is spared, and the probe
+        // fires exactly once.
+        const { companyId, agentId } = await seed();
+        const wedgedRunId = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id: wedgedRunId,
+          companyId,
+          agentId,
+          status: "running",
+          invocationSource: "assignment",
+          // No activity signal of any kind, forcing the per-issue fallback.
+          startedAt: null,
+          lastOutputAt: null,
+          lastUsefulActionAt: null,
+        });
+        const pastCeilingIssueId = randomUUID();
+        const inBandIssueId = randomUUID();
+        await db.insert(issues).values([
+          {
+            id: pastCeilingIssueId,
+            companyId,
+            title: "Lock held past the busy ceiling",
+            status: "in_progress",
+            priority: "high",
+            assigneeAgentId: agentId,
+            checkoutRunId: wedgedRunId,
+            executionRunId: wedgedRunId,
+            executionLockedAt: new Date(
+              Date.now() - (AGENT_POD_BUSY_MAX_STALE_MS + 10 * 60 * 1000),
+            ),
+          },
+          {
+            id: inBandIssueId,
+            companyId,
+            title: "Lock held inside the busy band",
+            status: "in_progress",
+            priority: "high",
+            assigneeAgentId: agentId,
+            checkoutRunId: wedgedRunId,
+            executionRunId: wedgedRunId,
+            executionLockedAt: new Date(Date.now() - SILENT_INSIDE_WINDOW_MS),
+          },
+        ]);
+        mockProbeAgentPodActivity.mockImplementation(async () => "busy");
+
+        const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+        expect(result.cleared).toBe(1);
+        expect(result.issueIds).toEqual([pastCeilingIssueId]);
+        expect(
+          await stillLockedIssueIds([pastCeilingIssueId, inBandIssueId]),
+        ).toEqual([inBandIssueId]);
+        expect(mockProbeAgentPodActivity).toHaveBeenCalledTimes(1);
       });
     });
 
