@@ -377,6 +377,18 @@ api:
   maxUnavailable: 0
   spreadAcrossNodes: true
 
+# Penstock credentials belong to the worker tier only. The worker creates
+# agent Jobs and is the only tier that needs to inherit this exact key. Do not
+# move this entry into env.extra: that list is rendered on the API Deployment
+# as well, and the chart rejects that configuration.
+worker:
+  extraEnv:
+    - name: PENSTOCK_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: paperclip-penstock-org-key
+          key: token
+
 # Service account must mount its bearer token so the k8s-Job adapters can
 # create Jobs / read Pod logs / patch Secrets via the in-cluster kubeconfig.
 serviceAccount:

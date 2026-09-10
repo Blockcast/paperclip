@@ -213,7 +213,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("vendors the opencode_k8s adapter commit and executes its env-guard and runtime regressions", () => {
-    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=ed0331690432d3c37cd7ed190ca1066c840b30c3");
+    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=87a865ded22d3ac4655b1c3fa1ad47473f23e7d8");
     expect(serverDockerfile).toContain(
       "npm test -- src/server/env-guard-plugin.test.ts src/server/execute.test.ts",
     );
