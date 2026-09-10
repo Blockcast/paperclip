@@ -53,7 +53,7 @@ Record the following before changing the release or agent:
 
 | Item | Required evidence |
 | --- | --- |
-| Adapter code | The OpenCode adapter change is merged and the Claude adapter vendor update is included in the image source |
+| Adapter code | The OpenCode adapter change is reviewed and merged, and the Claude adapter vendor update is included in the image source |
 | Image | The exact server and agent image digests to test; both contain the runtime assets |
 | Launcher | `PENSTOCK_RUNTIME_REF` and `PENSTOCK_RUNTIME_SHA256` from `Dockerfile` |
 | Caveman | `CAVEMAN_RELEASE`, architecture-specific checksum, and `caveman-proxy version` output |
