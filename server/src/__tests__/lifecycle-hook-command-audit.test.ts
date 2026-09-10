@@ -269,6 +269,122 @@ describe("findMissingHookCommandPaths — previously silent recall gaps", () => 
   });
 });
 
+// BLO-29505 independent review (native-codex). Before this, every `-flag` was
+// skipped and the *next* word was taken as the script, so an option that
+// consumes a separate operand shadowed the real script: `python3 -X utf8
+// /app/hook.py` resolved `utf8`, found no absolute path, and stopped — leaving
+// a dead hook silently unaudited, which is the exact BLO-28782 failure this
+// module exists to catch.
+describe("findMissingHookCommandPaths — options that consume a separate operand", () => {
+  it("reaches the script behind a node preload option, and audits both", () => {
+    expect(
+      findMissingHookCommandPaths("node --require /missing-preload.js /app/hook.js", fsWith()),
+    ).toEqual(["/missing-preload.js", "/app/hook.js"]);
+  });
+
+  it("flags the script when only the script is missing", () => {
+    // Non-vacuous control: the row above must not be passing because the
+    // preload happens to absorb the finding.
+    expect(
+      findMissingHookCommandPaths(
+        "node --require /app/pre.js /app/hook.js",
+        fsWith("/app/pre.js"),
+      ),
+    ).toEqual(["/app/hook.js"]);
+    expect(
+      findMissingHookCommandPaths(
+        "node -r /app/pre.js /app/hook.js",
+        fsWith("/app/pre.js"),
+      ),
+    ).toEqual(["/app/hook.js"]);
+  });
+
+  it("reaches the script behind a python value option", () => {
+    // `utf8` is a value, not a filename — it must be consumed and never stat'd.
+    const stated: string[] = [];
+    expect(
+      findMissingHookCommandPaths("python3 -X utf8 /app/hook.py", {
+        fileExists: (p) => {
+          stated.push(p);
+          return false;
+        },
+      }),
+    ).toEqual(["/app/hook.py"]);
+    expect(stated).toEqual(["/app/hook.py"]);
+  });
+
+  const operandCases: { label: string; command: string; expected: string[] }[] = [
+    {
+      label: "node --import",
+      command: "node --import /app/reg.js /app/hook.js",
+      expected: ["/app/reg.js", "/app/hook.js"],
+    },
+    {
+      label: "node --loader",
+      command: "node --loader /app/loader.mjs /app/hook.js",
+      expected: ["/app/loader.mjs", "/app/hook.js"],
+    },
+    {
+      label: "node --require= attached form",
+      command: "node --require=/app/pre.js /app/hook.js",
+      expected: ["/app/pre.js", "/app/hook.js"],
+    },
+    {
+      label: "python -W filter",
+      command: "python3 -W ignore /app/hook.py",
+      expected: ["/app/hook.py"],
+    },
+    {
+      label: "python -X then -W",
+      command: "python3 -X utf8 -W ignore /app/hook.py",
+      expected: ["/app/hook.py"],
+    },
+    {
+      label: "perl -I include dir",
+      command: "perl -I /opt/lib /app/hook.pl",
+      expected: ["/app/hook.pl"],
+    },
+    {
+      label: "ruby -I include dir",
+      command: "ruby -I /opt/lib /app/hook.rb",
+      expected: ["/app/hook.rb"],
+    },
+  ];
+
+  for (const { label, command, expected } of operandCases) {
+    it(`resolves the script past ${label}: \`${command}\``, () => {
+      expect(findMissingHookCommandPaths(command, fsWith())).toEqual(expected);
+    });
+  }
+
+  it("never stats a value operand", () => {
+    // perl tolerates a missing `-I` directory silently, so flagging it would be
+    // a false positive on a working command.
+    const stated: string[] = [];
+    findMissingHookCommandPaths("perl -I /opt/gone /app/hook.pl", {
+      fileExists: (p) => {
+        stated.push(p);
+        return true;
+      },
+    });
+    expect(stated).toEqual(["/app/hook.pl"]);
+    expect(stated).not.toContain("/opt/gone");
+  });
+
+  it("keeps option meaning interpreter-scoped", () => {
+    // The same spelling means opposite things per binary, and guessing either
+    // way is a defect:
+    //   php -r  is *code*   -> stop, never stat the command string
+    //   node -r is a *path* -> audit it, then continue to the script
+    expect(findMissingHookCommandPaths(`php -r "/app/gone.php"`, fsWith())).toEqual([]);
+    //   python -I is isolated mode and takes no operand, so the very next word
+    //   is still the script; perl's -I takes a directory.
+    expect(findMissingHookCommandPaths("python3 -I /app/hook.py", fsWith())).toEqual([
+      "/app/hook.py",
+    ]);
+  });
+});
+
 // Documented skips: these stay silent on purpose. Asserting them keeps the
 // module header's stated limits honest — if a later change starts flagging one,
 // a test fails rather than an operator getting a warning we cannot stand behind.
