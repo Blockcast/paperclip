@@ -194,8 +194,67 @@ describe("inspectReviewAttestation", () => {
   // nothing and reads as "no attestation" rather than as a broken one.
   it("classifies the real 42-character marker as malformed, not absent", () => {
     const attestation = inspectReviewAttestation(bodyAttesting(MALFORMED_MARKER));
-    expect(attestation).toEqual({ kind: "malformed", raw: MALFORMED_MARKER });
+    expect(attestation).toEqual({
+      kind: "malformed",
+      raw: MALFORMED_MARKER,
+      detail: "not-a-sha",
+    });
     expect(MALFORMED_MARKER).toHaveLength(42);
+  });
+
+  // A good token is not a good attestation. The consumer requires the line to
+  // end after optional delimiters and whitespace, so trailing prose makes the
+  // line match its pattern nowhere — the review attests no head and the gate
+  // becomes permanently unsatisfiable, which is the fail-closed shape this
+  // guard exists to refuse. Validating only the token would allow it.
+  it("refuses a valid SHA followed by trailing prose", () => {
+    const attestation = inspectReviewAttestation(
+      `## Ally — Consolidated PR Review\nReviewed head: ${PIM_2864_HEAD} (rebased onto master)`,
+    );
+    expect(attestation).toEqual({
+      kind: "malformed",
+      raw: `${PIM_2864_HEAD} (rebased onto master)`,
+      detail: "trailing-content",
+    });
+  });
+
+  it("refuses an unmatched closing delimiter followed by trailing prose", () => {
+    expect(
+      inspectReviewAttestation(`Reviewed head: \`${PIM_2864_HEAD}\` see below`),
+    ).toMatchObject({ kind: "malformed", detail: "trailing-content" });
+  });
+
+  // The trailers the consumer does tolerate must still pass, or the guard would
+  // refuse the emphasis styles Ally actually emits. This list was derived by
+  // running each form through the real extractAllyReviewedHeadSha rather than
+  // read off its regex — the two agree on every case here.
+  it("accepts the forms the consumer tolerates", () => {
+    for (const line of [
+      `Reviewed head: ${PIM_2864_HEAD}`,
+      `Reviewed head: ${PIM_2864_HEAD}   `,
+      `Reviewed head: \`${PIM_2864_HEAD}\``,
+      `Reviewed head: **${PIM_2864_HEAD}**`,
+      `Reviewed head: _${PIM_2864_HEAD}_`,
+      `   Reviewed head: ${PIM_2864_HEAD}`,
+    ]) {
+      expect(inspectReviewAttestation(line), line).toEqual({
+        kind: "well-formed",
+        sha: PIM_2864_HEAD,
+      });
+    }
+  });
+
+  // A bolded *label* (`**Reviewed head:** \`sha\``) is rejected by the consumer
+  // too — the emphasis run cannot span `**` plus the space before the SHA. So
+  // refusing it here is agreement, not added strictness: posting it would
+  // produce an attestation the gate cannot read. Pinned so that if the
+  // consumer's grammar is ever widened to accept it (cf. BLO-31730, which
+  // widened for backticks), this test fails and the two are re-aligned
+  // deliberately rather than drifting apart.
+  it("refuses a bolded label, matching the consumer's own rejection", () => {
+    expect(
+      inspectReviewAttestation(`**Reviewed head:** \`${PIM_2864_HEAD}\``),
+    ).toMatchObject({ kind: "malformed" });
   });
 
   it("treats several attestations as ambiguous", () => {
@@ -292,6 +351,23 @@ describe("evaluateReviewSubmission", () => {
     expect((await evaluateReviewSubmission(crossRepoArgv, io))?.reason).toBe(
       "ambiguous-attestation",
     );
+  });
+
+  // Same local-refusal property as the 42-char case: the token resolves fine,
+  // so a reachability check would pass and the review would be posted with an
+  // attestation the gate can never read.
+  it("refuses trailing content after a resolvable SHA without consulting the network", async () => {
+    const resolveCommitReachability = vi.fn(async () => "reachable" as CommitReachability);
+    const io = makeIo({
+      readText: () => `Reviewed head: ${MEDIAMTX_HEAD} (after rebase)`,
+      resolveCommitReachability,
+    });
+
+    const refusal = await evaluateReviewSubmission(crossRepoArgv, io);
+
+    expect(refusal?.reason).toBe("malformed-attestation");
+    expect(refusal?.message).toContain("does not end after the SHA");
+    expect(resolveCommitReachability).not.toHaveBeenCalled();
   });
 
   // Reviewing a prior head is legitimate and common; the gate's own staleness
