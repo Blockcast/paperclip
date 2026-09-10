@@ -234,6 +234,22 @@ jobs:
         run: node --test ./scripts/opencode-k8s-runtime-cache-pin.test.js
         timeout-minutes: 1
 
+      # BLO-33204: its neighbour above pins WHICH commit; this checks the commit
+      # is still REACHABLE. A squash-merge in the adapter repo orphans the branch
+      # head we pinned without changing a byte of our Dockerfile, and the vendor
+      # stage's `git clone` only fetches ref-reachable objects — so the build
+      # dies with `fatal: unable to read tree` on the next cache miss while
+      # cache-hitting builds keep passing. That made a hard, estate-wide deploy
+      # break look intermittent and commit-specific. Needs network (the adapter
+      # repo is public, no token required); it fails the PR only on a definite
+      # orphan and warns rather than blocking when the probe itself cannot run.
+      - name: Validate opencode_k8s adapter pin is reachable (BLO-33204)
+        if: ${{ !cancelled() }}
+        run: |
+          node --test ./scripts/__tests__/opencode-k8s-pin-reachable.test.mjs
+          node ./scripts/check-opencode-k8s-pin-reachable.mjs
+        timeout-minutes: 3
+
       - name: Test merge-group concurrency key
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/merge-group-concurrency.test.mjs
