@@ -2648,6 +2648,27 @@ describeEmbeddedPostgres("github-webhook route", () => {
       );
     }
 
+    /**
+     * The wakes the notice scheduled for the assignee.
+     *
+     * A notice with no wake is just a row: `synchronize` suppresses the ordinary
+     * PR author wake, so this path is the only thing that puts the notice in
+     * front of the assignee before its next timer tick.
+     */
+    async function foreignCommitWakes(agentId: string) {
+      return db
+        .select({
+          reason: agentWakeupRequests.reason,
+          payload: agentWakeupRequests.payload,
+          idempotencyKey: agentWakeupRequests.idempotencyKey,
+        })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.reason, "github_foreign_commit"),
+        ));
+    }
+
     it("AC(a): posts exactly one notice naming the committing identity and SHA", async () => {
       const { issueId, foreignAgentId } = await seedForeignCommitFixture("BLO-41001");
       const app = buildApp({
@@ -2684,7 +2705,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     });
 
     it("AC(b): the assignee's own commit posts nothing", async () => {
-      const { issueId } = await seedForeignCommitFixture("BLO-41002");
+      const { issueId, assigneeAgentId } = await seedForeignCommitFixture("BLO-41002");
       const app = buildApp({
         listPullRequestCommits: commitsStub([
           {
@@ -2703,6 +2724,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       });
       expect(res.status).toBe(200);
       expect(await foreignCommitNotices(issueId)).toHaveLength(0);
+      expect(await foreignCommitWakes(assigneeAgentId)).toHaveLength(0);
     });
 
     it("AC(c): a merge commit posts nothing even though it is App-attributed", async () => {
@@ -2728,7 +2750,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     });
 
     it("is idempotent across a redelivery replaying the same SHA", async () => {
-      const { issueId } = await seedForeignCommitFixture("BLO-41004");
+      const { issueId, assigneeAgentId } = await seedForeignCommitFixture("BLO-41004");
       const app = buildApp({
         listPullRequestCommits: commitsStub([
           {
@@ -2746,6 +2768,68 @@ describeEmbeddedPostgres("github-webhook route", () => {
       await postSync(app, { identifier: "BLO-41004", number: 41004, deliveryId: "fc-d-2" });
 
       expect(await foreignCommitNotices(issueId)).toHaveLength(1);
+      // The wake dedupes with the row: the replay inserts no comment, so it
+      // never reaches the wake -- one notice, one interruption.
+      expect(await foreignCommitWakes(assigneeAgentId)).toHaveLength(1);
+    });
+
+    // The Critical finding on PR #1760: the notice was written straight to
+    // issue_comments and nothing scheduled the assignee, so the "notification"
+    // was a row that would sit unread until the next timer tick. `synchronize`
+    // suppresses the ordinary PR author wake (suppressAuthorWake), so this is
+    // the ONLY thing that puts the notice in front of its addressee.
+    it("wakes the assignee for the notice, carrying the comment into the run context", async () => {
+      const { issueId, assigneeAgentId } = await seedForeignCommitFixture("BLO-41008");
+      const app = buildApp({
+        listPullRequestCommits: commitsStub([
+          {
+            sha: WITNESS_SHA,
+            authorEmail: FOREIGN_EMAIL,
+            authorName: "Backend Engineer Go",
+            parentCount: 1,
+          },
+        ]),
+      });
+
+      const res = await postSync(app, {
+        identifier: "BLO-41008",
+        number: 41008,
+        deliveryId: "fc-h-1",
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.wakes).toContainEqual({
+        issueIdentifier: "BLO-41008",
+        agentId: assigneeAgentId,
+      });
+
+      const [notice] = await foreignCommitNotices(issueId);
+      expect(notice).toBeDefined();
+
+      const woken = await foreignCommitWakes(assigneeAgentId);
+      expect(woken).toHaveLength(1);
+      expect(woken[0]?.idempotencyKey).toBe(notice?.idempotencyKey);
+      expect(woken[0]?.payload).toMatchObject({
+        issueId,
+        prNumber: 41008,
+        repoFullName: "Blockcast/paperclip",
+        commitSha: WITNESS_SHA,
+      });
+
+      // wakeCommentId is what deriveCommentId resolves, so the run's directive
+      // renders the notice body instead of an unexplained "something changed".
+      const runs = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, assigneeAgentId));
+      expect(runs).toContainEqual(
+        expect.objectContaining({
+          contextSnapshot: expect.objectContaining({
+            issueId,
+            wakeReason: "github_foreign_commit",
+            wakeCommentId: expect.any(String),
+          }),
+        }),
+      );
     });
 
     it("does not fire on a shared-App author: unattributable is not foreign", async () => {

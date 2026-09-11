@@ -4996,6 +4996,20 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // Best-effort throughout: any failure is logged and never breaks the wake
     // path, mirroring the back-link and work-product blocks above.
     let foreignCommitNotices = 0;
+    // One entry per notice that was freshly inserted by THIS delivery. The
+    // wake is fired below, once `heartbeat` exists -- a notice nobody is woken
+    // for is just a row: `synchronize` sets suppressAuthorWake, so the
+    // assignee's normal PR wake is deliberately off on exactly the event this
+    // notice rides on. Carrying the comment id is what puts the notice body in
+    // the wake directive (deriveCommentId -> wakeCommentContext).
+    const foreignCommitWakes: Array<{
+      issueId: string;
+      issueIdentifier: string | null;
+      agentId: string;
+      commentId: string;
+      idempotencyKey: string;
+      sha: string;
+    }> = [];
     const foreignCommitAction = readStringField(payload, "action");
     const foreignCommitRepo = context.repoFullName;
     const foreignCommitPrNumber = context.prNumber;
@@ -5038,9 +5052,17 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               .where(inArray(agents.companyId, companyIds));
 
             for (const issue of owningMatched) {
+              // No assignee, nobody to tell. The notice body asserts "which is
+              // assigned to you", and there is no wake target either, so an
+              // unassigned issue would collect a row addressed to no one.
+              const noticeAssigneeAgentId = issue.assigneeAgentId;
+              if (!noticeAssigneeAgentId) continue;
+              // Same rule as the author-wake loop below: a teammate's commit is
+              // not a reason to reopen `done`/`cancelled` work.
+              if (issue.status === "done" || issue.status === "cancelled") continue;
               const selection = selectForeignCommits({
                 commits: commitsResult.commits,
-                assigneeAgentId: issue.assigneeAgentId,
+                assigneeAgentId: noticeAssigneeAgentId,
                 agents: roster.filter((a) => a.companyId === issue.companyId),
               });
 
@@ -5077,7 +5099,20 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
                   .onConflictDoNothing()
                   .returning({ id: issueComments.id })
                   .then((rows) => rows[0] ?? null);
-                if (inserted) foreignCommitNotices += 1;
+                // A replay inserts nothing, so the wake is deduped by the same
+                // (repo, pr, sha) key the row is -- no separate precheck, and a
+                // force-push replaying a known SHA cannot re-wake either.
+                if (inserted) {
+                  foreignCommitNotices += 1;
+                  foreignCommitWakes.push({
+                    issueId: issue.id,
+                    issueIdentifier: issue.identifier,
+                    agentId: noticeAssigneeAgentId,
+                    commentId: inserted.id,
+                    idempotencyKey,
+                    sha: foreign.sha,
+                  });
+                }
               }
             }
           }
@@ -5121,6 +5156,73 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       ownerType: "agent" | "board";
       cycles: number;
     }> = [];
+    // BLO-19528: fire the wake for each notice inserted above. Without this the
+    // notice is a row nobody is scheduled to read: `synchronize` sets
+    // suppressAuthorWake below, so the assignee's ordinary PR wake is
+    // deliberately off on exactly the event this notice rides on, and the
+    // assignee would not see it until its next timer tick -- by which time the
+    // force-push this exists to prevent may already have happened.
+    //
+    // Deliberately NOT routed through issueService.addComment: that function
+    // inserts and bumps updatedAt, and schedules no wake at all (the keyed
+    // comment-effect ledger that does is constructed inside routes/issues.ts,
+    // over that module's own svc/heartbeat closure, and is not reachable here).
+    // Insert + explicit heartbeat.wakeup is this file's established pattern --
+    // reopenInReviewIssueForActionablePrFeedback does exactly the same.
+    //
+    // `reason` deliberately does not start with `github_pr_`: that prefix is
+    // what makes derivePaperclipPrReview classify a run as PR-review-shaped, and
+    // this is an author-directed notice, not a review.
+    for (const notice of foreignCommitWakes) {
+      try {
+        await heartbeat.wakeup(notice.agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "github_foreign_commit",
+          // Same (repo, pr, sha) identity as the notice row. A replay inserts no
+          // comment so never reaches here; this keys the concurrent-delivery case.
+          idempotencyKey: notice.idempotencyKey,
+          payload: {
+            issueId: notice.issueId,
+            commentId: notice.commentId,
+            wakeCommentId: notice.commentId,
+            source: "github",
+            event: eventName,
+            deliveryId,
+            prNumber: foreignCommitPrNumber,
+            repoFullName: foreignCommitRepo,
+            prUrl: foreignCommitPrUrl,
+            commitSha: notice.sha,
+          },
+          contextSnapshot: {
+            issueId: notice.issueId,
+            taskId: notice.issueId,
+            wakeReason: "github_foreign_commit",
+            wakeSource: "automation",
+            wakeTriggerDetail: "system",
+            commentSource: "github",
+            // Carries the notice body into the run's directive via
+            // deriveCommentId -> wakeCommentContext.
+            wakeCommentId: notice.commentId,
+            commentId: notice.commentId,
+            githubEvent: eventName,
+            githubDeliveryId: deliveryId,
+            githubPrNumber: foreignCommitPrNumber,
+            githubRepoFullName: foreignCommitRepo,
+          },
+        });
+        wakes.push({ issueIdentifier: notice.issueIdentifier, agentId: notice.agentId });
+      } catch (err) {
+        // Best-effort like the notice itself: the row is already durable, so a
+        // failed wake degrades to "seen on the next tick", never to a 500.
+        logger.warn(
+          { err, issueId: notice.issueId, agentId: notice.agentId, sha: notice.sha },
+          "foreign-commit notice wake failed (non-fatal)",
+        );
+        skipped.push({ issueIdentifier: notice.issueIdentifier, reason: "foreign_commit_wake_threw" });
+      }
+    }
+
     let recoveryInstance: ReturnType<typeof recoveryService> | null = null;
     const getRecovery = () =>
       (recoveryInstance ??= recoveryService(db, { enqueueWakeup: heartbeat.wakeup }));
