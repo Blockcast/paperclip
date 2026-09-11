@@ -31,6 +31,7 @@ import {
   classifyGitInvocation,
   formatRefusal,
   formatScanFailure,
+  gitGlobalOptions,
   parsePrePushInput,
   scanPrePushUpdates,
   type GitReader,
@@ -81,9 +82,13 @@ export class GitEgressRuntimeError extends Error {
  */
 export function buildGitArgv(
   argv: readonly string[],
-  options: { hooksDir: string; resolveAlias?: (name: string) => string | null },
+  options: {
+    hooksDir: string;
+    resolveAlias?: (name: string) => string | null;
+    env?: NodeJS.ProcessEnv;
+  },
 ): string[] {
-  const classification = classifyGitInvocation(argv, options.resolveAlias);
+  const classification = classifyGitInvocation(argv, options.resolveAlias, options.env ?? {});
   if (!classification.isPush) return [...argv];
 
   if (classification.hasNoVerify) {
@@ -199,17 +204,37 @@ export function runGitEgressRuntime(options: {
   target: string;
   argv: string[];
   hooksDir: string;
+  env?: NodeJS.ProcessEnv;
 }): Promise<number> {
+  const env = options.env ?? process.env;
+
+  // Resolve aliases under the same effective configuration git itself will use.
+  // A bare `git config --get` reads whichever config files the WRAPPER's cwd
+  // selects, which is not necessarily the set the invocation selects: `-C`,
+  // `--git-dir` and `--work-tree` all change it, so `git -C /elsewhere yolo`
+  // would be looked up against the wrong repository. Forwarding the caller's
+  // own global options puts the lookup in the same place as the push.
+  //
+  // `--no-pager` goes last so it beats a caller's `-p`, which would otherwise
+  // hand this read to a pager. Nothing here can run a hook: `config` is a read.
+  //
+  // This does NOT cover `-c alias.x=...`; a definition on the command line is
+  // unreachable from a second process no matter what it is passed. That case is
+  // closed in `classifyGitInvocation`, which reads such definitions straight out
+  // of argv and consults them before this callback.
+  const globals = gitGlobalOptions(options.argv);
   const resolveAlias = (name: string): string | null => {
-    const result = spawnSync(options.target, ["config", "--get", `alias.${name}`], {
-      encoding: "utf8",
-    });
+    const result = spawnSync(
+      options.target,
+      [...globals, "--no-pager", "config", "--get", `alias.${name}`],
+      { encoding: "utf8", env, timeout: 10_000 },
+    );
     if (result.error || result.status !== 0) return null;
     const value = result.stdout.trim();
     return value.length > 0 ? value : null;
   };
 
-  const argv = buildGitArgv(options.argv, { hooksDir: options.hooksDir, resolveAlias });
+  const argv = buildGitArgv(options.argv, { hooksDir: options.hooksDir, resolveAlias, env });
 
   return new Promise((resolve, reject) => {
     const child = spawn(options.target, argv, { stdio: "inherit" });

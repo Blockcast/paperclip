@@ -57,6 +57,23 @@ const NO_VERIFY_FLAGS: ReadonlySet<string> = new Set(["--no-verify"]);
 /** The config key whose value decides which directory git reads hooks from. */
 const HOOKS_PATH_KEY = "core.hookspath";
 
+/** The config section under which an assignment defines an alias. */
+const ALIAS_KEY_PREFIX = "alias.";
+
+/**
+ * The environment `--config-env` reads through.
+ *
+ * Narrower than `NodeJS.ProcessEnv` on purpose: this module is pure, and taking
+ * the lookup as data keeps `--config-env` testable without mutating the real
+ * environment.
+ */
+export type GitEgressEnv = Readonly<Record<string, string | undefined>>;
+
+/** The key half of a `<name>=<value>` config assignment, case-folded. */
+function assignmentKey(assignment: string): string {
+  return (assignment.split("=", 1)[0] ?? "").trim().toLowerCase();
+}
+
 /**
  * True when a `<name>=<value>` config assignment targets `core.hooksPath`.
  *
@@ -66,7 +83,35 @@ const HOOKS_PATH_KEY = "core.hookspath";
  * only one of the two spellings. Verified against git 2.47.3.
  */
 function isHooksPathAssignment(assignment: string): boolean {
-  return (assignment.split("=", 1)[0] ?? "").trim().toLowerCase() === HOOKS_PATH_KEY;
+  return assignmentKey(assignment) === HOOKS_PATH_KEY;
+}
+
+/**
+ * The alias a `<name>=<value>` config assignment defines, or null.
+ *
+ * Case-folded for the same reason {@link isHooksPathAssignment} is, and
+ * measured the same way: against git 2.47.3, `-c alias.YOLO=...` defines the
+ * alias `git yolo` runs and `-c ALIAS.zz=...` defines `git zz`, so a
+ * case-sensitive match here would see one spelling of three.
+ *
+ * An assignment carrying no `=` defines nothing. Git rejects `-c alias.b`
+ * outright (`missing value for 'alias.b'`, `fatal: unable to parse command-line
+ * config`), so there is no boolean-true alias to model.
+ */
+function aliasAssignment(
+  assignment: string,
+  options: { fromEnv: boolean; env: GitEgressEnv },
+): { name: string; expansion: string } | null {
+  const separator = assignment.indexOf("=");
+  if (separator < 0) return null;
+  const key = assignmentKey(assignment);
+  if (!key.startsWith(ALIAS_KEY_PREFIX)) return null;
+  const name = key.slice(ALIAS_KEY_PREFIX.length);
+  if (!name) return null;
+  const raw = assignment.slice(separator + 1);
+  // `--config-env` names an environment variable; `-c` carries the value itself.
+  const expansion = options.fromEnv ? options.env[raw] : raw;
+  return expansion === undefined ? null : { name, expansion };
 }
 
 interface GlobalOptionScan {
@@ -74,42 +119,73 @@ interface GlobalOptionScan {
   subcommandIndex: number;
   /** A caller-supplied `core.hooksPath` override, as spelled, or null. */
   hooksPathOverride: string | null;
+  /** Aliases this token run defines, keyed by case-folded name. */
+  aliasDefinitions: Map<string, string>;
 }
 
 /**
- * Walk git's global options, reporting where the subcommand starts and whether
- * the caller set `core.hooksPath` along the way.
+ * Walk git's global options, reporting where the subcommand starts, whether the
+ * caller set `core.hooksPath` along the way, and which aliases they defined.
  *
- * Both outputs are security-relevant. Getting the option boundary wrong shifts
- * which token reads as the subcommand, so `git -c foo=bar push` would classify
- * as a `foo=bar` subcommand and sail past the guard. Missing a `core.hooksPath`
- * override lets the caller nominate the hooks directory themselves.
+ * All three outputs are security-relevant. Getting the option boundary wrong
+ * shifts which token reads as the subcommand, so `git -c foo=bar push` would
+ * classify as a `foo=bar` subcommand and sail past the guard. Missing a
+ * `core.hooksPath` override lets the caller nominate the hooks directory
+ * themselves. Missing an alias DEFINITION is the subtler one and is why
+ * `aliasDefinitions` exists at all: an alias defined here is invisible to a
+ * separate `git config --get`, so it cannot be looked up after the fact — see
+ * {@link classifyGitInvocation}.
+ *
+ * Only the separate-token `-c <name>=<value>` spelling is modelled because it is
+ * the only one git accepts: `-calias.x=push` is rejected with `unknown option`
+ * (git 2.47.3), so there is no attached short form to miss.
  */
-function scanGlobalOptions(tokens: readonly string[]): GlobalOptionScan {
+function scanGlobalOptions(
+  tokens: readonly string[],
+  env: GitEgressEnv = {},
+): GlobalOptionScan {
   let index = 0;
   let hooksPathOverride: string | null = null;
+  const aliasDefinitions = new Map<string, string>();
+  const define = (assignment: string, fromEnv: boolean) => {
+    const alias = aliasAssignment(assignment, { fromEnv, env });
+    // Last wins, matching git: `-c alias.d=status -c alias.d=push` runs push.
+    if (alias) aliasDefinitions.set(alias.name, alias.expansion);
+  };
   while (index < tokens.length) {
     const token = tokens[index]!;
     if (!token.startsWith("-")) break;
     // `--opt=value` carries its own value; `--opt value` and `-c x=y` do not.
     if (VALUE_TAKING_GLOBAL_OPTIONS.has(token)) {
       const value = tokens[index + 1];
-      if (
-        value !== undefined &&
-        (token === "-c" || token === "--config-env") &&
-        isHooksPathAssignment(value)
-      ) {
-        hooksPathOverride ??= `${token} ${value}`;
+      if (value !== undefined && (token === "-c" || token === "--config-env")) {
+        if (isHooksPathAssignment(value)) hooksPathOverride ??= `${token} ${value}`;
+        define(value, token === "--config-env");
       }
       index += 2;
       continue;
     }
-    if (token.startsWith("--config-env=") && isHooksPathAssignment(token.slice("--config-env=".length))) {
-      hooksPathOverride ??= token;
+    if (token.startsWith("--config-env=")) {
+      const assignment = token.slice("--config-env=".length);
+      if (isHooksPathAssignment(assignment)) hooksPathOverride ??= token;
+      define(assignment, true);
     }
     index += 1;
   }
-  return { subcommandIndex: index, hooksPathOverride };
+  return { subcommandIndex: index, hooksPathOverride, aliasDefinitions };
+}
+
+/**
+ * The leading global options of an invocation, up to but excluding the
+ * subcommand.
+ *
+ * Exported so the wrapper can resolve aliases under the same effective
+ * configuration git itself will use — `-C`, `--git-dir` and friends all select
+ * WHICH config files an alias lookup reads, and a bare `git config --get` reads
+ * the wrong ones.
+ */
+export function gitGlobalOptions(argv: readonly string[]): string[] {
+  return argv.slice(0, scanGlobalOptions(argv).subcommandIndex);
 }
 
 /** A hook bypass carried by an alias expansion rather than by argv. */
@@ -150,9 +226,27 @@ export interface GitInvocationClassification {
 /**
  * Split argv into git's global options and its subcommand.
  *
- * `resolveAlias` is consulted when the subcommand is not `push` — `git -c
- * alias.yolo=push yolo` is otherwise a complete bypass of this guard, and an
- * alias is cheap to resolve because it is a local config read with no network.
+ * Aliases are resolved when the subcommand is not `push` — `git -c
+ * alias.yolo=push yolo` is otherwise a complete bypass of this guard.
+ * Resolution has two sources, and the order between them is the fix for a
+ * measured hole:
+ *
+ *  1. Aliases the invocation DEFINES ITSELF, via `-c alias.x=...` or
+ *     `--config-env=alias.x=VAR`. These come first because git resolves them
+ *     first, and because they are invisible to any lookup made in a separate
+ *     process: `git -c alias.yolo='push --no-verify' yolo` pushes, while a
+ *     plain `git config --get alias.yolo` beside it exits 1 with no output.
+ *     Asking `resolveAlias` alone therefore returns nothing, `yolo` classifies
+ *     as not-a-push, and the argv is handed to git untouched — which then
+ *     expands the alias and skips the hook. Measured end to end against git
+ *     2.47.3: the push landed on the remote with the hook never running.
+ *  2. `resolveAlias`, for aliases that live in config files. Cheap: a local
+ *     config read with no network.
+ *
+ * Definitions accumulate ACROSS hops, because an expansion's own global options
+ * define aliases too — `alias.outer = -c alias.inner=push inner` reaches a push
+ * in git 2.47.3, so dropping the inner definition would lose the chain.
+ *
  * Resolution is bounded rather than recursive: git permits an alias to expand to
  * another alias, and an unbounded loop here would be a denial-of-service on a
  * config the agent controls.
@@ -166,8 +260,9 @@ export interface GitInvocationClassification {
 export function classifyGitInvocation(
   argv: readonly string[],
   resolveAlias?: (name: string) => string | null,
+  env: GitEgressEnv = {},
 ): GitInvocationClassification {
-  const globals = scanGlobalOptions(argv);
+  const globals = scanGlobalOptions(argv, env);
 
   if (globals.subcommandIndex >= argv.length) {
     return {
@@ -191,10 +286,15 @@ export function classifyGitInvocation(
   // business, and refusing it would break unrelated tooling.
   let pendingBypass: GitAliasBypass | null = null;
 
-  if (!isPush && resolveAlias) {
+  if (!isPush) {
+    const definitions = new Map(globals.aliasDefinitions);
+    // Command-line definitions beat config files, as they do in git.
+    const lookup = (name: string): string | null =>
+      definitions.get(name.toLowerCase()) ?? resolveAlias?.(name) ?? null;
+
     let name: string | null = subcommand;
     for (let hop = 0; hop < 4 && name && !isPush; hop += 1) {
-      const expansion = resolveAlias(name);
+      const expansion = lookup(name);
       if (!expansion) break;
       // A `!`-prefixed alias is an arbitrary shell command. We cannot parse it,
       // and refusing every one of them would break unrelated tooling, so it is
@@ -202,7 +302,10 @@ export function classifyGitInvocation(
       if (expansion.startsWith("!")) break;
 
       const tokens = expansion.trim().split(/\s+/).filter((token) => token.length > 0);
-      const expansionGlobals = scanGlobalOptions(tokens);
+      const expansionGlobals = scanGlobalOptions(tokens, env);
+      for (const [alias, value] of expansionGlobals.aliasDefinitions) {
+        definitions.set(alias, value);
+      }
       if (!pendingBypass && expansionGlobals.hooksPathOverride) {
         pendingBypass = { alias: name, expansion, reason: "hooks-path" };
       }

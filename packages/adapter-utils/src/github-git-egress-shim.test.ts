@@ -6,6 +6,7 @@ import {
   commitsForRefUpdate,
   formatRefusal,
   GitEgressScanError,
+  gitGlobalOptions,
   parsePrePushInput,
   scanCommit,
   scanPrePushUpdates,
@@ -167,6 +168,109 @@ describe("classifyGitInvocation", () => {
     const result = classifyGitInvocation(["p"], resolve);
     expect(result.isPush).toBe(true);
     expect(result.aliasBypass).toBeNull();
+  });
+
+  it("resolves an alias the invocation defines on its own command line", () => {
+    // The hole this closes, measured end to end against git 2.47.3:
+    //   git -c alias.yolo='push --no-verify' yolo origin HEAD:refs/heads/t
+    // pushed to the remote with the pre-push hook never running. A separate
+    // `git config --get alias.yolo` run beside it exits 1 with no output, so a
+    // lookup in another process cannot see the definition at all — consulting
+    // only `resolveAlias` classified `yolo` as not-a-push, left argv untouched,
+    // and git then expanded the alias itself. The definition is therefore read
+    // out of argv rather than looked up. No resolver is passed here on purpose.
+    const result = classifyGitInvocation(["-c", "alias.yolo=push --no-verify", "yolo"]);
+    expect(result.isPush).toBe(true);
+    // argv itself carries no --no-verify; only the expansion does.
+    expect(result.hasNoVerify).toBe(false);
+    expect(result.aliasBypass).toMatchObject({ alias: "yolo", reason: "no-verify" });
+  });
+
+  it("resolves a command-line alias that expands to an ordinary push", () => {
+    // The other half of the same hole, and the half that is not a refusal:
+    // classifying this as a push is what makes the wrapper inject the guard.
+    // Verified against git 2.47.3 — with `-c core.hooksPath=` injected the hook
+    // ran and aborted the push; without it the push went through unscanned.
+    const result = classifyGitInvocation(["-c", "alias.p=push", "p", "origin", "main"]);
+    expect(result.isPush).toBe(true);
+    expect(result.aliasBypass).toBeNull();
+    expect(result.subcommandIndex).toBe(2);
+  });
+
+  it("reads a command-line alias however git would spell it", () => {
+    const cases: Array<[string, string[], Record<string, string>]> = [
+      ["-c", ["-c", "alias.yolo=push", "yolo"], {}],
+      // Section and variable names are both case-insensitive in git config;
+      // `-c alias.YOLO=` and `-c ALIAS.yolo=` each define what `git yolo` runs.
+      ["case-folded name", ["-c", "alias.YOLO=push", "yolo"], {}],
+      ["case-folded section", ["-c", "ALIAS.yolo=push", "yolo"], {}],
+      ["--config-env=", ["--config-env=alias.yolo=A_PUSH", "yolo"], { A_PUSH: "push" }],
+      ["--config-env separate", ["--config-env", "alias.yolo=A_PUSH", "yolo"], { A_PUSH: "push" }],
+    ];
+    for (const [label, argv, env] of cases) {
+      expect(classifyGitInvocation(argv, undefined, env).isPush, label).toBe(true);
+    }
+  });
+
+  it("takes the LAST command-line definition of an alias, as git does", () => {
+    // `git -c alias.d=status -c alias.d='push --no-verify' config --get-all
+    // alias.d` prints both, and git runs the last. Taking the first would read
+    // this invocation as a `status` and wave the push through.
+    const result = classifyGitInvocation([
+      "-c",
+      "alias.d=status",
+      "-c",
+      "alias.d=push --no-verify",
+      "d",
+    ]);
+    expect(result.isPush).toBe(true);
+    expect(result.aliasBypass).toMatchObject({ reason: "no-verify" });
+  });
+
+  it("prefers a command-line definition over one in config, as git does", () => {
+    const result = classifyGitInvocation(
+      ["-c", "alias.p=push --no-verify", "p"],
+      () => "status",
+    );
+    expect(result.isPush).toBe(true);
+    expect(result.aliasBypass).toMatchObject({ reason: "no-verify" });
+  });
+
+  it("carries command-line definitions made inside an alias expansion", () => {
+    // `alias.outer = -c alias.inner=push inner` reaches a push in git 2.47.3:
+    // the expansion's own `-c` defines an alias git then resolves. Scanning the
+    // expansion for its subcommand but discarding what it DEFINES loses the
+    // chain one hop early.
+    const result = classifyGitInvocation(["-c", "alias.outer=-c alias.inner=push inner", "outer"]);
+    expect(result.isPush).toBe(true);
+  });
+
+  it("does not treat a command-line alias to a non-push as a push", () => {
+    const result = classifyGitInvocation(["-c", "alias.st=status --short", "st"]);
+    expect(result.isPush).toBe(false);
+    expect(result.aliasBypass).toBeNull();
+  });
+
+  it("ignores a --config-env alias naming a variable that is not set", () => {
+    // git would fail the invocation outright; there is no expansion to parse,
+    // and inventing one would refuse a push over a definition that never
+    // existed.
+    expect(classifyGitInvocation(["--config-env=alias.yolo=NOPE", "yolo"], undefined, {}).isPush).toBe(
+      false,
+    );
+  });
+});
+
+describe("gitGlobalOptions", () => {
+  it("returns the options that precede the subcommand", () => {
+    expect(gitGlobalOptions(["-C", "/repo", "-c", "alias.p=push", "p", "origin"])).toEqual([
+      "-C",
+      "/repo",
+      "-c",
+      "alias.p=push",
+    ]);
+    expect(gitGlobalOptions(["push", "origin"])).toEqual([]);
+    expect(gitGlobalOptions([])).toEqual([]);
   });
 });
 

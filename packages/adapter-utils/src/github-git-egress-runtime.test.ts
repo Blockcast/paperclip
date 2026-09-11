@@ -1,15 +1,24 @@
 import { describe, expect, it } from "vitest";
 
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
 import {
   buildGitArgv,
   DEFAULT_HOOKS_DIR,
   GitEgressRuntimeError,
   hooksDirectory,
+  runGitEgressRuntime,
   runPrePushHook,
 } from "./github-git-egress-runtime.js";
 import type { GitReader } from "./github-git-egress-shim.js";
 
 const HOOKS = "/hooks";
+
+/** Real git, or null when this environment has none to drive. */
+const GIT = spawnSync("git", ["--version"], { encoding: "utf8" }).status === 0 ? "git" : null;
 
 describe("buildGitArgv", () => {
   it("points a push at the hooks directory that holds the guard", () => {
@@ -123,6 +132,93 @@ describe("buildGitArgv", () => {
       resolveAlias: (name) => (name === "yolo" ? "push --force" : null),
     });
     expect(argv).toEqual(["-c", `core.hooksPath=${HOOKS}`, "yolo"]);
+  });
+
+  it("refuses an alias the command line defines for itself", () => {
+    // `git -c alias.yolo='push --no-verify' yolo` pushed to a real remote with
+    // the hook never running (git 2.47.3). The definition is unreachable from
+    // the `git config --get` this wrapper runs — that lookup exits 1 with no
+    // output — so no resolver is supplied here: the guard has to read the
+    // definition out of argv or it does not hold at all.
+    expect(() =>
+      buildGitArgv(["-c", "alias.yolo=push --no-verify", "yolo"], { hooksDir: HOOKS }),
+    ).toThrow(/expands to a push that skips the pre-push hook/);
+  });
+
+  it("guards a push reached through an alias the command line defines", () => {
+    // The non-refusal half: an ordinary command-line alias must still be
+    // recognised as a push so the guard is injected. Measured against git
+    // 2.47.3, `git -c alias.p=push -c core.hooksPath=<dir> p origin HEAD:...`
+    // ran the hook and the push aborted; without the injection it succeeded.
+    const argv = buildGitArgv(["-c", "alias.p=push", "p", "origin", "main"], {
+      hooksDir: HOOKS,
+    });
+    expect(argv).toEqual([
+      "-c",
+      "alias.p=push",
+      "-c",
+      `core.hooksPath=${HOOKS}`,
+      "p",
+      "origin",
+      "main",
+    ]);
+    expect(argv.indexOf(`core.hooksPath=${HOOKS}`)).toBeLessThan(argv.indexOf("p"));
+  });
+
+  it("reads a --config-env alias through the environment it is given", () => {
+    expect(() =>
+      buildGitArgv(["--config-env=alias.yolo=A_PUSH", "yolo"], {
+        hooksDir: HOOKS,
+        env: { A_PUSH: "push --no-verify" },
+      }),
+    ).toThrow(/expands to a push that skips the pre-push hook/);
+  });
+
+  it("leaves a command-line alias to a non-push alone", () => {
+    const argv = ["-c", "alias.st=status --short", "st"];
+    expect(buildGitArgv(argv, { hooksDir: HOOKS })).toEqual(argv);
+  });
+});
+
+describe.skipIf(!GIT)("runGitEgressRuntime alias resolution", () => {
+  // These drive REAL git, because the thing under test is whether the alias
+  // lookup runs against the same configuration git will use. A stubbed
+  // resolver would answer whatever the stub decided and prove nothing.
+
+  it("resolves a file-based alias in the repository the invocation selects", () => {
+    // `-C` chooses which config files an alias lookup reads. A bare `git config
+    // --get` reads the WRAPPER's cwd instead, finds nothing, and classifies the
+    // invocation as not-a-push. Measured against git 2.47.3 on a real remote:
+    // before the caller's global options were forwarded to the lookup,
+    // `git -C <repo> <push-alias>` published a commit carrying credential-shaped
+    // material with the hook never running.
+    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-"));
+    execFileSync("git", ["init", "-q", repo]);
+    execFileSync("git", ["-C", repo, "config", "alias.yolo", "push --no-verify"]);
+
+    // Refused during argv construction, so no push is ever attempted: reaching
+    // the refusal at all is the proof that the alias resolved.
+    // Thrown synchronously, before the promise is built — which is exactly why
+    // the entrypoint wraps this call in a try/catch as well as a .catch().
+    expect(() =>
+      runGitEgressRuntime({ target: "git", argv: ["-C", repo, "yolo"], hooksDir: HOOKS }),
+    ).toThrow(/expands to a push that skips the pre-push hook/);
+  });
+
+  it("prefers a command-line definition over the repository's own", () => {
+    // Git takes the command-line one; so must the guard, or a benign on-disk
+    // alias masks a hostile command-line redefinition of the same name.
+    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-"));
+    execFileSync("git", ["init", "-q", repo]);
+    execFileSync("git", ["-C", repo, "config", "alias.p", "status"]);
+
+    expect(() =>
+      runGitEgressRuntime({
+        target: "git",
+        argv: ["-C", repo, "-c", "alias.p=push --no-verify", "p"],
+        hooksDir: HOOKS,
+      }),
+    ).toThrow(/expands to a push that skips the pre-push hook/);
   });
 });
 
