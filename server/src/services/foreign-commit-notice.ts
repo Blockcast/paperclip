@@ -2,7 +2,7 @@
  * Foreign-commit detection for PR branches (BLO-19528).
  *
  * An agent is not told when *another* agent commits to a branch it believes it
- * solely owns. On trafficcontrol#1292 a genuine per-agent `git push` by
+ * solely owns. On trafficcontrol#1292 a genuine per-agent local push by
  * BackendEngineerGo landed on the CTO's branch; the CTO's next status comment
  * still described a PR it believed it solely authored. The same drift earlier
  * in that issue's history nearly caused a force-push over a teammate's work.
