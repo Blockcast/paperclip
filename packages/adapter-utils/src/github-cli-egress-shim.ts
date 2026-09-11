@@ -315,6 +315,15 @@ function splitRequestBody(body: string): {
   const proseFired = new Set<GitHubEgressScrubClass>();
 
   const walk = (node: unknown): unknown => {
+    // A string reaching walk() came from an ARRAY element (object properties
+    // are handled by key in the loop below, which is the only place a
+    // content-role key can be recognised). An array element has no key, so it
+    // is prose by construction and is always scrubbed.
+    if (typeof node === "string") {
+      const scrubbed = scrubGitHubEgressText(node);
+      for (const cls of scrubbed.classes) proseFired.add(cls);
+      return scrubbed.text;
+    }
     if (Array.isArray(node)) return node.map(walk);
     if (node === null || typeof node !== "object") return node;
 
