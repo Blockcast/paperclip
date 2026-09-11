@@ -176,6 +176,26 @@ describe("PEN-3139: run-log storage sanitizer masks vendor credential shapes wit
       expect(sanitized).not.toContain(SHORT_FINAL_LINE);
     });
 
+    it("masks a truncated key whose final fragment is shorter than the old floor", () => {
+      // Ally's second case: `compactRunLogChunk` can cut mid-fragment, leaving a
+      // sub-16-character tail that the segment walk used to pass through.
+      const fragment = "QUJ";
+      const chunk = `-----BEGIN RSA PRIVATE KEY-----\n${FULL_LINE}\n${fragment}`;
+
+      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+
+      expect(sanitized).not.toContain(fragment);
+    });
+
+    it("masks a truncated short final fragment arriving with escaped newlines", () => {
+      const fragment = "QUJ";
+      const chunk = `-----BEGIN RSA PRIVATE KEY-----\\n${FULL_LINE}\\n${fragment}`;
+
+      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+
+      expect(sanitized).not.toContain(fragment);
+    });
+
     /**
      * The 16+ floor is still load-bearing for the truncated case: with no footer
      * to bound the scan, a body matcher that accepts any base64-ish run would
