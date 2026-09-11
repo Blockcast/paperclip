@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -2941,6 +2941,163 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         )
       );
     expect(repeatedAnnouncements).toHaveLength(1);
+  });
+
+  // BLO-19124 AC4 (burst safety): "creating N recovery actions for one owner in a short
+  // window does not depend on that owner absorbing N wakes. Demonstrate with N >= 20
+  // against an owner whose maxConcurrentRuns is 3."
+  //
+  // The burst is the load shape that produced the original defect: 59 one-shot wakes landed
+  // on one owner in a day, the owner could absorb 3, and the rest were stranded forever. The
+  // guarantee under test is that a wake the owner CANNOT absorb costs the action nothing —
+  // the reserved attempt is refunded and the non-delivery is recorded in the separate
+  // dimension, so the deferred actions still hold their whole budget when capacity frees.
+  //
+  // `enqueueWakeup` is the seam, and null is not a stand-in for capacity here: null is
+  // literally how the real one reports every non-delivery path, capacity deferral included
+  // (see `enqueueOrRefundAttempt`, recovery/service.ts:5799). What this does NOT cover is
+  // whether the real dispatcher defers at exactly `maxConcurrentRuns` — that is the
+  // heartbeat's contract and has its own tests. The agent is still seeded with the AC's
+  // capacity so the mock's ceiling is read from the fixture rather than a magic literal.
+  it("refunds a burst of wakes one owner cannot absorb instead of spending their budget (BLO-19124 AC4)", async () => {
+    const BURST = 25;
+    const MAX_CONCURRENT = 3;
+    expect(BURST).toBeGreaterThanOrEqual(20);
+
+    const { companyId, coderId, prefix, sourceIssue } = await seedCompany();
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: MAX_CONCURRENT } } })
+      .where(eq(agents.id, coderId));
+    const [owner] = await db.select().from(agents).where(eq(agents.id, coderId));
+    const capacity =
+      (owner!.runtimeConfig as { heartbeat?: { maxConcurrentRuns?: number } })?.heartbeat
+        ?.maxConcurrentRuns ?? 0;
+    expect(capacity).toBe(MAX_CONCURRENT);
+
+    // seedCompany already made issue #1; fill the burst out to BURST on the same owner.
+    const extraIds = Array.from({ length: BURST - 1 }, () => randomUUID());
+    await db.insert(issues).values(
+      extraIds.map((id, index) => ({
+        id,
+        companyId,
+        title: `Burst issue ${index + 2}`,
+        status: "in_progress" as const,
+        priority: "medium" as const,
+        assigneeAgentId: coderId,
+        issueNumber: index + 2,
+        identifier: `${prefix}-${index + 2}`,
+      })),
+    );
+    const burstIssues = [
+      sourceIssue,
+      ...(await db.select().from(issues).where(inArray(issues.id, extraIds))),
+    ];
+    expect(burstIssues).toHaveLength(BURST);
+
+    let inFlight = 0;
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string } | null>
+    >(async () => {
+      if (inFlight >= capacity) return null; // owner is saturated — woke nobody
+      inFlight += 1;
+      return { id: randomUUID() };
+    });
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const escalate = (issue: (typeof burstIssues)[number]) =>
+      recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_progress",
+        latestRun: {
+          id: randomUUID(),
+          agentId: coderId,
+          status: "failed",
+          error: "agent is not invokable",
+          errorCode: "agent_not_invokable",
+          contextSnapshot: { retryReason: "issue_continuation_needed" },
+          livenessState: "needs_followup",
+          resultJson: null,
+          usageJson: null,
+          createdAt: new Date(),
+        },
+        comment: "Automatic continuation recovery failed.",
+      });
+
+    for (const issue of burstIssues) await escalate(issue);
+
+    const readActions = async () =>
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, companyId));
+    const afterBurst = await readActions();
+    expect(afterBurst).toHaveLength(BURST);
+
+    // (a) every action in the burst is bounded, so none can sit active forever.
+    for (const action of afterBurst) {
+      expect(action.maxAttempts !== null || action.timeoutAt !== null).toBe(true);
+    }
+
+    // The burst split exactly on what the owner could absorb.
+    const delivered = afterBurst.filter((action) => action.attemptCount > 0);
+    const deferred = afterBurst.filter((action) => action.attemptCount === 0);
+    expect(delivered).toHaveLength(MAX_CONCURRENT);
+    expect(deferred).toHaveLength(BURST - MAX_CONCURRENT);
+
+    // The load-bearing assertion. Without the refund every one of these carries
+    // attemptCount 1 for a wake that reached nobody, which is how a single burst used to
+    // eat 1/5 of 22 budgets at once. The two dimensions must not be conflated: the
+    // non-delivery is counted, just not against the budget.
+    for (const action of deferred) {
+      expect(action).toMatchObject({
+        attemptCount: 0,
+        nonDeliverySweepCount: 1,
+        status: "active",
+        retiringBound: null,
+      });
+    }
+    for (const action of delivered) {
+      expect(action).toMatchObject({ attemptCount: 1, nonDeliverySweepCount: 0 });
+    }
+
+    // AC4 itself: the burst must not have made the deferred work depend on having been
+    // absorbed by that first pass. A real owner frees its slots as runs finish, so drain
+    // the deferred set over successive sweep rounds with capacity released between them,
+    // and count the rounds — that count is the thing the 6h horizon has to accommodate.
+    const deferredIssueIds = new Set(deferred.map((action) => action.sourceIssueId));
+    const roundCap = BURST; // generous; the real number is asserted below
+    let rounds = 0;
+    let outstanding = [...deferredIssueIds];
+    while (outstanding.length > 0 && rounds < roundCap) {
+      rounds += 1;
+      inFlight = 0; // the owner's runs from the previous round have completed
+      // Re-read every round: the first sweep moved these to `blocked`, and the production
+      // sweep always reads current state. Passing the stale in_progress rows would be
+      // testing a shape that never reaches this path.
+      const refreshed = await db.select().from(issues).where(inArray(issues.id, outstanding));
+      for (const issue of refreshed) await escalate(issue);
+      const stillZero = await readActions();
+      outstanding = stillZero
+        .filter((row) => deferredIssueIds.has(row.sourceIssueId) && row.attemptCount === 0)
+        .map((row) => row.sourceIssueId);
+    }
+
+    // Every deferred action was eventually reached, and the burst cost it nothing: exactly
+    // one delivered wake out of a budget of `maxAttempts`, with every non-delivery it
+    // absorbed on the way counted in the other dimension instead.
+    const recovered = (await readActions()).filter((row) =>
+      deferredIssueIds.has(row.sourceIssueId),
+    );
+    expect(recovered).toHaveLength(BURST - MAX_CONCURRENT);
+    for (const action of recovered) {
+      expect(action.status).toBe("active");
+      expect(action.attemptCount).toBe(1);
+      expect(action.attemptCount).toBeLessThan(action.maxAttempts ?? Number.POSITIVE_INFINITY);
+      expect(action.nonDeliverySweepCount).toBeGreaterThanOrEqual(1);
+    }
+
+    // The number that matters to the horizon, pinned rather than described: draining a
+    // burst of N against capacity C takes ceil((N - C) / C) rounds, and the action has to
+    // stay alive across all of them. If a future change makes the sweep drain more per
+    // round this fails loudly, which is the good direction.
+    expect(rounds).toBe(Math.ceil((BURST - MAX_CONCURRENT) / MAX_CONCURRENT));
   });
 
   it("stamps configured bounds when creating a wake-owner recovery action", async () => {
