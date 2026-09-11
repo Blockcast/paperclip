@@ -980,14 +980,40 @@ const MAX_RUN_RESULT_JSON_REDACT_DEPTH = 24;
  * (not by key name) keeps the guard intact without exempting a
  * `terminalClaimToken` that appears anywhere else in the tree.
  *
- * Audited 2026-09-10 against every field read back out of `resultJson`
+ * `configurationIncomplete.missingBindings.{secretId,secretName}` are the
+ * SECRET REFERENCE — a `secrets` row UUID and its operator-chosen name — not
+ * the secret value, which by construction does not exist yet: this payload is
+ * raised by the pre-dispatch gate precisely because the binding is MISSING, so
+ * nothing was resolved. Both keys tokenize to two tokens containing `secret`,
+ * which `promotesTier2ToTier1` promotes to Tier 1, so key-name classification
+ * masked the only two fields that say WHICH binding to create. That reduced
+ * `reason: "secret_binding_missing"` to an unactionable notification, which is
+ * the same "opaque setup failure" the gate exists to replace. The sibling
+ * `error` column deliberately carries the identical `secretName` in the clear
+ * for triage (the PEN-3149 ruling keeps `error` company-readable), so masking
+ * it here protected nothing and only desynchronized the two columns.
+ *
+ * Audited 2026-09-10, re-audited 2026-09-11 after this row's CI caught the gap.
+ * The first audit covered only fields READ BACK OUT of `resultJson`
  * (`retryNotBefore`, `providerCapacityResetAt`, `errorFamily`, `stopReason`,
- * `processLoss`, `subtype`, …): this is the ONLY one that collides with a
- * secret-ish stem. Adding a control field whose name contains a Tier-1 stem
- * means adding it here, with a test.
+ * `processLoss`, `subtype`, …) and so could not see a HUMAN-TRIAGE field that
+ * no code path reads. The re-audit instead enumerated all 55 keys appearing in
+ * server-authored `resultJson` literals and ran every one through this walker:
+ * `secretId` and `secretName` are the only two over-masked, and `token` /
+ * `apiKey` / `password` / `authorization` / `secret` all still mask. Adding a
+ * control field whose name contains a Tier-1 stem means adding it here, with a
+ * test.
+ *
+ * These stay PATH-anchored rather than key-name exemptions on purpose: the
+ * paths below are written by the server (`heartbeat.ts` from the secrets
+ * service), never by an adapter, so adapter-authored content cannot reach them
+ * and claim the carve-out. An array index contributes no path segment, so one
+ * entry covers every element of `missingBindings`.
  */
 const RUN_RESULT_JSON_CONTROL_PATHS: ReadonlySet<string> = new Set([
   "externalLifecycleRecovery.terminalClaimToken",
+  "configurationIncomplete.missingBindings.secretId",
+  "configurationIncomplete.missingBindings.secretName",
 ]);
 
 /**

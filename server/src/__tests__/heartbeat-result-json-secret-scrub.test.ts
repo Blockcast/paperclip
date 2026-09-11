@@ -143,6 +143,82 @@ describe("sanitizeRunResultJsonForStorage (PEN-3153)", () => {
     });
   });
 
+  it("keeps the missing-binding secret REFERENCE readable for triage", () => {
+    // Caught by this row's own CI (server shard 2/4, run 34547653433): the
+    // key-tier half masked `secretId`/`secretName` inside
+    // `configurationIncomplete`, breaking
+    // `heartbeat-process-recovery.test.ts` > "blocks before dispatch when a
+    // declared secret ref has no binding instead of emitting an opaque setup
+    // failure".
+    //
+    // Both keys tokenize to two tokens containing `secret`, so
+    // `promotesTier2ToTier1` promotes them to Tier 1. But they are the secret
+    // REFERENCE (a `secrets` row UUID and its operator-chosen name), not the
+    // value -- and the value cannot be present, because this payload is raised
+    // by the pre-dispatch gate precisely because the binding is MISSING.
+    // Masking them protected nothing and reduced a "create THIS binding"
+    // instruction to the opaque failure the gate exists to replace.
+    const missingBinding = {
+      configPath: "env.UNBOUND_API_KEY",
+      consumerId: "1becd8a5-3512-460f-ac6e-abfb341c50a4",
+      consumerType: "agent",
+      envKey: "UNBOUND_API_KEY",
+      secretId: "b41f0b0b-daba-4341-8301-27bf71cc9e98",
+      secretName: "unbound-runtime-3d9c878d",
+    };
+    const controlShape = {
+      configurationIncomplete: {
+        reason: "secret_binding_missing",
+        missingBindings: [missingBinding],
+      },
+    };
+    // An array index contributes no path segment, so the single allowlist
+    // entry has to cover every element -- not just the first.
+    const twoEntries = {
+      configurationIncomplete: {
+        reason: "secret_binding_missing",
+        missingBindings: [missingBinding, { ...missingBinding, envKey: "OTHER_API_KEY" }],
+      },
+    };
+    expect(sanitizeRunResultJsonForStorage(controlShape)).toEqual(controlShape);
+    expect(sanitizeRunResultJsonForStorage(twoEntries)).toEqual(twoEntries);
+  });
+
+  it("exempts the missing-binding reference by PATH, not by key name", () => {
+    // Same root-anchoring rule as the claim token. `secretName` is only a
+    // reference where the SERVER writes it; the same key elsewhere in the tree
+    // is adapter-reachable and must still mask, or the carve-out becomes a
+    // laundering channel.
+    expect(
+      sanitizeRunResultJsonForStorage({
+        secretId: "b41f0b0b-daba-4341-8301-27bf71cc9e98",
+        secretName: "unbound-runtime-3d9c878d",
+        missingBindings: [{ secretName: "unbound-runtime-3d9c878d" }],
+      }),
+    ).toEqual({
+      secretId: "***REDACTED***",
+      secretName: "***REDACTED***",
+      missingBindings: [{ secretName: "***REDACTED***" }],
+    });
+  });
+
+  it("still text-scrubs a credential planted at an exempt control path", () => {
+    // Defense in depth for BOTH allowlist entries. The exemption suppresses
+    // key-name masking only; `redactSensitiveText` still runs on the leaf. A
+    // UUID and a binding name match no credential shape and survive, but a
+    // real credential parked at the same path does not -- so the carve-out
+    // cannot be used to launder one.
+    const scrubbed = sanitizeRunResultJsonForStorage({
+      externalLifecycleRecovery: {
+        terminalClaimToken: `PEN3153_FIXTURE_TOKEN=${FIXTURE_SECRET}`,
+      },
+      configurationIncomplete: {
+        missingBindings: [{ secretName: `PEN3153_FIXTURE_PASSWORD=${FIXTURE_SECRET}` }],
+      },
+    });
+    expect(JSON.stringify(scrubbed)).not.toContain(FIXTURE_SECRET);
+  });
+
   it("passes through values that are not plain objects or arrays", () => {
     expect(sanitizeRunResultJsonForStorage(null)).toBeNull();
     expect(sanitizeRunResultJsonForStorage(undefined)).toBeUndefined();
