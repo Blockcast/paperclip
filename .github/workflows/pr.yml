@@ -1604,17 +1604,6 @@ jobs:
     # 100% and 2/4 99%, policy 99%, server 1/4 98%, Typecheck 96%) and 46 cap
     # kills file-wide costing ~25.7 runner-hours/week. See BLO-32794 for the
     # full per-job table before sizing any other cap here by eye.
-    # successful jobs: setup p50 5.6m / p100 14.3m, but `Run e2e tests` p50
-    # 36.8m / p100 62.9m -- the suite is 87% of a median job, so nothing done
-    # to setup can move this. All three banked cap kills died INSIDE the suite
-    # step (62.8m, 64.7m, 69.0m of suite time), never in setup. Daily p50 of
-    # successful runs: 28.8 (09-03) -> 34.0 -> 39.5 -> 34.9 (09-06), i.e. a
-    # level shift then flat, NOT a linear ramp -- so do not derive a shelf life
-    # from a slope. BLO-33282 owns the durable fix (cross-job `--shard`, which
-    # `workers: 1` does NOT preclude: that setting bounds intra-job parallelism
-    # because specs share one server, while each sharded JOB boots its own
-    # throwaway webServer). Re-derive this number there rather than raising it
-    # again.
     timeout-minutes: 90
 
     steps:
