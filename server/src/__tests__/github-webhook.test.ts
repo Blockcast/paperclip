@@ -2600,8 +2600,9 @@ describeEmbeddedPostgres("github-webhook route", () => {
         authorName: string | null;
         parentCount: number;
       }>,
+      truncated = false,
     ): NonNullable<GithubWebhookConfig["listPullRequestCommits"]> {
-      return async () => ({ commits });
+      return async () => ({ commits, truncated });
     }
 
     async function postSync(
@@ -2702,6 +2703,59 @@ describeEmbeddedPostgres("github-webhook route", () => {
         committingAgentId: foreignAgentId,
         prNumber: 41001,
       });
+    });
+
+    it("a truncated commit listing still notifies and reports the gap", async () => {
+      const { issueId } = await seedForeignCommitFixture("BLO-41009");
+      // The shape the 250 ceiling produces: a foreign commit inside the window
+      // that was read, and an unknown number outside it that was not.
+      const app = buildApp({
+        listPullRequestCommits: commitsStub(
+          [
+            {
+              sha: WITNESS_SHA,
+              authorEmail: FOREIGN_EMAIL,
+              authorName: "Backend Engineer Go",
+              parentCount: 1,
+            },
+          ],
+          true,
+        ),
+      });
+
+      const res = await postSync(app, {
+        identifier: "BLO-41009",
+        number: 41009,
+        deliveryId: "fc-trunc-1",
+      });
+      expect(res.status).toBe(200);
+      // Truncation must not silently downgrade the guarantee to "no foreign
+      // commits": the visible one still notifies...
+      expect(await foreignCommitNotices(issueId)).toHaveLength(1);
+      // ...and the unchecked remainder is reported rather than assumed clean.
+      expect(res.body.foreignCommitListingTruncated).toBe(true);
+    });
+
+    it("a complete commit listing does not report truncation", async () => {
+      await seedForeignCommitFixture("BLO-41010");
+      const app = buildApp({
+        listPullRequestCommits: commitsStub([
+          {
+            sha: WITNESS_SHA,
+            authorEmail: FOREIGN_EMAIL,
+            authorName: "Backend Engineer Go",
+            parentCount: 1,
+          },
+        ]),
+      });
+
+      const res = await postSync(app, {
+        identifier: "BLO-41010",
+        number: 41010,
+        deliveryId: "fc-trunc-2",
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.foreignCommitListingTruncated).toBeUndefined();
     });
 
     it("AC(b): the assignee's own commit posts nothing", async () => {

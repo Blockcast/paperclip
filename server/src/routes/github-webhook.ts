@@ -4996,6 +4996,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // Best-effort throughout: any failure is logged and never breaks the wake
     // path, mirroring the back-link and work-product blocks above.
     let foreignCommitNotices = 0;
+    let foreignCommitListingTruncated = false;
     // One entry per notice that was freshly inserted by THIS delivery. The
     // wake is fired below, once `heartbeat` exists -- a notice nobody is woken
     // for is just a row: `synchronize` sets suppressAuthorWake, so the
@@ -5045,6 +5046,21 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               "foreign-commit notice: PR commit listing failed (non-fatal)",
             );
           } else {
+            // A short listing is unproven, not empty. Notify on what was read
+            // -- dropping it would trade "missed the oldest commits" for
+            // "missed all of them" -- but say so, because the whole hazard
+            // this notice exists for is an assignee trusting a silent gap.
+            if (commitsResult.truncated) {
+              foreignCommitListingTruncated = true;
+              logger.warn(
+                {
+                  prNumber: foreignCommitPrNumber,
+                  repoFullName: foreignCommitRepo,
+                  commitsRead: commitsResult.commits.length,
+                },
+                "foreign-commit notice: PR commit listing truncated, older commits cannot be checked",
+              );
+            }
             const companyIds = Array.from(new Set(owningMatched.map((i) => i.companyId)));
             const roster = await db
               .select({ id: agents.id, name: agents.name, companyId: agents.companyId })
@@ -5598,6 +5614,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       ...(workProductsUpserted > 0 ? { workProductsUpserted } : {}),
       ...(backLinked.length ? { backLinked } : {}),
       ...(foreignCommitNotices > 0 ? { foreignCommitNotices } : {}),
+      ...(foreignCommitListingTruncated ? { foreignCommitListingTruncated } : {}),
       ...(escalated.length ? { escalated } : {}),
     });
   });

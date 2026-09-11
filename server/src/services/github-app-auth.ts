@@ -514,12 +514,31 @@ export type GitHubPullRequestCommit = {
   parentCount: number;
 };
 
+/**
+ * `truncated` means "this listing is not provably complete" -- see
+ * {@link GITHUB_PR_COMMITS_ENDPOINT_LIMIT}. It is NOT an error: the commits
+ * that were read are still usable, and dropping them would notify about
+ * nothing rather than about most things. Callers must surface it, because a
+ * silently short list is indistinguishable from a PR with no foreign commits.
+ */
 export type GitHubPullRequestCommitsResult =
-  | { commits: GitHubPullRequestCommit[] }
+  | { commits: GitHubPullRequestCommit[]; truncated: boolean }
   | { error: string };
 
 /** Cap on `/pulls/{n}/commits` pages. GitHub itself truncates this endpoint at 250 commits. */
 export const GITHUB_PR_COMMITS_MAX_PAGES = 3;
+
+/**
+ * GitHub's own ceiling on `/pulls/{n}/commits`: "Lists a maximum of 250
+ * commits for a pull request." It is announced nowhere in the response -- the
+ * endpoint just stops, so a 250-commit page-out looks exactly like a PR that
+ * has 250 commits and no more. This ceiling, not {@link
+ * GITHUB_PR_COMMITS_MAX_PAGES}, is what actually truncates in practice: 250 <
+ * 3 * 100, so the page loop always breaks on a short page first and never
+ * reaches its own cap. Both are still checked -- the page cap is the one that
+ * bites if `per_page` or the cap is ever retuned.
+ */
+export const GITHUB_PR_COMMITS_ENDPOINT_LIMIT = 250;
 
 /**
  * List a PR's commits with their **git author** identity (BLO-19528).
@@ -530,6 +549,11 @@ export const GITHUB_PR_COMMITS_MAX_PAGES = 3;
  *
  * `parents.length` is carried through so the caller can exclude merge/squash
  * commits, which the GitHub merge API creates and legitimately App-attributes.
+ *
+ * Returns `truncated: true` when the listing cannot be proven complete. A
+ * truncated read is *unproven*, never absence -- the caller still gets every
+ * commit that was read and must report the gap rather than treat the short
+ * list as the whole PR.
  */
 export async function githubListPullRequestCommits(input: {
   repoFullName: string;
@@ -541,6 +565,7 @@ export async function githubListPullRequestCommits(input: {
   const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
   const apiBase = gitHubApiBase(GITHUB_HOST);
   const commits: GitHubPullRequestCommit[] = [];
+  let truncated = false;
 
   for (let page = 1; page <= GITHUB_PR_COMMITS_MAX_PAGES; page += 1) {
     const url =
@@ -580,9 +605,18 @@ export async function githubListPullRequestCommits(input: {
     }
 
     if (batch.length < 100) break;
+    // A full last page with no pages left: our own cap cut the listing short.
+    if (page === GITHUB_PR_COMMITS_MAX_PAGES) truncated = true;
   }
 
-  return { commits };
+  // GitHub's 250 ceiling reports itself as a short page, so the loop above
+  // exits believing it read to the end. Landing on the ceiling is the only
+  // signal there is, and it is deliberately fail-closed: a PR with exactly
+  // 250 commits is flagged too, because nothing in the response distinguishes
+  // it from one with 400.
+  if (commits.length >= GITHUB_PR_COMMITS_ENDPOINT_LIMIT) truncated = true;
+
+  return { commits, truncated };
 }
 
 export async function githubHasReviewerEvidenceForPr(input: {
