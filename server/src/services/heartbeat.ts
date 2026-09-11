@@ -24046,9 +24046,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const runContext = parseObject(run.contextSnapshot);
-      const monitorIssueId = readNonEmptyString(runContext.issueId);
-      const monitorNextCheckAt = monitorIssueId
-        ? monitorNextCheckAtByIssue.get(`${run.companyId}:${monitorIssueId}`)
+      // Presence of an issue id is what separates durable issue work from a
+      // timer/maintenance run, so this is read by both the monitor-wake lookup
+      // below and the pre-adapter retry gate (BLO-33385).
+      const runIssueId = readNonEmptyString(runContext.issueId);
+      const monitorNextCheckAt = runIssueId
+        ? monitorNextCheckAtByIssue.get(`${run.companyId}:${runIssueId}`)
         : undefined;
       const monitorDispatchLostWithoutFutureWake =
         readNonEmptyString(runContext.wakeReason) === "issue_monitor_due" &&
@@ -24106,7 +24109,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           (run.processLossRetryCount ?? 0) < 1 &&
           prReviewRetry
         ) ||
-        (externalLifecyclePreAdapter && (run.processLossRetryCount ?? 0) < 1 && prReviewRetry) ||
+        // BLO-33385: an issue-scoped run that died before adapter invocation
+        // loses a ONE-SHOT wake (issue_comment_mentioned, missing_issue_comment,
+        // issue_continuation_needed, ...). Nothing redelivers those, so without a
+        // retry the issue is released and strands. `externalLifecyclePreAdapter`
+        // is the durable proof that adapter invocation never began -- the same
+        // proof the job_failed/oom_killed path demands before allowing a retry --
+        // so there are no partial external writes to duplicate. Gating on issue
+        // id keeps timer/maintenance runs terminal (BLO-7913): those self-
+        // redeliver, so retrying them only leaks. Same shape as the
+        // k8s_concurrent_run_blocked rule above (`isIssueRun || isPrReview...`).
+        (
+          externalLifecyclePreAdapter &&
+          (run.processLossRetryCount ?? 0) < 1 &&
+          (prReviewRetry || !!runIssueId)
+        ) ||
         ((run.processLossRetryCount ?? 0) < 1 && monitorDispatchLostWithoutFutureWake);
       const baseMessage = externalLifecyclePreAdapter
         ? "Process lost before external adapter invocation -- k8s job terminated or server restarted"
