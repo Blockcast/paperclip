@@ -203,6 +203,8 @@ describe("agent inbox-lite concurrent-claim guard (BLO-29965)", () => {
       scheduledRetryReason: "ccrotate_capacity",
       scheduledRetryAttempt: 1,
       scheduledRetryRunId: "run-a",
+      // run-a belongs to the SAME agent as the caller: the sibling case.
+      scheduledRetryAgentId: "agent-1",
       ...overrides,
     };
   }
@@ -271,11 +273,44 @@ describe("agent inbox-lite concurrent-claim guard (BLO-29965)", () => {
         scheduledRetryReason: null,
         scheduledRetryAttempt: null,
         scheduledRetryRunId: null,
+        scheduledRetryAgentId: null,
       }),
     ]);
 
     const items = await loadInbox({ callerRunId: "run-b", nowMs: RUN_B_WOKE });
 
     expect(items.map((issue) => issue.id)).toEqual(["issue-1"]);
+  });
+
+  // BLO-29965 review round 3. Reassigning an issue leaves the previous
+  // assignee's `scheduled_retry` row alive — `issues.update` nulls only the
+  // issue-side lock columns and never writes `heartbeat_runs`. The new assignee
+  // then saw a retry run id that was simply not its own and hid its own row.
+  //
+  // Self-sustaining, which is what made it worth fixing rather than tolerating:
+  // the sweep that clears the stale retry runs from `enqueueWakeup`, and an
+  // agent whose inbox reads empty exits without enqueuing anything.
+  it("offers a reassigned row whose stale retry belongs to the PREVIOUS assignee", async () => {
+    mockIssueService.list.mockResolvedValue([
+      parkedRetryRow({ scheduledRetryAgentId: "agent-previous" }),
+    ]);
+    const onWithheldForeignScheduledRetry = vi.fn();
+
+    const items = await loadAgentInboxLite({
+      issuesSvc: mockIssueService as unknown as LoadInboxInput["issuesSvc"],
+      recoveryActionsSvc:
+        mockRecoveryActionService as unknown as LoadInboxInput["recoveryActionsSvc"],
+      companyId: "company-1",
+      agentId: "agent-1",
+      callerRunId: "run-b",
+      limit: 100,
+      isWorktreeRuntime: false,
+      worktreeActivation: inactiveWorktreeActivation,
+      nowMs: RUN_B_WOKE,
+      onWithheldForeignScheduledRetry,
+    });
+
+    expect(items.map((issue) => issue.id)).toEqual(["issue-1"]);
+    expect(onWithheldForeignScheduledRetry).not.toHaveBeenCalled();
   });
 });

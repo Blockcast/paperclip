@@ -195,6 +195,15 @@ describeEmbeddedPostgres("issue list scheduled-retry projection", () => {
     expect(new Date(listRow.scheduledRetryAt).toISOString()).toBe(new Date(detailRetry.scheduledRetryAt).toISOString());
     expect(listRow.scheduledRetryReason).toBe(detailRetry.scheduledRetryReason);
     expect(listRow.scheduledRetryAttempt).toBe(detailRetry.scheduledRetryAttempt);
+    // BLO-29965 review round 3: the OWNER of the retry, over real SQL. The
+    // self-selection guard withholds a row only for a sibling run of the SAME
+    // agent, so if the list projection drops this column the guard silently
+    // starts hiding reassigned rows from their new assignee. The unit tests for
+    // the predicate mock this projection, so this parity check is the only
+    // place the actual SELECT is exercised.
+    expect(listRow.scheduledRetryRunId).toBe(detailRetry.runId);
+    expect(listRow.scheduledRetryAgentId).toBe(detailRetry.agentId);
+    expect(listRow.scheduledRetryAgentId).toBeTruthy();
   });
 
   it("selects the same row the single-issue read would when an issue has several parked runs", async () => {

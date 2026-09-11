@@ -12,6 +12,10 @@ import {
 const NOW = Date.parse("2026-07-30T12:00:00.000Z");
 const CALLER = "11111111-1111-1111-1111-111111111111";
 const OTHER = "22222222-2222-2222-2222-222222222222";
+// The agent both CALLER and OTHER belong to: the sibling-run case this guard is
+// for. OTHER_AGENT is the previous assignee in the reassignment case.
+const AGENT = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+const OTHER_AGENT = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 
 function runAt(offsetMs: number, overrides: Record<string, unknown> = {}) {
   return {
@@ -171,7 +175,9 @@ describe("isIssueHeldByForeignRun", () => {
 describe("isIssueHeldByForeignScheduledRetry", () => {
   const armed = {
     scheduledRetryRunId: OTHER,
+    scheduledRetryAgentId: AGENT,
     callerRunId: CALLER,
+    callerAgentId: AGENT,
     nowMs: NOW,
   };
 
@@ -241,6 +247,60 @@ describe("isIssueHeldByForeignScheduledRetry", () => {
         isIssueHeldByForeignScheduledRetry({
           ...armed,
           callerRunId,
+          scheduledRetryAt: new Date(NOW + 4 * 60_000),
+        }),
+      ).toBe(false);
+    }
+  });
+
+  // BLO-29965 review round 3. "Sibling" means SAME AGENT; run-id inequality
+  // alone does not establish it.
+  //
+  // Reassigning an issue from agent A to agent B leaves A's `scheduled_retry`
+  // row untouched — `issues.update` nulls only the issue-side lock columns
+  // (checkoutRunId/executionRunId) and never writes `heartbeat_runs`. So B's
+  // inbox saw a retry run id that was merely not its own and hid B's own
+  // freshly-assigned row for up to the grace window.
+  //
+  // Withholding it buys nothing: A's retry cannot run any more either, because
+  // promotion gates on `issue.assigneeAgentId !== run.agentId` and cancels it
+  // `issue_reassigned`. Worse, it is self-sustaining — the sweep that clears the
+  // stale row runs from `enqueueWakeup`, and an agent whose inbox reads empty
+  // exits without enqueuing anything.
+  it("fails OPEN for a retry owned by a DIFFERENT agent — a reassigned row must not hide from its new assignee", () => {
+    expect(
+      isIssueHeldByForeignScheduledRetry({
+        ...armed,
+        scheduledRetryAgentId: OTHER_AGENT,
+        scheduledRetryAt: new Date(NOW + 4 * 60_000),
+      }),
+    ).toBe(false);
+  });
+
+  it("still withholds a sibling run of the SAME agent — the case the guard exists for", () => {
+    expect(
+      isIssueHeldByForeignScheduledRetry({
+        ...armed,
+        scheduledRetryAgentId: AGENT,
+        callerAgentId: AGENT,
+        scheduledRetryAt: new Date(NOW + 4 * 60_000),
+      }),
+    ).toBe(true);
+  });
+
+  it("fails OPEN when either side's agent is unknown", () => {
+    for (const missing of [null, undefined, ""]) {
+      expect(
+        isIssueHeldByForeignScheduledRetry({
+          ...armed,
+          scheduledRetryAgentId: missing,
+          scheduledRetryAt: new Date(NOW + 4 * 60_000),
+        }),
+      ).toBe(false);
+      expect(
+        isIssueHeldByForeignScheduledRetry({
+          ...armed,
+          callerAgentId: missing,
           scheduledRetryAt: new Date(NOW + 4 * 60_000),
         }),
       ).toBe(false);

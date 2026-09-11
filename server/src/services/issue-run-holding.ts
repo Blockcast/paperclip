@@ -163,20 +163,42 @@ export function isIssueHeldByForeignRun(input: {
  * the holder's own retry fails open by run id, and the strand is bounded by the
  * grace window. Pinned by "does NOT consult startedAt" in
  * `issue-run-holding.test.ts`.
+ *
+ * SIBLING means *same agent*, so the retry's owner is compared, not just its run
+ * id. Review round 3 caught the gap: an issue reassigned from agent A to agent B
+ * keeps A's `scheduled_retry` row alive — `issues.update` nulls only the
+ * issue-side lock columns (`checkoutRunId`/`executionRunId`) and never touches
+ * `heartbeat_runs` — so B's inbox saw a retry run id that was merely *not its
+ * own* and withheld B's freshly-assigned row for up to the grace window.
+ *
+ * That withholding buys nothing, because A's retry can no longer run: promotion
+ * gates on `issue.assigneeAgentId !== run.agentId` and cancels it
+ * `issue_reassigned` (heartbeat.ts). It is also self-sustaining — the sweep that
+ * would clear the stale row runs from `enqueueWakeup`, and an agent whose inbox
+ * looks empty exits without enqueuing anything. So a cross-agent retry is
+ * exactly the "cannot prove it is a sibling" case the fail-open discipline above
+ * exists for.
  */
 export function isIssueHeldByForeignScheduledRetry(input: {
   scheduledRetryAt: Date | string | null | undefined;
   scheduledRetryRunId: string | null | undefined;
+  scheduledRetryAgentId: string | null | undefined;
   callerRunId: string | null | undefined;
+  callerAgentId: string | null | undefined;
   nowMs: number;
 }): boolean {
-  const { scheduledRetryAt, scheduledRetryRunId, callerRunId, nowMs } = input;
+  const { scheduledRetryAt, scheduledRetryRunId, scheduledRetryAgentId, callerRunId, callerAgentId, nowMs } = input;
   // No armed retry, or no identifiable holder: nothing we can prove is foreign.
   if (!scheduledRetryRunId) return false;
   const dueMs = toMs(scheduledRetryAt);
   if (dueMs == null) return false;
   if (!callerRunId) return false; // fail open — same discipline as above
   if (scheduledRetryRunId === callerRunId) return false; // the caller's own retry
+  // Owner unknown on either side: cannot prove this is a sibling. Fail open.
+  // Both identities are required fields, so a call site that forgets to wire one
+  // is a compile error rather than a guard that quietly stops guarding.
+  if (!scheduledRetryAgentId || !callerAgentId) return false;
+  if (scheduledRetryAgentId !== callerAgentId) return false; // another agent's retry
   // Lapsed well past its horizon: stop deferring so a dead retry cannot strand
   // the row forever.
   return nowMs <= dueMs + SCHEDULED_RETRY_HOLD_GRACE_MS;
