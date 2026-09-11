@@ -201,7 +201,10 @@ function pathKeySet(...lists: { companyId: string; issueId: string | null }[][])
   const keys = new Set<string>();
   for (const list of lists) {
     for (const entry of list) {
-      if (entry.issueId) keys.add(pathKey(entry.companyId, entry.issueId));
+      // `!= null`, not truthiness: the lookup side keys `pathKey(issue.companyId, issue.id)`
+      // unconditionally, so dropping an empty-string id here would diverge from the
+      // `entry.issueId === issueId` scan this replaced.
+      if (entry.issueId != null) keys.add(pathKey(entry.companyId, entry.issueId));
     }
   }
   return keys;
