@@ -6,7 +6,12 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { redactionMarker } from "./github-egress-scrub.js";
-import { MAX_FRAME_BYTES, splitFrames, transformFrame } from "./github-mcp-egress-runtime.js";
+import {
+  MAX_FRAME_BYTES,
+  createFrameReader,
+  splitFrames,
+  transformFrame,
+} from "./github-mcp-egress-runtime.js";
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const runtimeEntryPoint = path.join(sourceDirectory, "github-mcp-egress-runtime.ts");
@@ -229,11 +234,60 @@ describe("github MCP egress runtime", () => {
     });
   });
 
+  describe("createFrameReader", () => {
+    // Node reads stdin on BYTE boundaries, so a multi-byte code point can be
+    // bisected between two chunks. Decoding each half independently yields two
+    // U+FFFDs and silently corrupts the payload — which the reader must not do,
+    // because the corrupted text is then what gets published to GitHub.
+    it("reassembles a code point split at every byte boundary inside it", () => {
+      const payload = '{"jsonrpc":"2.0","id":1,"params":{"body":"🔑é☃"}}';
+      const bytes = Buffer.from(`${payload}\n`, "utf8");
+
+      // Exhaustive over cut positions: any single one could pass by luck, and
+      // the interesting cuts are the ones inside a multi-byte sequence.
+      for (let cut = 1; cut < bytes.length; cut += 1) {
+        const read = createFrameReader();
+        const first = read(bytes.subarray(0, cut));
+        const second = read(bytes.subarray(cut));
+        expect([...first, ...second], `split after byte ${cut}`).toEqual([payload]);
+      }
+    });
+
+    it("reassembles a frame split across chunks", () => {
+      const read = createFrameReader();
+      expect(read('{"jsonrpc":"2.0",')).toEqual([]);
+      expect(read('"id":1}\n')).toEqual(['{"jsonrpc":"2.0","id":1}']);
+    });
+
+    it("accepts an already-decoded string chunk without re-encoding it", () => {
+      const read = createFrameReader();
+      expect(read('{"body":"é"}\n')).toEqual(['{"body":"é"}']);
+    });
+  });
+
   describe("fail closed", () => {
     it("caps the unterminated buffer well above any legitimate frame", () => {
       // Guard the constant itself: a future edit that drops it to a plausible
       // payload size would start refusing real traffic.
       expect(MAX_FRAME_BYTES).toBeGreaterThanOrEqual(16 * 1024 * 1024);
+    });
+
+    it("refuses an oversized frame that arrives complete, newline and all", () => {
+      // The cap used to be checked only on the remainder left AFTER complete
+      // lines were removed, so delivering the newline in the same read left a
+      // short remainder, passed the check, and forwarded the oversized frame.
+      // The well-sized frame in front of it is here on purpose: throwing means
+      // it is never returned either, i.e. the whole read is discarded.
+      const read = createFrameReader();
+      const oversized = `{"a":1}\n${"a".repeat(MAX_FRAME_BYTES + 1)}\n`;
+
+      expect(() => read(oversized)).toThrow(/exceeded the \d+-byte cap/);
+    });
+
+    it("still refuses an oversized frame with no terminator", () => {
+      const read = createFrameReader();
+
+      expect(() => read("a".repeat(MAX_FRAME_BYTES + 1))).toThrow(/no newline terminator/);
     });
 
     it("refuses a frame it cannot walk rather than forwarding it", () => {

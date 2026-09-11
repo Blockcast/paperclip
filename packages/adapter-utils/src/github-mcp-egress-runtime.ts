@@ -19,13 +19,14 @@
 // ## Fail-closed policy
 //
 // A frame is forwarded only after it has been scrubbed. If it cannot be
-// scrubbed — unparseable depth, or an oversized frame with no terminator — the
-// runtime tears down rather than passing it through. An agent seeing its MCP
-// server drop is a loud, diagnosable failure; an agent whose secret reached a
-// public repository is not.
+// scrubbed — unparseable depth, or a frame over the size cap whether or not it
+// arrived terminated — the runtime tears down rather than passing it through.
+// An agent seeing its MCP server drop is a loud, diagnosable failure; an agent
+// whose secret reached a public repository is not.
 
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -34,14 +35,17 @@ import {
 } from "./github-mcp-egress-shim.js";
 
 /**
- * Largest client frame this runtime will buffer while waiting for its
- * terminating newline, in bytes.
+ * Largest client frame this runtime will forward, in bytes.
  *
- * A frame must be complete before it can be scrubbed, so some cap is required
- * or a stream that never emits a newline grows without bound. 64 MiB is far
- * above any legitimate MCP frame — GitHub's own contents API rejects blobs
- * orders of magnitude smaller — and exceeding it means the stream is not
- * carrying MCP traffic, at which point refusing is correct.
+ * The cap applies to every frame, not only to a partial one still awaiting its
+ * newline. Two distinct things need it: a frame must be complete before it can
+ * be scrubbed, so without a cap a stream that never emits a newline grows
+ * without bound; and a frame that arrives complete but enormous is one this
+ * process would have to hold, walk and rewrite in memory before forwarding.
+ *
+ * 64 MiB is far above any legitimate MCP frame — GitHub's own contents API
+ * rejects blobs orders of magnitude smaller — and exceeding it means the stream
+ * is not carrying MCP traffic, at which point refusing is correct.
  */
 export const MAX_FRAME_BYTES = 64 * 1024 * 1024;
 
@@ -77,11 +81,43 @@ const defaultIo: GitHubMcpEgressRuntimeIo = {
 };
 
 /**
+ * Refuse an over-cap frame.
+ *
+ * Terminated and unterminated frames are refused at the same limit but are
+ * distinguishable failures, and the message says which: an unterminated frame
+ * may merely have been still growing, whereas a terminated one was delivered
+ * oversized in full.
+ */
+function refuseOversizedFrame(byteLength: number, terminated: boolean): never {
+  throw new GitHubMcpEgressRuntimeError(
+    terminated
+      ? `client frame of ${byteLength} bytes exceeded the ${MAX_FRAME_BYTES}-byte cap; refusing to forward it unscrubbed`
+      : `client frame exceeded ${MAX_FRAME_BYTES} bytes with no newline terminator; refusing to forward it unscrubbed`,
+  );
+}
+
+/**
  * Split a chunk-accumulated buffer into complete lines plus the trailing
- * remainder, enforcing the frame cap on the remainder.
+ * remainder, enforcing the frame cap on EVERY frame — each complete line as
+ * well as the remainder.
+ *
+ * Capping only the remainder leaves the cap trivially evadable: a read
+ * carrying an oversized line *together with its newline* leaves a short
+ * remainder, so the remainder check passes and the oversized frame is
+ * forwarded anyway. That was the shipped behaviour until the Ally review of
+ * `fd577e4` caught it.
+ *
+ * The cap belongs to the frame rather than to the leftover, so it is enforced
+ * here instead of by the caller — an exported splitter that hands back an
+ * over-cap line is a splitter whose next caller forgets to check it. Refusal
+ * discards the whole read, including any well-sized lines that preceded the
+ * offender, which is the fail-closed reading: a stream that produced one
+ * impossible frame has stopped being MCP traffic.
  *
  * Exported for tests: the buffering is where a stdio proxy usually goes wrong,
  * and it is worth asserting directly rather than only through a spawned child.
+ *
+ * @throws {GitHubMcpEgressRuntimeError} if any frame exceeds `MAX_FRAME_BYTES`.
  */
 export function splitFrames(buffer: string): { lines: string[]; rest: string } {
   const lines: string[] = [];
@@ -89,10 +125,18 @@ export function splitFrames(buffer: string): { lines: string[]; rest: string } {
   for (;;) {
     const at = buffer.indexOf("\n", start);
     if (at < 0) break;
-    lines.push(buffer.slice(start, at));
+    const line = buffer.slice(start, at);
+    const lineBytes = Buffer.byteLength(line, "utf8");
+    if (lineBytes > MAX_FRAME_BYTES) refuseOversizedFrame(lineBytes, true);
+    lines.push(line);
     start = at + 1;
   }
-  return { lines, rest: buffer.slice(start) };
+
+  const rest = buffer.slice(start);
+  const restBytes = Buffer.byteLength(rest, "utf8");
+  if (restBytes > MAX_FRAME_BYTES) refuseOversizedFrame(restBytes, false);
+
+  return { lines, rest };
 }
 
 /**
@@ -118,6 +162,37 @@ export function transformFrame(
   return `${result.line}${hasCr ? "\r" : ""}\n`;
 }
 
+/**
+ * Build a stateful reader that turns raw stdin chunks into complete frames.
+ *
+ * It carries the two pieces of cross-chunk state, which is why this is a named
+ * unit rather than a few lines inside the data handler:
+ *
+ * - a `StringDecoder`, so a multi-byte code point split across a chunk
+ *   boundary is completed rather than decoded as two U+FFFDs;
+ * - the partial-frame buffer, so a frame split across chunks is reassembled.
+ *
+ * Exported so tests can drive chunk boundaries exactly. The inputs that matter
+ * here — a code point bisected between two reads, an oversized frame arriving
+ * whole — are precisely the ones a spawned child cannot be made to produce on
+ * demand, because chunking is the kernel's choice and not the writer's.
+ *
+ * @throws {GitHubMcpEgressRuntimeError} if any frame exceeds `MAX_FRAME_BYTES`.
+ */
+export function createFrameReader(): (chunk: Buffer | string) => string[] {
+  const decoder = new StringDecoder("utf8");
+  let buffer = "";
+
+  return (chunk) => {
+    // A chunk that is already a string was decoded upstream, so it bypasses
+    // the decoder rather than being re-encoded on the way in.
+    buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
+    const { lines, rest } = splitFrames(buffer);
+    buffer = rest;
+    return lines;
+  };
+}
+
 export function runGitHubMcpEgressRuntime(
   options: GitHubMcpEgressRuntimeOptions,
   io: GitHubMcpEgressRuntimeIo = defaultIo,
@@ -134,7 +209,8 @@ export function runGitHubMcpEgressRuntime(
 
     let settled = false;
     let forwardedSignal = false;
-    let buffer = "";
+    // Per-stream: the carry-over bytes and partial frame belong to this stdin.
+    const readFrames = createFrameReader();
 
     const forwardSignal = (signal: NodeJS.Signals) => {
       forwardedSignal = true;
@@ -168,15 +244,14 @@ export function runGitHubMcpEgressRuntime(
     });
 
     function onData(chunk: Buffer | string): void {
-      buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
-      const { lines, rest } = splitFrames(buffer);
-      buffer = rest;
-
-      if (Buffer.byteLength(buffer, "utf8") > MAX_FRAME_BYTES) {
+      let lines: string[];
+      try {
+        lines = readFrames(chunk);
+      } catch (error) {
         fail(
-          new GitHubMcpEgressRuntimeError(
-            `client frame exceeded ${MAX_FRAME_BYTES} bytes with no newline terminator; refusing to forward it unscrubbed`,
-          ),
+          error instanceof GitHubMcpEgressRuntimeError
+            ? error
+            : new GitHubMcpEgressRuntimeError("unable to frame outbound MCP traffic"),
         );
         return;
       }
