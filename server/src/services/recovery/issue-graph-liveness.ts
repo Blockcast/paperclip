@@ -142,11 +142,42 @@ function pathEntry(issue: IssueLivenessIssueInput): IssueLivenessDependencyPathE
   };
 }
 
+/**
+ * BLO-33225: memoized per `agentsById` instance, and that is the whole point of the
+ * WeakMap rather than a plain call.
+ *
+ * `isAgentInvokable` walks the org chain, so it is not cheap, and this used to
+ * re-materialize the entire agent list (`[...agentsById.values()]`) on every call. The
+ * classifier calls it once per owner candidate over the full issue graph, so at ~40k
+ * issues the CPU profile attributed ~1.9 s of self time per classify pass to
+ * `getAgentOrgChainHealth` alone, plus the GC of one throwaway array per call. That is a
+ * synchronous stall on the worker event loop — `reconcileIssueGraphLiveness` classifies
+ * twice per tick — and it sat 2.2 s under the readiness timeout (BLO-31945).
+ *
+ * Sound because the result is a pure function of `(agent, agents)` and `agentsById` is
+ * built once per classify pass and never mutated, so agent id is a complete key. Keyed on
+ * the map instance so a later pass with a different agent set cannot read a stale answer.
+ */
+const invokableAgentMemo = new WeakMap<
+  Map<string, IssueLivenessAgentInput>,
+  { agents: IssueLivenessAgentInput[]; byAgentId: Map<string, boolean> }
+>();
+
 function isInvokableAgent(
   agent: IssueLivenessAgentInput | null | undefined,
   agentsById: Map<string, IssueLivenessAgentInput>,
 ) {
-  return Boolean(agent && isAgentInvokable({ agent, agents: [...agentsById.values()] }));
+  if (!agent) return false;
+  let memo = invokableAgentMemo.get(agentsById);
+  if (!memo) {
+    memo = { agents: [...agentsById.values()], byAgentId: new Map() };
+    invokableAgentMemo.set(agentsById, memo);
+  }
+  const cached = memo.byAgentId.get(agent.id);
+  if (cached !== undefined) return cached;
+  const invokable = isAgentInvokable({ agent, agents: memo.agents });
+  memo.byAgentId.set(agent.id, invokable);
+  return invokable;
 }
 
 function isNonExecutingAttributionAgent(agent: IssueLivenessAgentInput) {
@@ -154,23 +185,26 @@ function isNonExecutingAttributionAgent(agent: IssueLivenessAgentInput) {
   return agent.status === "paused" && agent.pauseReason === "manual" && heartbeat?.enabled === false;
 }
 
-function hasActiveExecutionPath(
-  companyId: string,
-  issueId: string,
-  activeRuns: IssueLivenessExecutionPathInput[],
-  queuedWakeRequests: IssueLivenessExecutionPathInput[],
-) {
-  return [...activeRuns, ...queuedWakeRequests].some(
-    (entry) => entry.companyId === companyId && entry.issueId === issueId,
-  );
-}
+/**
+ * BLO-33225: index a waiting-path list by `(companyId, issueId)` once per classify pass.
+ *
+ * These lookups used to be `.some()` linear scans, and `hasActiveExecutionPath`
+ * additionally spread both of its lists into a fresh array on every call. Called from
+ * `hasExplicitWaitingPath` over the whole issue graph that is O(issues x paths) with one
+ * throwaway allocation per issue; the CPU profile attributed ~0.8 s of self time per
+ * classify pass to it at ~40k issues, and the term grows with the number of open
+ * runs/wakes/interactions/approvals/recovery rows rather than with anything bounded.
+ */
+const pathKey = (companyId: string, issueId: string) => `${companyId}\u0000${issueId}`;
 
-function hasWaitingPath(
-  companyId: string,
-  issueId: string,
-  waitingPaths: IssueLivenessWaitingPathInput[],
-) {
-  return waitingPaths.some((entry) => entry.companyId === companyId && entry.issueId === issueId);
+function pathKeySet(...lists: { companyId: string; issueId: string | null }[][]) {
+  const keys = new Set<string>();
+  for (const list of lists) {
+    for (const entry of list) {
+      if (entry.issueId) keys.add(pathKey(entry.companyId, entry.issueId));
+    }
+  }
+  return keys;
 }
 
 function readRecord(value: unknown): Record<string, unknown> | null {
@@ -439,6 +473,11 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   const pendingInteractions = input.pendingInteractions ?? [];
   const pendingApprovals = input.pendingApprovals ?? [];
   const openRecoveryIssues = input.openRecoveryIssues ?? [];
+  // Indexed once per pass rather than scanned per issue — see `pathKeySet` (BLO-33225).
+  const executionPathKeys = pathKeySet(activeRuns, queuedWakeRequests);
+  const interactionPathKeys = pathKeySet(pendingInteractions);
+  const approvalPathKeys = pathKeySet(pendingApprovals);
+  const recoveryPathKeys = pathKeySet(openRecoveryIssues);
 
   for (const relation of input.relations) {
     const list = blockersByBlockedIssueId.get(relation.blockedIssueId) ?? [];
@@ -500,13 +539,14 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
    * is a coherent thing to wait for.
    */
   function hasExplicitWaitingPath(issue: IssueLivenessIssueInput) {
+    const key = pathKey(issue.companyId, issue.id);
     return Boolean(issue.assigneeUserId) ||
       hasScheduledMonitor(issue, nowMs) ||
       hasActiveParkedDisposition(issue, nowMs) ||
-      hasActiveExecutionPath(issue.companyId, issue.id, activeRuns, queuedWakeRequests) ||
-      hasWaitingPath(issue.companyId, issue.id, pendingInteractions) ||
-      hasWaitingPath(issue.companyId, issue.id, pendingApprovals) ||
-      hasWaitingPath(issue.companyId, issue.id, openRecoveryIssues);
+      executionPathKeys.has(key) ||
+      interactionPathKeys.has(key) ||
+      approvalPathKeys.has(key) ||
+      recoveryPathKeys.has(key);
   }
 
   /**
