@@ -12,9 +12,12 @@ import {
 
 /**
  * Refresh the per-agent oldest-`queued`-run-age gauge (BLO-21116). Recomputed
- * live on every scrape from a MIN(coalesce(queued_at, created_at)) aggregate over `heartbeatRuns`
- * status='queued', the same "compute on scrape, never trust a stale cache"
- * shape as {@link refreshExternalRuntimeReservationMetrics}. `heartbeatRuns`
+ * from a MIN(coalesce(queued_at, created_at)) aggregate over `heartbeatRuns`
+ * status='queued', the same "recompute, never trust a stale cache" shape as
+ * {@link refreshExternalRuntimeReservationMetrics}. Driven by the background
+ * collector in `scrape-metrics-collector.ts`, not by the scrape itself: it ran
+ * inline until BLO-33243, where the summed DB latency of five such refreshes
+ * pushed whole scrapes past their 10 s timeout and lost every sample. `heartbeatRuns`
  * is the correct table for this: a `queued` row is a run Paperclip has
  * already decided to dispatch and is waiting on a concurrency slot or the
  * scheduler tick to pick it up, which is exactly the "invisible strand" this

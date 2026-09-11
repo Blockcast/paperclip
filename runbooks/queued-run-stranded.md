@@ -195,15 +195,25 @@ is stale and needs correction before a re-wake is dismissed.
 
 ## When the refresh-failure alert fires
 
-1. Inspect serving Paperclip logs for `failed to refresh queued-run-age
-   metrics before scrape` and the underlying database error.
+1. Inspect serving Paperclip logs for `scrape-metrics collector refresh failed`
+   with `refresh: "queued-run-age"` and the underlying database error. (Before
+   BLO-33243 this refresh ran inline on the scrape and logged `failed to
+   refresh queued-run-age metrics before scrape`; it now runs on a 15 s
+   background interval.)
 2. Check database reachability, connection-pool saturation, and query latency.
-   Do not interpret an exported age of `0` as current data while freshness is
-   `0`.
+   `paperclip_db_pool_waiting_queries` above 0 with
+   `paperclip_db_pool_connections{state="idle"}` at 0 is pool exhaustion on
+   that pod (BLO-33243). Do not interpret an exported age of `0` as current
+   data while freshness is `0`.
 3. Confirm a fresh `/metrics` scrape exposes
    `paperclip_queued_run_age_metrics_refresh_success 1`.
 4. If queued rows are urgent while the metric is stale, run the SQL above
    manually and work from that result.
+
+Freshness now also drops to `0` when the collector *stops ticking altogether*,
+not only when a refresh rejects — a wedged collector would otherwise leave the
+gauge reading last-good over a frozen age, which is the same invisible failure
+the gauge exists to prevent.
 
 ## Silencing
 
@@ -344,16 +354,18 @@ statement timeout or plan regression can hit one and not the other. A healthy
 `paperclip_queued_run_age_metrics_refresh_success` does **not** vouch for this
 one — check this series by name.
 
-1. Check Paperclip server logs for `failed to refresh
-   overdue-scheduled-retry-age metrics before scrape`; the `err` field carries
-   the database error.
+1. Check Paperclip server logs for `scrape-metrics collector refresh failed`
+   with `refresh: "overdue-scheduled-retry-age"`; the `err` field carries the
+   database error. (Pre-BLO-33243 this logged `failed to refresh
+   overdue-scheduled-retry-age metrics before scrape`.)
 2. Check database connectivity and statement timeouts. If only this refresh is
    failing while the sibling is healthy, suspect the `0224` partial index —
    confirm `heartbeat_runs_overdue_scheduled_retry_idx` is `valid` in
    `pg_index`, since an invalid index left behind by a failed
    `CREATE INDEX CONCURRENTLY` makes the planner fall back to a sequential
    scan over ~219k rows.
-3. Recovery is automatic on the next successful scrape — the gauge returns to
+3. Recovery is automatic on the next successful collector tick (15 s) — the
+   gauge returns to
    `paperclip_overdue_scheduled_retry_age_metrics_refresh_success 1`.
 
 Do not silence this to quiet the page: silencing it while the gate is closed
