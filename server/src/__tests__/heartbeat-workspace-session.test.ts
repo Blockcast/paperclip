@@ -17,7 +17,6 @@ import {
   buildExplicitResumeSessionOverride,
   buildEffectiveRunSessionConfigMetadata,
   buildEffectiveRunWorkspaceConfigMetadata,
-  buildK8sRunIsolationDescriptor,
   shouldUseRepoLessFallbackWorkspaceSource,
   buildWorkspaceConfigFreshnessOperation,
   computeK8sIsolationRetryDelayMs,
@@ -43,6 +42,7 @@ import {
   resolveExecutionWorkspaceConfigFreshness,
   resolveExecutionWorkspaceReuseRequestForIssue,
   resolveExecutionWorkspaceReuseProvisioningPolicy,
+  buildK8sRunIsolationDescriptor,
   resolveK8sRunIsolationIdentity,
   resolveNextSessionState,
   resolveTaskSessionConfigFreshness,
@@ -65,6 +65,7 @@ import {
   resolveRepoRelativeWorkspaceCwd,
   type ResolvedWorkspaceForRunSuccess,
 } from "../services/heartbeat.js";
+import { buildK8sRunIsolationDescriptorFromWorkspace } from "./helpers/k8s-isolation-descriptor.ts";
 import { applyRunScopeToBranchName } from "../services/workspace-runtime.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
@@ -2920,7 +2921,7 @@ describe("K8s session isolation metadata", () => {
 
   it("returns null for non-K8s adapters", () => {
     expect(
-      buildK8sRunIsolationDescriptor({
+      buildK8sRunIsolationDescriptorFromWorkspace({
         adapterType: "opencode_local",
         runId: "run-1",
         companyId: "company-1",
@@ -2939,7 +2940,7 @@ describe("K8s session isolation metadata", () => {
 
   it("builds deterministic workspace isolation metadata for K8s adapters", () => {
     expect(
-      buildK8sRunIsolationDescriptor({
+      buildK8sRunIsolationDescriptorFromWorkspace({
         adapterType: "opencode_k8s",
         runId: "run-1",
         companyId: "company-1",
@@ -2997,7 +2998,7 @@ describe("K8s session isolation metadata", () => {
   // root -- even though `shared_workspace` mode never sets `isWorkspaceIsolated`.
   it("uses the reused workspace root for an explicitly selected persisted shared_workspace under concurrency", () => {
     expect(
-      buildK8sRunIsolationDescriptor({
+      buildK8sRunIsolationDescriptorFromWorkspace({
         adapterType: "claude_k8s",
         runId: "run-1",
         companyId: "company-1",
@@ -3023,7 +3024,7 @@ describe("K8s session isolation metadata", () => {
 
   it("keeps shared roots and legacy warm sessions for explicit shared_workspace reuse at concurrency one", () => {
     const sharedRoot = resolveDefaultAgentWorkspaceDir("agent-1");
-    const sharedIsolation = buildK8sRunIsolationDescriptor({
+    const sharedIsolation = buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "claude_k8s",
       runId: "run-1",
       companyId: "company-1",
@@ -3073,7 +3074,7 @@ describe("K8s session isolation metadata", () => {
   // ephemeral scratch dir is what pushed agents back into the project BASE
   // checkout, which accumulated 32 uncommitted files across three days.
   it("keeps the provisioned worktree as the workspace root under per-run isolation", () => {
-    const isolation = buildK8sRunIsolationDescriptor({
+    const isolation = buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "claude_k8s",
       runId: "run-1",
       companyId: "company-1",
@@ -3110,16 +3111,18 @@ describe("K8s session isolation metadata", () => {
     });
   });
 
-  // BLO-31282 review follow-up: the tests above let the descriptor resolve its
-  // own identity, but production NEVER does -- `dispatchHeartbeatRun` always
-  // passes a precomputed `isolationIdentity`, built with the narrower
-  // `isWorkspaceIsolated: workspaceIsolationRequested` (mode only) rather than
-  // the broader in-function definition (mode OR task_session OR git_worktree).
-  // Pin the shipping path explicitly so a future change to either definition
-  // cannot silently stop covering it.
+  // BLO-31282 review follow-up: the tests above go through the
+  // `...FromWorkspace` test fixture, which derives the identity from raw
+  // workspace inputs using the broader `mode OR task_session OR git_worktree`
+  // reading. Production never does that -- `dispatchHeartbeatRun` resolves the
+  // identity itself, with the narrower `isWorkspaceIsolated:
+  // workspaceIsolationRequested` (mode only), and hands it straight to
+  // `buildK8sRunIsolationDescriptor`. Call the real function here so the
+  // shipping path is pinned explicitly and a future change to either reading
+  // cannot silently stop covering it. (BLO-31443 moved the broad reading out of
+  // production and into the fixture for exactly this reason.)
   const buildPrecomputedIdentityDescriptor = () =>
     buildK8sRunIsolationDescriptor({
-      adapterType: "claude_k8s",
       runId: "run-1",
       companyId: "company-1",
       agentId: "agent-1",
@@ -3127,11 +3130,9 @@ describe("K8s session isolation metadata", () => {
       statelessPrReview: false,
       executionWorkspace: {
         cwd: "/paperclip/projects/project-1/repo/.paperclip/worktrees/BLO-31282",
-        source: "task_session",
         strategy: "git_worktree",
       },
       persistedExecutionWorkspaceId: null,
-      effectiveExecutionWorkspaceMode: "isolated_workspace",
       // Exactly what dispatch hands in when it planned no workspace id.
       isolationIdentity: { isolationMode: "run", isolationKey: "run:run-1" },
     });
@@ -3181,7 +3182,7 @@ describe("K8s session isolation metadata", () => {
   // has `cwd` pointing at the BASE checkout, so keying the workspace path off
   // the mode would route every such run into the base deterministically.
   it("stays ephemeral when isolated_workspace intent realized as the base checkout", () => {
-    const isolation = buildK8sRunIsolationDescriptor({
+    const isolation = buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "claude_k8s",
       runId: "run-1",
       companyId: "company-1",
@@ -3209,7 +3210,7 @@ describe("K8s session isolation metadata", () => {
   // persisted workspace and must stay fully ephemeral even though its realized
   // strategy is `git_worktree`.
   it("keeps a stateless PR review ephemeral despite a realized git worktree", () => {
-    const isolation = buildK8sRunIsolationDescriptor({
+    const isolation = buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "claude_k8s",
       runId: "run-1",
       companyId: "company-1",
@@ -3251,7 +3252,7 @@ describe("K8s session isolation metadata", () => {
 
   it("builds fully ephemeral run isolation metadata for stateless PR reviews", () => {
     expect(
-      buildK8sRunIsolationDescriptor({
+      buildK8sRunIsolationDescriptorFromWorkspace({
         adapterType: "opencode_k8s",
         runId: "run-1",
         companyId: "company-1",
@@ -3288,7 +3289,7 @@ describe("K8s session isolation metadata", () => {
   });
 
   it("does not reuse a stateless PR review session across heartbeat runs", () => {
-    const buildRunIsolation = (runId: string) => buildK8sRunIsolationDescriptor({
+    const buildRunIsolation = (runId: string) => buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "claude_k8s",
       runId,
       companyId: "company-1",
@@ -3317,7 +3318,7 @@ describe("K8s session isolation metadata", () => {
   });
 
   it("gives concurrent stateless runs disjoint mutable roots on shared RWX storage", () => {
-    const buildRunIsolation = (runId: string) => buildK8sRunIsolationDescriptor({
+    const buildRunIsolation = (runId: string) => buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "opencode_k8s",
       runId,
       companyId: "company-1",
@@ -3361,7 +3362,7 @@ describe("K8s session isolation metadata", () => {
   });
 
   it("reuses the durable workspace and session scope across heartbeat runs", () => {
-    const buildWorkspaceIsolation = (runId: string) => buildK8sRunIsolationDescriptor({
+    const buildWorkspaceIsolation = (runId: string) => buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "opencode_k8s",
       runId,
       companyId: "company-1",
@@ -3391,7 +3392,7 @@ describe("K8s session isolation metadata", () => {
   });
 
   it("falls back to serialized shared mode when an isolated workspace has no durable id", () => {
-    expect(buildK8sRunIsolationDescriptor({
+    expect(buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "opencode_k8s",
       runId: "run-1",
       companyId: "company-1",
@@ -3413,7 +3414,7 @@ describe("K8s session isolation metadata", () => {
 
   it("builds shared isolation metadata for shared K8s adapters", () => {
     expect(
-      buildK8sRunIsolationDescriptor({
+      buildK8sRunIsolationDescriptorFromWorkspace({
         adapterType: "claude_k8s",
         runId: "run-1",
         companyId: "company-1",
@@ -3480,7 +3481,7 @@ describe("K8s session isolation metadata", () => {
 
   it("logs scheduler-side K8s guard decisions with bounded isolation fields", () => {
     const spy = vi.spyOn(logger, "info").mockImplementation(() => {});
-    const workspaceIsolation = buildK8sRunIsolationDescriptor({
+    const workspaceIsolation = buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "opencode_k8s",
       runId: "run-1",
       companyId: "company-1",
