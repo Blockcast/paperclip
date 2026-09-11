@@ -299,6 +299,37 @@ describe("the scrub is reachable from server/ at all", () => {
     );
     expect(statusHelper).toContain("scrubOutboundGitHubText(input.description");
   });
+
+  it("leaves no server-side GitHub writer outside the scrub", () => {
+    // Derived from source at file granularity, the same way PEN-3152's outbound
+    // coverage table derives its writer set: a `ghFetch(` call plus a mutating
+    // method. A NEW service file that starts writing to GitHub fails here until
+    // it either routes through the shared helpers or calls the scrub itself.
+    //
+    // Enumerate-then-filter rather than grepping for an expected name: a
+    // pathspec that matches nothing returns the same empty set as "everything
+    // is covered", and that failure mode is silent.
+    const servicesDir = path.join(repoRoot, "server/src/services");
+    const { readdirSync } = require("node:fs") as typeof import("node:fs");
+    const writers: string[] = [];
+    for (const entry of readdirSync(servicesDir)) {
+      if (!entry.endsWith(".ts") || entry.endsWith(".test.ts")) continue;
+      const source = readFileSync(path.join(servicesDir, entry), "utf8");
+      if (!source.includes("ghFetch(")) continue;
+      if (!/method:\s*"(?:POST|PATCH|PUT|DELETE)"/.test(source)) continue;
+      writers.push(entry);
+    }
+    // Positive control: the derivation must actually find the file we know
+    // writes, or an empty `writers` would make the assertion below vacuous.
+    expect(writers).toContain("github-app-auth.ts");
+
+    for (const writer of writers) {
+      const source = readFileSync(path.join(servicesDir, writer), "utf8");
+      expect(source, `${writer} writes to GitHub without reaching the egress scrub`).toContain(
+        "scrubOutboundGitHubText",
+      );
+    }
+  });
 });
 
 describe("unrecognized ledger verbs cannot carry a credential (PEN-3157 #3)", () => {
