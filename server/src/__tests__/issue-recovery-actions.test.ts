@@ -3067,17 +3067,23 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   // whether the real dispatcher defers at exactly `maxConcurrentRuns` — that is the
   // heartbeat's contract and has its own tests. The agent is still seeded with the AC's
   // capacity so the mock's ceiling is read from the fixture rather than a magic literal.
+  //
+  // The capacity goes on the MANAGER, not the coder: this path routes the wake to
+  // `resolveStrandedIssueRecoveryOwnerAgentId`, which takes the assignee's `reportsTo`
+  // before the assignee. Seeding the coder would configure an agent this path never wakes,
+  // and the test would still pass — the AC says "an owner whose maxConcurrentRuns is 3",
+  // so the mock asserts it is that owner being woken before applying the ceiling.
   it("refunds a burst of wakes one owner cannot absorb instead of spending their budget (BLO-19124 AC4)", async () => {
     const BURST = 25;
     const MAX_CONCURRENT = 3;
     expect(BURST).toBeGreaterThanOrEqual(20);
 
-    const { companyId, coderId, prefix, sourceIssue } = await seedCompany();
+    const { companyId, managerId, coderId, prefix, sourceIssue } = await seedCompany();
     await db
       .update(agents)
       .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: MAX_CONCURRENT } } })
-      .where(eq(agents.id, coderId));
-    const [owner] = await db.select().from(agents).where(eq(agents.id, coderId));
+      .where(eq(agents.id, managerId));
+    const [owner] = await db.select().from(agents).where(eq(agents.id, managerId));
     const capacity =
       (owner!.runtimeConfig as { heartbeat?: { maxConcurrentRuns?: number } })?.heartbeat
         ?.maxConcurrentRuns ?? 0;
@@ -3106,7 +3112,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     let inFlight = 0;
     const enqueueWakeup = vi.fn<
       (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string } | null>
-    >(async () => {
+    >(async (agentId) => {
+      // The ceiling is only meaningful if it is the routed owner's ceiling.
+      expect(agentId).toBe(managerId);
       if (inFlight >= capacity) return null; // owner is saturated — woke nobody
       inFlight += 1;
       return { id: randomUUID() };
@@ -3201,11 +3209,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(action.nonDeliverySweepCount).toBeGreaterThanOrEqual(1);
     }
 
-    // The number that matters to the horizon, pinned rather than described: draining a
-    // burst of N against capacity C takes ceil((N - C) / C) rounds, and the action has to
-    // stay alive across all of them. If a future change makes the sweep drain more per
-    // round this fails loudly, which is the good direction.
-    expect(rounds).toBe(Math.ceil((BURST - MAX_CONCURRENT) / MAX_CONCURRENT));
+    // The number that matters to the horizon: draining a burst of N against capacity C
+    // takes at most ceil((N - C) / C) rounds, and the action has to stay alive across all
+    // of them. Bounded rather than pinned — a sweep that drains more per round is an
+    // improvement, and pinning equality would assert this mock's drain policy instead.
+    expect(rounds).toBeLessThanOrEqual(Math.ceil((BURST - MAX_CONCURRENT) / MAX_CONCURRENT));
+    expect(rounds).toBeGreaterThan(1); // a burst this size cannot drain in one pass
   });
 
   it("stamps configured bounds when creating a wake-owner recovery action", async () => {
