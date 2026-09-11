@@ -41,6 +41,30 @@ const FILE_TEXT_FLAGS = new Set(["--body-file", "--notes-file", "--input"]);
 const FIELD_FLAGS = new Set(["--raw-field", "-f", "--field", "-F"]);
 const TYPED_FIELD_FLAGS = new Set(["--field", "-F"]);
 
+/** BLO-33171: request fields that carry REPOSITORY FILE BYTES rather than
+ *  authored prose. `content` is GitHub's field name for file bytes on every
+ *  endpoint that writes them — `POST /git/blobs`, `PUT /repos/{o}/{r}/contents/{path}`,
+ *  the `tree[].content` entries of `POST /git/trees`, and gist files.
+ *
+ *  These are never scrubbed IN PLACE. A scrub rewrites the bytes that get
+ *  committed, so a credential-shaped string literal in source — say the input
+ *  fixture of a redaction regression test — is silently replaced and the commit
+ *  still looks deliberate on review. That is how #1542 landed with 9 `sk-`
+ *  literals eaten and the diff reading as an intentional test weakening.
+ *
+ *  Exempting them from the scrubber is NOT the fix: a blob in a public repo is
+ *  exactly as public as a PR comment, so an exemption is a credential
+ *  exfiltration bypass on the highest-bandwidth path. Corruption is loud on
+ *  review; a leak is silent forever. So: pass through byte-exact when nothing
+ *  fires, and REFUSE the call when something does.
+ *
+ *  Keying on the field NAME does not violate this module's "structural, never
+ *  name-based" doctrine (github-egress-scrub.ts:9). That doctrine forbids
+ *  inferring whether a VALUE IS SECRET from its name. Identifying the ROLE of a
+ *  request field is a different question, answered by a fixed GitHub API
+ *  schema rather than by model-authored prose. */
+const CONTENT_FIELD_KEYS = new Set(["content"]);
+
 export interface GitHubCliScrubIo {
   /** Read a request-text file. Throw if unreadable — the caller decides the policy. */
   readText(path: string): string;
@@ -48,10 +72,22 @@ export interface GitHubCliScrubIo {
   writeTempText(contents: string): string;
 }
 
+/** A content-bearing field that tripped a detector. The caller refuses the
+ *  invocation; this carries what the operator needs to fix it. */
+export interface GitHubCliContentRefusal {
+  /** The request field, or the `--input` flag whose body carried one. */
+  field: string;
+  /** Path, when the bytes came from a file rather than inline argv. */
+  path: string | null;
+  classes: GitHubEgressScrubClass[];
+}
+
 export interface GitHubCliScrubResult {
   argv: string[];
   redacted: boolean;
   classes: GitHubEgressScrubClass[];
+  /** Non-empty when the invocation must be refused rather than run. */
+  refusals: GitHubCliContentRefusal[];
 }
 
 /**
@@ -99,9 +135,13 @@ export function scrubGitHubCliInvocation(
 ): GitHubCliScrubResult {
   const out = [...argv];
   const fired = new Set<GitHubEgressScrubClass>();
+  const refusals: GitHubCliContentRefusal[] = [];
 
   const record = (classes: readonly GitHubEgressScrubClass[]) => {
     for (const cls of classes) fired.add(cls);
+  };
+  const refuse = (refusal: GitHubCliContentRefusal) => {
+    refusals.push(refusal);
   };
 
   for (let i = 0; i < out.length; i += 1) {
@@ -121,12 +161,12 @@ export function scrubGitHubCliInvocation(
         continue;
       }
       if (FILE_TEXT_FLAGS.has(flag)) {
-        const rewritten = scrubTextFile(value, io, record);
+        const rewritten = scrubTextFile(value, flag, io, record, refuse);
         if (rewritten !== null) out[i] = `${flag}=${rewritten}`;
         continue;
       }
       if (FIELD_FLAGS.has(flag)) {
-        const rewritten = scrubField(value, TYPED_FIELD_FLAGS.has(flag), io, record);
+        const rewritten = scrubField(value, TYPED_FIELD_FLAGS.has(flag), io, record, refuse);
         if (rewritten !== value) out[i] = `${flag}=${rewritten}`;
         continue;
       }
@@ -137,7 +177,7 @@ export function scrubGitHubCliInvocation(
     // Preserve whether the original used `-f=...` or `-f...` when clean.
     const shortFused = splitShortFieldOption(arg);
     if (shortFused) {
-      const rewritten = scrubField(shortFused.value, shortFused.typed, io, record);
+      const rewritten = scrubField(shortFused.value, shortFused.typed, io, record, refuse);
       if (rewritten !== shortFused.value) {
         out[i] = `${shortFused.flag}${shortFused.separator}${rewritten}`;
       }
@@ -158,14 +198,14 @@ export function scrubGitHubCliInvocation(
     }
 
     if (FILE_TEXT_FLAGS.has(arg)) {
-      const rewritten = scrubTextFile(next, io, record);
+      const rewritten = scrubTextFile(next, arg, io, record, refuse);
       if (rewritten !== null) out[i + 1] = rewritten;
       i += 1;
       continue;
     }
 
     if (FIELD_FLAGS.has(arg)) {
-      const rewritten = scrubField(next, TYPED_FIELD_FLAGS.has(arg), io, record);
+      const rewritten = scrubField(next, TYPED_FIELD_FLAGS.has(arg), io, record, refuse);
       out[i + 1] = rewritten;
       i += 1;
     }
@@ -184,6 +224,7 @@ export function scrubGitHubCliInvocation(
     argv: out,
     redacted: fired.size > 0,
     classes: order.filter((cls) => fired.has(cls)),
+    refusals,
   };
 }
 
@@ -193,11 +234,17 @@ export function scrubGitHubCliInvocation(
  * `-` means "read stdin"; the runtime rejects that form before `gh` starts.
  * This helper is only called after that check, so it is not a path and must
  * not be opened here.
+ *
+ * `gh api --input` is a whole request body rather than a prose document, so a
+ * body that carries file bytes under a `content` key is refused rather than
+ * rewritten — see CONTENT_FIELD_KEYS.
  */
 function scrubTextFile(
   path: string,
+  field: string,
   io: GitHubCliScrubIo,
   record: (classes: readonly GitHubEgressScrubClass[]) => void,
+  refuse: (refusal: GitHubCliContentRefusal) => void,
 ): string | null {
   if (path === "-") return null;
 
@@ -205,8 +252,43 @@ function scrubTextFile(
   const scrubbed = scrubGitHubEgressText(contents);
   if (!scrubbed.redacted) return null;
 
+  if (field === "--input" && requestBodyCarriesContent(contents)) {
+    refuse({ field, path, classes: scrubbed.classes });
+    return null;
+  }
+
   record(scrubbed.classes);
   return io.writeTempText(scrubbed.text);
+}
+
+/**
+ * True when a `gh api --input` request body carries repository file bytes.
+ *
+ * The body is JSON by construction, so the key is read from the parsed object
+ * rather than matched in the raw text — a prose comment body that merely
+ * mentions `"content":` must still be scrubbed, not refused. Nested because
+ * `POST /git/trees` carries its bytes at `tree[].content`. A body that does not
+ * parse is treated as prose: refusing on unparseable input would fail closed in
+ * the wrong direction, blocking review text over a syntax error.
+ */
+function requestBodyCarriesContent(body: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return false;
+  }
+
+  const walk = (node: unknown): boolean => {
+    if (node === null || typeof node !== "object") return false;
+    if (Array.isArray(node)) return node.some((entry) => walk(entry));
+    for (const [key, value] of Object.entries(node)) {
+      if (CONTENT_FIELD_KEYS.has(key) && typeof value === "string") return true;
+      if (walk(value)) return true;
+    }
+    return false;
+  };
+  return walk(parsed);
 }
 
 function splitLongOption(arg: string): { flag: string; value: string } | null {
@@ -238,26 +320,43 @@ function typedFieldUsesStdin(flag: string, expression: string): boolean {
 
 /** Scrub a `key=value` field expression. Typed fields additionally support
  *  `key=@file`; rewrite a credential-bearing file to a private temp copy so
- *  gh cannot read the original unsanitized contents. */
+ *  gh cannot read the original unsanitized contents.
+ *
+ *  A repository-content key is never rewritten: it passes through byte-exact,
+ *  or the invocation is refused. See CONTENT_FIELD_KEYS. */
 function scrubField(
   expression: string,
   typed: boolean,
   io: GitHubCliScrubIo,
   record: (classes: readonly GitHubEgressScrubClass[]) => void,
+  refuse: (refusal: GitHubCliContentRefusal) => void,
 ): string {
   const equals = expression.indexOf("=");
   if (equals < 0) return expression;
 
   const key = expression.slice(0, equals);
   const value = expression.slice(equals + 1);
+  const isContent = CONTENT_FIELD_KEYS.has(key);
+
   if (typed && value.startsWith("@") && value.length > 1) {
-    const rewritten = scrubTextFile(value.slice(1), io, record);
+    const filePath = value.slice(1);
+    if (isContent) {
+      // The whole file IS the committed bytes.
+      const scrubbed = scrubGitHubEgressText(io.readText(filePath));
+      if (scrubbed.redacted) refuse({ field: key, path: filePath, classes: scrubbed.classes });
+      return expression;
+    }
+    const rewritten = scrubTextFile(filePath, key, io, record, refuse);
     if (rewritten !== null) return `${key}=@${rewritten}`;
     return expression;
   }
 
   const scrubbed = scrubGitHubEgressText(value);
   if (!scrubbed.redacted) return expression;
+  if (isContent) {
+    refuse({ field: key, path: null, classes: scrubbed.classes });
+    return expression;
+  }
   record(scrubbed.classes);
   return `${key}=${scrubbed.text}`;
 }

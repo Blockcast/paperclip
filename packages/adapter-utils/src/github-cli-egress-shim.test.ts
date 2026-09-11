@@ -5,6 +5,7 @@ import {
   scrubGitHubCliInvocation,
   type GitHubCliScrubIo,
 } from "./github-cli-egress-shim.js";
+import { redactionMarker } from "./github-egress-scrub.js";
 
 // Synthetic throughout — see github-egress-scrub.test.ts for the standing rule.
 const SYNTHETIC_OPAQUE_VALUE = "s7Kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj0Tg";
@@ -233,6 +234,156 @@ describe("scrubGitHubCliInvocation", () => {
       expect(hasGitHubCliStdinTextFile(["api", "repos/acme/widget/issues/7", "-F", "body=@-"])).toBe(true);
       expect(hasGitHubCliStdinTextFile(["api", "repos/acme/widget/issues/7", "--field=body=@-"])).toBe(true);
       expect(hasGitHubCliStdinTextFile(["api", "repos/acme/widget/issues/7", "-f", "body=@-"])).toBe(false);
+    });
+  });
+
+  // BLO-33171. The boundary is pinned in BOTH directions in this one block on
+  // purpose: the tempting "fix" for the corruption is to exempt `content` from
+  // the scrubber, which converts a loud-on-review corruption into a silent
+  // credential-exfiltration bypass. Every positive case below is paired with
+  // the prose case that must still be redacted.
+  describe("repository content is refused, never rewritten", () => {
+    // The shape that was actually eaten on #1542: a vendor-key literal used as
+    // the INPUT FIXTURE of a redaction regression test.
+    // Derived at runtime, never embedded: an inline literal here would be real
+    // credential-shaped material in tracked source, which the git publish guard
+    // (PEN-3156) refuses on any commit that touches this line.
+    const VENDOR_TOKEN = ["sk", "ant", "api03-AAAAAAAAAAAAAAAAAAAA"].join("-");
+    const SOURCE_WITH_FIXTURE = [
+      "const REDACTION_FIXTURES = [",
+      `  "${VENDOR_TOKEN}",`,
+      "];",
+    ].join("\n");
+
+    it("passes clean content through byte-exact", () => {
+      const argv = ["api", "repos/o/r/git/blobs", "-f", "content=export const x = 1;\n"];
+      const result = scrubGitHubCliInvocation(argv, makeIo());
+
+      expect(result.argv).toEqual(argv);
+      expect(result.refusals).toEqual([]);
+      expect(result.redacted).toBe(false);
+    });
+
+    it("leaves credential-shaped content byte-exact and refuses the call", () => {
+      const argv = ["api", "repos/o/r/git/blobs", "-f", `content=${SOURCE_WITH_FIXTURE}`];
+      const io = makeIo();
+      const result = scrubGitHubCliInvocation(argv, io);
+
+      // The bytes are untouched — this is what stops the silent corruption.
+      expect(result.argv).toEqual(argv);
+      expect(result.argv[3]).toContain(VENDOR_TOKEN);
+      expect(io.written).toEqual([]);
+      // ...but the invocation is not allowed to run.
+      expect(result.refusals).toEqual([
+        { field: "content", path: null, classes: ["vendor-key"] },
+      ]);
+    });
+
+    it("still redacts the SAME token in a prose body (no blanket exemption)", () => {
+      const result = scrubGitHubCliInvocation(
+        ["api", "repos/o/r/issues/7/comments", "-f", `body=${SOURCE_WITH_FIXTURE}`],
+        makeIo(),
+      );
+
+      expect(result.argv[3]).toContain(redactionMarker("vendor-key"));
+      expect(result.argv[3]).not.toContain(VENDOR_TOKEN);
+      expect(result.refusals).toEqual([]);
+      expect(result.redacted).toBe(true);
+    });
+
+    it("refuses a typed content field backed by a file", () => {
+      const io = makeIo({ "/tmp/src.ts": SOURCE_WITH_FIXTURE });
+      const result = scrubGitHubCliInvocation(
+        ["api", "repos/o/r/git/blobs", "-F", "content=@/tmp/src.ts"],
+        io,
+      );
+
+      expect(result.argv[3]).toBe("content=@/tmp/src.ts");
+      expect(io.written).toEqual([]); // no scrubbed temp copy for gh to send
+      expect(result.refusals).toEqual([
+        { field: "content", path: "/tmp/src.ts", classes: ["vendor-key"] },
+      ]);
+    });
+
+    it("refuses a --input request body carrying file bytes", () => {
+      const body = JSON.stringify({ content: SOURCE_WITH_FIXTURE, encoding: "utf-8" });
+      const io = makeIo({ "/tmp/blob.json": body });
+      const result = scrubGitHubCliInvocation(
+        ["api", "repos/o/r/git/blobs", "--input", "/tmp/blob.json"],
+        io,
+      );
+
+      expect(result.argv[3]).toBe("/tmp/blob.json");
+      expect(io.written).toEqual([]);
+      expect(result.refusals).toEqual([
+        { field: "--input", path: "/tmp/blob.json", classes: ["vendor-key"] },
+      ]);
+    });
+
+    it("refuses content nested in a git/trees request body", () => {
+      const body = JSON.stringify({
+        tree: [{ path: "a.ts", mode: "100644", content: SOURCE_WITH_FIXTURE }],
+      });
+      const io = makeIo({ "/tmp/tree.json": body });
+      const result = scrubGitHubCliInvocation(
+        ["api", "repos/o/r/git/trees", "--input", "/tmp/tree.json"],
+        io,
+      );
+
+      // Behavioural assertion first: without the fix gh is handed a scrubbed
+      // temp copy, so this fails on the corruption rather than on a shape.
+      expect(io.written).toEqual([]);
+      expect(result.argv[3]).toBe("/tmp/tree.json");
+      expect(result.refusals).toHaveLength(1);
+    });
+
+    it("still scrubs a --input body that is prose, not content", () => {
+      const body = JSON.stringify({ body: `comment ${SOURCE_WITH_FIXTURE}` });
+      const io = makeIo({ "/tmp/comment.json": body });
+      const result = scrubGitHubCliInvocation(
+        ["api", "repos/o/r/issues/7/comments", "--input", "/tmp/comment.json"],
+        io,
+      );
+
+      expect(result.refusals).toEqual([]);
+      expect(io.written).toHaveLength(1);
+      expect(io.written[0]).toContain(redactionMarker("vendor-key"));
+    });
+
+    it("does not refuse prose that merely mentions a content key", () => {
+      // Name-shaped text inside a PROSE value must not trip the content rule —
+      // this is why the --input predicate parses JSON instead of grepping.
+      const body = JSON.stringify({
+        body: `the "content": field broke, see ${SOURCE_WITH_FIXTURE}`,
+      });
+      const io = makeIo({ "/tmp/c.json": body });
+      const result = scrubGitHubCliInvocation(
+        ["api", "repos/o/r/issues/7/comments", "--input", "/tmp/c.json"],
+        io,
+      );
+
+      expect(result.refusals).toEqual([]);
+      expect(io.written).toHaveLength(1);
+    });
+
+    it("leaves the documented base64 fleet write path working", () => {
+      // AGENTS.md:300 — `contents/{path}` PUT with base64 content and a prose
+      // commit message. Standard base64 has no `-`, so `sk-` cannot survive the
+      // encoding; the message beside it is prose and must still be scrubbed.
+      const encoded = Buffer.from(SOURCE_WITH_FIXTURE, "utf8").toString("base64");
+      const result = scrubGitHubCliInvocation(
+        [
+          "api", "repos/o/r/contents/src/a.ts", "-X", "PUT",
+          "-f", `message=land ${VENDOR_TOKEN}`,
+          "-f", `content=${encoded}`,
+          "-f", "branch=main",
+        ],
+        makeIo(),
+      );
+
+      expect(result.refusals).toEqual([]);
+      expect(result.argv[7]).toBe(`content=${encoded}`); // content untouched
+      expect(result.argv[5]).toContain(redactionMarker("vendor-key"));
     });
   });
 

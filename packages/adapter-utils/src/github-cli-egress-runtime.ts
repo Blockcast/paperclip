@@ -65,6 +65,29 @@ export function prepareGitHubCliInvocation(options: GitHubCliEgressRuntimeOption
     },
   });
 
+  // BLO-33171: a repository-content field that trips a detector is refused, not
+  // rewritten. Scrubbing it in place would silently corrupt the bytes that get
+  // committed — #1542 landed with 9 `sk-` test fixtures replaced, and the diff
+  // read on review as a deliberate weakening of a redaction test. Exempting the
+  // field instead would be a credential-exfiltration bypass, since a blob in a
+  // public repo is as public as a PR comment. Same fail-closed reasoning as the
+  // stdin rejection above: refuse, and say exactly what to fix.
+  if (result.refusals.length > 0) {
+    if (temporaryDirectory) rmSync(temporaryDirectory, { recursive: true, force: true });
+    const detail = result.refusals
+      .map((refusal) => {
+        const where = refusal.path ? ` (${refusal.path})` : "";
+        return `\`${refusal.field}\`${where} matched ${refusal.classes.join(", ")}`;
+      })
+      .join("; ");
+    throw new GitHubCliEgressRuntimeError(
+      `refusing to rewrite GitHub repository content: ${detail}. ` +
+        "Content fields are never scrubbed in place — a silent rewrite would corrupt the committed bytes. " +
+        "Remove the credential-shaped material; if it is a test fixture, derive the value at runtime " +
+        "rather than embedding a literal.",
+    );
+  }
+
   return { argv: result.argv, temporaryDirectory };
 }
 
