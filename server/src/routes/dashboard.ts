@@ -72,13 +72,17 @@ export function dashboardRoutes(db: Db) {
     const kind = typeof req.query.kind === "string" ? req.query.kind : undefined;
     const status = typeof req.query.status === "string" ? req.query.status : undefined;
     const limit = parsePositiveNumber(req.query.limit, 100, 500);
+    const offset = Math.max(0, Math.floor(parsePositiveNumber(req.query.offset, 0)));
+    const order = req.query.order === "asc" ? "asc" : "desc";
     const actions = await recoveryObservability.listActions(companyId, {
       ownerAgentId,
       kind,
       status,
       limit,
+      offset,
+      order,
     });
-    res.json({ companyId, ownerAgentId: ownerAgentId ?? null, kind: kind ?? null, status: status ?? null, actions });
+    res.json({ companyId, ownerAgentId: ownerAgentId ?? null, kind: kind ?? null, status: status ?? null, limit, offset, order, actions });
   });
 
   return router;

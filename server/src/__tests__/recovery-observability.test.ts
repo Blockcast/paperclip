@@ -440,4 +440,53 @@ describeEmbeddedPostgres("recovery observability report", () => {
     expect(resolved).toHaveLength(1);
     expect(resolved[0]?.outcome).toBe("restored");
   });
+
+  // BLO-19124: `listActions` was newest-first with `limit` hard-capped at 500 and
+  // no offset, so against a population larger than the cap the OLDEST actions
+  // were unreachable through the API by construction — the surface built to make
+  // the drain measurable could not see the legacy stock the drain is about. The
+  // cap is simulated here with `limit: 2` over 3 rows; what is asserted is the
+  // reachability of the tail, not the ordering cosmetics.
+  it("reaches the oldest actions past the limit via `offset` and `order: asc`", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+
+    const seedAt = async (n: number, createdAt: Date) =>
+      seedRecoveryAction({
+        companyId,
+        n,
+        createdAt,
+        cause: "stranded_assigned_issue",
+        errorCode: "adapter_failed",
+        status: "escalated",
+        outcome: null,
+        ownerAgentId: managerId,
+        returnOwnerAgentId: coderId,
+        finalAssigneeAgentId: managerId,
+        finalIssueStatus: "in_progress",
+      });
+
+    await seedAt(1, new Date("2026-06-10T00:00:00.000Z")); // oldest — the legacy tail
+    await seedAt(2, regressionWeek);
+    await seedAt(3, latestWeek); // newest
+
+    const service = recoveryObservabilityService(db);
+
+    // Default page is newest-first and stops short of the tail: this is the
+    // blindness. SRC-1 exists and is simply not reachable on this page.
+    const firstPage = await service.listActions(companyId, { limit: 2 });
+    expect(firstPage.map((a) => a.sourceIssueIdentifier)).toEqual(["SRC-3", "SRC-2"]);
+
+    // `offset` pages past the cap and reaches it.
+    const secondPage = await service.listActions(companyId, { limit: 2, offset: 2 });
+    expect(secondPage.map((a) => a.sourceIssueIdentifier)).toEqual(["SRC-1"]);
+
+    // `order: "asc"` reaches it directly, and is the drift-free walk: inserts
+    // land at the tail of an ascending list, so paging cannot skip an old row.
+    const oldestFirst = await service.listActions(companyId, { order: "asc", limit: 2 });
+    expect(oldestFirst.map((a) => a.sourceIssueIdentifier)).toEqual(["SRC-1", "SRC-2"]);
+
+    // `desc` stays the default for callers that pass no `order`.
+    const defaultOrder = await service.listActions(companyId, {});
+    expect(defaultOrder[0]?.sourceIssueIdentifier).toBe("SRC-3");
+  });
 });
