@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
-  buildK8sRunIsolationDescriptor,
   resolveExternalLifecycleConcurrency,
   resolveHeartbeatPolicyForRuntimeConfig,
+  buildK8sRunIsolationDescriptor,
   resolveK8sRunIsolationIdentity,
   scopeSessionParamsToIsolation,
   sessionParamsMatchIsolation,
 } from "../services/heartbeat.ts";
+import { buildK8sRunIsolationDescriptorFromWorkspace } from "./helpers/k8s-isolation-descriptor.ts";
 
 // Regression coverage for BLO-15959: bounded external-lifecycle concurrency
 // must default to the pre-existing one-run-per-agent containment, and only
@@ -459,7 +460,6 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
   it("never lets a same-issue run resume a session stamped by an earlier run", () => {
     const descriptorFor = (runId: string, perIssueWorkspaceTreeKey: string | null) =>
       buildK8sRunIsolationDescriptor({
-        adapterType: "claude_k8s",
         runId,
         companyId: "company-1",
         agentId: base.agentId,
@@ -467,11 +467,9 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
         statelessPrReview: false,
         executionWorkspace: {
           cwd: "/paperclip/worktrees/issue-7",
-          source: "task_session",
           strategy: "git_worktree",
         },
         persistedExecutionWorkspaceId: null,
-        effectiveExecutionWorkspaceMode: "isolated_workspace",
         isolationIdentity: resolveK8sRunIsolationIdentity({
           ...base,
           runId,
@@ -526,7 +524,6 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
   it("keeps tmpRoot per-run for two same-issue runs", () => {
     const tmpRootFor = (runId: string) =>
       buildK8sRunIsolationDescriptor({
-        adapterType: "claude_k8s",
         runId,
         companyId: "company-1",
         agentId: base.agentId,
@@ -534,11 +531,9 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
         statelessPrReview: false,
         executionWorkspace: {
           cwd: "/paperclip/worktrees/issue-7",
-          source: "task_session",
           strategy: "git_worktree",
         },
         persistedExecutionWorkspaceId: null,
-        effectiveExecutionWorkspaceMode: "isolated_workspace",
         isolationIdentity: resolveK8sRunIsolationIdentity({
           ...base,
           runId,
@@ -556,7 +551,6 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
   // key alone: a stateless PR review stays fully ephemeral and run-scoped.
   it("keeps a stateless PR review on an ephemeral per-run workspace", () => {
     const descriptor = buildK8sRunIsolationDescriptor({
-      adapterType: "claude_k8s",
       runId: "run-A",
       companyId: "company-1",
       agentId: base.agentId,
@@ -564,11 +558,9 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
       statelessPrReview: true,
       executionWorkspace: {
         cwd: "/paperclip/worktrees/issue-7",
-        source: "task_session",
         strategy: "git_worktree",
       },
       persistedExecutionWorkspaceId: null,
-      effectiveExecutionWorkspaceMode: "isolated_workspace",
       isolationIdentity: resolveK8sRunIsolationIdentity({
         ...base,
         runId: "run-A",

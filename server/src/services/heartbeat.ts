@@ -6333,8 +6333,18 @@ export function isQueuedRunAdmissionDeferred(
   return isK8sIsolationRetryDeferred(context, now) || isBranchClaimRetryDeferred(context, now);
 }
 
+/**
+ * BLO-31443: the caller resolves the isolation identity and passes it in. This
+ * function used to resolve it itself when the caller omitted it, off an
+ * `isWorkspaceIsolated` it derived locally — and that derivation was *wider*
+ * than the `workspaceIsolationRequested` production feeds the same resolver, so
+ * the two could return different `isolationMode`s for equal input. Production
+ * has always injected the identity, so the fallback was reachable only from
+ * tests: a test-only path that could disagree with production is a test that
+ * passes while production does something else. `null` here means "not a K8s
+ * run" — `resolveK8sRunIsolationIdentity` is the single place that decides both.
+ */
 export function buildK8sRunIsolationDescriptor(input: {
-  adapterType: string | null | undefined;
   runId: string;
   companyId: string;
   agentId: string;
@@ -6342,45 +6352,15 @@ export function buildK8sRunIsolationDescriptor(input: {
   statelessPrReview: boolean;
   executionWorkspace: {
     cwd: string;
-    source: string;
     strategy?: string | null;
   };
   persistedExecutionWorkspaceId?: string | null;
-  persistedWorkspaceExplicitlySelected?: boolean;
-  effectiveMaxConcurrentRuns?: number;
-  effectiveExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode>;
-  isolationIdentity?: {
+  isolationIdentity: {
     isolationMode: "shared" | "run" | "workspace";
     isolationKey: string;
   } | null;
 }): AdapterRunIsolationDescriptor | null {
-  if (!isK8sAdapter(input.adapterType)) return null;
-
-  const isWorkspaceIsolated =
-    input.effectiveExecutionWorkspaceMode === "isolated_workspace" ||
-    input.effectiveExecutionWorkspaceMode === "operator_branch" ||
-    input.executionWorkspace.source === "task_session" ||
-    input.executionWorkspace.strategy === "git_worktree";
-  // BLO-31443: `perIssueWorkspaceTreeKey: null` is deliberate. The tree key only
-  // ever reaches `reservationKey` (`withTreeScopedReservationKey`), and
-  // `AdapterRunIsolationDescriptor` has no reservation field — so a descriptor
-  // cannot carry reservation semantics, stale or otherwise. Reservations bind
-  // `reservationKey` off the identity directly, never a descriptor.
-  //
-  // This fallback is NOT production-faithful in one respect: `isWorkspaceIsolated`
-  // above is wider than the `workspaceIsolationRequested` production feeds the
-  // same resolver, so the two can disagree on `isolationMode` for equal input.
-  const isolationIdentity = input.isolationIdentity ?? resolveK8sRunIsolationIdentity({
-    adapterType: input.adapterType,
-    runId: input.runId,
-    agentId: input.agentId,
-    statelessPrReview: input.statelessPrReview,
-    isWorkspaceIsolated,
-    persistedExecutionWorkspaceId: input.persistedExecutionWorkspaceId,
-    persistedWorkspaceExplicitlySelected: input.persistedWorkspaceExplicitlySelected,
-    effectiveMaxConcurrentRuns: input.effectiveMaxConcurrentRuns ?? 1,
-    perIssueWorkspaceTreeKey: null,
-  });
+  const { isolationIdentity } = input;
   if (!isolationIdentity) return null;
   const { isolationMode, isolationKey } = isolationIdentity;
   const persistentIsolationRoot = isolationMode === "workspace"
@@ -28498,7 +28478,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       })
       .where(eq(heartbeatRuns.id, run.id));
     const k8sRunIsolation = buildK8sRunIsolationDescriptor({
-      adapterType: agent.adapterType,
       runId: run.id,
       companyId: agent.companyId,
       agentId: agent.id,
@@ -28506,7 +28485,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       statelessPrReview: paperclipPrReview !== null,
       executionWorkspace,
       persistedExecutionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
-      effectiveExecutionWorkspaceMode,
       isolationIdentity: k8sIsolationIdentity,
     });
     if (k8sRunIsolation) {
