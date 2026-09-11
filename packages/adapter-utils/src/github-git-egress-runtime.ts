@@ -1,5 +1,14 @@
 // PEN-3156: process wrapper for the `git` egress door.
 //
+// SCOPE — this is an ACCIDENTAL-DISCLOSURE guard. It is not a tamper-resistant
+// boundary and must not be described as one. Every component of it — wrapper,
+// hook, and scanner alike — sits on a surface writable by the account it
+// guards, so it stops a mistake and does not stop a decision. Enforcement that
+// holds against a deliberate bypass does not exist yet; it is tracked as
+// PEN-3183 and that, not this file, is the control to cite when asking whether
+// an agent can publish a credential on purpose. The reasoning is under THREAT
+// MODEL below. Read it before extending, renaming, or relying on any of this.
+//
 // Two modes, one module, because they must agree about what a push is:
 //
 //   wrapper   node github-git-egress-runtime.js <git> <argv...>
@@ -55,9 +64,12 @@
 // Making this door hold against a deliberate bypass is a different change in a
 // different place: enforcement off the agent's own machine (a server-side
 // pre-receive hook, or egress network policy that forces pushes through a
-// proxy). That is filed separately rather than approximated here, because a
-// control that looks tamper-proof and is not is worse than one whose limits are
-// written down.
+// proxy). That is PEN-3183 — filed, with the four bypasses enumerated and
+// measured, rather than approximated here. It is named rather than gestured at
+// on purpose: "filed separately" is a promise a reader cannot check, and an
+// uncheckable promise is how a documented limit quietly becomes a forgotten
+// one. A control that looks tamper-proof and is not is worse than one whose
+// limits are written down and tracked.
 
 import { spawn, spawnSync } from "node:child_process";
 import { accessSync, constants } from "node:fs";
@@ -117,7 +129,14 @@ export class GitEgressRuntimeError extends Error {
 }
 
 /**
- * Is the guard actually installed at `hooksDir`?
+ * Is SOME executable `pre-push` present at `hooksDir`?
+ *
+ * Named for what it can observe, not for what the caller wishes it meant. It
+ * was `prePushHookInstalled`, and "installed" read at the call site as "the
+ * guard is in place" — which is precisely the claim this cannot support and
+ * the misreading the threat model exists to prevent. An executable
+ * pass-through named `pre-push` satisfies it exactly as well as this scanner
+ * does.
  *
  * Pointing `core.hooksPath` at a directory that holds no executable `pre-push`
  * is not an error to git — it runs no hook and the push proceeds. That is the
@@ -138,7 +157,7 @@ export class GitEgressRuntimeError extends Error {
  * agent cannot rewrite, and the scanner's own code is on an agent-writable
  * path regardless. See the threat model at the top of this file.
  */
-function prePushHookInstalled(hooksDir: string): boolean {
+function prePushHookPresent(hooksDir: string): boolean {
   try {
     accessSync(path.join(hooksDir, "pre-push"), constants.X_OK);
     return true;
@@ -173,7 +192,7 @@ export function buildGitArgv(
     resolveAlias?: (name: string) => string | null;
     env?: NodeJS.ProcessEnv;
     /** Seam for the fs check; the default is the real one. */
-    hookInstalled?: (hooksDir: string) => boolean;
+    hookPresent?: (hooksDir: string) => boolean;
   },
 ): string[] {
   const classification = classifyGitInvocation(argv, options.resolveAlias, options.env ?? {});
@@ -227,8 +246,8 @@ export function buildGitArgv(
   // Last, so the specific caller-error refusals above win the message. Placed
   // before the injection because injecting a hooks path with no hook in it is
   // indistinguishable, from the outside, from a push that was scanned.
-  const hookInstalled = options.hookInstalled ?? prePushHookInstalled;
-  if (!hookInstalled(options.hooksDir)) {
+  const hookPresent = options.hookPresent ?? prePushHookPresent;
+  if (!hookPresent(options.hooksDir)) {
     throw new GitEgressRuntimeError(
       `paperclip-github-egress: refusing to publish — no executable pre-push hook at \`${path.join(options.hooksDir, "pre-push")}\`, so this push could not be checked for credential-shaped material. This is a deployment fault, not something to work around: the hook is written by the chart's agent-runtime seed. Report it rather than pushing past it.`,
     );
@@ -317,7 +336,7 @@ export function runGitEgressRuntime(options: {
   argv: string[];
   hooksDir: string;
   env?: NodeJS.ProcessEnv;
-  hookInstalled?: (hooksDir: string) => boolean;
+  hookPresent?: (hooksDir: string) => boolean;
 }): Promise<number> {
   const env = options.env ?? process.env;
 
@@ -351,7 +370,7 @@ export function runGitEgressRuntime(options: {
     hooksDir: options.hooksDir,
     resolveAlias,
     env,
-    hookInstalled: options.hookInstalled,
+    hookPresent: options.hookPresent,
   });
 
   return new Promise((resolve, reject) => {

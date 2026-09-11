@@ -28,14 +28,14 @@ const HOOKS = "/hooks";
  * now a refusal — see the "fails closed when the hook is missing" test. Tests
  * that are not about that case assert the precondition holds.
  */
-const INSTALLED = { hooksDir: HOOKS, hookInstalled: () => true };
+const PRESENT = { hooksDir: HOOKS, hookPresent: () => true };
 
 /** Real git, or null when this environment has none to drive. */
 const GIT = spawnSync("git", ["--version"], { encoding: "utf8" }).status === 0 ? "git" : null;
 
 describe("buildGitArgv", () => {
   it("points a push at the hooks directory that holds the guard", () => {
-    expect(buildGitArgv(["push", "origin", "main"], { ...INSTALLED })).toEqual([
+    expect(buildGitArgv(["push", "origin", "main"], { ...PRESENT })).toEqual([
       "-c",
       `core.hooksPath=${HOOKS}`,
       "push",
@@ -47,7 +47,7 @@ describe("buildGitArgv", () => {
   it("puts the injected option before the subcommand", () => {
     // git only accepts global options ahead of the subcommand; appending it
     // would make git treat it as a push argument and the hook would not run.
-    const argv = buildGitArgv(["push"], { ...INSTALLED });
+    const argv = buildGitArgv(["push"], { ...PRESENT });
     expect(argv.indexOf("-c")).toBeLessThan(argv.indexOf("push"));
   });
 
@@ -56,16 +56,16 @@ describe("buildGitArgv", () => {
     // silently disables a repository's pre-commit and commit-msg hooks, so this
     // must not be set globally.
     for (const argv of [["status"], ["commit", "-m", "x"], ["fetch", "origin"], ["log"]]) {
-      expect(buildGitArgv(argv, { ...INSTALLED })).toEqual(argv);
+      expect(buildGitArgv(argv, { ...PRESENT })).toEqual(argv);
     }
   });
 
   it("refuses the flag that would skip the hook", () => {
     // Without this the whole control is one flag away from being off.
-    expect(() => buildGitArgv(["push", "--no-verify"], { ...INSTALLED })).toThrow(
+    expect(() => buildGitArgv(["push", "--no-verify"], { ...PRESENT })).toThrow(
       GitEgressRuntimeError,
     );
-    expect(() => buildGitArgv(["push", "--no-verify"], { ...INSTALLED })).toThrow(
+    expect(() => buildGitArgv(["push", "--no-verify"], { ...PRESENT })).toThrow(
       /--no-verify is disabled/,
     );
   });
@@ -74,7 +74,7 @@ describe("buildGitArgv", () => {
     // `-n` means --dry-run for push. The hook still runs under it and nothing
     // is published either way, so refusing it rejected a safe command and gave
     // a reason that was not true.
-    expect(buildGitArgv(["push", "-n"], { ...INSTALLED })).toEqual([
+    expect(buildGitArgv(["push", "-n"], { ...PRESENT })).toEqual([
       "-c",
       `core.hooksPath=${HOOKS}`,
       "push",
@@ -87,7 +87,7 @@ describe("buildGitArgv", () => {
     // `git -c core.hooksPath=/tmp/empty push` override the guard and skip the
     // scanner while still traversing the wrapper — measured against git 2.47.3.
     const argv = buildGitArgv(["-C", "/repo", "--no-pager", "push", "origin", "main"], {
-      ...INSTALLED,
+      ...PRESENT,
     });
     expect(argv).toEqual([
       "-C",
@@ -114,7 +114,7 @@ describe("buildGitArgv", () => {
       ["-c", "CORE.HOOKSPATH=/tmp/empty", "push"],
       ["--config-env=core.hooksPath=HP", "push"],
     ]) {
-      expect(() => buildGitArgv(argv, { ...INSTALLED }), argv.join(" ")).toThrow(
+      expect(() => buildGitArgv(argv, { ...PRESENT }), argv.join(" ")).toThrow(
         /sets core\.hooksPath itself/,
       );
     }
@@ -125,14 +125,14 @@ describe("buildGitArgv", () => {
     // so the expansion's own flag is the last thing git sees.
     expect(() =>
       buildGitArgv(["yolo"], {
-        ...INSTALLED,
+        ...PRESENT,
         resolveAlias: (name) => (name === "yolo" ? "push --no-verify" : null),
       }),
     ).toThrow(/expands to a push that skips the pre-push hook/);
 
     expect(() =>
       buildGitArgv(["sneaky"], {
-        ...INSTALLED,
+        ...PRESENT,
         resolveAlias: (name) =>
           name === "sneaky" ? "-c core.hooksPath=/tmp/empty push" : null,
       }),
@@ -141,7 +141,7 @@ describe("buildGitArgv", () => {
 
   it("still guards a push reached through an alias", () => {
     const argv = buildGitArgv(["yolo"], {
-      ...INSTALLED,
+      ...PRESENT,
       resolveAlias: (name) => (name === "yolo" ? "push --force" : null),
     });
     expect(argv).toEqual(["-c", `core.hooksPath=${HOOKS}`, "yolo"]);
@@ -154,7 +154,7 @@ describe("buildGitArgv", () => {
     // output — so no resolver is supplied here: the guard has to read the
     // definition out of argv or it does not hold at all.
     expect(() =>
-      buildGitArgv(["-c", "alias.yolo=push --no-verify", "yolo"], { ...INSTALLED }),
+      buildGitArgv(["-c", "alias.yolo=push --no-verify", "yolo"], { ...PRESENT }),
     ).toThrow(/expands to a push that skips the pre-push hook/);
   });
 
@@ -164,7 +164,7 @@ describe("buildGitArgv", () => {
     // 2.47.3, `git -c alias.p=push -c core.hooksPath=<dir> p origin HEAD:...`
     // ran the hook and the push aborted; without the injection it succeeded.
     const argv = buildGitArgv(["-c", "alias.p=push", "p", "origin", "main"], {
-      ...INSTALLED,
+      ...PRESENT,
     });
     expect(argv).toEqual([
       "-c",
@@ -181,7 +181,7 @@ describe("buildGitArgv", () => {
   it("reads a --config-env alias through the environment it is given", () => {
     expect(() =>
       buildGitArgv(["--config-env=alias.yolo=A_PUSH", "yolo"], {
-        ...INSTALLED,
+        ...PRESENT,
         env: { A_PUSH: "push --no-verify" },
       }),
     ).toThrow(/expands to a push that skips the pre-push hook/);
@@ -189,7 +189,7 @@ describe("buildGitArgv", () => {
 
   it("leaves a command-line alias to a non-push alone", () => {
     const argv = ["-c", "alias.st=status --short", "st"];
-    expect(buildGitArgv(argv, { ...INSTALLED })).toEqual(argv);
+    expect(buildGitArgv(argv, { ...PRESENT })).toEqual(argv);
   });
 });
 
@@ -214,7 +214,7 @@ describe.skipIf(!GIT)("runGitEgressRuntime alias resolution", () => {
     // Thrown synchronously, before the promise is built — which is exactly why
     // the entrypoint wraps this call in a try/catch as well as a .catch().
     expect(() =>
-      runGitEgressRuntime({ target: "git", argv: ["-C", repo, "yolo"], ...INSTALLED }),
+      runGitEgressRuntime({ target: "git", argv: ["-C", repo, "yolo"], ...PRESENT }),
     ).toThrow(/expands to a push that skips the pre-push hook/);
   });
 
@@ -229,7 +229,7 @@ describe.skipIf(!GIT)("runGitEgressRuntime alias resolution", () => {
       runGitEgressRuntime({
         target: "git",
         argv: ["-C", repo, "-c", "alias.p=push --no-verify", "p"],
-        ...INSTALLED,
+        ...PRESENT,
       }),
     ).toThrow(/expands to a push that skips the pre-push hook/);
   });
@@ -281,13 +281,13 @@ describe("missing hook", () => {
   // scan, so the only safe reading of an absent guard is refusal.
   it("fails closed when the hook is not installed", () => {
     expect(() =>
-      buildGitArgv(["push", "origin", "main"], { hooksDir: HOOKS, hookInstalled: () => false }),
+      buildGitArgv(["push", "origin", "main"], { hooksDir: HOOKS, hookPresent: () => false }),
     ).toThrow(/no executable pre-push hook/);
   });
 
   it("does not require the hook for commands that publish nothing", () => {
     const argv = ["status"];
-    expect(buildGitArgv(argv, { hooksDir: HOOKS, hookInstalled: () => false })).toEqual(argv);
+    expect(buildGitArgv(argv, { hooksDir: HOOKS, hookPresent: () => false })).toEqual(argv);
   });
 });
 
@@ -309,7 +309,7 @@ describe("shell aliases", () => {
   it("refuses a shell alias rather than guessing whether it publishes", () => {
     expect(() =>
       buildGitArgv(["publish"], {
-        ...INSTALLED,
+        ...PRESENT,
         resolveAlias: (name) =>
           name === "publish" ? `!/usr/bin/git ${PUSH} --no-verify` : null,
       }),
@@ -321,7 +321,7 @@ describe("shell aliases", () => {
     // the subcommand that indirection can defeat is worth trusting.
     expect(() =>
       buildGitArgv(["helper"], {
-        ...INSTALLED,
+        ...PRESENT,
         resolveAlias: (name) => (name === "helper" ? `!f() { git ${PUSH}; }; f` : null),
       }),
     ).toThrow(/refusing to run the shell alias `helper`/);
@@ -329,13 +329,13 @@ describe("shell aliases", () => {
 
   it("refuses one defined on the command line, which no separate lookup can see", () => {
     expect(() =>
-      buildGitArgv(["-c", `alias.x=!/usr/bin/git ${PUSH}`, "x"], { ...INSTALLED }),
+      buildGitArgv(["-c", `alias.x=!/usr/bin/git ${PUSH}`, "x"], { ...PRESENT }),
     ).toThrow(/refusing to run the shell alias `x`/);
   });
 
   it("leaves ordinary non-shell aliases alone", () => {
     const argv = buildGitArgv(["lg"], {
-      ...INSTALLED,
+      ...PRESENT,
       resolveAlias: (name) => (name === "lg" ? "log --oneline" : null),
     });
     expect(argv).toEqual(["lg"]);
