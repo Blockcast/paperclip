@@ -2257,7 +2257,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     await tempDb?.cleanup();
   }, 60_000);
 
-  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "resolvePrReviewHeadSha" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions"> = {}) {
+  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "resolvePrReviewHeadSha" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions" | "listPullRequestCommits" | "notifyForeignCommits"> = {}) {
     const app = express();
     app.use(express.json({
       verify: (req, _res, buf) => {
@@ -2542,6 +2542,273 @@ describeEmbeddedPostgres("github-webhook route", () => {
   // so productivity/liveness accounting -- whose own verdict criteria ask for
   // "a non-stale PR/MR link in the source issue's evidence" -- could never find
   // one, and an assignee pushing commits to an open PR read as zero progress.
+  // BLO-19528. The pure selection boundary is covered in
+  // foreign-commit-notice.test.ts; these are the route-level cases the issue's
+  // verifying signal asks for, which assert that a *comment row actually lands
+  // on the assignee's issue* (or does not) rather than that the selector
+  // returned the right array.
+  describe("foreign-commit notice (BLO-19528)", () => {
+    // The commit this feature exists to catch: BackendEngineerGo's per-agent
+    // `git push` onto the CTO's branch on trafficcontrol#1292.
+    const WITNESS_SHA = "d51b62a3aaaabbbbccccddddeeeeffff00001111";
+    const FOREIGN_EMAIL = "backend-engineer-go@blockcast.net";
+
+    async function seedForeignCommitFixture(identifier: string) {
+      const companyId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      const foreignAgentId = randomUUID();
+      const issueId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Test",
+        issuePrefix: identifier.split("-")[0]!,
+        defaultResponsibleUserId: "test-board-user",
+        requireBoardApprovalForNewAgents: false,
+      });
+      const agentDefaults = {
+        companyId,
+        role: "engineer",
+        status: "idle",
+        adapterType: "claude_k8s",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      } as const;
+      // Names chosen so deriveAgentUrlKey inverts to the author local parts
+      // below: "CTO" -> cto, "Backend Engineer Go" -> backend-engineer-go.
+      await db.insert(agents).values([
+        { ...agentDefaults, id: assigneeAgentId, name: "CTO" },
+        { ...agentDefaults, id: foreignAgentId, name: "Backend Engineer Go" },
+      ]);
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Test issue",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId,
+        issueNumber: Number(identifier.split("-")[1] ?? 1),
+        identifier,
+      });
+      return { companyId, assigneeAgentId, foreignAgentId, issueId };
+    }
+
+    function commitsStub(
+      commits: Array<{
+        sha: string;
+        authorEmail: string | null;
+        authorName: string | null;
+        parentCount: number;
+      }>,
+    ): NonNullable<GithubWebhookConfig["listPullRequestCommits"]> {
+      return async () => ({ commits });
+    }
+
+    async function postSync(
+      app: express.Express,
+      opts: { identifier: string; number: number; deliveryId: string },
+    ) {
+      const payload = {
+        action: "synchronize",
+        pull_request: {
+          number: opts.number,
+          title: `Fix ${opts.identifier}`,
+          body: null,
+          html_url: `https://github.com/Blockcast/paperclip/pull/${opts.number}`,
+          updated_at: "2026-04-30T10:05:00Z",
+          draft: false,
+          merged: false,
+          head: { ref: `fix/${opts.identifier.toLowerCase()}`, sha: "head-one" },
+        },
+        repository: { full_name: "Blockcast/paperclip" },
+      };
+      const { body, signature } = signedRequest(payload);
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", opts.deliveryId)
+        .set("content-type", "application/json")
+        .send(body);
+    }
+
+    /** Only the foreign-commit notices -- the route posts other comments too. */
+    async function foreignCommitNotices(issueId: string) {
+      const rows = await db
+        .select({
+          body: issueComments.body,
+          metadata: issueComments.metadata,
+          idempotencyKey: issueComments.idempotencyKey,
+        })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      return rows.filter(
+        (row) =>
+          (row.metadata as { kind?: string } | null)?.kind === "github_foreign_commit_notice",
+      );
+    }
+
+    it("AC(a): posts exactly one notice naming the committing identity and SHA", async () => {
+      const { issueId, foreignAgentId } = await seedForeignCommitFixture("BLO-41001");
+      const app = buildApp({
+        listPullRequestCommits: commitsStub([
+          {
+            sha: WITNESS_SHA,
+            authorEmail: FOREIGN_EMAIL,
+            authorName: "Backend Engineer Go",
+            parentCount: 1,
+          },
+        ]),
+      });
+
+      const res = await postSync(app, {
+        identifier: "BLO-41001",
+        number: 41001,
+        deliveryId: "fc-a-1",
+      });
+      expect(res.status).toBe(200);
+
+      const posted = await foreignCommitNotices(issueId);
+      expect(posted).toHaveLength(1);
+      // The assignee must be able to act on this without opening GitHub: who,
+      // which commit, which PR.
+      expect(posted[0]?.body).toContain("Backend Engineer Go");
+      expect(posted[0]?.body).toContain(WITNESS_SHA.slice(0, 12));
+      expect(posted[0]?.body).toContain("Blockcast/paperclip#41001");
+      expect(posted[0]?.metadata).toMatchObject({
+        kind: "github_foreign_commit_notice",
+        commitSha: WITNESS_SHA,
+        committingAgentId: foreignAgentId,
+        prNumber: 41001,
+      });
+    });
+
+    it("AC(b): the assignee's own commit posts nothing", async () => {
+      const { issueId } = await seedForeignCommitFixture("BLO-41002");
+      const app = buildApp({
+        listPullRequestCommits: commitsStub([
+          {
+            sha: "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
+            authorEmail: "cto@paperclip.blockcast.net",
+            authorName: "CTO",
+            parentCount: 1,
+          },
+        ]),
+      });
+
+      const res = await postSync(app, {
+        identifier: "BLO-41002",
+        number: 41002,
+        deliveryId: "fc-b-1",
+      });
+      expect(res.status).toBe(200);
+      expect(await foreignCommitNotices(issueId)).toHaveLength(0);
+    });
+
+    it("AC(c): a merge commit posts nothing even though it is App-attributed", async () => {
+      const { issueId } = await seedForeignCommitFixture("BLO-41003");
+      const app = buildApp({
+        listPullRequestCommits: commitsStub([
+          {
+            sha: "bbbb1111cccc2222dddd3333eeee4444ffff5555",
+            authorEmail: "allyblockcast[bot]@users.noreply.github.com",
+            authorName: "allyblockcast[bot]",
+            parentCount: 2,
+          },
+        ]),
+      });
+
+      const res = await postSync(app, {
+        identifier: "BLO-41003",
+        number: 41003,
+        deliveryId: "fc-c-1",
+      });
+      expect(res.status).toBe(200);
+      expect(await foreignCommitNotices(issueId)).toHaveLength(0);
+    });
+
+    it("is idempotent across a redelivery replaying the same SHA", async () => {
+      const { issueId } = await seedForeignCommitFixture("BLO-41004");
+      const app = buildApp({
+        listPullRequestCommits: commitsStub([
+          {
+            sha: WITNESS_SHA,
+            authorEmail: FOREIGN_EMAIL,
+            authorName: "Backend Engineer Go",
+            parentCount: 1,
+          },
+        ]),
+      });
+
+      await postSync(app, { identifier: "BLO-41004", number: 41004, deliveryId: "fc-d-1" });
+      // A force-push replaying a known SHA arrives as a fresh delivery id, so
+      // the key is (repo, pr, sha) and not the delivery.
+      await postSync(app, { identifier: "BLO-41004", number: 41004, deliveryId: "fc-d-2" });
+
+      expect(await foreignCommitNotices(issueId)).toHaveLength(1);
+    });
+
+    it("does not fire on a shared-App author: unattributable is not foreign", async () => {
+      const { issueId } = await seedForeignCommitFixture("BLO-41005");
+      const app = buildApp({
+        listPullRequestCommits: commitsStub([
+          {
+            sha: "cccc1111dddd2222eeee3333ffff4444aaaa5555",
+            authorEmail: "allyblockcast[bot]@users.noreply.github.com",
+            authorName: "allyblockcast[bot]",
+            parentCount: 1,
+          },
+        ]),
+      });
+
+      const res = await postSync(app, {
+        identifier: "BLO-41005",
+        number: 41005,
+        deliveryId: "fc-e-1",
+      });
+      expect(res.status).toBe(200);
+      expect(await foreignCommitNotices(issueId)).toHaveLength(0);
+    });
+
+    it("does not fire on an ordinary human contributor address", async () => {
+      const { issueId } = await seedForeignCommitFixture("BLO-41006");
+      const app = buildApp({
+        listPullRequestCommits: commitsStub([
+          {
+            sha: "dddd1111eeee2222ffff3333aaaa4444bbbb5555",
+            authorEmail: "person@example.invalid",
+            authorName: "A Human",
+            parentCount: 1,
+          },
+        ]),
+      });
+
+      const res = await postSync(app, {
+        identifier: "BLO-41006",
+        number: 41006,
+        deliveryId: "fc-f-1",
+      });
+      expect(res.status).toBe(200);
+      expect(await foreignCommitNotices(issueId)).toHaveLength(0);
+    });
+
+    it("survives a failing commit listing without breaking the wake path", async () => {
+      const { issueId } = await seedForeignCommitFixture("BLO-41007");
+      const app = buildApp({
+        listPullRequestCommits: async () => ({ error: "not_configured" }),
+      });
+
+      const res = await postSync(app, {
+        identifier: "BLO-41007",
+        number: 41007,
+        deliveryId: "fc-g-1",
+      });
+      // Best-effort: the notice is skipped, the delivery still succeeds.
+      expect(res.status).toBe(200);
+      expect(await foreignCommitNotices(issueId)).toHaveLength(0);
+    });
+  });
+
   describe("pull_request work products", () => {
     function prPayload(opts: {
       action: string;
