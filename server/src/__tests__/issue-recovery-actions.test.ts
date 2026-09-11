@@ -1503,6 +1503,55 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).toHaveBeenCalledWith(coderId, expect.anything());
   });
 
+  // BLO-33223: the same family, one pod-death reason later. A container killed by
+  // the kernel OOM killer is read at exit (not found missing), so it carries the
+  // `exit code 137 … reason=OOMKilled` shape rather than the pod-removal sentence,
+  // and used to classify `infraClassCause: false` and escalate to the manager.
+  // Measured live on recovery action `cf5f83a6-…`, which stranded BLO-31945 four
+  // times. The negative control for this case is the test immediately below: an
+  // agent-side crash is `exit code 1, reason=Error` and must still escalate.
+  it("re-dispatches an OOMKilled claude_truncated failure to the existing assignee instead of the manager", async () => {
+    const { managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Claude run was truncated mid-stream — assistant produced content but no result " +
+        "event arrived; exit code 137, SIGKILL (commonly OOMKilled), reason=OOMKilled",
+      errorCode: "claude_truncated",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(action).toMatchObject({
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      ownerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+    });
+    expect(action?.ownerAgentId).toBe(action?.returnOwnerAgentId);
+    expect(action?.ownerAgentId).not.toBe(managerId);
+    expect(action?.evidence).toMatchObject({ infraClassCause: true });
+  });
+
   it("still escalates a claude_truncated failure without pod-removal evidence to the manager", async () => {
     const { managerId, coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn<
@@ -1796,6 +1845,46 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           ...baseRun,
           errorCode: "adapter_failed",
           error: "pod is gone — Job pod was removed (eviction, preemption, or external delete)",
+        }),
+      ).toBe(false);
+    });
+
+    // BLO-33223. The live message is pinned verbatim; the two below it pin that
+    // each marker carries on its own, since an adapter that reports the reason
+    // without an exit code (or vice versa) must not fall back to escalation.
+    it("is true for the adapter's OOMKilled termination sentence", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: "Claude run was truncated mid-stream — assistant produced content but no " +
+            "result event arrived; exit code 137, SIGKILL (commonly OOMKilled), reason=OOMKilled",
+        }),
+      ).toBe(true);
+    });
+
+    it.each([
+      ["exit code alone", "exit code 137, reason=Error"],
+      ["reason alone", "reason=OOMKilled"],
+    ])("is true for a SIGKILLed container reported by %s", (_label, tail) => {
+      expect(
+        isInfraClassStrandedFailure({ ...baseRun, errorCode: "claude_truncated", error: tail }),
+      ).toBe(true);
+    });
+
+    // The discriminator is the KILL, not the pod death: an agent-side crash is
+    // also a pod-lifecycle termination and must keep escalating. `exit code 13`
+    // guards the word-boundary — a prefix match on "137" would swallow it.
+    it.each([
+      ["an agent-side crash", "exit code 1, reason=Error, message=panic: nil pointer dereference"],
+      ["an exit code that merely starts with 13", "exit code 13, reason=Error"],
+      ["a message that merely mentions OOM", "exit code 2, reason=Error, message=parser hit an OOMKilled log line"],
+    ])("is false for %s", (_label, tail) => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: `Claude run was truncated mid-stream — ${tail}`,
         }),
       ).toBe(false);
     });
