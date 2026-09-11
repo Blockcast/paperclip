@@ -124,7 +124,15 @@ export type RecoveryActionListOptions = {
    * `asc` is not merely the reverse view: this subsystem inserts continuously (in
    * bursts of tens per day), and inserts land at the *head* of a `desc` list, so
    * paging `desc` shifts the tail deeper mid-walk and can skip rows. Oldest-first
-   * is stable at the head, which makes `asc` + `offset` a drift-free full walk.
+   * is stable against inserts, because they land at the *tail* of the walk.
+   *
+   * That is narrower than drift-free, and for a census the gap matters: `status`
+   * is filtered before ordering, so a row that leaves the filtered set mid-walk
+   * (`active` -> `resolved`) shrinks the already-walked prefix and slides the next
+   * page up by one, skipping an unwalked row per exit. Offset paging cannot see
+   * that. For an exact census, walk `order: "asc"` with NO `status` filter and
+   * bucket by status client-side — rows are never deleted and `createdAt` is never
+   * rewritten, so the unfiltered set is append-only and the walk is stable.
    */
   order?: "asc" | "desc";
 };
@@ -254,9 +262,13 @@ export function recoveryObservabilityService(db: Db) {
       .leftJoin(agents, eq(agents.id, issueRecoveryActions.ownerAgentId))
       .where(and(...filters))
       .orderBy(
-        opts.order === "asc"
-          ? asc(issueRecoveryActions.createdAt)
-          : desc(issueRecoveryActions.createdAt),
+        // `id` breaks ties: `createdAt` collides inside a burst (the sweeps that
+        // create these touch tens of rows per second), and without a second key
+        // the order of a tied group is database-defined, so a page boundary
+        // landing inside one can repeat or drop a row between calls.
+        ...(opts.order === "asc"
+          ? [asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id)]
+          : [desc(issueRecoveryActions.createdAt), desc(issueRecoveryActions.id)]),
       )
       .limit(limit)
       .offset(offset);

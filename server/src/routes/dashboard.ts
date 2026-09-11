@@ -73,7 +73,13 @@ export function dashboardRoutes(db: Db) {
     const status = typeof req.query.status === "string" ? req.query.status : undefined;
     const limit = parsePositiveNumber(req.query.limit, 100, 500);
     const offset = Math.max(0, Math.floor(parsePositiveNumber(req.query.offset, 0)));
-    const order = req.query.order === "asc" ? "asc" : "desc";
+    // Rejected rather than coerced: a silently-ignored `order=ascending` returns a
+    // newest-first page that the caller reads as a census of the oldest rows.
+    const orderParam = req.query.order;
+    if (orderParam !== undefined && orderParam !== "asc" && orderParam !== "desc") {
+      throw badRequest('Query parameter order must be "asc" or "desc"');
+    }
+    const order = orderParam === "asc" ? "asc" : "desc";
     const actions = await recoveryObservability.listActions(companyId, {
       ownerAgentId,
       kind,
