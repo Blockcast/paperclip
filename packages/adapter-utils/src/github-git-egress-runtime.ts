@@ -20,8 +20,44 @@
 //
 // Why the wrapper is still needed: a hook alone is bypassable with
 // `--no-verify`, and `core.hooksPath` has to be injected by something. The
-// wrapper is the part an agent cannot route around, because it is what `git`
-// resolves to on PATH.
+// wrapper is what `git` resolves to on PATH, so it is on the path every
+// ordinary invocation takes.
+//
+// THREAT MODEL — read this before extending the guard, because it bounds what
+// any change here can achieve.
+//
+// What this defends against is an agent that discloses WITHOUT INTENDING TO.
+// That is the exposure this control descends from: PEN-2526 was an environment
+// dump interpolated into prose by an agent doing its job. Against that, a guard
+// on the path the agent actually takes is effective, and every refusal above
+// earns its place.
+//
+// What it does NOT defend against is an agent that sets out to defeat it. In
+// the deployed pod, measured 2026-09-11:
+//
+//   - `/usr/bin/git` is mode 0755 and directly executable. Nothing routes it
+//     through this wrapper; the wrapper is reached via PATH, which the caller
+//     chooses. No file needs to be written to take that path.
+//   - The agent runs as uid 1000 (`node`), and
+//     `/opt/paperclip-bundled-adapters` — which holds THIS FILE as compiled
+//     JavaScript — is `drwxr-xr-x node node`. The scanner is writable by the
+//     account it scans.
+//   - `${LOCAL_BIN}/git`, `${PATH_BIN}/git` and the hooks directory are all on
+//     the PVC, mounted `fsGroup: 1000`, so they are writable too.
+//
+// So the hook, the wrapper and the scanner are peers, not layers: an agent able
+// to tamper with any one of them can tamper with all three, and does not need
+// to tamper with anything to call the real git directly. Do not add integrity
+// checks between these components — verifying the hook's content from the
+// wrapper, or vice versa, asserts a boundary that does not exist and reads to
+// the next person as though tamper-resistance had been established.
+//
+// Making this door hold against a deliberate bypass is a different change in a
+// different place: enforcement off the agent's own machine (a server-side
+// pre-receive hook, or egress network policy that forces pushes through a
+// proxy). That is filed separately rather than approximated here, because a
+// control that looks tamper-proof and is not is worse than one whose limits are
+// written down.
 
 import { spawn, spawnSync } from "node:child_process";
 import { accessSync, constants } from "node:fs";
@@ -93,6 +129,14 @@ export class GitEgressRuntimeError extends Error {
  * `{{ .Values.persistence.mountPath }}` — equal in every values file today, but
  * a deployment that changed the mount path would silently publish unscanned.
  * Checking turns that from a hole into a refusal that names the missing file.
+ *
+ * This is a DEPLOYMENT check, not a tamper check, and the distinction is worth
+ * keeping straight: it establishes that a hook is present and executable, not
+ * that the hook is this scanner. It cannot establish the latter, and neither
+ * could a content or ownership check bolted on beside it — the seed runs
+ * `runAsNonRoot: true, runAsUser: 1000`, so it has no way to write a file the
+ * agent cannot rewrite, and the scanner's own code is on an agent-writable
+ * path regardless. See the threat model at the top of this file.
  */
 function prePushHookInstalled(hooksDir: string): boolean {
   try {

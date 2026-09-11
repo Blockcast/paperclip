@@ -549,9 +549,36 @@ export function scanCommit(commit: string, runGit: GitReader): GitPushFinding[] 
   // `--format=` suppresses the commit header so the message is not scanned
   // twice and reported as two findings. `--no-color` keeps escape sequences out
   // of the scrubbed text. `-m` makes merge commits emit a patch at all.
+  //
+  // `--text` and `--no-textconv` are SECURITY flags, not formatting ones. Both
+  // defeat a way for a file's real bytes never to reach this scanner, and each
+  // was verified against git 2.47 by committing the material and reading what
+  // `show` emitted:
+  //
+  //   --text         Without it git prints `Binary files ... differ` and NO `+`
+  //                  lines for anything it considers binary, so
+  //                  `addedLinesFromPatch` returns the empty string and the
+  //                  commit is reported clean. Two ways in: a single NUL byte in
+  //                  the first 8000 bytes makes any file binary, and a
+  //                  `.gitattributes` entry marking a path `-diff` does the same
+  //                  to a plain-ASCII one. The second is the wider hole —
+  //                  `* -diff` blanks the content leg for the WHOLE tree, needs
+  //                  no binary content at all, and is committed in the same push
+  //                  it hides.
+  //   --no-textconv  A `diff.<driver>.textconv` in the repository's own config,
+  //                  bound to a path by `.gitattributes`, replaces a file's
+  //                  content with that command's output for display. It is
+  //                  ordinary repo config, so it is agent-writable, and it
+  //                  launders the bytes before the scanner ever sees them.
+  //
+  // Size policy is the reader's `maxBuffer`, and it fails closed: an oversized
+  // read leaves spawnSync with `ENOBUFS` and a null status, `makeGitReader`
+  // returns null, and `readGit` throws rather than scanning a truncated patch.
+  // That is deliberate — the alternative is scanning a prefix and calling the
+  // rest clean, which is worst exactly when the push is biggest.
   const patch = readGit(
     runGit,
-    ["show", "--format=", "--no-color", "-m", "--unified=0", commit],
+    ["show", "--format=", "--no-color", "-m", "--unified=0", "--text", "--no-textconv", commit],
     commit,
   );
   if (patch) {

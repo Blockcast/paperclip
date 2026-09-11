@@ -481,6 +481,12 @@ spec:
               exec /usr/local/bin/node /opt/paperclip-bundled-adapters/node_modules/@paperclipai/adapter-utils/dist/github-git-egress-runtime.js --pre-push-hook "$@"
               EOF
               chmod 0755 "${GIT_HOOKS_DIR}/pre-push"
+              # Ownership, not a security boundary. This container is already
+              # runAsUser 1000 and the PVC is fsGroup 1000, so the hook is
+              # writable by the agent no matter what is written here — and the
+              # chart has no root to make it otherwise. The guard's threat model
+              # is accidental disclosure; see the header of
+              # packages/adapter-utils/src/github-git-egress-runtime.ts.
               chown 1000:1000 "${GIT_HOOKS_DIR}" "${GIT_HOOKS_DIR}/pre-push" 2>/dev/null || true
               cat > "${LOCAL_BIN}/git" <<'EOF'
               #!/bin/sh

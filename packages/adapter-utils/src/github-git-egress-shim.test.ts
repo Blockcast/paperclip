@@ -372,7 +372,7 @@ describe("addedLinesFromPatch", () => {
       fakeGit({
         "log -1 --format=%s deadbeefcafe0000": "add config",
         "log -1 --format=%B deadbeefcafe0000": "add config\n",
-        "show --format= --no-color -m --unified=0 deadbeefcafe0000": patch,
+        "show --format= --no-color -m --unified=0 --text --no-textconv deadbeefcafe0000": patch,
       }),
     );
     expect(findings.map((f) => f.where)).toEqual(["content"]);
@@ -389,7 +389,7 @@ describe("scanCommit", () => {
       fakeGit({
         [`log -1 --format=%s ${sha}`]: "wip",
         [`log -1 --format=%B ${sha}`]: `wip\n\n${environmentDump()}\n`,
-        [`show --format= --no-color -m --unified=0 ${sha}`]: "",
+        [`show --format= --no-color -m --unified=0 --text --no-textconv ${sha}`]: "",
       }),
     );
     expect(findings).toHaveLength(1);
@@ -404,7 +404,7 @@ describe("scanCommit", () => {
       fakeGit({
         [`log -1 --format=%s ${sha}`]: "fix: tidy the readme",
         [`log -1 --format=%B ${sha}`]: "fix: tidy the readme\n",
-        [`show --format= --no-color -m --unified=0 ${sha}`]: "+Hello, world.\n",
+        [`show --format= --no-color -m --unified=0 --text --no-textconv ${sha}`]: "+Hello, world.\n",
       }),
     );
     expect(findings).toEqual([]);
@@ -417,7 +417,7 @@ describe("scanCommit", () => {
     const complete: Record<string, string> = {
       [`log -1 --format=%s ${sha}`]: "wip",
       [`log -1 --format=%B ${sha}`]: "wip\n",
-      [`show --format= --no-color -m --unified=0 ${sha}`]: "+clean\n",
+      [`show --format= --no-color -m --unified=0 --text --no-textconv ${sha}`]: "+clean\n",
     };
     for (const omitted of Object.keys(complete)) {
       const responses = { ...complete };
@@ -435,7 +435,7 @@ describe("scanCommit", () => {
       fakeGit({
         [`log -1 --format=%s ${sha}`]: "",
         [`log -1 --format=%B ${sha}`]: "",
-        [`show --format= --no-color -m --unified=0 ${sha}`]: "",
+        [`show --format= --no-color -m --unified=0 --text --no-textconv ${sha}`]: "",
       }),
     );
     expect(findings).toEqual([]);

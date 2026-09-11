@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -12,6 +12,7 @@ import {
   GitEgressRuntimeError,
   gitBinary,
   hooksDirectory,
+  makeGitReader,
   runGitEgressRuntime,
   runPrePushHook,
 } from "./github-git-egress-runtime.js";
@@ -419,5 +420,134 @@ describe("runPrePushHook", () => {
     });
     expect(code).toBe(1);
     expect(errors.join("\n")).toContain("git went missing");
+  });
+});
+
+describe.skipIf(!GIT)("content leg against a real repository", () => {
+  // These drive REAL git for the same reason the alias tests above do: the
+  // property under test is what `git show` EMITS, which a stubbed reader would
+  // simply assert into existence. Each case below is a way for a file's bytes
+  // never to reach the scanner, and each was a silent pass before `--text` /
+  // `--no-textconv` (Ally review on b8ae369f found the first; the other two
+  // turned up while confirming it).
+
+  /**
+   * A vendor key, assembled rather than pasted — same rule as the fixtures in
+   * `github-git-egress-shim.test.ts`. A literal would be a real `sk-` string
+   * committed to this repository: `.github/scripts/check-pr-security.mjs`
+   * flags `sk-[a-zA-Z0-9]{32,}` as a high-severity finding, so the pull request
+   * adding a secret-containment control would itself trip the secret scan.
+   * Joining the parts at runtime produces the same bytes for git to publish
+   * while leaving no matchable literal in the source.
+   */
+  function vendorKey(): string {
+    return ["sk", "ant", "api03", "Xq7mZp2Lw9Rt4Nv8Bc3Hj6Kd1Fg5Ys0Ae"].join("-");
+  }
+
+  /** A repo with one commit, and the pre-push input that would publish it. */
+  function repoWithCommit(files: Record<string, string | Buffer>): {
+    runGit: GitReader;
+    input: string;
+  } {
+    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-content-"));
+    execFileSync("git", ["init", "-q", repo]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
+    for (const [name, body] of Object.entries(files)) {
+      writeFileSync(path.join(repo, name), body);
+    }
+    execFileSync("git", ["-C", repo, "add", "-A"]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "add fixtures"]);
+    const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    return {
+      runGit: makeGitReader("git", repo),
+      // A new branch the remote does not have: `0`*40 on the remote side is the
+      // shape git hands the hook for a first push.
+      input: `refs/heads/topic ${head} refs/heads/topic ${"0".repeat(40)}\n`,
+    };
+  }
+
+  async function refusals(files: Record<string, string | Buffer>): Promise<string> {
+    const { runGit, input } = repoWithCommit(files);
+    const errors: string[] = [];
+    const code = await runPrePushHook({
+      input,
+      runGit,
+      stderr: (message) => errors.push(message),
+    });
+    expect(code).toBe(1);
+    return errors.join("\n");
+  }
+
+  it("scans a binary addition instead of skipping it", async () => {
+    // Git calls a file binary when a NUL lands in the first 8000 bytes, and
+    // then prints `Binary files ... differ` with no `+` lines at all — so
+    // `addedLinesFromPatch` saw the empty string and reported the commit clean.
+    // A credential does not stop being a credential for sharing a blob with a
+    // NUL byte.
+    const blob = Buffer.concat([
+      Buffer.from("header"),
+      Buffer.from([0x00]),
+      Buffer.from(`${vendorKey()}\n`),
+    ]);
+    expect(await refusals({ "payload.bin": blob })).toContain("vendor-key");
+  });
+
+  it("scans a path a .gitattributes entry marks -diff", async () => {
+    // The wider hole, and it needs no binary content: `-diff` makes git print
+    // the same `Binary files ... differ` summary for plain ASCII. `*` applies
+    // it to the whole tree, and the attributes file is committed in the same
+    // push it hides, so nothing earlier in the range would have caught it.
+    expect(
+      await refusals({ ".gitattributes": "* -diff\n", "secret.txt": `${vendorKey()}\n` }),
+    ).toContain("vendor-key");
+  });
+
+  it("scans the real bytes, not a textconv driver's output", async () => {
+    // `diff.<driver>.textconv` is ordinary repository config — agent-writable —
+    // and replaces a file's content with that command's output for display.
+    // Without `--no-textconv` the scanner reads `innocuous` and passes the
+    // commit while the real bytes go to the remote.
+    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-textconv-"));
+    execFileSync("git", ["init", "-q", repo]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
+    execFileSync("git", ["-C", repo, "config", "diff.launder.textconv", "echo innocuous"]);
+    writeFileSync(path.join(repo, ".gitattributes"), "secret.txt diff=launder\n");
+    writeFileSync(path.join(repo, "secret.txt"), `${vendorKey()}\n`);
+    execFileSync("git", ["-C", repo, "add", "-A"]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "add fixtures"]);
+    const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+
+    const errors: string[] = [];
+    const code = await runPrePushHook({
+      input: `refs/heads/topic ${head} refs/heads/topic ${"0".repeat(40)}\n`,
+      runGit: makeGitReader("git", repo),
+      stderr: (message) => errors.push(message),
+    });
+    expect(code).toBe(1);
+    expect(errors.join("\n")).toContain("vendor-key");
+  });
+
+  it("still passes a genuinely clean commit", async () => {
+    // The flags widen what the scanner SEES; they must not turn every binary
+    // file into a refusal. A png-shaped blob with nothing credential-shaped in
+    // it is the common case and has to keep pushing.
+    const { runGit, input } = repoWithCommit({
+      "logo.bin": Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02, 0x03]),
+      "readme.md": "Hello, world.\n",
+    });
+    const errors: string[] = [];
+    const code = await runPrePushHook({
+      input,
+      runGit,
+      stderr: (message) => errors.push(message),
+    });
+    expect(errors.join("\n")).toBe("");
+    expect(code).toBe(0);
   });
 });
