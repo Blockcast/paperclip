@@ -79,17 +79,24 @@ const COMMAND_SLACK_TOKEN_RE = /\bxox[baprs]-[A-Za-z0-9-]{10,}/g;
  *    is wrapped at, all of it goes. The lazy quantifier is bounded by the
  *    required `-----END` literal, so it cannot run past the block it belongs to.
  * 2. Footer absent (truncated mid-block): fall back to walking 16+ base64
- *    segments, so the scan stops at ordinary prose instead of swallowing it.
+ *    segments, so the scan stops at ordinary prose instead of swallowing it —
+ *    plus at most one shorter trailing fragment, and only at end of chunk,
+ *    which is where truncation puts it.
  *
  * Branch 1 exists because requiring 16+ chars of *every* segment left the final
  * line of a real key in the clear: PEM bodies wrap at 64 characters, so the last
  * line is a short remainder for all but exact multiples, and that line plus the
- * footer survived redaction. The 16+ floor is still right for branch 2, where
- * there is no footer to bound the scan — it is only wrong when applied to a
- * block whose end is already known.
+ * footer survived redaction. The 16+ floor is still right mid-chunk in branch 2,
+ * where there is no footer to bound the scan — it is only wrong when applied to
+ * a block whose end is already known, or to the final fragment of a cut key.
+ *
+ * The end-anchored fragment does mean a short ordinary word ending a chunk that
+ * opened with a PEM header is redacted too. That is deliberate: over-redacting
+ * <=15 characters of prose inside a chunk already carrying a private-key header
+ * is strictly preferable to emitting that many characters of real key material.
  */
 const COMMAND_PEM_PRIVATE_KEY_RE =
-  /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----(?:[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|(?:(?:\s|\\[rn])+[A-Za-z0-9+/=]{16,})*)/g;
+  /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----(?:[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|(?:(?:\s|\\[rn])+[A-Za-z0-9+/=]{16,})*(?:(?:\s|\\[rn])+[A-Za-z0-9+/=]{1,15}(?:\s|\\[rn])*$)?)/g;
 const COMMAND_JWT_RE =
   /\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?\b/g;
 const COMMAND_SECRET_HINTS = [
