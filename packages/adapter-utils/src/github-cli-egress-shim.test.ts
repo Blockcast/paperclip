@@ -362,6 +362,36 @@ describe("scrubGitHubCliInvocation", () => {
       expect(result.classes).toContain("vendor-key");
     });
 
+    it("scrubs prose strings nested in arrays beside clean content", () => {
+      // walk() used to hand primitive strings straight back, so a string
+      // INSIDE an array reached neither the content branch nor the scrubber.
+      // Once any `content` key set sawContent, the body was sent as-is and the
+      // credential shipped verbatim — a leak, not a corruption.
+      const clean = Buffer.from("export const x = 1;\n", "utf8").toString("base64");
+      const body = JSON.stringify({
+        content: clean,
+        messages: [`rotate ${VENDOR_TOKEN}`, { note: `also ${VENDOR_TOKEN}` }],
+      });
+      const io = makeIo({ "/tmp/put.json": body });
+      const result = scrubGitHubCliInvocation(
+        ["api", "repos/o/r/contents/a.ts", "--input", "/tmp/put.json"],
+        io,
+      );
+
+      expect(result.refusals).toEqual([]);
+      expect(io.written).toHaveLength(1);
+      expect(io.written[0]).not.toContain(VENDOR_TOKEN);
+
+      const sent = JSON.parse(io.written[0] as string) as {
+        content: string;
+        messages: [string, { note: string }];
+      };
+      expect(sent.content).toBe(clean);
+      expect(sent.messages[0]).toContain(redactionMarker("vendor-key"));
+      expect(sent.messages[1].note).toContain(redactionMarker("vendor-key"));
+      expect(result.classes).toContain("vendor-key");
+    });
+
     it("refuses on the content value even when prose beside it is clean", () => {
       // The mirror of the case above: attribution has to work in both
       // directions, or "attribute the match" degrades into "never refuse".
