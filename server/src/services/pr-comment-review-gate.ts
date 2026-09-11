@@ -345,6 +345,22 @@ export function evaluateCommentReviewGate(input: {
     // the detail this branch exists to surface. The verb list is budgeted for
     // the same reason — the regex accepts an arbitrarily long verb, and the
     // head plus the "unrecognized ledger verb" phrase must survive intact.
+    //
+    // PEN-3157 asked whether this republishes model-authored text to a public
+    // commit status without a scrub, since the verb is lifted verbatim out of
+    // an Ally review comment body. It does not, and the reason is worth having
+    // in writing because the interpolation looks unbounded here: the verb is
+    // unbounded in LENGTH but not in ALPHABET. It reaches this line through the
+    // single capture group `([a-z][a-z-]*)` in
+    // `PRIOR_FINDING_DISPOSITION_PATTERN` (ally-review-detection.ts), the only
+    // writer of `disposition`, so it is lowercase letters and hyphens and
+    // nothing else. That admits no credential this codebase is exposed to — an
+    // AWS key id, a bearer token, a JWT and a PEM all carry uppercase, digits,
+    // or punctuation outside that class. See the invariant test in
+    // `github-write-egress-scrub.test.ts`, which fails if the class widens.
+    // Defence in depth still applies: `githubPostCommitStatusDetailed` scrubs
+    // every description on the way out, so widening the class would be caught
+    // by the boundary even if that test were deleted.
     const verbList = carried.unrecognizedVerbs
       .map((verb) => `"${verb}"`)
       .join(", ")

@@ -19,6 +19,8 @@
  */
 import { createSign } from "node:crypto";
 
+import { scrubGitHubEgressText } from "@paperclipai/adapter-utils";
+
 import { loadConfig } from "../config.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 
@@ -821,6 +823,44 @@ export async function githubGetLatestCommitStatusForContext(input: {
 }
 
 /**
+ * Strip credential-shaped material from one free-text field bound for GitHub
+ * (PEN-3157).
+ *
+ * ## Why this sits in the write helpers and not at each call site
+ *
+ * The same gap has now been found twice — PEN-2527 covered the `gh` binary and
+ * missed the MCP server; PEN-3152 covered both wrappers and missed `server/`
+ * entirely. Both times the cause was the same: a scrub applied per-caller, so
+ * closing it required every future caller to remember. These two functions are
+ * the only way `paperclip-api` puts authored text on GitHub, so scrubbing here
+ * makes the control a property of the boundary rather than of the caller's
+ * diligence. A new caller of either helper is covered the day it is written.
+ *
+ * ## Why not at `ghFetch`
+ *
+ * `ghFetch` is the wider boundary but the wrong altitude: it sees an opaque
+ * request body and cannot tell a prose field from protocol. Scrubbing a
+ * serialized payload there risks rewriting GraphQL text or an id, and the
+ * detectors are tuned for prose. Here the free-text fields are named by the
+ * signature, so each one is scrubbed for exactly what it is.
+ *
+ * The scrub returns its input byte-for-byte when nothing matches, so ordinary
+ * gate prose is never reformatted. When something does match we log the
+ * *classes* and never the text — a log line quoting the match would re-publish
+ * the secret into the very transcripts PEN-3139 is narrowing.
+ */
+function scrubOutboundGitHubText(value: string, field: string): string {
+  const result = scrubGitHubEgressText(value);
+  if (result.redacted) {
+    console.warn(
+      `[github-egress] Redacted credential-shaped material from an outbound GitHub ${field}: ` +
+        `${result.classes.join(", ")}. The write proceeded with redaction markers in place.`,
+    );
+  }
+  return result.text;
+}
+
+/**
  * Post a commit status as the GitHub App with a classified result so callers
  * can retry transient failures and surface permanent configuration/permission
  * failures separately.
@@ -841,6 +881,18 @@ export async function githubPostCommitStatusDetailed(input: {
     "content-type": "application/json",
   };
   const apiBase = gitHubApiBase(GITHUB_HOST);
+  // GitHub truncates a description at 140 chars; trim here so the message we
+  // intend is the message that lands rather than an arbitrary server-side cut.
+  // Scrub BEFORE that trim, never after: trimming first can cut a vendor-key
+  // prefix or a PEM header in half, and half a token matches no detector while
+  // the surviving half is still most of the secret.
+  const description = input.description
+    ? scrubOutboundGitHubText(input.description, "commit-status description").slice(0, 140)
+    : undefined;
+  const context = scrubOutboundGitHubText(input.context, "commit-status context");
+  const targetUrl = input.targetUrl
+    ? scrubOutboundGitHubText(input.targetUrl, "commit-status target_url")
+    : input.targetUrl;
   try {
     const url = `${apiBase}/repos/${input.repoFullName}/statuses/${input.sha}`;
     const res = await ghFetch(url, {
@@ -848,11 +900,9 @@ export async function githubPostCommitStatusDetailed(input: {
       headers,
       body: JSON.stringify({
         state: input.state,
-        context: input.context,
-        // GitHub truncates at 140 chars; trim here so the message we intend is
-        // the message that lands rather than an arbitrary server-side cut.
-        ...(input.description ? { description: input.description.slice(0, 140) } : {}),
-        ...(input.targetUrl ? { target_url: input.targetUrl } : {}),
+        context,
+        ...(description ? { description } : {}),
+        ...(targetUrl ? { target_url: targetUrl } : {}),
       }),
     });
     if (res.ok) return { ok: true, statusCode: res.status };
@@ -882,6 +932,13 @@ export async function githubPostCommitStatus(input: {
  * Post an issue/PR comment as the GitHub App. Returns false when creds are
  * absent or the write fails — the caller logs and continues; a back-link post
  * failure must never break the webhook wake path. (BLO-13353)
+ *
+ * `body` is an arbitrary string by signature, which is what makes this the
+ * widest server-side egress surface in the repo. Its only caller today passes a
+ * template over an issue identifier and a URL, so the exposure is latent rather
+ * than live — but "benign by its current caller" is not a property anyone can
+ * rely on, and a PR comment is the highest-visibility thing this service can
+ * publish. Scrubbed here so the next caller inherits the control (PEN-3157).
  */
 export async function githubPostIssueComment(input: {
   repoFullName: string;
@@ -896,12 +953,13 @@ export async function githubPostIssueComment(input: {
     "content-type": "application/json",
   };
   const apiBase = gitHubApiBase(GITHUB_HOST);
+  const body = scrubOutboundGitHubText(input.body, "issue-comment body");
   try {
     const url = `${apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments`;
     const res = await ghFetch(url, {
       method: "POST",
       headers,
-      body: JSON.stringify({ body: input.body }),
+      body: JSON.stringify({ body }),
     });
     return res.ok;
   } catch {

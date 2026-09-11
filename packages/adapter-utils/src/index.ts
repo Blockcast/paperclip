@@ -66,6 +66,20 @@ export {
   REDACTED_COMMAND_TEXT_VALUE,
   redactCommandText,
 } from "./command-redaction.js";
+// PEN-3157. Exported from the barrel, not just the `./*` subpath, because the
+// consumer that needed it most could not find it: `paperclip-api` writes to
+// GitHub over HTTP from `server/`, and every server-side write reached the
+// public internet unscrubbed while this module sat one directory away, imported
+// only by the two sandbox wrappers. A control nobody can locate is a control
+// nobody applies.
+export {
+  redactionMarker,
+  scrubGitHubEgressText,
+} from "./github-egress-scrub.js";
+export type {
+  GitHubEgressScrubClass,
+  GitHubEgressScrubResult,
+} from "./github-egress-scrub.js";
 export { buildSandboxNpmInstallCommand } from "./sandbox-install-command.js";
 export { createRuntimeProgressReporter } from "./runtime-progress.js";
 export type {
