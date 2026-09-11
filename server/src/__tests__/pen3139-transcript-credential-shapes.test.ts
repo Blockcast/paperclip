@@ -135,6 +135,77 @@ describe("PEN-3139: run-log storage sanitizer masks vendor credential shapes wit
 
     expect(sanitized).not.toContain(body);
   });
+
+  /**
+   * Ally review finding on PR #1736. The fixture above is a single 35-character
+   * body line, which no real key has: PEM bodies wrap at 64 characters, so the
+   * final line is a short remainder unless the body is an exact multiple. The
+   * old pattern required 16+ chars of every segment, so that remainder — and the
+   * `-----END-----` footer after it — stayed in the clear. The single-line
+   * fixture is precisely why the suite did not catch it.
+   */
+  describe("a real key's short final body line", () => {
+    const FULL_LINE = "MIIEEXAMPLEfakebodyAAAA0000000000000000000000000000000000000000aa";
+    const SHORT_FINAL_LINE = "QUJD=";
+
+    it("masks the short final line and the footer, on real newlines", () => {
+      const chunk = `-----BEGIN RSA PRIVATE KEY-----\n${FULL_LINE}\n${SHORT_FINAL_LINE}\n-----END RSA PRIVATE KEY-----`;
+
+      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+
+      expect(sanitized).not.toContain(SHORT_FINAL_LINE);
+      expect(sanitized).not.toContain(FULL_LINE);
+      expect(sanitized).not.toContain("-----END RSA PRIVATE KEY-----");
+      expect(sanitized).toContain(REDACTED);
+    });
+
+    it("masks the short final line when the block arrives escaped inside a JSON tool result", () => {
+      const chunk = `-----BEGIN RSA PRIVATE KEY-----\\n${FULL_LINE}\\n${SHORT_FINAL_LINE}\\n-----END RSA PRIVATE KEY-----`;
+
+      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+
+      expect(sanitized).not.toContain(SHORT_FINAL_LINE);
+      expect(sanitized).not.toContain("-----END RSA PRIVATE KEY-----");
+    });
+
+    it("masks a body whose only line is shorter than the old 16-character floor", () => {
+      const chunk = `-----BEGIN PRIVATE KEY-----\n${SHORT_FINAL_LINE}\n-----END PRIVATE KEY-----`;
+
+      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+
+      expect(sanitized).not.toContain(SHORT_FINAL_LINE);
+    });
+
+    /**
+     * The 16+ floor is still load-bearing for the truncated case: with no footer
+     * to bound the scan, a body matcher that accepts any base64-ish run would
+     * swallow the prose after the block. Widening branch 1 must not cost this.
+     */
+    it("still stops at ordinary prose after an unterminated block", () => {
+      const prose = "the deploy then failed because the node was cordoned";
+      const chunk = `-----BEGIN RSA PRIVATE KEY-----\n${FULL_LINE}\n${prose}`;
+
+      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+
+      expect(sanitized).not.toContain(FULL_LINE);
+      expect(sanitized).toContain(prose);
+    });
+
+    it("masks both keys in a chunk carrying two blocks, keeping the prose between them", () => {
+      const prose = "and then the second handshake was attempted";
+      const chunk =
+        `-----BEGIN PRIVATE KEY-----\n${FULL_LINE}\n${SHORT_FINAL_LINE}\n-----END PRIVATE KEY-----\n` +
+        `${prose}\n` +
+        `-----BEGIN EC PRIVATE KEY-----\n${FULL_LINE}\nZZ=\n-----END EC PRIVATE KEY-----`;
+
+      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+
+      expect(sanitized).not.toContain(SHORT_FINAL_LINE);
+      expect(sanitized).not.toContain("ZZ=");
+      expect(sanitized).not.toContain("-----END EC PRIVATE KEY-----");
+      expect(sanitized).toContain(prose);
+    });
+  });
 });
 
 describe("PEN-3139: free-text scrub stays in step with the shared whole-value shape list", () => {
