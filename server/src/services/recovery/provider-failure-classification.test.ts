@@ -292,8 +292,12 @@ describe("classifyAdapterFailureForRecovery -- workspace git transport", () => {
 
 describe("isInfraClassStrandedFailure -- git transport", () => {
   it("records a pre-model-call git transport fault as infrastructure-class", () => {
-    // AUDIT ONLY. `infraClassCause` has no production reader; the attempt-budget
-    // exemption comes from routing this cause to `workspace_validation_failed`.
+    // AUDIT ONLY *for this arm*. `isInfraClassStrandedFailure` does have a
+    // production reader -- `resolveStrandedRecoveryRouting` -- but a git
+    // transport fault is re-caused to `workspace_validation_failed` before it
+    // gets there, so widening this arm only relabels evidence. The
+    // `claude_truncated` arm is NOT audit-only (BLO-33223): it keeps the
+    // `stranded_assigned_issue` cause and so decides owner-vs-manager.
     expect(isWorkspaceGitTransportStrandedFailure({
       id: "run-1",
       agentId: "agent-1",

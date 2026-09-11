@@ -893,16 +893,39 @@ export function isInfraClassStrandedFailure(latestRun: LatestIssueRun): boolean 
   // vanished pod -- the run never got to succeed or fail on its own merits, and
   // the cause is not something a retry can move.
   //
-  // Note for anyone reading this expecting behaviour: `infraClassCause` is
-  // AUDIT-ONLY. It is written once, in `buildStrandedRecoveryActionEvidence`,
-  // and read by nothing in production. It does NOT gate the attempt budget --
-  // `classifyContinuationFailure` does, on error-code set membership alone. The
-  // budget exemption for this class comes from routing it to
-  // `workspace_validation_failed`, not from this predicate. Widening this alone
-  // would relabel the evidence and change nothing an operator could feel.
+  // Note on blast radius, because the two halves of this predicate differ.
+  // The evidence field `infraClassCause` is audit-only: it is written once, in
+  // `buildStrandedRecoveryActionEvidence`, and gates nothing -- the attempt
+  // budget is `classifyContinuationFailure`, on error-code set membership
+  // alone. But the PREDICATE is also read by `resolveStrandedRecoveryRouting`,
+  // where it decides owner-vs-manager for a `stranded_assigned_issue`. Git
+  // transport runs never reach that test (they are re-caused to
+  // `workspace_validation_failed` first), so widening the git arm really does
+  // only relabel evidence. Widening the `claude_truncated` arm below does NOT:
+  // that cause stays `stranded_assigned_issue`, so it changes routing.
   if (isWorkspaceGitTransportStrandedFailure(latestRun)) return true;
   if (latestRun.errorCode !== "claude_truncated") return false;
-  return /pod is gone|pod was removed/i.test(latestRun.error ?? "");
+  // BLO-33223: the other pod-lifecycle death. When the container is read at
+  // exit rather than found missing, `describeTruncationCause` reports the k8s
+  // terminated state as `exit code <N>, reason=<Reason>`, and a kernel OOM kill
+  // arrives as `exit code 137, SIGKILL (commonly OOMKilled), reason=OOMKilled`.
+  //
+  // Anchored on the KILL, not on the reason word, and deliberately not on "the
+  // pod died" as the CTO's filing floated. Both shapes of this message are
+  // pod-lifecycle reads -- an agent-side crash is also a pod death, reported as
+  // `exit code 1, reason=Error` -- so "the pod died" does not discriminate, and
+  // inverting on it would make every `reason=` value except a hardcoded `Error`
+  // return to the lane, defaulting unknown/future k8s reasons to infra-class.
+  // What carries the meaning is whether the container CHOSE to exit or was
+  // killed: 137 is 128+SIGKILL, which no agent-side fault can produce for the
+  // container's own PID 1. That is a kernel-level invariant, so unlike a
+  // `reason=` enumeration it does not need extending when Kubernetes adds a
+  // reason string. `reason=OOMKilled` is kept alongside it only to cover an
+  // adapter that reports the reason without an exit code; the `SIGKILL (...)`
+  // gloss is excluded because it is this adapter's restatement of 137 and so
+  // adds no true-positive coverage, only false-collision surface -- the same
+  // narrowing BLO-20933 applied to the eviction/preemption wording above.
+  return /pod is gone|pod was removed|exit code 137\b|reason=OOMKilled/i.test(latestRun.error ?? "");
 }
 
 function resolveStrandedRecoveryCause(
