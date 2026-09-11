@@ -173,11 +173,17 @@ async function resolveSharedDocSourcePath(
  * shared doc keeps serving the placeholder forever — even after the source becomes
  * resolvable. Only our own placeholder heading qualifies; any other existing file is a
  * workspace doc and is never overwritten.
+ *
+ * The heading is matched as a *complete first line*, not a prefix. The heading embeds the
+ * requested path and carries no terminator of its own, so a prefix test also accepts any
+ * same-line continuation of it — a placeholder for a longer path that shares the prefix
+ * (`…: docs/x.md.bak`), or a genuine doc whose title quotes the heading. Those are
+ * workspace docs, and overwriting one destroys content we never wrote.
  */
 async function isOwnPlaceholder(targetPath: string, relativeDocPath: string): Promise<boolean> {
   try {
     const existing = await fs.readFile(targetPath, "utf8");
-    return existing.startsWith(missingSharedDocPlaceholderHeading(relativeDocPath));
+    return existing.split(/\r?\n/, 1)[0] === missingSharedDocPlaceholderHeading(relativeDocPath);
   } catch {
     return false;
   }
