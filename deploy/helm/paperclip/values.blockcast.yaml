@@ -388,6 +388,16 @@ worker:
         secretKeyRef:
           name: paperclip-penstock-org-key
           key: token
+    # BLO-33279: the launcher's default Caveman readiness budget is 15000 ms,
+    # but measured cold starts on a live agent pod reach 11548 ms under
+    # 5-way concurrency — a 1.3x margin. The launcher retries only on
+    # EADDRINUSE, so a readiness timeout throws on attempt 1 with no
+    # resilience; two agent lanes died this way on 2026-09-11. 60000 ms is
+    # 5.2x the worst observed start. Non-secret literal, so the claude_k8s
+    # adapter carries it into every agent Job via selfPod.inheritedEnv, and
+    # the launcher scrubs every PENSTOCK_* name from both child processes.
+    - name: PENSTOCK_READY_TIMEOUT_MS
+      value: "60000"
 
 # Service account must mount its bearer token so the k8s-Job adapters can
 # create Jobs / read Pod logs / patch Secrets via the in-cluster kubeconfig.
