@@ -5,6 +5,7 @@ import {
   classifyGitInvocation,
   commitsForRefUpdate,
   formatRefusal,
+  type GitAliasBypass,
   GitEgressScanError,
   gitGlobalOptions,
   parsePrePushInput,
@@ -89,6 +90,52 @@ describe("classifyGitInvocation", () => {
     // inside a security control.
     const shellAlias = `!git ${"push"} --all`;
     expect(classifyGitInvocation(["sh"], () => shellAlias).isPush).toBe(false);
+  });
+
+  it("sees a bypass through every quoting form git dequotes", () => {
+    // Git does NOT split an alias on whitespace — it runs `split_cmdline()`,
+    // which applies shell quoting. Splitting on /\s+/ left `"--no-verify"` with
+    // its quotes attached, matched nothing, and pushed unscanned.
+    //
+    // Every form below was measured against git 2.47.3 as a REAL bypass: with
+    // `-c core.hooksPath=<h> -c 'alias.q=<form>' q origin HEAD:refs/heads/t`
+    // the push exited 0, the hook did not run, and the ref landed on the bare
+    // remote. They are regression cases, not hypotheses.
+    const forms: Array<[string, string, GitAliasBypass["reason"]]> = [
+      ["bare", "push --no-verify", "no-verify"],
+      ["double-quoted", 'push "--no-verify"', "no-verify"],
+      ["single-quoted", "push '--no-verify'", "no-verify"],
+      ["split across a quote boundary", 'push "--no-ver"ify', "no-verify"],
+      ["backslash-escaped", "push \\-\\-no-verify", "no-verify"],
+      ["bare hooks path", "-c core.hooksPath=/tmp/empty push", "hooks-path"],
+      ["quoted hooks path", '-c "core.hooksPath=/tmp/empty" push', "hooks-path"],
+    ];
+    for (const [label, expansion, reason] of forms) {
+      const result = classifyGitInvocation(["q"], (name) =>
+        name === "q" ? expansion : null,
+      );
+      expect(result.aliasBypass, label).toMatchObject({ alias: "q", reason });
+    }
+  });
+
+  it("fails closed on an alias it cannot tokenise", () => {
+    // Git rejects an unclosed quote outright (`fatal: bad alias.q string:
+    // unclosed quote`), so nothing publishes either way — but the guard must
+    // not make its safety depend on git's parser agreeing with ours.
+    const result = classifyGitInvocation(["q"], (name) =>
+      name === "q" ? 'push "--no-verify' : null,
+    );
+    expect(result.aliasBypass).toMatchObject({ alias: "q", reason: "unquotable" });
+  });
+
+  it("does not refuse an ordinary alias that merely contains quotes", () => {
+    // Failing closed on the presence of a quote would reject legitimate
+    // aliases; it is an unparseable expansion that is refused, not a quoted one.
+    const result = classifyGitInvocation(["p"], (name) =>
+      name === "p" ? 'push "origin" main' : null,
+    );
+    expect(result.isPush).toBe(true);
+    expect(result.aliasBypass).toBeNull();
   });
 
   it("detects the hook-skipping flag", () => {

@@ -194,8 +194,105 @@ export interface GitAliasBypass {
   alias: string;
   /** Its expansion, so the refusal can quote what git would have run. */
   expansion: string;
-  /** Which bypass the expansion carries. */
-  reason: "no-verify" | "hooks-path";
+  /**
+   * Which bypass the expansion carries.
+   *
+   * `unquotable` is the fail-closed case: the expansion could not be tokenised
+   * the way git would tokenise it, so no claim about its contents is sound.
+   */
+  reason: "no-verify" | "hooks-path" | "unquotable";
+}
+
+/**
+ * Split an alias expansion the way git splits it, or return null.
+ *
+ * Git does NOT split an alias on whitespace. It runs the expansion through
+ * `split_cmdline()` (`alias.c`), which applies shell-style quoting, so the
+ * tokens git acts on are not the tokens a `/\s+/` split produces. That gap was
+ * a live bypass, measured against git 2.47.3:
+ *
+ *   git -c core.hooksPath=<h> -c 'alias.q=push "--no-verify"' q origin HEAD:t
+ *
+ * split on whitespace yields the token `"--no-verify"` WITH its quotes, which
+ * matches no entry in {@link NO_VERIFY_FLAGS}, so the expansion read as an
+ * ordinary push and the guard injected its hooks path as usual. Git dequoted it
+ * to `--no-verify`, skipped the hook, exited 0, and the ref landed on the
+ * remote. The scanner never ran.
+ *
+ * Rules implemented, matching `split_cmdline`: single quotes are literal to the
+ * next single quote; double quotes run to the next unescaped double quote and
+ * honour backslash escapes; a backslash outside quotes escapes the next
+ * character; quoted and bare runs concatenate within one token (`"--no-ver"ify`
+ * is one token, `--no-verify`).
+ *
+ * Returns null on an unterminated quote — which git rejects outright — so the
+ * caller can fail closed. Guessing at a string git itself will not parse is how
+ * a bypass gets waved through by a scanner that believed it understood the
+ * command.
+ */
+export function splitAliasExpansion(expansion: string): string[] | null {
+  const tokens: string[] = [];
+  let current = "";
+  let started = false;
+  let index = 0;
+
+  while (index < expansion.length) {
+    const char = expansion[index]!;
+
+    if (/\s/.test(char)) {
+      if (started) {
+        tokens.push(current);
+        current = "";
+        started = false;
+      }
+      index += 1;
+      continue;
+    }
+
+    started = true;
+
+    if (char === "'") {
+      const end = expansion.indexOf("'", index + 1);
+      if (end === -1) return null;
+      current += expansion.slice(index + 1, end);
+      index = end + 1;
+      continue;
+    }
+
+    if (char === '"') {
+      index += 1;
+      let closed = false;
+      while (index < expansion.length) {
+        const inner = expansion[index]!;
+        if (inner === "\\" && index + 1 < expansion.length) {
+          current += expansion[index + 1]!;
+          index += 2;
+          continue;
+        }
+        if (inner === '"') {
+          closed = true;
+          index += 1;
+          break;
+        }
+        current += inner;
+        index += 1;
+      }
+      if (!closed) return null;
+      continue;
+    }
+
+    if (char === "\\" && index + 1 < expansion.length) {
+      current += expansion[index + 1]!;
+      index += 2;
+      continue;
+    }
+
+    current += char;
+    index += 1;
+  }
+
+  if (started) tokens.push(current);
+  return tokens;
 }
 
 export interface GitInvocationClassification {
@@ -339,7 +436,18 @@ export function classifyGitInvocation(
         break;
       }
 
-      const tokens = expansion.trim().split(/\s+/).filter((token) => token.length > 0);
+      // Tokenised the way git tokenises an alias, not on whitespace. See
+      // `splitAliasExpansion`: a `/\s+/` split leaves quotes attached, and a
+      // quoted `"--no-verify"` then matched nothing and pushed unscanned.
+      const tokens = splitAliasExpansion(expansion);
+      if (tokens === null) {
+        // Unterminated quote. Git rejects this, so it cannot reach a push — but
+        // the guard must not be the component that decides that on a guess, and
+        // a parser disagreeing with git in the permissive direction is exactly
+        // the failure this whole function exists to avoid.
+        if (!pendingBypass) pendingBypass = { alias: name, expansion, reason: "unquotable" };
+        break;
+      }
       const expansionGlobals = scanGlobalOptions(tokens, env);
       for (const [alias, value] of expansionGlobals.aliasDefinitions) {
         definitions.set(alias, value);
@@ -368,7 +476,15 @@ export function classifyGitInvocation(
     hasNoVerify,
     subcommandIndex,
     hooksPathOverride: globals.hooksPathOverride,
-    aliasBypass: isPush ? pendingBypass : null,
+    // An alias bypass only matters on a push — EXCEPT when the expansion could
+    // not be tokenised, where "is it a push?" is precisely the question that
+    // went unanswered. Git happens to reject an unclosed quote itself (measured:
+    // `fatal: bad alias.q string: unclosed quote`), so nothing publishes either
+    // way, but gating the refusal on `isPush` would make this guard's safety
+    // depend on git's parser agreeing with ours. Where they disagree the guard
+    // must be the stricter one; a visible refusal is the safe direction, a
+    // silent pass is not.
+    aliasBypass: isPush || pendingBypass?.reason === "unquotable" ? pendingBypass : null,
     shellAlias,
   };
 }

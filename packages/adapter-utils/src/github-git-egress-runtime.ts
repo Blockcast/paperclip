@@ -237,7 +237,9 @@ export function buildGitArgv(
     const what =
       reason === "no-verify"
         ? "skips the pre-push hook with --no-verify"
-        : "points core.hooksPath somewhere else";
+        : reason === "hooks-path"
+          ? "points core.hooksPath somewhere else"
+          : "cannot be parsed the way git parses an alias (unterminated quote), so it cannot be checked for a bypass";
     throw new GitEgressRuntimeError(
       `paperclip-github-egress: refusing to publish — the alias \`${alias}\` expands to a push that ${what} (\`${expansion}\`), which would bypass the check for credential-shaped material. Invoke the push directly instead of through the alias, or redefine the alias without it.`,
     );
