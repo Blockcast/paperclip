@@ -4,7 +4,7 @@ import { and, eq, inArray, lt, sql } from "drizzle-orm";
 import { githubReviewGateDeliveries, type Db } from "@paperclipai/db";
 import { loadConfig } from "../config.js";
 import { logger } from "../middleware/logger.js";
-import { getInstallationTokenResult } from "./github-app-auth.js";
+import { getInstallationTokenResult, scrubOutboundGitHubText } from "./github-app-auth.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 
 const GITHUB_HOST = "github.com";
@@ -315,6 +315,15 @@ async function postPendingStatus(input: {
   targetUrl: string | null;
   origin: string;
 }): Promise<{ ok: true } | { ok: false; reason: string }> {
+  // This worker builds its own request rather than calling
+  // `githubPostCommitStatusDetailed`, because it carries a caller-supplied token
+  // and an abort signal that helper does not model. That makes it the one
+  // server-side GitHub write outside the shared write path, so it applies the
+  // same scrub directly — leaving it out would reproduce, in miniature, exactly
+  // the per-call-site gap PEN-3157 exists to close. Every field is a fixed
+  // template or an id today; the scrub is a byte-for-byte no-op on those, and it
+  // is here so that stays true if someone later interpolates a variable
+  // (PEN-3157).
   try {
     const response = await ghFetch(
       `${gitHubApiBase(GITHUB_HOST)}/repos/${input.row.repoFullName}/statuses/${input.sha}`,
@@ -327,9 +336,16 @@ async function postPendingStatus(input: {
         },
         body: JSON.stringify({
           state: "pending",
-          context: input.row.statusContext,
-          description: `Evaluating Ally review gate after signed webhook ${input.origin}.`.slice(0, 140),
-          ...(input.targetUrl ? { target_url: input.targetUrl } : {}),
+          context: scrubOutboundGitHubText(input.row.statusContext, "commit-status context"),
+          description: scrubOutboundGitHubText(
+            `Evaluating Ally review gate after signed webhook ${input.origin}.`,
+            "commit-status description",
+          ).slice(0, 140),
+          ...(input.targetUrl
+            ? {
+                target_url: scrubOutboundGitHubText(input.targetUrl, "commit-status target_url"),
+              }
+            : {}),
         }),
         signal: requestSignal(),
       },

@@ -832,9 +832,15 @@ export async function githubGetLatestCommitStatusForContext(input: {
  * missed the MCP server; PEN-3152 covered both wrappers and missed `server/`
  * entirely. Both times the cause was the same: a scrub applied per-caller, so
  * closing it required every future caller to remember. These two functions are
- * the only way `paperclip-api` puts authored text on GitHub, so scrubbing here
- * makes the control a property of the boundary rather than of the caller's
- * diligence. A new caller of either helper is covered the day it is written.
+ * how `paperclip-api` puts authored text on GitHub, so scrubbing here makes the
+ * control a property of the boundary rather than of the caller's diligence. A
+ * new caller of either helper is covered the day it is written.
+ *
+ * Exported for the one writer that cannot use those helpers:
+ * `github-review-gate-authority.ts` builds its own request because it carries a
+ * caller-supplied token and an abort signal that `githubPostCommitStatusDetailed`
+ * does not model. Rather than leave a structural exception, it calls this
+ * directly — so the write set has no member outside the scrub.
  *
  * ## Why not at `ghFetch`
  *
@@ -849,7 +855,7 @@ export async function githubGetLatestCommitStatusForContext(input: {
  * *classes* and never the text — a log line quoting the match would re-publish
  * the secret into the very transcripts PEN-3139 is narrowing.
  */
-function scrubOutboundGitHubText(value: string, field: string): string {
+export function scrubOutboundGitHubText(value: string, field: string): string {
   const result = scrubGitHubEgressText(value);
   if (result.redacted) {
     console.warn(
