@@ -92,3 +92,46 @@ test("worker Penstock key requires a Secret name and key", () => {
   ]);
   assert.match(missingKey, /requires valueFrom\.secretKeyRef\.key/);
 });
+
+// BLO-33279. The launcher's readiness budget defaults to 15000 ms, but measured
+// Caveman cold starts reach 11548 ms under concurrency — a 1.3x margin, and the
+// retry loop covers only EADDRINUSE, so a readiness timeout kills the run on
+// attempt 1. The override lives in worker.extraEnv because the claude_k8s
+// adapter copies the worker container's literal env into every agent Job via
+// selfPod.inheritedEnv; that is what makes one committed line a fleet-wide
+// default instead of N hand-edited adapterConfig records.
+const LAUNCHER_DEFAULT_READY_TIMEOUT_MS = 15_000;
+const LAUNCHER_MAX_READY_TIMEOUT_MS = 300_000;
+
+test("worker exports an inheritable Caveman readiness budget above the launcher default", () => {
+  const rendered = render("templates/statefulset.yaml");
+  const match = rendered.match(/- name: PENSTOCK_READY_TIMEOUT_MS\s+value: "(\d+)"/);
+
+  // A literal value, not valueFrom: the adapter only reaches inheritedEnv for
+  // literals, and this is a tunable rather than a credential.
+  assert.ok(match, "worker must export PENSTOCK_READY_TIMEOUT_MS as a quoted literal");
+
+  // The launcher's positiveInteger() silently falls back to the 15000 ms default
+  // on anything unparseable or out of range. That failure is invisible — the
+  // manifest still renders the typo — so assert the bounds the launcher applies
+  // rather than merely that the name is present.
+  const budgetMs = Number(match[1]);
+  assert.ok(
+    budgetMs > LAUNCHER_DEFAULT_READY_TIMEOUT_MS,
+    `budget ${budgetMs}ms must exceed the ${LAUNCHER_DEFAULT_READY_TIMEOUT_MS}ms default it exists to raise`,
+  );
+  assert.ok(
+    budgetMs <= LAUNCHER_MAX_READY_TIMEOUT_MS,
+    `budget ${budgetMs}ms exceeds the launcher cap of ${LAUNCHER_MAX_READY_TIMEOUT_MS}ms and would be ignored`,
+  );
+});
+
+test("API Deployment does not receive the worker-only readiness budget", () => {
+  const rendered = render("templates/deployment-api.yaml", [
+    "--set",
+    "api.enabled=true",
+    "--set",
+    "persistence.existingClaim=paperclip-shared",
+  ]);
+  assert.doesNotMatch(rendered, /PENSTOCK_READY_TIMEOUT_MS/);
+});
