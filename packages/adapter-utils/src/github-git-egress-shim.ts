@@ -43,8 +43,84 @@ const VALUE_TAKING_GLOBAL_OPTIONS: ReadonlySet<string> = new Set([
   "--attr-source",
 ]);
 
-/** Spellings of the flag that skips the pre-push hook. */
-const NO_VERIFY_FLAGS: ReadonlySet<string> = new Set(["--no-verify", "-n"]);
+/**
+ * Spellings of the flag that skips the pre-push hook.
+ *
+ * `-n` is deliberately NOT here. For `push` it means `--dry-run`, not
+ * `--no-verify` (see the subcommand's own `-h` output), and it is harmless
+ * twice over: the pre-push hook still runs under it, and a dry run publishes
+ * nothing even if it did not. Refusing it would reject a safe command while
+ * telling the author something untrue about why.
+ */
+const NO_VERIFY_FLAGS: ReadonlySet<string> = new Set(["--no-verify"]);
+
+/** The config key whose value decides which directory git reads hooks from. */
+const HOOKS_PATH_KEY = "core.hookspath";
+
+/**
+ * True when a `<name>=<value>` config assignment targets `core.hooksPath`.
+ *
+ * The comparison is case-folded because git config keys are case-insensitive in
+ * their section and variable names: `-c CORE.HOOKSPATH=...` sets exactly the
+ * same key as `-c core.hooksPath=...`, and a case-sensitive check here would see
+ * only one of the two spellings. Verified against git 2.47.3.
+ */
+function isHooksPathAssignment(assignment: string): boolean {
+  return (assignment.split("=", 1)[0] ?? "").trim().toLowerCase() === HOOKS_PATH_KEY;
+}
+
+interface GlobalOptionScan {
+  /** Index of the first token that is not a global option or its value. */
+  subcommandIndex: number;
+  /** A caller-supplied `core.hooksPath` override, as spelled, or null. */
+  hooksPathOverride: string | null;
+}
+
+/**
+ * Walk git's global options, reporting where the subcommand starts and whether
+ * the caller set `core.hooksPath` along the way.
+ *
+ * Both outputs are security-relevant. Getting the option boundary wrong shifts
+ * which token reads as the subcommand, so `git -c foo=bar push` would classify
+ * as a `foo=bar` subcommand and sail past the guard. Missing a `core.hooksPath`
+ * override lets the caller nominate the hooks directory themselves.
+ */
+function scanGlobalOptions(tokens: readonly string[]): GlobalOptionScan {
+  let index = 0;
+  let hooksPathOverride: string | null = null;
+  while (index < tokens.length) {
+    const token = tokens[index]!;
+    if (!token.startsWith("-")) break;
+    // `--opt=value` carries its own value; `--opt value` and `-c x=y` do not.
+    if (VALUE_TAKING_GLOBAL_OPTIONS.has(token)) {
+      const value = tokens[index + 1];
+      if (
+        value !== undefined &&
+        (token === "-c" || token === "--config-env") &&
+        isHooksPathAssignment(value)
+      ) {
+        hooksPathOverride ??= `${token} ${value}`;
+      }
+      index += 2;
+      continue;
+    }
+    if (token.startsWith("--config-env=") && isHooksPathAssignment(token.slice("--config-env=".length))) {
+      hooksPathOverride ??= token;
+    }
+    index += 1;
+  }
+  return { subcommandIndex: index, hooksPathOverride };
+}
+
+/** A hook bypass carried by an alias expansion rather than by argv. */
+export interface GitAliasBypass {
+  /** The alias the caller invoked. */
+  alias: string;
+  /** Its expansion, so the refusal can quote what git would have run. */
+  expansion: string;
+  /** Which bypass the expansion carries. */
+  reason: "no-verify" | "hooks-path";
+}
 
 export interface GitInvocationClassification {
   /** The resolved subcommand, or null when argv carries only global options. */
@@ -55,6 +131,20 @@ export interface GitInvocationClassification {
   hasNoVerify: boolean;
   /** Index in argv at which the subcommand was found, or -1. */
   subcommandIndex: number;
+  /**
+   * A caller-supplied `core.hooksPath` override among argv's global options.
+   *
+   * Injecting the guard last already beats this one (git takes the LAST `-c`
+   * for a key), but it is reported so the wrapper can refuse it explicitly
+   * rather than silently discarding what the caller asked for.
+   */
+  hooksPathOverride: string | null;
+  /**
+   * A bypass inside an alias expansion. Unlike the argv case this CANNOT be
+   * beaten by injection: git expands the alias after the command line, so the
+   * expansion's own `-c core.hooksPath=` or `--no-verify` wins.
+   */
+  aliasBypass: GitAliasBypass | null;
 }
 
 /**
@@ -66,33 +156,41 @@ export interface GitInvocationClassification {
  * Resolution is bounded rather than recursive: git permits an alias to expand to
  * another alias, and an unbounded loop here would be a denial-of-service on a
  * config the agent controls.
+ *
+ * An expansion is parsed with the same global-option scan as argv, not by
+ * reading its first word. `alias.sneaky = -c core.hooksPath=/tmp/empty push`
+ * expands to a push whose first word is `-c`, so a first-word test classifies it
+ * as not-a-push and the guard is never injected at all — measured as a working
+ * bypass against git 2.47.3.
  */
 export function classifyGitInvocation(
   argv: readonly string[],
   resolveAlias?: (name: string) => string | null,
 ): GitInvocationClassification {
-  let index = 0;
-  while (index < argv.length) {
-    const token = argv[index]!;
-    if (!token.startsWith("-")) break;
-    // `--opt=value` carries its own value; `--opt value` and `-c x=y` do not.
-    if (VALUE_TAKING_GLOBAL_OPTIONS.has(token)) {
-      index += 2;
-      continue;
-    }
-    index += 1;
+  const globals = scanGlobalOptions(argv);
+
+  if (globals.subcommandIndex >= argv.length) {
+    return {
+      subcommand: null,
+      isPush: false,
+      hasNoVerify: false,
+      subcommandIndex: -1,
+      hooksPathOverride: globals.hooksPathOverride,
+      aliasBypass: null,
+    };
   }
 
-  if (index >= argv.length) {
-    return { subcommand: null, isPush: false, hasNoVerify: false, subcommandIndex: -1 };
-  }
-
-  const subcommandIndex = index;
+  const subcommandIndex = globals.subcommandIndex;
   const subcommand = argv[subcommandIndex]!;
   const rest = argv.slice(subcommandIndex + 1);
   const hasNoVerify = rest.some((token) => NO_VERIFY_FLAGS.has(token));
 
   let isPush = subcommand === "push";
+  // Accumulated across hops, then kept only if the chain reaches a push: a
+  // bypass on an alias that never publishes anything is not this guard's
+  // business, and refusing it would break unrelated tooling.
+  let pendingBypass: GitAliasBypass | null = null;
+
   if (!isPush && resolveAlias) {
     let name: string | null = subcommand;
     for (let hop = 0; hop < 4 && name && !isPush; hop += 1) {
@@ -102,16 +200,35 @@ export function classifyGitInvocation(
       // and refusing every one of them would break unrelated tooling, so it is
       // reported as not-a-push and the residual gap is documented on the door.
       if (expansion.startsWith("!")) break;
-      const first = expansion.trim().split(/\s+/)[0] ?? "";
-      if (first === "push") {
+
+      const tokens = expansion.trim().split(/\s+/).filter((token) => token.length > 0);
+      const expansionGlobals = scanGlobalOptions(tokens);
+      if (!pendingBypass && expansionGlobals.hooksPathOverride) {
+        pendingBypass = { alias: name, expansion, reason: "hooks-path" };
+      }
+
+      const expanded: string | null = tokens[expansionGlobals.subcommandIndex] ?? null;
+      const expandedRest = tokens.slice(expansionGlobals.subcommandIndex + 1);
+      if (!pendingBypass && expandedRest.some((token) => NO_VERIFY_FLAGS.has(token))) {
+        pendingBypass = { alias: name, expansion, reason: "no-verify" };
+      }
+
+      if (expanded === "push") {
         isPush = true;
         break;
       }
-      name = first || null;
+      name = expanded;
     }
   }
 
-  return { subcommand, isPush, hasNoVerify, subcommandIndex };
+  return {
+    subcommand,
+    isPush,
+    hasNoVerify,
+    subcommandIndex,
+    hooksPathOverride: globals.hooksPathOverride,
+    aliasBypass: isPush ? pendingBypass : null,
+  };
 }
 
 export interface PrePushRefUpdate {
@@ -171,12 +288,48 @@ export interface GitPushFinding {
 export type GitReader = (args: string[]) => string | null;
 
 /**
+ * A git read the scanner needed in order to reach a verdict did not succeed.
+ *
+ * This exists so an unreadable repository cannot be mistaken for a clean one.
+ * Every read below decides either WHICH commits the push would publish or WHAT
+ * is inside one, so a failure leaves the scanner with no evidence — and "no
+ * evidence of credential-shaped material" is not the same statement as "no
+ * credential-shaped material". Treating the two as equivalent turns any git
+ * error, including a `maxBuffer` overflow on a large diff, into a silent pass
+ * at exactly the moment the push is biggest.
+ */
+export class GitEgressScanError extends Error {
+  constructor(
+    readonly command: readonly string[],
+    readonly commit?: string,
+  ) {
+    super(
+      `\`git ${command.join(" ")}\` failed, so ${
+        commit ? `commit ${commit.slice(0, 12)}` : "the set of commits this push would publish"
+      } could not be read`,
+    );
+    this.name = "GitEgressScanError";
+  }
+}
+
+/** Run a read the verdict depends on, refusing rather than guessing on failure. */
+function readGit(runGit: GitReader, args: string[], commit?: string): string {
+  const output = runGit(args);
+  if (output === null) throw new GitEgressScanError(args, commit);
+  return output;
+}
+
+/**
  * Commits that a push would publish for one ref update.
  *
  * For an existing remote ref the range is `remoteSha..localSha`. For a ref the
  * remote does not have, `--not --remotes` excludes everything already published
  * under any remote-tracking ref, which is what keeps a new branch off a shared
  * base from re-reporting the entire history of the repository.
+ *
+ * Throws {@link GitEgressScanError} if `rev-list` fails: without its output the
+ * scanner does not know what the push contains, and an empty list would read as
+ * "nothing to check" and pass.
  */
 export function commitsForRefUpdate(
   update: PrePushRefUpdate,
@@ -186,9 +339,7 @@ export function commitsForRefUpdate(
   const args = isNullSha(update.remoteSha)
     ? ["rev-list", update.localSha, "--not", "--remotes"]
     : ["rev-list", `${update.remoteSha}..${update.localSha}`];
-  const output = runGit(args);
-  if (output === null) return [];
-  return output
+  return readGit(runGit, args)
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
@@ -232,13 +383,20 @@ export function addedLinesFromPatch(patch: string): string {
  * the remedy is a rewrite of that commit. Material already present on the remote
  * is out of scope here by construction: it has already been published, and
  * re-reporting it would make every push refuse with nothing the author can do.
+ *
+ * Every read throws {@link GitEgressScanError} on failure rather than being
+ * skipped. An unreadable message or patch is an unscanned commit, and letting it
+ * through would mean the guard reports clean on precisely the commits it could
+ * not inspect. Note this is distinct from an EMPTY read: git exits zero with no
+ * output for a commit with an empty message or no diff, and that genuinely is
+ * nothing to scan.
  */
 export function scanCommit(commit: string, runGit: GitReader): GitPushFinding[] {
   const findings: GitPushFinding[] = [];
   const shortCommit = commit.slice(0, 12);
-  const subject = (runGit(["log", "-1", "--format=%s", commit]) ?? "").trim();
+  const subject = readGit(runGit, ["log", "-1", "--format=%s", commit], commit).trim();
 
-  const message = runGit(["log", "-1", "--format=%B", commit]);
+  const message = readGit(runGit, ["log", "-1", "--format=%B", commit], commit);
   if (message) {
     const scrubbed = scrubGitHubEgressText(message);
     if (scrubbed.redacted) {
@@ -249,7 +407,11 @@ export function scanCommit(commit: string, runGit: GitReader): GitPushFinding[] 
   // `--format=` suppresses the commit header so the message is not scanned
   // twice and reported as two findings. `--no-color` keeps escape sequences out
   // of the scrubbed text. `-m` makes merge commits emit a patch at all.
-  const patch = runGit(["show", "--format=", "--no-color", "-m", "--unified=0", commit]);
+  const patch = readGit(
+    runGit,
+    ["show", "--format=", "--no-color", "-m", "--unified=0", commit],
+    commit,
+  );
   if (patch) {
     const scrubbed = scrubGitHubEgressText(addedLinesFromPatch(patch));
     if (scrubbed.redacted) {
@@ -317,4 +479,28 @@ export function formatRefusal(findings: readonly GitPushFinding[]): string {
   );
 
   return lines.join("\n");
+}
+
+/**
+ * The refusal text for a scan that could not be completed.
+ *
+ * Deliberately distinct from {@link formatRefusal}: nothing was found, so
+ * telling the author to amend a commit would send them looking for material
+ * that may not exist. What they need to know is that this is a refusal rather
+ * than a detection, and what to do about the read that failed.
+ */
+export function formatScanFailure(error: unknown): string {
+  const detail = error instanceof Error ? error.message : String(error);
+  return [
+    "paperclip-github-egress: refusing to publish — the credential scan could not be completed.",
+    "",
+    `  ${detail}`,
+    "",
+    "This is a refusal, not a detection: nothing was found because nothing could be read.",
+    "A scan that cannot inspect the commits it is meant to check cannot report them clean,",
+    "so the push is stopped rather than allowed through unscanned.",
+    "",
+    "If git cannot read the repository, fix that and re-run. If the push is very large, the",
+    "read may have exceeded the scanner's buffer — push in smaller batches.",
+  ].join("\n");
 }

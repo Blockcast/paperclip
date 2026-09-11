@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import {
   classifyGitInvocation,
   formatRefusal,
+  formatScanFailure,
   parsePrePushInput,
   scanPrePushUpdates,
   type GitReader,
@@ -67,6 +68,16 @@ export class GitEgressRuntimeError extends Error {
  * because a hooks directory holding only `pre-push` makes the rest silently stop
  * running. Scoping the injection to the one command whose hook we supply keeps
  * that blast radius off unrelated workflows.
+ *
+ * Placement is a security property, not a style choice. Git takes the LAST `-c`
+ * given for a key, so injecting at the FRONT lets a caller-supplied
+ * `git -c core.hooksPath=/tmp/empty push` override the guard and skip the
+ * scanner entirely. The guard therefore goes immediately before the subcommand,
+ * after every global option the caller passed, where it is the last value git
+ * sees. Measured against git 2.47.3: from that position it also beats
+ * `--config-env=core.hooksPath=...`, the case-folded `CORE.HOOKSPATH` spelling,
+ * a repository's own `core.hooksPath` config, and `GIT_CONFIG_KEY_*` in the
+ * environment.
  */
 export function buildGitArgv(
   argv: readonly string[],
@@ -81,8 +92,41 @@ export function buildGitArgv(
     );
   }
 
-  // Global options must precede the subcommand, so this goes at the front.
-  return ["-c", `core.hooksPath=${options.hooksDir}`, ...argv];
+  // Injecting last already wins over this, so the refusal is not what makes the
+  // guard hold — it is here so a caller who asked for a different hooks
+  // directory is told their request was rejected rather than silently dropped,
+  // and so the control does not rest on ordering alone.
+  if (classification.hooksPathOverride) {
+    throw new GitEgressRuntimeError(
+      `paperclip-github-egress: refusing to publish — this invocation sets core.hooksPath itself (\`${classification.hooksPathOverride}\`), which would replace the hook that checks whether these commits carry credential-shaped material. Re-run the push without it.`,
+    );
+  }
+
+  // An alias is the one case injection cannot win: git expands it AFTER the
+  // command line, so a `-c core.hooksPath=` or `--no-verify` inside the
+  // expansion is the last thing git sees no matter where the guard is placed.
+  // Refusal is the only enforcement available here.
+  if (classification.aliasBypass) {
+    const { alias, expansion, reason } = classification.aliasBypass;
+    const what =
+      reason === "no-verify"
+        ? "skips the pre-push hook with --no-verify"
+        : "points core.hooksPath somewhere else";
+    throw new GitEgressRuntimeError(
+      `paperclip-github-egress: refusing to publish — the alias \`${alias}\` expands to a push that ${what} (\`${expansion}\`), which would bypass the check for credential-shaped material. Invoke the push directly instead of through the alias, or redefine the alias without it.`,
+    );
+  }
+
+  // Immediately before the subcommand: after the caller's global options, so
+  // this is the last `core.hooksPath` git reads, and still ahead of the
+  // subcommand, which is where git requires global options to sit.
+  const at = classification.subcommandIndex;
+  return [
+    ...argv.slice(0, at),
+    "-c",
+    `core.hooksPath=${options.hooksDir}`,
+    ...argv.slice(at),
+  ];
 }
 
 export function makeGitReader(gitPath: string, cwd?: string): GitReader {
@@ -119,6 +163,11 @@ function readStdin(): Promise<string> {
  * Every remote is guarded, not only github.com. The material this refuses is
  * credential-shaped wherever it lands, and scoping the check by remote URL would
  * turn `git remote add` into the bypass.
+ *
+ * The scan is wrapped so that ANY failure aborts the push. A guard whose error
+ * path is "allow" is not a guard: a git read that fails, a buffer that
+ * overflows on a large diff, or an unanticipated throw would each otherwise
+ * publish the commits unscanned, and the larger the push the likelier that gets.
  */
 export async function runPrePushHook(options: {
   input: string;
@@ -129,7 +178,17 @@ export async function runPrePushHook(options: {
   const updates = parsePrePushInput(options.input);
   if (updates.length === 0) return 0;
 
-  const findings = scanPrePushUpdates(updates, options.runGit);
+  let findings;
+  try {
+    findings = scanPrePushUpdates(updates, options.runGit);
+  } catch (error) {
+    // Deliberately catching everything, not just GitEgressScanError. An
+    // unexpected throw is exactly the case where the scanner's verdict is
+    // unknown, which must refuse rather than pass.
+    write(formatScanFailure(error));
+    return 1;
+  }
+
   if (findings.length === 0) return 0;
 
   write(formatRefusal(findings));

@@ -5,6 +5,7 @@ import {
   classifyGitInvocation,
   commitsForRefUpdate,
   formatRefusal,
+  GitEgressScanError,
   parsePrePushInput,
   scanCommit,
   scanPrePushUpdates,
@@ -88,10 +89,84 @@ describe("classifyGitInvocation", () => {
     expect(classifyGitInvocation(["sh"], () => shellAlias).isPush).toBe(false);
   });
 
-  it("detects the hook-skipping flags", () => {
+  it("detects the hook-skipping flag", () => {
     expect(classifyGitInvocation(["push", "--no-verify"]).hasNoVerify).toBe(true);
-    expect(classifyGitInvocation(["push", "-n"]).hasNoVerify).toBe(true);
     expect(classifyGitInvocation(["push"]).hasNoVerify).toBe(false);
+  });
+
+  it("does not treat `push -n` as a hook bypass, because it is --dry-run", () => {
+    // For `push`, `-n` is --dry-run, not --no-verify (see the subcommand's own
+    // `-h` output). Refusing
+    // it would reject a safe command while giving a false reason, and it is
+    // harmless twice over: verified against git 2.47.3, the pre-push hook still
+    // runs under --dry-run, and a dry run publishes nothing even if it did not.
+    expect(classifyGitInvocation(["push", "-n"]).hasNoVerify).toBe(false);
+  });
+
+  it("reports a caller-supplied core.hooksPath override, however it is spelled", () => {
+    // Each of these overrode a guard injected at the FRONT of argv when
+    // measured against git 2.47.3, because git takes the last value for a key.
+    const cases: Array<[string, string[]]> = [
+      ["-c", ["-c", "core.hooksPath=/tmp/empty", "push"]],
+      ["case-folded key", ["-c", "CORE.HOOKSPATH=/tmp/empty", "push"]],
+      ["--config-env=", ["--config-env=core.hooksPath=HP", "push"]],
+      ["--config-env separate", ["--config-env", "core.hooksPath=HP", "push"]],
+    ];
+    for (const [label, argv] of cases) {
+      const result = classifyGitInvocation(argv);
+      expect(result.isPush, label).toBe(true);
+      expect(result.hooksPathOverride, label).not.toBeNull();
+    }
+  });
+
+  it("leaves hooksPathOverride null for unrelated config", () => {
+    const result = classifyGitInvocation(["-c", "user.name=someone", "push"]);
+    expect(result.isPush).toBe(true);
+    expect(result.hooksPathOverride).toBeNull();
+  });
+
+  it("still sees the push when an alias expansion leads with its own global options", () => {
+    // Reading only the expansion's first word classifies this as a `-c`
+    // subcommand, so the guard is never injected and the alias pushes freely.
+    // Measured as a working bypass against git 2.47.3.
+    const resolve = (name: string) =>
+      name === "sneaky" ? "-c core.hooksPath=/tmp/empty push" : null;
+    const result = classifyGitInvocation(["sneaky"], resolve);
+    expect(result.isPush).toBe(true);
+    expect(result.aliasBypass).toMatchObject({ alias: "sneaky", reason: "hooks-path" });
+  });
+
+  it("reports an alias whose expansion skips the hook", () => {
+    const resolve = (name: string) => (name === "yolo" ? "push --no-verify" : null);
+    const result = classifyGitInvocation(["yolo"], resolve);
+    expect(result.isPush).toBe(true);
+    // argv itself carries no --no-verify; the bypass is only in the expansion,
+    // and git applies it after the command line, so injection cannot beat it.
+    expect(result.hasNoVerify).toBe(false);
+    expect(result.aliasBypass).toMatchObject({ alias: "yolo", reason: "no-verify" });
+  });
+
+  it("carries a bypass found part-way along an alias chain", () => {
+    const chain: Record<string, string> = { a: "-c core.hooksPath=/tmp/empty b", b: "push" };
+    const result = classifyGitInvocation(["a"], (n) => chain[n] ?? null);
+    expect(result.isPush).toBe(true);
+    expect(result.aliasBypass).toMatchObject({ alias: "a", reason: "hooks-path" });
+  });
+
+  it("ignores a bypass on an alias that never reaches a push", () => {
+    // `git amend` skipping commit-msg hooks is not this guard's business, and
+    // refusing it would break unrelated tooling.
+    const resolve = (name: string) => (name === "amend" ? "commit --amend --no-verify" : null);
+    const result = classifyGitInvocation(["amend"], resolve);
+    expect(result.isPush).toBe(false);
+    expect(result.aliasBypass).toBeNull();
+  });
+
+  it("reports no alias bypass for an ordinary push alias", () => {
+    const resolve = (name: string) => (name === "p" ? "push --force-with-lease" : null);
+    const result = classifyGitInvocation(["p"], resolve);
+    expect(result.isPush).toBe(true);
+    expect(result.aliasBypass).toBeNull();
   });
 });
 
@@ -155,6 +230,19 @@ describe("commitsForRefUpdate", () => {
     );
     expect(commits).toEqual([]);
   });
+
+  it("refuses rather than reporting an empty range when rev-list fails", () => {
+    // The regression this guards: returning [] on a failed read makes the push
+    // look like it publishes nothing, so it proceeds entirely unscanned. A
+    // `maxBuffer` overflow reaches here, which makes the largest pushes the
+    // likeliest to slip through.
+    expect(() =>
+      commitsForRefUpdate(
+        { localRef: "r", localSha: "new", remoteRef: "r", remoteSha: "old" },
+        () => null,
+      ),
+    ).toThrow(GitEgressScanError);
+  });
 });
 
 describe("addedLinesFromPatch", () => {
@@ -213,6 +301,37 @@ describe("scanCommit", () => {
         [`log -1 --format=%s ${sha}`]: "fix: tidy the readme",
         [`log -1 --format=%B ${sha}`]: "fix: tidy the readme\n",
         [`show --format= --no-color -m --unified=0 ${sha}`]: "+Hello, world.\n",
+      }),
+    );
+    expect(findings).toEqual([]);
+  });
+
+  it("refuses when a read it needs fails, rather than skipping that leg", () => {
+    // Each read decides part of the verdict, so skipping one reports a commit
+    // clean that was never inspected. `fakeGit` returns null for any key it is
+    // not given, so each case below omits exactly one read.
+    const complete: Record<string, string> = {
+      [`log -1 --format=%s ${sha}`]: "wip",
+      [`log -1 --format=%B ${sha}`]: "wip\n",
+      [`show --format= --no-color -m --unified=0 ${sha}`]: "+clean\n",
+    };
+    for (const omitted of Object.keys(complete)) {
+      const responses = { ...complete };
+      delete responses[omitted];
+      expect(() => scanCommit(sha, fakeGit(responses)), omitted).toThrow(GitEgressScanError);
+    }
+  });
+
+  it("distinguishes an empty read from a failed one", () => {
+    // git exits zero with no output for an empty message or an empty diff.
+    // That is genuinely nothing to scan and must not be confused with a read
+    // that failed, or every such commit would refuse its own push.
+    const findings = scanCommit(
+      sha,
+      fakeGit({
+        [`log -1 --format=%s ${sha}`]: "",
+        [`log -1 --format=%B ${sha}`]: "",
+        [`show --format= --no-color -m --unified=0 ${sha}`]: "",
       }),
     );
     expect(findings).toEqual([]);
