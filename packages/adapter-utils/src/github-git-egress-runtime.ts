@@ -24,6 +24,7 @@
 // resolves to on PATH.
 
 import { spawn, spawnSync } from "node:child_process";
+import { accessSync, constants } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -43,12 +44,30 @@ export const DEFAULT_HOOKS_DIR = "/paperclip/.local/share/paperclip-git-hooks";
 /** The real git, for the hook's own read-only queries. */
 export const DEFAULT_GIT_BINARY = "/usr/bin/git";
 
-export function hooksDirectory(env: NodeJS.ProcessEnv = process.env): string {
-  return env.PAPERCLIP_GIT_EGRESS_HOOKS_DIR || DEFAULT_HOOKS_DIR;
+/**
+ * The hooks directory the deployed entrypoint uses.
+ *
+ * Takes no arguments, and reads no environment, on purpose. These were once
+ * `env`-backed overrides defaulting to the constants, which is an escape hatch
+ * in a boundary whose whole job is to be unavoidable: the environment here is
+ * agent-controlled, so a publish run with
+ * `PAPERCLIP_GIT_EGRESS_HOOKS_DIR=/tmp/empty` aimed `core.hooksPath` at a
+ * directory with no hook and proceeded unscanned. The sibling
+ * `PAPERCLIP_GIT_EGRESS_GIT` was worse: it aimed the hook's own reader at a
+ * binary of the caller's choosing, so a fake git reporting clean output
+ * cleared the scan.
+ *
+ * The test seam that justified them is still there and is strictly better —
+ * `runGitEgressRuntime` takes `hooksDir` and `runPrePushHook` takes `runGit` as
+ * parameters, so tests inject directly instead of through ambient state.
+ */
+export function hooksDirectory(): string {
+  return DEFAULT_HOOKS_DIR;
 }
 
-export function gitBinary(env: NodeJS.ProcessEnv = process.env): string {
-  return env.PAPERCLIP_GIT_EGRESS_GIT || DEFAULT_GIT_BINARY;
+/** The git binary the deployed entrypoint reads with. See `hooksDirectory`. */
+export function gitBinary(): string {
+  return DEFAULT_GIT_BINARY;
 }
 
 export class GitEgressRuntimeError extends Error {
@@ -58,6 +77,29 @@ export class GitEgressRuntimeError extends Error {
   ) {
     super(message);
     this.name = "GitEgressRuntimeError";
+  }
+}
+
+/**
+ * Is the guard actually installed at `hooksDir`?
+ *
+ * Pointing `core.hooksPath` at a directory that holds no executable `pre-push`
+ * is not an error to git — it runs no hook and the push proceeds. That is the
+ * one failure mode this whole door cannot tolerate, and it is silent: nothing
+ * in the output distinguishes "scanned and clean" from "never scanned".
+ *
+ * It matters more now that the directory is a constant rather than an override.
+ * `DEFAULT_HOOKS_DIR` hardcodes `/paperclip`, while the seed writes to
+ * `{{ .Values.persistence.mountPath }}` — equal in every values file today, but
+ * a deployment that changed the mount path would silently publish unscanned.
+ * Checking turns that from a hole into a refusal that names the missing file.
+ */
+function prePushHookInstalled(hooksDir: string): boolean {
+  try {
+    accessSync(path.join(hooksDir, "pre-push"), constants.X_OK);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -86,9 +128,25 @@ export function buildGitArgv(
     hooksDir: string;
     resolveAlias?: (name: string) => string | null;
     env?: NodeJS.ProcessEnv;
+    /** Seam for the fs check; the default is the real one. */
+    hookInstalled?: (hooksDir: string) => boolean;
   },
 ): string[] {
   const classification = classifyGitInvocation(argv, options.resolveAlias, options.env ?? {});
+
+  // Checked ahead of the not-a-push early return, deliberately. A shell alias
+  // cannot be classified as a push or not — its expansion is arbitrary shell —
+  // and it is the one form that escapes this guard entirely, because git
+  // prepends its exec-path (which ships a complete `git`) to PATH for the shell
+  // it spawns. So a bare `git push` inside the expansion reaches the real git
+  // without passing through this wrapper or the hook.
+  if (classification.shellAlias) {
+    const { alias, expansion } = classification.shellAlias;
+    throw new GitEgressRuntimeError(
+      `paperclip-github-egress: refusing to run the shell alias \`${alias}\` (\`${expansion}\`). A \`!\` alias runs arbitrary shell, and git puts its own exec-path ahead of PATH for it, so a \`push\` inside the expansion would reach git directly and skip the check for credential-shaped material. Run the underlying commands directly instead of through the alias.`,
+    );
+  }
+
   if (!classification.isPush) return [...argv];
 
   if (classification.hasNoVerify) {
@@ -119,6 +177,16 @@ export function buildGitArgv(
         : "points core.hooksPath somewhere else";
     throw new GitEgressRuntimeError(
       `paperclip-github-egress: refusing to publish — the alias \`${alias}\` expands to a push that ${what} (\`${expansion}\`), which would bypass the check for credential-shaped material. Invoke the push directly instead of through the alias, or redefine the alias without it.`,
+    );
+  }
+
+  // Last, so the specific caller-error refusals above win the message. Placed
+  // before the injection because injecting a hooks path with no hook in it is
+  // indistinguishable, from the outside, from a push that was scanned.
+  const hookInstalled = options.hookInstalled ?? prePushHookInstalled;
+  if (!hookInstalled(options.hooksDir)) {
+    throw new GitEgressRuntimeError(
+      `paperclip-github-egress: refusing to publish — no executable pre-push hook at \`${path.join(options.hooksDir, "pre-push")}\`, so this push could not be checked for credential-shaped material. This is a deployment fault, not something to work around: the hook is written by the chart's agent-runtime seed. Report it rather than pushing past it.`,
     );
   }
 
@@ -205,6 +273,7 @@ export function runGitEgressRuntime(options: {
   argv: string[];
   hooksDir: string;
   env?: NodeJS.ProcessEnv;
+  hookInstalled?: (hooksDir: string) => boolean;
 }): Promise<number> {
   const env = options.env ?? process.env;
 
@@ -234,7 +303,12 @@ export function runGitEgressRuntime(options: {
     return value.length > 0 ? value : null;
   };
 
-  const argv = buildGitArgv(options.argv, { hooksDir: options.hooksDir, resolveAlias, env });
+  const argv = buildGitArgv(options.argv, {
+    hooksDir: options.hooksDir,
+    resolveAlias,
+    env,
+    hookInstalled: options.hookInstalled,
+  });
 
   return new Promise((resolve, reject) => {
     const child = spawn(options.target, argv, { stdio: "inherit" });

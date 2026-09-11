@@ -221,6 +221,23 @@ export interface GitInvocationClassification {
    * expansion's own `-c core.hooksPath=` or `--no-verify` wins.
    */
   aliasBypass: GitAliasBypass | null;
+  /**
+   * A `!`-prefixed shell alias reached while resolving the subcommand.
+   *
+   * Set whether or not the chain reached a push, because for a shell alias that
+   * question is unanswerable: the expansion is arbitrary shell, and deciding
+   * whether it publishes would mean parsing it. The wrapper refuses on this
+   * rather than guessing. See `classifyGitInvocation` for why passing it through
+   * is not an option.
+   */
+  shellAlias: GitShellAlias | null;
+}
+
+export interface GitShellAlias {
+  /** The alias the caller invoked. */
+  alias: string;
+  /** Its expansion, so the refusal can quote what git would have run. */
+  expansion: string;
 }
 
 /**
@@ -272,6 +289,7 @@ export function classifyGitInvocation(
       subcommandIndex: -1,
       hooksPathOverride: globals.hooksPathOverride,
       aliasBypass: null,
+      shellAlias: null,
     };
   }
 
@@ -285,6 +303,7 @@ export function classifyGitInvocation(
   // bypass on an alias that never publishes anything is not this guard's
   // business, and refusing it would break unrelated tooling.
   let pendingBypass: GitAliasBypass | null = null;
+  let shellAlias: GitShellAlias | null = null;
 
   if (!isPush) {
     const definitions = new Map(globals.aliasDefinitions);
@@ -296,10 +315,29 @@ export function classifyGitInvocation(
     for (let hop = 0; hop < 4 && name && !isPush; hop += 1) {
       const expansion = lookup(name);
       if (!expansion) break;
-      // A `!`-prefixed alias is an arbitrary shell command. We cannot parse it,
-      // and refusing every one of them would break unrelated tooling, so it is
-      // reported as not-a-push and the residual gap is documented on the door.
-      if (expansion.startsWith("!")) break;
+      // A `!`-prefixed alias is an arbitrary shell command, and it is the one
+      // expansion that escapes this guard completely — so it is recorded for
+      // refusal rather than passed through.
+      //
+      // Passing it through used to be justified on the theory that a bare `git`
+      // inside the expansion would re-enter the wrapper through PATH. Measured
+      // against git 2.47.3, that is false: git PREPENDS its exec-path to PATH
+      // for the shell it spawns, and `/usr/lib/git-core` ships a complete `git`
+      // binary. So inside a shell alias, a bare `git push` resolves to
+      // /usr/lib/git-core/git — the real one — and neither the wrapper nor the
+      // hook is reached. No absolute path is needed for the bypass; the alias
+      // supplies it. That makes this the dangerous shape: an ordinary-looking
+      // `git <name>` that silently is not guarded.
+      //
+      // Refusal is the only sound response. Deciding whether the expansion
+      // publishes would mean parsing arbitrary shell, and a textual test for
+      // `push` is defeated by any indirection. Refusing every shell alias is
+      // the conservative direction, and it is cheap: no shell alias is defined
+      // in any config the agent image ships.
+      if (expansion.startsWith("!")) {
+        shellAlias = { alias: name, expansion };
+        break;
+      }
 
       const tokens = expansion.trim().split(/\s+/).filter((token) => token.length > 0);
       const expansionGlobals = scanGlobalOptions(tokens, env);
@@ -331,6 +369,7 @@ export function classifyGitInvocation(
     subcommandIndex,
     hooksPathOverride: globals.hooksPathOverride,
     aliasBypass: isPush ? pendingBypass : null,
+    shellAlias,
   };
 }
 
