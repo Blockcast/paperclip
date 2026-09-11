@@ -194,6 +194,7 @@ describeEmbeddedPostgres("recovery observability report", () => {
     returnOwnerAgentId: string | null;
     finalAssigneeAgentId: string | null;
     finalIssueStatus: string;
+    id?: string;
   }) {
     const sourceIssueId = randomUUID();
     await db.insert(issues).values({
@@ -207,7 +208,7 @@ describeEmbeddedPostgres("recovery observability report", () => {
       identifier: `SRC-${input.n}`,
     });
     await db.insert(issueRecoveryActions).values({
-      id: randomUUID(),
+      id: input.id ?? randomUUID(),
       companyId: input.companyId,
       sourceIssueId,
       kind: "stranded_assigned_issue",
@@ -480,13 +481,70 @@ describeEmbeddedPostgres("recovery observability report", () => {
     const secondPage = await service.listActions(companyId, { limit: 2, offset: 2 });
     expect(secondPage.map((a) => a.sourceIssueIdentifier)).toEqual(["SRC-1"]);
 
-    // `order: "asc"` reaches it directly, and is the drift-free walk: inserts
+    // `order: "asc"` reaches it directly, and is stable against inserts: they
     // land at the tail of an ascending list, so paging cannot skip an old row.
+    // (Stable against inserts only — see `RecoveryActionListOptions.order` for
+    // why a status-filtered walk is still not an exact census.)
     const oldestFirst = await service.listActions(companyId, { order: "asc", limit: 2 });
     expect(oldestFirst.map((a) => a.sourceIssueIdentifier)).toEqual(["SRC-1", "SRC-2"]);
 
     // `desc` stays the default for callers that pass no `order`.
     const defaultOrder = await service.listActions(companyId, {});
     expect(defaultOrder[0]?.sourceIssueIdentifier).toBe("SRC-3");
+  });
+
+  // BLO-19124 (Ally review on #1762): `createdAt` alone is not a total order.
+  // These sweeps touch tens of rows at a time, so ties are the normal case inside
+  // a burst, and an untied group orders database-defined — a page boundary landing
+  // inside one can repeat or drop a row between calls. The three rows below share
+  // a `createdAt` to the millisecond and are inserted in the REVERSE of their id
+  // order, so a walk that forgot the `id` tiebreaker returns insertion order and
+  // fails these assertions rather than passing by luck.
+  it("breaks `createdAt` ties by id so paging a burst cannot repeat or drop a row", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+    const burstAt = new Date("2026-07-14T09:00:00.000Z");
+
+    // n -> id, ascending by id. SRC-1 < SRC-2 < SRC-3 as ids.
+    const ids: Record<number, string> = {
+      1: "00000000-0000-4000-8000-0000000000a1",
+      2: "00000000-0000-4000-8000-0000000000a2",
+      3: "00000000-0000-4000-8000-0000000000a3",
+    };
+
+    for (const n of [3, 2, 1]) {
+      await seedRecoveryAction({
+        companyId,
+        n,
+        id: ids[n],
+        createdAt: burstAt,
+        cause: "stranded_assigned_issue",
+        errorCode: "adapter_failed",
+        status: "escalated",
+        outcome: null,
+        ownerAgentId: managerId,
+        returnOwnerAgentId: coderId,
+        finalAssigneeAgentId: managerId,
+        finalIssueStatus: "in_progress",
+      });
+    }
+
+    const service = recoveryObservabilityService(db);
+
+    expect(
+      (await service.listActions(companyId, { order: "asc" })).map((a) => a.sourceIssueIdentifier),
+    ).toEqual(["SRC-1", "SRC-2", "SRC-3"]);
+    expect(
+      (await service.listActions(companyId, { order: "desc" })).map((a) => a.sourceIssueIdentifier),
+    ).toEqual(["SRC-3", "SRC-2", "SRC-1"]);
+
+    // The point of the tiebreaker: paging across a boundary inside the tie covers
+    // the burst exactly once — no repeat, no drop.
+    const page1 = await service.listActions(companyId, { order: "asc", limit: 2 });
+    const page2 = await service.listActions(companyId, { order: "asc", limit: 2, offset: 2 });
+    expect([...page1, ...page2].map((a) => a.sourceIssueIdentifier)).toEqual([
+      "SRC-1",
+      "SRC-2",
+      "SRC-3",
+    ]);
   });
 });
