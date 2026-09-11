@@ -75,7 +75,9 @@ export async function loadAgentInboxLite({
       const retryHeld = isIssueHeldByForeignScheduledRetry({
         scheduledRetryAt: issue.scheduledRetryAt,
         scheduledRetryRunId: issue.scheduledRetryRunId,
+        scheduledRetryAgentId: issue.scheduledRetryAgentId,
         callerRunId,
+        callerAgentId: agentId,
         nowMs,
       });
       if (retryHeld) onWithheldForeignScheduledRetry?.(issue);
