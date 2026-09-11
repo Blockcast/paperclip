@@ -198,13 +198,20 @@ export const DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS = 7 * 24 * 60 * 60
  * (BLO-27676 review).
  *
  * `findSuppressingResolvedLivenessRecoveryIssue` orders and compares on
- * `coalesce(completed_at, updated_at)` but must FILTER on bare `updated_at`,
- * because only the bare column is servable by `issues_company_updated_idx` and
- * the alternative is an unbounded scan of the company's whole escalation
- * history. Those two are not the same instant: `services/issues.ts` stamps
- * `updatedAt` when it builds the patch and `completedAt` from a second clock
- * read later in the same request, so `completed_at` can lead `updated_at` by
- * however long the intervening work takes.
+ * `coalesce(completed_at, cancelled_at, updated_at)` but must FILTER on bare
+ * `updated_at`, because only the bare column is servable by
+ * `issues_company_updated_idx` and the alternative is an unbounded scan of the
+ * company's whole escalation history. Those two are not the same instant:
+ * `services/issues.ts` stamps `updatedAt` when it builds the patch and
+ * `completedAt` from a second clock read later in the same request, so
+ * `completed_at` can lead `updated_at` by however long the intervening work
+ * takes.
+ *
+ * It is the `completed_at` arm that needs the allowance. The `cancelled_at` arm
+ * (BLO-29764) is written from the SAME clock read as `updated_at` on every
+ * current cancel path, so it satisfies the superset property at zero skew --
+ * see the inventory at the query itself. Sizing this constant is therefore a
+ * question about `completed_at` only.
  *
  * Without slack, a row resolved within that gap of the horizon boundary is
  * filtered out, the suppressor returns null, and the escalation re-raises --
