@@ -960,6 +960,135 @@ export function redactApprovalPayloadForDisplay(
   return { payload: displayPayload, redactedFields };
 }
 
+/**
+ * PEN-3153: depth cap for the `resultJson` traversal. Adapter output is
+ * attacker-influenced in shape as well as content, so the walk is bounded.
+ */
+const MAX_RUN_RESULT_JSON_REDACT_DEPTH = 24;
+
+/**
+ * Root-anchored paths inside `heartbeat_runs.resultJson` that carry CONTROL
+ * metadata and must survive key-name redaction.
+ *
+ * `externalLifecycleRecovery.terminalClaimToken` is a `randomUUID()` that
+ * decides which caller owns a terminal run transition:
+ * `setRunStatusIfCurrentStatus` compares the patch's token against the stored
+ * one and refuses the write when they differ. `token` is a Tier-1 stem, so
+ * key-name classification masks it unconditionally — and masking BOTH sides of
+ * that comparison makes them compare EQUAL, inverting the guard so every
+ * racing reconciler pass believes it won the claim. Exempting it by exact path
+ * (not by key name) keeps the guard intact without exempting a
+ * `terminalClaimToken` that appears anywhere else in the tree.
+ *
+ * Audited 2026-09-10 against every field read back out of `resultJson`
+ * (`retryNotBefore`, `providerCapacityResetAt`, `errorFamily`, `stopReason`,
+ * `processLoss`, `subtype`, …): this is the ONLY one that collides with a
+ * secret-ish stem. Adding a control field whose name contains a Tier-1 stem
+ * means adding it here, with a test.
+ */
+const RUN_RESULT_JSON_CONTROL_PATHS: ReadonlySet<string> = new Set([
+  "externalLifecycleRecovery.terminalClaimToken",
+]);
+
+/**
+ * PEN-3153: secret-scrub a `heartbeat_runs.resultJson` tree on its way to the
+ * column.
+ *
+ * ## Why this is a UNION of both primitives, and not either one alone
+ *
+ * Measured 2026-09-10 (probe over this module, not reasoned):
+ *
+ * | input                                            | leaf-text scrub | key-tier scrub |
+ * |--------------------------------------------------|-----------------|----------------|
+ * | `{ api_key: "hunter2" }`                         | SURVIVES        | redacted       |
+ * | `{ summary: "…used token sk-ant-api03-… to…" }`  | redacted        | SURVIVES       |
+ *
+ * So each primitive misses exactly what the other catches:
+ *
+ *  - Key-name classification (`sanitizeRecord`) masks a short structured
+ *    credential under a secret-ish key, but never inspects prose under a
+ *    NEUTRAL key — and `resultJson.result`/`summary`/`message`/`stdout`/
+ *    `stderr` are all neutral keys holding model- and CLI-authored free text.
+ *    That is the class actually observed occupied in this column.
+ *  - `redactSensitiveText` per string leaf catches credentials in that prose,
+ *    but a bare `"hunter2"` matches no credential shape on its own, so a
+ *    structured `{ password: "hunter2" }` walks straight through.
+ *
+ * Applying `redactSensitiveText` to `JSON.stringify(tree)` is NOT a shortcut
+ * for the union: `JSON_SECRET_FIELD_TEXT_RE` matches `"<key>": "<value>"` in
+ * text, so serializing smuggles key names into the scrubbed string and
+ * reintroduces key-name masking — including of the control token above.
+ *
+ * Hence: classify by key name AND scrub every string leaf as text, with the
+ * control-path allowlist carved out of the key-name half only.
+ */
+function redactRunResultJsonValue(
+  value: unknown,
+  tier: 1 | 2 | null,
+  path: string,
+  depth: number,
+): unknown {
+  if (typeof value === "string") {
+    // The allowlist exempts a control field from KEY-NAME masking only. The
+    // leaf-text scrub still runs: a UUID matches no credential shape, so the
+    // token survives, but the field cannot become a laundering channel.
+    if (RUN_RESULT_JSON_CONTROL_PATHS.has(path)) return redactSensitiveText(value);
+    if (tier === 1) return REDACTED_EVENT_VALUE;
+    if (tier === 2 && looksLikeCredentialValue(value)) return REDACTED_EVENT_VALUE;
+    return redactSensitiveText(value);
+  }
+  if (depth >= MAX_RUN_RESULT_JSON_REDACT_DEPTH) return null;
+  if (Array.isArray(value)) {
+    // An array index contributes no key name, so tier and path both carry
+    // through to the entries.
+    return value.map((entry) => redactRunResultJsonValue(entry, tier, path, depth + 1));
+  }
+  if (isPlainObject(value)) {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      // A child key's own classification only ever STRENGTHENS the inherited
+      // tier (min(1, 2) = 1), never weakens it — mirroring
+      // `sanitizeSecretMatchedValue`, so a neutral child under a secret-ish
+      // parent stays protected.
+      const childTier = classifyKeyTier(key);
+      const effectiveTier =
+        tier === null ? childTier : childTier !== null && childTier < tier ? childTier : tier;
+      out[key] = redactRunResultJsonValue(
+        entry,
+        effectiveTier,
+        path.length === 0 ? key : `${path}.${key}`,
+        depth + 1,
+      );
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Entry point for the `resultJson` column. Returns the input unchanged for
+ * anything that is not a plain object or array — notably a drizzle `SQL`
+ * fragment, which several callers pass instead of a value and which must
+ * reach the driver verbatim.
+ */
+export function redactRunResultJson<T>(resultJson: T): T {
+  if (!isPlainObject(resultJson) && !Array.isArray(resultJson)) return resultJson;
+  return redactRunResultJsonValue(resultJson, null, "", 0) as T;
+}
+
+/**
+ * PEN-3153: the `error` column was identity-redacted
+ * (`redactCurrentUserText`) but never secret-scrubbed, so it was in the same
+ * condition as `resultJson`. The PEN-3149 ruling keeps `error`
+ * company-readable on purpose — it is machine-authored and load-bearing for
+ * triage — so this masks credential shapes only and leaves the diagnosis
+ * intact. Non-strings (drizzle `SQL` fragments built by the stage-exit
+ * branch) pass through untouched.
+ */
+export function redactRunError<T>(error: T): T {
+  return typeof error === "string" ? (redactSensitiveText(error) as unknown as T) : error;
+}
+
 export function redactSensitiveText(input: string): string {
   if (!maybeContainsSecretText(input)) return input;
   const envRedacted = input
