@@ -48,7 +48,7 @@ import { HttpError, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
-import { redactSensitiveText } from "../../redaction.js";
+import { redactRunResultJson, redactSensitiveText } from "../../redaction.js";
 import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "../provider-capacity-horizon-bound.js";
 import { truncateText } from "../truncate-text.js";
 // BLO-30087: the stale-lock sweeper below is the second consumer of the
@@ -3888,7 +3888,9 @@ export function recoveryService(
     if (!input.evidence) return { kind: "skipped" as const };
     const cleanup = await cleanupSourceResolvedRunProcess({ run: input.run, runningAgent: input.runningAgent });
     const finalRunStatus = input.sourceIssue.status === "cancelled" ? "cancelled" : "succeeded";
-    const resultJson = {
+    // PEN-3153: spreads the stored adapter `resultJson` forward through a
+    // direct UPDATE that never reaches the heartbeat status writers.
+    const resultJson = redactRunResultJson({
       ...parseObject(input.run.resultJson),
       sourceResolvedWatchdogFold: {
         sourceIssueId: input.sourceIssue.id,
@@ -3903,7 +3905,7 @@ export function recoveryService(
         evaluationIssueIdentifier: input.existingEvaluation?.identifier ?? null,
         cleanup,
       },
-    };
+    });
     const finalizedRun = await db.transaction(async (tx) => {
       // Lock order: issues before heartbeat_runs.
       //
@@ -7712,7 +7714,10 @@ export function recoveryService(
       .update(heartbeatRuns)
       .set({
         errorCode: classifiedRun.errorCode,
-        resultJson: parseObject(classifiedRun.resultJson),
+        // PEN-3153: re-persists the stored adapter `resultJson` with a recovery
+        // classification added, through a direct UPDATE that never reaches the
+        // heartbeat status writers where the scrub otherwise sits.
+        resultJson: redactRunResultJson(parseObject(classifiedRun.resultJson)),
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, latestRun.id));

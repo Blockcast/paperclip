@@ -53,6 +53,7 @@ import { logActivity } from "./activity-log.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService } from "./authorization.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { redactRunError } from "../redaction.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 import {
   formatPipelineCaseOutputContextMarkdown,
@@ -3149,7 +3150,7 @@ export function pipelineService(
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: cancellationReason,
+        error: redactRunError(cancellationReason),
         errorCode: "pipeline_stage_exited",
         updatedAt: now,
       })
@@ -3162,6 +3163,15 @@ export function pipelineService(
     const runningRuns = await tx
       .update(heartbeatRuns)
       .set({
+        // pen3153-scrub-exempt: the written value is a server-generated ISO
+        // timestamp, and this is a drizzle `SQL` fragment rather than a JS
+        // value — `jsonb_set` merges the key in-database, so no adapter- or
+        // provider-derived text passes through this statement. Wrapping the
+        // fragment in the scrub would be a silent no-op (the entry point
+        // returns non-object input unchanged) that reads as coverage while
+        // guarding nothing. The pre-existing bytes this merges INTO were
+        // scrubbed by the write that persisted them; rows written before
+        // PEN-3153 are the forward-only gap tracked on PEN-3158.
         resultJson: sql`jsonb_set(
           coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb),
           '{pipelineStageExitCancellationRequestedAt}',

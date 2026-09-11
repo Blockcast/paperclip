@@ -92,6 +92,57 @@ describe("sanitizeRunResultJsonForStorage (PEN-3153)", () => {
     expect(sanitizeRunResultJsonForStorage(controlShape)).toEqual(controlShape);
   });
 
+  it("masks a SHORT structured credential under a secret-ish key", () => {
+    // #1746 review, Important. The first version of this fix scrubbed string
+    // leaves only, so it never evaluated the key a value sits under, and a
+    // short structured credential walked straight through: measured
+    // `{api_key:"hunter2"} -> {api_key:"hunter2"}`. No text heuristic can
+    // catch these -- `hunter2` is a word, not a credential shape -- so the
+    // key name is the ONLY available signal. Values here are deliberately
+    // short and vendor-prefix-free: the point is that nothing but the key
+    // name identifies them.
+    const scrubbed = sanitizeRunResultJsonForStorage({
+      api_key: "hunter2",
+      password: "hunter2",
+      nested: { accessToken: "hunter2" },
+      viaArray: [{ authorization: "hunter2" }],
+    }) as Record<string, unknown>;
+    expect(scrubbed).toEqual({
+      api_key: "***REDACTED***",
+      password: "***REDACTED***",
+      nested: { accessToken: "***REDACTED***" },
+      viaArray: [{ authorization: "***REDACTED***" }],
+    });
+  });
+
+  it("still masks credentials in PROSE under a NEUTRAL key", () => {
+    // The other half of the union, and the reason the fix is not simply
+    // `sanitizeRecord`. Key-name classification never inspects a neutral key,
+    // so it returns this fixture UNCHANGED (measured). `resultJson.result` /
+    // `summary` / `message` / `stdout` / `stderr` are all neutral keys holding
+    // model- and CLI-authored free text, and that is the class actually
+    // observed occupied in this column. Deleting the leaf-text half to "just
+    // use the key tiers" would reopen exactly what this row was filed for.
+    const scrubbed = sanitizeRunResultJsonForStorage({
+      summary: `ran with PEN3153_FIXTURE_TOKEN=${FIXTURE_SECRET}`,
+      result: `then set PEN3153_FIXTURE_TOKEN=${FIXTURE_SECRET}`,
+    });
+    const serialized = JSON.stringify(scrubbed);
+    expect(serialized).not.toContain(FIXTURE_SECRET);
+    expect(serialized).toContain("***REDACTED***");
+  });
+
+  it("exempts the terminal-claim token by PATH, not by key name", () => {
+    // The allowlist is root-anchored. A `terminalClaimToken` appearing
+    // anywhere other than under `externalLifecycleRecovery` is not control
+    // metadata and must still be masked, or the exemption becomes a
+    // laundering channel for any value a caller chooses to park under that
+    // key name.
+    expect(sanitizeRunResultJsonForStorage({ terminalClaimToken: CONTROL_CLAIM_TOKEN })).toEqual({
+      terminalClaimToken: "***REDACTED***",
+    });
+  });
+
   it("passes through values that are not plain objects or arrays", () => {
     expect(sanitizeRunResultJsonForStorage(null)).toBeNull();
     expect(sanitizeRunResultJsonForStorage(undefined)).toBeUndefined();
@@ -108,7 +159,7 @@ describe("sanitizeRunResultJsonForStorage (PEN-3153)", () => {
 async function waitForRunToFinish(
   heartbeat: ReturnType<typeof heartbeatService>,
   runId: string,
-  timeoutMs = 5_000,
+  timeoutMs = 60_000,
 ) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -116,7 +167,16 @@ async function waitForRunToFinish(
     if (run && !["queued", "running"].includes(run.status)) return run;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  return await heartbeat.getRun(runId);
+  // Fail loudly rather than returning a still-running row. Handing a `queued`/
+  // `running` row back to the caller turns "the run never executed" into a
+  // confusing assertion failure about column contents — or, worse, lets a
+  // future case pass without ever exercising terminal persistence, which is
+  // the only thing these tests are here to check (#1746 review).
+  const last = await heartbeat.getRun(runId);
+  throw new Error(
+    `waitForRunToFinish: run ${runId} did not reach a terminal status within ${timeoutMs}ms `
+      + `(last status: ${last?.status ?? "<missing>"}). The scrub assertions below never ran.`,
+  );
 }
 
 describeEmbeddedPostgres("heartbeat resultJson secret scrub (PEN-3153)", () => {

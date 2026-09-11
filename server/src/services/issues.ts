@@ -123,7 +123,7 @@ import {
   normalizePrReviewRepoFullName,
 } from "./pr-review-duplicate-issue-guard.js";
 import { redactCurrentUserText } from "../log-redaction.js";
-import { redactSensitiveText } from "../redaction.js";
+import { redactRunError, redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
 import {
   evaluateIssueRepoBinding,
@@ -6561,7 +6561,7 @@ export function issueService(db: Db) {
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: input.reason,
+        error: redactRunError(input.reason),
         errorCode: input.errorCode,
         updatedAt: now,
       })
@@ -7521,7 +7521,7 @@ export function issueService(db: Db) {
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: input.reason,
+        error: redactRunError(input.reason),
         errorCode: input.errorCode,
         updatedAt: now,
       })

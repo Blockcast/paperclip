@@ -497,7 +497,13 @@ import {
   redactCurrentUserValue,
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
-import { isPlainObject, redactEventPayload, redactSensitiveText } from "../redaction.js";
+import {
+  isPlainObject,
+  redactEventPayload,
+  redactRunError,
+  redactRunResultJson,
+  redactSensitiveText,
+} from "../redaction.js";
 import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
@@ -4117,15 +4123,6 @@ export function sanitizeRunLogChunkForStorage(
 }
 
 /**
- * Depth bound for the `resultJson` scrub. Adapter results are shallow in
- * practice; the cap only exists so a pathological nesting cannot turn a write
- * into unbounded recursion. Beyond it the subtree is dropped rather than
- * persisted unscrubbed — failing closed, because the whole point of this
- * traversal is that nothing reaches the column unfiltered.
- */
-const MAX_RESULT_JSON_SCRUB_DEPTH = 24;
-
-/**
  * PEN-3153: `resultJson` used to reach the database with no secret scrub on the
  * path. `stdoutExcerpt`/`stderrExcerpt` and run-event payloads written in the
  * same `UPDATE` were both scrubbed; `resultJson` was not, so it was the least
@@ -4135,68 +4132,19 @@ const MAX_RESULT_JSON_SCRUB_DEPTH = 24;
  * The scrub has to run server-side, not in the adapters: no package under
  * `packages/adapters/` imports `server/src/redaction.ts`, which is the
  * structural reason the gap existed at all. A fix inside one adapter recreates
- * it for the next one, so this sits downstream of the single `adapter.execute`
- * call site and again at the persistence chokepoint.
+ * it for the next one, so this sits at the persistence chokepoints below.
  *
- * ## Why per-string-leaf, and not the two obvious alternatives
- *
- * Both readier primitives corrupt control metadata that this table's own
- * correctness depends on. `resultJson.externalLifecycleRecovery
- * .terminalClaimToken` is a `randomUUID()` that decides which caller owns a
- * terminal transition (`setRunStatusIfCurrentStatus` compares the patch's token
- * against the stored one and refuses the write when they differ):
- *
- *  - `redactEventPayload`/`sanitizeRecord` classify by KEY NAME, and `token` is
- *    a Tier-1 stem, so `terminalClaimToken` is masked unconditionally.
- *  - `redactSensitiveText(JSON.stringify(resultJson))` masks it too:
- *    `JSON_SECRET_FIELD_TEXT_RE` matches `"<secret-ish-key>": "<value>"` in the
- *    serialized text, so serializing puts the key name inside the string being
- *    scrubbed and reintroduces key-name masking through the back door.
- *
- * Either one rewrites both sides of that comparison to `***REDACTED***`, which
- * makes them compare EQUAL — inverting the guard so every racing reconciler
- * pass believes it won the claim. Scrubbing each string leaf on its own keeps
- * key names out of the scrubbed text, so the UUID survives (it matches no
- * credential shape) while credential material inside `stdout`/`stderr`/`result`
- * prose is still masked.
- */
-function scrubResultJsonValueForStorage(value: unknown, depth = 0): unknown {
-  if (typeof value === "string") return redactSensitiveText(value);
-  if (depth >= MAX_RESULT_JSON_SCRUB_DEPTH) return null;
-  if (Array.isArray(value)) {
-    return value.map((entry) => scrubResultJsonValueForStorage(entry, depth + 1));
-  }
-  if (isPlainObject(value)) {
-    const out: Record<string, unknown> = {};
-    for (const [key, entry] of Object.entries(value)) {
-      out[key] = scrubResultJsonValueForStorage(entry, depth + 1);
-    }
-    return out;
-  }
-  return value;
-}
-
-/**
- * Secret-scrub a `resultJson` object on its way to the column. Returns the
- * input unchanged for anything that is not a plain object or array — notably a
- * drizzle `SQL` fragment, which several callers pass instead of a value and
- * which must reach the driver verbatim.
+ * The traversal itself lives in `server/src/redaction.ts` next to the tier
+ * primitives it composes (`redactRunResultJson`), so the key-name classifier,
+ * the value heuristic and the control-path allowlist stay in one module rather
+ * than being re-derived here.
  */
 export function sanitizeRunResultJsonForStorage<T>(resultJson: T): T {
-  if (!isPlainObject(resultJson) && !Array.isArray(resultJson)) return resultJson;
-  return scrubResultJsonValueForStorage(resultJson) as T;
+  return redactRunResultJson(resultJson);
 }
 
-/**
- * PEN-3153: the `error` column was identity-redacted (`redactCurrentUserText`)
- * but never secret-scrubbed, so it was in the same condition as `resultJson`.
- * The CTO ruling on PEN-3149 keeps `error` company-readable on purpose — it is
- * machine-authored and load-bearing for triage — so this masks credential
- * shapes only and leaves the diagnosis intact. Non-strings (drizzle `SQL`
- * fragments built by the stage-exit branch) pass through untouched.
- */
 function sanitizeRunErrorForStorage<T>(error: T): T {
-  return typeof error === "string" ? (redactSensitiveText(error) as unknown as T) : error;
+  return redactRunError(error);
 }
 
 /**
@@ -12563,7 +12511,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: MANUAL_CAPACITY_REPROBE_CANCEL_REASON,
+        error: sanitizeRunErrorForStorage(MANUAL_CAPACITY_REPROBE_CANCEL_REASON),
         errorCode: MANUAL_CAPACITY_REPROBE_ERROR_CODE,
         updatedAt: now,
       })
@@ -15582,7 +15530,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           livenessReason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
-          resultJson: withUnmanagedBackgroundTaskStopReason(parseObject(run.resultJson)),
+          // PEN-3153: re-persists the stored adapter `resultJson` with a stop
+          // reason added, via a direct UPDATE the status writers never see.
+          resultJson: sanitizeRunResultJsonForStorage(
+            withUnmanagedBackgroundTaskStopReason(parseObject(run.resultJson)),
+          ),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id));
@@ -16776,8 +16728,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const updated = await db
         .update(heartbeatRuns)
         .set({
-          resultJson,
-          error: run.errorCode === DETACHED_PROCESS_ERROR_CODE ? null : run.error,
+          // PEN-3153: hot-restart adoption re-persists the stored adapter
+          // `resultJson` (and carries `run.error` forward) through a direct
+          // UPDATE that never reaches the status writers.
+          resultJson: sanitizeRunResultJsonForStorage(resultJson),
+          error:
+            run.errorCode === DETACHED_PROCESS_ERROR_CODE ? null : sanitizeRunErrorForStorage(run.error),
           errorCode: run.errorCode === DETACHED_PROCESS_ERROR_CODE ? null : run.errorCode,
           updatedAt: now,
         })
@@ -16992,7 +16948,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .set({
         status: "interrupted",
         finishedAt: now,
-        error: message,
+        error: sanitizeRunErrorForStorage(message),
         errorCode: "worker_crashed",
         updatedAt: now,
       })
@@ -18015,7 +17971,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: gate.reason,
+        error: sanitizeRunErrorForStorage(gate.reason),
         errorCode: gate.errorCode,
         updatedAt: now,
       })
@@ -18246,7 +18202,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .set({
               status: "cancelled",
               finishedAt: now,
-              error: `provider capacity retry exhausted after ${downForHours}h unavailable (${dueRun.scheduledRetryAttempt ?? 0} re-probes); pool did not recover`,
+              error: sanitizeRunErrorForStorage(
+                `provider capacity retry exhausted after ${downForHours}h unavailable (${dueRun.scheduledRetryAttempt ?? 0} re-probes); pool did not recover`,
+              ),
               errorCode: "rate_limit_exhausted",
               updatedAt: now,
             })
@@ -18458,11 +18416,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .set({
                 status: "cancelled",
                 finishedAt: now,
-                error: `dependency-blocked park exceeded the ${Math.round(
+                error: sanitizeRunErrorForStorage(`dependency-blocked park exceeded the ${Math.round(
                   DEP_BLOCKED_MAX_PARK_AGE_MS / 3_600_000,
                 )}h maximum age (first parked ${firstParkedAt.toISOString()}, attempt ${
                   dueRun.scheduledRetryAttempt ?? 0
-                }); blockers never resolved`,
+                }); blockers never resolved`),
                 errorCode: "issue_dependencies_blocked",
                 updatedAt: now,
               })
@@ -18525,7 +18483,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .set({
                 status: "cancelled",
                 finishedAt: now,
-                error: `dependency-blocked retry exhausted after ${dueRun.scheduledRetryAttempt ?? 0} attempts; blockers never resolved`,
+                error: sanitizeRunErrorForStorage(
+                  `dependency-blocked retry exhausted after ${dueRun.scheduledRetryAttempt ?? 0} attempts; blockers never resolved`,
+                ),
                 errorCode: "issue_dependencies_blocked",
                 updatedAt: now,
               })
@@ -18697,7 +18657,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .set({
             status: "cancelled",
             finishedAt: now,
-            error: promotionGate.reason,
+            error: sanitizeRunErrorForStorage(promotionGate.reason),
             errorCode: promotionGate.errorCode,
             updatedAt: now,
           })
@@ -22492,7 +22452,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // to carry it before the retry decision below.
           const persisted = await db
             .update(heartbeatRuns)
-            .set({ resultJson: mergedResultJson, updatedAt: new Date() })
+            .set({ resultJson: sanitizeRunResultJsonForStorage(mergedResultJson), updatedAt: new Date() })
             .where(eq(heartbeatRuns.id, input.run.id))
             .returning()
             .then((rows) => rows[0] ?? null);
@@ -24278,12 +24238,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .set({
                 status: "cancelled",
                 finishedAt: now,
-                error: cancelReason,
+                error: sanitizeRunErrorForStorage(cancelReason),
                 errorCode: "queued_run_detached_from_issue",
-                resultJson: {
+                // PEN-3153: spreads the stored adapter `resultJson` forward.
+                resultJson: sanitizeRunResultJsonForStorage({
                   ...parseObject(sibling.run.resultJson),
                   stopReason: "queued_run_detached_from_issue",
-                },
+                }),
                 updatedAt: now,
               })
               .where(and(eq(heartbeatRuns.id, sibling.run.id), eq(heartbeatRuns.status, "queued")))
@@ -32904,7 +32865,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .set({
               status: "cancelled",
               finishedAt: now,
-              error: reason,
+              error: sanitizeRunErrorForStorage(reason),
               errorCode: issueCancelled ? "issue_cancelled" : "issue_reassigned",
               updatedAt: now,
             })
@@ -33240,7 +33201,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .set({
               status: "cancelled",
               finishedAt: now,
-              error: reason,
+              error: sanitizeRunErrorForStorage(reason),
               errorCode,
               updatedAt: now,
             })
@@ -36037,7 +35998,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           status: "cancelled",
           finishedAt,
-          error: reason,
+          error: sanitizeRunErrorForStorage(reason),
           errorCode: "task_scope_cancelled",
           updatedAt: finishedAt,
         })
