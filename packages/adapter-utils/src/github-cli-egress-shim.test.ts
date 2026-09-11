@@ -337,6 +337,47 @@ describe("scrubGitHubCliInvocation", () => {
       expect(result.refusals).toHaveLength(1);
     });
 
+    it("scrubs prose beside clean content instead of refusing the whole body", () => {
+      // The `contents/{path}` write path: base64 bytes plus an authored commit
+      // message. A detector firing in the MESSAGE must not condemn the bytes —
+      // refusing on any-hit-anywhere would block the documented fleet path over
+      // prose the scrubber is supposed to rewrite in place.
+      const clean = Buffer.from("export const x = 1;\n", "utf8").toString("base64");
+      const body = JSON.stringify({ content: clean, message: `rotate ${VENDOR_TOKEN}` });
+      const io = makeIo({ "/tmp/put.json": body });
+      const result = scrubGitHubCliInvocation(
+        ["api", "repos/o/r/contents/a.ts", "--input", "/tmp/put.json"],
+        io,
+      );
+
+      expect(result.refusals).toEqual([]);
+      expect(io.written).toHaveLength(1);
+
+      const sent = JSON.parse(io.written[0] as string) as Record<string, string>;
+      // Bytes survive byte-exact...
+      expect(sent.content).toBe(clean);
+      // ...while the prose beside them is still redacted.
+      expect(sent.message).toContain(redactionMarker("vendor-key"));
+      expect(sent.message).not.toContain(VENDOR_TOKEN);
+      expect(result.classes).toContain("vendor-key");
+    });
+
+    it("refuses on the content value even when prose beside it is clean", () => {
+      // The mirror of the case above: attribution has to work in both
+      // directions, or "attribute the match" degrades into "never refuse".
+      const body = JSON.stringify({ content: SOURCE_WITH_FIXTURE, message: "add fixtures" });
+      const io = makeIo({ "/tmp/put.json": body });
+      const result = scrubGitHubCliInvocation(
+        ["api", "repos/o/r/contents/a.ts", "--input", "/tmp/put.json"],
+        io,
+      );
+
+      expect(io.written).toEqual([]);
+      expect(result.refusals).toEqual([
+        { field: "--input", path: "/tmp/put.json", classes: ["vendor-key"] },
+      ]);
+    });
+
     it("still scrubs a --input body that is prose, not content", () => {
       const body = JSON.stringify({ body: `comment ${SOURCE_WITH_FIXTURE}` });
       const io = makeIo({ "/tmp/comment.json": body });

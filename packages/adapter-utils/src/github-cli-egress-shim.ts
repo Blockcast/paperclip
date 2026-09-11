@@ -62,8 +62,28 @@ const TYPED_FIELD_FLAGS = new Set(["--field", "-F"]);
  *  name-based" doctrine (github-egress-scrub.ts:9). That doctrine forbids
  *  inferring whether a VALUE IS SECRET from its name. Identifying the ROLE of a
  *  request field is a different question, answered by a fixed GitHub API
- *  schema rather than by model-authored prose. */
+ *  schema rather than by model-authored prose.
+ *
+ *  Deliberately endpoint-AGNOSTIC: the rule keys on the field, not on the URL.
+ *  An endpoint allowlist would have to enumerate every GitHub API that writes
+ *  bytes, and the cost of the two mistakes is asymmetric — an endpoint missing
+ *  from the list silently corrupts (the #1542 failure), whereas an unrelated
+ *  API that happens to use `content` for prose gets a loud refusal the operator
+ *  can see and route around. Fail toward the visible error. */
 const CONTENT_FIELD_KEYS = new Set(["content"]);
+
+/** Report order for scrub classes: severity-ish, stable across calls. */
+const CLASS_ORDER: readonly GitHubEgressScrubClass[] = [
+  "private-key-block",
+  "credentialed-uri",
+  "jwt",
+  "vendor-key",
+  "environment-dump",
+  "high-entropy-assignment",
+];
+
+const orderedClasses = (fired: ReadonlySet<GitHubEgressScrubClass>): GitHubEgressScrubClass[] =>
+  CLASS_ORDER.filter((cls) => fired.has(cls));
 
 export interface GitHubCliScrubIo {
   /** Read a request-text file. Throw if unreadable — the caller decides the policy. */
@@ -211,19 +231,10 @@ export function scrubGitHubCliInvocation(
     }
   }
 
-  const order: GitHubEgressScrubClass[] = [
-    "private-key-block",
-    "credentialed-uri",
-    "jwt",
-    "vendor-key",
-    "environment-dump",
-    "high-entropy-assignment",
-  ];
-
   return {
     argv: out,
     redacted: fired.size > 0,
-    classes: order.filter((cls) => fired.has(cls)),
+    classes: orderedClasses(fired),
     refusals,
   };
 }
@@ -236,8 +247,8 @@ export function scrubGitHubCliInvocation(
  * not be opened here.
  *
  * `gh api --input` is a whole request body rather than a prose document, so a
- * body that carries file bytes under a `content` key is refused rather than
- * rewritten — see CONTENT_FIELD_KEYS.
+ * body that carries file bytes under a `content` key is handled per-value:
+ * see splitRequestBody.
  */
 function scrubTextFile(
   path: string,
@@ -249,46 +260,91 @@ function scrubTextFile(
   if (path === "-") return null;
 
   const contents = io.readText(path);
+
+  if (field === "--input") {
+    const split = splitRequestBody(contents);
+    if (split) {
+      if (split.contentClasses.length > 0) {
+        refuse({ field, path, classes: split.contentClasses });
+        return null;
+      }
+      if (split.proseClasses.length === 0) return null;
+      record(split.proseClasses);
+      return io.writeTempText(split.body);
+    }
+  }
+
   const scrubbed = scrubGitHubEgressText(contents);
   if (!scrubbed.redacted) return null;
-
-  if (field === "--input" && requestBodyCarriesContent(contents)) {
-    refuse({ field, path, classes: scrubbed.classes });
-    return null;
-  }
 
   record(scrubbed.classes);
   return io.writeTempText(scrubbed.text);
 }
 
 /**
- * True when a `gh api --input` request body carries repository file bytes.
+ * Split a `gh api --input` request body into content-role and prose values.
  *
- * The body is JSON by construction, so the key is read from the parsed object
- * rather than matched in the raw text — a prose comment body that merely
- * mentions `"content":` must still be scrubbed, not refused. Nested because
- * `POST /git/trees` carries its bytes at `tree[].content`. A body that does not
- * parse is treated as prose: refusing on unparseable input would fail closed in
- * the wrong direction, blocking review text over a syntax error.
+ * Returns null when the body is not JSON carrying repository bytes; the caller
+ * then treats the whole document as prose, which is the pre-BLO-33171 path.
+ *
+ * Every detector match is attributed to the VALUE it fired in. Refusing on
+ * any-hit-anywhere would block the documented `contents/{path}` write path
+ * whenever a credential-shaped string sits in the `message` beside clean
+ * bytes — and that prose is exactly what the scrubber should be rewriting.
+ * So content values are checked but never rewritten, and prose values beside
+ * them are scrubbed as usual.
+ *
+ * Matching runs on the DECODED string rather than the raw JSON text, so an
+ * escaped `sk-…` literal is still caught and no match can straddle a
+ * string boundary into an adjacent field.
  */
-function requestBodyCarriesContent(body: string): boolean {
+function splitRequestBody(body: string): {
+  body: string;
+  contentClasses: GitHubEgressScrubClass[];
+  proseClasses: GitHubEgressScrubClass[];
+} | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(body);
   } catch {
-    return false;
+    return null;
   }
 
-  const walk = (node: unknown): boolean => {
-    if (node === null || typeof node !== "object") return false;
-    if (Array.isArray(node)) return node.some((entry) => walk(entry));
+  let sawContent = false;
+  const contentFired = new Set<GitHubEgressScrubClass>();
+  const proseFired = new Set<GitHubEgressScrubClass>();
+
+  const walk = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(walk);
+    if (node === null || typeof node !== "object") return node;
+
+    const out: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(node)) {
-      if (CONTENT_FIELD_KEYS.has(key) && typeof value === "string") return true;
-      if (walk(value)) return true;
+      if (typeof value !== "string") {
+        out[key] = walk(value);
+        continue;
+      }
+      const scrubbed = scrubGitHubEgressText(value);
+      if (CONTENT_FIELD_KEYS.has(key)) {
+        sawContent = true;
+        for (const cls of scrubbed.classes) contentFired.add(cls);
+        out[key] = value; // byte-exact, always — refuse instead of rewriting
+        continue;
+      }
+      for (const cls of scrubbed.classes) proseFired.add(cls);
+      out[key] = scrubbed.text;
     }
-    return false;
+    return out;
   };
-  return walk(parsed);
+
+  const rewritten = walk(parsed);
+  if (!sawContent) return null;
+
+  return {
+    body: JSON.stringify(rewritten),
+    contentClasses: orderedClasses(contentFired),
+    proseClasses: orderedClasses(proseFired),
+  };
 }
 
 function splitLongOption(arg: string): { flag: string; value: string } | null {
