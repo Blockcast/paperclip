@@ -565,3 +565,141 @@ describe("isContinuationAttemptRetryReason — combined process_lost attempt cap
     expect(isContinuationAttemptRetryReason("zero_token_session_reset", "process_lost")).toBe(false);
   });
 });
+
+/**
+ * BLO-33225. The recovery backstop tick cost a fixed ~2.1-2.8 s synchronous event-loop
+ * stall on the worker, load-independent and only 2.2 s under the 5 s readiness timeout
+ * (BLO-31945). `reconcileIssueGraphLiveness` runs `classifyIssueGraphLiveness` twice per
+ * tick over EVERY visible issue, and a CPU profile at 40k issues attributed the stall to
+ * two per-candidate call sites in here: `isInvokableAgent` re-walking the org chain (and
+ * re-materializing the whole agent list) on every owner candidate, and
+ * `hasExplicitWaitingPath` linear-scanning five waiting-path arrays per issue.
+ *
+ * These assert ATTRIBUTION, not a wall-clock total — following #1715's precedent, and for
+ * the same reason: a duration assertion is flaky on shared CI runners and would not name
+ * which call site regressed. The shape asserted is "work per pass is a function of the
+ * agent/path input size, NOT of the issue count", so quadrupling the graph must not move
+ * the counters at all. On the pre-fix code both counters scale with the issue count.
+ */
+describe("issue graph liveness classifier does per-pass work, not per-candidate work", () => {
+  const perfCompany = "company-perf";
+
+  /**
+   * Counts reads of `props` only. For agents that is deliberately narrow: `id`,
+   * `companyId` and `reportsTo` are read by the per-finding owner-candidate assembly,
+   * which legitimately scales with findings, so counting them would measure the wrong
+   * thing. `status` is read by `getAgentWorkEligibility` — the org-chain walk this
+   * memoizes — and by nothing else on the hot path, so it isolates exactly the
+   * regression. Measured on the pre-fix code: `status` reads went 900 -> 3600 across
+   * these two graphs; post-fix they are 18 -> 18.
+   */
+  function countingProxy<T extends object>(
+    target: T,
+    counter: { reads: number },
+    props: readonly (string | symbol)[] | null = null,
+  ): T {
+    return new Proxy(target, {
+      get(obj, prop, receiver) {
+        if (!props || props.includes(prop)) counter.reads += 1;
+        return Reflect.get(obj, prop, receiver);
+      },
+    });
+  }
+
+  /** A graph of `issueCount` blocked issues, each behind its own unassigned blocker. */
+  function buildGraph(issueCount: number) {
+    const agentCounter = { reads: 0 };
+    const pathCounter = { reads: 0 };
+
+    const issues = [];
+    const relations = [];
+    for (let i = 0; i < issueCount; i++) {
+      issues.push({
+        id: `perf-blocked-${i}`,
+        companyId: perfCompany,
+        identifier: `PERF-${i}`,
+        title: `blocked ${i}`,
+        status: "blocked",
+        assigneeAgentId: "perf-agent-0",
+        assigneeUserId: null,
+        createdByAgentId: "perf-agent-0",
+        createdByUserId: null,
+        executionState: null,
+      });
+      issues.push({
+        id: `perf-blocker-${i}`,
+        companyId: perfCompany,
+        identifier: `PERF-B${i}`,
+        title: `blocker ${i}`,
+        status: "todo",
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        createdByAgentId: "perf-agent-0",
+        createdByUserId: null,
+        executionState: null,
+      });
+      relations.push({
+        companyId: perfCompany,
+        blockerIssueId: `perf-blocker-${i}`,
+        blockedIssueId: `perf-blocked-${i}`,
+      });
+    }
+
+    // Fixed-size regardless of `issueCount`: these are the inputs the per-pass cost is
+    // allowed to scale with.
+    const agents = [0, 1, 2, 3].map((i) => countingProxy({
+      id: `perf-agent-${i}`,
+      companyId: perfCompany,
+      name: `agent ${i}`,
+      role: i === 0 ? "cto" : "engineer",
+      status: "idle",
+      reportsTo: i === 0 ? null : "perf-agent-0",
+    }, agentCounter, ["status"]));
+
+    const openRecoveryIssues = [0, 1, 2, 3, 4].map((i) => ({
+      companyId: perfCompany,
+      // Deliberately satisfies nothing in the graph, so the classifier must read every
+      // entry rather than short-circuiting on an early hit.
+      issueId: `perf-unrelated-${i}`,
+      status: "todo",
+    }));
+
+    return {
+      agentCounter,
+      pathCounter,
+      input: {
+        issues,
+        relations,
+        agents,
+        openRecoveryIssues: countingProxy(openRecoveryIssues, pathCounter),
+      },
+    };
+  }
+
+  function measure(issueCount: number) {
+    const graph = buildGraph(issueCount);
+    graph.agentCounter.reads = 0;
+    graph.pathCounter.reads = 0;
+    const findings = classifyIssueGraphLiveness(graph.input as never);
+    return {
+      findings: findings.length,
+      agentReads: graph.agentCounter.reads,
+      pathReads: graph.pathCounter.reads,
+    };
+  }
+
+  it("reads the agent set and the waiting-path set a fixed number of times per pass", () => {
+    const small = measure(25);
+    const large = measure(100);
+
+    // Control: the larger graph really does produce more findings, so the pass is doing
+    // strictly more classification work. Without this the counters below could be equal
+    // because nothing was classified at all.
+    expect(small.findings).toBe(25);
+    expect(large.findings).toBe(100);
+
+    // 4x the issues and 4x the findings, byte-identical cost on both hot inputs.
+    expect(large.agentReads).toBe(small.agentReads);
+    expect(large.pathReads).toBe(small.pathReads);
+  });
+});
