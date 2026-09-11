@@ -282,6 +282,52 @@ describe("referenced shared docs materialization", () => {
     }
   });
 
+  it("never overwrites a workspace doc whose heading only shares a prefix with the placeholder", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-docs-prefix-"));
+    const cwd = path.join(root, "workspace");
+    const companyRoot = path.join(root, "company");
+    const instructionsRootPath = path.join(companyRoot, "agents", "cto");
+    await fs.mkdir(instructionsRootPath, { recursive: true });
+    await fs.mkdir(path.join(cwd, "docs"), { recursive: true });
+    await fs.mkdir(path.join(companyRoot, "docs"), { recursive: true });
+    await fs.writeFile(path.join(companyRoot, "docs", "vision-template.md"), "# Company vision\n", "utf8");
+    await fs.writeFile(path.join(companyRoot, "docs", "pr-conventions.md"), "# PR conventions\n", "utf8");
+
+    // Both of these begin with this path's placeholder heading and then continue on the
+    // same line, so a prefix test mistakes them for our own placeholder. The first is a
+    // placeholder for a *longer* path that happens to share the prefix; the second is a
+    // genuine doc whose title quotes the heading. Neither is ours; neither may be lost.
+    await fs.writeFile(
+      path.join(cwd, "docs", "vision-template.md"),
+      "# Missing Shared Documentation: docs/vision-template.md.bak\n",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(cwd, "docs", "pr-conventions.md"),
+      "# Missing Shared Documentation: docs/pr-conventions.md — resolved, see below\n\nReal content.\n",
+      "utf8",
+    );
+
+    try {
+      await ensureReferencedSharedDocsMaterialized({
+        cwd,
+        instructionsRootPath,
+        instructionsContents: "Read: docs/vision-template.md\nRead: docs/pr-conventions.md",
+        sharedDocSearchBoundaryPath: root,
+        onLog: async () => {},
+      });
+
+      await expect(fs.readFile(path.join(cwd, "docs", "vision-template.md"), "utf8"))
+        .resolves.toBe("# Missing Shared Documentation: docs/vision-template.md.bak\n");
+      await expect(fs.readFile(path.join(cwd, "docs", "pr-conventions.md"), "utf8"))
+        .resolves.toBe(
+          "# Missing Shared Documentation: docs/pr-conventions.md — resolved, see below\n\nReal content.\n",
+        );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("probes no ancestor without a boundary, so a bare root cannot reach /docs", () => {
     expect(sharedDocSourceRoots("/tmp/instructions")).toEqual(["/tmp/instructions"]);
     expect(sharedDocSourceRoots("/tmp/instructions", null)).toEqual(["/tmp/instructions"]);
