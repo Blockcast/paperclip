@@ -1448,9 +1448,87 @@ jobs:
     # Keep PR browser suites off the org-wide default pool. Merge groups use
     # the queue's reserved capacity so unrelated repos cannot delay admission.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-e2e' }}
-    # The serial browser suite now covers 43 flows and remained active through
-    # test 42 when ARC enforced the previous 30-minute job ceiling.
-    timeout-minutes: 75
+    # The serial browser suite covers 43 flows. 90, not 75, sized against the
+    # measured p100 of SUCCESSFUL runs rather than the median. Every ratio here
+    # is stated one way -- p100 as a percentage OF THE CAP -- so it can be
+    # compared across jobs without inverting anything.
+    #
+    # Measured over 600 pr.yml runs / 598 e2e jobs (2026-09-03..09-11), 434
+    # successful: p50 36.0m, p90 52.6m, p100 73.2m. Against the old 75m that is
+    # 98% of cap, i.e. 1.8m of margin; against 90 it is 81%, i.e. 16.8m.
+    #
+    # The two independently-observed tails have not yet co-occurred, and the
+    # bound they imply is TIGHTER than an earlier revision of this comment
+    # claimed. Worst suite 62.9m (job 103123856477, setup only 9.0m); worst
+    # setup 21.0m (job 101223622109, suite only 51.4m). Their sum is 83.8m --
+    # 93% of 90, not the 77.2m/86% stated before. That 77.2m came from a
+    # 28-job step-level sample whose setup p100 was 14.3m; over all 434
+    # successful jobs setup p100 is 21.0m. So 90 is defensible but holds only
+    # ~6m against a combination whose parts have both already happened -- do
+    # not read the 16.8m p100 margin as the real headroom.
+    #
+    # Setup is 13% of a MEDIAN job and 25% of that tail bound, so "setup cannot
+    # move this" is true of the median only. The tail is driven by
+    # `Install Playwright system dependencies` (up to 13.1m) and
+    # `Install Playwright browser` (up to 6.2m) -- apt/download variance, not
+    # the suite. Baking those into the runner image is the cheapest way to buy
+    # tail margin back; nothing here depends on it.
+    #
+    # 9 jobs died on the clock in that window. The classification rule, stated
+    # so it reproduces: a 75m cap cannot end a job BEFORE 75.0m, so a kill is
+    # exactly `conclusion == cancelled && 75.0 <= duration <= 80`. All 9 land in
+    # 75.6-76.1m -- that tight cluster IS the cap-kill signature. Deliberately
+    # excluded: 117 cancels under 70m (push-supersedes), 3 cancels at 70.7/73.6/
+    # 73.9m (long supersedes -- below the cap, so they cannot be kills), and 2
+    # at 155m/653m (lost-runner orphans -- a 75m cap cannot produce those).
+    # Rate = 9 / (434 success + 17 failure + 9 kills) = 9/460 = 2.0%.
+    #
+    # A cap kill is pure waste: it burns the full budget, produces no verdict,
+    # and forces a re-run. Cost of 75 on a demand-bound pool: 9 x 75m nominal
+    # = 675 dead runner-min / 9 days x 7 = 525/week (8.8h). That charges each
+    # kill the NOMINAL cap, so 525 is a FLOOR -- measured time-to-kill ran
+    # 75.6-76.1m, and re-run occupancy is NOT counted at all. Either refinement
+    # only makes it worse, so raising the ceiling REDUCES expected arc-e2e
+    # occupancy. Only worst-case single-job occupancy rises (+15m). How much 90
+    # costs is NOT yet known -- nothing observes how long a killed job would
+    # have taken, which is exactly what this change makes measurable.
+    # Deliberately left below the ~107m that Playwright's own limits can produce
+    # (43 tests x 60s timeout x `retries: 1`, plus the 300s webServer boot and
+    # measured setup), so a genuinely wedged suite is still killed rather than
+    # sitting on a runner.
+    #
+    # 90 is the DURABLE value, not a stop-gap. BLO-33282 evaluated cross-job
+    # sharding as the alternative and ruled against it on measurement; do not
+    # re-open it as "the fix nobody got round to".
+    #
+    # Why sharding does not help here. Per-file wall-times over 6 full runs:
+    # `smoke-lab.spec.ts` is ONE test (`test.setTimeout(1_800_000)`, 7 CI-safe
+    # P1-P7 scenarios in one `describe.serial` body) taking 18.6m median /
+    # 22.9m p100 -- 44% of a 42.1m suite. Playwright balances shards by TEST
+    # COUNT, not duration (testGroups.ts `filterForShard`: "Shards are still
+    # balanced by the number of tests, not files"), and shards non-parallel
+    # files as whole groups. So `--shard=i/N` puts that one 18.6m test in a
+    # shard with ~half the other 42 tests: simulated against the real algorithm
+    # the wall-time miss vs `suite/N` is +34% (N=2), +91% (N=3), +100% (N=4) --
+    # all failing BLO-33282's own <=20% balance criterion. A `--grep
+    # @smoke-lab` / `--grep-invert` split DOES balance (+12%, wall 23.6m), but
+    # 18.6m is an irreducible floor at ANY N because a single test cannot be
+    # split, so N>2 buys nothing.
+    #
+    # The blocker is pool capacity, not suite structure: `arc-e2e` is
+    # maxRunners 8 and was observed at 8/8 with 2 pending. Over this window 42%
+    # of e2e jobs waited >1m for admission, 27% >5m, 15% >15m (queue p90 22.8m,
+    # p99 406m). A 2-way split doubles e2e jobs per PR for +10% total
+    # runner-minutes, and the ~18.5m of wall-time it saves is SMALLER than the
+    # queue p90 it would worsen. Revisit only once arc-e2e maxRunners rises
+    # (BLO-23434) -- then the tag split, not `--shard`, is the mechanism.
+    #
+    # This job is not special: the same 9-day sweep found 6 more job caps in
+    # pr.yml at >=96% of their own p100 (Build 100%, General tests server 4/4
+    # 100% and 2/4 99%, policy 99%, server 1/4 98%, Typecheck 96%) and 46 cap
+    # kills file-wide costing ~25.7 runner-hours/week. See BLO-32794 for the
+    # full per-job table before sizing any other cap here by eye.
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
