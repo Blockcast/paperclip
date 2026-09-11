@@ -43,6 +43,7 @@
  *    must resolve to "missing", not to that company's amount — otherwise the
  *    sweep both leaks a cross-tenant figure and raises false drift from it.
  */
+import { createHash } from "node:crypto";
 import { and, asc, eq, inArray, isNull, lte, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, budgetPolicies, issues } from "@paperclipai/db";
@@ -303,6 +304,49 @@ export function diffEnforcementAssertions(
 }
 
 /**
+ * Stable identity of a *drift state* — which policies disagree, and how.
+ *
+ * Distinct from `originId` (the approval) because those two answer different
+ * questions, and conflating them is what produced the re-file loop below.
+ *
+ * A decision is a statement about one moment; this sweep re-asserts it forever.
+ * When the owner's correct disposition is "superseded, do not apply" — the AC's
+ * own first bullet — the disagreement never goes away, so every later pass sees
+ * drift, finds no *open* issue, and files a fresh one. Measured on approval
+ * `6f45844e`: BLO-33160 was closed `done` at 2026-09-11T21:34:36Z after a full
+ * adjudication and BLO-33397 was raised from the identical state **44 minutes
+ * later**, costing a CEO run and a CTO run per cycle to re-derive the same
+ * answer.
+ *
+ * Suppressing on *any* closed issue would be the wrong repair: the partial
+ * unique index (migrations/0240) is scoped to the open population precisely so a
+ * genuine later recurrence can file fresh, and that is worth keeping. The
+ * missing distinction is not open-vs-closed but **changed-vs-unchanged**, and
+ * only the enforced state can tell those apart. So: adjudicating a drift state
+ * silences that state, and any movement in it — a different amount, a policy
+ * going missing or inactive — is a new state that files again.
+ *
+ * Sorted so map iteration order cannot change the digest, and keyed on the
+ * enforced side as well as the decided side so reverting an applied figure back
+ * to an already-adjudicated one is still recognised as that same state.
+ */
+export function computeDriftFingerprint(
+  approvalId: string,
+  drifts: readonly EnforcementDrift[],
+): string {
+  const canonical = drifts
+    .map(
+      (drift) =>
+        `${drift.assertion.policyId}:${drift.reason}:${drift.assertion.expectedAmountCents}:${
+          drift.actualAmountCents ?? "none"
+        }`,
+    )
+    .sort()
+    .join("|");
+  return `${approvalId}:${createHash("sha256").update(canonical).digest("hex").slice(0, 16)}`;
+}
+
+/**
  * Guard for HTTP-backed resolvers (none today; repo/branch settings next).
  *
  * The API root answers 200-with-HTML for any path, so `res.ok` proves nothing
@@ -418,7 +462,9 @@ function buildDriftIssueBody(input: {
   return [
     `Approval \`${input.approvalId}\` was **approved**, but ${input.drifts.length} of ${input.assertionCount} machine-checkable assertion(s) it carries do not match the object that enforces them.`,
     "",
-    input.approvalTitle ? `> ${input.approvalTitle}` : "",
+    input.approvalTitle
+      ? `> ${input.approvalTitle}\n>\n> ⚠ Quoted verbatim from the card as filed. It states the situation at **decision time** and may be months stale — re-measure any urgency it claims before acting on it.`
+      : "",
     "",
     `- Decided at: \`${decidedAtIso}\``,
     `- Enforcing object: \`budget_policies.amount\` (the row the budget hard-stop gate reads)`,
@@ -428,10 +474,13 @@ function buildDriftIssueBody(input: {
     "",
     "## Acceptance criteria",
     "- Every assertion above either matches the enforcing object, or is explicitly superseded by a newer decision recorded on this issue.",
-    "- The reconciler's next pass reports zero drift for this approval.",
     "",
     "## Verifying signal",
-    `- The approval-enforcement reconciler (\`${APPROVAL_ENFORCEMENT_DRIFT_ORIGIN_KIND}\`) reports zero drift for approval \`${input.approvalId}\` after re-reading \`budget_policies\`; the assigned owner must then close this issue. Editing a mirror column will not satisfy the check.`,
+    "- **Either** the reconciler's next pass reports zero drift for approval " +
+      `\`${input.approvalId}\` after re-reading \`budget_policies\` — editing a mirror column will not satisfy this;`,
+    "- **or** the supersession is recorded on this issue and the issue is closed. A decision is a statement about one moment, so a drift the owner has ruled should **not** be applied will never converge to zero, and that is a legitimate close rather than a failure to finish.",
+    "",
+    "Closing on the second branch suppresses only this exact drift state. If the enforced amount later moves, that is a new state and it will be raised again.",
     "",
     "---",
     "Raised automatically by the approval-enforcement reconciler (BLO-24631). An approved decision that never reaches its enforcing object is invisible to everyone: the board reads it as approved and the requester reads it as resolved.",
@@ -503,6 +552,42 @@ async function findOpenDriftIssue(db: Db, companyId: string, approvalId: string)
         eq(issues.originId, approvalId),
         isNull(issues.hiddenAt),
         notInArray(issues.status, ["done", "cancelled"]),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+}
+
+/**
+ * A terminal drift issue recording that the owner already adjudicated *this
+ * exact* drift state.
+ *
+ * Matched on `originFingerprint`, not merely on the approval, so this suppresses
+ * only the state that was actually dispositioned. If the enforced side moves
+ * afterwards the fingerprint changes, nothing matches here, and the recurrence
+ * files a fresh issue exactly as migrations/0240 intends.
+ *
+ * `hiddenAt` is excluded for the same reason as in the open lookup: a
+ * soft-deleted row has been withdrawn from the record, so it should not go on
+ * silencing a live disagreement.
+ */
+async function findAdjudicatedDriftIssue(
+  db: Db,
+  companyId: string,
+  approvalId: string,
+  fingerprint: string,
+) {
+  return db
+    .select({ id: issues.id, identifier: issues.identifier, status: issues.status })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, companyId),
+        eq(issues.originKind, APPROVAL_ENFORCEMENT_DRIFT_ORIGIN_KIND),
+        eq(issues.originId, approvalId),
+        eq(issues.originFingerprint, fingerprint),
+        isNull(issues.hiddenAt),
+        inArray(issues.status, ["done", "cancelled"]),
       ),
     )
     .limit(1)
@@ -695,6 +780,31 @@ export async function reconcileApprovalEnforcement(
           continue;
         }
 
+        // The owner may already have adjudicated exactly this state and closed
+        // the row — "superseded by a newer decision", the AC's own first bullet.
+        // That disposition does not make the disagreement go away, so without
+        // this check the next pass re-files it indefinitely. Keyed on the drift
+        // state, so a genuine recurrence still files (see the fingerprint doc).
+        const fingerprint = computeDriftFingerprint(approval.id, drifts);
+        const adjudicated = await findAdjudicatedDriftIssue(
+          db,
+          approval.companyId,
+          approval.id,
+          fingerprint,
+        );
+        if (adjudicated) {
+          log.info(
+            {
+              approvalId: approval.id,
+              issueId: adjudicated.id,
+              issueStatus: adjudicated.status,
+              driftCount: drifts.length,
+            },
+            "approval-enforcement reconciler: drift state unchanged since the owner closed it; not re-raising (BLO-24631)",
+          );
+          continue;
+        }
+
         const payloadRecord = asRecord(approval.payload);
         const approvalTitle = payloadRecord ? asNonEmptyString(payloadRecord.title) : null;
 
@@ -741,7 +851,7 @@ export async function reconcileApprovalEnforcement(
             trustExplicitResponsibleUserId: approval.requestedByUserId !== null,
             originKind: APPROVAL_ENFORCEMENT_DRIFT_ORIGIN_KIND,
             originId: approval.id,
-            originFingerprint: approval.id,
+            originFingerprint: fingerprint,
           });
           raised += 1;
           log.warn(
