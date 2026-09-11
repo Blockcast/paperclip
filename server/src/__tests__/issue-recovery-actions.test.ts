@@ -2112,6 +2112,81 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  // BLO-28931. The candidate loop had no per-issue error boundary, so any throw from
+  // one issue's reconcile body propagated out of the entire sweep. Candidates are
+  // ordered (companyId, assigneeAgentId, createdAt, id), which made the
+  // surviving-vs-dropped split deterministic rather than random: every candidate after
+  // the first thrower was silently left unreconciled, on every tick, for as long as
+  // that issue kept throwing. The counters could not show it either -- unreached
+  // candidates are simply absent from `issueIds` rather than counted as skipped or
+  // failed, so a truncated sweep was indistinguishable from a clean one.
+  it("continues reconciling later candidates when one issue's reconcile body throws", async () => {
+    const { companyId, coderId, sourceIssueId, prefix } = await seedCompany();
+    const laterIssueIds = [randomUUID(), randomUUID()];
+    await db
+      .update(issues)
+      .set({ createdAt: new Date("2026-07-26T10:00:00.000Z") })
+      .where(eq(issues.id, sourceIssueId));
+    await db.insert(issues).values(
+      laterIssueIds.map((id, index) => ({
+        id,
+        companyId,
+        title: `Later stranded candidate ${index + 1}`,
+        status: "in_progress" as const,
+        priority: "medium" as const,
+        assigneeAgentId: coderId,
+        issueNumber: index + 2,
+        identifier: `${prefix}-${index + 2}`,
+        createdAt: new Date(`2026-07-26T1${index + 1}:00:00.000Z`),
+      })),
+    );
+    for (const issueId of [sourceIssueId, ...laterIssueIds]) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "External lifecycle Job is missing while heartbeat run is still running",
+        errorCode: "job_missing",
+        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
+        contextSnapshot: { issueId },
+        startedAt: new Date("2026-07-26T13:45:00.000Z"),
+        finishedAt: new Date("2026-07-26T13:52:00.000Z"),
+      });
+    }
+    // Throw on the first wake only. Keyed on call order rather than on a named
+    // internal call site, so this asserts the loop boundary itself and does not pin
+    // the escalation path's current internals. Candidate ordering guarantees the
+    // first call belongs to the first candidate.
+    const enqueueWakeup = vi.fn(async () => {
+      if (enqueueWakeup.mock.calls.length === 1) {
+        throw new Error("synthetic non-409 failure raised by the first candidate");
+      }
+      return null;
+    });
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.reconcileErrors).toBe(1);
+    expect(result.escalated).toBe(2);
+    expect(result.issueIds).toEqual(expect.arrayContaining(laterIssueIds));
+    expect(result.issueIds).not.toContain(sourceIssueId);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(3);
+    // The boundary sits outside every transaction on this path -- no `db.transaction`
+    // appears lexically in the loop body, and the escalation's own transaction has
+    // already committed by the time the wake is enqueued. So all three candidates hold
+    // a committed recovery action and catching here converted nothing atomic into a
+    // partial commit. The thrower's action-committed-but-wake-not-enqueued state is
+    // pre-existing sequencing in that path, unchanged by the error boundary; it is
+    // asserted here so a future move of the wake inside the transaction is caught.
+    const actions = await db.select().from(issueRecoveryActions);
+    expect(actions.map((action) => action.sourceIssueId).sort()).toEqual(
+      [sourceIssueId, ...laterIssueIds].sort(),
+    );
+  });
+
   // PEN-2791. The sweep counted five attendance paths -- live run, deferred execution
   // wake, pending wake interaction, active monitor, unresolved blocker -- and none of
   // them was an external event wake. That put two platform controls in contradiction:
