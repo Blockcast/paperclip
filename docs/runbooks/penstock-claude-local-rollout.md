@@ -146,10 +146,21 @@ The reference may appear in the worker StatefulSet, but must not appear in the
 API Deployment. Do not attach the rendered file to an issue if it contains
 other secret references.
 
-The adapter's inheritance policy admits the exact name `PENSTOCK_API_KEY` and
-denies adjacent `PENSTOCK_*` names. The Job should therefore receive the
-Secret reference through `valueFrom`; the resolved value must never be visible
-in the adapter configuration or Job manifest.
+The Job receives the Secret reference through `valueFrom`; the resolved value
+must never be visible in the adapter configuration or Job manifest.
+
+Note what the adapter actually does with worker env, because it is broader than
+a `PENSTOCK_API_KEY` carve-out: `getSelfPod` copies **every** non-empty literal
+env entry off the worker's main container into `inheritedEnv`, and every
+`valueFrom` entry into `inheritedEnvValueFrom`. There is no name allowlist or
+denylist. So any non-secret `PENSTOCK_*` tunable added to `worker.extraEnv`
+reaches every agent Job — this is the supported way to set a fleet-wide
+launcher default without editing each agent's `adapterConfig` (see
+`PENSTOCK_READY_TIMEOUT_MS`, BLO-33279). Per-agent `adapterConfig.env` is
+layered after inheritance and still wins for a single agent.
+
+Because inheritance is unfiltered, treat the worker container env as the
+blast radius: never put a credential there as a literal value.
 
 ## 3. Configure one test agent
 
