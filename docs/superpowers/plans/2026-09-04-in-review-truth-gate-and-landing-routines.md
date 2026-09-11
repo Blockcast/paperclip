@@ -2731,11 +2731,10 @@ Minimal `executionPolicy` for the default path. Send it on the `PATCH /api/issue
     "commentRequired": true,
     "stages": [
       {
-        "id": "qa-review",
         "type": "review",
         "approvalsNeeded": 1,
         "participants": [
-          { "id": "qa", "type": "agent", "agentId": "c6d95c42-9456-4806-b691-88014fc95e32" }
+          { "type": "agent", "agentId": "c6d95c42-9456-4806-b691-88014fc95e32" }
         ]
       }
     ]
@@ -2743,7 +2742,7 @@ Minimal `executionPolicy` for the default path. Send it on the `PATCH /api/issue
 }
 ```
 
-Replace `agentId` with the reviewing agent named in the issue when there is one. Agent-to-agent handoff is a valid review path; a human assignee is not a review path for finished work.
+Replace `agentId` with the reviewing agent named in the issue when there is one. Agent-to-agent handoff is a valid review path; a human assignee is not a review path for finished work. Omit `id` on the stage and on each participant — both are `z.string().uuid().optional()` (`packages/shared/src/validators/issue.ts:154,174`), so a readable label like `"qa-review"` fails validation and 422s the whole PATCH; the server generates them.
 MD
 ````
 Run: `grep -c 'typed_execution_state_current_participant' /tmp/track-d/block_rule1.md`  Expected: `2` (once in the paragraph, once in the list). Note: Step 1's assertion counts `1` in the target file because grep -c counts lines and both mentions are on separate lines; if the assertion reports `2`, change its expected count to `2`.
