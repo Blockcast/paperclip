@@ -414,14 +414,21 @@ export function parsePrePushInput(input: string): PrePushRefUpdate[] {
 }
 
 export interface GitPushFinding {
-  /** Full sha of the commit carrying the material. */
+  /** Full sha of the object carrying the material — a commit, or a tag object. */
   commit: string;
   /** Abbreviated sha, for the message. */
   shortCommit: string;
   /** Commit subject, so the author can recognise it without looking it up. */
   subject: string;
-  /** Where in the commit the material sits. */
-  where: "message" | "content";
+  /**
+   * Where in the pushed object the material sits.
+   *
+   * `tag-message` is the annotated-tag object's own message, which is neither a
+   * commit message nor file content and is published by the tag ref update
+   * itself. It is a separate case because the remedy differs: a tag is retagged,
+   * not amended.
+   */
+  where: "message" | "content" | "tag-message";
   /** Which scrub classes fired. */
   classes: GitHubEgressScrubClass[];
 }
@@ -591,6 +598,85 @@ export function scanCommit(commit: string, runGit: GitReader): GitPushFinding[] 
   return findings;
 }
 
+/**
+ * Scan the annotated-tag objects a ref update would publish.
+ *
+ * `commitsForRefUpdate` peels a tag to the commits it reaches, because that is
+ * what `rev-list` does — measured: `rev-list <tag-sha> --not --remotes` returns
+ * the tagged COMMIT and never the tag object itself. So a tag object's own
+ * message is reachable by nothing `scanCommit` reads, while `git push
+ * refs/tags/<tag>` publishes that object verbatim, free-form message included.
+ * A generated release tag that interpolates build environment into its message
+ * is the PEN-2526 class exactly, on a ref update whose commits are all clean.
+ *
+ * Lightweight tags need nothing here: their ref points straight at a commit, so
+ * `cat-file -t` reports `commit` and the commit leg already covers it.
+ *
+ * The peel loop handles a tag pointing at a tag, which git permits. It is
+ * bounded rather than `while (true)`: a malformed or cyclic chain must not spin
+ * a push forever, and stopping early only ever means scanning less than the
+ * whole chain, which the depth cap makes explicit rather than silent.
+ *
+ * Reads throw {@link GitEgressScanError} rather than being skipped, for the same
+ * reason as every other read on this path — an unreadable tag object is an
+ * unscanned tag object, and treating it as clean would report a pass on
+ * precisely what could not be inspected.
+ */
+export function scanAnnotatedTags(
+  update: PrePushRefUpdate,
+  runGit: GitReader,
+): GitPushFinding[] {
+  if (isNullSha(update.localSha)) return []; // a deletion publishes no object
+
+  const findings: GitPushFinding[] = [];
+  let sha = update.localSha;
+
+  for (let depth = 0; depth < 16; depth += 1) {
+    if (readGit(runGit, ["cat-file", "-t", sha], sha).trim() !== "tag") break;
+
+    const raw = readGit(runGit, ["cat-file", "tag", sha], sha);
+    const shortCommit = sha.slice(0, 12);
+    const { name, message } = parseTagObject(raw);
+
+    if (message) {
+      const scrubbed = scrubGitHubEgressText(message);
+      if (scrubbed.redacted) {
+        findings.push({
+          commit: sha,
+          shortCommit,
+          subject: name ? `tag ${name}` : "annotated tag",
+          where: "tag-message",
+          classes: scrubbed.classes,
+        });
+      }
+    }
+
+    // Follow `object` to whatever this tag points at; a commit ends the walk on
+    // the next iteration's type check.
+    const target = /^object ([0-9a-f]{40,64})$/m.exec(raw)?.[1];
+    if (!target || target === sha) break;
+    sha = target;
+  }
+
+  return findings;
+}
+
+/**
+ * Split a raw tag object into its tag name and its message.
+ *
+ * The object is a header block (`object`, `type`, `tag`, `tagger`) terminated by
+ * ONE blank line, then the free-form message. Splitting on the first blank line
+ * rather than counting headers keeps this correct if git ever adds a header, and
+ * keeps header text out of the scanned body — a `tagger` line carries an email
+ * address, which should not be reported as a finding.
+ */
+function parseTagObject(raw: string): { name: string | null; message: string } {
+  const separator = raw.indexOf("\n\n");
+  const header = separator === -1 ? raw : raw.slice(0, separator);
+  const message = separator === -1 ? "" : raw.slice(separator + 2);
+  return { name: /^tag (.+)$/m.exec(header)?.[1]?.trim() ?? null, message };
+}
+
 export function scanPrePushUpdates(
   updates: readonly PrePushRefUpdate[],
   runGit: GitReader,
@@ -598,6 +684,15 @@ export function scanPrePushUpdates(
   const findings: GitPushFinding[] = [];
   const seen = new Set<string>();
   for (const update of updates) {
+    // Tag objects first: the annotated-tag leg is about the object the ref
+    // names, which `commitsForRefUpdate` peels away before the commit leg ever
+    // sees it.
+    for (const finding of scanAnnotatedTags(update, runGit)) {
+      // A tag pushed under two refs is one problem, not two.
+      if (seen.has(finding.commit)) continue;
+      seen.add(finding.commit);
+      findings.push(finding);
+    }
     for (const commit of commitsForRefUpdate(update, runGit)) {
       // A commit reachable from two pushed refs is one problem, not two.
       if (seen.has(commit)) continue;
@@ -611,35 +706,56 @@ export function scanPrePushUpdates(
 /**
  * The refusal text.
  *
- * It names the commit and the class because a bare rejection is not actionable:
+ * It names the object and the class because a bare rejection is not actionable:
  * the author cannot amend what they cannot locate. The oldest offending commit
  * is called out separately because that is the one an interactive rebase has to
  * reach, and it is the single most common thing to get wrong when the material
  * is several commits back.
+ *
+ * Tag findings get their OWN remedy line, and the commit remedy is emitted only
+ * when a commit is actually implicated. An annotated tag is not reachable by
+ * `--amend` or `rebase -i` — it is a separate object that has to be recreated —
+ * so printing the commit advice for a tag-only refusal would send the author to
+ * a command that cannot fix what was found.
  */
 export function formatRefusal(findings: readonly GitPushFinding[]): string {
   const lines: string[] = [
-    "paperclip-github-egress: refusing to publish — credential-shaped material found in commits this push would make public.",
+    "paperclip-github-egress: refusing to publish — credential-shaped material found in objects this push would make public.",
     "",
-    "Commit objects are content-addressed, so this cannot be redacted in flight the way an issue comment or a pull-request body is; the commit itself has to change.",
+    "Git objects are content-addressed, so this cannot be redacted in flight the way an issue comment or a pull-request body is; the object itself has to change.",
     "",
   ];
 
+  const WHERE_LABEL = {
+    message: "commit message",
+    content: "file content",
+    "tag-message": "annotated tag message",
+  } as const;
+
   for (const finding of findings) {
-    const where = finding.where === "message" ? "commit message" : "file content";
     lines.push(
-      `  ${finding.shortCommit}  ${where}: ${finding.classes.join(", ")}${finding.subject ? `  (${finding.subject})` : ""}`,
+      `  ${finding.shortCommit}  ${WHERE_LABEL[finding.where]}: ${finding.classes.join(", ")}${finding.subject ? `  (${finding.subject})` : ""}`,
     );
   }
 
-  const oldest = findings.length > 0 ? findings[findings.length - 1]! : null;
+  const commitFindings = findings.filter((finding) => finding.where !== "tag-message");
+  const tagFindings = findings.filter((finding) => finding.where === "tag-message");
+  const oldest = commitFindings.length > 0 ? commitFindings[commitFindings.length - 1]! : null;
   lines.push("");
-  if (oldest && findings.length === 1) {
+  if (oldest && commitFindings.length === 1) {
     lines.push("To fix: remove the material, then `git commit --amend` if it is the tip commit,");
     lines.push(`or \`git rebase -i ${oldest.shortCommit}~1\` to reach it if it is not.`);
   } else if (oldest) {
     lines.push(
       `To fix: remove the material from each commit above. The oldest is ${oldest.shortCommit}, so \`git rebase -i ${oldest.shortCommit}~1\` reaches all of them.`,
+    );
+  }
+  if (tagFindings.length > 0) {
+    const names = tagFindings
+      .map((finding) => finding.subject.replace(/^tag /, ""))
+      .filter((name) => name && name !== "annotated tag");
+    lines.push(
+      `To fix the annotated tag${tagFindings.length === 1 ? "" : "s"}: the message lives in the tag object, not in any commit, so \`--amend\` and \`rebase\` cannot reach it. Recreate with \`git tag -f -a ${names[0] ?? "<tag>"} -m '<clean message>'\`${names.length > 0 ? "" : " for each tag above"}.`,
     );
   }
   lines.push("");

@@ -8,6 +8,7 @@ import {
   GitEgressScanError,
   gitGlobalOptions,
   parsePrePushInput,
+  scanAnnotatedTags,
   scanCommit,
   scanPrePushUpdates,
   type GitReader,
@@ -459,6 +460,107 @@ describe("scanPrePushUpdates", () => {
       runGit,
     );
     expect(findings).toHaveLength(1);
+  });
+});
+
+describe("scanAnnotatedTags", () => {
+  const zero = "0".repeat(40);
+  const tagSha = "a".repeat(40);
+  const commitSha = "b".repeat(40);
+
+  function tagObject(message: string, name = "v1"): string {
+    return [
+      `object ${commitSha}`,
+      "type commit",
+      `tag ${name}`,
+      "tagger T <t@example.invalid> 1700000000 +0000",
+      "",
+      message,
+    ].join("\n");
+  }
+
+  it("finds credential-shaped material in a tag object's own message", () => {
+    const findings = scanAnnotatedTags(
+      { localRef: "refs/tags/v1", localSha: tagSha, remoteRef: "refs/tags/v1", remoteSha: zero },
+      fakeGit({
+        [`cat-file -t ${tagSha}`]: "tag\n",
+        [`cat-file tag ${tagSha}`]: tagObject(`Release v1\n\n${environmentDump()}\n`),
+        [`cat-file -t ${commitSha}`]: "commit\n",
+      }),
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.where).toBe("tag-message");
+    expect(findings[0]!.subject).toBe("tag v1");
+    expect(findings[0]!.commit).toBe(tagSha);
+  });
+
+  it("does not scan the tagger header as message content", () => {
+    // The header block carries an email address. Reporting it would refuse
+    // every annotated tag on material the author did not write into the
+    // message, so the split has to land after the header's blank line.
+    const findings = scanAnnotatedTags(
+      { localRef: "refs/tags/v1", localSha: tagSha, remoteRef: "refs/tags/v1", remoteSha: zero },
+      fakeGit({
+        [`cat-file -t ${tagSha}`]: "tag\n",
+        [`cat-file tag ${tagSha}`]: tagObject("Release v1\n\nJust a normal release.\n"),
+        [`cat-file -t ${commitSha}`]: "commit\n",
+      }),
+    );
+    expect(findings).toEqual([]);
+  });
+
+  it("reads nothing for a lightweight tag", () => {
+    // The ref points at a commit, so there is no tag object and the commit leg
+    // already covers it.
+    const findings = scanAnnotatedTags(
+      { localRef: "refs/tags/v1", localSha: commitSha, remoteRef: "refs/tags/v1", remoteSha: zero },
+      fakeGit({ [`cat-file -t ${commitSha}`]: "commit\n" }),
+    );
+    expect(findings).toEqual([]);
+  });
+
+  it("consults git for nothing on a tag deletion", () => {
+    expect(
+      scanAnnotatedTags(
+        { localRef: "", localSha: zero, remoteRef: "refs/tags/v1", remoteSha: commitSha },
+        () => {
+          throw new Error("git must not be consulted for a deletion");
+        },
+      ),
+    ).toEqual([]);
+  });
+
+  it("refuses rather than passing when the tag object cannot be read", () => {
+    // Fail closed, for the same reason every other read on this path does: an
+    // unreadable tag object is an unscanned tag object.
+    expect(() =>
+      scanAnnotatedTags(
+        { localRef: "refs/tags/v1", localSha: tagSha, remoteRef: "refs/tags/v1", remoteSha: zero },
+        fakeGit({ [`cat-file -t ${tagSha}`]: "tag\n" }),
+      ),
+    ).toThrow(GitEgressScanError);
+  });
+
+  it("terminates on a tag object that points at itself", () => {
+    // Git permits a tag pointing at a tag. A cyclic or malformed chain must not
+    // spin the push forever.
+    const selfReferential = [
+      `object ${tagSha}`,
+      "type tag",
+      "tag loop",
+      "tagger T <t@example.invalid> 1700000000 +0000",
+      "",
+      "nothing interesting",
+    ].join("\n");
+    expect(
+      scanAnnotatedTags(
+        { localRef: "refs/tags/loop", localSha: tagSha, remoteRef: "refs/tags/loop", remoteSha: zero },
+        fakeGit({
+          [`cat-file -t ${tagSha}`]: "tag\n",
+          [`cat-file tag ${tagSha}`]: selfReferential,
+        }),
+      ),
+    ).toEqual([]);
   });
 });
 

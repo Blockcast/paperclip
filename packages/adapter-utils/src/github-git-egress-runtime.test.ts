@@ -405,6 +405,28 @@ describe("runPrePushHook", () => {
     expect(text).toContain("could not be completed");
     // It must not read as a detection: there is no commit to go and amend.
     expect(text).toContain("refusal, not a detection");
+    // Name the git command that failed, so the fault is diagnosable. Matched by
+    // shape rather than by literal: which read fails FIRST is an ordering
+    // detail (the annotated-tag `cat-file -t` probe now precedes `rev-list`),
+    // and pinning the literal here turned a reordering into a false failure.
+    // The rev-list leg keeps its own explicit coverage in the next test.
+    expect(text).toMatch(/`git [a-z][a-z-]*/);
+  });
+
+  it("names rev-list when the commit range is what fails", async () => {
+    // Guards the leg the test above used to pin: the tag probe succeeds, so the
+    // scan reaches `rev-list`, and its failure must still abort and be named.
+    const errors: string[] = [];
+    const code = await runPrePushHook({
+      input: "refs/heads/m a refs/heads/m b\n",
+      // `cat-file -t` answers "commit" (no tag object to scan); everything else
+      // fails, which lands on the rev-list read.
+      runGit: (args) => (args[0] === "cat-file" && args[1] === "-t" ? "commit\n" : null),
+      stderr: (message) => errors.push(message),
+    });
+    expect(code).toBe(1);
+    const text = errors.join("\n");
+    expect(text).toContain("could not be completed");
     expect(text).toContain("rev-list");
   });
 
@@ -531,6 +553,103 @@ describe.skipIf(!GIT)("content leg against a real repository", () => {
     });
     expect(code).toBe(1);
     expect(errors.join("\n")).toContain("vendor-key");
+  });
+
+  it("scans an annotated tag's own message, which no commit carries", async () => {
+    // The gap: `commitsForRefUpdate` runs `rev-list <tag-sha>`, which PEELS the
+    // tag to the commits it reaches — measured, the tag object's own sha is
+    // never in that output. `scanCommit` then reads commit messages and patches,
+    // so nothing on the path ever reads the tag object. But `git push
+    // refs/tags/<tag>` publishes that object verbatim, free-form message
+    // included. A release tag whose message interpolates build environment is
+    // the PEN-2526 class on a ref update whose every commit is clean.
+    //
+    // The commit here is deliberately spotless, so a pass would mean the tag
+    // message went out unscanned rather than that something else caught it.
+    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-tag-"));
+    execFileSync("git", ["init", "-q", repo]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
+    writeFileSync(path.join(repo, "readme.md"), "Nothing interesting here.\n");
+    execFileSync("git", ["-C", repo, "add", "-A"]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "a completely clean commit"]);
+    execFileSync("git", [
+      "-C",
+      repo,
+      "tag",
+      "-a",
+      "v1",
+      "-m",
+      `Release v1\n\nBuilt with:\n${vendorKey()}\n`,
+    ]);
+    const tagSha = execFileSync("git", ["-C", repo, "rev-parse", "v1"], {
+      encoding: "utf8",
+    }).trim();
+
+    // What git hands the hook for a tag push is the TAG OBJECT's sha.
+    const errors: string[] = [];
+    const code = await runPrePushHook({
+      input: `refs/tags/v1 ${tagSha} refs/tags/v1 ${"0".repeat(40)}\n`,
+      runGit: makeGitReader("git", repo),
+      stderr: (message) => errors.push(message),
+    });
+    expect(code).toBe(1);
+    const report = errors.join("\n");
+    expect(report).toContain("vendor-key");
+    expect(report).toContain("annotated tag message");
+    // The remedy has to be the one that can actually reach a tag object.
+    expect(report).toContain("git tag -f -a v1");
+    expect(report).not.toContain("rebase -i");
+  });
+
+  it("leaves a lightweight tag to the commit leg", async () => {
+    // A lightweight tag's ref points straight at the commit, so there is no tag
+    // object to read and the commit leg already covers it. This asserts the
+    // scan does not refuse or error on the no-tag-object shape.
+    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-lightweight-"));
+    execFileSync("git", ["init", "-q", repo]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
+    writeFileSync(path.join(repo, "readme.md"), "Nothing interesting here.\n");
+    execFileSync("git", ["-C", repo, "add", "-A"]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "a completely clean commit"]);
+    execFileSync("git", ["-C", repo, "tag", "v-light"]);
+    const sha = execFileSync("git", ["-C", repo, "rev-parse", "v-light"], {
+      encoding: "utf8",
+    }).trim();
+
+    const errors: string[] = [];
+    const code = await runPrePushHook({
+      input: `refs/tags/v-light ${sha} refs/tags/v-light ${"0".repeat(40)}\n`,
+      runGit: makeGitReader("git", repo),
+      stderr: (message) => errors.push(message),
+    });
+    expect(errors.join("\n")).toBe("");
+    expect(code).toBe(0);
+  });
+
+  it("still passes an annotated tag with a clean message", async () => {
+    // The tag leg must not turn every release tag into a refusal.
+    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-tag-clean-"));
+    execFileSync("git", ["init", "-q", repo]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
+    writeFileSync(path.join(repo, "readme.md"), "Nothing interesting here.\n");
+    execFileSync("git", ["-C", repo, "add", "-A"]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "a completely clean commit"]);
+    execFileSync("git", ["-C", repo, "tag", "-a", "v2", "-m", "Release v2\n\nBug fixes.\n"]);
+    const tagSha = execFileSync("git", ["-C", repo, "rev-parse", "v2"], {
+      encoding: "utf8",
+    }).trim();
+
+    const errors: string[] = [];
+    const code = await runPrePushHook({
+      input: `refs/tags/v2 ${tagSha} refs/tags/v2 ${"0".repeat(40)}\n`,
+      runGit: makeGitReader("git", repo),
+      stderr: (message) => errors.push(message),
+    });
+    expect(errors.join("\n")).toBe("");
+    expect(code).toBe(0);
   });
 
   it("still passes a genuinely clean commit", async () => {
