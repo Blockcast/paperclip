@@ -69,13 +69,11 @@ import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "./routes/tool-gatew
 import { adapterRoutes } from "./routes/adapters.js";
 import { metricsIngestRoutes } from "./routes/metrics-ingest.js";
 import { renderMetrics } from "./services/metrics.js";
-import { refreshExternalRuntimeReservationMetrics } from "./services/external-runtime-reservations.js";
 import {
-  refreshOverdueScheduledRetryAgeMetrics,
-  refreshQueuedRunAgeMetrics,
-  refreshScheduledRetryParkHorizonMetrics,
-} from "./services/queued-run-age-metrics.js";
-import { refreshExternalRuntimeReservationStrandMetrics } from "./services/external-runtime-reservation-strand-metrics.js";
+  expireStaleRefreshFreshness,
+  refreshDbPoolMetrics,
+  startScrapeMetricsCollector,
+} from "./services/scrape-metrics-collector.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -313,27 +311,20 @@ export async function createApp(
   // actorMiddleware: scrapes are unauthenticated (access is gated at the
   // network layer by the ServiceMonitor scrape-allow NetworkPolicy) and would
   // otherwise spam request logs every scrape interval.
+  //
+  // BLO-33243: this handler MUST NOT touch the database. It used to await five
+  // DB-querying refreshes in series, so a pool stall pushed the scrape past its
+  // 10 s timeout and the scrape ingested *no sample at all* -- destroying every
+  // in-process metric for that interval, including the event-loop-lag gauge
+  // that would have explained the stall. Two of three control-plane pods were
+  // losing ~1 scrape in 8 that way. The refreshes now run on a background
+  // interval (services/scrape-metrics-collector.ts); this handler renders the
+  // registry and nothing else. `expireStaleRefreshFreshness` and
+  // `refreshDbPoolMetrics` are synchronous in-memory reads, not queries.
   app.get("/metrics", async (_req, res, next) => {
     try {
-      await refreshExternalRuntimeReservationMetrics(db).catch((err) => {
-        logger.warn({ err }, "failed to refresh external-runtime reservation metrics before scrape");
-      });
-      await refreshQueuedRunAgeMetrics(db).catch((err) => {
-        logger.warn({ err }, "failed to refresh queued-run-age metrics before scrape");
-      });
-      await refreshOverdueScheduledRetryAgeMetrics(db).catch((err) => {
-        logger.warn({ err }, "failed to refresh overdue-scheduled-retry-age metrics before scrape");
-      });
-      await refreshScheduledRetryParkHorizonMetrics(db).catch((err) => {
-        logger.warn({ err }, "failed to refresh scheduled-retry park horizon metrics before scrape");
-      });
-      // BLO-28865. Swallowing the rejection here is safe and intended: the
-      // refresh has already set its own freshness gauge to 0 on the way out,
-      // which is what makes the stale age ineligible for the strand alert and
-      // pages the refresh failure on its own. Same contract as the two above.
-      await refreshExternalRuntimeReservationStrandMetrics(db).catch((err) => {
-        logger.warn({ err }, "failed to refresh stranded-reservation metrics before scrape");
-      });
+      expireStaleRefreshFreshness();
+      refreshDbPoolMetrics(db);
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);
     } catch (err) {
@@ -1042,6 +1033,9 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   let stopPluginStatusCollector: (() => void) | null = null;
   let stopGithubReviewGateDeliveryWorker: (() => Promise<void>) | null = null;
   let stopIssueCommentEffectReconciler: (() => Promise<void>) | null = null;
+  // BLO-33243: every tier serves /metrics and is a scrape target, so unlike the
+  // plugin-status collector this one is NOT gated on the node role.
+  const stopScrapeMetricsCollector = startScrapeMetricsCollector(db);
   if (appConfig.paperclipNodeRole === "api") {
     logger.info(
       { role: appConfig.paperclipNodeRole },
@@ -1089,6 +1083,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     stopPluginEventOutbox?.();
     stopGitHubStatusDeliveryOutbox?.();
     stopPluginStatusCollector?.();
+    stopScrapeMetricsCollector();
     await stopIssueCommentEffectReconciler?.();
     disableFeedbackExportFlushes();
     devWatcher?.close();
