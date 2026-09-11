@@ -116,7 +116,7 @@ export function isIssueHeldByForeignRun(input: {
  *
  *   - 2026-08-23, `penstock-llm-proxy-core` #1503 vs #1504: two runs of one
  *     agent independently derived the same hotfix on a red `main`, and one
- *     run's `git push` to the other's branch was rejected non-fast-forward.
+ *     run's push to the other's branch was rejected non-fast-forward.
  *   - 2026-09-03, BLO-31354 / `paperclip` #1612: run A parked at 01:52Z on
  *     `scheduledRetryReason: ccrotate_capacity` with `scheduledRetryAt`
  *     02:22:54Z; run B woke at 02:18Z — 4 min before A's retry — read the row
