@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
 
@@ -113,6 +113,20 @@ export type RecoveryActionListOptions = {
   kind?: string;
   status?: string;
   limit?: number;
+  offset?: number;
+  /**
+   * BLO-19124: `desc` (default) answers "what just happened"; `asc` is what makes
+   * a census of the *legacy* tail possible. With `limit` hard-capped at 500, a
+   * newest-first-only list cannot reach row 501+ at all, so the oldest actions
+   * were unreachable through the API by construction — the surface built to make
+   * the drain measurable was blind to exactly the rows the drain is about.
+   *
+   * `asc` is not merely the reverse view: this subsystem inserts continuously (in
+   * bursts of tens per day), and inserts land at the *head* of a `desc` list, so
+   * paging `desc` shifts the tail deeper mid-walk and can skip rows. Oldest-first
+   * is stable at the head, which makes `asc` + `offset` a drift-free full walk.
+   */
+  order?: "asc" | "desc";
 };
 
 export type HandoffClass =
@@ -209,6 +223,7 @@ export function recoveryObservabilityService(db: Db) {
     }
 
     const limit = Math.min(500, Math.max(1, Math.floor(opts.limit ?? 100)));
+    const offset = Math.max(0, Math.floor(opts.offset ?? 0));
     return db
       .select({
         id: issueRecoveryActions.id,
@@ -238,8 +253,13 @@ export function recoveryObservabilityService(db: Db) {
       .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
       .leftJoin(agents, eq(agents.id, issueRecoveryActions.ownerAgentId))
       .where(and(...filters))
-      .orderBy(desc(issueRecoveryActions.createdAt))
-      .limit(limit);
+      .orderBy(
+        opts.order === "asc"
+          ? asc(issueRecoveryActions.createdAt)
+          : desc(issueRecoveryActions.createdAt),
+      )
+      .limit(limit)
+      .offset(offset);
   }
 
   async function report(
