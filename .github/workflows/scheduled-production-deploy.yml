@@ -22,28 +22,47 @@
 # Auto-approval was considered and rejected on 2026-08-28: three green guards prove the
 # code builds, not that a human intends to ship it. That reasoning is unchanged.
 #
-# THE THREE EXITS ARE DISTINGUISHABLE (PEN-2848)
-# ----------------------------------------------
-# This workflow can end three ways, and originally all three were an identical
+# THE FOUR EXITS ARE DISTINGUISHABLE (PEN-2848, BLO-33400)
+# --------------------------------------------------------
+# This workflow can end four ways, and originally all of them were an identical
 # green `exit 0`. On 2026-09-01 the first-ever real slot skipped because a deploy
 # had been waiting on a human since 00:52Z, reported `conclusion: success`, and
 # nothing escalated — production reached 45 commits behind. Guard (1) is correct;
 # what was missing was any way to tell "declined to dispatch" from "dispatched".
 #
-#   dispatched       -> ::notice:: + step summary, green
-#   up-to-date       -> ::notice:: + step summary, green (nothing to do, nobody to chase)
-#   skipped-pending  -> ::warning:: + step summary; and if the pending approval is
-#                       older than PENDING_DEPLOY_ALERT_HOURS, a severity=critical
-#                       ProductionDeployApprovalStuck alert to Alertmanager plus a
-#                       RED run, so `conclusion` itself carries the signal.
+#   dispatched         -> ::notice:: + step summary, green
+#   up-to-date         -> ::notice:: + step summary, green (nothing to do, nobody to chase)
+#   checked-no-pending -> ::notice:: + step summary, green. An hourly approval-age
+#                         slot with nothing pending; never dispatches (guard 1b).
+#   skipped-pending    -> ::warning:: + step summary; and if the pending approval is
+#                         older than PENDING_DEPLOY_ALERT_HOURS, a severity=critical
+#                         ProductionDeployApprovalStuck alert to Alertmanager plus a
+#                         RED run, so `conclusion` itself carries the signal.
 name: Scheduled production deploy dispatch
 
 on:
   schedule:
-    # 07:23 UTC daily. Deliberately not :00 — every scheduler on the planet fires there.
-    # Daily is chosen to sit inside the 24h drift threshold: a same-day approval keeps
-    # the metric under its alert line without a second cadence to maintain.
+    # 07:23 UTC daily — the ONLY cron that dispatches. Deliberately not :00, every
+    # scheduler on the planet fires there. Daily sits inside the 24h drift
+    # threshold: a same-day approval keeps the metric under its alert line.
     - cron: "23 7 * * *"
+    # Hourly, every hour EXCEPT 07. Sampling only: this slot can reach
+    # `skipped-pending` and therefore the escalation, but guard (1b) stops it
+    # before the dispatch.
+    #
+    # Why it exists (BLO-33400): PENDING_DEPLOY_ALERT_HOURS is 6h, and the
+    # escalation below was reachable only from the daily slot — so a 6h condition
+    # was sampled once per 24h. Both failure modes were measured live here:
+    #   * late   — docker.yml dispatch 34324444180 sat 27.8h on the reviewer gate;
+    #              the alert fired at 24.0h, 4x its own threshold.
+    #   * silent — dispatch 34561898524 sat 15h28m (2026-09-11 04:21Z -> 19:50Z)
+    #              and was cancelled between samples. The single 07:23 sample
+    #              caught it at 3h10m, so nothing escalated at any duration.
+    #
+    # Disjoint hours rather than "23 * * * *" so the two entries never match the
+    # same minute: GitHub fires one run per matching cron entry, so an overlap
+    # would queue a redundant second run every day at 07:23.
+    - cron: "23 0-6,8-23 * * *"
   workflow_dispatch: # manual kick, e.g. after a hotfix merge
 
 permissions:
@@ -70,6 +89,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PENDING_JSON_PATH: ${{ runner.temp }}/pending-dispatches.json
+          # True only for the daily cron and a manual kick. Keyed on WHICH cron
+          # entry fired, not on the wall clock: GitHub delays scheduled runs under
+          # load (5-17min late on this repo's own history), and an hour check would
+          # silently drop the day's dispatch whenever a 07:23 slot slipped to 08:xx.
+          IS_DISPATCH_SLOT: ${{ github.event_name != 'schedule' || github.event.schedule == '23 7 * * *' }}
         run: |
           set -euo pipefail
           MASTER_SHA="$(git rev-parse origin/master)"
@@ -101,6 +125,25 @@ jobs:
               echo "**Production stays at its current commit until the pending approval is approved or rejected.**"
             } >> "$GITHUB_STEP_SUMMARY"
             echo "outcome=skipped-pending" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # (1b) Sampling slots stop here. They exist ONLY to age a pending approval,
+          # which is why this sits BELOW guard (1) rather than above it: guard (1) is
+          # what emits `skipped-pending`, and `skipped-pending` is what arms the
+          # escalation step. Hoisting this block would restore the exact BLO-33400
+          # defect — a 6h threshold evaluated once per 24h — while looking like a
+          # tidy-up. .github/scripts/tests/scheduled-production-deploy-schedule.test.mjs
+          # pins the order for that reason.
+          if [ "$IS_DISPATCH_SLOT" != "true" ]; then
+            echo "::notice::Approval-age check only: nothing pending, and this is not the daily dispatch slot."
+            {
+              echo "### Approval-age check only — not a dispatch slot"
+              echo
+              echo "No non-terminal \`docker.yml\` dispatch is pending, so there is no approval age to judge."
+              echo "This slot never dispatches; the dispatch stays exactly once daily at \`23 7 * * *\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "outcome=checked-no-pending" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 

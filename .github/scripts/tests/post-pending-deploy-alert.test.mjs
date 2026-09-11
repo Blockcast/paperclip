@@ -203,7 +203,7 @@ test('buildAlert: names the pending run so the reader can act without opening th
   assert.match(alert.annotations.summary, /10\.0h/);
 });
 
-test('buildAlert: endsAt outlives the daily schedule so firing stays continuous', () => {
+test('buildAlert: endsAt brackets the hourly schedule — outlives a missed slot, resolves same-day', () => {
   const verdict = selectStuckApproval({
     pendingRuns: [waitingRun('2026-09-01T02:00:00.000Z')],
     alertAfterHours: 6,
@@ -218,9 +218,16 @@ test('buildAlert: endsAt outlives the daily schedule so firing stays continuous'
     now: NOW,
   });
 
+  const HOUR = 60 * 60 * 1000;
   assert.equal(alert.startsAt, NOW.toISOString());
   assert.equal(new Date(alert.endsAt).getTime() - NOW.getTime(), ALERT_TTL_MS);
-  // 24h schedule; a TTL at or under that would let the alert resolve between
-  // runs and re-notify as if it were new.
-  assert.ok(ALERT_TTL_MS > 24 * 60 * 60 * 1000);
+  // Lower bound: the escalation re-pushes on the hourly cron, so a TTL at or
+  // under one hour would let the alert resolve between runs and re-notify as if
+  // it were new. Two hours of slack absorbs a delayed or failed slot.
+  assert.ok(ALERT_TTL_MS > 2 * HOUR, 'TTL must survive one missed hourly slot');
+  // Upper bound, and this is the half BLO-33400 added: the TTL is also how long
+  // a CLEARED gate keeps a critical alert firing, because nothing detects the
+  // fix — it resolves by expiry. At the old 25h value an approval granted at
+  // 10:00 paged until 11:00 the next day.
+  assert.ok(ALERT_TTL_MS <= 6 * HOUR, 'TTL must not outlive the gate it reports');
 });
