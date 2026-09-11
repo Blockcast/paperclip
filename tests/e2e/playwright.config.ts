@@ -34,6 +34,14 @@ export default defineConfig({
   // state (the `enableConferenceRoomChat` experimental flag) that changes
   // which UI variant renders. Run files serially so a flag flip in one spec
   // can't change the wizard/thread under another spec mid-flight.
+  //
+  // This bounds INTRA-job parallelism only. It is NOT a ban on cross-job
+  // `--shard=i/N`: each sharded job boots its own throwaway PAPERCLIP_HOME via
+  // `mkdtempSync` + `reuseExistingServer: false`, so cross-shard flag flips
+  // cannot interact. BLO-33282 measured sharding anyway and ruled against it
+  // for now -- `smoke-lab.spec.ts` is a single 18.6m test worth 44% of the
+  // suite, and Playwright balances shards by test count, so no N balances.
+  // See the `e2e` job comment in .github/workflows/pr.yml before revisiting.
   workers: 1,
   use: {
     baseURL: BASE_URL,
