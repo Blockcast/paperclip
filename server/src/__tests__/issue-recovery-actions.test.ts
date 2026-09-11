@@ -1874,11 +1874,16 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     // The discriminator is the KILL, not the pod death: an agent-side crash is
     // also a pod-lifecycle termination and must keep escalating. `exit code 13`
-    // guards the word-boundary — a prefix match on "137" would swallow it.
+    // guards the word-boundary — a prefix match on "137" would swallow it. The
+    // last two guard the kubelet's free-form `message=` tail: a marker-shaped
+    // substring quoted there (agents in this fleet discuss OOMKills routinely)
+    // must not decide routing, which a whole-string scan would let it do.
     it.each([
       ["an agent-side crash", "exit code 1, reason=Error, message=panic: nil pointer dereference"],
       ["an exit code that merely starts with 13", "exit code 13, reason=Error"],
       ["a message that merely mentions OOM", "exit code 2, reason=Error, message=parser hit an OOMKilled log line"],
+      ["a message quoting the reason marker", "exit code 1, reason=Error, message=observed reason=OOMKilled in logs"],
+      ["a message quoting the exit code marker", "exit code 1, reason=Error, message=child died with exit code 137 mid-parse"],
     ])("is false for %s", (_label, tail) => {
       expect(
         isInfraClassStrandedFailure({
@@ -1887,6 +1892,20 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           error: `Claude run was truncated mid-stream — ${tail}`,
         }),
       ).toBe(false);
+    });
+
+    // The cut must not cost a true positive: a real OOM kill still classifies
+    // when the kubelet attaches its own diagnostic tail, which it routinely does.
+    it("is true for a real OOM kill carrying a kubelet message tail", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: "Claude run was truncated mid-stream — assistant produced content but no " +
+            "result event arrived; exit code 137, SIGKILL (commonly OOMKilled), " +
+            "reason=OOMKilled, message=Memory cgroup out of memory",
+        }),
+      ).toBe(true);
     });
   });
 
