@@ -70,11 +70,26 @@ const COMMAND_SLACK_TOKEN_RE = /\bxox[baprs]-[A-Za-z0-9-]{10,}/g;
  *
  * Body segments tolerate literal `\n` / `\r` escapes because a PEM block
  * reaching a log inside a JSON tool result arrives escaped rather than as real
- * newlines. Each segment must be 16+ base64 characters so the greedy body scan
- * stops at ordinary prose after an unterminated block instead of swallowing it.
+ * newlines.
+ *
+ * Two branches, tried in order, because "footer present" and "footer absent"
+ * want opposite things:
+ *
+ * 1. Footer present: consume everything between the markers. Whatever the body
+ *    is wrapped at, all of it goes. The lazy quantifier is bounded by the
+ *    required `-----END` literal, so it cannot run past the block it belongs to.
+ * 2. Footer absent (truncated mid-block): fall back to walking 16+ base64
+ *    segments, so the scan stops at ordinary prose instead of swallowing it.
+ *
+ * Branch 1 exists because requiring 16+ chars of *every* segment left the final
+ * line of a real key in the clear: PEM bodies wrap at 64 characters, so the last
+ * line is a short remainder for all but exact multiples, and that line plus the
+ * footer survived redaction. The 16+ floor is still right for branch 2, where
+ * there is no footer to bound the scan — it is only wrong when applied to a
+ * block whose end is already known.
  */
 const COMMAND_PEM_PRIVATE_KEY_RE =
-  /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----(?:(?:\s|\\[rn])+[A-Za-z0-9+/=]{16,})*(?:(?:\s|\\[rn])*-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----)?/g;
+  /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----(?:[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|(?:(?:\s|\\[rn])+[A-Za-z0-9+/=]{16,})*)/g;
 const COMMAND_JWT_RE =
   /\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?\b/g;
 const COMMAND_SECRET_HINTS = [
