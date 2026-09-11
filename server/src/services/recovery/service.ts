@@ -9828,12 +9828,14 @@ export function recoveryService(
   /**
    * Should we suppress re-raising an escalation we have already delivered once?
    *
-   * Two suppressors (BLO-27676):
+   * Two suppressors (BLO-27676), both fed by RESOLVED rows -- `done` or
+   * `cancelled` (BLO-29764, see the status predicate below):
    *
-   *   1. `cooldown` -- a `done` escalation for this incident inside `cooldownMs`.
-   *      Debounces the detector against its own sweep cadence. Unchanged.
+   *   1. `cooldown` -- a resolved escalation for this incident inside
+   *      `cooldownMs`. Debounces the detector against its own sweep cadence.
+   *      Unchanged.
    *
-   *   2. `unchanged_target` -- a `done` escalation for this incident whose leaf
+   *   2. `unchanged_target` -- a resolved escalation for this incident whose leaf
    *      target has had no activity since it resolved. This is the termination
    *      path the class lacked. The old rule was purely time-based: it consulted
    *      only elapsed time, never the target, so it always expired and an
@@ -9869,17 +9871,26 @@ export function recoveryService(
    *   - any activity on the leaf after the resolution
    *   - the suppression ceiling elapsing (see 2 above)
    *   - a different invariant state (the fingerprint carries `state`)
-   *   - a `cancelled` rather than `done` prior escalation
    *   - a leaf we cannot read (fails open)
    *
-   * Trade-off, now bounded rather than open-ended: an escalation resolved `done`
+   * A `cancelled` prior escalation is deliberately NOT on that list any more
+   * (BLO-29764, 2026-08-23). It used to be the immediate hatch; the ruling
+   * removed it because the two cases that hatch was justified by are the two
+   * cases where re-filing at once is the harmful act -- a report that was WRONG
+   * gets its false positive re-delivered, and a report that was CONSOLIDATED
+   * AWAY gets the duplicate it was merged into re-created. Measured 5 of 5 in
+   * August 2026: a cancel was reverted by a re-file under a new identifier in
+   * 42-84 s, with no signal. The first bullet above is the replacement hatch and
+   * is strictly stronger -- it means something actually changed about the thing
+   * being complained about.
+   *
+   * Trade-off, now bounded rather than open-ended: an escalation resolved
    * WITHOUT actually giving the leaf an action path will not re-raise under the
    * same fingerprint until the leaf is touched or the ceiling elapses. That is
    * the intended reading of "closing a row must not, by itself, regenerate it";
-   * the alternative is the unbounded loop this replaces, and cancelling rather
-   * than closing re-arms immediately. Resolving an escalation does not itself
-   * write to the leaf (`removeRecoveryBlockerFromSource` touches the SOURCE), so
-   * the comparison is stable rather than self-clearing.
+   * the alternative is the unbounded loop this replaces. Resolving an escalation
+   * does not itself write to the leaf (`removeRecoveryBlockerFromSource` touches
+   * the SOURCE), so the comparison is stable rather than self-clearing.
    */
   async function findSuppressingResolvedLivenessRecoveryIssue(
     finding: IssueLivenessFinding,
@@ -9894,93 +9905,21 @@ export function recoveryService(
     // disabled" genuinely free instead of merely inert.
     if (cooldownMs <= 0 && unchangedTargetSuppressionMs <= 0) return null;
 
-    // Retired-row cooldown (BLO-28957). Checked before the `done` lookup below
-    // because it is the cheaper query -- bounded by the cooldown (60m default)
-    // rather than by `max(cooldown, unchangedTarget)` (7d) -- so a hit here
-    // saves the wide scan entirely.
+    // BLO-28957 added a SECOND, narrower query here that matched `cancelled`
+    // rows and fed them to the cooldown branch only, deliberately keeping them
+    // out of the 7d `unchanged_target` branch below. BLO-29764 (2026-08-23)
+    // reversed that scoping: `cancelled` now suppresses on the same two gates as
+    // `done`, so the widened status filter below subsumes it and the separate
+    // query is gone rather than left as a redundant pre-check.
     //
-    // This exists because retiring a row IS the re-file trigger: the retire
-    // cancels the row, `openRecoveryIssues` then sees nothing open, and the very
-    // next sweep re-files. On a `done`-only cooldown the abandonment bound above
-    // would therefore have converted an unbounded wedge into an unbounded
-    // re-file loop -- the 48% re-file rate (240 of 500 rows, 2026-08-18) that
-    // BLO-28618 exists to kill, just on a timer. The bound and this hold are one
-    // change; neither is safe alone.
-    //
-    // Scoped to the COOLDOWN branch only, and that scoping is load-bearing. The
-    // `unchanged_target` branch below suppresses for up to 7 days on the reading
-    // that a report closed `done` without the leaf being touched should not
-    // re-raise every 75 minutes. A cancellation is not that: it is not a
-    // resolution, and the leaf of an abandoned row is quiet *by construction*
-    // (that is the finding's precondition), so letting `cancelled` reach that
-    // branch would suppress the re-escalation for a week and trade this issue's
-    // unbounded wedge for a 7-day recurring one. Feeding it through the 60m
-    // cooldown instead holds exactly one sweep-cycle's worth of churn and then
-    // lets the finding speak again.
-    //
-    // Kept as a SEPARATE query rather than widening the status filter below, so
-    // BLO-27676 is provably unperturbed. Widening that filter would let a
-    // recently-cancelled row out-sort an older `done` row under the shared
-    // `limit(1)`, which would silently *weaken* the target-state suppressor for
-    // reasons unrelated to this fix.
-    //
-    // Accepted cost, stated so a reviewer can weigh it: when a human cancels a
-    // row they consider bogus, re-escalation is delayed by one cooldown rather
-    // than firing on the next sweep. The end state is identical -- the finding
-    // re-files if it still reproduces -- so this trades ~1h of latency in that
-    // case for closing the loop. First-time detection on an incident sharing
-    // neither key nor leaf fingerprint is unaffected.
-    if (cooldownMs > 0) {
-      const cooldownCutoff = new Date(
-        now.getTime() - cooldownMs - LIVENESS_SUPPRESSION_SCAN_SKEW_MS,
-      );
-      const recentlyCancelled = await db
-        .select({
-          id: issues.id,
-          identifier: issues.identifier,
-          status: issues.status,
-          completedAt: issues.completedAt,
-          updatedAt: issues.updatedAt,
-        })
-        .from(issues)
-        .where(
-          and(
-            eq(issues.companyId, finding.companyId),
-            eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
-            or(
-              eq(issues.originId, finding.incidentKey),
-              eq(issues.originFingerprint, livenessRecoveryLeafFingerprint(finding)),
-            ),
-            visibleIssueCondition(),
-            eq(issues.status, "cancelled"),
-            // Same sargability and skew reasoning as the `done` query below:
-            // filter on bare `updated_at` (servable by
-            // `issues_company_updated_idx`) while comparing on
-            // `coalesce(completed_at, updated_at)`, with slack so a row whose
-            // `completed_at` leads `updated_at` is not dropped at the boundary.
-            gte(issues.updatedAt, cooldownCutoff),
-          ),
-        )
-        .orderBy(desc(sql`coalesce(${issues.completedAt}, ${issues.updatedAt})`), desc(issues.id))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-      const cancelledAtMs = (recentlyCancelled?.completedAt ?? recentlyCancelled?.updatedAt)
-        ?.getTime();
-      if (
-        recentlyCancelled &&
-        cancelledAtMs !== undefined &&
-        Number.isFinite(cancelledAtMs) &&
-        cancelledAtMs >= now.getTime() - cooldownMs
-      ) {
-        return {
-          id: recentlyCancelled.id,
-          identifier: recentlyCancelled.identifier,
-          status: recentlyCancelled.status,
-          resolvedAtMs: cancelledAtMs,
-          reason: "cooldown" as const,
-        };
-      }
-    }
+    // Folding it in is not merely tidier -- the separate query resolved a
+    // cancelled row's timestamp from `coalesce(completed_at, updated_at)`, and
+    // production cancels write `completed_at = NULL` (measured 2026-08-23 over
+    // all 67 August rows of this origin kind: `completed_at` non-null on 0/67,
+    // `cancelled_at` non-null on 67/67). So EVERY cancelled row was judged by
+    // `updated_at`, which drifts on any later edit -- a retitle days after the
+    // cancel re-armed the cooldown as though the row had just been cancelled.
+    // `resolvedAtExpr` below coalesces `cancelled_at` and closes that.
 
     // The ORDER BY must be the same expression that `resolvedAtMs` reads below,
     // or the row selected is not the row whose timestamp is compared. Ordering
@@ -9992,7 +9931,19 @@ export function recoveryService(
     // `updatedAt` silently swallows a genuine leaf touch. Pinned by "picks the
     // most recently resolved escalation even when an older row was edited after
     // it closed".
-    const resolvedAtExpr = sql`coalesce(${issues.completedAt}, ${issues.updatedAt})`;
+    //
+    // `cancelledAt` is in the coalesce because without it that same hole is not
+    // narrowed but WIDE OPEN for the whole `cancelled` population this query now
+    // admits: those rows carry `completed_at = NULL` essentially always (0/67 in
+    // August 2026), so every one of them would fall through to the drifting
+    // `updatedAt`. Pinned by "judges a cancelled escalation by `cancelledAt`
+    // even when a later edit drifted its `updatedAt`".
+    //
+    // `completedAt` stays ahead of `cancelledAt` in the coalesce so a row that
+    // was closed `done` and only later cancelled is still anchored to the
+    // resolution it actually delivered. That is the conservative direction: it
+    // can only make the suppression window OLDER, never fresher.
+    const resolvedAtExpr = sql`coalesce(${issues.completedAt}, ${issues.cancelledAt}, ${issues.updatedAt})`;
     // Keep the scan bounded. Neither OR arm is servable for these rows: the
     // fingerprint arm's only indexes (`issues_active_liveness_recovery_leaf_uq`,
     // `issues_active_alert_escalation_cover_uq` -- schema/issues.ts) are partial
@@ -10057,6 +10008,16 @@ export function recoveryService(
     // non-load-bearing: it holds for ANY path whose gap stays under it,
     // including ones added later.
     //
+    // The `cancelled_at` arm needs the same invariant and gets it for free, in
+    // the strict rather than the skewed form: every path that writes
+    // `cancelled_at` sets it and `updated_at` from ONE clock read in a single
+    // `update` (`issue-tree-control.ts` cancel, `pipelines.ts` retire, the
+    // stale-run cancel above), so `cancelled_at = updated_at` exactly and the
+    // superset property holds at zero skew. The reopen paths write
+    // `cancelled_at = NULL`, which coalesces past it rather than leaving a stale
+    // value behind. If a future cancel path ever sets the two from separate
+    // clock reads it lands inside the same skew allowance as `completed_at`.
+    //
     // Unskewed, that leaves a real hole: a row with
     // `updated_at < cutoff <= completed_at` is dropped by the filter, the
     // suppressor returns null, and the escalation re-raises -- this issue's loop
@@ -10076,15 +10037,13 @@ export function recoveryService(
       .select({
         id: issues.id,
         identifier: issues.identifier,
-        // Read the status back rather than hardcoding "done" at the return
-        // sites, even though the filter below currently admits only `done`.
-        // BLO-29764 ruled (2026-08-23) that `cancelled` rows will suppress on
-        // these same two gates; BLO-29838 implements that by widening the
-        // filter. Sourcing the logged status from the row means that change
-        // flows into the audit log for free -- and a hardcoded "done" would
-        // instead go quietly, permanently wrong the day it lands.
+        // Read the status back rather than hardcoding a literal at the return
+        // sites: the filter below admits `done` and `cancelled`, so the audit
+        // log carries which one actually suppressed (BLO-29761 exists to keep
+        // that distinction legible).
         status: issues.status,
         completedAt: issues.completedAt,
+        cancelledAt: issues.cancelledAt,
         updatedAt: issues.updatedAt,
       })
       .from(issues)
@@ -10097,14 +10056,16 @@ export function recoveryService(
             eq(issues.originFingerprint, livenessRecoveryLeafFingerprint(finding)),
           ),
           visibleIssueCondition(),
-          // `done` only, deliberately -- this is the branch that can suppress
-          // for 7 days, and only a genuine resolution earns that. `cancelled`
-          // is handled by the narrow cooldown-only lookup above (BLO-28957);
-          // routing it here instead would hold an abandoned row's source silent
-          // for a week, because such a leaf is quiet by construction. Pinned by
-          // "holds re-escalation for one cooldown after a matching escalation is
-          // cancelled", which asserts the 1h hold AND the release after it.
-          eq(issues.status, "done"),
+          // `done` AND `cancelled` (BLO-29764, 2026-08-23). This branch can
+          // suppress for 7 days, and the earlier reading was that only a
+          // genuine resolution earns that -- so `cancelled` was routed to a
+          // separate cooldown-only lookup instead (BLO-28957). That reading was
+          // reversed: the two things a cancel actually means are "the report was
+          // wrong" and "it was consolidated away", and in BOTH re-filing at once
+          // is the harmful act rather than the safe one. Re-arming stays
+          // available through the leaf-touch hatch and the 7d ceiling, so this
+          // is a delay, not a mute.
+          inArray(issues.status, ["done", "cancelled"]),
           // Sargable superset of the suppression horizon -- see the note above
           // the query. Restores the bound the 60m cooldown used to provide, and
           // carries a skew allowance because `completed_at` can lead
@@ -10117,7 +10078,11 @@ export function recoveryService(
       .then((rows) => rows[0] ?? null);
     if (!mostRecentDone) return null;
 
-    const resolvedAtMs = (mostRecentDone.completedAt ?? mostRecentDone.updatedAt)?.getTime();
+    // Must stay identical to `resolvedAtExpr` above, including the order of the
+    // coalesce arms -- see the note there.
+    const resolvedAtMs = (
+      mostRecentDone.completedAt ?? mostRecentDone.cancelledAt ?? mostRecentDone.updatedAt
+    )?.getTime();
     if (resolvedAtMs === undefined || !Number.isFinite(resolvedAtMs)) return null;
 
     if (cooldownMs > 0 && resolvedAtMs >= now.getTime() - cooldownMs) {
