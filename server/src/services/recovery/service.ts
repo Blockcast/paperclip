@@ -63,7 +63,7 @@ import {
 import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
-import { issueRecoveryActionService } from "../issue-recovery-actions.js";
+import { RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, issueRecoveryActionService } from "../issue-recovery-actions.js";
 import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
@@ -177,6 +177,10 @@ export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
+// Derived, never hardcoded: the takeover comment quotes this window to the
+// previous owner, so a change to the TTL must not silently make that prose lie
+// (which is the BLO-19124 defect this line exists to avoid repeating).
+const recoveryHandoffCommentGrantTtlHours = Math.round(RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS / (60 * 60 * 1000));
 /**
  * Ceiling on the `unchanged_target` re-escalation suppressor (BLO-27676).
  *
@@ -7239,7 +7243,15 @@ export function recoveryService(
           `- Recovery owner: ${agentUiLink(recoveryOwner, prefix)}`,
           ...(reassignsAssignee
             ? [
-              `- ${reassignmentMarker}: taken over from ${agentUiLink(sourceAssignee, prefix)}, which can no longer PATCH or comment on this issue as its assignee.`,
+              `- ${reassignmentMarker}: taken over from ${agentUiLink(sourceAssignee, prefix)}, which can no longer PATCH this issue as its assignee.`,
+              // BLO-19124: this line used to say "no longer PATCH or comment",
+              // which is false — `agentHasRecoveryHandoffGrantOnIssue`
+              // (BLO-18906, TTL BLO-20263) deliberately keeps the comment
+              // channel open to exactly this agent. Measured cost of the wrong
+              // sentence on BLO-33322: the previous owner went on to complete
+              // the work, read "cannot comment", recorded nothing, and the row
+              // read as dead for 42 minutes while it was most active.
+              `- ${agentUiLink(sourceAssignee, prefix)} CAN still comment here for ${recoveryHandoffCommentGrantTtlHours} hours after this transfer, and should: post what it already knows and anything it does next, so the recovery owner does not start cold.`,
             ]
             : []),
           workspacePreflightHandoffCause
