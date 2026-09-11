@@ -17,10 +17,18 @@ import {
   hasGitHubCliStdinTextFile,
   scrubGitHubCliInvocation,
 } from "./github-cli-egress-shim.js";
+import {
+  type CommitReachability,
+  evaluateReviewSubmission,
+  type ReviewAttestationGuardIo,
+} from "./github-review-attestation.js";
 
 export interface GitHubCliEgressRuntimeOptions {
   target: string;
   argv: string[];
+  /** Override the review-attestation guard's I/O. Tests inject a resolver so
+   *  the guard can be exercised without a network or a real repository. */
+  guardIo?: ReviewAttestationGuardIo;
 }
 
 export class GitHubCliEgressRuntimeError extends Error {
@@ -68,9 +76,96 @@ export function prepareGitHubCliInvocation(options: GitHubCliEgressRuntimeOption
   return { argv: result.argv, temporaryDirectory };
 }
 
-export function runGitHubCliEgressRuntime(
+/**
+ * Run the real GitHub CLI and capture its output.
+ *
+ * `target` is the binary this wrapper fronts (/usr/bin/gh in the pod), never
+ * the wrapper itself, so the guard's own probe calls cannot recurse back
+ * through this runtime.
+ */
+function captureTarget(
+  target: string,
+  argv: readonly string[],
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(target, [...argv], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.setEncoding("utf8").on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr?.setEncoding("utf8").on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.once("error", (error: NodeJS.ErrnoException) => {
+      resolve({ code: null, stdout, stderr: `${stderr}${error.code ?? "spawn failed"}` });
+    });
+    child.once("close", (code) => {
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
+// A definite "this commit is not in this repository". `gh api` reports a
+// nonexistent SHA as 422 ("No commit found for SHA") and a missing or
+// invisible repository as 404. Anything else — a 5xx, a DNS failure, an auth
+// problem — is deliberately NOT matched here, so it falls through to
+// "indeterminate" and is refused rather than mistaken for a clean negative.
+const DEFINITE_ABSENCE_PATTERN = /HTTP 404|HTTP 422|Not Found|No commit found/i;
+
+/**
+ * Build the guard's I/O against the real GitHub CLI.
+ *
+ * Reachability is asked via `GET /repos/{owner}/{repo}/commits/{sha}` rather
+ * than commit search: search is index-backed and returns an empty result for a
+ * commit pushed moments earlier, which would refuse legitimate reviews of a
+ * fresh head. The direct endpoint is authoritative.
+ */
+export function createReviewAttestationGuardIo(target: string): ReviewAttestationGuardIo {
+  return {
+    readText: (filePath) => readFileSync(filePath, "utf8"),
+    resolveCommitReachability: async (repo, sha): Promise<CommitReachability> => {
+      const result = await captureTarget(target, [
+        "api",
+        `repos/${repo}/commits/${sha}`,
+        "--jq",
+        ".sha",
+      ]);
+      if (result.code === 0 && result.stdout.trim().length > 0) return "reachable";
+      if (DEFINITE_ABSENCE_PATTERN.test(result.stderr)) return "unreachable";
+      return "indeterminate";
+    },
+    resolveDefaultRepo: async () => {
+      const result = await captureTarget(target, [
+        "repo",
+        "view",
+        "--json",
+        "nameWithOwner",
+        "--jq",
+        ".nameWithOwner",
+      ]);
+      if (result.code !== 0) return null;
+      const name = result.stdout.trim();
+      return name.length > 0 ? name : null;
+    },
+  };
+}
+
+export async function runGitHubCliEgressRuntime(
   options: GitHubCliEgressRuntimeOptions,
 ): Promise<number> {
+  // BLO-32844: refuse an incoherent review before anything is scrubbed or
+  // spawned. This runs first because it is the only check whose failure means
+  // the call must not happen at all — the scrub rewrites a call that is going
+  // to proceed, whereas this one cancels it.
+  const refusal = await evaluateReviewSubmission(
+    options.argv,
+    options.guardIo ?? createReviewAttestationGuardIo(options.target),
+  );
+  if (refusal) {
+    throw new GitHubCliEgressRuntimeError(`${refusal.message} [${refusal.reason}]`, 65);
+  }
+
   const invocation = prepareGitHubCliInvocation(options);
   return new Promise((resolve, reject) => {
     const child = spawn(options.target, invocation.argv, { stdio: "inherit" });
