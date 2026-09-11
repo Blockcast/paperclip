@@ -11901,8 +11901,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // unchanged. Only the query needed widening: `escalated` still holds
     // `issue_recovery_actions_active_source_uq`, so counting both active statuses is still
     // counting exactly the rows the uniqueness constraint governs, whereas filtering on
-    // `active` alone reads a correctly-retired row as a missing one. The budget is also
-    // still not over-spendable by the race — `attemptCount` is asserted below unchanged.
+    // `active` alone reads a correctly-retired row as a missing one.
     const actions = await db
       .select()
       .from(issueRecoveryActions)
@@ -11912,7 +11911,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         inArray(issueRecoveryActions.status, ["active", "escalated"]),
       ));
     expect(actions).toHaveLength(1);
-    expect(actions[0]?.attemptCount).toBe(Math.min(8, defaultRecoveryActionMaxAttempts));
+    // BLO-33410: a BOUND, not an equality. `attemptCount` is not a gate — the reserve does a
+    // read-modify-write (`existing.attemptCount + 1`, issue-recovery-actions.ts), so it counts
+    // sweeps that landed, and the budget bounds WAKES rather than increments. 8 racing sweeps
+    // can therefore carry it past `defaultRecoveryActionMaxAttempts`; the old
+    // `.toBe(Math.min(8, defaultRecoveryActionMaxAttempts))` demanded exactly 5 of 8 land and
+    // failed ~2 runs in 3 on unchanged master (measured 6 and 7). 8 is the real ceiling — one
+    // increment per concurrent caller — so this still fails if a retry path double-increments.
+    expect(actions[0]?.attemptCount).toBeGreaterThanOrEqual(1);
+    expect(actions[0]?.attemptCount).toBeLessThanOrEqual(8);
     // Pin WHICH bound retired it. The creation-anchored horizon is hours out here, so the
     // budget is the only bound that can have fired — which makes this the one assertion that
     // fails if the wake path ever goes back to hardcoding the bound on a disjunctive gate.
