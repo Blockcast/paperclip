@@ -11,6 +11,7 @@ import {
   githubGetLatestCommitStatusForContext,
   githubHasReviewerEvidenceForPr,
   githubPostCommitStatusDetailed,
+  scrubOutboundGitHubText,
   type GitHubCommitStatusState,
 } from "./github-app-auth.js";
 
@@ -515,7 +516,18 @@ export async function enqueueGithubCommitStatusDelivery(
     context: input.context,
     state: input.state,
     forceWrite: input.forceWrite ?? false,
-    description: input.description.slice(0, 140),
+    // Scrub BEFORE this 140-char cap, not only at the send. The replay path
+    // hands `row.description` to githubPostCommitStatusDetailed, which scrubs
+    // it — but by then the value has already been truncated here, and a
+    // credential straddling the cut loses the prefix or terminator its detector
+    // needs. The surviving fragment then matches nothing, is persisted, and is
+    // published on every replay. Scrubbing first also means the durable row
+    // never holds credential-shaped text at rest, which the send-time scrub
+    // cannot achieve from here (PEN-3157).
+    description: scrubOutboundGitHubText(
+      input.description,
+      "outbox commit-status description",
+    ).slice(0, 140),
     targetUrl: input.targetUrl ?? null,
     prNumber: input.prNumber,
     prUrl: input.prUrl ?? null,

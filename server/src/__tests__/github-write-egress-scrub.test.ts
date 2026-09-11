@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateKeyPairSync } from "node:crypto";
@@ -310,7 +310,6 @@ describe("the scrub is reachable from server/ at all", () => {
     // pathspec that matches nothing returns the same empty set as "everything
     // is covered", and that failure mode is silent.
     const servicesDir = path.join(repoRoot, "server/src/services");
-    const { readdirSync } = require("node:fs") as typeof import("node:fs");
     const writers: string[] = [];
     for (const entry of readdirSync(servicesDir)) {
       if (!entry.endsWith(".ts") || entry.endsWith(".test.ts")) continue;
