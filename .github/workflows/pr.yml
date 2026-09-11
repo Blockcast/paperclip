@@ -1464,15 +1464,20 @@ jobs:
     # 10 jobs died on the clock in that window: 2.2% of the 459 that were not
     # supersede-cancelled (the other 107 cancels are push-supersedes and are
     # NOT cap kills -- do not count them). A cap kill is pure waste: it burns
-    # the full budget, produces no verdict, and forces a re-run. 75 therefore
-    # cost ~589 dead runner-minutes/week (9.8h) on a demand-bound pool, so
-    # raising the ceiling REDUCES expected arc-e2e occupancy. Only worst-case
-    # single-job occupancy rises (+15m). How much 90 costs is NOT yet known --
-    # nothing observes how long a killed job would have taken, which is exactly
-    # what this change makes measurable. Deliberately left below the ~107m that
-    # Playwright's own limits can produce (43 tests x 60s timeout x
-    # `retries: 1`, plus the 300s webServer boot and measured setup), so a
-    # genuinely wedged suite is still killed rather than sitting on a runner.
+    # the full budget, produces no verdict, and forces a re-run. Cost of 75 on
+    # a demand-bound pool, stated so it reproduces: 10 kills x 75m nominal cap
+    # = 750 dead runner-min / 9 days x 7 = 583/week (9.7h). That charges each
+    # kill the NOMINAL cap, so 583 is a FLOOR -- measured time-to-kill ran
+    # 75.5-75.8m on the three kills whose durations are banked on BLO-32794,
+    # and re-run occupancy is NOT counted at all. Either refinement only makes
+    # it worse, so raising the ceiling REDUCES expected arc-e2e occupancy.
+    # Only worst-case single-job occupancy rises (+15m). How much 90 costs is
+    # NOT yet known -- nothing observes how long a killed job would have taken,
+    # which is exactly what this change makes measurable. Deliberately left
+    # below the ~107m that Playwright's own limits can produce (43 tests x 60s
+    # timeout x `retries: 1`, plus the 300s webServer boot and measured setup),
+    # so a genuinely wedged suite is still killed rather than sitting on a
+    # runner.
     #
     # NOTE: this is a stop-gap, not a durable fix. Step-level split of 28
     # successful jobs: setup p50 5.6m / p100 14.3m, but `Run e2e tests` p50
