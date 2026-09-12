@@ -74,7 +74,7 @@ describeEmbeddedPostgres("PATCH /agents/:agentId/budgets records a config revisi
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-budgets-route-revision-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     await db.delete(activityLog);

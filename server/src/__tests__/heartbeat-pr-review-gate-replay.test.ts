@@ -196,7 +196,7 @@ describeEmbeddedPostgres(
         `UPDATE "heartbeat_runs" SET status='failed', finished_at=NOW() WHERE status IN ('queued','running')`,
       ));
       await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
-    }, 60_000);
+    });
 
     afterAll(async () => {
       await db?.execute(sql.raw(
@@ -204,7 +204,7 @@ describeEmbeddedPostgres(
       ));
       await db?.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
       await tempDb?.cleanup();
-    }, 60_000);
+    });
 
     function buildApp(reviewerAgentId: string) {
       const app = express();

@@ -105,7 +105,7 @@ describeEmbeddedPostgres("smoke lab service pack and results API", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-smoke-lab-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     vi.unstubAllEnvs();
