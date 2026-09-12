@@ -7108,6 +7108,75 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   );
 
   it(
+    "BLO-27463: a run that yielded its slot for a live external wait is not stranded or reassigned",
+    async () => {
+      // BLO-33463 (2026-09-12, `critical`): Ally armed a PR-checks monitor, yielded the
+      // slot as #1195 intends, and the sweep escalated the resulting `cancelled` run as a
+      // stranded assignment — Ally -> CTO -> CEO in six minutes, coming to rest `blocked`
+      // with an empty blocker set, which destroyed the monitor that was the issue's only
+      // wake path and took the two issues it blocks with it.
+      //
+      // The durable-wait gate already knew this issue was attended; it just refused to
+      // look, because it only consulted the wait path for a *succeeded* run.
+      //
+      // Asserted on the acceptance criteria (no recovery action, no ownership move, status
+      // and monitor intact) rather than on a counter, so the test survives the mechanism
+      // moving between layers.
+      const monitorNextCheckAt = new Date(Date.now() + 60 * 60_000);
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        runErrorCode: "external_wait_yield",
+        runError: "Yielded after persisting an external-service wait",
+        monitorNextCheckAt,
+        resultJson: { yieldedExternalWait: true, issueId: null, serviceName: "github-actions" },
+      });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      expect(result.escalated).toBe(0);
+      expect(result.skipped).toBe(1);
+      expect(result.issueIds).not.toContain(issueId);
+
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(issue?.status).toBe("in_progress");
+      expect(issue?.assigneeAgentId).toBe(agentId);
+      expect(issue?.monitorNextCheckAt?.toISOString()).toBe(monitorNextCheckAt.toISOString());
+
+      const actions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(actions).toHaveLength(0);
+    },
+  );
+
+  it(
+    "BLO-27463: an external-wait yield whose monitor has lapsed is still seen by the sweep",
+    async () => {
+      // The bound on the fix above. Admitting the yield to the durable-wait gate must not
+      // create a row that can never be recovered: once the monitor it armed is past due and
+      // no PR or blocker path replaces it, the wait is no longer a wake path and the strand
+      // arms have to stay reachable. Same shape as the BLO-24782 past-due test.
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        runErrorCode: "external_wait_yield",
+        runError: "Yielded after persisting an external-service wait",
+        monitorNextCheckAt: new Date(Date.now() - 48 * 60 * 60_000),
+      });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      expect(result.skipped).toBe(0);
+    },
+  );
+
+  it(
     "BLO-24782: a `triggered` monitor past the grace bound is no longer believed by the " +
       "monitor-gated park, which hands the issue to the ungated no-dependency park instead",
     async () => {
