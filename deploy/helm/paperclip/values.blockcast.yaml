@@ -418,7 +418,8 @@ tolerations:
     operator: Equal
     value: paperclip
     effect: NoSchedule
-  # With pve3 excluded (below), the API's hard two-host spread left pve2 as the
+  # When pve3 was excluded outright (a hard rule that ran 2026-09-05 to 09-12),
+  # the API's hard two-host spread left pve2 as the
   # only host for the second replica, and pve2 saturates under CI bursts
   # (34-49% steal on paperclip-10, 2026-09-06 03:00Z; pod-local /api/health up
   # to 9.9 s against a 10 s liveness timeout). paperclip-8 (pve1, 32 cores)
@@ -447,36 +448,30 @@ tolerations:
     value: "true"
     effect: NoSchedule
 
-# Keep production off nodes whose Proxmox host is pve3 (BLO-32054). pve3 runs
-# ~172 vCPUs on 80 cores and steals 20-40% of CPU time from every guest; a 5 s
-# liveness probe on a stalled vCPU misses its deadline and the kubelet kills a
-# healthy container (paperclip-api + paperclip-0 on 2026-09-05). Nodes already
-# carry blockcast.net/pve-storage-domain=<pve host>, so the rule keys on that.
-# The API template merges this beside its own podAntiAffinity; the StatefulSet
-# takes it verbatim. Drop the entry once pve3 is rebalanced (tracked in
-# BLO-32054).
+# Bias production away from saturated Proxmox hosts (BLO-32054). pve3 steals
+# 20-40% of CPU time from every guest; a 5 s liveness probe on a stalled vCPU
+# misses its deadline and the kubelet kills a healthy container (paperclip-api
+# + paperclip-0 on 2026-09-05). pve2 saturates the same way under CI runner
+# bursts (49% steal on paperclip-10, 2026-09-06 03:00Z). Nodes carry
+# blockcast.net/pve-storage-domain=<pve host>, so the rules key on that. The
+# API template merges this beside its own podAntiAffinity; the StatefulSet
+# takes it verbatim.
 #
-# pve2 saturates the same way whenever CI runner bursts land on
-# paperclip-5/-10/-11 (load 135/80 seen 2026-09-05 17:30Z, 20-24% steal;
-# 148/80 and 49% steal on 2026-09-06 03:00Z), but it is still not excluded
-# outright: the API's hard two-host spread (api.spreadAcrossNodes) needs a
-# second eligible node, pve4 hosts only paperclip-3, and the pve1 nodes
-# paperclip-1/-4 carry arc-dind-reserved, which production does not tolerate.
-# A NotIn [pve2, pve3] rule therefore wedged the rollout with a replica
-# Pending (2026-09-05 17:45Z). Instead: prefer pve4 outright, fall back to any
-# host that is not pve2, and let the spread rule place the second replica on
-# the best remaining host. Since the arc-multicast-integ-reserved toleration
-# above, that host is paperclip-8 (pve1); pve2 stays reachable only as the
-# fallback if paperclip-8 is full. This is a scheduler bias, not a pin.
+# Every rule here is PREFERRED, deliberately. A hard `required NotIn [pve3]`
+# shipped 2026-09-05 and was removed 2026-09-12 by CEO ruling on BLO-32054: it
+# excluded 4 of 11 nodes and stacked with the API's hard two-host spread
+# (api.spreadAcrossNodes, whenUnsatisfiable: DoNotSchedule) over only 5
+# uncordoned eligible nodes, so a cordon during an incident could leave a
+# replica Pending — the same failure a NotIn [pve2, pve3] rule already caused
+# on 2026-09-05 17:45Z. Steal is a capacity problem, not a correctness one:
+# preferring away captures nearly all the benefit without the outage tail.
+#
+# Resulting gradient (weights sum): pve4 = pve1 = 150 > pve3 = 50 > pve2 = 0.
+# pve1 joins pve4 at weight 100 on 7d hypervisor CPU (pve1 p95 0.829, above
+# 0.85 only 3.7% of the week; pve4 p95 0.552; pve2 58.2% and pve3 57.5% of the
+# week above 0.85). pve3 stays reachable as a last resort rather than excluded.
 affinity:
   nodeAffinity:
-    requiredDuringSchedulingIgnoredDuringExecution:
-      nodeSelectorTerms:
-        - matchExpressions:
-            - key: blockcast.net/pve-storage-domain
-              operator: NotIn
-              values:
-                - pve3
     preferredDuringSchedulingIgnoredDuringExecution:
       - weight: 100
         preference:
@@ -485,6 +480,7 @@ affinity:
               operator: In
               values:
                 - pve4
+                - pve1
       - weight: 50
         preference:
           matchExpressions:
