@@ -14,6 +14,34 @@ function blockEventLoop(ms: number): void {
   }
 }
 
+/**
+ * Blocks until the sampler reports a stall, or the deadline passes.
+ *
+ * A single block is a coin flip at these settings, and waiting longer cannot
+ * recover a lost one. After the block, our sampler's timer and the histogram's
+ * own timer are both overdue; whichever libuv runs first wins, and if ours does
+ * the histogram is re-armed before it can record, so `max` reads 0 and the
+ * stall is gone for good. At `sampleMs: 50` the two come due within the
+ * histogram's 20ms resolution of each other, so ours wins ~20% of the time
+ * (measured 19-40 misses per 120-150 blocks, idle host). Production samples at
+ * 1000ms, where the histogram is overdue by nearly a full second more than the
+ * sampler and always wins — 0 misses in 26 blocks of 1100ms and 3000ms — which
+ * is why this is a test-only concern and the module is unchanged.
+ */
+async function blockUntilStallObserved(
+  observed: ReadonlyArray<unknown>,
+  deadlineMs = 5_000,
+): Promise<void> {
+  const end = Date.now() + deadlineMs;
+  do {
+    // The histogram only measures once the loop has iterated after enable(),
+    // so yield first — blocking in the same tick records nothing.
+    await sleep(60);
+    blockEventLoop(400);
+    await sleep(150);
+  } while (observed.length === 0 && Date.now() < end);
+}
+
 describe("resolveStallThresholdMs", () => {
   it("defaults to 1000ms and treats 0 as disabled", () => {
     expect(resolveStallThresholdMs(undefined)).toBe(1_000);
@@ -45,11 +73,7 @@ describe("startEventLoopStallLogging", () => {
       log: (fields) => lines.push(fields),
     });
     try {
-      // The histogram only measures once the loop has iterated after enable(),
-      // so yield first — blocking in the same tick records nothing.
-      await sleep(60);
-      blockEventLoop(400);
-      await sleep(150);
+      await blockUntilStallObserved(lines);
 
       expect(lines.length).toBeGreaterThan(0);
       expect(lines[0].stallMs).toBeGreaterThanOrEqual(200);
@@ -96,9 +120,7 @@ describe("startEventLoopStallLogging", () => {
     try {
       // Only one sampler exists, so the second start never wired its own log.
       expect(stopSecond).toBe(stopFirst);
-      await sleep(60);
-      blockEventLoop(400);
-      await sleep(150);
+      await blockUntilStallObserved(first);
       expect(first.length).toBeGreaterThan(0);
       expect(second).toHaveLength(0);
     } finally {

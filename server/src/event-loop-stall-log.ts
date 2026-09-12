@@ -35,6 +35,15 @@ export function resolveStallThresholdMs(
 
 export interface EventLoopStallLogOptions {
   thresholdMs?: number;
+  /**
+   * Keep this an order of magnitude above `HISTOGRAM_RESOLUTION_MS`. After a
+   * stall both this timer and the histogram's own are overdue, and if libuv
+   * runs ours first the histogram is re-armed before it can record — `max`
+   * reads 0 and the stall is lost, unrecoverably. The default 1000ms leaves the
+   * histogram overdue by nearly a second more, so it always wins (0 misses in
+   * 26 blocks). At 50ms the two are within the resolution and ours wins ~20% of
+   * the time; only the tests go that low, and they retry the block.
+   */
   sampleMs?: number;
   log?: (fields: Record<string, number>, message: string) => void;
 }
