@@ -159,7 +159,10 @@ function executionWorkspaceFixture(): ExecutionWorkspace {
     // The storage layout: `config` is a derived view over `metadata.config`, so the same bytes are
     // reachable through both keys. This fixture reproduces that, which is the point of the test.
     metadata: { config: { workspaceRuntime: runtime } },
-    runtimeServices: [],
+    // Populated, not `[]`. The empty array here is what let the ordinary GET/LIST exits go
+    // unexamined for a round: `publicExecutionWorkspace` spreads the row, so a field it does not
+    // name is disclosed — but a fixture with nothing in it cannot show that.
+    runtimeServices: [runtimeServiceFixture()],
     createdAt: new Date("2026-01-01T00:00:00.000Z"),
     updatedAt: new Date("2026-01-01T00:00:00.000Z"),
   };
@@ -187,7 +190,16 @@ function projectWorkspaceFixture(): ProjectWorkspace {
     runtimeConfig: { workspaceRuntime: runtime, desiredState: "running", serviceStates: null },
     hasWorkspaceRuntimeConfig: true,
     isPrimary: true,
-    runtimeServices: [],
+    runtimeServices: [
+      runtimeServiceFixture({
+        id: "runtime-service-2",
+        scopeType: "project_workspace",
+        scopeId: "project-workspace-1",
+        executionWorkspaceId: null,
+        projectWorkspaceId: "project-workspace-1",
+        projectId: "project-1",
+      }),
+    ],
     createdAt: new Date("2026-01-01T00:00:00.000Z"),
     updatedAt: new Date("2026-01-01T00:00:00.000Z"),
   };
@@ -273,6 +285,9 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       expect(withheld.metadata).toBeNull();
       expect(JSON.stringify(withheld)).not.toContain(SECRET_SENTINEL);
       expect(JSON.stringify(withheld)).not.toContain(SECOND_SENTINEL);
+      // Third exit, same projection: `runtimeServices` rides the spread unless named.
+      expect(JSON.stringify(withheld)).not.toContain(SERVICE_COMMAND_SENTINEL);
+      expect(JSON.stringify(withheld)).not.toContain(SERVICE_CWD_SENTINEL);
     });
 
     it("closes BOTH exits on a project workspace", () => {
@@ -285,6 +300,8 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       expect(withheld.metadata).toBeNull();
       expect(JSON.stringify(withheld)).not.toContain(SECRET_SENTINEL);
       expect(JSON.stringify(withheld)).not.toContain(SECOND_SENTINEL);
+      expect(JSON.stringify(withheld)).not.toContain(SERVICE_COMMAND_SENTINEL);
+      expect(JSON.stringify(withheld)).not.toContain(SERVICE_CWD_SENTINEL);
     });
 
     it("keeps the diagnostic fields a withheld reader still needs", () => {
@@ -318,6 +335,23 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       expect(res.body.hasWorkspaceRuntimeConfig).toBe(true);
     });
 
+    /**
+     * The exit Ally found. `close-readiness` was fixed first and reads as "the route that answers
+     * with service rows" — but the ORDINARY read answers with them too, through the same helper,
+     * with no route of its own to notice.
+     */
+    it("masks runtimeServices command/cwd on the ordinary read, not just close-readiness", async () => {
+      const res = await request(createApp("execution-workspaces")).get("/api/execution-workspaces/workspace-1");
+
+      expect(JSON.stringify(res.body)).not.toContain(SERVICE_COMMAND_SENTINEL);
+      expect(JSON.stringify(res.body)).not.toContain(SERVICE_CWD_SENTINEL);
+      // Masked, not dropped: the row still identifies the service it withheld the pair from.
+      expect(res.body.runtimeServices).toHaveLength(1);
+      expect(res.body.runtimeServices[0].command).toBe(REDACTED_EVENT_VALUE);
+      expect(res.body.runtimeServices[0].cwd).toBe(REDACTED_EVENT_VALUE);
+      expect(res.body.runtimeServices[0].serviceName).toBe("api");
+    });
+
     it("discloses it to a reader holding workspace_runtime:read", async () => {
       decideAsRuntimeManager();
 
@@ -338,6 +372,9 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       expect(res.body).toHaveLength(1);
       expect(JSON.stringify(res.body)).not.toContain(SECRET_SENTINEL);
       expect(res.body[0].metadata).toBeNull();
+      // Widest exit in the file: every workspace in the company, each with its service rows.
+      expect(JSON.stringify(res.body)).not.toContain(SERVICE_COMMAND_SENTINEL);
+      expect(JSON.stringify(res.body)).not.toContain(SERVICE_CWD_SENTINEL);
     });
 
     it("leaves summary mode alone — it carries no config or metadata to withhold", async () => {
@@ -431,6 +468,11 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       expect(res.body[0].runtimeConfig.workspaceRuntime).toBeNull();
       expect(res.body[0].metadata).toBeNull();
       expect(res.body[0].hasWorkspaceRuntimeConfig).toBe(true);
+      // `ProjectWorkspace.runtimeServices` is the same exit on the other row type.
+      expect(JSON.stringify(res.body)).not.toContain(SERVICE_COMMAND_SENTINEL);
+      expect(JSON.stringify(res.body)).not.toContain(SERVICE_CWD_SENTINEL);
+      expect(res.body[0].runtimeServices[0].command).toBe(REDACTED_EVENT_VALUE);
+      expect(res.body[0].runtimeServices[0].cwd).toBe(REDACTED_EVENT_VALUE);
     });
 
     it("discloses it to a reader holding workspace_runtime:read", async () => {

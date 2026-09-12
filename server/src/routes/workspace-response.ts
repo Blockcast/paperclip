@@ -55,6 +55,16 @@ import type { accessService } from "../services/index.js";
  * derived-view trap as `config` vs `metadata` in (1) above, one level further out. `routes/issues.ts`
  * already masks that pair (`compactIssueRuntimeService`, PEN-2854 door #14); `publicRuntimeServices`
  * below is that same treatment for routes answering with service rows directly.
+ *
+ * It is applied in three places, not one, and the reason is the third property worth stating: the
+ * workspace projections below are `{...workspace, <overrides>}`, so they disclose by DEFAULT — every
+ * field not named in the override list rides through untouched. `runtimeServices` is a populated
+ * field on both row types (`toExecutionWorkspace(workspace, runtimeServices)`,
+ * `services/projects.ts`), so the ordinary GET and LIST routes handed the withheld pair out one key
+ * over while the module read as if it had closed the boundary. A call-site guard cannot catch this:
+ * `workspace-response-withholding-guard.test.ts` proves the door is USED, never that it is CLOSED.
+ * Anything added to `ExecutionWorkspace` or `ProjectWorkspace` carrying operator text has to be
+ * named here or it is disclosed silently.
  */
 
 export interface WorkspaceRuntimeViewer {
@@ -89,6 +99,8 @@ export function publicExecutionWorkspace(
     ...workspace,
     config: workspace.config === null ? null : { ...workspace.config, workspaceRuntime: null },
     metadata: null,
+    runtimeServices:
+      workspace.runtimeServices && publicRuntimeServices(workspace.runtimeServices, viewer),
   };
 }
 
@@ -173,6 +185,8 @@ export function publicProjectWorkspace(
     runtimeConfig:
       workspace.runtimeConfig === null ? null : { ...workspace.runtimeConfig, workspaceRuntime: null },
     metadata: null,
+    runtimeServices:
+      workspace.runtimeServices && publicRuntimeServices(workspace.runtimeServices, viewer),
   };
 }
 
