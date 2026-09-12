@@ -9332,11 +9332,70 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
 }
 
 type GithubReviewerEvidenceVerification =
-  | { status: "found"; via: "review" | "comment"; repoFullName: string; prNumber: number; headSha: string | null }
+  | {
+    status: "found";
+    via: "review" | "comment";
+    /**
+     * BLO-28920: true when the wake's pinned head found nothing and the review
+     * was matched on the PR's *live* head instead. Logged so a future reader of
+     * the run event can tell "review at the head we asked about" from "review at
+     * the head the reviewer actually saw" — the distinction whose absence made
+     * this defect invisible for 24 days.
+     */
+    viaLiveHead?: boolean;
+    repoFullName: string;
+    prNumber: number;
+    headSha: string | null;
+  }
   | { status: "not_found"; repoFullName: string; prNumber: number; headSha: string | null }
   | { status: "unavailable"; reason: string; repoFullName: string | null; prNumber: number | null; headSha: string | null };
 
-async function verifyGithubReviewerEvidence(
+/**
+ * Is there server-side GitHub evidence that the trusted reviewer App reviewed
+ * this PR? Run-output **attestation** — deliberately distinct from *merge
+ * authorization*, which rightly demands `APPROVED` (BLO-24056).
+ *
+ * Exported for the same reason as {@link probeStaleKillReviewEvidence}: the
+ * head-resolution contract below is the whole defect, and it must be unit-
+ * testable without standing up the external-lifecycle finalize path.
+ *
+ * ## Which head counts (BLO-28920)
+ *
+ * Two halves of the system disagree about which head is authoritative, and both
+ * are right about their own half:
+ *
+ *  - The **wake** pins a head at dispatch time (`contextSnapshot.githubHeadSha`,
+ *    back-filled by `github-webhook.ts` for marker requests), so essentially
+ *    every reviewer wake carries a *snapshot* SHA.
+ *  - The **reviewer** is required to re-resolve and review the PR's *live* head.
+ *
+ * So on any PR pushed to between dispatch and review completion the reviewer
+ * legitimately reviews head Y while the gate asks about head X — a guaranteed
+ * miss that failed the run for "no exact-head review" with a valid review
+ * sitting on the PR. Worse, `githubHeadSha` is a `GITHUB_PR_CONTEXT_KEYS`
+ * coalescing key, so the retry inherits the same stale X: deterministic, not
+ * transient, and each cycle re-posts a duplicate review.
+ *
+ * Both heads are ones a reviewer was legitimately handed, so accept either. A
+ * review at any *third* commit still fails, which is the stale-review case the
+ * guard exists for.
+ *
+ * ⚠ This widening belongs **here**, not in `githubHasReviewerEvidenceForPr`.
+ * That function has three other callers and two want the opposite:
+ *
+ *  | caller | wants |
+ *  |---|---|
+ *  | this function (both attestation sites) | either head |
+ *  | `probeStaleKillReviewEvidence` | wake head ONLY — a false negative there authorizes a retry, i.e. a double review (BLO-18030) |
+ *  | `github-status-delivery-outbox` | the status target's own SHA — a different question entirely |
+ *
+ * **Known widening, stated rather than glossed:** a run that posted nothing can
+ * now be credited with a *different* run's review at the live head. That matches
+ * the outcome we want — do not re-review a PR whose current head already carries
+ * a trusted review — but it is a real loosening. Tighten by gating the second
+ * check on the review being newer than the run's `startedAt` if that ever bites.
+ */
+export async function verifyGithubReviewerEvidence(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ): Promise<GithubReviewerEvidenceVerification> {
   const prReview = derivePaperclipPrReview(contextSnapshot);
@@ -9351,11 +9410,32 @@ async function verifyGithubReviewerEvidence(
   }
 
   try {
-    const verified = await githubHasReviewerEvidenceForPr({
+    let verified = await githubHasReviewerEvidenceForPr({
       repoFullName: prReview.repoFullName,
       prNumber: prReview.prNumber,
       headSha: prReview.headSha,
     });
+    // BLO-28920: the wake's head is a dispatch-time snapshot; the reviewer
+    // reviews the live head. Re-check once against the live head on a miss —
+    // `headSha: null` reuses the callee's own `fetchPrHeadSha` fallback, so this
+    // adds no new resolution path. Only fires when the first pass found nothing,
+    // and only when a pinned head was what we searched (a null pinned head
+    // already resolved live on the first pass, so re-running would be identical).
+    let viaLiveHead = false;
+    if (!("error" in verified) && !verified.found && prReview.headSha) {
+      const liveHeadVerified = await githubHasReviewerEvidenceForPr({
+        repoFullName: prReview.repoFullName,
+        prNumber: prReview.prNumber,
+        headSha: null,
+      });
+      // A failure of the *second* pass must not mask the first pass's clean
+      // `not_found`: the run genuinely has no evidence at its pinned head, and
+      // reporting `unavailable` here would convert that into a retry.
+      if (!("error" in liveHeadVerified) && liveHeadVerified.found) {
+        verified = liveHeadVerified;
+        viaLiveHead = true;
+      }
+    }
     if ("error" in verified) {
       return {
         status: "unavailable",
@@ -9367,7 +9447,7 @@ async function verifyGithubReviewerEvidence(
     }
     return {
       status: verified.found ? "found" : "not_found",
-      ...(verified.found ? { via: verified.via } : {}),
+      ...(verified.found ? { via: verified.via, ...(viaLiveHead ? { viaLiveHead: true } : {}) } : {}),
       repoFullName: prReview.repoFullName,
       prNumber: prReview.prNumber,
       headSha: prReview.headSha,
@@ -22376,6 +22456,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             headSha: verification.headSha,
             outcome: verification.status,
             ...(verification.status === "found" ? { via: verification.via } : {}),
+            // BLO-28920: the review was matched on the PR's live head, not the
+            // head this wake pinned. Absent when they agreed.
+            ...(verification.status === "found" && verification.viaLiveHead ? { viaLiveHead: true } : {}),
             ...(verification.status === "unavailable" ? { reason: verification.reason } : {}),
           },
         });
@@ -30134,6 +30217,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             headSha: verification.headSha,
             outcome: verification.status,
             ...(verification.status === "found" ? { via: verification.via } : {}),
+            // BLO-28920: the review was matched on the PR's live head, not the
+            // head this wake pinned. Absent when they agreed.
+            ...(verification.status === "found" && verification.viaLiveHead ? { viaLiveHead: true } : {}),
             ...(verification.status === "unavailable" ? { reason: verification.reason } : {}),
           },
         });
