@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -23,6 +23,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateCompanyScopedTestState } from "./helpers/truncate-company-scoped-test-state.js";
 import { errorHandler } from "../middleware/index.js";
 import { logger } from "../middleware/logger.js";
 import { issueRoutes } from "../routes/issues.js";
@@ -422,17 +423,21 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // Defensive: a test that arms the seam but never reaches it must not leak
     // the hook into the next test.
     pauseHoldSeam.onNextCheck = null;
-    // BLO-33498: one TRUNCATE, not a 13-statement DELETE sequence. The sequence was
-    // correctly ordered (comments before issues) and still failed, because ordering
-    // only helps if nothing writes DURING teardown. Vitest does not cancel a test's
-    // async work when it fails it for timeout, so an abandoned escalation kept
-    // inserting comments and landed one in the window between `delete(issueComments)`
-    // and `delete(issues)` nine statements later — teardown then died on
-    // `issue_comments_issue_id_issues_id_fk` and reddened whichever test ran next.
-    // A single statement has no such window. `companies` cascades to every
-    // company-scoped table; `environments` declares no FKs at all, so it will not be
-    // reached by that cascade and has to be named as a second root.
-    await db.execute(sql.raw(`TRUNCATE TABLE "companies", "environments" CASCADE`));
+    // BLO-33498: the hand-ordered DELETE list was correctly ordered (comments nine
+    // statements before issues) and still failed, because ordering only helps while
+    // nothing else is writing. `request(app)` resolves when the response is flushed,
+    // not when the handler has settled, so a best-effort trailing write can still be
+    // in flight when `afterEach` starts; landing between the child and parent delete
+    // it broke `issue_comments_issue_id_issues_id_fk`. Ordering was never the bug.
+    //
+    // This is the shared helper, not a local TRUNCATE, and the difference is
+    // load-bearing: a bare `TRUNCATE ... CASCADE` takes ACCESS EXCLUSIVE on the whole
+    // cascade and deadlocks (40P01) against those same stragglers — a hand-rolled one
+    // here failed 2/189 in a single run. The helper wraps it in a transaction-scoped
+    // advisory lock plus transient-deadlock retry (the "v513 saga"). `environments`
+    // declares no FK to `companies`, so the cascade cannot reach it and it has to be
+    // named as a second root.
+    await truncateCompanyScopedTestState(db, { extraTruncateTables: ["environments"] });
   });
 
   afterAll(async () => {
