@@ -39,9 +39,32 @@ function reviewerName(entry) {
   return r.login ?? r.slug ?? r.name ?? null;
 }
 
+/**
+ * Stable slugs for the four things this check can find wrong.
+ *
+ * These exist so a caller can key on *which* control broke without parsing the
+ * human-facing prose, which embeds reviewer logins and observed values and so
+ * changes for cosmetic reasons. The alert path promotes these to a label, where
+ * the value has to be stable enough that an unchanged violation set produces an
+ * unchanged Alertmanager fingerprint (BLO-22329 / PEN-2863).
+ */
+export const VIOLATION_KINDS = {
+  REQUIRED_REVIEWERS_RULE: 'required_reviewers_rule',
+  REQUIRED_REVIEWERS_MEMBERSHIP: 'required_reviewers_membership',
+  CAN_ADMINS_BYPASS: 'can_admins_bypass',
+  PROTECTED_BRANCHES: 'protected_branches',
+};
+
 export function evaluateEnvironmentProtection(env, options = {}) {
   const expected = options.expectedReviewers ?? RATIFIED_REVIEWERS;
   const violations = [];
+  const violationKinds = [];
+
+  /** Keep the prose and its slug in lockstep — a violation must never be one without the other. */
+  const violation = (kind, message) => {
+    violations.push(message);
+    violationKinds.push(kind);
+  };
 
   const rule = (env.protection_rules ?? []).find((r) => r.type === 'required_reviewers');
   const reviewers = Array.isArray(rule?.reviewers)
@@ -49,7 +72,8 @@ export function evaluateEnvironmentProtection(env, options = {}) {
     : [];
 
   if (rule == null || reviewers.length === 0 || rule.prevent_self_review !== true) {
-    violations.push(
+    violation(
+      VIOLATION_KINDS.REQUIRED_REVIEWERS_RULE,
       'required_reviewers: missing, or reviewers is empty, or prevent_self_review is not true',
     );
   } else {
@@ -65,7 +89,8 @@ export function evaluateEnvironmentProtection(env, options = {}) {
       const parts = [];
       if (added.length > 0) parts.push(`unexpected ${JSON.stringify(added)}`);
       if (removed.length > 0) parts.push(`missing ${JSON.stringify(removed)}`);
-      violations.push(
+      violation(
+        VIOLATION_KINDS.REQUIRED_REVIEWERS_MEMBERSHIP,
         `required_reviewers membership: ${parts.join(', ')} ` +
           `(ratified set is ${JSON.stringify(expected)})`,
       );
@@ -73,13 +98,15 @@ export function evaluateEnvironmentProtection(env, options = {}) {
   }
 
   if (env.can_admins_bypass !== false) {
-    violations.push(
+    violation(
+      VIOLATION_KINDS.CAN_ADMINS_BYPASS,
       `can_admins_bypass: expected false, got ${JSON.stringify(env.can_admins_bypass)}`,
     );
   }
 
   if (env.deployment_branch_policy?.protected_branches !== true) {
-    violations.push(
+    violation(
+      VIOLATION_KINDS.PROTECTED_BRANCHES,
       'deployment_branch_policy.protected_branches: expected true, got ' +
         `${JSON.stringify(env.deployment_branch_policy?.protected_branches)}`,
     );
@@ -88,6 +115,7 @@ export function evaluateEnvironmentProtection(env, options = {}) {
   return {
     compliant: violations.length === 0,
     violations,
+    violationKinds,
     observed: {
       reviewers,
       prevent_self_review: rule?.prevent_self_review ?? null,
@@ -157,7 +185,7 @@ async function main() {
     return;
   }
 
-  const { compliant, violations, observed } = evaluateEnvironmentProtection(env, {
+  const { compliant, violations, violationKinds, observed } = evaluateEnvironmentProtection(env, {
     expectedReviewers,
   });
 
@@ -178,7 +206,7 @@ async function main() {
   for (const violation of violations) {
     console.error(`  - ${violation}`);
   }
-  writeSummary({ status: 'drift', repo, environment: environmentName, violations, observed });
+  writeSummary({ status: 'drift', repo, environment: environmentName, violations, violationKinds, observed });
   process.exitCode = 1;
 }
 

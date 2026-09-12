@@ -185,6 +185,75 @@ test('evaluateEnvironmentProtection: reports all three violations independently 
   assert.equal(result.violations.length, 3);
 });
 
+// ── violationKinds ───────────────────────────────────────────────────────────
+// The alert path promotes these slugs to an Alertmanager label so a changed
+// violation set changes the fingerprint (PEN-2863). They therefore have to stay
+// in lockstep with the prose and must not carry any observed value.
+
+test('evaluateEnvironmentProtection: violationKinds stays in lockstep with violations', () => {
+  const compliant = evaluateEnvironmentProtection(COMPLIANT_ENV);
+  assert.deepEqual(compliant.violationKinds, []);
+
+  const everythingUnset = evaluateEnvironmentProtection({});
+  assert.equal(everythingUnset.violationKinds.length, everythingUnset.violations.length);
+});
+
+test('evaluateEnvironmentProtection: a membership widening is kind-tagged distinctly from a bypass flip', () => {
+  // The live 2026-09-01 shape: kkroo added, but can_admins_bypass still false.
+  const widened = evaluateEnvironmentProtection({
+    ...COMPLIANT_ENV,
+    protection_rules: [
+      { id: 61677470, type: 'branch_policy' },
+      {
+        id: 61904232,
+        type: 'required_reviewers',
+        prevent_self_review: true,
+        reviewers: [...RATIFIED_REVIEWERS, 'kkroo'].map(user),
+      },
+    ],
+  });
+  assert.deepEqual(widened.violationKinds, ['required_reviewers_membership']);
+
+  // The 2026-08-08 compound: the same widening PLUS the admin bypass route.
+  const compound = evaluateEnvironmentProtection({
+    ...COMPLIANT_ENV,
+    can_admins_bypass: true,
+    protection_rules: [
+      { id: 61677470, type: 'branch_policy' },
+      {
+        id: 61904232,
+        type: 'required_reviewers',
+        prevent_self_review: true,
+        reviewers: [...RATIFIED_REVIEWERS, 'kkroo'].map(user),
+      },
+    ],
+  });
+  assert.deepEqual(compound.violationKinds, [
+    'required_reviewers_membership',
+    'can_admins_bypass',
+  ]);
+});
+
+test('evaluateEnvironmentProtection: violation kinds carry no observed values', () => {
+  // A slug that embedded a login would change the alert fingerprint whenever a
+  // reviewer changed, re-firing for a drift that had not actually changed kind.
+  const result = evaluateEnvironmentProtection({
+    ...COMPLIANT_ENV,
+    protection_rules: [
+      { id: 61677470, type: 'branch_policy' },
+      {
+        id: 61904232,
+        type: 'required_reviewers',
+        prevent_self_review: true,
+        reviewers: [...RATIFIED_REVIEWERS, 'kkroo'].map(user),
+      },
+    ],
+  });
+  for (const kind of result.violationKinds) {
+    assert.match(kind, /^[a-z_]+$/, `kind ${JSON.stringify(kind)} must be a bare slug`);
+  }
+});
+
 // ── fetchEnvironment ──────────────────────────────────────────────────────────
 
 test('fetchEnvironment: passes through the environment path, repo, and token', async () => {
