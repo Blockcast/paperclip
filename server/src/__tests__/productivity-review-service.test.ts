@@ -6432,6 +6432,139 @@ describeEmbeddedPostgres("productivity review service", () => {
     });
   });
 
+  // BLO-33477: retirement-scan starvation, the same defect BLO-30303 fixed on
+  // the source scan. `closeOpenSuppressedReviews` is the only path that can
+  // retire an open review, and it only writes to a review it *retires* — a
+  // review that is scanned and correctly declined (its alarm still stands) has
+  // nothing written back, so its `updatedAt` never advances. Under
+  // `asc(updatedAt)` the same oldest-MAX_CANDIDATE_ISSUES declined rows
+  // re-occupied the window on every pass forever, and no review sorting behind
+  // them could ever be evaluated.
+  //
+  // As in BLO-30303, the assertion that matters is rotation *across* passes,
+  // not reachability on any single one: on pass 1 every row's watermark is
+  // still null, so the target legitimately sorts outside the window. What the
+  // fix guarantees is that pass 2 reaches it. Pre-fix this is red at any number
+  // of passes, which is what distinguishes a rotation key from a cap increase.
+  it("retires a review that sorts outside one retirement-scan window (BLO-33477)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "done",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+
+    // Fill one whole window with open reviews whose alarm still stands. Their
+    // trigger is `no_comment_streak`, which completion never invalidates, so
+    // the retirement loop scans them and declines every one — writing nothing
+    // back, which is the whole mechanism. Their sources are `done` so the
+    // source-candidate scan cannot mint anything new for them and perturb the
+    // window. Each needs its own source: `issues_active_productivity_review_uq`
+    // allows at most one active review per (company, originId).
+    const decoyCount = 250;
+    const decoyAt = new Date("2026-04-01T00:00:00.000Z");
+    const decoySourceIds = Array.from({ length: decoyCount }, () => randomUUID());
+    const decoyReviewIds = Array.from({ length: decoyCount }, () => randomUUID());
+    await db.insert(issues).values(
+      decoySourceIds.map((id, i) => ({
+        id,
+        companyId: seeded.companyId,
+        title: `Decoy source ${i}`,
+        status: "done" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.coderId,
+        originKind: "manual",
+        issueNumber: 1000 + i,
+        identifier: `${seeded.issuePrefix}-${1000 + i}`,
+        createdAt: decoyAt,
+        updatedAt: decoyAt,
+      })),
+    );
+    await db.insert(issues).values(
+      decoyReviewIds.map((id, i) => ({
+        id,
+        companyId: seeded.companyId,
+        title: `Decoy review ${i}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.managerId,
+        parentId: decoySourceIds[i],
+        originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+        originId: decoySourceIds[i],
+        originFingerprint: `productivity-review:${decoySourceIds[i]}`,
+        issueNumber: 2000 + i,
+        identifier: `${seeded.issuePrefix}-${2000 + i}`,
+        // Older than the target on both keys, so the target sorts outside the
+        // window under the pre-fix `updatedAt` order *and* under the fixed
+        // `coalesce(productivityScannedAt, createdAt)` order on pass 1.
+        createdAt: decoyAt,
+        updatedAt: decoyAt,
+      })),
+    );
+    await db.insert(activityLog).values(
+      decoyReviewIds.map((id, i) => ({
+        companyId: seeded.companyId,
+        actorType: "system",
+        actorId: "system",
+        action: "issue.productivity_review_created",
+        entityType: "issue",
+        entityId: id,
+        details: { trigger: "no_comment_streak", sourceIssueId: decoySourceIds[i] },
+        createdAt: decoyAt,
+      })),
+    );
+
+    // The target: newest open review, source already `done`, so it is retirable
+    // the moment the scan actually reaches it. `createdAt` must be strictly
+    // before `now`: on pass 2 the decoys carry a watermark of exactly `now`, so
+    // an equal `createdAt` would tie and then lose the `asc(updatedAt)`
+    // tiebreak to them, leaving the target outside the window even post-fix.
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: new Date("2026-04-27T00:00:00.000Z"),
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: { trigger: "long_active_duration", sourceIssueId: seeded.issueId },
+    });
+
+    const service = productivityReviewService(db);
+
+    const first = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    // Pass 1 scans a full window and retires nothing — the funnel shape a
+    // starved sweep has, and the reason AC4 wants it counted rather than silent.
+    expect(first.retirementScanned).toBe(decoyCount);
+    expect(first.retirementRetired).toBe(0);
+    expect(first.retirementDeclined).toBe(decoyCount);
+
+    const second = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    // Pre-fix pass 2 re-scans the identical 250 decoys and this is 0 forever.
+    expect(second.retirementRetired).toBe(1);
+    expect(second.closedTerminalSourceReviews).toBe(1);
+    const [review] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review?.status).toBe("done");
+  }, 120_000);
+
   it("does not close a long-active productivity review when the source was cancelled", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
