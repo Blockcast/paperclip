@@ -701,7 +701,49 @@ jobs:
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}
     # ARC setup plus the sequential build-gap typechecks exceeded the previous
     # 20-minute ceiling while the final UI typecheck was still making progress.
-    timeout-minutes: 40
+    #
+    # 50, not 40. BLO-33313 swept 598 pr.yml runs (2026-09-04..09-12): p100 of
+    # 459 successful runs here was 38.2m, i.e. 96% of the old 40m cap,
+    # with a cap-band kill to match (run 34286001265, cancelled at 40.3m while
+    # sibling jobs ran on and succeeded for another 37m -- so the run was alive
+    # and the cancel was job-scoped, not a push supersede). 45 would pass that
+    # row's own "p100 <= 85% of cap" test by a tenth of a point, which is not a
+    # margin; 50 puts p100 at 76%.
+    #
+    # POOL-OCCUPANCY MODEL, shared by every cap BLO-33313 raised (its AC4).
+    # These jobs run on arc-paperclip-general (maxRunners 16, observed at 16/16
+    # with runners pending -- BLO-22835) or, for merge_group, arc-merge-queue
+    # (maxRunners 12). Raising a cap by D minutes costs nothing on a job that
+    # finishes; only a job that HANGS to the ceiling burns the delta. So the
+    # worst case is D runner-minutes per hang -- one slot, i.e. 1/16 of the
+    # pull-request pool, held D minutes longer. Against that, every ceiling kill
+    # the raise converts into a success returns the whole old cap AND the re-run
+    # the kill forces, which nothing here counts. Cap-band kills are an upper
+    # bound on hangs, so each raise below is at worst old_cap : D per kill --
+    # 40:10 here. Re-derive if arc-paperclip-general shrinks (BLO-23434,
+    # BLO-25404, BLO-30085).
+    #
+    # The whole-file trade, as a number. The window held 16 cap-band kills
+    # across the four caps raised here (Build 7, General tests 6, Typecheck 2,
+    # Canary 1) costing 800 dead runner-minutes. If EVERY one of them were a
+    # true hang the raises would add 7*5 + 6*20 + 2*10 + 1*5 = 180 runner-
+    # minutes per window and recover nothing; if every one were a ceiling kill
+    # they recover all 800 plus the forced re-runs. Break-even is therefore a
+    # 180/800 = 23% ceiling-kill share. The evidence says the real share is far
+    # above that: the kill durations are CONTIGUOUS with the upper tail of the
+    # successful distribution (successful Builds reach 20.0m and the kills land
+    # at 20.0-20.8m; successful server shards reach 89.7m and the kills land at
+    # 90.3-90.5m), which is the ceiling signature -- a genuinely hung job has no
+    # reason to stop within half a minute of p100.
+    #
+    # Honest caveat: the kills are not uniform in time. 11 of the 16 fall on
+    # 2026-09-06 alone, so a large share of this cost is one contention
+    # episode rather than steady-state work growth (BLO-33313 lists that
+    # separation as not verified, and this sweep does not settle it either).
+    # That argues FOR the headroom rather than against it -- absorbing a bad
+    # runner day instead of converting it into discarded work is what the
+    # margin is for -- but do not read 800/window as a steady-state rate.
+    timeout-minutes: 50
 
     steps:
       - name: Checkout repository
@@ -876,6 +918,17 @@ jobs:
     # precisely the slow-cold-migration case this lane exists to catch, discarding the
     # diagnostics the watchdog is meant to preserve. Keep this above 3 * (270s + 150s)
     # plus setup margin if either budget in the suite changes.
+    #
+    # BLO-33313 AC3 audited this cap and deliberately LEFT it at 30. p100 of
+    # 486 successful runs is 27.3m = 91% of the cap, which fails that
+    # row's "p100 <= 85% of cap" test -- but that test is the wrong instrument
+    # here, because this cap is derived from the suite's own declared budget
+    # (the 3 * (270s + 150s) above) rather than fitted to an observed
+    # distribution. p50 is 5.3m and p90 8.9m, so the outlier is one run
+    # that spent most of the budget the suite declares for itself: the cap
+    # working as designed, not a cap running out of room. Zero cap-band
+    # kills in 598 runs. Re-derive this number when MIGRATION_TIMEOUT_MS,
+    # TEST_TIMEOUT_MS, or the iteration count changes -- NOT when p100/cap moves.
     timeout-minutes: 30
 
     steps:
@@ -928,7 +981,34 @@ jobs:
     # ARC node storage. A server shard reached the previous 60-minute ceiling
     # while still advancing through passing suites, so retain a bounded margin
     # without treating runner I/O contention as a test failure.
-    timeout-minutes: 90
+    #
+    # PER-VARIANT, not matrix-wide -- BLO-33313 AC2. One cap across six jobs of
+    # very different size was simultaneously too tight for one half of the
+    # matrix and roughly 3x too loose for the other. p100 of successful runs
+    # against the old single 90m cap: server 4/4 89.7m (100%), server 2/4
+    # 89.3m (99%), server 1/4 88.3m (98%), server 3/4 81.4m (90%),
+    # workspaces-a 55.9m (62%), workspaces-b 25.7m (29%). All SIX cap-band
+    # kills in the window were server shards -- 4/4 x3, 2/4 x2, 1/4 x1, and
+    # ZERO on either workspaces shard. Run 34023045937 is the clean instance:
+    # three cancels spread over 2h06m (Build 09:51Z, server 1/4 11:29Z, server
+    # 4/4 11:57Z) with Canary, Typecheck and k8s-ro all SUCCEEDING in between.
+    # A push supersede cancels every in-flight job at once, so a multi-hour
+    # spread rules it out; across the whole window the two populations separate
+    # cleanly, every supersede landing within 29s and every kill either alone in
+    # its run or 116s-7561s from the next cancel.
+    #
+    # 110 puts the server shards at 82%. 75 and 45 put workspaces-a/-b at
+    # 75% and 57% while LOWERING the ceiling a hung workspaces job
+    # can burn -- by 15 and 45 minutes respectively -- which a single
+    # matrix-wide 110 would instead have raised for them. See
+    # typecheck_release_registry above for the pool-occupancy model.
+    #
+    # 110 is a ceiling raise and not the durable fix for the server shards.
+    # BLO-28956 (the 2.0x serialized route/authz imbalance across those four
+    # shards) would LOWER their p100 instead of raising their ceiling. This row
+    # is deliberately NOT blocked on it: that row is unowned backlog, and these
+    # caps bite today. Bring 110 back down when it lands.
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       # Every matrix entry gets an isolated ARC pod/database. Serializing this
@@ -941,26 +1021,32 @@ jobs:
             group_label: server 1/4
             shard_index: 0
             shard_count: 4
+            timeout_minutes: 110
           - group: general-server
             group_label: server 2/4
             shard_index: 1
             shard_count: 4
+            timeout_minutes: 110
           - group: general-server
             group_label: server 3/4
             shard_index: 2
             shard_count: 4
+            timeout_minutes: 110
           - group: general-server
             group_label: server 4/4
             shard_index: 3
             shard_count: 4
+            timeout_minutes: 110
           - group: general-workspaces-a
             group_label: workspaces-a
             shard_index: ''
             shard_count: ''
+            timeout_minutes: 75
           - group: general-workspaces-b
             group_label: workspaces-b
             shard_index: ''
             shard_count: ''
+            timeout_minutes: 45
 
     steps:
       - name: Checkout repository
@@ -1355,7 +1441,14 @@ jobs:
     # pool so pull_request and merge_group traffic cannot starve each other.
     # See typecheck_release_registry above.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}
-    timeout-minutes: 20
+    # 25, not 20. BLO-33313 measured p100 of 471 successful Build jobs at
+    # 20.0m against the old 20m cap -- 100%, the tightest ratio in this
+    # file -- with cap-band kills to match (run 34175815206, cancelled at 20.1m
+    # while 16 sibling jobs ran on for another 2.5h and most succeeded, so the
+    # run was alive and the cancel was job-scoped, not a push supersede). 25
+    # puts p100 at 80%. See typecheck_release_registry above for the
+    # pool-occupancy model.
+    timeout-minutes: 25
 
     steps:
       - name: Checkout repository
@@ -1393,7 +1486,14 @@ jobs:
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}
     # ARC setup/cache restore plus release.sh's mandatory workspace build hit
     # the previous 20-minute ceiling while the build was still progressing.
-    timeout-minutes: 40
+    #
+    # 45, not 40: BLO-33313 measured p100 of 463 successful runs at 37.0m =
+    # 92% of the old cap, with a cap-band kill to match (run 34286001265,
+    # cancelled at 40.3m while sibling jobs ran on and succeeded for another
+    # 37m, so the run was alive and the cancel was job-scoped). 45 puts p100 at
+    # 82%. See typecheck_release_registry above for the pool-occupancy
+    # model.
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
