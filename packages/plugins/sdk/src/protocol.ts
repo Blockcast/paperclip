@@ -430,6 +430,17 @@ export type PluginFencingPrecondition = {
 export const PLUGIN_FENCING_GENERATION_LOST_CODE = "fencing_generation_lost";
 
 /**
+ * Error code returned when a `state.set` carrying `ifMatch` finds the stored
+ * value is no longer the one the caller read.
+ *
+ * Distinct from {@link PLUGIN_FENCING_GENERATION_LOST_CODE} because the two
+ * answer different questions: the fence says "you were displaced as owner",
+ * this says "your read went stale". A plugin holding its generation can still
+ * lose this race to another writer of the same key.
+ */
+export const PLUGIN_STATE_PRECONDITION_FAILED_CODE = "state_precondition_failed";
+
+/**
  * A best-effort ownership check for `events.emit`. **This is not a fence, and
  * it is a separate type from {@link PluginFencingPrecondition} for exactly that
  * reason.**
@@ -1085,6 +1096,7 @@ export interface WorkerToHostMethods {
       stateKey: string;
       value: unknown;
       fencing?: PluginFencingPrecondition;
+      ifMatch?: unknown;
     },
     result: void,
   ];

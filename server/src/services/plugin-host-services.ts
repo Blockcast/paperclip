@@ -1340,6 +1340,7 @@ export function buildHostServices(
             value: params.value,
           },
           await resolveCallerFencingPrecondition(params.fencing),
+          params.ifMatch,
         );
       },
       async delete(params) {

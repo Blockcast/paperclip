@@ -537,6 +537,54 @@ host API to enumerate a plugin's configured companies, which `PluginConfigClient
 does not expose today (BLO-20595). Delivery is unaffected.
 
 
+### Concurrent writers of one alert-state record (BLO-20650)
+
+Two independent paths mutate the same `alert:<fingerprint>` row, and both are
+read-modify-writes: the **inbound webhook** (firing, re-fire, resolve) and the
+**`check-alert-escalations` sweep** (hold, rung advance, chain exhausted).
+
+They are not symmetric, and the fix follows that asymmetry:
+
+- The **webhook is authoritative.** It is reporting what Alertmanager says is
+  true right now, so it writes unconditionally and always wins.
+- The **sweep is speculative.** It reads the record, then spends several awaits
+  — `listComments`, `agents.get`, and on the cover rung an entire issue
+  creation — before writing `{ ...state, ... }` back. Every field it did not
+  intend to change rides along stale.
+
+The field that made this expensive is `resolvedAt`. A resolve landing inside
+the sweep's window was silently reverted to `null`, so the ladder advanced a
+rung on an alert that had already cleared — and *stayed* wrong, because nothing
+re-derives a resolution once it has been overwritten. The observable cost is a
+page, a reassignment, and eventually a `[user-cover]` row for an incident that
+is over.
+
+Every sweep-side write now passes `ifMatch` to `ctx.state.set`, a
+compare-and-swap added to the plugin SDK for this
+(`PluginStateClient.set(..., { ifMatch })`). The host applies the write only
+while the stored value is still exactly the one the sweep read, and performs
+the comparison and the write in **one** `UPDATE` statement — so unlike a
+re-read immediately before the write, there is no window left for the webhook
+to land in. `value_json` is `jsonb`, so the comparison is structural equality
+on the normalized document and needed no schema change.
+
+A refused swap is a **normal outcome, not an error**: the webhook won, and the
+sweep abandons the rung and re-decides on the next tick against fresh state.
+Rejection is raised with `code: "state_precondition_failed"` (distinct from
+`fencing_generation_lost`, which answers "am I still the owner?" rather than
+"is my read still current?"), and the sweep logs it at `info`. Crucially the
+swap sits **ahead of** the rung's user-visible effects, so losing it aborts
+before anyone is paged rather than after.
+
+Known limitation: on the chain-exhausted rung the cover issue is deliberately
+created *before* this write (so a failure there retries on the next sweep
+rather than silently never covering). A resolve winning the swap at that exact
+point therefore leaves the cover open with an unresolved member, because the
+resolve's own cascade ran before the cover existed. That is strictly better
+than the pre-CAS behaviour — which left the same orphan *and* resurrected
+`resolvedAt` — but closing it needs cover creation and the resolve cascade to
+share a claim.
+
 ### Bearer rotation in a Kubernetes deployment
 
 In a typical onprem-k8s deployment the bearer value lives in three places
