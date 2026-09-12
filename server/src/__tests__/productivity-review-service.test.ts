@@ -2927,6 +2927,80 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(second.scanned).toBeGreaterThan(0);
   }, 120_000);
 
+  // BLO-30303 Ally review follow-up: the first cut ordered `NULLS FIRST`, which
+  // is an *absolute* priority class — never-scanned rows outrank every scanned
+  // row no matter how long the scanned one has waited. Under a sustained influx
+  // of >= MAX_CANDIDATE_ISSUES new eligible rows per pass, the NULL cohort
+  // consumes the entire window on every pass and an already-scanned row is
+  // never revisited.
+  //
+  // That victim is the one that matters: a row is scanned while it is still
+  // healthy, and only becomes interesting once it *later* goes quiet. So the
+  // rows this detector exists to catch are exactly the rows NULLS FIRST can
+  // permanently preempt. Coalescing to `createdAt` makes the key a strict FIFO
+  // and closes it.
+  it("re-reaches an already-scanned issue under a sustained influx of never-scanned rows (BLO-30303)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await pinExecutionRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "running",
+      lockedAt: episodeStart,
+      lastOutputAt: new Date(now.getTime() - 10 * 60 * 1000),
+    });
+
+    // The victim is a row already visited on an earlier pass — the state every
+    // healthy issue is in before it goes quiet. It has waited longer than any
+    // row in the influx below, so a fair scan must reach it first.
+    await db
+      .update(issues)
+      .set({ productivityScannedAt: new Date("2026-04-20T00:00:00.000Z") })
+      .where(eq(issues.id, seeded.issueId));
+
+    // One full scan window of genuinely-new eligible rows per pass. They are
+    // *newer* than the victim's watermark, so under a FIFO key they queue
+    // behind it; under NULLS FIRST they preempt it outright.
+    const influxSize = 250;
+    const insertInflux = async (round: number) => {
+      await db.insert(issues).values(
+        Array.from({ length: influxSize }, (_, i) => {
+          // Widely-spaced blocks: a review issue created by the previous pass
+          // takes `max(issueNumber) + 1`, which would collide with a
+          // contiguous next block.
+          const n = 10_000 + round * 1_000 + i;
+          return {
+            id: randomUUID(),
+            companyId: seeded.companyId,
+            title: `Influx ${round}-${i}`,
+            status: "in_progress" as const,
+            priority: "medium" as const,
+            assigneeAgentId: seeded.coderId,
+            originKind: "manual",
+            issueNumber: n,
+            identifier: `${seeded.issuePrefix}-${n}`,
+            // Recent episode start: nothing for long_active_duration to fire on.
+            startedAt: new Date(now.getTime() - 60 * 1000),
+            createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+            updatedAt: new Date(now.getTime() - 60 * 60 * 1000),
+          };
+        }),
+      );
+    };
+
+    const service = productivityReviewService(db);
+    for (const round of [0, 1]) {
+      await insertInflux(round);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    }
+
+    // Pre-fix the NULL cohort fills the window on both passes and this is 0.
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews.map((review) => review.originId)).toContain(seeded.issueId);
+  }, 120_000);
+
   // BLO-19848 review follow-up: the tail clamp alone regressed the moment a
   // parked holder resumed. Once the run is `running` again it is genuinely
   // live, so the clamp releases — and because elapsed was still measured from
