@@ -123,6 +123,67 @@ const ATTESTED_HEAD_RE = new RegExp(
 );
 const ATTESTED_HEAD_GLOBAL_RE = new RegExp(ATTESTED_HEAD_RE.source, "gim");
 
+// Ally's structured verdict block — the primary source, mirroring
+// server/src/services/ally-review-detection.ts so this reader and the gate
+// cannot disagree about which tree was reviewed. The prose line above is the
+// fallback for a body carrying no block.
+const VERDICT_BLOCK_RE = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:(\d+)([\s\S]*?)-->`,
+  "gm",
+);
+const VERDICT_OPENER_RE = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:(?:\d+)`,
+  "gm",
+);
+const SUPPORTED_VERDICT_VERSION = 1;
+
+/**
+ * `{ kind: "absent" }` when no block is present (fall back to prose),
+ * `{ kind: "unreadable" }` when one is present but cannot be trusted (fail
+ * closed — never fall back), or `{ kind: "ok", head }`.
+ */
+function structuredVerdictHead(text) {
+  const blocks = Array.from(text.matchAll(VERDICT_BLOCK_RE));
+  const openers = Array.from(text.matchAll(VERDICT_OPENER_RE));
+  // A truncated payload is a broken block, not an older review, so it must not
+  // fall through to the prose parser the block exists to replace.
+  if (openers.length > blocks.length) return { kind: "unreadable" };
+  if (blocks.length === 0) return { kind: "absent" };
+  if (blocks.length > 1) return { kind: "unreadable" };
+  if (Number(blocks[0][1]) !== SUPPORTED_VERDICT_VERSION) return { kind: "unreadable" };
+  let parsed;
+  try {
+    parsed = JSON.parse(blocks[0][2].trim());
+  } catch {
+    return { kind: "unreadable" };
+  }
+  const head = parsed?.head;
+  if (typeof head !== "string" || !/^[0-9a-f]{40}$/i.test(head.trim())) {
+    return { kind: "unreadable" };
+  }
+  return { kind: "ok", head: head.trim().toLowerCase() };
+}
+
+/**
+ * The head this body attests, from the structured block when it carries one and
+ * the prose line otherwise. Null on any ambiguity, which every caller reads as
+ * "not a signal for this head".
+ *
+ * Asymmetric on purpose, matching `extractAllyReviewedHeadSha`: only a prose
+ * line *disagreeing* with the block is fatal. An absent or unparseable prose
+ * line is not — that is the #1675 body (an attested SHA trailed by a
+ * parenthetical), and requiring the prose to parse would put the retired regex
+ * back on the critical path.
+ */
+function attestedHeadFrom(text) {
+  const block = structuredVerdictHead(text);
+  if (block.kind === "unreadable") return null;
+  const attestations = Array.from(text.matchAll(ATTESTED_HEAD_GLOBAL_RE));
+  const proseHead = attestations.length === 1 ? attestations[0][1].toLowerCase() : null;
+  if (block.kind === "absent") return proseHead;
+  return proseHead !== null && proseHead !== block.head ? null : block.head;
+}
+
 const ALLY_REVIEW_LANES = ["app", "seat"];
 
 function normalizedLogin(login) {
@@ -161,9 +222,8 @@ function reviewDetails(reviews) {
 function canonicalReviewHead(body) {
   const text = String(body ?? "");
   const headings = Array.from(text.matchAll(CANONICAL_REVIEW_HEADING_RE));
-  const attestations = Array.from(text.matchAll(ATTESTED_HEAD_GLOBAL_RE));
-  if (headings.length !== 1 || attestations.length !== 1) return null;
-  return attestations[0][1].toLowerCase();
+  if (headings.length !== 1) return null;
+  return attestedHeadFrom(text);
 }
 
 // The two distinct GitHub principals required by the protected-merge policy.
@@ -227,8 +287,7 @@ export function hasStillPresentDisposition(body) {
 }
 
 export function attestedHead(body) {
-  const match = ATTESTED_HEAD_RE.exec(String(body ?? ""));
-  return match ? match[1].toLowerCase() : null;
+  return attestedHeadFrom(String(body ?? ""));
 }
 
 export function operativeAllyReviews(reviews, headSha, lane = null) {

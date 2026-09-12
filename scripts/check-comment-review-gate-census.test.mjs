@@ -53,7 +53,7 @@ describe("admitsNothingEvaluated", () => {
   it("does not flag a genuine reviewed-and-clean description", () => {
     assert.equal(
       admitsNothingEvaluated(
-        "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
+        "Ally's most recent consolidated-review comment for this head reports no unresolved findings, per its structured ally-verdict block.",
       ),
       false,
     );
@@ -126,7 +126,7 @@ describe("findPrViolations", () => {
         pr([
           status({
             description:
-              "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
+              "Ally's most recent consolidated-review comment for this head reports no unresolved findings, per its structured ally-verdict block.",
           }),
         ]),
       ),

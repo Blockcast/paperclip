@@ -79,17 +79,83 @@ REVIEWED_HEAD_PATTERN = re.compile(
 )
 
 
+# Ally's structured verdict block -- the primary source, mirroring
+# server/src/services/ally-review-detection.ts so this reader and the merge gate
+# cannot disagree about which tree was reviewed. The prose line above is the
+# fallback for a body that carries no block.
+VERDICT_BLOCK_PATTERN = re.compile(
+    r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)<!--[ \t]*ally-verdict:(\d+)(.*?)-->",
+    re.MULTILINE | re.DOTALL,
+)
+VERDICT_OPENER_PATTERN = re.compile(
+    r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)<!--[ \t]*ally-verdict:\d+", re.MULTILINE
+)
+SUPPORTED_VERDICT_VERSION = 1
+FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+
+# Same latitude the previous `startswith("## Ally") and "Consolidated PR Review"
+# in body` pair allowed, minus the first-byte anchor.
+CONSOLIDATED_HEADING_PATTERN = re.compile(
+    r"^[ \t]*##[ \t]*Ally\b.*Consolidated PR Review", re.MULTILINE | re.IGNORECASE
+)
+
+
+def parse_verdict_block_head(body):
+    """Return ("ok", head) / ("absent", None) / ("unreadable", None).
+
+    "absent" means fall back to the prose line. "unreadable" means a block is
+    present but cannot be trusted, and must NOT fall back -- falling back would
+    put the retired prose regex back on the critical path for exactly the
+    bodies the block exists to carry.
+    """
+    text = body or ""
+    blocks = VERDICT_BLOCK_PATTERN.findall(text)
+    openers = VERDICT_OPENER_PATTERN.findall(text)
+    # An opener with no terminator is a truncated payload, not an older review.
+    if len(openers) > len(blocks):
+        return ("unreadable", None)
+    if not blocks:
+        return ("absent", None)
+    if len(blocks) > 1:
+        return ("unreadable", None)
+    raw_version, raw_payload = blocks[0]
+    if raw_version != str(SUPPORTED_VERDICT_VERSION):
+        return ("unreadable", None)
+    try:
+        parsed = json.loads(raw_payload.strip())
+    except ValueError:
+        return ("unreadable", None)
+    if not isinstance(parsed, dict):
+        return ("unreadable", None)
+    head = parsed.get("head")
+    if not isinstance(head, str) or not FULL_SHA_PATTERN.match(head.strip()):
+        return ("unreadable", None)
+    return ("ok", head.strip().lower())
+
+
 def parse_reviewed_head(body):
     """Return the single attested head OID, or None.
 
-    Requires EXACTLY ONE standalone attestation line. Zero means the body makes
-    no claim about which revision it covers; more than one is ambiguous. Both
-    fail closed -- the caller treats them as "not a signal for this head".
+    The structured block wins when present. Prose is the fallback and requires
+    EXACTLY ONE standalone attestation line: zero means the body makes no claim
+    about which revision it covers, more than one is ambiguous. Both fail closed
+    -- the caller treats them as "not a signal for this head".
+
+    Asymmetric on purpose, matching `extractAllyReviewedHeadSha`: only a prose
+    line *disagreeing* with the block is fatal. An absent or unparseable prose
+    line is not -- that is the #1675 body (an attested SHA trailed by a
+    parenthetical), which the prose regex cannot read.
     """
-    matches = REVIEWED_HEAD_PATTERN.findall(body or "")
-    if len(matches) != 1:
+    kind, block_head = parse_verdict_block_head(body)
+    if kind == "unreadable":
         return None
-    return matches[0].lower()
+    matches = REVIEWED_HEAD_PATTERN.findall(body or "")
+    prose_head = matches[0].lower() if len(matches) == 1 else None
+    if kind == "absent":
+        return prose_head
+    if prose_head is not None and prose_head != block_head:
+        return None
+    return block_head
 
 
 def attests_head(body, head_sha):
@@ -104,9 +170,11 @@ def attests_head(body, head_sha):
 
 
 def is_consolidated_ally_comment_for_head(body, head_sha):
+    # Not `startswith`: the verdict block legitimately precedes the heading, so
+    # anchoring on "## Ally" being the first byte misses Ally's own emitted
+    # bodies. Require the heading on its own line instead.
     return (
-        body.startswith("## Ally")
-        and "Consolidated PR Review" in body
+        CONSOLIDATED_HEADING_PATTERN.search(body or "") is not None
         and attests_head(body, head_sha)
     )
 
