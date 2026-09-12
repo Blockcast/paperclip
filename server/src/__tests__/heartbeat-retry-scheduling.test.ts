@@ -3120,6 +3120,58 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
+  // BLO-17938: the concurrency guard's `catch` sibling. Raised before the prompt
+  // bundle is assembled and before any Job exists, so it is retryable on exactly
+  // the same terms as `k8s_concurrent_run_blocked` — and was previously retried
+  // on none, falling through to the adapter_failed/process_lost tail.
+  it("retries k8s_concurrency_guard_unreachable for issue-backed and pr_review runs", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(true);
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: { reviewKind: "pr_review" },
+      }),
+    ).toBe(true);
+  });
+
+  it("does not retry k8s_concurrency_guard_unreachable without an issue or PR-review context", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: {},
+      }),
+    ).toBe(false);
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: { wakeReason: "heartbeat_timer" },
+      }),
+    ).toBe(false);
+  });
+
+  // BLO-17938 guardrail pin: widening the guard-unreachable arm must not reach
+  // the job_failed family, whose retry still requires proof nothing began.
+  it("leaves the job_failed adapterInvocationStarted guardrail intact", () => {
+    for (const errorCode of ["job_failed", "oom_killed", "exit_137"]) {
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode,
+          resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+        }),
+      ).toBe(false);
+    }
+  });
+
   it.each(["job_failed", "oom_killed", "exit_137"])(
     "retries %s only when durable evidence proves adapter invocation never began",
     (errorCode) => {
