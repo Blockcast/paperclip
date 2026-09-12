@@ -1608,7 +1608,25 @@ export function shouldScheduleAutomaticRunRetry(
 
   // Capacity refusals are safe to retry for durable issue work as well as PR
   // reviews. Timer and maintenance runs remain terminal to avoid retry leaks.
-  if (run.errorCode === "k8s_concurrent_run_blocked") {
+  //
+  // BLO-17938: `k8s_concurrency_guard_unreachable` belongs on this arm too. The
+  // claude-k8s adapter returns it from the `catch` around the concurrency
+  // guard's `listNamespacedJob` — a fail-closed refusal raised BEFORE the prompt
+  // bundle is assembled and before any Job is created, so no adapter invocation
+  // and no external work can have happened. It is the sibling of
+  // `k8s_concurrent_run_blocked` in the same guard (the `try` refuses, the
+  // `catch` cannot tell), differing only in that the K8s API was unreachable
+  // rather than busy — i.e. strictly more transient. It was nonetheless absent
+  // from every arm here, so it fell through to the `adapter_failed`/
+  // `process_lost` tail and was never retried at all, while `recovery/service.ts`
+  // already lists it in ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES — the platform
+  // treated it as a recoverable infra fault everywhere except the one place that
+  // could recover it. Same issue/PR-review scoping as its sibling; it takes the
+  // default bounded transient backoff from resolveAutomaticRunRetryOpts.
+  if (
+    run.errorCode === "k8s_concurrent_run_blocked" ||
+    run.errorCode === "k8s_concurrency_guard_unreachable"
+  ) {
     return isIssueRun || isPrReviewRetryContext(contextSnapshot);
   }
 
