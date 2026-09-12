@@ -232,7 +232,7 @@ The chart rule in `deploy/helm/paperclip/templates/prometheusrule.yaml` is a
 mirror on Blockcast: `prometheusRule.enabled` is false in
 `values.blockcast.yaml`. The production rule must also be landed in the two
 lockstep `Blockcast/onprem-k8s` alert files: the authoritative
-`monitoring/prometheus-configmap.yaml` key
+`monitoring/prometheus-rules-2-configmap.yaml` key
 `paperclip-runtime-alerts.rules.yml` and the CRD documentation copy. Then
 manually sync the `monitoring-rules` Argo application (BLO-19095). Merging
 this repository alone does not make the alert live. Before treating the

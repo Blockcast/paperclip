@@ -48,7 +48,7 @@ which is the same failure in a different costume.
 > than inferring it from a package name, and remember a selector that matches
 > nothing is a permanently-inert rule, not a visible failure (PEN-2579).
 > The **live** selector is the rendered literal in
-> `monitoring/prometheus-configmap.yaml` in `Blockcast/onprem-k8s`, not this
+> `monitoring/prometheus-rules-2-configmap.yaml` in `Blockcast/onprem-k8s`, not this
 > chart's Helm value — this cluster has no prometheus-operator, so editing
 > the chart alone changes nothing that pages.
 
@@ -206,7 +206,7 @@ The chart copy at `deploy/helm/paperclip/templates/prometheusrule.yaml`
 **does not deploy on Blockcast** (`prometheusRule.enabled: false` in
 `values.blockcast.yaml` — see the file's header comment for why). The rule
 that fires in production lives in `Blockcast/onprem-k8s`, in both
-lockstep-enforced files: `monitoring/prometheus-configmap.yaml` (key
+lockstep-enforced files: `monitoring/prometheus-rules-2-configmap.yaml` (key
 `paperclip-runtime-alerts.rules.yml`, authoritative) and
 `paperclip/paperclip-runtime-alerts-prometheusrule.yaml` (CRD documentation
 copy).
@@ -217,7 +217,7 @@ Confirm the rule is in the live ConfigMap and in Prometheus `/api/v1/rules`
 before treating this alert as production observability:
 
 ```bash
-gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
+gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-rules-2-configmap.yaml \
   --jq '.content' | base64 -d | grep PaperclipPluginErrored
 ```
 

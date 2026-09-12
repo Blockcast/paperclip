@@ -221,7 +221,7 @@ not deploy on Blockcast** (`prometheusRule.enabled: false` in
 `values.blockcast.yaml` — `paperclip-ci-deploy` has no RBAC on
 `prometheusrules.monitoring.coreos.com`). The rule that fires in production
 lives in `Blockcast/onprem-k8s`, in both lockstep-enforced files:
-`monitoring/prometheus-configmap.yaml` (key `paperclip-runtime-alerts.rules.yml`,
+`monitoring/prometheus-rules-2-configmap.yaml` (key `paperclip-runtime-alerts.rules.yml`,
 authoritative) and `paperclip/paperclip-runtime-alerts-prometheusrule.yaml`
 (CRD documentation copy). Added by Blockcast/onprem-k8s#1946.
 
