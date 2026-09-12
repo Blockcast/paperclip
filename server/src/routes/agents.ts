@@ -118,6 +118,7 @@ import { assertEnvironmentSelectionForCompany } from "./environment-selection.js
 import { recoveryService } from "../services/recovery/service.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
 import { readObject } from "../lib/objects.js";
+import { publicWorkspaceOperations, resolveWorkspaceRuntimeViewer } from "./workspace-response.js";
 import { listInvalidOrgChainDescendantIds } from "../services/agent-invokability.js";
 import {
   AGENT_PROFILE_CHANGE_CONSENT_FIELDS,
@@ -5040,7 +5041,14 @@ export function agentRoutes(
     const context = asRecord(run.contextSnapshot);
     const executionWorkspaceId = asNonEmptyString(context?.executionWorkspaceId);
     const operations = await workspaceOperations.listForRun(runId, executionWorkspaceId);
-    res.json(redactCurrentUserValue(operations, await getCurrentUserRedactionOptions()));
+    // Same projection as the execution-workspace route: this endpoint answers with the identical
+    // `WorkspaceOperation` rows carrying the same copied `command`/`cwd`, gated only on company
+    // scope, so withholding on one route and not the other leaves the exit open one URL over.
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, run.companyId);
+    res.json(redactCurrentUserValue(
+      publicWorkspaceOperations(operations, viewer),
+      await getCurrentUserRedactionOptions(),
+    ));
   });
 
   router.get("/workspace-operations/:operationId/log", async (req, res) => {
