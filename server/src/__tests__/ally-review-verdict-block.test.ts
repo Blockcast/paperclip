@@ -484,6 +484,79 @@ describe("BLO-32695 — the block path blocks on the prose path's severities", (
 });
 
 /**
+ * A severity key outside the vocabulary must make the block unreadable, not be
+ * dropped — the one fail-open the structured path could still reintroduce.
+ *
+ * Every blocking check consults BLOCKING_SEVERITIES, so a key outside it is
+ * never read by anything. Accept-then-ignore therefore makes `{"critcal": 1}`
+ * parse as a readable verdict that is *byte-indistinguishable from a clean
+ * one*: a verdict stating it found a Critical clears the head. Measured before
+ * the fix, on a body whose prose also said `### Critical Issues (1)`:
+ *
+ *     typo'd blocking key    parse=ok | actionable=false | refs=[]
+ *     control: clean         parse=ok | actionable=false | refs=[]
+ *
+ * Identical. And worse than the prose parser it replaces, which would have
+ * blocked on that heading — the block short-circuits it. That is BLO-29711's
+ * fail-open direction arriving through the new path, so it fails closed.
+ *
+ * Schema drift, not just typos: the vocabulary is a contract between a producer
+ * and a consumer that ship separately, so a renamed bucket has to be loud.
+ */
+describe("BLO-32695 — an unknown severity key fails closed, not open", () => {
+  const typod = (findings: unknown) =>
+    `${verdictBlock({ head: PR1675_HEAD, findings })}\n## Ally — Consolidated PR Review\n` +
+    `Reviewed head: ${PR1675_HEAD}\n\n### Critical Issues (1)\n- something is badly wrong`;
+
+  it("reads a misspelled blocking severity as unreadable, naming the key", () => {
+    expect(parseAllyVerdictBlock(typod({ critcal: 1, important: 0 }))).toMatchObject({
+      kind: "unreadable",
+      reason: /unsupported severity `critcal`/,
+    });
+  });
+
+  it("resolves it to a failure, not the clean verdict it used to mimic", () => {
+    expect(
+      evaluateCommentReviewGate({
+        headSha: PR1675_HEAD,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: [allyComment(typod({ critcal: 1, important: 0 }), "2026-09-07T15:41:42Z")],
+      }),
+    ).toMatchObject({ state: "failure", outcome: "unreadable_verdict" });
+  });
+
+  it("is now distinguishable from clean: null refs, not an empty list", () => {
+    // `[]` is "reviewed, found nothing"; `null` is "we could not read it".
+    // Collapsing the two is what let the typo pass as a clean review.
+    expect(extractAllyReportedFindingRefs(typod({ critcal: 1, important: 0 }))).toBeNull();
+    expect(extractAllyReportedFindingRefs(typod({ critical: 0, important: 0 }))).toEqual([]);
+  });
+
+  // Controls against over-tightening in either direction.
+  it("still reads every supported key, including non-blocking suggestions", () => {
+    expect(
+      parseAllyVerdictBlock(typod({ critical: 0, important: 0, suggestions: 2 })),
+    ).toMatchObject({ kind: "ok" });
+  });
+
+  it("does not constrain disposition severities, which are open by design", () => {
+    // #1675's ledger retires `prior:583085ded recommended-action 4` — failure #4
+    // of this row. The findings vocabulary is closed because a typo there clears
+    // a head; a disposition severity only ever names a finding to retire, so
+    // closing it would re-open the false red this row exists to fix.
+    expect(parseAllyVerdictBlock(verdictBlock(PR1675_VERDICT))).toMatchObject({
+      kind: "ok",
+      verdict: {
+        dispositions: [
+          { severity: "important", index: 1, verb: "fixed" },
+          { severity: "recommended-action", index: 4, verb: "withdrawn" },
+        ],
+      },
+    });
+  });
+});
+
+/**
  * The opener is line-anchored, so only a *real* block counts.
  *
  * Fencing is not the only way to quote, and withoutFencedCodeBlocks strips only

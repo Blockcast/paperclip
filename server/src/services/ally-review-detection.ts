@@ -293,13 +293,32 @@ export type AllyVerdictBlockParse =
  * would clear a head. The asymmetry is the contract's — `findings` is
  * mandatory, `dispositions` is genuinely absent on a review that retires
  * nothing.
+ *
+ * Returns the counts, or the reason they could not be read — the caller turns
+ * that string into `unreadable`. A reason rather than a bare `null` because an
+ * unsupported severity key is worth naming: it is almost always a typo, and
+ * the gate description is the only place Ally will see which key we rejected.
  */
-function asSeverityCounts(raw: unknown): Map<string, number> | null {
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+function asSeverityCounts(raw: unknown): Map<string, number> | string {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return "ally-verdict findings are not severity counts";
+  }
   const counts = new Map<string, number>();
   for (const [severity, value] of Object.entries(raw as Record<string, unknown>)) {
-    if (typeof value !== "number" || !Number.isInteger(value) || value < 0) return null;
-    counts.set(severity.trim().toLowerCase(), value);
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+      return "ally-verdict findings are not severity counts";
+    }
+    const key = severity.trim().toLowerCase();
+    // An unrecognized key must make the whole block unreadable, not be dropped.
+    // Dropping it is a fail-open: no blocking check ever consults a severity
+    // outside BLOCKING_SEVERITIES, so `{"critcal": 1}` parses as a readable
+    // verdict that is byte-indistinguishable from a clean one — a verdict
+    // stating it found a Critical would clear the head. That is the BLO-29711
+    // direction arriving through the structured path, so it fails closed here.
+    if (!VERDICT_SEVERITIES.has(key)) {
+      return `ally-verdict findings name unsupported severity \`${key}\``;
+    }
+    counts.set(key, value);
   }
   return counts;
 }
@@ -400,7 +419,7 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
     return { kind: "unreadable", reason: "ally-verdict block states no findings counts" };
   }
   const counts = asSeverityCounts(findings);
-  if (!counts) return { kind: "unreadable", reason: "ally-verdict findings are not severity counts" };
+  if (typeof counts === "string") return { kind: "unreadable", reason: counts };
   const ledger = asDispositions(dispositions);
   if (!ledger) return { kind: "unreadable", reason: "ally-verdict dispositions are malformed" };
 
@@ -508,6 +527,15 @@ const COUNTED_FINDINGS_BUCKET_PATTERN =
 // A severity added here must be one Ally's ledger can name in a disposition,
 // or it re-opens the unretirable carry from the other direction.
 const BLOCKING_SEVERITIES: ReadonlySet<string> = new Set(["critical", "important"]);
+
+// The full vocabulary a structured `findings` object may name. Derived from
+// BLOCKING_SEVERITIES so the subset relation cannot drift: adding a blocking
+// severity above automatically makes it readable here, and the only extra is
+// `suggestions`, which reads but never blocks.
+//
+// Anything outside this set makes the block `unreadable` — see asSeverityCounts
+// for why dropping an unknown key is a fail-open rather than a nicety.
+const VERDICT_SEVERITIES: ReadonlySet<string> = new Set([...BLOCKING_SEVERITIES, "suggestions"]);
 
 // Ally's disposition vocabulary is three words: `fixed` and
 // `no-longer-applicable` retire a prior finding, `still-present` asserts it
