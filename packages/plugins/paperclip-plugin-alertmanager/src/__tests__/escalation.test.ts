@@ -815,6 +815,48 @@ describe("BLO-20650 concurrent webhook + sweep on one alert-state record", () =>
     expect(store.read().escalationComplete).toBe(true);
   });
 
+  /**
+   * The chain-exhausted rung cannot claim the state before it acts: an
+   * `escalationComplete: true` written ahead of a failing `createCover` is
+   * short-circuited by the guard at the top of every later sweep, so the alert
+   * would never be covered at all. The cover therefore stays ahead of the CAS,
+   * and the race that ordering leaves open is compensated instead — the sweep
+   * closes the cover it just created once it learns the alert resolved under it.
+   */
+  it("closes the cover it just created when a resolve wins the chain-exhausted swap", async () => {
+    const exhausted: AlertStateRecord = { ...unresolved(), escalationAttempt: 1 };
+    const store = buildFakeStateStore(exhausted);
+    // reportsTo: null -> the chain is exhausted, so this sweep takes the cover rung.
+    const { ctx, mocks, store: covers } = sweepContext(exhausted, null);
+    mocks.state = store as never;
+
+    // Land the resolve *inside* `createCover`: `access.members.list` is an
+    // await there, after the membership guard and before the cover issue
+    // exists — so the resolve's own cascade finds no membership to close,
+    // which is exactly why the cover would otherwise be orphaned.
+    mocks.access.members.list = vi.fn(async () => {
+      await handleResolved(resolveContext(store), config(), resolvedAlert);
+      return [{ principalType: "user", principalId: "board-1", status: "active", membershipRole: "owner" }];
+    });
+
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    // The resolution survives, as on every other rung.
+    expect(store.read().resolvedAt).toBe("2026-07-11T02:00:00Z");
+    // No "chain exhausted while alert remains firing" announcement for an
+    // alert that had already cleared: the comment now sits behind the CAS.
+    expect(mocks.issues.createComment).not.toHaveBeenCalledWith(
+      "issue-1", expect.stringContaining("Agent chain exhausted"), "company-1",
+    );
+    // And the cover created in that window is closed rather than left sitting
+    // in a human queue. Both assertions fail without the compensating cascade:
+    // the membership stays open, which in turn blocks the closing claim, so
+    // `reconcileStuckCovers` cannot clean it up either.
+    const [coverRow] = [...covers.covers.values()];
+    expect(covers.members.get(`${coverRow.cover_issue_id}:issue-1`)?.resolved_at).not.toBeNull();
+    expect(coverRow.cancelled_at).not.toBeNull();
+  });
+
   it("refuses a stale sweep write against a record any other writer touched", async () => {
     // Same guard, non-resolve mutation: any concurrent rewrite must void the
     // sweep's read. Otherwise this would be a special case for one field
