@@ -421,6 +421,32 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
     },
   );
 
+  it.each([
+    "workspace_repo_mismatch",
+    "workspace_validation_failed",
+    "setup_failed",
+  ])(
+    "collapses issue_id/agent_id for pre-dispatch setup failure %s (BLO-28648)",
+    async (errorCode) => {
+      const labels = recordHeartbeatRunFailed({
+        agentId: "agent-a",
+        issueId: "issue-a",
+        adapter: "claude_k8s",
+        errorCode,
+        invocationSource: "capacity_blocked_retry",
+        isolationMode: "shared",
+      });
+      // Only run-isolated k8s_pod_schedule_failed keeps the real ids. Every other
+      // code — including every workspace refusal — collapses them, so a Prometheus
+      // selector of the form `error_code="<workspace code>", issue_id!="none"` can
+      // never match. BLO-28648 shipped exactly that alert; it loaded healthy and
+      // could not fire. Assert the collapse so the impossibility stays documented.
+      expect(labels.issue_id).toBe("none");
+      expect(labels.agent_id).toBe(UNKNOWN_AGENT_ID);
+      expect(labels.error_code).toBe(errorCode);
+    },
+  );
+
   it("collapses unknown invocation source to the bounded fallback (cardinality guardrail)", async () => {
     const labels = recordHeartbeatRunFailed({
       agentId: "agent-a",

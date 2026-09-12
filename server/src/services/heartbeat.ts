@@ -30978,7 +30978,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
             const failedAgent = setupFailureAgent ?? await getAgent(run.agentId).catch(() => null);
             if (failedAgent) {
+              // BLO-28648: pre-dispatch setup failures terminalize here rather than
+              // through the liveness finalization path, and this was the only
+              // `failed` write that never incremented the counter. The whole class
+              // was therefore invisible to Prometheus: `workspace_repo_mismatch`,
+              // `workspace_validation_failed`, `environment_not_found` and the
+              // `setup_failed` fallback have never produced a single sample, while
+              // adapter-returned codes (`k8s_job_create_failed`, …) always did.
+              // An alert written against this metric for a workspace refusal loaded
+              // healthy and could never fire — the failure mode is silence, so
+              // nothing surfaced the gap for 18 days. `k8sRunIsolation: null`
+              // matches the other out-of-try call site; the builder recovers
+              // isolation_mode from the run's persisted contextSnapshot.
+              // A stage-exit race converts this write into a cancellation, and a
+              // cancellation is not a failed run: the liveness path suppresses the
+              // same sample by coercing `outcome` to `cancelled`, so guard here to
+              // match rather than manufacture a false failure.
               if (!terminalDecision.pipelineStageExited) {
+                recordHeartbeatRunFailed(buildHeartbeatRunFailedMetricInput({
+                  agent: failedAgent,
+                  issueId: setupFailureIssueId,
+                  run: livenessRun,
+                  k8sRunIsolation: null,
+                }));
                 await refreshContinuationSummaryForRun(livenessRun, failedAgent).catch(() => undefined);
               }
               if (
