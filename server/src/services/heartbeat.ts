@@ -345,6 +345,7 @@ import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   buildIssueMonitorDispatchRearmPatch,
   buildIssueMonitorClearedPatch,
+  buildIssueMonitorEligibilityPatch,
   buildIssueMonitorTriggeredPatch,
   derivePersistedMonitorState,
   exhaustedMonitorClearReason,
@@ -25021,6 +25022,153 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { scanned: candidates.length, woken, skipped, failed };
   }
 
+  /**
+   * BLO-33539 — clear a monitor that is armed on an issue it can never reach.
+   *
+   * `tickDueIssueMonitors` only ever *selects* deliverable rows: agent-assigned
+   * and `in_progress`/`in_review`. Nothing examines the complement, so a row
+   * demoted out of that set keeps a populated `monitorNextCheckAt` and reads
+   * `scheduled` forever while being structurally incapable of firing —
+   * indistinguishable, on every triage surface, from a monitor that is simply
+   * not due yet.
+   *
+   * `applyMonitorTransition` and `buildIssueMonitorEligibilityPatch` already
+   * close this at the instant of a demotion, and three such transition-time
+   * fixes have shipped (checkout-restore, raw assignee demotion, bulk user
+   * removal). Each one has to be taught about one specific producer, and the
+   * defect is still live: BLO-22498 was parked `in_progress` -> `blocked` by
+   * `workspace_validation` recovery 2m37s before its monitor was due — a fourth
+   * producer, on a gate that had already gone green — and sat dead for two days.
+   * Enumerating producers has been tried three times and loses to every new
+   * recovery cause for free, so this pass deliberately does not know or care
+   * which write stranded the row.
+   *
+   * Three things it is careful NOT to do:
+   *
+   *  - It never grants a wake. An ineligible issue still gets nothing; the only
+   *    change is that the dead monitor stops claiming to be scheduled. Handing
+   *    out the wake the monitor could not deliver would bypass the very
+   *    eligibility rule the scheduler enforces.
+   *  - It skips non-active companies. Those rows cannot fire either, but the
+   *    cause is the company, not the issue, and it resolves if the company is
+   *    reactivated — so clearing them would destroy live state to fix nothing.
+   *  - It CASes on (status, monitorNextCheckAt). Candidate selection and the
+   *    clear are separate statements, so a concurrent checkout can re-promote
+   *    the row and arm a fresh monitor in between; without the guard this pass
+   *    would delete that new monitor and cause the exact stall it exists to
+   *    prevent.
+   *
+   * The monitor's `notes` are the whole record of what the run was waiting for,
+   * so they are preserved twice over: `buildIssueMonitorClearedPatch` keeps an
+   * audit copy on `executionState.monitor.notes`, and the activity entry below
+   * carries them alongside the clear reason. Deliberately an activity row and
+   * not an issue comment — a comment fires an `issue_commented` wake, which
+   * would turn a bookkeeping sweep into wake fan-out across every stranded row.
+   */
+  async function reconcileUndeliverableIssueMonitors(opts?: {
+    companyId?: string;
+    limit?: number;
+    /** Test seam: runs between candidate selection and the guarded clear. */
+    beforeClear?: () => Promise<void>;
+  }) {
+    const limit = opts?.limit ?? 200;
+    const candidates = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        executionPolicy: issues.executionPolicy,
+        executionState: issues.executionState,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
+        monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
+        monitorAttemptCount: issues.monitorAttemptCount,
+        monitorNotes: issues.monitorNotes,
+        monitorScheduledBy: issues.monitorScheduledBy,
+      })
+      .from(issues)
+      .innerJoin(companies, eq(companies.id, issues.companyId))
+      .where(
+        and(
+          eq(companies.status, "active"),
+          opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
+          sql`${issues.monitorNextCheckAt} is not null`,
+          // The exact complement of the scheduler's eligibility predicate.
+          sql`not (${issues.assigneeAgentId} is not null and ${issues.assigneeUserId} is null and ${issues.status} in ('in_progress', 'in_review'))`,
+        ),
+      )
+      .orderBy(asc(issues.monitorNextCheckAt), asc(issues.id))
+      .limit(limit);
+
+    let cleared = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    for (const candidate of candidates) {
+      try {
+        const patch = buildIssueMonitorEligibilityPatch(candidate);
+        if (Object.keys(patch).length === 0) {
+          skipped += 1;
+          continue;
+        }
+        if (opts?.beforeClear) await opts.beforeClear();
+
+        const updated = await db
+          .update(issues)
+          .set({ ...patch, updatedAt: new Date() })
+          .where(
+            and(
+              eq(issues.id, candidate.id),
+              eq(issues.status, candidate.status),
+              eq(issues.monitorNextCheckAt, candidate.monitorNextCheckAt!),
+            ),
+          )
+          .returning({ id: issues.id })
+          .then((rows) => rows[0] ?? null);
+
+        if (!updated) {
+          skipped += 1;
+          continue;
+        }
+        cleared += 1;
+
+        const clearReason = (patch.executionState as { monitor?: { clearReason?: string } } | null)
+          ?.monitor?.clearReason ?? null;
+        await logActivity(db, {
+          companyId: candidate.companyId,
+          actorType: "system",
+          actorId: "heartbeat_scheduler",
+          agentId: null,
+          runId: null,
+          action: "issue.monitor_cleared_undeliverable",
+          entityType: "issue",
+          entityId: candidate.id,
+          details: {
+            identifier: candidate.identifier,
+            clearReason,
+            status: candidate.status,
+            nextCheckAt: candidate.monitorNextCheckAt?.toISOString() ?? null,
+            attemptCount: candidate.monitorAttemptCount ?? 0,
+            // The record of what the run was waiting for. Kept here so it is
+            // readable without reaching into executionState.
+            notes: candidate.monitorNotes,
+          },
+        });
+      } catch (err) {
+        failed += 1;
+        logger.warn(
+          { err, issueId: candidate.id, outcome: "failed" },
+          "reconcileUndeliverableIssueMonitors clear failed",
+        );
+      }
+    }
+
+    return { scanned: candidates.length, cleared, skipped, failed };
+  }
+
   async function reconcileTaskWatchdogs(opts?: { companyId?: string | null; runId?: string | null }) {
     return taskWatchdogs.reconcileTaskWatchdogs({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
@@ -37242,6 +37390,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileProductivityReviews,
 
     reconcileResolvedBlockerDependents,
+    reconcileUndeliverableIssueMonitors,
     reconcileTaskWatchdogs,
 
     buildRunOutputSilence,

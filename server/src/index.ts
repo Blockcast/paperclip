@@ -1294,6 +1294,14 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...blockerDependentsSwept }, "startup resolved-blocker-dependents sweep enqueued wakes");
         }
 
+        const deadMonitors = await heartbeat.reconcileUndeliverableIssueMonitors();
+        if (deadMonitors.cleared > 0 || deadMonitors.failed > 0) {
+          logger.warn(
+            { ...deadMonitors },
+            "startup undeliverable-monitor reconciliation cleared monitors armed on ineligible issues (BLO-33539)",
+          );
+        }
+
         const failedWakeDispatches = await heartbeat.reconcileFailedWakeDispatches();
         if (failedWakeDispatches.recovered > 0 || failedWakeDispatches.exhausted > 0) {
           logger.warn(
@@ -1659,6 +1667,19 @@ export async function startServer(): Promise<StartedServer> {
               const swept = await heartbeat.reconcileResolvedBlockerDependents();
               if (swept.woken > 0 || swept.failed > 0) {
                 logger.warn({ ...swept }, "periodic resolved-blocker-dependents sweep enqueued wakes");
+              }
+            })
+            .then(async () => {
+              // BLO-33539: producer-agnostic backstop for a monitor armed on an
+              // issue the scheduler can never select. Transition-time guards
+              // each cover one demotion path; this pass covers the rest,
+              // including recovery parks that have no guard of their own.
+              const deadMonitors = await heartbeat.reconcileUndeliverableIssueMonitors();
+              if (deadMonitors.cleared > 0 || deadMonitors.failed > 0) {
+                logger.warn(
+                  { ...deadMonitors },
+                  "periodic undeliverable-monitor reconciliation cleared monitors armed on ineligible issues",
+                );
               }
             })
             .then(async () => {
