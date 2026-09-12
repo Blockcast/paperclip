@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   PROCESS_LOST_LIVENESS_NULL_METRIC,
   PROCESS_LOST_TOTAL_METRIC,
+  HEARTBEAT_RUN_FAILED_METRIC,
   __resetMetricsForTest,
   renderMetrics,
 } from "../services/metrics.js";
@@ -1608,6 +1609,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("uses the persisted stage-exit cancellation in the setup-error terminal path", async () => {
+    __resetMetricsForTest();
     const { companyId, agentId, runId, wakeupRequestId } = await seedQueuedIssueRunFixture();
     const svc = secretService(db);
     const secret = await svc.create(companyId, {
@@ -1658,6 +1660,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       level: "warn",
       payload: expect.objectContaining({ errorCode: "pipeline_stage_exited" }),
     }));
+    // BLO-28648: the setup path increments the failure counter, but a stage-exit
+    // race turns this terminalization into a cancellation. No failure sample may
+    // be emitted for it, matching the liveness path.
+    const { body: metrics } = await renderMetrics();
+    expect(metrics).not.toContain(`${HEARTBEAT_RUN_FAILED_METRIC}{`);
+    __resetMetricsForTest();
   });
 
   it("uses the persisted stage-exit cancellation in external-lifecycle recovery", async () => {

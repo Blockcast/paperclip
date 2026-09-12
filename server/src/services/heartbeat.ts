@@ -30990,13 +30990,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               // nothing surfaced the gap for 18 days. `k8sRunIsolation: null`
               // matches the other out-of-try call site; the builder recovers
               // isolation_mode from the run's persisted contextSnapshot.
-              recordHeartbeatRunFailed(buildHeartbeatRunFailedMetricInput({
-                agent: failedAgent,
-                issueId: setupFailureIssueId,
-                run: livenessRun,
-                k8sRunIsolation: null,
-              }));
+              // A stage-exit race converts this write into a cancellation, and a
+              // cancellation is not a failed run: the liveness path suppresses the
+              // same sample by coercing `outcome` to `cancelled`, so guard here to
+              // match rather than manufacture a false failure.
               if (!terminalDecision.pipelineStageExited) {
+                recordHeartbeatRunFailed(buildHeartbeatRunFailedMetricInput({
+                  agent: failedAgent,
+                  issueId: setupFailureIssueId,
+                  run: livenessRun,
+                  k8sRunIsolation: null,
+                }));
                 await refreshContinuationSummaryForRun(livenessRun, failedAgent).catch(() => undefined);
               }
               if (
