@@ -87,8 +87,19 @@ export function buildPodLogPath(companyId: string, agentId: string, runId: strin
 }
 
 /** Prompts above this size (bytes) are staged via a Secret instead of an
- *  init container env var, protecting against the ~1 MiB PodSpec limit. */
-const LARGE_PROMPT_THRESHOLD_BYTES = 256 * 1024;
+ *  init container env var.
+ *
+ *  The binding limit is NOT the ~1 MiB PodSpec cap (which this constant used to
+ *  be sized against, at 256 KiB) but Linux `MAX_ARG_STRLEN` — 32 pages = 131072
+ *  bytes — which caps each INDIVIDUAL string in `envp`, not just argv. The env
+ *  string is `PROMPT_CONTENT=<prompt>\0`, so a prompt of 131057 bytes or more
+ *  makes `execve` of the init container fail with E2BIG. Sized at 256 KiB, every
+ *  prompt in 131057..262144 took the env path and could never start: the pod
+ *  surfaced it as `k8s_pod_schedule_failed ... exit code 255`, which reads as a
+ *  cluster-capacity problem and sends you nowhere near the prompt (BLO-33420 —
+ *  routine a03b2236 lost every window for 12h once its prompt crossed 131 KB).
+ *  Keep this comfortably under 131057; the Secret path has no such limit. */
+const LARGE_PROMPT_THRESHOLD_BYTES = 120 * 1024;
 const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
 const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";

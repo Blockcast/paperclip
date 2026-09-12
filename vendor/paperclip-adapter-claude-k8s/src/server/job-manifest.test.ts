@@ -1780,8 +1780,8 @@ describe("buildJobManifest", () => {
       expect(promptSecret).toBeNull();
     });
 
-    it("returns promptSecret for prompts >256 KiB", () => {
-      // Build a prompt >256 KiB via a custom template
+    it("returns promptSecret for prompts over the threshold", () => {
+      // Build a prompt over the threshold via a custom template
       const largePrompt = "x".repeat(300 * 1024);
       ctx.config = { promptTemplate: largePrompt };
       const { promptSecret, job } = buildJobManifest({ ctx, selfPod });
@@ -1800,6 +1800,51 @@ describe("buildJobManifest", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const init = job.spec?.template?.spec?.initContainers?.[0];
       expect(init?.env?.[0]?.name).toBe("PROMPT_CONTENT");
+    });
+
+    // BLO-33420. The threshold used to be 256 KiB, sized against the ~1 MiB
+    // PodSpec cap. But `PROMPT_CONTENT=<prompt>\0` is a single `envp` string, and
+    // Linux caps each of those at MAX_ARG_STRLEN (32 pages = 131072 bytes) — so
+    // every prompt in 131057..262144 took the env path and `execve` failed E2BIG
+    // before the container ever ran. Kubernetes surfaced that as
+    // `k8s_pod_schedule_failed ... exit code 255`, which reads as cluster capacity
+    // and points nowhere near the prompt. Routine a03b2236 lost every 6h window
+    // for 12h this way, at 133205 and then 140442 bytes.
+    //
+    // Assert the INVARIANT rather than the numeral: whatever the threshold is, a
+    // prompt at it must still produce an env string that fits MAX_ARG_STRLEN.
+    const MAX_ARG_STRLEN = 131072;
+    it("never routes a prompt to the env path whose env string exceeds MAX_ARG_STRLEN", () => {
+      // Binary-search the largest prompt that still takes the env path.
+      let lo = 1;
+      let hi = 4 * MAX_ARG_STRLEN;
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        ctx.config = { promptTemplate: "x".repeat(mid) };
+        if (buildJobManifest({ ctx, selfPod }).promptSecret === null) lo = mid;
+        else hi = mid - 1;
+      }
+      ctx.config = { promptTemplate: "x".repeat(lo) };
+      const { job, promptSecret } = buildJobManifest({ ctx, selfPod });
+      expect(promptSecret).toBeNull();
+      const env = job.spec?.template?.spec?.initContainers?.[0]?.env?.find(
+        (e: { name: string }) => e.name === "PROMPT_CONTENT",
+      );
+      // `NAME=value` plus the NUL terminator must fit.
+      const envStringBytes = Buffer.byteLength(`PROMPT_CONTENT=${env?.value ?? ""}`) + 1;
+      expect(envStringBytes).toBeLessThanOrEqual(MAX_ARG_STRLEN);
+    });
+
+    it("routes the exact live BLO-33420 prompt sizes to the Secret path", () => {
+      // The two sizes that actually lost windows, as a true-positive control: a
+      // threshold regression back above 131056 fails here even if the invariant
+      // test above is somehow satisfied.
+      for (const bytes of [133205, 140442]) {
+        ctx.config = { promptTemplate: "x".repeat(bytes) };
+        const { promptSecret, job } = buildJobManifest({ ctx, selfPod });
+        expect(promptSecret, `${bytes} bytes must not take the env path`).not.toBeNull();
+        expect(job.spec?.template?.spec?.initContainers?.[0]?.env).toBeUndefined();
+      }
     });
   });
 
