@@ -1,8 +1,9 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ExecutionWorkspace, ProjectWorkspace } from "@paperclipai/shared";
+import type { ExecutionWorkspace, ProjectWorkspace, WorkspaceRuntimeService } from "@paperclipai/shared";
 import { errorHandler } from "../middleware/index.js";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
 import { projectRoutes } from "../routes/projects.js";
 import {
@@ -21,6 +22,64 @@ import {
 
 const SECRET_SENTINEL = "sentinel-runtime-value-must-not-egress";
 const SECOND_SENTINEL = "sentinel-nested-command-must-not-egress";
+
+/**
+ * `close-readiness` answers with `runtimeServices` rows directly, and `command`/`cwd` are the same
+ * operator strings promoted onto typed columns when the service started — so they need their own
+ * sentinels, distinct from the blob ones above, or a passing assertion cannot tell which exit it
+ * closed. Both invented; `command` is shaped like the inline-assignment idiom `sh -c` makes normal.
+ */
+const SERVICE_COMMAND_SENTINEL = "TOKEN_FIXTURE=sentinel-service-command-not-a-real-credential npm run dev";
+const SERVICE_CWD_SENTINEL = "/fixture/sentinel-service-cwd";
+
+function runtimeServiceFixture(overrides: Record<string, unknown> = {}): WorkspaceRuntimeService {
+  return {
+    id: "runtime-service-1",
+    companyId: "company-1",
+    projectId: null,
+    projectWorkspaceId: null,
+    executionWorkspaceId: "workspace-1",
+    issueId: null,
+    scopeType: "execution_workspace",
+    scopeId: "workspace-1",
+    serviceName: "api",
+    status: "running",
+    lifecycle: "shared",
+    reuseKey: "sha256-digest-not-the-env",
+    command: SERVICE_COMMAND_SENTINEL,
+    cwd: SERVICE_CWD_SENTINEL,
+    port: 3000,
+    url: "http://127.0.0.1:3000",
+    provider: "local_process",
+    providerRef: "12345",
+    ownerAgentId: "agent-1",
+    startedByRunId: null,
+    lastUsedAt: new Date("2026-01-01T00:00:00.000Z"),
+    startedAt: new Date("2026-01-01T00:00:00.000Z"),
+    stoppedAt: null,
+    stopPolicy: null,
+    healthStatus: "healthy",
+    createdAt: new Date("2026-01-01T00:00:00.000Z"),
+    updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+    ...overrides,
+  } as WorkspaceRuntimeService;
+}
+
+function closeReadinessFixture(runtimeServices = [runtimeServiceFixture()]) {
+  return {
+    workspaceId: "workspace-1",
+    state: "ready",
+    blockingReasons: [],
+    warnings: [],
+    linkedIssues: [],
+    plannedActions: [],
+    isDestructiveCloseAllowed: true,
+    isSharedWorkspace: false,
+    isProjectPrimaryWorkspace: false,
+    git: null,
+    runtimeServices,
+  };
+}
 
 const mockExecutionWorkspaceService = vi.hoisted(() => ({
   list: vi.fn(),
@@ -192,6 +251,7 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
     decideAsUnprivilegedReader();
     mockExecutionWorkspaceService.getById.mockResolvedValue(executionWorkspaceFixture());
     mockExecutionWorkspaceService.list.mockResolvedValue([executionWorkspaceFixture()]);
+    mockExecutionWorkspaceService.getCloseReadiness.mockResolvedValue(closeReadinessFixture());
     mockProjectService.getById.mockResolvedValue({ id: "project-1", companyId: "company-1" });
     mockProjectService.resolveByReference.mockResolvedValue({
       ambiguous: false,
@@ -296,6 +356,68 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
         mode: "isolated_workspace",
         projectWorkspaceId: null,
       });
+    });
+  });
+
+  describe("GET /execution-workspaces/:id/close-readiness", () => {
+    it("masks runtimeServices command/cwd for an ordinary same-company agent", async () => {
+      const res = await request(createApp("execution-workspaces")).get(
+        "/api/execution-workspaces/workspace-1/close-readiness",
+      );
+
+      expect(res.status).toBe(200);
+      // The whole-body assertion is the load-bearing one: this route answered with the raw
+      // service row, so both sentinels crossed in cleartext to any caller holding only
+      // `company_scope:read`.
+      expect(JSON.stringify(res.body)).not.toContain(SERVICE_COMMAND_SENTINEL);
+      expect(JSON.stringify(res.body)).not.toContain(SERVICE_CWD_SENTINEL);
+
+      const service = res.body.runtimeServices[0];
+      expect(service.command).toBe(REDACTED_EVENT_VALUE);
+      expect(service.cwd).toBe(REDACTED_EVENT_VALUE);
+    });
+
+    it("keeps the readiness fields close-readiness exists to answer", async () => {
+      const res = await request(createApp("execution-workspaces")).get(
+        "/api/execution-workspaces/workspace-1/close-readiness",
+      );
+
+      // Field-level, not `runtimeServices: []` — the route counts running services to decide
+      // whether closing is destructive, so emptying the array would break the feature.
+      expect(res.body.runtimeServices).toHaveLength(1);
+      expect(res.body.runtimeServices[0].serviceName).toBe("api");
+      expect(res.body.runtimeServices[0].status).toBe("running");
+      // Runtime-generated, not operator free text, and `paperclipWaitForIssueWorkspaceService`
+      // returns it to callers — see `publicRuntimeServices`.
+      expect(res.body.runtimeServices[0].url).toBe("http://127.0.0.1:3000");
+      expect(res.body.state).toBe("ready");
+      expect(res.body.isDestructiveCloseAllowed).toBe(true);
+    });
+
+    it("discloses to a reader holding workspace_runtime:read", async () => {
+      decideAsRuntimeManager();
+
+      const res = await request(createApp("execution-workspaces")).get(
+        "/api/execution-workspaces/workspace-1/close-readiness",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body.runtimeServices[0].command).toBe(SERVICE_COMMAND_SENTINEL);
+      expect(res.body.runtimeServices[0].cwd).toBe(SERVICE_CWD_SENTINEL);
+    });
+
+    it("distinguishes a withheld command from a service that has none", async () => {
+      mockExecutionWorkspaceService.getCloseReadiness.mockResolvedValue(
+        closeReadinessFixture([runtimeServiceFixture({ command: null, cwd: null })]),
+      );
+
+      const res = await request(createApp("execution-workspaces")).get(
+        "/api/execution-workspaces/workspace-1/close-readiness",
+      );
+
+      // withheld-is-not-absent, the same contract as `hasWorkspaceRuntimeConfig`.
+      expect(res.body.runtimeServices[0].command).toBeNull();
+      expect(res.body.runtimeServices[0].cwd).toBeNull();
     });
   });
 

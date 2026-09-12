@@ -1,5 +1,6 @@
 import type { Request } from "express";
-import type { ExecutionWorkspace, ProjectWorkspace } from "@paperclipai/shared";
+import type { ExecutionWorkspace, ProjectWorkspace, WorkspaceRuntimeService } from "@paperclipai/shared";
+import { maskWorkspaceRuntimeTextForRead } from "../redaction.js";
 import type { accessService } from "../services/index.js";
 
 /**
@@ -44,8 +45,16 @@ import type { accessService } from "../services/index.js";
  *     agents, task-bridge keys and skill-test run tokens all get the withheld projection.
  *
  * Callers keep `hasWorkspaceRuntimeConfig` regardless of entitlement, so a UI that only needs to
- * know whether a runtime config exists never needs the contents. `runtimeServices` is unaffected:
- * it is a separately-typed, separately-populated field, not part of the withheld blob.
+ * know whether a runtime config exists never needs the contents.
+ *
+ * `runtimeServices` needs its own projection, and an earlier revision of this comment claimed the
+ * opposite — "unaffected: a separately-typed, separately-populated field, not part of the withheld
+ * blob". Separately *typed* is true and irrelevant. `command` and `cwd` are copied onto each
+ * service row from the very `workspaceRuntime` entry this module withholds, so answering with a
+ * raw service row hands the same operator-authored string back one key over — the same
+ * derived-view trap as `config` vs `metadata` in (1) above, one level further out. `routes/issues.ts`
+ * already masks that pair (`compactIssueRuntimeService`, PEN-2854 door #14); `publicRuntimeServices`
+ * below is that same treatment for routes answering with service rows directly.
  */
 
 export interface WorkspaceRuntimeViewer {
@@ -118,6 +127,40 @@ export function publicExecutionWorkspaces(
   viewer: WorkspaceRuntimeViewer,
 ): ExecutionWorkspace[] {
   return workspaces.map((workspace) => publicExecutionWorkspace(workspace, viewer));
+}
+
+/**
+ * Field-level, deliberately not `runtimeServices: []`. Routes answering with service rows do so
+ * because the caller needs the fleet — `close-readiness` counts running services to decide whether
+ * closing is destructive — so emptying the array would break the feature to protect two fields.
+ *
+ * `command` and `cwd` are the withheld pair: `command` is handed to `sh -c`, which makes an inline
+ * `FOO_TOKEN=… npm run dev` an ordinary idiom, and `cwd` discloses host paths. Both are copied from
+ * the operator's `workspaceRuntime` entry, so they are the same bytes this module withholds
+ * elsewhere.
+ *
+ * `url` deliberately survives, and that is a measurement rather than an inherited assumption: the
+ * operator-authored entry parsed by `listWorkspaceServiceCommandDefinitions`
+ * (`packages/shared/src/workspace-commands.ts`) has no `url` key at all. The value is written only
+ * from a runtime process report, so it is a generated local address and not operator free text —
+ * and `paperclipWaitForIssueWorkspaceService` returns it to the caller, so masking it would break a
+ * tool to hide a string the operator never wrote. `providerRef` is a pid. This matches the call
+ * `compactIssueRuntimeService` already made for the issue projection.
+ *
+ * Masked rather than nulled, so a withheld reader can still tell "this service has no command" from
+ * "this service's command was withheld" — the same withheld-is-not-absent contract as
+ * `hasWorkspaceRuntimeConfig`.
+ */
+export function publicRuntimeServices(
+  services: WorkspaceRuntimeService[],
+  viewer: WorkspaceRuntimeViewer,
+): WorkspaceRuntimeService[] {
+  if (viewer.revealRuntimeConfig) return services;
+  return services.map((service) => ({
+    ...service,
+    command: maskWorkspaceRuntimeTextForRead(service.command),
+    cwd: maskWorkspaceRuntimeTextForRead(service.cwd),
+  }));
 }
 
 export function publicProjectWorkspace(
