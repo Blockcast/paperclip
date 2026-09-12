@@ -424,9 +424,7 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
   if (!ledger) return { kind: "unreadable", reason: "ally-verdict dispositions are malformed" };
 
   // A readable prose attestation naming a *different* head is two claims about
-  // which tree was examined, and this module would silently pick the block
-  // while the three prose-only readers picked the other one. Fail closed
-  // instead — see the additive-block warning above.
+  // which tree was examined. Fail closed instead of silently picking one.
   //
   // Asymmetric on purpose: only a *disagreement* is fatal. An unreadable or
   // absent prose line is not, because that is the #1675 case this block exists
@@ -437,12 +435,18 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
   // carrying a block *and* a #1675-shaped prose line would read `unreadable` —
   // the exact false red this row retires, reintroduced one layer down.
   //
-  // Additivity is therefore a *producer* invariant, pinned where it costs
-  // nothing: "the verdict block is additive, never a replacement for the prose
-  // line" in scripts/ally-agent-idempotency-contract.test.mjs holds the
-  // emitting template to both forms, and `isAllyConsolidatedReviewComment`
-  // admits only Ally-authored bodies. A block-only review is unreachable, so
-  // readers 2-4 keep the prose line they parse and this reader keeps the block.
+  // This rule is no longer this module's alone. All four readers of an Ally
+  // body now apply it, so none of them can attest a tree the others do not:
+  // `consolidatedReviewHead` in github-app-auth.ts delegates here outright,
+  // and `attestedHead`/`canonicalReviewHead` in
+  // scripts/check-ally-review-consistency.mjs plus `parse_reviewed_head` in
+  // .github/scripts/sweep-stalled-ally-reviews.py mirror it in their own
+  // languages, pinned by tests alongside each. Block additivity stays a
+  // producer invariant ("the verdict block is additive, never a replacement
+  // for the prose line", scripts/ally-agent-idempotency-contract.test.mjs),
+  // but the readers no longer *depend* on the producer honouring it — which
+  // matters, because the producer is a model following a prompt rather than a
+  // serializer, and #1675 is the existence proof that its prose drifts.
   const attestedHead = head.trim().toLowerCase();
   const proseHead = soleProseAttestedHead(text);
   if (proseHead !== null && proseHead !== attestedHead) {

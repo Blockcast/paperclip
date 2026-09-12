@@ -176,6 +176,51 @@ describe("attestedHead", () => {
   it("ignores a SHA mentioned mid-sentence", () => {
     assert.equal(attestedHead(`I reviewed head: ${HEAD} earlier today`), null);
   });
+
+  // The structured block is the primary source here exactly as it is in
+  // server/src/services/ally-review-detection.ts. Before this, a body carrying
+  // a block plus a #1675-shaped prose line read as "no attestation" to this
+  // script while the merge gate read it as attesting — the readers disagreed
+  // about which tree was reviewed, which is the BLO-32695 finding.
+  const block = (head) =>
+    `<!-- ally-verdict:1\n{"head":"${head}","findings":{"critical":0,"important":0,"suggestions":0}}\n-->`;
+
+  it("reads the structured block when the prose line is unparseable (#1675)", () => {
+    const body = `${block(HEAD)}\n\n## Ally — Consolidated PR Review\nReviewed head: ${HEAD} (unchanged since my last pass — no new commits)\n`;
+    assert.equal(attestedHead(body), HEAD);
+  });
+
+  it("reads the structured block when no prose line is present", () => {
+    assert.equal(attestedHead(block(HEAD)), HEAD);
+  });
+
+  it("fails closed when the block and the prose line name different heads", () => {
+    const other = "a".repeat(40);
+    assert.equal(attestedHead(`${block(HEAD)}\nReviewed head: ${other}`), null);
+  });
+
+  it("fails closed on two blocks rather than falling back to prose", () => {
+    const body = `${block(HEAD)}\n${block(HEAD)}\nReviewed head: ${HEAD}`;
+    assert.equal(attestedHead(body), null);
+  });
+
+  it("fails closed on an unterminated block rather than falling back to prose", () => {
+    const body = `<!-- ally-verdict:1\n{"head":"${HEAD}"}\nReviewed head: ${HEAD}`;
+    assert.equal(attestedHead(body), null);
+  });
+
+  it("fails closed on an unsupported block version", () => {
+    assert.equal(attestedHead(`<!-- ally-verdict:2\n{"head":"${HEAD}"}\n-->`), null);
+  });
+
+  it("fails closed on a block whose head is not a complete SHA", () => {
+    assert.equal(attestedHead(`<!-- ally-verdict:1\n{"head":"${HEAD.slice(0, 7)}"}\n-->`), null);
+  });
+
+  it("ignores a quoted block — that is a body discussing one, not emitting one", () => {
+    const body = `> ${block(HEAD).split("\n").join("\n> ")}\nReviewed head: ${HEAD}`;
+    assert.equal(attestedHead(body), HEAD);
+  });
 });
 
 describe("operativeAllyReviews", () => {
