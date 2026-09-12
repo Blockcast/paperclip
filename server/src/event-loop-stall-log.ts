@@ -39,10 +39,27 @@ export interface EventLoopStallLogOptions {
   log?: (fields: Record<string, number>, message: string) => void;
 }
 
-/** Starts sampling. Returns a stop function; the timer is unref'd either way. */
+/** Non-null while a sampler is running. See the idempotency note below. */
+let activeStop: (() => void) | null = null;
+
+/**
+ * Starts sampling. Returns a stop function; the timer is unref'd either way.
+ *
+ * Idempotent: a second start while one is running is a no-op that hands back
+ * the running sampler's disposer, so the caller's options are ignored. The
+ * alternative — wiring the disposer through shutdown — does not fix the case
+ * that actually occurs: `startServer()` is exported and called repeatedly
+ * in-process by the test suite (25 times in one file), which sends no
+ * `SIGINT`/`SIGTERM`, so every prior histogram and interval would stay live
+ * and degrade the very loop they measure. Same reasoning, and the same remedy,
+ * as the crash guard installing under `isMainModule` rather than in
+ * `startServer()`.
+ */
 export function startEventLoopStallLogging(
   options: EventLoopStallLogOptions = {},
 ): () => void {
+  if (activeStop) return activeStop;
+
   const thresholdMs = options.thresholdMs ?? resolveStallThresholdMs();
   if (thresholdMs <= 0) return () => {};
 
@@ -74,10 +91,15 @@ export function startEventLoopStallLogging(
   }, sampleMs);
   timer.unref();
 
-  return () => {
+  const stop = () => {
     clearInterval(timer);
     delay.disable();
+    // Only deregister if we are still the live sampler: a disposer called
+    // twice, after a later start, must not unregister that later sampler.
+    if (activeStop === stop) activeStop = null;
   };
+  activeStop = stop;
+  return stop;
 }
 
 // ponytail: no phase attribution — the issue asked for "the current dispatcher
