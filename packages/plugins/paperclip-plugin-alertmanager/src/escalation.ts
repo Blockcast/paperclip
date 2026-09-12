@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { PLUGIN_STATE_PRECONDITION_FAILED_CODE, type PluginContext } from "@paperclipai/plugin-sdk";
 import { DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES, alertStateRef } from "./constants.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, type AlertStateRecord } from "./types.js";
@@ -367,6 +367,62 @@ export async function runAlertEscalationSweep(ctx: PluginContext, config: Alertm
 
 type SweepIssue = Awaited<ReturnType<PluginContext["issues"]["list"]>>[number];
 
+/**
+ * True for the host's compare-and-swap rejection on `ctx.state.set`.
+ *
+ * Two shapes, both real in this repo: out-of-process the code arrives as
+ * `data.code` on the RPC error (`plugin-worker-manager.ts` forwards only a
+ * string `details.code` across that boundary), while a host error thrown
+ * directly carries `details.code`. Matching the code — never the prose — is
+ * what makes this a contract rather than a substring guess.
+ */
+function isStatePreconditionFailed(err: unknown): boolean {
+  for (const key of ["data", "details"] as const) {
+    const carrier = (err as Record<string, unknown> | null)?.[key];
+    if (carrier && typeof carrier === "object"
+      && (carrier as { code?: unknown }).code === PLUGIN_STATE_PRECONDITION_FAILED_CODE) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Compare-and-swap the alert's state record, returning whether the write
+ * landed (BLO-20650).
+ *
+ * The sweep is a *speculative* writer. It read `previous` several awaits ago —
+ * `listComments`, `agents.get`, and on the cover rung a whole issue creation —
+ * and a webhook may have resolved or re-fired the alert in that window. A plain
+ * `set()` of `{ ...previous, ... }` would write the stale fields back, and the
+ * field that matters is `resolvedAt`: resurrecting it as `null` restarts a
+ * ladder on an alert that has already cleared, which is a page for something
+ * that is no longer happening, and every subsequent rung repeats the mistake
+ * because nothing re-derives the resolution.
+ *
+ * `ifMatch` moves the check into the host's own UPDATE statement, so there is
+ * no window between the comparison and the write for the webhook to land in.
+ *
+ * A refusal is a normal outcome, not an error: the authoritative writer (the
+ * webhook) won, and the next sweep re-reads and re-decides against fresh state.
+ * Callers must therefore treat `false` as "abandon this rung", never as "retry
+ * now" — a retry loop here would race the same webhook again.
+ */
+async function casAlertState(
+  ctx: PluginContext,
+  ref: ReturnType<typeof alertStateRef>,
+  previous: AlertStateRecord,
+  next: AlertStateRecord,
+): Promise<boolean> {
+  try {
+    await ctx.state.set(ref, next, { ifMatch: previous });
+    return true;
+  } catch (err) {
+    if (!isStatePreconditionFailed(err)) throw err;
+    return false;
+  }
+}
+
 async function advanceIssueLadder(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
@@ -380,7 +436,9 @@ async function advanceIssueLadder(
   if (!state || state.resolvedAt || state.escalationComplete || !state.nextEscalationAt || Date.parse(state.nextEscalationAt) > now.getTime()) return;
   const hold = holdUntil(await ctx.issues.listComments(issue.id, companyId));
   if (hold && hold > now.getTime()) {
-    await ctx.state.set(ref, { ...state, nextEscalationAt: new Date(hold).toISOString() });
+    // Refusal needs no branch: re-arming the schedule is idempotent and the
+    // next sweep recomputes it from whatever the webhook wrote.
+    await casAlertState(ctx, ref, state, { ...state, nextEscalationAt: new Date(hold).toISOString() });
     return;
   }
   const attempt = state.escalationAttempt ?? 0;
@@ -393,7 +451,14 @@ async function advanceIssueLadder(
     // sweep instead of silently never covering.
     await createCover(ctx, issue, companyId, state.alertname, config, now);
     await ctx.issues.createComment(issue.id, "[alert-escalation] Agent chain exhausted while alert remains firing; created a [user-cover] escalation.", companyId);
-    await ctx.state.set(ref, { ...state, escalationAttempt: MAX_ATTEMPTS, escalationComplete: true, nextEscalationAt: null });
+    // ponytail: cover creation deliberately stays ahead of this write (see
+    // above), so a resolve winning the CAS here leaves the cover open with an
+    // unresolved member — the resolve's own cascade ran before the cover
+    // existed. Strictly better than the pre-CAS behaviour, which left that
+    // same orphan AND resurrected `resolvedAt`. Closing it needs the cover
+    // cascade and cover creation to share a claim; tracked separately rather
+    // than reordering a durability property this diff did not set out to move.
+    await casAlertState(ctx, ref, state, { ...state, escalationAttempt: MAX_ATTEMPTS, escalationComplete: true, nextEscalationAt: null });
     return;
   }
 
@@ -401,8 +466,21 @@ async function advanceIssueLadder(
   // then degrades to a missed notification on this rung, never a per-sweep
   // repeat of the same rung (comment storm). The reassign rung re-reads the
   // live assignee next time, so an interrupted rung self-heals upward.
+  //
+  // That ordering is also what makes the CAS worth having here: the rung's
+  // user-visible effects (a comment claiming the alert is still firing, and a
+  // wake) all sit behind this write, so losing the swap aborts the rung before
+  // anyone is paged rather than after.
   const next = attempt + 1;
-  await ctx.state.set(ref, { ...state, escalationAttempt: next, escalationComplete: false, nextEscalationAt: new Date(now.getTime() + rungIntervalMs(state, config)).toISOString() });
+  const advanced = await casAlertState(ctx, ref, state, { ...state, escalationAttempt: next, escalationComplete: false, nextEscalationAt: new Date(now.getTime() + rungIntervalMs(state, config)).toISOString() });
+  if (!advanced) {
+    // A webhook rewrote the record while this rung was being assembled. It is
+    // the authoritative writer, so it wins; re-deciding happens next sweep
+    // against fresh state. Logged at info because this is the guard working,
+    // not a fault.
+    ctx.logger.info(`alert-escalation: abandoned rung ${next} for ${issue.identifier ?? issue.id}; alert state changed under the sweep`);
+    return;
+  }
 
   if (attempt === 0 && current) {
     await ctx.issues.createComment(issue.id, `[alert-escalation 1/${MAX_ATTEMPTS}] Alert is still firing; waking current owner ${current.name}.`, companyId);
