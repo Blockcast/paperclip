@@ -86,6 +86,7 @@ function denyingGate(resumeAt: Date | null): PenstockAvailabilityGate {
         provider: "anthropic",
         reason: "penstock.model_capacity_unavailable",
         model: "claude-test",
+        probePath: "capacity",
         resumeAt,
         retryAfterSeconds: null,
       };
@@ -121,6 +122,7 @@ function denyingGateAtBarrier(expectedChecks: number): PenstockAvailabilityGate 
         provider: "anthropic",
         reason: "penstock.model_capacity_unavailable",
         model: "claude-sonnet-5[1m]",
+        probePath: "capacity",
         resumeAt: new Date("2026-07-14T11:00:00.000Z"),
         retryAfterSeconds: 300,
       };
@@ -143,6 +145,7 @@ function denyingGateWithRetryAfter(retryAfterSeconds: number): PenstockAvailabil
         provider: "anthropic",
         reason: "penstock.model_capacity_unavailable",
         model: "claude-sonnet-5[1m]",
+        probePath: "capacity",
         resumeAt: new Date(Date.now() + retryAfterSeconds * 1000),
         retryAfterSeconds,
       };
