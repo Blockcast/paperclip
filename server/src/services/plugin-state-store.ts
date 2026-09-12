@@ -226,29 +226,6 @@ export function pluginStateStore(db: Db) {
       const namespace = input.namespace ?? DEFAULT_NAMESPACE;
       const scopeId = input.scopeId ?? null;
 
-      const values = {
-        pluginId,
-        scopeKind: input.scopeKind,
-        scopeId,
-        namespace,
-        stateKey: input.stateKey,
-        valueJson: input.value,
-        updatedAt: new Date(),
-      };
-      const onConflict = {
-        target: [
-          pluginState.pluginId,
-          pluginState.scopeKind,
-          pluginState.scopeId,
-          pluginState.namespace,
-          pluginState.stateKey,
-        ],
-        set: {
-          valueJson: input.value,
-          updatedAt: new Date(),
-        },
-      };
-
       /**
        * Unconditional upsert, or — when `expectedValue` is supplied — a guarded
        * UPDATE whose `WHERE` carries the caller's prior value.
@@ -267,7 +244,30 @@ export function pluginStateStore(db: Db) {
        */
       const applyWrite = async (runner: StateWriteRunner): Promise<void> => {
         if (expectedValue === undefined) {
-          await runner.insert(pluginState).values(values).onConflictDoUpdate(onConflict);
+          await runner
+            .insert(pluginState)
+            .values({
+              pluginId,
+              scopeKind: input.scopeKind,
+              scopeId,
+              namespace,
+              stateKey: input.stateKey,
+              valueJson: input.value,
+              updatedAt: new Date(),
+            })
+            .onConflictDoUpdate({
+              target: [
+                pluginState.pluginId,
+                pluginState.scopeKind,
+                pluginState.scopeId,
+                pluginState.namespace,
+                pluginState.stateKey,
+              ],
+              set: {
+                valueJson: input.value,
+                updatedAt: new Date(),
+              },
+            });
           return;
         }
         const updated = await runner
