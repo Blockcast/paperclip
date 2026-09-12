@@ -35,6 +35,7 @@ import { assertCanManageExecutionWorkspaceRuntimeServices } from "./workspace-ru
 import {
   publicExecutionWorkspace,
   publicExecutionWorkspaces,
+  publicRuntimeServices,
   resolveWorkspaceRuntimeViewer,
 } from "./workspace-response.js";
 import { appendWithCap } from "../adapters/utils.js";
@@ -137,7 +138,8 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       res.status(404).json({ error: "Execution workspace not found" });
       return;
     }
-    res.json(readiness);
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, workspace.companyId);
+    res.json({ ...readiness, runtimeServices: publicRuntimeServices(readiness.runtimeServices, viewer) });
   });
 
   router.get("/execution-workspaces/:id/workspace-operations", async (req, res) => {
