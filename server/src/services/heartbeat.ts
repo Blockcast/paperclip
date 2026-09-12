@@ -428,6 +428,7 @@ import {
   recordExternalLifecycleRunSilenceGap,
   recordPrReviewQueueWait,
   setAgentLivenessMetrics,
+  CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
@@ -935,6 +936,28 @@ export const CAPACITY_BLOCKED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 20;
 export const JOB_FAILED_HEARTBEAT_RETRY_REASON = "job_failed";
 export const JOB_FAILED_HEARTBEAT_RETRY_WAKE_REASON = "job_failed_retry";
 export const JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 4;
+/**
+ * Every error code that is a `job_failed` wearing a more specific name.
+ *
+ * `classifyAgentJobFailureErrorCode` relabels a failed Job's terminal code once
+ * the pod's own diagnostics say what actually died. Those runs must keep the
+ * `job_failed` retry contract — the relabel adds precision to the census, it
+ * does not change whether the work is safe to retry, which is still decided
+ * solely by the `adapterInvocationStarted === false` proof below.
+ *
+ * Shared because the list is read in two places (admission and opts) and a
+ * member added to only one of them is a silent half-regression: the run is
+ * admitted for retry and then scheduled under the wrong reason/attempt budget,
+ * or admitted nowhere at all and quietly turned terminal. BLO-33441 added
+ * `caveman_proxy_not_ready` and this set exists so the next one cannot be
+ * half-added.
+ */
+const JOB_FAILED_EQUIVALENT_ERROR_CODES: ReadonlySet<string> = new Set([
+  "job_failed",
+  "oom_killed",
+  "exit_137",
+  CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
+]);
 // The adapter already makes one fresh-session attempt in-process. These are a
 // bounded backstop for control-plane/process loss around that transition.
 const SESSION_UNAVAILABLE_HEARTBEAT_RETRY_REASON = SESSION_UNAVAILABLE_RECOVERY_RETRY_REASON;
@@ -1617,15 +1640,10 @@ export function shouldScheduleAutomaticRunRetry(
   // lock/status gates alone cannot make partial external writes safe. A missing
   // Job is only produced after adapter.invoke and therefore never reaches this
   // safe state; pre-invocation disappearance is process_lost instead.
-  if (
-    run.errorCode === "job_failed" ||
-    run.errorCode === "oom_killed" ||
-    run.errorCode === "exit_137"
-  ) {
+  if (JOB_FAILED_EQUIVALENT_ERROR_CODES.has(run.errorCode ?? "")) {
     const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
     return isIssueRun && recovery.adapterInvocationStarted === false;
   }
-
   if (run.errorCode === "session_unavailable") return true;
   if (run.errorCode !== "adapter_failed" && run.errorCode !== "process_lost") return false;
 
@@ -1695,11 +1713,7 @@ export function resolveAutomaticRunRetryOpts(
       delayMs: CAPACITY_BLOCKED_HEARTBEAT_RETRY_DELAY_MS,
     };
   }
-  if (
-    run.errorCode === "job_failed" ||
-    run.errorCode === "oom_killed" ||
-    run.errorCode === "exit_137"
-  ) {
+  if (JOB_FAILED_EQUIVALENT_ERROR_CODES.has(run.errorCode ?? "")) {
     return {
       retryReason: JOB_FAILED_HEARTBEAT_RETRY_REASON,
       wakeReason: JOB_FAILED_HEARTBEAT_RETRY_WAKE_REASON,
