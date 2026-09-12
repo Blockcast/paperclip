@@ -18,6 +18,7 @@ import {
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { resolveAgentEmptyWorkspaceSourceDir, resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { waitForRunToFinish } from "./helpers/wait-for-run-to-finish.js";
 
 const adapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -85,20 +86,6 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 const execFile = promisify(execFileCallback);
-
-async function waitForRunToFinish(
-  heartbeat: ReturnType<typeof heartbeatService>,
-  runId: string,
-  timeoutMs = 10_000,
-) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const run = await heartbeat.getRun(runId);
-    if (run && !["queued", "running"].includes(run.status)) return run;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return await heartbeat.getRun(runId);
-}
 
 describeEmbeddedPostgres("claude_k8s agent-home git probe timeout", () => {
   let db!: ReturnType<typeof createDb>;

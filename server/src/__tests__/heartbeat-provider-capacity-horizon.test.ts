@@ -48,6 +48,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
+import { waitForRunToFinish } from "./helpers/wait-for-run-to-finish.js";
 
 vi.mock("../telemetry.ts", () => ({
   getTelemetryClient: () => ({ track: vi.fn() }),
@@ -466,20 +467,6 @@ if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping embedded Postgres provider-capacity-horizon tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
-}
-
-async function waitForRunToFinish(
-  heartbeat: ReturnType<typeof heartbeatService>,
-  runId: string,
-  timeoutMs = 5_000,
-) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const run = await heartbeat.getRun(runId);
-    if (run && !["queued", "running"].includes(run.status)) return run;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return await heartbeat.getRun(runId);
 }
 
 describeEmbeddedPostgres("provider 429 advertising a capacity reset honors that horizon", () => {
