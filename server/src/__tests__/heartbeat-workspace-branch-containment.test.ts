@@ -47,6 +47,7 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../services/execution-workspace-policy.ts";
+import { waitForRunToFinish } from "./helpers/wait-for-run-to-finish.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -164,16 +165,6 @@ async function createForwardBranchMismatch(input: {
   await writeFile(path.join(input.worktreePath, "actual-branch.txt"), "actual branch work\n", "utf8");
   await runGit(input.worktreePath, ["add", "actual-branch.txt"]);
   await runGit(input.worktreePath, ["commit", "-m", "Add actual branch work"]);
-}
-
-async function waitForRunToFinish(heartbeat: Heartbeat, runId: string, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const run = await heartbeat.getRun(runId);
-    if (run && run.status !== "queued" && run.status !== "running") return run;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return heartbeat.getRun(runId);
 }
 
 async function waitForHeartbeatIdle(db: Db, timeoutMs = 5_000) {
