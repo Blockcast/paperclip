@@ -380,9 +380,18 @@ jobs:
       # that cannot be re-checked after the fact: that severity stays `critical`
       # (anything else routes to the paperclip webhook only, which is not a
       # human), and that queued/building runs never page the reviewers.
-      - name: Test stuck production-approval escalation (PEN-2848)
+      #
+      # BLO-33400 adds the schedule suite alongside it, for the same reason at a
+      # different layer: the escalation was correct and simply sampled too
+      # rarely to observe a 6h condition, which no assertion about the script
+      # itself can catch. Those tests pin the sampling cadence and the step
+      # ORDER the cadence depends on.
+      - name: Test stuck production-approval escalation (PEN-2848, BLO-33400)
         if: ${{ !cancelled() }}
-        run: node --test ./.github/scripts/tests/post-pending-deploy-alert.test.mjs
+        run: |
+          node --test \
+            ./.github/scripts/tests/post-pending-deploy-alert.test.mjs \
+            ./.github/scripts/tests/scheduled-production-deploy-schedule.test.mjs
         timeout-minutes: 1
 
       # BLO-28203. The stalled-Ally-review sweep's decision suite otherwise runs

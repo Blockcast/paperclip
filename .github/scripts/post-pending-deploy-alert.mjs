@@ -54,8 +54,18 @@
 import { appendFileSync, readFileSync } from 'node:fs';
 
 const DEFAULT_ALERTMANAGER_URL = 'http://alertmanager.monitoring.svc.cluster.local:9093';
-/** Slightly longer than the 24h dispatcher schedule, so firing is continuous. */
-export const ALERT_TTL_MS = 25 * 60 * 60 * 1000;
+/**
+ * Slightly longer than the hourly sampling cadence, so firing is continuous
+ * across one delayed or failed slot while still resolving promptly once the
+ * gate clears. Was 25h when the escalation was reachable only from the daily
+ * 07:23 dispatch (BLO-33400 makes it hourly): at that TTL an approval granted
+ * at 10:00 kept a critical alert firing until 11:00 the NEXT day, which is the
+ * opposite defect to the one this script exists to fix. Three hours absorbs two
+ * consecutive missed hourly slots — GitHub delays scheduled runs under load,
+ * observed 5-17min late here — without which a single skipped slot would emit a
+ * spurious resolved/firing pair.
+ */
+export const ALERT_TTL_MS = 3 * 60 * 60 * 1000;
 export const DEFAULT_ALERT_AFTER_HOURS = 6;
 
 /**
