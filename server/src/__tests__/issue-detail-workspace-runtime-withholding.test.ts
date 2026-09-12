@@ -293,6 +293,22 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
     // config was disclosed outright.
     expect(res.body.project.workspaces[0].hasWorkspaceRuntimeConfig).toBe(true);
     expect(res.body.project.primaryWorkspace.hasWorkspaceRuntimeConfig).toBe(true);
+    // The execution-workspace projection is a *separate* field list and loses the flag
+    // independently of the three above — which is how it shipped without one. Asserted on both
+    // exits that serialize it, because `/issues/:id` passing says nothing about heartbeat-context.
+    expect(res.body.currentExecutionWorkspace.hasWorkspaceRuntimeConfig).toBe(true);
+  });
+
+  it("reports hasWorkspaceRuntimeConfig on heartbeat-context currentExecutionWorkspace", async () => {
+    const { companyId, agentId, issueId } = await seedScenario();
+
+    const res = await request(createApp(agentActor(companyId, agentId))).get(
+      `/api/issues/${issueId}/heartbeat-context`,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.currentExecutionWorkspace.config.workspaceRuntime).toBeNull();
+    expect(res.body.currentExecutionWorkspace.hasWorkspaceRuntimeConfig).toBe(true);
   });
 
   it("withholds currentExecutionWorkspace on heartbeat-context — the read an agent makes on wake", async () => {

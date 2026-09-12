@@ -7700,6 +7700,13 @@ export function issueRoutes(
             serviceStates: workspace.config.serviceStates,
           }
         : null,
+      // PEN-2852: the compensating existence flag, same contract as the project
+      // projection above — `workspace-response.ts` states callers keep this
+      // regardless of entitlement. This projection selects fields by name, so the
+      // flag survives only if it is named; without it a withheld caller reading
+      // `GET /issues/:id` or `/heartbeat-context` cannot tell "no runtime config"
+      // from "withheld", a distinction it had before withholding.
+      hasWorkspaceRuntimeConfig: workspace.hasWorkspaceRuntimeConfig,
       metadata: null,
       runtimeServices: (workspace.runtimeServices ?? [])
         .filter((service) => service.status === "starting" || service.status === "running")
