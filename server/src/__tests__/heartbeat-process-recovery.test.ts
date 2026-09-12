@@ -2677,7 +2677,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       prNumber: 1648,
       headSha,
     });
-    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledTimes(1);
+    // BLO-28920: a miss at the wake's pinned head is now re-checked once against
+    // the PR's live head (`headSha: null` reuses the callee's own resolution).
+    // Both passes miss here, so this test's subject — a run's own summary is not
+    // outcome evidence — is unchanged; only the call count is.
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 1648,
+      headSha: null,
+    });
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledTimes(2);
     expect(await heartbeat.getRun(runId)).toMatchObject({
       status: "failed",
       errorCode: "job_missing",
