@@ -1601,6 +1601,120 @@ describe("execute: waitForPod edge cases", () => {
 
     expect(result.errorCode).toBe("k8s_pod_schedule_failed");
     expect(result.errorMessage).toContain("write-prompt");
+    // BLO-33503: the pod was placed and a container ran, so the label must not
+    // send the reader to cluster capacity. Fails against the old two-branch
+    // ternary, which emitted "Pod scheduling failed" here.
+    expect(result.errorMessage).toContain("Init container failed");
+    expect(result.errorMessage).not.toContain("Pod scheduling failed");
+    expect(result.errorMessage).not.toContain("Pod startup failed");
+    expect(result.errorMessage).toContain("exit code 1");
+  });
+
+  // BLO-33503: the shape the incident actually produces. restartPolicy is
+  // Never, so a failed init container takes the pod to phase=Failed — the
+  // init_container kind is unreachable unless the init check precedes the
+  // phase=Failed branch. Fails if that ordering regresses: the generic
+  // terminated branch has no "claude" status to read, so it emits the bare
+  // "reached phase=Failed" with neither the container name nor the exit code.
+  it("labels an init-container failure that took the pod to phase=Failed", async () => {
+    mockCoreListPods.mockResolvedValue({
+      items: [{
+        metadata: { name: "pod-x" },
+        spec: { nodeName: "k8s-paperclip-1" },
+        status: {
+          phase: "Failed",
+          conditions: [{ type: "PodScheduled", status: "True" }],
+          initContainerStatuses: [{
+            name: "write-prompt",
+            state: { terminated: { exitCode: 255, reason: "Error" } },
+          }],
+          containerStatuses: [],
+        },
+      }],
+    });
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toContain("Init container failed");
+    expect(result.errorMessage).toContain("write-prompt");
+    expect(result.errorMessage).toContain("exit code 255");
+    expect(result.errorMessage).not.toContain("Pod scheduling failed");
+    expect(result.errorMessage).not.toContain("Pod terminated before startup");
+  });
+
+  // A phase=Failed pod whose MAIN container died is unaffected by that
+  // ordering — it must still report the terminated label, so the move above
+  // cannot be satisfied by relabelling every Failed pod as an init failure.
+  it("still reports the terminated label when the main container died", async () => {
+    mockCoreListPods.mockResolvedValue({
+      items: [{
+        metadata: { name: "pod-x" },
+        status: {
+          phase: "Failed",
+          initContainerStatuses: [{
+            name: "write-prompt",
+            state: { terminated: { exitCode: 0, reason: "Completed" } },
+          }],
+          containerStatuses: [{
+            name: "claude",
+            state: { terminated: { exitCode: 137, reason: "OOMKilled" } },
+          }],
+        },
+      }],
+    });
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toContain("Pod terminated before startup");
+    expect(result.errorMessage).toContain("OOMKilled");
+    expect(result.errorMessage).not.toContain("Init container failed");
+  });
+
+  // BLO-33503 true-positive control: a genuine scheduling failure must still
+  // report "Pod scheduling failed", so the fix cannot be satisfied by
+  // relabelling everything away from the scheduling category. This one passes
+  // both before and after the fix — that is the point of a true-positive
+  // control, and the reason it is not part of the negative control set.
+  it("still reports Pod scheduling failed when the pod is unschedulable", async () => {
+    mockCoreListPods.mockResolvedValue({
+      items: [{
+        metadata: { name: "pod-x" },
+        status: {
+          phase: "Pending",
+          conditions: [{
+            type: "PodScheduled",
+            status: "False",
+            reason: "Unschedulable",
+            message: "0/3 nodes are available: Insufficient cpu.",
+          }],
+          initContainerStatuses: [],
+          containerStatuses: [],
+        },
+      }],
+    });
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toContain("Pod scheduling failed");
+    expect(result.errorMessage).toContain("Insufficient cpu");
+  });
+
+  // BLO-33503: a failure the author never anticipated must not silently inherit
+  // the scheduling label. A k8s API error is not a PodWaitError, so it carries
+  // no recorded kind and gets the neutral one. Fails against the old ternary,
+  // whose else-branch was "Pod scheduling failed".
+  it("reports an unclassified label for a failure with no recorded kind", async () => {
+    mockCoreListPods.mockRejectedValue(new Error("connect ETIMEDOUT 10.0.0.1:443"));
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).not.toContain("Pod scheduling failed");
+    expect(result.errorMessage).toContain("unclassified");
+    expect(result.errorMessage).toContain("ETIMEDOUT");
   });
 
   it("throws k8s_pod_schedule_failed when init container has ImagePullBackOff", async () => {
