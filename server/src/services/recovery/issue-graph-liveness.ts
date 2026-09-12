@@ -551,6 +551,15 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
    * nobody should be working on this yet; it does not say a dependency on a cancelled row
    * is a coherent thing to wait for.
    *
+   * Nor does a park reach `in_review`'s write-side gate — `assertAgentInReviewReviewPath`
+   * in routes/issues.ts, which answers this same question on the write path and accepts a
+   * strict SUBSET of this list. That is the invariant to preserve when changing either
+   * side: everything the validator admits, this predicate must count; the reverse does not
+   * hold and must not be "fixed". BLO-33572 records why the park in particular stays off
+   * the validator's list (a park asserts nobody is acting, `in_review` asserts someone is),
+   * and PEN-2853 records the same asymmetry for the monitor. Widening this predicate is
+   * therefore cheap; widening that one is a semantic change — go read its comment first.
+   *
    * `openPullRequestPathKeys` is the eighth (PEN-3198) and the only one no *person* sets
    * at all: it is written by the GitHub webhook. That matters for the BLO-27912 defect
    * above rather than merely lengthening the list. Every other satisfier is a claim by

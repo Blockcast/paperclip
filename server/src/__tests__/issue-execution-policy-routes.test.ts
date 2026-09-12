@@ -831,6 +831,72 @@ describe("issue execution policy routes", () => {
   });
 
   /**
+   * BLO-33572 — the same read/write asymmetry as PEN-2853 above, one satisfier over.
+   *
+   * A live deliberate park (BLO-27912) IS a strandedness-sweep satisfier and is NOT a
+   * review path. That is a decision, not an omission, so asserting the status code alone
+   * would not pin it: a 422 is equally consistent with "deliberately refused" and with
+   * "nobody considered it", and those decay differently — the second gets "fixed" by the
+   * next reader. The message assertion is the half that carries the decision.
+   *
+   * The park is set in the future and is the row's ONLY candidate path: no human assignee,
+   * no execution participant, no monitor, no interaction, no approval. So if the validator
+   * ever starts reading `parkedUntil`, this row starts returning 2xx and this test fails.
+   */
+  it("refuses an in_review transition on a live park, and says why a park is not a review path", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-33572",
+      title: "Deliberately parked, not in review",
+      executionPolicy: null,
+      executionState: null,
+      monitorAttemptCount: 0,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      monitorNotes: null,
+      monitorScheduledBy: null,
+      // A day out: the sweep's `hasActiveParkedDisposition` counts this.
+      parkedUntil: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      parkedReason: "waiting on an upstream decision",
+      parkedByAgentId: "33333333-3333-4333-8333-333333333333",
+      parkedAt: new Date(),
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_issue_disposition",
+      missing: "review_path",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    // The refusal names the park and states the remedy, rather than leaving the caller to
+    // infer it from a list of five alternatives that omits it without comment.
+    expect(res.body.error).toContain("parkedUntil");
+    expect(res.body.error).toContain("BLO-33572");
+    expect(res.body.error).toMatch(/park the row on the status that is actually true/i);
+
+    // And the park is still absent from the enumerated paths -- the message is the only
+    // place that explains it, which is exactly why the message is asserted above.
+    expect(res.body.details.validReviewPaths).not.toContain("deliberate_park");
+    expect(res.body.details.validReviewPaths).toHaveLength(5);
+  });
+
+  /**
    * The divergence test the fix exists to make possible.
    *
    * Expectations are not hand-written per row: each is `isMonitorNextCheckAtLive`, the
