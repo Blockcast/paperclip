@@ -253,6 +253,177 @@ describe("BLO-32695 — the structured verdict block as the primary source", () 
 });
 
 /**
+ * Cross-reader agreement about which tree was examined.
+ *
+ * Four readers parse `Reviewed head:` and only this module understands the
+ * block — consolidatedReviewHead (github-app-auth.ts), ATTESTED_HEAD_RE
+ * (check-ally-review-consistency.mjs) and HEAD_ATTESTATION_RE
+ * (sweep-stalled-ally-reviews.py) are the other three. So a body whose block
+ * and prose name different heads would set the merge gate against one tree
+ * while the retry sweep reasoned about another.
+ *
+ * The asymmetry is the whole design and is easy to get backwards. Requiring a
+ * *matching* prose attestation before the block may be trusted would have been
+ * the obvious reading of the finding, and it would have reverted BLO-32695
+ * outright: the #1675 body's prose attestation is exactly the one the retired
+ * regex cannot read, so the block would have been unusable on the very review
+ * that motivated it. Only a readable *disagreement* is fatal.
+ */
+describe("BLO-32695 — the block and the prose line must not name different heads", () => {
+  const OTHER_HEAD = "1111111111111111111111111111111111111111";
+
+  it("fails closed when a clean prose attestation contradicts the block", () => {
+    const conflicting = [
+      verdictBlock(PR1675_VERDICT),
+      "## Ally — Consolidated PR Review",
+      `Reviewed head: ${OTHER_HEAD}`,
+    ].join("\n");
+
+    expect(parseAllyVerdictBlock(conflicting)).toMatchObject({ kind: "unreadable" });
+    expect(extractAllyReviewedHeadSha(conflicting)).toBeNull();
+  });
+
+  it("does not resolve a contradicting body to success", () => {
+    const conflicting = [
+      verdictBlock(PR1675_VERDICT),
+      "## Ally — Consolidated PR Review",
+      `Reviewed head: ${OTHER_HEAD}`,
+    ].join("\n");
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: PR1675_HEAD,
+      reviewerBotLogin: ALLY_BOT_LOGIN,
+      comments: [allyComment(conflicting, "2026-09-07T15:41:42Z")],
+    });
+    expect(verdict.state).not.toBe("success");
+  });
+
+  it("still trusts the block when the prose agrees", () => {
+    const agreeing = [
+      verdictBlock(PR1675_VERDICT),
+      "## Ally — Consolidated PR Review",
+      `Reviewed head: ${PR1675_HEAD}`,
+    ].join("\n");
+
+    expect(extractAllyReviewedHeadSha(agreeing)).toBe(PR1675_HEAD);
+  });
+
+  it("still trusts the block when the prose attestation is the unreadable #1675 shape", () => {
+    // The regression guard for the obvious-but-wrong fix. This body's prose
+    // line carries the trailing parenthetical that yields zero matches, so a
+    // rule demanding a matching prose attestation would null it out — the
+    // exact false red BLO-32695 was filed to end.
+    const withBlock = `${verdictBlock(PR1675_VERDICT)}\n${PR1675_CLEAN_REVIEW_BODY}`;
+    // Control: without the block that same prose attests nothing at all.
+    expect(extractAllyReviewedHeadSha(PR1675_CLEAN_REVIEW_BODY)).toBeNull();
+    expect(extractAllyReviewedHeadSha(withBlock)).toBe(PR1675_HEAD);
+  });
+
+  it("still trusts the block when the prose is ambiguous rather than contradicting", () => {
+    // Two attestations are not a competing claim, they are noise — precisely
+    // what the block exists to speak over. Failing closed here would let any
+    // review that *quotes* a head defeat its own verdict.
+    const ambiguous = [
+      verdictBlock(PR1675_VERDICT),
+      "## Ally — Consolidated PR Review",
+      `Reviewed head: ${PR1675_HEAD}`,
+      `Reviewed head: ${OTHER_HEAD}`,
+    ].join("\n");
+
+    expect(extractAllyReviewedHeadSha(ambiguous)).toBe(PR1675_HEAD);
+  });
+});
+
+/**
+ * A truncated block must not fall through to the prose parser.
+ *
+ * The fail-closed branch had a hole shaped like its own entry condition. An
+ * unterminated `<!-- ally-verdict:1` matches no complete block, so the block
+ * pattern counted zero and returned `absent` — the one branch that is
+ * *permitted* to trust prose, because every review posted before this shipped
+ * is such a body. A body carrying a broken block plus prose that happens to
+ * read clean would therefore clear the gate on exactly the prose the block
+ * exists to stop trusting.
+ *
+ * The two facts an author must not conflate: "Ally predates the block" and
+ * "Ally tried to state a verdict and the payload is broken". Only the first
+ * may use the prose path.
+ */
+describe("BLO-32695 — an unterminated block opener is unreadable, not absent", () => {
+  // The clean prose from the fall-back suite below, verbatim: on its own it
+  // resolves to success, which is what makes it the right control here.
+  const cleanProse = [
+    "## Ally — Consolidated PR Review",
+    `Reviewed head: ${PR1675_HEAD}`,
+    "### Critical Issues (0)",
+    "### Important Issues (0)",
+  ].join("\n");
+
+  const truncated = [
+    `<!-- ally-verdict:1`,
+    JSON.stringify(PR1675_VERDICT, null, 2),
+    "",
+    cleanProse,
+  ].join("\n");
+
+  it("control: that prose alone takes the absent branch and clears", () => {
+    expect(parseAllyVerdictBlock(cleanProse)).toEqual({ kind: "absent" });
+    expect(
+      evaluateCommentReviewGate({
+        headSha: PR1675_HEAD,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: [allyComment(cleanProse, "2026-09-07T15:41:42Z")],
+      }),
+    ).toMatchObject({ state: "success" });
+  });
+
+  it("reports the missing terminator rather than falling back", () => {
+    expect(parseAllyVerdictBlock(truncated)).toMatchObject({
+      kind: "unreadable",
+      reason: expect.stringContaining("terminator"),
+    });
+  });
+
+  it("does not clear the gate on the clean prose behind the broken block", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: PR1675_HEAD,
+      reviewerBotLogin: ALLY_BOT_LOGIN,
+      comments: [allyComment(truncated, "2026-09-07T15:41:42Z")],
+    });
+    expect(verdict.state).not.toBe("success");
+  });
+
+  it("attests no head, so a truncated block cannot borrow the prose attestation", () => {
+    expect(extractAllyReviewedHeadSha(truncated)).toBeNull();
+  });
+
+  it("ignores a quoted or indented opener, exactly as the block pattern does", () => {
+    // Same anchoring as ALLY_VERDICT_BLOCK_PATTERN, and for the same reason: a
+    // review *discussing* this format is the likeliest place an opener appears
+    // in prose, and on this file that discussion happens in its own reviews. An
+    // unanchored opener count would let a review of this parser wedge its own
+    // gate — the failure the block anchoring was added to prevent, re-entering
+    // through the counter.
+    for (const quoted of [
+      `> <!-- ally-verdict:1`,
+      `    <!-- ally-verdict:1`,
+      `see <!-- ally-verdict:1 mid-line`,
+    ]) {
+      expect(parseAllyVerdictBlock(`${quoted}\n${cleanProse}`)).toEqual({ kind: "absent" });
+    }
+  });
+
+  it("still reads a well-formed block that merely sits alongside a quoted opener", () => {
+    const body = [
+      verdictBlock(PR1675_VERDICT),
+      "> <!-- ally-verdict:1  (quoting the format in prose)",
+      cleanProse,
+    ].join("\n");
+    expect(parseAllyVerdictBlock(body)).toMatchObject({ kind: "ok" });
+  });
+});
+
+/**
  * The block path must block on the same two severities the prose path does.
  *
  * The prose readers get that bound for free from COUNTED_FINDINGS_BUCKET_PATTERN,

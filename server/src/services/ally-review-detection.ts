@@ -142,6 +142,17 @@ const REVIEWED_HEAD_ATTESTATION_PATTERN = new RegExp(
   "gi",
 );
 
+// The prose attestation, when the body states exactly one. Ambiguity — none,
+// or several — is not an answer, because this decides which tree a required
+// check is set against.
+function soleProseAttestedHead(text: string): string | null {
+  const attestations = Array.from(
+    text.matchAll(REVIEWED_HEAD_ATTESTATION_PATTERN),
+    (match) => match[1]!.toLowerCase(),
+  );
+  return attestations.length === 1 ? attestations[0]! : null;
+}
+
 export function extractAllyReviewedHeadSha(body: string | null | undefined): string | null {
   // The structured block wins outright when present: it says which tree was
   // examined as a field, so no amount of prose around it can move the answer.
@@ -154,11 +165,7 @@ export function extractAllyReviewedHeadSha(body: string | null | undefined): str
   if (block.kind === "unreadable") return null;
   const text = emittedReviewText(body);
   if (text === null) return null;
-  const attestations = Array.from(
-    text.matchAll(REVIEWED_HEAD_ATTESTATION_PATTERN),
-    (match) => match[1]!.toLowerCase(),
-  );
-  return attestations.length === 1 ? attestations[0]! : null;
+  return soleProseAttestedHead(text);
 }
 
 /**
@@ -227,6 +234,21 @@ export function extractAllyReviewedHeadSha(body: string | null | undefined): str
  */
 const ALLY_VERDICT_BLOCK_PATTERN = new RegExp(
   String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:(\d+)([\s\S]*?)-->`,
+  "gm",
+);
+
+// The opener alone, anchored identically to the block above so the two agree
+// on what they are looking at. Counting openers is what distinguishes "Ally
+// tried to state a verdict and the payload is broken" from "this review
+// predates the block" — the pattern above cannot tell them apart, because an
+// unterminated marker simply fails to match and reads as `absent`.
+//
+// It matters because `absent` falls through to the prose parser. A body whose
+// block is truncated but whose prose happens to read clean would clear the
+// gate on the strength of the very prose the block exists to stop trusting,
+// which is a fail-open path through the fail-closed branch.
+const ALLY_VERDICT_OPENER_PATTERN = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:(?:\d+)`,
   "gm",
 );
 
@@ -321,6 +343,14 @@ function asDispositions(raw: unknown): AllyStructuredDisposition[] | null {
  *     a clean verdict, so defaulting would let a partial payload clear a head
  *     it never made a claim about. An *empty* `findings` object still reads —
  *     that is Ally stating counts, not omitting them.
+ *   - A prose `Reviewed head:` line that reads cleanly and names a *different*
+ *     head. The block would win here and the three prose-only readers would
+ *     not, so the same review would attest two different trees depending on
+ *     who asked. Only disagreement is fatal; prose that is absent or that this
+ *     file cannot parse is the #1675 case the block exists to survive.
+ *   - An opener with no `-->` terminator. A truncated payload is Ally trying
+ *     to state a verdict and failing, which is not the same fact as a review
+ *     that predates the block — and only the latter may use the prose path.
  *
  * Note the asymmetry with the prose fallback: an unreadable *block* is red,
  * whereas an unreadable *body* with no block keeps the historical behavior.
@@ -332,6 +362,16 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
   const text = emittedReviewText(body);
   if (text === null) return { kind: "absent" };
   const blocks = [...text.matchAll(ALLY_VERDICT_BLOCK_PATTERN)];
+  // Openers without a matching complete block mean a truncated payload, not an
+  // older review. Checked before the `absent` return so a broken block can
+  // never fall through to the prose parser it exists to replace.
+  const openers = [...text.matchAll(ALLY_VERDICT_OPENER_PATTERN)];
+  if (openers.length > blocks.length) {
+    return {
+      kind: "unreadable",
+      reason: `${openers.length - blocks.length} ally-verdict opener(s) have no \`-->\` terminator`,
+    };
+  }
   if (blocks.length === 0) return { kind: "absent" };
   if (blocks.length > 1) {
     return { kind: "unreadable", reason: `${blocks.length} ally-verdict blocks; expected exactly one` };
@@ -364,9 +404,29 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
   const ledger = asDispositions(dispositions);
   if (!ledger) return { kind: "unreadable", reason: "ally-verdict dispositions are malformed" };
 
+  // A readable prose attestation naming a *different* head is two claims about
+  // which tree was examined, and this module would silently pick the block
+  // while the three prose-only readers picked the other one. Fail closed
+  // instead — see the additive-block warning above.
+  //
+  // Asymmetric on purpose: only a *disagreement* is fatal. An unreadable or
+  // absent prose line is not, because that is the #1675 case this block exists
+  // to survive — requiring the prose to parse would put the retired regex back
+  // on the critical path and undo the whole change.
+  const attestedHead = head.trim().toLowerCase();
+  const proseHead = soleProseAttestedHead(text);
+  if (proseHead !== null && proseHead !== attestedHead) {
+    return {
+      kind: "unreadable",
+      reason:
+        `ally-verdict head ${attestedHead.slice(0, 7)} disagrees with the prose ` +
+        `attestation ${proseHead.slice(0, 7)}`,
+    };
+  }
+
   return {
     kind: "ok",
-    verdict: { head: head.trim().toLowerCase(), findings: counts, dispositions: ledger },
+    verdict: { head: attestedHead, findings: counts, dispositions: ledger },
   };
 }
 
