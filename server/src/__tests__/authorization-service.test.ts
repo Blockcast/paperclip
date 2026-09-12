@@ -3911,4 +3911,102 @@ describeEmbeddedPostgres("authorization service", () => {
       resource: { type: "company", companyId: company.id },
     })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
   });
+  /**
+   * PEN-2852 — the withholding boundary on workspace responses
+   * (`routes/workspace-response.ts`) resolves its viewer with this service. These cases pin the
+   * policy the boundary depends on, against the REAL decision path rather than a mock.
+   *
+   * They exist because the first version of that boundary gated disclosure on `runtime:manage` and
+   * was proven correct only by a route test whose mock returned denied. The mock was free to deny;
+   * the real policy allows `runtime:manage` to every standard same-company agent
+   * (`allow_company_agent`), so the boundary withheld from nothing but restricted principals while
+   * its tests were green. The first case below is the one that would have caught that: it asserts
+   * the two actions differ for exactly that actor. Do not weaken it into a single-action check.
+   */
+  describe("PEN-2852 workspace_runtime:read", () => {
+    it("denies a standard same-company agent, while runtime:manage still allows it", async () => {
+      const company = await createCompany(db, "WorkspaceRuntimeReadAgent");
+      const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+      const authorization = authorizationService(db);
+      const actor = {
+        type: "agent" as const,
+        agentId: actorAgent.id,
+        companyId: company.id,
+        source: "agent_key" as const,
+      };
+      const resource = { type: "company" as const, companyId: company.id };
+
+      // The control: this is the action the boundary used to gate on, and it allows.
+      await expect(authorization.decide({ actor, action: "runtime:manage", resource }))
+        .resolves.toMatchObject({ allowed: true, reason: "allow_company_agent" });
+
+      // The assertion: the read entitlement must NOT follow it into the blanket allow.
+      await expect(authorization.decide({ actor, action: "workspace_runtime:read", resource }))
+        .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    });
+
+    it("denies an agent acting on behalf of an active non-viewer responsible user", async () => {
+      // The responsible-user intersection can only NARROW an agent decision, so a human operator
+      // behind an agent JWT does not re-open the disclosure. Pinned because it is the most
+      // plausible accidental re-widening: granting on the user half and forgetting the agent half.
+      const company = await createCompany(db, "WorkspaceRuntimeReadOnBehalf");
+      const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+      const responsibleUserId = `user-${randomUUID()}`;
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: responsibleUserId,
+        status: "active",
+        membershipRole: "operator",
+      });
+
+      await expect(authorizationService(db).decide({
+        actor: {
+          type: "agent",
+          agentId: actorAgent.id,
+          companyId: company.id,
+          onBehalfOfUserId: responsibleUserId,
+          source: "agent_jwt",
+        },
+        action: "workspace_runtime:read",
+        resource: { type: "company", companyId: company.id },
+      })).resolves.toMatchObject({ allowed: false });
+    });
+
+    it("allows an active non-viewer board member so the runtime editors keep working", async () => {
+      const company = await createCompany(db, "WorkspaceRuntimeReadMember");
+      const userId = `user-${randomUUID()}`;
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: userId,
+        status: "active",
+        membershipRole: "member",
+      });
+
+      await expect(authorizationService(db).decide({
+        actor: { type: "board", userId, source: "session" },
+        action: "workspace_runtime:read",
+        resource: { type: "company", companyId: company.id },
+      })).resolves.toMatchObject({ allowed: true, reason: "allow_simple_company_member" });
+    });
+
+    it("denies a viewer board member", async () => {
+      const company = await createCompany(db, "WorkspaceRuntimeReadViewer");
+      const userId = `user-${randomUUID()}`;
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: userId,
+        status: "active",
+        membershipRole: "viewer",
+      });
+
+      await expect(authorizationService(db).decide({
+        actor: { type: "board", userId, source: "session" },
+        action: "workspace_runtime:read",
+        resource: { type: "company", companyId: company.id },
+      })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    });
+  });
 });
