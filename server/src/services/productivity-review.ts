@@ -4706,9 +4706,38 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
       )
-      .orderBy(asc(issues.updatedAt), asc(issues.id))
+      // BLO-30303: rotate on a least-recently-*scanned* watermark, not on
+      // `updatedAt`. Nothing in this file writes back to a scanned *source*
+      // row, so under the old `asc(updatedAt)` ordering the same oldest-250
+      // rows were re-selected on every pass forever and `created` was
+      // permanently 0 once the eligible population passed the cap. `desc` is
+      // not the fix either — a stalled issue's `updatedAt` stops advancing by
+      // definition, so it would sink out of the window exactly as it became
+      // interesting. Any static ordering on a field uncorrelated with
+      // eligibility starves at some cap; rotation makes that impossible by
+      // construction. NULLS FIRST so never-scanned rows drain ahead of visited
+      // ones; `updatedAt`/`id` only break ties within one watermark value.
+      .orderBy(sql`${issues.productivityScannedAt} asc nulls first`, asc(issues.updatedAt), asc(issues.id))
       .limit(MAX_CANDIDATE_ISSUES);
     result.scanned = candidates.length;
+
+    // Stamp before evaluating, not after: a candidate that throws mid-loop has
+    // already rotated out, so one poison row cannot wedge the window forever
+    // (the failure shape of BLO-30320). A bare column write — it does not
+    // touch `updatedAt`, so the `issues_sync_last_activity_at` trigger stays
+    // quiet and the watermark is invisible to the evidence signals this
+    // detector reads.
+    if (candidates.length > 0) {
+      await db
+        .update(issues)
+        .set({ productivityScannedAt: now })
+        .where(
+          inArray(
+            issues.id,
+            candidates.map((candidate) => candidate.id),
+          ),
+        );
+    }
 
     // BLO-22436: an issue with an unresolved blocker has its queued *routine*
     // runs cancelled by the dependency gate before dispatch (see
