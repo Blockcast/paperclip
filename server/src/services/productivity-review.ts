@@ -4715,9 +4715,28 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // definition, so it would sink out of the window exactly as it became
       // interesting. Any static ordering on a field uncorrelated with
       // eligibility starves at some cap; rotation makes that impossible by
-      // construction. NULLS FIRST so never-scanned rows drain ahead of visited
-      // ones; `updatedAt`/`id` only break ties within one watermark value.
-      .orderBy(sql`${issues.productivityScannedAt} asc nulls first`, asc(issues.updatedAt), asc(issues.id))
+      // construction.
+      //
+      // Coalesce to `createdAt` rather than sorting NULLS FIRST (Ally review).
+      // NULLS FIRST is an *absolute* priority class: never-scanned rows always
+      // outrank every scanned row, so a sustained influx of >= MAX_CANDIDATE_ISSUES
+      // new eligible rows per pass would consume the whole window forever and
+      // an already-scanned row could never be revisited. That is the same
+      // starvation this fix exists to remove, just with a different victim —
+      // and the victim is the one that matters, since a row is scanned while it
+      // is still healthy and only becomes interesting once it later goes quiet.
+      // Treating "created" as the implicit first touch makes the key a strict
+      // FIFO: it advances only when a row is scanned, so the scan always takes
+      // the globally longest-waiting rows and new arrivals cannot jump the
+      // queue. Every eligible row is then evaluated within ceil(N/250) passes
+      // at any population and any arrival rate.
+      // `updatedAt`/`id` only break ties within one watermark value — a whole
+      // scan batch shares one `now`, so ties are common and must be stable.
+      .orderBy(
+        sql`coalesce(${issues.productivityScannedAt}, ${issues.createdAt}) asc`,
+        asc(issues.updatedAt),
+        asc(issues.id),
+      )
       .limit(MAX_CANDIDATE_ISSUES);
     result.scanned = candidates.length;
 
