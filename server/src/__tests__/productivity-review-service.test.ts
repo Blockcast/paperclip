@@ -5376,8 +5376,14 @@ describeEmbeddedPostgres("productivity review service", () => {
       `);
     }
 
+    // BLO-33477: a failed finalize now clamps the reservation's scan key to that
+    // pass's `staleCutoff` so it cannot pin the head of the window. The row is
+    // re-admitted on any *later* pass, so this second reconcile advances the
+    // clock rather than replaying the same instant. One second is enough — the
+    // point of clamping to the cutoff rather than to `now` is that a transient
+    // failure costs the next pass, not a whole stale interval.
     const recovered = await productivityReviewService(db).reconcileProductivityReviews({
-      now,
+      now: new Date(now.getTime() + 1_000),
       companyId: seeded.companyId,
       thresholds: { monitorLapseServiceGraceMs: 60_000 },
     });
@@ -5454,6 +5460,208 @@ describeEmbeddedPostgres("productivity review service", () => {
     const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
     expect(review?.identifier).toBe(`${seeded.issuePrefix}-2`);
     expect(review?.issueNumber).toBe(2);
+  });
+
+  it("advances the scan key of a stale reservation whose finalize keeps throwing", async () => {
+    // BLO-33477 AC3. The catch was the one path out of the recovery loop that
+    // left the row untouched, so a deterministically-failing finalize kept its
+    // `updatedAt` and re-selected at the head of `asc(updatedAt) LIMIT 250` on
+    // every pass — MAX_CANDIDATE_ISSUES of them would pin the window and starve
+    // every newer stale reservation behind it. Asserting the key advances is
+    // the tighter test than seeding the cap: starvation is impossible once no
+    // row can hold a fixed slot across passes.
+    //
+    // The key is clamped to `staleCutoff`, not to `now`, so the row is still
+    // retried on the next pass — a transient failure must not cost a full
+    // PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS. Both halves are asserted here.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const staleMs = 5 * 60_000;
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+
+    let attempts = 0;
+    const service = productivityReviewService(db, {
+      async beforeStaleReservationRecoveryFinalize(review) {
+        if (review.id !== reviewId) return;
+        attempts += 1;
+        throw new Error("finalize is deterministically broken for this reservation");
+      },
+    });
+    const reconcileAt = (at: Date) =>
+      service.reconcileProductivityReviews({
+        now: at,
+        companyId: seeded.companyId,
+        thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      });
+    const scanKey = async () =>
+      db
+        .select({ updatedAt: issues.updatedAt })
+        .from(issues)
+        .where(eq(issues.id, reviewId))
+        .then((rows) => rows[0]?.updatedAt);
+
+    const first = await reconcileAt(now);
+    expect(first.failed).toBe(1);
+    expect(attempts).toBe(1);
+    // Freed the slot for this pass, and moved strictly forward off `reservedAt`.
+    expect(await scanKey()).toEqual(new Date(now.getTime() - staleMs));
+
+    // Re-admitted on the very next pass rather than held out for a stale
+    // interval: a transient failure is retried promptly.
+    const second = await reconcileAt(new Date(now.getTime() + 1_000));
+    expect(second.failed).toBe(1);
+    expect(attempts).toBe(2);
+    expect(await scanKey()).toEqual(new Date(now.getTime() + 1_000 - staleMs));
+
+    // The key rides the cutoff, so it keeps advancing and cannot pin a slot.
+    const third = await reconcileAt(new Date(now.getTime() + 2_000));
+    expect(third.failed).toBe(1);
+    expect(attempts).toBe(3);
+    expect(await scanKey()).toEqual(new Date(now.getTime() + 2_000 - staleMs));
+
+    // The reservation itself is untouched apart from the scan key.
+    const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
+    expect(review?.identifier).toBeNull();
+    expect(review?.issueNumber).toBeNull();
+    expect(review?.status).toBe("todo");
+  });
+
+  // BLO-33477 AC3, capped-window form. The test above proves the *key* advances;
+  // this one proves what that buys — the tail is still reached when a whole
+  // window of deterministically-failing reservations is in front of it.
+  //
+  // The bound is TWO eligible passes, not one, and asserting one would be red
+  // against correct code. A row `N` with a fixed key `n` is first eligible on
+  // the pass `j` where `n < c_j`; on that pass the failing cohort still carries
+  // `c_{j-1} <= n`, so it sorts ahead of `N` and the LIMIT cuts `N`. The catch
+  // then clamps the cohort to `c_j`, and since `n < c_j`, `N` sorts strictly
+  // ahead of all 250 of them on pass `j+1` — whatever the cohort size.
+  //
+  // That is the whole refutation of "the failures stay ahead indefinitely":
+  // clamping to the cutoff makes the cohort's key advance at exactly the rate
+  // of the eligibility frontier, and a moving key cannot sit statically ahead
+  // of a fixed one. Pre-fix the cohort kept its original `reservedAt` — a fixed
+  // key, always <= any newer row's — and this test never goes green.
+  it("recovers a stale reservation behind a full window of failing ones (BLO-33477)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const staleMs = 5 * 60_000;
+    const staleCutoff = new Date(now.getTime() - staleMs); // c_1 = 11:55:00Z
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+
+    // Fill one whole window with reservations whose finalize throws every time.
+    // Each needs its own reviewable source: `issues_active_productivity_review_uq`
+    // allows at most one active review per (company, originId), and an
+    // unreviewable source would be *retired* rather than failed, which drops it
+    // out of the window and defeats the point.
+    const failingCount = 250;
+    const decoyReservedAt = new Date("2026-04-28T11:00:00.000Z"); // d
+    const decoySourceIds = Array.from({ length: failingCount }, () => randomUUID());
+    const decoyReviewIds = Array.from({ length: failingCount }, () => randomUUID());
+    await db.insert(issues).values(
+      decoySourceIds.map((id, i) => ({
+        id,
+        companyId: seeded.companyId,
+        title: `Failing source ${i}`,
+        status: "in_progress" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.coderId,
+        originKind: "manual",
+        issueNumber: 1000 + i,
+        identifier: `${seeded.issuePrefix}-${1000 + i}`,
+        startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+        monitorScheduledBy: "assignee" as const,
+        createdAt: decoyReservedAt,
+        updatedAt: decoyReservedAt,
+      })),
+    );
+    await db.insert(issues).values(
+      decoyReviewIds.map((id, i) => ({
+        id,
+        companyId: seeded.companyId,
+        title: `Failing reservation ${i}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        parentId: decoySourceIds[i],
+        assigneeAgentId: seeded.managerId,
+        createdByAgentId: seeded.coderId,
+        originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+        originId: decoySourceIds[i],
+        originFingerprint: `productivity-review:${decoySourceIds[i]}`,
+        requestDepth: 1,
+        // Reserved: no identifier/issueNumber yet, which is what keeps them in
+        // `recoverStaleReservedProductivityReviews`' predicate pass after pass.
+        issueNumber: null,
+        identifier: null,
+        createdAt: decoyReservedAt,
+        updatedAt: decoyReservedAt,
+        lastActivityAt: decoyReservedAt,
+      })),
+    );
+
+    // The target: `d < n < c_1`, so it is eligible on pass 1 yet sorts behind
+    // the whole failing cohort and is cut by the LIMIT.
+    const targetReservedAt = new Date("2026-04-28T11:50:00.000Z"); // n
+    expect(decoyReservedAt.getTime()).toBeLessThan(targetReservedAt.getTime());
+    expect(targetReservedAt.getTime()).toBeLessThan(staleCutoff.getTime());
+    const targetId = await insertProductivityReview({ seeded, createdAt: targetReservedAt });
+
+    const failing = new Set(decoyReviewIds);
+    let targetFinalizeAttempts = 0;
+    const service = productivityReviewService(db, {
+      async beforeStaleReservationRecoveryFinalize(review) {
+        if (failing.has(review.id)) {
+          throw new Error("finalize is deterministically broken for this reservation");
+        }
+        if (review.id === targetId) targetFinalizeAttempts += 1;
+      },
+    });
+    const reconcileAt = (at: Date) =>
+      service.reconcileProductivityReviews({
+        now: at,
+        companyId: seeded.companyId,
+        thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      });
+    const target = async () =>
+      db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, targetId))
+        .then((rows) => rows[0]);
+
+    // Pass 1: the window is saturated by the failing cohort, so the target is
+    // never even attempted. This is the starved shape, and it is correct here.
+    const first = await reconcileAt(now);
+    expect(first.failed).toBe(failingCount);
+    expect(targetFinalizeAttempts).toBe(0);
+    expect((await target())?.identifier).toBeNull();
+
+    // Pass 2: the cohort now carries `c_1`, the target's fixed `n < c_1`, so it
+    // sorts first and is recovered. Pre-fix the cohort is still at
+    // `decoyReservedAt` and this stays red forever, at any number of passes.
+    const second = await reconcileAt(new Date(now.getTime() + 1_000));
+    expect(targetFinalizeAttempts).toBe(1);
+    const recovered = await target();
+    // Finalized — identifier/issueNumber allocated is exactly what "recovered"
+    // means here, and is the inverse of the reserved state asserted above. The
+    // number itself is not pinned: the cohort's own sources consume the prefix
+    // sequence, so it tracks `failingCount` rather than the source's `-2`.
+    expect(recovered?.identifier).not.toBeNull();
+    expect(recovered?.issueNumber).not.toBeNull();
+    // The cohort keeps failing and keeps yielding the head slot; only the
+    // LIMIT-th of them is displaced by the target, nothing is lost.
+    expect(second.failed).toBe(failingCount - 1);
   });
 
   it("replays missing finalized review side effects without duplicating them", async () => {
@@ -6431,6 +6639,139 @@ describeEmbeddedPostgres("productivity review service", () => {
       sourceIssueId: seeded.issueId,
     });
   });
+
+  // BLO-33477: retirement-scan starvation, the same defect BLO-30303 fixed on
+  // the source scan. `closeOpenSuppressedReviews` is the only path that can
+  // retire an open review, and it only writes to a review it *retires* — a
+  // review that is scanned and correctly declined (its alarm still stands) has
+  // nothing written back, so its `updatedAt` never advances. Under
+  // `asc(updatedAt)` the same oldest-MAX_CANDIDATE_ISSUES declined rows
+  // re-occupied the window on every pass forever, and no review sorting behind
+  // them could ever be evaluated.
+  //
+  // As in BLO-30303, the assertion that matters is rotation *across* passes,
+  // not reachability on any single one: on pass 1 every row's watermark is
+  // still null, so the target legitimately sorts outside the window. What the
+  // fix guarantees is that pass 2 reaches it. Pre-fix this is red at any number
+  // of passes, which is what distinguishes a rotation key from a cap increase.
+  it("retires a review that sorts outside one retirement-scan window (BLO-33477)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "done",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+
+    // Fill one whole window with open reviews whose alarm still stands. Their
+    // trigger is `no_comment_streak`, which completion never invalidates, so
+    // the retirement loop scans them and declines every one — writing nothing
+    // back, which is the whole mechanism. Their sources are `done` so the
+    // source-candidate scan cannot mint anything new for them and perturb the
+    // window. Each needs its own source: `issues_active_productivity_review_uq`
+    // allows at most one active review per (company, originId).
+    const decoyCount = 250;
+    const decoyAt = new Date("2026-04-01T00:00:00.000Z");
+    const decoySourceIds = Array.from({ length: decoyCount }, () => randomUUID());
+    const decoyReviewIds = Array.from({ length: decoyCount }, () => randomUUID());
+    await db.insert(issues).values(
+      decoySourceIds.map((id, i) => ({
+        id,
+        companyId: seeded.companyId,
+        title: `Decoy source ${i}`,
+        status: "done" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.coderId,
+        originKind: "manual",
+        issueNumber: 1000 + i,
+        identifier: `${seeded.issuePrefix}-${1000 + i}`,
+        createdAt: decoyAt,
+        updatedAt: decoyAt,
+      })),
+    );
+    await db.insert(issues).values(
+      decoyReviewIds.map((id, i) => ({
+        id,
+        companyId: seeded.companyId,
+        title: `Decoy review ${i}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.managerId,
+        parentId: decoySourceIds[i],
+        originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+        originId: decoySourceIds[i],
+        originFingerprint: `productivity-review:${decoySourceIds[i]}`,
+        issueNumber: 2000 + i,
+        identifier: `${seeded.issuePrefix}-${2000 + i}`,
+        // Older than the target on both keys, so the target sorts outside the
+        // window under the pre-fix `updatedAt` order *and* under the fixed
+        // `coalesce(productivityScannedAt, createdAt)` order on pass 1.
+        createdAt: decoyAt,
+        updatedAt: decoyAt,
+      })),
+    );
+    await db.insert(activityLog).values(
+      decoyReviewIds.map((id, i) => ({
+        companyId: seeded.companyId,
+        actorType: "system",
+        actorId: "system",
+        action: "issue.productivity_review_created",
+        entityType: "issue",
+        entityId: id,
+        details: { trigger: "no_comment_streak", sourceIssueId: decoySourceIds[i] },
+        createdAt: decoyAt,
+      })),
+    );
+
+    // The target: newest open review, source already `done`, so it is retirable
+    // the moment the scan actually reaches it. `createdAt` must be strictly
+    // before `now`: on pass 2 the decoys carry a watermark of exactly `now`, so
+    // an equal `createdAt` would tie and then lose the `asc(updatedAt)`
+    // tiebreak to them, leaving the target outside the window even post-fix.
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: new Date("2026-04-27T00:00:00.000Z"),
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: { trigger: "long_active_duration", sourceIssueId: seeded.issueId },
+    });
+
+    const service = productivityReviewService(db);
+
+    const first = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    // Pass 1 scans a full window and retires nothing — the funnel shape a
+    // starved sweep has, and the reason AC4 wants it counted rather than silent.
+    expect(first.retirementScanned).toBe(decoyCount);
+    expect(first.retirementRetired).toBe(0);
+    expect(first.retirementDeclined).toBe(decoyCount);
+
+    const second = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    // Pre-fix pass 2 re-scans the identical 250 decoys and this is 0 forever.
+    expect(second.retirementRetired).toBe(1);
+    expect(second.closedTerminalSourceReviews).toBe(1);
+    const [review] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review?.status).toBe("done");
+  }, 120_000);
 
   it("does not close a long-active productivity review when the source was cancelled", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");

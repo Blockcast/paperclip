@@ -2708,8 +2708,58 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           notInArray(issues.status, ["done", "cancelled"]),
         ),
       )
-      .orderBy(asc(issues.updatedAt), asc(issues.id))
+      // BLO-33477: rotate on the same least-recently-scanned watermark the
+      // source candidate scan uses (BLO-30303), for the same reason. This loop
+      // writes only to a review it *retires*; a review that is scanned and
+      // correctly declined — its alarm still stands — has nothing written back,
+      // so its `updatedAt` never advances. Under `asc(updatedAt)` the same
+      // oldest-MAX_CANDIDATE_ISSUES declined rows therefore re-occupied the
+      // window on every pass forever, and once the open-review population
+      // passed the cap no review sorting behind them could ever be evaluated
+      // for retirement. Those are exactly the reviews whose sources have since
+      // gone `done` — dead alarms, each costing a manager run to triage by hand.
+      //
+      // Sharing `productivityScannedAt` with the source scan is safe: that scan
+      // filters `originKind <> PRODUCTIVITY_REVIEW_ORIGIN_KIND` and this one
+      // requires equality, so the two stamp strictly disjoint row sets and
+      // neither can perturb the other's ordering.
+      // `recoverStaleReservedProductivityReviews` reads a subset of these rows
+      // but orders on `updatedAt` and never reads this column, so it is
+      // unaffected either way (see the note on its own query).
+      //
+      // Coalesce to `createdAt` rather than sorting NULLS FIRST, for the reason
+      // given at the source scan: NULLS FIRST is an absolute priority class, so
+      // a sustained influx of new reviews would permanently preempt an
+      // already-scanned one — the same starvation with a different victim.
+      // Treating "created" as the implicit first touch makes the key a strict
+      // FIFO, so every open review is reached within
+      // ceil(N / MAX_CANDIDATE_ISSUES) passes at any population and arrival
+      // rate. `updatedAt`/`id` only break ties within one watermark value; a
+      // whole batch shares one `now`, so ties are common and must be stable.
+      .orderBy(
+        sql`coalesce(${issues.productivityScannedAt}, ${issues.createdAt}) asc`,
+        asc(issues.updatedAt),
+        asc(issues.id),
+      )
       .limit(MAX_CANDIDATE_ISSUES);
+
+    // Stamp before evaluating, not after: a review that throws mid-loop has
+    // already rotated out, so one poison row cannot wedge the window forever.
+    // A bare column write — it leaves `updatedAt` alone, so the
+    // `issues_sync_last_activity_at` BEFORE UPDATE trigger (which fires only
+    // when `updated_at` is distinct from OLD) stays quiet and the watermark
+    // cannot masquerade as activity on the review.
+    if (reviewRows.length > 0) {
+      await db
+        .update(issues)
+        .set({ productivityScannedAt: now })
+        .where(
+          inArray(
+            issues.id,
+            reviewRows.map((review) => review.id),
+          ),
+        );
+    }
 
     const sourceIssueIds = [
       ...new Set(reviewRows.map((review) => review.originId).filter((id): id is string => Boolean(id))),
@@ -2904,10 +2954,21 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       else if (suppressedBy === "dependency_blocked") closedDependencyBlocked += 1;
       else closedMonitorScheduled += 1;
     }
+    const retiredCount = closedMonitorScheduled + closedTerminalSource + closedDependencyBlocked;
     return {
       monitorScheduled: closedMonitorScheduled,
       terminalSource: closedTerminalSource,
       dependencyBlocked: closedDependencyBlocked,
+      // BLO-33477 AC4: funnel counters for the retirement pass. A sweep that
+      // scans a full window and retires nothing is exactly what starvation
+      // looks like, and without `scanned` it is indistinguishable from a
+      // healthy sweep with nothing to do — the same blind spot that let
+      // BLO-30303 read as normal for 23 days. `declined` is "scanned but not
+      // retired", which folds in the early `continue`s (no origin, missing or
+      // cross-company source, lost close race) as well as a standing alarm.
+      scanned: reviewRows.length,
+      retired: retiredCount,
+      declined: reviewRows.length - retiredCount,
     };
   }
 
@@ -4361,6 +4422,28 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     now: Date;
     companyId?: string;
   }) {
+    // BLO-33477 AC3: this scan keeps `asc(updatedAt)` rather than moving to the
+    // `productivityScannedAt` watermark the source scan (BLO-30303) and the
+    // retirement scan above use — it cannot share that column, because
+    // `closeOpenSuppressedReviews` stamps a superset of these rows and would
+    // drive the ordering. It is nonetheless starvation-free, because every path
+    // out of the loop below advances the row past this window:
+    //
+    //   - retired      -> status `done`, drops out of `notInArray(status, ...)`
+    //   - finalized    -> gains identifier/issueNumber, drops out of `isNull(...)`
+    //   - retire raced -> `existing`; transient, the row changed under us
+    //   - finalize threw -> `failed`, and the catch bumps `updatedAt`
+    //
+    // That last path is the one that used to break the invariant: a reservation
+    // whose finalize throws deterministically kept its `updatedAt` and
+    // re-selected at the head on every pass, so MAX_CANDIDATE_ISSUES of them
+    // would pin the window and starve every newer stale reservation behind it —
+    // the same mechanism as the retirement scan, with a rarer trigger. Clamping
+    // `updatedAt` to `staleCutoff` in the catch closes it without a second
+    // watermark column: the key moves strictly forward on every failed attempt,
+    // so no row can hold a fixed slot, while the row is still re-admitted on the
+    // next pass so a transient failure is not punished with a delay. See the
+    // catch below.
     const staleCutoff = new Date(input.now.getTime() - PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS);
     const reservedReviews = await db
       .select()
@@ -4518,6 +4601,38 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       } catch (err) {
         result.failed += 1;
         result.failedIssueIds.push(sourceIssue.id);
+        // BLO-33477 AC3: advance the scan key so a deterministically-failing
+        // finalize cannot re-select at the head of every pass and starve the
+        // reservations behind it (see the note on the query above). Guarded to
+        // rows still reserved: if finalize threw *after* assigning
+        // identifier/issueNumber the row has already left this window.
+        //
+        // `staleCutoff`, deliberately, not `input.now` — both free the slot for
+        // this pass, but `input.now` would also hold the row out for a further
+        // stale interval, turning a *transient* finalize failure into a
+        // 5-minute recovery delay. Clamping to the cutoff re-admits the row on
+        // the next pass while still moving the key strictly forward (the row
+        // was only selected because `updatedAt < staleCutoff`), so a poison row
+        // rides the cutoff and is overtaken by any fixed-key row within one
+        // stale interval instead of pinning a slot indefinitely.
+        //
+        // This advances `lastActivityAt` too, via the migration-0076 BEFORE
+        // UPDATE trigger — it mirrors any `updatedAt` advance unless the caller
+        // writes a *different* value, so passing the current one through does
+        // not suppress it. Intended: the row was genuinely touched.
+        await db
+          .update(issues)
+          .set({ updatedAt: staleCutoff })
+          .where(
+            and(
+              eq(issues.companyId, review.companyId),
+              eq(issues.id, review.id),
+              eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+              isNull(issues.issueNumber),
+              isNull(issues.identifier),
+              notInArray(issues.status, ["done", "cancelled"]),
+            ),
+          );
         logger.warn(
           {
             err,
@@ -4667,6 +4782,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       closedSuppressedMonitorReviews: 0,
       closedTerminalSourceReviews: 0,
       closedDependencyBlockedReviews: 0,
+      // BLO-33477 AC4: the retirement pass's own funnel. Kept separate from the
+      // `closed*` counters above because those are outcome tallies and one of
+      // them (`closedTerminalSourceReviews`) is also credited by the stale
+      // reservation recovery below — so neither it nor their sum isolates what
+      // this sweep actually did.
+      retirementScanned: 0,
+      retirementRetired: 0,
+      retirementDeclined: 0,
       creationCapped: 0,
       noActionSuppressed: 0,
       skipped: 0,
@@ -4680,6 +4803,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     result.closedSuppressedMonitorReviews = closedSuppressed.monitorScheduled;
     result.closedTerminalSourceReviews = closedSuppressed.terminalSource;
     result.closedDependencyBlockedReviews = closedSuppressed.dependencyBlocked;
+    result.retirementScanned = closedSuppressed.scanned;
+    result.retirementRetired = closedSuppressed.retired;
+    result.retirementDeclined = closedSuppressed.declined;
 
     const recoveredReservations = await recoverStaleReservedProductivityReviews({
       now,
