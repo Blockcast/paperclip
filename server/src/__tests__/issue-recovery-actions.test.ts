@@ -9,8 +9,6 @@ import {
   activityLog,
   companies,
   createDb,
-  environmentLeases,
-  environments,
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
@@ -25,6 +23,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateCompanyScopedTestState } from "./helpers/truncate-company-scoped-test-state.js";
 import { errorHandler } from "../middleware/index.js";
 import { logger } from "../middleware/logger.js";
 import { issueRoutes } from "../routes/issues.js";
@@ -424,19 +423,21 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // Defensive: a test that arms the seam but never reaches it must not leak
     // the hook into the next test.
     pauseHoldSeam.onNextCheck = null;
-    await db.delete(issueRecoveryActions);
-    await db.delete(issueComments);
-    await db.delete(issueWorkProducts);
-    await db.delete(environmentLeases);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(environments);
-    await db.delete(routineRuns);
-    await db.delete(routines);
-    await db.delete(issues);
-    await db.delete(agents);
-    await db.delete(companies);
+    // BLO-33498: the hand-ordered DELETE list was correctly ordered (comments nine
+    // statements before issues) and still failed, because ordering only helps while
+    // nothing else is writing. `request(app)` resolves when the response is flushed,
+    // not when the handler has settled, so a best-effort trailing write can still be
+    // in flight when `afterEach` starts; landing between the child and parent delete
+    // it broke `issue_comments_issue_id_issues_id_fk`. Ordering was never the bug.
+    //
+    // This is the shared helper, not a local TRUNCATE, and the difference is
+    // load-bearing: a bare `TRUNCATE ... CASCADE` takes ACCESS EXCLUSIVE on the whole
+    // cascade and deadlocks (40P01) against those same stragglers — a hand-rolled one
+    // here failed 2/189 in a single run. The helper wraps it in a transaction-scoped
+    // advisory lock plus transient-deadlock retry (the "v513 saga"). `environments`
+    // declares no FK to `companies`, so the cascade cannot reach it and it has to be
+    // named as a second root.
+    await truncateCompanyScopedTestState(db, { extraTruncateTables: ["environments"] });
   });
 
   afterAll(async () => {
@@ -3215,7 +3216,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // improvement, and pinning equality would assert this mock's drain policy instead.
     expect(rounds).toBeLessThanOrEqual(Math.ceil((BURST - MAX_CONCURRENT) / MAX_CONCURRENT));
     expect(rounds).toBeGreaterThan(1); // a burst this size cannot drain in one pass
-  });
+    // BLO-33498: this test needs a per-test budget, and the default 60s is not it.
+    // It performs 117 real escalations (25 in the burst + 92 draining it over 8
+    // rounds), each a multi-statement transaction against embedded Postgres, measured
+    // at ~0.92s each / ~110s total on an IDLE local box. There is no artificial delay
+    // to remove — the cost is intrinsic to the load shape AC4 asks for, so no fix to
+    // the recovery service could have brought it under 60s. Budget is set for the
+    // contended ARC pool, which vitest.config.ts records as ~3-4x slower on
+    // embedded-postgres work. Vitest honours a per-test timeout over the global.
+  }, 600_000);
 
   it("stamps configured bounds when creating a wake-owner recovery action", async () => {
     const previousMaxAttempts = process.env.RECOVERY_ACTION_MAX_ATTEMPTS;
