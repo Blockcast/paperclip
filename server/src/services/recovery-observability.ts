@@ -106,6 +106,20 @@ export type RecoveryActionListItem = {
   outcome: string | null;
   createdAt: Date;
   updatedAt: Date;
+  /**
+   * BLO-19124: `status` alone is NOT a routing outcome, and reading it as one is a
+   * measured misread, not a hypothetical. Company-wide, `status = 'resolved'` is a
+   * single narrow transition that `classifyRecoveryHandoff` never reads — so
+   * counting it produced "resolves 1 action in 200", while ~2,546 `cancelled`
+   * actions in the same pool carried a real routing class. This list shipped
+   * projecting `status` only, which reproduces that same misread per-owner.
+   *
+   * The two `final*` fields are the classifier's inputs, returned alongside its
+   * verdict so a consumer can audit the class without a second query.
+   */
+  finalAssigneeAgentId: string | null;
+  finalIssueStatus: string | null;
+  handoffClass: HandoffClass;
 };
 
 export type RecoveryActionListOptions = {
@@ -232,7 +246,7 @@ export function recoveryObservabilityService(db: Db) {
 
     const limit = Math.min(500, Math.max(1, Math.floor(opts.limit ?? 100)));
     const offset = Math.max(0, Math.floor(opts.offset ?? 0));
-    return db
+    const rows = await db
       .select({
         id: issueRecoveryActions.id,
         sourceIssueId: issueRecoveryActions.sourceIssueId,
@@ -256,6 +270,8 @@ export function recoveryObservabilityService(db: Db) {
         outcome: issueRecoveryActions.outcome,
         createdAt: issueRecoveryActions.createdAt,
         updatedAt: issueRecoveryActions.updatedAt,
+        finalAssigneeAgentId: issues.assigneeAgentId,
+        finalIssueStatus: issues.status,
       })
       .from(issueRecoveryActions)
       .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
@@ -272,6 +288,10 @@ export function recoveryObservabilityService(db: Db) {
       )
       .limit(limit)
       .offset(offset);
+
+    // Same pure classifier the company-wide report uses, over the same inputs, so
+    // the per-owner list and the aggregate can never disagree about a given row.
+    return rows.map((row) => ({ ...row, handoffClass: classifyRecoveryHandoff(row) }));
   }
 
   async function report(

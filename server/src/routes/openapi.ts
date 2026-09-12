@@ -3225,6 +3225,11 @@ registry.registerPath({
       kind: z.string().optional(),
       status: z.string().optional(),
       limit: z.string().optional(),
+      offset: z.string().optional(),
+      // Documented because `asc` is what makes a census of the legacy tail
+      // reachable at all past the 500-row limit; the route has accepted both
+      // since BLO-19124 but neither appeared here.
+      order: z.enum(["asc", "desc"]).optional(),
     }),
   },
   responses: { 200: r.ok(), 401: r.unauthorized },
