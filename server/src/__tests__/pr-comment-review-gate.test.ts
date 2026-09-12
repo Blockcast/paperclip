@@ -1176,6 +1176,36 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
     expect(hasActionablePrReviewFeedback(body)).toBe(true);
   });
 
+  it("still blocks a still-present ledger entry sitting under an unbalanced fence", () => {
+    // The one shape that separates reading the ledger from the text in hand
+    // from delegating to the emitted-only extractor. An unbalanced fence blanks
+    // to end of body, so a fence opened *above* the ledger takes the entry with
+    // it on the fence-stripped pass and the raw pass is the only reader left
+    // that can see it; control then reaches the clean declaration, which the
+    // raw pass's intact 0/0 satisfies, and the gate clears. `:708`/`:729` pin
+    // exactly this hazard for the bucket signal, which reads the text in hand.
+    //
+    // Fence *position* alone must not decide the verdict, which is what the
+    // second assertion holds fixed: identical body, fence moved below the
+    // ledger, where stripping cannot reach it.
+    const ledger = [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — still-present — re-checked against this head.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+    ];
+    const unterminatedFence = ["```ts", "const unterminated = true;"];
+
+    expect(hasActionablePrReviewFeedback(reviewBody(CURRENT_HEAD, [...unterminatedFence, ...ledger]))).toBe(
+      true,
+    );
+    expect(hasActionablePrReviewFeedback(reviewBody(CURRENT_HEAD, [...ledger, ...unterminatedFence]))).toBe(
+      true,
+    );
+  });
+
   it("clears a 0/0 review whose ledger only retires prior findings", () => {
     // The control for the case above: `fixed` classifies as `retires`, so it
     // must not block. Without this, the still-present guard could be satisfied
