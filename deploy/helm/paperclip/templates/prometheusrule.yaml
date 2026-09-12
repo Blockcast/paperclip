@@ -10,9 +10,16 @@
   So a rule added ONLY here is dead code on the cluster it is meant to protect.
   The live alerting surface is Blockcast/onprem-k8s, and it is itself a pair:
 
-    1. monitoring/prometheus-configmap.yaml, key `paperclip-runtime-alerts.rules.yml`
+    1. monitoring/prometheus-rules-2-configmap.yaml, key `paperclip-runtime-alerts.rules.yml`
        — AUTHORITATIVE. The cluster runs a vanilla Prometheus StatefulSet that
        loads rules from this static ConfigMap. This is the copy that fires.
+       The rules used to live in monitoring/prometheus-configmap.yaml; they were
+       sharded out into monitoring/prometheus-rules-{1..5}-configmap.yaml, and
+       prometheus-configmap.yaml now carries zero `alert:` rules (it keeps
+       scrape config + `rule_files: /etc/prometheus/rules/*.rules.yml`). Shard
+       membership is arbitrary and can change — find a rule with
+       `grep -rl <AlertName> monitoring/prometheus-rules-*-configmap.yaml`
+       rather than assuming shard 2 (BLO-33598).
     2. paperclip/paperclip-runtime-alerts-prometheusrule.yaml
        — a documentation copy of the same rules as a PrometheusRule CRD. No
        prometheus-operator runs on this cluster, so the CRD is an orphaned
@@ -32,7 +39,7 @@
     - Landed on both authoritative onprem-k8s files by Blockcast/onprem-k8s#1784,
       merged 2026-07-30T13:01:18Z as 423e32bc76c1bcdfa88c02bfce722a2ee71c22ef.
       Verify:
-        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-rules-2-configmap.yaml \
           --jq '.content' | base64 -d | grep PaperclipGithubReviewRequestDeadLettered
 
     - LIVE as of 2026-07-31T01:10Z after manually syncing the monitoring-rules
@@ -53,23 +60,24 @@
 
     - Added to both authoritative onprem-k8s files by Blockcast/onprem-k8s#1946
       (branch cto/blo-20255-terminal-failed-wake-alert). Verify:
-        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-rules-2-configmap.yaml \
           --jq '.content' | base64 -d | grep PaperclipPrReviewWakeTerminalFailed
 
     - NOT yet merged and NOT yet live as of 2026-08-02. It reads a metric this
       PR adds, so it is inert until both land. Same manual `monitoring-rules`
-      Argo sync gate as above applies afterwards.
+      Argo sync gate as above applies afterwards. Re-checked 2026-09-12: still
+      absent from all of monitoring/prometheus-rules-{1..5}-configmap.yaml.
 
   STATUS of the BLO-21092 plugin-error alert, same auditability rule:
 
-    - Not yet landed on the onprem-k8s authoritative files as of the PR that
-      introduces this comment. It reads paperclip_plugin_error, a new gauge
-      this same PR adds to server/src/services/metrics.ts -- both the metric
-      and the rule are inert until the server image ships AND the onprem-k8s
-      lockstep pair (monitoring/prometheus-configmap.yaml,
-      paperclip/paperclip-runtime-alerts-prometheusrule.yaml) is merged. Verify
-      before treating it as live:
-        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
+    - LANDED. Was "not yet landed" when this comment was written; re-checked
+      2026-09-12, PaperclipPluginErrored is present in
+      monitoring/prometheus-rules-2-configmap.yaml and in
+      paperclip/paperclip-runtime-alerts-prometheusrule.yaml. It reads
+      paperclip_plugin_error from server/src/services/metrics.ts, so it is
+      still inert unless the server image shipping that gauge is deployed.
+      Verify before treating it as live:
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-rules-2-configmap.yaml \
           --jq '.content' | base64 -d | grep PaperclipPluginErrored
     - Same manual `monitoring-rules` Argo sync gate as above (BLO-19095)
       applies after merge -- a merged rule is not a deployed one.
