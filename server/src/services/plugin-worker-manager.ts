@@ -53,6 +53,7 @@ import type {
   InitializeParams,
 } from "@paperclipai/plugin-sdk";
 import { logger } from "../middleware/logger.js";
+import { HttpError } from "../errors.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -652,6 +653,27 @@ export function createPluginWorkerHandle(
     return typeof code === "string" && code.length > 0 ? { code } : undefined;
   }
 
+  /**
+   * Whether a host-handler throw is the host *refusing* the call rather than
+   * *failing* it.
+   *
+   * A denial is an expected, plugin-handled outcome: the capability is absent,
+   * the call escaped its invocation scope, or the host service rejected it with
+   * a 4xx (`binding_missing`, `binding_ambiguous`, not-found, conflict). The
+   * plugin already logs its own reaction, so the host copy is context, not a
+   * page. Anything else — a thrown `TypeError`, a dead database handle — is a
+   * genuine host fault and stays at ERROR (BLO-33419).
+   */
+  function isHostCallDenial(err: unknown, code: number): boolean {
+    if (
+      code === PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED ||
+      code === PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED
+    ) {
+      return true;
+    }
+    return err instanceof HttpError && err.status >= 400 && err.status < 500;
+  }
+
   // -----------------------------------------------------------------------
   // Incoming message handling
   // -----------------------------------------------------------------------
@@ -839,14 +861,29 @@ export function createPluginWorkerHandle(
       });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      log.error({ method, err: errorMessage }, "host handler error");
+      const errorCode = errorCodeForWorkerHostError(err);
+      const errorData = workerHostErrorData(err);
+      // `reason`, not `err`: pino-pretty reserves the `err` key and hoists a
+      // string value onto a CONTINUATION line, which Loki ingests as its own
+      // entry with no level, no message and no correlation back to this one.
+      // The reason was being emitted and was unjoinable in practice.
+      const fields = {
+        method,
+        reason: errorMessage,
+        ...(errorData ? { reasonCode: errorData.code } : {}),
+      };
+      if (isHostCallDenial(err, errorCode)) {
+        log.warn(fields, "host call denied");
+      } else {
+        log.error(fields, "host handler error");
+      }
       try {
         sendMessage(
           createErrorResponse(
             request.id,
-            errorCodeForWorkerHostError(err),
+            errorCode,
             errorMessage,
-            workerHostErrorData(err),
+            errorData,
           ),
         );
       } catch {
