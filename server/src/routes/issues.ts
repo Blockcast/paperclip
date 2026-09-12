@@ -7532,9 +7532,22 @@ export function issueRoutes(
       //
       // Enumerated rather than spread so a field added to
       // `ProjectWorkspaceRuntimeConfig` later has to be considered here first.
+      //
+      // PEN-2852 composition (BLO-33407): the gate decides *whether* the value is
+      // disclosed, the mask is a second layer that only survives if the gate
+      // regresses. `publicProjectWorkspace` above has already set
+      // `workspaceRuntime: null` for an unentitled viewer, so masking it would be a
+      // no-op; the mask's entire live effect was on the *entitled* path, where
+      // `workspace_runtime:read` exists for exactly this disclosure. Values cross
+      // by design for an entitled reader — the runtime editors depend on it. The
+      // same `viewer.revealRuntimeConfig` flag is re-read here rather than
+      // re-derived, so if the `publicProjectWorkspace` call is ever dropped or
+      // bypassed the mask still fires and only names and structure cross.
       runtimeConfig: workspace.runtimeConfig
         ? {
-            workspaceRuntime: maskWorkspaceRuntimeForRead(workspace.runtimeConfig.workspaceRuntime),
+            workspaceRuntime: viewer.revealRuntimeConfig
+              ? workspace.runtimeConfig.workspaceRuntime
+              : maskWorkspaceRuntimeForRead(workspace.runtimeConfig.workspaceRuntime),
             desiredState: workspace.runtimeConfig.desiredState,
             serviceStates: workspace.runtimeConfig.serviceStates,
           }
@@ -7665,8 +7678,24 @@ export function issueRoutes(
             // sets `metadata: null` rather than spreading the row. Passing the
             // runtime config through verbatim handed every operator-authored key
             // in a service definition to three MCP tools any same-company agent
-            // holds. Names and structure still cross; values do not.
-            workspaceRuntime: maskWorkspaceRuntimeForRead(workspace.config.workspaceRuntime),
+            // holds.
+            //
+            // PEN-2852 composition (BLO-33407): the gate decides *whether* the
+            // value is disclosed, the mask is a second layer that only survives if
+            // the gate regresses. `publicExecutionWorkspace` above has already set
+            // `workspaceRuntime: null` for an unentitled viewer — the agent class
+            // this mask was written against — so masking it would be a no-op; the
+            // mask's entire live effect was on the *entitled* path, where
+            // `workspace_runtime:read` exists for exactly this disclosure. So: for
+            // an unentitled reader, nothing crosses at all; for an entitled one,
+            // values cross by design and the heartbeat-context runtime editors
+            // depend on it. The same `viewer.revealRuntimeConfig` flag is re-read
+            // here rather than re-derived, so if the `publicExecutionWorkspace`
+            // call is ever dropped or bypassed the mask still fires and only names
+            // and structure cross.
+            workspaceRuntime: viewer.revealRuntimeConfig
+              ? workspace.config.workspaceRuntime
+              : maskWorkspaceRuntimeForRead(workspace.config.workspaceRuntime),
             desiredState: workspace.config.desiredState,
             serviceStates: workspace.config.serviceStates,
           }
