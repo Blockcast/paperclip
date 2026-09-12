@@ -357,6 +357,7 @@ import {
   issueTreeControlService,
 } from "./issue-tree-control.js";
 import { RUN_STALE_SILENCE_MS } from "./issue-run-holding.js";
+import { describeSharedCheckoutOccupancy } from "./shared-checkout-occupancy.js";
 import {
   continuationSummaryParksExecutor,
   getIssueContinuationSummaryDocument,
@@ -7127,6 +7128,58 @@ export function formatRuntimeWorkspaceWarningLog(warning: string) {
   return {
     stream: "stdout" as const,
     chunk: `[paperclip] ${warning}\n`,
+  };
+}
+
+/**
+ * Builds `context.paperclipWorkspace` -- the object the adapter context is
+ * spread from, i.e. what the agent process actually receives.
+ *
+ * Extracted from the inline literal so the delivery contract is testable.
+ * BLO-27858 shipped a warning that was only ever drained to the run log while
+ * its own doc comments claimed it reached the agent; nothing failed, because
+ * no test asserted the warning was observable at its claimed destination.
+ *
+ * Two properties are load-bearing and are pinned by tests:
+ *
+ *   * `warnings` is present at all. Drop the key and the agent is told nothing.
+ *   * `warnings` is the CALLER'S ARRAY BY REFERENCE, not a copy. Callers keep
+ *     pushing onto it after this returns (session-compaction warnings, for
+ *     one), and the run-log drain reads the same array later still. Copying
+ *     here would silently drop every entry added after the call.
+ */
+export function buildPaperclipWorkspaceContext(input: {
+  executionWorkspace: {
+    cwd: string;
+    source: string;
+    strategy: string;
+    projectId: string | null;
+    workspaceId: string | null;
+    repoUrl: string | null;
+    repoRef: string | null;
+    branchName: string | null;
+    worktreePath: string | null;
+  };
+  mode: string;
+  warnings: string[];
+  realization: unknown;
+  agentHome: string;
+}) {
+  const { executionWorkspace } = input;
+  return {
+    cwd: executionWorkspace.cwd,
+    source: executionWorkspace.source,
+    mode: input.mode,
+    strategy: executionWorkspace.strategy,
+    warnings: input.warnings,
+    projectId: executionWorkspace.projectId,
+    workspaceId: executionWorkspace.workspaceId,
+    repoUrl: executionWorkspace.repoUrl,
+    repoRef: executionWorkspace.repoRef,
+    branchName: executionWorkspace.branchName,
+    worktreePath: executionWorkspace.worktreePath,
+    realization: input.realization,
+    agentHome: input.agentHome,
   };
 }
 
@@ -28556,9 +28609,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       isolationScopedRuntimeSessionParams,
       k8sRunIsolation,
     );
+    // BLO-27858: probe for a sibling run sharing this checkout.
+    //
+    // Sited here rather than inside realizeExecutionWorkspace deliberately.
+    // `executionWorkspace` is the FINAL resolved workspace, so this covers the
+    // restore branch of provisionExecutionWorkspaceWithReuse as well as the
+    // realize branch. Probing inside realization would miss `reuse_existing`
+    // entirely -- the mode whose whole purpose is handing run 2+ the tree run 1
+    // is already using, i.e. the configuration with the highest prior
+    // probability of contention.
+    //
+    // git_worktree is exempt: it gives every run its own path and stamps
+    // ownership, so there is no shared tree to warn about.
+    const sharedCheckoutWarning =
+      executionWorkspace.strategy === "git_worktree"
+        ? null
+        : await describeSharedCheckoutOccupancy({
+            db,
+            companyId: agent.companyId,
+            agentId: agent.id,
+            heartbeatRunId: run.id,
+            cwd: executionWorkspace.cwd,
+            strategyType: executionWorkspace.strategy,
+          });
     const runtimeWorkspaceWarnings = [
       ...resolvedWorkspace.warnings,
       ...executionWorkspace.warnings,
+      ...(sharedCheckoutWarning ? [sharedCheckoutWarning] : []),
       ...(runtimeSessionResolution.warning ? [runtimeSessionResolution.warning] : []),
       ...(isolationSessionMismatch && k8sRunIsolation
         ? [
@@ -28578,24 +28655,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ]
         : []),
     ];
-    context.paperclipWorkspace = {
-      cwd: executionWorkspace.cwd,
-      source: executionWorkspace.source,
+    context.paperclipWorkspace = buildPaperclipWorkspaceContext({
+      executionWorkspace,
       mode: effectiveExecutionWorkspaceMode,
-      strategy: executionWorkspace.strategy,
-      projectId: executionWorkspace.projectId,
-      workspaceId: executionWorkspace.workspaceId,
-      repoUrl: executionWorkspace.repoUrl,
-      repoRef: executionWorkspace.repoRef,
-      branchName: executionWorkspace.branchName,
-      worktreePath: executionWorkspace.worktreePath,
+      warnings: runtimeWorkspaceWarnings,
       realization: workspaceRealization,
       agentHome: await (async () => {
         const home = resolveDefaultAgentWorkspaceDir(agent.id);
         await fs.mkdir(home, { recursive: true });
         return home;
       })(),
-    };
+    });
     context.paperclipWorkspaces = resolvedWorkspace.workspaceHints;
     // The wake payload is built before the execution workspace is resolved, so
     // attach the branch pin here; the shared wake-prompt renderer surfaces it as
