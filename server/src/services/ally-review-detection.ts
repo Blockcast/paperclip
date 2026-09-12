@@ -423,9 +423,23 @@ function carriesBlockingFeedback(text: string, options?: ActionableFeedbackOptio
   // the defence for when that mirroring is omitted. It matters because
   // evaluateCommentReviewGate short-circuits on a current-head attestation
   // before consulting the carry-forward, so nothing else re-examines the entry.
+  //
+  // Matched against the `text` passed in rather than delegated to
+  // extractAllyPriorFindingDispositions, which re-applies emittedReviewText
+  // internally. Delegating made both passes of hasActionablePrReviewFeedback
+  // read stripped text, so the raw pass bought nothing here while the bucket
+  // signal beside it genuinely read raw — and an unbalanced fence anywhere
+  // above the ledger blanks it to end of body, dropping the entry and letting
+  // the raw pass's intact 0/0 clear the gate. This clause is a *blocking*
+  // predicate, so it belongs to the detecting group (emitted and raw), not the
+  // retiring group (emitted only); see the header at :26-32. The cost is that
+  // a fenced paste of a ledger now blocks, which is the false red :486-492
+  // already accepts and which the bucket clause already pays.
   if (
     options?.countInheritedLedgerAssertion !== false &&
-    extractAllyPriorFindingDispositions(text).some((entry) => entry.kind === "blocks")
+    Array.from(text.matchAll(PRIOR_FINDING_DISPOSITION_PATTERN)).some(
+      (match) => classifyPriorDisposition(match[4]!) === "blocks",
+    )
   ) {
     return true;
   }
