@@ -115,6 +115,7 @@ import {
   ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
   TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
+  runOwnsIssueExecutionLock,
 } from "./issue-execution-lock.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import {
@@ -12166,14 +12167,9 @@ export function issueService(db: Db) {
       // Same run-identity test as isCurrentIssueExecutionRun: hold every lock
       // column that is set, so a run owning only one of a divergent pair does
       // not read as the owner.
-      const ownsCheckout = current.checkoutRunId === actorRunId;
-      const ownsExecution = current.executionRunId === actorRunId;
-      const owned =
-        actorRunId != null &&
-        (ownsCheckout || ownsExecution) &&
-        (current.checkoutRunId == null || ownsCheckout) &&
-        (current.executionRunId == null || ownsExecution);
-      if (owned) return { owned: true as const, fenced: true as const };
+      if (runOwnsIssueExecutionLock(current, actorRunId)) {
+        return { owned: true as const, fenced: true as const };
+      }
 
       throw conflict("Issue run ownership conflict", {
         issueId: current.id,
@@ -12206,6 +12202,45 @@ export function issueService(db: Db) {
 
         if (!existing) return null;
         if (actorAgentId && existing.assigneeAgentId && existing.assigneeAgentId !== actorAgentId) {
+          // BLO-27356: a run that owns this issue's lock but is no longer its
+          // assignee degrades to relinquishing ONLY the lock.
+          //
+          // The stale pair "A holds the lock, B is the assignee" is produced by
+          // ordinary operation, not abuse — the heartbeat's reassignment
+          // lock-release deliberately leaves a `running` holder alone, and an
+          // ordinary manager hand-back where the releasing run stays alive
+          // re-stamps the lock onto a row that now belongs to B. Refusing
+          // outright was directionally right and wrong in granularity: the full
+          // release below nulls `assigneeAgentId` and forces `todo`, which would
+          // clobber B, but A never needed to reassign the row — only to let go.
+          //
+          // Two things are deliberately NOT done here:
+          //   * `status` and `assigneeAgentId` are left untouched, so a recovery
+          //     takeover or manager reassignment still wins. No monitor
+          //     eligibility patch is needed for the same reason — the two fields
+          //     it reconciles against are exactly the two that do not change.
+          //   * `cancelStaleIssueContextRuns` is SKIPPED entirely rather than
+          //     threaded a `keepRunId`. That parameter is singular, so it cannot
+          //     both spare B's run and reap a third foreign run; and cancelling
+          //     anything at all is out of scope for an actor relinquishing its
+          //     own lock. Skipping needs no new parameter and no exception list.
+          if (runOwnsIssueExecutionLock(existing, actorRunId)) {
+            const relinquished = await tx
+              .update(issues)
+              .set({
+                checkoutRunId: null,
+                executionRunId: null,
+                executionAgentNameKey: null,
+                executionLockedAt: null,
+                updatedAt: new Date(),
+              })
+              .where(eq(issues.id, id))
+              .returning()
+              .then((rows) => rows[0] ?? null);
+            if (!relinquished) return null;
+            const [enrichedRelinquished] = await withIssueLabels(tx, [relinquished]);
+            return enrichedRelinquished;
+          }
           throw conflict("Only assignee can release issue");
         }
         if (existing.checkoutRunId || existing.executionRunId) {
