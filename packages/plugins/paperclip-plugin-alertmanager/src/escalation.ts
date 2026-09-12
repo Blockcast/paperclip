@@ -456,7 +456,7 @@ async function advanceIssueLadder(
     // unresolved member — the resolve's own cascade ran before the cover
     // existed. Strictly better than the pre-CAS behaviour, which left that
     // same orphan AND resurrected `resolvedAt`. Closing it needs the cover
-    // cascade and cover creation to share a claim; tracked separately rather
+    // cascade and cover creation to share a claim: BLO-33497, filed rather
     // than reordering a durability property this diff did not set out to move.
     await casAlertState(ctx, ref, state, { ...state, escalationAttempt: MAX_ATTEMPTS, escalationComplete: true, nextEscalationAt: null });
     return;

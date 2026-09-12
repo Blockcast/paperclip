@@ -583,7 +583,7 @@ point therefore leaves the cover open with an unresolved member, because the
 resolve's own cascade ran before the cover existed. That is strictly better
 than the pre-CAS behaviour — which left the same orphan *and* resurrected
 `resolvedAt` — but closing it needs cover creation and the resolve cascade to
-share a claim.
+share a claim: tracked as BLO-33497.
 
 ### Bearer rotation in a Kubernetes deployment
 
