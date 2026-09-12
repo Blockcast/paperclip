@@ -431,7 +431,18 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
   // Asymmetric on purpose: only a *disagreement* is fatal. An unreadable or
   // absent prose line is not, because that is the #1675 case this block exists
   // to survive — requiring the prose to parse would put the retired regex back
-  // on the critical path and undo the whole change.
+  // on the critical path and undo the whole change. The measurement is in this
+  // repo: `extractAllyReviewedHeadSha` on the verbatim #1675 body is `null`
+  // (ally-review-verdict-block.test.ts), so under a stricter rule here a review
+  // carrying a block *and* a #1675-shaped prose line would read `unreadable` —
+  // the exact false red this row retires, reintroduced one layer down.
+  //
+  // Additivity is therefore a *producer* invariant, pinned where it costs
+  // nothing: "the verdict block is additive, never a replacement for the prose
+  // line" in scripts/ally-agent-idempotency-contract.test.mjs holds the
+  // emitting template to both forms, and `isAllyConsolidatedReviewComment`
+  // admits only Ally-authored bodies. A block-only review is unreachable, so
+  // readers 2-4 keep the prose line they parse and this reader keeps the block.
   const attestedHead = head.trim().toLowerCase();
   const proseHead = soleProseAttestedHead(text);
   if (proseHead !== null && proseHead !== attestedHead) {
