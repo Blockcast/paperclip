@@ -5532,6 +5532,138 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.status).toBe("todo");
   });
 
+  // BLO-33477 AC3, capped-window form. The test above proves the *key* advances;
+  // this one proves what that buys — the tail is still reached when a whole
+  // window of deterministically-failing reservations is in front of it.
+  //
+  // The bound is TWO eligible passes, not one, and asserting one would be red
+  // against correct code. A row `N` with a fixed key `n` is first eligible on
+  // the pass `j` where `n < c_j`; on that pass the failing cohort still carries
+  // `c_{j-1} <= n`, so it sorts ahead of `N` and the LIMIT cuts `N`. The catch
+  // then clamps the cohort to `c_j`, and since `n < c_j`, `N` sorts strictly
+  // ahead of all 250 of them on pass `j+1` — whatever the cohort size.
+  //
+  // That is the whole refutation of "the failures stay ahead indefinitely":
+  // clamping to the cutoff makes the cohort's key advance at exactly the rate
+  // of the eligibility frontier, and a moving key cannot sit statically ahead
+  // of a fixed one. Pre-fix the cohort kept its original `reservedAt` — a fixed
+  // key, always <= any newer row's — and this test never goes green.
+  it("recovers a stale reservation behind a full window of failing ones (BLO-33477)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const staleMs = 5 * 60_000;
+    const staleCutoff = new Date(now.getTime() - staleMs); // c_1 = 11:55:00Z
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+
+    // Fill one whole window with reservations whose finalize throws every time.
+    // Each needs its own reviewable source: `issues_active_productivity_review_uq`
+    // allows at most one active review per (company, originId), and an
+    // unreviewable source would be *retired* rather than failed, which drops it
+    // out of the window and defeats the point.
+    const failingCount = 250;
+    const decoyReservedAt = new Date("2026-04-28T11:00:00.000Z"); // d
+    const decoySourceIds = Array.from({ length: failingCount }, () => randomUUID());
+    const decoyReviewIds = Array.from({ length: failingCount }, () => randomUUID());
+    await db.insert(issues).values(
+      decoySourceIds.map((id, i) => ({
+        id,
+        companyId: seeded.companyId,
+        title: `Failing source ${i}`,
+        status: "in_progress" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.coderId,
+        originKind: "manual",
+        issueNumber: 1000 + i,
+        identifier: `${seeded.issuePrefix}-${1000 + i}`,
+        startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+        monitorScheduledBy: "assignee" as const,
+        createdAt: decoyReservedAt,
+        updatedAt: decoyReservedAt,
+      })),
+    );
+    await db.insert(issues).values(
+      decoyReviewIds.map((id, i) => ({
+        id,
+        companyId: seeded.companyId,
+        title: `Failing reservation ${i}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        parentId: decoySourceIds[i],
+        assigneeAgentId: seeded.managerId,
+        createdByAgentId: seeded.coderId,
+        originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+        originId: decoySourceIds[i],
+        originFingerprint: `productivity-review:${decoySourceIds[i]}`,
+        requestDepth: 1,
+        // Reserved: no identifier/issueNumber yet, which is what keeps them in
+        // `recoverStaleReservedProductivityReviews`' predicate pass after pass.
+        issueNumber: null,
+        identifier: null,
+        createdAt: decoyReservedAt,
+        updatedAt: decoyReservedAt,
+        lastActivityAt: decoyReservedAt,
+      })),
+    );
+
+    // The target: `d < n < c_1`, so it is eligible on pass 1 yet sorts behind
+    // the whole failing cohort and is cut by the LIMIT.
+    const targetReservedAt = new Date("2026-04-28T11:50:00.000Z"); // n
+    expect(decoyReservedAt.getTime()).toBeLessThan(targetReservedAt.getTime());
+    expect(targetReservedAt.getTime()).toBeLessThan(staleCutoff.getTime());
+    const targetId = await insertProductivityReview({ seeded, createdAt: targetReservedAt });
+
+    const failing = new Set(decoyReviewIds);
+    let targetFinalizeAttempts = 0;
+    const service = productivityReviewService(db, {
+      async beforeStaleReservationRecoveryFinalize(review) {
+        if (failing.has(review.id)) {
+          throw new Error("finalize is deterministically broken for this reservation");
+        }
+        if (review.id === targetId) targetFinalizeAttempts += 1;
+      },
+    });
+    const reconcileAt = (at: Date) =>
+      service.reconcileProductivityReviews({
+        now: at,
+        companyId: seeded.companyId,
+        thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      });
+    const target = async () =>
+      db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, targetId))
+        .then((rows) => rows[0]);
+
+    // Pass 1: the window is saturated by the failing cohort, so the target is
+    // never even attempted. This is the starved shape, and it is correct here.
+    const first = await reconcileAt(now);
+    expect(first.failed).toBe(failingCount);
+    expect(targetFinalizeAttempts).toBe(0);
+    expect((await target())?.identifier).toBeNull();
+
+    // Pass 2: the cohort now carries `c_1`, the target's fixed `n < c_1`, so it
+    // sorts first and is recovered. Pre-fix the cohort is still at
+    // `decoyReservedAt` and this stays red forever, at any number of passes.
+    const second = await reconcileAt(new Date(now.getTime() + 1_000));
+    expect(targetFinalizeAttempts).toBe(1);
+    const recovered = await target();
+    // Finalized — identifier/issueNumber allocated is exactly what "recovered"
+    // means here, and is the inverse of the reserved state asserted above. The
+    // number itself is not pinned: the cohort's own sources consume the prefix
+    // sequence, so it tracks `failingCount` rather than the source's `-2`.
+    expect(recovered?.identifier).not.toBeNull();
+    expect(recovered?.issueNumber).not.toBeNull();
+    // The cohort keeps failing and keeps yielding the head slot; only the
+    // LIMIT-th of them is displaced by the target, nothing is lost.
+    expect(second.failed).toBe(failingCount - 1);
+  });
+
   it("replays missing finalized review side effects without duplicating them", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const createdAt = new Date(now.getTime() - 60_000);
