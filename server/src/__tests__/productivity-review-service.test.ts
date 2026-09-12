@@ -5376,8 +5376,14 @@ describeEmbeddedPostgres("productivity review service", () => {
       `);
     }
 
+    // BLO-33477: a failed finalize now clamps the reservation's scan key to that
+    // pass's `staleCutoff` so it cannot pin the head of the window. The row is
+    // re-admitted on any *later* pass, so this second reconcile advances the
+    // clock rather than replaying the same instant. One second is enough — the
+    // point of clamping to the cutoff rather than to `now` is that a transient
+    // failure costs the next pass, not a whole stale interval.
     const recovered = await productivityReviewService(db).reconcileProductivityReviews({
-      now,
+      now: new Date(now.getTime() + 1_000),
       companyId: seeded.companyId,
       thresholds: { monitorLapseServiceGraceMs: 60_000 },
     });
@@ -5454,6 +5460,76 @@ describeEmbeddedPostgres("productivity review service", () => {
     const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
     expect(review?.identifier).toBe(`${seeded.issuePrefix}-2`);
     expect(review?.issueNumber).toBe(2);
+  });
+
+  it("advances the scan key of a stale reservation whose finalize keeps throwing", async () => {
+    // BLO-33477 AC3. The catch was the one path out of the recovery loop that
+    // left the row untouched, so a deterministically-failing finalize kept its
+    // `updatedAt` and re-selected at the head of `asc(updatedAt) LIMIT 250` on
+    // every pass — MAX_CANDIDATE_ISSUES of them would pin the window and starve
+    // every newer stale reservation behind it. Asserting the key advances is
+    // the tighter test than seeding the cap: starvation is impossible once no
+    // row can hold a fixed slot across passes.
+    //
+    // The key is clamped to `staleCutoff`, not to `now`, so the row is still
+    // retried on the next pass — a transient failure must not cost a full
+    // PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS. Both halves are asserted here.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const staleMs = 5 * 60_000;
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+
+    let attempts = 0;
+    const service = productivityReviewService(db, {
+      async beforeStaleReservationRecoveryFinalize(review) {
+        if (review.id !== reviewId) return;
+        attempts += 1;
+        throw new Error("finalize is deterministically broken for this reservation");
+      },
+    });
+    const reconcileAt = (at: Date) =>
+      service.reconcileProductivityReviews({
+        now: at,
+        companyId: seeded.companyId,
+        thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      });
+    const scanKey = async () =>
+      db
+        .select({ updatedAt: issues.updatedAt })
+        .from(issues)
+        .where(eq(issues.id, reviewId))
+        .then((rows) => rows[0]?.updatedAt);
+
+    const first = await reconcileAt(now);
+    expect(first.failed).toBe(1);
+    expect(attempts).toBe(1);
+    // Freed the slot for this pass, and moved strictly forward off `reservedAt`.
+    expect(await scanKey()).toEqual(new Date(now.getTime() - staleMs));
+
+    // Re-admitted on the very next pass rather than held out for a stale
+    // interval: a transient failure is retried promptly.
+    const second = await reconcileAt(new Date(now.getTime() + 1_000));
+    expect(second.failed).toBe(1);
+    expect(attempts).toBe(2);
+    expect(await scanKey()).toEqual(new Date(now.getTime() + 1_000 - staleMs));
+
+    // The key rides the cutoff, so it keeps advancing and cannot pin a slot.
+    const third = await reconcileAt(new Date(now.getTime() + 2_000));
+    expect(third.failed).toBe(1);
+    expect(attempts).toBe(3);
+    expect(await scanKey()).toEqual(new Date(now.getTime() + 2_000 - staleMs));
+
+    // The reservation itself is untouched apart from the scan key.
+    const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
+    expect(review?.identifier).toBeNull();
+    expect(review?.issueNumber).toBeNull();
+    expect(review?.status).toBe("todo");
   });
 
   it("replays missing finalized review side effects without duplicating them", async () => {
