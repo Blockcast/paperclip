@@ -696,7 +696,39 @@ describe.sequential("issue goal context routes", () => {
   //
   // The fixture value is invented. The real endpoint was never called: reading it
   // is the exposure.
-  describe("workspaceRuntime masking (PEN-2846)", () => {
+  //
+  // PEN-2852 (BLO-33407) STRENGTHENED this contract, and these cases now pin the
+  // stronger one. The threat actor named above — a same-company agent holding only
+  // `company_scope:read` — no longer gets a name-preserving *mask*; it gets
+  // `workspaceRuntime: null`, and `metadata` closes with it. `null` is strictly
+  // stronger than `***REDACTED***`: the mask kept keys, enum values and identity
+  // strings crossing, and closed nothing on `metadata` at all.
+  //
+  // Two things about the fixture matter, and getting either wrong silently inverts
+  // what is measured:
+  //
+  //   1. The outer `beforeEach` mocks `accessService.decide` to allow EVERY action,
+  //      which makes this block's caller *entitled* under PEN-2852 — the one class
+  //      that is supposed to see raw values. Measured at `c1127276f`: with that
+  //      blanket allow the secret crosses and `not.toContain` fires. The local
+  //      `beforeEach` below denies `workspace_runtime:read` so the caller models the
+  //      agent this block is actually about.
+  //   2. Narrowing `services/authorization.ts` cannot affect this file. The whole
+  //      service index is `vi.mock`ed above (`accessService: () => mockAccessService`),
+  //      so no production authorization code runs here. The entitlement under test is
+  //      the one this mock states, and nothing else.
+  describe("workspaceRuntime withholding (PEN-2846 mask → PEN-2852 null)", () => {
+    // The unentitled same-company agent of the comment above. Scoped to this block so
+    // the rest of the file keeps the blanket allow it was written against.
+    beforeEach(() => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action !== "workspace_runtime:read",
+        action: input.action,
+        reason: "allow_test",
+        explanation: "Allowed by test mock.",
+      }));
+    });
+
     const CONFIGURED_SECRET = "invented-fixture-value-not-a-real-credential";
     const workspaceWithRuntime = {
       id: "55555555-5555-4555-8555-555555555555",
@@ -716,12 +748,15 @@ describe.sequential("issue goal context routes", () => {
         },
       },
       runtimeServices: [],
+      // Set by `services/execution-workspaces.ts` on every real row; the mock has to
+      // carry it or the compensating-flag assertion below measures the fixture.
+      hasWorkspaceRuntimeConfig: true,
     };
 
     for (const path of ["heartbeat-context", ""] as const) {
       const route = `/api/issues/11111111-1111-4111-8111-111111111111${path ? `/${path}` : ""}`;
 
-      it(`masks configured workspaceRuntime values on GET ${route || "/issues/:id"}`, async () => {
+      it(`withholds configured workspaceRuntime on GET ${route || "/issues/:id"}`, async () => {
         mockIssueService.getById.mockResolvedValue({
           ...legacyProjectLinkedIssue,
           executionWorkspaceId: "55555555-5555-4555-8555-555555555555",
@@ -732,11 +767,13 @@ describe.sequential("issue goal context routes", () => {
 
         expect(res.status).toBe(200);
         expect(JSON.stringify(res.body)).not.toContain(CONFIGURED_SECRET);
-        const runtime = res.body.currentExecutionWorkspace.config.workspaceRuntime;
-        // Structure and names survive so the config stays legible; values do not.
-        expect(runtime.services[0].name).toBe("api");
-        expect(Object.keys(runtime.services[0])).toEqual(["name", "command", "GRAFANA_API_TOKEN"]);
-        expect(runtime.services[0].GRAFANA_API_TOKEN).toBe("***REDACTED***");
+        // PEN-2852: withheld outright rather than masked. Nothing of the operator's
+        // blob crosses — not values, and not the key names the mask used to keep.
+        expect(res.body.currentExecutionWorkspace.config.workspaceRuntime).toBeNull();
+        expect(res.body.currentExecutionWorkspace.metadata).toBeNull();
+        // The compensating existence flag: a withheld caller can still tell "no
+        // runtime config" from "withheld", which the bare null alone cannot say.
+        expect(res.body.currentExecutionWorkspace.hasWorkspaceRuntimeConfig).toBe(true);
       });
     }
 
@@ -756,7 +793,7 @@ describe.sequential("issue goal context routes", () => {
     // projection — the neighbouring-control trap this ticket flagged four times.
     //
     // Fixture values are invented; the real endpoint was never called.
-    it("masks configured workspaceRuntime values on project workspaces from GET /issues/:id", async () => {
+    it("withholds configured workspaceRuntime on project workspaces from GET /issues/:id", async () => {
       const PROJECT_WORKSPACE_SECRET = "invented-project-workspace-fixture-value";
       const runtimeConfig = {
         workspaceRuntime: {
@@ -777,6 +814,8 @@ describe.sequential("issue goal context routes", () => {
         visibility: "default",
         metadata: { runtimeConfig },
         runtimeConfig,
+        // As above: `services/projects.ts` derives this on every real row.
+        hasWorkspaceRuntimeConfig: true,
         isPrimary: true,
         createdAt: new Date("2026-03-20T00:00:00Z"),
         updatedAt: new Date("2026-03-20T00:00:00Z"),
@@ -796,13 +835,11 @@ describe.sequential("issue goal context routes", () => {
 
       // Both exits off this projection: the array and the primary alias.
       for (const emitted of [res.body.project.workspaces[0], res.body.project.primaryWorkspace]) {
-        const runtime = emitted.runtimeConfig.workspaceRuntime;
-        // Names and structure survive so the config stays legible; values do not.
-        expect(Object.keys(runtime.services[0])).toEqual(["name", "command", "DEPLOY_TOKEN"]);
-        expect(runtime.services[0].name).toBe("web");
-        expect(runtime.services[0].DEPLOY_TOKEN).toBe("***REDACTED***");
+        // PEN-2852: withheld outright rather than masked, same as the execution exit.
+        expect(emitted.runtimeConfig.workspaceRuntime).toBeNull();
+        expect(emitted.hasWorkspaceRuntimeConfig).toBe(true);
         // `desiredState` is enum-validated by the reader, so it must NOT be
-        // masked — this pins the fix to the open field instead of the whole object.
+        // withheld — this pins the fix to the open field instead of the whole object.
         expect(emitted.runtimeConfig.desiredState).toBe("running");
       }
     });
