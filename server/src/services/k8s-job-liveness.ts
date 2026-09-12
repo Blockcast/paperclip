@@ -2,6 +2,7 @@ import * as k8s from "@kubernetes/client-node";
 
 import { logger } from "../middleware/logger.js";
 import { redactSensitiveText } from "../redaction.js";
+import { CAVEMAN_PROXY_NOT_READY_ERROR_CODE } from "./metrics.js";
 
 // Namespace where the claude_k8s / opencode_k8s adapters create their agent
 // Job pods. Matches the chart's deploy namespace; an explicit env override
@@ -275,16 +276,55 @@ export type AgentJobFailureDiagnostics = {
   logTailTruncated: boolean;
 };
 
+/**
+ * Marker for the Caveman-proxy readiness timeout (BLO-33441).
+ *
+ * The launcher (`penstock-agent-runtime.mjs`) throws
+ * `Caveman proxy did not become ready` when the proxy misses its readiness
+ * budget, prints it via `console.error` and exits 1. `console.error` writes to
+ * STDERR, and the adapter's wrapper redirects only stdout
+ * (`… | tee <podLog> | awk … > /dev/null`), so this line does reach the
+ * container log and is readable in {@link AgentJobFailureDiagnostics.logTail}.
+ * That is the whole reason the code is recoverable at all.
+ *
+ * SUBSTRING, not equality, and deliberately so — same idiom and same hazard as
+ * `classifyAgentErrorReason`'s `session unavailable` test. The text is not ours:
+ * the launcher wraps it as `penstock agent runtime: <message>` and the pod log
+ * carries surrounding lines. An equality check would read as working — the
+ * series would exist and sit at a plausible 0 — while classifying every real
+ * occurrence as plain `job_failed`, which is precisely the false pass this
+ * change exists to remove.
+ *
+ * Matched lowercase. The sibling `Caveman proxy exited before readiness` is
+ * deliberately NOT matched: that is the proxy dying, not the budget expiring,
+ * and folding it in would make the new code mean two different faults.
+ */
+const CAVEMAN_PROXY_NOT_READY_MARKER = "caveman proxy did not become ready";
+
 export function classifyAgentJobFailureErrorCode(
   diagnostics: AgentJobFailureDiagnostics | null,
-): "oom_killed" | "exit_137" | null {
+): "oom_killed" | "exit_137" | "caveman_proxy_not_ready" | null {
   const failedApps = diagnostics?.containers.filter(
     (entry) => entry.kind === "app" && (entry.exitCode ?? 0) !== 0,
   ) ?? [];
   if (failedApps.some((entry) => entry.reason?.toLowerCase() === "oomkilled")) {
     return "oom_killed";
   }
-  return failedApps.some((entry) => entry.exitCode === 137) ? "exit_137" : null;
+  if (failedApps.some((entry) => entry.exitCode === 137)) return "exit_137";
+  // Ordered last on purpose: a pod OOM-killed or SIGKILLed *during* proxy
+  // startup is an OOM/137, and those are the actionable causes. The readiness
+  // marker would otherwise shadow them, since the launcher can print it on the
+  // way out.
+  const haystack = [
+    diagnostics?.logTail,
+    ...failedApps.map((entry) => entry.terminationMessage),
+  ]
+    .filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
+    .join("\n")
+    .toLowerCase();
+  return failedApps.length > 0 && haystack.includes(CAVEMAN_PROXY_NOT_READY_MARKER)
+    ? CAVEMAN_PROXY_NOT_READY_ERROR_CODE
+    : null;
 }
 
 type ClientState =

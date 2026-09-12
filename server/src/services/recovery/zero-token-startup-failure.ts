@@ -132,6 +132,14 @@ export function isDependencyBlockedRun(run: Pick<NeverExecutedRunInput, "errorCo
 // as BLO-32679's move of `isInfraFailureRun` below.
 export const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
   "job_failed",
+  // BLO-33441: a `job_failed` that the pod's own diagnostics proved was the
+  // Caveman readiness timeout. It was a member of this set until it got its own
+  // code (`CAVEMAN_PROXY_NOT_READY_ERROR_CODE` in services/metrics.ts), and it is
+  // the same class of fault (the agent never started), so it stays — the relabel
+  // is for the census, not a routing decision. Spelled as a literal like every
+  // other member: this module has no imports, and pulling in metrics.js would
+  // drag prom-client into productivity-review's graph for one string.
+  "caveman_proxy_not_ready",
   "k8s_pod_schedule_failed",
   "adapter_failed",
   "external_lifecycle_stale_killed",
