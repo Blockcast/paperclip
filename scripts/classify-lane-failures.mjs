@@ -48,8 +48,11 @@ const RUNNER_LOSS_PATTERNS = [
 // conclusion (matching signal 2). The two signals are independent in general
 // but not here — they agree on the wrong answer.
 //
-// Every lane in pr.yml sets a timeout (general_tests 90m, typecheck 40m,
-// build 20m), so a hung, deadlocked or pathologically slow test introduced by
+// Every lane in pr.yml sets a timeout (general_tests 110m for the server
+// shards and 75/45m for workspaces-a/-b, typecheck 50m, build 25m — all
+// re-sized against measured p100 by BLO-33313; read the file, do not trust
+// these numbers to stay current), so a hung, deadlocked or pathologically slow
+// test introduced by
 // the diff would otherwise be announced as "KILLED MID-JOB by the CI runner
 // pool… not a defect in this PR's diff… Re-run the job" — inverting this
 // script's purpose and turning a real red into an invitation to re-run
