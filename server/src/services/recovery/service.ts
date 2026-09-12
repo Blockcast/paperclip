@@ -180,7 +180,12 @@ export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 // Derived, never hardcoded: the takeover comment quotes this window to the
 // previous owner, so a change to the TTL must not silently make that prose lie
 // (which is the BLO-19124 defect this line exists to avoid repeating).
-const recoveryHandoffCommentGrantTtlHours = Math.round(RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS / (60 * 60 * 1000));
+// Read lazily, NOT at module scope: `agent-permissions-routes.test.ts`
+// factory-mocks `issue-recovery-actions.js`, and vitest's mock namespace throws
+// on any export the factory omits. At module scope that throw kills the whole
+// `recovery/service.ts` init and every module downstream of it (62 failures in
+// a file that touches none of this).
+const recoveryHandoffCommentGrantTtlHours = () => Math.round(RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS / (60 * 60 * 1000));
 /**
  * Ceiling on the `unchanged_target` re-escalation suppressor (BLO-27676).
  *
@@ -7251,7 +7256,7 @@ export function recoveryService(
               // sentence on BLO-33322: the previous owner went on to complete
               // the work, read "cannot comment", recorded nothing, and the row
               // read as dead for 42 minutes while it was most active.
-              `- ${agentUiLink(sourceAssignee, prefix)} CAN still comment here for ${recoveryHandoffCommentGrantTtlHours} hours after this transfer, and should: post what it already knows and anything it does next, so the recovery owner does not start cold.`,
+              `- ${agentUiLink(sourceAssignee, prefix)} CAN still comment here for ${recoveryHandoffCommentGrantTtlHours()} hours after this transfer, and should: post what it already knows and anything it does next, so the recovery owner does not start cold.`,
             ]
             : []),
           workspacePreflightHandoffCause
