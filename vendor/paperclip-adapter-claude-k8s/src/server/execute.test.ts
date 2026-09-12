@@ -1610,6 +1610,68 @@ describe("execute: waitForPod edge cases", () => {
     expect(result.errorMessage).toContain("exit code 1");
   });
 
+  // BLO-33503: the shape the incident actually produces. restartPolicy is
+  // Never, so a failed init container takes the pod to phase=Failed — the
+  // init_container kind is unreachable unless the init check precedes the
+  // phase=Failed branch. Fails if that ordering regresses: the generic
+  // terminated branch has no "claude" status to read, so it emits the bare
+  // "reached phase=Failed" with neither the container name nor the exit code.
+  it("labels an init-container failure that took the pod to phase=Failed", async () => {
+    mockCoreListPods.mockResolvedValue({
+      items: [{
+        metadata: { name: "pod-x" },
+        spec: { nodeName: "k8s-paperclip-1" },
+        status: {
+          phase: "Failed",
+          conditions: [{ type: "PodScheduled", status: "True" }],
+          initContainerStatuses: [{
+            name: "write-prompt",
+            state: { terminated: { exitCode: 255, reason: "Error" } },
+          }],
+          containerStatuses: [],
+        },
+      }],
+    });
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toContain("Init container failed");
+    expect(result.errorMessage).toContain("write-prompt");
+    expect(result.errorMessage).toContain("exit code 255");
+    expect(result.errorMessage).not.toContain("Pod scheduling failed");
+    expect(result.errorMessage).not.toContain("Pod terminated before startup");
+  });
+
+  // A phase=Failed pod whose MAIN container died is unaffected by that
+  // ordering — it must still report the terminated label, so the move above
+  // cannot be satisfied by relabelling every Failed pod as an init failure.
+  it("still reports the terminated label when the main container died", async () => {
+    mockCoreListPods.mockResolvedValue({
+      items: [{
+        metadata: { name: "pod-x" },
+        status: {
+          phase: "Failed",
+          initContainerStatuses: [{
+            name: "write-prompt",
+            state: { terminated: { exitCode: 0, reason: "Completed" } },
+          }],
+          containerStatuses: [{
+            name: "claude",
+            state: { terminated: { exitCode: 137, reason: "OOMKilled" } },
+          }],
+        },
+      }],
+    });
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toContain("Pod terminated before startup");
+    expect(result.errorMessage).toContain("OOMKilled");
+    expect(result.errorMessage).not.toContain("Init container failed");
+  });
+
   // BLO-33503 true-positive control: a genuine scheduling failure must still
   // report "Pod scheduling failed", so the fix cannot be satisfied by
   // relabelling everything away from the scheduling category. This one passes

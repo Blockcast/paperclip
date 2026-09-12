@@ -1160,6 +1160,24 @@ async function waitForPod(
     if (phase === "Running" || phase === "Succeeded") {
       return podName;
     }
+    // Check for init container failures.  This runs BEFORE the phase=Failed
+    // check: restartPolicy is Never (job-manifest.ts), so a failed init
+    // container takes the whole pod to phase=Failed, and the generic
+    // "terminated" branch below would swallow the specific cause (BLO-33503).
+    for (const init of initStatuses) {
+      const terminated = init.state?.terminated;
+      if (terminated && (terminated.exitCode ?? 0) !== 0) {
+        throw new PodWaitError("init_container", `Init container "${init.name}" failed with exit code ${terminated.exitCode}: ${terminated.reason ?? terminated.message ?? "unknown"}`);
+      }
+      const waiting = init.state?.waiting;
+      if (waiting?.reason === "ErrImagePull" || waiting?.reason === "ImagePullBackOff") {
+        throw new PodWaitError("init_container", `Init container "${init.name}" image pull failed: ${waiting.message ?? waiting.reason}`);
+      }
+      if (waiting?.reason === "CrashLoopBackOff") {
+        throw new PodWaitError("init_container", `Init container "${init.name}" crash loop: ${waiting.message ?? waiting.reason}`);
+      }
+    }
+
     // phase=Failed means the pod crashed before we could stream logs.
     // Throwing here routes the caller into the error path with a structured
     // message instead of entering the log-streaming path with a dead pod.
@@ -1174,21 +1192,6 @@ async function waitForPod(
     const mainRunning = containerStatuses.some((s) => s.state?.running);
     if (allInitsDone && mainRunning) {
       return podName;
-    }
-
-    // Check for init container failures
-    for (const init of initStatuses) {
-      const terminated = init.state?.terminated;
-      if (terminated && (terminated.exitCode ?? 0) !== 0) {
-        throw new PodWaitError("init_container", `Init container "${init.name}" failed with exit code ${terminated.exitCode}: ${terminated.reason ?? terminated.message ?? "unknown"}`);
-      }
-      const waiting = init.state?.waiting;
-      if (waiting?.reason === "ErrImagePull" || waiting?.reason === "ImagePullBackOff") {
-        throw new PodWaitError("init_container", `Init container "${init.name}" image pull failed: ${waiting.message ?? waiting.reason}`);
-      }
-      if (waiting?.reason === "CrashLoopBackOff") {
-        throw new PodWaitError("init_container", `Init container "${init.name}" crash loop: ${waiting.message ?? waiting.reason}`);
-      }
     }
 
     // Check for unrecoverable scheduling failures
