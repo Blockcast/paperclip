@@ -1549,21 +1549,129 @@ export async function awaitSessionWithProgress<T>(
   start: () => Promise<T>,
   delays: { firstDelayMs?: number; maxDelayMs?: number } = {},
 ): Promise<T> {
+  const startedAtMs = Date.now();
+  return awaitPhaseWithProgress(
+    start,
+    async (stage) => {
+      await emitAcpxLog(ctx, {
+        type: "acpx.session_establish",
+        stage: stage === "settled" ? "established" : stage,
+        attempt: meta.attempt,
+        resume: meta.resume,
+        elapsedMs: Math.max(0, Date.now() - startedAtMs),
+        observedAt: new Date().toISOString(),
+      });
+    },
+    delays,
+  );
+}
+
+/**
+ * Await runtime preparation while emitting periodic elapsed-time progress.
+ *
+ * Everything the engine does before the handshake -- billing-identity
+ * resolution, workspace and state directory creation, skill installation, and
+ * the ancestor-bin walk that resolves the agent command -- runs before the run
+ * has emitted a byte of its own. `awaitSessionWithProgress` covers only the
+ * handshake that follows it, so a stall in this window still left the run log
+ * frozen at its pre-exec prefix: indistinguishable, at `lastOutputSeq: 1`,
+ * from a process that never started at all. Several of those steps are
+ * filesystem syscalls against a network mount, where a blocked call does not
+ * return on its own.
+ *
+ * Closing this window narrows "silent at seq 1" towards meaning one thing,
+ * which is the discriminator any decision taken against a silent run needs.
+ *
+ * ⚠️ It does NOT close it completely, and a consumer of this signal must know
+ * where the coverage actually starts. `acpx.runtime_prepare` begins inside
+ * `executeAcpxEngine`; the adapter entry points reach that function through a
+ * lazy `await import(...)` of this module (e.g.
+ * `packages/adapters/claude-local/src/server/acp.ts`), so that module load
+ * happens before the first tick. That residual is now measured (PEN-3099):
+ * across 1,808 `claude_local` runs over 46 days the window containing it ran
+ * p50 637 ms, p99 16.7 s, max 2.1 min, and never once reached the 5 min tick
+ * ceiling, let alone `RUN_STALE_SILENCE_MS`.
+ *
+ * Three corrections to the reasoning that first flagged it, since each is easy
+ * to re-derive wrongly. The load is paid once per *process*, not per run: every
+ * importer of this module is a server-side `acp.ts`, the `await import(...)`
+ * resolves from the ESM module registry after the first load, and the worker
+ * awaits `adapter.execute` in-process -- the per-run pod adapters
+ * (`claude_k8s`, `opencode_k8s`) never import it. Credit the registry, not the
+ * executor memo: `createClaudeAcpExecutor`'s `let executor` is *function*-scoped
+ * (`packages/adapters/claude-local/src/server/acp.ts:180`) and is per-process
+ * only because that factory happens to be called at module scope
+ * (`.../server/execute.ts:98`). Construct a second executor and the memo is
+ * gone; the disk read is still paid once, because the registry caches it.
+ * It is not I/O on the network mount either: the module is read from the
+ * container image layer, whereas the mount that has been observed to wedge
+ * backs the workspace and state directories this helper *does* bracket. And a
+ * run parked in the import is not byte-identical to one parked after it -- the
+ * `Adapter execution timeout:` line is emitted from this module using the
+ * result of `buildRuntime`, so its presence proves the import, the billing
+ * lookup and the prepare all returned.
+ *
+ * A liveness predicate keyed on that line's presence therefore does not inherit
+ * this residual; one keyed on a raw `seq <= 1` still does, which is the shape of
+ * the precision failure that withdrew #1462. Key it on the line and not on the
+ * byte count: the leading workspace-fallback line is conditional, so a healthy
+ * prefix is legitimately two or three lines.
+ *
+ * Same non-terminating contract as the handshake ticker -- this reports, it does
+ * not bound. Payload carries only stage/elapsed metadata: never prompts,
+ * credentials, environment values, paths, or model output.
+ */
+export async function awaitRuntimePrepareWithProgress<T>(
+  ctx: AdapterExecutionContext,
+  start: () => Promise<T>,
+  delays: { firstDelayMs?: number; maxDelayMs?: number } = {},
+): Promise<T> {
+  const startedAtMs = Date.now();
+  return awaitPhaseWithProgress(
+    start,
+    async (stage) => {
+      await emitAcpxLog(ctx, {
+        type: "acpx.runtime_prepare",
+        stage: stage === "settled" ? "prepared" : stage,
+        elapsedMs: Math.max(0, Date.now() - startedAtMs),
+        observedAt: new Date().toISOString(),
+      });
+    },
+    delays,
+  );
+}
+
+/**
+ * Run `start()` while emitting `started`, backing-off `waiting`, and one
+ * terminal `settled`/`failed` progress tick.
+ *
+ * Shared by every phase that awaits an unbounded operation before the run
+ * produces output of its own; each caller names its own wire stages and owns
+ * its own payload. The cadence is the point: ticks arrive faster than the
+ * shortest staleness window that reads a run's last-output timestamp, so a
+ * phase that is merely slow cannot be read as one whose process is gone. That
+ * window is `RUN_STALE_SILENCE_MS` (15m) in
+ * `server/src/services/issue-run-holding.ts`, three times the 5m tick ceiling
+ * here. The relationship is deliberately prose and not an assertion: this
+ * package is a dependency of the server, so importing that constant to test
+ * against would invert the layering. If the server ever tightens it below 15m,
+ * `ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS` has to come down with it.
+ */
+async function awaitPhaseWithProgress<T>(
+  start: () => Promise<T>,
+  emit: (stage: "started" | "waiting" | "settled" | "failed") => Promise<void>,
+  delays: { firstDelayMs?: number; maxDelayMs?: number },
+): Promise<T> {
   const firstDelayMs = Math.max(1, delays.firstDelayMs ?? ACP_ENGINE_SESSION_PROGRESS_FIRST_DELAY_MS);
   const maxDelayMs = Math.max(firstDelayMs, delays.maxDelayMs ?? ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS);
-  const startedAtMs = Date.now();
-  const emit = async (stage: "started" | "waiting" | "established" | "failed") => {
-    await emitAcpxLog(ctx, {
-      type: "acpx.session_establish",
-      stage,
-      attempt: meta.attempt,
-      resume: meta.resume,
-      elapsedMs: Math.max(0, Date.now() - startedAtMs),
-      observedAt: new Date().toISOString(),
-    });
-  };
 
-  await emit("started");
+  // Guarded like every sibling emit below, and for a sharper reason: this is the
+  // first statement of the run, and the prepare wrapper is awaited *above* the
+  // block whose catch routes to `emitAcpxFailure`. An unguarded rejection here
+  // would leave `executeAcpxEngine` via an unclassified throw before any
+  // `acpx.*` diagnostic exists -- making the instrumentation the reason the run
+  // died, with less evidence than the silent runs it exists to explain.
+  await emit("started").catch(() => {});
 
   let timer: NodeJS.Timeout | null = null;
   let delayMs = firstDelayMs;
@@ -1594,10 +1702,10 @@ export async function awaitSessionWithProgress<T>(
   const pending = start();
   scheduleNext();
   try {
-    const handle = await pending;
+    const value = await pending;
     stop();
-    await emit("established").catch(() => {});
-    return handle;
+    await emit("settled").catch(() => {});
+    return value;
   } catch (err) {
     stop();
     await emit("failed").catch(() => {});
@@ -2015,18 +2123,23 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
   const engine = resolveEngineSettings(deps);
 
   return async function executeAcpxEngine(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-    let billingIdentity: AcpxEngineBillingIdentity | null = null;
-    try {
-      billingIdentity = (await deps.resolveBillingIdentity?.(ctx)) ?? null;
-    } catch {
-      billingIdentity = null;
-    }
+    // Both awaits are inside the ticker: this is the whole window between the
+    // pre-exec prefix and the first byte the engine emits on its own, and it is
+    // where an unreturning filesystem call parks a run with nothing in the log.
+    const { prepared, billingIdentity } = await awaitRuntimePrepareWithProgress(ctx, async () => {
+      let identity: AcpxEngineBillingIdentity | null = null;
+      try {
+        identity = (await deps.resolveBillingIdentity?.(ctx)) ?? null;
+      } catch {
+        identity = null;
+      }
+      return { prepared: await buildRuntime({ ctx, engine }), billingIdentity: identity };
+    });
     const billingFields = {
       provider: billingIdentity?.provider ?? "acpx",
       ...(billingIdentity?.biller ? { biller: billingIdentity.biller } : {}),
       billingType: billingIdentity?.billingType ?? ("unknown" as const),
     };
-    const prepared = await buildRuntime({ ctx, engine });
     // State the effective wall-clock timeout and its source up front so a
     // later timeout is diagnosable from the run log alone. Goes to stderr:
     // the acpx stdout log stream carries JSON acpx.* event payloads and must

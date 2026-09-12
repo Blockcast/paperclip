@@ -26,6 +26,7 @@ import {
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { resolveAssigneeUserId, resolveFallbackAgentId } from "./owner-resolver.js";
+import type { FallbackOwnerResolution } from "./owner-resolver.js";
 import { aggregateKeyForAlert } from "./aggregate-key.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
 import {
@@ -62,6 +63,36 @@ export class AlertDeliveryIncompleteError extends Error {
     );
     this.name = "AlertDeliveryIncompleteError";
     this.fingerprints = fingerprints;
+  }
+}
+
+/**
+ * Raised by a per-alert path whose failure no retry can fix — a configuration
+ * or roster fact rather than process state.
+ *
+ * The per-alert catch treats these as *handled*: the alert is dropped, the
+ * failure is recorded (log + metric), and the fingerprint is deliberately NOT
+ * added to `failedFingerprints`, so the delivery still answers 200.
+ *
+ * This is the same "log + 200" treatment the malformed-payload and
+ * permanent-policy drops already get. It exists because the taxonomy the
+ * per-alert catch was written against — "these failures are issue-RPC,
+ * state-store, event, and metric errors, which are transient" — stopped being
+ * true once `handleFiring` began throwing on unresolvable fallback ownership
+ * (PEN-2581). Reporting a permanent fault through the transient channel makes
+ * Alertmanager retry it 15-17× and drop the delivery anyway, and the resulting
+ * `alertmanager_notifications_failed_total` storm masks concurrent *transient*
+ * failures that retrying would genuinely have fixed.
+ *
+ * Only reachable from the firing path (owner resolution is never run on
+ * resolve), so a dropped alert that is still firing returns on Alertmanager's
+ * next `repeat_interval` — this trades a doomed retry burst for a later
+ * re-delivery, not for silent permanent loss.
+ */
+export class PermanentAlertError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PermanentAlertError";
   }
 }
 
@@ -141,7 +172,7 @@ type AggregateMemberResolution = {
  */
 type AggregateFiringClaim =
   | { ok: true; token: string }
-  | { ok: false; blockingPhase: string | null };
+  | { ok: false; blockingPhase: string | null; heldMs?: number | null };
 
 function q(ns: string, table: string): string {
   return `${ns}.${table}`;
@@ -373,6 +404,28 @@ async function upsertAggregateMember(
 }
 
 /**
+ * How long a `firing`/`cancelling` fence may be held before the next claim for
+ * that aggregate reclaims it regardless of who owns it (BLO-32113).
+ *
+ * This is a backstop against an unreclaimable fence, not a lease: nothing
+ * renews it, and the identity rules in `beginAggregateFiring` are tried first
+ * and handle every ordinary case. It exists because identity-based reclaim has
+ * one blind spot it cannot close by construction — a fence leaked by a process
+ * that is still running — and in that state no automatic path can ever recover
+ * the aggregate.
+ *
+ * 15 minutes is not a new number: it is the horizon this file already calls
+ * wedged (see `assertFiringGeneration`, which is a SELECT specifically so it
+ * cannot bump `updated_at` and hide a fence from the
+ * `updated_at < now() - interval '15 minutes'` detector). A legitimate hold
+ * covers one delivery's issue RPCs and clears in the sub-second range; the
+ * contention wait budget above is 3s. So this is ~300x the wait budget and
+ * orders of magnitude beyond any healthy hold — a delivery still holding at 15
+ * minutes is pathological whether or not its process is alive.
+ */
+const AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS = 15 * 60_000;
+
+/**
  * Firing claims the aggregate fence before it mutates member state or touches
  * the issue. A resolver may only begin finalization while the fence is active;
  * once it is cancelling, a new firing fails its delivery and retries after the
@@ -411,6 +464,46 @@ async function beginAggregateFiring(
   //
   // A live sibling delivery in *this* process shares WORKER_INSTANCE_ID and is
   // therefore excluded, as is any owner in another slot.
+  //
+  // Those two exclusions are also the identity steal's blind spot, and BLO-32113
+  // measured it in production: a fence leaked by a process that is still alive
+  // — same instance id, or an owner in a slot that never restarts — matched
+  // NEITHER this steal NOR `reconcileAbandonedAggregateFences`, because both
+  // required `owner_instance_id IS DISTINCT FROM` the running process. It was
+  // then unreclaimable by any automatic path, and the only drain was the
+  // board-user recovery route. Four aggregates sat that way while every delivery
+  // for them 502'd (`ArgoAppOutOfSyncTooLong`,
+  // `HeartbeatRunQueueAgentOldestQueuedHigh`, `BlockcastdImageDriftDetected`,
+  // `LLMProxyProviderAuthenticationFailed`: 25 distinct fingerprints retried
+  // ~50x each, none ever succeeding).
+  //
+  // The third disjunct is the backstop for that, and it closes the half that
+  // matters most: an aggregate that keeps firing recovers on its very next
+  // delivery, with no restart and no human. It cannot close the other half on
+  // its own, because it only ever runs *on a delivery* — an aggregate whose
+  // alert has stopped firing delivers nothing. `reconcileAbandonedAggregateFences`
+  // carries the same age clause for exactly that case; between them no fence
+  // stays held, but the two cover different triggers and neither is redundant.
+  //
+  // It is NOT a lease, and it does
+  // not weaken the rule above it: identity remains the ordinary reclaim path and
+  // is tried first. This only admits a fence whose hold has already exceeded
+  // AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS — a duration this file already treats
+  // as pathological, since `assertFiringGeneration` is deliberately a SELECT so
+  // that it cannot bump `updated_at` and hide a fence from the wedged-fence
+  // detector's `updated_at < now() - interval '15 minutes'`. That detector
+  // defines the condition; nothing acted on it. This is the actor.
+  //
+  // Stealing from a possibly-live owner is already this design's accepted
+  // posture, not a new one: the comment above admits same-slot/different-instance
+  // on "strong evidence of death, NOT proof of it", and rests correctness on the
+  // generation instead. A backstop steal is safe by exactly that argument. A
+  // holder that resumes after losing the race cannot attach a member
+  // (`upsertAggregateMember`), cannot complete (`finishAggregateFiring`), and
+  // cannot mutate the issue (the `firingFence(...)` share lock, BLO-31049); it
+  // fails loudly and Alertmanager retries. So an over-eager backstop costs one
+  // retry, while the current behaviour costs every alert in the aggregate
+  // indefinitely.
   const result = await ctx.db.execute(
     `INSERT INTO ${fences}
        (company_id, aggregate_key, phase, firing_token, owner_instance_id, owner_slot)
@@ -427,8 +520,20 @@ async function beginAggregateFiring(
           ${fences}.phase IN ('firing', 'cancelling')
           AND ${fences}.owner_slot = $5
           AND ${fences}.owner_instance_id IS DISTINCT FROM $4
+        )
+        OR (
+          ${fences}.phase IN ('firing', 'cancelling')
+          AND ${fences}.updated_at
+              < now() - ($6::bigint * interval '1 millisecond')
         )`,
-    [companyId, aggregateKey, token, WORKER_INSTANCE_ID, WORKER_SLOT],
+    [
+      companyId,
+      aggregateKey,
+      token,
+      WORKER_INSTANCE_ID,
+      WORKER_SLOT,
+      AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS,
+    ],
   );
   if (result.rowCount > 0) return { ok: true, token };
   // Read back the phase that actually refused the claim. The upsert admits
@@ -437,14 +542,23 @@ async function beginAggregateFiring(
   // what makes the wedge diagnosable from the delivery error alone; reporting a
   // fixed phase here sent a six-day production investigation (PEN-2581) after
   // `finalizing`, which is the one phase that cannot produce this failure.
-  const rows = await ctx.db.query<{ phase: string }>(
-    `SELECT phase
+  const rows = await ctx.db.query<{ phase: string; held_ms: number | string | null }>(
+    `SELECT phase,
+            EXTRACT(EPOCH FROM (now() - updated_at)) * 1000 AS held_ms
        FROM ${fences}
       WHERE company_id = $1
         AND aggregate_key = $2`,
     [companyId, aggregateKey],
   );
-  return { ok: false, blockingPhase: rows[0]?.phase ?? null };
+  const heldMsRaw = rows[0]?.held_ms;
+  const heldMs = heldMsRaw === null || heldMsRaw === undefined
+    ? null
+    : Math.round(Number(heldMsRaw));
+  return {
+    ok: false,
+    blockingPhase: rows[0]?.phase ?? null,
+    heldMs: heldMs !== null && Number.isFinite(heldMs) ? heldMs : null,
+  };
 }
 
 /**
@@ -603,13 +717,30 @@ async function claimAggregateFiringWaiting(
  * held after the owner dies" an invariant rather than a property of alerts that
  * happen to repeat.
  *
- * Release is justified by identity, never by age:
+ * Release is justified by identity:
  *   - `owner_instance_id IS DISTINCT FROM` this process — never touches a fence
  *     held by a live sibling delivery in this same process. A delivery can
  *     arrive while setup is still running, so this exclusion is load-bearing.
  *   - same `owner_slot`, or NULL. NULL means the row was written before this
  *     column existed, i.e. by a strictly older image, which the running process
  *     has by definition replaced.
+ *
+ * ...or by age, past `AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS` (BLO-32113). The
+ * identity arm alone leaves one state with no automatic drain: a fence leaked
+ * by a live process in a *foreign* slot, whose alert then stops firing. It
+ * matches neither this sweep (wrong slot) nor the per-claim backstop in
+ * `beginAggregateFiring` (that only ever runs on a delivery, and a stopped
+ * alert delivers nothing), so it waits on that foreign slot restarting — which
+ * may never happen. The age disjunct is what makes the invariant hold for
+ * aggregates that do not fire again.
+ *
+ * The age arm does not weaken the exclusion above it. That exclusion protects a
+ * live sibling delivery in *this* process, and this sweep runs only from
+ * `setup()` (see `worker.ts`) — a fence this process owns cannot already be 15
+ * minutes old when the process is seconds old, so the two arms do not overlap
+ * in practice. Safety does not rest on that timing argument either way: as with
+ * the per-claim backstop, a stolen holder is refused at every mutation site by
+ * the `firing_token` generation, so an over-eager release costs one retry.
  *
  * Deliberately non-fatal: a failed sweep leaves fences wedged, which the
  * per-claim steal can still recover. Throwing here would prevent the worker
@@ -629,15 +760,25 @@ export async function reconcileAbandonedAggregateFences(
            owner_slot = NULL,
            updated_at = now()
        WHERE phase IN ('firing', 'cancelling')
-         AND owner_instance_id IS DISTINCT FROM $1
-         AND (owner_slot IS NULL OR owner_slot = $2)`,
-      [WORKER_INSTANCE_ID, WORKER_SLOT],
+         AND (
+           (
+             owner_instance_id IS DISTINCT FROM $1
+             AND (owner_slot IS NULL OR owner_slot = $2)
+           )
+           OR updated_at < now() - ($3::bigint * interval '1 millisecond')
+         )`,
+      [
+        WORKER_INSTANCE_ID,
+        WORKER_SLOT,
+        AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS,
+      ],
     );
     if (result.rowCount > 0) {
       ctx.logger.warn(
         `paperclip-plugin-alertmanager: released ${result.rowCount} aggregate lifecycle fence(s) ` +
-          `abandoned by a previous occupant of slot ${WORKER_SLOT}. Each of these was refusing ` +
-          `every firing delivery for its aggregate until now.`,
+          `abandoned by a previous occupant of slot ${WORKER_SLOT}, or held past the ` +
+          `${AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS}ms abandonment backstop by any owner. Each of ` +
+          `these was refusing every firing delivery for its aggregate until now.`,
       );
     }
     return result.rowCount;
@@ -1210,14 +1351,14 @@ function suppressionExpiryLabel(
  * delivery (rather than the module) is what keeps it correct: a config edit or
  * an agent being paused takes effect on the very next delivery.
  */
-export type FallbackOwnerMemo = Map<string, Promise<string | undefined>>;
+export type FallbackOwnerMemo = Map<string, Promise<FallbackOwnerResolution>>;
 
 function resolveFallbackAgentIdMemoized(
   ctx: Pick<PluginContext, "agents" | "logger">,
   companyId: string,
   fallbackAgentName: string | undefined,
   memo: FallbackOwnerMemo | undefined,
-): Promise<string | undefined> {
+): Promise<FallbackOwnerResolution> {
   if (!memo) return resolveFallbackAgentId(ctx, companyId, fallbackAgentName);
   // JSON-encoded pair rather than a naive `a + sep + b`: agent names are
   // operator-supplied config, so any single-character separator could be
@@ -1230,11 +1371,12 @@ function resolveFallbackAgentIdMemoized(
     companyId,
     fallbackAgentName,
   ).catch((err: unknown) => {
-    // Evict on failure. A refusal (bad name / paused / ambiguous) resolves to
-    // `undefined` and IS cached — it is a config fact, stable for the delivery.
-    // A *throw* is a transient host fault, and caching it would let one failed
-    // `agents.list` poison every remaining alert in the batch, converting a
-    // blip that previously cost one alert into a whole-delivery failure.
+    // Evict on failure. A refusal (bad name / paused / ambiguous) resolves to a
+    // `refusal` value and IS cached — the underlying condition is stable for the
+    // delivery, whether or not it is permanent beyond it. A *throw* is a
+    // transient host fault, and caching it would let one failed `agents.list`
+    // poison every remaining alert in the batch, converting a blip that
+    // previously cost one alert into a whole-delivery failure.
     memo.delete(key);
     throw err;
   });
@@ -1321,13 +1463,111 @@ export async function handleFiring(
     fenceWedgedMemo,
   );
   if (!firingClaim.ok) {
+    // Surface the wedge as a metric so it is detectable as a *cause* rather
+    // than inferred hours later from the webhook delivery ratio (BLO-32113).
+    //
+    // Two series: an occurrence count of `1` (matching every other
+    // `ctx.metrics.write` call site in this file) plus the hold age as its own
+    // series. The value is deliberately NOT the duration:
+    //
+    //   - As of PEN-2799 the host publishes every `metrics.write` to the
+    //     prom-client counter `paperclip_plugin_metric_total{metric="..."}`
+    //     *before* appending the `plugin_logs` row at `level: "metric"`
+    //     (`server/src/services/plugin-host-services.ts` -> `recordPluginMetric`
+    //     in `server/src/services/metrics.ts`). Both still happen; the counter
+    //     is the scraped path, ordered first because that is what an alert rule
+    //     depends on. So both series below are real, monotonic, scraped
+    //     counters today — which makes the PromQL at the end of this comment
+    //     executable rather than aspirational.
+    //   - Because a counter accumulates every write, a single duration-valued
+    //     series would become a monotonically climbing sum of hold ages:
+    //     non-zero forever after the first wedge, unable to distinguish "the
+    //     reclaim is broken" from "one wedge happened last month" — the only
+    //     question it exists to answer. Splitting the count from the summed age
+    //     keeps both recoverable under `rate()`.
+    //
+    // Both names clear the host's drop gates: each satisfies
+    // PLUGIN_METRIC_NAME_REGEX and sits under the name-length bound, and this
+    // plugin mints 21 static names (no interpolation) against a
+    // PLUGIN_METRIC_NAME_BUDGET of 50, so neither can collapse into the shared
+    // `_overflow` series. Both values are non-negative, so neither trips
+    // `bad_value`.
+    //
+    // NB: AC3 of BLO-32113 asks for a Prometheus *rule* on fence age. The
+    // series it needs are scrapeable from here; authoring and deploying the
+    // rule itself remains BLO-32163. Two things that rule's author needs which
+    // are not visible from the `metrics.write` calls below:
+    //
+    //   - `aggregate_key` and `phase` do NOT reach Prometheus. The host
+    //     promotes a tag to a label only if it is BOTH manifest-declared and
+    //     in PLUGIN_METRIC_PROMOTABLE_TAG_KEYS (`metrics.ts`); this plugin
+    //     declares `["alertname", "severity", "version"]` (`manifest.ts`) and
+    //     neither key is promotable in any case. So the scraped series is
+    //     dimensioned by `tag_alertname` only — promoted tags publish under the
+    //     host's `tag_` prefix (`pluginMetricTagLabel` =
+    //     PLUGIN_METRIC_TAG_LABEL_PREFIX + key, `metrics.ts`), and the counter's
+    //     label set is built through exactly that mapper, so a rule matching a
+    //     bare `alertname` hits the same empty-vector trap as the bare
+    //     `rate(age) / rate(count)` described below. AC3's "naming the
+    //     aggregate_key" has to come from the `plugin_logs` metric row or the
+    //     error thrown below — both carry the full tag set — not from the
+    //     rule's labels.
+    //   - Both series land on the SAME prom-client counter
+    //     (`paperclip_plugin_metric_total`), distinguished only by the `metric`
+    //     label. Prometheus matches binary operands on all labels by default,
+    //     so a bare `rate(age) / rate(count)` matches nothing and returns an
+    //     empty vector — no error, just a rule that can never fire, which is
+    //     the same invisible-failure class as the wedge itself. The division
+    //     needs an explicit `ignoring(metric)`:
+    //
+    //       rate(paperclip_plugin_metric_total{
+    //         metric="alertmanager.aggregate.fence_blocked"}[5m])
+    //       -> blocked deliveries/sec
+    //
+    //       rate(paperclip_plugin_metric_total{
+    //         metric="alertmanager.aggregate.fence_blocked_age_seconds"}[5m])
+    //         / ignoring(metric)
+    //       rate(paperclip_plugin_metric_total{
+    //         metric="alertmanager.aggregate.fence_blocked"}[5m])
+    //       -> mean hold age, seconds
+    //
+    // Past the backstop this should be self-clearing, so a sustained non-zero
+    // *rate* on the first series means the reclaim itself is not working.
+    const heldMs = firingClaim.heldMs ?? null;
+    const metricTags = {
+      alertname,
+      aggregate_key: aggregateKey,
+      phase: firingClaim.blockingPhase ?? "unknown",
+    };
+    try {
+      await ctx.metrics.write("alertmanager.aggregate.fence_blocked", 1, metricTags);
+      // Skipped rather than zero-filled when the age is unknown (the fence row
+      // vanished between the refused upsert and the read-back, which implies it
+      // was released). A zero would drag the mean down and misreport a wedge as
+      // brief; omitting it leaves the ratio honest, at the cost of one
+      // occurrence counted without an age.
+      if (heldMs !== null) {
+        await ctx.metrics.write(
+          "alertmanager.aggregate.fence_blocked_age_seconds",
+          Math.round(heldMs / 1000),
+          metricTags,
+        );
+      }
+    } catch (metricErr) {
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record blocked-fence metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
     throw new Error(
       `Alertmanager aggregate ${aggregateKey} is held in phase ` +
         `'${firingClaim.blockingPhase ?? "unknown"}' by a delivery in progress; ` +
+        (heldMs === null ? "" : `held for ${Math.round(heldMs / 1000)}s; `) +
         `retrying firing delivery. A fence abandoned by a dead process is released ` +
-        `automatically by its slot's next worker; if this persists, the holder is ` +
-        `either live or in another slot, and an operator can release it via the ` +
-        `plugin's recover-aggregate-firing route.`,
+        `automatically by its slot's next worker, and any fence held past the ` +
+        `abandonment backstop is reclaimed by the next claim regardless of owner. ` +
+        `So this should clear on its own; if it persists past that backstop the ` +
+        `reclaim itself is failing, and an operator can force it via the plugin's ` +
+        `recover-aggregate-firing route.`,
     );
   }
   const firingToken = firingClaim.token;
@@ -1675,7 +1915,7 @@ export async function handleFiring(
         ? `agent:${resolution.agentId}`
         : resolution.email ?? "(none)";
   }
-  const fallbackAssigneeAgentId =
+  const fallbackResolution =
     retainedIssue || createAssigneeAgentId || createAssigneeUserId
       ? undefined
       : await resolveFallbackAgentIdMemoized(
@@ -1684,18 +1924,48 @@ export async function handleFiring(
           config.fallbackAgentName,
           fallbackOwnerMemo,
         );
+  const fallbackAssigneeAgentId = fallbackResolution?.agentId;
   const finalAssigneeAgentId = createAssigneeAgentId ?? fallbackAssigneeAgentId;
   if (!retainedIssue && !finalAssigneeAgentId && !createAssigneeUserId) {
+    // Only `terminated` / wrong-name / genuinely-ambiguous is unfixable by
+    // retrying. A `paused` or `pending_approval` fallback owner becomes
+    // invokable without anyone editing config, and Alertmanager's retry window
+    // is the only thing that lets the alert land within minutes of that rather
+    // than waiting out a whole `repeat_interval`. Absent a classification we
+    // take the transient branch: a needless retry burst is survivable, a
+    // wrongly-dropped alert is not.
+    const isPermanent = fallbackResolution?.refusal === "permanent";
     ctx.logger.warn(
-      `Cannot create issue for ${alertname}: fallbackAgentName is missing, invalid, or ambiguous`,
+      `Cannot create issue for ${alertname}: fallbackAgentName is missing, invalid, or ambiguous (${
+        isPermanent ? "permanent" : "transient"
+      })`,
     );
-    await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
-      alertname,
-      severity,
-    });
-    throw new Error(
-      `Fallback owner resolution failed for ${alertname}; refusing ownerless issue creation`,
-    );
+    try {
+      // `refusal` splits the two outcomes this metric otherwise conflates: a
+      // permanent refusal is dropped at 200 and will not be retried, a
+      // transient one keeps Alertmanager's retry window. Without the label an
+      // operator has to join this series against
+      // `alertmanager.alert.permanent_error` to tell "gone until someone edits
+      // config" from "retrying, may still land". Two values, so no meaningful
+      // cardinality cost.
+      await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
+        alertname,
+        severity,
+        refusal: isPermanent ? "permanent" : "transient",
+      });
+    } catch (metricErr) {
+      // Best-effort, matching the severity-floor and opt-out drops above. On the
+      // permanent branch this is load-bearing: letting a metrics outage throw
+      // would surface a *metrics* error instead of `PermanentAlertError`, the
+      // per-alert catch would push the fingerprint, and the delivery would 502
+      // — reinstating exactly the doomed retry burst this path removes, and
+      // taking the rest of the batch down with it.
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record fallback owner metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
+    const message = `Fallback owner resolution failed for ${alertname}; refusing ownerless issue creation`;
+    throw isPermanent ? new PermanentAlertError(message) : new Error(message);
   }
   const routeProjectId = nonEmptyString(issueRoute?.projectId);
   const routeGoalId = nonEmptyString(issueRoute?.goalId);
@@ -2392,17 +2662,44 @@ export async function handleWebhook(
       // so Alertmanager stopped retrying and the alert was destroyed with no
       // durable issue or state row — the same silent-loss class as the outage
       // this plugin already suffered (BLO-20467).
+      //
+      // `PermanentAlertError` is the one documented exception to that taxonomy:
+      // a config/roster fault no retry can fix, so it takes the same "log + 200"
+      // route as the malformed payload above instead of the transient-retry
+      // route. Retrying it burns Alertmanager's 15-17 attempts, drops the
+      // delivery anyway, and storms the failure metric that transient faults
+      // need to stay legible. See the class doc (PEN-2581).
+      const permanent = err instanceof PermanentAlertError;
       ctx.logger.error(
-        `paperclip-plugin-alertmanager: error processing alert ${alert.fingerprint}: ${String(err)}`,
+        permanent
+          ? `paperclip-plugin-alertmanager: permanently dropping alert ${alert.fingerprint}: ${String(err)} — no retry can resolve this, so the delivery is not failed`
+          : `paperclip-plugin-alertmanager: error processing alert ${alert.fingerprint}: ${String(err)}`,
       );
-      failedFingerprints.push(alert.fingerprint);
+      if (!permanent) {
+        failedFingerprints.push(alert.fingerprint);
+      }
       try {
-        await ctx.metrics.write("alertmanager.alert.error", 1, {
-          alertname: alert.labels.alertname ?? "unknown",
-        });
+        // `severity` is carried on both branches for the same reason the
+        // `refusal` label exists on `alertmanager.owner.fallback_failed`:
+        // without it, "did we drop a critical?" needs a join against another
+        // series. It matters most on the permanent branch — that drop returns
+        // 200, so it is by design invisible in Alertmanager's own failure
+        // metrics and this series is the entire detection surface for it.
+        await ctx.metrics.write(
+          permanent
+            ? "alertmanager.alert.permanent_error"
+            : "alertmanager.alert.error",
+          1,
+          {
+            alertname: alert.labels.alertname ?? "unknown",
+            severity: alert.labels.severity ?? "unknown",
+          },
+        );
       } catch (metricErr) {
         // Telemetry is best-effort; a metrics outage must not be the thing that
-        // aborts the remaining alerts. The delivery already counts as failed.
+        // aborts the remaining alerts. The delivery's outcome is already
+        // decided either way — failed for a transient fault, 200 for a
+        // permanent one.
         ctx.logger.error(
           `paperclip-plugin-alertmanager: failed to record alert error metric for ${alert.fingerprint}: ${String(metricErr)}`,
         );

@@ -72,13 +72,23 @@ export function dashboardRoutes(db: Db) {
     const kind = typeof req.query.kind === "string" ? req.query.kind : undefined;
     const status = typeof req.query.status === "string" ? req.query.status : undefined;
     const limit = parsePositiveNumber(req.query.limit, 100, 500);
+    const offset = Math.max(0, Math.floor(parsePositiveNumber(req.query.offset, 0)));
+    // Rejected rather than coerced: a silently-ignored `order=ascending` returns a
+    // newest-first page that the caller reads as a census of the oldest rows.
+    const orderParam = req.query.order;
+    if (orderParam !== undefined && orderParam !== "asc" && orderParam !== "desc") {
+      throw badRequest('Query parameter order must be "asc" or "desc"');
+    }
+    const order = orderParam === "asc" ? "asc" : "desc";
     const actions = await recoveryObservability.listActions(companyId, {
       ownerAgentId,
       kind,
       status,
       limit,
+      offset,
+      order,
     });
-    res.json({ companyId, ownerAgentId: ownerAgentId ?? null, kind: kind ?? null, status: status ?? null, actions });
+    res.json({ companyId, ownerAgentId: ownerAgentId ?? null, kind: kind ?? null, status: status ?? null, limit, offset, order, actions });
   });
 
   return router;

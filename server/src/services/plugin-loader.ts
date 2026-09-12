@@ -109,8 +109,11 @@ const SDK_INSTALL_RACE_RETRY_DELAYS_MS = [500, 1500, 3500, 7500, 15500];
 // closed, so static-but-transient install snapshots get more than the observed
 // <5s reconciliation time while permanent mismatches still fail well below the
 // 60s worker initialize timeout.
-const SDK_STORE_CONSISTENCY_RECHECK_DELAYS_MS = SDK_INSTALL_RACE_RETRY_DELAYS_MS;
-const SDK_STORE_CONSISTENCY_MIN_STABLE_MISMATCH_MS = 10_000;
+//
+// Exported so tests can derive their timing bounds from the ladder rather than
+// hard-coding numbers copied out of it, which silently rot when it is retuned.
+export const SDK_STORE_CONSISTENCY_RECHECK_DELAYS_MS = SDK_INSTALL_RACE_RETRY_DELAYS_MS;
+export const SDK_STORE_CONSISTENCY_MIN_STABLE_MISMATCH_MS = 10_000;
 const SDK_INSTALL_RACE_PACKAGE_MARKER = "@paperclipai/plugin-sdk";
 const SDK_INSTALL_RACE_ERR_MARKER = "ERR_MODULE_NOT_FOUND";
 
@@ -177,6 +180,252 @@ export function isTransientActivationRetryError(err: unknown): boolean {
  * that causes these timeouts; this is the safety net for what slips through.
  */
 export const TRANSIENT_ACTIVATION_RETRY_DELAYS_MS = [2_000, 8_000];
+
+/**
+ * Written into `lastError` when activation latched *after* spending the
+ * transient retry budget above. `reviveContentionLatchedPluginsAtStartup()`
+ * keys its "safe to re-attempt this row" decision off this exact string, so the
+ * two must stay coupled — hence a shared constant rather than a repeated
+ * literal (same arrangement as `TORN_STORE_ERROR_MARKER`).
+ *
+ * Its absence is load-bearing in the other direction: a plugin that failed
+ * closed never carries this marker and is therefore never revived, which is
+ * what keeps a genuinely broken plugin terminal.
+ */
+export const TRANSIENT_RETRY_EXHAUSTED_MARKER = "transient activation retries exhausted";
+
+/**
+ * The SDK-install-race counterpart. Exhausting `SDK_INSTALL_RACE_RETRY_DELAYS_MS`
+ * leaves a row latched for exactly the reason BLO-20410 is about: the plugin is
+ * fine, it lost a race against a concurrent `@paperclipai/plugin-sdk` install,
+ * and by the next boot the install it was waiting on has finished. Latching it
+ * terminally would leave half of this defect class live — a restart would not
+ * recover it and a human `/enable` would again be the only way back.
+ *
+ * It is a separate constant rather than a reuse of the transient marker so the
+ * two contention classes stay distinguishable to an operator reading the row;
+ * they share one cross-boot re-attempt budget.
+ */
+export const SDK_INSTALL_RACE_RETRY_EXHAUSTED_MARKER = "sdk-install-race retries exhausted";
+
+/** Latch provenance for one failed activation, as recorded in `lastError`. */
+export interface ActivationLatchClassification {
+  /** Appended to `lastError` after the error message itself. */
+  suffix: string;
+  /** Whether a later boot may re-attempt this row. */
+  eligibleForBootReattempt: boolean;
+}
+
+/**
+ * The retry-budget tally every latch suffix carries. Kept beside its regex twin
+ * `RETRIES_SPENT_SOURCE` because `isBootReattemptEligibleLatch` matches the
+ * suffix this writes: if the two drift, eligibility silently stops recognising
+ * rows this function latched. `classifyActivationLatch` round-trips through the
+ * predicate in `plugin-activation-boot-retry.test.ts` to pin that.
+ */
+function formatRetriesSpent(transientAttempt: number, sdkRaceAttempt: number): string {
+  return `${transientAttempt} transient and ${sdkRaceAttempt} sdk-install-race retries spent`;
+}
+
+const RETRIES_SPENT_SOURCE = String.raw`\d+ transient and \d+ sdk-install-race retries spent`;
+
+/**
+ * Decide what a failed activation records about *how* it got here, and whether
+ * a later boot may re-attempt it.
+ *
+ * The decision is keyed on the **terminal** error, not on whether a retry was
+ * spent. Those are different questions, and conflating them admits rows the
+ * revival pass promises to exclude: a plugin whose first attempt times out
+ * (`transientAttempt → 1`) and whose second fails closed — bad credentials,
+ * missing config, any explicit RPC rejection — leaves the retry loop via
+ * `throw err` with the counter still non-zero. Keying on the counter would mark
+ * that row transient and burn the whole boot budget re-attempting a genuinely
+ * broken plugin. The same held for any failure raised *after* the loop broke
+ * successfully (manifest refresh, job/tool/webhook registration): the outer
+ * catch saw the earlier successful retry's counter and mislabelled it.
+ *
+ * Each class must also have spent its *own* budget. `isSdkInstallRaceError` and
+ * `isTransientActivationRetryError` can both match a worker that crashed at
+ * import, so the SDK-race test is applied first and excluded from the transient
+ * branch — mirroring the retry loop, which refuses to let one class borrow the
+ * other's attempts.
+ */
+export function classifyActivationLatch(params: {
+  err: unknown;
+  transientAttempt: number;
+  sdkRaceAttempt: number;
+}): ActivationLatchClassification {
+  const { err, transientAttempt, sdkRaceAttempt } = params;
+  const spent = formatRetriesSpent(transientAttempt, sdkRaceAttempt);
+
+  const terminalIsSdkRace = isSdkInstallRaceError(err);
+  const terminalIsTransient = !terminalIsSdkRace && isTransientActivationRetryError(err);
+
+  if (terminalIsTransient && transientAttempt > 0) {
+    return {
+      suffix: ` (${TRANSIENT_RETRY_EXHAUSTED_MARKER}: ${spent})`,
+      eligibleForBootReattempt: true,
+    };
+  }
+
+  if (terminalIsSdkRace && sdkRaceAttempt > 0) {
+    return {
+      suffix: ` (${SDK_INSTALL_RACE_RETRY_EXHAUSTED_MARKER}: ${spent})`,
+      eligibleForBootReattempt: true,
+    };
+  }
+
+  return {
+    suffix: ` (failed closed after ${spent}; not classified as retryable contention)`,
+    eligibleForBootReattempt: false,
+  };
+}
+
+/** The `lastError` markers that make a latched row eligible for boot re-attempt. */
+const BOOT_REATTEMPT_ELIGIBLE_MARKERS = [
+  TRANSIENT_RETRY_EXHAUSTED_MARKER,
+  SDK_INSTALL_RACE_RETRY_EXHAUSTED_MARKER,
+] as const;
+
+/**
+ * `loadAll()` selects `status='ready'`, so a row latched at `error` is invisible
+ * to every subsequent boot — the in-activation retry above only ever covers the
+ * attempt that is already running. That is why the original four plugins were
+ * still dead 9 hours and one restart later, and why a human `/enable` was the
+ * only way back (BLO-20410).
+ *
+ * A boot therefore re-attempts rows whose latch provenance says contention, and
+ * counts those re-attempts in `lastError` so the budget survives the restart it
+ * is measured in. After the limit the row stays latched: three consecutive
+ * boots of transient failure is no longer evidence of contention, and silently
+ * re-attempting forever would bury exactly that signal.
+ *
+ * Set `PAPERCLIP_PLUGIN_BOOT_ACTIVATION_RETRY_LIMIT=0` to disable the pass and
+ * restore the pre-fix latch-forever behaviour.
+ */
+const DEFAULT_BOOT_ACTIVATION_RETRY_LIMIT = 3;
+
+export function resolveBootActivationRetryLimit(): number {
+  const raw = process.env.PAPERCLIP_PLUGIN_BOOT_ACTIVATION_RETRY_LIMIT;
+  if (!raw) return DEFAULT_BOOT_ACTIVATION_RETRY_LIMIT;
+  const parsed = Number.parseInt(raw, 10);
+  // Deliberate: a malformed or negative value falls back to the default rather
+  // than to 0. `0` is the documented disable switch and disabling this pass
+  // restores the latch-forever behaviour BLO-20410 is about, so a typo must not
+  // be able to silently turn the recovery off. `Number.parseInt` is likewise
+  // permissive by design — "3abc" reads as 3 rather than disabling the pass.
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_BOOT_ACTIVATION_RETRY_LIMIT;
+  }
+  return parsed;
+}
+
+const BOOT_ACTIVATION_RETRY_TAG = "boot-activation-retry";
+// Anchored to end-of-string because the tag is always appended last. `lastError`
+// concatenates plugin-controlled `errorMessage`, so an unanchored pattern lets a
+// plugin whose own error text contains ` [boot-activation-retry 1/3]` win the
+// first match: the count would pin at 1 and `stripBootActivationRetryTag` would
+// remove the plugin's copy instead of ours, so the budget would never advance
+// and the row would re-attempt on every boot forever. Anchoring makes the real
+// tag authoritative, and the worst a forged one can now do is spend the budget
+// faster — the fail-safe direction.
+const BOOT_ACTIVATION_RETRY_PATTERN = new RegExp(
+  ` \\[${BOOT_ACTIVATION_RETRY_TAG} (\\d+)/\\d+\\]$`,
+);
+
+/** How many boots have already re-attempted this row, per its `lastError`. */
+export function readBootActivationRetryCount(lastError: string | null | undefined): number {
+  const match = BOOT_ACTIVATION_RETRY_PATTERN.exec(lastError ?? "");
+  if (!match) return 0;
+  const parsed = Number.parseInt(match[1]!, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function stripBootActivationRetryTag(lastError: string): string {
+  return lastError.replace(BOOT_ACTIVATION_RETRY_PATTERN, "");
+}
+
+function formatBootActivationRetryTag(count: number, limit: number): string {
+  return ` [${BOOT_ACTIVATION_RETRY_TAG} ${count}/${limit}]`;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Anchored for the same reason as `BOOT_ACTIVATION_RETRY_PATTERN`, and it is
+ * the more important of the two. `lastError` is
+ * `Activation failed: ${errorMessage}${latch.suffix}${bootRetryTag}` with
+ * `errorMessage` plugin-controlled and unsanitised, so a substring scan for the
+ * bare marker lets a plugin forge its own eligibility.
+ *
+ * A forged *tag* only spends the budget faster — fail-safe. A forged *marker*
+ * used to defeat the budget outright, because the two halves disagreed about
+ * which region of the string they trusted: eligibility scanned everything while
+ * the count read only the anchored tail. A plugin whose error text embedded the
+ * marker and then failed closed latched with no tag (`bootRetryTag` is
+ * suppressed when `eligibleForBootReattempt` is false), so the next boot read
+ * eligible=true, spent=0, re-attempted, failed closed, and dropped the tag
+ * again — a fixed point that re-attempted the row on every boot forever and
+ * buried the `spent >= limit` "this is no longer contention" warning the pass
+ * exists to surface.
+ *
+ * Both halves now read the same trusted region: strip the tag, then require the
+ * remainder to *end* with a suffix `classifyActivationLatch` actually writes.
+ * The real suffix is always appended after the plugin's message, so a forged
+ * copy can never be the trailing one.
+ */
+const BOOT_REATTEMPT_ELIGIBLE_SUFFIX_PATTERN = new RegExp(
+  ` \\((?:${BOOT_REATTEMPT_ELIGIBLE_MARKERS.map(escapeRegExp).join("|")}): ` +
+    `${RETRIES_SPENT_SOURCE}\\)$`,
+);
+
+/**
+ * The suffix the *previous* release wrote, honoured for one re-attempt so the
+ * rows this pass exists to rescue are actually rescued by the deploy that ships
+ * it.
+ *
+ * Without this, eligibility recognises only suffixes written by the new
+ * `classifyActivationLatch`, so every row latched by the currently-deployed
+ * build stays dead and a human `/enable` remains the only way back for exactly
+ * the cohort in BLO-20410 (including `lucitra.plugin-secrets`). The pass would
+ * cover only failures that happen *after* the rollout — inverting its headline
+ * outcome on the one boot an operator will be watching.
+ *
+ * The cost is real and bounded, and both halves matter:
+ *
+ * - The legacy format is keyed on the retry *counter*, not on the terminal
+ *   error, so it cannot distinguish "exhausted transient retries" from "hit one
+ *   transient blip, retried, then failed closed". Honouring it therefore
+ *   re-attempts some genuinely-broken rows — the case
+ *   `classifyActivationLatch` was rewritten to exclude.
+ * - That re-attempt can happen **at most once per row, ever**. The revive pass
+ *   writes its tag *before* re-activating, and every subsequent latch rewrites
+ *   `lastError` from the current failure through `classifyActivationLatch`,
+ *   which always appends one of its three new-format suffixes — including on
+ *   the failed-closed branch. So the legacy suffix can never be the trailing
+ *   region again, and the correct terminal-error keying takes over permanently
+ *   from the first re-attempt onward.
+ *
+ * Anchored identically to the pattern above, and for the same reason: a plugin
+ * that embeds this text in its own error message forges one re-attempt, not an
+ * unbounded loop, because the real suffix is appended after the message and
+ * becomes the trailing one.
+ *
+ * Delete one release after the rollout that introduces the new format — by then
+ * no unrescued row can still carry it.
+ */
+const LEGACY_BOOT_REATTEMPT_ELIGIBLE_SUFFIX_PATTERN =
+  / \(after \d+ transient and \d+ sdk-install-race retries\)$/;
+
+export function isBootReattemptEligibleLatch(lastError: string | null | undefined): boolean {
+  const withoutTag = stripBootActivationRetryTag(lastError ?? "");
+  return (
+    BOOT_REATTEMPT_ELIGIBLE_SUFFIX_PATTERN.test(withoutTag) ||
+    LEGACY_BOOT_REATTEMPT_ELIGIBLE_SUFFIX_PATTERN.test(withoutTag)
+  );
+}
 
 /**
  * Boot-time activation was an unbounded `Promise.allSettled` over every ready
@@ -272,8 +521,43 @@ export interface SharedDependencyConsistencyCheck {
   lockfileState: "missing" | "ok" | "invalid";
   installedState: "missing" | "ok" | "invalid";
   consistent: boolean;
-  problem: "metadata_invalid" | "version_mismatch" | null;
+  problem: "metadata_invalid" | "version_mismatch" | "not_installed" | null;
   diagnostic: string | null;
+}
+
+export interface SharedDependencyConsistencyScope {
+  /**
+   * Whether `packageName` has to be physically present inside `installDir`
+   * itself for the tree to be usable.
+   *
+   * True (the default) for an install dir the server owns — one it ran
+   * `npm install --prefix` into, i.e. every isolated plugin (BLO-20961). The
+   * worker imports the SDK from that tree and nothing above it provides one,
+   * so an empty dir cannot work and `(absent)/(absent)` is a real fault.
+   *
+   * False for a **shared-store** row — `installDir IS NULL` on the plugin
+   * record, which is how local-filesystem and `cwd/node_modules` discovery
+   * persist a plugin that was never isolated. Those resolve the SDK by walking
+   * *up* from the package, so the shared `~/.paperclip/plugins` dir is
+   * routinely empty of it while the plugin imports it fine from the workspace
+   * root. Rejecting `(absent)/(absent)` there fails a working dev checkout
+   * (BLO-31857), so the caller must opt out.
+   */
+  requireInstalledInTree?: boolean;
+}
+
+/**
+ * Whether `installDir` is a tree the server npm-installed into, and therefore
+ * one that must contain the SDK itself rather than inherit it from an ancestor.
+ *
+ * Shared by the activation guard and the startup un-latch so the two cannot
+ * drift into disagreeing about which rows the strict verdict applies to.
+ */
+function requiresSelfContainedSdkTree(
+  installDir: string | null | undefined,
+  sharedStoreDir: string,
+): boolean {
+  return !!installDir && installDir !== sharedStoreDir;
 }
 
 interface SharedDependencyVersionRead {
@@ -421,14 +705,49 @@ async function readLockfileVersion(
  * package-lock.json against the version physically installed under
  * `installDir/node_modules`.
  *
- * Absence on either side is NOT treated as a mismatch — a missing lockfile
- * (local dev without one) or a not-yet-installed package makes no claim to
- * disagree with. Present-but-invalid metadata fails closed, as do two
- * present, differing versions.
+ * Absence on *one* side is NOT treated as a mismatch — a missing lockfile
+ * entry or a not-yet-installed package makes no claim to disagree with.
+ * Present-but-invalid metadata fails closed, as do two present, differing
+ * versions.
+ *
+ * The two single-sided absences are deliberately asymmetric, and neither
+ * default is arbitrary (BLO-31857):
+ *
+ * - `(lock absent)/(installed ok)` is **congruent**, because it is the normal
+ *   steady state of every isolated install dir in production. Measured on the
+ *   live PVC 2026-09-04, all of `@lucitra/paperclip-plugin-secrets`,
+ *   `@lucitra/paperclip-plugin-chat` and `@penstock/paperclip-plugin` carry a
+ *   package-lock.json with zero `plugin-sdk` entries while the SDK itself is
+ *   installed and working — a peer-dependency-only plugin records no direct
+ *   dependency to lock. Rejecting this shape fails activation for all three at
+ *   once, since the caller below throws on `!consistent` before spawning a
+ *   worker. `plugin-store-consistency.test.ts` pins it as congruent.
+ * - `(lock ok)/(installed absent)` is also congruent, because it is the
+ *   boot-time install race that `SDK_INSTALL_RACE_RETRY_DELAYS_MS` already
+ *   owns: the worker raises ERR_MODULE_NOT_FOUND and recovers on retry.
+ *
+ * `(absent)/(absent)` is the one absence that fails closed, and only for an
+ * install dir the server owns (`scope.requireInstalledInTree`). Nothing is
+ * recorded and nothing is installed, so there is no tree here for a worker to
+ * import the SDK from — and unlike the two rows above, no other mechanism
+ * covers it: it is not a version disagreement, and a guard that called it
+ * congruent would let a boot fixture pass vacuously while asserting nothing.
+ * A transient `(absent)/(absent)` during the concurrent boot install is still
+ * safe, because every inconsistent result routes through
+ * `checkSharedDependencyConsistencyAfterRecheck`, which returns as soon as the
+ * problem clears and only fails closed on a mismatch stable past
+ * `SDK_STORE_CONSISTENCY_MIN_STABLE_MISMATCH_MS`; if it does latch, the startup
+ * re-probe in `reconcileLegacyIsolatedInstallsAtStartup` clears the row once
+ * the install lands.
+ *
+ * A **shared-store** row must pass `requireInstalledInTree: false` — it
+ * resolves the SDK from an ancestor, so an empty dir there is normal. See
+ * `SharedDependencyConsistencyScope`.
  */
 export async function checkSharedDependencyConsistency(
   installDir: string,
   packageName: string = SDK_INSTALL_RACE_PACKAGE_MARKER,
+  { requireInstalledInTree = true }: SharedDependencyConsistencyScope = {},
 ): Promise<SharedDependencyConsistencyCheck> {
   const [lockfileRead, installedRead] = await Promise.all([
     readLockfileVersion(installDir, packageName),
@@ -442,9 +761,12 @@ export async function checkSharedDependencyConsistency(
     lockfileRead.state === "ok" &&
     installedRead.state === "ok" &&
     lockfileVersion !== installedVersion;
+  const notInstalled =
+    requireInstalledInTree && lockfileRead.state === "missing" && installedRead.state === "missing";
   const consistent =
     !metadataInvalid &&
-    !versionMismatch;
+    !versionMismatch &&
+    !notInstalled;
   const diagnostics = [lockfileRead.diagnostic, installedRead.diagnostic].filter((detail): detail is string => !!detail);
 
   return {
@@ -454,7 +776,13 @@ export async function checkSharedDependencyConsistency(
     lockfileState: lockfileRead.state,
     installedState: installedRead.state,
     consistent,
-    problem: metadataInvalid ? "metadata_invalid" : versionMismatch ? "version_mismatch" : null,
+    problem: metadataInvalid
+      ? "metadata_invalid"
+      : versionMismatch
+        ? "version_mismatch"
+        : notInstalled
+          ? "not_installed"
+          : null,
     diagnostic: diagnostics.length > 0 ? diagnostics.join("; ") : null,
   };
 }
@@ -474,15 +802,16 @@ function sharedDependencyProblemKey(check: SharedDependencyConsistencyCheck): st
 export async function checkSharedDependencyConsistencyAfterRecheck(
   installDir: string,
   packageName: string = SDK_INSTALL_RACE_PACKAGE_MARKER,
+  scope: SharedDependencyConsistencyScope = {},
 ): Promise<SharedDependencyConsistencyCheck> {
-  let check = await checkSharedDependencyConsistency(installDir, packageName);
+  let check = await checkSharedDependencyConsistency(installDir, packageName, scope);
   let previousProblemKey = sharedDependencyProblemKey(check);
   let previousProblemFirstSeenAt = Date.now();
   if (!previousProblemKey) return check;
 
   for (const delayMs of SDK_STORE_CONSISTENCY_RECHECK_DELAYS_MS) {
     await sleep(delayMs);
-    const next = await checkSharedDependencyConsistency(installDir, packageName);
+    const next = await checkSharedDependencyConsistency(installDir, packageName, scope);
     const nextProblemKey = sharedDependencyProblemKey(next);
     if (!nextProblemKey) return next;
     const now = Date.now();
@@ -510,6 +839,23 @@ export async function checkSharedDependencyConsistencyAfterRecheck(
  */
 export const TORN_STORE_ERROR_MARKER = "Torn plugin store detected";
 
+/**
+ * Leading text of the nothing-installed refusal. Deliberately NOT
+ * `TORN_STORE_ERROR_MARKER`: `reconcileLegacyIsolatedInstallsAtStartup`
+ * un-latches rows carrying that marker on the theory that relocating the
+ * install dir resolves them, which is true of a version disagreement inside a
+ * populated tree and false here. An empty tree is fixed by an actual install,
+ * which does not move the dir.
+ *
+ * So this marker gets its own un-latch rule in that same function: the row is
+ * revived only when a fresh `checkSharedDependencyConsistency` re-probe reports
+ * the tree congruent, independent of whether `installDir` changed. That keeps a
+ * still-empty tree errored while letting a slow boot `npm install` — one that
+ * outran the activation recheck window — self-heal on the next boot instead of
+ * needing an operator (BLO-31857).
+ */
+export const SDK_NOT_INSTALLED_ERROR_MARKER = "Plugin SDK is not installed";
+
 function formatSharedDependencyConsistencyError(check: SharedDependencyConsistencyCheck, installDir: string): string {
   const installedPath = path.join(installDir, "node_modules", ...check.packageName.split("/"));
   if (check.problem === "metadata_invalid") {
@@ -518,6 +864,16 @@ function formatSharedDependencyConsistencyError(check: SharedDependencyConsisten
       `Refusing to activate to avoid a silent worker initialize timeout. Reconcile the shared plugin store ` +
       `(e.g. inspect ${path.join(installDir, "package-lock.json")} and ${path.join(installedPath, "package.json")}, ` +
       `then re-run 'npm install --prefix ${installDir}') before re-enabling this plugin.`
+    );
+  }
+  if (check.problem === "not_installed") {
+    return (
+      `${SDK_NOT_INSTALLED_ERROR_MARKER}: ${path.join(installDir, "package-lock.json")} records no ` +
+      `${check.packageName} entry and nothing is installed at ${installedPath}. The install dir is empty of ` +
+      `the SDK, so the worker has no tree to import it from. Refusing to activate to avoid a silent worker ` +
+      `initialize timeout. Run 'npm install --prefix ${installDir}' before re-enabling this plugin. ` +
+      `(A populated install dir that merely omits the SDK from its lockfile — the normal ` +
+      `peer-dependency-only shape — is congruent and is not this error.)`
     );
   }
   return (
@@ -1825,11 +2181,22 @@ export function pluginLoader(
    * Run `reconcileLegacyIsolatedInstall` across installed rows before
    * `loadAll()` selects by status.
    *
-   * Also un-latches rows the torn-store guard parked in `error`: `loadAll()`
+   * Also un-latches rows the SDK-store guards parked in `error`: `loadAll()`
    * only selects `status='ready'`, so a row refused once stays invisible to
    * every later boot even after the underlying cause is fixed. Only rows whose
-   * `lastError` came from that guard are revived, and only when the relocation
-   * actually moved them — an unrelated failure keeps its error and stays out.
+   * `lastError` came from one of those guards are revived — an unrelated
+   * failure keeps its error and stays out — and each marker has its own
+   * evidence that the cause is gone:
+   *
+   * - `TORN_STORE_ERROR_MARKER` (a version disagreement inside a populated
+   *   tree) is cleared when the relocation actually moved the row, which is
+   *   what repoints it away from the torn shared store.
+   * - `SDK_NOT_INSTALLED_ERROR_MARKER` (an empty tree) is cleared when a fresh
+   *   consistency **re-probe** reports the tree congruent, whether or not the
+   *   dir moved. An empty tree is fixed by an install, not a relocation, so a
+   *   relocation test would strand it forever; conversely a still-empty tree
+   *   must stay errored rather than be revived into the same failure
+   *   (BLO-31857).
    *
    * Best-effort per row: one plugin that cannot be reinstalled (npm offline,
    * yanked version) must not abort boot for every other plugin.
@@ -1840,10 +2207,44 @@ export function pluginLoader(
     for (const plugin of installed) {
       const latchedByTornStore =
         plugin.status === "error" && !!plugin.lastError?.includes(TORN_STORE_ERROR_MARKER);
-      if (plugin.status !== "ready" && !latchedByTornStore) continue;
+      const latchedByNotInstalled =
+        plugin.status === "error" && !!plugin.lastError?.includes(SDK_NOT_INSTALLED_ERROR_MARKER);
+      if (plugin.status !== "ready" && !latchedByTornStore && !latchedByNotInstalled) continue;
 
       try {
         const migrated = await reconcileLegacyIsolatedInstall(plugin);
+
+        // Re-probe before the relocation test below: an empty tree is repaired
+        // by an actual install (a boot `npm install` that outran the
+        // activation recheck window, or an operator repair), and neither moves
+        // the install dir.
+        if (latchedByNotInstalled) {
+          const probeDir = migrated.installDir ?? localPluginDir;
+          const reprobe = await checkSharedDependencyConsistency(
+            probeDir,
+            SDK_INSTALL_RACE_PACKAGE_MARKER,
+            { requireInstalledInTree: requiresSelfContainedSdkTree(migrated.installDir, localPluginDir) },
+          );
+          if (reprobe.consistent) {
+            await registry.updateStatus(migrated.id, { status: "ready", lastError: null });
+            log.info(
+              { pluginId: migrated.id, pluginKey: migrated.pluginKey, installDir: probeDir },
+              "plugin-loader: re-enabled plugin latched by a missing plugin SDK; the install has since landed",
+            );
+          } else {
+            log.warn(
+              {
+                pluginId: migrated.id,
+                pluginKey: migrated.pluginKey,
+                installDir: probeDir,
+                problem: reprobe.problem,
+              },
+              "plugin-loader: plugin still has no usable SDK tree; leaving it errored",
+            );
+          }
+          continue;
+        }
+
         if (migrated.installDir === plugin.installDir) continue;
 
         if (latchedByTornStore) {
@@ -1861,6 +2262,76 @@ export function pluginLoader(
             err: err instanceof Error ? err.message : String(err),
           },
           "plugin-loader: legacy isolated-store migration failed; leaving row unchanged",
+        );
+      }
+    }
+  }
+
+  /**
+   * Re-attempt rows a previous boot latched after spending a retryable
+   * contention budget, before `loadAll()` selects by status.
+   *
+   * This is the automatic form of the manual `/enable` that recovered all four
+   * plugins in BLO-20410 with no other change: flip the row back to `ready` and
+   * let the normal activation path try again. It is deliberately the same two
+   * writes `lifecycle.enable()` performs, so a revived row is indistinguishable
+   * from an operator-enabled one by the time `activatePlugin` sees it.
+   *
+   * Two things keep it from becoming an unbounded retry:
+   *
+   * - Only rows whose latch provenance says retryable contention are eligible —
+   *   `TRANSIENT_RETRY_EXHAUSTED_MARKER` or
+   *   `SDK_INSTALL_RACE_RETRY_EXHAUSTED_MARKER`. A plugin that failed closed —
+   *   bad credentials, missing config, any explicit RPC rejection — never wrote
+   *   either marker and stays latched. `classifyActivationLatch` keys that on
+   *   the terminal error, so spending a retry and *then* failing closed does
+   *   not buy a row into this pass.
+   * - The re-attempt count rides in `lastError` (cleared on the next successful
+   *   activation), so the budget is spent across boots rather than reset by
+   *   each one. Both contention classes share the one budget.
+   *
+   * Best-effort per row: one row that cannot be updated must not abort boot for
+   * the rest.
+   */
+  async function reviveContentionLatchedPluginsAtStartup(): Promise<void> {
+    const limit = resolveBootActivationRetryLimit();
+    if (limit <= 0) return;
+
+    const installed = (await registry.listInstalled()) as PluginRecord[];
+
+    for (const plugin of installed) {
+      if (plugin.status !== "error") continue;
+      const lastError = plugin.lastError ?? "";
+      if (!isBootReattemptEligibleLatch(lastError)) continue;
+
+      const spent = readBootActivationRetryCount(lastError);
+      if (spent >= limit) {
+        log.warn(
+          { pluginId: plugin.id, pluginKey: plugin.pluginKey, attempts: spent, limit },
+          "plugin-loader: boot activation re-attempt budget exhausted across boots; " +
+            "leaving plugin latched (this is no longer contention)",
+        );
+        continue;
+      }
+
+      const attempt = spent + 1;
+      try {
+        await registry.updateStatus(plugin.id, {
+          status: "ready",
+          lastError: `${stripBootActivationRetryTag(lastError)}${formatBootActivationRetryTag(attempt, limit)}`,
+        });
+        log.info(
+          { pluginId: plugin.id, pluginKey: plugin.pluginKey, attempt, limit },
+          "plugin-loader: re-attempting plugin latched by retryable activation contention",
+        );
+      } catch (err) {
+        log.warn(
+          {
+            pluginId: plugin.id,
+            pluginKey: plugin.pluginKey,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          "plugin-loader: failed to revive contention-latched plugin; leaving row unchanged",
         );
       }
     }
@@ -2528,6 +2999,18 @@ export function pluginLoader(
 
       log.info("plugin-loader: loading all ready plugins");
 
+      // Give rows a previous boot latched on retryable contention one more
+      // activation before selecting by status. Without this the in-activation
+      // retry only ever covers the attempt already running, so a plugin that
+      // loses the initialize race stays invisible to every later boot and only
+      // a human `/enable` brings it back (BLO-20410).
+      //
+      // This runs *before* the legacy reconcile so a row that is both
+      // pre-isolation (installDir IS NULL) and latched gets relocated too: the
+      // reconcile below only considers `ready` or torn-store-latched rows, so a
+      // row revived after it would activate from its legacy install dir.
+      await reviveContentionLatchedPluginsAtStartup();
+
       // Relocate pre-isolation rows (installDir IS NULL) into their isolated
       // dirs and revive any the torn-store guard latched, BEFORE selecting by
       // status — a revived row must be visible to the query below.
@@ -2772,6 +3255,11 @@ export function pluginLoader(
     let sdkRaceAttempt = 0;
     let transientAttempt = 0;
 
+    // Read before activation can rewrite the row: `activePlugin` is replaced by
+    // the isolation migration mid-flight, and the boot re-attempt count lives
+    // in the `lastError` of the record as it was handed to us.
+    const inboundLastError = plugin.lastError;
+
     // Guard: runtime services must exist (callers already checked)
     if (!runtimeServices) {
       return {
@@ -2826,8 +3314,33 @@ export function pluginLoader(
       // npm install / workspace SDK re-patch can settle before we mark the
       // plugin errored, while a persistent mismatch still fails well before
       // the worker initialize timeout.
+      //
+      // Deliberately NOT a resolvability probe (BLO-31857). The obvious
+      // stronger gate — "can this tree actually resolve the SDK?" — was
+      // measured against the live layout on 2026-09-04 and cannot be used:
+      // `require.resolve('@paperclipai/plugin-sdk', { paths: [installDir] })`
+      // throws ERR_PACKAGE_PATH_NOT_EXPORTED on all three isolated trees,
+      // including the two known-good ones, because the SDK's `exports` map is
+      // ESM-only with no `require` condition; `import.meta.resolve(spec,
+      // parentURL)` failed on all four targets including hindsight, which is
+      // provably working. Either one would fail closed for every plugin on the
+      // box. If a resolvability gate is ever added here, verify it passes
+      // against the current production layout FIRST — otherwise it tests the
+      // probe rather than the tree.
+      //
+      // The nothing-installed verdict is scoped to install dirs the server
+      // owns (BLO-31857). A row with `installDir IS NULL` resolves the SDK by
+      // walking *up* from `cwd/node_modules` or the shared store to the
+      // workspace root, so its `pluginInstallDir` — the shared
+      // `localPluginDir` — is routinely empty of the SDK while the plugin
+      // imports it fine. That is a working dev checkout, not a torn tree, and
+      // failing it closed here would break every non-isolated plugin.
       // ------------------------------------------------------------------
-      const sdkConsistency = await checkSharedDependencyConsistencyAfterRecheck(pluginInstallDir);
+      const sdkConsistency = await checkSharedDependencyConsistencyAfterRecheck(
+        pluginInstallDir,
+        SDK_INSTALL_RACE_PACKAGE_MARKER,
+        { requireInstalledInTree: requiresSelfContainedSdkTree(activePlugin.installDir, localPluginDir) },
+      );
       if (!sdkConsistency.consistent) {
         throw new Error(formatSharedDependencyConsistencyError(sdkConsistency, pluginInstallDir));
       }
@@ -3085,6 +3598,31 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       // Done — plugin fully activated
       // ------------------------------------------------------------------
+
+      // A row revived by the boot re-attempt pass arrives `ready` still
+      // carrying the latch text that made it eligible. Clearing it here is what
+      // makes a recovered plugin indistinguishable from one that never failed —
+      // otherwise the UI shows a healthy plugin with a stale error, and the
+      // cross-boot retry count never resets after a good boot.
+      if (activePlugin.lastError) {
+        try {
+          const cleared = (await registry.updateStatus(pluginId, {
+            status: "ready",
+            lastError: null,
+          })) as PluginRecord | null;
+          if (cleared) activePlugin = cleared;
+        } catch (clearErr) {
+          log.warn(
+            {
+              pluginId,
+              pluginKey,
+              err: clearErr instanceof Error ? clearErr.message : String(clearErr),
+            },
+            "plugin-loader: activated plugin but failed to clear its stale lastError",
+          );
+        }
+      }
+
       log.info(
         {
           pluginId,
@@ -3127,12 +3665,23 @@ export function pluginLoader(
 
       // Record how the plugin reached this state alongside the error itself.
       // `lastError` outlives log retention, so it carries the one fact the logs
-      // cannot: whether retries were spent (contention) or the failure was
-      // terminal on the first attempt (a real fault). See BLO-20410.
-      const retrySuffix =
-        sdkRaceAttempt > 0 || transientAttempt > 0
-          ? ` (after ${transientAttempt} transient and ${sdkRaceAttempt} sdk-install-race retries)`
-          : " (failed closed on first attempt; not classified as transient)";
+      // cannot: whether this was retryable contention or a terminal fault. See
+      // BLO-20410.
+      //
+      // It is also the machine-readable half: the marker is what makes this row
+      // eligible for a re-attempt on the next boot, which is why the decision is
+      // keyed on the terminal error rather than on whether a retry was spent.
+      const latch = classifyActivationLatch({ err, transientAttempt, sdkRaceAttempt });
+
+      // Carry the cross-boot re-attempt count from the row we were handed, so
+      // the budget is spent over consecutive boots instead of being reset by
+      // each latch. Only meaningful when this latch is itself eligible — a row
+      // that fails closed leaves the pass regardless of its count.
+      const carriedBootRetries = readBootActivationRetryCount(inboundLastError);
+      const bootRetryTag =
+        latch.eligibleForBootReattempt && carriedBootRetries > 0
+          ? formatBootActivationRetryTag(carriedBootRetries, resolveBootActivationRetryLimit())
+          : "";
 
       // Mark the plugin as errored in the database. Transient failures are
       // retried above before reaching this point (BLO-20410); anything that
@@ -3141,7 +3690,7 @@ export function pluginLoader(
       try {
         await lifecycleManager.markError(
           pluginId,
-          `Activation failed: ${errorMessage}${retrySuffix}`,
+          `Activation failed: ${errorMessage}${latch.suffix}${bootRetryTag}`,
         );
       } catch (markErr) {
         log.error(

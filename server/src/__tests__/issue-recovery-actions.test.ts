@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -41,6 +41,7 @@ import {
   STRANDED_ASSIGNED_ISSUE_STATUSES,
   STRANDED_RECOVERY_WAKE_BACKSTOP_FOLD_ONLY_STATUSES,
   STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES,
+  backstopSweepCompletionPath,
   isInfraClassStrandedFailure,
   recoveryService,
   strandedRecoveryWakeAttemptsExhausted,
@@ -72,6 +73,35 @@ vi.mock("../services/recovery/pause-hold-guard.js", async (importOriginal) => {
       return actual.isAutomaticRecoverySuppressedByPauseHold(...args);
     },
   };
+});
+
+describe("backstop sweep completion path", () => {
+  it.each([
+    ["page_drained", false],
+    ["cursor_wrap", true],
+  ] as const)("reports %s completion", (expected, cursorWasReset) => {
+    expect(backstopSweepCompletionPath({
+      useCursor: true,
+      cursorBeforeQuery: "cursor-1",
+      cursorWasReset,
+      candidateLimitSkipped: 0,
+    })).toBe(expected);
+  });
+
+  it("does not report an incomplete page or a non-cursor query as completion", () => {
+    expect(backstopSweepCompletionPath({
+      useCursor: true,
+      cursorBeforeQuery: "cursor-1",
+      cursorWasReset: false,
+      candidateLimitSkipped: 1,
+    })).toBeNull();
+    expect(backstopSweepCompletionPath({
+      useCursor: false,
+      cursorBeforeQuery: null,
+      cursorWasReset: false,
+      candidateLimitSkipped: 0,
+    })).toBeNull();
+  });
 });
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -129,8 +159,10 @@ function makeRecoveryActionRow(overrides: Record<string, unknown> = {}) {
     wakePolicy: null,
     monitorPolicy: null,
     attemptCount: 1,
+    nonDeliverySweepCount: 0,
     maxAttempts: null,
     timeoutAt: null,
+    retiringBound: null,
     lastAttemptAt: now,
     outcome: null,
     resolutionNote: null,
@@ -654,6 +686,49 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(current).toMatchObject({ ownerAgentId: managerId, attemptCount: 0 });
   });
 
+  it("atomically retires an exhausted reservation so the backstop cannot redeliver it", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "blocked", assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+    const svc = issueRecoveryActionService(db);
+    const action = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "atomic-retire-refund:fingerprint",
+      nextAction: "Wake the recovery owner.",
+      maxAttempts: 5,
+    });
+
+    await svc.retireAndReleaseWakeAttempt({
+      companyId,
+      actionId: action.id,
+      expectedOwnerAgentId: managerId,
+      expectedAttemptCount: action.attemptCount,
+      retiringBound: "attempt_budget",
+    });
+
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.reconcileStrandedRecoveryWakeBackstop({
+      companyId,
+      now: new Date("2026-08-26T00:00:00.000Z"),
+      cooldownMs: 30 * 60 * 1000,
+    });
+
+    expect(result).toMatchObject({ checked: 0, exhaustedSkipped: 0, healed: 0 });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const [current] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(current).toMatchObject({
+      status: "escalated",
+      retiringBound: "attempt_budget",
+      attemptCount: action.attemptCount - 1,
+      nonDeliverySweepCount: 1,
+    });
+  });
+
   it.each([
     ["job_missing", "in_progress"],
     ["job_missing", "todo"],
@@ -976,11 +1051,72 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
     const [unchanged] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
     expect(unchanged).toMatchObject({
-      status: "active",
+      status: "escalated",
       attemptCount: defaultRecoveryActionMaxAttempts,
       maxAttempts: defaultRecoveryActionMaxAttempts,
+      retiringBound: "attempt_budget",
     });
     expect(unchanged?.lastAttemptAt).toEqual(new Date("2026-05-01T00:00:00.000Z"));
+
+    // Retirement is sticky: a later sweep must not reselect the escalated row
+    // after the attempt count was refunded by the retirement CAS.
+    const secondSweep = await recovery.reconcileStrandedRecoveryWakeBackstop({
+      companyId,
+      now: new Date("2026-08-26T00:30:00.000Z"),
+      cooldownMs: 30 * 60 * 1000,
+    });
+    expect(secondSweep).toMatchObject({ checked: 0, exhaustedSkipped: 0, healed: 0 });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const [stillRetired] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
+    expect(stillRetired).toMatchObject({
+      status: "escalated",
+      attemptCount: defaultRecoveryActionMaxAttempts,
+      retiringBound: "attempt_budget",
+    });
+  });
+
+  it("does not claim a candidate retired after selection", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "blocked", assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: null,
+      fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:claim-race`,
+      evidence: {},
+      nextAction: "Wake the recovery owner.",
+      attemptCount: 0,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
+      timeoutAt: new Date("2026-12-31T00:00:00.000Z"),
+      lastAttemptAt: new Date("2026-05-01T00:00:00.000Z"),
+    }).returning();
+
+    pauseHoldSeam.onNextCheck = async () => {
+      await issueRecoveryActionService(db).retireWakeAction({
+        companyId,
+        actionId: action!.id,
+        retiringBound: "timeout_horizon",
+      });
+    };
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedRecoveryWakeBackstop({
+      companyId,
+      now: new Date("2026-08-26T00:00:00.000Z"),
+      cooldownMs: 30 * 60 * 1000,
+    });
+
+    expect(result).toMatchObject({ checked: 1, claimLost: 1, healed: 0 });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const [retired] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
+    expect(retired).toMatchObject({ status: "escalated", retiringBound: "timeout_horizon" });
+    expect(retired?.lastAttemptAt).toEqual(new Date("2026-05-01T00:00:00.000Z"));
   });
 
   it("publishes the committed review-stage escalation activity", async () => {
@@ -1367,6 +1503,55 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).toHaveBeenCalledWith(coderId, expect.anything());
   });
 
+  // BLO-33223: the same family, one pod-death reason later. A container killed by
+  // the kernel OOM killer is read at exit (not found missing), so it carries the
+  // `exit code 137 … reason=OOMKilled` shape rather than the pod-removal sentence,
+  // and used to classify `infraClassCause: false` and escalate to the manager.
+  // Measured live on recovery action `cf5f83a6-…`, which stranded BLO-31945 four
+  // times. The negative control for this case is the test immediately below: an
+  // agent-side crash is `exit code 1, reason=Error` and must still escalate.
+  it("re-dispatches an OOMKilled claude_truncated failure to the existing assignee instead of the manager", async () => {
+    const { managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Claude run was truncated mid-stream — assistant produced content but no result " +
+        "event arrived; exit code 137, SIGKILL (commonly OOMKilled), reason=OOMKilled",
+      errorCode: "claude_truncated",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(action).toMatchObject({
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      ownerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+    });
+    expect(action?.ownerAgentId).toBe(action?.returnOwnerAgentId);
+    expect(action?.ownerAgentId).not.toBe(managerId);
+    expect(action?.evidence).toMatchObject({ infraClassCause: true });
+  });
+
   it("still escalates a claude_truncated failure without pod-removal evidence to the manager", async () => {
     const { managerId, coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn<
@@ -1662,6 +1847,65 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           error: "pod is gone — Job pod was removed (eviction, preemption, or external delete)",
         }),
       ).toBe(false);
+    });
+
+    // BLO-33223. The live message is pinned verbatim; the two below it pin that
+    // each marker carries on its own, since an adapter that reports the reason
+    // without an exit code (or vice versa) must not fall back to escalation.
+    it("is true for the adapter's OOMKilled termination sentence", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: "Claude run was truncated mid-stream — assistant produced content but no " +
+            "result event arrived; exit code 137, SIGKILL (commonly OOMKilled), reason=OOMKilled",
+        }),
+      ).toBe(true);
+    });
+
+    it.each([
+      ["exit code alone", "exit code 137, reason=Error"],
+      ["reason alone", "reason=OOMKilled"],
+    ])("is true for a SIGKILLed container reported by %s", (_label, tail) => {
+      expect(
+        isInfraClassStrandedFailure({ ...baseRun, errorCode: "claude_truncated", error: tail }),
+      ).toBe(true);
+    });
+
+    // The discriminator is the KILL, not the pod death: an agent-side crash is
+    // also a pod-lifecycle termination and must keep escalating. `exit code 13`
+    // guards the word-boundary — a prefix match on "137" would swallow it. The
+    // last two guard the kubelet's free-form `message=` tail: a marker-shaped
+    // substring quoted there (agents in this fleet discuss OOMKills routinely)
+    // must not decide routing, which a whole-string scan would let it do.
+    it.each([
+      ["an agent-side crash", "exit code 1, reason=Error, message=panic: nil pointer dereference"],
+      ["an exit code that merely starts with 13", "exit code 13, reason=Error"],
+      ["a message that merely mentions OOM", "exit code 2, reason=Error, message=parser hit an OOMKilled log line"],
+      ["a message quoting the reason marker", "exit code 1, reason=Error, message=observed reason=OOMKilled in logs"],
+      ["a message quoting the exit code marker", "exit code 1, reason=Error, message=child died with exit code 137 mid-parse"],
+    ])("is false for %s", (_label, tail) => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: `Claude run was truncated mid-stream — ${tail}`,
+        }),
+      ).toBe(false);
+    });
+
+    // The cut must not cost a true positive: a real OOM kill still classifies
+    // when the kubelet attaches its own diagnostic tail, which it routinely does.
+    it("is true for a real OOM kill carrying a kubelet message tail", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: "Claude run was truncated mid-stream — assistant produced content but no " +
+            "result event arrived; exit code 137, SIGKILL (commonly OOMKilled), " +
+            "reason=OOMKilled, message=Memory cgroup out of memory",
+        }),
+      ).toBe(true);
     });
   });
 
@@ -2771,9 +3015,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
     expect(actionRow).toMatchObject({
-      status: "active",
+      status: "escalated",
       attemptCount: Math.min(ESCALATIONS, defaultRecoveryActionMaxAttempts),
       maxAttempts: defaultRecoveryActionMaxAttempts,
+      retiringBound: "attempt_budget",
     });
 
     const commentBodies = await db
@@ -2804,6 +3049,172 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         )
       );
     expect(repeatedAnnouncements).toHaveLength(1);
+  });
+
+  // BLO-19124 AC4 (burst safety): "creating N recovery actions for one owner in a short
+  // window does not depend on that owner absorbing N wakes. Demonstrate with N >= 20
+  // against an owner whose maxConcurrentRuns is 3."
+  //
+  // The burst is the load shape that produced the original defect: 59 one-shot wakes landed
+  // on one owner in a day, the owner could absorb 3, and the rest were stranded forever. The
+  // guarantee under test is that a wake the owner CANNOT absorb costs the action nothing —
+  // the reserved attempt is refunded and the non-delivery is recorded in the separate
+  // dimension, so the deferred actions still hold their whole budget when capacity frees.
+  //
+  // `enqueueWakeup` is the seam, and null is not a stand-in for capacity here: null is
+  // literally how the real one reports every non-delivery path, capacity deferral included
+  // (see `enqueueOrRefundAttempt`, recovery/service.ts:5799). What this does NOT cover is
+  // whether the real dispatcher defers at exactly `maxConcurrentRuns` — that is the
+  // heartbeat's contract and has its own tests. The agent is still seeded with the AC's
+  // capacity so the mock's ceiling is read from the fixture rather than a magic literal.
+  //
+  // The capacity goes on the MANAGER, not the coder: this path routes the wake to
+  // `resolveStrandedIssueRecoveryOwnerAgentId`, which takes the assignee's `reportsTo`
+  // before the assignee. Seeding the coder would configure an agent this path never wakes,
+  // and the test would still pass — the AC says "an owner whose maxConcurrentRuns is 3",
+  // so the mock asserts it is that owner being woken before applying the ceiling.
+  it("refunds a burst of wakes one owner cannot absorb instead of spending their budget (BLO-19124 AC4)", async () => {
+    const BURST = 25;
+    const MAX_CONCURRENT = 3;
+    expect(BURST).toBeGreaterThanOrEqual(20);
+
+    const { companyId, managerId, coderId, prefix, sourceIssue } = await seedCompany();
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: MAX_CONCURRENT } } })
+      .where(eq(agents.id, managerId));
+    const [owner] = await db.select().from(agents).where(eq(agents.id, managerId));
+    const capacity =
+      (owner!.runtimeConfig as { heartbeat?: { maxConcurrentRuns?: number } })?.heartbeat
+        ?.maxConcurrentRuns ?? 0;
+    expect(capacity).toBe(MAX_CONCURRENT);
+
+    // seedCompany already made issue #1; fill the burst out to BURST on the same owner.
+    const extraIds = Array.from({ length: BURST - 1 }, () => randomUUID());
+    await db.insert(issues).values(
+      extraIds.map((id, index) => ({
+        id,
+        companyId,
+        title: `Burst issue ${index + 2}`,
+        status: "in_progress" as const,
+        priority: "medium" as const,
+        assigneeAgentId: coderId,
+        issueNumber: index + 2,
+        identifier: `${prefix}-${index + 2}`,
+      })),
+    );
+    const burstIssues = [
+      sourceIssue,
+      ...(await db.select().from(issues).where(inArray(issues.id, extraIds))),
+    ];
+    expect(burstIssues).toHaveLength(BURST);
+
+    let inFlight = 0;
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string } | null>
+    >(async (agentId) => {
+      // The ceiling is only meaningful if it is the routed owner's ceiling.
+      expect(agentId).toBe(managerId);
+      if (inFlight >= capacity) return null; // owner is saturated — woke nobody
+      inFlight += 1;
+      return { id: randomUUID() };
+    });
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const escalate = (issue: (typeof burstIssues)[number]) =>
+      recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_progress",
+        latestRun: {
+          id: randomUUID(),
+          agentId: coderId,
+          status: "failed",
+          error: "agent is not invokable",
+          errorCode: "agent_not_invokable",
+          contextSnapshot: { retryReason: "issue_continuation_needed" },
+          livenessState: "needs_followup",
+          resultJson: null,
+          usageJson: null,
+          createdAt: new Date(),
+        },
+        comment: "Automatic continuation recovery failed.",
+      });
+
+    for (const issue of burstIssues) await escalate(issue);
+
+    const readActions = async () =>
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, companyId));
+    const afterBurst = await readActions();
+    expect(afterBurst).toHaveLength(BURST);
+
+    // (a) every action in the burst is bounded, so none can sit active forever.
+    for (const action of afterBurst) {
+      expect(action.maxAttempts !== null || action.timeoutAt !== null).toBe(true);
+    }
+
+    // The burst split exactly on what the owner could absorb.
+    const delivered = afterBurst.filter((action) => action.attemptCount > 0);
+    const deferred = afterBurst.filter((action) => action.attemptCount === 0);
+    expect(delivered).toHaveLength(MAX_CONCURRENT);
+    expect(deferred).toHaveLength(BURST - MAX_CONCURRENT);
+
+    // The load-bearing assertion. Without the refund every one of these carries
+    // attemptCount 1 for a wake that reached nobody, which is how a single burst used to
+    // eat 1/5 of 22 budgets at once. The two dimensions must not be conflated: the
+    // non-delivery is counted, just not against the budget.
+    for (const action of deferred) {
+      expect(action).toMatchObject({
+        attemptCount: 0,
+        nonDeliverySweepCount: 1,
+        status: "active",
+        retiringBound: null,
+      });
+    }
+    for (const action of delivered) {
+      expect(action).toMatchObject({ attemptCount: 1, nonDeliverySweepCount: 0 });
+    }
+
+    // AC4 itself: the burst must not have made the deferred work depend on having been
+    // absorbed by that first pass. A real owner frees its slots as runs finish, so drain
+    // the deferred set over successive sweep rounds with capacity released between them,
+    // and count the rounds — that count is the thing the 6h horizon has to accommodate.
+    const deferredIssueIds = new Set(deferred.map((action) => action.sourceIssueId));
+    const roundCap = BURST; // generous; the real number is asserted below
+    let rounds = 0;
+    let outstanding = [...deferredIssueIds];
+    while (outstanding.length > 0 && rounds < roundCap) {
+      rounds += 1;
+      inFlight = 0; // the owner's runs from the previous round have completed
+      // Re-read every round: the first sweep moved these to `blocked`, and the production
+      // sweep always reads current state. Passing the stale in_progress rows would be
+      // testing a shape that never reaches this path.
+      const refreshed = await db.select().from(issues).where(inArray(issues.id, outstanding));
+      for (const issue of refreshed) await escalate(issue);
+      const stillZero = await readActions();
+      outstanding = stillZero
+        .filter((row) => deferredIssueIds.has(row.sourceIssueId) && row.attemptCount === 0)
+        .map((row) => row.sourceIssueId);
+    }
+
+    // Every deferred action was eventually reached, and the burst cost it nothing: exactly
+    // one delivered wake out of a budget of `maxAttempts`, with every non-delivery it
+    // absorbed on the way counted in the other dimension instead.
+    const recovered = (await readActions()).filter((row) =>
+      deferredIssueIds.has(row.sourceIssueId),
+    );
+    expect(recovered).toHaveLength(BURST - MAX_CONCURRENT);
+    for (const action of recovered) {
+      expect(action.status).toBe("active");
+      expect(action.attemptCount).toBe(1);
+      expect(action.attemptCount).toBeLessThan(action.maxAttempts ?? Number.POSITIVE_INFINITY);
+      expect(action.nonDeliverySweepCount).toBeGreaterThanOrEqual(1);
+    }
+
+    // The number that matters to the horizon: draining a burst of N against capacity C
+    // takes at most ceil((N - C) / C) rounds, and the action has to stay alive across all
+    // of them. Bounded rather than pinned — a sweep that drains more per round is an
+    // improvement, and pinning equality would assert this mock's drain policy instead.
+    expect(rounds).toBeLessThanOrEqual(Math.ceil((BURST - MAX_CONCURRENT) / MAX_CONCURRENT));
+    expect(rounds).toBeGreaterThan(1); // a burst this size cannot drain in one pass
   });
 
   it("stamps configured bounds when creating a wake-owner recovery action", async () => {
@@ -2943,7 +3354,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .select()
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
-    expect(exhaustedAction).toMatchObject({ status: "active", ownerAgentId: managerId });
+    expect(exhaustedAction).toMatchObject({
+      status: "escalated",
+      ownerAgentId: managerId,
+      retiringBound: "attempt_budget",
+    });
     // BLO-19124: the counter FREEZES at the delivered-wake count. It used to read
     // `toBeGreaterThan(maxAttempts)` because the exhaustion gate returned without refunding
     // the unconditional reserve, so every post-exhaustion sweep added +1 forever — after
@@ -2992,9 +3407,16 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
     expect(reassignedAction).toMatchObject({
+      // BLO-19124: the owner change LIFTS the `attempt_budget` retirement, so the row comes
+      // back as `active` with no bound. It must not stay `escalated` carrying that bound —
+      // `shouldReuseStrandedRecoveryAction` reads `escalated` + an unchanged owner as a
+      // standing escalation and returns before the upsert on every later sweep, so the
+      // replacement owner would be woken exactly once and then starve on a budget it can
+      // never spend. Step 4 is what proves it can spend it; this pins the shape that lets it.
       status: "active",
       ownerAgentId: secondManagerId,
       attemptCount: 1,
+      retiringBound: null,
     });
     expect(wakesTo(secondManagerId)).toBe(1);
 
@@ -3036,6 +3458,166 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(exhaustionComments).toHaveLength(2);
     expect(exhaustionComments.some((body) => body.includes(`(owner \`${managerId}\`)`))).toBe(true);
     expect(exhaustionComments.some((body) => body.includes(`(owner \`${secondManagerId}\`)`))).toBe(true);
+  });
+
+  it("freezes the attempt counter across post-retirement sweeps that change the fingerprint", async () => {
+    // BLO-19124, Ally's review of #1542. The exhaustion test above and the budget test
+    // before it BOTH sweep an unchanged assignee, so `shouldReuseStrandedRecoveryAction`
+    // sees an unchanged fingerprint plus a standing escalation and returns BEFORE
+    // `upsertSourceScoped` reserves anything. Their freeze assertions therefore hold no
+    // matter what the retire/refund CAS does — they are blind to it, which is why the
+    // self-disarming predicate shipped green.
+    //
+    // This drives the one shape that clears that gate: a fingerprint that changes while the
+    // ROUTED OWNER stays put. The stranded fingerprint ends in `issue.assigneeAgentId`, so
+    // alternating the issue between two engineers who report to the SAME manager changes it
+    // every sweep while routing keeps resolving that one manager. The reuse gate declines,
+    // the reserve lands on an already-retired row, and the refund is the only thing standing
+    // between this and `attemptCount` climbing +1 per sweep forever (a live row reached 30).
+    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    const siblingCoderId = randomUUID();
+    await db.insert(agents).values({
+      id: siblingCoderId,
+      companyId,
+      name: "Sibling Coder",
+      role: "engineer",
+      status: "idle",
+      reportsTo: managerId,
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const baseRun = {
+      agentId: coderId,
+      status: "failed",
+      error: "agent is not invokable",
+      errorCode: "agent_not_invokable",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+    const wakesTo = (agentId: string) =>
+      enqueueWakeup.mock.calls.filter((call) => call[0] === agentId).length;
+
+    // Escalation reassigns the issue to the recovery owner, so the assignee is put back on
+    // one of the two engineers before every sweep. Alternating which one is what moves the
+    // fingerprint without moving the owner.
+    const sweepAs = async (assigneeAgentId: string) => {
+      await db
+        .update(issues)
+        .set({ assigneeAgentId, status: "in_progress" })
+        .where(eq(issues.id, sourceIssue.id));
+      const [current] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+      await recovery.escalateStrandedAssignedIssue({
+        issue: current!,
+        previousStatus: "in_progress",
+        latestRun: { ...baseRun, id: randomUUID() },
+        comment: "Automatic continuation recovery failed.",
+      });
+    };
+    const readAction = async () => {
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+      return row!;
+    };
+
+    // Burn the budget, then retire. One extra sweep past `maxAttempts` trips the exhaustion
+    // gate, which retires the row and refunds the reserve it did not spend.
+    for (let attempt = 0; attempt <= defaultRecoveryActionMaxAttempts; attempt += 1) {
+      await sweepAs(attempt % 2 === 0 ? coderId : siblingCoderId);
+    }
+    const retired = await readAction();
+    expect(retired).toMatchObject({
+      status: "escalated",
+      ownerAgentId: managerId,
+      retiringBound: "attempt_budget",
+      attemptCount: defaultRecoveryActionMaxAttempts,
+    });
+    expect(wakesTo(managerId)).toBe(defaultRecoveryActionMaxAttempts);
+
+    // Now the assertion the suite was missing. Every one of these sweeps reserves an attempt
+    // on a row that is already `escalated` with a bound set, which is precisely where the
+    // old CAS matched zero rows and stopped refunding. The counter must not move, the
+    // retirement must not be rewritten, and nobody must be woken again.
+    const retiredAt = retired.updatedAt;
+    for (let extra = 0; extra < 4; extra += 1) {
+      await sweepAs(extra % 2 === 0 ? siblingCoderId : coderId);
+      const frozen = await readAction();
+      expect(frozen.attemptCount).toBe(defaultRecoveryActionMaxAttempts);
+      expect(frozen.status).toBe("escalated");
+      expect(frozen.retiringBound).toBe("attempt_budget");
+      expect(wakesTo(managerId)).toBe(defaultRecoveryActionMaxAttempts);
+    }
+    // The non-delivery dimension is the one that MUST keep moving: these sweeps really did
+    // touch the row and really did wake nobody, and AC2 requires those be counted apart from
+    // delivered wakes. A frozen `attemptCount` with a frozen sweep count would mean the
+    // refund was never reached at all, which is the failure this test exists to tell apart.
+    const settled = await readAction();
+    expect(settled.nonDeliverySweepCount).toBeGreaterThan(retired.nonDeliverySweepCount);
+    expect(settled.updatedAt.getTime()).toBeGreaterThan(retiredAt.getTime());
+  });
+
+  it("retires a legacy escalated row that predates the retiring-bound column exactly once", async () => {
+    // BLO-19124, Ally's review of #1542. `0240` adds `retiring_bound` and backfills the rows
+    // already `escalated` when it runs. This covers the shape from the other side: the CAS
+    // must be able to retire an `escalated` row that reaches the sweep without a bound, so a
+    // row arriving in that state by any route other than the backfill can still acquire one.
+    //
+    // Before the widening both retire predicates required `status = 'active'`, so a legacy
+    // row matched zero rows and the return value was discarded at the call site. It stayed a
+    // backstop candidate — `isNull(retiringBound)` keeps admitting it — on every future
+    // sweep, incrementing `exhaustedSkipped` forever without ever being retired.
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      status: "escalated",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "agent_not_invokable",
+      fingerprint: `legacy:${actionId}`,
+      evidence: {},
+      nextAction: "Wake the recovery owner.",
+      attemptCount: 0,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
+      timeoutAt: new Date(Date.now() - 60 * 60 * 1000),
+      retiringBound: null,
+    });
+
+    const first = await svc.retireWakeAction({
+      companyId,
+      actionId,
+      retiringBound: "timeout_horizon",
+    });
+    expect(first).toMatchObject({ status: "escalated", retiringBound: "timeout_horizon" });
+
+    // Idempotent: `retiring_bound IS NULL` is what carries that, and a second pass must not
+    // relabel a row with a bound some other path already wrote.
+    const second = await svc.retireWakeAction({
+      companyId,
+      actionId,
+      retiringBound: "attempt_budget",
+    });
+    expect(second).toBeNull();
+    const [settled] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(settled).toMatchObject({ status: "escalated", retiringBound: "timeout_horizon" });
   });
 
   it("does not refresh the handoff grant when recovery sweeps through its own owner churn", async () => {

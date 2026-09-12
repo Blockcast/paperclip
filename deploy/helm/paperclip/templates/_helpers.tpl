@@ -177,6 +177,35 @@ rendered:
 {{- end }}
 
 {{/*
+The API tier must not receive the Penstock org credential. `env.extra` is
+shared by both tiers, so a credential-shaped entry there is a configuration
+error rather than a convenient shortcut. The worker-only `extraEnv` block is
+the reviewed boundary for this binding.
+*/}}
+{{- define "paperclip.validateSharedEnvExtra" -}}
+{{- range $entry := .Values.env.extra -}}
+{{- if eq (toString ($entry.name | default "")) "PENSTOCK_API_KEY" -}}
+{{- fail "env.extra must not define PENSTOCK_API_KEY: bind the Penstock credential through worker.extraEnv so API pods do not receive it" -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/* Validate the exact Secret-backed Penstock binding when configured. */}}
+{{- define "paperclip.validateWorkerExtraEnv" -}}
+{{- range $entry := .Values.worker.extraEnv -}}
+{{- if eq (toString ($entry.name | default "")) "PENSTOCK_API_KEY" -}}
+{{- if hasKey $entry "value" -}}
+{{- fail "worker.extraEnv PENSTOCK_API_KEY must use valueFrom.secretKeyRef, not a literal value" -}}
+{{- end -}}
+{{- $valueFrom := (get $entry "valueFrom") | default dict -}}
+{{- $secretKeyRef := (get $valueFrom "secretKeyRef") | default dict -}}
+{{- $_ := required "worker.extraEnv PENSTOCK_API_KEY requires valueFrom.secretKeyRef.name" (get $secretKeyRef "name") -}}
+{{- $_ := required "worker.extraEnv PENSTOCK_API_KEY requires valueFrom.secretKeyRef.key" (get $secretKeyRef "key") -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 The directories the seed init container publishes the GitHub egress wrappers
 into, in the order they must appear on PATH. Derived from persistence.mountPath
 because the seed derives them the same way (`BASE={{ .Values.persistence.mountPath }}`);

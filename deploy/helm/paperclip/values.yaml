@@ -124,6 +124,12 @@ worker:
   # deploy that rolled the api and left the worker on older code reported
   # `success` and every tier-level signal read green (BLO-28920).
   deployedCommit: ""
+  # -- Additional environment variables for the worker StatefulSet only. These
+  # values are intentionally not merged into env.extra, because env.extra is
+  # rendered on both the API and worker tiers. Keep provider credentials here
+  # as Secret-backed valueFrom entries; literal credential values are rejected
+  # by policy and must never live in this file.
+  extraEnv: []
 
 # -- Kubernetes Service exposing the HTTP UI/API.
 service:
@@ -353,12 +359,25 @@ workerProbes:
   #
   # BLO-19722 — why this is deliberately laxer than `probes.liveness` above.
   #
-  # What `/healthz` actually measures: nothing declares this route. No handler
-  # in `server/src` matches `/healthz` (the only one in the repo belongs to the
-  # MCP gateway), so the request falls through to the SPA catch-all at
-  # `server/src/app.ts:777-787`, which synchronously returns 200 + static HTML.
-  # It therefore probes exactly one thing — "is the event loop able to service
-  # a request right now" — and says nothing about database or heartbeat health.
+  # What `/healthz` actually measures: "is the event loop able to service a
+  # request right now", and nothing else. It says nothing about database or
+  # heartbeat health, and that is deliberate — see below.
+  #
+  # BLO-32164 update (2026-09-10). This used to read "nothing declares this
+  # route": the request fell through to the SPA catch-all, which answered 200
+  # with the UI shell after a synchronous `readFileSync` of index.html. There
+  # is now an explicit handler (`app.get("/healthz")`, mounted beside
+  # /metrics ahead of httpLogger, the hostname guard and actorMiddleware).
+  # The measured semantics are unchanged; what changed is that the probe no
+  # longer does blocking disk I/O on the path it is timing, no longer depends
+  # on the UI existing, and no longer needs the `Host: 127.0.0.1:3100` header
+  # to clear the private-hostname allowlist. `server/src/__tests__/healthz-probe-route.test.ts`
+  # pins the route against the probe paths in this file so the two cannot
+  # drift apart again.
+  #
+  # The "latent landmine" previously recorded here — a build serving no
+  # `ui-dist` skips the catch-all, so every probe 404s and CrashLoops the
+  # worker for a reason unrelated to its health — is closed by that handler.
   #
   # At the previous `timeoutSeconds: 5 / periodSeconds: 30 / failureThreshold: 3`
   # a ~90s event-loop stall was enough for kubelet to kill the pod. That is not
@@ -374,16 +393,22 @@ workerProbes:
   # stall tolerance at the cost of slower detection of a true wedge:
   # 6 × 30s ≈ 180s before a kill, versus ~90s previously.
   #
-  # Not fixed here: making `/healthz` un-blockable. Node runs our request
-  # handling on one thread, so any in-process endpoint is blocked by whatever
-  # blocks the loop; a genuinely independent health responder needs a worker
-  # thread (or a sidecar) and is a larger change than this issue should carry.
-  # Widening with the rationale recorded is the other branch this issue allows.
+  # Still not fixed, and now the dominant remaining cause: making `/healthz`
+  # un-blockable. Node runs our request handling on one thread, so any
+  # in-process endpoint is blocked by whatever blocks the loop; a genuinely
+  # independent health responder needs a worker thread (or a sidecar). The
+  # explicit handler removes the probe's *own* blocking work but cannot
+  # protect it from someone else's. Measured 2026-09-10 on `paperclip-0`:
+  # `exitCode: 137` at 08:09:25Z with memory steady at ~3 GiB against a 10 GiB
+  # limit (OOM excluded), i.e. a liveness kill at 6 × 30s — the widened
+  # threshold above bought time but did not remove the cause. Tracking as
+  # BLO-32164 (a); the stall's own mechanism is BLO-32668.
   #
-  # Latent landmine while we are here: because `/healthz` resolves via the SPA
-  # catch-all, a build serving no `ui-dist` (`app.ts:788-790` warns and skips
-  # the catch-all) would 404 every probe and CrashLoop the worker for a reason
-  # that has nothing to do with its health.
+  # Do NOT add a database check to this probe. BLO-32164 originally proposed
+  # exactly that; measured 2026-09-10, `/api/health` took 13.19s under pool
+  # saturation while `/healthz` answered in 6ms in the same second. A query
+  # here would import that stall onto the liveness path and kill the singleton
+  # worker for pool saturation, converting a latency problem into an outage.
   liveness:
     httpGet:
       path: /healthz
@@ -396,10 +421,66 @@ workerProbes:
     timeoutSeconds: 10
     failureThreshold: 6
   # -- Worker readiness probe.
-  # Readiness gates the API-to-worker Service endpoint. Keep it tighter than
-  # liveness so API callers stop routing to a worker whose event loop is not
-  # answering promptly; during a long-but-recoverable stall the pod may stay
-  # alive while temporarily leaving the Service endpoints.
+  #
+  # BLO-31945 — why this is no longer tuned "tighter than liveness".
+  #
+  # The rationale here used to read: "Keep it tighter than liveness so API
+  # callers stop routing to a worker whose event loop is not answering
+  # promptly." That holds for a horizontally-scaled tier, where readiness
+  # sheds traffic to healthy peers. This StatefulSet runs `replicas: 1`, so
+  # there is no peer to shed to: removing the only endpoint does not redirect
+  # plugin traffic, it 502s it. Every API-to-worker call then fails in the
+  # `catch` at `server/src/routes/worker-tier-proxy.ts` with "Worker tier
+  # unreachable", which is how a `/healthz` latency blip became a total
+  # plugin-tier outage — Alertmanager webhook delivery included. Alertmanager
+  # then retries each delivery 4x into the worker that just failed its probe.
+  #
+  # Measured on `paperclip-0` over the 24h to 2026-09-05T20:30Z from the
+  # kubelet `prober_probe_*` metrics — same endpoint, same pod, same window,
+  # with the per-probe timeout as the only material difference: readiness at a
+  # 5s timeout failed 100.2 of 8559 probes (1.171%), while liveness at a 10s
+  # timeout failed 13.1 of 2838 (0.462%).
+  #
+  # Readiness failed at 2.53x the liveness rate against the identical
+  # `/healthz`. The tail latency confirms the cause: p99.9 of *successful*
+  # liveness probes is 8.59s, i.e. `/healthz` legitimately takes longer than
+  # the old 5s readiness timeout. A timeout set below the endpoint's own tail
+  # is a false-positive generator, not a sensitivity knob.
+  #
+  # Trap when re-deriving this: `prober_probe_duration_seconds` is a
+  # SUCCESS-ONLY histogram — its `_count` matches
+  # `prober_probe_total{result="successful"}`, not the total. Timed-out probes
+  # are censored out of it, so the bucket distribution on its own reads as
+  # "almost nothing exceeds 5s" and will invert this diagnosis if used without
+  # the failure counter.
+  #
+  # timeoutSeconds now matches liveness (10s), above the measured tail, and
+  # periodSeconds moves to 15 so a probe cannot outlast its own period.
+  # Worst-case endpoint removal, stated derivably rather than as `3 x period`:
+  # probes start at t=0/15/30 and each times out 10s in, so the third
+  # consecutive failure is only observed at t=40s, and endpoint propagation
+  # adds more on top. That is ~40s+ versus ~20s+ under the old 10s/5s
+  # settings. The slower detection costs nothing real at `replicas: 1`,
+  # because endpoint removal has no upside here in the first place.
+  #
+  # Decision, recorded explicitly rather than left implicit: readiness is
+  # KEPT, not retired. It still gates the endpoint during rollout, and
+  # deleting it would make a genuine wedge hang API callers until TCP timeout
+  # instead of failing fast. What is retired is tuning it as though it could
+  # shed load. This is mitigation, not a cure: at the liveness failure rate
+  # the probe still drops the endpoint occasionally, and the durable fix is a
+  # second replica (BLO-29307 / BLO-29004) or a `/healthz` that cannot be
+  # blocked by the event loop. Until one of those lands, this probe must be
+  # tolerant rather than tight.
+  #
+  # `failureThreshold: 3` is load-bearing, not incidental, and it is the knob
+  # a future reader will reach for once told not to touch the timeout. At the
+  # 0.462% per-probe failure rate this endpoint actually exhibits, requiring
+  # three *consecutive* failures puts an endpoint drop at roughly one per
+  # several years; `failureThreshold: 1` would drop the only endpoint on any
+  # single tail-latency blip, i.e. tens of times a day, reopening exactly the
+  # outage this change closes. `tests/probes.test.mjs` enforces both this
+  # floor and the timeout relationship while the tier is single-replica.
   readiness:
     httpGet:
       path: /healthz
@@ -408,10 +489,19 @@ workerProbes:
         - name: Host
           value: 127.0.0.1:3100
     initialDelaySeconds: 5
-    periodSeconds: 10
-    timeoutSeconds: 5
+    periodSeconds: 15
+    timeoutSeconds: 10
     failureThreshold: 3
   # -- Worker startup probe.
+  #
+  # Deliberately left at `timeoutSeconds: 5`, below the 8.59s `/healthz` tail
+  # measured above, and that exemption is intentional rather than an
+  # oversight: `failureThreshold: 30` at a 10s period gives a ~300s budget, so
+  # an individual timed-out probe is absorbed instead of being fatal. The
+  # readiness defect was that three false timeouts were *sufficient* to remove
+  # the endpoint; here they are not close to sufficient, so tail sensitivity
+  # carries no cost. Re-tighten `failureThreshold` here and that stops being
+  # true.
   startup:
     httpGet:
       path: /healthz

@@ -32,6 +32,41 @@ import { inspectMigrations } from "./client.js";
  * different definition is caught by each migration's own structural check and
  * still surfaces the slow way. Absence is the case that has actually bitten a
  * production deploy, and it is the case this closes.
+ *
+ * Second scope limit, and it is why `decidePreflightBlocker` exists: the
+ * guards refuse **only on a populated table**. The property every migration in
+ * this family shares — pinned by a test, and stated as the property rather than
+ * as syntax because the syntax is not uniform — is that no emptiness test can
+ * gate its structural raise: every `EXISTS (SELECT 1 FROM <table> LIMIT 1)`
+ * sits *after* the mismatch raise, and the absent-index path builds the index
+ * itself, inline and without `CONCURRENTLY`. So on an empty table an absent
+ * index raises nothing and needs no operator at all. Most of the family spells
+ * that as one `IF/ELSE` or `IF/ELSIF` chain, but 0236 is flat — sequential
+ * `IF ... END IF` blocks, neither `ELSE` nor `ELSIF` — which is why the
+ * contract is worded as ordering and not as branch shape. Reporting such a
+ * migration as a blocker is a false block, and on a fresh bootstrap database —
+ * no journal, every migration pending, every index absent, every table empty
+ * or not yet created — it is a false block on *every* registered entry, which
+ * fails a deploy that would have succeeded unaided (BLO-31746).
+ *
+ * The exemption is deliberately narrow. It applies to an **absent** index
+ * only. A half-built index takes the migration's *mismatch* path, which
+ * requires `indisvalid` and raises with no emptiness test whatever — so an
+ * empty table does not rescue it, and exempting that case would re-open the
+ * outage this module exists to prevent.
+ *
+ * The emptiness probe is advisory, and that is acceptable rather than
+ * engineered around: the table can gain its first row between this check and
+ * the migration. The migration re-checks under `LOCK TABLE ... IN SHARE MODE`
+ * and fails loudly if it happens, exactly as it does today. Racing to a false
+ * *negative* leaves behaviour no worse than before this module existed.
+ *
+ * Against this module's *current* behaviour it is a trade rather than a strict
+ * improvement, and worth naming as one: today an empty table reports a blocker
+ * — wrongly, but that happens to cover the race. The trade is still clearly
+ * right. It swaps a guaranteed false block on every fresh bootstrap for a
+ * false negative that needs the table to gain its *first* row mid-deploy, and
+ * whose failure mode is loud and already handled.
  */
 export type PrecreateRequiredIndex = {
   /** Migration filename, exactly as it appears in `migrations/`. */
@@ -143,6 +178,56 @@ export type PreflightBlocker = {
   readonly remediation: string;
 };
 
+/** What `pg_index` says about the prerequisite index right now. */
+export type IndexProbe = { readonly exists: boolean; readonly usable: boolean };
+
+/**
+ * Whether the guard's own `EXISTS (SELECT 1 FROM <table>)` would fire.
+ *
+ * `absent` is the fresh-bootstrap case: the table has not been created yet
+ * because the migration that creates it is itself still pending. It cannot
+ * hold a row by the time the guard runs, so it is treated exactly like
+ * `empty`.
+ */
+export type TablePopulation = "absent" | "empty" | "populated";
+
+/**
+ * Whether a guarded pending migration will actually stall, given what the
+ * database looks like now. Pure, so both directions are testable without a
+ * live database — the load-bearing one being that a populated table with a
+ * missing index is still a blocker.
+ */
+export function decidePreflightBlocker(
+  spec: PrecreateRequiredIndex,
+  index: IndexProbe,
+  table: TablePopulation,
+): PreflightBlocker | null {
+  if (index.usable) return null;
+
+  if (index.exists) {
+    // Takes the migration's structural branch, which demands `indisvalid` and
+    // raises with no emptiness test. Emptiness is irrelevant here; reporting
+    // it is the whole point of the module.
+    return {
+      migration: spec.migration,
+      index: spec.name,
+      state: "build-incomplete",
+      remediation: spec.createStatement,
+    };
+  }
+
+  // Index absent: the guard raises only if the table already has a row.
+  // Otherwise the migration builds the index inline and needs no operator.
+  if (table !== "populated") return null;
+
+  return {
+    migration: spec.migration,
+    index: spec.name,
+    state: "absent",
+    remediation: spec.createStatement,
+  };
+}
+
 export type PendingMigrationPreflightResult = {
   readonly pendingMigrations: readonly string[];
   /** Pending migrations that require a precreated index. */
@@ -187,8 +272,6 @@ export function formatPreflightFailure(blockers: readonly PreflightBlocker[]): s
   return lines.join("\n");
 }
 
-type IndexProbe = { readonly exists: boolean; readonly usable: boolean };
-
 async function probeIndex(sql: ReturnType<typeof postgres>, name: string): Promise<IndexProbe> {
   const rows = await sql<{ indisvalid: boolean; indisready: boolean }[]>`
     select index_metadata.indisvalid, index_metadata.indisready
@@ -198,6 +281,72 @@ async function probeIndex(sql: ReturnType<typeof postgres>, name: string): Promi
   if (rows.length === 0) return { exists: false, usable: false };
   const [{ indisvalid, indisready }] = rows;
   return { exists: true, usable: indisvalid && indisready };
+}
+
+/**
+ * Mirrors the guard's own `EXISTS (SELECT 1 FROM <table> LIMIT 1)`.
+ *
+ * The `to_regclass` hop is not optional. On a fresh bootstrap the table does
+ * not exist yet, and selecting from it would raise `undefined_table` and abort
+ * the pre-flight — turning the false block this fixes into a hard crash.
+ * `to_regclass` returns NULL for a missing relation instead of erroring.
+ */
+async function probeTablePopulation(
+  sql: ReturnType<typeof postgres>,
+  table: string,
+): Promise<TablePopulation> {
+  const [present] = await sql<{ exists: boolean }[]>`
+    select to_regclass(${`public.${table}`}) is not null as exists
+  `;
+  if (!present?.exists) return "absent";
+
+  // `reltuples` is not usable here: it is an estimate, and -1 on a table that
+  // has never been analyzed — which is every table on a fresh bootstrap.
+  const rows = await sql`select 1 from ${sql(table)} limit 1`;
+  return rows.length > 0 ? "populated" : "empty";
+}
+
+/** The two catalog reads the scan needs, injectable so the scan is testable. */
+export type PreflightProbes = {
+  readonly index: (name: string) => Promise<IndexProbe>;
+  readonly population: (table: string) => Promise<TablePopulation>;
+};
+
+/**
+ * Decides every guarded pending spec, issuing as few probes as it can.
+ *
+ * Split out from `checkPendingMigrationPreflight` so the two things that are
+ * easy to regress silently are reachable without a live database: the
+ * per-table memo, and the short-circuit that skips the population probe when
+ * the index is already usable. Both are pure efficiency — the verdict comes
+ * from `decidePreflightBlocker` either way — which is exactly why a test has
+ * to assert the call counts. A regression here costs round trips and changes
+ * no output, so nothing else would notice.
+ */
+export async function collectPreflightBlockers(
+  guarded: readonly PrecreateRequiredIndex[],
+  probes: PreflightProbes,
+): Promise<readonly PreflightBlocker[]> {
+  const blockers: PreflightBlocker[] = [];
+  // Several specs share a table (seven of them are `heartbeat_runs`); probe
+  // each distinct table once so a pre-flight stays a handful of round trips.
+  const populationByTable = new Map<string, TablePopulation>();
+  for (const spec of guarded) {
+    const index = await probes.index(spec.name);
+    // A usable index is never a blocker whatever the table looks like, so skip
+    // the population probe entirely — `decidePreflightBlocker` would only
+    // discard it. This mirrors that function's own first line; the probe is a
+    // read with nothing to preserve.
+    if (index.usable) continue;
+    let population = populationByTable.get(spec.table);
+    if (population === undefined) {
+      population = await probes.population(spec.table);
+      populationByTable.set(spec.table, population);
+    }
+    const blocker = decidePreflightBlocker(spec, index, population);
+    if (blocker) blockers.push(blocker);
+  }
+  return blockers;
 }
 
 /**
@@ -219,18 +368,12 @@ export async function checkPendingMigrationPreflight(
   }
 
   const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
-  const blockers: PreflightBlocker[] = [];
+  let blockers: readonly PreflightBlocker[];
   try {
-    for (const spec of guarded) {
-      const probe = await probeIndex(sql, spec.name);
-      if (probe.usable) continue;
-      blockers.push({
-        migration: spec.migration,
-        index: spec.name,
-        state: probe.exists ? "build-incomplete" : "absent",
-        remediation: spec.createStatement,
-      });
-    }
+    blockers = await collectPreflightBlockers(guarded, {
+      index: (name) => probeIndex(sql, name),
+      population: (table) => probeTablePopulation(sql, table),
+    });
   } finally {
     await sql.end();
   }

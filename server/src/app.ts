@@ -69,13 +69,11 @@ import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "./routes/tool-gatew
 import { adapterRoutes } from "./routes/adapters.js";
 import { metricsIngestRoutes } from "./routes/metrics-ingest.js";
 import { renderMetrics } from "./services/metrics.js";
-import { refreshExternalRuntimeReservationMetrics } from "./services/external-runtime-reservations.js";
 import {
-  refreshOverdueScheduledRetryAgeMetrics,
-  refreshQueuedRunAgeMetrics,
-  refreshScheduledRetryParkHorizonMetrics,
-} from "./services/queued-run-age-metrics.js";
-import { refreshExternalRuntimeReservationStrandMetrics } from "./services/external-runtime-reservation-strand-metrics.js";
+  expireStaleRefreshFreshness,
+  refreshDbPoolMetrics,
+  startScrapeMetricsCollector,
+} from "./services/scrape-metrics-collector.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -313,32 +311,65 @@ export async function createApp(
   // actorMiddleware: scrapes are unauthenticated (access is gated at the
   // network layer by the ServiceMonitor scrape-allow NetworkPolicy) and would
   // otherwise spam request logs every scrape interval.
+  //
+  // BLO-33243: this handler MUST NOT touch the database. It used to await five
+  // DB-querying refreshes in series, so a pool stall pushed the scrape past its
+  // 10 s timeout and the scrape ingested *no sample at all* -- destroying every
+  // in-process metric for that interval, including the event-loop-lag gauge
+  // that would have explained the stall. Two of three control-plane pods were
+  // losing ~1 scrape in 8 that way. The refreshes now run on a background
+  // interval (services/scrape-metrics-collector.ts); this handler renders the
+  // registry and nothing else. `expireStaleRefreshFreshness` and
+  // `refreshDbPoolMetrics` are synchronous in-memory reads, not queries.
   app.get("/metrics", async (_req, res, next) => {
     try {
-      await refreshExternalRuntimeReservationMetrics(db).catch((err) => {
-        logger.warn({ err }, "failed to refresh external-runtime reservation metrics before scrape");
-      });
-      await refreshQueuedRunAgeMetrics(db).catch((err) => {
-        logger.warn({ err }, "failed to refresh queued-run-age metrics before scrape");
-      });
-      await refreshOverdueScheduledRetryAgeMetrics(db).catch((err) => {
-        logger.warn({ err }, "failed to refresh overdue-scheduled-retry-age metrics before scrape");
-      });
-      await refreshScheduledRetryParkHorizonMetrics(db).catch((err) => {
-        logger.warn({ err }, "failed to refresh scheduled-retry park horizon metrics before scrape");
-      });
-      // BLO-28865. Swallowing the rejection here is safe and intended: the
-      // refresh has already set its own freshness gauge to 0 on the way out,
-      // which is what makes the stale age ineligible for the strand alert and
-      // pages the refresh failure on its own. Same contract as the two above.
-      await refreshExternalRuntimeReservationStrandMetrics(db).catch((err) => {
-        logger.warn({ err }, "failed to refresh stranded-reservation metrics before scrape");
-      });
+      expireStaleRefreshFreshness();
+      refreshDbPoolMetrics(db);
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);
     } catch (err) {
       next(err);
     }
+  });
+
+  // Kubernetes probe endpoint (BLO-32164). Every probe in the chart —
+  // liveness, readiness and startup, on both the API Deployment and the worker
+  // StatefulSet — targets `/healthz`, but until this route existed **nothing
+  // declared it**. The request fell through to the SPA catch-all near the
+  // bottom of this file, which answered 200 with the UI shell. That accident
+  // held for a long time and hid three sharp edges:
+  //
+  //   1. Every probe did a synchronous `fs.readFileSync(index.html)` plus the
+  //      `applyUiBranding` string pass, on the event loop, on the exact path
+  //      that is expected to answer within 5-10s. Blocking disk work is the
+  //      worst possible thing to put on a liveness path: under image-fs
+  //      pressure that read is unbounded, so the probe could fail for a
+  //      reason that has nothing to do with whether the process is healthy.
+  //   2. A build serving no `ui-dist` skips the catch-all entirely, so every
+  //      probe would 404 and CrashLoop the pod for an unrelated reason. This
+  //      was recorded as a "latent landmine" in values.yaml under BLO-19722
+  //      and is now closed: this route does not depend on the UI existing.
+  //   3. The probe's semantics were undocumented and accidental. They are now
+  //      explicit, and deliberately UNCHANGED: this answers exactly one
+  //      question — "can the event loop service a request right now" — and
+  //      says nothing about database or heartbeat health.
+  //
+  // Deliberately NOT adding a DB check here. BLO-32164 originally attributed
+  // the probe failures to `/health`'s pool queries queueing behind the
+  // recovery sweep, but `/health` is mounted under `/api` and the kubelet
+  // never calls it; measured 2026-09-10, `/api/health` took 13.19s while
+  // `/healthz` answered in 6ms in the same second. Putting a query here would
+  // import that 13s stall onto the liveness path and start killing the
+  // singleton worker for pool saturation — turning a latency problem into an
+  // availability one. Readiness gating on the database belongs in `/api/health`.
+  //
+  // Mounted here, beside /metrics and ahead of httpLogger, the hostname guard
+  // and actorMiddleware, so a probe cannot be failed by auth, by log volume,
+  // or by the `Host: 127.0.0.1:3100` header the chart currently has to send to
+  // satisfy the private-hostname allowlist. The response carries no
+  // information, so exposing it unauthenticated costs nothing.
+  app.get("/healthz", (_req, res) => {
+    res.status(200).set("Cache-Control", "no-store").json({ status: "ok" });
   });
 
   // Respect the operator's `TRUST_PROXY` env var (see middleware/trust-proxy.ts).
@@ -1042,6 +1073,9 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   let stopPluginStatusCollector: (() => void) | null = null;
   let stopGithubReviewGateDeliveryWorker: (() => Promise<void>) | null = null;
   let stopIssueCommentEffectReconciler: (() => Promise<void>) | null = null;
+  // BLO-33243: every tier serves /metrics and is a scrape target, so unlike the
+  // plugin-status collector this one is NOT gated on the node role.
+  const stopScrapeMetricsCollector = startScrapeMetricsCollector(db);
   if (appConfig.paperclipNodeRole === "api") {
     logger.info(
       { role: appConfig.paperclipNodeRole },
@@ -1089,6 +1123,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     stopPluginEventOutbox?.();
     stopGitHubStatusDeliveryOutbox?.();
     stopPluginStatusCollector?.();
+    stopScrapeMetricsCollector();
     await stopIssueCommentEffectReconciler?.();
     disableFeedbackExportFlushes();
     devWatcher?.close();

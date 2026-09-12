@@ -17,7 +17,6 @@ import {
   buildExplicitResumeSessionOverride,
   buildEffectiveRunSessionConfigMetadata,
   buildEffectiveRunWorkspaceConfigMetadata,
-  buildK8sRunIsolationDescriptor,
   shouldUseRepoLessFallbackWorkspaceSource,
   buildWorkspaceConfigFreshnessOperation,
   computeK8sIsolationRetryDelayMs,
@@ -43,6 +42,7 @@ import {
   resolveExecutionWorkspaceConfigFreshness,
   resolveExecutionWorkspaceReuseRequestForIssue,
   resolveExecutionWorkspaceReuseProvisioningPolicy,
+  buildK8sRunIsolationDescriptor,
   resolveK8sRunIsolationIdentity,
   resolveNextSessionState,
   resolveTaskSessionConfigFreshness,
@@ -65,6 +65,7 @@ import {
   resolveRepoRelativeWorkspaceCwd,
   type ResolvedWorkspaceForRunSuccess,
 } from "../services/heartbeat.js";
+import { buildK8sRunIsolationDescriptorFromWorkspace } from "./helpers/k8s-isolation-descriptor.ts";
 import { applyRunScopeToBranchName } from "../services/workspace-runtime.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
@@ -2920,7 +2921,7 @@ describe("K8s session isolation metadata", () => {
 
   it("returns null for non-K8s adapters", () => {
     expect(
-      buildK8sRunIsolationDescriptor({
+      buildK8sRunIsolationDescriptorFromWorkspace({
         adapterType: "opencode_local",
         runId: "run-1",
         companyId: "company-1",
@@ -2939,7 +2940,7 @@ describe("K8s session isolation metadata", () => {
 
   it("builds deterministic workspace isolation metadata for K8s adapters", () => {
     expect(
-      buildK8sRunIsolationDescriptor({
+      buildK8sRunIsolationDescriptorFromWorkspace({
         adapterType: "opencode_k8s",
         runId: "run-1",
         companyId: "company-1",
@@ -2987,6 +2988,7 @@ describe("K8s session isolation metadata", () => {
     })).toEqual({
       isolationMode: "workspace",
       isolationKey: "workspace:planned-workspace-1",
+      reservationKey: "workspace:planned-workspace-1",
     });
   });
 
@@ -2996,7 +2998,7 @@ describe("K8s session isolation metadata", () => {
   // root -- even though `shared_workspace` mode never sets `isWorkspaceIsolated`.
   it("uses the reused workspace root for an explicitly selected persisted shared_workspace under concurrency", () => {
     expect(
-      buildK8sRunIsolationDescriptor({
+      buildK8sRunIsolationDescriptorFromWorkspace({
         adapterType: "claude_k8s",
         runId: "run-1",
         companyId: "company-1",
@@ -3022,7 +3024,7 @@ describe("K8s session isolation metadata", () => {
 
   it("keeps shared roots and legacy warm sessions for explicit shared_workspace reuse at concurrency one", () => {
     const sharedRoot = resolveDefaultAgentWorkspaceDir("agent-1");
-    const sharedIsolation = buildK8sRunIsolationDescriptor({
+    const sharedIsolation = buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "claude_k8s",
       runId: "run-1",
       companyId: "company-1",
@@ -3062,6 +3064,7 @@ describe("K8s session isolation metadata", () => {
     })).toEqual({
       isolationMode: "run",
       isolationKey: "run:run-1",
+      reservationKey: "run:run-1",
     });
   });
 
@@ -3071,7 +3074,7 @@ describe("K8s session isolation metadata", () => {
   // ephemeral scratch dir is what pushed agents back into the project BASE
   // checkout, which accumulated 32 uncommitted files across three days.
   it("keeps the provisioned worktree as the workspace root under per-run isolation", () => {
-    const isolation = buildK8sRunIsolationDescriptor({
+    const isolation = buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "claude_k8s",
       runId: "run-1",
       companyId: "company-1",
@@ -3108,16 +3111,18 @@ describe("K8s session isolation metadata", () => {
     });
   });
 
-  // BLO-31282 review follow-up: the tests above let the descriptor resolve its
-  // own identity, but production NEVER does -- `dispatchHeartbeatRun` always
-  // passes a precomputed `isolationIdentity`, built with the narrower
-  // `isWorkspaceIsolated: workspaceIsolationRequested` (mode only) rather than
-  // the broader in-function definition (mode OR task_session OR git_worktree).
-  // Pin the shipping path explicitly so a future change to either definition
-  // cannot silently stop covering it.
+  // BLO-31282 review follow-up: the tests above go through the
+  // `...FromWorkspace` test fixture, which derives the identity from raw
+  // workspace inputs using the broader `mode OR task_session OR git_worktree`
+  // reading. Production never does that -- `dispatchHeartbeatRun` resolves the
+  // identity itself, with the narrower `isWorkspaceIsolated:
+  // workspaceIsolationRequested` (mode only), and hands it straight to
+  // `buildK8sRunIsolationDescriptor`. Call the real function here so the
+  // shipping path is pinned explicitly and a future change to either reading
+  // cannot silently stop covering it. (BLO-31443 moved the broad reading out of
+  // production and into the fixture for exactly this reason.)
   const buildPrecomputedIdentityDescriptor = () =>
     buildK8sRunIsolationDescriptor({
-      adapterType: "claude_k8s",
       runId: "run-1",
       companyId: "company-1",
       agentId: "agent-1",
@@ -3125,11 +3130,9 @@ describe("K8s session isolation metadata", () => {
       statelessPrReview: false,
       executionWorkspace: {
         cwd: "/paperclip/projects/project-1/repo/.paperclip/worktrees/BLO-31282",
-        source: "task_session",
         strategy: "git_worktree",
       },
       persistedExecutionWorkspaceId: null,
-      effectiveExecutionWorkspaceMode: "isolated_workspace",
       // Exactly what dispatch hands in when it planned no workspace id.
       isolationIdentity: { isolationMode: "run", isolationKey: "run:run-1" },
     });
@@ -3143,18 +3146,31 @@ describe("K8s session isolation metadata", () => {
     });
     expect(isolation?.storage.workspace).toBe("persistent");
     // BLO-31443: keeping the *workspace* persistent must not leak into the
-    // sibling storage classes. These three are the ones that would move if
-    // someone later widened `usesEphemeralWorkspace` to cover them too.
+    // sibling storage classes. `usesEphemeralWorkspace` has exactly two
+    // readers in the descriptor — `workspaceRoot` and `storage.workspace`,
+    // deliberately coupled so the mount tracks the path — and within
+    // `storage` it is read by `workspace` alone. So widening that predicate
+    // cannot move these three: `home` and `session` take the local
+    // `persistent` const, `cache` keys off `isolationMode === "shared"`.
+    // That is exactly why they are asserted here — they are the containment
+    // check on the line above, pinning that the persistence stayed where it
+    // was put rather than spreading. Moving any of them would take a
+    // different edit, in a different expression.
     expect(isolation?.storage.home).toBe("ephemeral");
     expect(isolation?.storage.session).toBe("ephemeral");
     expect(isolation?.storage.cache).toBe("ephemeral");
   });
 
   // BLO-31443: a DIFFERENT invariant from the storage classes above, split out
-  // so a failure here is not misread as the widening regression. `homeRoot` and
-  // `sessionRoot` never consult `usesEphemeralWorkspace` -- they key purely off
-  // `isolationMode` -- so that widening cannot move them. What these pin is the
-  // ephemeral root LAYOUT, which is worth catching if it ever changes silently.
+  // so a failure here is not misread as the widening regression. The split is
+  // NOT about which predicate is consulted — the two readers of
+  // `usesEphemeralWorkspace` are `workspaceRoot` and `storage.workspace`, and
+  // neither the storage trio above nor the two roots below is one of them, so
+  // both groups are equally immune to that widening. It is about which
+  // PROPERTY is pinned: above, the storage *class* attached to each root;
+  // here, the ephemeral root LAYOUT. Both derive from `isolationMode`, and a
+  // layout change is worth catching on its own rather than as a confusing
+  // second failure in the storage test.
   it("keeps the sibling roots under the per-run ephemeral root when the worktree is pinned", () => {
     const isolation = buildPrecomputedIdentityDescriptor();
     expect(isolation?.homeRoot).toBe("/runtime-cache/paperclip-runs/run-1/home");
@@ -3166,7 +3182,7 @@ describe("K8s session isolation metadata", () => {
   // has `cwd` pointing at the BASE checkout, so keying the workspace path off
   // the mode would route every such run into the base deterministically.
   it("stays ephemeral when isolated_workspace intent realized as the base checkout", () => {
-    const isolation = buildK8sRunIsolationDescriptor({
+    const isolation = buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "claude_k8s",
       runId: "run-1",
       companyId: "company-1",
@@ -3194,7 +3210,7 @@ describe("K8s session isolation metadata", () => {
   // persisted workspace and must stay fully ephemeral even though its realized
   // strategy is `git_worktree`.
   it("keeps a stateless PR review ephemeral despite a realized git worktree", () => {
-    const isolation = buildK8sRunIsolationDescriptor({
+    const isolation = buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "claude_k8s",
       runId: "run-1",
       companyId: "company-1",
@@ -3236,7 +3252,7 @@ describe("K8s session isolation metadata", () => {
 
   it("builds fully ephemeral run isolation metadata for stateless PR reviews", () => {
     expect(
-      buildK8sRunIsolationDescriptor({
+      buildK8sRunIsolationDescriptorFromWorkspace({
         adapterType: "opencode_k8s",
         runId: "run-1",
         companyId: "company-1",
@@ -3273,7 +3289,7 @@ describe("K8s session isolation metadata", () => {
   });
 
   it("does not reuse a stateless PR review session across heartbeat runs", () => {
-    const buildRunIsolation = (runId: string) => buildK8sRunIsolationDescriptor({
+    const buildRunIsolation = (runId: string) => buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "claude_k8s",
       runId,
       companyId: "company-1",
@@ -3302,7 +3318,7 @@ describe("K8s session isolation metadata", () => {
   });
 
   it("gives concurrent stateless runs disjoint mutable roots on shared RWX storage", () => {
-    const buildRunIsolation = (runId: string) => buildK8sRunIsolationDescriptor({
+    const buildRunIsolation = (runId: string) => buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "opencode_k8s",
       runId,
       companyId: "company-1",
@@ -3346,7 +3362,7 @@ describe("K8s session isolation metadata", () => {
   });
 
   it("reuses the durable workspace and session scope across heartbeat runs", () => {
-    const buildWorkspaceIsolation = (runId: string) => buildK8sRunIsolationDescriptor({
+    const buildWorkspaceIsolation = (runId: string) => buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "opencode_k8s",
       runId,
       companyId: "company-1",
@@ -3376,7 +3392,7 @@ describe("K8s session isolation metadata", () => {
   });
 
   it("falls back to serialized shared mode when an isolated workspace has no durable id", () => {
-    expect(buildK8sRunIsolationDescriptor({
+    expect(buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "opencode_k8s",
       runId: "run-1",
       companyId: "company-1",
@@ -3398,7 +3414,7 @@ describe("K8s session isolation metadata", () => {
 
   it("builds shared isolation metadata for shared K8s adapters", () => {
     expect(
-      buildK8sRunIsolationDescriptor({
+      buildK8sRunIsolationDescriptorFromWorkspace({
         adapterType: "claude_k8s",
         runId: "run-1",
         companyId: "company-1",
@@ -3465,7 +3481,7 @@ describe("K8s session isolation metadata", () => {
 
   it("logs scheduler-side K8s guard decisions with bounded isolation fields", () => {
     const spy = vi.spyOn(logger, "info").mockImplementation(() => {});
-    const workspaceIsolation = buildK8sRunIsolationDescriptor({
+    const workspaceIsolation = buildK8sRunIsolationDescriptorFromWorkspace({
       adapterType: "opencode_k8s",
       runId: "run-1",
       companyId: "company-1",
@@ -4741,5 +4757,160 @@ describe("BLO-19063 per_run predicate agrees with the config realization consume
     });
 
     expect(merged.workspaceStrategy).toMatchObject({ baseRef: "release" });
+  });
+});
+
+// BLO-23144 (1): the overlay above is applied field by field, not wholesale.
+//
+// The tests in the preceding describe all have the issue override *mention*
+// runScope, so they pass under either merge semantics. These cover the case the
+// fleet actually hits: an override that means to change one unrelated field and
+// never mentions runScope at all. Under the old wholesale replace that override
+// silently deleted an agent-level `per_run`, which is the same silent-downgrade
+// shape as the bug PR #1154 fixed one level up — isolation that reads as
+// configured and delivers none.
+describe("BLO-23144 issue workspaceStrategy overlay merges field-wise", () => {
+  const noProfile = {
+    requested: null,
+    requestedBy: null,
+    applied: null,
+    configSource: null,
+    fallbackReason: null,
+    adapterConfig: null,
+  } as const;
+
+  const mergeStrategy = (
+    baseStrategy: unknown,
+    overlayStrategy: unknown,
+  ): Record<string, unknown> | undefined =>
+    mergeModelProfileAdapterConfig({
+      baseConfig: { workspaceStrategy: baseStrategy },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { workspaceStrategy: overlayStrategy },
+    }).workspaceStrategy as Record<string, unknown> | undefined;
+
+  it("inherits runScope when the issue override omits it", () => {
+    // The fleet-wide default is set once on the agent; an issue that only wanted
+    // a different baseRef must not silently opt itself out of per-run isolation.
+    const strategy = mergeStrategy(
+      { type: "git_worktree", runScope: "per_run" },
+      { type: "git_worktree", baseRef: "release" },
+    );
+
+    expect(strategy).toMatchObject({
+      type: "git_worktree",
+      runScope: "per_run",
+      baseRef: "release",
+    });
+  });
+
+  it("agrees with the per_run predicate on that same override", () => {
+    // The predicate and the merge share resolveOverlaidWorkspaceStrategy exactly
+    // so they cannot drift. A disagreement here restores a pinned workspace for a
+    // run that realization then treats as per_run — two runs, one tree.
+    const policyInput = {
+      agentConfig: {
+        workspaceStrategy: { type: "git_worktree", runScope: "per_run" },
+      },
+      projectPolicy: null,
+      issueSettings: null,
+      mode: "isolated_workspace" as const,
+      legacyUseProjectWorkspace: null,
+    };
+    const issueAdapterConfig = { workspaceStrategy: { type: "git_worktree", baseRef: "release" } };
+
+    const predicted = executionWorkspaceUsesPerRunScope({ ...policyInput, issueAdapterConfig });
+    const realized = mergeModelProfileAdapterConfig({
+      baseConfig: buildExecutionWorkspaceAdapterConfig(policyInput),
+      modelProfile: { ...noProfile },
+      issueAdapterConfig,
+    });
+
+    expect((realized.workspaceStrategy as { runScope?: unknown }).runScope).toBe("per_run");
+    expect(predicted).toBe(true);
+  });
+
+  it("lets an explicit per_issue in the override still win", () => {
+    // Only *omission* inherits. Naming the field is an explicit downgrade and
+    // must keep working, or this fix would trade one silent override for another.
+    const strategy = mergeStrategy(
+      { type: "git_worktree", runScope: "per_run" },
+      { type: "git_worktree", runScope: "per_issue" },
+    );
+
+    expect(strategy).toMatchObject({ runScope: "per_issue" });
+  });
+
+  it("treats a non-object override as a wholesale clear, not a merge", () => {
+    // `null` is an explicit reset; merging into it is not meaningful, and
+    // inheriting through it would make the strategy impossible to clear.
+    expect(mergeStrategy({ type: "git_worktree", runScope: "per_run" }, null)).toBeNull();
+  });
+
+  it("gives an override that switches type a clean slate, not the old type's fields", () => {
+    // Field-wise inheritance is only meaningful between two descriptions of the
+    // same strategy type. Without the type guard the merge is type-blind, so a
+    // switch to project_primary would still carry git_worktree's
+    // worktreeParentDir and runScope; parseExecutionWorkspaceStrategy whitelists
+    // fields without cross-checking them against `type`, so nothing downstream
+    // would reject the nonsense. Raised by review on PR #1693.
+    const strategy = mergeStrategy(
+      { type: "git_worktree", runScope: "per_run", worktreeParentDir: "/x" },
+      { type: "project_primary" },
+    );
+
+    expect(strategy).toEqual({ type: "project_primary" });
+  });
+
+  it("still inherits by omission when the override keeps the same type", () => {
+    // The type guard must not swallow the BLO-23144 fix itself: an overlay that
+    // names the same type, or omits `type` entirely, still inherits runScope.
+    expect(
+      mergeStrategy(
+        { type: "git_worktree", runScope: "per_run" },
+        { type: "git_worktree", baseRef: "release" },
+      ),
+    ).toMatchObject({ runScope: "per_run", baseRef: "release" });
+
+    expect(
+      mergeStrategy({ type: "git_worktree", runScope: "per_run" }, { baseRef: "release" }),
+    ).toMatchObject({ type: "git_worktree", runScope: "per_run", baseRef: "release" });
+  });
+
+  it("does not resurrect a base strategy the mode gate deleted", () => {
+    // buildExecutionWorkspaceAdapterConfig removes workspaceStrategy outside
+    // isolated_workspace. With no own key on the base there is nothing to
+    // inherit, so the override stands alone — shared_workspace stays default-safe
+    // (BLO-19063 AC4).
+    const base = buildExecutionWorkspaceAdapterConfig({
+      agentConfig: { workspaceStrategy: { type: "git_worktree", runScope: "per_run" } },
+      projectPolicy: null,
+      issueSettings: { mode: "shared_workspace" },
+      mode: "shared_workspace",
+      legacyUseProjectWorkspace: null,
+    });
+    expect(Object.hasOwn(base, "workspaceStrategy")).toBe(false);
+
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: base,
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { workspaceStrategy: { type: "git_worktree", baseRef: "release" } },
+    });
+
+    expect((merged.workspaceStrategy as { runScope?: unknown }).runScope).toBeUndefined();
+  });
+
+  it("still ignores a model profile's strategy rather than merging it in", () => {
+    // The profile slot remains excluded entirely: field-wise merging is between
+    // the two *authoritative* slots, and widening it to the profile would let a
+    // model choice move the run's tree.
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { workspaceStrategy: { type: "git_worktree", baseRef: "main" } },
+      modelProfile: { ...noProfile, adapterConfig: { workspaceStrategy: { runScope: "per_run" } } },
+      issueAdapterConfig: null,
+    });
+
+    expect(merged.workspaceStrategy).toMatchObject({ baseRef: "main" });
+    expect((merged.workspaceStrategy as { runScope?: unknown }).runScope).toBeUndefined();
   });
 });

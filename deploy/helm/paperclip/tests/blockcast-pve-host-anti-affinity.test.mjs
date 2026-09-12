@@ -105,3 +105,46 @@ test("API liveness tolerates 10 s x 6 like the worker", () => {
   assert.match(readiness, /failureThreshold: 3\b/);
   assert.match(readiness, /timeoutSeconds: 5\b/);
 });
+
+// With pve3 excluded, the hard two-host spread left pve2 as the only host for
+// the second API replica, and pve2 saturates under CI bursts (34-49% steal on
+// paperclip-10, 2026-09-06 03:00Z, pod-local /api/health up to 9.9 s against a
+// 10 s liveness timeout). paperclip-8 (pve1) idles at 87% with three
+// multicast-integ runners (a reserved floor), so production tolerates that
+// node's reserved taint and the pve4-then-not-pve2 preference lands the second
+// replica there.
+// Slice the pod-spec tolerations list (key at six spaces, entries at eight, in
+// both templates) so the assertion cannot be satisfied by a tolerations key
+// elsewhere in the document.
+function podTolerations(rendered) {
+  const match = rendered.match(/\n {6}tolerations:\n((?: {8}- .*\n(?: {10}.*\n)*)+)/);
+  assert.ok(match, "pod-spec tolerations block not found");
+  return match[1];
+}
+
+// Helm marshals map keys alphabetically, so the rendered entry order is
+// effect/key/operator/value regardless of how the values file lists them.
+const MULTICAST_INTEG_TOLERATION =
+  / {8}- effect: NoSchedule\n {10}key: blockcast\.net\/arc-multicast-integ-reserved\n {10}operator: Equal\n {10}value: "true"\n/;
+const DEDICATED_TOLERATION =
+  / {8}- effect: NoSchedule\n {10}key: dedicated\n {10}operator: Equal\n {10}value: paperclip\n/;
+
+test("API deployment tolerates the paperclip-8 multicast-integ reserved taint", () => {
+  const rendered = renderTemplate("templates/deployment-api.yaml", [
+    "--set",
+    "api.enabled=true",
+  ]);
+
+  const tolerations = podTolerations(rendered);
+  assert.match(tolerations, MULTICAST_INTEG_TOLERATION);
+  // The dedicated=paperclip toleration must survive alongside it.
+  assert.match(tolerations, DEDICATED_TOLERATION);
+});
+
+test("worker StatefulSet tolerates the paperclip-8 multicast-integ reserved taint", () => {
+  const rendered = renderTemplate("templates/statefulset.yaml");
+
+  const tolerations = podTolerations(rendered);
+  assert.match(tolerations, MULTICAST_INTEG_TOLERATION);
+  assert.match(tolerations, DEDICATED_TOLERATION);
+});

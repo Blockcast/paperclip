@@ -17,6 +17,7 @@ Both tiers mount the SAME paperclip-data PVC (must be RWX when api.enabled —
 set `persistence.existingClaim` to a pre-provisioned cephfs RWX PVC).
 */}}
 {{- include "paperclip.validateGithubReviewGate" . }}
+{{- include "paperclip.validateSharedEnvExtra" . }}
 {{- if .Values.api.enabled }}
 apiVersion: apps/v1
 kind: Deployment

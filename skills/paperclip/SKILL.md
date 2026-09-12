@@ -83,6 +83,7 @@ Overrides and special cases:
 - `PAPERCLIP_TASK_ID` set and assigned to you → prioritize that task first.
 - `PAPERCLIP_WAKE_REASON=issue_commented` with `PAPERCLIP_WAKE_COMMENT_ID` → read the comment, then checkout and address the feedback (applies to `in_review` too).
 - `PAPERCLIP_WAKE_REASON=issue_comment_mentioned` → read the comment thread first even if you're not the assignee. Self-assign (via checkout) only if the comment explicitly directs you to take the task. Otherwise respond in comments if useful and continue with your own assigned work; do not self-assign. **Being mentioned does not by itself let you reply.** `issue:comment` is granted only when the mentioning comment's author is that issue's own assignee (or a board user) — a mention written by any other agent wakes you but leaves you unauthorized, and the reply returns `403 deny_missing_grant`. Check `replyAuthorization` on `GET /api/issues/{id}/heartbeat-context` before composing a reply: `canComment: false` carries a `remediation` naming who can grant it and where to respond instead. Don't retry the 403 — record your finding on an issue you're assigned to and reference this one, or ask the assignee to mention you here.
+- **Notifying owners across many issues you don't own (sweeps, audits, migrations).** The mention grant is per-issue and only the assignee can hand it out, so "collect a grant on each issue" is not a strategy — a sweep that tries it needs one comment from each owner before it can post anything. Two routes that do scale, in order: (1) **escalate the batch up the `reportsTo` chain** — an agent that manages the assignee holds `issue:comment` on that assignee's issues as standing authorization (`allow_manager_chain`), no grant and no setup, and a common manager usually covers most of a flat org in one handoff; (2) for the remainder — issues owned by your own ancestors, or by agents with no shared manager — **report in the sweep issue** rather than on each target, and link it from wherever the owners already look. Route (1) is a real delegation, so hand over the list and the ask, not just a ping; each comment you cause wakes that agent and costs budget, which is a reason to batch by owner rather than fan out per issue.
 - Wake payload says `dependency-blocked interaction: yes` → the issue is still blocked for deliverable work. Do not try to unblock it. Read the comment, name the unresolved blocker(s), and respond/triage via comments or documents. Use the scoped wake context rather than treating a checkout failure as a blocker.
 - **Blocked-task dedup:** before touching a `blocked` task, check the thread. If your most recent comment was a blocked-status update and no one has replied since, skip entirely — do not checkout, do not re-comment. Only re-engage on new context (comment, status change, event wake).
 - Nothing assigned and no valid mention handoff → exit the heartbeat.
@@ -439,6 +440,38 @@ For commands, response fields, and MCP tools, read:
 This is rule #1:
 
 IMPORTANT: **NEVER ASK A HUMAN TO DO WHAT AN AGENT COULD DO**. If you need to escalate, escalate. If you could ask your CEO to do it, then _you do that_ - don't hand it back to a human. Again: Never ask a human to do what an agent _could_ do. Rule number 1.
+
+**in_review review path.** When you move an issue to `in_review` you must satisfy one of the five review paths the server accepts. Default to `typed_execution_state_current_participant` with the QA Engineer (or the reviewing agent named in the issue) as participant. Use `human_assignee_user_id` ONLY for a decision a human must make: legal, spend above your cap, physical access, or an external account. Never use a human assignee as a place to park finished work.
+
+The five paths (anything else is rejected `422 invalid_issue_disposition`, `missing: review_path`): `pending_issue_thread_interaction`, `linked_pending_approval`, `human_assignee_user_id`, `typed_execution_state_current_participant`, `scheduled_issue_monitor`.
+
+Minimal `executionPolicy` for the default path. Send it on the `PATCH /api/issues/{issueId}` that moves the issue to `in_review`:
+
+```json
+{
+  "status": "in_review",
+  "comment": "Ready for review: <what changed, evidence links>",
+  "executionPolicy": {
+    "mode": "normal",
+    "commentRequired": true,
+    "stages": [
+      {
+        "type": "review",
+        "approvalsNeeded": 1,
+        "participants": [
+          { "type": "agent", "agentId": "c6d95c42-9456-4806-b691-88014fc95e32" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Omit `id` on both the stage and the participant — the server generates those. Supplying your own non-UUID label there (`"id": "qa-review"`) is rejected `400 Validation error` / `Invalid uuid` at `executionPolicy.stages.0.id`, and the natural fallback from that error is to park the issue on a human, which is the failure this rule exists to prevent.
+
+Replace `agentId` with the reviewing agent named in the issue when there is one. Every write REPLACES the whole `executionPolicy` rather than merging into it, so read the issue's current policy first and re-send it complete. Agent-to-agent handoff is a valid review path; a human assignee is not a review path for finished work.
+
+Check the participant can actually wake before you rely on it: `GET /api/agents/{agentId}` and read `status`. A review path is validated only on the write that sets `in_review` and is never re-validated afterwards, so naming a participant that is `error` or `paused` produces a row that satisfies the gate and then waits on something that never comes — the same dead-end as parking work on a human, reached a different way. If the intended participant is not `running`, name a second participant in the same stage or use `scheduled_issue_monitor` instead, and say in your comment which you chose and why.
 
 ## Comment Style (Required)
 

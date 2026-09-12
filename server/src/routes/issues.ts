@@ -187,7 +187,12 @@ import {
 import { findWakeIdempotencyReceipt } from "../services/wake-idempotency.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
-import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import {
+  maskWorkspaceRuntimeForRead,
+  maskWorkspaceRuntimeTextForRead,
+  redactEventPayload,
+  redactSensitiveText,
+} from "../redaction.js";
 import {
   createCompanySearchRateLimiter,
   type CompanySearchRateLimiter,
@@ -4439,6 +4444,17 @@ export function issueRoutes(
   // live grant that fires on quotation, which is the hazard the paragraph above
   // refuses to accept from the parser side. The id is given separately, bare, on
   // the next clause; bare tokens grant nothing, which is the whole point.
+  //
+  // BLO-22742: the per-issue mention is the only *transferable* grant, and it
+  // does not scale. A sweep hit this deny on 216 issues at once and had no
+  // route out, because both remedies above are per-issue and neither is
+  // something the blocked agent can execute itself. There is a second standing
+  // authorization the text never mentioned: `allow_manager_chain`
+  // (services/authorization.ts) carries `issue:comment` to any agent above the
+  // assignee in the `reportsTo` chain, with no grant and no per-issue setup. A
+  // peer cannot self-serve it — that is the point — but it means "escalate to
+  // their manager" is a real, in-system answer to fan-out notification, not a
+  // workaround. Naming it here is what turns a 216-issue wall into one handoff.
   function issueCommentGrantRemediation(input: {
     actorAgentId: string;
     assigneeAgentId: string | null;
@@ -4454,7 +4470,10 @@ export function issueRoutes(
       `where <agent-id> is ${input.actorAgentId}. A bare agent://${input.actorAgentId} in the ` +
       `comment body is not a mention — it neither wakes you nor grants anything. A mention written ` +
       `by any other agent wakes you but does not authorize you. Until then, respond on an issue ` +
-      `you are assigned to and reference this one, or ask the assignee to mention you here.`
+      `you are assigned to and reference this one, or ask the assignee to mention you here. If ` +
+      `you need to reach this assignee across many issues at once, do not collect grants one ` +
+      `issue at a time: escalate the batch to an agent above them in the reportsTo chain, ` +
+      `which carries issue:comment on their assignees' issues without any grant.`
     );
   }
 
@@ -7462,7 +7481,30 @@ export function issueRoutes(
       remoteProvider: workspace.remoteProvider,
       remoteWorkspaceRef: workspace.remoteWorkspaceRef,
       sharedWorkspaceKey: workspace.sharedWorkspaceKey,
-      runtimeConfig: workspace.runtimeConfig,
+      // PEN-2846 (door #12b): the second `workspaceRuntime` exit in this file.
+      // This projection is a withholding boundary too — it omits `metadata` and
+      // `runtimeServices` off the row rather than spreading it — but
+      // `runtimeConfig` is a *view onto that same omitted `metadata`*:
+      // `services/projects.ts` derives it via
+      // `readProjectWorkspaceRuntimeConfig(row.metadata)`, reading
+      // `metadata.runtimeConfig`. So passing it through verbatim handed back a
+      // slice of the column this projection drops.
+      //
+      // Only `workspaceRuntime` is open — an operator-authored
+      // `Record<string, unknown>` (`ProjectWorkspaceRuntimeConfig`), the same type
+      // and the same hazard as the execution-workspace side masked in
+      // `compactIssueExecutionWorkspace` below. `desiredState` and `serviceStates`
+      // are enum-validated on the way out of that reader, so they cross intact.
+      //
+      // Enumerated rather than spread so a field added to
+      // `ProjectWorkspaceRuntimeConfig` later has to be considered here first.
+      runtimeConfig: workspace.runtimeConfig
+        ? {
+            workspaceRuntime: maskWorkspaceRuntimeForRead(workspace.runtimeConfig.workspaceRuntime),
+            desiredState: workspace.runtimeConfig.desiredState,
+            serviceStates: workspace.runtimeConfig.serviceStates,
+          }
+        : null,
       isPrimary: workspace.isPrimary,
       createdAt: workspace.createdAt,
       updatedAt: workspace.updatedAt,
@@ -7515,9 +7557,18 @@ export function issueRoutes(
       status: service.status,
       lifecycle: service.lifecycle,
       reuseKey: service.reuseKey,
-      command: service.command,
-      cwd: service.cwd,
+      // `command`/`cwd` are the operator's own free text, copied onto this row
+      // from the `workspaceRuntime` entry that `compactIssueExecutionWorkspace`
+      // masks ~50 lines below. Emitting them here handed the same string back in
+      // cleartext in the same response body (PEN-2854, door #14). `command` runs
+      // through `sh -c`, so an inline `FOO_TOKEN=... npm run dev` is a normal
+      // idiom; `cwd` discloses host paths.
+      command: maskWorkspaceRuntimeTextForRead(service.command),
+      cwd: maskWorkspaceRuntimeTextForRead(service.cwd),
       port: service.port,
+      // `url` deliberately survives: `paperclipWaitForIssueWorkspaceService`
+      // returns it to the caller, and it is a generated local address rather
+      // than operator free text. `providerRef` is a pid.
       url: service.url,
       provider: service.provider,
       providerRef: service.providerRef,
@@ -7561,7 +7612,14 @@ export function issueRoutes(
             provisionCommand: workspace.config.provisionCommand,
             teardownCommand: workspace.config.teardownCommand,
             cleanupCommand: workspace.config.cleanupCommand,
-            workspaceRuntime: workspace.config.workspaceRuntime,
+            // PEN-2846 (door #12): `workspaceRuntime` is an open
+            // `Record<string, unknown>` an operator authors by hand, and this
+            // function is a withholding boundary — it enumerates its fields and
+            // sets `metadata: null` rather than spreading the row. Passing the
+            // runtime config through verbatim handed every operator-authored key
+            // in a service definition to three MCP tools any same-company agent
+            // holds. Names and structure still cross; values do not.
+            workspaceRuntime: maskWorkspaceRuntimeForRead(workspace.config.workspaceRuntime),
             desiredState: workspace.config.desiredState,
             serviceStates: workspace.config.serviceStates,
           }
@@ -11912,6 +11970,63 @@ export function issueRoutes(
       };
     }
     await routinesSvc.syncRunStatusForIssue(issue.id);
+
+    const externalWaitMonitor = nextExecutionPolicy?.monitor;
+    const externalWaitNextCheckAt = issue.monitorNextCheckAt;
+    const shouldYieldCurrentRunForExternalWait =
+      req.actor.type === "agent" &&
+      actor.runId !== null &&
+      isCurrentIssueExecutionRun(req, existing) &&
+      externalWaitMonitor?.kind === "external_service" &&
+      externalWaitNextCheckAt !== null &&
+      (issue.status === "in_progress" || issue.status === "in_review") &&
+      (req.body.executionPolicy !== undefined || (existing.status !== "in_review" && issue.status === "in_review"));
+
+    if (shouldYieldCurrentRunForExternalWait) {
+      const yielded = await heartbeat.cancelRun(
+        actor.runId as string,
+        "Yielded after persisting an external-service wait",
+        {
+          errorCode: "external_wait_yield",
+          resultJson: {
+            yieldedExternalWait: true,
+            issueId: issue.id,
+            serviceName: externalWaitMonitor.serviceName ?? null,
+          },
+          eventMessage: "run yielded after persisting an external-service wait",
+          eventPayload: {
+            issueId: issue.id,
+            serviceName: externalWaitMonitor.serviceName ?? null,
+          },
+          persistBeforeTerminate: true,
+          repairTerminalRelease: true,
+        },
+      ).catch((err) => {
+        logger.warn(
+          { err, runId: actor.runId, issueId: issue.id },
+          "failed to yield run slot after persisting an external-service wait");
+        return null;
+      });
+      if (yielded?.status === "cancelled" && yielded.errorCode === "external_wait_yield") {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "heartbeat.external_wait_yielded",
+          entityType: "heartbeat_run",
+          entityId: yielded.id,
+          issueId: issue.id,
+          details: {
+            issueId: issue.id,
+            serviceName: externalWaitMonitor.serviceName ?? null,
+            monitorNextCheckAt: externalWaitNextCheckAt.toISOString(),
+          },
+        });
+      }
+    }
 
     if (actor.runId) {
       await heartbeat.reportRunActivity(actor.runId).catch((err) =>

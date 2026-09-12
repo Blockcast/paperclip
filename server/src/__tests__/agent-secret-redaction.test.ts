@@ -155,11 +155,11 @@ vi.mock("../services/index.js", () => ({
   workspaceOperationService: () => mockWorkspaceOperationService,
 }));
 
-function createDbStub() {
+function createDbStub(requireBoardApprovalForNewAgents = false) {
   const rows = [{
     id: companyId,
     name: "Paperclip",
-    requireBoardApprovalForNewAgents: false,
+    requireBoardApprovalForNewAgents,
   }];
   return {
     select: vi.fn().mockReturnValue({
@@ -175,14 +175,14 @@ function createDbStub() {
   };
 }
 
-function createApp(actor: Record<string, unknown>) {
+function createApp(actor: Record<string, unknown>, requireBoardApprovalForNewAgents = false) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
     (req as any).actor = actor;
     next();
   });
-  app.use("/api", agentRoutes(createDbStub() as any));
+  app.use("/api", agentRoutes(createDbStub(requireBoardApprovalForNewAgents) as any));
   app.use(errorHandler);
   return app;
 }
@@ -456,6 +456,14 @@ describe("agent secret redaction on mutating responses", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // `clearAllMocks` clears calls but KEEPS implementations, so a fixture set
+    // inside a helper outlives the test that needed it. `hire()` is the only
+    // setter of these two in this block, and `mockApprovalService.create` has
+    // no other setter in the file — so reset them rather than seeding a value:
+    // a test added later that reaches a create path should fail loudly on an
+    // unset mock instead of silently inheriting a hire-shaped row.
+    mockAgentService.create.mockReset();
+    mockApprovalService.create.mockReset();
     mockAgentService.getById.mockResolvedValue(baseAgent);
     mockAgentService.update.mockResolvedValue(baseAgent);
     mockAgentService.updatePermissions.mockResolvedValue(baseAgent);
@@ -534,8 +542,415 @@ describe("agent secret redaction on mutating responses", () => {
     expectNoPlaintextSecrets(res.body);
   });
 
-  // secret_ref bindings are pointers, never plaintext. They must not gain a
-  // resolved `value` on any response regardless of projectionClass.
+  // `redactRevisionSnapshot` spread the stored snapshot and then overrode three
+  // named fields — `adapterConfig`, `runtimeConfig`, `metadata`. That list is
+  // complete for `buildConfigSnapshot`'s current shape, so the surface does not
+  // leak today; it leaks the moment a config-bearing field is added to the
+  // snapshot and this list is not extended in the same commit. Doors #12 and
+  // #13 on PEN-2370 were both exactly that drift (`workspaceRuntime` added to a
+  // projection whose withholding list nobody revisited), so the class is pinned
+  // here rather than the three spellings.
+  //
+  // The revisions are also the one config surface stored *pre-redaction* by a
+  // name-based sanitizer, which is why an ordinary-keyed value reaches the row.
+  const SNAPSHOT_DRIFT_SECRET = "revision-snapshot-secret-under-an-ordinary-key";
+  const revisionId = "33333333-3333-4333-8333-333333333333";
+
+  function snapshotWithUnnamedConfigField() {
+    return {
+      name: "Builder",
+      role: "engineer",
+      // `title` and `icon` are the two other string-valued fields
+      // `buildConfigSnapshot` emits. They are pinned as READABLE below because
+      // passing the whole record to `sanitizeRecord` subjects the snapshot's top
+      // level to every gate in it — not just `classifyKeyTier` but the
+      // `env`/`headers` special cases, `^args$`, and the dotted-value rule — so
+      // an over-redaction here would blank the revision diff in the UI.
+      // (Boundary, stated so it is not mistaken for a guarantee: a *dotted*
+      // three-segment value in one of these fields would be blanked by the
+      // dotted-value rule. No caller produces one; this pins the realistic
+      // shape, not every possible string.)
+      title: "Staff Engineer",
+      icon: "wrench",
+      adapterType: "claude_local",
+      adapterConfig: { env: { FOO: { type: "plain", value: SNAPSHOT_DRIFT_SECRET } } },
+      runtimeConfig: {},
+      metadata: null,
+      // Stands in for any field a future `buildConfigSnapshot` adds. It is not
+      // in the override list, so the spread used to carry it out verbatim.
+      sidecarConfig: { env: { BAR: { type: "plain", value: SNAPSHOT_DRIFT_SECRET } } },
+    };
+  }
+
+  function revisionRow() {
+    return {
+      id: revisionId,
+      agentId,
+      companyId,
+      source: "patch",
+      changedKeys: ["adapterConfig"],
+      beforeConfig: snapshotWithUnnamedConfigField(),
+      afterConfig: snapshotWithUnnamedConfigField(),
+    };
+  }
+
+  it("GET /agents/:id/config-revisions/:revisionId contains a snapshot field the override list does not name", async () => {
+    mockAgentService.getConfigRevision.mockResolvedValue(revisionRow());
+
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}/config-revisions/${revisionId}`);
+
+    // Assert the success path explicitly — a 403/404 would pass every negative
+    // assertion below vacuously.
+    expect(res.status).toBe(200);
+    // The named field still works, so a regression here is not what fails.
+    expect(res.body.afterConfig.adapterConfig.env.FOO).toEqual({
+      type: "plain",
+      value: "***REDACTED***",
+    });
+    // The unnamed one is the point.
+    expect(res.body.afterConfig.sidecarConfig.env.BAR).toEqual({
+      type: "plain",
+      value: "***REDACTED***",
+    });
+    expect(res.body.beforeConfig.sidecarConfig.env.BAR).toEqual({
+      type: "plain",
+      value: "***REDACTED***",
+    });
+    // Non-credential snapshot fields stay readable — containment must not turn
+    // the revision diff into an unreadable wall of sentinels.
+    expect(res.body.afterConfig.name).toBe("Builder");
+    expect(res.body.afterConfig.role).toBe("engineer");
+    expect(res.body.afterConfig.title).toBe("Staff Engineer");
+    expect(res.body.afterConfig.icon).toBe("wrench");
+    expect(res.body.afterConfig.adapterType).toBe("claude_local");
+    // The response-shape contract the three overrides used to guarantee.
+    expect(res.body.afterConfig.runtimeConfig).toEqual({});
+    expect(res.body.afterConfig.metadata).toBeNull();
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  it("GET /agents/:id/config-revisions contains the same field on the list route", async () => {
+    mockAgentService.listConfigRevisions.mockResolvedValue([revisionRow()]);
+
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}/config-revisions`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].afterConfig.sidecarConfig.env.BAR).toEqual({
+      type: "plain",
+      value: "***REDACTED***",
+    });
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  // The old `metadata` branch gated on `typeof x === "object" && x !== null`,
+  // which is TRUE for an array, and the redactor returns a non-plain-object
+  // argument unchanged — so an array-valued `metadata` went out verbatim. This
+  // is the third instance of that `isPlainObject` hole on PEN-2370.
+  //
+  // Pinned rather than argued: the containment change closes it because
+  // `sanitizeValue` maps arrays element-wise, but nothing in this file exercised
+  // an array-shaped `metadata`, so the fix rested on the PR description alone.
+  it("masks a plain binding carried in an ARRAY-valued metadata field", async () => {
+    const snapshot = {
+      ...snapshotWithUnnamedConfigField(),
+      metadata: [{ type: "plain", value: SNAPSHOT_DRIFT_SECRET }],
+    };
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      ...revisionRow(),
+      beforeConfig: snapshot,
+      afterConfig: snapshot,
+    });
+
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}/config-revisions/${revisionId}`);
+
+    expect(res.status).toBe(200);
+    // The array SHAPE must survive — coercing it to `null` would hide the leak
+    // by destroying the field, which is not the same fix and would break the
+    // diff view. It must arrive as an array whose elements are masked.
+    expect(Array.isArray(res.body.afterConfig.metadata)).toBe(true);
+    expect(res.body.afterConfig.metadata).toEqual([
+      { type: "plain", value: "***REDACTED***" },
+    ]);
+    expect(res.body.beforeConfig.metadata).toEqual([
+      { type: "plain", value: "***REDACTED***" },
+    ]);
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  // The admit gate and the sanitize gate must be the same predicate. The
+  // redactor sanitizes only `isPlainObject` values and otherwise returns its
+  // argument BY REFERENCE, so admitting on a wider "is it an object" test made
+  // the containment a no-op for a foreign-prototype snapshot: the spread would
+  // emit the raw record and the sub-field lines would only reshape it.
+  //
+  // Not reachable from today's callers — `jsonb` columns arrive via `JSON.parse`
+  // and always carry `Object.prototype`. Pinned because an unstated assumption
+  // about the shape a containment function is handed is the defect class this
+  // whole projection exists to close, and because failing OPEN is the wrong
+  // direction for the one mask standing over at-rest plaintext.
+  it("contains a snapshot whose prototype is not Object.prototype", async () => {
+    const foreignPrototype = Object.assign(
+      Object.create({ inherited: true }),
+      snapshotWithUnnamedConfigField(),
+    );
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      ...revisionRow(),
+      beforeConfig: foreignPrototype,
+      afterConfig: foreignPrototype,
+    });
+
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}/config-revisions/${revisionId}`);
+
+    expect(res.status).toBe(200);
+    // Fails closed: an un-sanitizable shape is withheld entirely rather than
+    // spread out uncontained.
+    expect(res.body.afterConfig).toEqual({});
+    expect(res.body.beforeConfig).toEqual({});
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  // Same hole, one level down and one key over. `metadata` matches no tier and
+  // no special case in `sanitizeRecord`, so it goes to `sanitizeValue`, which
+  // returns a non-plain non-array object BY REFERENCE — `contained.metadata`
+  // was the caller's object, unsanitized, and `?? null` emitted it verbatim.
+  // `adapterConfig` and `runtimeConfig` beside it already failed closed on this
+  // exact shape; `metadata` failed open.
+  //
+  // Asserted as a pair, because the two halves can regress independently: the
+  // array case must SURVIVE as a masked array (above) and the foreign-prototype
+  // case must be WITHHELD. A fix that collapses either into the other passes one
+  // assertion and fails the other.
+  it("contains a metadata field whose prototype is not Object.prototype", async () => {
+    const foreignMetadata = Object.assign(Object.create({ inherited: true }), {
+      leaked: { type: "plain", value: SNAPSHOT_DRIFT_SECRET },
+    });
+    const snapshot = { ...snapshotWithUnnamedConfigField(), metadata: foreignMetadata };
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      ...revisionRow(),
+      beforeConfig: snapshot,
+      afterConfig: snapshot,
+    });
+
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}/config-revisions/${revisionId}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.afterConfig.metadata).toBeNull();
+    expect(res.body.beforeConfig.metadata).toBeNull();
+    // The rest of the snapshot is a plain object, so it must still project —
+    // this is containment of the one un-sanitizable field, not of the response.
+    expect(res.body.afterConfig.name).toBe("Builder");
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  // `redactAgentSecrets` is the primary agent serializer — its own doc comment
+  // says every agent-serializing response must go through it — and it gated on
+  // `asRecord`, which admits a foreign-prototype object the redactor then hands
+  // straight back by reference.
+  //
+  // Note what does NOT fix this: swapping the gate to `isPlainObject`. The
+  // assignment is inside the `if`, so a failing gate leaves the RAW value on the
+  // `{ ...agent }` spread — same value on the wire, by a different route. The
+  // contained value has to be written back, which is why the fix is a helper
+  // rather than a one-word predicate change.
+  it("PATCH /agents/:id contains an adapterConfig whose prototype is not Object.prototype", async () => {
+    const foreignConfig = Object.assign(Object.create({ inherited: true }), {
+      // The top-level `env` is masked by its own loop over `asRecord(config.env)`
+      // regardless of the parent's prototype, so it would hide the leak. The
+      // secret has to sit OUTSIDE `env` to exercise the by-reference return:
+      // `redactedConfig` is the raw object, and the spread carries this out.
+      env: { FOO: { type: "plain", value: "unrelated" } },
+      sidecarConfig: { env: { BAZ: { type: "plain", value: SNAPSHOT_DRIFT_SECRET } } },
+    });
+    const foreignAgent = { ...baseAgent, adapterConfig: foreignConfig };
+    mockAgentService.getById.mockResolvedValue(foreignAgent);
+    mockAgentService.update.mockResolvedValue(foreignAgent);
+
+    const app = createApp(boardActor);
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 1 });
+
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expect(res.body.adapterConfig).toEqual({});
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  it("PATCH /agents/:id contains a runtimeConfig whose prototype is not Object.prototype", async () => {
+    const foreignRuntime = Object.assign(Object.create({ inherited: true }), {
+      modelProfiles: { main: { adapterConfig: { env: { BAR: SNAPSHOT_DRIFT_SECRET } } } },
+    });
+    const foreignAgent = { ...baseAgent, runtimeConfig: foreignRuntime };
+    mockAgentService.getById.mockResolvedValue(foreignAgent);
+    mockAgentService.update.mockResolvedValue(foreignAgent);
+
+    const app = createApp(boardActor);
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ spentMonthlyCents: 1 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.runtimeConfig).toEqual({});
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    // Only `runtimeConfig` is replaced here, so `adapterConfig` is still the
+    // shared fixture's — every PEN-2747 shape rides this response and the sweep
+    // is what pins them.
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  // `redactAgentConfiguration` passes the value in with no plain-object gate at
+  // all, so the redactor's own by-reference return was the only thing between a
+  // foreign-prototype config and the wire. Both of its config fields, because
+  // they are two separate call sites that can regress independently.
+  it("GET /agents/:id/configuration contains configs whose prototype is not Object.prototype", async () => {
+    const foreignAgent = {
+      ...baseAgent,
+      adapterConfig: Object.assign(Object.create({ inherited: true }), {
+        env: { FOO: { type: "plain", value: SNAPSHOT_DRIFT_SECRET } },
+      }),
+      runtimeConfig: Object.assign(Object.create({ inherited: true }), {
+        env: { BAR: { type: "plain", value: SNAPSHOT_DRIFT_SECRET } },
+      }),
+    };
+    mockAgentService.getById.mockResolvedValue(foreignAgent);
+
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}/configuration`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig).toEqual({});
+    expect(res.body.runtimeConfig).toEqual({});
+    // The enumerated readable fields still project — containment is scoped to
+    // the two config fields, not to the whole response.
+    expect(res.body.name).toBe("Builder");
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  // The fifth converted site, and the last one this suite did not reach. The
+  // hire approval payload is the one place the *stored* value is deliberately
+  // left credential-bearing — `activatePendingApproval` replays it verbatim
+  // over the agent row, so redacting it on the way in would write masks back
+  // over live credentials. Containment on the way out is therefore the only
+  // control here, not a second layer behind one.
+  //
+  // Both cases drive the real route rather than calling the helper: the value
+  // being contained is whatever `approvalsSvc.create` RESOLVES, so a test that
+  // asserted on the object literal the route builds would pass while the
+  // returned row went out uncontained.
+  async function hire(payload: unknown) {
+    // `instructionsRootPath` takes the early return in
+    // `materializeDefaultInstructionsBundleForNewAgent`, so the hire lands
+    // without dragging bundle materialization (and its disk reads) into a test
+    // about response containment.
+    mockAgentService.create.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { ...baseAgent.adapterConfig, instructionsRootPath: "/workspace/instructions" },
+    });
+    mockApprovalService.create.mockResolvedValue({
+      id: "44444444-4444-4444-8444-444444444444",
+      type: "hire_agent",
+      status: "pending",
+      payload,
+    });
+
+    return request(createApp(boardActor, true))
+      .post(`/api/companies/${companyId}/agent-hires`)
+      .send({ name: "Hire", role: "engineer", adapterType: "claude_local" });
+  }
+
+  it("POST /companies/:companyId/agent-hires contains an approval payload whose prototype is not Object.prototype", async () => {
+    // `asRecord` admits any non-array object, so the old expression handed a
+    // foreign-prototype payload to a redactor that returns it BY REFERENCE.
+    // The secret sits outside `env` for the reason given at the adapterConfig
+    // case above: the top-level `env` loop would mask it either way and hide
+    // the by-reference return that is actually under test.
+    const res = await hire(
+      Object.assign(Object.create({ inherited: true }), {
+        adapterConfig: { sidecarConfig: { env: { BAZ: { type: "plain", value: SNAPSHOT_DRIFT_SECRET } } } },
+      }),
+    );
+
+    expect(res.status).toBe(201);
+    // Plaintext first, deliberately: the shape assertion below also fails on
+    // the pre-fix expression, so leading with it would let this test report a
+    // changed shape when what it exists to catch is a credential on the wire.
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expect(res.body.approval.payload).toEqual({});
+    // The rest of the approval row still projects — containment is scoped to
+    // `payload`, not to the whole response.
+    expect(res.body.approval.type).toBe("hire_agent");
+    // `SNAPSHOT_DRIFT_SECRET` lives only in the payload this test builds, so the
+    // assertion above says nothing about the OTHER half of this response.
+    // `POST /agent-hires` returns `{ agent: redactAgentSecrets(agent), approval }`
+    // and `hire()` resolves a `baseAgent`-derived row, so an edit that serialized
+    // `agent` directly would leave every PEN-2747 shape on the wire with all
+    // three hire tests still green. The shared-fixture sweep is what catches it.
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  // Not a leak on either side of the change, and pinned for exactly that
+  // reason: it is the one converted line whose output shape moved for a
+  // plausible input, so leaving it unasserted means the next reader cannot
+  // tell the delta was intended. `asRecord` rejects arrays and mapped this to
+  // `null`; `containAgentConfig` withholds it as `{}`.
+  it("POST /companies/:companyId/agent-hires withholds an ARRAY-valued approval payload as {}, not null", async () => {
+    const res = await hire([{ type: "plain", value: SNAPSHOT_DRIFT_SECRET }]);
+
+    expect(res.status).toBe(201);
+    expect(res.body.approval.payload).toEqual({});
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  // The masking arm — the one every REAL hire takes, since a hire payload is an
+  // ordinary plain object. The two cases above both land on the withholding arm
+  // (`{}`), so without this the production path at agents.ts:3177 is unpinned.
+  //
+  // ⚠️ This is a characterization test, NOT a fail-first leak guard: the pre-fix
+  // expression `redactAgentConfigPayload(asRecord(payload) ?? null)` masks a
+  // plain object identically, so it passes on both sides of the change. Its job
+  // is to hold the arm still — a future edit to `containAgentConfig` that turned
+  // masking into withholding would satisfy every other test in this block while
+  // silently blanking the payload the board reads to approve a hire. Proven able
+  // to fail by mutating that branch to `return {}`.
+  //
+  // Both keys carry the secret on purpose: the payload embeds the requested
+  // adapterConfig twice, the second time under `requestedConfigurationSnapshot`,
+  // so masking only the first would leave the same credential one key over
+  // (BLO-18969) — which is the concern the route comment at :3171 states.
+  it("POST /companies/:companyId/agent-hires MASKS a plain approval payload and still projects it", async () => {
+    const binding = { type: "plain", value: SNAPSHOT_DRIFT_SECRET };
+    const res = await hire({
+      adapterConfig: { env: { API_KEY: { ...binding } } },
+      requestedConfigurationSnapshot: { adapterConfig: { env: { API_KEY: { ...binding } } } },
+    });
+
+    expect(res.status).toBe(201);
+    // Plaintext first, for the reason given at the foreign-prototype case above.
+    expect(JSON.stringify(res.body)).not.toContain(SNAPSHOT_DRIFT_SECRET);
+
+    // Masked AND projected — this is what distinguishes this arm from the
+    // withholding one. An assertion that only checked for absence of the secret
+    // would also pass if the whole payload were blanked to `{}`. The mask is
+    // spelled literally, per this file's convention: asserting against the
+    // exported constant would still pass if the constant itself became "".
+    const masked = { type: "plain", value: "***REDACTED***" };
+    expect(res.body.approval.payload.adapterConfig.env.API_KEY).toEqual(masked);
+    expect(res.body.approval.payload.requestedConfigurationSnapshot.adapterConfig.env.API_KEY).toEqual(masked);
+    expectNoPlaintextSecrets(res.body);
+  });
+
+  // `secret_ref` bindings are pointers, never plaintext, so they survive the
+  // redactor by design — but a resolved `value` riding along on one is a secret
+  // that leaked in, and the schema has no field for it.
   it("never serializes a resolved value for a secret_ref env binding", async () => {
     const refAgent = {
       ...baseAgent,

@@ -4,6 +4,7 @@ import {
   addIssueCommentSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
+  issueExecutionMonitorPolicySchema,
   issueExecutionPolicySchema,
   MISPLACED_ISSUE_MONITOR_INPUT_KEYS,
   misplacedIssueMonitorInputMessage,
@@ -462,6 +463,27 @@ describe("issue validators", () => {
       const text = issueExecutionPolicySchema.shape.monitor.description ?? "";
       expect(text).toContain("attemptCount");
       expect(text).toContain("maxAttempts");
+    });
+
+    // BLO-32419: the `pr:…:review` gate is re-checked by the agent by hand, so this description
+    // IS the implementation for that caller. A single-page fetch reads a reviewed PR as
+    // `reviews=0` — the exact false negative BLO-22574 exists to kill. The clause is +660 chars
+    // on a string paid twice per tool-schema load, so it is a standing candidate for a
+    // size-motivated trim; without this guard such a trim is silent. Assert the invariants, not
+    // the prose, so wording stays free to change.
+    it("requires paginating BOTH review-evidence surfaces and treats a truncated read as unproven", () => {
+      const text = issueExecutionMonitorPolicySchema.shape.gateSignals.description ?? "";
+      // Both surfaces, not the comment surface alone — the helper paginates each of them.
+      expect(text).toMatch(/PAGINATE BOTH surfaces/);
+      expect(text).toContain("per_page=100");
+      // Truncation must fail closed as unproven rather than reading as absence.
+      expect(text).toMatch(/TRUNCATED read is UNPROVEN/i);
+      // Both exhaustion codes, which are outcomes distinct from `{found:false}`.
+      for (const code of ["reviews_pagination_exhausted", "comments_pagination_exhausted"]) {
+        expect(text).toContain(code);
+      }
+      // The hazard that actually bites a hand-rolled fetch is the default page size, not the cap.
+      expect(text).toMatch(/DEFAULT page size is 30/);
     });
   });
 

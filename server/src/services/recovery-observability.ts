@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
 
@@ -98,8 +98,10 @@ export type RecoveryActionListItem = {
   cause: string;
   nextAction: string;
   attemptCount: number;
+  nonDeliverySweepCount: number;
   maxAttempts: number | null;
   timeoutAt: Date | null;
+  retiringBound: string | null;
   lastAttemptAt: Date | null;
   outcome: string | null;
   createdAt: Date;
@@ -111,6 +113,28 @@ export type RecoveryActionListOptions = {
   kind?: string;
   status?: string;
   limit?: number;
+  offset?: number;
+  /**
+   * BLO-19124: `desc` (default) answers "what just happened"; `asc` is what makes
+   * a census of the *legacy* tail possible. With `limit` hard-capped at 500, a
+   * newest-first-only list cannot reach row 501+ at all, so the oldest actions
+   * were unreachable through the API by construction — the surface built to make
+   * the drain measurable was blind to exactly the rows the drain is about.
+   *
+   * `asc` is not merely the reverse view: this subsystem inserts continuously (in
+   * bursts of tens per day), and inserts land at the *head* of a `desc` list, so
+   * paging `desc` shifts the tail deeper mid-walk and can skip rows. Oldest-first
+   * is stable against inserts, because they land at the *tail* of the walk.
+   *
+   * That is narrower than drift-free, and for a census the gap matters: `status`
+   * is filtered before ordering, so a row that leaves the filtered set mid-walk
+   * (`active` -> `resolved`) shrinks the already-walked prefix and slides the next
+   * page up by one, skipping an unwalked row per exit. Offset paging cannot see
+   * that. For an exact census, walk `order: "asc"` with NO `status` filter and
+   * bucket by status client-side — rows are never deleted and `createdAt` is never
+   * rewritten, so the unfiltered set is append-only and the walk is stable.
+   */
+  order?: "asc" | "desc";
 };
 
 export type HandoffClass =
@@ -207,6 +231,7 @@ export function recoveryObservabilityService(db: Db) {
     }
 
     const limit = Math.min(500, Math.max(1, Math.floor(opts.limit ?? 100)));
+    const offset = Math.max(0, Math.floor(opts.offset ?? 0));
     return db
       .select({
         id: issueRecoveryActions.id,
@@ -223,8 +248,10 @@ export function recoveryObservabilityService(db: Db) {
         cause: issueRecoveryActions.cause,
         nextAction: issueRecoveryActions.nextAction,
         attemptCount: issueRecoveryActions.attemptCount,
+        nonDeliverySweepCount: issueRecoveryActions.nonDeliverySweepCount,
         maxAttempts: issueRecoveryActions.maxAttempts,
         timeoutAt: issueRecoveryActions.timeoutAt,
+        retiringBound: issueRecoveryActions.retiringBound,
         lastAttemptAt: issueRecoveryActions.lastAttemptAt,
         outcome: issueRecoveryActions.outcome,
         createdAt: issueRecoveryActions.createdAt,
@@ -234,8 +261,17 @@ export function recoveryObservabilityService(db: Db) {
       .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
       .leftJoin(agents, eq(agents.id, issueRecoveryActions.ownerAgentId))
       .where(and(...filters))
-      .orderBy(desc(issueRecoveryActions.createdAt))
-      .limit(limit);
+      .orderBy(
+        // `id` breaks ties: `createdAt` collides inside a burst (the sweeps that
+        // create these touch tens of rows per second), and without a second key
+        // the order of a tied group is database-defined, so a page boundary
+        // landing inside one can repeat or drop a row between calls.
+        ...(opts.order === "asc"
+          ? [asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id)]
+          : [desc(issueRecoveryActions.createdAt), desc(issueRecoveryActions.id)]),
+      )
+      .limit(limit)
+      .offset(offset);
   }
 
   async function report(

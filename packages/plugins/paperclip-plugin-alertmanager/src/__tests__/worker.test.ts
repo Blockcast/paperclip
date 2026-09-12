@@ -669,15 +669,303 @@ describe("handleWebhook — firing first time", () => {
   it("fails closed when the fallback agent configuration is missing", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ ownerMap: {}, fallbackAgentName: undefined });
+    // The fail-closed guarantee (BLO-26613) is unchanged and still asserted
+    // below: no ownerless issue, no state row. PEN-2581 changed only how the
+    // drop is *reported* — an unresolvable owner is a config/roster fact no
+    // retry can fix, so the delivery acknowledges it instead of failing.
     await expect(
       handleWebhook(ctx, config, true, baseInput()),
-    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+    ).resolves.toBeUndefined();
     expect(mocks.issues.create).not.toHaveBeenCalled();
     expect(mocks.state.set).not.toHaveBeenCalled();
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.owner.fallback_failed",
       1,
+      {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "critical",
+        refusal: "permanent",
+      },
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
       { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+  });
+
+  it("drops one ownerless alert without aborting the loop or failing the delivery", async () => {
+    // What this pins, stated precisely, because the obvious reading is wrong:
+    // the per-alert catch in `handleWebhook` ALREADY kept the rest of the batch
+    // processing before PEN-2581. The catch is inside the loop and
+    // `AlertDeliveryIncompleteError` is thrown only after it completes, so a
+    // sibling alert's issue was created on the first attempt even when the
+    // delivery reported 502. Verified by running it, not assumed, and
+    // reproducible as written: neutralise the carve-out (`const permanent =
+    // false` at the per-alert catch in `webhook-handler.ts`), then comment out
+    // BOTH the outcome assertion below and the `permanent_error` assertion at
+    // the end — on the pre-change source that alert reports through
+    // `alertmanager.alert.error`. The `issues.create` and `alert:` state
+    // assertions still pass. Both have to be neutralised first because Vitest
+    // aborts a test at its first failing assertion, so a run that trips the
+    // outcome assertion never reaches the ones that carry the point.
+    //
+    // What PEN-2581 actually changed is the delivery's reported *outcome*: the
+    // ownerless fingerprint is no longer accumulated, so Alertmanager is no
+    // longer told to retry a batch 15-17× for a fault no retry can fix, and the
+    // resulting failure storm no longer masks genuinely-transient failures that
+    // retrying would have fixed.
+    //
+    // The production incident did dark-tier every alert, but for an
+    // incident-specific reason rather than a structural one: with
+    // `fallbackAgentName` unset, *every* unmapped alert in the batch took this
+    // same throw, so there were no healthy siblings left to survive. That case
+    // is real and reachable — it is just not what "one ownerless alert" does to
+    // a mixed batch, which is what this test covers.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ fallbackAgentName: undefined });
+    // team=platform resolves through ownerMap; team=storage is unmapped, and
+    // with no fallbackAgentName it is permanently ownerless.
+    mocks.users.findByEmail.mockResolvedValue({
+      id: "user-42",
+      email: "alice@example.com",
+      name: "Alice",
+    });
+    const owned = baseAlert({
+      labels: {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "critical",
+        team: "platform",
+        node: "pve-3",
+      },
+      fingerprint: "aaaa1111",
+    });
+    const ownerless = baseAlert({
+      labels: {
+        alertname: "CephOsdNearFull",
+        severity: "critical",
+        team: "storage",
+        node: "pve-4",
+      },
+      fingerprint: "bbbb2222",
+    });
+
+    await expect(
+      handleWebhook(
+        ctx,
+        config,
+        true,
+        baseInput({
+          parsedBody: baseEnvelope({ alerts: [ownerless, owned] }),
+        }),
+      ),
+    ).resolves.toBeUndefined();
+
+    // The healthy alert still became tracked work — and it is ordered SECOND in
+    // the payload, behind the ownerless one, so this pins that the permanent
+    // drop does not abort the remainder of the loop.
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.create.mock.calls[0][0].title).toBe(
+      "[critical] CiliumPolicyDropsHigh · platform",
+    );
+    // The other half of the BLO-26613 fail-closed guarantee, asserted here and
+    // not only in the single-alert tests: the ownerless alert must leave no
+    // state row behind, and a multi-alert batch is where that is easiest to
+    // regress.
+    //
+    // Filtered to `alert:` keys rather than counting `state.set` calls
+    // outright: the healthy alert's owner lookup also memoises
+    // `owner-by-email:…` on the instance scope, so a raw count would be 2 and
+    // would couple this fail-closed assertion to an unrelated cache. Keying on
+    // the fingerprint says the thing we actually mean — one alert row, and it
+    // belongs to the alert that got an issue.
+    const alertStateWrites = mocks.state.set.mock.calls.filter((call) =>
+      String(call[0].stateKey).startsWith("alert:"),
+    );
+    expect(alertStateWrites).toHaveLength(1);
+    expect(alertStateWrites[0][0].stateKey).toBe(`alert:${owned.fingerprint}`);
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      { alertname: "CephOsdNearFull", severity: "critical" },
+    );
+  });
+
+  // The permanent drop above is driven by *unset config*, which returns before
+  // `agents.list` is ever called. This one is driven by roster contents: the
+  // name is configured and correct-looking, and the refusal is decided by what
+  // the list came back with. That is the branch every roster-derived permanent
+  // refusal actually takes in production — `agents.list` filters terminated
+  // agents out, so a terminated fallback owner never reaches the eligibility
+  // ladder and lands here as an unmatched name instead.
+  it("permanently drops when the configured name is absent from the roster", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {} });
+    // A non-empty roster that simply does not contain the configured name —
+    // indistinguishable from a typo, and correctly permanent.
+    mocks.agents.list.mockResolvedValue([
+      { id: "agent-other", name: "Someone Else", status: "idle" },
+    ]);
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput()),
+    ).resolves.toBeUndefined();
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.fallback_failed",
+      1,
+      {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "critical",
+        refusal: "permanent",
+      },
+    );
+  });
+
+  // The guard that separates a degraded host from a wrong name. Same "no
+  // match" outcome as the test directly above, opposite refusal class, and the
+  // only difference in the input is that the roster is empty rather than merely
+  // lacking the name. An `agents.list` that fails by *returning* `[]` instead
+  // of throwing would otherwise be dropped at 200 and never retried, while the
+  // throwing variant of the identical fault keeps its retry window.
+  it("keeps the retry window when the roster comes back empty", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {} });
+    mocks.agents.list.mockResolvedValue([]);
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput()),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+
+    // Fail-closed is intact either way — the class change is about the
+    // reporting channel, never about creating an ownerless issue.
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.fallback_failed",
+      1,
+      {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "critical",
+        refusal: "transient",
+      },
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      expect.anything(),
+    );
+  });
+
+  it("keeps the retry window when the fallback agent is only paused", async () => {
+    // The counterpart to the permanent drop above, and the case that makes the
+    // refusal *class* load-bearing rather than cosmetic. A paused fallback owner
+    // becomes invokable again with nobody editing config, so Alertmanager's
+    // 15-17 retries are the only thing that lets the alert land within minutes
+    // of the unpause instead of waiting out a whole `repeat_interval`. Dropping
+    // it at 200 here would be a time-to-detect regression for a critical alert.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {} });
+    mocks.agents.list.mockResolvedValue([
+      { id: "agent-fallback", name: "Alert Fallback", status: "paused" },
+    ]);
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput()),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+
+    // Fail-closed is still intact — a paused owner is no more assignable than a
+    // terminated one; only the reporting channel differs.
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    // Reported as transient, NOT permanent.
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.error",
+      1,
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      expect.anything(),
+    );
+    // The `refusal` label's other value, pinned here because the permanent test
+    // above pins only `"permanent"`. Splitting drop-from-retry within this one
+    // series is the label's entire purpose, so a regression that hardcoded
+    // `"permanent"` at the write site would otherwise pass the whole suite —
+    // the alert-level metric split asserted just above would still be correct.
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.fallback_failed",
+      1,
+      {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "critical",
+        refusal: "transient",
+      },
+    );
+    // The operator-facing warning names the blocking reason, so the next
+    // occurrence is diagnosable from the log alone (PEN-2581).
+    expect(mocks.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("agent-fallback=paused"),
+    );
+  });
+
+  it("still acknowledges a permanent drop when the metrics write fails", async () => {
+    // The permanent drop's own invariant must not depend on telemetry being up.
+    // If the `fallback_failed` write threw, handleFiring would surface a
+    // *metrics* error instead of PermanentAlertError, the per-alert catch would
+    // treat it as transient and push the fingerprint, and the delivery would
+    // 502 — reinstating the doomed retry burst this path exists to remove, and
+    // taking the rest of the batch down with it.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {}, fallbackAgentName: undefined });
+    mocks.metrics.write.mockImplementation(async (name: string) => {
+      if (name === "alertmanager.owner.fallback_failed") {
+        throw new Error("metrics backend unavailable");
+      }
+    });
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput()),
+    ).resolves.toBeUndefined();
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    // The permanent classification survived the telemetry outage.
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+    // And the swallowed metrics failure is still audible in the log.
+    expect(mocks.logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("failed to record fallback owner metric"),
+    );
+  });
+
+  it("still fails the delivery for a transient per-alert fault", async () => {
+    // Control for the two tests above: the permanent carve-out must not have
+    // widened into "swallow every per-alert failure". A transient fault still
+    // owes Alertmanager a retry, so it still fails the delivery and still
+    // reports through the transient metric (BLO-20467's silent-loss guard).
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    mocks.issues.create.mockRejectedValueOnce(new Error("issue RPC timed out"));
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput()),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.error",
+      1,
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      expect.anything(),
     );
   });
 
