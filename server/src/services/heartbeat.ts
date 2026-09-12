@@ -9381,7 +9381,7 @@ type GithubReviewerEvidenceVerification =
  * guard exists for.
  *
  * ⚠ This widening belongs **here**, not in `githubHasReviewerEvidenceForPr`.
- * That function has three other callers and two want the opposite:
+ * That function has two other callers and both want the opposite:
  *
  *  | caller | wants |
  *  |---|---|
