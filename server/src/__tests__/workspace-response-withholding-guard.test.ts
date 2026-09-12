@@ -510,7 +510,13 @@ describe("workspace response withholding guard (PEN-2852, PEN-2370 (b2))", () =>
   it("does not flag a response that delegates to the withholding boundary", () => {
     const synthetic = [
       "  res.json(publicExecutionWorkspace(workspace, viewer));",
-      "  res.json({ workspace: publicProjectWorkspace(updatedWorkspace, viewer), operation });",
+      // Both keys wrapped, deliberately. This fixture used to read `…, operation });` with the
+      // sibling raw — the exact shape that WAS the live door #15 defect in the POST runtime-command
+      // handler, sitting in the suite as an example of a clean response. The scan does not track
+      // `operation` as a noun, so it was never the guard's verdict that made it look fine; it was
+      // the fixture. See the operation cases in `workspace-runtime-response-withholding.test.ts`,
+      // which hold that line behaviourally.
+      "  res.json({ workspace: publicProjectWorkspace(updatedWorkspace, viewer), operation: publicWorkspaceOperation(operation, viewer) });",
       "  res.json(publicProject(project, viewer));",
     ].join("\n");
 

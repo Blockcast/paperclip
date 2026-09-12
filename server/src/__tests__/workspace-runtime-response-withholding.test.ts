@@ -1,7 +1,15 @@
 import express from "express";
 import request from "supertest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ExecutionWorkspace, ProjectWorkspace, WorkspaceRuntimeService } from "@paperclipai/shared";
+import type {
+  ExecutionWorkspace,
+  ProjectWorkspace,
+  WorkspaceOperation,
+  WorkspaceRuntimeService,
+} from "@paperclipai/shared";
 import { errorHandler } from "../middleware/index.js";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
@@ -9,6 +17,7 @@ import { projectRoutes } from "../routes/projects.js";
 import {
   publicExecutionWorkspace,
   publicProjectWorkspace,
+  publicWorkspaceOperation,
   WITHHELD_WORKSPACE_RUNTIME_VIEWER,
 } from "../routes/workspace-response.js";
 
@@ -31,6 +40,46 @@ const SECOND_SENTINEL = "sentinel-nested-command-must-not-egress";
  */
 const SERVICE_COMMAND_SENTINEL = "TOKEN_FIXTURE=sentinel-service-command-not-a-real-credential npm run dev";
 const SERVICE_CWD_SENTINEL = "/fixture/sentinel-service-cwd";
+
+/**
+ * `WorkspaceOperation` carries the same pair a third time, by copy: the recorder is handed
+ * `command: workspaceCommand?.command` and `cwd: existing.cwd`. Distinct sentinels again, so a
+ * passing assertion names which exit it closed rather than borrowing another's.
+ *
+ * `metadata` gets its own: it is an open record written by ~10 recorder call sites and carries host
+ * paths (`worktreePath`, `repoRoot`) that no named-key list would have covered in advance.
+ */
+const OPERATION_COMMAND_SENTINEL = "TOKEN_FIXTURE=sentinel-operation-command-not-a-real-credential npm run build";
+const OPERATION_CWD_SENTINEL = "/fixture/sentinel-operation-cwd";
+const OPERATION_METADATA_SENTINEL = "/fixture/sentinel-operation-worktree-path";
+
+function workspaceOperationFixture(overrides: Record<string, unknown> = {}): WorkspaceOperation {
+  return {
+    id: "operation-1",
+    companyId: "company-1",
+    executionWorkspaceId: "workspace-1",
+    heartbeatRunId: null,
+    issueId: null,
+    phase: "workspace_provision",
+    command: OPERATION_COMMAND_SENTINEL,
+    cwd: OPERATION_CWD_SENTINEL,
+    status: "succeeded",
+    exitCode: 0,
+    logStore: null,
+    logRef: null,
+    logBytes: 4096,
+    logSha256: null,
+    logCompressed: false,
+    stdoutExcerpt: null,
+    stderrExcerpt: null,
+    metadata: { action: "start", worktreePath: OPERATION_METADATA_SENTINEL },
+    startedAt: new Date("2026-01-01T00:00:00.000Z"),
+    finishedAt: new Date("2026-01-01T00:00:01.000Z"),
+    createdAt: new Date("2026-01-01T00:00:00.000Z"),
+    updatedAt: new Date("2026-01-01T00:00:01.000Z"),
+    ...overrides,
+  } as WorkspaceOperation;
+}
 
 function runtimeServiceFixture(overrides: Record<string, unknown> = {}): WorkspaceRuntimeService {
   return {
@@ -482,6 +531,131 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
 
       expect(res.status).toBe(200);
       expect(JSON.stringify(res.body)).toContain(SECRET_SENTINEL);
+    });
+  });
+
+  /**
+   * Door #15 — `WorkspaceOperation`, found by Ally at head `ff95da68` and ruled in scope by the CTO
+   * (BLO-33407 Ruling F).
+   *
+   * The defect this closes is not an adjacent field: the POST runtime-command handler reached into
+   * one response literal, masked `workspace`, and left the sibling `operation` raw on the next line
+   * — while `operation.command`/`.cwd` are recorded verbatim FROM the workspace command and
+   * `existing.cwd` it had just withheld. Withholding a value at one projection and handing out a
+   * byte-identical copy at another is the same exit, not a scope boundary.
+   */
+  describe("workspace operations (door #15)", () => {
+    it("masks the copied command/cwd pair and the open metadata record", () => {
+      const withheld = publicWorkspaceOperation(
+        workspaceOperationFixture(),
+        WITHHELD_WORKSPACE_RUNTIME_VIEWER,
+      );
+
+      expect(JSON.stringify(withheld)).not.toContain(OPERATION_COMMAND_SENTINEL);
+      expect(JSON.stringify(withheld)).not.toContain(OPERATION_CWD_SENTINEL);
+      // `metadata` is the exit a named-key list would have missed: `worktreePath` is written by one
+      // recorder call site out of ~10, and the record has no closed shape.
+      expect(JSON.stringify(withheld)).not.toContain(OPERATION_METADATA_SENTINEL);
+      expect(withheld.command).toBe(REDACTED_EVENT_VALUE);
+      expect(withheld.cwd).toBe(REDACTED_EVENT_VALUE);
+    });
+
+    it("keeps the fields a withheld reader still needs to see that an operation ran", () => {
+      const withheld = publicWorkspaceOperation(
+        workspaceOperationFixture(),
+        WITHHELD_WORKSPACE_RUNTIME_VIEWER,
+      );
+
+      // Withholding the operator's text is the point; hiding the fact of execution is not.
+      expect(withheld.phase).toBe("workspace_provision");
+      expect(withheld.status).toBe("succeeded");
+      expect(withheld.exitCode).toBe(0);
+      expect(withheld.logBytes).toBe(4096);
+      expect(withheld.id).toBe("operation-1");
+      expect(withheld.executionWorkspaceId).toBe("workspace-1");
+      expect(withheld.finishedAt).toEqual(new Date("2026-01-01T00:00:01.000Z"));
+    });
+
+    it("distinguishes a withheld command from an operation that has none", () => {
+      const withheld = publicWorkspaceOperation(
+        workspaceOperationFixture({ command: null, cwd: null, metadata: null }),
+        WITHHELD_WORKSPACE_RUNTIME_VIEWER,
+      );
+
+      // withheld-is-not-absent, inherited from `maskWorkspaceRuntimeTextForRead` rather than
+      // re-derived here.
+      expect(withheld.command).toBeNull();
+      expect(withheld.cwd).toBeNull();
+      expect(withheld.metadata).toBeNull();
+    });
+
+    it("does not copy the input when the viewer is entitled", () => {
+      const raw = workspaceOperationFixture();
+      expect(publicWorkspaceOperation(raw, { revealRuntimeConfig: true })).toBe(raw);
+    });
+
+    it("withholds on GET /execution-workspaces/:id/workspace-operations", async () => {
+      mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
+        workspaceOperationFixture(),
+      ]);
+
+      const res = await request(createApp("execution-workspaces")).get(
+        "/api/execution-workspaces/workspace-1/workspace-operations",
+      );
+
+      expect(res.status).toBe(200);
+      // The load-bearing assertion: this route answered with the raw rows, so all three sentinels
+      // crossed in cleartext to any caller holding only `company_scope:read`.
+      expect(JSON.stringify(res.body)).not.toContain(OPERATION_COMMAND_SENTINEL);
+      expect(JSON.stringify(res.body)).not.toContain(OPERATION_CWD_SENTINEL);
+      expect(JSON.stringify(res.body)).not.toContain(OPERATION_METADATA_SENTINEL);
+      expect(res.body).toHaveLength(1);
+      expect(res.body[0].command).toBe(REDACTED_EVENT_VALUE);
+      expect(res.body[0].phase).toBe("workspace_provision");
+    });
+
+    it("discloses to a reader holding workspace_runtime:read", async () => {
+      decideAsRuntimeManager();
+      mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
+        workspaceOperationFixture(),
+      ]);
+
+      const res = await request(createApp("execution-workspaces")).get(
+        "/api/execution-workspaces/workspace-1/workspace-operations",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body[0].command).toBe(OPERATION_COMMAND_SENTINEL);
+      expect(res.body[0].cwd).toBe(OPERATION_CWD_SENTINEL);
+    });
+
+    /**
+     * The other two call sites, pinned against the route SOURCE rather than driven.
+     *
+     * Both are real exits and neither is cheap to reach with a 200: the POST runs the whole
+     * runtime-command path (command resolution, the recorder, workspace provisioning) before it
+     * reaches its response literal, and the heartbeat-run route lives in `agents.ts`, whose router
+     * needs ~30 services mocked to mount. A source assertion is weaker than a driven one and is
+     * stated as such — but it fails loudly if someone deletes the wrapper, which is the regression
+     * this door actually had.
+     */
+    it.each([
+      {
+        module: "execution-workspaces.ts",
+        marker: "operation: publicWorkspaceOperation(operation, viewer)",
+        site: "POST /execution-workspaces/:id/runtime-services/:action",
+      },
+      {
+        module: "agents.ts",
+        marker: "publicWorkspaceOperations(operations, viewer)",
+        site: "GET /heartbeat-runs/:runId/workspace-operations",
+      },
+    ])("$site routes its operations through the withholding boundary", ({ module, marker }) => {
+      const source = readFileSync(
+        path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "routes", module),
+        "utf8",
+      );
+      expect(source).toContain(marker);
     });
   });
 });

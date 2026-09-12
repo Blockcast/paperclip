@@ -1,6 +1,11 @@
 import type { Request } from "express";
-import type { ExecutionWorkspace, ProjectWorkspace, WorkspaceRuntimeService } from "@paperclipai/shared";
-import { maskWorkspaceRuntimeTextForRead } from "../redaction.js";
+import type {
+  ExecutionWorkspace,
+  ProjectWorkspace,
+  WorkspaceOperation,
+  WorkspaceRuntimeService,
+} from "@paperclipai/shared";
+import { maskWorkspaceRuntimeForRead, maskWorkspaceRuntimeTextForRead } from "../redaction.js";
 import type { accessService } from "../services/index.js";
 
 /**
@@ -173,6 +178,48 @@ export function publicRuntimeServices(
     command: maskWorkspaceRuntimeTextForRead(service.command),
     cwd: maskWorkspaceRuntimeTextForRead(service.cwd),
   }));
+}
+
+/**
+ * `WorkspaceOperation` is the third carrier of the withheld `command`/`cwd` pair, and it reaches it
+ * by copy rather than by nesting: `routes/execution-workspaces.ts` records an operation with
+ * `command: workspaceCommand?.command` and `cwd: existing.cwd` — the very strings
+ * `publicRuntimeServices` masks one projection over. A route that withholds `workspace` and answers
+ * with a raw `operation` in the same response literal hands the same bytes back one key over, which
+ * is the derived-view trap of (1) above at a third remove.
+ *
+ * `metadata` goes through `maskWorkspaceRuntimeForRead` rather than a named-key list because it is
+ * an open `Record<string, unknown>` written by ~10 recorder call sites — it carries `worktreePath`,
+ * `repoRoot`, `branchName` and `baseRef` today, and whatever the next call site adds tomorrow. A
+ * name list cannot cover a key that does not exist yet; the deny-by-default walk can, and it already
+ * handles the array- and JSON-string-shaped bypasses this series shipped once each.
+ *
+ * Kept deliberately: `phase`, `status`, `exitCode`, `logBytes`, the ids and the timestamps. An
+ * unentitled operator must still be able to see that an operation ran and how it ended — withholding
+ * the operator's text is the point, hiding the fact of execution is not.
+ *
+ * `stdoutExcerpt` / `stderrExcerpt` / `logRef` are deliberately NOT withheld here. They are command
+ * *output*, not a copy of a declared-withheld value, so they sit on the far side of BLO-33568's rule
+ * and are a product decision rather than a projection bug (CTO Ruling F §4, BLO-33407).
+ */
+export function publicWorkspaceOperation(
+  operation: WorkspaceOperation,
+  viewer: WorkspaceRuntimeViewer,
+): WorkspaceOperation {
+  if (viewer.revealRuntimeConfig) return operation;
+  return {
+    ...operation,
+    command: maskWorkspaceRuntimeTextForRead(operation.command),
+    cwd: maskWorkspaceRuntimeTextForRead(operation.cwd),
+    metadata: maskWorkspaceRuntimeForRead(operation.metadata) as Record<string, unknown> | null,
+  };
+}
+
+export function publicWorkspaceOperations(
+  operations: WorkspaceOperation[],
+  viewer: WorkspaceRuntimeViewer,
+): WorkspaceOperation[] {
+  return operations.map((operation) => publicWorkspaceOperation(operation, viewer));
 }
 
 export function publicProjectWorkspace(

@@ -36,6 +36,8 @@ import {
   publicExecutionWorkspace,
   publicExecutionWorkspaces,
   publicRuntimeServices,
+  publicWorkspaceOperation,
+  publicWorkspaceOperations,
   resolveWorkspaceRuntimeViewer,
 } from "./workspace-response.js";
 import { appendWithCap } from "../adapters/utils.js";
@@ -148,7 +150,8 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     if (!workspace) return;
     if (!(await assertExecutionWorkspaceReadAllowed(req, res, workspace.companyId))) return;
     const operations = await workspaceOperationsSvc.listForExecutionWorkspace(id);
-    res.json(operations);
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, workspace.companyId);
+    res.json(publicWorkspaceOperations(operations, viewer));
   });
 
   async function handleExecutionWorkspaceRuntimeCommand(req: Request, res: Response) {
@@ -486,12 +489,14 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       },
     });
 
+    // One viewer for both keys of this literal: `operation.command`/`.cwd` are recorded from the
+    // selected workspace command and `existing.cwd` above, so they are a verbatim copy of what
+    // `publicExecutionWorkspace` withholds on the sibling key. Masking one and not the other is the
+    // same exit, not a scope boundary (BLO-33568, CTO Ruling F on BLO-33407).
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, existing.companyId);
     res.json({
-      workspace: publicExecutionWorkspace(
-        workspace,
-        await resolveWorkspaceRuntimeViewer(access, req, existing.companyId),
-      ),
-      operation,
+      workspace: publicExecutionWorkspace(workspace, viewer),
+      operation: publicWorkspaceOperation(operation, viewer),
     });
   }
 
