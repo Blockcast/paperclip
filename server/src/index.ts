@@ -270,8 +270,9 @@ export async function startServer(): Promise<StartedServer> {
   // Tracing must be active (or have failed and logged) before the first DB
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
-  // Scrape-independent stall evidence (BLO-32668). Unref'd sampler, no teardown
-  // needed: it must not outlive the process and cannot keep it alive.
+  // Scrape-independent stall evidence (BLO-32668). The disposer is discarded
+  // deliberately: the sampler is idempotent and unref'd, so repeated in-process
+  // `startServer()` calls start exactly one, and it cannot outlive the process.
   startEventLoopStallLogging();
   let config = loadConfig();
   if (config.githubPrReviewerAgentIds.length > 0) {

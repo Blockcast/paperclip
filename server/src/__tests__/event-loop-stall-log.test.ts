@@ -75,4 +75,43 @@ describe("startEventLoopStallLogging", () => {
     await sleep(150);
     expect(lines).toHaveLength(0);
   });
+
+  it("is idempotent across repeated starts, and one stop releases them", async () => {
+    // `startServer()` is called repeatedly in-process by the suite and never
+    // shuts down, so a sampler per call would leave every prior histogram and
+    // interval live for the worker's lifetime (BLO-32668 review).
+    const first: Array<Record<string, number>> = [];
+    const second: Array<Record<string, number>> = [];
+    const stopFirst = startEventLoopStallLogging({
+      thresholdMs: 200,
+      sampleMs: 50,
+      log: (fields) => first.push(fields),
+    });
+    const stopSecond = startEventLoopStallLogging({
+      thresholdMs: 200,
+      sampleMs: 50,
+      log: (fields) => second.push(fields),
+    });
+
+    try {
+      // Only one sampler exists, so the second start never wired its own log.
+      expect(stopSecond).toBe(stopFirst);
+      await sleep(60);
+      blockEventLoop(400);
+      await sleep(150);
+      expect(first.length).toBeGreaterThan(0);
+      expect(second).toHaveLength(0);
+    } finally {
+      stopFirst();
+    }
+
+    // A single stop must release everything: a leaked second interval would
+    // still be firing here.
+    first.length = 0;
+    await sleep(60);
+    blockEventLoop(400);
+    await sleep(150);
+    expect(first).toHaveLength(0);
+    expect(second).toHaveLength(0);
+  });
 });
