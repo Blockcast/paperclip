@@ -2862,6 +2862,71 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
+  // BLO-30303: candidate-selection starvation. The scan reads
+  // `LIMIT MAX_CANDIDATE_ISSUES` and nothing in the review pipeline writes back
+  // to a scanned *source* row, so under the old `asc(updatedAt)` ordering the
+  // same oldest-N rows were re-selected on every pass forever. Once the
+  // eligible population passed the cap, an issue outside that window could
+  // never receive a review no matter how many passes ran — which is why
+  // fleet-wide emission was a hard zero from 2026-08-19 to 2026-09-12.
+  //
+  // The assertion that matters is rotation across passes, not reachability on
+  // any single pass. A watermark still sorts the target last on pass 1 (every
+  // row starts NULL, so ties fall through to the old `updatedAt` order); what
+  // it guarantees is that pass 2 reaches it. Pre-fix this test is red at *any*
+  // number of passes, which is the distinction a `desc(updatedAt)` flip would
+  // fail to make.
+  it("reaches a recently-updated stalled issue that sorts outside one scan window (BLO-30303)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    // seedAssignedIssue stamps updatedAt = 2026-04-28T10:00:00Z, so every decoy
+    // below sorts ahead of the target under `asc(updatedAt)`.
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await pinExecutionRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      status: "running",
+      lockedAt: episodeStart,
+      lastOutputAt: new Date(now.getTime() - 10 * 60 * 1000),
+    });
+
+    // Fill one whole scan window with eligible-but-uninteresting rows. They
+    // must be genuinely eligible (agent-assigned, non-terminal, not a review)
+    // to occupy the window; they just never fire a trigger.
+    const decoyCount = 250;
+    const decoyUpdatedAt = new Date("2026-04-01T00:00:00.000Z");
+    await db.insert(issues).values(
+      Array.from({ length: decoyCount }, (_, i) => ({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        title: `Decoy ${i}`,
+        status: "in_progress" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.coderId,
+        originKind: "manual",
+        issueNumber: 1000 + i,
+        identifier: `${seeded.issuePrefix}-${1000 + i}`,
+        // Recent episode start: nothing for long_active_duration to fire on.
+        startedAt: new Date(now.getTime() - 60 * 1000),
+        createdAt: decoyUpdatedAt,
+        updatedAt: decoyUpdatedAt,
+      })),
+    );
+
+    const service = productivityReviewService(db);
+
+    const first = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    expect(first.scanned).toBe(decoyCount);
+
+    const second = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    // Pre-fix both passes scan the identical oldest-250 decoys and this is 0.
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews.map((review) => review.originId)).toContain(seeded.issueId);
+    expect(second.scanned).toBeGreaterThan(0);
+  }, 120_000);
+
   // BLO-19848 review follow-up: the tail clamp alone regressed the moment a
   // parked holder resumed. Once the run is `running` again it is genuinely
   // live, so the clamp releases — and because elapsed was still measured from

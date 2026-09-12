@@ -3683,6 +3683,11 @@ const issueListSelect = {
   // recorded verdict.
   lastEvidenceVerdict: issues.lastEvidenceVerdict,
   lastEvidenceVerdictEvaluatedAt: issues.lastEvidenceVerdictEvaluatedAt,
+  // BLO-30303: internal scan watermark, carried here only because this
+  // projection is maintained as the full column set (the type flows into
+  // withIssueLabels/withActiveRuns, which require a complete row). No consumer
+  // reads it; same disposition as lastEvidenceVerdictEvaluatedAt above.
+  productivityScannedAt: issues.productivityScannedAt,
 };
 
 /**
