@@ -5875,11 +5875,20 @@ describe("executeProcess (timeout classification)", () => {
     const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-stdio-drain-"));
     const markerPath = path.join(markerDir, "write-after-drain");
     // The invariant is an ordering one: the call must return on the 2s
-    // PROCESS_STDIO_DRAIN_GRACE_MS rather than waiting for the descendant. Budget
-    // and descendant delay move together so that stays exact. 10s is 5x the grace
-    // and ~2x the 4.65s worst case observed under merge-queue load (BLO-22985) —
-    // a call that actually waits for the descendant still fails.
-    const DESCENDANT_WRITE_DELAY_MS = 10_000;
+    // PROCESS_STDIO_DRAIN_GRACE_MS rather than waiting for the descendant. The
+    // return budget is therefore derived from that 2s contract and kept
+    // INDEPENDENT of the descendant delay — tying the two together would let any
+    // implementation that returns before the descendant writes pass, however long
+    // its grace had silently grown.
+    //
+    // 7s is 3.5x the contract and 1.5x the 4.65s worst case observed under
+    // merge-queue load (BLO-22985); it fails a grace inflated past ~5s. A tighter
+    // bound is not available: 5s is only 1.07x that observed worst case and would
+    // have failed on the very occurrence this issue was opened for.
+    const DRAIN_GRACE_RETURN_BUDGET_MS = 7_000;
+    // Comfortably above the budget so the two stay decoupled, and above the call's
+    // own timeoutMs so a call that really waits for the descendant trips that too.
+    const DESCENDANT_WRITE_DELAY_MS = 12_000;
     const writerScript = `
       const fs = require("node:fs");
       setTimeout(() => {
@@ -5908,7 +5917,12 @@ describe("executeProcess (timeout classification)", () => {
       expect(result.code).toBe(0);
       expect(result.timedOut).toBe(false);
       const elapsedMs = Date.now() - started;
-      expect(elapsedMs).toBeLessThan(DESCENDANT_WRITE_DELAY_MS);
+      expect(elapsedMs).toBeLessThan(DRAIN_GRACE_RETURN_BUDGET_MS);
+
+      // Load-independent half of the same ordering invariant: the descendant has
+      // not written yet, so a call that returned only after the descendant's write
+      // fails here regardless of how contended the shard is.
+      await expect(fs.stat(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
 
       // Without destroying the captured streams, the descendant keeps stdout open,
       // writes successfully, and leaves the marker after this call has returned.
