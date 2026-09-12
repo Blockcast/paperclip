@@ -25,6 +25,13 @@ const COMPANY_NAME = `E2E-Test-${Date.now()}`;
 const MISSION = "Build affordable home robots that handle household chores.";
 
 test.describe("Onboarding wizard", () => {
+  // The single test below declares 15s + 10s + 30s = 55s of assertion budget
+  // against the suite's 60s default cap, leaving 5s for a goto, two clicks,
+  // two fills and four API round-trips. Statically that budget is unreachable,
+  // which is the same defect that made applications-crud and
+  // application-delete-screenshot flake (BLO-33320).
+  test.setTimeout(180_000);
+
   test("create-company path: name + mission creates company and goal", async ({
     page,
   }) => {
