@@ -677,3 +677,47 @@ describe("BLO-32695 — block-less bodies keep the prose fallback", () => {
     ).toMatchObject({ state: "success", outcome: "clean" });
   });
 });
+
+/**
+ * The producer/consumer heading contract.
+ *
+ * Every other reader in this file is gated behind `hasAllyConsolidatedReviewHeading`
+ * — a body that fails it is not treated as a review at all, so a correct verdict
+ * block inside it is never even looked for. That makes the heading the one field
+ * where a producer/consumer mismatch is *silent on both sides*: the block parses
+ * fine in isolation, and the gate simply never sees the comment.
+ *
+ * Asserted against the real exported function rather than a transcribed regex.
+ * A copy here would be one more prose pattern drifting from its consumer, which
+ * is the failure mode this whole row exists to retire.
+ */
+describe("BLO-32695 — the Step 4 template satisfies the heading the gate requires", () => {
+  const agentsDoc = readFileSync(
+    fileURLToPath(new URL("../../../.planning/ally-agent/AGENTS.md", import.meta.url)),
+    "utf8",
+  );
+
+  /** The emitted template itself — the fenced block, not the prose around it. */
+  function step4Template(): string {
+    const start = agentsDoc.indexOf("### Step 4");
+    expect(start).not.toBe(-1);
+    const step4 = agentsDoc.slice(start, agentsDoc.indexOf("### Step 5", start));
+    const fence = /```markdown\n([\s\S]*?)```/.exec(step4);
+    expect(fence, "Step 4 must retain its markdown review template").not.toBeNull();
+    return fence![1];
+  }
+
+  it("is recognised as an Ally consolidated review", () => {
+    expect(hasAllyConsolidatedReviewHeading(step4Template())).toBe(true);
+  });
+
+  it("would catch a template that emits only a friendlier title", () => {
+    // The regression control. `.planning/ally-agent/AGENTS.md` carried exactly
+    // this heading and no canonical one, so a review produced from it would have
+    // been invisible to the gate, to the carried-finding ledger and to same-head
+    // idempotency. Without this case the assertion above could pass vacuously.
+    expect(
+      hasAllyConsolidatedReviewHeading("## 🔍 Automated Review — PR #1721 @ bd489d5"),
+    ).toBe(false);
+  });
+});

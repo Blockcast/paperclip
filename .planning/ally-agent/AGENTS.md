@@ -172,7 +172,9 @@ Merge findings from both pipelines into one consolidated review. Follow this str
 }
 -->
 
-## 🔍 Automated Review — PR #<N> @ <sha-short>
+## Ally — Consolidated PR Review
+
+_🔍 Automated Review — PR #<N> @ <sha-short>_
 
 Reviewed head: <full 40-character lowercase HEAD_SHA>
 
@@ -202,6 +204,8 @@ Reviewed head: <full 40-character lowercase HEAD_SHA>
 ```
 
 **Dedup rule**: if both pipelines flag the same line for similar reasons, merge into one bullet with both `[pipeline]` tags. Don't double-count.
+
+**The `Ally — Consolidated PR Review` heading is mandatory, and it gates everything below.** `hasAllyConsolidatedReviewHeading` (`server/src/services/ally-review-detection.ts`) is the first thing the gate applies, and a body that fails it is not treated as a review at all — so a perfectly well-formed `ally-verdict:1` block inside it is never even looked for. That makes this the one field whose mismatch is silent on *both* sides: the block still parses in isolation, and the gate simply never sees the comment. Keep any friendlier title as secondary prose underneath, not in place of it.
 
 **`Reviewed head:` is mandatory, in every state.** It is the immutable attestation Step 2 reads, and it is the *only* thing that makes the skip work — the heading's `<sha-short>` is not a substitute. Emit the full 40-character lowercase SHA on its own line. Omit it and Step 2 counts zero forever, so every wake re-reviews the same head; that is one of the two ways this guard has previously gone inert, and it is invisible until duplicate reviews pile up.
 
