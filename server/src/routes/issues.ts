@@ -1915,7 +1915,12 @@ const INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE =
   "Keep working instead of moving to review, create a request_confirmation or ask_user_questions interaction, " +
   "link or request a pending approval, assign a human reviewer with assigneeUserId, set a typed executionState.currentParticipant through an execution policy, " +
   "or schedule an issue monitor for an external review/check with a nextCheckAt in the future — a lapsed or past-dated monitor is not a review path, " +
-  "because the strandedness sweep has already stopped counting it. After creating one of those review paths, retry the status update.";
+  "because the strandedness sweep has already stopped counting it. " +
+  "A live deliberate park (parkedDisposition / parkedUntil) is NOT on this list, and its absence is a decision rather than an oversight (BLO-33572): " +
+  "a park records that nobody is acting on this row until a stated deadline, which is the opposite of what in_review asserts, and it expires on its own — " +
+  "so admitting it here would reach in_review with no reviewer at all and merely defer this same refusal to the park's deadline. " +
+  "The strandedness sweep does count a live park, on any status, which is the point: park the row on the status that is actually true (todo/backlog) instead of moving it to review. " +
+  "After creating one of those review paths, retry the status update.";
 
 function isPendingIssueThreadInteractionReviewPath(interaction: { kind: string; status: string }) {
   return interaction.status === "pending" && REVIEW_PATH_INTERACTION_KINDS.has(interaction.kind);
@@ -3902,6 +3907,36 @@ export function issueRoutes(
     );
   }
 
+  /**
+   * The write-side half of "does anything own the next action on this row?".
+   *
+   * The read-side half is `hasExplicitWaitingPath` in
+   * services/recovery/issue-graph-liveness.ts. The two answer the same question and are
+   * deliberately NOT the same predicate: the sweep accepts a superset, and that asymmetry
+   * is safe in exactly one direction — everything this validator admits, the sweep counts.
+   * Keep it that way. PEN-2853 records the first instance (a lapsed monitor the sweep had
+   * stopped counting still cleared this gate); BLO-33572 is the second, below.
+   *
+   * BLO-33572 — a live deliberate park (`parkedUntil` in the future) is a sweep satisfier
+   * and is deliberately NOT a review path here, which is why this function never reads the
+   * column. The reasoning, since the asymmetry is surprising from the caller's side and the
+   * 422 previously listed five alternatives without saying why a sixth was missing:
+   *
+   * - The two claims are opposites, not degrees of the same claim. A park says "nobody is
+   *   acting on this, by decision of a named actor, until T." `in_review` says "someone
+   *   will act." Admitting the park would let a row reach `in_review` with no reviewer at
+   *   all — precisely the state this gate exists to prevent.
+   * - A park expires by design (that is what stops it decaying into permanent silence). So
+   *   accepting it would not answer the finding, only defer it to the park's deadline, at
+   *   which point the row is `in_review` with nothing and the sweep fires anyway.
+   * - The caller already has the disposition they want, on a different status. The sweep
+   *   honours a live park on `todo`/`backlog` too, so a parked row does not need `in_review`
+   *   — using it as a parking lot is the mistake, and the message now says so.
+   *
+   * This is the PEN-2853 sentence one predicate over: the sweep's leniency exists to avoid
+   * *seizing* a row nobody has had a chance to act on; it is not a licence to *assert* a
+   * review path.
+   */
   async function assertAgentInReviewReviewPath(input: {
     existing: {
       id: string;
