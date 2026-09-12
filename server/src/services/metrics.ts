@@ -2953,8 +2953,19 @@ export function recordHeartbeatRunFailed(
   // Per-issue labels are intentionally limited to the retry-loop failure this
   // monitor needs. Keeping them on every terminal failure would retain one
   // Prometheus counter series per historical issue for the process lifetime.
+  // The `error_code` gate alone supplies that bound: it is what confines the
+  // per-issue series to one failure mode.
+  //
+  // BLO-17953: this deliberately does NOT also gate on `isolationMode === "run"`.
+  // `resolveK8sRunIsolationIdentity` returns run | workspace | shared for every
+  // k8s adapter and all three are execution pods, so gating on "run" erased
+  // `agent_id` AND `issue_id` together — one boolean feeds both labels below —
+  // for the majority of the population the alert exists to catch (measured
+  // 2026-09-12: 54.1 of 96.2 pod-schedule failures over 24h sat in
+  // workspace/shared and were therefore unattributable). Narrowing by isolation
+  // mode never added a cardinality bound; the error code already was the bound.
   const isolationMode = normalizeIsolationMode(input.isolationMode);
-  const retainSourceIds = input.errorCode === "k8s_pod_schedule_failed" && isolationMode === "run";
+  const retainSourceIds = input.errorCode === "k8s_pod_schedule_failed";
   const labels = {
     agent_id: retainSourceIds && typeof input.agentId === "string" && input.agentId.length > 0
       ? input.agentId
