@@ -116,7 +116,30 @@ test("every job that sets up pnpm has headroom for a second attempt", async () =
       if (!text.includes(wrapperRef)) continue;
 
       const declared = text.match(/^ {4}timeout-minutes: (\d+)$/m);
-      if (!declared) {
+
+      // A matrix job may declare its budget PER VARIANT as
+      // `timeout-minutes: ${{ matrix.<key> }}` (pr.yml general_tests does, per
+      // BLO-33313). Resolve that against the job's own `include:` entries and
+      // hold EVERY variant to the floor -- six checks instead of one. Without
+      // this the literal-only regex below reads a per-variant budget as NO
+      // budget, which is both a false alarm and, worse, an invitation to
+      // silence it by listing the job in WRAPPER_JOBS_WITHOUT_A_BUDGET when it
+      // does in fact declare one. An expression that resolves to nothing still
+      // falls through to the must-be-listed branch, so this is not a loophole.
+      const perVariantKey = text.match(
+        /^ {4}timeout-minutes: \$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}$/m,
+      )?.[1];
+      const budgets = declared
+        ? [Number(declared[1])]
+        : perVariantKey
+          ? [
+              ...text.matchAll(
+                new RegExp(String.raw`^\s+${perVariantKey}: (\d+)$`, "gm"),
+              ),
+            ].map((m) => Number(m[1]))
+          : [];
+
+      if (budgets.length === 0) {
         // Not a free pass: absence has to be listed. Otherwise deleting the
         // line is the cheapest way to satisfy the floor, and inheriting
         // GitHub's 360m default is strictly worse merge-queue protection than
@@ -131,12 +154,15 @@ test("every job that sets up pnpm has headroom for a second attempt", async () =
         continue;
       }
 
-      assert.ok(
-        Number(declared[1]) >= MIN_TIMEOUT_MINUTES_FOR_RETRY,
-        `${name} job "${job.name}" sets up pnpm with timeout-minutes: ${declared[1]}, ` +
-          `below the ${MIN_TIMEOUT_MINUTES_FOR_RETRY}m needed for the retry budget — a stalled ` +
-          `registry would time the job out instead of retrying (BLO-28813)`,
-      );
+      for (const budget of budgets) {
+        assert.ok(
+          budget >= MIN_TIMEOUT_MINUTES_FOR_RETRY,
+          `${name} job "${job.name}" sets up pnpm with timeout-minutes: ${budget}` +
+            (perVariantKey ? ` (via matrix.${perVariantKey})` : "") +
+            `, below the ${MIN_TIMEOUT_MINUTES_FOR_RETRY}m needed for the retry budget — a stalled ` +
+            `registry would time the job out instead of retrying (BLO-28813)`,
+        );
+      }
     }
   }
 });
