@@ -5874,12 +5874,18 @@ describe("executeProcess (timeout classification)", () => {
     // until the descendant eventually exits.
     const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-stdio-drain-"));
     const markerPath = path.join(markerDir, "write-after-drain");
+    // The invariant is an ordering one: the call must return on the 2s
+    // PROCESS_STDIO_DRAIN_GRACE_MS rather than waiting for the descendant. Budget
+    // and descendant delay move together so that stays exact. 10s is 5x the grace
+    // and ~2x the 4.65s worst case observed under merge-queue load (BLO-22985) —
+    // a call that actually waits for the descendant still fails.
+    const DESCENDANT_WRITE_DELAY_MS = 10_000;
     const writerScript = `
       const fs = require("node:fs");
       setTimeout(() => {
         fs.writeSync(1, "late output after drain\\n");
         fs.writeFileSync(${JSON.stringify(markerPath)}, "survived");
-      }, 3500);
+      }, ${DESCENDANT_WRITE_DELAY_MS});
     `;
     const launcherScript = `
       const { spawn } = require("node:child_process");
@@ -5901,16 +5907,20 @@ describe("executeProcess (timeout classification)", () => {
 
       expect(result.code).toBe(0);
       expect(result.timedOut).toBe(false);
-      expect(Date.now() - started).toBeLessThan(3_500);
+      const elapsedMs = Date.now() - started;
+      expect(elapsedMs).toBeLessThan(DESCENDANT_WRITE_DELAY_MS);
 
       // Without destroying the captured streams, the descendant keeps stdout open,
       // writes successfully, and leaves the marker after this call has returned.
-      await new Promise((resolve) => setTimeout(resolve, 2_500));
+      // Wait past the descendant's own write deadline before asserting absence.
+      await new Promise((resolve) =>
+        setTimeout(resolve, DESCENDANT_WRITE_DELAY_MS - elapsedMs + 2_500),
+      );
       await expect(fs.stat(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await fs.rm(markerDir, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, 40_000);
 
   it("reports a clean exit unchanged", async () => {
     const result = await executeProcessForTests({
