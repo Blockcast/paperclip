@@ -449,16 +449,34 @@ async function advanceIssueLadder(
     // stays ahead of the state write — it dedups via originKind/originId (and,
     // cross-issue, via originFingerprint), so a partial failure retries next
     // sweep instead of silently never covering.
+    //
+    // Claiming the state first would trade this rung's race for a strictly
+    // worse one: `escalationComplete: true` with a failed `createCover` is
+    // short-circuited by the `state.escalationComplete` guard at the top of
+    // every later sweep, so the alert would never be covered at all — silence
+    // where a board escalation belongs. So the CAS stays behind the cover, and
+    // the case it cannot prevent is compensated below instead.
     await createCover(ctx, issue, companyId, state.alertname, config, now);
+    const claimed = await casAlertState(ctx, ref, state, { ...state, escalationAttempt: MAX_ATTEMPTS, escalationComplete: true, nextEscalationAt: null });
+    if (!claimed) {
+      // A webhook won the record while the cover was being created. If it was a
+      // resolve, its own cascade ran before the cover existed and so could not
+      // see it — leaving an open board-assigned cover for an alert that has
+      // already cleared. Re-running the cascade here against the cover we just
+      // created is the compensating close.
+      //
+      // Safe to run unconditionally on a resolved winner: the cascade is
+      // idempotent (`COALESCE(resolved_at, now())` plus the single-UPDATE
+      // closing claim), and it only cancels a cover whose every member has
+      // resolved — so a storm-batched sibling that is still firing correctly
+      // keeps the cover open. A re-fire rather than a resolve leaves it open
+      // too, which is what a firing alert should have.
+      const winner = await ctx.state.get(ref) as AlertStateRecord | null;
+      if (winner?.resolvedAt) await recordSourceResolvedAndCloseCovers(ctx, companyId, issue.id);
+      ctx.logger.info(`alert-escalation: abandoned cover rung for ${issue.identifier ?? issue.id}; alert state changed under the sweep`);
+      return;
+    }
     await ctx.issues.createComment(issue.id, "[alert-escalation] Agent chain exhausted while alert remains firing; created a [user-cover] escalation.", companyId);
-    // ponytail: cover creation deliberately stays ahead of this write (see
-    // above), so a resolve winning the CAS here leaves the cover open with an
-    // unresolved member — the resolve's own cascade ran before the cover
-    // existed. Strictly better than the pre-CAS behaviour, which left that
-    // same orphan AND resurrected `resolvedAt`. Closing it needs the cover
-    // cascade and cover creation to share a claim: BLO-33497, filed rather
-    // than reordering a durability property this diff did not set out to move.
-    await casAlertState(ctx, ref, state, { ...state, escalationAttempt: MAX_ATTEMPTS, escalationComplete: true, nextEscalationAt: null });
     return;
   }
 

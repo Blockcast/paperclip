@@ -576,14 +576,21 @@ Rejection is raised with `code: "state_precondition_failed"` (distinct from
 swap sits **ahead of** the rung's user-visible effects, so losing it aborts
 before anyone is paged rather than after.
 
-Known limitation: on the chain-exhausted rung the cover issue is deliberately
-created *before* this write (so a failure there retries on the next sweep
-rather than silently never covering). A resolve winning the swap at that exact
-point therefore leaves the cover open with an unresolved member, because the
-resolve's own cascade ran before the cover existed. That is strictly better
-than the pre-CAS behaviour — which left the same orphan *and* resurrected
-`resolvedAt` — but closing it needs cover creation and the resolve cascade to
-share a claim: tracked as BLO-33497.
+The chain-exhausted rung is the one exception to that ordering, and it is
+compensated rather than reordered. Its cover issue is deliberately created
+*before* the swap: claiming the state first would write
+`escalationComplete: true`, which the guard at the top of every later sweep
+short-circuits — so a `createCover` that then failed would leave the alert
+never covered at all, silence exactly where a board escalation belongs. A
+resolve winning the swap at that point would otherwise leave the cover open
+with an unresolved member, since the resolve's own cascade ran before the cover
+existed. The sweep therefore re-reads the winning record and, if it resolved
+the alert, runs the cover cascade itself
+(`recordSourceResolvedAndCloseCovers`). That is idempotent by construction and
+only cancels a cover whose every member has resolved, so a storm-batched
+sibling that is still firing keeps the cover open. The "chain exhausted"
+comment sits behind the swap, so no announcement is posted for an alert that
+has already cleared.
 
 ### Bearer rotation in a Kubernetes deployment
 
