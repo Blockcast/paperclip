@@ -1370,6 +1370,34 @@ function isTerminalDispatchRaceRun(
   );
 }
 
+// BLO-27463: `external_wait_yield` is the run cancelling ITSELF after it durably
+// persisted an external-service monitor (`routes/issues.ts`, the #1195 slot-yield
+// path). Nothing failed: the run gave its slot back precisely so the wait would not
+// hold a runtime seat, and the wake path it left behind is the monitor it just armed.
+//
+// The sweep read it as a lost execution path anyway, because the durable-wait-path
+// gate below only consults `hasPersistedDurableWaitPath` for a *succeeded* run. A
+// yield is `cancelled`, so an issue with a live monitor fell straight through to the
+// strand arms. Measured on BLO-33463 (2026-09-12, `critical`): yielded on a PR-checks
+// monitor, escalated `stranded_assigned_issue` and reassigned Ally -> CTO (12:36:34Z)
+// -> CEO (12:42:33Z), landing `blocked` with an empty blocker set. That state has no
+// wake path at all — `blocked` is skipped by the heartbeat and a monitor cannot hold
+// on it — so the escalation destroyed the one wake the run had correctly created, and
+// took the two issues this one `blocks` with it.
+//
+// #1195 shipped the yield half; this is the classification half, and they are
+// different layers.
+const EXTERNAL_WAIT_YIELD_ERROR_CODE = "external_wait_yield";
+
+function isExternalWaitYieldRun(
+  latestRun: LatestIssueRun,
+): latestRun is NonNullable<LatestIssueRun> {
+  return (
+    latestRun?.status === "cancelled" &&
+    readNonEmptyString(latestRun.errorCode) === EXTERNAL_WAIT_YIELD_ERROR_CODE
+  );
+}
+
 // BLO-19160: the outcome of observing a checkout-handover marker when the
 // adopter can no longer prove continuity. `markerRunId` is the handover run —
 // the newest run genuinely scoped to this issue, so the honest retry parent.
@@ -8255,8 +8283,17 @@ export function recoveryService(
         result.skipped += 1;
         continue;
       }
+      // BLO-27463: a deliberate external-wait yield is admitted here on the same terms
+      // as a succeeded run. Both are the assignee leaving the issue attended rather
+      // than broken, and neither is positive evidence that anything failed — which is
+      // the line `hasPersistedDurableWaitPath`'s docstring draws for consulting it.
+      //
+      // The predicate is still required to hold: if the monitor the yield armed has
+      // since lapsed (and no PR/blocker path replaces it), there really is no wake left
+      // and the strand arms below stay reachable. So this suppresses the misclassified
+      // population without creating a class of row that can never be recovered.
       if (
-        latestRun?.status === "succeeded" &&
+        (latestRun?.status === "succeeded" || isExternalWaitYieldRun(latestRun)) &&
         await hasPersistedDurableWaitPath(
           issue,
           lapsedMonitorGraceMs,
