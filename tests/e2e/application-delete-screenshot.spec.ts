@@ -4,6 +4,13 @@ import { expect, test } from "@playwright/test";
 // table now redirects into Apps, so capture the current app removal
 // confirmation on the app Advanced tab instead.
 test("captures the current app removal confirmations", async ({ page }) => {
+  // Two full app-creation -> Advanced -> remove flows plus two full-page
+  // screenshots in one test. The Apps Advanced page alone takes ~20s to
+  // bootstrap on CI, so this does not fit the 60s suite default and fails on
+  // whichever await the clock lands in (BLO-33320). 240s matches the sibling
+  // specs covering the same routes (app-not-connected, apps-dark-mode-shots).
+  test.setTimeout(240_000);
+
   const flags = await page.request.patch("/api/instance/settings/experimental", { data: { enableApps: true } });
   expect(flags.ok(), `enable apps failed ${flags.status()}: ${await flags.text()}`).toBe(true);
 
