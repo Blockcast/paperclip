@@ -339,19 +339,14 @@ export async function resolveCompanyScope(
  * configured for this plugin, each with its own invocation scope, rather
  * than a process-wide dispatch that only ever worked for one company).
  *
- * Unlike `resolveCompanyScope`, a missing or misrouted config for this
- * dispatch resolves to `null` instead of throwing — the escalation sweep is
- * a scheduled job with no inbound delivery to retry against, so those cases
- * are a "skip and log" condition, not a retryable failure. A `ctx.config.get`
- * RPC failure still propagates (the caller lets it fail the job run so it
- * shows up in `plugin_job_runs`, rather than silently skipping a company on
- * a transient blip). This also never resolves a bearer token — the sweep
- * only reads and updates issues, it does not authenticate inbound webhook
- * traffic.
+ * Unlike `resolveCompanyScope`, this does not resolve a bearer token. The
+ * sweep only reads and updates issues, it does not authenticate inbound
+ * webhook traffic. A missing or misrouted config returns `null` so the worker
+ * can add job-specific context before throwing and recording a failed run.
  *
  * Returns `null` when there is no stored config for `companyId`, or when the
- * stored config's `defaultCompanyId` names a *different* tenant (a
- * misconfigured row — refuse rather than sweep under the wrong tenant).
+ * stored config's `defaultCompanyId` names a *different* tenant. The caller
+ * must treat either result as a failure, never as a successful no-op.
  */
 export async function resolveEscalationSweepConfig(
   ctx: PluginContext,

@@ -25,6 +25,7 @@ import { handleWebhook, reconcileAbandonedAggregateFences } from "./webhook-hand
 import { runAlertEscalationSweep } from "./escalation.js";
 import {
   authenticateWebhook,
+  CompanyScopeUnavailableError,
   resolveCompanyScope,
   resolveEscalationSweepConfig,
 } from "./config-scope.js";
@@ -55,25 +56,18 @@ export const plugin = definePlugin({
     ctx.jobs.register("check-alert-escalations", async (job: PluginJobContext) => {
       const companyId = job.companyId;
       if (!companyId) {
-        // The host dispatches once per company configured for this plugin
-        // (BLO-20957) — on the scheduled path *and* on manual/retry "run
-        // now" triggers, both of which fan out per company and stamp
-        // `job.companyId`. So this branch no longer fires for a normal
-        // trigger; it means the plugin has zero configured companies (a
-        // successful empty enumeration), which for an escalation sweep is
-        // genuinely nothing to do. Warn rather than no-op silently so the
-        // "configured nowhere" case is still visible.
-        ctx.logger.warn(
-          "paperclip-plugin-alertmanager: escalation sweep skipped — dispatch carried no company scope (plugin has no configured companies)",
+        // The scheduler dispatches once per configured company. An
+        // instance-scoped dispatch therefore means the registry returned an
+        // empty set, which cannot run this company-scoped sweep safely.
+        throw new CompanyScopeUnavailableError(
+          "paperclip-plugin-alertmanager: escalation sweep cannot run without a company scope",
         );
-        return;
       }
       const config = await resolveEscalationSweepConfig(ctx, companyId);
       if (!config) {
-        ctx.logger.warn(
-          `paperclip-plugin-alertmanager: escalation sweep skipped for company ${companyId} — no stored config`,
+        throw new CompanyScopeUnavailableError(
+          `paperclip-plugin-alertmanager: escalation sweep cannot run for company ${companyId} — no matching stored config`,
         );
-        return;
       }
       await runAlertEscalationSweep(ctx, config);
     });
