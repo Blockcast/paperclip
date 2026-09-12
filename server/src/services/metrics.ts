@@ -2105,10 +2105,11 @@ function ensureRegistry(): {
       help:
         "Count of heartbeat runs that reached terminal status 'failed', labeled by agent, source issue, "
         + "adapter, error_code, invocation_source (wake reason), and bounded isolation_mode. Used to "
-        + "compute webhook-driven PR-review failure rate and detect repeated run-isolated execution-pod "
-        + "failures for one issue (BLO-7457 / BLO-9147 / BLO-17953). Agent and issue identifiers are "
-        + "retained only for run-isolated k8s_pod_schedule_failed; other failures collapse them to "
-        + "bounded fallbacks.",
+        + "compute webhook-driven PR-review failure rate and detect repeated execution-pod "
+        + "failures (BLO-7457 / BLO-9147 / BLO-17953). Agent and issue identifiers are "
+        + "retained for k8s_pod_schedule_failed in every isolation mode (run, workspace and shared are "
+        + "all execution pods); other error codes collapse them to bounded fallbacks. Note issue_id is "
+        + "legitimately 'none' for stateless PR-review runs, which are issue-less by construction.",
       labelNames: ["agent_id", "issue_id", "adapter", "error_code", "invocation_source", "isolation_mode"],
       registers: [registry],
     });
