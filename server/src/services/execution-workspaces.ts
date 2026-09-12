@@ -778,6 +778,7 @@ function toExecutionWorkspace(
   runtimeServices: WorkspaceRuntimeService[] = [],
 ): ExecutionWorkspace {
   const metadata = (row.metadata as Record<string, unknown> | null) ?? null;
+  const config = readExecutionWorkspaceConfig(metadata);
   return {
     id: row.id,
     companyId: row.companyId,
@@ -801,7 +802,8 @@ function toExecutionWorkspace(
     closedAt: row.closedAt ?? null,
     cleanupEligibleAt: row.cleanupEligibleAt ?? null,
     cleanupReason: row.cleanupReason ?? null,
-    config: readExecutionWorkspaceConfig(metadata),
+    config,
+    hasWorkspaceRuntimeConfig: Boolean(config?.workspaceRuntime),
     metadata,
     runtimeServices,
     createdAt: row.createdAt,

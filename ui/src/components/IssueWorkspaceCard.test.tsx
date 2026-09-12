@@ -62,6 +62,7 @@ function createExecutionWorkspace(overrides: Partial<ExecutionWorkspace> = {}): 
     closedAt: null,
     cleanupEligibleAt: null,
     cleanupReason: null,
+    hasWorkspaceRuntimeConfig: false,
     config: {
       environmentId: "env-workspace",
       provisionCommand: null,
