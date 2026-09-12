@@ -5583,7 +5583,12 @@ describeEmbeddedPostgres("productivity review service", () => {
           companyId: seeded.companyId,
           thresholds: { monitorLapseServiceGraceMs: 60_000, longActiveMs: 60_000 },
         }),
-        1_000,
+        // Hang guard, not a latency budget: this catches the enqueue blocking
+        // forever on the row lock it takes below. Happy path is tens of ms; the
+        // old 1_000 tripped under merge-queue shard contention (BLO-22985, 3x).
+        // 15s stays well under the 60s vitest testTimeout so the labelled error
+        // still beats the generic timeout, which is why the guard exists.
+        15_000,
         "productivity review wake enqueue row-lock replay",
       ),
     ).resolves.toMatchObject({ created: 1 });
