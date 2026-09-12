@@ -5,7 +5,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { pluginStateStore } from "../services/plugin-state-store.js";
+import { STATE_PRECONDITION_FAILED_CODE, pluginStateStore } from "../services/plugin-state-store.js";
 import { GBRAIN_RECALL_METRIC, __resetMetricsForTest, renderMetrics } from "../services/metrics.js";
 // Imported from the gbrain plugin's real producer on purpose (BLO-25892). The
 // server-side extractor in plugin-state-store.ts duck-types `value.status` out
@@ -103,6 +103,55 @@ describeEmbeddedPostgres("plugin state store", () => {
       expect(result.rows.map((row) => row.stateKey)).toEqual(expected);
       expect(result.hasMore).toBe(false);
     }
+  });
+
+  /**
+   * BLO-20650 — `expectedValue` turns the upsert into a compare-and-swap, so a
+   * speculative reader (the alertmanager escalation sweep) cannot write a
+   * stale record back over a concurrent authoritative write (an inbound
+   * resolve webhook). Exercised against real Postgres because the guard is a
+   * `jsonb` equality in the statement's own `WHERE`, and nothing above this
+   * layer can tell a comparison that is wrong from one that never ran.
+   */
+  const casRef = { scopeKind: "company" as const, scopeId: "company-1", stateKey: "alert:fp-1" };
+  const readCas = (store: ReturnType<typeof pluginStateStore>, stateKey = casRef.stateKey) =>
+    store.get(pluginId, casRef.scopeKind, stateKey, { scopeId: casRef.scopeId });
+
+  it("applies an ifMatch write only while the stored value is unchanged (BLO-20650)", async () => {
+    const store = pluginStateStore(db);
+    const initial = { resolvedAt: null, escalationAttempt: 0, alertname: "SyntheticAlert" };
+    await store.set(pluginId, { ...casRef, value: initial });
+
+    // Swap against a current read lands.
+    await store.set(pluginId, { ...casRef, value: { ...initial, escalationAttempt: 1 } }, null, initial);
+    expect(await readCas(store)).toEqual({ ...initial, escalationAttempt: 1 });
+
+    // A second writer still holding the now-stale read is refused and changes
+    // nothing. This is the concurrent-webhook case the sweep has to lose.
+    await expect(
+      store.set(pluginId, { ...casRef, value: { ...initial, escalationAttempt: 2 } }, null, initial),
+    ).rejects.toMatchObject({ details: { code: STATE_PRECONDITION_FAILED_CODE } });
+    expect(await readCas(store)).toEqual({ ...initial, escalationAttempt: 1 });
+  });
+
+  it("compares ifMatch structurally, and refuses a missing row (BLO-20650)", async () => {
+    const store = pluginStateStore(db);
+    await store.set(pluginId, { ...casRef, value: { a: 1, b: { c: 2 } } });
+
+    // jsonb `=` compares the normalized document, so a differently-ordered but
+    // equal object still matches. That matters because the caller's `ifMatch`
+    // has been through a JSON round-trip over the worker RPC and it does not
+    // control key order.
+    await store.set(pluginId, { ...casRef, value: { ok: true } }, null, { b: { c: 2 }, a: 1 });
+    expect(await readCas(store)).toEqual({ ok: true });
+
+    // No row at all: the value the caller read is gone, so writing it back
+    // would be a lost update. Refuse rather than silently resurrect it — an
+    // `onConflictDoUpdate ... setWhere` would have INSERTed here.
+    await expect(
+      store.set(pluginId, { ...casRef, stateKey: "alert:absent", value: { x: 1 } }, null, { x: 0 }),
+    ).rejects.toMatchObject({ details: { code: STATE_PRECONDITION_FAILED_CODE } });
+    expect(await readCas(store, "alert:absent")).toBeNull();
   });
 
   it("increments the gbrain recall metric on a run-scoped gbrain-context write, and not on other writes (BLO-25892)", async () => {

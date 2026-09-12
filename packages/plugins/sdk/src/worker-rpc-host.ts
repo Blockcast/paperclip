@@ -688,7 +688,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         async set(
           input: ScopeKey,
           value: unknown,
-          options?: { fencing?: PluginFencingPrecondition },
+          options?: { fencing?: PluginFencingPrecondition; ifMatch?: unknown },
         ): Promise<void> {
           await callHost("state.set", {
             scopeKind: input.scopeKind,
@@ -697,6 +697,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             stateKey: input.stateKey,
             value,
             fencing: options?.fencing,
+            ifMatch: options?.ifMatch,
           });
         },
 

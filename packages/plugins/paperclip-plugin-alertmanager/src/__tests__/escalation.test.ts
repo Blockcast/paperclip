@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { PLUGIN_STATE_PRECONDITION_FAILED_CODE, type PluginContext } from "@paperclipai/plugin-sdk";
 import { COVER_ORIGIN, escalationDeadlineMs, recordSourceResolvedAndCloseCovers, runAlertEscalationSweep } from "../escalation.js";
 import { handleFiring, handleResolved } from "../webhook-handler.js";
 import { DEFAULT_ISSUE_ROUTE_MAP } from "../constants.js";
@@ -27,6 +27,19 @@ const FIRING_FENCE_ARG = {
     }),
   },
 };
+
+/**
+ * BLO-20650 — every sweep-side `ctx.state.set` is a compare-and-swap against
+ * the exact record the sweep read, so those calls now take a third argument
+ * too.
+ *
+ * Pinned for the same reason as `FIRING_FENCE_ARG`: relaxing this to
+ * `expect.anything()`, or dropping the argument so vitest only checks a
+ * prefix, would leave every assertion below green with the guard removed — and
+ * the guard is the entire fix. Passing the wrong `ifMatch` is as broken as
+ * passing none, because the host would reject a write that should have landed.
+ */
+const casArg = (previous: unknown) => ({ ifMatch: previous });
 
 const alert = (severity = "critical"): AlertmanagerAlert => ({
   status: "firing",
@@ -259,11 +272,12 @@ describe("alert escalation", () => {
     await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
     // critical default = 30m: next rung fires at 01:30, so the chain climbs one
     // level per deadline period rather than one level per minute-sweep.
-    expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 1, nextEscalationAt: "2026-07-11T01:30:00.000Z" }));
-    const stored = sweepContext({ ...due, escalationAttempt: 1, escalationIntervalMs: 5 * 60_000 });
+    expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 1, nextEscalationAt: "2026-07-11T01:30:00.000Z" }), casArg(due));
+    const storedState = { ...due, escalationAttempt: 1, escalationIntervalMs: 5 * 60_000 };
+    const stored = sweepContext(storedState);
     await runAlertEscalationSweep(stored.ctx, config(), new Date("2026-07-11T01:00:00Z"));
     // an interval captured at firing time (e.g. route override) wins over severity config
-    expect(stored.mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 2, nextEscalationAt: "2026-07-11T01:05:00.000Z" }));
+    expect(stored.mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 2, nextEscalationAt: "2026-07-11T01:05:00.000Z" }), casArg(storedState));
   });
 
   it("creates one board-owned user-cover issue at the top of chain, with durable membership", async () => {
@@ -271,7 +285,7 @@ describe("alert escalation", () => {
     const { ctx, mocks, store } = sweepContext(state, null);
     await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
     expect(mocks.issues.create).toHaveBeenCalledWith(expect.objectContaining({ title: expect.stringContaining("[user-cover]"), assigneeUserId: "board-1", originId: "issue-1" }));
-    expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationComplete: true, nextEscalationAt: null }));
+    expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationComplete: true, nextEscalationAt: null }), casArg(state));
     expect(store.covers.size).toBe(1);
     const [coverRow] = [...store.covers.values()];
     expect(store.members.get(`${coverRow.cover_issue_id}:issue-1`)?.resolved_at).toBeNull();
@@ -367,7 +381,7 @@ describe("alert escalation", () => {
     await expect(runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"))).resolves.toBeUndefined();
     // live incident 2026-07-11: the throw used to abort before the state
     // write, repeating rung 1 (comment + wake) every minute-sweep forever
-    expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 1 }));
+    expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 1 }), casArg(due));
     expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
     expect(mocks.logger.warn).toHaveBeenCalled();
   });
@@ -392,7 +406,7 @@ describe("alert escalation", () => {
     });
     await expect(runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"))).resolves.toBeUndefined();
     // the healthy issue behind the broken one still advanced
-    expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 1 }));
+    expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 1 }), casArg(due));
     expect(mocks.logger.warn).toHaveBeenCalledWith(expect.stringContaining("BLO-0"));
   });
 
@@ -687,6 +701,171 @@ describe("BLO-15982 pod_pending route: 240-minute escalation deadline end-to-end
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ escalationAttempt: 1, nextEscalationAt: "2026-07-11T05:00:00.000Z" }),
+      casArg(dueState),
     );
+  });
+});
+
+/**
+ * BLO-20650 — the escalation sweep and the inbound webhook are two concurrent
+ * read-modify-writers of one `(company, fingerprint)` alert-state record, and
+ * the sweep's read goes stale across several awaits (`listComments`,
+ * `agents.get`) before it writes. Unguarded, the sweep's `{ ...state, ... }`
+ * spread writes a stale `resolvedAt: null` back over a resolution that landed
+ * in that window, and the ladder then replays a rung — paging someone about an
+ * alert that has already cleared, permanently, because nothing re-derives the
+ * resolution afterwards.
+ */
+describe("BLO-20650 concurrent webhook + sweep on one alert-state record", () => {
+  /**
+   * In-memory model of `plugin_state` for a single record, carrying the host's
+   * compare-and-swap semantics (`server/src/services/plugin-state-store.ts`).
+   *
+   * The comparison and the write have no `await` between them — same reasoning
+   * as `buildFakeAlertmanagerStore` above, and same reasoning as the real
+   * single-statement guarded `UPDATE`: a concurrent caller cannot land between
+   * check and write. Omitting `ifMatch` writes unconditionally, which is
+   * exactly how the authoritative webhook path behaves.
+   */
+  function buildFakeStateStore(initial: AlertStateRecord) {
+    let stored: AlertStateRecord = initial;
+    return {
+      get: vi.fn(async () => stored),
+      set: vi.fn(async (_ref: unknown, value: AlertStateRecord, options?: { ifMatch?: unknown }) => {
+        if (options && "ifMatch" in options && JSON.stringify(options.ifMatch) !== JSON.stringify(stored)) {
+          // Mirrors the host rejection, including the machine-readable code the
+          // plugin discriminates on. `data` is the shape that survives the
+          // worker RPC boundary.
+          throw Object.assign(new Error("Plugin state changed since it was read; refusing the write"), {
+            data: { code: PLUGIN_STATE_PRECONDITION_FAILED_CODE },
+          });
+        }
+        stored = value;
+      }),
+      read: () => stored,
+    };
+  }
+
+  const unresolved = (): AlertStateRecord => ({
+    paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null,
+    assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical",
+    firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null,
+    nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 0,
+  });
+
+  /** A `handleResolved`-ready ctx sharing one state store with the sweep. */
+  function resolveContext(store: ReturnType<typeof buildFakeStateStore>) {
+    return {
+      state: store,
+      issues: {
+        get: vi.fn(async () => ({ id: "issue-1", status: "todo" })),
+        update: vi.fn(async () => ({})),
+        createComment: vi.fn(async () => ({})),
+      },
+      db: { namespace: "alertmanager", execute: vi.fn(async () => ({ rowCount: 0 })), query: vi.fn(async () => []) },
+      events: { emit: vi.fn() },
+      metrics: { write: vi.fn() },
+      logger: { info: vi.fn(), warn: vi.fn() },
+    } as unknown as PluginContext;
+  }
+
+  const resolvedAlert = { ...alert(), status: "resolved" as const, endsAt: "2026-07-11T02:00:00Z" };
+
+  it("keeps the resolution when it lands mid-rung, and announces no rung", async () => {
+    const store = buildFakeStateStore(unresolved());
+    const { ctx, mocks } = sweepContext(unresolved());
+    mocks.state = store as never;
+
+    // Land the webhook resolve at an await that sits between the sweep's read
+    // and its write — precisely the window the race lives in. Driving it from
+    // inside the sweep's own call stack makes the interleaving exact, rather
+    // than depending on how many microtasks the sweep happens to take to get
+    // here.
+    mocks.issues.listComments = vi.fn(async () => {
+      await handleResolved(resolveContext(store), config(), resolvedAlert);
+      return [];
+    });
+
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    // The resolution survives. This is the assertion that fails if the
+    // compare-and-swap is reverted to a plain set().
+    expect(store.read().resolvedAt).toBe("2026-07-11T02:00:00Z");
+    expect(store.read().escalationComplete).toBe(true);
+    expect(store.read().escalationAttempt).toBe(0);
+    // And the rung was abandoned *before* its user-visible effects, so nobody
+    // was paged about an alert that had already cleared.
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+    expect(mocks.issues.requestWakeup).not.toHaveBeenCalled();
+  });
+
+  it("keeps the resolution in the opposite order, when the rung lands first", async () => {
+    const store = buildFakeStateStore(unresolved());
+    const { ctx, mocks } = sweepContext(unresolved());
+    mocks.state = store as never;
+
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    expect(store.read().escalationAttempt).toBe(1); // uncontended: the rung advances normally
+    expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(1);
+
+    await handleResolved(resolveContext(store), config(), resolvedAlert);
+
+    expect(store.read().resolvedAt).toBe("2026-07-11T02:00:00Z");
+    expect(store.read().nextEscalationAt).toBeNull();
+    expect(store.read().escalationComplete).toBe(true);
+  });
+
+  /**
+   * The chain-exhausted rung cannot claim the state before it acts: an
+   * `escalationComplete: true` written ahead of a failing `createCover` is
+   * short-circuited by the guard at the top of every later sweep, so the alert
+   * would never be covered at all. The cover therefore stays ahead of the CAS,
+   * and the race that ordering leaves open is compensated instead — the sweep
+   * closes the cover it just created once it learns the alert resolved under it.
+   */
+  it("closes the cover it just created when a resolve wins the chain-exhausted swap", async () => {
+    const exhausted: AlertStateRecord = { ...unresolved(), escalationAttempt: 1 };
+    const store = buildFakeStateStore(exhausted);
+    // reportsTo: null -> the chain is exhausted, so this sweep takes the cover rung.
+    const { ctx, mocks, store: covers } = sweepContext(exhausted, null);
+    mocks.state = store as never;
+
+    // Land the resolve *inside* `createCover`: `access.members.list` is an
+    // await there, after the membership guard and before the cover issue
+    // exists — so the resolve's own cascade finds no membership to close,
+    // which is exactly why the cover would otherwise be orphaned.
+    mocks.access.members.list = vi.fn(async () => {
+      await handleResolved(resolveContext(store), config(), resolvedAlert);
+      return [{ principalType: "user", principalId: "board-1", status: "active", membershipRole: "owner" }];
+    });
+
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    // The resolution survives, as on every other rung.
+    expect(store.read().resolvedAt).toBe("2026-07-11T02:00:00Z");
+    // No "chain exhausted while alert remains firing" announcement for an
+    // alert that had already cleared: the comment now sits behind the CAS.
+    expect(mocks.issues.createComment).not.toHaveBeenCalledWith(
+      "issue-1", expect.stringContaining("Agent chain exhausted"), "company-1",
+    );
+    // And the cover created in that window is closed rather than left sitting
+    // in a human queue. Both assertions fail without the compensating cascade:
+    // the membership stays open, which in turn blocks the closing claim, so
+    // `reconcileStuckCovers` cannot clean it up either.
+    const [coverRow] = [...covers.covers.values()];
+    expect(covers.members.get(`${coverRow.cover_issue_id}:issue-1`)?.resolved_at).not.toBeNull();
+    expect(coverRow.cancelled_at).not.toBeNull();
+  });
+
+  it("refuses a stale sweep write against a record any other writer touched", async () => {
+    // Same guard, non-resolve mutation: any concurrent rewrite must void the
+    // sweep's read. Otherwise this would be a special case for one field
+    // rather than a compare-and-swap.
+    const store = buildFakeStateStore(unresolved());
+    const stale = unresolved();
+    await expect(
+      store.set(null, { ...stale, escalationAttempt: 9 }, { ifMatch: { ...stale, lastFiredAt: "a-concurrent-re-fire" } }),
+    ).rejects.toMatchObject({ data: { code: PLUGIN_STATE_PRECONDITION_FAILED_CODE } });
+    expect(store.read().escalationAttempt).toBe(0);
   });
 });
