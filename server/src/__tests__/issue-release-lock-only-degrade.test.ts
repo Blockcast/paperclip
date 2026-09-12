@@ -211,6 +211,20 @@ describeEmbeddedPostgres("issue release: lock-only degrade for a non-assignee lo
   it("AC-3: does not cancel the new assignee's run (the cancelStaleIssueContextRuns cascade)", async () => {
     const { companyId, agentA, agentB, issueId, runA } = await seedStalePair();
     const bRun = await seedQueuedRunForIssue(companyId, agentB, issueId);
+    // A third agent's queued run, also targeting this issue, owned by neither
+    // the lock holder nor the new assignee. The degrade skips the cascade
+    // OUTRIGHT rather than threading a `keepRunId`, so collateral queued work
+    // is left alone wholesale — not spared case by case.
+    //
+    // This is the assertion that separates the shipped design from the
+    // alternative the service comment rejects. `keepRunId` is singular: an
+    // implementation that threaded B's run through it would spare B and reap
+    // this one, passing every other assertion in this file.
+    const strangerRun = await seedQueuedRunForIssue(
+      companyId,
+      await seedAgent(companyId, "Agent E"),
+      issueId,
+    );
 
     await issueService(db).release(issueId, agentA, runA);
 
@@ -224,6 +238,14 @@ describeEmbeddedPostgres("issue release: lock-only degrade for a non-assignee lo
 
     const bWakeAfter = await readWake(bRun.wakeupRequestId);
     expect(bWakeAfter?.status).toBe("queued");
+
+    const strangerRunAfter = await readRun(strangerRun.runId);
+    expect(strangerRunAfter?.status).toBe("queued");
+    expect(strangerRunAfter?.finishedAt).toBeNull();
+    expect(strangerRunAfter?.errorCode).toBeNull();
+
+    const strangerWakeAfter = await readWake(strangerRun.wakeupRequestId);
+    expect(strangerWakeAfter?.status).toBe("queued");
   });
 
   it("AC-4: still refuses an actor that holds no lock and is not the assignee", async () => {
