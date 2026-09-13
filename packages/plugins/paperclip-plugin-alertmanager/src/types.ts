@@ -199,9 +199,28 @@ export interface AlertStateRecord {
   lastFiredAt: string;
   resolvedAt: string | null;
   /**
+   * When the plugin itself last closed this issue — i.e. a resolve delivery's
+   * `status: "cancelled"` patch actually landed (BLO-31736).
+   *
+   * This is the authorship record that `resolvedAt` was previously (and
+   * wrongly) read as. `resolvedAt` says only "the alert cleared", which is
+   * also true when the plugin's terminal guard *declined* to close an issue an
+   * agent had already closed by hand — so keying the re-fire decision on it
+   * resurrected agent-authored `done` rows one cycle later and made
+   * BLO-24234's operator suppression unreachable for any alert that had ever
+   * resolved.
+   *
+   * `null` means the last terminal transition we know about was NOT the
+   * plugin's, so an operator close stands. `undefined` means the row predates
+   * this field and authorship is genuinely unknown — see `closedByPlugin` in
+   * webhook-handler.ts for how that is resolved without muting live alerts.
+   */
+  pluginClosedAt?: string | null;
+  /**
    * When the plugin FIRST saw this fingerprint re-fire against an issue that
-   * an operator (not the plugin) had closed — i.e. terminal status with no
-   * `resolvedAt` (BLO-24234). Anchors the `operatorSuppressionHours` window.
+   * an operator (not the plugin) had closed — i.e. terminal status that
+   * `closedByPlugin` does not attribute to the plugin (BLO-24234, BLO-31736).
+   * Anchors the `operatorSuppressionHours` window.
    *
    * Cleared whenever the issue is observed open again, so a close/re-open
    * cycle restarts the window rather than carrying a stale anchor forward.

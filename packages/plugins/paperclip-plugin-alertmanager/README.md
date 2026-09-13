@@ -393,13 +393,45 @@ branch is decided by `decideRefire()` in `webhook-handler.ts` and each one emits
 a distinct metric, so "the alert delivered but I see no issue" is answerable
 from telemetry rather than by reading the issue body's `Started:` timestamp.
 
-| Issue status at re-fire | `resolvedAt` in state | Outcome | Metric |
+| Issue status at re-fire | Closed by the plugin? | Outcome | Metric |
 |---|---|---|---|
 | open (any non-terminal) | — | refresh description | `alertmanager.firing.deduped` |
-| `done` / `cancelled` | set (plugin closed it on resolve) | re-open → `todo` | `alertmanager.firing.reopened` |
-| `done` / `cancelled` | null (**operator** closed it) — inside window | stay closed, stay quiet | `alertmanager.firing.suppressed` |
-| `done` / `cancelled` | null — window expired | re-open → `todo` + comment | `alertmanager.firing.suppression_expired` |
+| `cancelled` | yes — `pluginClosedAt` set | re-open → `todo` | `alertmanager.firing.reopened` |
+| `cancelled` with `pluginClosedAt` **absent** | unknown — legacy row, or an aggregate member whose close a sibling landed; falls back to `resolvedAt` | re-open → `todo` | `alertmanager.firing.reopened` |
+| `done`, or `cancelled` with `pluginClosedAt: null` | no (**operator** closed it) — inside window | stay closed, stay quiet | `alertmanager.firing.suppressed` |
+| as above — window expired | no | re-open → `todo` + comment | `alertmanager.firing.suppression_expired` |
 | issue unreadable / deleted | — | leave state intact | `alertmanager.firing.issue_missing` |
+
+**Authorship is recorded, not inferred (BLO-31736).** That middle column used to
+read `resolvedAt in state`, and the code matched it. It was wrong: `resolvedAt`
+says only *"the alert last cleared"*, which is also true when the resolve path's
+terminal guard **declined** to close an issue an agent had already closed by
+hand. So a deliberate `done` was read as "the plugin closed this", re-opened to
+`todo` on the next re-fire, and cancelled by the resolve after it — once per
+fire/clear cycle, indefinitely, ending in a plugin-authored `cancelled` that
+looks like a normal auto-close on every triage surface. It also made the
+suppression row above unreachable for any alert that had *ever* resolved, i.e.
+every flapping alert — precisely the ones operators close by hand.
+
+`pluginClosedAt` is now written only on the branch where the plugin's own
+`cancelled` patch actually landed, and cleared by any firing delivery that
+observed the issue's status. Two details worth knowing when reading the table:
+
+- **`done` is never a close of ours.** The plugin's only status writes are
+  `todo` and `cancelled`, so a `done` row was always dispositioned by someone
+  else — true even for state rows written before this field existed.
+- **An absent `pluginClosedAt` means authorship is unknown**, and falls back to
+  `resolvedAt`. Two rows land there: one written before the field existed, and
+  one belonging to an **aggregate** whose close this member deferred to a
+  sibling. The second case is why the record cannot simply be `null` when our
+  own cancel did not land here: `pluginClosedAt` is per-fingerprint, but the
+  close it records happens to the aggregate's *shared* issue, and only the last
+  member to resolve lands it. A non-last member that kept asserting `null` read
+  its own aggregate's close as an operator close and muted the next genuine
+  recurrence.
+  The fallback is asymmetric on purpose: reading our close as an operator's
+  would *mute a live recurring alert* for a whole window, while the reverse
+  costs one unwanted re-open. Legacy rows drain on their first firing.
 
 `alertmanager.firing.deduped` is still emitted on **every** re-fire, so existing
 dashboards keep working; the metrics above narrate what the re-fire actually did.
