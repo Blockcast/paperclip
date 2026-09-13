@@ -891,23 +891,152 @@ const WITHHELD_RUN_STATE_CONTENT_KEYS = [
 ] as const;
 
 /**
- * `resultJson` is NOT all-or-nothing, and withholding the whole blob would
- * break live fleet diagnosis: PEN-2501 switched its throttle-family filter to
+ * `resultJson` is NOT all-or-nothing, and withholding the whole blob would break
+ * live fleet diagnosis: PEN-2501 switched its throttle-family filter to
  * `resultJson.penstockReason`, and PEN-3129 / PEN-2513 read capacity refusals
- * out of it. So project *inside* the object — withhold the free-text keys the
- * adapter fills from run output, keep every machine key.
+ * out of it. So project *inside* the object.
  *
- * `error` is deliberately absent from this list: the PEN-3140 decision names
- * "error text" on the company-readable side, and the same reasoning that keeps
- * `error` / `errorCode` readable at the top level applies inside the blob.
+ * **Why a denylist could not work here.** `resultJson` is an open
+ * `Record<string, unknown>` written straight from a third party's own result
+ * event — four adapter families persist it verbatim (`claude-local` and
+ * `claude_k8s` `parse.ts`, `gemini-local/execute.ts:717`, and the
+ * `openclaw-gateway` JSON-RPC payloads) — and PEN-3153 establishes that
+ * **nothing scrubs it on the write path at all**. A denylist of the five
+ * free-text keys we happen to know therefore fails open twice over: an adapter
+ * that renames its output field, or a new adapter that invents one, writes
+ * unscrubbed run output under a key no list mentions and the peer projection
+ * passes it through. Ally's review of PR #1741 called this out; it is the same
+ * open-`Record` boundary failure as door #12 / #15.
+ *
+ * **Why a pure key allowlist could not work either.** A census of every reader
+ * of the blob found ~90 live keys across those four adapter families plus the
+ * vendor passthrough keys nobody enumerates (`uuid`, `num_turns`,
+ * `duration_ms`, `modelUsage`, …), and five more that do not exist in the
+ * database at all — `truncated`, `truncationReason`, `originalSizeBytes`,
+ * `stdoutTruncated`, `stderrTruncated` are synthesized into the wire object by
+ * the oversize-blob SQL in `heartbeat.ts:3938-3972`. A key allowlist silently
+ * drops every key it forgets, and that list is not knowable from this file.
+ *
+ * **So the rule is value-shaped, not key-shaped**, which is the second option
+ * the review offered. The exposure is *prose*, and prose is a string:
+ *
+ * - a string value is kept only if its key is named below,
+ * - numbers, booleans and null are kept regardless of key — they cannot carry
+ *   a transcript, which is what preserves every unenumerated vendor counter,
+ * - objects and arrays recurse under the same rule.
+ *
+ * The recursion is the half a key allowlist cannot reach. `workspaceValidation`
+ * and `externalLifecycleRecovery` read as platform-authored machine blocks and
+ * an earlier cut of this change allowlisted them whole — but
+ * `workspaceValidation.plainLanguageReason` (`workspace-runtime.ts:1683`),
+ * `externalLifecycleRecovery.jobMessage` / `.prReviewErrorMessage`, and
+ * `.containerDiagnostics` (which carries container log tails, i.e. captured
+ * output) are prose sitting inside them. Recursing withholds those subkeys
+ * without needing anyone to have enumerated them.
+ *
+ * `error` and `errorMessage` are prose and are kept anyway: the PEN-3140
+ * decision names "error text" on the company-readable side, and the same
+ * reasoning that keeps `error` / `errorCode` at the top level applies inside the
+ * blob. That is the decision's call, not an oversight.
+ *
+ * Withheld keys are reported in `withheldFields`, so a consumer that needs a
+ * newly-added *string* machine key sees why it vanished instead of silently
+ * reading `undefined`.
  */
-const WITHHELD_RUN_RESULT_JSON_CONTENT_KEYS = [
-  "result",
-  "summary",
-  "message",
-  "stdout",
-  "stderr",
-] as const;
+const RUN_RESULT_JSON_MACHINE_TEXT_KEYS = new Set([
+  // outcome / failure enums — matched against a fixed regex by
+  // `resultJsonIndicatesFailure` (`services/heartbeat.ts:11128-11145`)
+  "status", "outcome", "type", "subtype", "stopReason", "stop_reason",
+  // error text — kept per the PEN-3140 decision, see above
+  "error", "errorMessage", "errorCode", "errorFamily",
+  "api_error_status", "error_status",
+  // provider capacity / throttle family (PEN-2501, PEN-3129, PEN-2513) and the
+  // park-diagnosis fields `paperclipListParkedAgents` renders
+  "penstockReason", "penstockProvider", "penstockModel",
+  "penstockAdvertisedResumeAt", "penstockCapacityParkClampedFrom",
+  "penstockCapacityFirstDeferredAt",
+  "providerCapacityResetAt", "providerQuotaRetryNotBefore",
+  "upstreamCapacityCode", "ccrotateTarget", "recoveryClassification",
+  // retry timing (ISO instants)
+  "retryNotBefore", "transientRetryNotBefore",
+  // stop/timeout provenance — the run-ledger stop labels
+  // (`ui/src/components/IssueRunLedger.tsx:311-327`) read these
+  "timeoutSource",
+  // interruption provenance (`ui/src/lib/interrupt-handoff.ts`)
+  "interruptionSource", "interruptedIssueId",
+  "interruptedByActorType", "interruptedByActorId",
+  // run/session identity
+  "session_id", "model", "uuid", "requestId", "runId",
+  "cursorAgentId", "cursorRunId", "envType", "envName",
+  "requestedModel", "requestedThinkingEffort", "permissionMode", "mode",
+  "phase", "agent", "billingType", "billing_type",
+  // gate + lifecycle codes
+  "wakeReason", "maintenanceCleanupAt", "reason", "reasonCode",
+  "issueId", "serviceName", "pipelineStageExitCancellationRequestedAt",
+  // synthesized by the oversize-blob SQL, never present in the column
+  "truncationReason",
+]);
+
+/**
+ * Project one `resultJson` value under the rule documented above. Returns
+ * `{ kept }` with `undefined` meaning "withheld"; `path` is only used to name
+ * the withheld field for `withheldFields`.
+ */
+function projectRunResultJsonValue(
+  key: string,
+  value: unknown,
+  path: string,
+  withheldFields: string[],
+): { kept: boolean; value?: unknown } {
+  // Non-prose primitives cannot carry a transcript. This is what keeps the
+  // vendor counters (`num_turns`, `duration_api_ms`, cost, `is_error`) working
+  // without anyone having to enumerate them.
+  if (value === null || typeof value === "number" || typeof value === "boolean") {
+    return { kept: true, value };
+  }
+
+  if (typeof value === "string") {
+    if (RUN_RESULT_JSON_MACHINE_TEXT_KEYS.has(key)) return { kept: true, value };
+    if (value.length > 0) withheldFields.push(path);
+    return { kept: false };
+  }
+
+  if (Array.isArray(value)) {
+    // Elements inherit the *array's* key, so `permission_denials: [...]` of
+    // objects recurses, while an array of raw strings under a non-machine key
+    // (a provider's `errors: [...]`) drops its prose and keeps its shape --
+    // presence still reads as presence, content does not leak.
+    const projected: unknown[] = [];
+    let droppedAny = false;
+    for (const [index, element] of value.entries()) {
+      const result = projectRunResultJsonValue(key, element, `${path}[${index}]`, withheldFields);
+      if (result.kept) projected.push(result.value);
+      else droppedAny = true;
+    }
+    if (droppedAny && projected.length === 0 && value.length > 0) return { kept: false };
+    return { kept: true, value: projected };
+  }
+
+  if (isPlainObject(value)) {
+    const projected: Record<string, unknown> = {};
+    for (const [childKey, childValue] of Object.entries(value)) {
+      const result = projectRunResultJsonValue(
+        childKey,
+        childValue,
+        `${path}.${childKey}`,
+        withheldFields,
+      );
+      if (result.kept) projected[childKey] = result.value;
+    }
+    return { kept: true, value: projected };
+  }
+
+  // Anything else (a function, a symbol) has no business on the wire.
+  withheldFields.push(path);
+  return { kept: false };
+}
+
+
 
 /**
  * Entitlement filter for the run-STATE responses (PEN-3142 + the PEN-3149
@@ -956,11 +1085,10 @@ export function withholdRunTranscriptStateContent<T extends Record<string, unkno
   }
 
   if (isPlainObject(out.resultJson)) {
-    const resultJson: Record<string, unknown> = { ...out.resultJson };
-    for (const key of WITHHELD_RUN_RESULT_JSON_CONTENT_KEYS) {
-      if (resultJson[key] === null || resultJson[key] === undefined) continue;
-      delete resultJson[key];
-      withheldFields.push(`resultJson.${key}`);
+    const resultJson: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(out.resultJson)) {
+      const result = projectRunResultJsonValue(key, value, `resultJson.${key}`, withheldFields);
+      if (result.kept) resultJson[key] = result.value;
     }
     out.resultJson = resultJson;
   }

@@ -259,6 +259,27 @@ describe("run transcript scoping (PEN-3142)", () => {
         retryNotBefore: "2026-09-10T04:00:00.000Z",
         error: "provider returned 429",
         totalCostUsd: 0.42,
+        // An adapter key no list mentions, carrying the canary. `resultJson` is
+        // an open `Record<string, unknown>` written verbatim from the adapter
+        // result event, and PEN-3153 establishes nothing scrubs it on the write
+        // path -- so a denylist of the five free-text keys we happen to know
+        // passes this straight through to an unentitled peer. Ally's review of
+        // PR #1741 flagged exactly this.
+        adapterVerboseOutput: "echo ANTHROPIC_API_KEY=sk-live-not-a-real-key",
+        // Unenumerated VENDOR counters. A key allowlist drops these; the
+        // value-shape rule keeps them, because a number cannot carry prose.
+        num_turns: 17,
+        duration_api_ms: 4821,
+        is_error: true,
+        // Prose nested inside an otherwise machine block. An earlier cut of
+        // this change allowlisted `workspaceValidation` WHOLE on the reasoning
+        // that it is platform-authored -- which is true of `reasonCode` and
+        // false of `plainLanguageReason`. Recursion is what catches it.
+        workspaceValidation: {
+          reasonCode: "git_worktree_not_reusable",
+          plainLanguageReason: "clone failed: remote rejected sk-live-not-a-real-key",
+          attempts: 2,
+        },
       },
       // The `result_*` GENERATED columns, which `getRun` selects because
       // `heartbeatRunSafeColumns` spreads `getTableColumns(heartbeatRuns)`.
@@ -694,6 +715,50 @@ describe("run transcript scoping (PEN-3142)", () => {
       expect(res.body.nextAction).toBe(
         "Next: rerun the deploy with ANTHROPIC_API_KEY=sk-live-not-a-real-key",
       );
+    });
+
+    it("withholds an unknown adapter key inside resultJson, not just the known five", async () => {
+      const res = await requestApp(
+        await createApp(peerAgentActor),
+        (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1"),
+      );
+
+      // The projection is an ALLOWLIST of machine keys, so a key no list
+      // mentions is withheld by default. A denylist of `result` / `summary` /
+      // `message` / `stdout` / `stderr` passes this through -- and since
+      // PEN-3153 shows `resultJson` is persisted with no write-path scrub, what
+      // it passes through is unscrubbed adapter output.
+      expect(res.body.resultJson).not.toHaveProperty("adapterVerboseOutput");
+      expect(res.body.withheldFields).toContain("resultJson.adapterVerboseOutput");
+      // The nested prose subkey is named by its full path, so a consumer that
+      // loses it can see exactly what went and why.
+      expect(res.body.resultJson.workspaceValidation)
+        .not.toHaveProperty("plainLanguageReason");
+      expect(res.body.withheldFields)
+        .toContain("resultJson.workspaceValidation.plainLanguageReason");
+      expect(JSON.stringify(res.body)).not.toContain("sk-live-not-a-real-key");
+
+      // ...and the allowlist is not a blunt instrument: every machine key the
+      // live fleet filters read is still here. Narrowing to "withhold the whole
+      // blob" would break PEN-2501 / PEN-3129 / PEN-2513.
+      expect(res.body.resultJson).toEqual({
+        status: "error",
+        stopReason: "max_turns",
+        errorFamily: "provider_capacity",
+        penstockReason: "throttled",
+        retryNotBefore: "2026-09-10T04:00:00.000Z",
+        error: "provider returned 429",
+        totalCostUsd: 0.42,
+        // Unenumerated vendor counters survive on value shape alone -- this is
+        // the half a key allowlist gets wrong, by dropping every key nobody
+        // thought to name.
+        num_turns: 17,
+        duration_api_ms: 4821,
+        is_error: true,
+        // ...and the nested block keeps its machine subkeys while losing its
+        // one prose subkey.
+        workspaceValidation: { reasonCode: "git_worktree_not_reusable", attempts: 2 },
+      });
     });
 
     it("gives an entitled reader the full run row", async () => {
