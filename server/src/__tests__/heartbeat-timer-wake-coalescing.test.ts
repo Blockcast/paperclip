@@ -224,6 +224,29 @@ describeEmbeddedPostgres("heartbeat timer wake coalescing", () => {
     });
   }
 
+  // A demand wake at the SAME task scope as the timer wake above. The explicit
+  // taskKey is what makes the comparison honest: for a non-timer wake
+  // `deriveTaskKeyWithHeartbeatFallback` does not synthesize `__heartbeat__`,
+  // so without it the wake would fall through on scope rather than on source
+  // and the assertion would prove nothing about this fix.
+  async function fireDemandWake(
+    heartbeat: ReturnType<typeof heartbeatService>,
+    agentId: string,
+    source: "on_demand" | "automation",
+  ) {
+    return heartbeat.wakeup(agentId, {
+      source,
+      triggerDetail: source === "on_demand" ? "manual" : "system",
+      reason: "manual_wake",
+      requestedByActorType: "system",
+      requestedByActorId: "overrun-test",
+      contextSnapshot: {
+        taskKey: "__heartbeat__",
+        responsibleUserId: "overrun-test-user",
+      },
+    });
+  }
+
   it("mints a new run instead of coalescing into a tracked run that has overrun its interval", async () => {
     // 3600s interval => 90 min budget (the floor). Started 4 h ago, so it has
     // already swallowed roughly three wakes it never serviced.
@@ -306,4 +329,46 @@ describeEmbeddedPostgres("heartbeat timer wake coalescing", () => {
       .where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(1);
   });
+
+  // -------------------------------------------------------------------------
+  // The rule is scoped to timer wakes, and these pin that.
+  //
+  // Only a periodic cadence tick can be shown lost by elapsed time: it fires on
+  // a schedule, so an interval that passed with no run is a tick that went
+  // unserviced. A demand wake fires once, when something happened, so its age
+  // proves nothing — and filtering on it would discard a live coalesce target
+  // and mint a CONCURRENT run for a manual or recovery wake, changing behaviour
+  // this fix has no evidence about and never intended to touch.
+  //
+  // `source` defaults to `on_demand`, so this gate is what keeps the rule on
+  // the intended path rather than the default one.
+  // -------------------------------------------------------------------------
+  for (const source of ["on_demand", "automation"] as const) {
+    it(`still coalesces an aged running target for a ${source} wake`, async () => {
+      // Identical fixture to the minting case above — 3600s interval, started
+      // 4 h ago, well past the 90 min budget. The ONLY difference is the wake
+      // source, so a coalesce here is attributable to the source gate alone.
+      const { agentId, runningRunId } = await seedAgentWithRunningRun({
+        intervalSec: 3600,
+        runStartedAt: new Date(Date.now() - 4 * 60 * 60 * 1000),
+      });
+
+      const heartbeat = heartbeatService(db, {
+        penstockAvailabilityGate: allowPenstockGate,
+        skipQueuedRunDispatch: true,
+      });
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runningRunId);
+
+      const run = await fireDemandWake(heartbeat, agentId, source);
+
+      expect(run?.id).toBe(runningRunId);
+
+      // No concurrent run minted: the whole point of the gate.
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs).toHaveLength(1);
+    });
+  }
 });
