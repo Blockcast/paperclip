@@ -24,6 +24,8 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRetryExhaustedReason: vi.fn(),
   getRetrySuccessor: vi.fn(),
   getRun: vi.fn(),
+  getRunIssueSummary: vi.fn(),
+  getActiveRunIssueSummaryForAgent: vi.fn(),
   getRunLogAccess: vi.fn(),
   list: vi.fn(),
   listEvents: vi.fn(),
@@ -41,6 +43,11 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
   getExperimental: vi.fn(),
   getGeneral: vi.fn(),
   listCompanyIds: vi.fn(),
+}));
+
+const mockIssueService = vi.hoisted(() => ({
+  getById: vi.fn(),
+  getByIdentifier: vi.fn(),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
@@ -66,7 +73,7 @@ function registerModuleMocks() {
   }));
 
   vi.doMock("../services/issues.js", () => ({
-    issueService: () => ({ getById: vi.fn(), getByIdentifier: vi.fn() }),
+    issueService: () => mockIssueService,
   }));
 
   vi.doMock("../services/index.js", () => ({
@@ -83,7 +90,7 @@ function registerModuleMocks() {
     budgetService: () => ({}),
     heartbeatService: () => mockHeartbeatService,
     issueApprovalService: () => ({}),
-    issueService: () => ({ getById: vi.fn(), getByIdentifier: vi.fn() }),
+    issueService: () => mockIssueService,
     logActivity: mockLogActivity,
     secretService: () => ({}),
     syncInstructionsBundleConfigFromFilePath: vi.fn((_agent, config) => config),
@@ -130,6 +137,43 @@ async function createApp(actor: Record<string, unknown> = boardActor) {
     next();
   });
   app.use("/api", agentRoutes({} as any, {} as any));
+  app.use(errorHandler);
+  return app;
+}
+
+/**
+ * Minimal thenable stand-in for the drizzle query builder. Every chain method
+ * returns the same object and the object itself resolves to `rows`, which is
+ * what lets it serve both terminal shapes these routes use:
+ * `…orderBy(…)` awaited directly, and `…orderBy(…)` held in a variable and
+ * then awaited via `.limit(n)`.
+ */
+function stubDb(rows: Record<string, unknown>[]) {
+  const chain: Record<string, unknown> = {
+    then: (resolve: (v: unknown) => unknown, reject?: (e: unknown) => unknown) =>
+      Promise.resolve(rows).then(resolve, reject),
+  };
+  for (const method of ["select", "from", "innerJoin", "leftJoin", "where", "orderBy", "limit", "offset", "groupBy"]) {
+    chain[method] = () => chain;
+  }
+  return chain as unknown;
+}
+
+async function createAppWithDb(actor: Record<string, unknown>, rows: Record<string, unknown>[]) {
+  const [{ agentRoutes }, { errorHandler }] = await Promise.all([
+    vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
+    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+  ]);
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    (req as any).actor = {
+      ...actor,
+      companyIds: Array.isArray(actor.companyIds) ? [...actor.companyIds] : actor.companyIds,
+    };
+    next();
+  });
+  app.use("/api", agentRoutes(stubDb(rows) as any, {} as any));
   app.use(errorHandler);
   return app;
 }
@@ -680,6 +724,120 @@ describe("run transcript scoping (PEN-3142)", () => {
       // Memoized on the owning agent. Without this a 200-run page would issue
       // 200 authorization decisions.
       expect(mockDecide).toHaveBeenCalledTimes(2);
+    });
+  });
+  /**
+   * The three routes below all changed in the same commit as the two above, and
+   * all three were shipping untested: they build their rows straight off `db`
+   * rather than through the heartbeat service, so the existing `{}`-db harness
+   * could not reach them. Sharing a verified helper with a tested route is not
+   * the same as being proven at the route -- a wrong `agentId` field or a
+   * projection applied to the wrong object would pass invisibly.
+   *
+   * `/companies/:companyId/live-runs` is the one that matters most: it is
+   * company-scoped, so it hands a peer every live agent's current prose in a
+   * single call.
+   */
+  describe("the remaining run-state feeds (PEN-3149) are gated too", () => {
+    const liveRunRow = {
+      id: "run-1",
+      companyId: "company-1",
+      agentId: runOwnerAgentId,
+      agentName: "Some Other Agent",
+      status: "running",
+      logBytes: 4096,
+    };
+
+    // minCount=0 keeps this to the single live-runs query; the padding branch
+    // issues a second one.
+    const liveRunsPath = "/api/companies/company-1/live-runs?minCount=0";
+
+    it("withholds the decorated prose on the company-wide live-runs feed", async () => {
+      const res = await requestApp(
+        await createAppWithDb(peerAgentActor, [liveRunRow]),
+        (baseUrl) => request(baseUrl).get(liveRunsPath),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toHaveLength(1);
+      expect(JSON.stringify(res.body)).not.toContain("sk-live-not-a-real-key");
+      expect(res.body[0].lastAssistantSnippet).toBeNull();
+      expect(res.body[0].currentStatusMessage).toBe("Using Bash");
+      // The row is projected, never dropped -- run state stays company-readable.
+      expect(res.body[0]).toMatchObject({ id: "run-1", status: "running", logBytes: 4096 });
+    });
+
+    it("gives an entitled reader the prose on that same feed", async () => {
+      mockDecide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: "allow_manager_chain",
+      }));
+
+      const res = await requestApp(
+        await createAppWithDb(peerAgentActor, [liveRunRow]),
+        (baseUrl) => request(baseUrl).get(liveRunsPath),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body[0].lastAssistantSnippet).toContain("sk-live-not-a-real-key");
+      expect(res.body[0]).not.toHaveProperty("withheldFields");
+    });
+
+    it("withholds the decorated prose on the per-issue live-runs feed", async () => {
+      const issue = {
+        id: "issue-1",
+        companyId: "company-1",
+        status: "in_progress",
+        executionRunId: null,
+        assigneeAgentId: runOwnerAgentId,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getByIdentifier.mockResolvedValue(issue);
+
+      const res = await requestApp(
+        await createAppWithDb(peerAgentActor, [liveRunRow]),
+        (baseUrl) => request(baseUrl).get("/api/issues/issue-1/live-runs"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toHaveLength(1);
+      expect(JSON.stringify(res.body)).not.toContain("sk-live-not-a-real-key");
+      expect(res.body[0].lastAssistantSnippet).toBeNull();
+      expect(res.body[0].currentStatusMessage).toBe("Using Bash");
+    });
+
+    it("withholds the decorated prose on the per-issue active-run route", async () => {
+      const issue = {
+        id: "issue-1",
+        companyId: "company-1",
+        status: "in_progress",
+        executionRunId: "run-1",
+        assigneeAgentId: runOwnerAgentId,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getByIdentifier.mockResolvedValue(issue);
+      mockHeartbeatService.getRunIssueSummary.mockResolvedValue({
+        ...liveRunRow,
+        issueId: "issue-1",
+      });
+      mockAgentService.getById.mockResolvedValue({
+        id: runOwnerAgentId,
+        name: "Some Other Agent",
+        adapterType: "claude_k8s",
+      });
+
+      const res = await requestApp(
+        await createAppWithDb(peerAgentActor, [liveRunRow]),
+        (baseUrl) => request(baseUrl).get("/api/issues/issue-1/active-run"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(JSON.stringify(res.body)).not.toContain("sk-live-not-a-real-key");
+      expect(res.body.lastAssistantSnippet).toBeNull();
+      expect(res.body.currentStatusMessage).toBe("Using Bash");
+      // Identity is not transcript and must survive the projection.
+      expect(res.body).toMatchObject({ agentId: runOwnerAgentId, agentName: "Some Other Agent" });
     });
   });
 });
