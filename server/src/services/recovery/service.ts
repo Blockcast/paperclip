@@ -397,6 +397,28 @@ export const STALE_ACTIVE_RUN_EVALUATION_REFIRE_COOLDOWN_MS = 60 * 60 * 1000;
 // its owner / CTO) rather than opening wrapper #N+1.
 export const STALE_ACTIVE_RUN_EVALUATION_ESCALATION_WINDOW_MS = 6 * 60 * 60 * 1000;
 export const STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD = 3;
+// PEN-2432: the window above is a LOOKBACK BOUND, not a required span, so a raw
+// count satisfies "N fires in 6h" even when all N landed inside a few seconds.
+// Observed on PEN-2392: four fires at 03:43:56 / 03:44:04 / 03:44:07 / 03:44:51
+// — all four inside 55s, starting 1m38s after the wrapper was closed. The
+// escalation text then asserts the run is "NOT draining on its own", which is a
+// PERSISTENCE claim, and a count without spacing cannot evidence persistence.
+// So also require the fires to span real wall-clock time. 20 min is above one
+// detector re-fire period (~10-15 min), so a burst inside a single sweep — or a
+// rapid retry storm right after a manual close — can never satisfy it, while
+// fires at the detector's natural cadence clear it with margin. This is a floor
+// on the evidence, not a proof of persistence: falling short only defers to the
+// normal suppression path (record the tally), so the escalation still happens
+// once the condition genuinely persists.
+//
+// The load-bearing constraint is the CEILING, not the floor: this path only runs
+// while the closed wrapper is still inside REFIRE_COOLDOWN_MS (1h), because past
+// that a fresh wrapper opens instead of tallying. So the span a re-fire sequence
+// can ever accumulate is bounded by that hour, and a minimum at or above it
+// would make escalation unreachable rather than merely stricter. Keep this well
+// under the cooldown: at 20 min, fires on the natural ~10-15 min cadence reach
+// the threshold around closedAt+30..45m and still clear it with room to spare.
+export const STALE_ACTIVE_RUN_EVALUATION_ESCALATION_MIN_SPAN_MS = 20 * 60 * 1000;
 // Stable body prefix on the suppression tally comment. Used both as the
 // human-facing marker and as the counting key for the escalation threshold
 // (issue_comments.metadata is a strict schema with no room for a custom tag,
@@ -3483,9 +3505,15 @@ export function recoveryService(
   // whose body starts with the stable re-fire marker; once we have recorded
   // STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD of them the detector
   // escalates by reopening instead of suppressing again.
+  // PEN-2432: also return the EARLIEST matched fire so the caller can measure
+  // how long the fires actually span. The count alone cannot distinguish a
+  // 55-second burst from a genuinely persistent wedge.
   async function countRecentStaleRunRefireComments(issueId: string, since: Date) {
     const [row] = await db
-      .select({ count: sql<number>`count(*)::int` })
+      .select({
+        count: sql<number>`count(*)::int`,
+        firstAt: sql<Date | null>`min(${issueComments.createdAt})`,
+      })
       .from(issueComments)
       .where(
         and(
@@ -3495,7 +3523,13 @@ export function recoveryService(
           sql`${issueComments.body} like ${`${STALE_ACTIVE_RUN_EVALUATION_REFIRE_COMMENT_MARKER}%`}`,
         ),
       );
-    return row?.count ?? 0;
+    // Drivers disagree on whether an aggregate over a timestamptz comes back as
+    // a Date or an ISO string, so normalize rather than trusting the declared type.
+    const firstAt = row?.firstAt ? new Date(row.firstAt) : null;
+    return {
+      count: row?.count ?? 0,
+      firstAt: firstAt && !Number.isNaN(firstAt.getTime()) ? firstAt : null,
+    };
   }
 
   // PCL-2571 (2026-05-25 RCA): when an active run is silent past the
@@ -4230,6 +4264,40 @@ export function recoveryService(
         `- ${issueUiLink({ identifier: issue.identifier, id: issue.id }, input.prefix)} \`${issue.status}\`: ${issue.title}`,
       ).join("\n")
       : "- none detected";
+    // PEN-2432: paperclip only records pid/process-group/process-start when IT
+    // spawned the process (onSpawn -> persistRunProcessMetadata). Adapters that
+    // spawn their own client — the acpx path on claude_local, per #1396 — never
+    // run that hook, so these columns are null on 12/12 recent Summarizer runs
+    // INCLUDING all 9 that succeeded. Rendering "pid `unknown`, process group
+    // `unknown`, in-memory handle `no`" next to a silence complaint reads as
+    // evidence the process died while carrying none of that information.
+    // Keyed on the values, not on an adapter allowlist: adapter types are
+    // `| (string & {})` and the k8s ones are plugin-registered at runtime, so
+    // any hardcoded list would misclassify (PEN-2432's own warning).
+    const hasInMemoryHandle = runningProcesses.has(input.run.id);
+    // All three columns are written together by persistRunProcessMetadata, so
+    // any one of them present means the hook DID run and the block is real
+    // evidence. Requiring all three would let a partial row print the
+    // non-diagnostic label over a value that was actually recorded, hiding the
+    // very instrumentation defect the label is meant to leave visible.
+    const processMetadataRecorded =
+      input.run.processPid !== null ||
+      input.run.processGroupId !== null ||
+      input.run.processStartedAt !== null ||
+      hasInMemoryHandle;
+    // The empty branch is keyed on the VALUES, so it also catches a failed
+    // metadata write and an adapter that was never instrumented. We have not
+    // established this adapter's capability here, so the text must not claim
+    // one — it says the absence carries no signal AND that it cannot identify
+    // the cause, rather than asserting the benign explanation.
+    const processMetadataLine = processMetadataRecorded
+      ? `- Process metadata: pid \`${input.run.processPid ?? "unknown"}\`, process group \`${input.run.processGroupId ?? "unknown"}\`, in-memory handle \`${hasInMemoryHandle ? "yes" : "no"}\``
+      : "- Process metadata: none recorded. NOT DIAGNOSTIC — paperclip records pid/process group only when it spawned the process itself, so on an adapter that spawns its own client these columns are expected to be empty and say nothing about whether the process is alive. This branch is keyed on the absent values rather than on a capability established for this adapter, so it cannot tell that expected case apart from an instrumentation gap (a failed metadata write, or a new adapter that was never wired up). Treat the absence as evidence in neither direction, and if this adapter is supposed to report process metadata, investigate the gap separately.";
+    // Same hook writes processStartedAt, so "unknown" there is the same
+    // non-signal rather than a process that failed to start.
+    const processStartedAtLine = input.run.processStartedAt
+      ? `- Process started at: ${input.run.processStartedAt.toISOString()}`
+      : "- Process started at: not recorded (see process metadata below)";
     return [
       `Paperclip detected ${input.level} output silence on an active heartbeat run.`,
       "",
@@ -4240,12 +4308,12 @@ export function recoveryService(
       `- Invocation: ${input.run.invocationSource}${input.run.triggerDetail ? ` / ${input.run.triggerDetail}` : ""}`,
       `- Source issue: ${sourceIssue}`,
       `- Started at: ${input.run.startedAt?.toISOString() ?? "unknown"}`,
-      `- Process started at: ${input.run.processStartedAt?.toISOString() ?? "unknown"}`,
+      processStartedAtLine,
       `- Last output at: ${input.run.lastOutputAt?.toISOString() ?? "none recorded"}`,
       `- Last output sequence: ${input.run.lastOutputSeq ?? 0}`,
       `- Silent for: ${formatDuration(input.evidence.silenceAgeMs)}`,
       `- Thresholds: suspicious after ${formatDuration(ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS)}, critical after ${formatDuration(ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS)}`,
-      `- Process metadata: pid \`${input.run.processPid ?? "unknown"}\`, process group \`${input.run.processGroupId ?? "unknown"}\`, in-memory handle \`${runningProcesses.has(input.run.id) ? "yes" : "no"}\``,
+      processMetadataLine,
       "",
       "## Last Output Excerpt",
       "",
@@ -4385,6 +4453,7 @@ export function recoveryService(
     sourceIssue: typeof issues.$inferSelect | null;
     closedEvaluation: NonNullable<Awaited<ReturnType<typeof findRecentClosedStaleRunEvaluation>>>;
     priorRefires: number;
+    observedSpanMs: number;
     now: Date;
   }) {
     const ownerAgentId =
@@ -4423,8 +4492,8 @@ export function recoveryService(
       [
         "## Re-fire escalation — reopening instead of opening a new wrapper",
         "",
-        `The \`stale_active_run_evaluation\` detector has now fired ${input.priorRefires + 1} times for run \`${input.run.id}\` (${input.runningAgent.name}) since this wrapper was closed, all inside a ${formatDuration(STALE_ACTIVE_RUN_EVALUATION_ESCALATION_WINDOW_MS)} window.`,
-        `That is past the ${STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD}-suppressed-fire threshold, so the underlying \`running\` run row is NOT draining on its own — closing this wrapper as a false-positive is no longer the right disposition.`,
+        `The \`stale_active_run_evaluation\` detector has now fired ${input.priorRefires + 1} times for run \`${input.run.id}\` (${input.runningAgent.name}) since this wrapper was closed, spanning ${formatDuration(input.observedSpanMs)} of wall clock.`,
+        `That is past the ${STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD}-suppressed-fire threshold, and the fires are spread over enough wall clock (at least ${formatDuration(STALE_ACTIVE_RUN_EVALUATION_ESCALATION_MIN_SPAN_MS)}) to show the \`running\` run row is not draining on its own — closing this wrapper as a false-positive is no longer the right disposition.`,
         "",
         "- This wrapper has been reopened to `in_progress` rather than spawning yet another duplicate review.",
         `- ${staleRunOrphanedRowRemedy(input.runningAgent.adapterType).remedy}`,
@@ -4447,6 +4516,8 @@ export function recoveryService(
         priorRefires: input.priorRefires,
         escalationThreshold: STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD,
         escalationWindowMs: STALE_ACTIVE_RUN_EVALUATION_ESCALATION_WINDOW_MS,
+        observedSpanMs: input.observedSpanMs,
+        escalationMinSpanMs: STALE_ACTIVE_RUN_EVALUATION_ESCALATION_MIN_SPAN_MS,
       },
     });
     if (ownerAgentId) {
@@ -4488,15 +4559,24 @@ export function recoveryService(
     now: Date;
   }) {
     const windowStart = new Date(input.now.getTime() - STALE_ACTIVE_RUN_EVALUATION_ESCALATION_WINDOW_MS);
-    const priorRefires = await countRecentStaleRunRefireComments(input.closedEvaluation.id, windowStart);
+    const { count: priorRefires, firstAt } = await countRecentStaleRunRefireComments(
+      input.closedEvaluation.id,
+      windowStart,
+    );
+    // PEN-2432: measure the span the fires actually cover — from the earliest
+    // one still inside the window through this fire — instead of asserting the
+    // window constant. With no prior fire recorded there is nothing to span.
+    const observedSpanMs = firstAt ? Math.max(0, input.now.getTime() - firstAt.getTime()) : 0;
+    const spanIsEvidence = observedSpanMs >= STALE_ACTIVE_RUN_EVALUATION_ESCALATION_MIN_SPAN_MS;
 
-    if (priorRefires >= STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD) {
+    if (priorRefires >= STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD && spanIsEvidence) {
       return escalateStaleRunRefire({
         run: input.run,
         runningAgent: input.runningAgent,
         sourceIssue: input.sourceIssue,
         closedEvaluation: input.closedEvaluation,
         priorRefires,
+        observedSpanMs,
         now: input.now,
       });
     }
@@ -4509,9 +4589,17 @@ export function recoveryService(
         "",
         `The \`stale_active_run_evaluation\` detector fired again for run \`${input.run.id}\` (${input.runningAgent.name}), but ${input.closedEvaluation.identifier} was already closed \`${input.closedEvaluation.status}\` within the last ${formatDuration(STALE_ACTIVE_RUN_EVALUATION_REFIRE_COOLDOWN_MS)}.`,
         `Suppressing a fresh wrapper: the orphaned \`running\` row is ${staleRunOrphanedRowRemedy(input.runningAgent.adapterType).mechanism}, so re-opening a new review every ~10-15 min would only burn a triage slot.`,
-        `- After ${STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD} suppressed re-fires in ${formatDuration(STALE_ACTIVE_RUN_EVALUATION_ESCALATION_WINDOW_MS)} this wrapper is reopened to \`in_progress\` instead of opening wrapper #${fireOrdinal + 1}.`,
+        `- Reopening to \`in_progress\` requires ${STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD} suppressed re-fires AND those fires spanning at least ${formatDuration(STALE_ACTIVE_RUN_EVALUATION_ESCALATION_MIN_SPAN_MS)} of wall clock; so far they span ${formatDuration(observedSpanMs)}.`,
       ].join("\n"),
       { runId: input.run.id },
+      // PEN-2432: stamp the tally with the DETECTOR's clock, not the database's.
+      // The span is measured against `input.now`, and countRecentStaleRunRefireComments
+      // derives its window `since` from it too, so a tally written at `defaultNow()`
+      // would sit in a different clock domain than the arithmetic that reads it.
+      // Identical in production (`now` IS the real clock); the domains can only
+      // diverge under an injected clock — which is precisely where a silent
+      // disagreement would hide.
+      { createdAt: input.now },
     );
     await logActivity(db, {
       companyId: input.run.companyId,
@@ -4528,6 +4616,10 @@ export function recoveryService(
         closedStatus: input.closedEvaluation.status,
         suppressedRefireCount: fireOrdinal,
         cooldownMs: STALE_ACTIVE_RUN_EVALUATION_REFIRE_COOLDOWN_MS,
+        // PEN-2432: record the measured span so an audit can tell "held below
+        // the count" apart from "had the count but not the spacing".
+        observedSpanMs,
+        escalationMinSpanMs: STALE_ACTIVE_RUN_EVALUATION_ESCALATION_MIN_SPAN_MS,
       },
     });
     return { kind: "suppressed" as const, evaluationIssueId: input.closedEvaluation.id };
