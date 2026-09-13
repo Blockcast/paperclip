@@ -459,7 +459,17 @@ spec:
               EOF
               cat > "${LOCAL_BIN}/github-mcp-server" <<'EOF'
               #!/bin/sh
-              exec /paperclip/.local/bin/paperclip-github-token-env /usr/local/bin/github-mcp-server "$@"
+              # PEN-3152: the SECOND egress door. The `gh` wrapper above was the
+              # whole of PEN-2527's coverage, but github-mcp-server is an
+              # independent path to the same destination holding the same seat
+              # token, and it runs the complete (default) toolset — so
+              # add_issue_comment / pull_request_review_write / create_pull_request
+              # / create_or_update_file / push_files all published model-authored
+              # text unscrubbed. The scrub runtime goes INSIDE the token wrapper so
+              # the server still inherits GITHUB_PERSONAL_ACCESS_TOKEN, exactly as
+              # before; the only change to its environment is that its stdin now
+              # arrives scrubbed. Do not "simplify" this back to a direct exec.
+              exec /paperclip/.local/bin/paperclip-github-token-env /usr/local/bin/node /opt/paperclip-bundled-adapters/node_modules/@paperclipai/adapter-utils/dist/github-mcp-egress-runtime.js /usr/local/bin/github-mcp-server "$@"
               EOF
               cat > "${LOCAL_BIN}/git" <<'EOF'
               #!/bin/sh
