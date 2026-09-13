@@ -832,11 +832,12 @@ interface ResolvedEventContext {
   // Classification must use the raw review body. reviewBody is deliberately
   // clamped for heartbeat context size, but a findings heading can occur
   // after the clamp boundary (as in frr#61 review 4968003838).
-  reviewHasActionableFeedback?: boolean;
-  // BLO-30420: the same verdict as reviewHasActionableFeedback, carrying the
-  // named reason and deciding predicate for the non-actionable case. Both come
-  // from one classifyPrReviewActionability call, so the boolean the wake path
-  // routes on and the reason the diagnostic reports cannot disagree.
+  //
+  // BLO-30420: one field, not two. The routing boolean and the named reason are
+  // both projections of this single decision, so they cannot drift apart --
+  // which is the failure class this issue exists to remove, and keeping a
+  // parallel `reviewHasActionableFeedback` boolean would have reintroduced it
+  // in miniature.
   reviewActionability?: PrReviewActionabilityDecision;
   reviewState?: string | null;
   // pull_request_review.submitted only — the numeric GitHub review id.
@@ -1399,7 +1400,6 @@ function resolveEventContextRaw(
         headSha: reviewCommitId ?? collected.headSha,
         prAuthorLogin: collected.authorLogin,
         reviewBody,
-        reviewHasActionableFeedback: reviewActionability.actionable,
         reviewActionability,
         reviewState,
         reviewId,
@@ -3485,7 +3485,7 @@ function prFeedbackAuthorLogin(context: ResolvedEventContext): string | null {
 function isActionableReviewFeedbackContext(context: ResolvedEventContext): boolean {
   if (context.wakeReason === "github_pr_review_feedback") return true;
   if (context.wakeReason !== "github_pr_review_submitted") return false;
-  if (context.reviewHasActionableFeedback !== undefined) return context.reviewHasActionableFeedback;
+  if (context.reviewActionability) return context.reviewActionability.actionable;
   return hasActionablePrReviewFeedback(context.reviewBody, context.reviewState);
 }
 
@@ -3502,9 +3502,17 @@ function isActionableReviewFeedbackContext(context: ResolvedEventContext): boole
 // by a classifier decision, so reporting a suppression reason for those would
 // be noise that buries the one case worth reading.
 //
-// Recomputed from the review body when the context predates
-// `reviewActionability` (synthetic/older contexts), so the reason is available
-// on the same inputs the boolean used rather than only on fresh deliveries.
+// Reported ONLY from the decision the delivery path already made on the raw
+// body. There is deliberately no recompute fallback: context.reviewBody is
+// clamped (see the field comment), and re-classifying a clamped body can land
+// the clamp BETWEEN two bucket headings -- `### Critical Issues (0)` surviving
+// while `### Important Issues (1)` is cut. extractAllyReportedFindingRefs then
+// returns non-null-but-empty and the classifier names `all_zero`, the HEALTHY
+// reason, for a body that was truncated with findings lost. The frr#61
+// specimen's buckets are 25 bytes apart (4248/4273), so that window is narrow
+// but real. Emitting no reason is recoverable; emitting a confidently wrong one
+// rebuilds the exact ambiguity this issue exists to remove.
+//
 // The reason/predicate pair is projected straight out of the classifier's
 // non-actionable variant rather than widened to `string`. This is the boundary
 // where the value becomes a published contract (log field, response field,
@@ -3520,9 +3528,8 @@ function resolveReviewFeedbackSuppression(
   context: ResolvedEventContext,
 ): PrReviewFeedbackSuppression | null {
   if (context.wakeReason !== "github_pr_review_submitted") return null;
-  const decision =
-    context.reviewActionability ?? classifyPrReviewActionability(context.reviewBody, context.reviewState);
-  if (decision.actionable) return null;
+  const decision = context.reviewActionability;
+  if (!decision || decision.actionable) return null;
   return { reason: decision.reason, predicate: decision.predicate };
 }
 
