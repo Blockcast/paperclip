@@ -5376,14 +5376,13 @@ describeEmbeddedPostgres("productivity review service", () => {
       `);
     }
 
-    // BLO-33477: a failed finalize now clamps the reservation's scan key to that
-    // pass's `staleCutoff` so it cannot pin the head of the window. The row is
-    // re-admitted on any *later* pass, so this second reconcile advances the
-    // clock rather than replaying the same instant. One second is enough — the
-    // point of clamping to the cutoff rather than to `now` is that a transient
-    // failure costs the next pass, not a whole stale interval.
+    // BLO-33477: a failed finalize now backs the reservation off for a full
+    // stale interval so it cannot hold a slot in the window. The row is
+    // re-admitted once it is stale again, so this second reconcile advances the
+    // clock past PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS rather than replaying
+    // the same instant.
     const recovered = await productivityReviewService(db).reconcileProductivityReviews({
-      now: new Date(now.getTime() + 1_000),
+      now: new Date(now.getTime() + 5 * 60_000 + 1_000),
       companyId: seeded.companyId,
       thresholds: { monitorLapseServiceGraceMs: 60_000 },
     });
@@ -5462,18 +5461,18 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.issueNumber).toBe(2);
   });
 
-  it("advances the scan key of a stale reservation whose finalize keeps throwing", async () => {
+  it("holds a stale reservation out of the window while its finalize keeps throwing", async () => {
     // BLO-33477 AC3. The catch was the one path out of the recovery loop that
     // left the row untouched, so a deterministically-failing finalize kept its
     // `updatedAt` and re-selected at the head of `asc(updatedAt) LIMIT 250` on
     // every pass — MAX_CANDIDATE_ISSUES of them would pin the window and starve
-    // every newer stale reservation behind it. Asserting the key advances is
-    // the tighter test than seeding the cap: starvation is impossible once no
-    // row can hold a fixed slot across passes.
+    // every newer stale reservation behind it.
     //
-    // The key is clamped to `staleCutoff`, not to `now`, so the row is still
-    // retried on the next pass — a transient failure must not cost a full
-    // PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS. Both halves are asserted here.
+    // The catch now sets `updatedAt = now`, which fails the query's own
+    // `updatedAt < staleCutoff` predicate: the row is not re-ordered within the
+    // window, it leaves the window, and cannot occupy a slot until it is stale
+    // again. Both halves — excluded during the back-off, retried after it — are
+    // asserted here.
     const now = new Date("2026-04-28T12:00:00.000Z");
     const staleMs = 5 * 60_000;
     const reservedAt = new Date(now.getTime() - 10 * 60_000);
@@ -5509,21 +5508,23 @@ describeEmbeddedPostgres("productivity review service", () => {
     const first = await reconcileAt(now);
     expect(first.failed).toBe(1);
     expect(attempts).toBe(1);
-    // Freed the slot for this pass, and moved strictly forward off `reservedAt`.
-    expect(await scanKey()).toEqual(new Date(now.getTime() - staleMs));
+    // Backed off to this pass's `now`, which is >= `staleCutoff` by definition.
+    expect(await scanKey()).toEqual(now);
 
-    // Re-admitted on the very next pass rather than held out for a stale
-    // interval: a transient failure is retried promptly.
+    // Held out of the window: not merely re-ordered within it, so it is not
+    // attempted at all and consumes no slot.
     const second = await reconcileAt(new Date(now.getTime() + 1_000));
-    expect(second.failed).toBe(1);
-    expect(attempts).toBe(2);
-    expect(await scanKey()).toEqual(new Date(now.getTime() + 1_000 - staleMs));
+    expect(second.failed).toBe(0);
+    expect(attempts).toBe(1);
+    expect(await scanKey()).toEqual(now);
 
-    // The key rides the cutoff, so it keeps advancing and cannot pin a slot.
-    const third = await reconcileAt(new Date(now.getTime() + 2_000));
+    // Stale again -> re-admitted and retried, so a transient failure is not
+    // punished beyond one stale interval.
+    const thirdAt = new Date(now.getTime() + staleMs + 1_000);
+    const third = await reconcileAt(thirdAt);
     expect(third.failed).toBe(1);
-    expect(attempts).toBe(3);
-    expect(await scanKey()).toEqual(new Date(now.getTime() + 2_000 - staleMs));
+    expect(attempts).toBe(2);
+    expect(await scanKey()).toEqual(thirdAt);
 
     // The reservation itself is untouched apart from the scan key.
     const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
@@ -5532,22 +5533,21 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.status).toBe("todo");
   });
 
-  // BLO-33477 AC3, capped-window form. The test above proves the *key* advances;
-  // this one proves what that buys — the tail is still reached when a whole
-  // window of deterministically-failing reservations is in front of it.
+  // BLO-33477 AC3, capped-window form. The test above proves a failing row
+  // leaves the window; this one proves what that buys — the tail is reached
+  // even when a whole window of deterministically-failing reservations is in
+  // front of it.
   //
   // The bound is TWO eligible passes, not one, and asserting one would be red
-  // against correct code. A row `N` with a fixed key `n` is first eligible on
-  // the pass `j` where `n < c_j`; on that pass the failing cohort still carries
-  // `c_{j-1} <= n`, so it sorts ahead of `N` and the LIMIT cuts `N`. The catch
-  // then clamps the cohort to `c_j`, and since `n < c_j`, `N` sorts strictly
-  // ahead of all 250 of them on pass `j+1` — whatever the cohort size.
+  // against correct code: on the first pass the cohort is still eligible, sorts
+  // ahead of the target, and the LIMIT cuts it. The catch then backs all 250 of
+  // them off to that pass's `now`, which is >= the next pass's `staleCutoff`,
+  // so on pass two the cohort is not in the candidate set at all — whatever its
+  // size, and whether the target's key is older or newer than theirs.
   //
-  // That is the whole refutation of "the failures stay ahead indefinitely":
-  // clamping to the cutoff makes the cohort's key advance at exactly the rate
-  // of the eligibility frontier, and a moving key cannot sit statically ahead
-  // of a fixed one. Pre-fix the cohort kept its original `reservedAt` — a fixed
-  // key, always <= any newer row's — and this test never goes green.
+  // That is the refutation of "the failures stay ahead indefinitely": they are
+  // not ahead, they are gone. Pre-fix the cohort kept its original `reservedAt`
+  // — a fixed key, always <= any newer row's — and this test never goes green.
   it("recovers a stale reservation behind a full window of failing ones (BLO-33477)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const staleMs = 5 * 60_000;
@@ -5647,8 +5647,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(targetFinalizeAttempts).toBe(0);
     expect((await target())?.identifier).toBeNull();
 
-    // Pass 2: the cohort now carries `c_1`, the target's fixed `n < c_1`, so it
-    // sorts first and is recovered. Pre-fix the cohort is still at
+    // Pass 2: the cohort was backed off to pass 1's `now`, so it no longer
+    // satisfies `updatedAt < staleCutoff` and vacates the window entirely; the
+    // target is the only candidate left. Pre-fix the cohort is still at
     // `decoyReservedAt` and this stays red forever, at any number of passes.
     const second = await reconcileAt(new Date(now.getTime() + 1_000));
     expect(targetFinalizeAttempts).toBe(1);
@@ -5659,9 +5660,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     // sequence, so it tracks `failingCount` rather than the source's `-2`.
     expect(recovered?.identifier).not.toBeNull();
     expect(recovered?.issueNumber).not.toBeNull();
-    // The cohort keeps failing and keeps yielding the head slot; only the
-    // LIMIT-th of them is displaced by the target, nothing is lost.
-    expect(second.failed).toBe(failingCount - 1);
+    // Nothing of the cohort is even attempted on this pass — the back-off is a
+    // hard exclusion, not a re-ordering, so it cannot occupy a single slot.
+    expect(second.failed).toBe(0);
   });
 
   it("replays missing finalized review side effects without duplicating them", async () => {
