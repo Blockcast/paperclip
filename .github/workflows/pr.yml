@@ -128,6 +128,18 @@ jobs:
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
         timeout-minutes: 1
 
+      # BLO-33382: the agent-image delivery lane's alert job routed through
+      # GitHub Issues on a repo where Issues are DISABLED, so it could never
+      # emit — 8 master failures in 27h produced zero notifications while every
+      # triage surface showed a workflow that had alerting. This is the
+      # workflow-lint-time assertion that would have caught it the day it was
+      # written, and it also pins the bump step's 5xx retry and legible error
+      # body.
+      - name: Validate agent-image alert channel and bump retry
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-docker-agent-alert-channel.test.js
+        timeout-minutes: 1
+
       # BLO-31598: pins the abandon-in-flight escape hatch's wiring. The
       # approval holds a lock until its rollout lands, so a deploy dying between
       # the approval step and `helm upgrade` strands a lock nothing can clear

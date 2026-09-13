@@ -366,20 +366,71 @@ jobs:
           total_skipped=0
           total_unchanged=0
           failed=0
+
+          # BLO-33382: this step used to issue ONE bare curl per company and
+          # exit 1 on any non-200. On 2026-09-11 a ~30s paperclip-api replica
+          # restart returned 503 and permanently dropped the image bump for
+          # THREE consecutive commits (b5a8bd38, 3b38d96b, 28707d7d) — the
+          # images were built, smoke-tested and promoted to Harbor, but the
+          # cluster refs never advanced and `pending_image_bump` stayed null,
+          # so nothing retried them either. This step is last in the chain,
+          # so there is no later step to recover it.
+          #
+          # Retry only what a retry can fix: a connection failure or a 5xx.
+          # A 4xx (bad token, bad company, malformed body) is deterministic —
+          # retrying it just burns five minutes before failing anyway.
+          post_bump() {
+            local cid="$1" response="$2"
+            local attempt=1 max_attempts=5 delay=5 http
+            while :; do
+              # `curl` exits non-zero on a connection failure and never writes
+              # a status; force the empty-string case into a sentinel so the
+              # classifier below has something to branch on.
+              http=$(curl -sS -o "$response" -w "%{http_code}" \
+                --connect-timeout 10 --max-time 60 \
+                -X POST "${PAPERCLIP_API}/api/admin/agents/bump-agent-image" \
+                -H "Authorization: Bearer ${PAPERCLIP_BUMP_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg image "$NEW_IMAGE" --arg sha "$BUILD_SHA" --arg cid "$cid" '
+                  { companyId: $cid, image: $image, source: "ci:docker-agent.yml", buildSha: $sha }
+                ')") || http="000"
+              [ -n "$http" ] || http="000"
+
+              case "$http" in
+                200) echo "$http"; return 0 ;;
+                000|5*)
+                  if [ "$attempt" -ge "$max_attempts" ]; then
+                    echo "$http"; return 0
+                  fi
+                  echo "::warning::bump-agent-image returned HTTP ${http} for ${cid} (attempt ${attempt}/${max_attempts}); retrying in ${delay}s" >&2
+                  sleep "$delay"
+                  attempt=$((attempt + 1))
+                  delay=$((delay * 2))
+                  ;;
+                *) echo "$http"; return 0 ;;
+              esac
+            done
+          }
+
           for cid in $COMPANY_IDS; do
             echo "--- Bumping company ${cid} ---"
             response=$(mktemp)
-            http=$(curl -sS -o "$response" -w "%{http_code}" \
-              -X POST "${PAPERCLIP_API}/api/admin/agents/bump-agent-image" \
-              -H "Authorization: Bearer ${PAPERCLIP_BUMP_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -d "$(jq -n --arg image "$NEW_IMAGE" --arg sha "$BUILD_SHA" --arg cid "$cid" '
-                { companyId: $cid, image: $image, source: "ci:docker-agent.yml", buildSha: $sha }
-              ')")
+            http=$(post_bump "$cid" "$response")
             echo "HTTP $http"
-            jq '.' "$response" || cat "$response"
+            # A non-200 is frequently a proxy's PLAIN-TEXT body ("upstream
+            # connect error ..."). Feeding that to `jq` first buried the real
+            # cause under `jq: parse error: Invalid numeric literal`, so the
+            # log's most prominent line described the parser rather than the
+            # fault. Print the raw body whenever it is not valid JSON.
+            if jq -e . "$response" >/dev/null 2>&1; then
+              jq '.' "$response"
+            else
+              echo "--- non-JSON response body ---"
+              cat "$response"
+              echo
+            fi
             if [ "$http" != "200" ]; then
-              echo "::error::bump-agent-image returned HTTP $http for company ${cid}"
+              echo "::error::bump-agent-image returned HTTP $http for company ${cid}: $(head -c 500 "$response")"
               failed=$((failed + 1))
             else
               total_bumped=$((total_bumped + $(jq -r '.bumped | length' "$response")))
@@ -404,37 +455,62 @@ jobs:
   # reporting green the entire time. File (or refresh) a tracking issue so a
   # dead delivery lane is loud instead of silent. Runs on ubuntu-latest, not
   # arc-dind — it only needs `gh`, not the self-hosted build toolchain.
+  # BLO-33382: this job previously filed a GitHub issue, on a repository where
+  # Issues are DISABLED (`gh api repos/Blockcast/paperclip --jq .has_issues` →
+  # false). `gh issue list` exited non-zero under `set -euo pipefail`, so the
+  # step died before reporting anything: the guardrail failed closed AND
+  # silently, and its own failure was the thing it was meant to report. Every
+  # triage surface showed a workflow that had alerting. 8 master failures in the
+  # 27h to 2026-09-11 produced zero notifications.
+  #
+  # Alertmanager is the channel this org actually runs on, needs no credential
+  # from the in-cluster `arc-*` pools, and its default route fans every alert to
+  # the paperclip-plugin-alertmanager webhook — so this becomes a Paperclip issue
+  # in the platform lane, deduped on the alert fingerprint and refreshed in place
+  # when it re-fires. Same delivery path as the production-environment guard
+  # (BLO-22329), which is proven in production.
   alert-on-failure:
     needs: build-and-push
     if: always() && needs.build-and-push.result == 'failure' && github.event_name != 'workflow_dispatch'
     runs-on: arc-light
-    permissions:
-      issues: write
     steps:
-      - name: File or refresh a tracking issue for the failed build
+      - uses: actions/checkout@v5
+      - name: Report the failed build to Alertmanager
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          STATE: firing
+          GH_REPO: ${{ github.repository }}
+          BRANCH: master
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
-        run: |
-          set -euo pipefail
-          title="Docker (agent base) is failing on master"
-          existing="$(gh issue list --repo "$REPO" --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')"
-          body="$(cat <<EOF
-          \`Docker (agent base)\` failed on master at commit ${HEAD_SHA}.
+          FAILED_JOB: build-and-push
+        run: node .github/scripts/post-docker-agent-alert.mjs
 
-          Run: ${RUN_URL}
-
-          While this workflow is red, steps \`Promote verified agent image\` and
-          \`Bump agent image refs in cluster\` never execute — no agent image change
-          reaches the cluster until it's fixed. See BLO-23128 for the incident where
-          this went unnoticed for ~6 days; check that issue and its comments for the
-          last confirmed root cause before starting a fresh investigation.
-          EOF
-          )"
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "$REPO" --body "$body"
-          else
-            gh issue create --repo "$REPO" --title "$title" --body "$body"
-          fi
+  # The other half of an honest alert: without it, `endsAt` would be the only
+  # thing retiring the firing alert, so the lane would go quiet on a TIMER
+  # rather than on a fix. Pushing the identical label set with a past `endsAt`
+  # makes Alertmanager send `resolved` (send_resolved: true on the paperclip
+  # receiver), which cancels the issue.
+  #
+  # It is also the continuous capability probe this defect went undetected for
+  # want of: every GREEN master build exercises the exact delivery path the
+  # failure path depends on, so a channel that rots is caught by the next
+  # successful build instead of by the next outage. That is why it is a separate
+  # job rather than a step inside build-and-push — a delivery failure here must
+  # not flip `build-and-push.result` to `failure` and fire a spurious
+  # "the build is failing" alert.
+  resolve-on-success:
+    needs: build-and-push
+    if: always() && needs.build-and-push.result == 'success' && github.event_name != 'workflow_dispatch'
+    runs-on: arc-light
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve the delivery-lane alert (and prove the channel still works)
+        env:
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          STATE: resolved
+          GH_REPO: ${{ github.repository }}
+          BRANCH: master
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: node .github/scripts/post-docker-agent-alert.mjs
