@@ -8044,7 +8044,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       }
     });
 
-    it("reports no suppression reason for PR wake reasons that are not review submissions", () => {
+    it("reports a suppression reason only for review submissions carrying a classifier decision", () => {
       // opened/synchronize/review_requested are non-actionable by
       // construction, not by a classifier decision. Naming a suppression
       // reason for them would bury the one case worth reading.
@@ -8057,7 +8057,27 @@ describeEmbeddedPostgres("github-webhook route", () => {
         }),
       ).toBeNull();
 
-      // ...but a review submission with no body at all still gets one.
+      // ...but a review submission does, projected from the decision the
+      // delivery path already made on the RAW body.
+      expect(
+        __test_resolveReviewFeedbackSuppression({
+          identifiers: ["PEN-1126"],
+          wakeReason: "github_pr_review_submitted",
+          prNumber: 61,
+          repoFullName: "Blockcast/frr",
+          reviewBody: null,
+          reviewState: "commented",
+          reviewActionability: __test_classifyPrReviewActionability(null, "commented"),
+        }),
+      ).toEqual({ reason: "review_body_absent", predicate: "typeof body !== 'string'" });
+
+      // A context carrying NO decision stays silent rather than re-classifying
+      // context.reviewBody, which is CLAMPED. A clamp landing between two bucket
+      // headings leaves extractAllyReportedFindingRefs non-null-but-empty, which
+      // names `ally_review_findings_all_zero` -- the HEALTHY reason -- for a body
+      // truncated with findings lost (frr#61's buckets are 25 bytes apart).
+      // Silence is recoverable; a confidently wrong name is the very ambiguity
+      // this issue exists to remove.
       expect(
         __test_resolveReviewFeedbackSuppression({
           identifiers: ["PEN-1126"],
@@ -8067,7 +8087,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
           reviewBody: null,
           reviewState: "commented",
         }),
-      ).toEqual({ reason: "review_body_absent", predicate: "typeof body !== 'string'" });
+      ).toBeNull();
     });
   });
 
