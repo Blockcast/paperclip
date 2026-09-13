@@ -41,11 +41,21 @@ export const PLANNING_ONLY_RECOVERY_GUARD_CONTEXT = {
 // assembled a complete board-ordered approval payload, each was refused, and each read this flag as
 // a retry that would arrive. None did. State the reachable exits instead of implying an unreachable
 // one — the caller can always take one of them in the run that is refused.
+//
+// BLO-32634: this string is scoped to the wakes the RECOVERY ACTION raises, not to "every wake on
+// this issue". Since a wake that declares its own run class now owns the guard block at
+// `mergeCoalescedContextSnapshot`, a declared normal-model wake on an issue with a live recovery
+// action is reachable, and the older universal phrasing asserted an invariant the merge falsifies.
+// The caller-facing point is unchanged and still exactly true: nothing you can WAIT for turns into
+// a normal-model run, because only a recorded disposition clears the action. The narrower phrasing
+// is deliberate in both directions — it must not go stale again, and it must not read to a refused
+// agent as an instruction to go arm itself an unguarded run (that residual is BLO-32774).
 export const STATUS_ONLY_RECOVERY_RESUME_GUIDANCE = {
   normalModelResumeIsAutomatic: false,
   resumeGuidance:
-    "No normal-model run is dispatched for this issue on its own: while its recovery action is " +
-    "active, every wake on it is status-only. Reachable exits from this run: record a valid issue " +
+    "No normal-model run is dispatched for this issue on its own: every wake the recovery action " +
+    "itself raises is status-only, and only a recorded disposition clears that action — so waiting " +
+    "for a normal-model run never ends. Reachable exits from this run: record a valid issue " +
     "disposition to clear the recovery action, or file a `request_board_approval` linked to the " +
     "run context's source issue.",
 } as const;
@@ -64,7 +74,8 @@ const RECOVERY_MODEL_PROFILE_HINT_KEYS = [
 // wake declares a run class. Exported so the merge and this module cannot drift:
 // a key added here without the merge knowing about it is exactly the partial
 // tuple this block exists to prevent.
-export const RECOVERY_GUARD_CONTEXT_KEYS: readonly string[] = RECOVERY_MODEL_PROFILE_HINT_KEYS;
+export const RECOVERY_GUARD_CONTEXT_KEYS: readonly RecoveryModelProfileHintKey[] =
+  RECOVERY_MODEL_PROFILE_HINT_KEYS;
 
 type RecoveryModelProfileHintKey = (typeof RECOVERY_MODEL_PROFILE_HINT_KEYS)[number];
 type WithoutRecoveryModelProfileHints<T> = Omit<T, RecoveryModelProfileHintKey>;
