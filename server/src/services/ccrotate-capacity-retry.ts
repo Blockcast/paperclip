@@ -206,6 +206,25 @@ const CCROTATE_CAPACITY_DECISION_KEYS = [
   "penstockRetryAfterSeconds",
   "penstockAdvertisedResumeAt",
   "penstockCapacityParkClampedFrom",
+  /**
+   * Which gate probe denied this park: "capacity" or "messages_fallback"
+   * (BLO-29900).
+   *
+   * `penstockReason` cannot answer this. A 429 from the cheap cached
+   * `GET /v1/pools/default/capacity` and a 429 from the real
+   * `POST /v1/messages` fallback both persist
+   * `penstock.model_capacity_unavailable`, so from a parked row alone it was
+   * impossible to tell whether the re-probe had consumed provider inference
+   * quota — which is exactly the cost the 15m re-probe cadence assumes it is
+   * not paying.
+   *
+   * Belongs in this list rather than beside
+   * {@link CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY}: it describes *this*
+   * denial, not the chain, so a re-defer that lands on the other path must
+   * overwrite it. A value that lingered from a previous hop would assert a
+   * probe cost this park did not pay, which is worse than no value at all.
+   */
+  "penstockProbePath",
 ] as const;
 
 /**
@@ -310,6 +329,14 @@ export interface CcrotateCapacityDecision {
   provider?: string | null;
   model?: string | null;
   reason?: string | null;
+  /**
+   * Which gate probe produced this denial ("capacity" | "messages_fallback"),
+   * persisted under `penstockProbePath` (BLO-29900). Optional so a caller with
+   * no gate result — a hand-built decision in a test, say — is not forced to
+   * invent one; the key is simply absent, which reads as "not recorded" rather
+   * than as a false claim about which probe ran.
+   */
+  probePath?: string | null;
   retryAfterSeconds?: number | null;
   /** What the provider advertised on *this* denial, ISO-8601, or null. */
   advertisedResumeAtIso: string | null;
@@ -390,6 +417,7 @@ export function applyCcrotateCapacityDecision(
   if (decision.provider != null) next.penstockProvider = decision.provider;
   if (decision.model != null) next.penstockModel = decision.model;
   if (decision.reason != null) next.penstockReason = decision.reason;
+  if (decision.probePath != null) next.penstockProbePath = decision.probePath;
   if (decision.retryAfterSeconds != null) {
     next.penstockRetryAfterSeconds = decision.retryAfterSeconds;
   }

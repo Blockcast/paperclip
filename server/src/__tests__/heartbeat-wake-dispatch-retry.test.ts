@@ -798,6 +798,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
                 provider: "anthropic" as const,
                 reason: "penstock.model_capacity_unavailable" as const,
                 model: "claude-opus-4-8",
+                probePath: "capacity" as const,
                 resumeAt: null,
                 retryAfterSeconds: 60,
               };
@@ -1226,6 +1227,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
                 provider: "anthropic" as const,
                 reason: "penstock.model_capacity_unavailable" as const,
                 model: "claude-opus-4-8",
+                probePath: "capacity" as const,
                 resumeAt: null,
                 retryAfterSeconds: 60,
               };

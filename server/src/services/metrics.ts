@@ -137,6 +137,109 @@ export const ISOLATED_RUN_STARTED_METRIC = "paperclip_k8s_isolated_run_started_t
  * Unknown/empty values collapse to "unknown" to guard against future changes.
  */
 export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_deferred_total";
+
+/**
+ * Penstock availability-gate probe counter (BLO-29900).
+ *
+ * ## Why this counter has to exist before anything else gets "fixed"
+ *
+ * `CCROTATE_CAPACITY_MAX_PARK_MS` (15m) is a deliberate trade: re-probe often
+ * rather than honour a provider horizon measured going stale within hours
+ * (BLO-23438 — ~76 runs frozen 5.2 days). That trade is sound *only if
+ * re-probing is cheap*, and the clamp's own docblock asserts exactly that —
+ * "Re-probing is a single cached GET".
+ *
+ * The assertion is **conditional, and the condition was unstated**. When
+ * `readPenstockCapacity` yields no verdict (404, non-ok status, unparseable
+ * body, or `state: "unknown"` without an authoritative reason) the gate falls
+ * through to `probePenstockAnthropicModel` — a real `POST /v1/messages`
+ * against the provider that is currently exhausted. The 30s verdict cache
+ * cannot absorb it at a ~15m cadence, and the fallback is anthropic-only,
+ * which matches the firing alert set (`LLMProxyProviderCapacityRetryStorm
+ * {provider="anthropic"}`, no codex equivalent).
+ *
+ * Before this counter, that path was **unobservable**: `penstock_proxy_requests_total`
+ * carries no `route` label, so probe traffic could not be separated from real
+ * dispatch, and both probe paths persisted the same `reason` on a 429. The
+ * fallback's existence is provable from the code; its *rate* is not provable
+ * from anything that existed. This series is what turns that into a
+ * measurement — deliberately shipped on its own, ahead of any suppression, so
+ * the decision to suppress rests on a number rather than on arithmetic over an
+ * unlabelled series (the BLO-29779 error).
+ *
+ * ## Reading it
+ *
+ * - `path="capacity"` counts every capacity **attempt**, whatever it returned.
+ *   It is the denominator: fallback share is
+ *   `{path="messages_fallback"} / {path="capacity"}`.
+ * - `path="messages_fallback"` counts the provider-inference probes actually
+ *   paid for. **An absent series means the fallback has not been taken since
+ *   process start** — the counter is not pre-seeded, deliberately, so a zero
+ *   cannot be confused with a series that was minted by seeding rather than by
+ *   a real probe. Confirm the gate is probing at all by checking the
+ *   `path="capacity"` series is advancing; do not read fallback silence alone
+ *   as health.
+ * - Cache hits do **not** increment. Only real network probes are counted, so
+ *   the ratio above is over re-probes rather than over gate calls.
+ * - `outcome="error"` isolates the failed-open case. The gate returns
+ *   `allow: true` on probe error, so a *broken* probe is indistinguishable from
+ *   a healthy one on every other signal — this label is the only place that
+ *   distinction is visible.
+ *
+ * Cardinality: `path` and `outcome` are fixed allow-lists (2 x 5), coerced
+ * here. `provider` is deliberately **not** coerced: it is bounded by its
+ * caller's own `PenstockProvider` union instead, because collapsing a
+ * genuinely new third provider to "unknown" would hide exactly the per-provider
+ * probe cost this series exists to attribute. `model` comes from
+ * operator-managed `adapterConfig.model`, so it is bounded by the models
+ * configured across the fleet — small, and never attacker- or request-supplied.
+ */
+export const PENSTOCK_AVAILABILITY_GATE_PROBE_METRIC = "penstock_availability_gate_probe_total";
+/**
+ * Latency of one availability-gate probe, in seconds
+ * ({@link PENSTOCK_AVAILABILITY_GATE_PROBE_METRIC} is the count).
+ *
+ * Labeled `path` and `provider` only: `model` and `outcome` are omitted on
+ * purpose because a histogram multiplies every label combination by the bucket
+ * count, and the question this series answers — "is the fallback probe
+ * materially more expensive than the capacity GET?" — does not need them. The
+ * counter keeps the finer breakdown.
+ */
+export const PENSTOCK_AVAILABILITY_GATE_PROBE_DURATION_METRIC =
+  "penstock_availability_gate_probe_duration_seconds";
+
+/** Which probe produced a verdict. Mirrors `PenstockProbePath` in the gate. */
+export const KNOWN_PENSTOCK_PROBE_PATHS = ["capacity", "messages_fallback"] as const;
+export type PenstockProbePathLabel = (typeof KNOWN_PENSTOCK_PROBE_PATHS)[number];
+
+/**
+ * Probe outcomes, as an allow-list so a future branch cannot mint a series.
+ *
+ * - `ok` — probe answered and capacity is available (the gate allows).
+ * - `deny_capacity` — answered `penstock.model_capacity_unavailable`.
+ * - `deny_temporary` — answered `penstock.model_temporarily_unavailable`.
+ * - `inconclusive` — the capacity probe returned no verdict. This is the branch
+ *   that triggers the messages fallback, so its rate is the fallback's cause.
+ * - `error` — transport failure or timeout; the gate fails **open**.
+ */
+export const KNOWN_PENSTOCK_PROBE_OUTCOMES = [
+  "ok",
+  "deny_capacity",
+  "deny_temporary",
+  "inconclusive",
+  "error",
+] as const;
+export type PenstockProbeOutcomeLabel = (typeof KNOWN_PENSTOCK_PROBE_OUTCOMES)[number];
+
+/**
+ * Buckets sized to the gate's own 3s `timeoutMs`: sub-100ms is a healthy
+ * same-region hop, and the 3s/5s tail exists so an aborted probe is visible
+ * rather than collapsed into `+Inf`.
+ */
+const PENSTOCK_PROBE_DURATION_BUCKETS_SECONDS = [
+  0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5,
+] as const;
+
 export const HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC =
   "paperclip_heartbeat_timer_scheduler_exclusion_total";
 
@@ -1863,6 +1966,8 @@ type HeartbeatRunFailedLabel =
 
 let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
+let penstockGateProbe: Counter<"path" | "outcome" | "provider" | "model"> | null = null;
+let penstockGateProbeDuration: Histogram<"path" | "provider"> | null = null;
 let heartbeatTimerSchedulerExclusion: Counter<"reason"> | null = null;
 let heartbeatPostTerminalRunEventDropped: Counter<"status"> | null = null;
 let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = null;
@@ -1975,6 +2080,8 @@ function ensureRegistry(): {
   isolatedStartedCounter: Counter<"agent_id" | "isolation_mode">;
   failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
+  penstockGateProbeCounter: Counter<"path" | "outcome" | "provider" | "model">;
+  penstockGateProbeDurationHistogram: Histogram<"path" | "provider">;
   heartbeatTimerSchedulerExclusionCounter: Counter<"reason">;
   heartbeatPostTerminalRunEventDroppedCounter: Counter<"status">;
   zeroTokenCompletedRunStreakGauge: Gauge<"agent_id" | "adapter">;
@@ -2031,6 +2138,8 @@ function ensureRegistry(): {
     || !isolatedRunStarted
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
+    || !penstockGateProbe
+    || !penstockGateProbeDuration
     || !heartbeatTimerSchedulerExclusion
     || !heartbeatPostTerminalRunEventDropped
     || !agentZeroTokenCompletedRunStreak
@@ -2120,6 +2229,32 @@ function ensureRegistry(): {
         + "that returned scheduled_retry with scheduledRetryReason='ccrotate_capacity'. "
         + "A sustained non-zero rate means the fleet is quota-stalled.",
       labelNames: ["adapter", "provider"],
+      registers: [registry],
+    });
+    penstockGateProbe = new Counter({
+      name: PENSTOCK_AVAILABILITY_GATE_PROBE_METRIC,
+      help:
+        "Count of penstock availability-gate probes (BLO-29900), labeled by path "
+        + "(capacity = the cached GET /v1/pools/default/capacity; messages_fallback = the "
+        + "real POST /v1/messages taken when that GET yields no verdict), bounded outcome, "
+        + "provider, and model. path=capacity counts every attempt and is the denominator "
+        + "for fallback share. Not pre-seeded: an absent messages_fallback series means the "
+        + "fallback has not been taken since process start, so confirm path=capacity is "
+        + "advancing before reading that silence as health. Cache hits are not counted, so "
+        + "the ratio is over real re-probes. outcome=error is the failed-open case, which no "
+        + "other signal can distinguish from a healthy probe.",
+      labelNames: ["path", "outcome", "provider", "model"],
+      registers: [registry],
+    });
+    penstockGateProbeDuration = new Histogram({
+      name: PENSTOCK_AVAILABILITY_GATE_PROBE_DURATION_METRIC,
+      help:
+        "Seconds spent in one penstock availability-gate probe, labeled by path and provider "
+        + "(BLO-29900). Answers whether the messages_fallback probe is materially more "
+        + "expensive than the capacity GET the clamp's cheapness assumption rests on. "
+        + "Buckets run to 5s so a probe aborted at the gate's 3s timeout stays visible.",
+      labelNames: ["path", "provider"],
+      buckets: [...PENSTOCK_PROBE_DURATION_BUCKETS_SECONDS],
       registers: [registry],
     });
     heartbeatTimerSchedulerExclusion = new Counter({
@@ -2816,6 +2951,8 @@ function ensureRegistry(): {
     isolatedStartedCounter: isolatedRunStarted,
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
+    penstockGateProbeCounter: penstockGateProbe,
+    penstockGateProbeDurationHistogram: penstockGateProbeDuration,
     heartbeatTimerSchedulerExclusionCounter: heartbeatTimerSchedulerExclusion,
     heartbeatPostTerminalRunEventDroppedCounter: heartbeatPostTerminalRunEventDropped,
     zeroTokenCompletedRunStreakGauge: agentZeroTokenCompletedRunStreak,
@@ -2993,6 +3130,82 @@ export function recordCcrotateCapacityDeferred(
       : "unknown",
   };
   ensureRegistry().capacityDeferredCounter.inc(labels);
+  return labels;
+}
+
+export interface RecordPenstockAvailabilityGateProbeInput {
+  /** Which probe ran. Coerced to the allow-list; anything else is rejected. */
+  path: string | null | undefined;
+  /** Bounded probe outcome. Coerced to the allow-list. */
+  outcome: string | null | undefined;
+  /** Penstock provider probed (e.g. "anthropic"). */
+  provider: string | null | undefined;
+  /** Model probed, from operator-managed adapter config. */
+  model: string | null | undefined;
+  /**
+   * Wall time the probe took, in seconds. Omit when the caller has no
+   * measurement; the counter still increments so attempt counts never depend on
+   * timing being available.
+   */
+  durationSeconds?: number | null;
+}
+
+/**
+ * Longest `model` label accepted verbatim.
+ *
+ * `model` is operator-managed rather than request-supplied, so this is a
+ * backstop against a malformed config value becoming a permanent series, not a
+ * defence against a hostile caller. Truncating rather than dropping keeps a
+ * genuinely long model id readable and attributable.
+ */
+const PENSTOCK_PROBE_MODEL_LABEL_MAX_LENGTH = 120;
+
+function normalizePenstockProbeLabel<T extends string>(
+  value: string | null | undefined,
+  allowed: readonly T[],
+  fallback: T,
+): T {
+  return typeof value === "string" && (allowed as readonly string[]).includes(value)
+    ? (value as T)
+    : fallback;
+}
+
+/**
+ * Increment {@link PENSTOCK_AVAILABILITY_GATE_PROBE_METRIC} and observe
+ * {@link PENSTOCK_AVAILABILITY_GATE_PROBE_DURATION_METRIC} for one probe.
+ *
+ * Call once per **network probe**, never on a verdict-cache hit: the fallback
+ * share this series exists to measure is a ratio over real re-probes, and
+ * counting cache hits in the denominator would understate it by exactly the
+ * cache hit rate.
+ *
+ * An unrecognised `path` collapses to "capacity" and an unrecognised `outcome`
+ * to "error". Both fallbacks are deliberately the *pessimistic* reading — an
+ * uninstrumented branch shows up as a probe that failed on the cheap path
+ * rather than silently inflating the expensive one, so a labelling mistake
+ * cannot manufacture evidence that the fallback is hot.
+ */
+export function recordPenstockAvailabilityGateProbe(
+  input: RecordPenstockAvailabilityGateProbeInput,
+): { path: PenstockProbePathLabel; outcome: PenstockProbeOutcomeLabel; provider: string; model: string } {
+  const path = normalizePenstockProbeLabel(input.path, KNOWN_PENSTOCK_PROBE_PATHS, "capacity");
+  const outcome = normalizePenstockProbeLabel(input.outcome, KNOWN_PENSTOCK_PROBE_OUTCOMES, "error");
+  const provider = typeof input.provider === "string" && input.provider.length > 0
+    ? input.provider
+    : "unknown";
+  const rawModel = typeof input.model === "string" ? input.model.trim() : "";
+  const model = rawModel.length > 0
+    ? rawModel.slice(0, PENSTOCK_PROBE_MODEL_LABEL_MAX_LENGTH)
+    : "unknown";
+  const labels = { path, outcome, provider, model };
+  const registryHandles = ensureRegistry();
+  registryHandles.penstockGateProbeCounter.inc(labels);
+  if (typeof input.durationSeconds === "number" && Number.isFinite(input.durationSeconds)) {
+    registryHandles.penstockGateProbeDurationHistogram.observe(
+      { path, provider },
+      Math.max(0, input.durationSeconds),
+    );
+  }
   return labels;
 }
 
@@ -4078,6 +4291,8 @@ export function __resetMetricsForTest(): void {
   isolatedRunStarted = null;
   heartbeatRunFailed = null;
   ccrotateCapacityDeferred = null;
+  penstockGateProbe = null;
+  penstockGateProbeDuration = null;
   heartbeatTimerSchedulerExclusion = null;
   heartbeatPostTerminalRunEventDropped = null;
   agentZeroTokenCompletedRunStreak = null;
