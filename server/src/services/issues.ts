@@ -951,11 +951,24 @@ type IssueScheduledRetryProjection = {
   scheduledRetryAt: Date | null;
   scheduledRetryReason: string | null;
   scheduledRetryAttempt: number | null;
+  // BLO-29965: WHICH run is parked on this retry. The single-issue read
+  // (`getCurrentScheduledRetryForIssue`) has always returned `runId`; the list
+  // projection dropped it, so a list consumer could see that *a* retry was
+  // armed but not whether it was its own. Self-selection has to tell those
+  // apart: deferring to your own parked retry strands the row.
+  scheduledRetryRunId: string | null;
+  // BLO-29965 review round 3. WHICH AGENT owns that retry. `scheduledRetryRunId`
+  // alone only answers "is this my run?", and a reassigned issue keeps the
+  // previous assignee's retry row alive, so the new assignee read "not my run"
+  // as "a sibling holds it" and hid its own work. Sibling means same agent.
+  scheduledRetryAgentId: string | null;
 };
 const EMPTY_SCHEDULED_RETRY_PROJECTION: IssueScheduledRetryProjection = {
   scheduledRetryAt: null,
   scheduledRetryReason: null,
   scheduledRetryAttempt: null,
+  scheduledRetryRunId: null,
+  scheduledRetryAgentId: null,
 };
 type IssueWithLabelsAndRun = IssueWithLabels
   & { activeRun: IssueActiveRunRow | null }
@@ -2760,6 +2773,8 @@ async function scheduledRetryProjectionMapForIssues(
         scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
         scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
         scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        scheduledRetryRunId: heartbeatRuns.id,
+        scheduledRetryAgentId: heartbeatRuns.agentId,
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
@@ -2780,6 +2795,8 @@ async function scheduledRetryProjectionMapForIssues(
         scheduledRetryAt: row.scheduledRetryAt ?? null,
         scheduledRetryReason: row.scheduledRetryReason ?? null,
         scheduledRetryAttempt: row.scheduledRetryAttempt ?? null,
+        scheduledRetryRunId: row.scheduledRetryRunId ?? null,
+        scheduledRetryAgentId: row.scheduledRetryAgentId ?? null,
       });
     }
   }
