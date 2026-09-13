@@ -1,0 +1,205 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  buildRunSearchWindow,
+  classifyMergeQueueEviction,
+  extractPaperclipIdentifiers,
+  filterMergeGroupRunsForPr,
+  mergeQueueHeadBranchPrefix,
+  selectLatestQueueAttemptWindow,
+} from "../merge-queue-eviction-detector.mjs";
+
+test("classifies zero merge_group runs as conflict_unstageable, not check_failure", () => {
+  // BLO-23395: PR #1092's exact incident shape -- added to the queue,
+  // evicted 4.5h later, and zero merge_group runs were ever created for it.
+  const classification = classifyMergeQueueEviction({ merged: false, mergeGroupRuns: [] });
+  assert.equal(classification, "conflict_unstageable");
+  assert.notEqual(classification, "check_failure");
+});
+
+test("classifies a failing merge_group run as check_failure", () => {
+  const classification = classifyMergeQueueEviction({
+    merged: false,
+    mergeGroupRuns: [{ conclusion: "success" }, { conclusion: "failure" }],
+  });
+  assert.equal(classification, "check_failure");
+});
+
+test("classifies a non-failing merge_group run with no merge as manual", () => {
+  const classification = classifyMergeQueueEviction({
+    merged: false,
+    mergeGroupRuns: [{ conclusion: "success" }],
+  });
+  assert.equal(classification, "manual");
+});
+
+test("classifies a stuck-in-progress run (never reaches a conclusion) that was dequeued as manual, not check_failure", () => {
+  // The runbook's existing "stalled head" shape: a merge_group run exists but
+  // never terminates, so an SRE manually dequeues it. That is not a check
+  // failure -- no check ever concluded failing.
+  const classification = classifyMergeQueueEviction({
+    merged: false,
+    mergeGroupRuns: [{ conclusion: null, status: "in_progress" }],
+  });
+  assert.equal(classification, "manual");
+});
+
+test("classifies merged PRs as merged regardless of run history", () => {
+  const classification = classifyMergeQueueEviction({
+    merged: true,
+    mergeGroupRuns: [],
+  });
+  assert.equal(classification, "merged");
+});
+
+test("classifies a truncated empty sample as unknown, not conflict_unstageable (Ally review #1220)", () => {
+  // A `gh run list` sample that hit its cap is not proof of absence -- on a
+  // busy repo, this PR's own merge_group run could sit beyond the cap. Only
+  // report conflict_unstageable when the empty result is known-complete.
+  const classification = classifyMergeQueueEviction({ merged: false, mergeGroupRuns: [], truncated: true });
+  assert.equal(classification, "unknown");
+  assert.notEqual(classification, "conflict_unstageable");
+});
+
+test("a truncated sample with a real match still classifies normally", () => {
+  // Truncation only matters when it could be hiding this PR's run; once a
+  // match is actually found, the sample answered the question either way.
+  const classification = classifyMergeQueueEviction({
+    merged: false,
+    mergeGroupRuns: [{ conclusion: "failure" }],
+    truncated: true,
+  });
+  assert.equal(classification, "check_failure");
+});
+
+test("mergeQueueHeadBranchPrefix matches GitHub's gh-readonly-queue naming", () => {
+  assert.equal(mergeQueueHeadBranchPrefix("master", 1092), "gh-readonly-queue/master/pr-1092-");
+});
+
+test("filterMergeGroupRunsForPr excludes runs for other PRs, including numeric-prefix collisions", () => {
+  const runs = [
+    { headBranch: "gh-readonly-queue/master/pr-1092-abc123", conclusion: "success" },
+    // Must NOT match PR 1092 despite sharing the "pr-1092" substring.
+    { headBranch: "gh-readonly-queue/master/pr-10920-def456", conclusion: "failure" },
+    { headBranch: "gh-readonly-queue/master/pr-961-ghi789", conclusion: "success" },
+    { headBranch: "refs/heads/master", conclusion: null },
+  ];
+  const matched = filterMergeGroupRunsForPr(runs, { base: "master", prNumber: 1092 });
+  assert.equal(matched.length, 1);
+  assert.equal(matched[0].headBranch, "gh-readonly-queue/master/pr-1092-abc123");
+});
+
+test("filterMergeGroupRunsForPr on an empty run list returns empty, driving conflict_unstageable end to end", () => {
+  // Replays the #1092 incident shape: enumerate every merge_group run in the
+  // window (pr-1165, pr-961, pr-1046, pr-1011, pr-988, pr-900, pr-1163,
+  // pr-1162, pr-1127 -- no pr-1092) and confirm the detector's full pipeline
+  // (filter -> classify) lands on conflict_unstageable.
+  const runs = [
+    "pr-1165", "pr-961", "pr-1046", "pr-1011", "pr-988", "pr-900", "pr-1163", "pr-1162", "pr-1127",
+  ].map((label, i) => ({
+    headBranch: `gh-readonly-queue/master/${label}-${"a".repeat(7)}${i}`,
+    conclusion: "success",
+  }));
+  const matched = filterMergeGroupRunsForPr(runs, { base: "master", prNumber: 1092 });
+  assert.equal(matched.length, 0);
+  assert.equal(classifyMergeQueueEviction({ merged: false, mergeGroupRuns: matched }), "conflict_unstageable");
+});
+
+test("selectLatestQueueAttemptWindow picks the most recent enqueue/dequeue pair for a re-queued PR (Ally review #1220)", () => {
+  // A PR dequeued once for a failing check, manually re-added, then evicted
+  // again for an un-stageable rebase must not have its first attempt's runs
+  // leak into the second attempt's classification.
+  const events = [
+    { event: "added_to_merge_queue", created_at: "2026-08-08T09:00:00Z" },
+    { event: "removed_from_merge_queue", created_at: "2026-08-08T09:10:00Z" },
+    { event: "added_to_merge_queue", created_at: "2026-08-08T09:24:35Z" },
+    { event: "removed_from_merge_queue", created_at: "2026-08-08T13:55:45Z" },
+  ];
+  const window = selectLatestQueueAttemptWindow(events, { now: Date.parse("2026-08-08T14:00:00Z") });
+  assert.deepEqual(window, {
+    enqueuedAt: "2026-08-08T09:24:35.000Z",
+    dequeuedAt: "2026-08-08T13:55:45.000Z",
+  });
+});
+
+test("selectLatestQueueAttemptWindow is unaffected by event order in the input array", () => {
+  const events = [
+    { event: "removed_from_merge_queue", created_at: "2026-08-08T13:55:45Z" },
+    { event: "added_to_merge_queue", created_at: "2026-08-08T09:24:35Z" },
+    { event: "removed_from_merge_queue", created_at: "2026-08-08T09:10:00Z" },
+    { event: "added_to_merge_queue", created_at: "2026-08-08T09:00:00Z" },
+  ];
+  const window = selectLatestQueueAttemptWindow(events, { now: Date.parse("2026-08-08T14:00:00Z") });
+  assert.deepEqual(window, {
+    enqueuedAt: "2026-08-08T09:24:35.000Z",
+    dequeuedAt: "2026-08-08T13:55:45.000Z",
+  });
+});
+
+test("selectLatestQueueAttemptWindow reports dequeuedAt: null when still enqueued (no matching removal yet), never a fabricated timestamp (Ally review #1220, 4th pass)", () => {
+  // The old behavior substituted `now` for a missing removal, which could
+  // misclassify an active or freshly-requeued attempt with no run yet as a
+  // real eviction. The caller must retry or decline, not guess.
+  const events = [{ event: "added_to_merge_queue", created_at: "2026-08-08T09:24:35Z" }];
+  const now = Date.parse("2026-08-08T09:30:00Z");
+  const window = selectLatestQueueAttemptWindow(events, { now });
+  assert.deepEqual(window, { enqueuedAt: "2026-08-08T09:24:35.000Z", dequeuedAt: null });
+});
+
+test("selectLatestQueueAttemptWindow ignores a re-enqueue that lands after `now` (Ally review #1220, grace-period race)", () => {
+  // The PR is dequeued (evicted) at 13:55:45, then manually re-added at
+  // 13:56:10 -- inside this run's 60s post-dequeue grace-period sleep. `now`
+  // is captured at trigger time (13:55:50), before that re-enqueue landed.
+  // The window must still classify the dequeue that triggered this run, not
+  // jump onto the brand-new attempt that has no runs yet.
+  const events = [
+    { event: "added_to_merge_queue", created_at: "2026-08-08T09:24:35Z" },
+    { event: "removed_from_merge_queue", created_at: "2026-08-08T13:55:45Z" },
+    { event: "added_to_merge_queue", created_at: "2026-08-08T13:56:10Z" },
+  ];
+  const now = Date.parse("2026-08-08T13:55:50Z");
+  const window = selectLatestQueueAttemptWindow(events, { now });
+  assert.deepEqual(window, {
+    enqueuedAt: "2026-08-08T09:24:35.000Z",
+    dequeuedAt: "2026-08-08T13:55:45.000Z",
+  });
+});
+
+test("selectLatestQueueAttemptWindow returns null when no added_to_merge_queue event exists", () => {
+  const window = selectLatestQueueAttemptWindow(
+    [{ event: "labeled", created_at: "2026-08-08T09:00:00Z" }],
+    { now: Date.now() },
+  );
+  assert.equal(window, null);
+});
+
+test("buildRunSearchWindow buffers the window by 5 minutes on each side", () => {
+  const range = buildRunSearchWindow({
+    enqueuedAt: "2026-08-08T09:24:35.000Z",
+    dequeuedAt: "2026-08-08T13:55:45.000Z",
+  });
+  assert.equal(range, "2026-08-08T09:19:35.000Z..2026-08-08T14:00:45.000Z");
+});
+
+test("extractPaperclipIdentifiers finds a ref in the branch name when title/body carry none (Ally review #1220, 4th pass)", () => {
+  // The webhook's issue_comment handler has no branch name to fall back on;
+  // this is the detector's own safety net -- embed the ref straight into the
+  // comment body it posts so the shared extractor's commentBody source
+  // picks it up regardless of what the PR's title/body say.
+  const ids = extractPaperclipIdentifiers("blo-23395-merge-queue-eviction-detector", "Add a detector", null);
+  assert.deepEqual(ids, ["BLO-23395"]);
+});
+
+test("extractPaperclipIdentifiers dedupes across sources and expands compact refs", () => {
+  const ids = extractPaperclipIdentifiers(
+    "fix/BLO-3182-thing",
+    "Fixes BLO-3182 and BLO-3763/3764",
+    "See also (BLO-3182)",
+  );
+  assert.deepEqual(new Set(ids), new Set(["BLO-3182", "BLO-3763", "BLO-3764"]));
+});
+
+test("extractPaperclipIdentifiers returns empty for a branch/title/body with no ticket ref", () => {
+  assert.deepEqual(extractPaperclipIdentifiers("chore/tidy-up", "Tidy up", null), []);
+});
