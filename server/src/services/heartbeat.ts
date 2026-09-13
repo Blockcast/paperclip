@@ -25052,11 +25052,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    *  - It skips non-active companies. Those rows cannot fire either, but the
    *    cause is the company, not the issue, and it resolves if the company is
    *    reactivated — so clearing them would destroy live state to fix nothing.
-   *  - It CASes on (status, monitorNextCheckAt). Candidate selection and the
+   *  - It CASes on the whole eligibility tuple — (status, assigneeAgentId,
+   *    assigneeUserId) plus monitorNextCheckAt. Candidate selection and the
    *    clear are separate statements, so a concurrent checkout can re-promote
    *    the row and arm a fresh monitor in between; without the guard this pass
    *    would delete that new monitor and cause the exact stall it exists to
-   *    prevent.
+   *    prevent. The assignee columns are load-bearing rather than
+   *    belt-and-braces: a row ineligible only for being unassigned goes
+   *    deliverable on an assignee write ALONE, leaving both status and
+   *    nextCheckAt untouched, so a CAS on those two would wave it through.
    *
    * The monitor's `notes` are the whole record of what the run was waiting for,
    * so they are preserved twice over: `buildIssueMonitorClearedPatch` keeps an
@@ -25124,6 +25128,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(issues.id, candidate.id),
               eq(issues.status, candidate.status),
               eq(issues.monitorNextCheckAt, candidate.monitorNextCheckAt!),
+              // Eligibility is (assignee_agent_id, assignee_user_id, status), so
+              // the CAS has to cover all three or it guards a strict subset of
+              // what it read. A row that was ineligible only for being
+              // unassigned becomes deliverable on an assignee write ALONE —
+              // status and nextCheckAt both unchanged — so a CAS on those two
+              // passes and this pass deletes a monitor that just went live,
+              // which is the stall it exists to prevent. Null-safe by branch
+              // rather than `is not distinct from`: these bind as uuid/text and
+              // an untyped null param is an inference error, not a false CAS.
+              candidate.assigneeAgentId === null
+                ? isNull(issues.assigneeAgentId)
+                : eq(issues.assigneeAgentId, candidate.assigneeAgentId),
+              candidate.assigneeUserId === null
+                ? isNull(issues.assigneeUserId)
+                : eq(issues.assigneeUserId, candidate.assigneeUserId),
             ),
           )
           .returning({ id: issues.id })

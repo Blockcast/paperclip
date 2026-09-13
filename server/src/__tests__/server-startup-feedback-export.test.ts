@@ -74,6 +74,7 @@ const {
     })),
     reconcileProductivityReviews: vi.fn(async () => ({ created: 0, updated: 0, failed: 0 })),
     reconcileResolvedBlockerDependents: vi.fn(async () => ({ woken: 0, failed: 0 })),
+    reconcileUndeliverableIssueMonitors: vi.fn(async () => ({ scanned: 0, cleared: 0, skipped: 0, failed: 0 })),
     reconcileFailedWakeDispatches: vi.fn(async () => ({ recovered: 0, exhausted: 0 })),
     sweepExpiredRuntimeStatuses: vi.fn(() => 0),
     publishAgentLivenessGauges: vi.fn(async () => {}),
