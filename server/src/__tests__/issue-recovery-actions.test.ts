@@ -30,7 +30,7 @@ import { logger } from "../middleware/logger.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { computeIssueMonitorGateFingerprint } from "../services/issue-execution-policy.js";
-import { issueRecoveryActionService, recoveryHandoffGrantIsWithinTtl } from "../services/issue-recovery-actions.js";
+import { RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, issueRecoveryActionService, recoveryHandoffGrantIsWithinTtl } from "../services/issue-recovery-actions.js";
 import { issueService } from "../services/issues.js";
 import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
@@ -7100,6 +7100,22 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       );
       expect(escalationComment?.body).toContain("cause `stranded_assigned_issue`");
       expect(escalationComment?.body).toContain(`to owner \`${managerId}\``);
+
+      // BLO-19124: the announcement must not contradict the grant the same
+      // codebase gives the previous owner. `agentHasRecoveryHandoffGrantOnIssue`
+      // (BLO-18906, TTL BLO-20263) keeps `issue:comment` open to exactly
+      // `previousOwnerAgentId` for RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS after
+      // this transfer — the grant itself is covered in
+      // `authorization-service.test.ts`. What this pins is that the only
+      // agent-facing sentence about it AGREES: the old text said "can no longer
+      // PATCH or comment", so on BLO-33322 the previous owner completed the work
+      // and recorded nothing, believing it had no channel.
+      expect(escalationComment?.body).not.toContain("no longer PATCH or comment");
+      expect(escalationComment?.body).toContain("CAN still comment here");
+      // The quoted window is derived, so raising the TTL without re-reading this
+      // prose fails here rather than shipping a sentence that under-states it.
+      const ttlHours = Math.round(RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS / (60 * 60 * 1000));
+      expect(escalationComment?.body).toContain(`for ${ttlHours} hours after this transfer`);
     });
   });
 
