@@ -2645,6 +2645,110 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("does not enqueue a second wake when another finalizer already claimed the notice (BLO-33589)", async () => {
+    // Concurrent finalization of ONE reviewer run. The wake used to be gated on
+    // a read of `agentWakeupRequests` by idempotency key — check-then-act, on a
+    // table with no unique index on that column, so both racers saw no row and
+    // both enqueued. The claim is now the system comment, whose partial unique
+    // index on (issue_id, idempotency_key) lets Postgres pick one winner.
+    //
+    // This drives the LOSER: the winner's comment is already committed under
+    // the shared key when the terminalizer runs, so `addComment` comes back
+    // `deduplicated` and the wake must not fire. Under the old code the wake
+    // row is absent at that point and it fires — the duplicate this closes.
+    const jobName = "agent-opencode-ambiguous-review-concurrent-claim";
+    const headSha = "bb1d4a7c0f2e46318a5c9d0e7b3f81624ad5e909";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      includeIssue: false,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/libmmt:446:${headSha}`,
+        githubRepoFullName: "Blockcast/libmmt",
+        githubPrNumber: 446,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+
+    const authorAgentId = randomUUID();
+    const authorIssueId = randomUUID();
+    await db.insert(agents).values({
+      id: authorAgentId,
+      companyId,
+      name: "PlayersEngineerConcurrent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: authorIssueId,
+      companyId,
+      title: "BLO-33589 concurrent finalization",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: authorAgentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 446,
+      identifier: "TAUTHOR-446",
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId,
+      issueId: authorIssueId,
+      type: "pull_request",
+      provider: "github",
+      externalId: "Blockcast/libmmt#446",
+      title: "BLO-33589 concurrent finalization",
+      url: "https://github.com/Blockcast/libmmt/pull/446",
+      status: "ready_for_review",
+    });
+    // The race winner, committed before this finalizer reaches the claim.
+    await db.insert(issueComments).values({
+      companyId,
+      issueId: authorIssueId,
+      authorType: "system",
+      idempotencyKey: `pr_review_gate_failed:${runId}:${authorIssueId}`,
+      body: "## Ally review did not land on `Blockcast/libmmt#446`",
+    });
+
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: false });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+    const previousGateContext = process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+    process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = "review/ally-complete";
+    try {
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    } finally {
+      if (previousGateContext === undefined) {
+        delete process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+      } else {
+        process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = previousGateContext;
+      }
+    }
+
+    const [comments, wakeups] = await Promise.all([
+      db.select().from(issueComments).where(eq(issueComments.issueId, authorIssueId)),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, authorAgentId)),
+    ]);
+    // One notice, from the winner — the loser neither posts nor wakes.
+    expect(
+      comments.filter((comment) => comment.body.includes("Ally review did not land on")),
+    ).toHaveLength(1);
+    expect(
+      wakeups.filter((wakeup) => wakeup.reason === "github_pr_review_gate_failed"),
+    ).toHaveLength(0);
+  });
+
   it.each(["pr_review_output_missing", "pr_review_verification_unavailable"])(
     "terminalizes the PR gate for non-retryable %s after adapter invocation",
     async (errorCode) => {

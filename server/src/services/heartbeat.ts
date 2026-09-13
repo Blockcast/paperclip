@@ -12104,7 +12104,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     issue: { id: string; status: string; assigneeAgentId: string | null },
     body: string,
   ) {
-    await issuesSvc.addComment(
+    const wakeIdempotencyKey = `pr_review_gate_failed:${run.id}:${issue.id}`;
+    const comment = await issuesSvc.addComment(
       issue.id,
       body,
       { runId: run.id },
@@ -12113,9 +12114,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Keyed on the run, so re-finalizing the same terminal run cannot
         // post twice, while a genuinely new failed reviewer run on the same
         // head still reports.
-        idempotencyKey: `pr_review_gate_failed:${run.id}:${issue.id}`,
+        idempotencyKey: wakeIdempotencyKey,
       },
     );
+
+    // The comment insert IS the claim on the wake, and that is the whole reason
+    // it is read here rather than discarded (BLO-33589 review). `issue_comments`
+    // carries a partial unique index on (issue_id, idempotency_key) for
+    // system-authored rows, so under concurrent finalization of the same
+    // reviewer run Postgres picks exactly one winner and every loser comes back
+    // `deduplicated`. Reading a `agentWakeupRequests` row first instead would be
+    // check-then-act: that table has no unique index on `idempotencyKey` (and
+    // must not grow one — recurring wake keys legitimately recur), so both
+    // racers would observe no row and both would enqueue.
+    //
+    // Consequence to know about: if the wake below throws, the claim is already
+    // committed and a later re-finalization of this same run will not retry it.
+    // `wakeupWithDispatchRetry` owns that retry, and the caller logs the
+    // failure per issue. A compensating claim release would trade a rare lost
+    // wake for a rare duplicate run; neither is worth the machinery.
+    if ("deduplicated" in comment) return;
 
     // A comment does not wake anyone. Only a live-status issue with an agent
     // assignee has somewhere for a wake to land.
@@ -12123,21 +12141,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (issue.status !== "todo" && issue.status !== "in_progress" && issue.status !== "in_review") {
       return;
     }
-    const wakeIdempotencyKey = `pr_review_gate_failed:${run.id}:${issue.id}`;
-    const existingWake = await db
-      .select({ id: agentWakeupRequests.id })
-      .from(agentWakeupRequests)
-      .where(
-        and(
-          eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
-          eq(agentWakeupRequests.idempotencyKey, wakeIdempotencyKey),
-        ),
-      )
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    // The key carries the run id, so it can never legitimately recur: any row
-    // at all under it means this notification was already dispatched.
-    if (existingWake) return;
     await wakeupWithDispatchRetry(issue.assigneeAgentId, {
       source: "automation",
       triggerDetail: "system",
