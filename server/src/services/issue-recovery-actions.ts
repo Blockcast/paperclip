@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, inArray, isNotNull, isNull, lte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueRecoveryActions } from "@paperclipai/db";
+import { issueRecoveryActions, issues } from "@paperclipai/db";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -55,6 +55,13 @@ const RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY = "recoveryHandoffGrantAnchorAt
 // Written by `buildStrandedRecoveryActionEvidence` in recovery/service.ts.
 const LATEST_RUN_AGENT_ID_EVIDENCE_KEY = "latestRunAgentId";
 const LATEST_RUN_ID_EVIDENCE_KEY = "latestRunId";
+// Where the source issue stood at the instant the action was resolved. Read by
+// `classifyRecoveryHandoff` (recovery-observability.ts) in place of a live
+// `issues` join, so a resolved action's routing class cannot change when the
+// issue is later reassigned or completed (BLO-33600). Absent on every row
+// resolved before this shipped; those classify as `unknown`, never `handed_back`.
+export const RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY = "resolvedAssigneeAgentId";
+export const RESOLVED_ISSUE_STATUS_EVIDENCE_KEY = "resolvedIssueStatus";
 
 // How long after a recovery transfer the previous owner keeps the comment-only
 // handoff channel opened by BLO-18906 / #827.
@@ -878,6 +885,14 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       predicates.push(eq(issueRecoveryActions.fingerprint, input.fingerprint));
     }
 
+    // Read inside the caller's transaction where there is one, so the snapshot
+    // reflects the same issue mutation that triggered this resolution.
+    const [sourceIssue] = await dbOrTx
+      .select({ assigneeAgentId: issues.assigneeAgentId, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, input.sourceIssueId))
+      .limit(1);
+
     const [updated] = await dbOrTx
       .update(issueRecoveryActions)
       .set({
@@ -887,6 +902,12 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         resolutionNote: input.resolutionNote ?? null,
         resolvedAt: now,
         updatedAt: now,
+        // Snapshot the source issue as it stands NOW. Merged in SQL rather than
+        // read-modify-written in TS so a concurrent evidence write is not lost.
+        evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+          [RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY]: sourceIssue?.assigneeAgentId ?? null,
+          [RESOLVED_ISSUE_STATUS_EVIDENCE_KEY]: sourceIssue?.status ?? null,
+        })}::jsonb`,
       })
       .where(and(...predicates))
       .returning();
