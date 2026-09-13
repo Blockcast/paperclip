@@ -143,13 +143,19 @@ function lower(value) {
 }
 
 /**
- * The latest state per check name.
+ * The latest state per check, as `[name, state]` pairs.
  *
  * A re-run, or a cancelled-then-superseded run, leaves both attempts hanging
  * off the same head. Reading them all makes a green PR look red (BLO-32733),
- * so the newest row per name wins. `statusCheckRollup` unifies the check-run
+ * so the newest row per check wins. `statusCheckRollup` unifies the check-run
  * and legacy commit-status surfaces, which is why this reads one field rather
  * than two endpoints that are each blind to the other.
+ *
+ * "Per check" means per (surface, name), not per name: the union carries
+ * `CheckRun` and `StatusContext` rows in independent namespaces, so keying on
+ * the name alone lets a newer green status context shadow an older failing
+ * check-run of the same name and enqueue past a red required check. Pairs
+ * rather than a Map for the same reason — a Map cannot hold both.
  */
 export function latestCheckStates(rollup) {
   const latest = new Map();
@@ -163,10 +169,11 @@ export function latestCheckStates(rollup) {
       context?.completedAt || context?.startedAt || context?.createdAt || "",
     );
     const stamp = Number.isFinite(at) ? at : 0;
-    const seen = latest.get(name);
-    if (!seen || stamp >= seen.stamp) latest.set(name, { state, stamp });
+    const key = `${context?.__typename ?? ""} ${name}`;
+    const seen = latest.get(key);
+    if (!seen || stamp >= seen.stamp) latest.set(key, { name, state, stamp });
   }
-  return new Map([...latest].map(([name, { state }]) => [name, state]));
+  return [...latest.values()].map(({ name, state }) => [name, state]);
 }
 
 /**
