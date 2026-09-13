@@ -7426,10 +7426,10 @@ export function filterZombieCoalesceTarget<
  *
  * `isZombieRun` only catches a run with no live in-memory execution. A run
  * that stalls *after* being registered in `activeRunExecutions` is tracked,
- * so it is not a zombie — yet every later same-scope wake is absorbed into it
- * by a bare UPDATE that mints no run and stamps no `lastHeartbeatAt`. The wake
- * is lost outright, and the UPDATE refreshes `updatedAt`, re-arming the shield.
- * The agent goes silent for the length of the stall.
+ * so it is not a zombie — yet every later same-scope timer wake is absorbed
+ * into it by a bare UPDATE that mints no run and stamps no `lastHeartbeatAt`.
+ * The wake is lost outright, and the UPDATE refreshes `updatedAt`, re-arming
+ * the shield. The agent goes silent for the length of the stall.
  *
  * Measured on the two `claude_local` built-ins (n=2000 runs, 2026-07-26 →
  * 2026-09-13): 38 runs outlived 2× their median cadence with *zero* runs
@@ -7482,22 +7482,49 @@ export function resolveStalledCoalesceBudgetMs(intervalSec: number): number {
 }
 
 /**
+ * The only wake source this rule may act on.
+ *
+ * The whole warrant for the rule is "a periodic cadence tick was lost": a timer
+ * wake absorbed into a running run mints nothing and stamps no
+ * `lastHeartbeatAt` (see the `source === "timer"` branch on the skip path), so
+ * elapsed time really does prove a tick went unserviced. A demand wake has no
+ * cadence to miss — it fires once, when something happened — so age alone says
+ * nothing about whether it was lost, and treating it as lost would discard a
+ * live target and mint a *concurrent* run for a manual or recovery wake.
+ *
+ * This matters more than it looks: `source` defaults to `"on_demand"`, so
+ * without this gate the rule would fire on the default path rather than the
+ * intended one. It also costs nothing against the measured evidence — that harm
+ * lives entirely on the `__heartbeat__` task key, which
+ * `deriveTaskKeyWithHeartbeatFallback` only mints for `wakeSource === "timer"`.
+ *
+ * Same reasoning, same shape as {@link isHeartbeatCooldownActive}, which gates
+ * the periodic-loop anti-thrash guard on exactly this source for exactly this
+ * reason.
+ */
+const STALLED_COALESCE_ELIGIBLE_WAKE_SOURCE = "timer";
+
+/**
  * True when `run` is a running row that has been in flight longer than
  * {@link resolveStalledCoalesceBudgetMs}, and so has necessarily already
- * absorbed a wake it did not service.
+ * absorbed a timer wake it did not service.
  *
- * Scoped to `running` on purpose. A `queued` or `scheduled_retry` row has not
+ * Scoped to timer wakes (see {@link STALLED_COALESCE_ELIGIBLE_WAKE_SOURCE}) and
+ * to `running` rows on purpose. A `queued` or `scheduled_retry` row has not
  * started yet and reads fresh context when it does, so coalescing into it is
  * correct however old it is.
  *
  * Fails safe on unknown input (missing or unparseable `startedAt`): returning
  * false preserves today's behaviour exactly.
  */
-export function isCoalesceTargetPastHeartbeatInterval(
-  run: { status: string; startedAt: Date | string | null },
-  intervalSec: number,
-  now: Date,
-): boolean {
+export function isCoalesceTargetPastHeartbeatInterval(input: {
+  run: { status: string; startedAt: Date | string | null };
+  source: string;
+  intervalSec: number;
+  now: Date;
+}): boolean {
+  const { run, source, intervalSec, now } = input;
+  if (source !== STALLED_COALESCE_ELIGIBLE_WAKE_SOURCE) return false;
   if (run.status !== "running") return false;
   if (!run.startedAt) return false;
   const startedAtMs = new Date(run.startedAt).getTime();
@@ -7507,18 +7534,22 @@ export function isCoalesceTargetPastHeartbeatInterval(
 
 /**
  * Filter a coalesce target that has overrun its heartbeat interval, so the
- * wake falls through and mints its own run instead of being swallowed.
+ * timer wake falls through and mints its own run instead of being swallowed.
  *
- * Null targets and non-running targets pass through unchanged.
+ * Null targets, non-timer wakes, and non-running targets pass through
+ * unchanged.
  */
 export function filterIntervalOverrunCoalesceTarget<
   T extends { status: string; id: string; startedAt: Date | string | null },
->(
-  target: T | null,
-  intervalSec: number,
-  now: Date,
-): T | null {
-  return target && isCoalesceTargetPastHeartbeatInterval(target, intervalSec, now)
+>(input: {
+  target: T | null;
+  source: string;
+  intervalSec: number;
+  now: Date;
+}): T | null {
+  const { target, source, intervalSec, now } = input;
+  if (!target) return null;
+  return isCoalesceTargetPastHeartbeatInterval({ run: target, source, intervalSec, now })
     ? null
     : target;
 }
@@ -35425,19 +35456,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       rawCoalescedTarget.scheduledRetryReason === CCROTATE_CAPACITY_RETRY_REASON
         ? rawCoalescedTarget
         : null;
-    const coalescedTargetRun = filterIntervalOverrunCoalesceTarget(
-      filterZombieCoalesceTarget(
+    const coalescedTargetRun = filterIntervalOverrunCoalesceTarget({
+      target: filterZombieCoalesceTarget(
         manualCapacityRetryTarget ? null : rawCoalescedTarget,
         liveRunExecutions,
       ),
-      // PEN-1995: the agent's own configured interval, so a slow-cadence agent
-      // gets a proportionally larger budget. `intervalSec` is always positive
-      // (clamped to [30, 86400]) and is returned even when heartbeats are
-      // disabled, so the floor in resolveStalledCoalesceBudgetMs — not this
-      // value — is what keeps fast-cadence agents safe.
-      resolveHeartbeatPolicyForRuntimeConfig(agent.runtimeConfig).intervalSec,
-      new Date(),
-    );
+      // PEN-1995: timer wakes only. A demand wake has no cadence to miss, so
+      // its age proves nothing was lost — filtering on it would discard a live
+      // target and mint a concurrent run for a manual or recovery wake. The
+      // helper enforces this; it is passed rather than branched here so the
+      // whole rule stays in one unit-testable place.
+      source,
+      // The agent's own configured interval, so a slow-cadence agent gets a
+      // proportionally larger budget. `intervalSec` is always positive (clamped
+      // to [30, 86400]) and is returned even when heartbeats are disabled, so
+      // the floor in resolveStalledCoalesceBudgetMs — not this value — is what
+      // keeps fast-cadence agents safe.
+      intervalSec: resolveHeartbeatPolicyForRuntimeConfig(agent.runtimeConfig).intervalSec,
+      now: new Date(),
+    });
 
     if (coalescedTargetRun) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(

@@ -141,6 +141,11 @@ const HOUR_MS = 60 * 60 * 1000;
 const now = new Date("2026-09-13T12:00:00.000Z");
 const agoMs = (ms: number) => new Date(now.getTime() - ms);
 
+// Every source the wakeup path can carry that is NOT the periodic cadence tick.
+// `on_demand` is also the DEFAULT (`opts.source ?? "on_demand"`), which is why
+// the source gate is load-bearing rather than cosmetic.
+const NON_TIMER_SOURCES = ["on_demand", "automation", "assignment"] as const;
+
 describe("resolveStalledCoalesceBudgetMs", () => {
   it("uses 1.5x the interval once that exceeds the floor", () => {
     // 24h interval (the clamp maximum) -> 36h budget.
@@ -171,77 +176,150 @@ describe("resolveStalledCoalesceBudgetMs", () => {
 describe("isCoalesceTargetPastHeartbeatInterval", () => {
   it("is true for a running run past its budget", () => {
     const run = { status: "running", startedAt: agoMs(4 * HOUR_MS) };
-    expect(isCoalesceTargetPastHeartbeatInterval(run, 3600, now)).toBe(true);
+    expect(isCoalesceTargetPastHeartbeatInterval({ run, source: "timer", intervalSec: 3600, now }))
+      .toBe(true);
   });
 
   it("is false for a running run inside its budget", () => {
     const run = { status: "running", startedAt: agoMs(5 * 60 * 1000) };
-    expect(isCoalesceTargetPastHeartbeatInterval(run, 3600, now)).toBe(false);
+    expect(isCoalesceTargetPastHeartbeatInterval({ run, source: "timer", intervalSec: 3600, now }))
+      .toBe(false);
+  });
+
+  // The review finding this gate answers: only a periodic cadence tick can be
+  // shown lost by elapsed time. A demand wake fires once, when something
+  // happened, so its age proves nothing — and firing here would discard a live
+  // target and mint a concurrent run for a manual or recovery wake.
+  it("never fires for a non-timer wake, however far past the budget", () => {
+    const run = { status: "running", startedAt: agoMs(48 * HOUR_MS) };
+    for (const source of NON_TIMER_SOURCES) {
+      expect(isCoalesceTargetPastHeartbeatInterval({ run, source, intervalSec: 3600, now }))
+        .toBe(false);
+    }
+    // Same run, same age, same interval — only the source differs.
+    expect(isCoalesceTargetPastHeartbeatInterval({ run, source: "timer", intervalSec: 3600, now }))
+      .toBe(true);
+  });
+
+  it("fails closed on an unrecognised source rather than assuming cadence", () => {
+    const run = { status: "running", startedAt: agoMs(48 * HOUR_MS) };
+    for (const source of ["", "Timer", "heartbeat_timer", "some_future_source"]) {
+      expect(isCoalesceTargetPastHeartbeatInterval({ run, source, intervalSec: 3600, now }))
+        .toBe(false);
+    }
   });
 
   it("is exclusive at the boundary — exactly at budget does not fire", () => {
     const exactly = { status: "running", startedAt: agoMs(STALLED_COALESCE_MIN_BUDGET_MS) };
-    expect(isCoalesceTargetPastHeartbeatInterval(exactly, 3600, now)).toBe(false);
+    expect(
+      isCoalesceTargetPastHeartbeatInterval({ run: exactly, source: "timer", intervalSec: 3600, now }),
+    ).toBe(false);
     const oneMsPast = {
       status: "running",
       startedAt: agoMs(STALLED_COALESCE_MIN_BUDGET_MS + 1),
     };
-    expect(isCoalesceTargetPastHeartbeatInterval(oneMsPast, 3600, now)).toBe(true);
+    expect(
+      isCoalesceTargetPastHeartbeatInterval({ run: oneMsPast, source: "timer", intervalSec: 3600, now }),
+    ).toBe(true);
   });
 
   it("never fires for queued or scheduled_retry however old — they read fresh context on start", () => {
     const startedAt = agoMs(48 * HOUR_MS);
     for (const status of ["queued", "scheduled_retry"]) {
-      expect(isCoalesceTargetPastHeartbeatInterval({ status, startedAt }, 3600, now)).toBe(false);
+      expect(
+        isCoalesceTargetPastHeartbeatInterval({
+          run: { status, startedAt },
+          source: "timer",
+          intervalSec: 3600,
+          now,
+        }),
+      ).toBe(false);
     }
   });
 
   it("never fires for terminal states", () => {
     const startedAt = agoMs(48 * HOUR_MS);
     for (const status of ["failed", "succeeded", "cancelled", "timed_out"]) {
-      expect(isCoalesceTargetPastHeartbeatInterval({ status, startedAt }, 3600, now)).toBe(false);
+      expect(
+        isCoalesceTargetPastHeartbeatInterval({
+          run: { status, startedAt },
+          source: "timer",
+          intervalSec: 3600,
+          now,
+        }),
+      ).toBe(false);
     }
   });
 
   it("fails safe (false) when startedAt is missing or unparseable", () => {
-    expect(isCoalesceTargetPastHeartbeatInterval({ status: "running", startedAt: null }, 3600, now))
-      .toBe(false);
-    expect(
-      isCoalesceTargetPastHeartbeatInterval({ status: "running", startedAt: "not-a-date" }, 3600, now),
-    ).toBe(false);
+    for (const startedAt of [null, "not-a-date"]) {
+      expect(
+        isCoalesceTargetPastHeartbeatInterval({
+          run: { status: "running", startedAt },
+          source: "timer",
+          intervalSec: 3600,
+          now,
+        }),
+      ).toBe(false);
+    }
   });
 
   it("accepts an ISO string startedAt, as read back from the DB driver", () => {
     const run = { status: "running", startedAt: agoMs(4 * HOUR_MS).toISOString() };
-    expect(isCoalesceTargetPastHeartbeatInterval(run, 3600, now)).toBe(true);
+    expect(isCoalesceTargetPastHeartbeatInterval({ run, source: "timer", intervalSec: 3600, now }))
+      .toBe(true);
   });
 
   it("holds a 30s-cadence agent to the floor rather than 45s", () => {
     // The whole reason the floor exists: 1.5x alone would fire here.
     const run = { status: "running", startedAt: agoMs(20 * 60 * 1000) };
-    expect(isCoalesceTargetPastHeartbeatInterval(run, 30, now)).toBe(false);
-    expect(isCoalesceTargetPastHeartbeatInterval({ ...run, startedAt: agoMs(2 * HOUR_MS) }, 30, now))
-      .toBe(true);
+    expect(isCoalesceTargetPastHeartbeatInterval({ run, source: "timer", intervalSec: 30, now }))
+      .toBe(false);
+    expect(
+      isCoalesceTargetPastHeartbeatInterval({
+        run: { ...run, startedAt: agoMs(2 * HOUR_MS) },
+        source: "timer",
+        intervalSec: 30,
+        now,
+      }),
+    ).toBe(true);
   });
 });
 
 describe("filterIntervalOverrunCoalesceTarget", () => {
-  it("returns null for an overrunning running target", () => {
+  it("returns null for an overrunning running target on a timer wake", () => {
     const target = { status: "running", id: "stalled-1", startedAt: agoMs(4 * HOUR_MS) };
-    expect(filterIntervalOverrunCoalesceTarget(target, 3600, now)).toBeNull();
+    expect(
+      filterIntervalOverrunCoalesceTarget({ target, source: "timer", intervalSec: 3600, now }),
+    ).toBeNull();
+  });
+
+  // Regression guard for the review finding: an aged running target must still
+  // coalesce for every non-timer source, so manual/recovery wakes keep today's
+  // behaviour and cannot mint a concurrent run.
+  it("passes through an aged running target for every non-timer source", () => {
+    const target = { status: "running", id: "stalled-2", startedAt: agoMs(48 * HOUR_MS) };
+    for (const source of NON_TIMER_SOURCES) {
+      expect(filterIntervalOverrunCoalesceTarget({ target, source, intervalSec: 3600, now }))
+        .toBe(target);
+    }
   });
 
   it("passes through a running target inside its budget", () => {
     const target = { status: "running", id: "live-1", startedAt: agoMs(5 * 60 * 1000) };
-    expect(filterIntervalOverrunCoalesceTarget(target, 3600, now)).toBe(target);
+    expect(filterIntervalOverrunCoalesceTarget({ target, source: "timer", intervalSec: 3600, now }))
+      .toBe(target);
   });
 
   it("passes through an aged queued target", () => {
     const target = { status: "queued", id: "queued-1", startedAt: agoMs(48 * HOUR_MS) };
-    expect(filterIntervalOverrunCoalesceTarget(target, 3600, now)).toBe(target);
+    expect(filterIntervalOverrunCoalesceTarget({ target, source: "timer", intervalSec: 3600, now }))
+      .toBe(target);
   });
 
   it("passes through a null target unchanged", () => {
-    expect(filterIntervalOverrunCoalesceTarget(null, 3600, now)).toBeNull();
+    expect(
+      filterIntervalOverrunCoalesceTarget({ target: null, source: "timer", intervalSec: 3600, now }),
+    ).toBeNull();
   });
 });
