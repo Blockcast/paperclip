@@ -7161,6 +7161,109 @@ export function filterZombieCoalesceTarget<
   return target && isZombieRun(target, tracked) ? null : target;
 }
 
+/**
+ * PEN-1995: how far past its own heartbeat interval a *running* run may go
+ * before it stops speaking for further timer wakes.
+ *
+ * `isZombieRun` only catches a run with no live in-memory execution. A run
+ * that stalls *after* being registered in `activeRunExecutions` is tracked,
+ * so it is not a zombie — yet every later same-scope wake is absorbed into it
+ * by a bare UPDATE that mints no run and stamps no `lastHeartbeatAt`. The wake
+ * is lost outright, and the UPDATE refreshes `updatedAt`, re-arming the shield.
+ * The agent goes silent for the length of the stall.
+ *
+ * Measured on the two `claude_local` built-ins (n=2000 runs, 2026-07-26 →
+ * 2026-09-13): 38 runs outlived 2× their median cadence with *zero* runs
+ * started behind them; the worst lost ~42 consecutive wakes over 43.2 h.
+ *
+ * A *liveness* test cannot catch those. Several of the worst offenders were
+ * alive and productive the whole time — `dd3fe54d` exited 0 after 43.2 h,
+ * `8c14e110` reached `lastOutputSeq` 43, `76fcc7c4` reached 288 — so a silence
+ * predicate correctly declines to fire and the cadence loss goes unrepaired.
+ * The decision is therefore about *concurrency*, not liveness: may a timer
+ * wake mint its own run alongside one that has already overrun its interval?
+ *
+ * 1.5× is chosen from the measured distribution rather than by feel. Run
+ * duration is strongly bimodal — p50 1.9–4.7 min, p90 11.3–16.0 min against a
+ * 3600 s interval — so 1.5× sits ~6–8× above p90, in a wide empty gap. At that
+ * threshold the rule fires on 0.4–4.5% of runs at 97.8–100% precision, versus
+ * 19% for the withdrawn `lastOutputSeq <= 1` predicate (PR #1462).
+ *
+ * This is deliberately NOT a terminating bound — PEN-1995 has rejected those
+ * three times over, at an 85.7–96.2% false-kill rate. The overrunning run is
+ * untouched and still free to finish and deliver; a false positive costs one
+ * extra queued run, never destroyed work. It is also self-limiting: the next
+ * wake coalesces into the *newest* running same-scope run, so a long stall
+ * mints roughly one run per interval — which is the cadence the agent was
+ * supposed to have had.
+ */
+export const STALLED_COALESCE_INTERVAL_MULTIPLE = 1.5;
+
+/**
+ * Absolute floor on the overrun budget, in ms (90 min).
+ *
+ * `intervalSec` is clamped to [30 s, 86400 s], so the multiple ALONE is unsafe
+ * at the low end: a 30 s-cadence agent would get a 45 s budget — below the
+ * 1.9–4.7 min p50 run duration measured here — and would mint a fresh run on
+ * almost every wake. The floor keeps the rule dormant for fast-cadence agents
+ * and makes the effective budget `max(1.5 × interval, 90 min)`, i.e. exactly
+ * the measured 90 min for any agent at or below hourly cadence, scaling up
+ * only for agents slower than that.
+ */
+export const STALLED_COALESCE_MIN_BUDGET_MS = 90 * 60 * 1000;
+
+export function resolveStalledCoalesceBudgetMs(intervalSec: number): number {
+  if (!Number.isFinite(intervalSec) || intervalSec <= 0) {
+    return STALLED_COALESCE_MIN_BUDGET_MS;
+  }
+  return Math.max(
+    intervalSec * 1000 * STALLED_COALESCE_INTERVAL_MULTIPLE,
+    STALLED_COALESCE_MIN_BUDGET_MS,
+  );
+}
+
+/**
+ * True when `run` is a running row that has been in flight longer than
+ * {@link resolveStalledCoalesceBudgetMs}, and so has necessarily already
+ * absorbed a wake it did not service.
+ *
+ * Scoped to `running` on purpose. A `queued` or `scheduled_retry` row has not
+ * started yet and reads fresh context when it does, so coalescing into it is
+ * correct however old it is.
+ *
+ * Fails safe on unknown input (missing or unparseable `startedAt`): returning
+ * false preserves today's behaviour exactly.
+ */
+export function isCoalesceTargetPastHeartbeatInterval(
+  run: { status: string; startedAt: Date | string | null },
+  intervalSec: number,
+  now: Date,
+): boolean {
+  if (run.status !== "running") return false;
+  if (!run.startedAt) return false;
+  const startedAtMs = new Date(run.startedAt).getTime();
+  if (!Number.isFinite(startedAtMs)) return false;
+  return now.getTime() - startedAtMs > resolveStalledCoalesceBudgetMs(intervalSec);
+}
+
+/**
+ * Filter a coalesce target that has overrun its heartbeat interval, so the
+ * wake falls through and mints its own run instead of being swallowed.
+ *
+ * Null targets and non-running targets pass through unchanged.
+ */
+export function filterIntervalOverrunCoalesceTarget<
+  T extends { status: string; id: string; startedAt: Date | string | null },
+>(
+  target: T | null,
+  intervalSec: number,
+  now: Date,
+): T | null {
+  return target && isCoalesceTargetPastHeartbeatInterval(target, intervalSec, now)
+    ? null
+    : target;
+}
+
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
@@ -34489,9 +34592,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       rawCoalescedTarget.scheduledRetryReason === CCROTATE_CAPACITY_RETRY_REASON
         ? rawCoalescedTarget
         : null;
-    const coalescedTargetRun = filterZombieCoalesceTarget(
-      manualCapacityRetryTarget ? null : rawCoalescedTarget,
-      liveRunExecutions,
+    const coalescedTargetRun = filterIntervalOverrunCoalesceTarget(
+      filterZombieCoalesceTarget(
+        manualCapacityRetryTarget ? null : rawCoalescedTarget,
+        liveRunExecutions,
+      ),
+      // PEN-1995: the agent's own configured interval, so a slow-cadence agent
+      // gets a proportionally larger budget. `intervalSec` is always positive
+      // (clamped to [30, 86400]) and is returned even when heartbeats are
+      // disabled, so the floor in resolveStalledCoalesceBudgetMs — not this
+      // value — is what keeps fast-cadence agents safe.
+      resolveHeartbeatPolicyForRuntimeConfig(agent.runtimeConfig).intervalSec,
+      new Date(),
     );
 
     if (coalescedTargetRun) {
