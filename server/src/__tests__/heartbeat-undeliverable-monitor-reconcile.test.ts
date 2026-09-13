@@ -226,4 +226,31 @@ describeEmbeddedPostgres("heartbeat reconcileUndeliverableIssueMonitors", () => 
     expect(result).toMatchObject({ scanned: 1, cleared: 0, skipped: 1, failed: 0 });
     expect((await readIssue(issueId)).monitorNextCheckAt).not.toBeNull();
   });
+
+  // The sibling above moves status AND nextCheckAt, so a CAS on just those two
+  // declines and the test passes either way. This one is the narrow case it
+  // cannot reach, and the one Ally raised: eligibility is the TUPLE (status,
+  // assigneeAgentId, assigneeUserId), so a row ineligible only for being
+  // unassigned goes deliverable on an assignee write ALONE — status stays
+  // `in_progress`, nextCheckAt never moves. A CAS on (status, nextCheckAt)
+  // therefore waves it through and this sweep deletes the monitor a checkout
+  // just armed, which is precisely the stall it exists to prevent. Red before
+  // the assignee predicates joined the CAS: cleared 1, monitorNextCheckAt null.
+  it("skips a row that was re-assigned between the read and the write", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const dueAt = new Date(Date.now() - 60 * 60 * 1000);
+    // Ineligible for the unassigned reason ONLY — already `in_progress`.
+    const issueId = await seedArmedIssue(companyId, null, dueAt);
+
+    const result = await heartbeat.reconcileUndeliverableIssueMonitors({
+      beforeClear: async () => {
+        await db.update(issues).set({ assigneeAgentId: agentId }).where(eq(issues.id, issueId));
+      },
+    });
+
+    expect(result).toMatchObject({ scanned: 1, cleared: 0, skipped: 1, failed: 0 });
+    const row = await readIssue(issueId);
+    expect(row.monitorNextCheckAt?.toISOString()).toBe(dueAt.toISOString());
+    expect((row.executionState as { monitor?: unknown } | null)?.monitor).toBeUndefined();
+  });
 });
