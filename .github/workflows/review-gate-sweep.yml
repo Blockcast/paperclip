@@ -125,25 +125,31 @@ permissions:
 # SECOND RESIDUAL, likewise stated rather than implied: two sweeps that execute
 # CONCURRENTLY can both re-fire the same PR. The per-PR cooldown is derived from
 # the marker comments already on the PR (`existing_marker_epochs`), i.e. from
-# GitHub state rather than run-local state -- but that check is not atomic. The
-# comments are read during the scan and the write happens later with no re-read
-# (sweep-stalled-ally-reviews.py: cooldown at `should_refire`, write at
-# `request_review`), so two runs interleaved inside that window both observe
-# `since_last >= REFIRE_COOLDOWN_SECONDS` and both fire. It is worse than a
+# GitHub state rather than run-local state -- but that check was check-then-act:
+# the comments were read during the scan and the write happened later with no
+# re-read, so two runs interleaved inside that window both observed
+# `since_last >= REFIRE_COOLDOWN_SECONDS` and both fired. It is worse than a
 # duplicate comment: `request_review` deliberately DELETEs before it POSTs, to
 # force a fresh `review_requested` event that a bare POST would no-op, so the
 # interleaving also leaves a window with no pending request at all.
 #
-# Dropping the group is what newly exposes this -- it was the one thing the
-# group did deliver correctly (mutual exclusion of RUNNING jobs), even though
-# it could not serialise a queued backlog. Accepted here, not dismissed, on
-# scope and on reachability. Scope: the fix belongs in the script's write path
-# (re-read the markers immediately before the write), and this change
-# deliberately does not touch the decision logic. Reachability: cadence is
-# hourly, a healthy run takes ~2min, and REFIRE_COOLDOWN_SECONDS is 2h, so
-# runs never overlap in normal operation -- it needs a starvation backlog
-# released together, which is the scenario this change creates by preserving
-# the backlog instead of discarding it. Tracked separately; do not read the
+# Dropping the group is what newly exposed this -- it was the one thing the
+# group did deliver correctly (mutual exclusion of RUNNING jobs), even though it
+# could not serialise a queued backlog. Reachability is narrow: cadence is
+# hourly, a healthy run takes ~2min, and REFIRE_COOLDOWN_SECONDS is 2h, so runs
+# never overlap in normal operation -- it needs a starvation backlog released
+# together, which is the scenario dropping the group creates by preserving the
+# backlog instead of discarding it.
+#
+# NARROWED, NOT CLOSED, by BLO-31908: the script now re-reads the marker
+# comments and re-applies the cooldown immediately before the write
+# (sweep-stalled-ally-reviews.py, `refire_still_permitted`, called from
+# `_consider_pr`), withholding BOTH writes -- the reviewer re-request and the
+# marker comment -- if a marker landed in between. That shrinks the window from
+# the whole scan (minutes, one request per open PR) to the gap between the
+# re-read and the POST (~a second). It does NOT eliminate the race: there is no
+# compare-and-set on the GitHub comment API, so a second run entering after the
+# re-read and before the POST still fires. Do not read either the guard or the
 # absent group as making overlapping writes safe.
 
 jobs:

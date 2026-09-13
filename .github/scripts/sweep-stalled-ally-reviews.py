@@ -221,6 +221,13 @@ SWEEP_ERROR_REASON_PREFIX = "skip: error"
 # MAX_REFIRES_PER_RUN. Distinct from a clean skip so main() can report it.
 DEFERRED_REASON_PREFIX = "skip: deferred"
 
+# Prefix for the reason recorded when the pre-write re-read (BLO-31908) found
+# a marker comment that was not there during the scan, so the cooldown no
+# longer permits the write. Distinct from a clean skip because it is the one
+# reason that is *evidence of a concurrent writer* -- rare by design, so worth
+# being able to grep for if sweeps ever start overlapping routinely.
+REREAD_SKIP_REASON_PREFIX = "skip: marker posted between scan and write"
+
 # Rate-limit exhaustion is recorded under SWEEP_ERROR_REASON_PREFIX (it IS a
 # failure to evaluate, and must count as one for the degraded-run exit below),
 # but carries this distinguishing token so main() can name the actual cause
@@ -371,6 +378,39 @@ def first_pending_since(statuses, context=STATUS_CONTEXT):
     return _parse_iso(start["created_at"])
 
 
+def marker_epochs_from_comments(comments):
+    """`created_at` epochs of this PR's prior marker comments, any author.
+
+    Pure. Shared by the scan and by the pre-write re-read (BLO-31908) so both
+    derive the cooldown's input the same way -- the guard must see exactly
+    what the decision saw, or it is guarding something else.
+    """
+    return [
+        _parse_iso(c["created_at"])
+        for c in comments
+        if str(c.get("body") or "").startswith(MARKER)
+    ]
+
+
+def cooldown_blocks_refire(marker_epochs, now):
+    """Pure: has a marker comment landed too recently to re-ask again?
+
+    Factored out of should_refire so that the scan-time check and the
+    pre-write re-read guard (refire_still_permitted) share ONE definition of
+    the cooldown arithmetic. Two copies would be free to drift, and a guard
+    that disagreed with the decision it guards would be worse than no guard.
+
+    Returns (bool, str|None) -- whether the write is blocked, and the reason
+    when it is.
+    """
+    if not marker_epochs:
+        return False, None
+    since_last = now - max(marker_epochs)
+    if since_last < REFIRE_COOLDOWN_SECONDS:
+        return True, "re-asked %ds ago < cooldown %ds" % (int(since_last), REFIRE_COOLDOWN_SECONDS)
+    return False, None
+
+
 def should_refire(pr, now):
     """Pure decision: does this PR need an automated re-ask right now?
 
@@ -401,11 +441,9 @@ def should_refire(pr, now):
     age = now - pr["pending_since"]
     if age < STALL_THRESHOLD_SECONDS:
         return False, "pending %ds < threshold %ds" % (int(age), STALL_THRESHOLD_SECONDS)
-    if pr["existing_marker_epochs"]:
-        last_marker = max(pr["existing_marker_epochs"])
-        since_last = now - last_marker
-        if since_last < REFIRE_COOLDOWN_SECONDS:
-            return False, "re-asked %ds ago < cooldown %ds" % (int(since_last), REFIRE_COOLDOWN_SECONDS)
+    blocked, cooled = cooldown_blocks_refire(pr["existing_marker_epochs"], now)
+    if blocked:
+        return False, cooled
     return True, "pending %ds >= threshold %ds" % (int(age), STALL_THRESHOLD_SECONDS)
 
 
@@ -578,6 +616,55 @@ def reviewer_is_already_requested(pr_payload, login=ALLY_REQUEST_REVIEWER_LOGIN)
     return any((entry or {}).get("login", "").lower() == target for entry in requested)
 
 
+def refire_still_permitted(owner, repo, number, token, api_base_url, now):
+    """Re-read this PR's marker comments and re-apply the cooldown, as late as
+    possible before the write. Returns (bool, str|None) -- permitted, and the
+    reason when it is not.
+
+    WHY (BLO-31908). The cooldown is derived from GitHub state
+    (`existing_marker_epochs`) rather than run-local state, which is the right
+    choice: it survives a restart and it counts an operator's manual re-ask
+    too. But the read happens during the scan and the write happens here, so
+    the check is check-then-act, not atomic. Two sweeps executing concurrently
+    can both observe `since_last >= REFIRE_COOLDOWN_SECONDS` and both fire.
+
+    That is worse than a duplicate comment. request_review deliberately
+    DELETEs before it POSTs (see its docstring -- a bare POST no-ops against an
+    existing request), so the interleaving `A-DELETE / A-POST / B-DELETE /
+    B-POST` both multiplies reviewer wakes AND leaves a window in which the PR
+    has no pending review request at all.
+
+    Concurrent sweeps are not the normal case -- cadence is hourly, a healthy
+    run takes ~2min, and the cooldown is 2h -- but review-gate-sweep.yml
+    deliberately carries no `concurrency` group (BLO-31818), because the group
+    could only ever discard a starved backlog rather than serialise it. So a
+    starvation window released all at once does run sweeps together.
+
+    RESIDUAL, stated rather than claimed away: this NARROWS the window from the
+    whole scan (minutes -- one request per open PR) to the gap between this
+    re-read and the POST (~a second). It does NOT close it. There is no
+    compare-and-set on the GitHub comment API, so a second run entering after
+    this re-read and before the write still fires, and the DELETE/POST
+    interleaving above is still reachable. The exposure is small, not absent;
+    do not read this guard as making overlapping writes safe.
+
+    `now` is the run's single scan-time clock, shared with should_refire rather
+    than re-sampled here. It lags real time by at most the run duration (~2min
+    against a 2h cooldown), and it lags in the SAFE direction: an older `now`
+    makes `since_last` smaller, so the guard blocks more readily, never less.
+
+    Failure is NOT swallowed the way request_review's is. A re-read that raises
+    propagates to sweep(), which isolates it per-PR and reports it. That is
+    deliberate: when the guard cannot be evaluated, the safe direction is to
+    withhold the write and say so, not to write blind.
+    """
+    comments = _fetch_paginated(
+        api_base_url, "/repos/%s/%s/issues/%d/comments" % (owner, repo, number), token
+    )
+    blocked, reason = cooldown_blocks_refire(marker_epochs_from_comments(comments), now)
+    return (not blocked), reason
+
+
 def request_review(owner, repo, number, token, api_base_url, login=ALLY_REQUEST_REVIEWER_LOGIN):
     """Fire a native review request (`pull_request.review_requested`) rather
     than relying on the marker comment alone. See ALLY_REQUEST_REVIEWER_LOGIN
@@ -737,6 +824,12 @@ def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry
     `dry_run` reports the decision without issuing either write. The returned
     re-fire flag stays True so the caller's accounting and budget match a live
     run exactly; only the side effects are withheld.
+
+    A re-fire decision is re-checked against freshly-read markers immediately
+    before the write (refire_still_permitted, BLO-31908) -- the scan's read is
+    minutes stale by then and a concurrent sweep may have re-asked in between.
+    Neither `may_refire=False` nor `dry_run` pays for that extra read, since
+    neither is going to write.
     """
     number = pr["number"]
     is_draft = bool(pr.get("draft"))
@@ -794,11 +887,7 @@ def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry
                 # is_alarming both skip it.
                 pending_since = None
             else:
-                marker_epochs = [
-                    _parse_iso(c["created_at"])
-                    for c in comments
-                    if str(c.get("body") or "").startswith(MARKER)
-                ]
+                marker_epochs = marker_epochs_from_comments(comments)
     decision_input = {
         "number": number,
         "is_draft": is_draft,
@@ -817,6 +906,18 @@ def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry
     if refire and dry_run:
         return (pr, head_sha, pending_since, True, "DRY-RUN would re-fire -- %s" % reason)
     if refire:
+        # Re-read the markers and re-apply the cooldown immediately before the
+        # write (BLO-31908). The scan's read is minutes stale by now; a sweep
+        # running concurrently -- or an operator re-asking by hand -- may have
+        # posted a marker in between, and firing again on top of it is the
+        # stacked-request pathology this repo has hit before.
+        permitted, cooled = refire_still_permitted(owner, repo, number, token, api_base_url, now)
+        if not permitted:
+            # BOTH writes are withheld, not just the reviewer re-request.
+            # Posting the marker comment alone would still double the re-ask
+            # trail and push the cooldown out for the next run, so gating only
+            # request_review would leave half the defect in place.
+            return (pr, head_sha, pending_since, False, "%s -- %s" % (REREAD_SKIP_REASON_PREFIX, cooled))
         requested = request_review(owner, repo, number, token, api_base_url)
         body = build_comment_body(
             number, head_sha, now - pending_since,
