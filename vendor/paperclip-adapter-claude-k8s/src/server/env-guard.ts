@@ -829,13 +829,17 @@ process.stdin.on("end", () => {
     const input = evt.tool_input || evt.toolInput || {};
     const command = input.command || input.cmd || "";
     if (/^(?:Bash|Shell)$/i.test(String(tool)) && command && isFullEnvDump(String(command))) {
-      const home = process.env.HOME || "/paperclip";
+      // The helper is installed beside this script (BLO-33641: both live on
+      // per-pod scratch, not $HOME/.claude), so name the real location.
+      const self = process.argv[1] || "";
+      const helperDir = self.slice(0, self.lastIndexOf("/") + 1) ||
+        (process.env.HOME || "/paperclip") + "/.claude/";
       process.stderr.write(
         "Blocked by Paperclip env-guard (PEN-1305): full-environment dumps " +
           "(env/printenv/set/export -p/declare -x/cat /proc/*/environ) are disallowed " +
           "because they leak secret-bearing runtime variables into the run transcript. " +
           "To inspect environment variable NAMES safely, run: node " +
-          home + "/.claude/safe-env-inspect.mjs\n",
+          helperDir + "safe-env-inspect.mjs\n",
       );
       process.exit(2);
     }
@@ -869,13 +873,31 @@ for (const name of Object.keys(process.env).sort()) console.log(name);
  * `settings.json` still points at the old in-$HOME location is migrated to the
  * per-pod path instead of accumulating a second entry.
  */
-const SETTINGS_MERGE_SCRIPT = String.raw`const fs=require("fs"),p=require("path");const dir=process.env.CLAUDE_CONFIG_DIR||(process.env.HOME||"/paperclip")+"/.claude";const sdir=process.env.PAPERCLIP_GUARD_SCRIPT_DIR||dir;const f=p.join(dir,"settings.json");let s={};try{s=JSON.parse(fs.readFileSync(f,"utf8"))||{}}catch(e){}if(typeof s!=="object"||s===null)s={};s.hooks=s.hooks||{};const list=Array.isArray(s.hooks.PreToolUse)?s.hooks.PreToolUse:[];const cmd="node "+p.join(sdir,"paperclip-env-guard.mjs");const isGuard=h=>h&&typeof h.command==="string"&&h.command.endsWith("paperclip-env-guard.mjs");const kept=list.filter(g=>!(g&&Array.isArray(g.hooks)&&g.hooks.some(isGuard)));const want=kept.concat([{matcher:"Bash",hooks:[{type:"command",command:cmd}]}]);if(JSON.stringify(list)!==JSON.stringify(want)){s.hooks.PreToolUse=want;fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(f,JSON.stringify(s,null,2));}`;
-
 /**
  * Per-pod scratch for the guard scripts. Matches RUNTIME_CACHE_MOUNT_PATH in
  * job-manifest.ts, which mounts an emptyDir at /runtime-cache unconditionally.
  */
 const GUARD_SCRIPT_DIR_DEFAULT = "/runtime-cache/paperclip-guard";
+
+/**
+ * The literal `command` recorded in the shared `settings.json`. It must be the
+ * SAME string for every pod: settings.json lives on the shared volume while
+ * the guard script is per-pod, so a command that embedded this pod's script
+ * dir would be rewritten by every pod whose dir differed and point the others
+ * at a file they do not have. Instead the command resolves at hook time —
+ * pod-local scratch first, then the CLAUDE_CONFIG_DIR fallback the setup shell
+ * uses when scratch is unavailable. A guard missing from both is reported on
+ * stderr and exits 0: fail-open per the BLO-22514 decision above, but never
+ * silently.
+ */
+export const ENV_GUARD_HOOK_COMMAND =
+  `f="${GUARD_SCRIPT_DIR_DEFAULT}/paperclip-env-guard.mjs"; ` +
+  '[ -r "$f" ] || f="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/paperclip-env-guard.mjs"; ' +
+  'if [ -r "$f" ]; then exec node "$f"; fi; ' +
+  'echo "[paperclip-env-guard] guard script missing at $f; env-dump guard not enforced for this call (PEN-1305)" >&2; exit 0';
+
+const SETTINGS_MERGE_SCRIPT = String.raw`const fs=require("fs"),p=require("path");const dir=process.env.CLAUDE_CONFIG_DIR||(process.env.HOME||"/paperclip")+"/.claude";const f=p.join(dir,"settings.json");let s={};try{s=JSON.parse(fs.readFileSync(f,"utf8"))||{}}catch(e){}if(typeof s!=="object"||s===null)s={};s.hooks=s.hooks||{};const list=Array.isArray(s.hooks.PreToolUse)?s.hooks.PreToolUse:[];const cmd=${JSON.stringify(ENV_GUARD_HOOK_COMMAND)};const isGuard=h=>h&&typeof h.command==="string"&&h.command.includes("paperclip-env-guard.mjs");const kept=list.filter(g=>!(g&&Array.isArray(g.hooks)&&g.hooks.some(isGuard)));const want=kept.concat([{matcher:"Bash",hooks:[{type:"command",command:cmd}]}]);if(JSON.stringify(list)!==JSON.stringify(want)){s.hooks.PreToolUse=want;fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(f,JSON.stringify(s,null,2));}`;
+
 
 /**
  * Build a `;`-joinable shell fragment that installs the guard + safe helper and
@@ -903,6 +925,6 @@ export function buildEnvGuardSetupShell(): string {
     `mkdir -p "\$GUARD_DIR"`,
     `printf %s '${guardB64}' | base64 -d > "\$GUARD_SCRIPT_DIR/paperclip-env-guard.mjs"`,
     `printf %s '${helperB64}' | base64 -d > "\$GUARD_SCRIPT_DIR/safe-env-inspect.mjs"`,
-    `printf %s '${mergeB64}' | base64 -d | PAPERCLIP_GUARD_SCRIPT_DIR="\$GUARD_SCRIPT_DIR" node - 2>/dev/null || echo "[paperclip-env-guard] settings merge skipped" >&2`,
+    `printf %s '${mergeB64}' | base64 -d | node - 2>/dev/null || echo "[paperclip-env-guard] settings merge skipped" >&2`,
   ].join("; ");
 }

@@ -236,7 +236,7 @@ describe("classifyAgentShellCommand", () => {
  * it a PreToolUse event on stdin — this validates the exact file the pod runs,
  * not a TS re-implementation.
  */
-function runGuardScript(event: unknown): { status: number | null; stderr: string } {
+function runGuardScript(event: unknown): { status: number | null; stderr: string; dir: string } {
   const dir = mkdtempSync(path.join(tmpdir(), "pc-guard-"));
   try {
     const file = path.join(dir, "guard.mjs");
@@ -245,7 +245,7 @@ function runGuardScript(event: unknown): { status: number | null; stderr: string
       input: JSON.stringify(event),
       encoding: "utf8",
     });
-    return { status: res.status, stderr: res.stderr ?? "" };
+    return { status: res.status, stderr: res.stderr ?? "", dir };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -257,6 +257,15 @@ describe("embedded guard script (real node process)", () => {
     expect(status).toBe(2);
     expect(stderr).toContain("PEN-1305");
     expect(stderr).toContain("safe-env-inspect.mjs");
+  });
+
+  it("points the remediation at the helper installed next to the guard, not $HOME/.claude", () => {
+    // BLO-33641 moved both scripts to per-pod scratch. The helper always lands
+    // beside the guard, so the guard can name its real location instead of a
+    // path on the shared volume that no longer receives the file.
+    const { stderr, dir } = runGuardScript({ tool_name: "Bash", tool_input: { command: "env" } });
+    expect(stderr).toContain(path.join(dir, "safe-env-inspect.mjs"));
+    expect(stderr).not.toContain("/.claude/safe-env-inspect.mjs");
   });
 
   it("exits 0 for a benign Bash command", () => {
@@ -383,6 +392,73 @@ describe("buildEnvGuardSetupShell", () => {
       expect(statSync(f).mtimeMs).toBe(firstWrite);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function mergedHookCommand(env: NodeJS.ProcessEnv): string {
+    const mergeScript = decodedBlobs(buildEnvGuardSetupShell())[2]!;
+    const dir = mkdtempSync(path.join(tmpdir(), "pc-settings-cmd-"));
+    try {
+      const res = spawnSync(process.execPath, ["-"], {
+        input: mergeScript,
+        encoding: "utf8",
+        env: { ...process.env, CLAUDE_CONFIG_DIR: dir, ...env },
+      });
+      expect(res.status).toBe(0);
+      const settings = JSON.parse(readFileSync(path.join(dir, "settings.json"), "utf8"));
+      return settings.hooks.PreToolUse.find((g: { matcher?: string }) => g.matcher === "Bash").hooks[0].command;
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("records a hook command that does not depend on which script dir this pod used", () => {
+    // settings.json is on the shared volume; the script dir is per-pod. If the
+    // command embedded the pod's own dir, every pod whose dir differed (e.g. one
+    // that fell back to GUARD_DIR) would rewrite the shared file and point every
+    // OTHER pod at a path that does not exist there.
+    const a = mergedHookCommand({ PAPERCLIP_GUARD_SCRIPT_DIR: "/scratch-a/guard" });
+    const b = mergedHookCommand({ PAPERCLIP_GUARD_SCRIPT_DIR: "/scratch-b/guard" });
+    expect(a).toBe(b);
+    expect(a).not.toContain("/scratch-a");
+  });
+
+  function runHookCommand(command: string, configDir: string, event: unknown) {
+    return spawnSync("sh", ["-c", command], {
+      input: JSON.stringify(event),
+      encoding: "utf8",
+      env: { ...process.env, HOME: path.dirname(configDir), CLAUDE_CONFIG_DIR: configDir },
+    });
+  }
+
+  it("hook command dispatches to the CLAUDE_CONFIG_DIR copy when the pod-local copy is absent", () => {
+    const configDir = mkdtempSync(path.join(tmpdir(), "pc-hook-dispatch-"));
+    try {
+      writeFileSync(path.join(configDir, "paperclip-env-guard.mjs"), ENV_GUARD_SCRIPT);
+      const cmd = mergedHookCommand({ PAPERCLIP_GUARD_SCRIPT_DIR: configDir });
+      const blocked = runHookCommand(cmd, configDir, { tool_name: "Bash", tool_input: { command: "env" } });
+      expect(blocked.status).toBe(2);
+      expect(blocked.stderr).toContain("PEN-1305");
+      const ok = runHookCommand(cmd, configDir, { tool_name: "Bash", tool_input: { command: "ls -la" } });
+      expect(ok.status).toBe(0);
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  it("hook command reports a missing guard instead of dying silently", () => {
+    // Stays fail-open (exit 0) per the recorded BLO-22514 decision, but the
+    // condition must be visible in the hook output rather than a bare module
+    // resolution error.
+    const configDir = mkdtempSync(path.join(tmpdir(), "pc-hook-missing-"));
+    try {
+      const cmd = mergedHookCommand({ PAPERCLIP_GUARD_SCRIPT_DIR: configDir });
+      const res = runHookCommand(cmd, configDir, { tool_name: "Bash", tool_input: { command: "env" } });
+      expect(res.status).toBe(0);
+      expect(res.stderr).toContain("paperclip-env-guard");
+      expect(res.stderr).toMatch(/missing|not installed/);
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
     }
   });
 
