@@ -895,14 +895,18 @@ export function isInfraClassStrandedFailure(latestRun: LatestIssueRun): boolean 
   // the cause is not something a retry can move.
   //
   // Note on blast radius, because the two halves of this predicate differ.
-  // The evidence field `infraClassCause` is audit-only: it is written once, in
+  // This predicate is recorded verbatim as the evidence field
+  // `infraClassCauseByMessage`, which is audit-only: it is written once, in
   // `buildStrandedRecoveryActionEvidence`, and gates nothing -- the attempt
   // budget is `classifyContinuationFailure`, on error-code set membership
-  // alone. But the PREDICATE is also read by `resolveStrandedRecoveryRouting`,
-  // where it decides owner-vs-manager for a `stranded_assigned_issue`. Git
-  // transport runs never reach that test (they are re-caused to
-  // `workspace_validation_failed` first), so widening the git arm really does
-  // only relabel evidence. Widening the `claude_truncated` arm below does NOT:
+  // alone. (BLO-33655: the neighbouring `infraClassCause` is the UNION of this
+  // predicate with `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES`, not this predicate,
+  // so do not reason about it from here.) But the PREDICATE is also read by
+  // `resolveStrandedRecoveryRouting`, where it decides owner-vs-manager for a
+  // `stranded_assigned_issue`. Git transport runs never reach that test (they
+  // are re-caused to `workspace_validation_failed` first), so widening the git
+  // arm really does only relabel evidence. Widening the `claude_truncated` arm
+  // below does NOT:
   // that cause stays `stranded_assigned_issue`, so it changes routing.
   if (isWorkspaceGitTransportStrandedFailure(latestRun)) return true;
   if (latestRun.errorCode !== "claude_truncated") return false;
@@ -5538,6 +5542,16 @@ export function recoveryService(
     const workspaceValidation = input.recoveryCause === "workspace_validation_failed"
       ? readWorkspaceValidationPayload(input.latestRun)
       : null;
+    // BLO-33655: the two arms of the infra-class union, kept as separate locals so the
+    // recorded union below cannot drift from the arm it is built out of. Deliberately NOT
+    // gated on `recoveryCause === "stranded_assigned_issue"` the way the routing union is:
+    // this field is documented above as recording the classification independent of which
+    // cause bucket the run landed in, and a git-transport `workspace_validation_failed`
+    // run has relied on that since BLO-31351.
+    const infraClassCauseByMessage = isInfraClassStrandedFailure(input.latestRun);
+    const infraClassCauseByErrorCode = ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has(
+      input.latestRun?.errorCode ?? "",
+    );
     return {
       sourceIssueId: input.issue.id,
       sourceIdentifier: input.issue.identifier,
@@ -5557,7 +5571,23 @@ export function recoveryService(
       // BLO-20933: audit trail for the routing decision above — records whether the
       // terminal cause was classified infrastructure-class (pod eviction/preemption/
       // external delete) independent of which `recoveryCause` bucket it landed in.
-      infraClassCause: isInfraClassStrandedFailure(input.latestRun),
+      //
+      // BLO-33655: this MUST be the same union `resolveStrandedRecoveryRouting` decides
+      // on, not just the message arm. It recorded `isInfraClassStrandedFailure` alone
+      // until 2026-09-13, so every row routed infra-class by error code ALONE
+      // (`job_failed`, `k8s_pod_schedule_failed`, `adapter_failed`, …) was returned to
+      // its lane while its own audit trail read `false`. Two senior lanes independently
+      // read that column, correctly concluded the classifier was not discriminating, and
+      // escalated it — 101 rows disagreed on one measured census. The field is named for
+      // "was this cause infra-class?", so it has to answer that question.
+      infraClassCause: infraClassCauseByErrorCode || infraClassCauseByMessage,
+      // The message arm on its own, under a name that says so. This is what BLO-20933 and
+      // BLO-33223 deliberately narrowed (pod-removal wording; `exit code 137`/
+      // `reason=OOMKilled` over the whole `reason=` enum), so collapsing it into the union
+      // would make that narrowing unauditable. The error-code arm needs no such field: it
+      // is set membership over `latestRunErrorCode`, which is already recorded two lines
+      // above, so it stays recomputable from the evidence block alone.
+      infraClassCauseByMessage,
       originalAssigneeMcpKeys: extractAgentMcpKeys(input.sourceAssignee),
       originalAssigneeCapabilities: summarizeAgentCapabilities(input.sourceAssignee),
       sourceRunId: input.successfulRunHandoffEvidence?.sourceRunId ?? null,
