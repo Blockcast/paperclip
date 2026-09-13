@@ -510,6 +510,162 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(run).toMatchObject({ status: "succeeded", error: null });
   }, 120_000);
 
+
+  it("does not finalize a run whose reservation is re-armed between the reaper's fresh read and its terminal write (BLO-33019)", async () => {
+    // Ally review on #1808: the fresh reservation read closed the snapshot
+    // window but was still check-then-act. The owner can re-arm AFTER
+    // isTerminalExternalJobConsumedByOwner returns false and BEFORE
+    // finalizeExternalLifecycleTerminalRun's status CAS -- getAgent, evidence
+    // evaluation and GitHub probes all sit in between. The decision has to be
+    // atomic with the reservation state: re-read under the run-row lock right
+    // before the write, and abort when the owner has moved on.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const jobName = "agent-claude-external-runtime-retry-rearm-before-cas";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "External Runtime Rearm Before CAS Co",
+      issuePrefix: "ERC",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Claude K8s",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { enabled: true, wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: {},
+    });
+
+    let releaseAttemptOne!: () => void;
+    const attemptOneGate = new Promise<void>((resolve) => { releaseAttemptOne = resolve; });
+    let markAttemptOneLaunched!: () => void;
+    const attemptOneLaunched = new Promise<void>((resolve) => { markAttemptOneLaunched = resolve; });
+    let releaseAttemptTwo!: () => void;
+    const attemptTwoGate = new Promise<void>((resolve) => { releaseAttemptTwo = resolve; });
+    let markAttemptTwoStarted!: () => void;
+    const attemptTwoStarted = new Promise<void>((resolve) => { markAttemptTwoStarted = resolve; });
+
+    mockAdapterExecute.mockImplementation(async (ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> => {
+      const attempt = mockAdapterExecute.mock.calls.length;
+      if (attempt === 2) {
+        markAttemptTwoStarted();
+        await attemptTwoGate;
+      }
+      await ctx.onMeta?.({ adapterType: "claude_k8s", command: `kubectl job/${jobName}` });
+      await ctx.onExternalRuntimeLaunched?.({ jobName, jobUid: `job-uid-${attempt}` });
+      if (attempt === 1) {
+        markAttemptOneLaunched();
+        await attemptOneGate;
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "provider throttled before progress",
+          resultJson: { api_error_status: 429, retry_after_seconds: 2 },
+          usage: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 },
+          provider: "test",
+          model: "test-model",
+        };
+      }
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "replacement Job completed",
+        resultJson: { ok: true },
+        usage: { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const execution = heartbeat.__test_executeRunForTesting(runId);
+    await attemptOneLaunched;
+
+    // The pass-start snapshot and the Job read both see attempt 1's terminal
+    // Job while the reservation still names it, so neither deferral fires.
+    mockListAgentJobRunStatuses.mockResolvedValue(new Map([
+      [runId, {
+        phase: "failed" as const,
+        reason: "BackoffLimitExceeded",
+        message: "Job has reached the specified backoff limit",
+        name: jobName,
+        uid: "job-uid-1",
+      }],
+    ]));
+
+    // Inject the race at the reaper's fresh read: hand back the pre-re-arm row
+    // (so the check says "not consumed"), then let attempt 1 return its 429 so
+    // the owner re-arms, and only then return -- the reaper now proceeds into
+    // finalization believing the terminal Job is authoritative.
+    // Keyed on the caller, not on call order: the reaper reads this
+    // reservation for other reasons earlier in the pass, and re-arming on one
+    // of those would let the fresh read itself see the re-arm and defer --
+    // which is the already-covered case above, not this one.
+    const actual = actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation;
+    let injectArmed = false;
+    mockGetActiveExternalRuntimeReservation.mockImplementation(async (...args: Parameters<typeof actual>) => {
+      // Capture before the first await: the synchronous caller frames are what
+      // identify the fresh read, and they are gone once this function yields.
+      const fromFreshRead = (new Error().stack ?? "").includes("isTerminalExternalJobConsumedByOwner");
+      const row = await actual(...args);
+      if (injectArmed && fromFreshRead && args[1] === runId) {
+        injectArmed = false;
+        expect(row).toMatchObject({ state: "launched", jobUid: "job-uid-1" });
+        releaseAttemptOne();
+        await attemptTwoStarted;
+      }
+      return row;
+    });
+
+    injectArmed = true;
+    const reaped = await heartbeat.reapOrphanedRuns();
+    expect(injectArmed, "the reaper never took its fresh reservation read").toBe(false);
+
+    // Run status first: a finalized run is the defect. (Its terminal write also
+    // trips the release trigger, so the reservation assertion below would fail
+    // second and less legibly.)
+    const runDuringRetry = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(runDuringRetry).toMatchObject({ status: "running", errorCode: null });
+    expect(reaped).not.toContain(runId);
+    const rearmedReservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, runId))
+      .then((rows) => rows[0]);
+    expect(rearmedReservation).toMatchObject({ state: "launching", jobName: null, jobUid: null });
+
+    releaseAttemptTwo();
+    await execution;
+    const finalRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(finalRun?.status).toBe("succeeded");
+  }, 120_000);
   it("defers a workspace-scope contender without failing or invoking its adapter", async () => {
     // BLO-16842 repurposed this case. Pre-fix, a concurrency-enabled k8s agent's
     // plain coding runs all shared the single `agent-shared:<agentId>` writer key,
