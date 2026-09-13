@@ -1644,7 +1644,14 @@
       "idx": 242,
       "version": "7",
       "when": 1788560240000,
-      "tag": "0242_runs_read_transcript_grant_seed",
+      "tag": "0242_issue_productivity_scanned_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 243,
+      "version": "7",
+      "when": 1788560300000,
+      "tag": "0243_runs_read_transcript_grant_seed",
       "breakpoints": true
     }
   ]

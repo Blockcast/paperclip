@@ -80,6 +80,7 @@ import {
   lockIssueOwnership,
   releaseIssueRunOwnership,
   restoreCheckoutPromotedStatus,
+  restoreStrandedCheckoutPromotions,
   type IssueLockOwnerState,
 } from "../issue-checkout-status.js";
 import {
@@ -892,16 +893,52 @@ export function isInfraClassStrandedFailure(latestRun: LatestIssueRun): boolean 
   // vanished pod -- the run never got to succeed or fail on its own merits, and
   // the cause is not something a retry can move.
   //
-  // Note for anyone reading this expecting behaviour: `infraClassCause` is
-  // AUDIT-ONLY. It is written once, in `buildStrandedRecoveryActionEvidence`,
-  // and read by nothing in production. It does NOT gate the attempt budget --
-  // `classifyContinuationFailure` does, on error-code set membership alone. The
-  // budget exemption for this class comes from routing it to
-  // `workspace_validation_failed`, not from this predicate. Widening this alone
-  // would relabel the evidence and change nothing an operator could feel.
+  // Note on blast radius, because the two halves of this predicate differ.
+  // The evidence field `infraClassCause` is audit-only: it is written once, in
+  // `buildStrandedRecoveryActionEvidence`, and gates nothing -- the attempt
+  // budget is `classifyContinuationFailure`, on error-code set membership
+  // alone. But the PREDICATE is also read by `resolveStrandedRecoveryRouting`,
+  // where it decides owner-vs-manager for a `stranded_assigned_issue`. Git
+  // transport runs never reach that test (they are re-caused to
+  // `workspace_validation_failed` first), so widening the git arm really does
+  // only relabel evidence. Widening the `claude_truncated` arm below does NOT:
+  // that cause stays `stranded_assigned_issue`, so it changes routing.
   if (isWorkspaceGitTransportStrandedFailure(latestRun)) return true;
   if (latestRun.errorCode !== "claude_truncated") return false;
-  return /pod is gone|pod was removed/i.test(latestRun.error ?? "");
+  // BLO-33223: the other pod-lifecycle death. When the container is read at
+  // exit rather than found missing, `describeTruncationCause` reports the k8s
+  // terminated state as `exit code <N>, reason=<Reason>`, and a kernel OOM kill
+  // arrives as `exit code 137, SIGKILL (commonly OOMKilled), reason=OOMKilled`.
+  //
+  // Anchored on the KILL, not on the reason word, and deliberately not on "the
+  // pod died" as the CTO's filing floated. Both shapes of this message are
+  // pod-lifecycle reads -- an agent-side crash is also a pod death, reported as
+  // `exit code 1, reason=Error` -- so "the pod died" does not discriminate, and
+  // inverting on it would make every `reason=` value except a hardcoded `Error`
+  // return to the lane, defaulting unknown/future k8s reasons to infra-class.
+  // What carries the meaning is whether the container CHOSE to exit or was
+  // killed: 137 is 128+SIGKILL, which no agent-side fault can produce for the
+  // container's own PID 1. That is a kernel-level invariant, so unlike a
+  // `reason=` enumeration it does not need extending when Kubernetes adds a
+  // reason string. `reason=OOMKilled` is kept alongside it only to cover an
+  // adapter that reports the reason without an exit code; the `SIGKILL (...)`
+  // gloss is excluded because it is this adapter's restatement of 137 and so
+  // adds no true-positive coverage, only false-collision surface -- the same
+  // narrowing BLO-20933 applied to the eviction/preemption wording above.
+  //
+  // Scan only the structured termination summary, never the whole error. Every
+  // field `describeTruncationCause` emits ahead of `message=` is machine-shaped
+  // (an exit code, a signal number, a k8s reason enum), but `message=` is the
+  // kubelet's free-form tail and is always appended last -- so cutting there
+  // keeps the whole signal and drops the whole hazard. Without the cut, a
+  // marker-shaped substring quoted inside that tail decides routing: an
+  // agent-side `exit code 1, reason=Error` crash whose message happens to
+  // contain `reason=OOMKilled` or `exit code 137` would be returned to the lane
+  // instead of escalating. That is not hypothetical here -- this fleet's agents
+  // discuss this exact failure shape in issue threads and logs, so the text is
+  // reachable, and the run that quotes it is precisely the one being classified.
+  const terminationSummary = (latestRun.error ?? "").split(/,\s*message=/i)[0];
+  return /pod is gone|pod was removed|exit code 137\b|reason=OOMKilled/i.test(terminationSummary);
 }
 
 function resolveStrandedRecoveryCause(
@@ -1111,11 +1148,20 @@ function readProviderCapacityResetAt(
 ): ProviderCapacityResetRead | null {
   const resultJson = parseObject(run.resultJson);
 
-  const family = readNonEmptyString(resultJson.errorFamily);
-  if (!family || !PROVIDER_CAPACITY_THROTTLE_FAMILIES.has(family)) return null;
-
   const bounds = readCapacityResetBounds(run);
 
+  // The explicit branch is gated by the server-written provenance marker, which
+  // carries its OWN throttle family and is stripped from adapter-supplied
+  // resultJson before persistence. That is strictly stronger evidence than the
+  // adapter-reachable top-level `errorFamily`, so requiring the top-level copy
+  // as well added no trust and cost reachability: the external-lifecycle
+  // reconciler (PEN-3129) cannot write that field, because it would move the
+  // run into `readTransientRecoveryContractFromRun`'s unconditional-retry arm
+  // and authorize retrying possibly non-idempotent external work. Gating the
+  // provenance branch on it therefore silently suppressed every 429 the Job
+  // reconciler recovered, which is the population that most needs naming — the
+  // strand comment there reads `job_failed` / `BackoffLimitExceeded`, the exact
+  // infrastructure-shaped text this function exists to replace.
   const provenance = readProviderCapacityResetProvenance(resultJson);
   const explicit = provenance
     ? canonicalizeCapacityResetInstant(resultJson.providerCapacityResetAt, bounds)
@@ -1127,6 +1173,13 @@ function readProviderCapacityResetAt(
       advertisedResetAt: provenance?.advertisedResetAt ?? null,
     };
   }
+
+  // The fallback reads a bare adapter-supplied `retryNotBefore` with no server
+  // marker behind it, so the top-level family stays its trust boundary: without
+  // it, any adapter could relabel an ordinary failure as a self-healing
+  // capacity window in a comment other agents read.
+  const family = readNonEmptyString(resultJson.errorFamily);
+  if (!family || !PROVIDER_CAPACITY_THROTTLE_FAMILIES.has(family)) return null;
 
   const advertised =
     canonicalizeCapacityResetInstant(resultJson.retryNotBefore, bounds) ??
@@ -13217,6 +13270,11 @@ export function recoveryService(
       // log line below.
       skippedByConcurrentLockChange: 0,
       skippedByConcurrentLockChangeIssueIds: [] as string[],
+      // BLO-33144: promotions restored by the reconciliation pass at the end of
+      // this sweep, which are disjoint from `issueIds` above — those had a lock
+      // to clear, these had none left.
+      restoredStrandedPromotions: 0,
+      restoredStrandedPromotionIssueIds: [] as string[],
     };
 
     const candidates = await db
@@ -13409,7 +13467,16 @@ export function recoveryService(
     // candidate scan. The in-transaction revalidation below reads the memo
     // synchronously — issuing a k8s metrics call inside `db.transaction` would
     // hold a Postgres transaction open across a network round-trip.
-    const busySparedByRunId = new Map<string, boolean>();
+    //
+    // BLO-30245: the memo records ONLY what the probe saw — "this pod was busy
+    // when we asked" — never the derived spare decision. One run can hold locks
+    // on several candidates, `silentMs` is re-derived per candidate, and the
+    // candidates are walked sequentially, so the ceiling is the one input that
+    // can change between two reads of the same memo. Both read sites therefore
+    // evaluate it themselves. Folding it into the memoized value let a run
+    // probed at 2h58m answer a later candidate at 3h03m from the memo and keep
+    // that lock past the advertised bound for the rest of the invocation.
+    const podBusyAtProbeByRunId = new Map<string, boolean>();
     const isBusySparedRunningHolder = async (runId: string | null, lockedAt: Date | null) => {
       if (!runId) return false;
       const basis = runningLockStaleBasis(runId, lockedAt);
@@ -13418,21 +13485,28 @@ export function recoveryService(
       // Only holders that have actually crossed the sweeper's bound matter here;
       // anything younger is kept by the bound itself and must not cost a probe.
       if (silentMs < STALE_RUNNING_ISSUE_LOCK_MS) return false;
-      const memoized = busySparedByRunId.get(runId);
-      if (memoized !== undefined) return memoized;
       // Past the shared ceiling a busy pod is a CPU-burning zombie and loses its
       // lock regardless, exactly as the reaper kills it regardless — so the
       // BLO-19941 reclamation guarantee still has a bound.
-      const spared = silentMs < AGENT_POD_BUSY_MAX_STALE_MS
-        && (await probeAgentPodActivity(runId)) === "busy";
-      busySparedByRunId.set(runId, spared);
-      if (spared) {
+      //
+      // Evaluated BEFORE the memo so a holder that crossed the ceiling mid-loop
+      // cannot be answered from an earlier in-band spare. Deliberately does NOT
+      // write the memo: a past-ceiling candidate learns nothing about the pod,
+      // and `runningLockStaleBasis` falls back to the per-issue lock timestamp
+      // when a run has stamped no activity at all, so a later candidate of the
+      // same run can legitimately be in-band and is still owed its one probe.
+      if (silentMs >= AGENT_POD_BUSY_MAX_STALE_MS) return false;
+      const memoized = podBusyAtProbeByRunId.get(runId);
+      if (memoized !== undefined) return memoized;
+      const podBusy = (await probeAgentPodActivity(runId)) === "busy";
+      podBusyAtProbeByRunId.set(runId, podBusy);
+      if (podBusy) {
         logger.info(
           { runId, silentMs, staleBoundMs: STALE_RUNNING_ISSUE_LOCK_MS, ceilingMs: AGENT_POD_BUSY_MAX_STALE_MS },
           "sweepStaleIssueLocks: keeping issue lock — holder pod is executing a live subprocess (BLO-30087)",
         );
       }
-      return spared;
+      return podBusy;
     };
 
     for (const issue of candidates) {
@@ -13598,14 +13672,31 @@ export function recoveryService(
         const currentRunningLockSilent = (runId: string | null, lockedAt: Date | null) => {
           const basis = currentRunningLockStaleBasis(runId, lockedAt);
           if (!basis) return false;
-          if (Date.now() - basis.getTime() < STALE_RUNNING_ISSUE_LOCK_MS) return false;
+          const silentMs = Date.now() - basis.getTime();
+          if (silentMs < STALE_RUNNING_ISSUE_LOCK_MS) return false;
           // BLO-30087: mirror of the busy-pod spare in the pre-transaction scan.
           // Reads the memo rather than probing, so this stays synchronous and no
           // k8s round-trip happens while this transaction holds `issues` and
           // `heartbeat_runs` FOR UPDATE. Safe to key by runId alone: the
           // concurrent-bump bailouts above already guarantee
           // currentIssue.executionRunId === issue.executionRunId here.
-          if (runId && busySparedByRunId.get(runId) === true) return false;
+          //
+          // BLO-30245: the ceiling is re-derived here rather than inherited from
+          // the memo. The memo says only that the pod was busy WHEN PROBED; this
+          // revalidation necessarily runs later than that probe, so it has to
+          // re-ask whether the holder is still inside the band. Without this the
+          // pre-transaction hoist would only relocate the overshoot: a holder
+          // that crossed the ceiling mid-loop now reaches this transaction
+          // (where before it was filtered out earlier), and a memoized `true`
+          // would spare it here instead — one layer further down, where the
+          // hoist cannot see it.
+          if (
+            silentMs < AGENT_POD_BUSY_MAX_STALE_MS
+            && runId
+            && podBusyAtProbeByRunId.get(runId) === true
+          ) {
+            return false;
+          }
           return true;
         };
         const currentExecutionLockExpired = currentPreClaimLockExpired(
@@ -14114,6 +14205,42 @@ export function recoveryService(
       logger.warn(
         { cleared: result.cleared, issueIds: result.issueIds },
         "swept stale issue lock columns",
+      );
+    }
+
+    // BLO-33144: drain the promotions whose locks an EARLIER pass already
+    // cleared without restoring.
+    //
+    // The candidate scan above requires a non-null lock column, so it cannot
+    // see these rows at all — that is not a tuning gap, it is the selection
+    // criterion. Before BLO-29913 every pass of this sweep nulled both lock
+    // columns and left the status alone, minting exactly the shape that is now
+    // permanently outside its own reach. The fix stops new ones; this clears
+    // the accumulated ones, and keeps clearing any that a future gap produces.
+    //
+    // Runs here rather than as its own sweeper so it cannot drift onto a
+    // different cadence from the pass that produces its input, and so both the
+    // startup and periodic call sites get it without wiring.
+    try {
+      result.restoredStrandedPromotionIssueIds =
+        await restoreStrandedCheckoutPromotions(db);
+      result.restoredStrandedPromotions =
+        result.restoredStrandedPromotionIssueIds.length;
+      if (result.restoredStrandedPromotions > 0) {
+        logger.warn(
+          {
+            restored: result.restoredStrandedPromotions,
+            issueIds: result.restoredStrandedPromotionIssueIds,
+          },
+          "restored checkout promotions stranded by an earlier lock sweep",
+        );
+      }
+    } catch (err) {
+      // Never let reconciliation failure mask a successful lock clear: stale
+      // ownership blocks every later run, the drain only costs visibility.
+      logger.error(
+        { err },
+        "stranded checkout-promotion reconciliation failed",
       );
     }
 

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -1503,6 +1503,55 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).toHaveBeenCalledWith(coderId, expect.anything());
   });
 
+  // BLO-33223: the same family, one pod-death reason later. A container killed by
+  // the kernel OOM killer is read at exit (not found missing), so it carries the
+  // `exit code 137 … reason=OOMKilled` shape rather than the pod-removal sentence,
+  // and used to classify `infraClassCause: false` and escalate to the manager.
+  // Measured live on recovery action `cf5f83a6-…`, which stranded BLO-31945 four
+  // times. The negative control for this case is the test immediately below: an
+  // agent-side crash is `exit code 1, reason=Error` and must still escalate.
+  it("re-dispatches an OOMKilled claude_truncated failure to the existing assignee instead of the manager", async () => {
+    const { managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Claude run was truncated mid-stream — assistant produced content but no result " +
+        "event arrived; exit code 137, SIGKILL (commonly OOMKilled), reason=OOMKilled",
+      errorCode: "claude_truncated",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(action).toMatchObject({
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      ownerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+    });
+    expect(action?.ownerAgentId).toBe(action?.returnOwnerAgentId);
+    expect(action?.ownerAgentId).not.toBe(managerId);
+    expect(action?.evidence).toMatchObject({ infraClassCause: true });
+  });
+
   it("still escalates a claude_truncated failure without pod-removal evidence to the manager", async () => {
     const { managerId, coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn<
@@ -1798,6 +1847,65 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           error: "pod is gone — Job pod was removed (eviction, preemption, or external delete)",
         }),
       ).toBe(false);
+    });
+
+    // BLO-33223. The live message is pinned verbatim; the two below it pin that
+    // each marker carries on its own, since an adapter that reports the reason
+    // without an exit code (or vice versa) must not fall back to escalation.
+    it("is true for the adapter's OOMKilled termination sentence", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: "Claude run was truncated mid-stream — assistant produced content but no " +
+            "result event arrived; exit code 137, SIGKILL (commonly OOMKilled), reason=OOMKilled",
+        }),
+      ).toBe(true);
+    });
+
+    it.each([
+      ["exit code alone", "exit code 137, reason=Error"],
+      ["reason alone", "reason=OOMKilled"],
+    ])("is true for a SIGKILLed container reported by %s", (_label, tail) => {
+      expect(
+        isInfraClassStrandedFailure({ ...baseRun, errorCode: "claude_truncated", error: tail }),
+      ).toBe(true);
+    });
+
+    // The discriminator is the KILL, not the pod death: an agent-side crash is
+    // also a pod-lifecycle termination and must keep escalating. `exit code 13`
+    // guards the word-boundary — a prefix match on "137" would swallow it. The
+    // last two guard the kubelet's free-form `message=` tail: a marker-shaped
+    // substring quoted there (agents in this fleet discuss OOMKills routinely)
+    // must not decide routing, which a whole-string scan would let it do.
+    it.each([
+      ["an agent-side crash", "exit code 1, reason=Error, message=panic: nil pointer dereference"],
+      ["an exit code that merely starts with 13", "exit code 13, reason=Error"],
+      ["a message that merely mentions OOM", "exit code 2, reason=Error, message=parser hit an OOMKilled log line"],
+      ["a message quoting the reason marker", "exit code 1, reason=Error, message=observed reason=OOMKilled in logs"],
+      ["a message quoting the exit code marker", "exit code 1, reason=Error, message=child died with exit code 137 mid-parse"],
+    ])("is false for %s", (_label, tail) => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: `Claude run was truncated mid-stream — ${tail}`,
+        }),
+      ).toBe(false);
+    });
+
+    // The cut must not cost a true positive: a real OOM kill still classifies
+    // when the kubelet attaches its own diagnostic tail, which it routinely does.
+    it("is true for a real OOM kill carrying a kubelet message tail", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: "Claude run was truncated mid-stream — assistant produced content but no " +
+            "result event arrived; exit code 137, SIGKILL (commonly OOMKilled), " +
+            "reason=OOMKilled, message=Memory cgroup out of memory",
+        }),
+      ).toBe(true);
     });
   });
 
@@ -2941,6 +3049,172 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         )
       );
     expect(repeatedAnnouncements).toHaveLength(1);
+  });
+
+  // BLO-19124 AC4 (burst safety): "creating N recovery actions for one owner in a short
+  // window does not depend on that owner absorbing N wakes. Demonstrate with N >= 20
+  // against an owner whose maxConcurrentRuns is 3."
+  //
+  // The burst is the load shape that produced the original defect: 59 one-shot wakes landed
+  // on one owner in a day, the owner could absorb 3, and the rest were stranded forever. The
+  // guarantee under test is that a wake the owner CANNOT absorb costs the action nothing —
+  // the reserved attempt is refunded and the non-delivery is recorded in the separate
+  // dimension, so the deferred actions still hold their whole budget when capacity frees.
+  //
+  // `enqueueWakeup` is the seam, and null is not a stand-in for capacity here: null is
+  // literally how the real one reports every non-delivery path, capacity deferral included
+  // (see `enqueueOrRefundAttempt`, recovery/service.ts:5799). What this does NOT cover is
+  // whether the real dispatcher defers at exactly `maxConcurrentRuns` — that is the
+  // heartbeat's contract and has its own tests. The agent is still seeded with the AC's
+  // capacity so the mock's ceiling is read from the fixture rather than a magic literal.
+  //
+  // The capacity goes on the MANAGER, not the coder: this path routes the wake to
+  // `resolveStrandedIssueRecoveryOwnerAgentId`, which takes the assignee's `reportsTo`
+  // before the assignee. Seeding the coder would configure an agent this path never wakes,
+  // and the test would still pass — the AC says "an owner whose maxConcurrentRuns is 3",
+  // so the mock asserts it is that owner being woken before applying the ceiling.
+  it("refunds a burst of wakes one owner cannot absorb instead of spending their budget (BLO-19124 AC4)", async () => {
+    const BURST = 25;
+    const MAX_CONCURRENT = 3;
+    expect(BURST).toBeGreaterThanOrEqual(20);
+
+    const { companyId, managerId, coderId, prefix, sourceIssue } = await seedCompany();
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: MAX_CONCURRENT } } })
+      .where(eq(agents.id, managerId));
+    const [owner] = await db.select().from(agents).where(eq(agents.id, managerId));
+    const capacity =
+      (owner!.runtimeConfig as { heartbeat?: { maxConcurrentRuns?: number } })?.heartbeat
+        ?.maxConcurrentRuns ?? 0;
+    expect(capacity).toBe(MAX_CONCURRENT);
+
+    // seedCompany already made issue #1; fill the burst out to BURST on the same owner.
+    const extraIds = Array.from({ length: BURST - 1 }, () => randomUUID());
+    await db.insert(issues).values(
+      extraIds.map((id, index) => ({
+        id,
+        companyId,
+        title: `Burst issue ${index + 2}`,
+        status: "in_progress" as const,
+        priority: "medium" as const,
+        assigneeAgentId: coderId,
+        issueNumber: index + 2,
+        identifier: `${prefix}-${index + 2}`,
+      })),
+    );
+    const burstIssues = [
+      sourceIssue,
+      ...(await db.select().from(issues).where(inArray(issues.id, extraIds))),
+    ];
+    expect(burstIssues).toHaveLength(BURST);
+
+    let inFlight = 0;
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string } | null>
+    >(async (agentId) => {
+      // The ceiling is only meaningful if it is the routed owner's ceiling.
+      expect(agentId).toBe(managerId);
+      if (inFlight >= capacity) return null; // owner is saturated — woke nobody
+      inFlight += 1;
+      return { id: randomUUID() };
+    });
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const escalate = (issue: (typeof burstIssues)[number]) =>
+      recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_progress",
+        latestRun: {
+          id: randomUUID(),
+          agentId: coderId,
+          status: "failed",
+          error: "agent is not invokable",
+          errorCode: "agent_not_invokable",
+          contextSnapshot: { retryReason: "issue_continuation_needed" },
+          livenessState: "needs_followup",
+          resultJson: null,
+          usageJson: null,
+          createdAt: new Date(),
+        },
+        comment: "Automatic continuation recovery failed.",
+      });
+
+    for (const issue of burstIssues) await escalate(issue);
+
+    const readActions = async () =>
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, companyId));
+    const afterBurst = await readActions();
+    expect(afterBurst).toHaveLength(BURST);
+
+    // (a) every action in the burst is bounded, so none can sit active forever.
+    for (const action of afterBurst) {
+      expect(action.maxAttempts !== null || action.timeoutAt !== null).toBe(true);
+    }
+
+    // The burst split exactly on what the owner could absorb.
+    const delivered = afterBurst.filter((action) => action.attemptCount > 0);
+    const deferred = afterBurst.filter((action) => action.attemptCount === 0);
+    expect(delivered).toHaveLength(MAX_CONCURRENT);
+    expect(deferred).toHaveLength(BURST - MAX_CONCURRENT);
+
+    // The load-bearing assertion. Without the refund every one of these carries
+    // attemptCount 1 for a wake that reached nobody, which is how a single burst used to
+    // eat 1/5 of 22 budgets at once. The two dimensions must not be conflated: the
+    // non-delivery is counted, just not against the budget.
+    for (const action of deferred) {
+      expect(action).toMatchObject({
+        attemptCount: 0,
+        nonDeliverySweepCount: 1,
+        status: "active",
+        retiringBound: null,
+      });
+    }
+    for (const action of delivered) {
+      expect(action).toMatchObject({ attemptCount: 1, nonDeliverySweepCount: 0 });
+    }
+
+    // AC4 itself: the burst must not have made the deferred work depend on having been
+    // absorbed by that first pass. A real owner frees its slots as runs finish, so drain
+    // the deferred set over successive sweep rounds with capacity released between them,
+    // and count the rounds — that count is the thing the 6h horizon has to accommodate.
+    const deferredIssueIds = new Set(deferred.map((action) => action.sourceIssueId));
+    const roundCap = BURST; // generous; the real number is asserted below
+    let rounds = 0;
+    let outstanding = [...deferredIssueIds];
+    while (outstanding.length > 0 && rounds < roundCap) {
+      rounds += 1;
+      inFlight = 0; // the owner's runs from the previous round have completed
+      // Re-read every round: the first sweep moved these to `blocked`, and the production
+      // sweep always reads current state. Passing the stale in_progress rows would be
+      // testing a shape that never reaches this path.
+      const refreshed = await db.select().from(issues).where(inArray(issues.id, outstanding));
+      for (const issue of refreshed) await escalate(issue);
+      const stillZero = await readActions();
+      outstanding = stillZero
+        .filter((row) => deferredIssueIds.has(row.sourceIssueId) && row.attemptCount === 0)
+        .map((row) => row.sourceIssueId);
+    }
+
+    // Every deferred action was eventually reached, and the burst cost it nothing: exactly
+    // one delivered wake out of a budget of `maxAttempts`, with every non-delivery it
+    // absorbed on the way counted in the other dimension instead.
+    const recovered = (await readActions()).filter((row) =>
+      deferredIssueIds.has(row.sourceIssueId),
+    );
+    expect(recovered).toHaveLength(BURST - MAX_CONCURRENT);
+    for (const action of recovered) {
+      expect(action.status).toBe("active");
+      expect(action.attemptCount).toBe(1);
+      expect(action.attemptCount).toBeLessThan(action.maxAttempts ?? Number.POSITIVE_INFINITY);
+      expect(action.nonDeliverySweepCount).toBeGreaterThanOrEqual(1);
+    }
+
+    // The number that matters to the horizon: draining a burst of N against capacity C
+    // takes at most ceil((N - C) / C) rounds, and the action has to stay alive across all
+    // of them. Bounded rather than pinned — a sweep that drains more per round is an
+    // improvement, and pinning equality would assert this mock's drain policy instead.
+    expect(rounds).toBeLessThanOrEqual(Math.ceil((BURST - MAX_CONCURRENT) / MAX_CONCURRENT));
+    expect(rounds).toBeGreaterThan(1); // a burst this size cannot drain in one pass
   });
 
   it("stamps configured bounds when creating a wake-owner recovery action", async () => {

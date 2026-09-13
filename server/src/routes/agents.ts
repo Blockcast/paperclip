@@ -2837,6 +2837,8 @@ export function agentRoutes(
       status: query.status,
       kind: query.kind,
       limit: query.limit,
+      offset: query.offset,
+      order: query.order,
     });
     res.json(actions);
   });

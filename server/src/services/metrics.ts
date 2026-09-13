@@ -263,6 +263,29 @@ export const SCHEDULED_RETRY_PARK_HORIZON_METRIC =
   "paperclip_scheduled_retry_park_horizon_seconds";
 export const SCHEDULED_RETRY_PARK_HORIZON_REFRESH_SUCCESS_METRIC =
   "paperclip_scheduled_retry_park_horizon_refresh_success";
+/**
+ * postgres.js connection-pool occupancy, by `state` (BLO-33243).
+ *
+ * There was no pool instrumentation anywhere in this fleet, which made pool
+ * saturation unobservable by construction: the 9 h measurement that produced
+ * BLO-33243 could establish that two control-plane pods were timing out
+ * `/metrics` independently of each other and of their nodes -- the signature
+ * of a per-process pool -- but could not confirm the pool was the mechanism,
+ * because nothing exported it. Saturation reads as `idle == 0` and
+ * `active == max` with {@link DB_POOL_WAITING_QUERIES_METRIC} above 0.
+ *
+ * `max` is carried as a state rather than a separate gauge so headroom is a
+ * plain ratio inside one series, without a second metric to join against.
+ */
+export const DB_POOL_CONNECTIONS_METRIC = "paperclip_db_pool_connections";
+/**
+ * Statements holding no connection yet (BLO-33243). This is the saturation
+ * signal itself: postgres.js only enqueues a query here once every connection
+ * in the pool is busy, so a sustained non-zero value IS pool exhaustion, and a
+ * zero value rules it out. Separate from {@link DB_POOL_CONNECTIONS_METRIC}
+ * because it counts queries, not connections.
+ */
+export const DB_POOL_WAITING_QUERIES_METRIC = "paperclip_db_pool_waiting_queries";
 /** Queue wait observed when a sanctioned GitHub PR-review run starts. */
 export const PR_REVIEW_QUEUE_WAIT_METRIC = "paperclip_pr_review_queue_wait_seconds";
 export const PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS = [60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800];
@@ -1868,6 +1891,8 @@ let overdueScheduledRetryOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryAgeMetricsRefreshSuccess: Gauge | null = null;
 let scheduledRetryParkHorizon: Gauge<"agent_id"> | null = null;
 let scheduledRetryParkHorizonRefreshSuccess: Gauge | null = null;
+let dbPoolConnections: Gauge<"state"> | null = null;
+let dbPoolWaitingQueries: Gauge | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
 let pluginMetric: Counter<
   "plugin_id" | "plugin_key" | "metric" | PluginMetricPromotableTagKey
@@ -1976,6 +2001,8 @@ function ensureRegistry(): {
   overdueScheduledRetryAgeMetricsRefreshSuccessGauge: Gauge;
   scheduledRetryParkHorizonGauge: Gauge<"agent_id">;
   scheduledRetryParkHorizonRefreshSuccessGauge: Gauge;
+  dbPoolConnectionsGauge: Gauge<"state">;
+  dbPoolWaitingQueriesGauge: Gauge;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
   pluginMetricCounter: Counter<
     "plugin_id" | "plugin_key" | "metric" | PluginMetricPromotableTagKey
@@ -2032,6 +2059,8 @@ function ensureRegistry(): {
     || !overdueScheduledRetryAgeMetricsRefreshSuccess
     || !scheduledRetryParkHorizon
     || !scheduledRetryParkHorizonRefreshSuccess
+    || !dbPoolConnections
+    || !dbPoolWaitingQueries
     || !pluginError
     || !pluginMetric
     || !pluginMetricDropped
@@ -2157,6 +2186,25 @@ function ensureRegistry(): {
       registers: [registry],
     });
     scheduledRetryParkHorizonRefreshSuccess.set(0);
+    dbPoolConnections = new Gauge({
+      name: DB_POOL_CONNECTIONS_METRIC,
+      help:
+        "postgres.js connection-pool occupancy by state (BLO-33243): max (the configured cap), "
+        + "idle (connected, no query), active (serving or reserved), connecting (handshaking). "
+        + "Per-pod, because the pool is per-process -- which is what made the /metrics scrape "
+        + "timeouts independent across pods and across nodes. Saturation is idle=0 with "
+        + "active=max and " + DB_POOL_WAITING_QUERIES_METRIC + " above 0.",
+      labelNames: ["state"],
+      registers: [registry],
+    });
+    dbPoolWaitingQueries = new Gauge({
+      name: DB_POOL_WAITING_QUERIES_METRIC,
+      help:
+        "Statements queued with no pool connection yet (BLO-33243). postgres.js only enqueues "
+        + "here once every connection is busy, so a sustained non-zero value IS pool exhaustion "
+        + "and a zero value rules it out.",
+      registers: [registry],
+    });
     externalRuntimeReservationStrandedOldestAge = new Gauge({
       name: EXTERNAL_RUNTIME_RESERVATION_STRANDED_OLDEST_AGE_METRIC,
       help:
@@ -2797,6 +2845,8 @@ function ensureRegistry(): {
     overdueScheduledRetryAgeMetricsRefreshSuccessGauge: overdueScheduledRetryAgeMetricsRefreshSuccess,
     scheduledRetryParkHorizonGauge: scheduledRetryParkHorizon,
     scheduledRetryParkHorizonRefreshSuccessGauge: scheduledRetryParkHorizonRefreshSuccess,
+    dbPoolConnectionsGauge: dbPoolConnections,
+    dbPoolWaitingQueriesGauge: dbPoolWaitingQueries,
     pluginErrorGauge: pluginError,
     pluginMetricCounter: pluginMetric,
     pluginMetricDroppedCounter: pluginMetricDropped,
@@ -3109,6 +3159,32 @@ export function setScheduledRetryParkHorizonMetrics(
 
 export function setScheduledRetryParkHorizonRefreshSuccess(success: boolean): void {
   ensureRegistry().scheduledRetryParkHorizonRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+/** Snapshot of postgres.js pool occupancy (BLO-33243). Plain numbers — reading them touches no socket. */
+export interface DbPoolStats {
+  max: number;
+  idle: number;
+  active: number;
+  connecting: number;
+  waiting: number;
+}
+
+/**
+ * Publish a pool snapshot (BLO-33243). Called on the `/metrics` request path
+ * rather than from the background collector on purpose: the reading costs
+ * nothing (it is four in-memory queue lengths, no query, no await) and the
+ * moment worth sampling is scrape time. A collector tick blocked waiting for a
+ * connection is exactly when the pool is interesting and exactly when it would
+ * fail to report.
+ */
+export function setDbPoolStats(stats: DbPoolStats): void {
+  const { dbPoolConnectionsGauge, dbPoolWaitingQueriesGauge } = ensureRegistry();
+  dbPoolConnectionsGauge.set({ state: "max" }, stats.max);
+  dbPoolConnectionsGauge.set({ state: "idle" }, stats.idle);
+  dbPoolConnectionsGauge.set({ state: "active" }, stats.active);
+  dbPoolConnectionsGauge.set({ state: "connecting" }, stats.connecting);
+  dbPoolWaitingQueriesGauge.set(stats.waiting);
 }
 
 /**

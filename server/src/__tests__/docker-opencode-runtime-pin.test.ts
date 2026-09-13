@@ -213,7 +213,12 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("vendors the opencode_k8s adapter commit and executes its env-guard and runtime regressions", () => {
-    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=87a865ded22d3ac4655b1c3fa1ad47473f23e7d8");
+    // BLO-33204: this is the SECOND place the pin is asserted; the canonical one is
+    // scripts/opencode-k8s-runtime-cache-pin.test.js, which also holds the known-bad
+    // list. Both must move together — 87a865de was orphaned by adapter #62's squash
+    // and is now asserted *against* over there, so leaving this line stale puts the
+    // two suites in direct contradiction.
+    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=2075ae1ba249e97c49a77386c81a9d88b22c481d");
     expect(serverDockerfile).toContain(
       "npm test -- src/server/env-guard-plugin.test.ts src/server/execute.test.ts",
     );

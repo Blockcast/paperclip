@@ -329,15 +329,46 @@ describeEmbeddedPostgres("reconcileApprovalEnforcement", () => {
     expect(await driftIssuesFor(companyId, approvalId)).toHaveLength(1);
   });
 
-  it("files a fresh issue if the drift recurs after the first was closed", async () => {
+  it("does not re-file when the owner closed the issue and the drift state is unchanged", async () => {
+    // BLO-33397. The owner's correct disposition is frequently "superseded by a
+    // newer decision, do not apply" — the AC's own first bullet — and that does
+    // not make the disagreement go away. Keying dedupe on the approval alone
+    // meant every later pass saw drift, found no *open* issue, and filed again:
+    // measured on approval 6f45844e, BLO-33160 was closed after a full
+    // adjudication and BLO-33397 was raised from the identical state 44 minutes
+    // later, burning a CEO run and a CTO run per cycle.
     const { companyId, approvalId } = await seed({ enforcedCents: PRE_APPROVAL_CENTS });
     await reconcileApprovalEnforcement(db);
 
     const [raised] = await driftIssuesFor(companyId, approvalId);
     await db.update(issues).set({ status: "done" }).where(eq(issues.id, raised!.id));
 
-    // The partial unique index is scoped to the open population precisely so a
-    // recurrence is not permanently suppressed by a closed issue.
+    const after = await reconcileApprovalEnforcement(db);
+
+    // Still counted as drift — it is real and unresolved — but not re-raised.
+    expect(after.drifted).toBe(1);
+    expect(after.raised).toBe(0);
+    expect(await driftIssuesFor(companyId, approvalId)).toHaveLength(1);
+  });
+
+  it("files a fresh issue if the drift state changes after the first was closed", async () => {
+    // The other half of the pair above, and the reason the fix keys on the
+    // drift *state* rather than simply suppressing on any closed issue: the
+    // partial unique index (migrations/0240) is scoped to the open population
+    // precisely so a genuine recurrence is not permanently silenced.
+    const { companyId, approvalId, policyId } = await seed({ enforcedCents: PRE_APPROVAL_CENTS });
+    await reconcileApprovalEnforcement(db);
+
+    const [raised] = await driftIssuesFor(companyId, approvalId);
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, raised!.id));
+
+    // The enforced side moves to a *different* wrong amount: a new state the
+    // owner has never adjudicated.
+    await db
+      .update(budgetPolicies)
+      .set({ amount: PRE_APPROVAL_CENTS + 500_00 })
+      .where(eq(budgetPolicies.id, policyId));
+
     expect((await reconcileApprovalEnforcement(db)).raised).toBe(1);
     expect(await driftIssuesFor(companyId, approvalId)).toHaveLength(2);
   });

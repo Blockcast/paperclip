@@ -1757,16 +1757,31 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // already resolving: exit 128, `unable to access ...: Failed to connect`.
   // Sharing one constant keeps the two from drifting apart.
   //
-  // Two limits on what this bound actually buys, both deliberate:
-  //   - it aborts a *transfer* that stalls below 1 KiB/s for 15s. A connect
-  //     that never completes is still bounded only by the kernel's TCP retry,
-  //     which is finite but longer.
-  //   - both knobs are consumed by the curl-based HTTP transport, so an
-  //     `ssh://` or `git@host:` remote would ignore them silently and the
-  //     calls would be unbounded again. Every configured workspace `repoUrl`
-  //     is https today so nothing reaches that path, but a future SSH remote
-  //     needs its own bound rather than inheriting this one.
-  const boundedRunWorkspaceGit = `${runWorkspaceGit} -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15`;
+  // Two bounds, because neither one catches the other's failure. Reading
+  // either as covering both is the mistake worth naming here:
+  //   - the low-speed knobs bound the connection once it is ESTABLISHED: if it
+  //     then carries less than 1 KiB/s for 15s, curl aborts. Measured against a
+  //     server that accepts the connection and never speaks: dropped at exactly
+  //     lowSpeedTime, exit 128. They do not bound the connect itself — a SYN
+  //     that is never answered is invisible to them — and both knobs are
+  //     consumed by the curl-based HTTP transport, so an `ssh://` or
+  //     `git@host:` remote ignores them silently. Every configured workspace
+  //     `repoUrl` is https today, so nothing reaches that second path yet.
+  //   - `timeout` bounds WALL CLOCK whatever the transport, so it is the only
+  //     one of the two that covers a connect that hangs, and the only one a
+  //     future SSH remote would inherit rather than silently discard. Measured
+  //     against a blackholed address with lowSpeedTime=3 set: the low-speed
+  //     bound never fired and the call ran 135s before the kernel gave up
+  //     (tcp_syn_retries=6). Over ssh, an established-but-silent connection has
+  //     no equivalent backstop at all.
+  //
+  // 60s therefore tightens the https connect case rather than restating it, and
+  // sits far above a healthy fetch here: the clone is `--shared` off a local
+  // base checkout, so this fetch carries only what upstream has gained since
+  // that base was last updated. Being killed is degradation, not failure — the
+  // chain is guarded and each breadcrumb reports the exit code, so 124 (killed
+  // by the wall-clock bound) stays distinguishable from git's own 128.
+  const boundedRunWorkspaceGit = `timeout 60 ${runWorkspaceGit} -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15`;
   const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
     ? [
         `if git -C ${quoteShellArg(workspaceCwd)} rev-parse --verify HEAD >/dev/null 2>&1; then`,
@@ -1798,7 +1813,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
                 //
                 // This runs on every run-isolated pod start, so both network
                 // calls are bounded — see `boundedRunWorkspaceGit` above for
-                // exactly what that bound does and does not cover.
+                // exactly what each of the two bounds does and does not cover.
+                //
+                // Each breadcrumb carries the failed call's exit code, spliced
+                // in by closing the single quotes around `"$?"` rather than
+                // double-quoting the whole message — the messages contain
+                // backticks, which double quotes would turn into command
+                // substitution. `$?` is read at word-expansion time, after the
+                // `||` has already decided to run the breadcrumb, so it is the
+                // status of the call that just failed. Without it the two
+                // bounds are indistinguishable after the fact, and a
+                // breadcrumb that names the wrong cause is worse than none.
                 //
                 // `set-head` is nested inside its own guard so that when the
                 // fetch succeeds but `set-head` fails, the chain does not fall
@@ -1809,7 +1834,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
                 // bare `symbolic-ref` failure for an agent to diagnose. (The
                 // sibling `originRemoved` breadcrumb below is not a failure —
                 // it is the no-upstream branch.)
-                `(${boundedRunWorkspaceGit} fetch --no-tags --quiet origin && (${boundedRunWorkspaceGit} remote set-head origin -a >/dev/null 2>&1 || ${runWorkspaceGit} config paperclip.originHeadUnset 'origin/HEAD could not be resolved, possibly a stalled transfer hit by the low-speed bound; run \`git remote set-head origin -a\` if you need the default branch (BLO-31359)' || true) || ${runWorkspaceGit} config paperclip.originFetchFailed 'best-effort fetch failed; run \`git fetch origin\` before using origin/<branch> (BLO-31359)' || true)`,
+                `(${boundedRunWorkspaceGit} fetch --no-tags --quiet origin && (${boundedRunWorkspaceGit} remote set-head origin -a >/dev/null 2>&1 || ${runWorkspaceGit} config paperclip.originHeadUnset 'origin/HEAD could not be resolved (exit '"$?"'; 124 means the wall-clock bound killed the call, any other code came from the call itself — a transfer aborted by the low-speed bound reports 128); run \`git remote set-head origin -a\` if you need the default branch (BLO-31359)' || true) || ${runWorkspaceGit} config paperclip.originFetchFailed 'best-effort fetch failed (exit '"$?"'; 124 means the wall-clock bound killed the call, any other code came from the call itself — a transfer aborted by the low-speed bound reports 128); run \`git fetch origin\` before using origin/<branch> (BLO-31359)' || true)`,
               ]
             : [
                 // No recorded upstream: leave the clone with no remote at all

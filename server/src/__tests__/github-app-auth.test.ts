@@ -26,6 +26,8 @@ import {
   githubGetLatestCommitStatusForContext,
   githubListIssueCommentsWithTimestamps,
   githubListPrReviewsWithTimestamps,
+  githubListPullRequestCommits,
+  GITHUB_PR_COMMITS_ENDPOINT_LIMIT,
   githubPostCommitStatus,
   githubPostCommitStatusDetailed,
   githubReviewerAppSlug,
@@ -793,6 +795,64 @@ describe("githubHasReviewerEvidenceForPr", () => {
         githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
       ).resolves.toEqual({ found: true, via: "comment" });
     });
+  });
+});
+
+// BLO-19528, Ally review of #1760. Foreign-commit notification is only as good
+// as the commit listing it reads, and GitHub truncates that listing at 250
+// without saying so -- the page loop sees a short page and concludes it reached
+// the end. A truncated read that reports itself complete turns "I could not
+// check the older commits" into "there are no foreign commits", which is the
+// exact silent-gap failure the notice exists to close.
+describe("githubListPullRequestCommits truncation", () => {
+  const repoFullName = "Blockcast/paperclip";
+  const prNumber = 1760;
+
+  function commitPage(count: number, label: string) {
+    return Array.from({ length: count }, (_, index) => ({
+      sha: `${label}-${index}`,
+      commit: { author: { email: `a${index}@blockcast.net`, name: `A${index}` } },
+      parents: [{ sha: "parent" }],
+    }));
+  }
+
+  /** Serve `total` commits across 100-per-page requests. */
+  function stubPages(total: number) {
+    setCreds();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const value = String(url);
+        if (value.includes("/access_tokens")) {
+          return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        }
+        const page = Number(value.match(/[?&]page=(\d+)/)?.[1] ?? "1");
+        const offset = (page - 1) * 100;
+        return jsonResponse(commitPage(Math.max(0, Math.min(100, total - offset)), `p${page}`));
+      }),
+    );
+  }
+
+  it("flags a listing that lands on GitHub's 250-commit ceiling", async () => {
+    // What a >250-commit PR actually returns: 100, 100, 50. The 50 looks like
+    // a natural last page, so nothing but the total gives the truncation away.
+    stubPages(GITHUB_PR_COMMITS_ENDPOINT_LIMIT);
+    const result = await githubListPullRequestCommits({ repoFullName, prNumber });
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    // The commits read are still returned -- a foreign commit among them must
+    // still notify, so truncation is a diagnostic and not an error.
+    expect(result.commits).toHaveLength(GITHUB_PR_COMMITS_ENDPOINT_LIMIT);
+    expect(result.truncated).toBe(true);
+  });
+
+  it("does not flag a listing that ends before the ceiling", async () => {
+    stubPages(150);
+    const result = await githubListPullRequestCommits({ repoFullName, prNumber });
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    expect(result.commits).toHaveLength(150);
+    expect(result.truncated).toBe(false);
   });
 });
 

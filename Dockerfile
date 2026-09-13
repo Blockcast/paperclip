@@ -381,7 +381,19 @@ WORKDIR /vendor
 # Bumped 2026-09-09 to 87a865d: add optional Caveman/Penstock and Ponytail
 # launcher wiring plus server-side credential-inheritance hardening while
 # retaining the persisted lifecycle recovery above.
-ARG OPENCODE_K8S_REF=87a865ded22d3ac4655b1c3fa1ad47473f23e7d8
+# Re-pinned 2026-09-10 to 2075ae1 (BLO-33204): CONTENT-IDENTICAL to 87a865d,
+# which was that PR's branch head and was orphaned when #62 squash-merged.
+# `git diff 87a865d 2075ae1` is empty and both carry tree
+# cd60d8476f3de8a9a8a1bafd741e468de32fae3c, so the Caveman/Penstock and
+# Ponytail wiring and the credential-inheritance hardening above are preserved
+# exactly — this moves the pin onto a reachable ref, it does not move the code.
+# `git clone` fetches only ref-reachable objects, so the orphaned SHA broke
+# every build that missed the vendor-stage cache with
+# `fatal: unable to read tree (87a865de...)`. Builds reusing a pre-force-push
+# vendor layer kept passing, which is why the break looked commit-timed rather
+# than cache-timed. scripts/check-opencode-k8s-pin-reachable.mjs now fails a PR
+# for an unreachable pin instead of waiting for a cache miss to find it.
+ARG OPENCODE_K8S_REF=2075ae1ba249e97c49a77386c81a9d88b22c481d
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
