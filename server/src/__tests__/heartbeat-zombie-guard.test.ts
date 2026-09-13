@@ -2,6 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   isZombieRun,
   filterZombieCoalesceTarget,
+  isCoalesceTargetPastHeartbeatInterval,
+  filterIntervalOverrunCoalesceTarget,
+  resolveStalledCoalesceBudgetMs,
+  STALLED_COALESCE_INTERVAL_MULTIPLE,
+  STALLED_COALESCE_MIN_BUDGET_MS,
 } from "../services/heartbeat.ts";
 
 // ---------------------------------------------------------------------------
@@ -121,5 +126,122 @@ describe("filterZombieCoalesceTarget", () => {
 
     expect(filterZombieCoalesceTarget(zombie, tracked)).toBeNull();
     expect(filterZombieCoalesceTarget(live, tracked)).toBe(live);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PEN-1995: the interval-overrun coalesce guard.
+//
+// `isZombieRun` only catches a run with no live in-memory execution. A run that
+// stalls AFTER being registered in `activeRunExecutions` is tracked, so it is
+// not a zombie, yet it silently swallows every later same-scope timer wake.
+// These cover the budget arithmetic and both sides of the boundary.
+// ---------------------------------------------------------------------------
+const HOUR_MS = 60 * 60 * 1000;
+const now = new Date("2026-09-13T12:00:00.000Z");
+const agoMs = (ms: number) => new Date(now.getTime() - ms);
+
+describe("resolveStalledCoalesceBudgetMs", () => {
+  it("uses 1.5x the interval once that exceeds the floor", () => {
+    // 24h interval (the clamp maximum) -> 36h budget.
+    expect(resolveStalledCoalesceBudgetMs(86_400)).toBe(
+      86_400 * 1000 * STALLED_COALESCE_INTERVAL_MULTIPLE,
+    );
+  });
+
+  it("floors a fast-cadence agent at the minimum budget", () => {
+    // 30s (the clamp minimum) * 1.5 = 45s, far below the floor.
+    expect(resolveStalledCoalesceBudgetMs(30)).toBe(STALLED_COALESCE_MIN_BUDGET_MS);
+  });
+
+  it("returns exactly the floor at the hourly default, where the two meet", () => {
+    // 3600 * 1.5 = 5400s = 90 min, identical to the floor. This is the
+    // measured population's threshold, so pin it explicitly.
+    expect(resolveStalledCoalesceBudgetMs(3600)).toBe(STALLED_COALESCE_MIN_BUDGET_MS);
+    expect(STALLED_COALESCE_MIN_BUDGET_MS).toBe(90 * 60 * 1000);
+  });
+
+  it("falls back to the floor for non-positive or non-finite intervals", () => {
+    expect(resolveStalledCoalesceBudgetMs(0)).toBe(STALLED_COALESCE_MIN_BUDGET_MS);
+    expect(resolveStalledCoalesceBudgetMs(-1)).toBe(STALLED_COALESCE_MIN_BUDGET_MS);
+    expect(resolveStalledCoalesceBudgetMs(Number.NaN)).toBe(STALLED_COALESCE_MIN_BUDGET_MS);
+  });
+});
+
+describe("isCoalesceTargetPastHeartbeatInterval", () => {
+  it("is true for a running run past its budget", () => {
+    const run = { status: "running", startedAt: agoMs(4 * HOUR_MS) };
+    expect(isCoalesceTargetPastHeartbeatInterval(run, 3600, now)).toBe(true);
+  });
+
+  it("is false for a running run inside its budget", () => {
+    const run = { status: "running", startedAt: agoMs(5 * 60 * 1000) };
+    expect(isCoalesceTargetPastHeartbeatInterval(run, 3600, now)).toBe(false);
+  });
+
+  it("is exclusive at the boundary — exactly at budget does not fire", () => {
+    const exactly = { status: "running", startedAt: agoMs(STALLED_COALESCE_MIN_BUDGET_MS) };
+    expect(isCoalesceTargetPastHeartbeatInterval(exactly, 3600, now)).toBe(false);
+    const oneMsPast = {
+      status: "running",
+      startedAt: agoMs(STALLED_COALESCE_MIN_BUDGET_MS + 1),
+    };
+    expect(isCoalesceTargetPastHeartbeatInterval(oneMsPast, 3600, now)).toBe(true);
+  });
+
+  it("never fires for queued or scheduled_retry however old — they read fresh context on start", () => {
+    const startedAt = agoMs(48 * HOUR_MS);
+    for (const status of ["queued", "scheduled_retry"]) {
+      expect(isCoalesceTargetPastHeartbeatInterval({ status, startedAt }, 3600, now)).toBe(false);
+    }
+  });
+
+  it("never fires for terminal states", () => {
+    const startedAt = agoMs(48 * HOUR_MS);
+    for (const status of ["failed", "succeeded", "cancelled", "timed_out"]) {
+      expect(isCoalesceTargetPastHeartbeatInterval({ status, startedAt }, 3600, now)).toBe(false);
+    }
+  });
+
+  it("fails safe (false) when startedAt is missing or unparseable", () => {
+    expect(isCoalesceTargetPastHeartbeatInterval({ status: "running", startedAt: null }, 3600, now))
+      .toBe(false);
+    expect(
+      isCoalesceTargetPastHeartbeatInterval({ status: "running", startedAt: "not-a-date" }, 3600, now),
+    ).toBe(false);
+  });
+
+  it("accepts an ISO string startedAt, as read back from the DB driver", () => {
+    const run = { status: "running", startedAt: agoMs(4 * HOUR_MS).toISOString() };
+    expect(isCoalesceTargetPastHeartbeatInterval(run, 3600, now)).toBe(true);
+  });
+
+  it("holds a 30s-cadence agent to the floor rather than 45s", () => {
+    // The whole reason the floor exists: 1.5x alone would fire here.
+    const run = { status: "running", startedAt: agoMs(20 * 60 * 1000) };
+    expect(isCoalesceTargetPastHeartbeatInterval(run, 30, now)).toBe(false);
+    expect(isCoalesceTargetPastHeartbeatInterval({ ...run, startedAt: agoMs(2 * HOUR_MS) }, 30, now))
+      .toBe(true);
+  });
+});
+
+describe("filterIntervalOverrunCoalesceTarget", () => {
+  it("returns null for an overrunning running target", () => {
+    const target = { status: "running", id: "stalled-1", startedAt: agoMs(4 * HOUR_MS) };
+    expect(filterIntervalOverrunCoalesceTarget(target, 3600, now)).toBeNull();
+  });
+
+  it("passes through a running target inside its budget", () => {
+    const target = { status: "running", id: "live-1", startedAt: agoMs(5 * 60 * 1000) };
+    expect(filterIntervalOverrunCoalesceTarget(target, 3600, now)).toBe(target);
+  });
+
+  it("passes through an aged queued target", () => {
+    const target = { status: "queued", id: "queued-1", startedAt: agoMs(48 * HOUR_MS) };
+    expect(filterIntervalOverrunCoalesceTarget(target, 3600, now)).toBe(target);
+  });
+
+  it("passes through a null target unchanged", () => {
+    expect(filterIntervalOverrunCoalesceTarget(null, 3600, now)).toBeNull();
   });
 });
