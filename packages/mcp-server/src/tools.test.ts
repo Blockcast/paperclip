@@ -699,7 +699,16 @@ describe("paperclip MCP tools", () => {
 
     const tool = getTool("paperclipApiRequest");
 
-    for (const path of ["/api/agents/me", "/api", "/API/agents/me"]) {
+    for (const path of [
+      "/api/agents/me",
+      "/api",
+      "/API/agents/me",
+      // Query- and fragment-only suffixes compose as /api/api?probe=1 and /api/api,
+      // i.e. the same ambiguous 404 — a guard anchored only on "/" or end-of-input
+      // lets them through.
+      "/api?probe=1",
+      "/api#probe",
+    ]) {
       const response = await tool.execute({ method: "GET", path });
       expect(response.content[0]?.text).toContain("path is relative to /api");
       expect(response.content[0]?.text).toContain("not a missing route on the server");
@@ -707,6 +716,20 @@ describe("paperclip MCP tools", () => {
     }
 
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not reject paths that merely start with the letters 'api'", async () => {
+    // Negative control: the guard is anchored on the /api *segment*, so a route
+    // like /apiary must still pass through. An over-broad guard breaks real calls.
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApiRequest");
+    await tool.execute({ method: "GET", path: "/apiary/x" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url] = fetchMock.mock.calls[0] as [string | URL, RequestInit];
+    expect(String(url)).toBe("http://localhost:3100/api/apiary/x");
   });
 
   it("passes a correctly relative path through unmodified", async () => {
