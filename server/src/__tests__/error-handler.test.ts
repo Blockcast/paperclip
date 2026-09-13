@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
+import { TRANSIENT_DB_SQLSTATES } from "../lib/db-retry.js";
 import { errorHandler } from "../middleware/error-handler.js";
 
 const recordResponsibleUserDenialOnActiveRunMock = vi.hoisted(() => vi.fn());
@@ -119,6 +120,62 @@ describe("errorHandler", () => {
       agentId: "agent-1",
       companyId: "company-1",
       code: "RESPONSIBLE_USER_UNAUTHORIZED",
+    });
+  });
+
+  // BLO-33733: PATCH /issues/:id {blockedByIssueIds} waits on a company-scoped
+  // advisory lock; under contention that wait is cancelled with 55P03 and used
+  // to surface as a bare 500, indistinguishable from a permanent fault.
+  describe("transient database conflicts", () => {
+    it("reports every transient SQLSTATE as a typed, retryable 503", () => {
+      for (const code of TRANSIENT_DB_SQLSTATES) {
+        const res = makeRes() as any;
+        errorHandler(
+          Object.assign(new Error(`pg error ${code}`), { code }),
+          makeReq(),
+          res,
+          vi.fn() as unknown as NextFunction,
+        );
+
+        expect(res.status).toHaveBeenCalledWith(503);
+        expect(res.json).toHaveBeenCalledWith({
+          error: "Database contention: the write was rolled back and did not apply. Retry.",
+          code: "transient_db_conflict",
+          retryable: true,
+          details: { sqlstate: code },
+        });
+      }
+    });
+
+    it("unwraps the drizzle wrapper the lock timeout actually arrives in", () => {
+      // Production shape: drizzle throws "Failed query", the SQLSTATE is on .cause.
+      const err = Object.assign(
+        new Error("Failed query: select pg_advisory_xact_lock(hashtextextended($1, 0))"),
+        { cause: Object.assign(new Error("canceling statement due to lock timeout"), { code: "55P03" }) },
+      );
+      const res = makeRes() as any;
+
+      errorHandler(err, makeReq(), res, vi.fn() as unknown as NextFunction);
+
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.json.mock.calls[0][0]).toMatchObject({
+        code: "transient_db_conflict",
+        retryable: true,
+        details: { sqlstate: "55P03" },
+      });
+    });
+
+    it("still reports a non-transient database error as a bare 500", () => {
+      const res = makeRes() as any;
+      errorHandler(
+        Object.assign(new Error("duplicate key"), { code: "23505" }), // unique_violation
+        makeReq(),
+        res,
+        vi.fn() as unknown as NextFunction,
+      );
+
+      expect(res.status).toHaveBeenCalledWith(500);
+      expect(res.json).toHaveBeenCalledWith({ error: "Internal server error" });
     });
   });
 });
