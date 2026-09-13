@@ -225,10 +225,12 @@ describe("per-fire cap", () => {
 
 describe("Ally verdict-mirror statuses are not CI checks", () => {
   // Measured on #1681 @c57fafa0: newest attesting review clean, gate red.
+  // Shape mirrors `gh pr view --json statusCheckRollup`, which unions
+  // CheckRun and StatusContext and tags every row with __typename.
   const ALLY_RED = [
-    { context: "gate/ally-comment-findings", state: "FAILURE" },
-    { context: "review/ally-comment", state: "FAILURE" },
-    { context: "review/ally-complete", state: "FAILURE" },
+    { __typename: "StatusContext", context: "gate/ally-comment-findings", state: "FAILURE" },
+    { __typename: "StatusContext", context: "review/ally-comment", state: "FAILURE" },
+    { __typename: "StatusContext", context: "review/ally-complete", state: "FAILURE" },
   ];
 
   it("does not let a stale Ally status veto a clean review", () => {
@@ -246,9 +248,35 @@ describe("Ally verdict-mirror statuses are not CI checks", () => {
   });
 
   it("keeps the bare `review` quality gate and Ally-named check-runs as real checks", () => {
-    assert.deepEqual(failingChecks([{ context: "review", state: "FAILURE" }]), ["review=FAILURE"]);
-    assert.deepEqual(failingChecks([{ name: "Ally review gate", conclusion: "FAILURE" }]), [
-      "Ally review gate=FAILURE",
+    assert.deepEqual(
+      failingChecks([{ __typename: "StatusContext", context: "review", state: "FAILURE" }]),
+      ["review=FAILURE"],
+    );
+    assert.deepEqual(
+      failingChecks([{ __typename: "CheckRun", name: "Ally review gate", conclusion: "FAILURE" }]),
+      ["Ally review gate=FAILURE"],
+    );
+  });
+
+  it("does not let the name exclusion swallow a failing check-run", () => {
+    // The exclusion is keyed on __typename, not on the name: a CheckRun in the
+    // Ally namespace is the workflow that publishes the status, and a red one
+    // is a real failure. Excluding it would enqueue past a red required check.
+    for (const name of ["review/ally-complete", "gate/ally-comment-findings"]) {
+      assert.deepEqual(failingChecks([{ __typename: "CheckRun", name, conclusion: "FAILURE" }]), [
+        `${name}=FAILURE`,
+      ]);
+      assert.equal(
+        classify({ statusCheckRollup: [{ __typename: "CheckRun", name, conclusion: "FAILURE" }] })
+          .reason,
+        "checks:FAILURE",
+      );
+    }
+  });
+
+  it("treats an untyped row as a real check, so the failure is over-hold not over-enqueue", () => {
+    assert.deepEqual(failingChecks([{ context: "review/ally-complete", state: "FAILURE" }]), [
+      "review/ally-complete=FAILURE",
     ]);
   });
 });
