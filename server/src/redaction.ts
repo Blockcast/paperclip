@@ -868,6 +868,26 @@ const WITHHELD_RUN_STATE_CONTENT_KEYS = [
   "resultSummary",
   "resultResult",
   "resultMessage",
+  // `nextAction` is a DISTILLATE of every source this function withholds, not an
+  // independent state field, and that makes it the third instance of the same
+  // re-derivation trap as `currentStatusMessage` below. `classifyRunLiveness`
+  // persists it from `extractNextAction` (`services/run-liveness.ts`), whose
+  // candidate list is, in order: issue comment bodies, `resultJson.nextAction`,
+  // `resultFinalText` (= `resultJson.summary` / `.result` / `.message` /
+  // `.error`), the issue continuation-summary body, then `rawSources` (=
+  // `resultJson.stdout` / `.stderr`, `stdoutExcerpt`, `stderrExcerpt`). Every
+  // one of those except `error` is withheld here or in
+  // `WITHHELD_RUN_RESULT_JSON_CONTENT_KEYS`.
+  //
+  // It is not a summary or a classification of that text either — the extractor
+  // returns the matched line VERBATIM, capped at 500 chars. So leaving it
+  // populated hands an unentitled reader a literal excerpt of the transcript
+  // this row exists to withhold, on the same response, one key over.
+  //
+  // Nulling it on the wire does not touch any consumer: the continuation
+  // decider (`heartbeat.ts`), the liveness classifier and the activity sweep
+  // all read the column from the database, never this projection.
+  "nextAction",
 ] as const;
 
 /**

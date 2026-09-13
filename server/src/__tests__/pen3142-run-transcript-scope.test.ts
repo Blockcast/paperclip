@@ -273,6 +273,14 @@ describe("run transcript scoping (PEN-3142)", () => {
       resultMessage: "done",
       // Error text stays company-readable, so this one must SURVIVE.
       resultError: "provider returned 429",
+      // `nextAction` is persisted by `classifyRunLiveness` from
+      // `extractNextAction`, which lifts the matched line VERBATIM (capped at
+      // 500 chars) out of -- among others -- `resultJson.summary`/`.result`/
+      // `.message`, `resultJson.stdout`/`.stderr`, `stdoutExcerpt` and
+      // `stderrExcerpt`. Every one of those is withheld above, so a populated
+      // `nextAction` re-exports the same credential one key over. Shaped like
+      // real extractor output: a "Next ..." line carrying the canary.
+      nextAction: "Next: rerun the deploy with ANTHROPIC_API_KEY=sk-live-not-a-real-key",
     });
     mockHeartbeatService.getRunLogAccess.mockResolvedValue({
       id: "run-1",
@@ -616,6 +624,9 @@ describe("run transcript scoping (PEN-3142)", () => {
       expect(res.body.resultMessage).toBeNull();
       // ...and the error mirror is state, so it survives alongside `error`.
       expect(res.body.resultError).toBe("provider returned 429");
+      // `nextAction` is a verbatim line lifted out of the sources withheld
+      // above, so it has to go with them.
+      expect(res.body.nextAction).toBeNull();
       // The whole point: no copy of the credential anywhere in the response.
       expect(JSON.stringify(res.body)).not.toContain("sk-live-not-a-real-key");
       // ...and state is still there beside it.
@@ -640,6 +651,48 @@ describe("run transcript scoping (PEN-3142)", () => {
       expect(res.body.currentToolName).toBe("Bash");
       expect(res.body.withheldFields).toEqual(
         expect.arrayContaining(["lastAssistantSnippet", "currentStatusMessage"]),
+      );
+    });
+
+    it("withholds nextAction, which carries the withheld prose verbatim", async () => {
+      const res = await requestApp(
+        await createApp(peerAgentActor),
+        (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1"),
+      );
+
+      // `nextAction` looks like a state field and is not one. `extractNextAction`
+      // (`services/run-liveness.ts`) scans issue comment bodies, then
+      // `resultJson.nextAction`, then `resultJson.summary`/`.result`/`.message`,
+      // then the continuation-summary body, then `resultJson.stdout`/`.stderr`
+      // plus `stdoutExcerpt`/`stderrExcerpt` -- and returns the matched line
+      // UNCHANGED, capped at 500 chars. So it is not a classification derived
+      // from the transcript, it is an excerpt OF it, and withholding the sources
+      // while leaving this populated closes nothing.
+      expect(res.body.nextAction).toBeNull();
+      expect(res.body.withheldFields).toContain("nextAction");
+      expect(JSON.stringify(res.body)).not.toContain("sk-live-not-a-real-key");
+      // Its machine-valued neighbours from the same classifier row are state and
+      // must survive -- `livenessReason` is a fixed classifier string and
+      // `continuationAttempt` a counter, so narrowing them would overshoot.
+      expect(res.body).toMatchObject({ status: "failed", errorCode: "rate_limit_exhausted" });
+    });
+
+    it("gives an entitled reader nextAction back", async () => {
+      mockDecide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: "allow_manager_chain",
+      }));
+
+      const res = await requestApp(
+        await createApp(peerAgentActor),
+        (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1"),
+      );
+
+      // The allow path must not be collateral damage: a manager diagnosing a
+      // stalled run needs exactly this line.
+      expect(res.body.nextAction).toBe(
+        "Next: rerun the deploy with ANTHROPIC_API_KEY=sk-live-not-a-real-key",
       );
     });
 
@@ -746,6 +799,10 @@ describe("run transcript scoping (PEN-3142)", () => {
       agentName: "Some Other Agent",
       status: "running",
       logBytes: 4096,
+      // These three feeds select `nextAction` explicitly in their column maps,
+      // so the canary has to be here too -- the per-run fixture above does not
+      // reach them.
+      nextAction: "Next: rerun the deploy with ANTHROPIC_API_KEY=sk-live-not-a-real-key",
     };
 
     // minCount=0 keeps this to the single live-runs query; the padding branch
@@ -763,6 +820,10 @@ describe("run transcript scoping (PEN-3142)", () => {
       expect(JSON.stringify(res.body)).not.toContain("sk-live-not-a-real-key");
       expect(res.body[0].lastAssistantSnippet).toBeNull();
       expect(res.body[0].currentStatusMessage).toBe("Using Bash");
+      // Ally flagged this feed by name: it selects `nextAction` in its own
+      // column map, and this is the widest of the three -- every live agent's
+      // current prose in one company-scoped call.
+      expect(res.body[0].nextAction).toBeNull();
       // The row is projected, never dropped -- run state stays company-readable.
       expect(res.body[0]).toMatchObject({ id: "run-1", status: "running", logBytes: 4096 });
     });
@@ -805,6 +866,7 @@ describe("run transcript scoping (PEN-3142)", () => {
       expect(JSON.stringify(res.body)).not.toContain("sk-live-not-a-real-key");
       expect(res.body[0].lastAssistantSnippet).toBeNull();
       expect(res.body[0].currentStatusMessage).toBe("Using Bash");
+      expect(res.body[0].nextAction).toBeNull();
     });
 
     it("withholds the decorated prose on the per-issue active-run route", async () => {
