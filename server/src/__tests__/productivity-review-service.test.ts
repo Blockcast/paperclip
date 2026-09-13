@@ -464,6 +464,14 @@ describeEmbeddedPostgres("productivity review service", () => {
   // commits from that same morning.
   describe("pull-request evidence (BLO-19566)", () => {
     async function seedIssueWithPullRequest(opts: {
+      /**
+       * PEN-3219: the PR title is what decides attribution for a row carrying
+       * no recorded `owningIdentifiers`. Defaults to a title naming the seeded
+       * issue — i.e. what a PR actually doing this row's work looks like.
+       * Pass a title naming some other identifier to seed the counterfeit
+       * signal: a PR attached to this row only because it mentioned it.
+       */
+      title?: string;
       prUpdatedAt: Date;
       status?: string;
       metadata?: Record<string, unknown> | null;
@@ -477,7 +485,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         type: "pull_request",
         provider: "github",
         externalId: "Blockcast/paperclip#806",
-        title: "Widen the authz grant",
+        title: opts.title ?? `Widen the authz grant (${seeded.issuePrefix}-1)`,
         url: opts.url === undefined ? "https://github.com/Blockcast/paperclip/pull/806" : opts.url,
         status: opts.status ?? "ready_for_review",
         metadata: opts.metadata === undefined
@@ -629,6 +637,194 @@ describeEmbeddedPostgres("productivity review service", () => {
       expect(description).toContain("The second signal is already present");
     });
 
+    // PEN-3219. A `pull_request` work product is written for EVERY issue a PR
+    // references anywhere, so a long-lived registry/invariant row accumulates
+    // every PR that name-drops it. Before this, the most recently *touched*
+    // member of that pile became the row's progress signal and the review told
+    // its reviewer "the second signal is already present" — on PEN-2370, a
+    // `critical` row dark for seven days carrying 44 such rows, none its own.
+    //
+    // NOTE for anyone adding a case here: the rendered phrase "attributed to
+    // this issue" is a SUBSTRING of "NOT attributed to this issue", so a lone
+    // `toContain("attributed to this issue")` passes on an unattributed PR.
+    // Always pair it with `not.toContain("NOT attributed to this issue")`.
+    describe("attribution of the linked PR (PEN-3219)", () => {
+      // The measured PEN-3216 shape: the row's ONLY fresh progress-eligible PR
+      // is titled for, owned by, and driven from a different issue.
+      it("does not count a fresh progress PR that belongs to another issue", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          title: "feat(security): scope run-transcript reads to own-run (ZZQ-3142)",
+        });
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now,
+        });
+
+        const service = productivityReviewService(db);
+        await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+        const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+        // The PR is still SHOWN — suppressing it would hide real information —
+        // but it no longer licenses the verdict.
+        expect(description).toContain("https://github.com/Blockcast/paperclip/pull/806");
+        expect(description).toContain("NOT attributed to this issue");
+        expect(description).not.toContain("The second signal is already present");
+        // And the reviewer is told why, rather than left to infer it from a
+        // line that still looks like progress.
+        expect(description).toContain("A linked PR moved recently, but it is NOT attributed to this issue");
+        expect(description).toContain("Do not treat it as grounds for \"Close as productive\"");
+      });
+
+      // The counterfeit signal must not shadow a real one: an unattributed PR
+      // that moved more recently cannot hide this row's own fresh PR.
+      it("picks this issue's own PR over a newer one belonging to another issue", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 5 * 60 * 60 * 1000),
+        });
+        await db.insert(issueWorkProducts).values({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          type: "pull_request",
+          provider: "github",
+          externalId: "Blockcast/paperclip#1741",
+          title: "feat(security): scope run-transcript reads to own-run (ZZQ-3142)",
+          url: "https://github.com/Blockcast/paperclip/pull/1741",
+          status: "ready_for_review",
+          metadata: { source: "github_pull_request_webhook", sourceEventOrder: 10 },
+          sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+          createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+          updatedAt: new Date(now.getTime() - 60 * 60 * 1000),
+        });
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now,
+        });
+
+        const service = productivityReviewService(db);
+        await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+        const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+        expect(description).toContain("The second signal is already present");
+        expect(description).toContain("https://github.com/Blockcast/paperclip/pull/806");
+        expect(description).not.toContain("https://github.com/Blockcast/paperclip/pull/1741");
+      });
+
+      // The webhook records the resolved owning set at write time, which is the
+      // only way a PR that claims its issue solely in a labeled BODY line can be
+      // recognised here — the row never stores the body.
+      it("attributes by the recorded owning set, not just the title", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          title: "chore: no identifier in this title at all",
+        });
+        await db
+          .update(issueWorkProducts)
+          .set({
+            metadata: {
+              source: "github_pull_request_webhook",
+              sourceEventOrder: 10,
+              owningIdentifiers: [`${seeded.issuePrefix}-1`],
+            },
+          })
+          .where(eq(issueWorkProducts.issueId, seeded.issueId));
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now,
+        });
+
+        const service = productivityReviewService(db);
+        await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+        const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+        expect(description).toContain("attributed to this issue");
+        expect(description).not.toContain("NOT attributed to this issue");
+        expect(description).toContain("The second signal is already present");
+      });
+
+      // A recorded EMPTY set is authoritative — the PR named no owner anywhere,
+      // so it is attributable to nothing. Only a missing key means "unknown"
+      // and falls back to deriving from the fields the row carries.
+      it("treats a recorded empty owning set as attributable to nothing", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        });
+        await db
+          .update(issueWorkProducts)
+          .set({
+            metadata: {
+              source: "github_pull_request_webhook",
+              sourceEventOrder: 10,
+              owningIdentifiers: [],
+            },
+          })
+          .where(eq(issueWorkProducts.issueId, seeded.issueId));
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now,
+        });
+
+        const service = productivityReviewService(db);
+        await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+        const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+        expect(description).toContain("NOT attributed to this issue");
+        expect(description).not.toContain("The second signal is already present");
+      });
+
+      // Legacy rows (written before the owning set was recorded) fall back to
+      // the tiers the row still carries. The branch is one of them, and real
+      // branches are lowercase where the identifier pattern is uppercase-only.
+      it("attributes a legacy row by its lowercase branch", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          title: "chore: no identifier in this title at all",
+        });
+        await db
+          .update(issueWorkProducts)
+          .set({
+            metadata: {
+              source: "github_pull_request_webhook",
+              sourceEventOrder: 10,
+              branch: `cto/${seeded.issuePrefix.toLowerCase()}-1-widen-grant`,
+            },
+          })
+          .where(eq(issueWorkProducts.issueId, seeded.issueId));
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now,
+        });
+
+        const service = productivityReviewService(db);
+        await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+        const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+        expect(description).toContain("attributed to this issue");
+        expect(description).not.toContain("NOT attributed to this issue");
+        expect(description).toContain("The second signal is already present");
+      });
+    });
+
     it("reads a delayed first delivery as stale by GitHub event time, not DB receipt time", async () => {
       // A first webhook delivery can land long after the PR event (retry,
       // backfill, outage drain). The row then inserts with `updatedAt = now`,
@@ -643,7 +839,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         type: "pull_request",
         provider: "github",
         externalId: "Blockcast/paperclip#806",
-        title: "Widen the authz grant",
+        title: `Widen the authz grant (${seeded.issuePrefix}-1)`,
         url: "https://github.com/Blockcast/paperclip/pull/806",
         status: "ready_for_review",
         metadata: {
