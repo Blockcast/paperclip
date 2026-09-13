@@ -977,6 +977,68 @@ export async function githubPostCommitStatusDetailed(input: {
 }
 
 /**
+ * Conclusions a completed check-run may carry. Only the three this codebase
+ * publishes are listed; the rest of GitHub's enum is unused here.
+ *
+ * `neutral` is the reason check-runs exist in this file at all. A legacy commit
+ * status has only success/failure/pending/error, so a verdict that is neither
+ * "reviewed and clean" nor "blocking" has no honest state to occupy: `pending`
+ * and `failure` block merge, and `success` is indistinguishable from a real
+ * pass. `neutral` renders distinctly and does not block (BLO-33657).
+ */
+export type GitHubCheckRunConclusion = "success" | "failure" | "neutral";
+
+/**
+ * Publish a completed check-run as the GitHub App.
+ *
+ * Requires the installation's `checks: write` permission — a commit status is
+ * `statuses: write` and the two are independent, so a deployment that can post
+ * statuses is not thereby able to post check-runs.
+ *
+ * ponytail: creates a new run per call rather than looking up and PATCHing the
+ * existing one for this name+sha. GitHub takes the latest per name, and commit
+ * statuses already append the same way, so repeated evaluations of one head
+ * leave several rows. Switch to find-then-PATCH if that noise ever matters.
+ */
+export async function githubPostCheckRun(input: {
+  repoFullName: string;
+  sha: string;
+  name: string;
+  conclusion: GitHubCheckRunConclusion;
+  title: string;
+  summary: string;
+  detailsUrl?: string | null;
+}): Promise<GitHubCommitStatusPostResult> {
+  const token = await getInstallationTokenResult();
+  if (!token.ok) return asCommitStatusFailure(token);
+  const headers = {
+    ...GITHUB_API_HEADERS,
+    authorization: `Bearer ${token.token}`,
+    "content-type": "application/json",
+  };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  try {
+    const res = await ghFetch(`${apiBase}/repos/${input.repoFullName}/check-runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        name: input.name,
+        head_sha: input.sha,
+        status: "completed",
+        conclusion: input.conclusion,
+        output: { title: input.title, summary: input.summary },
+        ...(input.detailsUrl ? { details_url: input.detailsUrl } : {}),
+      }),
+    });
+    if (res.ok) return { ok: true, statusCode: res.status };
+    const classified = await classifyGithubHttpFailure("check_run_write", res);
+    return { ok: false, ...classified, statusCode: res.status };
+  } catch {
+    return { ok: false, retryable: true, reason: "check_run_write_fetch_failed" };
+  }
+}
+
+/**
  * Boolean compatibility wrapper for existing call sites.
  */
 export async function githubPostCommitStatus(input: {
