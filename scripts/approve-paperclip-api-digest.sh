@@ -975,13 +975,8 @@ live_running_digest() {
 # branch itself for why that conflation is not hypothetical.
 serving_replicaset_image() {
   local live_json="$1"
-  local selector uid rs_json rs_err rs_status jq_err jq_status state_dir state_dir_owned="" image=""
-
-  selector="$(jq -r '
-    [ (.spec.selector.matchLabels // {}) | to_entries[] | "\(.key)=\(.value)" ]
-    | join(",")
-  ' <<<"$live_json" 2>/dev/null)" || return 0
-  uid="$(jq -r '.metadata.uid // ""' <<<"$live_json" 2>/dev/null)" || return 0
+  local selector uid read_err read_status rs_json rs_err rs_status jq_err jq_status
+  local state_dir state_dir_owned="" image=""
 
   # Warn-once markers and the stderr capture live in a directory the CALLER owns.
   # Both properties matter and neither is available any other way: this function
@@ -998,7 +993,39 @@ serving_replicaset_image() {
     state_dir_owned=1
   fi
 
-  if [[ -z "$selector" || -z "$uid" ]]; then
+  # These two reads are minted AFTER the state directory on purpose (BLO-32396).
+  # They used to run above it behind `2>/dev/null` and a bare `return 0`, which
+  # was the same abort-vs-decline conflation BLO-32267 removed one layer down and
+  # strictly quieter: returning before the directory exists means no marker
+  # machinery exists either, so an abort warned nothing at all -- not even once --
+  # and the reader reported "no rollback target" with nothing anywhere saying why.
+  # Its own marker, so it can neither mask nor be masked by the three below.
+  read_err="${state_dir}/read-err"
+  : >"$read_err"
+  selector="$(jq -r '
+    [ (.spec.selector.matchLabels // {}) | to_entries[] | "\(.key)=\(.value)" ]
+    | join(",")
+  ' <<<"$live_json" 2>"$read_err")" && read_status=0 || read_status=$?
+  if (( read_status == 0 )); then
+    uid="$(jq -r '.metadata.uid // ""' <<<"$live_json" 2>>"$read_err")" && read_status=0 || read_status=$?
+  fi
+
+  if (( read_status != 0 )); then
+    # A broken program, not a decline. Both guards above -- `// {}` and `// ""` --
+    # already express "absent" by SUCCEEDING and emitting "", which the selector
+    # branch below turns into its own warning. So a non-zero exit here can only
+    # mean the jq itself cannot run, and the empty result is a symptom rather than
+    # an answer. Degrades to empty and exit 0 like every other branch: this is an
+    # availability safeguard, not a gate.
+    if [[ ! -e "${state_dir}/warned-read" ]]; then
+      : >"${state_dir}/warned-read"
+      echo "warning: the ReplicaSet reader's selector/uid jq program failed (exit ${read_status}), so the" >&2
+      echo "         digest that last actually served traffic cannot be named. This is a broken" >&2
+      echo "         program rather than a decline: the approval ring falls back to pure age" >&2
+      echo "         ordering and the rollback target can age out (BLO-28483, BLO-31842)." >&2
+      sed 's/^/         /' <"$read_err" >&2
+    fi
+  elif [[ -z "$selector" || -z "$uid" ]]; then
     # Not reachable against the Helm-rendered paperclip-api Deployment, which uses
     # matchLabels. It is reachable for a selector written with matchExpressions
     # only, and returning quietly there would be the same silent hollowing-out
@@ -1102,6 +1129,7 @@ serving_replicaset_image() {
     fi
     rm -f "$rs_err"
   fi
+  rm -f "$read_err"
 
   if [[ -n "$state_dir_owned" ]]; then
     rm -rf "$state_dir"

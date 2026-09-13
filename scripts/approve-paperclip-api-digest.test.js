@@ -452,6 +452,30 @@ const unguardedCoercionReaderSource = replicaSetReaderSource.replace(
   "| ($r | tonumber);",
 );
 
+// BLO-32396. The same neutering, one layer up, for each of the two reads that
+// derive the label selector and the owner uid. Those ran above the state
+// directory behind `2>/dev/null` and a bare `return 0`, so an abort there warned
+// nothing AT ALL — not even once — and was indistinguishable from "no rollback
+// target". One anchor per read, so a case can break exactly one of them and the
+// other stays honest.
+//
+// The selector mutation drops the `// {}` guard, which is a regression a future
+// edit could genuinely make: against a Deployment with no matchLabels the read
+// then aborts on `null | to_entries` instead of yielding the empty selector the
+// branch below is written to warn about. The uid mutation is an unguarded
+// coercion, the same shape as the one above, because `// ""` has no absent-field
+// abort to expose — a uid that is missing already succeeds and emits "".
+const SELECTOR_GUARD_ANCHOR = "[ (.spec.selector.matchLabels // {}) | to_entries[]";
+const brokenSelectorReadReaderSource = replicaSetReaderSource.replace(
+  SELECTOR_GUARD_ANCHOR,
+  "[ (.spec.selector.matchLabels) | to_entries[]",
+);
+const UID_READ_ANCHOR = `uid="$(jq -r '.metadata.uid // ""'`;
+const brokenUidReadReaderSource = replicaSetReaderSource.replace(
+  UID_READ_ANCHOR,
+  `uid="$(jq -r '.metadata.uid // "" | tonumber'`,
+);
+
 // `deployment` of null makes the stub exit non-zero, standing in for "no such
 // Deployment" or an unreachable apiserver.
 //
@@ -476,6 +500,8 @@ function readerRunFor(
     repeat = 1,
     callerOwnedStateDir = false,
     unguardedCoercion = false,
+    brokenSelectorRead = false,
+    brokenUidRead = false,
   } = {},
 ) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-live-digest-"));
@@ -522,7 +548,13 @@ function readerRunFor(
     `  esac`,
     `}`,
     "deploy_kubectl=(fake_kubectl)",
-    unguardedCoercion ? unguardedCoercionReaderSource : replicaSetReaderSource,
+    unguardedCoercion
+      ? unguardedCoercionReaderSource
+      : brokenSelectorRead
+        ? brokenSelectorReadReaderSource
+        : brokenUidRead
+          ? brokenUidReadReaderSource
+          : replicaSetReaderSource,
     readerSource,
     // Mints and clears the state directory exactly as the script's own top level
     // and EXIT trap do, so leftover-file accounting measures the reader rather
@@ -1430,6 +1462,96 @@ test("a selector the reader cannot use warns instead of degrading silently", () 
     0,
     "a selector that cannot be built must not reach the apiserver",
   );
+  // The selector DECLINE and a selector jq ABORT are different outcomes, and the
+  // cases below prove the second is visible. Pin here that this one is not
+  // reporting itself as the other.
+  assert.doesNotMatch(run.stderr, /selector\/uid jq program failed/);
+});
+
+// BLO-32396. Same conflation as BLO-32267, one layer up, and strictly quieter
+// there: these two reads ran ABOVE the state directory behind `2>/dev/null` and a
+// bare `return 0`, so an abort returned empty with no warning at all — not even a
+// once-per-run one — and the reader reported "no rollback target" with nothing
+// anywhere saying why. Each read gets its own case so a mutation that breaks one
+// cannot pass on the other's behalf; both assert the anchor still matched the
+// SHIPPING source, so a rewrite fails loudly instead of quietly testing nothing.
+test("a broken selector jq read is reported as an error, not returned as a silent empty", () => {
+  assert.notEqual(
+    brokenSelectorReadReaderSource,
+    replicaSetReaderSource,
+    "the selector-guard anchor no longer matches the shipping source — this case would prove nothing",
+  );
+  const run = readerRunFor(
+    deploymentWith({
+      images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`],
+      status: NEVER_READY,
+      selector: {
+        matchExpressions: [
+          { key: "app.kubernetes.io/name", operator: "In", values: ["paperclip"] },
+        ],
+      },
+    }),
+    { brokenSelectorRead: true, callerOwnedStateDir: true },
+  );
+  // Still degrades rather than failing the release — this stays a safeguard.
+  assert.equal(run.digest, "");
+  assert.match(run.stderr, /selector\/uid jq program failed/);
+  assert.match(run.stderr, /broken\s+program rather than a decline/);
+  assert.match(run.stderr, /BLO-31842/);
+  // jq's own message is carried through, which is the whole point — and it is
+  // what separates this from the decline the SAME fixture produces unmutated.
+  assert.match(run.stderr, /has no keys/);
+  assert.doesNotMatch(run.stderr, /no matchLabels selector/);
+  // Own marker, and the capture reclaimed: neither may mask the three markers the
+  // branches below it write.
+  assert.deepEqual(run.stateDirResidue, ["warned-read"]);
+});
+
+test("a broken uid jq read is reported as an error, not returned as a silent empty", () => {
+  assert.notEqual(
+    brokenUidReadReaderSource,
+    replicaSetReaderSource,
+    "the uid-read anchor no longer matches the shipping source — this case would prove nothing",
+  );
+  const run = readerRunFor(neverReadyDeployment(digest(0xbb)), {
+    brokenUidRead: true,
+    callerOwnedStateDir: true,
+    replicaSets: [
+      replicaSetWith({ name: "paperclip-api-old", images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`], ready: 2 }),
+    ],
+  });
+  assert.equal(run.digest, "");
+  assert.match(run.stderr, /selector\/uid jq program failed/);
+  assert.match(run.stderr, /Invalid numeric literal/);
+  // The selector resolved, so this is NOT the empty-selector decline — and the
+  // list is never reached, so it is not the list failure either.
+  assert.doesNotMatch(run.stderr, /no matchLabels selector/);
+  assert.equal(
+    run.argv.filter((line) => line.includes("replicasets")).length,
+    0,
+    "a uid that cannot be read must not reach the apiserver",
+  );
+  assert.deepEqual(run.stateDirResidue, ["warned-read"]);
+});
+
+// Same guard as the other three branches, for the same reason: the rotate loop
+// re-enters this reader on every 409, so an unguarded warning prints its five
+// lines up to MAX_ROTATE_ATTEMPTS times and buries itself. This is the property
+// the pre-fix code could not have at all — it returned before the state directory
+// that holds the markers was minted.
+test("a repeated selector/uid read abort warns once, not once per rotation", () => {
+  const run = readerRunFor(neverReadyDeployment(digest(0xbb)), {
+    brokenUidRead: true,
+    repeat: 5,
+    callerOwnedStateDir: true,
+  });
+  const warnings = run.stderr.match(/selector\/uid jq program failed/g)?.length ?? 0;
+  assert.equal(
+    warnings,
+    1,
+    `expected exactly one selector/uid read-abort warning across 5 rotations, got ${warnings}:\n${run.stderr}`,
+  );
+  assert.deepEqual(run.leftoverTempFiles, []);
 });
 
 // The rotate loop re-reads the running digest on EVERY 409 retry, so an unguarded
