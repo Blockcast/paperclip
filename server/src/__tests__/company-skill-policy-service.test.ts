@@ -23,7 +23,7 @@ describeEmbeddedPostgres("companySkillPolicyService", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-skill-policy-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     await db.delete(activityLog);

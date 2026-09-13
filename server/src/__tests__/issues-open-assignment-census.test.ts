@@ -105,7 +105,7 @@ describeEmbeddedPostgres("issueService.openAssignmentCensus", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-open-assignment-census-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     await db.delete(issues);
@@ -562,7 +562,7 @@ describeEmbeddedPostgres("GET /companies/:companyId/issues/open-assignment-censu
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-census-routes-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   beforeEach(async () => {
     companyId = randomUUID();

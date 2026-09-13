@@ -2247,7 +2247,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       `UPDATE "heartbeat_runs" SET status='failed', finished_at=NOW() WHERE status IN ('queued','running')`,
     ));
     await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
-  }, 60_000);
+  });
 
   afterAll(async () => {
     await db.execute(sql.raw(
@@ -2255,7 +2255,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     ));
     await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
     await tempDb?.cleanup();
-  }, 60_000);
+  });
 
   function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "resolvePrReviewHeadSha" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions" | "listPullRequestCommits" | "notifyForeignCommits"> = {}) {
     const app = express();
