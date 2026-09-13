@@ -2826,3 +2826,156 @@ describe("env name classification gate (BLO-29804)", () => {
     expect(Object.keys(envSecret?.data ?? {}).sort()).toEqual(EXPECTED_SECRET_BACKED);
   });
 });
+
+// BLO-32734 — the shared `data` PVC is mounted whole and rw into every agent
+// pod, and every pod runs as uid 1000, so no file mode can separate one company
+// from another. These pin the mount-level boundary that replaces it: a read-only
+// parent with nested rw `subPath` re-mounts for exactly the trees a run writes.
+describe("scoped writable mounts (BLO-32734)", () => {
+  const WORKSPACE_DESCRIPTOR = {
+    isolationMode: "workspace",
+    isolationKey: "workspace:ws-1",
+    workspaceRoot: "/paperclip/instances/default/projects/co1/proj-1/_default",
+    homeRoot: "/paperclip/instances/default/data/k8s-isolation/workspaces/ws-1/home",
+    sessionRoot: "/paperclip/instances/default/data/k8s-isolation/workspaces/ws-1/session",
+    cacheRoot: "/runtime-cache/paperclip-workspaces/ws-1/cache",
+    tmpRoot: "/runtime-cache/paperclip-workspaces/ws-1/tmp",
+  };
+
+  function mountsFor(ctx: AdapterExecutionContext) {
+    const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const spec = job.spec?.template?.spec;
+    return {
+      main: spec?.containers[0]?.volumeMounts ?? [],
+      init: spec?.initContainers?.[0]?.volumeMounts ?? [],
+    };
+  }
+
+  function isolatedCtx() {
+    const ctx = makeCtx();
+    setRuntimeIsolation(ctx, { ...WORKSPACE_DESCRIPTOR, storage: isolatedStorage() });
+    return ctx;
+  }
+
+  it("mounts the data volume read-only and re-mounts only the run's own trees rw", () => {
+    const { main } = mountsFor(isolatedCtx());
+    const parent = main.find((m) => m.mountPath === "/paperclip" && !m.subPath);
+    expect(parent?.readOnly).toBe(true);
+
+    const scoped = main.filter((m) => m.name === "data" && m.subPath);
+    // Every nested re-mount is writable and scoped to a subtree, never the root.
+    for (const mount of scoped) {
+      expect(mount.readOnly).toBeFalsy();
+      expect(mount.subPath).toBeTruthy();
+      expect(mount.subPath).not.toBe("");
+    }
+    const byPath = new Map(scoped.map((m) => [m.mountPath, m.subPath]));
+    // The run's own workspace, session/home tree and pod-log dir stay writable.
+    expect(byPath.get("/paperclip/instances/default/projects/co1/proj-1/_default")).toBe(
+      "instances/default/projects/co1/proj-1/_default",
+    );
+    expect(byPath.get("/paperclip/instances/default/data/k8s-isolation/workspaces/ws-1/home")).toBe(
+      "instances/default/data/k8s-isolation/workspaces/ws-1/home",
+    );
+    expect(byPath.get("/paperclip/instances/default/data/run-logs/co1/agent-abc/isolated/workspacews-1")).toBeTruthy();
+  });
+
+  // The actual boundary assertion: a foreign company's trees must be covered by
+  // NO writable mount. Asserting the allow-list alone would pass even if an
+  // extra mount re-opened the volume.
+  it("leaves no writable mount covering a foreign company's trees", () => {
+    const { main, init } = mountsFor(isolatedCtx());
+    const foreign = [
+      "/paperclip/instances/default/data/run-logs/co2/agent-zzz",
+      "/paperclip/instances/default/projects/co2/proj-9/_default",
+      "/paperclip/instances/default/companies/co2/agents/agent-zzz/instructions",
+      "/paperclip/.claude/settings.json",
+      "/paperclip/.claude/paperclip-env-guard.mjs",
+      "/paperclip/.mcp.json",
+    ];
+    for (const container of [main, init]) {
+      const writable = container.filter((m) => !m.readOnly);
+      for (const target of foreign) {
+        const covering = writable.filter(
+          (m) => target === m.mountPath || target.startsWith(`${m.mountPath}/`),
+        );
+        expect(covering, `${target} must not be writable, covered by ${JSON.stringify(covering)}`).toEqual([]);
+      }
+    }
+  });
+
+  it("company-scopes the shared scratch trees without moving their paths", () => {
+    const { main } = mountsFor(isolatedCtx());
+    const byPath = new Map(main.filter((m) => m.subPath).map((m) => [m.mountPath, m.subPath]));
+    // Agents keep writing /paperclip/work verbatim; it lands in co1's subdir.
+    expect(byPath.get("/paperclip/work")).toBe("work/co1");
+    expect(byPath.get("/paperclip/wt")).toBe("wt/co1");
+  });
+
+  it("gives the init container the same scoped mounts as the main container", () => {
+    const { main, init } = mountsFor(isolatedCtx());
+    const scopedOf = (mounts: typeof main) =>
+      mounts.filter((m) => m.subPath).map((m) => `${m.mountPath}=>${m.subPath}`).sort();
+    // The init container mkdir -p's the isolation roots INSIDE this mount, so a
+    // missing re-mount there is an EACCES on every run rather than a drift.
+    expect(scopedOf(init)).toEqual(scopedOf(main));
+    expect(init.find((m) => m.mountPath === "/paperclip" && !m.subPath)?.readOnly).toBe(true);
+  });
+
+  it("reports every scoped dir so the caller can pre-create it", () => {
+    const result = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
+    const scoped = (result.job.spec?.template?.spec?.containers[0]?.volumeMounts ?? [])
+      .filter((m) => m.subPath)
+      .map((m) => `/paperclip/${m.subPath}`)
+      .sort();
+    // Without fsGroup the kubelet would create these root:root 0755, so the
+    // reported list must cover every subPath the manifest actually declares.
+    expect(result.scopedWritableDirs.slice().sort()).toEqual(scoped);
+  });
+
+  it("collapses a target an ancestor target already covers", () => {
+    const ctx = makeCtx();
+    setRuntimeIsolation(ctx, {
+      ...WORKSPACE_DESCRIPTOR,
+      // sessionRoot nested under homeRoot: one mount must cover both.
+      sessionRoot: "/paperclip/instances/default/data/k8s-isolation/workspaces/ws-1/home/session",
+      storage: isolatedStorage(),
+    });
+    const { main } = mountsFor(ctx);
+    const paths = main.filter((m) => m.subPath).map((m) => m.mountPath);
+    expect(paths).toContain("/paperclip/instances/default/data/k8s-isolation/workspaces/ws-1/home");
+    expect(paths).not.toContain("/paperclip/instances/default/data/k8s-isolation/workspaces/ws-1/home/session");
+  });
+
+  // A `..` in a server-supplied root would escape the company scope the subPath
+  // exists to establish, so the build must fail rather than emit that mount.
+  it("refuses to build when a descriptor root is not normalized", () => {
+    const ctx = makeCtx();
+    setRuntimeIsolation(ctx, {
+      ...WORKSPACE_DESCRIPTOR,
+      homeRoot: "/paperclip/instances/default/data/k8s-isolation/workspaces/../../../../home",
+      storage: isolatedStorage(),
+    });
+    expect(() => buildJobManifest({ ctx, selfPod: makeSelfPod() })).toThrow(/normalized absolute path/);
+  });
+
+  it("refuses to build when a root resolves to the data mount root itself", () => {
+    const ctx = makeCtx();
+    setRuntimeIsolation(ctx, { ...WORKSPACE_DESCRIPTOR, homeRoot: "/paperclip", storage: isolatedStorage() });
+    expect(() => buildJobManifest({ ctx, selfPod: makeSelfPod() })).toThrow(/must not be the data mount root/);
+  });
+
+  // The residual, pinned deliberately: a shared-isolation run has no per-run
+  // roots to derive a scope from (HOME falls back to /paperclip itself), so it
+  // keeps today's broad rw mount. Narrowing it needs the roots to exist first.
+  it("keeps the broad rw mount for a shared-isolation run", () => {
+    const ctx = makeCtx();
+    setRuntimeIsolation(ctx, { isolationMode: "shared", isolationKey: "agent-shared:agent-abc" });
+    const result = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const main = result.job.spec?.template?.spec?.containers[0]?.volumeMounts ?? [];
+    const parent = main.find((m) => m.mountPath === "/paperclip");
+    expect(parent?.readOnly).toBeFalsy();
+    expect(main.filter((m) => m.subPath)).toEqual([]);
+    expect(result.scopedWritableDirs).toEqual([]);
+  });
+});

@@ -1747,6 +1747,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     envSecret = built.envSecret;
     mcpConfigSecret = built.mcpConfigSecret;
     podLogPath = built.podLogPath;
+    // Create the `subPath` targets before the Job exists (BLO-32734). Without
+    // fsGroup, the kubelet creates a missing subPath dir as root:root 0755,
+    // which is EACCES for the pod's uid 1000 — so a first run for a new company
+    // or workspace would fail at init. This process holds the broad rw mount, so
+    // creating them here lets ownership inherit from the 2775 setgid parent.
+    // Best-effort per directory: an already-present dir is the common case, and
+    // a failure here must surface as the pod's own error rather than pre-empting
+    // the run with a less specific one.
+    for (const dir of built.scopedWritableDirs) {
+      try {
+        await fs.mkdir(dir, { recursive: true });
+      } catch (err) {
+        await onLog("stderr", `[paperclip] Warning: could not pre-create scoped mount dir ${dir}: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
+    }
     await onLog("stdout", `[paperclip] Resolved ServiceAccount: ${built.serviceAccountName}\n`);
     if (built.skippedLabels.length > 0) {
       await onLog("stderr", `[paperclip] Warning: skipped ${built.skippedLabels.length} extra label(s) with reserved prefix: ${built.skippedLabels.join(", ")}\n`);
