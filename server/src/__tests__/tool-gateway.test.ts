@@ -1985,6 +1985,8 @@ rl.on("line", (line) => {
     }
   });
 
+  const RECOVERY_HOP_TIMEOUT_MS = 4_000;
+
   it("recovers normal connector reads after more than 610 seconds idle", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
@@ -2065,7 +2067,12 @@ rl.on("line", (line) => {
           sessionToken: session.token,
           tool: connectedTool!.name,
           parameters: { kind },
-          timeoutMs: 1_500,
+          // One AbortController spans the whole stale-session recovery, so this
+          // budget covers four delayed hops (stale tools/call, initialize,
+          // notifications/initialized, retried tools/call) = 800ms of scripted
+          // sleep. 1_500 left only 1.9x and aborted under CI load; 5x still
+          // fails a genuinely hung connector well inside the 60s testTimeout.
+          timeoutMs: RECOVERY_HOP_TIMEOUT_MS,
         });
         contents.push(result.result?.content);
       }
@@ -2084,7 +2091,7 @@ rl.on("line", (line) => {
         sessionToken: session.token,
         tool: connectedTool!.name,
         parameters: { kind: "Pod" },
-        timeoutMs: 1_500,
+        timeoutMs: RECOVERY_HOP_TIMEOUT_MS,
       })).resolves.toMatchObject({ status: "completed" });
       expect(fake.requests.slice(-4).map((request) => request.body?.method)).toEqual([
         "tools/call", "initialize", "notifications/initialized", "tools/call",
