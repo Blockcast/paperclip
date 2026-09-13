@@ -976,14 +976,17 @@ function resolveEventContextRaw(
       commentId: number | null;
       commentAuthorLogin: string | null;
       commentUrl: string | null;
-      // BLO-21618: two distinct drops share this callback. "missing_marker" is
+      // BLO-21618: three distinct drops share this callback. "missing_marker" is
       // the original BLO-18273 case (bare alias, no marker at all).
       // "marker_disqualified_by_heading" is a marker-bearing agent request
       // whose body ALSO happens to contain a standalone Ally-consolidated-
       // review-heading line (see hasAllyConsolidatedReviewHeading) — the same
       // exclusion that correctly silences Ally's own review echoes also
       // silences this genuine request, and until now did so with zero trace.
-      reason: "missing_marker" | "marker_disqualified_by_heading";
+      // BLO-33589: "missing_mention" is a marker-bearing agent request that
+      // never names the reviewer, so `reviewerRequest` fails on the mention
+      // conjunct rather than on the marker one.
+      reason: "missing_marker" | "marker_disqualified_by_heading" | "missing_mention";
     }) => void;
     // BLO-23059: invoked when a pull_request_review.submitted delivery was
     // dropped as a Claude Code Review service notice. Separate from
@@ -1205,6 +1208,54 @@ function resolveEventContextRaw(
         hasPrReviewerAgentRequestMarker(commentBody) &&
         hasAllyConsolidatedReviewHeading(commentBody) &&
         hasPrReviewerRequestMention(commentBody);
+      // BLO-33589: the THIRD invisible drop, and the last one. `reviewerRequest`
+      // is a conjunction of the marker path AND the mention; the two reports
+      // above both only ever fire on a body that HAS the mention, so a
+      // marker-prefixed agent request that simply never names the reviewer fell
+      // out of here as silent `null`. Measured on Blockcast/libmmt 2026-09-11..12:
+      // 4 such comments across #436/#442/#444, and on #444 they were the only
+      // surviving wake path because the automatic `opened` wake had already been
+      // lost, so the PR sat 10h06m with zero reviews.
+      //
+      // Cannot reclassify either existing report: `hasPrReviewerBareAliasMention`
+      // is a strict subset of `hasPrReviewerRequestMention` (bare `@ally` matches
+      // both patterns), so `!hasPrReviewerRequestMention` excludes the
+      // missing_marker branch, and `markerRequestDisqualifiedByHeading` requires
+      // the mention outright. Not gated on the heading: Ally's own output is
+      // never marker-prefixed (the marker must be the literal first byte), so
+      // this cannot fire on a self-echo whether or not a heading is present —
+      // and a marker+heading body with no mention is blocked by the missing
+      // mention first, which is the actionable half.
+      const markerRequestMissingMention =
+        commentAuthorIsReviewerBot &&
+        hasPrReviewerAgentRequestMarker(commentBody) &&
+        !hasPrReviewerRequestMention(commentBody);
+      // Exhaustive over bot-authored bodies that do NOT wake the reviewer, by
+      // (marker, mention, heading):
+      //   marker=0, mention=1            -> missing_marker (BLO-18273)
+      //   marker=1, mention=1, heading=1 -> marker_disqualified_by_heading (BLO-21618)
+      //   marker=1, mention=0            -> missing_mention (BLO-33589)
+      //   marker=0, mention=0            -> INTENTIONALLY UNLOGGED. Addresses
+      //     nobody and carries no marker: an ordinary PR comment, not a dropped
+      //     request. Reporting it would log every bot comment in the repo.
+      //   marker=0, mention=1 via the LONG login only (`@allyblockcast[bot]`,
+      //     not bare `@ally`) -> INTENTIONALLY UNLOGGED. That is the
+      //     commitperclip template gate greeting the bot account; suppressing it
+      //     is the fix for the #583 loop, not a lost handoff. See
+      //     PR_REVIEWER_BARE_ALIAS_MENTION_PATTERN.
+      // (marker=1, mention=1, heading=0 is the waking path and reaches neither
+      // report, by construction.)
+      //
+      // Scope note, measured 2026-09-13: the BLO-33589 sweep reported 4
+      // marker-without-mention comments on Blockcast/libmmt in the window. Three
+      // are bot-authored (#442 once, #444 twice) and are what the new branch
+      // covers. The fourth, on #436 at 2026-09-11T03:21:04Z, was authored by the
+      // HUMAN `kkroo`. A human's marker-only body is dropped for the same reason
+      // (the mention is the missing conjunct) but was never in the author-guard
+      // suppression class this callback reports on — every reason here is
+      // prefixed `reviewer_bot_authored_`. Left uncovered deliberately rather
+      // than by oversight; widening the callback to non-bot authors is a
+      // separate decision with a different blast radius.
       if (!reviewerRequest && !reviewFeedback) {
         if (
           commentAuthorIsReviewerBot &&
@@ -1227,6 +1278,15 @@ function resolveEventContextRaw(
             commentAuthorLogin,
             commentUrl: readStringField(comment, "html_url"),
             reason: "marker_disqualified_by_heading",
+          });
+        } else if (markerRequestMissingMention) {
+          options.onSuppressedReviewRequest?.({
+            repoFullName,
+            prNumber: (issue.number as number | undefined) ?? null,
+            commentId: (comment?.id as number | undefined) ?? null,
+            commentAuthorLogin,
+            commentUrl: readStringField(comment, "html_url"),
+            reason: "missing_mention",
           });
         }
       }
@@ -4068,21 +4128,45 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
 
     let context = resolveEventContext(eventName, payload, {
       prReviewerBotLogin: config.prReviewerBotLogin,
-      // BLO-18273/BLO-21618: surface both silent drops in this handler — an
-      // agent request missing the marker, and a marker-bearing agent request
-      // disqualified by an incidental heading match (see the two reasons on
-      // `onSuppressedReviewRequest`). Neither produces a wake or an error
-      // otherwise; this callback is the only trace either ever leaves.
+      // BLO-18273/BLO-21618/BLO-33589: surface all three silent drops in this
+      // handler — an agent request missing the marker, a marker-bearing request
+      // disqualified by an incidental heading match, and a marker-bearing
+      // request that never names the reviewer (see the three reasons on
+      // `onSuppressedReviewRequest`). None produces a wake or an error
+      // otherwise; this callback is the only trace any of them ever leaves.
       onSuppressedReviewRequest: (info) => {
-        const message =
-          info.reason === "marker_disqualified_by_heading"
-            ? "github webhook reviewer wake skipped: @ally request carries a valid start-of-body " +
+        // Keyed by reason rather than chained ternaries on purpose: a future
+        // fourth reason then fails to typecheck here instead of silently
+        // inheriting the missing_marker text and counter, which is exactly how
+        // BLO-33589's drop stayed invisible.
+        const report: Record<
+          typeof info.reason,
+          { suppressionReason: string; message: string }
+        > = {
+          marker_disqualified_by_heading: {
+            suppressionReason: "reviewer_bot_authored_request_disqualified_by_heading",
+            message:
+              "github webhook reviewer wake skipped: @ally request carries a valid start-of-body " +
               "<!-- paperclip:review-request --> marker, but its body also contains a standalone Ally " +
               "consolidated-review heading, so the self-echo guard (BLO-15799/BLO-18865) treated it as the " +
-              "reviewer's own output (BLO-21618); no review was requested"
-            : "github webhook reviewer wake skipped: @ally request authored by the reviewer bot login carries no " +
+              "reviewer's own output (BLO-21618); no review was requested",
+          },
+          missing_marker: {
+            suppressionReason: "reviewer_bot_authored_request_missing_marker",
+            message:
+              "github webhook reviewer wake skipped: @ally request authored by the reviewer bot login carries no " +
               "start-of-body <!-- paperclip:review-request --> marker, so it is indistinguishable from the " +
-              "reviewer's own output (BLO-18865/BLO-18273); no review was requested";
+              "reviewer's own output (BLO-18865/BLO-18273); no review was requested",
+          },
+          missing_mention: {
+            suppressionReason: "reviewer_bot_authored_request_missing_mention",
+            message:
+              "github webhook reviewer wake skipped: request carries a valid start-of-body " +
+              "<!-- paperclip:review-request --> marker but never mentions the reviewer, and the marker alone " +
+              "does not request a review (BLO-33589); no review was requested",
+          },
+        };
+        const { suppressionReason, message } = report[info.reason];
         logger.warn(
           {
             event: eventName,
@@ -4092,10 +4176,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             commentId: info.commentId,
             commentAuthorLogin: info.commentAuthorLogin,
             commentUrl: info.commentUrl,
-            suppressionReason:
-              info.reason === "marker_disqualified_by_heading"
-                ? "reviewer_bot_authored_request_disqualified_by_heading"
-                : "reviewer_bot_authored_request_missing_marker",
+            suppressionReason,
           },
           message,
         );
