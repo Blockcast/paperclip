@@ -481,6 +481,14 @@ jobs:
         run: node --test ./scripts/check-ally-review-consistency.test.mjs
         timeout-minutes: 1
 
+      - name: Test landing classifier
+        if: ${{ !cancelled() }}
+        # The classifier itself is not run here. It only ever reports in CI
+        # (`--apply` is opt-in) but it makes one `gh` call per open PR, and the
+        # routine that owns the live fire is BLO-32511.
+        run: node --test ./scripts/land-clean-prs.test.mjs
+        timeout-minutes: 1
+
       - name: Test comment-review-gate census
         if: ${{ !cancelled() }}
         # The census itself is not run here: it fails on 100% of sampled merges
