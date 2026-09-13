@@ -3388,6 +3388,64 @@ describe("handleWebhook — creation policy", () => {
     );
   });
 
+  it("clears an owner already on a severity=none row when it re-fires", async () => {
+    // The self-healing half. A creation-only guard leaves every row filed
+    // before this policy — and every row something later assigns — stuck in
+    // the recirculation loop forever, which is exactly the "one-shot patch"
+    // BLO-24177 opens by complaining about.
+    const { ctx, mocks } = mkCtx();
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-watchdog",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: "agent-stranded",
+      alertname: "Watchdog",
+      severity: "none",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-watchdog",
+      status: "todo",
+      assigneeAgentId: "agent-stranded",
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [watchdogAlert()] }) }),
+    );
+
+    // The row is still refreshed — it is the delivery evidence — but unowned.
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-watchdog",
+      expect.objectContaining({
+        description: expect.any(String),
+        assigneeAgentId: null,
+        assigneeUserId: null,
+      }),
+      "company-1",
+      undefined,
+      expect.any(Object),
+    );
+    // State and the emitted event must agree with the issue, not keep
+    // reporting the owner that was just cleared.
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ assigneeAgentId: null, assigneeUserId: null }),
+      FIRING_FENCE_ARG,
+    );
+    expect(mocks.events.emit).toHaveBeenCalledWith(
+      "alertmanager.alert.firing",
+      "company-1",
+      expect.objectContaining({ assigneeAgentId: null, reFired: true }),
+      FIRING_EMIT_OWNERSHIP_ARG,
+    );
+  });
+
   it("drops firing info alerts before owner, issue, state, event, or activity side effects", async () => {
     const { ctx, mocks } = mkCtx();
     const alert = baseAlert({

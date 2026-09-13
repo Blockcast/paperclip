@@ -1439,6 +1439,28 @@ export async function handleFiring(
     : null;
   const aggregateKey = storedAggregateKey ?? aggregateKeyForAlert(alert);
 
+  // BLO-24177: `severity: none` is the heartbeat band — Prometheus' `Watchdog`
+  // (`vector(1)`) is its only member, and it is *designed* never to resolve. It
+  // is deliberately above the `info` creation floor below, because the row it
+  // files is the only live evidence that the in-cluster paperclip delivery leg
+  // accepts POSTs while the dead-man's-snitch receiver is disabled (BLO-21307).
+  // But an alert that can never be actioned must not carry an owner: an
+  // assigned row that can never legitimately close recirculates forever through
+  // agent assignment and `stranded_assigned_issue` recovery. So the row is
+  // suppressed as *work* and kept as *evidence*. The escalation ladder needs no
+  // exemption — `none` maps to no `escalationDeadlineMinutes`, so
+  // `nextEscalationAt` is already null.
+  const nonActionable = severity.trim().toLowerCase() === NON_ACTIONABLE_SEVERITY;
+  // Re-asserted on every fire rather than only at creation. A creation-only
+  // guard is the same one-shot patch as unassigning the row by hand: anything
+  // that later attaches an owner — a recovery sweep, an operator, a row filed
+  // before this policy existed — drops it straight back into the loop, and the
+  // next fire would happily refresh it as owned work. Clearing here makes the
+  // policy self-healing, which is the complaint BLO-24177 opens with.
+  const nonActionableOwnerPatch = nonActionable
+    ? { assigneeAgentId: null, assigneeUserId: null }
+    : {};
+
   if (!existing && (alert.labels.severity ?? "").trim().toLowerCase() === "info") {
     ctx.logger.info(
       `Alertmanager: ${alertname} is below the issue creation floor (severity=info)`,
@@ -1619,7 +1641,7 @@ export async function handleFiring(
               tracked = rebindAlertState(existing, activeAggregateIssue);
               await ctx.issues.update(
                 activeAggregateIssue.id,
-                { description: newDescription },
+                { description: newDescription, ...nonActionableOwnerPatch },
                 existing.paperclipCompanyId,
                 undefined,
                 { fencing: firingFence(companyId, aggregateKey, firingToken) },
@@ -1632,7 +1654,7 @@ export async function handleFiring(
               try {
                 await ctx.issues.update(
                   existing.paperclipIssueId,
-                  { status: "todo", description: newDescription },
+                  { status: "todo", description: newDescription, ...nonActionableOwnerPatch },
                   existing.paperclipCompanyId,
                   undefined,
                   { fencing: firingFence(companyId, aggregateKey, firingToken) },
@@ -1659,7 +1681,7 @@ export async function handleFiring(
                 tracked = rebindAlertState(existing, reboundIssue);
                 await ctx.issues.update(
                   reboundIssue.id,
-                  { description: newDescription },
+                  { description: newDescription, ...nonActionableOwnerPatch },
                   existing.paperclipCompanyId,
                   undefined,
                   { fencing: firingFence(companyId, aggregateKey, firingToken) },
@@ -1673,7 +1695,7 @@ export async function handleFiring(
           } else {
             await ctx.issues.update(
               existing.paperclipIssueId,
-              { status: "todo", description: newDescription },
+              { status: "todo", description: newDescription, ...nonActionableOwnerPatch },
               existing.paperclipCompanyId,
               undefined,
               { fencing: firingFence(companyId, aggregateKey, firingToken) },
@@ -1703,7 +1725,7 @@ export async function handleFiring(
         } else if (decision.kind === "refresh") {
           await ctx.issues.update(
             existing.paperclipIssueId,
-            { description: newDescription },
+            { description: newDescription, ...nonActionableOwnerPatch },
             existing.paperclipCompanyId,
             undefined,
             { fencing: firingFence(companyId, aggregateKey, firingToken) },
@@ -1788,6 +1810,10 @@ export async function handleFiring(
 
       const updated: AlertStateRecord = {
         ...tracked,
+        // Mirrors the owner clear applied to the issue above, so state and the
+        // firing event below do not keep reporting an owner the row no longer
+        // has.
+        ...nonActionableOwnerPatch,
         aggregateKey,
         alertname,
         severity,
@@ -1835,8 +1861,11 @@ export async function handleFiring(
           labels: alert.labels,
           annotations: alert.annotations,
           paperclipIssueId: tracked.paperclipIssueId,
-          assigneeUserId: tracked.assigneeUserId,
-          assigneeAgentId: tracked.assigneeAgentId ?? null,
+          // Read off `updated`, not `tracked`: on the non-actionable path the
+          // owner was just cleared, and `tracked` still holds the pre-clear
+          // value. Identical to `tracked` on every other path.
+          assigneeUserId: updated.assigneeUserId,
+          assigneeAgentId: updated.assigneeAgentId ?? null,
           reFired: true,
         },
         { ownershipCheck: firingFence(companyId, aggregateKey, firingToken) },
@@ -1879,19 +1908,6 @@ export async function handleFiring(
 
   // First time we've seen this fingerprint — create a new issue. `companyId` is
   // already resolved and non-empty; it scoped the state read above.
-  //
-  // BLO-24177: `severity: none` is the heartbeat band — Prometheus' `Watchdog`
-  // (`vector(1)`) is its only member, and it is *designed* never to resolve. It
-  // is deliberately above the `info` floor above, because the row it files is
-  // the only live evidence that the in-cluster paperclip delivery leg accepts
-  // POSTs while the dead-man's-snitch receiver is disabled (BLO-21307). But an
-  // alert that can never be actioned must not carry an owner: an assigned row
-  // that can never legitimately close recirculates forever through agent
-  // assignment and `stranded_assigned_issue` recovery. So the row is suppressed
-  // as *work* (no assignee, no fallback owner, no refusal for having none) and
-  // kept as *evidence*. The escalation ladder needs no exemption — `none` maps
-  // to no `escalationDeadlineMinutes`, so `nextEscalationAt` is already null.
-  const nonActionable = severity.trim().toLowerCase() === NON_ACTIONABLE_SEVERITY;
   let retainedIssue = await findActiveAggregateIssue(ctx, companyId, aggregateKey);
   const issueRouteResolution = resolveIssueRoute(alert, config.issueRouteMap);
   const issueRoute = issueRouteResolution.route;

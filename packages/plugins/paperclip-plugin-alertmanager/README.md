@@ -325,6 +325,12 @@ A third, weaker gate suppresses *ownership* rather than creation:
   exemption is needed: `none` maps to no `escalationDeadlineMinutes`, so
   `nextEscalationAt` is already `null`.
 
+  Unlike the two gates above, this one is **not** creation-only: every re-fire
+  re-clears the assignee on the issue, the state record, and the emitted firing
+  event. A creation-only guard would leave rows filed before the policy — and
+  any row something later assigns — stuck in the loop, which is the same
+  one-shot patch as unassigning by hand.
+
 Letting resolve through is what keeps the opt-out from wedging the issues it was
 added to silence. Gating it too would mean `handleResolved` never runs for an
 opted-out rule, so `state.resolvedAt` would stay `null` and the issue would
