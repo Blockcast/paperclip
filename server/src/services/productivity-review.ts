@@ -3586,6 +3586,27 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       };
     }
 
+    // BLO-27698 A1: a fresh, progress-eligible linked PR is a concrete progress
+    // signal, so `long_active_duration` must not fire over it. A GitHub-side push
+    // is invisible to every Paperclip-side recency measure this detector reads
+    // (issue comments, run cadence), so an assignee actively pushing commits
+    // produced an evidence pack indistinguishable from an idle issue — BLO-27207
+    // fired with the PR 6h13m old and the last comment only 7m outside the
+    // window. `isProgressPullRequest` already gated the render-side "second
+    // signal is already present" line; this is the caller it never had in the
+    // generation path, so the suppression and the report now agree on what
+    // counts as progress.
+    //
+    // Bounded by construction, per BLO-22331 AC2: progress-eligibility requires
+    // `ageMs <= PRODUCTIVITY_REVIEW_PR_FRESH_MS` (24h), so a PR that stops moving
+    // ages out and the trigger fires again — this cannot suppress indefinitely.
+    // Returns null rather than a recorded suppression for the same reason the
+    // gated-elapsed check below does: `long_active_duration` is last in
+    // `choosePrimaryTrigger`'s ladder, so no other fired trigger is discarded.
+    if (trigger === "long_active_duration" && isProgressPullRequest(latestPullRequest)) {
+      return null;
+    }
+
     // BLO-25877: computed once here — after both suppression gates above have had
     // their chance to hold this review back — and reused as-is for the report-text
     // field further down, rather than recomputed there.

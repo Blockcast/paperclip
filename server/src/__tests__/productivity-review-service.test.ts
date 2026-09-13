@@ -469,8 +469,9 @@ describeEmbeddedPostgres("productivity review service", () => {
       metadata?: Record<string, unknown> | null;
       url?: string | null;
       createdByRunId?: string | null;
+      issue?: Parameters<typeof seedAssignedIssue>[0];
     }) {
-      const seeded = await seedAssignedIssue();
+      const seeded = await seedAssignedIssue(opts.issue);
       await db.insert(issueWorkProducts).values({
         companyId: seeded.companyId,
         issueId: seeded.issueId,
@@ -809,6 +810,82 @@ describeEmbeddedPostgres("productivity review service", () => {
 
       const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
       expect(description).toContain("Linked pull request: none recorded");
+    });
+
+    // BLO-27698 A1. Until now `isProgressPullRequest` had exactly one caller, in
+    // `buildReviewMarkdown` — the evidence pack could say "the second signal is
+    // already present" on a review that should never have been generated. These
+    // assert NON-generation, which is what makes them new coverage over the
+    // rendering tests above.
+    describe("long-active suppression by a fresh progress PR (BLO-27698 A1)", () => {
+      // The BLO-27207 fixture: episode long past `longActiveMs`, PR pushed 6h13m
+      // ago (well inside the 24h bar), and no Paperclip-side comment recency to
+      // save it. This fired a false positive on master.
+      it("does not generate a long-active review while a fresh progress PR exists", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - (6 * 60 + 13) * 60 * 1000),
+          issue: {
+            status: "in_progress",
+            startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+          },
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(0);
+        expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+      });
+
+      // BLO-22331 AC2 boundedness guard: the suppression must lapse on its own.
+      // A PR that stopped moving 30h ago is outside PRODUCTIVITY_REVIEW_PR_FRESH_MS,
+      // so the trigger fires again rather than being held off indefinitely.
+      it("still fires once the PR ages past the freshness window", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+          issue: {
+            status: "in_progress",
+            startedAt: new Date(now.getTime() - 31 * 60 * 60 * 1000),
+          },
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      });
+
+      // Keys on progress-eligibility, not mere freshness: a PR the assignee
+      // closed without merging is not progress, however recently it moved. Proves
+      // the gate reads `isProgressPullRequest`, not `isFreshPullRequest`.
+      it("still fires for a fresh but closed-unmerged PR", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          status: "closed",
+          issue: {
+            status: "in_progress",
+            startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+          },
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      });
     });
   });
 
