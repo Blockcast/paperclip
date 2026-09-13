@@ -440,6 +440,7 @@ jobs:
       - name: Test fast-uri advisory range table
         if: ${{ !cancelled() }}
         run: node --test ./scripts/fast-uri-advisory.test.js
+        timeout-minutes: 1
 
       - name: Validate Designer fast-uri security floor
         if: ${{ !cancelled() }}
