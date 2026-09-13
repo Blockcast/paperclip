@@ -164,6 +164,24 @@ vi.mock("../services/index.js", () => ({
   workspaceOperationService: () => mockWorkspaceOperationService,
 }));
 
+/**
+ * The runtime-command POSTs sit behind a MANAGE gate that reads `agents` and `heartbeatRuns` off a
+ * real `db`; these apps mount `{}`. Stubbing it is what makes those routes drivable at all.
+ *
+ * This is deliberately not the control under test, and stubbing it does not weaken the ones that
+ * are. A standard same-company agent genuinely PASSES this gate — it holds `runtime:manage` via
+ * `allow_company_agent` — so a pass is the realistic case, and it is precisely that pass which
+ * makes the READ boundary below the only thing standing between such an agent and the operator's
+ * command text. The gate has its own coverage in `workspace-runtime-service-authz.test.ts`.
+ */
+const mockAssertCanManageProjectWorkspaceRuntimeServices = vi.hoisted(() =>
+  vi.fn(async () => undefined),
+);
+vi.mock("../routes/workspace-runtime-service-authz.js", () => ({
+  assertCanManageProjectWorkspaceRuntimeServices: mockAssertCanManageProjectWorkspaceRuntimeServices,
+  assertCanManageExecutionWorkspaceRuntimeServices: vi.fn(async () => undefined),
+}));
+
 function runtimeBlob(): Record<string, unknown> {
   return {
     services: [{ name: "web", command: SECRET_SENTINEL, env: { TOKEN_FIXTURE: SECOND_SENTINEL } }],
@@ -630,11 +648,70 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
     });
 
     /**
-     * The other three call sites, pinned against the route SOURCE rather than driven.
+     * Driven rather than source-pinned, at Ally's ask on the review of `024a330c`, and it is the
+     * one that most deserved it: this exact handler is where the door was found. It masked
+     * `workspace` and returned the sibling `operation` raw on the very next line — so a source
+     * marker on the line above would have been green while the exit was open.
      *
-     * All are real exits and none is cheap to reach with a 200: the two POSTs run the whole
-     * runtime-command path (command resolution, the recorder, workspace provisioning) before they
-     * reach their response literal, and the heartbeat-run route lives in `agents.ts`, whose router
+     * The recorder is the seam that makes a 200 cheap. `recordOperation` owns the `run` callback,
+     * so stubbing it hands back a recorded row without executing command resolution, the
+     * service start/stop, or workspace provisioning. `action=stop` is the branch with no
+     * `workspaceCommand` or `runtimeConfig` precondition, so nothing upstream short-circuits.
+     */
+    function arrangeProjectRuntimeCommand() {
+      mockProjectService.getById.mockResolvedValue({
+        id: "project-1",
+        companyId: "company-1",
+        workspaces: [projectWorkspaceFixture()],
+      });
+      mockWorkspaceOperationService.createRecorder.mockReturnValue({
+        recordOperation: vi.fn(async () => workspaceOperationFixture()),
+      });
+    }
+
+    it("withholds on POST /projects/:id/workspaces/:workspaceId/runtime-services/:action", async () => {
+      arrangeProjectRuntimeCommand();
+
+      const res = await request(createApp("projects"))
+        .post("/api/projects/project-1/workspaces/project-workspace-1/runtime-services/stop")
+        .send({});
+
+      expect(res.status).toBe(200);
+      // The sibling that was raw. All three sentinels, against the serialized body — a field-level
+      // assertion alone would miss `metadata`, which has no closed shape.
+      expect(JSON.stringify(res.body)).not.toContain(OPERATION_COMMAND_SENTINEL);
+      expect(JSON.stringify(res.body)).not.toContain(OPERATION_CWD_SENTINEL);
+      expect(JSON.stringify(res.body)).not.toContain(OPERATION_METADATA_SENTINEL);
+      expect(res.body.operation.command).toBe(REDACTED_EVENT_VALUE);
+      expect(res.body.operation.cwd).toBe(REDACTED_EVENT_VALUE);
+      // Withholding the operator's text is the point; hiding that an operation ran is not.
+      expect(res.body.operation.phase).toBe("workspace_provision");
+      expect(res.body.operation.status).toBe("succeeded");
+      // The workspace half in the same literal, so this pins both exits of the one response.
+      expect(JSON.stringify(res.body)).not.toContain(SECRET_SENTINEL);
+      expect(JSON.stringify(res.body)).not.toContain(SECOND_SENTINEL);
+    });
+
+    it("discloses the operation to a reader holding workspace_runtime:read", async () => {
+      decideAsRuntimeManager();
+      arrangeProjectRuntimeCommand();
+
+      const res = await request(createApp("projects"))
+        .post("/api/projects/project-1/workspaces/project-workspace-1/runtime-services/stop")
+        .send({});
+
+      expect(res.status).toBe(200);
+      expect(res.body.operation.command).toBe(OPERATION_COMMAND_SENTINEL);
+      expect(res.body.operation.cwd).toBe(OPERATION_CWD_SENTINEL);
+      expect(JSON.stringify(res.body)).toContain(OPERATION_METADATA_SENTINEL);
+    });
+
+    /**
+     * The other two call sites, pinned against the route SOURCE rather than driven.
+     *
+     * Both are real exits and neither is cheap to reach with a 200: the POST runs the whole
+     * runtime-command path (command resolution, the recorder, workspace provisioning) before it
+     * reaches its response literal, and the heartbeat-run route lives in `agents.ts`, whose router
      * needs ~30 services mocked to mount. A source assertion is weaker than a driven one and is
      * stated as such — but it fails loudly if someone deletes the wrapper, which is the regression
      * this door actually had.
@@ -649,11 +726,6 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
         module: "agents.ts",
         marker: "publicWorkspaceOperations(operations, viewer)",
         site: "GET /heartbeat-runs/:runId/workspace-operations",
-      },
-      {
-        module: "projects.ts",
-        marker: "operation: publicWorkspaceOperation(operation, viewer)",
-        site: "POST /projects/:id/workspaces/:workspaceId/runtime-services/:action",
       },
     ])("$site routes its operations through the withholding boundary", ({ module, marker }) => {
       const source = readFileSync(
