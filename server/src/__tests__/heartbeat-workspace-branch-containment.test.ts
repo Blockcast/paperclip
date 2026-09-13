@@ -166,6 +166,12 @@ async function createForwardBranchMismatch(input: {
   await runGit(input.worktreePath, ["commit", "-m", "Add actual branch work"]);
 }
 
+// CI-load margin (BLO-22985). Measured overruns on run 34673003753 (General tests
+// server 3/4, 2026-09-12): fresh worktree reuse 10_052ms and persisted restore
+// 10_689ms against a 10_000ms budget (+0.5% / +6.9%); forward reconcile 30_322ms
+// against 30_000ms (+1.1%). These are a loaded runner losing a scheduling slice, not
+// a hung run, so the budgets move to 20_000/45_000 — ~2x the observed elapsed. The
+// invariant is unchanged: a run that never terminates still fails, just later.
 async function waitForRunToFinish(heartbeat: Heartbeat, runId: string, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -608,7 +614,7 @@ async function expectContainedWorkspaceBranchFailure(input: {
   expectedBranch: string;
   actualBranch: string;
 }) {
-  const finishedRun = await waitForRunToFinish(input.heartbeat, input.runId, 10_000);
+  const finishedRun = await waitForRunToFinish(input.heartbeat, input.runId, 20_000);
   expect(finishedRun).toMatchObject({
     status: "failed",
     errorCode: "workspace_validation_failed",
@@ -726,7 +732,7 @@ async function expectForwardBranchReconciled(input: {
   expectsExistingRecordUpdate: boolean;
   expectedResolvedRecoveryActionFingerprint?: string | null;
 }) {
-  const finishedRun = await waitForRunToFinish(input.heartbeat, input.runId, 30_000);
+  const finishedRun = await waitForRunToFinish(input.heartbeat, input.runId, 45_000);
   expect(finishedRun).toMatchObject({
     status: "succeeded",
     errorCode: null,
@@ -1298,7 +1304,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       actualBranch: seeded.actualBranch,
     });
     expect(adapterExecute).toHaveBeenCalledTimes(callSite === "finalize" ? 1 : 0);
-  }, 30_000);
+  }, 60_000);
 
   it.each([
     ["workspace-runtime fresh worktree reuse", "fresh_realize" as const, false],
@@ -1408,5 +1414,5 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       expectedResolvedRecoveryActionFingerprint,
     });
     expect(adapterExecute).toHaveBeenCalledTimes(1);
-  }, 60_000);
+  }, 90_000);
 });
