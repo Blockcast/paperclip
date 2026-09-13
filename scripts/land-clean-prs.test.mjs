@@ -308,6 +308,27 @@ describe("helpers", () => {
     assert.deepEqual(failingChecks([{ name: "lint", state: "SUCCESS" }]), []);
   });
 
+  it("does not let a green status context shadow a failing check-run of the same name", () => {
+    // The two surfaces are independent namespaces inside one rollup, so the
+    // newest row must be picked within each — not across both.
+    const rollup = [
+      {
+        __typename: "CheckRun",
+        name: "verify",
+        conclusion: "FAILURE",
+        completedAt: "2026-09-13T05:00:00Z",
+      },
+      {
+        __typename: "StatusContext",
+        context: "verify",
+        state: "SUCCESS",
+        createdAt: "2026-09-13T06:00:00Z",
+      },
+    ];
+    assert.deepEqual(failingChecks(rollup), ["verify=FAILURE"]);
+    assert.equal(classify({ statusCheckRollup: rollup }).reason, "checks:FAILURE");
+  });
+
   it("counts a team review request as never satisfied by a login approval", () => {
     assert.deepEqual(
       unsatisfiedOwners({
