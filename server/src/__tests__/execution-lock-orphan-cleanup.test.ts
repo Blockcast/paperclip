@@ -9,6 +9,7 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueRelations,
   issues,
 } from "@paperclipai/db";
 import {
@@ -487,7 +488,7 @@ describeEmbeddedPostgres("execution lock orphan cleanup", () => {
     async function seedPromotedIssue(
       companyId: string,
       runId: string,
-      restoreStatus: "todo" | "backlog" | null,
+      restoreStatus: "todo" | "backlog" | "blocked" | null,
     ) {
       return seedIssue(companyId, {
         status: "in_progress",
@@ -575,6 +576,62 @@ describeEmbeddedPostgres("execution lock orphan cleanup", () => {
       expect(after?.status).toBe("in_progress");
       expect(after?.checkoutRestoreStatus).toBe("todo");
       expect(after?.executionRunId).toBe(retryRunId);
+    });
+
+    // BLO-27553: `stranded_assigned_issue` recovery writes `blocked` with no edge
+    // when a run dies on infra failure. The next checkout captures that as the
+    // restore marker, so a second death would re-apply `blocked` with an empty
+    // blocker set — and the heartbeat skips `blocked`, leaving no wake path at
+    // all. Restoring `todo` instead keeps the row re-dispatchable.
+    it("restores todo rather than a blocker-less blocked, which would have no wake path", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, "CEO");
+
+      const runId = randomUUID();
+      await seedRun(companyId, agentId, runId);
+      const issueId = await seedPromotedIssue(companyId, runId, "blocked");
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: { issueId } })
+        .where(eq(heartbeatRuns.id, runId));
+
+      await heartbeatService(db).cancelRun(runId);
+
+      const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(after?.status).toBe("todo");
+      expect(after?.checkoutRestoreStatus).toBeNull();
+    });
+
+    // The other half of the guard, and the one that keeps it honest: a row with a
+    // real blocker edge is legitimately parked. It self-drains via
+    // `issue_blockers_resolved_sweep`, so demoting it would undo a correct park.
+    // Keyed on edge existence, not blocker status — an all-`done` blocker set is
+    // healed by `reconcileResolvedDependencyWakeBackstop` and a `cancelled` one
+    // is reported by `blocked_by_cancelled_issue`; both need the edge left alone.
+    it("still restores blocked when a real blocker edge exists", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, "CEO");
+
+      const runId = randomUUID();
+      await seedRun(companyId, agentId, runId);
+      const issueId = await seedPromotedIssue(companyId, runId, "blocked");
+      const blockerId = await seedIssue(companyId, { status: "todo" });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: issueId,
+        type: "blocks",
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: { issueId } })
+        .where(eq(heartbeatRuns.id, runId));
+
+      await heartbeatService(db).cancelRun(runId);
+
+      const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(after?.status).toBe("blocked");
+      expect(after?.checkoutRestoreStatus).toBeNull();
     });
   });
 });

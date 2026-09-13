@@ -1,5 +1,5 @@
 import { and, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
-import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
+import { heartbeatRuns, issueRelations, issues, type Db } from "@paperclipai/db";
 import { TERMINAL_HEARTBEAT_RUN_STATUS_VALUES } from "./issue-execution-lock.js";
 import { buildIssueMonitorEligibilityPatch } from "./issue-execution-policy.js";
 
@@ -116,8 +116,59 @@ const restorableCheckoutPromotion = and(
   )`,
 );
 
+/**
+ * BLO-27553 — never restore `blocked` onto a row that has no blocker edge.
+ *
+ * `checkoutRestoreStatusExpression` captures whatever status the row held at
+ * checkout, and `stranded_assigned_issue` recovery writes `blocked` with no edge
+ * when a run dies on infra failure. A run that checks such a row out inherits
+ * `checkout_restore_status = 'blocked'`, so if it dies too — the same class of
+ * event — this restore re-applies `blocked` with an empty blocker set. The
+ * heartbeat skips `blocked`, so that row has no wake path of any kind and
+ * nothing can ever select it again.
+ *
+ * That makes strand production correlate with the conditions that kill runs,
+ * which is exactly when nobody is watching. No agent authors the write, so the
+ * agent-side pre-write rule cannot reach it; the guard has to live here.
+ *
+ * Keyed on "no blocker edge exists at all", matching `hasAnyBlockerEdge` in
+ * recovery/issue-graph-liveness.ts rather than `hasUnresolvedBlockerEdge`. The
+ * difference is load-bearing in both directions:
+ *
+ *   - all-`done` blockers → NOT dead; `reconcileResolvedDependencyWakeBackstop`
+ *     wakes that row. Demoting it here would change the status out from under a
+ *     backstop that is already healing it.
+ *   - a `cancelled` blocker → NOT dead; `blocked_by_cancelled_issue` reports it
+ *     with a "remove this edge" instruction that demoting would discard.
+ *
+ * Only a row with no edge at all has neither, which is precisely the signature
+ * this defect is tracked under. Restoring `todo` keeps it in
+ * `paperclipInboxLite` and re-dispatchable.
+ *
+ * Existence is tested on `issue_relations` alone — no join back to `issues`.
+ * `issue_relations.issue_id` is a FK with `on delete cascade`, so an edge row
+ * existing already means the blocker issue exists, and the relation carries its
+ * own `company_id` to scope with. That also keeps the test on the
+ * `(company_id, related_issue_id)` index. A self-join would need an alias, and
+ * drizzle renders an interpolated `alias()` in a JOIN as the bare alias name
+ * rather than `"issues" "restore_blocker"` — a statement that fails at runtime
+ * on the finalizer's hot path.
+ *
+ * Ambiguous edges therefore keep `blocked`, which is the conservative
+ * direction: wrongly demoting a legitimately parked row is worse than leaving
+ * an exotic one exactly as it is today.
+ */
 const restoreCheckoutPromotionSet = () => ({
-  status: sql`${issues.checkoutRestoreStatus}`,
+  status: sql`case
+    when ${issues.checkoutRestoreStatus} = 'blocked' and not exists (
+      select 1
+      from ${issueRelations}
+      where ${issueRelations.relatedIssueId} = ${issues.id}
+        and ${issueRelations.companyId} = ${issues.companyId}
+        and ${issueRelations.type} = 'blocks'
+    ) then 'todo'
+    else ${issues.checkoutRestoreStatus}
+  end`,
   checkoutRestoreStatus: null,
   updatedAt: new Date(),
 });
