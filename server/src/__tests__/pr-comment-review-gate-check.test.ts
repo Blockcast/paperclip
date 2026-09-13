@@ -18,6 +18,7 @@ const mockListComments = vi.hoisted(() => vi.fn());
 const mockListReviews = vi.hoisted(() => vi.fn());
 const mockFetchHeadSha = vi.hoisted(() => vi.fn());
 const mockPostStatus = vi.hoisted(() => vi.fn());
+const mockPostCheckRun = vi.hoisted(() => vi.fn());
 const mockStatusDeliveryLock = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/github-app-auth.js", () => ({
@@ -25,6 +26,7 @@ vi.mock("../services/github-app-auth.js", () => ({
   githubListIssueCommentsWithTimestamps: mockListComments,
   githubListPrReviewsWithTimestamps: mockListReviews,
   githubPostCommitStatusDetailed: mockPostStatus,
+  githubPostCheckRun: mockPostCheckRun,
   githubReviewerIdentityMatches: (login: string, configuredLogin: string) => {
     const candidate = login.trim().toLowerCase().replace(/^@/, "");
     const configured = configuredLogin.trim().toLowerCase().replace(/^@/, "");
@@ -70,11 +72,13 @@ beforeEach(() => {
   mockListReviews.mockReset();
   mockFetchHeadSha.mockReset();
   mockPostStatus.mockReset();
+  mockPostCheckRun.mockReset();
   mockStatusDeliveryLock.mockReset();
   mockStatusDeliveryLock.mockImplementation(async (_db, _key, operation) => operation());
   // Default both surfaces to empty; each test overrides the one it exercises.
   mockListComments.mockResolvedValue([]);
   mockListReviews.mockResolvedValue([]);
+  mockPostCheckRun.mockResolvedValue({ ok: true, statusCode: 201 });
 });
 
 afterEach(() => {
@@ -339,5 +343,61 @@ describe("retired status contexts", () => {
 
     await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
     expect(mockPostStatus).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("check-run mirror (BLO-33657)", () => {
+  const clean = {
+    login: "allyblockcast[bot]",
+    body:
+      `## Ally — Consolidated PR Review\nReviewed head: ${TARGET.headSha}\n` +
+      "### Critical Issues (0)\n### Important Issues (0)",
+    createdAt: "2026-09-13T05:00:00Z",
+  };
+
+  it("mirrors the verdict as a check-run alongside the commit status", async () => {
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+    mockListComments.mockResolvedValue([clean]);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
+
+    expect(mockPostCheckRun).toHaveBeenCalledTimes(1);
+    expect(mockPostCheckRun.mock.calls[0][0]).toMatchObject({
+      sha: TARGET.headSha,
+      name: "review/ally-comment-gate",
+      conclusion: "success",
+    });
+  });
+
+  it("publishes neutral, not success, when nothing attests the head", async () => {
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
+
+    // The commit status is green here and has to stay green — going non-green
+    // on absence deadlocks formally-reviewed PRs (BLO-29711). The check-run is
+    // what carries the distinction.
+    expect(mockPostStatus.mock.calls[0][0]).toMatchObject({ state: "success" });
+    expect(mockPostCheckRun.mock.calls[0][0]).toMatchObject({ conclusion: "neutral" });
+  });
+
+  it("does not fail the check when the check-run write is refused", async () => {
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+    mockPostCheckRun.mockResolvedValue({ ok: false, retryable: false, reason: "check_run_write_http_403" });
+
+    // An installation without `checks: write` must keep the working status
+    // surface rather than losing it to the surface that is only nicer.
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
+  });
+
+  it("does not fail the check when the check-run write throws", async () => {
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+    mockPostCheckRun.mockRejectedValue(new Error("githubPostCheckRun is not a function"));
+
+    // "Best-effort" has to survive a thrown error too, not just a classified
+    // failure result — otherwise the rejection escapes and takes down the
+    // commit status that was already published.
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
+    expect(mockPostStatus).toHaveBeenCalled();
   });
 });

@@ -746,25 +746,38 @@ async function publishCheckRunMirror(
   context: string,
   verdict: CommentReviewGateVerdict,
 ): Promise<void> {
-  const result = await withBoundedRetry<GitHubCommitStatusPostResult>(
-    () =>
-      githubPostCheckRun({
-        repoFullName: input.repoFullName,
-        sha: headSha,
-        name: context,
-        conclusion: commentReviewGateCheckConclusion(verdict),
-        title: commentReviewGateCheckTitle(verdict),
-        summary: verdict.reason,
-        detailsUrl: input.prUrl ?? null,
-      }),
-    (attempt) => !attempt.ok && attempt.retryable,
-  );
-  if (result.ok) return;
+  let reason: string;
+  try {
+    const result = await withBoundedRetry<GitHubCommitStatusPostResult>(
+      () =>
+        githubPostCheckRun({
+          repoFullName: input.repoFullName,
+          sha: headSha,
+          name: context,
+          conclusion: commentReviewGateCheckConclusion(verdict),
+          title: commentReviewGateCheckTitle(verdict),
+          summary: verdict.reason,
+          detailsUrl: input.prUrl ?? null,
+        }),
+      (attempt) => !attempt.ok && attempt.retryable,
+    );
+    if (result.ok) return;
+    reason = result.reason;
+  } catch (error) {
+    // "Best-effort" has to mean it too. `githubPostCheckRun` returns a
+    // classified result rather than throwing, but it can still throw for
+    // reasons outside its own error handling — an unmocked export under test,
+    // a module that failed to load. Letting that escape would reject the whole
+    // publish and lose the commit status that was already written, which is the
+    // exact "a better signal takes out the working one" outcome this function
+    // is structured to avoid.
+    reason = error instanceof Error ? error.message : String(error);
+  }
   if (checkRunWriteWarnings.has(input.repoFullName)) return;
   checkRunWriteWarnings.add(input.repoFullName);
   console.warn(
     `[pr-comment-review-gate] Could not publish the "${context}" check-run on ${input.repoFullName}: ` +
-      `${result.reason}. The commit status is still authoritative, but "not evaluated" and ` +
+      `${reason}. The commit status is still authoritative, but "not evaluated" and ` +
       `"reviewed clean" both render green there — the check-run is what separates them. ` +
       "A 403 here means the installation is missing `checks: write` (BLO-33657).",
   );
