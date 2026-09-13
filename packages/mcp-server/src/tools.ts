@@ -868,9 +868,10 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         // The client's base URL already ends in /api, so an /api-prefixed path would
         // request /api/api/... and come back 404 "API route not found" — byte-identical
         // to an absent route. Reject it, so a usage error can never read as a measurement.
-        if (/^\/api(\/|$)/i.test(path)) {
+        if (/^\/api([/?#]|$)/i.test(path)) {
+          const relative = path.slice(4);
           throw new Error(
-            `path is relative to /api — pass '${path.slice(4) || "/agents/me"}', not '${path}'. ` +
+            `path is relative to /api — pass '${relative.startsWith("/") ? relative : "/agents/me"}', not '${path}'. ` +
               "This is a usage error in the caller, not a missing route on the server.",
           );
         }
