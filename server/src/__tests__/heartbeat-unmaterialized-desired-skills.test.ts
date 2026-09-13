@@ -396,18 +396,24 @@ describe("buildUnmaterializedSkillNoticeMarkdown", () => {
     );
     // Only the one genuinely-absent key is claimed as a configuration fault.
     expect(notice).toContain("- …and 2 more (1 not in the company skill library)");
-    // The unknown reason is disclosed in the honest total but never described
-    // by a verdict that does not cover it.
     expect(notice).not.toContain("2 not in the company skill library");
-    expect(notice).not.toContain("a configuration fault, not a transient error — retrying will not fix them.\n");
+    // …and the verdict names that label and no other, so the unknown reason is
+    // disclosed in the honest total without being described by a verdict that
+    // does not cover it. Asserting the *absence* of the verdict sentence cannot
+    // express this: `a/b/gone` is genuinely absent, so the sentence is supposed
+    // to render — an absence check on it either fails on correct output or, if
+    // narrowed until it passes, stops distinguishing pass from fail at all.
+    expect(notice).toContain(
+      "The keys marked *not in the company skill library* are a configuration fault",
+    );
   });
 
   // Ally raised the reverse of the mirror case above: 20 visible `absent` keys
   // and hidden `unresolved_source` ones, with nothing pending. It renders
-  // correctly and needs no disclosure, because the label-scoped verdict is
-  // gated on `hasPending` — with no pending key the flat sentence renders
-  // instead, and it covers both config-fault labels. Pinned so a later widening
-  // of that gate has to argue with a test rather than a comment.
+  // correctly and needs no disclosure, because both reasons are the same
+  // remediation class — the flat sentence covers them together and names no
+  // label, so there is no label without a visible bullet. Pinned so a later
+  // widening of that gate has to argue with a test rather than a comment.
   it("needs no disclosure when every reported key is a configuration fault", () => {
     const notice = buildUnmaterializedSkillNoticeMarkdown(
       [
@@ -425,6 +431,28 @@ describe("buildUnmaterializedSkillNoticeMarkdown", () => {
     expect(notice).not.toContain("The keys marked");
     expect(notice).toContain("- …and 1 more");
     expect(notice).not.toContain("- …and 1 more (");
+  });
+
+  // The flat verdict asserts over *every* reported key at once, so it may only
+  // render when every reported key is one the allowlist admits. It was the last
+  // site where a reason added to the union later could still be enrolled in
+  // "retrying will not fix it": nothing is pending here, so the old
+  // `hasPending` gate chose the flat form and swept `some_future_reason` into a
+  // verdict that does not describe it. Nothing pending is what makes this the
+  // distinct case — the mixed fixture above never reaches the flat branch.
+  it("does not enrol an unknown reason in the flat config-fault verdict", () => {
+    const notice = buildUnmaterializedSkillNoticeMarkdown(
+      [
+        { key: "a/b/gone", reason: "absent" as const, detail: null },
+        { key: "a/b/future", reason: "some_future_reason", detail: null } as unknown as
+          UnmaterializedDesiredSkill,
+      ],
+      10,
+    );
+    expect(notice).toContain(
+      "The keys marked *not in the company skill library* are a configuration fault",
+    );
+    expect(notice).not.toContain("This is a configuration fault");
   });
 
   it("does not annotate the overflow line when nothing hidden is pending", () => {

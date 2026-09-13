@@ -2863,7 +2863,33 @@ export function buildUnmaterializedSkillNoticeMarkdown(
   const configFaultReasons = UNMATERIALIZED_SKILL_CONFIG_FAULT_REASONS.filter((reason) =>
     missing.some((entry) => entry.reason === reason),
   );
-  const isMixed = hasPending && configFaultReasons.length > 0;
+  // The remediation *classes* present — not the reasons. Two reasons that get
+  // the same advice count as one class (`absent` and `unresolved_source` are
+  // both configuration faults), so a notice made only of those still renders
+  // the single flat verdict and still needs no truncation disclosure. A reason
+  // the allowlist does not admit is its own class, `unclassified`, which is
+  // what keeps it out of every verdict instead of being absorbed by whichever
+  // one happens to render.
+  //
+  // One predicate now drives both the verdict and the disclosure, because they
+  // answer the same question: is there a key here that the paragraph about to
+  // be written does not describe? The previous `hasPending && …` form answered
+  // it for one of the three classes only, so the flat verdict was the last
+  // place a reason added to the union later could still be enrolled in
+  // "retrying will not fix it" — the enrollment
+  // UNMATERIALIZED_SKILL_CONFIG_FAULT_REASONS exists to prevent. With today's
+  // three reasons the two forms agree on every input, so no rendered notice
+  // changes at this head.
+  const remediationClasses = new Set(
+    missing.map((entry) =>
+      (UNMATERIALIZED_SKILL_CONFIG_FAULT_REASONS as readonly string[]).includes(entry.reason)
+        ? "config_fault"
+        : entry.reason === "runtime_files_unpublished"
+          ? "pending"
+          : "unclassified",
+    ),
+  );
+  const isMixed = remediationClasses.size > 1;
 
   const lines = shown.map((entry) => {
     const reason = UNMATERIALIZED_SKILL_REASON_SUMMARY[entry.reason];
@@ -2893,9 +2919,19 @@ export function buildUnmaterializedSkillNoticeMarkdown(
     // paragraph lower: a fourth reason would have been silently counted here as
     // "a configuration fault" while `configFaultReasons` correctly refused to
     // cover it — the two sites disagreeing about the same question. Counting per
-    // reason also lets the disclosure name the same labels the verdict quotes,
+    // reason also lets these buckets name the same labels the verdict quotes,
     // so the reader matches "N <label>" against a label they can see on a bullet
     // instead of bridging a class word to a label by inference.
+    //
+    // That last property is scoped to the config-fault buckets on purpose and
+    // does not extend to the pending disclosure below, which keeps a short
+    // paraphrase. Substituting its summary label verbatim renders
+    //   - …and 3 more (2 in the company skill library, but its runtime files are
+    //     not published yet, 1 not in the company skill library)
+    // — the label carries its own comma, so a two-item list joined by ", " reads
+    // as three and the reader can no longer tell where the first item ends.
+    // Bridging "with runtime files unpublished" to that bullet is one word; the
+    // ambiguity the substitution buys is worse than the inference it removes.
     const hiddenConfigFault = UNMATERIALIZED_SKILL_CONFIG_FAULT_REASONS
       .map((reason) => ({ reason, count: hidden.filter((e) => e.reason === reason).length }))
       .filter((bucket) => bucket.count > 0);
@@ -2929,7 +2965,7 @@ export function buildUnmaterializedSkillNoticeMarkdown(
       .map((reason) => `*${UNMATERIALIZED_SKILL_REASON_SUMMARY[reason]}*`)
       .join(" or ");
     remediation.push(
-      hasPending
+      isMixed
         ? `The keys marked ${covered} are a configuration fault, not a transient error — `
           + "retrying will not fix them."
         : "This is a configuration fault, not a transient error — retrying will not fix it.",
