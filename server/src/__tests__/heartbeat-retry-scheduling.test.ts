@@ -3120,7 +3120,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
-  it.each(["job_failed", "oom_killed", "exit_137"])(
+  it.each(["job_failed", "oom_killed", "exit_137", "caveman_proxy_not_ready"])(
     "retries %s only when durable evidence proves adapter invocation never began",
     (errorCode) => {
       expect(
@@ -3161,6 +3161,21 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       expect(JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(4);
     },
   );
+
+  // BLO-33441: the relabel out of `job_failed` must not quietly change the
+  // retry CONTRACT, only the census label. Admission is asserted above; this
+  // pins the other half, because a code admitted for retry but missing from the
+  // opts arm is scheduled under the default transient opts — a silent
+  // half-regression with no failing assertion anywhere else.
+  it("schedules caveman_proxy_not_ready under the same retry opts as job_failed", () => {
+    expect(resolveAutomaticRunRetryOpts({
+      errorCode: "caveman_proxy_not_ready",
+      contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+    })).toEqual(resolveAutomaticRunRetryOpts({
+      errorCode: "job_failed",
+      contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+    }));
+  });
 
   it("does not retry job_missing even with synthetic never-invoked evidence", () => {
     expect(

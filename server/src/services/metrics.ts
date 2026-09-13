@@ -101,6 +101,24 @@ export type BackstopSkipReason = (typeof BACKSTOP_SKIP_REASONS)[number];
  */
 export const PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC = "paperclip_plugin_webhook_delivery_rejected_total";
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
+/**
+ * `error_code` booked when a `job_failed` run is proven to be the Caveman-proxy
+ * readiness timeout (BLO-33441). Classified in `k8s-job-liveness.ts`; declared
+ * here so the metric layer can key on it without importing
+ * `@kubernetes/client-node`.
+ *
+ * `error_code` on this counter is free-form (it is `heartbeat_runs.error_code`
+ * passed through), so this is a shared constant rather than an allow-list entry
+ * — there is no list to add it to.
+ *
+ * Exists because BLO-33279's AC5 ("zero occurrences for 7 days") was
+ * unverifiable: the failure fell into `job_failed`, a catch-all running ~8000
+ * per 7d against a defect firing ~10/day, so the query returned "clean" whether
+ * or not the defect recurred. With its own code the check is
+ * `increase(paperclip_heartbeat_run_failed_total{error_code="caveman_proxy_not_ready"}[7d]) == 0`
+ * and stays honest.
+ */
+export const CAVEMAN_PROXY_NOT_READY_ERROR_CODE = "caveman_proxy_not_ready";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
 /**
  * Outcome counter for blocker-resolved dependent wakes (BLO-13250). Labeled
@@ -1047,6 +1065,11 @@ export const PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC =
 export const KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES = [
   "external_lifecycle_stale_killed",
   "job_failed",
+  // BLO-33441: listed for the same reason it is listed in recovery's
+  // infra-routing set — these runs WERE `job_failed` (a member) before the
+  // relabel, so omitting it would silently move them to `other` and change
+  // this gauge's meaning without anything upstream having changed.
+  CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
   "job_missing",
   "adapter_failed",
   "process_lost",
@@ -2955,8 +2978,15 @@ export function recordHeartbeatRunFailed(
   // Prometheus counter series per historical issue for the process lifetime.
   const isolationMode = normalizeIsolationMode(input.isolationMode);
   const retainSourceIds = input.errorCode === "k8s_pod_schedule_failed" && isolationMode === "run";
+  // BLO-33441: `agent_id` only — NOT `issue_id`. "Which lane is losing runs to
+  // proxy startup" is the question this code exists to answer, and the agent
+  // roster is bounded (tens), so the series count is bounded with it. `issue_id`
+  // is unbounded and stays collapsed, which is the distinction the comment above
+  // is really about.
+  const retainAgentId = retainSourceIds
+    || input.errorCode === CAVEMAN_PROXY_NOT_READY_ERROR_CODE;
   const labels = {
-    agent_id: retainSourceIds && typeof input.agentId === "string" && input.agentId.length > 0
+    agent_id: retainAgentId && typeof input.agentId === "string" && input.agentId.length > 0
       ? input.agentId
       : UNKNOWN_AGENT_ID,
     issue_id: retainSourceIds && typeof input.issueId === "string" && input.issueId.length > 0
