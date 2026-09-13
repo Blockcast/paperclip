@@ -36,6 +36,7 @@ import {
   publicProjects,
   publicProjectWorkspace,
   publicProjectWorkspaces,
+  publicWorkspaceOperation,
   resolveWorkspaceRuntimeViewer,
 } from "./workspace-response.js";
 import { getTelemetryClient } from "../telemetry.js";
@@ -640,12 +641,11 @@ export function projectRoutes(db: Db) {
       },
     });
 
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, project.companyId);
+
     res.json({
-      workspace: publicProjectWorkspace(
-        updatedWorkspace,
-        await resolveWorkspaceRuntimeViewer(access, req, project.companyId),
-      ),
-      operation,
+      workspace: publicProjectWorkspace(updatedWorkspace, viewer),
+      operation: publicWorkspaceOperation(operation, viewer),
     });
   }
 
