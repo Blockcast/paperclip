@@ -5,7 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { FAST_URI_ADVISORY, isVulnerableFastUri } from "./fast-uri-advisory.js";
+import {
+  fastUriAdvisoriesFor,
+  isVulnerableFastUri,
+} from "./fast-uri-advisory.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = new URL("..", import.meta.url);
@@ -52,17 +55,29 @@ async function main() {
     assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.6");
 
     const lockfile = await readFile(join(fixtureRoot, "pnpm-lock.yaml"), "utf8");
-    const fastUriResolutions = [
-      ...lockfile.matchAll(/^  fast-uri@(\d+\.\d+\.\d+):$/gm),
-    ].map((match) => match[1]);
-    assert.ok(
-      fastUriResolutions.length > 0,
-      "lockfile missing fast-uri resolution",
+    // Capture the whole version token, not `\d+\.\d+\.\d+` -- that pattern
+    // MISSES `fast-uri@4.1.0-rc.1:`, and a missed entry is silently skipped
+    // rather than rejected, so the guard fails open on exactly the resolution
+    // it exists to catch. Everything after the `@` goes to `parseVersion`,
+    // which throws on anything it cannot compare. The optional `(...)` suffix
+    // is pnpm's peer/patch descriptor and is not part of the version. Both
+    // the `packages:` key and the `snapshots:` `<key>: {}` line are matched --
+    // the count cross-check below is only sound if neither shape is skipped.
+    const fastUriEntries = [
+      ...lockfile.matchAll(/^ {2}'?fast-uri@([^:'\n]+)'?:(?: \{\})?$/gm),
+    ].map((match) => match[1].replace(/\(.*\)$/, ""));
+    assert.ok(fastUriEntries.length > 0, "lockfile missing fast-uri resolution");
+    // Cross-check against a bare line count so a key shape the pattern above
+    // does not anticipate reads as a failure, not as "nothing found".
+    assert.equal(
+      fastUriEntries.length,
+      (lockfile.match(/^ {2}'?fast-uri@/gm) ?? []).length,
+      "lockfile has a fast-uri entry this scan could not parse",
     );
-    for (const version of fastUriResolutions) {
+    for (const version of fastUriEntries) {
       assert.ok(
         !isVulnerableFastUri(version),
-        `lockfile resolved fast-uri ${version}, vulnerable per ${FAST_URI_ADVISORY}`,
+        `lockfile resolved fast-uri ${version}, vulnerable per ${fastUriAdvisoriesFor(version).join(", ")}`,
       );
     }
 
@@ -90,7 +105,7 @@ async function main() {
     for (const [path, fastUri] of designerResolutions) {
       assert.ok(
         !isVulnerableFastUri(fastUri.version),
-        `designer lockfile ${path} resolved fast-uri ${fastUri.version}, vulnerable per ${FAST_URI_ADVISORY}`,
+        `designer lockfile ${path} resolved fast-uri ${fastUri.version}, vulnerable per ${fastUriAdvisoriesFor(fastUri.version).join(", ")}`,
       );
     }
     assertIncludes(lockfile, "undici@6.27.0:", "lockfile");
