@@ -736,6 +736,13 @@ describe.sequential("issue goal context routes", () => {
         // Structure and names survive so the config stays legible; values do not.
         expect(runtime.services[0].name).toBe("api");
         expect(Object.keys(runtime.services[0])).toEqual(["name", "command", "GRAFANA_API_TOKEN"]);
+        // PEN-3130. `command` is pinned by VALUE, not merely by its presence in the key
+        // set above. A projection edit that re-attached the operator-authored command
+        // line after masking — "keep the command legible in the UI" — leaves that key set
+        // byte-identical, keeps the token redacted, and keeps the `not.toContain` guard
+        // green (this fixture's secret lives in the token, not the command). Without this
+        // line nothing at this boundary would see it.
+        expect(runtime.services[0].command).toBe("***REDACTED***");
         expect(runtime.services[0].GRAFANA_API_TOKEN).toBe("***REDACTED***");
       });
     }
@@ -800,6 +807,10 @@ describe.sequential("issue goal context routes", () => {
         // Names and structure survive so the config stays legible; values do not.
         expect(Object.keys(runtime.services[0])).toEqual(["name", "command", "DEPLOY_TOKEN"]);
         expect(runtime.services[0].name).toBe("web");
+        // PEN-3130, same reasoning as the execution-workspace door above: pinned by
+        // value so a command-only pass-through at this projection cannot hide behind
+        // an unchanged key set and a still-redacted token.
+        expect(runtime.services[0].command).toBe("***REDACTED***");
         expect(runtime.services[0].DEPLOY_TOKEN).toBe("***REDACTED***");
         // `desiredState` is enum-validated by the reader, so it must NOT be
         // masked — this pins the fix to the open field instead of the whole object.
