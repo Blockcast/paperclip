@@ -43,6 +43,21 @@ describe("extractAllyReviewedHeadSha", () => {
     expect(extractAllyReviewedHeadSha(body(`_Reviewed head:_ \`${SHA}\``))).toBe(SHA);
   });
 
+  // REGRESSION (CTO review of 539864f). Matching emphasis and whitespace as one
+  // bounded run is what admits the case above, but a bound of six also *removes*
+  // three forms the pre-widening pattern accepted, because ordinary space runs
+  // are no longer matched by an unbounded `[ \t]*`. That is a narrowing wearing a
+  // widening's clothes, and here it fails open — an attestation that stops
+  // parsing makes a real review invisible, which is the BLO-31730 bug class. The
+  // fix keeps the bounded wrapper and restores the unbounded whitespace runs on
+  // either side of it; these three cases are what hold that fix in place, so do
+  // not fold them into the case above.
+  it("accepts whitespace runs longer than the wrapper bound", () => {
+    expect(extractAllyReviewedHeadSha(body(`Reviewed head:${" ".repeat(7)}${SHA}`))).toBe(SHA);
+    expect(extractAllyReviewedHeadSha(body(`Reviewed head:${" ".repeat(30)}${SHA}`))).toBe(SHA);
+    expect(extractAllyReviewedHeadSha(body(`Reviewed head: ${SHA}${" ".repeat(9)}`))).toBe(SHA);
+  });
+
   it("lowercases", () => {
     expect(extractAllyReviewedHeadSha(body(`Reviewed head: ${SHA.toUpperCase()}`))).toBe(SHA);
   });

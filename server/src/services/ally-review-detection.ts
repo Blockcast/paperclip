@@ -150,9 +150,21 @@ const ATTESTATION_WRAPPER_RUN = "[*_`\\t ]{0,6}";
 
 // Indentation is bounded to agree with the heading pattern above — see
 // NOT_INDENTED_CODE.
+//
+// The unbounded `[ \t]*` on either side of the bounded wrapper run is
+// load-bearing, not redundant with it. Bounding the wrapper is what lets
+// emphasis and whitespace interleave; leaving the plain-whitespace runs
+// unbounded is what stops that bound from truncating a long run of ordinary
+// spaces. Without them, seven or more spaces after the colon — or nine after
+// the SHA — overflow `{0,6}` and the attestation stops parsing, which this
+// module's header explains is a fail-OPEN: an unattested review is never
+// recognised, so the gate reaches not_evaluated rather than blocking. That is
+// the BLO-31730 bug class the widening exists to close, so a widening must not
+// reintroduce it one delimiter out. Regression cases for all three forms are
+// pinned in ally-review-detection.test.ts.
 const REVIEWED_HEAD_ATTESTATION_PATTERN = new RegExp(
-  `(?:^|\\n)${NOT_INDENTED_CODE} {0,3}${MARKDOWN_EMPHASIS_RUN}[ \\t]{0,3}reviewed head:` +
-    `${ATTESTATION_WRAPPER_RUN}([0-9a-f]{40})${ATTESTATION_WRAPPER_RUN}(?=\\n|$)`,
+  `(?:^|\\n)${NOT_INDENTED_CODE} {0,3}${MARKDOWN_EMPHASIS_RUN}[ \\t]{0,3}reviewed head:[ \\t]*` +
+    `${ATTESTATION_WRAPPER_RUN}([0-9a-f]{40})${ATTESTATION_WRAPPER_RUN}[ \\t]*(?=\\n|$)`,
   "gi",
 );
 
