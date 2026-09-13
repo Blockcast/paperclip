@@ -1549,7 +1549,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
     expect(action?.ownerAgentId).toBe(action?.returnOwnerAgentId);
     expect(action?.ownerAgentId).not.toBe(managerId);
-    expect(action?.evidence).toMatchObject({ infraClassCause: true });
+    // BLO-33655: `claude_truncated` is in NEITHER error-code set, so the message arm is
+    // the only thing that can carry this row. Asserting the arm (not just the union)
+    // keeps BLO-33223's narrowing -- anchored on the kill, not on the `reason=` enum --
+    // auditable from evidence alone.
+    expect(action?.evidence).toMatchObject({
+      infraClassCause: true,
+      infraClassCauseByMessage: true,
+    });
   });
 
   it("still escalates a claude_truncated failure without pod-removal evidence to the manager", async () => {
@@ -1589,7 +1596,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       ownerAgentId: managerId,
       returnOwnerAgentId: coderId,
     });
-    expect(action?.evidence).toMatchObject({ infraClassCause: false });
+    // BLO-33655 negative control: a genuine agent-side fault matches NEITHER arm --
+    // `claude_truncated` is absent from `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES`, and
+    // `exit code 1, reason=Error` is not a kill. If widening the recorded field into the
+    // union had made it vacuously true, this is the assertion that fails.
+    expect(action?.evidence).toMatchObject({
+      infraClassCause: false,
+      infraClassCauseByMessage: false,
+    });
 
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
     expect(updatedIssue).toMatchObject({
@@ -1597,6 +1611,76 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       assigneeAgentId: managerId,
     });
     expect(enqueueWakeup).toHaveBeenCalledWith(managerId, expect.anything());
+  });
+
+  // BLO-33655: the OTHER arm of the routing union. `k8s_pod_schedule_failed` is
+  // infra-class by error code ALONE -- it is in `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES`,
+  // and `isInfraClassStrandedFailure` never matches it (that predicate only fires on
+  // `k8s_job_deleted_externally`, a git transport fault, or `claude_truncated` carrying
+  // pod-lifecycle wording). So this run routes to the lane on the error-code arm while
+  // matching no message marker at all.
+  //
+  // Until 2026-09-13 the evidence recorded only the message arm, so this exact row --
+  // correctly returned to its assignee -- stamped `infraClassCause: false`. Two senior
+  // lanes read that column on live queues, correctly inferred the classifier was not
+  // discriminating, and escalated it; the remediation both proposed (widen the message
+  // predicate over the whole error-code set) would have been a routing no-op that
+  // re-added the false-collision surface BLO-20933 and BLO-33223 each narrowed away.
+  //
+  // Mutation check: `infraClassCause` is asserted `true` here and this fails against the
+  // pre-fix code, so the fixture is known to exercise the defect rather than pass
+  // vacuously. The error text is deliberately marker-free -- if it accidentally carried
+  // pod-removal wording the message arm would carry the assertion and the error-code arm
+  // would go untested. `infraClassCauseByMessage: false` pins that.
+  it("records the error-code arm of the infra-class union in evidence (BLO-33655)", async () => {
+    const { managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Pod startup failed: Timed out waiting for pod containers to start (600s): " +
+        "phase=Pending, init/write-prompt: waiting (PodInitializing), claude: waiting " +
+        "(PodInitializing)",
+      errorCode: "k8s_pod_schedule_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    // The routing half, asserted first so the evidence assertion below is known to be
+    // describing a row that really was returned to its lane.
+    expect(action).toMatchObject({
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      ownerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+    });
+    expect(action?.ownerAgentId).toBe(action?.returnOwnerAgentId);
+    expect(action?.ownerAgentId).not.toBe(managerId);
+    // The labelling half: the field an operator reads now agrees with that routing, and
+    // the narrow message arm is still separately readable.
+    expect(action?.evidence).toMatchObject({
+      infraClassCause: true,
+      infraClassCauseByMessage: false,
+      latestRunErrorCode: "k8s_pod_schedule_failed",
+    });
   });
 
   it("keeps the original return owner after a temporary invocability fallback", async () => {
