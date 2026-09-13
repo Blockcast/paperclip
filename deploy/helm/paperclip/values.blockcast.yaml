@@ -306,10 +306,95 @@ env:
 # Worker tier also runs plugin workers and scheduled plugin jobs. Linear's
 # periodic sync can transiently burn CPU over large BLO backlogs; keep enough
 # headroom for Alertmanager webhooks and health probes to complete.
+#
+# NOTE: this ONE block renders into BOTH tiers — templates/statefulset.yaml
+# (paperclip-0, the singleton worker) and templates/deployment-api.yaml
+# (paperclip-api, 2 replicas) both do `toYaml .Values.resources`. There is no
+# `api.resources`. So any change here multiplies by 3 pods, not 1.
 resources:
   requests:
     cpu: 1500m
-    memory: 2Gi
+    # 7Gi (was 2Gi) — PEN-2957 / PEN-2943.
+    #
+    # WHY: at 2Gi the worker was requesting far below what it actually uses, so
+    # it sorted to the front of the kubelet's eviction queue. Burstable pods are
+    # ranked for eviction by usage-above-request, and paperclip-0 is the
+    # heartbeat scheduler + plugin-worker host for every claude_local agent —
+    # i.e. the most load-bearing pod in the namespace was also the first one
+    # the kubelet would kill under node pressure. This is a RELIABILITY change
+    # and reclaims nothing; it does not reduce anyone's capacity.
+    #
+    # WHY 7Gi AND NOT 5Gi (which is what PEN-2943 proposed): 5Gi is below both
+    # the measured peak and the configured design envelope, so it would have
+    # left the same failure mode in place under exactly the load that triggers
+    # it. Measured 2026-09-04 over 14d, max_over_time on
+    # container_memory_working_set_bytes — the signal the kubelet actually
+    # ranks eviction on:
+    #   paperclip-0 (worker)  peak 5.86 GiB   (instantaneous at read: 2.97 GiB)
+    #   paperclip-api         peak 4.70 GiB across replicas (live ~0.85 GiB)
+    # Do NOT re-derive these from container_memory_usage_bytes: it peaks at
+    # 6.19 GiB on the same selector because it counts reclaimable page cache,
+    # and it is not the eviction signal. An earlier revision of this comment
+    # quoted 6.24 GiB from that metric while naming working_set, so the figure
+    # did not reproduce from the query as written (caught in review, PR #1643).
+    # Switching to working_set makes the argument stronger, not weaker — 5.86
+    # GiB still exceeds the 5Gi PEN-2943 proposed, so that remains insufficient.
+    # NODE_OPTIONS above also pins --max-old-space-size=6144, a 6 GiB V8 old-space
+    # ceiling, so ~6 GiB of heap is by design and not an anomaly to be squeezed.
+    # 7Gi sits above the worker's 14d peak, above the V8 ceiling, and above the
+    # API tier's peak, while staying 3Gi under the 10Gi limit for off-heap burst.
+    # It matches the 7Gi chosen for paperclip-pg on PEN-2956 for the same reason.
+    #
+    # COST: +5Gi on each of 3 pods = +15 GiB of cluster memory *reservation*
+    # (not usage). Exactly two templates render `.Values.resources` —
+    # templates/statefulset.yaml (paperclip-0) and templates/deployment-api.yaml
+    # (2 replicas) — and there is no `api.resources` override, which is why this
+    # one value moves 3 pods rather than 1. (`paperclip-api-deploy-drift` matches
+    # the same name prefix but is an unrelated BLO-22032 monitoring exporter with
+    # its own 32Mi request, not part of this chart.)
+    #
+    # AFFORDABILITY — this is a threshold test, not a number to memorise.
+    # Do not trust any headroom figure written in this comment, including the
+    # ones below. Both the pool floor's VALUE and WHICH NODE holds it move
+    # within the hour: on 2026-09-04 alone the phase-filtered floor read
+    # ~15.5 GiB (k8s-paperclip-3), then ~23.5 GiB, then 25.6 GiB — by which
+    # point the floor node was k8s-paperclip-8 and k8s-paperclip-3 had risen to
+    # 37.5 GiB. Two successive revisions of this comment pinned a figure and
+    # then a band, and BOTH fell outside their own stated range within hours.
+    #
+    # The durable part is the decision rule. What binds is not the +5Gi delta
+    # but a FULL 7Gi request fitting on whatever node the pod lands on — the
+    # scheduler re-evaluates the entire request on every reschedule, not the
+    # increment. So the test is:
+    #
+    #   smallest phase-filtered headroom in the workload=paperclip pool  >=  7Gi
+    #
+    # Every floor observed on 2026-09-04 (15.5 / 23.5 / 25.6 GiB) clears that by
+    # more than 2x, which is why this change is free today. If a future
+    # re-derivation returns a floor below ~14 GiB the margin is gone and this
+    # needs re-deciding; below 7 GiB the pod cannot be placed there at all.
+    # That threshold is a property of THIS change and does not decay with the
+    # cluster. Re-derive the floor with:
+    #   sum by (node) (kube_node_status_allocatable{resource="memory"})
+    #   - sum by (node) (
+    #       kube_pod_container_resource_requests{resource="memory"}
+    #       * on (namespace,pod) group_left()
+    #       (max by (namespace,pod) (kube_pod_status_phase{phase=~"Running|Pending"} == 1))
+    #     )
+    # The phase join is mandatory, not tidiness. Unfiltered, the query also
+    # counts the requests of pods that have already finished (Succeeded AND
+    # Failed), which on k8s-paperclip-6 reads ~44 GiB too pessimistic. Keep the
+    # DELTA, not the endpoints: measured hours apart the two endpoints moved
+    # from -21.5/+22.6 GiB to +2.5/+46.6 GiB, while the gap between them held at
+    # 44.09 GiB both times — because it is a phantom, it is stable even as real
+    # headroom swings. Of that 44.09 GiB, 40.09 GiB is Succeeded pods (239 in
+    # the namespace) and exactly 4.00 GiB is Failed. This is the same retention
+    # that PEN-2957 item B caps: reaper history is what inflates the phantom.
+    #
+    # The API tier is over-provisioned by this at its ~0.85 GiB steady state.
+    # That is the accepted cost of a shared block; splitting `api.resources` out
+    # of the chart is the cleaner fix and is deliberately not bundled here.
+    memory: 7Gi
   limits:
     cpu: "4"
     # 10Gi steady-state limit: off-heap bursts measured up to ~5Gi (and a 6Gi
