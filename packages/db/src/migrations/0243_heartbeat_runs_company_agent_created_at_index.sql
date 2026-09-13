@@ -24,6 +24,7 @@ BEGIN
           ORDER BY key_position
         ) = ARRAY['company_id', 'agent_id', 'created_at', 'id']
         AND index_metadata.indoption = '0 0 3 3'::int2vector
+        AND pg_get_expr(index_metadata.indpred, index_metadata.indrelid, TRUE) IS NULL
     )
   THEN
     RAISE EXCEPTION USING
