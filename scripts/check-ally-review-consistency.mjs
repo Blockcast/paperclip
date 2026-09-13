@@ -158,7 +158,7 @@ function reviewDetails(reviews) {
   return reviews.map((review) => `${reviewState(review)}/${review.id}`).join(", ");
 }
 
-function canonicalReviewHead(body) {
+export function canonicalReviewHead(body) {
   const text = String(body ?? "");
   const headings = Array.from(text.matchAll(CANONICAL_REVIEW_HEADING_RE));
   const attestations = Array.from(text.matchAll(ATTESTED_HEAD_GLOBAL_RE));
