@@ -394,10 +394,15 @@ test("annotations are read past the first page, at the same size the jobs call u
   };
 
   try {
-    const annotations = await fetchAnnotations(4242, "token", "Blockcast/paperclip");
+    const { annotations, truncated } = await fetchAnnotations(4242, "token", "Blockcast/paperclip");
 
     assert.equal(annotations.length, 101, "both pages are concatenated");
     assert.equal(requested.length, 2, "paging stops on the first short page");
+    // BLO-32753 case (b), and the one that matters: an ordinary complete read
+    // must NOT start claiming degradation. Reporting a truncation that did not
+    // happen would be a worse defect than the silent one being fixed, because
+    // every red run would carry a warning nobody can act on.
+    assert.equal(truncated, false, "a short page is a COMPLETE read");
     for (const url of requested) {
       assert.match(url, /[?&]per_page=100(&|$)/, "must not fall back to the 30-item default");
     }
@@ -405,14 +410,23 @@ test("annotations are read past the first page, at the same size the jobs call u
     assert.deepEqual(classifyStepKills({ annotations, steps: [] }).kills, [
       { name: "Late step", budgetMinutes: 3, elapsedSeconds: null },
     ]);
+    assert.deepEqual(
+      renderAnnotations({ kills: [], degraded: truncated ? "truncated" : null }),
+      [],
+      "a complete read emits no degradation warning",
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test("annotation paging is bounded rather than trusting the server to terminate", async () => {
-  // A pathological response that never returns a short page must not spin here
-  // forever — the same reasoning as MAX_JOB_PAGES on the jobs loop.
+test("annotation paging reports the cap exit as a truncated read, not a clean one", async () => {
+  // BLO-32753 case (a). A pathological response that never returns a short page
+  // must not spin here forever — the same reasoning as MAX_JOB_PAGES on the
+  // jobs loop — but stopping at the cap is NOT evidence the server had nothing
+  // more. Before this, the cap and a short page left through the same path, so
+  // a truncated read reported `degraded: null`: byte-identical to a complete
+  // one, on precisely the run whose kill line fell past the cap.
   let calls = 0;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => {
@@ -426,9 +440,21 @@ test("annotation paging is bounded rather than trusting the server to terminate"
   };
 
   try {
-    const annotations = await fetchAnnotations(1, "token", "Blockcast/paperclip");
+    const { annotations, truncated } = await fetchAnnotations(1, "token", "Blockcast/paperclip");
     assert.ok(calls <= 5, `paging must be bounded, made ${calls} requests`);
     assert.equal(annotations.length, calls * 100);
+    assert.equal(truncated, true, "exiting on the cap is a TRUNCATED read");
+
+    // The invariant the script states about itself: a degradation is never
+    // silent. `truncated` has to reach the reader as a ::warning::, the same
+    // wording every other degradation path in the file uses.
+    const lines = renderAnnotations({
+      kills: [],
+      degraded: truncated ? "annotations for job 1 were truncated at the 5-page cap" : null,
+    });
+    assert.equal(lines.length, 1, "a truncated read speaks");
+    assert.match(lines[0], /^::warning title=Step-kill classifier degraded::/);
+    assert.match(lines[0], /truncated/);
   } finally {
     globalThis.fetch = originalFetch;
   }

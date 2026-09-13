@@ -221,9 +221,35 @@ async function githubJson(pathname, token, repository) {
   return response.json();
 }
 
-// Bounded for the same reason the jobs loop is: a pathological response must
-// not spin here forever.
+// Both paging loops are bounded for the same reason: a pathological response
+// must not spin here forever.
+const PAGE_SIZE = 100;
 const MAX_ANNOTATION_PAGES = 5;
+const MAX_JOB_PAGES = 20;
+
+/**
+ * Page a GitHub list endpoint, reporting WHICH of the two exits it took.
+ *
+ * BLO-32753: the cap and a short page used to leave through the same path, so a
+ * truncated read was byte-identical to a complete one — `degraded: null`, no
+ * warning, a missed kill reported with the ordinary wording. That is the exact
+ * silence this script exists to break, and both loops in this file had it.
+ * `truncated` is the whole point of this helper: a short page is evidence the
+ * server had nothing more, the cap is only evidence that we stopped asking.
+ *
+ * @param {(page: number) => string} pathFor
+ * @param {(payload: unknown) => Array<unknown>} select
+ * @returns {Promise<{items: Array<unknown>, truncated: boolean}>}
+ */
+async function fetchPaged(pathFor, select, maxPages, token, repository) {
+  const items = [];
+  for (let page = 1; page <= maxPages; page += 1) {
+    const batch = select(await githubJson(pathFor(page), token, repository));
+    items.push(...batch);
+    if (batch.length < PAGE_SIZE) return { items, truncated: false };
+  }
+  return { items, truncated: true };
+}
 
 /**
  * Read every annotation on a check run, not just the first page.
@@ -235,20 +261,22 @@ const MAX_ANNOTATION_PAGES = 5;
  * AND trip the propagation retry below, whose `some(level === "failure")` test
  * would be evaluated over a truncated page: four wasted seconds and a warning
  * claiming no failure annotation exists, on precisely the run where it did.
+ *
+ * Returns `{annotations, truncated}` rather than a bare array so the caller can
+ * tell a complete read from one that stopped at MAX_ANNOTATION_PAGES. The
+ * annotations read BEFORE the cap are still returned and still classified — a
+ * truncated read is partial evidence, not no evidence, and dropping a kill line
+ * we already hold would reintroduce the silence rather than report it.
  */
 export async function fetchAnnotations(jobId, token, repository) {
-  const all = [];
-  for (let page = 1; page <= MAX_ANNOTATION_PAGES; page += 1) {
-    const payload = await githubJson(
-      `/check-runs/${jobId}/annotations?per_page=100&page=${page}`,
-      token,
-      repository,
-    );
-    const batch = Array.isArray(payload) ? payload : [];
-    all.push(...batch);
-    if (batch.length < 100) break;
-  }
-  return all;
+  const { items, truncated } = await fetchPaged(
+    (page) => `/check-runs/${jobId}/annotations?per_page=${PAGE_SIZE}&page=${page}`,
+    (payload) => (Array.isArray(payload) ? payload : []),
+    MAX_ANNOTATION_PAGES,
+    token,
+    repository,
+  );
+  return { annotations: items, truncated };
 }
 
 /**
@@ -278,25 +306,26 @@ async function main() {
     );
   }
 
-  // Structurally bounded, same reasoning as classify-lane-failures: a
-  // pathological response must not spin here forever.
-  const MAX_JOB_PAGES = 20;
-  const jobs = [];
-  for (let page = 1; page <= MAX_JOB_PAGES; page += 1) {
-    const payload = await githubJson(
-      `/actions/runs/${runId}/jobs?per_page=100&page=${page}&filter=latest`,
-      token,
-      repository,
-    );
-    jobs.push(...(payload.jobs ?? []));
-    if ((payload.jobs ?? []).length < 100) break;
-  }
+  const { items: jobs, truncated: jobsTruncated } = await fetchPaged(
+    (page) => `/actions/runs/${runId}/jobs?per_page=${PAGE_SIZE}&page=${page}&filter=latest`,
+    (payload) => payload?.jobs ?? [],
+    MAX_JOB_PAGES,
+    token,
+    repository,
+  );
 
   const job = selectCurrentJob(jobs, jobName);
   if (!job) {
+    // Truncation only matters on THIS branch. If the job was found, pages we
+    // never read cannot contain a better match. If it was not, "no job named X"
+    // is a negative-existence claim drawn from an admittedly partial read, and
+    // saying it outright would be wrong in the one direction that misleads.
     for (const line of renderAnnotations({
       kills: [],
-      degraded: `no job named '${jobName}' in run ${runId}`,
+      degraded: jobsTruncated
+        ? `job list for run ${runId} was truncated at the ${MAX_JOB_PAGES}-page cap ` +
+          `(${MAX_JOB_PAGES * PAGE_SIZE} jobs read), so '${jobName}' may sit past it`
+        : `no job named '${jobName}' in run ${runId}`,
     })) {
       process.stdout.write(`${line}\n`);
     }
@@ -327,8 +356,16 @@ async function main() {
       // `checks: read`, a DIFFERENT scope from the `actions: read` the jobs
       // call above needs, so this can 403 on its own while the jobs call
       // succeeds.
-      annotations = await fetchAnnotations(job.id, token, repository);
-      degraded = null;
+      const page = await fetchAnnotations(job.id, token, repository);
+      annotations = page.annotations;
+      // A truncated read is reported even though it succeeded: the kill line
+      // may sit on a page we never asked for, so "no kill found" here is not
+      // evidence of absence. Overwritten by a later clean attempt, same as any
+      // other degradation, because `degraded` is recomputed every attempt.
+      degraded = page.truncated
+        ? `annotations for job ${job.id} were truncated at the ${MAX_ANNOTATION_PAGES}-page cap ` +
+          `(${MAX_ANNOTATION_PAGES * PAGE_SIZE} read), so a timeout line past that point was not seen`
+        : null;
     } catch (error) {
       annotations = null;
       degraded = `annotations unavailable for job ${job.id}: ${error.message}`;
