@@ -22,6 +22,25 @@ export interface PullRequestWorkProductInput {
   prUpdatedAt?: string | null;
   /** GitHub `action` from the pull_request event. */
   action: string;
+  /**
+   * Identifiers this PR *owns*, as resolved by the ranked tiers in
+   * `resolveOwningPaperclipIdentifiers` — NOT every identifier it mentions
+   * (BLO-20886).
+   *
+   * A PR work product is written for every issue the PR references anywhere,
+   * deliberately: the row is evidence about the PR, not a wake. That makes the
+   * row's mere existence useless for deciding whether the PR represents
+   * progress on the issue holding it, because a long-lived registry issue
+   * accumulates every PR that name-drops it. Recording the owning set here lets
+   * a consumer ask "does this PR belong to the row I am reviewing?" without
+   * re-deriving ownership from fields the row does not carry (the PR body is
+   * never persisted).
+   *
+   * `undefined`/`null` means "not recorded" — for rows written before this
+   * field existed — and must not be read as "owns nothing". An empty array IS
+   * authoritative: the PR named no owner in its title, branch, or labeled body.
+   */
+  owningIdentifiers?: readonly string[] | null;
 }
 
 export interface PullRequestWorkProductFields {
@@ -156,6 +175,12 @@ export function buildPullRequestWorkProductFields(
       merged: input.prMerged === true,
       mergedAt: input.prMergedAt ?? null,
       lastEventAction: input.action,
+      // Null (not `[]`) when the caller did not resolve ownership, so a
+      // consumer can tell "not recorded" from "owns nothing" — see the field
+      // docblock on PullRequestWorkProductInput.
+      owningIdentifiers: Array.isArray(input.owningIdentifiers)
+        ? [...input.owningIdentifiers]
+        : null,
     },
     sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
   };
