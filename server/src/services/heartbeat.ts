@@ -1684,6 +1684,22 @@ export function selectAgedPrReviewRunForFairDispatch(
 export function resolveAutomaticRunRetryOpts(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "contextSnapshot">,
 ) {
+  // TODO(PEN-3097): `errorCode === "timeout"` is the GENERIC code the finalizer
+  // sets for every adapter's `timed_out` outcome, and this branch sits ahead of
+  // the more specific ones below -- so any future adapter that times out
+  // inherits the 1-attempt cap without opting into it. That is latent today
+  // (only claude-local tags a timeout, via `resultJson.errorFamily`).
+  //
+  // Deliberately NOT narrowed to claude-local's `resultJson.timedOutBeforeOutput`
+  // evidence (PEN-3093, carried-over suggestion 2). It is feasible -- `resultJson`
+  // is a run column -- but it would make this generic resolver reach into one
+  // adapter's private result payload, and it would drop the cap for a
+  // claude-local timeout that DID produce output, changing live retry behaviour.
+  // The right fix is a more specific `errorCode` from the finalizer (e.g.
+  // `timeout_before_output`) so the policy stays keyed on the run's own
+  // vocabulary; that is a separate change with its own review, tracked in
+  // PEN-3097. Anything that starts tagging a NON-claude-local timeout should
+  // land that first -- otherwise it silently inherits this cap.
   if (run.errorCode === "timeout") {
     return { maxAttempts: 1 };
   }
