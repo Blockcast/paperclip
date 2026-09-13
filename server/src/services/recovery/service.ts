@@ -772,7 +772,7 @@ type LatestIssueRun = Pick<
   // after a refused document write. A hand-enumerated projection that omits this
   // disables that escalation in production while every unit test still passes,
   // because the tests construct the row literal rather than selecting it — which
-  // is why all three producers below now share `LATEST_ISSUE_RUN_COLUMNS`.
+  // is why all four producers below now share `LATEST_ISSUE_RUN_COLUMNS`.
   | "statusOnlyDocumentWriteRefusedAt"
   | "createdAt"
   | "finishedAt"
@@ -959,6 +959,29 @@ function resolveStrandedRecoveryCause(
     return "codex_output_inactivity_monitor";
   }
   return "stranded_assigned_issue";
+}
+
+/**
+ * Whether `enqueueSourceScopedStrandedRecoveryWake` will actually dispatch, given the
+ * recovery action and the resolved cause. Both of its arms used to live only inside that
+ * function as early returns.
+ *
+ * BLO-32566 (review): the escalation activity row now records the work class the stranded
+ * wake was dispatched at, so a refused document write is discoverable outside the blocked
+ * issue's own documents. That row is written inside the escalation transaction, which
+ * commits *before* the wake is enqueued — so the two sites have to agree on whether a wake
+ * happens at all, or the row claims a work class for a wake that was never sent. Stated
+ * once here instead of copied into the details block.
+ *
+ * `provider_quota` needs no arm of its own: its original guard was
+ * `provider_quota && !ownerAgentId`, which the owner check already subsumes.
+ */
+function strandedRecoveryWakeWillDispatch(
+  action: { ownerAgentId: string | null },
+  recoveryCause: StrandedRecoveryCause,
+): boolean {
+  if (!action.ownerAgentId) return false;
+  return recoveryCause !== "workspace_validation_failed" && recoveryCause !== "configuration_incomplete";
 }
 
 function readWorkspaceValidationPayload(latestRun: LatestIssueRun): Record<string, unknown> | null {
@@ -2223,11 +2246,13 @@ export function recoveryService(
   // Column set behind `LatestIssueRun`. Shared by every helper that produces
   // run evidence for the recovery classifiers so the shapes cannot drift apart.
   //
-  // BLO-32566: that claim was aspirational until now — two of the three
+  // BLO-32566: that claim was aspirational until now — two of the four
   // producers (`getLatestIssueRunForAgentStage`, `getLatestIssueRunSince`) had
   // hand-copied this list instead of referencing it, so adding a column here
   // left them silently short of the declared type. They now select this const,
-  // which is what makes the sentence above true.
+  // which is what makes the sentence above true. The four are `getLatestIssueRun`,
+  // `getCheckoutAdoptingRun`, `getLatestIssueRunForAgentStage`, and
+  // `getLatestIssueRunSince`.
   const LATEST_ISSUE_RUN_COLUMNS = {
     id: heartbeatRuns.id,
     agentId: heartbeatRuns.agentId,
@@ -5712,13 +5737,21 @@ export function recoveryService(
     action: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
+    // BLO-32566 (review): the id of the newest run on this issue when it carries
+    // `statusOnlyDocumentWriteRefusedAt`, else null. Threaded in rather than read
+    // off `input.latestRun` — see the gate below for why that read was unsound —
+    // and resolved by the caller so the escalation activity row, written inside
+    // the escalation transaction that precedes this call, can record the same fact.
+    documentWriteRefusedRunId: string | null;
     recoveryCause: StrandedRecoveryCause;
     hasNewActivitySinceLastAttempt: boolean;
     expectedLockOwnerState?: IssueLockOwnerState | null;
   }) {
-    if (input.recoveryCause === "provider_quota" && !input.action.ownerAgentId) return;
-    if (input.recoveryCause === "workspace_validation_failed" || input.recoveryCause === "configuration_incomplete") return;
+    // The owner arm is repeated from `strandedRecoveryWakeWillDispatch` so the
+    // narrowing reaches `reservedOwnerAgentId` below; the predicate itself is the
+    // shared statement of the rule.
     if (!input.action.ownerAgentId) return;
+    if (!strandedRecoveryWakeWillDispatch(input.action, input.recoveryCause)) return;
     // BLO-18996 (review follow-up): the attempt this wake spends was already committed.
     // `recoveryActionsSvc` runs on the outer `db`, not on `escalateStrandedAssignedIssue`'s
     // transaction, so `upsertSourceScoped`'s `attemptCount` increment is durable before we
@@ -5887,10 +5920,25 @@ export function recoveryService(
     //
     // `Boolean(...)` guards an absent column, not `undefined`: the row type is
     // `Date | null`, so the only way this reads falsy-by-accident is a
-    // projection that omits the field. All three `LatestIssueRun` producers now
+    // projection that omits the field. All four `LatestIssueRun` producers now
     // share `LATEST_ISSUE_RUN_COLUMNS` for that reason — before that, two had
     // hand-copied the column list and would have silently disabled this.
-    const documentWriteWasRefused = Boolean(input.latestRun?.statusOnlyDocumentWriteRefusedAt);
+    //
+    // BLO-32566 (review): this deliberately does NOT read `input.latestRun`. That
+    // parameter is the *sweep's classification run*, not the issue's newest run,
+    // and callers narrow or null it for reasons unrelated to the refusal stamp:
+    // the terminal-dispatch-race and adoption-handover paths pass `null`
+    // outright, and two `in_review` sub-lanes substitute
+    // `getLatestIssueRunForAgentStage` (participant + stage) or
+    // `getLatestIssueRunSince` (filtered on `contextSnapshot ->> 'interactionId'`).
+    // A `source_scoped_recovery_action` wake's own context snapshot — built a few
+    // lines below — carries no `interactionId` and no stage, so the run that gets
+    // *stamped* can never match either scoped producer: on those lanes the gate
+    // would have been false by construction and the trap would have stayed open
+    // for exactly the statuses this fix is documented to cover. The caller
+    // therefore resolves it from a direct newest-run read for this issue, the
+    // same thing the backstop site does inline.
+    const documentWriteWasRefused = input.documentWriteRefusedRunId !== null;
     if (!input.hasNewActivitySinceLastAttempt && ownerIsNonAssignee && input.action.attemptCount > 1) {
       const assigneeAgentId = input.issue.assigneeAgentId;
       if (!assigneeAgentId) {
@@ -7017,6 +7065,18 @@ export function recoveryService(
       });
     }
 
+    // BLO-32566 (review): the stranded wake's escalation gate, resolved from a direct
+    // newest-run read for this issue rather than from `input.latestRun`. `input.latestRun`
+    // is the sweep's classification run — nulled on two paths and replaced with a
+    // stage-scoped or interaction-scoped run on two others — so a gate reading it is
+    // structurally false on exactly the lanes the refusal stamp lands in. Read once here,
+    // before the transaction, because both consumers need it: the escalation activity row
+    // written inside the transaction, and the wake dispatched after it commits.
+    const newestIssueRun = await getLatestIssueRun(input.issue.companyId, input.issue.id);
+    const documentWriteRefusedRunId = newestIssueRun?.statusOnlyDocumentWriteRefusedAt
+      ? newestIssueRun.id
+      : null;
+
     // Serialize escalation per (company, source-issue) so concurrent
     // reconcile sweeps don't fight over the same recovery-action upsert,
     // wakeup, and source-issue UPDATE.
@@ -7515,6 +7575,21 @@ export function recoveryService(
           previousOwnerAgentId: action.previousOwnerAgentId,
           returnOwnerAgentId: action.returnOwnerAgentId,
           blockerIssueIds: blockerIds,
+          // BLO-32566 AC: the refusal must be discoverable without reading the blocked
+          // issue's own documents — the surface the first two occurrences were reported
+          // on and lost. The wake backstop records the same three fields, but it only
+          // covers `blocked` issues; this lane covers todo/in_progress/in_review, which
+          // is where every reported occurrence happened. Recording it on only one lane
+          // left "which issues escalated off status-only, and when" unanswerable for the
+          // majority of them.
+          //
+          // `null` work class means no stranded wake is dispatched for this escalation at
+          // all — distinct from one dispatched status-only.
+          recoveryWorkClass: strandedRecoveryWakeWillDispatch(action, recoveryCause)
+            ? (documentWriteRefusedRunId ? "planning_only" : "status_only")
+            : null,
+          escalatedAfterDocumentWriteRefusal: documentWriteRefusedRunId !== null,
+          documentWriteRefusedRunId,
         },
       }, {
         // The activity row is transactional; publish only after its commit.
@@ -7563,6 +7638,7 @@ export function recoveryService(
       action: escalation.action,
       issue: escalation.fresh,
       latestRun: input.latestRun,
+      documentWriteRefusedRunId,
       recoveryCause: escalation.recoveryCause,
       hasNewActivitySinceLastAttempt: escalation.hasNewActivitySinceLastAttempt,
       expectedLockOwnerState: {

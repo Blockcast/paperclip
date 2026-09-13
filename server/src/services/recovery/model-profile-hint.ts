@@ -124,11 +124,26 @@ export function recoveryAssigneeAdapterOverrides(_workClass: Extract<RecoveryMod
  * with `allowDocumentUpdates: true`, while deliverable and annotation writes stay
  * barred. It is the same escalation BLO-23197 chose for the successful-run-handoff
  * lane, which deliberately scoped this lane out as follow-up.
+ *
+ * Residual, tracked as BLO-32634: the four guard keys above are set explicitly on
+ * the `planning_only` arm and survive a coalesced merge intact, but `modelProfile`
+ * is scrub-only. So an escalated wake that coalesces with an already-queued
+ * status-only wake can carry `allowDocumentUpdates: true` while retaining
+ * `modelProfile: "cheap"` — the document write still succeeds, so the trap stays
+ * closed, but the run may execute on the cheap profile.
+ *
+ * The return type is annotated rather than inferred so the union is intentional:
+ * `modelProfile` exists on the status-only arm only, which makes reading it off the
+ * result a compile error instead of a silently-optional field.
  */
 export function withStrandedRecoveryWakeWorkClass<T extends Record<string, unknown>>(
   input: T,
   escalateAfterRefusedDocumentWrite: boolean,
-) {
+):
+  | (WithoutRecoveryModelProfileHints<T> & typeof PLANNING_ONLY_RECOVERY_GUARD_CONTEXT)
+  | (WithoutRecoveryModelProfileHints<T> & typeof STATUS_ONLY_RECOVERY_GUARD_CONTEXT & {
+    modelProfile: typeof RECOVERY_MODEL_PROFILE_KEY;
+  }) {
   return escalateAfterRefusedDocumentWrite
     ? withRecoveryModelProfileHint(input, "planning_only")
     : withRecoveryModelProfileHint(input, "status_only");
