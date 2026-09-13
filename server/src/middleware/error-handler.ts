@@ -2,6 +2,7 @@ import type { Request, Response, NextFunction } from "express";
 import type { Db } from "@paperclipai/db";
 import { ZodError } from "zod";
 import { HttpError } from "../errors.js";
+import { findPgError, TRANSIENT_DB_SQLSTATES } from "../lib/db-retry.js";
 import { trackErrorHandlerCrash } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
@@ -134,6 +135,27 @@ export function errorHandler(
 
   const tc = getTelemetryClient();
   if (tc) trackErrorHandlerCrash(tc, { errorCode: rootError.name });
+
+  // BLO-33733: a transient PostgreSQL conflict is not a broken server. Every
+  // SQLSTATE in TRANSIENT_DB_SQLSTATES is rollback-guaranteed (see db-retry.ts),
+  // so the write provably did not apply and replaying it is safe. Reported as a
+  // bare 500 it is indistinguishable from a permanent fault, so callers either
+  // retry a genuinely broken request forever or abandon a recoverable one.
+  //
+  // The live instance: PATCH /issues/:id with `blockedByIssueIds` takes a
+  // company-scoped advisory lock (`paperclip:issue-parent:<companyId>`) that a
+  // status-only patch never takes, so under graph contention that one field
+  // 500s while every other field on the same row succeeds.
+  const pgError = findPgError(err);
+  if (pgError && TRANSIENT_DB_SQLSTATES.has(pgError.code)) {
+    res.status(503).json({
+      error: "Database contention: the write was rolled back and did not apply. Retry.",
+      code: "transient_db_conflict",
+      retryable: true,
+      details: { sqlstate: pgError.code },
+    });
+    return;
+  }
 
   res.status(500).json({
     error: "Internal server error",
