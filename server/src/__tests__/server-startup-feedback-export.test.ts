@@ -570,7 +570,79 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
-  // Pins the OTHER half of the hoist (BLO-31335, Ally round 2): the gauge
+  // BLO-33539 (Ally round 1): the undeliverable-monitor reconciler is a
+  // producer-agnostic backstop, so it must not be a link in the long serial
+  // recovery chain — that chain has a single terminal catch, and the
+  // conditions that make an unrelated recovery pass throw are exactly the
+  // conditions that strand monitors. Same defect class as BLO-31335 above.
+  it("reconciles undeliverable monitors on a tick whose recovery chain rejects early", async () => {
+    const schedulerIntervalMs = 30000;
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === schedulerIntervalMs) intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+
+      // Drain startup recovery before clearing mocks: it calls this same pass,
+      // so without this the assertion below could go green off recovery's call
+      // rather than the tick's. Same reasoning as the sibling test above.
+      await vi.waitFor(() => {
+        expect(heartbeatServiceMock.reconcileFailedWakeDispatches).toHaveBeenCalled();
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      heartbeatServiceMock.reconcileUndeliverableIssueMonitors.mockClear();
+      heartbeatServiceMock.reconcileFailedWakeDispatches.mockClear();
+      // An UNRELATED pass, early in the chain and well ahead of where this
+      // reconciler used to sit.
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockRejectedValue(
+        new Error("stranded-assigned-issue reconciliation failed"),
+      );
+
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      // Wait on the chain's terminal catch, not on the pass under test: it is
+      // the deterministic signal that the chain has actually short-circuited,
+      // which is what makes the negative control below meaningful rather than
+      // merely early.
+      await vi.waitFor(() => {
+        expect(logger.error).toHaveBeenCalledWith(
+          expect.anything(),
+          "periodic heartbeat recovery failed",
+        );
+      });
+
+      // The point of the fix.
+      expect(heartbeatServiceMock.reconcileUndeliverableIssueMonitors).toHaveBeenCalledTimes(1);
+      // Control that the chain really did die where we think: this pass sits
+      // downstream of the rejection and must NOT have run. Without it the
+      // assertion above would also pass on a build that never short-circuited.
+      expect(heartbeatServiceMock.reconcileFailedWakeDispatches).not.toHaveBeenCalled();
+    } finally {
+      // `beforeEach` uses `clearAllMocks`, which keeps implementations.
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockImplementation(async () => ({
+        assignmentDispatched: 0,
+        dispatchRequeued: 0,
+        continuationRequeued: 0,
+        successfulRunHandoffEscalated: 0,
+        escalated: 0,
+        skipped: 0,
+        issueIds: [],
+      }));
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   // registrations sit above the `heartbeatStartupRecoveryPending` early-return,
   // not merely above the suppression gate. Both gauges are zero-initialized, so
   // a replica that skipped them while recovery ran would not render "No data" —

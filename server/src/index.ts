@@ -1605,6 +1605,36 @@ export async function startServer(): Promise<StartedServer> {
               logger.error({ err }, "periodic detached-queued-run sweeper failed");
             }));
 
+          if (heartbeatSchedulerStopped) return;
+
+          // BLO-33539: producer-agnostic backstop for a monitor armed on an
+          // issue the scheduler can never select. Transition-time guards each
+          // cover one demotion path; this pass covers the rest, including
+          // recovery parks that have no guard of their own.
+          //
+          // Deliberately NOT a link in the long recovery chain below. That
+          // chain is serial with a single terminal catch, so a rejection in any
+          // earlier pass silently skips every later one — and the conditions
+          // that make an unrelated recovery pass throw are exactly the
+          // conditions that strand monitors. A backstop that only runs when
+          // nothing else is broken is not a backstop. It needs no ordering
+          // against those passes either: the clear is a CAS on the eligibility
+          // tuple, so a concurrent status or assignee change loses the race and
+          // is skipped rather than clobbered.
+          trackHeartbeatSchedulerWork(heartbeat
+            .reconcileUndeliverableIssueMonitors()
+            .then((deadMonitors) => {
+              if (deadMonitors.cleared > 0 || deadMonitors.failed > 0) {
+                logger.warn(
+                  { ...deadMonitors },
+                  "periodic undeliverable-monitor reconciliation cleared monitors armed on ineligible issues",
+                );
+              }
+            })
+            .catch((err) => {
+              logger.error({ err }, "periodic undeliverable-monitor reconciliation failed");
+            }));
+
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat
@@ -1667,19 +1697,6 @@ export async function startServer(): Promise<StartedServer> {
               const swept = await heartbeat.reconcileResolvedBlockerDependents();
               if (swept.woken > 0 || swept.failed > 0) {
                 logger.warn({ ...swept }, "periodic resolved-blocker-dependents sweep enqueued wakes");
-              }
-            })
-            .then(async () => {
-              // BLO-33539: producer-agnostic backstop for a monitor armed on an
-              // issue the scheduler can never select. Transition-time guards
-              // each cover one demotion path; this pass covers the rest,
-              // including recovery parks that have no guard of their own.
-              const deadMonitors = await heartbeat.reconcileUndeliverableIssueMonitors();
-              if (deadMonitors.cleared > 0 || deadMonitors.failed > 0) {
-                logger.warn(
-                  { ...deadMonitors },
-                  "periodic undeliverable-monitor reconciliation cleared monitors armed on ineligible issues",
-                );
               }
             })
             .then(async () => {
