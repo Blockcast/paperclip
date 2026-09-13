@@ -13,6 +13,7 @@ import {
   ACCEPTED_SCHEMA_VERSIONS,
   DEFAULT_OPERATOR_SUPPRESSION_HOURS,
   MAX_OPERATOR_SUPPRESSION_HOURS,
+  NON_ACTIONABLE_SEVERITY,
   WEBHOOK_KEYS,
   alertStateRef,
   legacyInstanceAlertStateRef,
@@ -1878,6 +1879,19 @@ export async function handleFiring(
 
   // First time we've seen this fingerprint — create a new issue. `companyId` is
   // already resolved and non-empty; it scoped the state read above.
+  //
+  // BLO-24177: `severity: none` is the heartbeat band — Prometheus' `Watchdog`
+  // (`vector(1)`) is its only member, and it is *designed* never to resolve. It
+  // is deliberately above the `info` floor above, because the row it files is
+  // the only live evidence that the in-cluster paperclip delivery leg accepts
+  // POSTs while the dead-man's-snitch receiver is disabled (BLO-21307). But an
+  // alert that can never be actioned must not carry an owner: an assigned row
+  // that can never legitimately close recirculates forever through agent
+  // assignment and `stranded_assigned_issue` recovery. So the row is suppressed
+  // as *work* (no assignee, no fallback owner, no refusal for having none) and
+  // kept as *evidence*. The escalation ladder needs no exemption — `none` maps
+  // to no `escalationDeadlineMinutes`, so `nextEscalationAt` is already null.
+  const nonActionable = severity.trim().toLowerCase() === NON_ACTIONABLE_SEVERITY;
   let retainedIssue = await findActiveAggregateIssue(ctx, companyId, aggregateKey);
   const issueRouteResolution = resolveIssueRoute(alert, config.issueRouteMap);
   const issueRoute = issueRouteResolution.route;
@@ -1899,16 +1913,22 @@ export async function handleFiring(
     const ownerOverride =
       resolution.source === "label-override" ||
       resolution.source === "annotation-override";
-    createAssigneeAgentId = ownerOverride
-      ? assigneeAgentId
-      : routeAssigneeAgentId ?? assigneeAgentId;
-    createAssigneeUserId = createAssigneeAgentId
-      ? undefined
-      : ownerOverride
-        ? assigneeUserId
-        : routeHasAssigneeUserId
-          ? routeAssigneeUserId
-          : assigneeUserId;
+    // A non-actionable alert takes no owner from routing or the owner map — see
+    // the `NON_ACTIONABLE_SEVERITY` comment below. An explicit per-alert
+    // override still wins: naming an assignee on the alert itself is a
+    // deliberate act, and policy here should not overrule it.
+    if (!nonActionable || ownerOverride) {
+      createAssigneeAgentId = ownerOverride
+        ? assigneeAgentId
+        : routeAssigneeAgentId ?? assigneeAgentId;
+      createAssigneeUserId = createAssigneeAgentId
+        ? undefined
+        : ownerOverride
+          ? assigneeUserId
+          : routeHasAssigneeUserId
+            ? routeAssigneeUserId
+            : assigneeUserId;
+    }
     assigneeResolutionSource = resolution.source;
     resolvedTarget =
       resolution.agentId
@@ -1916,7 +1936,7 @@ export async function handleFiring(
         : resolution.email ?? "(none)";
   }
   const fallbackResolution =
-    retainedIssue || createAssigneeAgentId || createAssigneeUserId
+    retainedIssue || nonActionable || createAssigneeAgentId || createAssigneeUserId
       ? undefined
       : await resolveFallbackAgentIdMemoized(
           ctx,
@@ -1926,7 +1946,15 @@ export async function handleFiring(
         );
   const fallbackAssigneeAgentId = fallbackResolution?.agentId;
   const finalAssigneeAgentId = createAssigneeAgentId ?? fallbackAssigneeAgentId;
-  if (!retainedIssue && !finalAssigneeAgentId && !createAssigneeUserId) {
+  // `nonActionable` is exempt: an ownerless issue is the *intent* there, not a
+  // resolution failure, so refusing creation would drop the very row that is
+  // this leg's only delivery evidence.
+  if (
+    !retainedIssue &&
+    !nonActionable &&
+    !finalAssigneeAgentId &&
+    !createAssigneeUserId
+  ) {
     // Only `terminated` / wrong-name / genuinely-ambiguous is unfixable by
     // retrying. A `paused` or `pending_approval` fallback owner becomes
     // invokable without anyone editing config, and Alertmanager's retry window

@@ -3327,6 +3327,67 @@ describe("handleWebhook — owner resolution fallback chain", () => {
 });
 
 describe("handleWebhook — creation policy", () => {
+  // BLO-24177. `severity: none` is the Watchdog heartbeat band: the row is the
+  // only live evidence the in-cluster delivery leg accepts POSTs, so it must be
+  // filed — but it can never legitimately close, so it must not be owned.
+  const watchdogAlert = () =>
+    baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      annotations: {},
+      fingerprint: "dafb7bdeb4e056cb",
+    });
+
+  it("files the severity=none row unowned instead of assigning the fallback agent", async () => {
+    const { ctx, mocks } = mkCtx();
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [watchdogAlert()] }) }),
+    );
+
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.assigneeAgentId).toBeUndefined();
+    expect(createArgs.assigneeUserId).toBeUndefined();
+  });
+
+  it("files the severity=none row even with no fallback agent configured", async () => {
+    // The ownerless-creation refusal is a resolution *failure* guard; here
+    // ownerless is the intent, so refusing would drop the delivery evidence.
+    const { ctx, mocks } = mkCtx();
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {}, fallbackAgentName: undefined }),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [watchdogAlert()] }) }),
+    );
+
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.create.mock.calls[0][0].assigneeAgentId).toBeUndefined();
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.owner.fallback_failed",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
+  it("still honours an explicit per-alert assignee override on severity=none", async () => {
+    const { ctx, mocks } = mkCtx();
+    const alert = watchdogAlert();
+    alert.labels.paperclip_assignee_email = "agent:agent-explicit";
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    expect(mocks.issues.create.mock.calls[0][0].assigneeAgentId).toBe(
+      "agent-explicit",
+    );
+  });
+
   it("drops firing info alerts before owner, issue, state, event, or activity side effects", async () => {
     const { ctx, mocks } = mkCtx();
     const alert = baseAlert({

@@ -213,6 +213,17 @@ export const DEFAULT_ISSUE_ROUTE_MAP: IssueRouteMap = {
 export const FALLBACK_PRIORITY: PaperclipPriority = "medium";
 
 /**
+ * Severity whose alerts file a row but never carry an owner (BLO-24177).
+ *
+ * This is the heartbeat band: Prometheus' `Watchdog` (`vector(1)`) is its only
+ * member and fires forever by design, so its row can never legitimately close.
+ * Filing it unowned keeps the row as delivery evidence while keeping it out of
+ * agent assignment and `stranded_assigned_issue` recovery. Distinct from the
+ * `info` creation floor, which files no row at all.
+ */
+export const NON_ACTIONABLE_SEVERITY = "none";
+
+/**
  * Reserved annotation keys treated as drill-in URLs. See spec §7.6 — order
  * here is the rendered order in the issue body.
  */

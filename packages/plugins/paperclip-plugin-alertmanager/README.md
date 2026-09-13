@@ -310,6 +310,21 @@ Two gates keep low-value alerts from becoming issues:
   lets the **resolved** path through. Emits
   `alertmanager.webhook.issue_opt_out`.
 
+A third, weaker gate suppresses *ownership* rather than creation:
+
+- **`severity: none` creates the issue unowned.** This is the heartbeat band —
+  Prometheus' `Watchdog` (`vector(1)`) is its only member and fires forever by
+  design. The row is kept because it is the only live evidence the delivery leg
+  accepts POSTs, but an alert that can never resolve must not carry an owner:
+  an assigned row that can never legitimately close recirculates through agent
+  assignment and `stranded_assigned_issue` recovery forever. So owner-map and
+  `issueRouteMap` assignment are skipped, `fallbackAgentName` is not consulted,
+  and the ownerless-creation refusal does not apply — ownerless is the intent
+  here, not a resolution failure. An explicit per-alert
+  `paperclip_assignee_email` label/annotation still wins. No escalation-ladder
+  exemption is needed: `none` maps to no `escalationDeadlineMinutes`, so
+  `nextEscalationAt` is already `null`.
+
 Letting resolve through is what keeps the opt-out from wedging the issues it was
 added to silence. Gating it too would mean `handleResolved` never runs for an
 opted-out rule, so `state.resolvedAt` would stay `null` and the issue would
