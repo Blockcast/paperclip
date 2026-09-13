@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { REDACTED_EVENT_VALUE, isPlainObject, redactAgentConfigPayload, redactEventPayload, withholdRunEventTranscriptContent } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, isPlainObject, redactAgentConfigPayload, redactEventPayload, withholdRunEventTranscriptContent, withholdRunTranscriptStateContent } from "../redaction.js";
 import { diffAgentAdapterSecretBindings } from "../services/agent-secret-bindings.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
@@ -62,7 +62,7 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
-import { assertBoard, assertCompanyAccess, assertInstanceAdmin, decideRunTranscriptRead, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { assertBoard, assertCompanyAccess, assertInstanceAdmin, decideRunTranscriptRead, getAccessibleResource, getActorInfo, hasCompanyAccess, runTranscriptReadGate } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
@@ -4480,7 +4480,22 @@ export function agentRoutes(
     const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
     const summary = req.query.summary === "true" || req.query.summary === "1";
     const runs = await heartbeat.list(companyId, agentId, limit, { summary });
-    res.json(runs);
+    // PEN-3149 ruling, folded into PEN-3142. This is the bulk feed: without
+    // it, narrowing the per-run `/log` body would be decorative, since the
+    // same prose leaves here for every run in the company at once via the
+    // `result_summary` / `result_result` / `result_message` projection.
+    // Gated per owning agent, memoized, so a mixed page costs one decision
+    // per distinct agent.
+    const canReadTranscript = runTranscriptReadGate(req, access, companyId);
+    res.json(
+      await Promise.all(
+        runs.map(async (run) =>
+          (await canReadTranscript((run as { agentId?: string | null }).agentId ?? null))
+            ? run
+            : withholdRunTranscriptStateContent(run as unknown as Record<string, unknown>),
+        ),
+      ),
+    );
   });
 
   router.get("/companies/:companyId/pr-review-queue", async (req, res) => {
@@ -4840,6 +4855,27 @@ export function agentRoutes(
     const liveRuns = await liveRunsQuery.limit(limit);
     const targetRunCount = Math.min(minCount, limit);
 
+    // PEN-3149 ruling, folded into PEN-3142. None of the columns selected above
+    // carry transcript content — but `decorateActiveRunStatus` ADDS
+    // `lastAssistantSnippet` and `currentStatusMessage` from the runtime-status
+    // store, so the content arrives after the query, not in it. Reading the
+    // column list alone says this route is clean; it is not.
+    //
+    // This is the widest of the run-state feeds: company-scoped rather than
+    // per-issue, so it hands a peer every live agent's current prose in one
+    // call with no per-run fetch. Narrowing the per-run routes while leaving
+    // it open would have been decorative.
+    const canReadTranscript = runTranscriptReadGate(req, access, companyId);
+    const projectLiveRun = async (run: (typeof liveRuns)[number]) => {
+      const decorated = {
+        ...heartbeat.decorateActiveRunStatus(run),
+        outputSilence: await heartbeat.buildRunOutputSilence(run),
+      };
+      return (await canReadTranscript(run.agentId ?? null))
+        ? decorated
+        : withholdRunTranscriptStateContent(decorated as unknown as Record<string, unknown>);
+    };
+
     if (targetRunCount > 0 && liveRuns.length < targetRunCount) {
       const activeIds = liveRuns.map((r) => r.id);
       const recentRuns = await db
@@ -4857,17 +4893,11 @@ export function agentRoutes(
         .limit(targetRunCount - liveRuns.length);
 
       const rows = [...liveRuns, ...recentRuns];
-      res.json(await Promise.all(rows.map(async (run) => ({
-        ...heartbeat.decorateActiveRunStatus(run),
-        outputSilence: await heartbeat.buildRunOutputSilence(run),
-      }))));
+      res.json(await Promise.all(rows.map(projectLiveRun)));
       return;
     }
 
-    res.json(await Promise.all(liveRuns.map(async (run) => ({
-      ...heartbeat.decorateActiveRunStatus(run),
-      outputSilence: await heartbeat.buildRunOutputSilence(run),
-    }))));
+    res.json(await Promise.all(liveRuns.map(projectLiveRun)));
   });
 
   router.get("/heartbeat-runs/:runId", async (req, res) => {
@@ -4881,10 +4911,19 @@ export function agentRoutes(
     // rather than a reverse scan of the company run list.
     const retrySuccessor = await heartbeat.getRetrySuccessor(run);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
+    // PEN-3149 ruling, folded into PEN-3142: this route is on the run-STATE
+    // side of the decision and stays 200 for every company peer — but the row
+    // it returns is every column of `heartbeat_runs`, which carries captured
+    // output and the adapter result blob. Same decider, same owning-agent
+    // scope; only the transcript-bearing fields are projected out.
+    const transcriptAccess = await decideRunTranscriptRead(req, access, run);
+    const projectedRun = transcriptAccess.allowed
+      ? decoratedRun
+      : withholdRunTranscriptStateContent(decoratedRun as unknown as Record<string, unknown>);
     res.json(
       redactCurrentUserValue(
         {
-          ...decoratedRun,
+          ...projectedRun,
           retryExhaustedReason,
           retrySuccessor,
           outputSilence: await heartbeat.buildRunOutputSilence(run),
@@ -5210,10 +5249,19 @@ export function agentRoutes(
         )
         .orderBy(desc(heartbeatRuns.createdAt));
 
-    res.json(await Promise.all(liveRuns.map(async (run) => ({
-      ...heartbeat.decorateActiveRunStatus(run, { companyId: issue.companyId, issueId: issue.id }),
-      outputSilence: await heartbeat.buildRunOutputSilence({ ...run, companyId: issue.companyId }),
-    }))));
+    // PEN-3149 ruling, folded into PEN-3142: `lastAssistantSnippet` reaches
+    // this route too, and `currentStatusMessage` re-derives the same prose
+    // from it — so both have to be closed here, not just the snippet.
+    const canReadTranscript = runTranscriptReadGate(req, access, issue.companyId);
+    res.json(await Promise.all(liveRuns.map(async (run) => {
+      const decorated = {
+        ...heartbeat.decorateActiveRunStatus(run, { companyId: issue.companyId, issueId: issue.id }),
+        outputSilence: await heartbeat.buildRunOutputSilence({ ...run, companyId: issue.companyId }),
+      };
+      return (await canReadTranscript(run.agentId ?? null))
+        ? decorated
+        : withholdRunTranscriptStateContent(decorated as unknown as Record<string, unknown>);
+    })));
   });
 
   router.get("/issues/:issueId/active-run", async (req, res) => {
@@ -5258,8 +5306,24 @@ export function agentRoutes(
     }
 
     const decoratedRun = heartbeat.decorateActiveRunStatus(run, { companyId: issue.companyId, issueId: issue.id });
+    // PEN-3149 ruling, folded into PEN-3142. Sibling of `/issues/:issueId/live-runs`
+    // and reached by the same callers; it carries the same decorated
+    // `lastAssistantSnippet` / `currentStatusMessage`. Gating one and not the
+    // other is precisely the split-sibling failure this row's constraint #1
+    // names, so both move together.
+    //
+    // The run is scoped to `run.agentId`, so the decision keys off the owning
+    // agent exactly as the per-run route does. `agentId` / `agentName` /
+    // `adapterType` are identity, not transcript, and stay readable.
+    const transcriptAccess = await decideRunTranscriptRead(req, access, {
+      companyId: issue.companyId,
+      agentId: run.agentId ?? null,
+    });
+    const projectedRun = transcriptAccess.allowed
+      ? decoratedRun
+      : withholdRunTranscriptStateContent(decoratedRun as unknown as Record<string, unknown>);
     res.json({
-      ...decoratedRun,
+      ...projectedRun,
       agentId: agent.id,
       agentName: agent.name,
       adapterType: agent.adapterType,

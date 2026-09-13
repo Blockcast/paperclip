@@ -260,6 +260,37 @@ export async function decideRunTranscriptRead(
 }
 
 /**
+ * List-route form of {@link decideRunTranscriptRead} (PEN-3149 ruling, folded
+ * into PEN-3142).
+ *
+ * A run list spans many owning agents, and the decision is scoped to the
+ * OWNING AGENT rather than the run — so the answer is per distinct agent, not
+ * per row. This memoizes on that key: a 200-run page owned by 6 agents costs 6
+ * decisions, not 200. The cache is per call, so it cannot outlive the request
+ * and go stale against a grant or reporting-line change.
+ *
+ * Returns a predicate rather than a filtered list because the caller must keep
+ * every row — run STATE stays company-readable, and only the transcript-bearing
+ * fields are projected out of the rows that fail the check.
+ */
+export function runTranscriptReadGate(
+  req: Request,
+  access: RunTranscriptReadDecider,
+  companyId: string,
+): (agentId: string | null) => Promise<boolean> {
+  const cache = new Map<string, Promise<boolean>>();
+  return (agentId: string | null) => {
+    const key = agentId ?? "";
+    const cached = cache.get(key);
+    if (cached) return cached;
+    const pending = decideRunTranscriptRead(req, access, { companyId, agentId })
+      .then((outcome) => outcome.allowed);
+    cache.set(key, pending);
+    return pending;
+  };
+}
+
+/**
  * Preferred way to fetch a company-scoped resource by id inside a route
  * handler. Wraps the two-step pattern described on `hasCompanyAccess` so
  * new routes cannot accidentally reintroduce the existence oracle:

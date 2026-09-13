@@ -835,6 +835,121 @@ export function withholdRunEventTranscriptContent(
 }
 
 /**
+ * The run-STATE routes carry transcript content too (PEN-3149 decision, folded
+ * into PEN-3142). `GET /heartbeat-runs/:runId` returns every column of
+ * `heartbeat_runs`, which includes captured output and the adapter's own result
+ * blob; the company list route and `/issues/:issueId/live-runs` carry narrower
+ * slices of the same material.
+ *
+ * Narrowing `/log` and `/events` while leaving these open would have been
+ * decorative: the same prose exits here, in bulk, without even a per-run fetch.
+ */
+const WITHHELD_RUN_STATE_CONTENT_KEYS = [
+  "stdoutExcerpt",
+  "stderrExcerpt",
+  "lastAssistantSnippet",
+  // The four `result_*` columns below are Postgres GENERATED columns
+  // (`packages/db/src/schema/heartbeat_runs.ts`, migration 0079) defined as
+  // `left(result_json ->> '<key>', 500)`. They are the same free text this
+  // function strips out of `resultJson`, mirrored to the top level under
+  // different key names — so projecting the blob alone closes one door and
+  // leaves its twin open.
+  //
+  // They reach the wire because `getRun` selects `heartbeatRunSafeColumns`,
+  // which spreads `getTableColumns(heartbeatRuns)` and therefore includes every
+  // generated column (verified: 71 columns, these four among them). The company
+  // LIST route is unaffected — `heartbeat.list` destructures them out of each
+  // row and folds them into its own `resultJson` summary — which is exactly why
+  // a fixture copied from the list route would not have caught this.
+  //
+  // `resultError` is deliberately NOT here, matching `error` inside the blob and
+  // `error` / `errorCode` at the top level: the PEN-3140 decision keeps error
+  // text on the company-readable side.
+  "resultSummary",
+  "resultResult",
+  "resultMessage",
+] as const;
+
+/**
+ * `resultJson` is NOT all-or-nothing, and withholding the whole blob would
+ * break live fleet diagnosis: PEN-2501 switched its throttle-family filter to
+ * `resultJson.penstockReason`, and PEN-3129 / PEN-2513 read capacity refusals
+ * out of it. So project *inside* the object — withhold the free-text keys the
+ * adapter fills from run output, keep every machine key.
+ *
+ * `error` is deliberately absent from this list: the PEN-3140 decision names
+ * "error text" on the company-readable side, and the same reasoning that keeps
+ * `error` / `errorCode` readable at the top level applies inside the blob.
+ */
+const WITHHELD_RUN_RESULT_JSON_CONTENT_KEYS = [
+  "result",
+  "summary",
+  "message",
+  "stdout",
+  "stderr",
+] as const;
+
+/**
+ * Entitlement filter for the run-STATE responses (PEN-3142 + the PEN-3149
+ * ruling). Sibling of {@link withholdRunEventTranscriptContent}: same
+ * "what may this caller see" job, applied to the run row rather than an event.
+ *
+ * Run state itself is untouched and stays company-readable — `status`,
+ * `error`, `errorCode`, exit/park reason, the retry edge, watchdog fields,
+ * `lastActivityAt`, `lastOutput*`, `logBytes`, usage/cost, `currentToolName`,
+ * and every machine key inside `resultJson`. A peer can still see that a run
+ * parked, failed, or was retried, which the decision requires.
+ *
+ * `currentStatusMessage` is RE-DERIVED rather than nulled, and that is the
+ * subtle half. It is not a stored field: `buildRunEventRuntimeProgress`
+ * (`heartbeat.ts`) computes it as
+ *
+ *     currentToolName ? `Using ${currentToolName}` : lastAssistantSnippet ?? fallbackMessage
+ *
+ * and `fallbackMessage` prefers the raw event `message` string before falling
+ * back to the event type. So withholding `lastAssistantSnippet` alone leaves
+ * the identical prose reachable on the same response through a different key.
+ * For an unentitled reader the message must come from `currentToolName` or the
+ * event type only — here, from `currentToolName`, else nothing. Closing one
+ * direction and not the other is the class of miss this row exists to fix.
+ */
+export function withholdRunTranscriptStateContent<T extends Record<string, unknown>>(
+  run: T,
+): T & { withheldFields: string[] } {
+  const out: Record<string, unknown> = { ...run };
+  const withheldFields: string[] = [];
+
+  for (const key of WITHHELD_RUN_STATE_CONTENT_KEYS) {
+    if (key in out) {
+      if (out[key] !== null && out[key] !== undefined) withheldFields.push(key);
+      out[key] = null;
+    }
+  }
+
+  if ("currentStatusMessage" in out) {
+    const toolName = out.currentToolName;
+    const rederived = typeof toolName === "string" && toolName ? `Using ${toolName}` : null;
+    if (out.currentStatusMessage !== rederived && out.currentStatusMessage !== null) {
+      withheldFields.push("currentStatusMessage");
+    }
+    out.currentStatusMessage = rederived;
+  }
+
+  if (isPlainObject(out.resultJson)) {
+    const resultJson: Record<string, unknown> = { ...out.resultJson };
+    for (const key of WITHHELD_RUN_RESULT_JSON_CONTENT_KEYS) {
+      if (resultJson[key] === null || resultJson[key] === undefined) continue;
+      delete resultJson[key];
+      withheldFields.push(`resultJson.${key}`);
+    }
+    out.resultJson = resultJson;
+  }
+
+  return { ...(out as T), withheldFields };
+}
+
+
+/**
  * `commands` / `services` / `jobs` are the three arrays `listWorkspaceCommandDefinitions`
  * (`packages/shared/src/workspace-commands.ts`) reads command entries out of. The
  * identity set below is the subset of an entry's keys that same parser reads into a
