@@ -27,6 +27,7 @@ import {
   buildWorkspaceRuntimeDesiredStatePatch,
   buildWorkspaceTemplateData,
   cleanupExecutionWorkspaceArtifacts,
+  ensureGitWorktreeBranchCoherent,
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
@@ -57,6 +58,7 @@ import {
   writeLocalServiceRegistryRecord,
 } from "../services/local-service-supervisor.ts";
 import { resolvePaperclipConfigPath } from "../paths.ts";
+import { executionWorkspaceService } from "../services/execution-workspaces.ts";
 import type { WorkspaceOperation } from "@paperclipai/shared";
 import { EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS } from "@paperclipai/shared";
 import type { WorkspaceOperationRecorder } from "../services/workspace-operations.js";
@@ -6795,6 +6797,163 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     });
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
     await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.not.toBe("");
+  }, 20_000);
+
+  it("does not treat the validating issue's own workspace as a rival claimant (BLO-33610)", async () => {
+    const expectedBranch = "PAP-461-recorded";
+    const actualBranch = "PAP-461-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-461",
+      claimant: "none",
+    });
+    // The operator remedy for a poisoned worktree: rebind executionWorkspaceId -> null. That is
+    // exactly the input that used to disable the self-exclusion.
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: null })
+      .where(eq(issues.id, ids.sourceIssueId));
+
+    const contention = await executionWorkspaceService(db).findGitWorktreeContention({
+      companyId: ids.companyId,
+      worktreePath,
+      liveBranchName: actualBranch,
+      excludingExecutionWorkspaceId: null,
+      excludingSourceIssueId: ids.sourceIssueId,
+    });
+
+    expect(contention).toBeNull();
+  }, 20_000);
+
+  it("still reports a different issue's workspace on the same path as a rival claimant", async () => {
+    const expectedBranch = "PAP-462-recorded";
+    const actualBranch = "PAP-462-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-462",
+      claimant: "none",
+    });
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: null })
+      .where(eq(issues.id, ids.sourceIssueId));
+
+    // A genuine rival: a different issue, squatting the same worktree path, with a live run.
+    const rivalIssueId = randomUUID();
+    const rivalWorkspaceId = randomUUID();
+    const rivalRunId = randomUUID();
+    const later = new Date(Date.now() + 5_000);
+    await db.insert(heartbeatRuns).values({
+      id: rivalRunId,
+      companyId: ids.companyId,
+      agentId: ids.agentId,
+      invocationSource: "manual",
+      status: "running",
+      startedAt: later,
+      updatedAt: later,
+    });
+    await db.insert(issues).values({
+      id: rivalIssueId,
+      companyId: ids.companyId,
+      projectId: ids.projectId,
+      projectWorkspaceId: ids.projectWorkspaceId,
+      title: "Rival on the same path",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: ids.agentId,
+      identifier: "PAP-998",
+      executionRunId: rivalRunId,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: rivalWorkspaceId,
+      companyId: ids.companyId,
+      projectId: ids.projectId,
+      projectWorkspaceId: ids.projectWorkspaceId,
+      sourceIssueId: rivalIssueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: expectedBranch,
+      status: "active",
+      cwd: worktreePath,
+      providerRef: worktreePath,
+      baseRef: "HEAD",
+      branchName: expectedBranch,
+      providerType: "git_worktree",
+      lastUsedAt: later,
+      updatedAt: later,
+    });
+
+    const contention = await executionWorkspaceService(db).findGitWorktreeContention({
+      companyId: ids.companyId,
+      worktreePath,
+      liveBranchName: actualBranch,
+      excludingExecutionWorkspaceId: null,
+      excludingSourceIssueId: ids.sourceIssueId,
+    });
+
+    expect(contention).toMatchObject({
+      claimedByWorkspaceId: rivalWorkspaceId,
+      claimedByIssueIdentifier: "PAP-998",
+      activeRun: expect.objectContaining({ id: rivalRunId, status: "running" }),
+    });
+    // A run never contends with itself, on any path.
+    expect(contention?.activeRun?.id).not.toBe(ids.runId);
+  }, 20_000);
+
+  it("lets a self-contending dirty worktree reach the remaining quarantine preconditions", async () => {
+    const expectedBranch = "PAP-463-recorded";
+    const actualBranch = "PAP-463-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-463",
+      claimant: "none",
+    });
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: null })
+      .where(eq(issues.id, ids.sourceIssueId));
+
+    // The self-contention gate no longer fires, so validation advances to the runtime-service
+    // precondition, which fail-closes on a null workspace id on its own merits. The operator-visible
+    // reason must name that gate, not a claim the issue made against itself.
+    await expect(ensureGitWorktreeBranchCoherent({
+      db,
+      repoRoot,
+      worktreePath,
+      expectedBranchName: expectedBranch,
+      sourceIssue: {
+        id: ids.sourceIssueId,
+        identifier: ids.sourceIdentifier,
+        title: "Repair dirty branch mismatch",
+      },
+      executionWorkspaceId: null,
+      heartbeatRunId: ids.runId,
+      enableWorkspaceDirtyQuarantineRepair: true,
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "dirty",
+          contention: null,
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            reason: "dirty quarantine repair requires an execution workspace id for runtime-service checks",
+          }),
+        }),
+      },
+    });
   }, 20_000);
 
   it("refuses dirty quarantine repair while the execution workspace has an active runtime service", async () => {
