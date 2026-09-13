@@ -5,6 +5,7 @@ import {
   FAST_URI_ADVISORIES,
   FAST_URI_VULNERABLE_RANGES,
   fastUriAdvisoriesFor,
+  fastUriLockfileVersions,
   isVulnerableFastUri,
   parseRange,
   parseVersion,
@@ -170,4 +171,45 @@ test("parseRange normalises GitHub bounds and fails closed", () => {
       `parseRange(${JSON.stringify(bad)}) must throw`,
     );
   }
+});
+
+test("the lockfile scan reads every pnpm key shape, and fails closed", () => {
+  // Both `packages:` (`key:`) and `snapshots:` (`key: {}`) forms, bare and
+  // quoted. The quoted forms are the ones worth pinning: the closing `'` must
+  // not reach parseVersion as part of the version.
+  for (const [line, want] of [
+    ["  fast-uri@3.1.7:", "3.1.7"],
+    ["  fast-uri@3.1.7: {}", "3.1.7"],
+    ["  'fast-uri@3.1.7':", "3.1.7"],
+    ["  'fast-uri@3.1.7': {}", "3.1.7"],
+    ["  fast-uri@3.1.7(patch_hash=abc):", "3.1.7"],
+    ["  'fast-uri@3.1.7(patch_hash=abc)': {}", "3.1.7"],
+  ]) {
+    assert.deepEqual(
+      fastUriLockfileVersions(line),
+      [want],
+      `${JSON.stringify(line)} must yield ${want}`,
+    );
+    // Whatever came back must be comparable, not just string-equal.
+    assert.equal(isVulnerableFastUri(fastUriLockfileVersions(line)[0]), false);
+  }
+
+  // A prerelease parses out of the key but is NOT silently dropped: it reaches
+  // parseVersion, which throws. Skipping it would fail open.
+  assert.deepEqual(fastUriLockfileVersions("  fast-uri@4.1.0-rc.1:"), [
+    "4.1.0-rc.1",
+  ]);
+  assert.throws(() => parseVersion("4.1.0-rc.1"), /unparseable fast-uri/);
+
+  // No fast-uri at all is not an error here -- the caller asserts non-empty.
+  assert.deepEqual(fastUriLockfileVersions("  other@1.0.0:"), []);
+
+  // A key shape the pattern does not anticipate must fail, not read as zero.
+  // pnpm's `link:`/`file:` protocol puts a `:` inside the key, so the version
+  // class stops early and the full pattern misses while the bare-key count
+  // still sees it -- exactly the disagreement the cross-check exists to catch.
+  assert.throws(
+    () => fastUriLockfileVersions("  fast-uri@link:../vendor/fast-uri:"),
+    /could not parse/,
+  );
 });

@@ -130,3 +130,28 @@ export function fastUriAdvisoriesFor(version) {
 export function isVulnerableFastUri(version) {
   return fastUriAdvisoriesFor(version).length > 0;
 }
+
+// Every fast-uri version token in a pnpm lockfile. Lives here rather than in
+// the caller so the shapes below are pinned by the CI-run test beside this
+// module -- `security-audit-overrides.test.js` is referenced by no workflow,
+// so a fixture there would never execute.
+//
+// Shapes: bare and quoted keys, `packages:` (`key:`) and `snapshots:`
+// (`key: {}`). The version class excludes `'` so a quoted key cannot carry its
+// closing quote into the capture; the trailing `(...)` is pnpm's peer/patch
+// descriptor and is not part of the version. Nothing is filtered for
+// parseability -- an unrecognised token reaches `parseVersion` and throws,
+// because a skipped entry fails open on exactly the resolution this guard
+// exists to catch.
+export function fastUriLockfileVersions(lockfile) {
+  const versions = [
+    ...lockfile.matchAll(/^ {2}'?fast-uri@([^:'\n]+)'?:(?: \{\})?$/gm),
+  ].map((match) => match[1].replace(/\(.*\)$/, ""));
+  const keys = (lockfile.match(/^ {2}'?fast-uri@/gm) ?? []).length;
+  if (versions.length !== keys) {
+    throw new Error(
+      `lockfile has a fast-uri entry this scan could not parse (${versions.length} of ${keys} keys matched)`,
+    );
+  }
+  return versions;
+}

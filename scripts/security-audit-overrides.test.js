@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 
 import {
   fastUriAdvisoriesFor,
+  fastUriLockfileVersions,
   isVulnerableFastUri,
 } from "./fast-uri-advisory.js";
 
@@ -45,7 +46,12 @@ async function main() {
     });
 
     await runPnpm(
-      ["install", "--lockfile-only", "--frozen-lockfile=false", "--ignore-scripts"],
+      [
+        "install",
+        "--lockfile-only",
+        "--frozen-lockfile=false",
+        "--ignore-scripts",
+      ],
       fixtureRoot,
     );
 
@@ -54,25 +60,16 @@ async function main() {
     );
     assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.6");
 
-    const lockfile = await readFile(join(fixtureRoot, "pnpm-lock.yaml"), "utf8");
-    // Capture the whole version token, not `\d+\.\d+\.\d+` -- that pattern
-    // MISSES `fast-uri@4.1.0-rc.1:`, and a missed entry is silently skipped
-    // rather than rejected, so the guard fails open on exactly the resolution
-    // it exists to catch. Everything after the `@` goes to `parseVersion`,
-    // which throws on anything it cannot compare. The optional `(...)` suffix
-    // is pnpm's peer/patch descriptor and is not part of the version. Both
-    // the `packages:` key and the `snapshots:` `<key>: {}` line are matched --
-    // the count cross-check below is only sound if neither shape is skipped.
-    const fastUriEntries = [
-      ...lockfile.matchAll(/^ {2}'?fast-uri@([^:'\n]+)'?:(?: \{\})?$/gm),
-    ].map((match) => match[1].replace(/\(.*\)$/, ""));
-    assert.ok(fastUriEntries.length > 0, "lockfile missing fast-uri resolution");
-    // Cross-check against a bare line count so a key shape the pattern above
-    // does not anticipate reads as a failure, not as "nothing found".
-    assert.equal(
-      fastUriEntries.length,
-      (lockfile.match(/^ {2}'?fast-uri@/gm) ?? []).length,
-      "lockfile has a fast-uri entry this scan could not parse",
+    const lockfile = await readFile(
+      join(fixtureRoot, "pnpm-lock.yaml"),
+      "utf8",
+    );
+    // Scan + count cross-check live in fast-uri-advisory.js, where the CI-run
+    // test pins every key shape. This file is referenced by no workflow.
+    const fastUriEntries = fastUriLockfileVersions(lockfile);
+    assert.ok(
+      fastUriEntries.length > 0,
+      "lockfile missing fast-uri resolution",
     );
     for (const version of fastUriEntries) {
       assert.ok(
@@ -114,8 +111,15 @@ async function main() {
     assertIncludes(lockfile, "'@babel/core@7.29.7':", "lockfile");
     assertIncludes(lockfile, "esbuild@0.28.1:", "lockfile");
     assertIncludes(lockfile, "js-yaml@4.3.1:", "lockfile");
-    const uiViteConfig = await readFile(join(fixtureRoot, "ui/vite.config.ts"), "utf8");
-    assertIncludes(uiViteConfig, 'const UI_ESBUILD_TARGET = "es2022";', "ui vite config");
+    const uiViteConfig = await readFile(
+      join(fixtureRoot, "ui/vite.config.ts"),
+      "utf8",
+    );
+    assertIncludes(
+      uiViteConfig,
+      'const UI_ESBUILD_TARGET = "es2022";',
+      "ui vite config",
+    );
     assertIncludes(uiViteConfig, "optimizeDeps", "ui vite config");
     assert.match(
       lockfile,
@@ -128,7 +132,11 @@ async function main() {
       "jsdom must resolve undici 7.29.0",
     );
 
-    const audit = await runPnpm(["audit", "--prod", "--json"], fixtureRoot, true);
+    const audit = await runPnpm(
+      ["audit", "--prod", "--json"],
+      fixtureRoot,
+      true,
+    );
     const auditJson = JSON.parse(audit.stdout);
     assert.equal(auditJson.metadata.vulnerabilities.moderate, 0);
     assert.equal(auditJson.metadata.vulnerabilities.high, 0);
