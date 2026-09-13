@@ -806,5 +806,83 @@ describe.sequential("issue goal context routes", () => {
         expect(emitted.runtimeConfig.desiredState).toBe("running");
       }
     });
+
+    // PEN-3114 door #15. The third open `Record<string, unknown>` off this same
+    // response, and the one furthest from an operator's hands:
+    // `managedByPlugin.defaultsJson.settings` is copied verbatim out of a plugin
+    // manifest's `PluginManagedProjectDeclaration.settings` by
+    // `buildManagedProjectDefaults`. Same `assertIssueReadAllowed` gate, same
+    // `paperclipGetIssue` reader, one line below the `env: null` that proves this
+    // projection is a withholding boundary.
+    //
+    // The secret is again a DISTINCT invented value: reusing either constant above
+    // would let one of the already-merged workspace-runtime masks satisfy the
+    // `not.toContain` assertion, and this test would pass against the unfixed
+    // projection. No workspace or execution workspace is mocked here either.
+    //
+    // Fixture values are invented; no real endpoint was called to produce them.
+    it("masks plugin-authored defaultsJson on the project from GET /issues/:id", async () => {
+      const PLUGIN_SETTINGS_SECRET = "invented-plugin-defaults-fixture-value";
+      const managedByPlugin = {
+        id: "plugin-binding-1",
+        pluginId: "plugin-1",
+        pluginKey: "acme-tracker",
+        pluginDisplayName: "Acme Tracker",
+        resourceKind: "project",
+        resourceKey: "onboarding",
+        defaultsJson: {
+          projectKey: "onboarding",
+          displayName: "Onboarding",
+          description: null,
+          status: "in_progress",
+          color: null,
+          settings: { INTEGRATION_API_TOKEN: PLUGIN_SETTINGS_SECRET, region: "us-east-1" },
+        },
+        createdAt: new Date("2026-03-20T00:00:00Z"),
+        updatedAt: new Date("2026-03-20T00:00:00Z"),
+      };
+
+      mockIssueService.getById.mockResolvedValue({ ...legacyProjectLinkedIssue });
+      mockProjectService.getById.mockResolvedValueOnce({
+        ...(await mockProjectService.getById()),
+        managedByPlugin: structuredClone(managedByPlugin),
+      });
+
+      const res = await request(createApp()).get("/api/issues/11111111-1111-4111-8111-111111111111");
+
+      expect(res.status).toBe(200);
+      expect(JSON.stringify(res.body)).not.toContain(PLUGIN_SETTINGS_SECRET);
+
+      const emitted = res.body.project.managedByPlugin;
+      // The closed, typed scalars survive — these are what addresses the binding, and
+      // `pluginDisplayName` / `pluginKey` / `resourceKey` are the three fields the UI
+      // actually reads off `managedByPlugin`.
+      expect(emitted.pluginKey).toBe("acme-tracker");
+      expect(emitted.pluginDisplayName).toBe("Acme Tracker");
+      expect(emitted.resourceKey).toBe("onboarding");
+
+      // Structure and every key name survive so the binding stays legible.
+      expect(Object.keys(emitted.defaultsJson)).toEqual([
+        "projectKey",
+        "displayName",
+        "description",
+        "status",
+        "color",
+        "settings",
+      ]);
+      expect(Object.keys(emitted.defaultsJson.settings)).toEqual(["INTEGRATION_API_TOKEN", "region"]);
+
+      // Values do not. Assert the credential leaf BY VALUE rather than by key
+      // presence — a regression passing `settings` through verbatim keeps the key set
+      // byte-identical, so a key-set assertion alone would stay green against it.
+      expect(emitted.defaultsJson.settings.INTEGRATION_API_TOKEN).toBe("***REDACTED***");
+      // `region` is not credential-named and is masked anyway: this walk is
+      // mask-by-default, not a key-name denylist, and that is the property that makes
+      // it cover a manifest key nobody enumerated in advance.
+      expect(emitted.defaultsJson.settings.region).toBe("***REDACTED***");
+      expect(emitted.defaultsJson.displayName).toBe("***REDACTED***");
+      // `null` carries nothing and stays `null` rather than becoming the sentinel.
+      expect(emitted.defaultsJson.color).toBeNull();
+    });
   });
 });
