@@ -503,7 +503,13 @@ import {
   redactCurrentUserValue,
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
-import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import {
+  isPlainObject,
+  redactEventPayload,
+  redactRunError,
+  redactRunResultJson,
+  redactSensitiveText,
+} from "../redaction.js";
 import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
@@ -4120,6 +4126,48 @@ export function sanitizeRunLogChunkForStorage(
   maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS,
 ) {
   return compactRunLogChunk(redactCurrentUserText(chunk, currentUserRedactionOptions), maxChars);
+}
+
+/**
+ * PEN-3153: `resultJson` used to reach the database with no secret scrub on the
+ * path. `stdoutExcerpt`/`stderrExcerpt` and run-event payloads written in the
+ * same `UPDATE` were both scrubbed; `resultJson` was not, so it was the least
+ * protected column in the row — and a durable one, reaching backups, exports
+ * and the `result_summary`/`result_result` generated columns.
+ *
+ * The scrub has to run server-side, not in the adapters: no package under
+ * `packages/adapters/` imports `server/src/redaction.ts`, which is the
+ * structural reason the gap existed at all. A fix inside one adapter recreates
+ * it for the next one, so this sits at the persistence chokepoints below.
+ *
+ * The traversal itself lives in `server/src/redaction.ts` next to the tier
+ * primitives it composes (`redactRunResultJson`), so the key-name classifier,
+ * the value heuristic and the control-path allowlist stay in one module rather
+ * than being re-derived here.
+ */
+export function sanitizeRunResultJsonForStorage<T>(resultJson: T): T {
+  return redactRunResultJson(resultJson);
+}
+
+function sanitizeRunErrorForStorage<T>(error: T): T {
+  return redactRunError(error);
+}
+
+/**
+ * Persistence chokepoint for the two free-text-bearing run columns. Applied
+ * inside the status writers rather than at their ~33 call sites, so a new write
+ * path cannot forget it.
+ */
+function sanitizeRunPatchForStorage<T extends Record<string, unknown> | undefined>(patch: T): T {
+  if (!patch) return patch;
+  const hasResultJson = Object.prototype.hasOwnProperty.call(patch, "resultJson");
+  const hasError = Object.prototype.hasOwnProperty.call(patch, "error");
+  if (!hasResultJson && !hasError) return patch;
+  return {
+    ...patch,
+    ...(hasResultJson ? { resultJson: sanitizeRunResultJsonForStorage(patch.resultJson) } : {}),
+    ...(hasError ? { error: sanitizeRunErrorForStorage(patch.error) } : {}),
+  };
 }
 
 const SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE =
@@ -12613,7 +12661,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: MANUAL_CAPACITY_REPROBE_CANCEL_REASON,
+        error: sanitizeRunErrorForStorage(MANUAL_CAPACITY_REPROBE_CANCEL_REASON),
         errorCode: MANUAL_CAPACITY_REPROBE_ERROR_CODE,
         updatedAt: now,
       })
@@ -14839,8 +14887,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function setRunStatus(
     runId: string,
     status: string,
-    patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    patchInput?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
+    // PEN-3153: scrub here rather than at the call sites. `resultJson` and
+    // `error` are the two free-text-bearing columns and ~33 write sites touch
+    // one of them; a per-site fix is the same shape of mistake as a per-adapter
+    // fix. Both status writers funnel their whole patch through this.
+    const patch = sanitizeRunPatchForStorage(patchInput);
     // BLO-16998: the finalize UPDATE can lose a deadlock (40P01), hit the role
     // statement_timeout (57014), or time out waiting on a row lock (55P03) under
     // bloat/contention. Unretried, the throw leaves the run stuck in `running`
@@ -14949,9 +15002,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string,
     expectedStatus: string,
     status: string,
-    patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
+    patchInput: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
     label: string,
   ) {
+    // PEN-3153: same chokepoint as `setRunStatus`. This is also the terminal
+    // finalize path, so it is where adapter `resultJson` actually lands.
+    const patch = sanitizeRunPatchForStorage(patchInput);
     // Pipeline retirement records cancellation intent while holding the issue
     // lock. A natural adapter completion may race that marker; terminalization
     // must give the persisted stage-exit decision precedence rather than erase
@@ -15624,7 +15680,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           livenessReason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
-          resultJson: withUnmanagedBackgroundTaskStopReason(parseObject(run.resultJson)),
+          // PEN-3153: re-persists the stored adapter `resultJson` with a stop
+          // reason added, via a direct UPDATE the status writers never see.
+          resultJson: sanitizeRunResultJsonForStorage(
+            withUnmanagedBackgroundTaskStopReason(parseObject(run.resultJson)),
+          ),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id));
@@ -16818,8 +16878,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const updated = await db
         .update(heartbeatRuns)
         .set({
-          resultJson,
-          error: run.errorCode === DETACHED_PROCESS_ERROR_CODE ? null : run.error,
+          // PEN-3153: hot-restart adoption re-persists the stored adapter
+          // `resultJson` (and carries `run.error` forward) through a direct
+          // UPDATE that never reaches the status writers.
+          resultJson: sanitizeRunResultJsonForStorage(resultJson),
+          error:
+            run.errorCode === DETACHED_PROCESS_ERROR_CODE ? null : sanitizeRunErrorForStorage(run.error),
           errorCode: run.errorCode === DETACHED_PROCESS_ERROR_CODE ? null : run.errorCode,
           updatedAt: now,
         })
@@ -17034,7 +17098,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .set({
         status: "interrupted",
         finishedAt: now,
-        error: message,
+        error: sanitizeRunErrorForStorage(message),
         errorCode: "worker_crashed",
         updatedAt: now,
       })
@@ -18057,7 +18121,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: gate.reason,
+        error: sanitizeRunErrorForStorage(gate.reason),
         errorCode: gate.errorCode,
         updatedAt: now,
       })
@@ -18288,7 +18352,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .set({
               status: "cancelled",
               finishedAt: now,
-              error: `provider capacity retry exhausted after ${downForHours}h unavailable (${dueRun.scheduledRetryAttempt ?? 0} re-probes); pool did not recover`,
+              error: sanitizeRunErrorForStorage(
+                `provider capacity retry exhausted after ${downForHours}h unavailable (${dueRun.scheduledRetryAttempt ?? 0} re-probes); pool did not recover`,
+              ),
               errorCode: "rate_limit_exhausted",
               updatedAt: now,
             })
@@ -18381,19 +18447,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // and `retryNotBefore: 08:00Z` against a `scheduledRetryAt` four days
         // out, which is two decisions wearing one row and reads like a
         // scheduler bug rather than a second, later denial.
-        const nextResultJson = applyCcrotateCapacityDecision(parseObject(dueRun.resultJson), {
-          retryAtIso: nextDueAt.toISOString(),
-          provider: capacity.penstockProvider,
-          model: capacity.penstockModel,
-          reason: capacity.reason,
-          retryAfterSeconds: capacity.penstockRetryAfterSeconds,
-          advertisedResumeAtIso: capacity.resumeAt ? capacity.resumeAt.toISOString() : null,
-          clampedFromIso: capacityRetryPlan.clampedFromIso,
-          // Set once for the chain. `resolveCapacityEscalation` already echoed
-          // back the stored origin when the row had one, so passing it here is
-          // idempotent — it only takes effect on the first hop.
-          firstDeferredAtIso: capacityEscalation.firstDeferredAtIso,
-        });
+        // PEN-3153: `capacity.reason` is upstream-provider text and this write
+        // is a direct UPDATE, so the status writers never see it.
+        const nextResultJson = sanitizeRunResultJsonForStorage(
+          applyCcrotateCapacityDecision(parseObject(dueRun.resultJson), {
+            retryAtIso: nextDueAt.toISOString(),
+            provider: capacity.penstockProvider,
+            model: capacity.penstockModel,
+            reason: capacity.reason,
+            retryAfterSeconds: capacity.penstockRetryAfterSeconds,
+            advertisedResumeAtIso: capacity.resumeAt ? capacity.resumeAt.toISOString() : null,
+            clampedFromIso: capacityRetryPlan.clampedFromIso,
+            // Set once for the chain. `resolveCapacityEscalation` already echoed
+            // back the stored origin when the row had one, so passing it here is
+            // idempotent — it only takes effect on the first hop.
+            firstDeferredAtIso: capacityEscalation.firstDeferredAtIso,
+          }),
+        );
         const rescheduled = await db
           .update(heartbeatRuns)
           .set({
@@ -18496,11 +18566,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .set({
                 status: "cancelled",
                 finishedAt: now,
-                error: `dependency-blocked park exceeded the ${Math.round(
+                error: sanitizeRunErrorForStorage(`dependency-blocked park exceeded the ${Math.round(
                   DEP_BLOCKED_MAX_PARK_AGE_MS / 3_600_000,
                 )}h maximum age (first parked ${firstParkedAt.toISOString()}, attempt ${
                   dueRun.scheduledRetryAttempt ?? 0
-                }); blockers never resolved`,
+                }); blockers never resolved`),
                 errorCode: "issue_dependencies_blocked",
                 updatedAt: now,
               })
@@ -18563,7 +18633,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .set({
                 status: "cancelled",
                 finishedAt: now,
-                error: `dependency-blocked retry exhausted after ${dueRun.scheduledRetryAttempt ?? 0} attempts; blockers never resolved`,
+                error: sanitizeRunErrorForStorage(
+                  `dependency-blocked retry exhausted after ${dueRun.scheduledRetryAttempt ?? 0} attempts; blockers never resolved`,
+                ),
                 errorCode: "issue_dependencies_blocked",
                 updatedAt: now,
               })
@@ -18735,7 +18807,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .set({
             status: "cancelled",
             finishedAt: now,
-            error: promotionGate.reason,
+            error: sanitizeRunErrorForStorage(promotionGate.reason),
             errorCode: promotionGate.errorCode,
             updatedAt: now,
           })
@@ -22671,7 +22743,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // to carry it before the retry decision below.
           const persisted = await db
             .update(heartbeatRuns)
-            .set({ resultJson: mergedResultJson, updatedAt: new Date() })
+            .set({ resultJson: sanitizeRunResultJsonForStorage(mergedResultJson), updatedAt: new Date() })
             .where(eq(heartbeatRuns.id, input.run.id))
             .returning()
             .then((rows) => rows[0] ?? null);
@@ -24457,12 +24529,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .set({
                 status: "cancelled",
                 finishedAt: now,
-                error: cancelReason,
+                error: sanitizeRunErrorForStorage(cancelReason),
                 errorCode: "queued_run_detached_from_issue",
-                resultJson: {
+                // PEN-3153: spreads the stored adapter `resultJson` forward.
+                resultJson: sanitizeRunResultJsonForStorage({
                   ...parseObject(sibling.run.resultJson),
                   stopReason: "queued_run_detached_from_issue",
-                },
+                }),
                 updatedAt: now,
               })
               .where(and(eq(heartbeatRuns.id, sibling.run.id), eq(heartbeatRuns.status, "queued")))
@@ -30313,8 +30386,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } as Record<string, unknown>)
           : null;
 
-      const adapterResultJsonForPersistence = stripAdapterProviderCapacityResetMetadata(
-        adapterResult.resultJson,
+      // PEN-3153: secret-scrub adapter-sourced result content once, here,
+      // downstream of the single `adapter.execute` call site. Both the success
+      // branch and the failure branch that dumps raw `proc.stdout`/`proc.stderr`
+      // (`adapters/process/execute.ts`, `claude-local`) return through this same
+      // value, so one call covers every adapter and both branches.
+      const adapterResultJsonForPersistence = sanitizeRunResultJsonForStorage(
+        stripAdapterProviderCapacityResetMetadata(adapterResult.resultJson),
       );
       const persistedResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {
@@ -32786,23 +32864,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             errorCode: "rate_limit_exhausted",
             // Shared with the promotion-time re-defer (BLO-24011) so the two
             // writers cannot drift in which fields describe the current park.
-            resultJson: applyCcrotateCapacityDecision(
-              {},
-              {
-                retryAtIso: resumeAtIso,
-                provider: gateResult.provider,
-                model: gateResult.model,
-                reason: gateResult.reason,
-                retryAfterSeconds: gateResult.retryAfterSeconds,
-                advertisedResumeAtIso: advertisedResumeAtIso,
-                clampedFromIso: capacityRetryPlan.clampedFromIso,
-                // First hop of a fresh chain by construction — this is the
-                // insert path — so the escalation clock starts here rather than
-                // at the first re-defer. Same instant the park was computed
-                // from, so the origin and the first hop cannot disagree
-                // (BLO-28919).
-                firstDeferredAtIso: capacityDeferredAt.toISOString(),
-              },
+            // PEN-3153: `reason` here is upstream-provider text off the
+            // penstock availability gate, and this is an INSERT, so neither the
+            // adapter boundary nor the status writers see it.
+            resultJson: sanitizeRunResultJsonForStorage(
+              applyCcrotateCapacityDecision(
+                {},
+                {
+                  retryAtIso: resumeAtIso,
+                  provider: gateResult.provider,
+                  model: gateResult.model,
+                  reason: gateResult.reason,
+                  retryAfterSeconds: gateResult.retryAfterSeconds,
+                  advertisedResumeAtIso: advertisedResumeAtIso,
+                  clampedFromIso: capacityRetryPlan.clampedFromIso,
+                  // First hop of a fresh chain by construction — this is the
+                  // insert path — so the escalation clock starts here rather
+                  // than at the first re-defer. Same instant the park was
+                  // computed from, so the origin and the first hop cannot
+                  // disagree (BLO-28919).
+                  firstDeferredAtIso: capacityDeferredAt.toISOString(),
+                },
+              ),
             ),
             contextSnapshot: retryContextSnapshot,
           })
@@ -33118,7 +33201,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .set({
               status: "cancelled",
               finishedAt: now,
-              error: reason,
+              error: sanitizeRunErrorForStorage(reason),
               errorCode: issueCancelled ? "issue_cancelled" : "issue_reassigned",
               updatedAt: now,
             })
@@ -33454,7 +33537,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .set({
               status: "cancelled",
               finishedAt: now,
-              error: reason,
+              error: sanitizeRunErrorForStorage(reason),
               errorCode,
               updatedAt: now,
             })
@@ -36251,7 +36334,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           status: "cancelled",
           finishedAt,
-          error: reason,
+          error: sanitizeRunErrorForStorage(reason),
           errorCode: "task_scope_cancelled",
           updatedAt: finishedAt,
         })
