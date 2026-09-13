@@ -410,6 +410,7 @@ import {
   recordCcrotateCapacityDeferred,
   recordHeartbeatTimerSchedulerExclusion,
   recordHeartbeatPostTerminalRunEventDropped,
+  recordHeartbeatTimerTick,
   recordConcurrentRunBlocked,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
@@ -37248,6 +37249,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     tickTimers: async (now = new Date()) => {
       if ((await getSchedulingSuppression()).suppressed) {
+        // Deliberately NOT recorded as a tick (BLO-32269). Nothing was
+        // examined, so counting this would report a suppressed fleet as a
+        // live-but-idle one and defeat the dispatch-dark rule these counters
+        // exist for.
+        //
+        // That is a real observability gap, and
+        // paperclip_heartbeat_timer_scheduler_exclusion_total does NOT close
+        // it: every one of its call sites is below `checked += 1`, so none of
+        // them is reachable from this return. Its
+        // `heartbeat.scheduling_suppressed` label exists but is emitted from
+        // inside the per-agent loop, which this return skips -- so the label
+        // being present is not evidence the counter moves here. Global
+        // suppression is observable from the scheduling-suppression record and
+        // worker state instead; see the cause list on
+        // HEARTBEAT_TIMER_CHECKED_METRIC in metrics.ts.
         return {
           checked: 0,
           enqueued: 0,
@@ -37448,7 +37464,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const issueMonitors = await tickDueIssueMonitors(now);
       const expiredIssueMonitors = await tickExpiredIssueMonitors(now);
 
-      return {
+      const result = {
         checked: checked + issueMonitors.checked + expiredIssueMonitors.checked,
         enqueued: enqueued + issueMonitors.triggered,
         // Blocker-deferred monitors delivered no wake, so they belong on the
@@ -37458,6 +37474,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           expiredIssueMonitors.recovered,
         idleSkipped,
       };
+      // Recorded here rather than at the caller's log line, which is gated on
+      // `enqueued > 0` and would therefore leave `_checked_total` pinned at
+      // zero on a healthy-but-idle fleet — the exact reading the pair exists to
+      // distinguish from a dead loop (BLO-32269).
+      recordHeartbeatTimerTick(result);
+      return result;
     },
 
 
