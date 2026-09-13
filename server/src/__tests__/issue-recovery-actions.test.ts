@@ -1801,6 +1801,62 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  // BLO-27463 AC#2: provider-capacity terminations must be classified infra-class —
+  // no org-chain reassignment. `rate_limit_exhausted` and `provider_throttled_no_progress`
+  // both carry errorFamily `rate_limit_exhausted` (heartbeat.ts
+  // `readHeartbeatRunErrorFamily`) and were absent from ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES,
+  // so a provider declining to serve moved `ownerAgentId` up the manager ladder for an
+  // event nobody on this side caused. Measured on the 4-week recovery-observability window
+  // 2026-09-13: 9 `provider_throttled_no_progress` + 8 `rate_limit_exhausted` actions filed
+  // under cause `stranded_assigned_issue`.
+  //
+  // Asserted per-code rather than in one case because the two are set members that can drift
+  // apart, and asserted on ownership (the acceptance criterion) rather than on a counter.
+  for (const errorCode of ["rate_limit_exhausted", "provider_throttled_no_progress"] as const) {
+    it(`re-dispatches a ${errorCode} provider-capacity failure to the existing assignee instead of the manager`, async () => {
+      const { managerId, coderId, sourceIssue } = await seedCompany();
+      const enqueueWakeup = vi.fn<
+        (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+      >(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const latestRun = {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: "provider capacity throttle (429) — the provider advertised availability no " +
+          "earlier than 2026-09-13T01:17:00.262Z",
+        errorCode,
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      } as const;
+
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      });
+
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+      expect(action).toMatchObject({
+        kind: "stranded_assigned_issue",
+        ownerAgentId: coderId,
+        returnOwnerAgentId: coderId,
+      });
+      expect(action?.ownerAgentId).not.toBe(managerId);
+
+      const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+      expect(updatedIssue).toMatchObject({ assigneeAgentId: coderId });
+      expect(enqueueWakeup).toHaveBeenCalledWith(coderId, expect.anything());
+    });
+  }
+
   it("keeps the original return owner after a temporary invocability fallback", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn<
