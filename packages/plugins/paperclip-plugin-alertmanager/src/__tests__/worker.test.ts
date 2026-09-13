@@ -3446,6 +3446,112 @@ describe("handleWebhook — creation policy", () => {
     );
   });
 
+  // The three cases below all share one invariant: state and the firing event
+  // describe the issue, so they may only report the owner cleared when an issue
+  // update actually cleared it. Reporting an ownerless row that still has an
+  // owner is worse than reporting the owner — the recirculation the policy
+  // exists to stop would keep happening, invisibly.
+  const ownedWatchdogState = (): AlertStateRecord => ({
+    paperclipIssueId: "issue-watchdog",
+    paperclipCompanyId: "company-1",
+    assigneeUserId: null,
+    assigneeAgentId: "agent-stranded",
+    alertname: "Watchdog",
+    severity: "none",
+    firstSeenAt: "2026-04-29T08:00:00Z",
+    lastFiredAt: "2026-04-29T08:00:00Z",
+    resolvedAt: null,
+  });
+
+  it("keeps the recorded owner when the severity=none re-fire update fails", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(ownedWatchdogState());
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-watchdog",
+      status: "todo",
+      assigneeAgentId: "agent-stranded",
+    });
+    mocks.issues.update.mockRejectedValueOnce(new Error("issues unavailable"));
+
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [watchdogAlert()] }) }),
+    );
+
+    // The clear never landed, so the issue is still owned. State must say so.
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ assigneeAgentId: "agent-stranded" }),
+      FIRING_FENCE_ARG,
+    );
+    expect(mocks.events.emit).toHaveBeenCalledWith(
+      "alertmanager.alert.firing",
+      "company-1",
+      expect.objectContaining({ assigneeAgentId: "agent-stranded" }),
+      FIRING_EMIT_OWNERSHIP_ARG,
+    );
+  });
+
+  it("keeps the recorded owner when the severity=none row's issue is unreadable", async () => {
+    // `issue_missing` updates nothing at all, so there is no clear to mirror.
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(ownedWatchdogState());
+    mocks.issues.get.mockResolvedValueOnce(null);
+
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [watchdogAlert()] }) }),
+    );
+
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ assigneeAgentId: "agent-stranded" }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
+  it("does not clear an explicit per-alert assignee on a severity=none re-fire", async () => {
+    // The README documents the override as winning over the no-owner policy.
+    // Honouring it only at creation would clear the named owner on the alert's
+    // very next fire, which is the opposite of that exception.
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce({
+      ...ownedWatchdogState(),
+      assigneeAgentId: "agent-explicit",
+    });
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-watchdog",
+      status: "todo",
+      assigneeAgentId: "agent-explicit",
+    });
+    const alert = watchdogAlert();
+    alert.labels.paperclip_assignee_email = "agent:agent-explicit";
+
+    await handleWebhook(
+      ctx,
+      baseConfig(),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    // Refreshed as normal, but carrying no owner fields at all — the patch is
+    // absent rather than nulled.
+    const updateArgs = mocks.issues.update.mock.calls[0][1];
+    expect(updateArgs).toHaveProperty("description");
+    expect(updateArgs).not.toHaveProperty("assigneeAgentId");
+    expect(updateArgs).not.toHaveProperty("assigneeUserId");
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ assigneeAgentId: "agent-explicit" }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
   it("drops firing info alerts before owner, issue, state, event, or activity side effects", async () => {
     const { ctx, mocks } = mkCtx();
     const alert = baseAlert({

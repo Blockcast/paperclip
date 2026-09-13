@@ -26,7 +26,11 @@ import {
   severityToPriority,
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
-import { resolveAssigneeUserId, resolveFallbackAgentId } from "./owner-resolver.js";
+import {
+  resolveAssigneeUserId,
+  resolveFallbackAgentId,
+  resolveOwnerEmail,
+} from "./owner-resolver.js";
 import type { FallbackOwnerResolution } from "./owner-resolver.js";
 import { aggregateKeyForAlert } from "./aggregate-key.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
@@ -1451,15 +1455,28 @@ export async function handleFiring(
   // exemption — `none` maps to no `escalationDeadlineMinutes`, so
   // `nextEscalationAt` is already null.
   const nonActionable = severity.trim().toLowerCase() === NON_ACTIONABLE_SEVERITY;
+  // An explicit per-alert assignee — `paperclip_assignee_email` as a label or
+  // an annotation — outranks the no-owner policy: naming an assignee on the
+  // alert itself is a deliberate act. Resolved here rather than only in the
+  // creation branch below so the re-fire patch honours it too; a creation-only
+  // reading would clear the named owner on the alert's very next fire, which is
+  // the opposite of the documented exception. `resolveOwnerEmail` is pure and
+  // is the same call `resolveAssigneeUserId` makes, so the two paths cannot
+  // disagree about what counts as an override.
+  const ownerOverrideSource = resolveOwnerEmail(alert, config.ownerMap).source;
+  const ownerOverride =
+    ownerOverrideSource === "label-override" ||
+    ownerOverrideSource === "annotation-override";
   // Re-asserted on every fire rather than only at creation. A creation-only
   // guard is the same one-shot patch as unassigning the row by hand: anything
   // that later attaches an owner — a recovery sweep, an operator, a row filed
   // before this policy existed — drops it straight back into the loop, and the
   // next fire would happily refresh it as owned work. Clearing here makes the
   // policy self-healing, which is the complaint BLO-24177 opens with.
-  const nonActionableOwnerPatch = nonActionable
-    ? { assigneeAgentId: null, assigneeUserId: null }
-    : {};
+  const nonActionableOwnerPatch =
+    nonActionable && !ownerOverride
+      ? { assigneeAgentId: null, assigneeUserId: null }
+      : {};
 
   if (!existing && (alert.labels.severity ?? "").trim().toLowerCase() === "info") {
     ctx.logger.info(
@@ -1808,12 +1825,23 @@ export async function handleFiring(
         firingToken,
       );
 
+      // Same rule as the suppression anchor: a clear the RPC did not apply must
+      // not be persisted as applied. `reopen` and `refresh` are the only
+      // branches that update an issue — `suppressed` and `issue_missing` mutate
+      // nothing, and a thrown re-sync leaves whatever owner the row had. In any
+      // of those cases mirroring the clear would make the state record, and the
+      // firing event built from it, report an ownerless row that still has an
+      // owner. The next successful re-fire re-applies it.
+      const ownerPatchApplied =
+        decisionApplied &&
+        (decision.kind === "reopen" || decision.kind === "refresh");
+
       const updated: AlertStateRecord = {
         ...tracked,
         // Mirrors the owner clear applied to the issue above, so state and the
         // firing event below do not keep reporting an owner the row no longer
         // has.
-        ...nonActionableOwnerPatch,
+        ...(ownerPatchApplied ? nonActionableOwnerPatch : {}),
         aggregateKey,
         alertname,
         severity,
@@ -1926,13 +1954,10 @@ export async function handleFiring(
   if (!retainedIssue) {
     const { assigneeUserId, assigneeAgentId, resolution } =
       await resolveAssigneeUserId(ctx, alert, config.ownerMap);
-    const ownerOverride =
-      resolution.source === "label-override" ||
-      resolution.source === "annotation-override";
     // A non-actionable alert takes no owner from routing or the owner map — see
     // the `NON_ACTIONABLE_SEVERITY` comment below. An explicit per-alert
-    // override still wins: naming an assignee on the alert itself is a
-    // deliberate act, and policy here should not overrule it.
+    // override still wins; `ownerOverride` is hoisted to the top of this
+    // function so the re-fire patch applies the same exception.
     if (!nonActionable || ownerOverride) {
       createAssigneeAgentId = ownerOverride
         ? assigneeAgentId

@@ -329,7 +329,12 @@ A third, weaker gate suppresses *ownership* rather than creation:
   re-clears the assignee on the issue, the state record, and the emitted firing
   event. A creation-only guard would leave rows filed before the policy — and
   any row something later assigns — stuck in the loop, which is the same
-  one-shot patch as unassigning by hand.
+  one-shot patch as unassigning by hand. The override exception is re-evaluated
+  on every fire too, so an alert carrying an explicit assignee keeps it; and the
+  state record only reports the owner cleared when an issue update actually
+  cleared it, so a failed re-sync, a suppressed re-fire, or an unreadable issue
+  leaves the recorded owner alone rather than claiming a clear that never
+  landed.
 
 Letting resolve through is what keeps the opt-out from wedging the issues it was
 added to silence. Gating it too would mean `handleResolved` never runs for an
