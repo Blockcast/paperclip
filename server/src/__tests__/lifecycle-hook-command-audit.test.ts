@@ -385,6 +385,92 @@ describe("findMissingHookCommandPaths — options that consume a separate operan
   });
 });
 
+// A single global set of "code-taking" options made `bash -e` and `perl -p` —
+// ordinary flags that consume nothing — end script resolution, so a missing hook
+// script written after one was silently skipped. That is the BLO-28782 shape
+// this module exists to catch, reintroduced through the option model.
+describe("findMissingHookCommandPaths — code options are interpreter-scoped", () => {
+  // Each of these is a no-operand flag for *its* interpreter, so the word after
+  // it is still the script and must be audited.
+  const plainFlagCases: { label: string; command: string }[] = [
+    { label: "bash -e (errexit)", command: "bash -e /app/hook.sh" },
+    { label: "sh -e (errexit)", command: "sh -e /app/hook.sh" },
+    { label: "bash -r (restricted)", command: "bash -r /app/hook.sh" },
+    { label: "bash -m (job control)", command: "bash -m /app/hook.sh" },
+    { label: "ksh -p (privileged)", command: "ksh -p /app/hook.sh" },
+  ];
+
+  for (const { label, command } of plainFlagCases) {
+    it(`audits the script behind ${label}: \`${command}\``, () => {
+      expect(findMissingHookCommandPaths(command, fsWith())).toEqual(["/app/hook.sh"]);
+    });
+  }
+
+  it("audits the script behind perl -p (print loop)", () => {
+    expect(findMissingHookCommandPaths("perl -p /app/hook.pl", fsWith())).toEqual([
+      "/app/hook.pl",
+    ]);
+  });
+
+  it("audits the script behind ruby -p (print loop)", () => {
+    expect(findMissingHookCommandPaths("ruby -p /app/hook.rb", fsWith())).toEqual([
+      "/app/hook.rb",
+    ]);
+  });
+
+  // `-c` is a syntax check for these, and its operand is the script itself.
+  const syntaxCheckCases: { command: string; expected: string }[] = [
+    { command: "node -c /app/hook.js", expected: "/app/hook.js" },
+    { command: "perl -c /app/hook.pl", expected: "/app/hook.pl" },
+    { command: "ruby -c /app/hook.rb", expected: "/app/hook.rb" },
+  ];
+
+  for (const { command, expected } of syntaxCheckCases) {
+    it(`audits the operand of a syntax-check -c: \`${command}\``, () => {
+      expect(findMissingHookCommandPaths(command, fsWith())).toEqual([expected]);
+    });
+  }
+
+  // The other direction: the same spelling still stops where it really is code.
+  const codeCases: { label: string; command: string }[] = [
+    { label: "node -e", command: `node -e "/app/gone.js"` },
+    { label: "node -p", command: `node -p "/app/gone.js"` },
+    { label: "node --eval", command: `node --eval "/app/gone.js"` },
+    { label: "python3 -c", command: `python3 -c "/app/gone.py"` },
+    { label: "python3 -m", command: "python3 -m /app/gone.py" },
+    { label: "perl -e", command: `perl -e "/app/gone.pl"` },
+    { label: "perl -E", command: `perl -E "/app/gone.pl"` },
+    { label: "ruby -e", command: `ruby -e "/app/gone.rb"` },
+    { label: "php -r", command: `php -r "/app/gone.php"` },
+    { label: "pwsh -Command", command: `pwsh -Command "/app/gone.ps1"` },
+  ];
+
+  for (const { label, command } of codeCases) {
+    it(`still stops at ${label}: \`${command}\``, () => {
+      expect(findMissingHookCommandPaths(command, fsWith())).toEqual([]);
+    });
+  }
+
+  it("reads -e as code or as errexit depending on the interpreter", () => {
+    // The finding in one assertion: same flag, opposite correct answers.
+    expect(findMissingHookCommandPaths(`node -e "/app/gone.js"`, fsWith())).toEqual([]);
+    expect(findMissingHookCommandPaths("bash -e /app/hook.sh", fsWith())).toEqual([
+      "/app/hook.sh",
+    ]);
+  });
+
+  it("never stats a code operand", () => {
+    const stated: string[] = [];
+    findMissingHookCommandPaths(`bash -c "/app/relogin.sh --force"`, {
+      fileExists: (p) => {
+        stated.push(p);
+        return true;
+      },
+    });
+    expect(stated).toEqual([]);
+  });
+});
+
 // Documented skips: these stay silent on purpose. Asserting them keeps the
 // module header's stated limits honest — if a later change starts flagging one,
 // a test fails rather than an operator getting a warning we cannot stand behind.

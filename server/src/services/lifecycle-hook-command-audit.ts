@@ -90,7 +90,10 @@
  *     likewise anything inside `eval` or a `$(…)` substitution. Not parsed; the
  *     operand is deliberately not stat'd, because a command *string* is not a
  *     filename. Seeing one of these ends script resolution for that command,
- *     so a script written after it is not audited either;
+ *     so a script written after it is not audited either. Which options mean
+ *     "code" is **per interpreter**: `-e` is code to node/perl/ruby but errexit
+ *     to a shell, and `-p` is `--print` to node but a no-operand flag to perl,
+ *     so `bash -e /app/hook.sh` and `perl -p /app/hook.pl` *are* audited;
  *   - the operand of an option that takes a *value* — `python3 -X utf8`,
  *     `perl -I /opt/lib`. Consumed so it cannot be mistaken for the script, but
  *     never stat'd: python does not open `utf8`, and perl ignores a missing
@@ -191,38 +194,10 @@ function isScriptInterpreter(basename: string): boolean {
 /** A leading `VAR=value` environment assignment, which precedes argv[0]. */
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
-/**
- * Interpreter options whose operand is **code or a module name**, not a script
- * path: `bash -c`, `node -e`, `python3 -m`, `perl -e`, `php -r`, `pwsh -Command`.
- *
- * Without this, `bash -c "/app/relogin.sh --force"` would stat the whole quoted
- * command string as if it were a filename and report
- * `/app/relogin.sh --force` missing — a false positive of exactly the kind this
- * change exists to remove. Seeing one of these stops script resolution for the
- * command entirely, which is why "the inner command of `bash -c`" is listed as
- * a deliberate skip rather than something we half-parse.
- */
-const CODE_TAKING_OPTIONS = new Set([
-  "-c",
-  "-e",
-  "-p",
-  "-m",
-  "-r",
-  "--eval",
-  "--print",
-  "--command",
-  "--module",
-]);
-
 /** `--require=/app/pre.js` -> `--require`; `-X` -> `-X`. */
 function optionName(option: string): string {
   const equals = option.indexOf("=");
   return equals === -1 ? option : option.slice(0, equals);
-}
-
-function takesCodeOperand(option: string): boolean {
-  const name = optionName(option);
-  return CODE_TAKING_OPTIONS.has(name) || CODE_TAKING_OPTIONS.has(name.toLowerCase());
 }
 
 /**
@@ -239,6 +214,66 @@ function takesCodeOperand(option: string): boolean {
 const NODE_LIKE_INTERPRETER = /^(?:node|nodejs|bun|deno|tsx|ts-node)(?:\d+(?:\.\d+)*)?$/;
 const PYTHON_LIKE_INTERPRETER = /^python(?:\d+(?:\.\d+)*)?$/;
 const INCLUDE_DIR_INTERPRETER = /^(?:perl|ruby)(?:\d+(?:\.\d+)*)?$/;
+const SHELL_INTERPRETER = /^(?:sh|bash|dash|ksh|zsh)$/;
+const PERL_INTERPRETER = /^perl(?:\d+(?:\.\d+)*)?$/;
+const RUBY_INTERPRETER = /^ruby(?:\d+(?:\.\d+)*)?$/;
+const PHP_INTERPRETER = /^php(?:\d+(?:\.\d+)*)?$/;
+const POWERSHELL_INTERPRETER = /^(?:pwsh|powershell)$/;
+
+/**
+ * Options whose operand is **code or a module name**, not a script path, keyed
+ * by the interpreter that parses them: `bash -c`, `node -e`, `python3 -m`,
+ * `perl -e`, `php -r`, `pwsh -Command`. Seeing one ends script resolution for
+ * that simple command, which is why "the inner command of `bash -c`" is a
+ * deliberate skip rather than something we half-parse — otherwise
+ * `bash -c "/app/relogin.sh --force"` stats the whole quoted command string as
+ * a filename and reports it missing on a correct configuration.
+ *
+ * These are per-interpreter for the same reason `separateOperandKind` is, and
+ * the review that caught it named the cost precisely: a single global set made
+ * `bash -e` and `perl -p` — ordinary no-operand flags — end resolution, so a
+ * missing hook script written after one was silently skipped. That is the
+ * BLO-28782 shape this module exists to catch, so the sets are deliberately
+ * tight: an option absent here is a plain flag and the script after it is still
+ * audited.
+ *
+ *   - `-e` is code to node/perl/ruby, but **errexit** to every shell.
+ *   - `-p` is `--print` to node, but perl's print-loop flag and ksh's
+ *     privileged mode — no operand in either.
+ *   - `-c` is code to shell/python, but a **syntax check** to node/perl/ruby
+ *     whose operand is the script itself, so it is omitted for those and the
+ *     script is resolved normally.
+ *   - `-r` is code to php, but a module **path** to node (handled above as a
+ *     path operand) and restricted mode to shells.
+ *
+ * PowerShell parameter names are case-insensitive, and its real spelling is the
+ * single-dash `-Command`. The previous global set held `--command`, so it never
+ * matched and `pwsh -Command "/app/gone.ps1"` stat'd the command string as a
+ * filename — the header's claimed skip was not the shipped behaviour. Every
+ * other interpreter is matched case-sensitively, because case is significant to
+ * them: `perl -E` is code while `-e`/`-E` are distinct flags generally.
+ */
+const SHELL_CODE_OPTIONS = new Set(["-c"]);
+const NODE_CODE_OPTIONS = new Set(["-e", "--eval", "-p", "--print"]);
+const PYTHON_CODE_OPTIONS = new Set(["-c", "-m"]);
+const PERL_CODE_OPTIONS = new Set(["-e", "-E"]);
+const RUBY_CODE_OPTIONS = new Set(["-e"]);
+const PHP_CODE_OPTIONS = new Set(["-r"]);
+const POWERSHELL_CODE_OPTIONS = new Set(["-c", "-command"]);
+
+function takesCodeOperand(interpreter: string, option: string): boolean {
+  const name = optionName(option);
+  if (SHELL_INTERPRETER.test(interpreter)) return SHELL_CODE_OPTIONS.has(name);
+  if (NODE_LIKE_INTERPRETER.test(interpreter)) return NODE_CODE_OPTIONS.has(name);
+  if (PYTHON_LIKE_INTERPRETER.test(interpreter)) return PYTHON_CODE_OPTIONS.has(name);
+  if (PERL_INTERPRETER.test(interpreter)) return PERL_CODE_OPTIONS.has(name);
+  if (RUBY_INTERPRETER.test(interpreter)) return RUBY_CODE_OPTIONS.has(name);
+  if (PHP_INTERPRETER.test(interpreter)) return PHP_CODE_OPTIONS.has(name);
+  if (POWERSHELL_INTERPRETER.test(interpreter)) {
+    return POWERSHELL_CODE_OPTIONS.has(name.toLowerCase());
+  }
+  return false;
+}
 
 /**
  * Node preload/loader options whose operand is a module **path** resolved
@@ -506,9 +541,11 @@ function resolveCommandPositionPaths(words: ShellWord[]): string[] {
           continue;
         }
 
-        // `-c`/`-e`/`-m` mean the operand is code or a module, not a path. Stop
-        // rather than stat a command string as a filename.
-        if (takesCodeOperand(argument.value)) return paths;
+        // `bash -c`/`node -e`/`python3 -m` mean the operand is code or a
+        // module, not a path. Stop rather than stat a command string as a
+        // filename. Scoped per interpreter: `bash -e` and `perl -p` are plain
+        // flags, and stopping on those hid the script after them.
+        if (takesCodeOperand(interpreter, argument.value)) return paths;
         j++;
         continue;
       }
