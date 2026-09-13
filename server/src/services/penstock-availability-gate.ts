@@ -372,7 +372,12 @@ async function readPenstockCapacity(input: {
 
     if (response.status === 404) return null;
 
-    if (response.status === 401 || response.status === 403 || response.status === 429 || response.status === 503) {
+    if (isProbeAuthFault(response.status)) {
+      logProbeAuthFault(input.log, response.status, input.model, "capacity readback");
+      return null;
+    }
+
+    if (response.status === 429 || response.status === 503) {
       return capacityEndpointUnavailable(input, response.status);
     }
 
@@ -436,6 +441,60 @@ async function readPenstockCapacity(input: {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/**
+ * 401/403 from either probe is an *authorization* fault, not an availability
+ * one, and this gate deliberately has nothing to say about it (PEN-2513).
+ *
+ * Both probes used to deny on `401 || 403 || 429 || 503`, and every deny is
+ * booked by the caller as `CCROTATE_CAPACITY_RETRY_REASON` — `heartbeat.ts`
+ * writes that constant unconditionally and never reads the `reason` this
+ * module computes. So a permanent permission fault — an un-entitled seat, say —
+ * parks on a *capacity* horizon: mislabelled as provider throttling in every
+ * census keyed on that constant, and — because the BLO-28919 re-defer path
+ * relabels a park to the capacity reason "whatever label it arrived with" —
+ * re-deferred on that horizon indefinitely. A capacity horizon cannot expire an
+ * entitlement fault, so nothing in the loop terminates it.
+ *
+ * This is read at source, not from a park census: PEN-2513 records that the
+ * live parked population carries zero capacity-labelled parks, because the path
+ * only fires when the *probe* draws one of these statuses. That absence
+ * measures current gateway health, not the classifier, so no observed incident
+ * is claimed here. Note also that the entitlement 403s seen on failed runs are
+ * an adapter-side authentication fault on a different surface than this probe;
+ * narrowing this gate may not touch them at all.
+ *
+ * Failing open instead costs one dispatch that fails fast against the real
+ * fault, which the ordinary run-failure path records with a truthful error
+ * code and bounds by the run retry limits. That trade — a bounded, attributable
+ * failure over an unbounded, mislabelled park — is the CEO ruling on PEN-2513,
+ * which authorized narrowing the gate (shape 3) for 401/403 only.
+ *
+ * 429 and 503 are untouched on purpose: 429 is a genuine capacity signal and
+ * 503 is a genuine availability signal, so both keep their existing deny, their
+ * existing reason, and their existing place in the census split-check. How a
+ * 503-origin park should be *labelled* is the still-open half of PEN-2513 and
+ * is not decided here.
+ *
+ * Logged at `warn` under its own message rather than reusing the generic
+ * fail-open branches: an entitlement outage that fails open is otherwise
+ * indistinguishable from a stray 500, and this one needs to stay greppable.
+ */
+function isProbeAuthFault(status: number): boolean {
+  return status === 401 || status === 403;
+}
+
+function logProbeAuthFault(
+  log: PenstockAvailabilityGateLogger,
+  status: number,
+  model: string,
+  probe: "capacity readback" | "availability probe",
+): void {
+  log.warn(
+    { status, model, probe },
+    "penstock probe auth fault: not an availability signal, allowing dispatch",
+  );
 }
 
 function capacityEndpointUnavailable(
@@ -518,7 +577,12 @@ async function probePenstockAnthropicModel(input: {
       signal: controller.signal,
     });
 
-    if (response.status === 401 || response.status === 403 || response.status === 429 || response.status === 503) {
+    if (isProbeAuthFault(response.status)) {
+      logProbeAuthFault(input.log, response.status, input.model, "availability probe");
+      return { allow: true };
+    }
+
+    if (response.status === 429 || response.status === 503) {
       const text = await response.text().catch(() => "");
       const parsed = parseCapacityRetry(text, response.headers, input.defaultRetryDelayMs, input.now());
       const retry = parsed ?? defaultCapacityRetry(input.defaultRetryDelayMs, input.now());
