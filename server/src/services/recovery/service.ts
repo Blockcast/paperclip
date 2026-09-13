@@ -790,6 +790,29 @@ const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
   "adapter_failed",
   "external_lifecycle_stale_killed",
   "k8s_concurrency_guard_unreachable",
+  // BLO-27463: provider capacity throttling. Both codes carry errorFamily
+  // `rate_limit_exhausted` (see heartbeat.ts `readHeartbeatRunErrorFamily`) — the
+  // provider refused to serve, which is infra-class by exactly the BLO-20933
+  // argument used for a vanished pod: the run never got to succeed or fail on its
+  // own merits, and the assignee had no part in it. Moving `ownerAgentId` up the
+  // manager ladder for a provider's capacity decision concentrates load on the
+  // manager for an event nobody on this side caused.
+  //
+  // Their sibling `provider_quota` never reaches here — `resolveStrandedRecoveryCause`
+  // re-causes it via `isProviderQuotaRecovery` — because it carries an authoritative
+  // reset instant and so gets the quota monitor/retry path. These two do not carry
+  // one, so they stay `stranded_assigned_issue` and are corrected here, at the
+  // routing decision, rather than by widening that quota predicate onto runs whose
+  // retry horizon it cannot resolve.
+  //
+  // Scope note: this fixes ROUTING only, not the attempt budget. Deliberately not
+  // added to TRANSIENT_INFRA_CONTINUATION_ERROR_CODES — BLO-5681's counterfactual
+  // asserts a `rate_limit_exhausted` continuation retry still produces a recovery
+  // action at zero tokens, and granting bounded retries here makes that (and two
+  // adjacent retry-count guards) fail. Changing the budget is a separate decision
+  // against those guards, not a side effect of fixing ownership.
+  "rate_limit_exhausted",
+  "provider_throttled_no_progress",
 ]);
 
 type SuccessfulRunHandoffRecoveryEvidence = {
