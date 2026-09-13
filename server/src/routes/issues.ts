@@ -176,7 +176,13 @@ import { executionWorkspaceService as executionWorkspaceServiceDirect } from "..
 import { decisionTrainingService } from "../services/decision-training.js";
 import { feedbackService } from "../services/feedback.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
-import { parseUnsupportedPaginationParams } from "../lib/issue-list-query.js";
+import {
+  ISSUE_LIST_APPLIED_LIMIT_HEADER,
+  ISSUE_LIST_TRUNCATED_HEADER,
+  issueListProbeLimit,
+  parseUnsupportedPaginationParams,
+  resolveIssueListTruncation,
+} from "../lib/issue-list-query.js";
 import { readAcceptedPlanConfirmationTarget } from "../services/issues.js";
 import { issueEfficiencyService } from "../services/issue-efficiency.js";
 import {
@@ -2662,10 +2668,17 @@ type IssueListPreparedResponse =
       body: CompactIssue[];
       etag: string;
       cacheControl: string;
+      // BLO-33741: carried on the prepared response, not computed at emit time,
+      // so a TTL-cache hit or a coalesced waiter reports the same truncation
+      // state as the request that actually did the query.
+      appliedLimit: number;
+      truncated: boolean;
     }
   | {
       kind: "full";
       body: unknown[];
+      appliedLimit: number;
+      truncated: boolean;
     };
 
 type IssueListCacheStatus = "miss" | "hit" | "coalesced" | "stale" | "retry";
@@ -8082,7 +8095,16 @@ export function issueRoutes(
       allowTtlCache: compactView,
       diagnostics: opts.issueListDiagnostics,
       compute: async () => {
-        const rawResult = await svc.list(companyId, listFilters);
+        // BLO-33741: probe one row past the page so truncation is detectable.
+        // `listFilters` keeps the caller's `limit` because it feeds the cache
+        // key — only the service call is widened. Truncation is resolved on the
+        // raw rows, before ACL filtering, because filtering shortens the page
+        // and would otherwise read as "not truncated".
+        const probed = await svc.list(companyId, {
+          ...listFilters,
+          limit: issueListProbeLimit(limit),
+        });
+        const { rows: rawResult, truncated } = resolveIssueListTruncation(probed, limit);
         const result = await actorCanReadCompanyScope(req, companyId)
           ? rawResult
           : await filterIssuesForActor(req, rawResult);
@@ -8116,6 +8138,8 @@ export function issueRoutes(
             body: compactResult,
             etag: compactIssueListEtag(compactResult),
             cacheControl: "private, must-revalidate",
+            appliedLimit: limit,
+            truncated,
           };
         }
         const [handoffStates, recoveryActionByIssue] = await Promise.all([
@@ -8142,6 +8166,8 @@ export function issueRoutes(
             successfulRunHandoff: handoffStates.get(issue.id) ?? null,
             activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
           })),
+          appliedLimit: limit,
+          truncated,
         };
       },
     });
@@ -8166,6 +8192,17 @@ export function issueRoutes(
       });
       res.status(429).json(body);
       return;
+    }
+
+    // BLO-33741: the body is a bare array with nowhere to carry a flag, so the
+    // truncation signal rides on headers. `X-Applied-Limit` is always present
+    // (a caller learns the effective cap even when it did not bite);
+    // `X-Result-Truncated` appears ONLY when rows were dropped, so its absence
+    // is the "you have everything" signal. Set before the 304 branch below —
+    // a revalidating client must still learn it is holding a truncated page.
+    res.setHeader(ISSUE_LIST_APPLIED_LIMIT_HEADER, String(coordinated.response.appliedLimit));
+    if (coordinated.response.truncated) {
+      res.setHeader(ISSUE_LIST_TRUNCATED_HEADER, "true");
     }
 
     if (coordinated.response.kind === "compact") {
@@ -8296,12 +8333,15 @@ export function issueRoutes(
   /**
    * Authoritative open-assignment census.
    *
-   * `GET /companies/:id/issues` silently clamps `limit` to ISSUE_LIST_MAX_LIMIT
-   * and returns a bare array with no total and no cursor, so a caller cannot
-   * tell a complete page from a truncated one, and offset paging over a
-   * mutating collection double-counts and drops rows. Consumers that need
-   * exact per-agent open counts (the agent-health sweep) must read them here
-   * instead of reconstructing them from that population.
+   * `GET /companies/:id/issues` clamps `limit` to ISSUE_LIST_MAX_LIMIT and
+   * returns a bare array, and offset paging over a mutating collection
+   * double-counts and drops rows. Consumers that need exact per-agent open
+   * counts (the agent-health sweep) must read them here instead of
+   * reconstructing them from that population.
+   *
+   * BLO-33741 added `X-Result-Truncated`/`X-Applied-Limit` to that endpoint, so
+   * a truncated page is now detectable rather than silent — but detection is
+   * not a count, and this census remains the authoritative source.
    */
   router.get("/companies/:companyId/issues/open-assignment-census", async (req, res) => {
     const companyId = req.params.companyId as string;
