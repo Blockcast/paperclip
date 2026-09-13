@@ -630,11 +630,11 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
     });
 
     /**
-     * The other two call sites, pinned against the route SOURCE rather than driven.
+     * The other three call sites, pinned against the route SOURCE rather than driven.
      *
-     * Both are real exits and neither is cheap to reach with a 200: the POST runs the whole
-     * runtime-command path (command resolution, the recorder, workspace provisioning) before it
-     * reaches its response literal, and the heartbeat-run route lives in `agents.ts`, whose router
+     * All are real exits and none is cheap to reach with a 200: the two POSTs run the whole
+     * runtime-command path (command resolution, the recorder, workspace provisioning) before they
+     * reach their response literal, and the heartbeat-run route lives in `agents.ts`, whose router
      * needs ~30 services mocked to mount. A source assertion is weaker than a driven one and is
      * stated as such — but it fails loudly if someone deletes the wrapper, which is the regression
      * this door actually had.
@@ -649,6 +649,11 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
         module: "agents.ts",
         marker: "publicWorkspaceOperations(operations, viewer)",
         site: "GET /heartbeat-runs/:runId/workspace-operations",
+      },
+      {
+        module: "projects.ts",
+        marker: "operation: publicWorkspaceOperation(operation, viewer)",
+        site: "POST /projects/:id/workspaces/:workspaceId/runtime-services/:action",
       },
     ])("$site routes its operations through the withholding boundary", ({ module, marker }) => {
       const source = readFileSync(
