@@ -1224,6 +1224,13 @@ export function executionWorkspaceService(db: Db) {
       worktreePath: string;
       liveBranchName: string | null;
       excludingExecutionWorkspaceId?: string | null;
+      /**
+       * The issue being validated. Excluded by issue identity as well as by workspace id,
+       * because `excludingExecutionWorkspaceId` is null exactly when an operator has applied
+       * the `executionWorkspaceId -> null` rebind remedy — and without this the issue's own
+       * workspace row becomes a candidate and the row contends with itself (BLO-33610).
+       */
+      excludingSourceIssueId?: string | null;
     }): Promise<ExecutionWorkspaceGitWorktreeContention> => {
       const resolvedWorktreePath = path.resolve(input.worktreePath);
       const pathOrBranchConditions = [
@@ -1258,6 +1265,14 @@ export function executionWorkspaceService(db: Db) {
           input.excludingExecutionWorkspaceId
             ? ne(executionWorkspaces.id, input.excludingExecutionWorkspaceId)
             : sql`true`,
+          // Keep rows with a null sourceIssueId: an orphaned workspace squatting the path is a
+          // genuine rival. A bare `ne` would drop them, since `NULL <> x` is NULL.
+          input.excludingSourceIssueId
+            ? or(
+                isNull(executionWorkspaces.sourceIssueId),
+                ne(executionWorkspaces.sourceIssueId, input.excludingSourceIssueId),
+              )
+            : sql`true`,
           or(...pathOrBranchConditions),
         ))
         .orderBy(desc(executionWorkspaces.lastUsedAt), desc(executionWorkspaces.updatedAt))
@@ -1282,6 +1297,9 @@ export function executionWorkspaceService(db: Db) {
           .where(and(
             eq(issues.companyId, input.companyId),
             isNull(issues.hiddenAt),
+            // A run cannot contend with itself: never let the validating issue seed `activeRun`,
+            // even via a rival workspace's `issues.executionWorkspaceId` arm.
+            input.excludingSourceIssueId ? ne(issues.id, input.excludingSourceIssueId) : sql`true`,
             linkedIssueConditions.length === 1 ? linkedIssueConditions[0]! : or(...linkedIssueConditions),
           ))
           .orderBy(desc(issues.updatedAt))
