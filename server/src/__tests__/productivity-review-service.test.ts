@@ -4608,6 +4608,68 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
+  // BLO-27698 A4 — suppression and reporting must agree on what "lapsed" means.
+  // `deliberatePendingMonitor` already treats a monitor inside
+  // `monitorLapseServiceGraceMs` as pending; `monitorGatingBreakdown` did not, so a
+  // monitor 20s past due reported "never re-armed" — reading to a manager as "nobody
+  // is watching" when dispatch is merely still due. Reachable whenever the
+  // suppression gates do not hold (here: a non-suppression-actor monitor), which is
+  // exactly when the report is rendered and read.
+  it("does not report a monitor inside the dispatch service grace as never re-armed", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 20_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorLastTriggeredAt: null,
+      monitorScheduledBy: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      // The 20s unattended residue is below the default long-active bar, so shrink
+      // the bar to render a report at all. Grace stays at its default 330s, which is
+      // the constant under test.
+      thresholds: { longActiveMs: 10_000 },
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).not.toContain("never re-armed");
+    expect(review?.description).toContain(
+      `20s unattended (monitor came due at ${monitorNextCheckAt.toISOString()} and is still inside the dispatch service grace`,
+    );
+  });
+
+  // BLO-27698 A4 boundedness — the converse, and the guard against A4 being applied
+  // as "recently due" rather than "inside grace". Same 20s-past-due monitor with the
+  // grace shrunk below 20s is genuinely unserviced, and must keep reporting the lapse.
+  it("still reports never re-armed once the monitor is past the dispatch service grace", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 20_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorLastTriggeredAt: null,
+      monitorScheduledBy: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { longActiveMs: 10_000, monitorLapseServiceGraceMs: 5_000 },
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      `20s unattended (monitor lapsed at ${monitorNextCheckAt.toISOString()}, never re-armed)`,
+    );
+  });
+
   it("does not renew backlog grace forever behind a non-draining predecessor", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
@@ -6131,6 +6193,15 @@ describeEmbeddedPostgres("productivity review service", () => {
   // the deliberate-monitor suppression, so the qualifier itself is pinned —
   // an unqualified "15h monitor-gated, 0m unattended" would tell the manager a
   // real stall was fully accounted for.
+  //
+  // BLO-27698: this is also the B3a regression guard BLO-27225 calls "the most
+  // important single test in the set" — `created: 1` below is what fails if the
+  // `!gatedIsUpperBound` condition is ever dropped from the long-active predicate,
+  // which would make the trigger structurally unfireable for any issue with a
+  // monitor armed however briefly (the indefinite-suppression hazard BLO-22331 AC2
+  // forbids). Verified by removing that condition and watching this go red. Named
+  // here because the guard was twice reported missing: it asserts the behaviour
+  // without mentioning `gatedIsUpperBound`, so a grep for the symbol does not find it.
   it("marks monitor-gated time as an upper bound while the monitor is still armed", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const armedUntil = new Date(now.getTime() + 30 * 60 * 1000);

@@ -357,6 +357,12 @@ type ProductivityReviewEvidence = {
     // monitor so `formatMonitorGating` doesn't blame the wrong thing.
     firedAt: Date | null;
     successorRunId: string | null;
+    // BLO-27698 A4: set (to the same instant as `lapsedAt`) when the monitor's
+    // scheduled check has passed but is still inside `monitorLapseServiceGraceMs`
+    // — the same window `deliberatePendingMonitor` treats as pending. Reporting
+    // only; see `monitorGatingBreakdown` for why it is deliberately not folded
+    // into `gatedIsUpperBound`.
+    awaitingServiceSince: Date | null;
   } | null;
   // BLO-23248/BLO-23624: elapsed time attributable to a no-executable-turn
   // run — the union of capacity park, dispatch backlog, and zero-token
@@ -988,6 +994,7 @@ function monitorGatingBreakdown(
   elapsedMs: number | null,
   now: Date,
   latestRuns: HeartbeatRunRow[],
+  thresholds: ProductivityReviewThresholds,
 ) {
   if (elapsedMs === null || !activeStartedAt) return null;
   const armedUntil = coerceDate(issue.monitorNextCheckAt);
@@ -1008,6 +1015,7 @@ function monitorGatingBreakdown(
       gatedIsUpperBound: true,
       firedAt: null,
       successorRunId: null,
+      awaitingServiceSince: null,
     };
   }
 
@@ -1024,6 +1032,7 @@ function monitorGatingBreakdown(
       gatedIsUpperBound: false,
       firedAt: null,
       successorRunId: null,
+      awaitingServiceSince: null,
     };
   }
   const lapsedAt = new Date(Math.max(...lapseCandidates.map((d) => d.getTime())));
@@ -1041,6 +1050,7 @@ function monitorGatingBreakdown(
       gatedIsUpperBound: false,
       firedAt: null,
       successorRunId: null,
+      awaitingServiceSince: null,
     };
   }
 
@@ -1059,6 +1069,25 @@ function monitorGatingBreakdown(
     : null;
 
   const gatedMs = Math.min(elapsedMs, lapsedAt.getTime() - activeStartedAt.getTime());
+  // BLO-27698 A4: a monitor whose scheduled check has only just passed has not
+  // "lapsed" — it is waiting on the dispatcher, inside the same
+  // `monitorLapseServiceGraceMs` window `deliberatePendingMonitor` already
+  // honours for suppression. Reporting that as "never re-armed" tells a manager
+  // nobody is watching when dispatch is merely still due, so suppression and
+  // reporting disagree about what lapsed means.
+  //
+  // Deliberately a separate display-only field rather than routing this case
+  // into the still-armed branch above, which is what a literal reading of the AC
+  // would do: that branch reports `gatedIsUpperBound: true`, and the BLO-22331
+  // AC2 guard below only subtracts the *measured* unattended component
+  // (`!gatedIsUpperBound`). Flipping this case into it would skip that guard
+  // entirely and fire the very `long_active_duration` review the current code
+  // correctly suppresses. Bucket math and `gatedIsUpperBound` are untouched here
+  // on purpose.
+  const awaitingServiceSince =
+    armedUntil !== null && now.getTime() - lapsedAt.getTime() <= thresholds.monitorLapseServiceGraceMs
+      ? lapsedAt
+      : null;
   return {
     gatedMs,
     unattendedMs: Math.max(0, elapsedMs - gatedMs),
@@ -1068,6 +1097,7 @@ function monitorGatingBreakdown(
     gatedIsUpperBound: false,
     firedAt: armedUntil === null ? lapsedAt : null,
     successorRunId,
+    awaitingServiceSince,
   };
 }
 
@@ -1086,6 +1116,9 @@ function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["mon
   if (gating.firedAt) {
     const successor = gating.successorRunId ? ` (run \`${gating.successorRunId}\`)` : "";
     return `${split} (monitor fired on schedule at ${gating.firedAt.toISOString()} and enqueued a successor run${successor}; nothing has re-armed it since)`;
+  }
+  if (gating.awaitingServiceSince) {
+    return `${split} (monitor came due at ${gating.awaitingServiceSince.toISOString()} and is still inside the dispatch service grace, so its wake has not been missed yet)`;
   }
   if (gating.lapsedAt) return `${split} (monitor lapsed at ${gating.lapsedAt.toISOString()}, never re-armed)`;
   if (gating.priorLapseAt) {
@@ -3589,7 +3622,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // BLO-25877: computed once here — after both suppression gates above have had
     // their chance to hold this review back — and reused as-is for the report-text
     // field further down, rather than recomputed there.
-    const monitorGating = monitorGatingBreakdown(sourceIssue, attributableStartAt, elapsedMs, now, latestRuns);
+    const monitorGating = monitorGatingBreakdown(sourceIssue, attributableStartAt, elapsedMs, now, latestRuns, thresholds);
     // Neither suppression gate above catches every "monitor accounted for most of
     // this episode" case: `currentPendingMonitorForReviewSuppression` only covers a
     // monitor that is still armed or within its lapse grace, not one that lapsed a
