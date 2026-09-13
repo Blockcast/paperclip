@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -344,6 +344,46 @@ describe("buildEnvGuardSetupShell", () => {
     const blobs = decodedBlobs(buildEnvGuardSetupShell());
     expect(blobs).toContain(ENV_GUARD_SCRIPT);
     expect(blobs).toContain(SAFE_ENV_INSPECT_SCRIPT);
+  });
+
+  it("writes the guard scripts to a per-pod path, not the shared CLAUDE_CONFIG_DIR", () => {
+    // BLO-33641: $HOME/.claude lives on the shared ReadWriteMany CephFS volume
+    // that every agent pod mounts, so a `>` redirect there is an O_TRUNC on one
+    // inode contended by ~92 CephFS clients. Measured: 71 MDS ops blocked on
+    // `setattr size=0` against this single file. The scripts are identical for
+    // every pod and are only read locally, so they belong on per-pod scratch.
+    const shell = buildEnvGuardSetupShell();
+    for (const script of ["paperclip-env-guard.mjs", "safe-env-inspect.mjs"]) {
+      const redirect = new RegExp(`> "\\$\\{?(\\w+)\\}?/${script.replace(".", "\\.")}"`);
+      const m = shell.match(redirect);
+      expect(m, `no redirect found for ${script}`).not.toBeNull();
+      // The redirect target must not be the shared config dir.
+      expect(m![1]).not.toBe("GUARD_DIR");
+    }
+    // settings.json still has to live in CLAUDE_CONFIG_DIR for Claude Code to
+    // read it, so GUARD_DIR itself must still be computed.
+    expect(shell).toContain('GUARD_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"');
+  });
+
+  it("does not rewrite settings.json when the hook is already present", () => {
+    // Same shared-inode problem: an unconditional writeFileSync on every pod
+    // start is another O_TRUNC on the shared volume. Steady state must be a
+    // pure read.
+    const mergeScript = decodedBlobs(buildEnvGuardSetupShell())[2]!;
+    const dir = mkdtempSync(path.join(tmpdir(), "pc-settings-nowrite-"));
+    try {
+      const f = path.join(dir, "settings.json");
+      const env = { ...process.env, CLAUDE_CONFIG_DIR: dir };
+      const run = () => spawnSync(process.execPath, ["-"], { input: mergeScript, encoding: "utf8", env });
+
+      expect(run().status).toBe(0); // first run installs the hook
+      const firstWrite = statSync(f).mtimeMs;
+
+      expect(run().status).toBe(0); // second run: hook already present
+      expect(statSync(f).mtimeMs).toBe(firstWrite);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("merges the PreToolUse hook idempotently, preserving existing hooks", () => {
