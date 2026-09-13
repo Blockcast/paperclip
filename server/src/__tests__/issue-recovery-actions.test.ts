@@ -8780,6 +8780,65 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         documentWriteRefusedRunId: refusedRunId,
       });
     });
+
+    /**
+     * BLO-32566 (review): the flag must not claim an escalation that was never delivered.
+     * `workspace_validation_failed` and `configuration_incomplete` dispatch no stranded wake
+     * at all (`strandedRecoveryWakeWillDispatch`), so a refused document write on those
+     * causes is a refusal that was RECORDED, not a planning-capable wake that was SENT.
+     * Reading the boolean straight off `documentWriteRefusedRunId` reported `true` here
+     * while `recoveryWorkClass` was `null` — the same row asserting both that an escalation
+     * happened and that no wake carried it, which overstates exactly the behaviour this
+     * signal exists to measure.
+     *
+     * Sign guard on the fix: with the flag derived from the raw id instead of the work
+     * class, this expects `false` and gets `true`. `documentWriteRefusedRunId` stays
+     * populated on purpose — the refusal is still a real, queryable fact; what it is not is
+     * a delivered escalation.
+     */
+    it("does not report an escalation after refusal when the cause dispatches no wake", async () => {
+      const { companyId, coderId, sourceIssue, sourceIssueId } = await seedCompany();
+      const refusedRunId = await seedNewestIssueRun({
+        companyId,
+        agentId: coderId,
+        issueId: sourceIssueId,
+        refusedAt: new Date("2026-09-07T16:15:00.000Z"),
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun: {
+          id: randomUUID(),
+          agentId: coderId,
+          status: "failed",
+          error: "workspace branch mismatch",
+          errorCode: "workspace_validation_failed",
+          contextSnapshot: {},
+          livenessState: "failed",
+          resultJson: {},
+        } as any,
+        comment: "Workspace failed validation.",
+        recoveryCause: "workspace_validation_failed",
+      });
+
+      const [entry] = await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityId, sourceIssueId),
+          sql`${activityLog.details} ->> 'source' = 'recovery.reconcile_workspace_validation_failed'`,
+        ));
+      expect(entry?.details).toMatchObject({
+        recoveryWorkClass: null,
+        escalatedAfterDocumentWriteRefusal: false,
+        // The refusal itself stays on the row; only the "was escalated" claim is withheld.
+        documentWriteRefusedRunId: refusedRunId,
+      });
+    });
   });
 
   describe("recovery sweep status coverage", () => {

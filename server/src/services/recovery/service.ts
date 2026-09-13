@@ -7065,18 +7065,6 @@ export function recoveryService(
       });
     }
 
-    // BLO-32566 (review): the stranded wake's escalation gate, resolved from a direct
-    // newest-run read for this issue rather than from `input.latestRun`. `input.latestRun`
-    // is the sweep's classification run — nulled on two paths and replaced with a
-    // stage-scoped or interaction-scoped run on two others — so a gate reading it is
-    // structurally false on exactly the lanes the refusal stamp lands in. Read once here,
-    // before the transaction, because both consumers need it: the escalation activity row
-    // written inside the transaction, and the wake dispatched after it commits.
-    const newestIssueRun = await getLatestIssueRun(input.issue.companyId, input.issue.id);
-    const documentWriteRefusedRunId = newestIssueRun?.statusOnlyDocumentWriteRefusedAt
-      ? newestIssueRun.id
-      : null;
-
     // Serialize escalation per (company, source-issue) so concurrent
     // reconcile sweeps don't fight over the same recovery-action upsert,
     // wakeup, and source-issue UPDATE.
@@ -7147,6 +7135,31 @@ export function recoveryService(
           return null;
         }
       } else if (fresh.status !== input.previousStatus && fresh.status !== "blocked") return null;
+
+      // BLO-32566 (review): the stranded wake's escalation gate, resolved from a direct
+      // newest-run read for this issue rather than from `input.latestRun`. `input.latestRun`
+      // is the sweep's classification run — nulled on two paths and replaced with a
+      // stage-scoped or interaction-scoped run on two others — so a gate reading it is
+      // structurally false on exactly the lanes the refusal stamp lands in.
+      //
+      // Read here rather than before the transaction so the value is as fresh as the
+      // mutation it feeds: the two lock acquisitions above can block on a contending
+      // sweep, and a pre-transaction read would carry a value taken before that wait
+      // across it. Both consumers take this one read — the activity row written below,
+      // and the wake dispatched after this commits (threaded out via the return).
+      //
+      // This NARROWS the stale-read window; it does not close it. The stamp writer
+      // (`routes/issues.ts`, the `statusOnly && mutationKind === "document"` refusal
+      // path) updates `heartbeat_runs` on the pooled connection and takes no advisory
+      // lock, so it does not serialize against `lockIssueOwnership` and can still land
+      // between this read and this commit. The residue is bounded rather than a dead
+      // end: the action stays active, so the next sweep re-enters here, observes the
+      // stamp, and escalates then — the cost of losing the race is one status-only wake
+      // out of the attempt budget, not a permanent status-only trap.
+      const newestIssueRun = await getLatestIssueRun(input.issue.companyId, input.issue.id);
+      const documentWriteRefusedRunId = newestIssueRun?.statusOnlyDocumentWriteRefusedAt
+        ? newestIssueRun.id
+        : null;
 
       // BLO-27463: a terminal `issue_dependencies_blocked` run on the *assignee's own
       // execution* is a wait state, never a stranded execution path (see
@@ -7330,6 +7343,11 @@ export function recoveryService(
           hasNewActivitySinceLastAttempt,
           needsHumanDecision,
           blockerIds,
+          // Carried on this branch too: it also falls through to
+          // `enqueueSourceScopedStrandedRecoveryWake` below, so omitting it here would
+          // widen the threaded type to `undefined` and silently drop the refusal signal
+          // on the provider-quota park.
+          documentWriteRefusedRunId,
           // BLO-21395: `null` suppresses the scheduler-side failure heartbeat. A provider
           // capacity park is not a strand the system has committed to — it may still
           // self-heal on retry — so emitting here would post a dark-window receipt about a
@@ -7523,6 +7541,18 @@ export function recoveryService(
         }
       }
 
+      // BLO-32566 (review): both telemetry fields below key off whether a stranded wake
+      // is actually dispatched for this escalation, so derive them from one evaluation of
+      // the predicate rather than letting the boolean read the raw refusal id. A refused
+      // document write on a cause that dispatches no wake at all
+      // (`workspace_validation_failed`, `configuration_incomplete`, or a
+      // null-owner action) is a refusal that was recorded, not an escalation that was
+      // delivered, and counting it as the latter overstates exactly the behaviour this
+      // signal exists to measure.
+      const recoveryWorkClass = strandedRecoveryWakeWillDispatch(action, recoveryCause)
+        ? (documentWriteRefusedRunId ? "planning_only" : "status_only")
+        : null;
+
       const publishEscalationActivity = await logActivity(tx as unknown as Db, {
         companyId: fresh.companyId,
         actorType: "system",
@@ -7585,10 +7615,13 @@ export function recoveryService(
           //
           // `null` work class means no stranded wake is dispatched for this escalation at
           // all — distinct from one dispatched status-only.
-          recoveryWorkClass: strandedRecoveryWakeWillDispatch(action, recoveryCause)
-            ? (documentWriteRefusedRunId ? "planning_only" : "status_only")
-            : null,
-          escalatedAfterDocumentWriteRefusal: documentWriteRefusedRunId !== null,
+          recoveryWorkClass,
+          // Derived from the work class, not from `documentWriteRefusedRunId` directly:
+          // this asserts a planning-capable wake was dispatched *because of* a refusal.
+          // `documentWriteRefusedRunId` below stays the raw fact — a refusal happened —
+          // so a refusal on a non-dispatching cause remains queryable without being
+          // counted as a delivered escalation.
+          escalatedAfterDocumentWriteRefusal: recoveryWorkClass === "planning_only",
           documentWriteRefusedRunId,
         },
       }, {
@@ -7605,6 +7638,10 @@ export function recoveryService(
         needsHumanDecision,
         blockerIds,
         publishEscalationActivity,
+        // BLO-32566 (review): the wake dispatched below must key off the same locked read
+        // the activity row was written from, or the two disagree about whether this
+        // escalation was planning-capable.
+        documentWriteRefusedRunId,
         // BLO-21395: the scheduler-side failure heartbeat is cross-posted after this
         // transaction commits, and `prefix` is only derived in here — threading it out
         // beats a second `getCompanyIssuePrefix` round trip on the same company. Non-null
@@ -7638,7 +7675,7 @@ export function recoveryService(
       action: escalation.action,
       issue: escalation.fresh,
       latestRun: input.latestRun,
-      documentWriteRefusedRunId,
+      documentWriteRefusedRunId: escalation.documentWriteRefusedRunId,
       recoveryCause: escalation.recoveryCause,
       hasNewActivitySinceLastAttempt: escalation.hasNewActivitySinceLastAttempt,
       expectedLockOwnerState: {
