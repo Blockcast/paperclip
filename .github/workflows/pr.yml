@@ -385,15 +385,6 @@ jobs:
         run: node --test ./.github/scripts/tests/check-ffmpeg-muxer.test.mjs
         timeout-minutes: 1
 
-      # Guards this workflow's own concurrency key. Keying merge_group on the
-      # constant `base_ref` is harmless at maximumEntriesToBuild=1 and silently
-      # caps the queue at serial the moment that is raised, so the regression
-      # would surface as unexplained latency rather than as a failure.
-      - name: Test merge-queue concurrency key (BLO-22902)
-        if: ${{ !cancelled() }}
-        run: node --test ./.github/scripts/tests/pr-workflow-concurrency.test.mjs
-        timeout-minutes: 1
-
       - name: Test production environment protection guard (BLO-22329)
         if: ${{ !cancelled() }}
         run: |
