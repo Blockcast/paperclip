@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import {
   classifyStepKills,
   fetchAnnotations,
+  main,
   renderAnnotations,
   selectCurrentJob,
   stepElapsedSeconds,
@@ -458,6 +459,136 @@ test("annotation paging reports the cap exit as a truncated read, not a clean on
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+// ---------------------------------------------------------------------------
+// End-to-end paths. The pure functions above cannot reach two behaviours that
+// exist only inside main(): the `payload?.jobs ?? []` selector paging the jobs
+// list, and the precedence that decides WHICH degradation the reader is told
+// about when more than one applies.
+// ---------------------------------------------------------------------------
+
+// main() reads these at call time, and every one of them is genuinely set when
+// this suite runs inside `policy` — so save and restore precisely rather than
+// deleting, or the second test inherits the first's leftovers.
+const MAIN_ENV_KEYS = [
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GITHUB_REPOSITORY",
+  "GITHUB_RUN_ID",
+  "POLICY_JOB_NAME",
+  "GITHUB_JOB",
+];
+
+/**
+ * Drive main() against a stubbed Actions API, returning what it asked for and
+ * what it wrote. `jobsPages` is indexed by page number; `annotationsFor(page)`
+ * answers the annotations endpoint.
+ */
+async function runMain({ jobsPages, annotationsFor }) {
+  const requested = [];
+  const written = [];
+  const originalFetch = globalThis.fetch;
+  const originalWrite = process.stdout.write;
+  const savedEnv = Object.fromEntries(MAIN_ENV_KEYS.map((key) => [key, process.env[key]]));
+
+  globalThis.fetch = async (url) => {
+    const parsed = new URL(String(url));
+    const page = Number(parsed.searchParams.get("page"));
+    requested.push(parsed.pathname);
+    const body = parsed.pathname.endsWith("/jobs")
+      ? (jobsPages[page - 1] ?? { jobs: [] })
+      : annotationsFor(page);
+    return { ok: true, status: 200, statusText: "OK", json: async () => body };
+  };
+  // Capture only the workflow commands main() emits and pass everything else
+  // straight through. The stub is global and main() spends seconds awaiting its
+  // backoffs, so the test runner's own reporter writes land here too — swallow
+  // them and a failure inside this test reports into the void.
+  process.stdout.write = (chunk, ...rest) => {
+    const text = String(chunk);
+    if (!text.startsWith("::")) return originalWrite.call(process.stdout, chunk, ...rest);
+    written.push(text);
+    return true;
+  };
+  Object.assign(process.env, {
+    GH_TOKEN: "token",
+    GITHUB_REPOSITORY: "Blockcast/paperclip",
+    GITHUB_RUN_ID: "34154564717",
+    POLICY_JOB_NAME: "policy",
+  });
+
+  try {
+    await main();
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.stdout.write = originalWrite;
+    for (const key of MAIN_ENV_KEYS) {
+      if (savedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedEnv[key];
+    }
+  }
+
+  return {
+    jobRequests: requested.filter((path) => path.endsWith("/jobs")).length,
+    annotationRequests: requested.filter((path) => path.endsWith("/annotations")).length,
+    lines: written.join("").split("\n").filter(Boolean),
+  };
+}
+
+test("the jobs list is paged through the {jobs: [...]} envelope to a short final page", async () => {
+  // The annotations endpoint returns a bare array; the jobs endpoint wraps its
+  // array in an envelope. They share one pager, so the jobs selector is the half
+  // that `Array.isArray(payload) ? payload : []` coverage says nothing about —
+  // a selector that returned the envelope itself, or [] on a full page, would
+  // pass every annotation test in this file and lose the job here.
+  const { jobRequests, annotationRequests, lines } = await runMain({
+    jobsPages: [
+      // Page 1 full: 100 other jobs, none of them ours. Unwrapping must survive
+      // the page that does NOT terminate the loop.
+      { jobs: Array.from({ length: 100 }, (_, index) => ({ id: index + 1, name: "e2e", status: "completed" })) },
+      // Page 2 short: the job we are after, past the first page.
+      { jobs: [{ id: 4242, name: "policy", status: "in_progress", steps: [KILLED_STEP] }] },
+    ],
+    annotationsFor: (page) => (page === 1 ? KILLED_JOB_ANNOTATIONS : []),
+  });
+
+  assert.equal(jobRequests, 2, "page 1 was full, so the pager must ask for page 2");
+  assert.equal(annotationRequests, 1, "3 annotations is a short page — one request");
+  // The kill is the proof the job from page 2 was selected AND carried its
+  // steps: 73s can only come from KILLED_STEP's timestamps.
+  assert.equal(lines.length, 1, "one annotation, no degradation");
+  assert.match(lines[0], /^::error title=Step timed out \(not a test failure\)::/);
+  assert.match(lines[0], /after running 73s/, "the selected job's steps supplied the elapsed time");
+});
+
+test("a cap-truncated read outranks the generic 'no failure annotation' message", async () => {
+  // Both degradations are true at once here: the job holds a failed step whose
+  // failure annotation never appears, AND every read stopped at the cap. The
+  // retry loop must report the truncation, because it is the more specific
+  // explanation — a partial read cannot establish that the annotation is absent,
+  // so saying "reported no failure annotation" would assert a negative drawn
+  // from evidence that does not support it. That is this script's whole thesis.
+  //
+  // Costs the loop's two real 2s backoffs (~4s against a 60s step budget). Left
+  // real rather than mocked: the precedence only exists in the branch that runs
+  // after the retries are exhausted.
+  const { annotationRequests, lines } = await runMain({
+    jobsPages: [{ jobs: [{ id: 99, name: "policy", status: "in_progress", steps: [KILLED_STEP] }] }],
+    // Never short, never a failure level: runs to the cap and never settles.
+    annotationsFor: () => Array.from({ length: 100 }, () => ({ annotation_level: "notice", message: "x" })),
+  });
+
+  assert.equal(annotationRequests, 15, "3 attempts x the 5-page cap");
+  assert.equal(lines.length, 1, "a degradation speaks exactly once");
+  assert.match(lines[0], /^::warning title=Step-kill classifier degraded::/);
+  assert.match(lines[0], /truncated at the 5-page cap/, "the specific explanation survives");
+  assert.doesNotMatch(
+    lines[0],
+    /reported no failure annotation/,
+    "the generic message must not overwrite a truncation it cannot rule out",
+  );
+  assert.doesNotMatch(lines[0], /^::error/, "no kill was observed, so none may be claimed");
 });
 
 // ---------------------------------------------------------------------------
