@@ -8495,6 +8495,24 @@ export function mergeCoalescedContextSnapshot(
   // spread alone did not: `planning_only` supplies no `modelProfile`, so an
   // inherited `cheap` used to ride along beside `recoveryIntent: planning_only`
   // as a tuple no caller can construct directly.
+  //
+  // INTENDED, with a known residual (BLO-32774). Clearing the block lifts cost
+  // containment, and on a `stranded_assigned_issue` recovery the guarded agent IS
+  // the assignee — `assertCanManageIssueMonitor` returns early for the assignee, so
+  // it can arm a monitor on its own issue and get back one unguarded run while its
+  // recovery action stays active. That is accepted here rather than patched here:
+  // the block belongs at the ARMING gate, where the actor's run class is known, not
+  // at the merge, which only sees a wake that has already been scheduled. Bounded
+  // meanwhile by deliberate action (no automatic path), one run per fire (the next
+  // recovery wake is status-only again), the `in_progress`/`in_review` arming
+  // precondition, and the convergence guard capping repeated self-arming at 3.
+  //
+  // Do NOT "fix" it by pinning `modelProfile`/`allowDeliverableWork` through the
+  // drop. That yields cheap-model-plus-deliverable-writes — the one tuple the
+  // system never otherwise builds, worse than either endpoint — because
+  // `allowDeliverableWork` is never read standalone, only as a conjunct of
+  // `isStatusOnlyCheapRecoveryContext`/`isPlanningOnlyRecoveryContext`; and it
+  // reintroduces the partial tuple this block exists to prevent.
   const declaresRecoveryWorkClass = readNonEmptyString(incoming[RECOVERY_WORK_CLASS_KEY]) !== null;
   if (declaresRecoveryWorkClass) {
     for (const key of RECOVERY_GUARD_CONTEXT_KEYS) {
@@ -13364,7 +13382,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         triggerDetail: input.triggerDetail,
         reason: wakeReason,
         idempotencyKey: `issue-monitor:${claimed.id}:${scheduledAtIso}`,
-        payload: {
+        payload: withRecoveryModelProfileHint({
           issueId: claimed.id,
           nextCheckAt: scheduledAtIso,
           monitorAttemptCount: nextAttemptCount,
@@ -13372,14 +13390,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...monitorMetadata,
           ...reviewRecoveryContext,
           source: input.activitySource,
-        },
+        }, "normal_model"),
         requestedByActorType: input.actorType,
         requestedByActorId: input.actorId,
         // BLO-32634: a monitor fire is assignee-scheduled work, never a recovery
         // wake — declare that explicitly rather than leaving the snapshot merely
         // silent. Silence is inherited by `mergeCoalescedContextSnapshot`, so a
         // fire landing on a run row stamped `status_only` used to come back
-        // guarded and have its own scheduled write refused.
+        // guarded and have its own scheduled write refused. Declared on the
+        // payload too, matching the 11 recovery dispatch sites: neither spread
+        // above carries `modelProfile` today, but
+        // `normalizeModelProfileWakeContext` copies `payload.modelProfile` into a
+        // snapshot that has none, so the pair is what keeps that bleed shut.
         contextSnapshot: withRecoveryModelProfileHint({
           issueId: claimed.id,
           source: isProviderQuotaReviewMonitor ? "issue.execution_review_recovery" : "issue.monitor",
