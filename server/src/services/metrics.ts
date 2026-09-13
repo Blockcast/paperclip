@@ -2214,6 +2214,8 @@ function ensureRegistry(): {
         + "non-zero rate means an adapter is emitting from a continuation that outlives "
         + "execute() — expected only on the orphan-kill path.",
       labelNames: ["status"],
+      registers: [registry],
+    });
     // Unlabeled on purpose (BLO-32269): consumed as
     // `sum(increase(...[15m])) == 0`. prom-client zero-initializes an unlabeled
     // counter at construction, so both series are present on the very first
