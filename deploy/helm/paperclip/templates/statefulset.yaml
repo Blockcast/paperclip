@@ -461,9 +461,36 @@ spec:
               #!/bin/sh
               exec /paperclip/.local/bin/paperclip-github-token-env /usr/local/bin/github-mcp-server "$@"
               EOF
+              # PEN-3156: the THIRD egress door. `gh` and `github-mcp-server`
+              # above rewrite a payload in flight; this one cannot, because a
+              # commit object is content-addressed — altering a blob or a
+              # message changes that commit's SHA and every descendant's. So the
+              # guard here REFUSES a publish that would carry credential-shaped
+              # material, and names the commit to amend.
+              #
+              # The runtime goes INSIDE the token wrapper, like
+              # github-mcp-server above, so git still inherits its credentials.
+              # It runs on every invocation but acts only on a publish: it
+              # injects core.hooksPath for the hook below and rejects
+              # --no-verify, which would otherwise skip that hook. Everything
+              # else is passed through untouched.
+              GIT_HOOKS_DIR="${BASE}/.local/share/paperclip-git-hooks"
+              mkdir -p "${GIT_HOOKS_DIR}"
+              cat > "${GIT_HOOKS_DIR}/pre-push" <<'EOF'
+              #!/bin/sh
+              exec /usr/local/bin/node /opt/paperclip-bundled-adapters/node_modules/@paperclipai/adapter-utils/dist/github-git-egress-runtime.js --pre-push-hook "$@"
+              EOF
+              chmod 0755 "${GIT_HOOKS_DIR}/pre-push"
+              # Ownership, not a security boundary. This container is already
+              # runAsUser 1000 and the PVC is fsGroup 1000, so the hook is
+              # writable by the agent no matter what is written here — and the
+              # chart has no root to make it otherwise. The guard's threat model
+              # is accidental disclosure; see the header of
+              # packages/adapter-utils/src/github-git-egress-runtime.ts.
+              chown 1000:1000 "${GIT_HOOKS_DIR}" "${GIT_HOOKS_DIR}/pre-push" 2>/dev/null || true
               cat > "${LOCAL_BIN}/git" <<'EOF'
               #!/bin/sh
-              exec /paperclip/.local/bin/paperclip-github-token-env /usr/bin/git \
+              exec /paperclip/.local/bin/paperclip-github-token-env /usr/local/bin/node /opt/paperclip-bundled-adapters/node_modules/@paperclipai/adapter-utils/dist/github-git-egress-runtime.js /usr/bin/git \
                 -c credential.https://github.com.helper= \
                 -c credential.https://github.com.helper=/paperclip/.local/bin/github-token-credential-helper \
                 "$@"
@@ -495,8 +522,19 @@ spec:
               mkdir -p "${PATH_BIN}"
               ln -sf "${LOCAL_BIN}/gh" "${PATH_BIN}/gh"
               chown -h 1000:1000 "${PATH_BIN}/gh" 2>/dev/null || true
+              # PEN-3156: `git` needs the same treatment, and for the same
+              # reason. Measured in a live agent Job pod before this change:
+              # PATH was ".../paperclip/bin:...:/usr/bin", `command -v gh` gave
+              # ${PATH_BIN}/gh, and `command -v git` gave /usr/bin/git — because
+              # ${LOCAL_BIN}/git existed but ${LOCAL_BIN} was not on that PATH
+              # and no symlink published it here. The push guard would have been
+              # a choke point nothing traverses. Without this line the rest of
+              # PEN-3156 is decorative.
+              ln -sf "${LOCAL_BIN}/git" "${PATH_BIN}/git"
+              chown -h 1000:1000 "${PATH_BIN}/git" 2>/dev/null || true
               echo "seed: installed fresh-read GitHub token wrappers in ${LOCAL_BIN}"
               echo "seed: published egress-scrubbing gh on the default PATH at ${PATH_BIN}/gh"
+              echo "seed: published publish-guarding git on the default PATH at ${PATH_BIN}/git"
 
               # Seed a project-scope .mcp.json at $HOME (CWD for k8s Job pods is
               # /paperclip by default — matches PAPERCLIP_HOME) so every claude
