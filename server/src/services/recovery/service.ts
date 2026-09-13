@@ -2755,6 +2755,36 @@ export function recoveryService(
    * MOVES, not that one arrives on a schedule -- see `openPullRequestAttendanceGraceMs`
    * for why the bound is days rather than the monitor's hours, and why it must exist.
    */
+  /**
+   * The clauses that make an `issue_work_products` row evidence that a webhook wake will
+   * still arrive — the single definition of "open PR attendance", shared by the two gates
+   * that consult it.
+   *
+   * Extracted by PEN-3198, which added the second consumer. Both gates ask exactly the
+   * same question and must not answer it differently: the stranded-assigned-issue sweep
+   * (`hasOpenPullRequestWakePath`) and the issue-graph liveness classifier's
+   * `in_review_without_action_path`. Duplicating seven clauses across two call sites is
+   * how they drift, and a drift here is silent in the dangerous direction — one gate
+   * suppressing while the other escalates reads as flapping, not as a bug.
+   *
+   * `freshSinceIso` is passed rather than derived so a single pass bounds every row it
+   * classifies against ONE instant. Bound as an ISO string with an explicit cast:
+   * postgres.js cannot serialize a Date interpolated into a raw `sql` fragment and throws
+   * ERR_INVALID_ARG_TYPE at bind time. Same hazard as `hasPositiveRunEvidence` and the
+   * work-product upsert, both of which were bitten by it.
+   */
+  function openPullRequestWakePathConditions(freshSinceIso: string) {
+    return [
+      eq(issueWorkProducts.provider, "github"),
+      eq(issueWorkProducts.type, "pull_request"),
+      inArray(issueWorkProducts.status, [...OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES]),
+      sql`${issueWorkProducts.metadata}->>'source' = ${PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE}`,
+      sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
+      sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
+      sql`${issueWorkProducts.updatedAt} > ${freshSinceIso}::timestamptz`,
+    ];
+  }
+
   async function hasOpenPullRequestWakePath(
     issue: typeof issues.$inferSelect,
     graceMs: number,
@@ -2767,17 +2797,7 @@ export function recoveryService(
         and(
           eq(issueWorkProducts.companyId, issue.companyId),
           eq(issueWorkProducts.issueId, issue.id),
-          eq(issueWorkProducts.provider, "github"),
-          eq(issueWorkProducts.type, "pull_request"),
-          inArray(issueWorkProducts.status, [...OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES]),
-          sql`${issueWorkProducts.metadata}->>'source' = ${PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE}`,
-          sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
-          sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
-          // Bound as an ISO string with an explicit cast: postgres.js cannot serialize a
-          // Date interpolated into a raw `sql` fragment and throws ERR_INVALID_ARG_TYPE
-          // at bind time. Same hazard as `hasPositiveRunEvidence` and the work-product
-          // upsert, both of which were bitten by it.
-          sql`${issueWorkProducts.updatedAt} > ${freshSinceIso}::timestamptz`,
+          ...openPullRequestWakePathConditions(freshSinceIso),
         ),
       )
       .limit(1)
@@ -9562,6 +9582,14 @@ export function recoveryService(
   }
 
   async function collectIssueGraphLiveness() {
+    // One read per pass, not one per issue: `loadConfig()` shells out to `tailscale` on
+    // the default config, so a per-row read would turn this sweep into a subprocess per
+    // candidate. Resolving here (rather than at module scope) keeps the operator's
+    // ability to retune the grace without a restart — the next pass sees the new value.
+    const openPullRequestAttendanceGraceMs = loadConfig().openPullRequestAttendanceGraceMs;
+    const openPullRequestFreshSinceIso =
+      new Date(Date.now() - openPullRequestAttendanceGraceMs).toISOString();
+
     const issueRowsPromise = Promise.resolve(db
       .select({
         id: issues.id,
@@ -9600,6 +9628,7 @@ export function recoveryService(
       approvalRows,
       recoveryIssueRows,
       recoveryActionRows,
+      openPullRequestRows,
     ] = await Promise.all([
       db
         .select({
@@ -9744,6 +9773,20 @@ export function recoveryService(
               ),
             );
       }),
+      // PEN-3198: open, webhook-written PRs still inside the attendance grace. Filtered in
+      // SQL rather than in the classifier so the whole predicate stays in one place
+      // (`openPullRequestWakePathConditions`) and the classifier stays pure — it receives
+      // the same pre-indexed `{companyId, issueId, status}` shape as every other waiting
+      // path. Bounded by the grace window, so this is not a scan of every PR ever
+      // recorded.
+      db
+        .select({
+          companyId: issueWorkProducts.companyId,
+          issueId: issueWorkProducts.issueId,
+          status: issueWorkProducts.status,
+        })
+        .from(issueWorkProducts)
+        .where(and(...openPullRequestWakePathConditions(openPullRequestFreshSinceIso))),
     ]);
 
     // Waiting paths contributed by OPEN liveness escalations, kept separate from every
@@ -9804,6 +9847,12 @@ export function recoveryService(
       })),
       pendingInteractions: interactionRows,
       pendingApprovals: approvalRows,
+      // PEN-3198. Deliberately part of `sharedInput` rather than passed per-view: unlike
+      // an open escalation, an open PR is NOT a path this subsystem creates, so the
+      // premise re-check below must keep seeing it. Dropping it there would make the
+      // re-check ask "does this still fire once we pretend the PR is gone?", which is the
+      // self-sealing mistake BLO-29601 fixed, run in reverse.
+      openPullRequestAttendance: openPullRequestRows,
       now: new Date(),
     };
 

@@ -278,6 +278,102 @@ describe("recovery classifier boundary", () => {
     expect(exhausted[0]?.state).toBe("in_review_without_action_path");
   });
 
+  describe("PEN-3198 open pull request as an in-review action path", () => {
+    const inReviewIssue = {
+      id: issueId,
+      companyId,
+      identifier: "PEN-3006",
+      title: "Awaiting review on a linked PR",
+      status: "in_review",
+      assigneeAgentId: agentId,
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionState: null,
+    };
+    const agents = [
+      {
+        id: agentId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "idle",
+        reportsTo: managerId,
+      },
+    ];
+
+    // Control. Without this the next test could pass against a row that was never
+    // escalating in the first place, which would make the suppression untested.
+    it("escalates an in-review row with no open pull request recorded", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [inReviewIssue],
+        relations: [],
+        agents,
+      });
+
+      expect(findings[0]?.state).toBe("in_review_without_action_path");
+    });
+
+    it("treats a recent open pull request on the row as the action path", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [inReviewIssue],
+        relations: [],
+        agents,
+        openPullRequestAttendance: [
+          { companyId, issueId, status: "ready_for_review" },
+        ],
+      });
+
+      expect(findings).toEqual([]);
+    });
+
+    // The attendance list is indexed by `(companyId, issueId)`. A PR on a DIFFERENT row
+    // must not silence this one -- a leak here would suppress the invariant graph-wide
+    // off a single open PR, which is the failure mode that would be hardest to notice
+    // precisely because it makes the alarm stop.
+    it("does not let a pull request on another issue silence this row", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [inReviewIssue],
+        relations: [],
+        agents,
+        openPullRequestAttendance: [
+          { companyId, issueId: "some-other-issue", status: "ready_for_review" },
+        ],
+      });
+
+      expect(findings[0]?.state).toBe("in_review_without_action_path");
+    });
+
+    it("does not let a pull request in another company silence this row", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [inReviewIssue],
+        relations: [],
+        agents,
+        openPullRequestAttendance: [
+          { companyId: "company-2", issueId, status: "ready_for_review" },
+        ],
+      });
+
+      expect(findings[0]?.state).toBe("in_review_without_action_path");
+    });
+
+    // The staleness bound lives in the caller's SQL, not here -- this classifier is pure
+    // and receives only rows that already passed `openPullRequestWakePathConditions`. An
+    // empty list is therefore how an EXPIRED PR arrives, and it must escalate: that is
+    // the bounded half of the ruling on PEN-3198, and the reason bare openness was
+    // rejected.
+    it("escalates when the attendance list is empty because the grace has expired", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [inReviewIssue],
+        relations: [],
+        agents,
+        openPullRequestAttendance: [],
+      });
+
+      expect(findings[0]?.state).toBe("in_review_without_action_path");
+    });
+  });
+
   it("keeps run liveness continuation decision parity with the compatibility export", () => {
     const input = {
       run: {
