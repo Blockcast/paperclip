@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -8749,26 +8749,120 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     /**
-     * The projection guard, asserted directly rather than only as a side effect of the cases
-     * above. `getLatestIssueRun` is one of four `LatestIssueRun` producers; before this change
-     * two of them hand-copied the column list instead of sharing `LATEST_ISSUE_RUN_COLUMNS`,
-     * so a column added to the type was silently absent from their rows. The type annotation on
-     * those functions now makes that a compile error, and this asserts the runtime half.
+     * Sign guard for Path B, paired with the case above: the identical seed minus the
+     * refusal stamp must stay status-only. Without it a Path B gate wired to escalate
+     * unconditionally would pass the positive case, which is the failure in the expensive
+     * direction — every assignee_fallback wake onto the normal model.
      */
-    it("reads the refusal stamp back through the real projection", async () => {
+    it("assignee_fallback wake stays status-only when no document write was refused", async () => {
+      const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+      await db
+        .update(issues)
+        .set({ lastActivityAt: new Date("2026-09-07T10:00:00.000Z") })
+        .where(eq(issues.id, sourceIssueId));
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "External lifecycle Job is missing while heartbeat run is still running",
+        errorCode: "job_missing",
+        resultJson: {
+          externalLifecycleRecovery: { adapterInvocationStarted: true },
+        },
+        contextSnapshot: { issueId: sourceIssueId },
+        statusOnlyDocumentWriteRefusedAt: null,
+        startedAt: new Date("2026-09-07T09:00:00.000Z"),
+        finishedAt: new Date("2026-09-07T09:30:00.000Z"),
+      });
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        cause: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        returnOwnerAgentId: coderId,
+        attemptCount: 2,
+        lastAttemptAt: new Date("2026-09-07T11:00:00.000Z"),
+        fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:stale-fingerprint`,
+        evidence: {},
+        nextAction: "Wake the owner to re-drive the stranded issue.",
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      await recovery.reconcileStrandedAssignedIssues();
+
+      const fallback = enqueueWakeup.mock.calls
+        .find(([, opts]) => typeof (opts as any)?.idempotencyKey === "string"
+          && (opts as any).idempotencyKey.endsWith(":assignee_fallback"));
+      expect(fallback).toBeDefined();
+      expect(fallback![0]).toBe(coderId);
+      expect((fallback![1] as any).contextSnapshot).toMatchObject({
+        suppressedNonAssigneeWake: true,
+        recoveryIntent: "status_only",
+        allowDocumentUpdates: false,
+        modelProfile: "cheap",
+      });
+    });
+
+    /**
+     * BLO-32566 (review): the gate must read the issue's NEWEST run, not the run the sweep
+     * classified on — those diverge on four caller paths (`latestRun` nulled on the
+     * terminal-dispatch-race and adoption-handover paths, replaced with a stage-scoped or
+     * interaction-scoped run on the two `in_review` sub-lanes), none of which can match a
+     * `source_scoped_recovery_action` run. The gate now takes a run id resolved from a
+     * direct `getLatestIssueRun`, so `input.latestRun` is not reachable from it at all.
+     *
+     * Asserted here through the escalation activity row, which is the same read: a wake that
+     * escalated and a row naming the run that was refused prove the resolved id reached both
+     * consumers. Staging an actual divergence would need an `in_review` pending-stage
+     * fixture; the invariant those lanes need is that the gate has no path back to the
+     * scoped parameter, which the threading makes structural.
+     */
+    it("records the escalation and the refused run on the escalation-time activity row", async () => {
       const { companyId, coderId, sourceIssueId } = await seedCompany();
-      const refusedAt = new Date("2026-09-07T16:15:00.000Z");
-      await seedNewestIssueRun({ companyId, agentId: coderId, issueId: sourceIssueId, refusedAt });
+      const refusedRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: refusedRunId,
+        companyId,
+        agentId: coderId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "External lifecycle Job is missing while heartbeat run is still running",
+        errorCode: "job_missing",
+        resultJson: {
+          externalLifecycleRecovery: { adapterInvocationStarted: true },
+        },
+        contextSnapshot: { issueId: sourceIssueId },
+        statusOnlyDocumentWriteRefusedAt: new Date("2026-09-07T16:15:00.000Z"),
+        startedAt: new Date("2026-09-07T16:10:00.000Z"),
+        finishedAt: new Date("2026-09-07T16:15:00.000Z"),
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
 
-      const [row] = await db
-        .select({ stamp: heartbeatRuns.statusOnlyDocumentWriteRefusedAt })
-        .from(heartbeatRuns)
+      await recovery.reconcileStrandedAssignedIssues();
+
+      // The backstop lane already recorded these three. Every reported occurrence was on
+      // THIS lane (todo/in_progress/in_review), so recording them on the backstop only left
+      // "which issues escalated off status-only, and when" unanswerable for the majority.
+      const [entry] = await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
         .where(and(
-          eq(heartbeatRuns.companyId, companyId),
-          eq(heartbeatRuns.agentId, coderId),
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityId, sourceIssueId),
+          sql`${activityLog.details} ->> 'source' = 'recovery.reconcile_stranded_assigned_issue'`,
         ));
-
-      expect(row?.stamp).toEqual(refusedAt);
+      expect(entry?.details).toMatchObject({
+        recoveryWorkClass: "planning_only",
+        escalatedAfterDocumentWriteRefusal: true,
+        documentWriteRefusedRunId: refusedRunId,
+      });
     });
   });
 
