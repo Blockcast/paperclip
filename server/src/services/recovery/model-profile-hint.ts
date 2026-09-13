@@ -60,6 +60,23 @@ export const STATUS_ONLY_RECOVERY_RESUME_GUIDANCE = {
     "run context's source issue.",
 } as const;
 
+// Does a run's `contextSnapshot` carry the full status-only guard tuple?
+//
+// BLO-32774: `issues.ts` used to hand-repeat these five keys inline. Deriving
+// the predicate from `STATUS_ONLY_RECOVERY_GUARD_CONTEXT` instead means editing
+// the tuple cannot leave a guard silently testing the old shape — that drift
+// fails OPEN, which is the dangerous direction for a write-containment guard.
+//
+// Every key must match. A partial tuple is deliberately NOT status-only: the
+// guard is the conjunction, and treating a subset as equivalent would let a
+// caller clear one key to escape containment.
+export function isStatusOnlyRecoveryContextSnapshot(contextSnapshot: unknown): boolean {
+  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
+  const context = contextSnapshot as Record<string, unknown>;
+  if (context.modelProfile !== RECOVERY_MODEL_PROFILE_KEY) return false;
+  return Object.entries(STATUS_ONLY_RECOVERY_GUARD_CONTEXT).every(([key, value]) => context[key] === value);
+}
+
 const RECOVERY_MODEL_PROFILE_HINT_KEYS = [
   "modelProfile",
   "paperclipModelProfile",
