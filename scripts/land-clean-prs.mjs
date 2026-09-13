@@ -113,9 +113,11 @@ const PASSING_CHECK_STATES = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
  * Deliberately narrow. It matches only the `review/ally-*` and `gate/ally-*`
  * legacy-status namespace. The bare `review` context is the PR-quality gate and
  * is a real check; any Ally-named *check-run* is the workflow that publishes
- * the status, and is also a real check. Neither is excluded. Verified on that
- * head: the Ally verdict exists only as commit statuses, with no check-run of
- * that name, so the namespace boundary is exact.
+ * the status, and is also a real check. Neither is excluded — and that is
+ * enforced by `isAllyVerdictStatus` below rather than assumed, because the
+ * names are only unambiguous while no check-run happens to share one.
+ * Measured on #1821 @5cc6a70e: all three Ally rows are `StatusContext`, so the
+ * name-only reading was load-bearing and untyped.
  *
  * This removes a duplicate reading, not a gate. `allyVerdictAtHead` still
  * blocks on Critical/Important findings and on a still-present prior
@@ -167,9 +169,25 @@ export function latestCheckStates(rollup) {
   return new Map([...latest].map(([name, { state }]) => [name, state]));
 }
 
+/**
+ * A legacy commit status in the Ally verdict-mirror namespace.
+ *
+ * Keyed on `__typename`, not on the name alone: `statusCheckRollup` unions
+ * `CheckRun` and `StatusContext`, so a name-only predicate would also swallow a
+ * genuinely failing *check-run* that happened to carry one of these names —
+ * contradicting the comment above and letting a PR enqueue past a red required
+ * check. Fails safe: if `__typename` is ever absent the row is treated as a
+ * real check, which can only over-hold, never over-enqueue.
+ */
+function isAllyVerdictStatus(context) {
+  return (
+    context?.__typename === "StatusContext" &&
+    ALLY_VERDICT_STATUS_RE.test(String(context?.context ?? ""))
+  );
+}
+
 export function failingChecks(rollup) {
-  return [...latestCheckStates(rollup)]
-    .filter(([name]) => !ALLY_VERDICT_STATUS_RE.test(name))
+  return [...latestCheckStates((rollup ?? []).filter((c) => !isAllyVerdictStatus(c)))]
     .filter(([, state]) => !PASSING_CHECK_STATES.has(state))
     .map(([name, state]) => `${name}=${state}`);
 }
