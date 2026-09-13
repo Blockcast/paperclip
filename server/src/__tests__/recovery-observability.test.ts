@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -19,6 +20,7 @@ import {
   recoveryObservabilityService,
   type WeeklyRecoveryRate,
 } from "../services/recovery-observability.ts";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -75,24 +77,34 @@ describe("classifyRecoveryHandoff", () => {
     outcome: "restored",
     ownerAgentId: "manager",
     returnOwnerAgentId: "coder",
-    finalAssigneeAgentId: "coder",
-    finalIssueStatus: "done",
+    resolutionSnapshot: { assigneeAgentId: "coder", issueStatus: "done" },
   };
 
   it("marks a manager who kept and completed the work as owner_completed", () => {
     expect(
-      classifyRecoveryHandoff({ ...base, finalAssigneeAgentId: "manager", finalIssueStatus: "done" }),
+      classifyRecoveryHandoff({
+        ...base,
+        resolutionSnapshot: { assigneeAgentId: "manager", issueStatus: "done" },
+      }),
     ).toBe("owner_completed");
   });
 
   it("marks work returned to the original assignee as handed_back", () => {
-    expect(classifyRecoveryHandoff({ ...base, finalAssigneeAgentId: "coder" })).toBe("handed_back");
+    expect(
+      classifyRecoveryHandoff({
+        ...base,
+        resolutionSnapshot: { assigneeAgentId: "coder", issueStatus: "done" },
+      }),
+    ).toBe("handed_back");
   });
 
   it("marks work delegated to a different specialist as handed_back", () => {
-    expect(classifyRecoveryHandoff({ ...base, finalAssigneeAgentId: "other-agent" })).toBe(
-      "handed_back",
-    );
+    expect(
+      classifyRecoveryHandoff({
+        ...base,
+        resolutionSnapshot: { assigneeAgentId: "other-agent", issueStatus: "done" },
+      }),
+    ).toBe("handed_back");
   });
 
   it("marks the original agent recovering its own issue as self_recovery", () => {
@@ -103,6 +115,30 @@ describe("classifyRecoveryHandoff", () => {
 
   it("treats still-active actions as active regardless of assignee", () => {
     expect(classifyRecoveryHandoff({ ...base, status: "active" })).toBe("active");
+  });
+
+  // BLO-33600: a row resolved before the snapshot shipped has nothing durable to
+  // classify from. It must say so rather than fall through to `handed_back`,
+  // which is what an absent `finalAssigneeAgentId` used to be read as.
+  it("reports a resolved takeover with no captured snapshot as unknown", () => {
+    expect(classifyRecoveryHandoff({ ...base, resolutionSnapshot: null })).toBe("unknown");
+  });
+
+  it("still classifies the three action-row-only classes without a snapshot", () => {
+    expect(classifyRecoveryHandoff({ ...base, status: "active", resolutionSnapshot: null })).toBe(
+      "active",
+    );
+    expect(
+      classifyRecoveryHandoff({ ...base, ownerAgentId: null, resolutionSnapshot: null }),
+    ).toBe("board_owned");
+    expect(
+      classifyRecoveryHandoff({
+        ...base,
+        ownerAgentId: "coder",
+        returnOwnerAgentId: "coder",
+        resolutionSnapshot: null,
+      }),
+    ).toBe("self_recovery");
   });
 });
 
@@ -195,6 +231,8 @@ describeEmbeddedPostgres("recovery observability report", () => {
     finalAssigneeAgentId: string | null;
     finalIssueStatus: string;
     id?: string;
+    /** Omit the snapshot to simulate a row resolved before BLO-33600 shipped. */
+    captureResolutionSnapshot?: boolean;
   }) {
     const sourceIssueId = randomUUID();
     await db.insert(issues).values({
@@ -219,7 +257,18 @@ describeEmbeddedPostgres("recovery observability report", () => {
       previousOwnerAgentId: input.returnOwnerAgentId,
       cause: input.cause,
       fingerprint: `fp-${input.n}`,
-      evidence: { latestRunErrorCode: input.errorCode },
+      evidence: {
+        latestRunErrorCode: input.errorCode,
+        // Where the issue stood when the action resolved. `resolveActiveForIssue`
+        // writes these for real; seeded rows state them directly so the fixture
+        // is not silently classified as `unknown` (BLO-33600).
+        ...(input.captureResolutionSnapshot === false
+          ? {}
+          : {
+              resolvedAssigneeAgentId: input.finalAssigneeAgentId,
+              resolvedIssueStatus: input.finalIssueStatus,
+            }),
+      },
       nextAction: "recover",
       outcome: input.outcome,
       createdAt: input.createdAt,
@@ -375,6 +424,102 @@ describeEmbeddedPostgres("recovery observability report", () => {
     expect(strandedRouting?.handedBack).toBe(2);
     expect(strandedRouting?.active).toBe(1);
     expect(strandedRouting?.escalated).toBe(1);
+  });
+
+  // BLO-33600. The defect this pins: `finalAssigneeAgentId`/`finalIssueStatus`
+  // were read live off `issues`, so a resolved action's class flipped whenever
+  // the source issue moved — and because `landedElsewhere` is tested first, a
+  // later hand-back permanently masked a real `owner_completed`, deflating the
+  // very number the report exists to measure. Against the pre-fix code this test
+  // passes the first assertion and FAILS the second.
+  it("keeps a resolved action's class stable when only the source issue moves", async () => {
+    const { companyId, managerId, coderId, otherId } = await seedBaseline();
+    const sourceIssueId = randomUUID();
+
+    // The manager took the issue over and finished it: assignee == recovery owner,
+    // terminal status. That is `owner_completed`.
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Drift source",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: managerId,
+      issueNumber: 900,
+      identifier: "SRC-900",
+    });
+    await db.insert(issueRecoveryActions).values({
+      id: randomUUID(),
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      previousOwnerAgentId: coderId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "fp-900",
+      evidence: { latestRunErrorCode: "adapter_failed" },
+      nextAction: "recover",
+      outcome: null,
+      createdAt: regressionWeek,
+      updatedAt: regressionWeek,
+    });
+
+    // Resolve through the real path — this is what captures the snapshot.
+    const resolved = await issueRecoveryActionService(db).resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      status: "resolved",
+      outcome: "restored",
+    });
+    expect(resolved).not.toBeNull();
+
+    const svc = recoveryObservabilityService(db);
+    const before = await svc.report(companyId, { now, weeks: 8 });
+    expect(before.handoff.ownerCompleted).toBe(1);
+    expect(before.handoff.handedBack).toBe(0);
+
+    // Mutate ONLY the source issue. The action row is untouched.
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: otherId, status: "in_progress" })
+      .where(eq(issues.id, sourceIssueId));
+
+    const after = await svc.report(companyId, { now, weeks: 8 });
+    expect(after.handoff).toEqual(before.handoff);
+    expect(after.perCauseRouting).toEqual(before.perCauseRouting);
+  });
+
+  it("reports a pre-snapshot row as unknown rather than bucketing it as handed_back", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+
+    await seedRecoveryAction({
+      companyId,
+      n: 901,
+      createdAt: regressionWeek,
+      cause: "stranded_assigned_issue",
+      errorCode: "adapter_failed",
+      status: "resolved",
+      outcome: "restored",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+      captureResolutionSnapshot: false,
+    });
+
+    const report = await recoveryObservabilityService(db).report(companyId, { now, weeks: 8 });
+
+    expect(report.handoff.unknownTakeover).toBe(1);
+    expect(report.handoff.handedBack).toBe(0);
+    expect(report.handoff.ownerCompleted).toBe(0);
+    expect(report.handoff.otherTakeover).toBe(0);
+    // Ratios stay null: nothing was decided, so there is no denominator to report.
+    expect(report.handoff.handedBackRatio).toBeNull();
+    const routing = report.perCauseRouting.find((r) => r.cause === "stranded_assigned_issue");
+    expect(routing?.unknown).toBe(1);
   });
 
   it("caps the reporting window so a huge `weeks` value can't over-allocate", async () => {
