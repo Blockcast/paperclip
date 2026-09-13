@@ -4443,28 +4443,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     now: Date;
     companyId?: string;
   }) {
-    // BLO-33477 AC3: this scan keeps `asc(updatedAt)` rather than moving to the
+    // BLO-33477 AC3: this scan orders by `asc(updatedAt)` rather than the
     // `productivityScannedAt` watermark the source scan (BLO-30303) and the
     // retirement scan above use — it cannot share that column, because
     // `closeOpenSuppressedReviews` stamps a superset of these rows and would
-    // drive the ordering. It is nonetheless starvation-free, because every path
-    // out of the loop below advances the row past this window:
+    // drive the ordering. It is starvation-free anyway: every path out of the
+    // loop below takes the row *out* of this window, including the failure
+    // path, which backs the row off for a full stale interval (see the catch).
     //
-    //   - retired      -> status `done`, drops out of `notInArray(status, ...)`
-    //   - finalized    -> gains identifier/issueNumber, drops out of `isNull(...)`
-    //   - retire raced -> `existing`; transient, the row changed under us
-    //   - finalize threw -> `failed`, and the catch bumps `updatedAt`
-    //
-    // That last path is the one that used to break the invariant: a reservation
-    // whose finalize throws deterministically kept its `updatedAt` and
-    // re-selected at the head on every pass, so MAX_CANDIDATE_ISSUES of them
-    // would pin the window and starve every newer stale reservation behind it —
-    // the same mechanism as the retirement scan, with a rarer trigger. Clamping
-    // `updatedAt` to `staleCutoff` in the catch closes it without a second
-    // watermark column: the key moves strictly forward on every failed attempt,
-    // so no row can hold a fixed slot, while the row is still re-admitted on the
-    // next pass so a transient failure is not punished with a delay. See the
-    // catch below.
+    //   - retired        -> status `done`, drops out of `notInArray(status, ...)`
+    //   - finalized      -> gains identifier/issueNumber, drops out of `isNull(...)`
+    //   - retire raced   -> `existing`; transient, the row changed under us
+    //   - finalize threw -> `failed`, and the catch sets `updatedAt = now`, so
+    //                       the row fails `updatedAt < staleCutoff` on the next
+    //                       pass and cannot hold a slot at all
     const staleCutoff = new Date(input.now.getTime() - PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS);
     const reservedReviews = await db
       .select()
@@ -4622,28 +4614,24 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       } catch (err) {
         result.failed += 1;
         result.failedIssueIds.push(sourceIssue.id);
-        // BLO-33477 AC3: advance the scan key so a deterministically-failing
-        // finalize cannot re-select at the head of every pass and starve the
-        // reservations behind it (see the note on the query above). Guarded to
-        // rows still reserved: if finalize threw *after* assigning
-        // identifier/issueNumber the row has already left this window.
+        // BLO-33477 AC3: back the row off for a full stale interval so a
+        // deterministically-failing finalize cannot re-select on the next pass
+        // and starve the reservations behind it. `input.now`, not `staleCutoff`
+        // — clamping to the cutoff also bounds starvation (the cohort's key
+        // tracks the eligibility frontier, so any fixed-key row overtakes it
+        // within two eligible passes) but keeps 250 poison rows re-filling the
+        // window forever; `now` drops them out of `updatedAt < staleCutoff`
+        // entirely until stale again, which is the property worth asserting.
+        // Costs a failed finalize one stale interval before retry, which this
+        // janitor path (rows are already >= 5min stale) can afford.
         //
-        // `staleCutoff`, deliberately, not `input.now` — both free the slot for
-        // this pass, but `input.now` would also hold the row out for a further
-        // stale interval, turning a *transient* finalize failure into a
-        // 5-minute recovery delay. Clamping to the cutoff re-admits the row on
-        // the next pass while still moving the key strictly forward (the row
-        // was only selected because `updatedAt < staleCutoff`), so a poison row
-        // rides the cutoff and is overtaken by any fixed-key row within one
-        // stale interval instead of pinning a slot indefinitely.
-        //
-        // This advances `lastActivityAt` too, via the migration-0076 BEFORE
-        // UPDATE trigger — it mirrors any `updatedAt` advance unless the caller
-        // writes a *different* value, so passing the current one through does
-        // not suppress it. Intended: the row was genuinely touched.
+        // Guarded to rows still reserved: if finalize threw *after* assigning
+        // identifier/issueNumber the row has already left this window. This
+        // advances `lastActivityAt` too, via the migration-0076 BEFORE UPDATE
+        // trigger — intended, the row was genuinely touched.
         await db
           .update(issues)
-          .set({ updatedAt: staleCutoff })
+          .set({ updatedAt: input.now })
           .where(
             and(
               eq(issues.companyId, review.companyId),
