@@ -300,6 +300,7 @@ import {
 import { githubGetPullRequestGate, githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
+import { pullRequestExternalId } from "./pull-request-work-products.js";
 import {
   ensureReferencedSharedDocsMaterialized,
   normalizeInstructionsEntryFile,
@@ -11991,6 +11992,177 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         repoFullName: target.repoFullName,
         prNumber: target.prNumber,
         headSha: target.sha,
+      },
+    });
+    await notifyLinkedIssuesOfFailedPrReviewGate(run, target, reason).catch((error) => {
+      logger.warn(
+        { err: error, runId: run.id, repoFullName: target.repoFullName, prNumber: target.prNumber },
+        "failed to notify Paperclip issues linked to a failed PR-review gate",
+      );
+    });
+  }
+
+  /**
+   * BLO-33589: make a reviewer run that terminated without a confirmed review
+   * readable INSIDE Paperclip, not only as a GitHub commit status.
+   *
+   * `queueFailedPrReviewGateStatus` turns the wedge into a red check on the PR,
+   * which is the right thing for a human reading GitHub and useless to the agent
+   * that asked for the review: it ended its own run believing it had handed off,
+   * and nothing in Paperclip ever learns the handoff died. Measured on
+   * Blockcast/libmmt#444 — "ended ambiguously and was not replayed" was written
+   * to a commit status at 2026-09-12T20:02:59Z and to nothing else, and the PR
+   * read to its owner as ordinary reviewer latency for 10h06m.
+   *
+   * So: one system comment per linked issue (the durable artifact) plus one wake
+   * of its assignee (the part that actually reaches an agent — an issue parked
+   * `in_review` waiting on this very review is excluded from `inbox-lite` by
+   * design, so a comment alone would leave exactly the silence this fixes).
+   *
+   * The link is the `pull_request` work product, matched on company + PR
+   * identity only. Deliberately NOT narrowed to system-promoted rows the way
+   * the webhook's `previouslyLinkedPullRequestIssues` lookup is: that lookup
+   * gates a wake that acts on webhook-supplied content, whereas this one only
+   * reports a fact this server itself just derived, and agent-registered PR work
+   * products are the common case (the Paperclip skill tells agents to create
+   * one). Narrowing it here would drop most real links.
+   */
+  async function notifyLinkedIssuesOfFailedPrReviewGate(
+    run: typeof heartbeatRuns.$inferSelect,
+    target: NonNullable<ReturnType<typeof resolvePrReviewGateStatusTarget>>,
+    reason: "retry_exhausted" | "non_retryable_external_lifecycle",
+  ) {
+    const linked = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issueWorkProducts)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.id, issueWorkProducts.issueId),
+          eq(issues.companyId, issueWorkProducts.companyId),
+        ),
+      )
+      .where(
+        and(
+          eq(issueWorkProducts.companyId, run.companyId),
+          eq(issueWorkProducts.provider, "github"),
+          eq(issueWorkProducts.type, "pull_request"),
+          eq(
+            issueWorkProducts.externalId,
+            pullRequestExternalId(target.repoFullName, target.prNumber),
+          ),
+        ),
+      );
+    if (linked.length === 0) {
+      logger.info(
+        { runId: run.id, repoFullName: target.repoFullName, prNumber: target.prNumber },
+        "failed PR-review gate has no linked Paperclip issue to notify",
+      );
+      return;
+    }
+
+    const shortSha = target.sha.slice(0, 7);
+    const cause = reason === "retry_exhausted"
+      ? "exhausted its automatic retries"
+      : "ended ambiguously and was not replayed";
+    const body = [
+      `## Ally review did not land on \`${target.repoFullName}#${target.prNumber}\``,
+      "",
+      `The Paperclip reviewer run for head \`${shortSha}\` ${cause}. **No review was posted, and none is coming for this head** — this is a terminal outcome, not reviewer latency.`,
+      "",
+      `- Head: \`${target.sha}\``,
+      `- Gate status: \`${target.context}\` set to \`failure\` on that commit`,
+      ...(target.prUrl ? [`- PR: ${target.prUrl}`] : []),
+      `- Reviewer run: \`${run.id}\``,
+      "",
+      "Re-request the review on the PR (a start-of-body `<!-- paperclip:review-request -->` marker **and** a bare `@ally` mention — the marker alone is silently dropped), or push a new head.",
+    ].join("\n");
+
+    for (const issue of linked) {
+      // Per-issue, so one unnotifiable issue (paused assignee, wake dispatch
+      // error) cannot silently swallow the notification for its siblings. That
+      // is the exact invisible-drop shape this function exists to remove.
+      await notifyOneLinkedIssueOfFailedPrReviewGate(run, target, reason, issue, body)
+        .catch((error) => {
+          logger.warn(
+            { err: error, runId: run.id, issueId: issue.id },
+            "failed to notify one Paperclip issue linked to a failed PR-review gate",
+          );
+        });
+    }
+  }
+
+  async function notifyOneLinkedIssueOfFailedPrReviewGate(
+    run: typeof heartbeatRuns.$inferSelect,
+    target: NonNullable<ReturnType<typeof resolvePrReviewGateStatusTarget>>,
+    reason: "retry_exhausted" | "non_retryable_external_lifecycle",
+    issue: { id: string; status: string; assigneeAgentId: string | null },
+    body: string,
+  ) {
+    await issuesSvc.addComment(
+      issue.id,
+      body,
+      { runId: run.id },
+      {
+        authorType: "system",
+        // Keyed on the run, so re-finalizing the same terminal run cannot
+        // post twice, while a genuinely new failed reviewer run on the same
+        // head still reports.
+        idempotencyKey: `pr_review_gate_failed:${run.id}:${issue.id}`,
+      },
+    );
+
+    // A comment does not wake anyone. Only a live-status issue with an agent
+    // assignee has somewhere for a wake to land.
+    if (!issue.assigneeAgentId) return;
+    if (issue.status !== "todo" && issue.status !== "in_progress" && issue.status !== "in_review") {
+      return;
+    }
+    const wakeIdempotencyKey = `pr_review_gate_failed:${run.id}:${issue.id}`;
+    const existingWake = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
+          eq(agentWakeupRequests.idempotencyKey, wakeIdempotencyKey),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    // The key carries the run id, so it can never legitimately recur: any row
+    // at all under it means this notification was already dispatched.
+    if (existingWake) return;
+    await wakeupWithDispatchRetry(issue.assigneeAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "github_pr_review_gate_failed",
+      idempotencyKey: wakeIdempotencyKey,
+      payload: {
+        issueId: issue.id,
+        source: "github",
+        repoFullName: target.repoFullName,
+        prNumber: target.prNumber,
+        prUrl: target.prUrl,
+        headSha: target.sha,
+        statusContext: target.context,
+        prReviewGateFailureReason: reason,
+        reviewerRunId: run.id,
+      },
+      contextSnapshot: {
+        issueId: issue.id,
+        wakeReason: "github_pr_review_gate_failed",
+        githubRepoFullName: target.repoFullName,
+        githubPrNumber: target.prNumber,
+        githubPrUrl: target.prUrl,
+        githubHeadSha: target.sha,
+        prReviewGateFailureReason: reason,
+        reviewerRunId: run.id,
       },
     });
   }
