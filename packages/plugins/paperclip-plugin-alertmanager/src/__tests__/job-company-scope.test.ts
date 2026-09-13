@@ -120,23 +120,25 @@ describe("alertmanager check-alert-escalations job scope (BLO-20957 review)", ()
     ).toEqual(["company-a", "company-b"]);
   });
 
-  it("skips with a warn — never a silent success — when no scope is carried", async () => {
+  it("fails when no scope is carried, rather than recording a silent success", async () => {
     const { handler, warn } = await setupAndGetSweepHandler();
-    await handler({ companyId: null } as unknown as PluginJobContext);
+    await expect(handler({ companyId: null } as unknown as PluginJobContext)).rejects.toThrow(
+      "cannot run without a company scope",
+    );
 
     expect(runAlertEscalationSweep).not.toHaveBeenCalled();
-    expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining("no company scope"),
-    );
+    expect(warn).not.toHaveBeenCalled();
   });
 
-  it("skips with a warn when the company has no stored config", async () => {
+  it("fails when the company has no stored config, rather than recording a silent success", async () => {
     resolveEscalationSweepConfig.mockResolvedValue(null);
 
     const { handler, warn } = await setupAndGetSweepHandler();
-    await handler({ companyId: "company-a" } as unknown as PluginJobContext);
+    await expect(handler({ companyId: "company-a" } as unknown as PluginJobContext)).rejects.toThrow(
+      "no matching stored config",
+    );
 
     expect(runAlertEscalationSweep).not.toHaveBeenCalled();
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("company-a"));
+    expect(warn).not.toHaveBeenCalled();
   });
 });

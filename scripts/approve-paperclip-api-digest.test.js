@@ -433,6 +433,25 @@ function extractJqBlock(name) {
 
 const SERVING_JQ = extractJqBlock("ROLLOUT_SERVING_JQ");
 
+// A jq program that cannot RUN is categorically different from one that runs and
+// declines, and until BLO-32267 both reached the caller as the same empty string.
+// Proving the difference is now visible needs a program that genuinely aborts, so
+// the guard is stripped out of the SHIPPING source rather than out of a restated
+// copy — the same neutering as BLO-32101's negative control D, which is the exact
+// regression a future edit here would reintroduce.
+//
+// Anchored on the guard's own text so a rewrite of it cannot silently turn this
+// into a no-op mutation that tests nothing; the cases below assert the anchor
+// still matched.
+const UNGUARDED_COERCION_ANCHOR = `| if ($r | type) == "string" and ($r | test("^[0-9]+$"))
+            then ($r | tonumber)
+            else null
+            end;`;
+const unguardedCoercionReaderSource = replicaSetReaderSource.replace(
+  UNGUARDED_COERCION_ANCHOR,
+  "| ($r | tonumber);",
+);
+
 // `deployment` of null makes the stub exit non-zero, standing in for "no such
 // Deployment" or an unreachable apiserver.
 //
@@ -452,7 +471,12 @@ const SERVING_JQ = extractJqBlock("ROLLOUT_SERVING_JQ");
 // leaves behind can be counted rather than assumed.
 function readerRunFor(
   deployment,
-  { replicaSets = [], repeat = 1, callerOwnedStateDir = false } = {},
+  {
+    replicaSets = [],
+    repeat = 1,
+    callerOwnedStateDir = false,
+    unguardedCoercion = false,
+  } = {},
 ) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-live-digest-"));
   const tmpRoot = path.join(dir, "tmp");
@@ -460,6 +484,10 @@ function readerRunFor(
   const deploymentFixture = path.join(dir, "deployment.json");
   const replicaSetFixture = path.join(dir, "replicasets.json");
   const argsLog = path.join(dir, "args.log");
+  // Kept OUTSIDE tmpRoot on purpose: tmpRoot is what leftoverTempFiles counts,
+  // so a log written into it would be indistinguishable from a file the reader
+  // failed to reclaim.
+  const residueLog = path.join(dir, "state-dir-residue.log");
   writeFileSync(deploymentFixture, deployment === null ? "" : JSON.stringify(deployment));
   writeFileSync(
     replicaSetFixture,
@@ -494,7 +522,7 @@ function readerRunFor(
     `  esac`,
     `}`,
     "deploy_kubectl=(fake_kubectl)",
-    replicaSetReaderSource,
+    unguardedCoercion ? unguardedCoercionReaderSource : replicaSetReaderSource,
     readerSource,
     // Mints and clears the state directory exactly as the script's own top level
     // and EXIT trap do, so leftover-file accounting measures the reader rather
@@ -503,6 +531,22 @@ function readerRunFor(
       ? ['rs_state_dir="$(mktemp -d "${TMPDIR}/paperclip-approve-rs.XXXXXX")"']
       : []),
     ...Array.from({ length: repeat }, () => READER_FUNCTION_NAME),
+    // Listed BEFORE the teardown below, which is the only moment the directory's
+    // contents are observable at all. leftoverTempFiles cannot see them: on this
+    // path the directory is torn down by the teardown, and on the no-caller path
+    // the reader tears down its own, so by the time readdirSync(tmpRoot) runs
+    // every per-invocation temp file is gone whether the reader reclaimed it or
+    // not. That is why an assertion on leftoverTempFiles alone passes with the
+    // reader's `rm -f` lines deleted -- measured on both of them (BLO-32395).
+    //
+    // A directory the reader has wrongly removed reads as its own sentinel
+    // rather than crashing the harness under `set -e`, so that failure names
+    // itself instead of arriving as a bare non-zero exit.
+    ...(callerOwnedStateDir
+      ? [
+          `if [[ -d "$rs_state_dir" ]]; then ( cd "$rs_state_dir" && ls -A ); else echo '<caller-owned-state-dir-removed-by-reader>'; fi > ${JSON.stringify(residueLog)}`,
+        ]
+      : []),
     ...(callerOwnedStateDir ? ['rm -rf "$rs_state_dir"'] : []),
   ].join("\n");
   const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
@@ -512,6 +556,12 @@ function readerRunFor(
     digests: result.stdout.trim().split("\n").filter(Boolean),
     stderr: result.stderr,
     leftoverTempFiles: readdirSync(tmpRoot),
+    // null rather than [] when there is no caller-owned directory to inspect, so
+    // a case that asserts on the residue in the wrong mode fails loudly instead
+    // of matching an empty array for the wrong reason.
+    stateDirResidue: callerOwnedStateDir
+      ? readFileSync(residueLog, "utf8").split("\n").filter(Boolean).sort()
+      : null,
     argv: existsSync(argsLog) ? readFileSync(argsLog, "utf8").trim().split("\n") : [],
   };
 }
@@ -1186,6 +1236,167 @@ test("the happy path stays quiet — no warning when nothing is wrong", () => {
   assert.equal(run.stderr.trim(), "");
 });
 
+// BLO-32267. `image="$(jq …)" || image=""` used to route jq's stderr to /dev/null,
+// which collapsed two categorically different outcomes onto the same empty string:
+// a program that ran and DECLINED (no serving ReplicaSet, a missing or non-integer
+// revision, tied revisions, a disqualified winner), and a program that could not
+// RUN at all. Downstream both read as "no rollback target", so a future edit that
+// breaks this jq would surface as a silently missing recovery digest rather than a
+// diagnosable error — in the very reader whose purpose is to preserve the digest a
+// rollback needs.
+//
+// This is not a hypothetical failure mode: BLO-32101's first attempt at the
+// malformed-revision case passed WITH and WITHOUT the guard it was written to
+// prove, precisely because an abort and a clean decline are indistinguishable from
+// outside. That case had to be reshaped to work around the conflation; this one
+// asserts the conflation is gone.
+//
+// The neutering is the same one as that issue's negative control D — drop the
+// string/type guard so a malformed annotation reaches `tonumber` — because
+// `$revisions` is bound eagerly, before the single-candidate branch is taken, so
+// even a lone ReplicaSet aborts the whole program.
+test("a jq abort is reported as an error, not returned as a silent empty", () => {
+  assert.notEqual(
+    unguardedCoercionReaderSource,
+    replicaSetReaderSource,
+    "the unguarded-coercion anchor no longer matches the shipping source — this case would prove nothing",
+  );
+  const run = readerRunFor(neverReadyDeployment(digest(0xbb)), {
+    unguardedCoercion: true,
+    replicaSets: [
+      replicaSetWith({
+        name: "paperclip-api-malformed",
+        images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+        ready: 2,
+        created: OLDER,
+        revision: "not-a-number",
+      }),
+    ],
+  });
+  // Still degrades rather than failing the release — this stays a safeguard.
+  assert.equal(run.digest, "");
+  assert.match(run.stderr, /jq program failed/);
+  // The warning is hard-wrapped across lines, so match across the wrap rather
+  // than pinning the exact column it breaks at.
+  assert.match(run.stderr, /broken program rather\s+than a decline/);
+  assert.match(run.stderr, /BLO-31842/);
+  // jq's own message is carried through, which is the whole point: without it the
+  // operator has an empty digest and nothing that says why.
+  assert.match(run.stderr, /Invalid numeric literal/);
+});
+
+// The other half of the contract. A decline is a NORMAL outcome — most releases
+// have no second serving ReplicaSet at all — so making aborts visible must not
+// start narrating the ordinary path. Every shape that declines by design is swept
+// here rather than trusting the happy-path case above to cover them.
+test("every deliberate decline stays silent and still returns empty", () => {
+  const declines = {
+    "no serving ReplicaSet": [
+      replicaSetWith({ name: "paperclip-api-idle", images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`], ready: 0 }),
+    ],
+    "missing revision annotation": [
+      replicaSetWith({ name: "paperclip-api-a", images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`], ready: 2, revision: null }),
+      replicaSetWith({ name: "paperclip-api-b", images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`], ready: 1, revision: "7" }),
+    ],
+    "tied revisions": [
+      replicaSetWith({ name: "paperclip-api-a", images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`], ready: 2, revision: "7" }),
+      replicaSetWith({ name: "paperclip-api-b", images: [`${IMAGE_REPOSITORY}@${digest(0xcc)}`], ready: 1, revision: "7" }),
+    ],
+    "containers disagree": [
+      replicaSetWith({
+        name: "paperclip-api-mixed",
+        images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`, `${IMAGE_REPOSITORY}@${digest(0xcc)}`],
+        ready: 2,
+        revision: "7",
+      }),
+    ],
+    "another repository": [
+      replicaSetWith({ name: "paperclip-api-foreign", images: [`ghcr.io/elsewhere/api@${digest(0xaa)}`], ready: 2, revision: "7" }),
+    ],
+  };
+  for (const [shape, replicaSets] of Object.entries(declines)) {
+    const run = readerRunFor(neverReadyDeployment(digest(0xbb)), { replicaSets });
+    assert.equal(run.digest, "", `${shape}: must decline`);
+    assert.equal(run.stderr.trim(), "", `${shape}: declining must not warn`);
+  }
+});
+
+// Same guard as the list-failure branch, for the same reason: the rotate loop
+// re-enters this reader on every 409, so an unguarded warning prints its four
+// lines up to MAX_ROTATE_ATTEMPTS times and buries itself.
+test("a repeated jq abort warns once, not once per rotation", () => {
+  const run = readerRunFor(neverReadyDeployment(digest(0xbb)), {
+    unguardedCoercion: true,
+    repeat: 5,
+    callerOwnedStateDir: true,
+    replicaSets: [
+      replicaSetWith({
+        name: "paperclip-api-malformed",
+        images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+        ready: 2,
+        revision: "not-a-number",
+      }),
+    ],
+  });
+  // Name which side of 1 it landed on. `undefined` (warned NOT AT ALL, the
+  // pre-BLO-32267 behaviour this case exists to catch) and 3 (warned per
+  // rotation) are opposite defects, and a message that reads "more than once"
+  // for both repeats in miniature the conflation this whole change is about.
+  const warnings = run.stderr.match(/jq program failed/g)?.length ?? 0;
+  assert.equal(
+    warnings,
+    1,
+    `expected exactly one jq-abort warning across 5 rotations, got ${warnings}:\n${run.stderr}`,
+  );
+});
+
+// The stderr capture is a temp file like every other one this reader mints, and
+// the abort path is the one that writes to it. It has to be reclaimed on that
+// path too, caller-owned directory or not.
+//
+// Asserted against the state directory's OWN contents, listed before teardown,
+// not against leftoverTempFiles. The outside-the-directory view cannot fail:
+// jq-err is minted inside state_dir, and state_dir is removed on both paths --
+// by the reader itself when it minted one, by the harness teardown when the
+// caller owns it -- so the file is gone from tmpRoot's point of view whether or
+// not the reader's `rm -f` reclaimed it first. Measured, not supposed: deleting
+// that `rm -f` from the shipping reader left this suite at 96/96 before this
+// case was rewritten (BLO-32395). The warn-once marker is expected to survive,
+// so the assertion names the exact residue rather than merely excluding jq-err
+// -- a not-includes check would still pass if the reader started leaving some
+// other file behind.
+test("the jq stderr capture leaves no temp file behind", () => {
+  for (const callerOwnedStateDir of [true, false]) {
+    const run = readerRunFor(neverReadyDeployment(digest(0xbb)), {
+      unguardedCoercion: true,
+      repeat: 2,
+      callerOwnedStateDir,
+      replicaSets: [
+        replicaSetWith({
+          name: "paperclip-api-malformed",
+          images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`],
+          ready: 2,
+          revision: "not-a-number",
+        }),
+      ],
+    });
+    assert.deepEqual(
+      run.leftoverTempFiles,
+      [],
+      `leftover temp files after a jq abort (callerOwned=${callerOwnedStateDir})`,
+    );
+    if (callerOwnedStateDir) {
+      // warned-jq only: the list succeeded, so no warned-list, and the selector
+      // resolved, so no warned-selector. Both stderr captures are reclaimed.
+      assert.deepEqual(
+        run.stateDirResidue,
+        ["warned-jq"],
+        "after a jq abort the state directory must hold only the warn-once marker, with both stderr captures reclaimed",
+      );
+    }
+  }
+});
+
 // A selector the reader cannot turn into a label query is the OTHER way this
 // fallback silently stops working, and it is the one that leaves no trace at the
 // apiserver: no call is made, so nothing appears in an audit log either. The
@@ -1246,9 +1457,18 @@ test("a repeated ReplicaSet list failure warns once, not once per rotation", () 
 // The one it cannot reclaim from a trap is the one it creates itself, because
 // $( ) hides it from the caller's EXIT trap — so the caller owns it instead, and
 // the no-caller case cleans up after itself.
+//
+// The leftoverTempFiles half pins the DIRECTORY: on the no-caller path it is the
+// only thing that catches a reader which mints an ephemeral state_dir and never
+// removes it. The residue half pins the FILES INSIDE it, and had to be added for
+// the same reason as on the jq case above — list-err lives inside state_dir, so
+// deleting the reader's `rm -f` for it left this suite green (BLO-32395). Two
+// different claims, so both are asserted rather than one standing in for the
+// other.
 test("the ReplicaSet reader leaves no temp files behind, caller-owned or not", () => {
   for (const callerOwnedStateDir of [true, false]) {
     for (const replicaSets of [null, []]) {
+      const listForbidden = replicaSets === null;
       const run = readerRunFor(
         deploymentWith({ images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`], status: NEVER_READY }),
         { replicaSets, repeat: 2, callerOwnedStateDir },
@@ -1256,8 +1476,20 @@ test("the ReplicaSet reader leaves no temp files behind, caller-owned or not", (
       assert.deepEqual(
         run.leftoverTempFiles,
         [],
-        `leftover temp files (callerOwned=${callerOwnedStateDir}, list=${replicaSets === null ? "forbidden" : "empty"})`,
+        `leftover temp files (callerOwned=${callerOwnedStateDir}, list=${listForbidden ? "forbidden" : "empty"})`,
       );
+      if (callerOwnedStateDir) {
+        // A forbidden list warns once and never reaches the jq branch, so the
+        // marker is the whole residue. An empty list takes the jq branch and it
+        // SUCCEEDS -- an empty $serving is a decline, not an abort -- so nothing
+        // warns and the residue is empty. Both stderr captures are reclaimed
+        // either way, which is the claim.
+        assert.deepEqual(
+          run.stateDirResidue,
+          listForbidden ? ["warned-list"] : [],
+          `state directory residue (list=${listForbidden ? "forbidden" : "empty"}): both stderr captures must be reclaimed, leaving only whatever warn-once marker that path sets`,
+        );
+      }
     }
   }
 });
@@ -1970,7 +2202,7 @@ test("a signal is routed into the cleanup rather than killing the script outrigh
 // cause, on the path with the LEAST operator visibility -- the caller prints
 // only the bare "could not retire the in-flight lock" and nobody is at a
 // terminal to re-run it with more logging.
-function runReleaseWrite({ stderrText, attempts = 3, writeSucceeds = false }) {
+function runReleaseWrite({ stderrText = "", attempts = 3, writeSucceeds = false } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-release-write-"));
   const countFile = path.join(dir, "replace_count");
   const sleepLog = path.join(dir, "sleeps");
@@ -2182,7 +2414,7 @@ test("a retirement write with no stderr still explains itself", () => {
 // rather than by presetting CLEAR_IN_FLIGHT_LOCK_ERR, so the variable is proven
 // populated by the script's own `2>&1 >/dev/null` capture -- the same standard
 // the release harness sets, for the same reason.
-function runRetireOnlyWrite({ stderrText, attempts = 3, writeSucceeds = false }) {
+function runRetireOnlyWrite({ stderrText = "", attempts = 3, writeSucceeds = false } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-retire-write-"));
   const countFile = path.join(dir, "replace_count");
   const sleepLog = path.join(dir, "sleeps");
@@ -2485,4 +2717,66 @@ test("no line citation can be added to this file without being pinned", () => {
     [],
     "a LINE_CITATIONS entry no longer matches any citation in the file -- remove it rather than leaving it pinning nothing",
   );
+});
+
+// Both write harnesses default `stderrText` to "" rather than destructuring it
+// bare, and this pins that default. Ally's suggestion 1 on #1671:
+// `JSON.stringify(undefined)` returns the VALUE undefined, not a string, so a
+// bare destructure interpolated the six-character token `undefined` into the
+// stub and shipped it as kubectl's stderr -- the release path's message read
+// `cannot retire the in-flight lock on sha256:deadbeef (owner owner-nonce-1):`
+// followed by an indented `undefined`, a cause no kubectl ever produced.
+//
+// No call site reached it: every failing-path caller passes the text
+// explicitly, and the callers that omit it pass writeSucceeds, which takes the
+// `return 0` arm and never reads the value. So the whole cost was in front of
+// us rather than behind -- this harness has taken new cases from four issues in
+// two days, and the next failing case that forgets the argument would have
+// asserted against that fabricated value, passing or failing on the harness
+// rather than on the script. That is the quiet-wrong-answer mode, which is why
+// it is worth a test despite being unreachable on the day it was written.
+//
+// Asserted as EQUIVALENCE to an explicit "", not merely as the absence of
+// /undefined/. The negative alone would still pass if the default were later
+// changed to some other invented string -- measured, not supposed: defaulting
+// to "(none)" instead leaves the negative green and trips only this deepEqual.
+// The equivalence pins it to the one value that already carries a tested
+// meaning on this path -- kubectl produced no output -- so a forgotten argument
+// lands on the empty-capture branch both harnesses defend directly above,
+// instead of on a new and unexamined one.
+//
+// Both harnesses in one test because it is one shared invariant, and because
+// the pair is the point: the defect was identical in both, so a per-harness
+// split would let a future divergence read as an unrelated single failure.
+//
+// The third assertion pins the `= {}` on the parameter object itself, which is
+// the same omission family one level out: with a bare `{ ... }` destructure the
+// defaults above are unreachable for a caller who passes nothing at all, and
+// `run()` dies with `TypeError: Cannot read properties of undefined (reading
+// 'stderrText')`. That is a loud failure rather than the quiet one this test
+// exists for, so it is pinned here as an extension of the same chain --
+// `run()` === `run({})` === `run({ stderrText: "" })` -- rather than given a
+// test of its own. Ally's suggestion 1 on #1682.
+test("omitting stderrText on a failing write is exactly an empty capture, never the token `undefined`", () => {
+  for (const [mode, run] of [
+    ["release", runReleaseWrite],
+    ["retire-only", runRetireOnlyWrite],
+  ]) {
+    const omitted = run({});
+    assert.doesNotMatch(
+      omitted.stderr,
+      /undefined/,
+      `${mode} mode fabricated a cause: the stub emitted the bare token \`undefined\` as kubectl's stderr, so any assertion about the cause would be measuring the harness rather than the script`,
+    );
+    assert.deepEqual(
+      omitted,
+      run({ stderrText: "" }),
+      `${mode} mode: omitting stderrText must be indistinguishable from passing "", so a failing case that forgets it lands on the tested empty-capture path`,
+    );
+    assert.deepEqual(
+      run(),
+      omitted,
+      `${mode} mode: omitting the argument object entirely must reach the same defaults as passing {}, not throw past them`,
+    );
+  }
 });

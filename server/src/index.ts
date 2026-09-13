@@ -37,6 +37,7 @@ import {
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
+import { startEventLoopStallLogging } from "./event-loop-stall-log.js";
 import { logger } from "./middleware/logger.js";
 import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
@@ -269,6 +270,10 @@ export async function startServer(): Promise<StartedServer> {
   // Tracing must be active (or have failed and logged) before the first DB
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
+  // Scrape-independent stall evidence (BLO-32668). The disposer is discarded
+  // deliberately: the sampler is idempotent and unref'd, so repeated in-process
+  // `startServer()` calls start exactly one, and it cannot outlive the process.
+  startEventLoopStallLogging();
   let config = loadConfig();
   if (config.githubPrReviewerAgentIds.length > 0) {
     if (!githubReviewerAppSlug(config.prReviewerBotLogin)) {
@@ -1279,6 +1284,12 @@ export async function startServer(): Promise<StartedServer> {
         }
 
         const reviewed = await heartbeat.reconcileProductivityReviews();
+        // BLO-30303 AC4: log the funnel counters unconditionally. Gating this
+        // on `created|updated|failed > 0` discarded the one record that
+        // explains a zero — which is how a fleet-wide hard zero looked
+        // identical to a healthy fleet for 23 days. `scanned` plus the
+        // suppression breakdown is what tells those two apart.
+        logger.info({ ...reviewed }, "startup productivity reconciliation funnel");
         if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
         }
@@ -1643,6 +1654,8 @@ export async function startServer(): Promise<StartedServer> {
             })
             .then(async () => {
               const reviewed = await heartbeat.reconcileProductivityReviews();
+              // BLO-30303 AC4: unconditional — see the startup pass above.
+              logger.info({ ...reviewed }, "periodic productivity reconciliation funnel");
               if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
                 logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
               }
@@ -1765,6 +1778,31 @@ export async function startServer(): Promise<StartedServer> {
     startStrandedBlockedIssueReconciler(
       db,
       config.strandedBlockedIssueReconcilerIntervalMinutes * 60 * 1000,
+    );
+  }
+
+  // Approval-enforcement reconciler (BLO-24631). Worker-tier singleton, same
+  // rationale as the reconcilers above: an approved decision that never
+  // reaches the object enforcing it is invisible — the board reads it as
+  // approved and the requester reads it as resolved, indefinitely. Read-only
+  // with respect to approvals and budget policies; it raises a deduped issue
+  // rather than silently re-applying a stale decided figure. Kicks off once on
+  // startup, then on interval.
+  if (config.approvalEnforcementReconcilerEnabled && config.paperclipNodeRole !== "api") {
+    const { startApprovalEnforcementReconciler } = await import(
+      "./services/approval-enforcement-reconciler.js"
+    );
+    logger.info(
+      {
+        intervalMinutes: config.approvalEnforcementReconcilerIntervalMinutes,
+        graceHours: config.approvalEnforcementReconcilerGraceHours,
+      },
+      "Approval-enforcement reconciler enabled (BLO-24631)",
+    );
+    startApprovalEnforcementReconciler(
+      db,
+      config.approvalEnforcementReconcilerIntervalMinutes * 60 * 1000,
+      { graceHours: config.approvalEnforcementReconcilerGraceHours },
     );
   }
 

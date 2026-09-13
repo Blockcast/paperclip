@@ -5,6 +5,7 @@ export const RECOVERY_ORIGIN_KINDS = {
   strandedIssueRecovery: "stranded_issue_recovery",
   staleActiveRunEvaluation: "stale_active_run_evaluation",
   ccrotateCapacityExhausted: "ccrotate_capacity_exhausted",
+  approvalEnforcementDrift: "approval_enforcement_drift",
 } as const;
 
 export const RECOVERY_REASON_KINDS = {

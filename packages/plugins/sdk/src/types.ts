@@ -1039,11 +1039,23 @@ export interface PluginStateClient {
    *   upsert's own transaction and holds it to commit, so a concurrent steal
    *   cannot land between the check and the write. Rejection throws with
    *   `code: "fencing_generation_lost"`.
+   * @param options.ifMatch - Compare-and-swap: only apply the write while the
+   *   stored value is still exactly this. Pass the value a preceding `get()`
+   *   returned to make a read-modify-write safe against a concurrent writer of
+   *   the same key — the host performs the comparison and the write in one
+   *   statement, so nothing can interleave between them. Rejection throws with
+   *   `code: "state_precondition_failed"`, which the caller is expected to
+   *   handle by retrying against a fresh `get()` or abandoning the write; it is
+   *   never silently absorbed. A missing row also rejects: the value that was
+   *   read is gone, so writing it back would be a lost update.
+   *
+   *   Composes with `fencing`, and answers a different question — the fence
+   *   asks "am I still the owner?", this asks "is my read still current?".
    */
   set(
     input: ScopeKey,
     value: unknown,
-    options?: { fencing?: PluginFencingPrecondition },
+    options?: { fencing?: PluginFencingPrecondition; ifMatch?: unknown },
   ): Promise<void>;
 
   /**

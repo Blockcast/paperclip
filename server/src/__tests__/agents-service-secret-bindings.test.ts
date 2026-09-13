@@ -33,6 +33,28 @@ vi.mock("../services/hire-hook.js", () => ({
   notifyHireApproved: mockNotifyHireApproved,
 }));
 
+/**
+ * Marks a promise whose rejection is asserted later, after an intervening `await`.
+ *
+ * The tests below deliberately leave a service call un-awaited so it blocks on a
+ * `for update` lock the test transaction holds, then assert the rejection once the
+ * transaction has committed. The rejection therefore lands at a socket-level race
+ * against that commit, and on the losing side the promise sits rejected with no
+ * handler: Node reports an unhandled rejection and vitest exits 1 with every test
+ * still passing (BLO-32352, CI run 34028692473).
+ *
+ * Attaching the no-op catch here makes the same-tick requirement structural rather
+ * than conventional -- the handler cannot drift below a later `await` because it is
+ * bound to promise creation at the call site. `.catch` and not `.finally`: finally
+ * re-raises on the promise it returns, which would move the leak one link down the
+ * chain instead of closing it. The returned promise is the original, so the
+ * rejection is still fully asserted by the caller.
+ */
+const expectLaterRejection = <T,>(promise: Promise<T>): Promise<T> => {
+  promise.catch(() => {});
+  return promise;
+};
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -478,7 +500,9 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     let pendingApproval!: ReturnType<ReturnType<typeof approvalService>["approve"]>;
     await db.transaction(async (tx) => {
       await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
-      pendingApproval = approvalService(db).approve(approvalId, "board-user", "Approved");
+      pendingApproval = expectLaterRejection(
+        approvalService(db).approve(approvalId, "board-user", "Approved"),
+      );
       await new Promise((resolve) => setTimeout(resolve, 100));
       await tx.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
     });

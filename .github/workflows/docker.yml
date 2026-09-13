@@ -282,6 +282,18 @@ jobs:
             type=raw,value=buildcache-${{ steps.target.outputs.full }}-k8s-vendored
             type=raw,value=latest-k8s-vendored,enable=${{ github.ref == 'refs/heads/master' && github.event_name != 'workflow_dispatch' }}
 
+      # Mint this immediately before the consuming build so the one-hour App
+      # token is not spent while a missing stable runtime image is prepared.
+      - name: Mint read-only Penstock runtime token
+        id: penstock-runtime-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.COMMITPERCLIP_APP_ID }}
+          private-key: ${{ secrets.COMMITPERCLIP_KEY }}
+          owner: Blockcast
+          repositories: penstock-llm-proxy-core
+          permission-contents: read
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@v7
@@ -318,6 +330,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           secrets: |
             gh_token=${{ secrets.PAPERCLIP_BOARD_TOKEN }}
+            penstock_runtime_token=${{ steps.penstock-runtime-token.outputs.token }}
 
       - name: Record built artifact
         run: |
@@ -805,6 +818,12 @@ jobs:
             fi
             # Surfaced in the run summary so retiring a lock is never a silent
             # side effect of a deploy someone skim-approved.
+            #
+            # Keep this AFTER both shape checks above. It interpolates
+            # operator-supplied input into the run log, so emitting it before
+            # validation would let `::stop-commands::` or `::add-mask::` inside
+            # `abandon_in_flight` take effect as workflow commands. The position
+            # is the protection; nothing about the echo itself enforces it.
             echo "::warning::retiring stranded in-flight approval ${ABANDON_IN_FLIGHT} (owner ${ABANDON_IN_FLIGHT_OWNER}) before approving ${DIGEST}"
           fi
 
@@ -1209,6 +1228,240 @@ jobs:
           helm -n "${NS}" list | head -3
           kubectl -n "${NS}" get pod -l app.kubernetes.io/name=paperclip \
             -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount
+
+      # BLO-33027. Production-side proof that paperclip-api-image-approval is
+      # actually EVALUATED by the live apiserver, not merely present on it.
+      #
+      # Every other link in the enforcement story is off-cluster or indirect:
+      # the CEL deny-assertion in onprem-k8s runs against a kind cluster, and
+      # `paperclip_admission_policy_drift{object="paperclip-api-image-approval"}`
+      # proves the Binding EXISTS with the expected validationActions. Neither
+      # produces a denial on the production apiserver. Measured 2026-09-09:
+      # `apiserver_validating_admission_policy_check_total{policy=
+      # "paperclip-api-image-approval"}` had NO samples, while five other
+      # policies reported into the same metric family — so the family is
+      # scraped and this policy had simply never been exercised in production.
+      #
+      # No RBAC is added, widened, or bound for this. It runs as the
+      # pre-existing deploy identity: KUBECONFIG_PAPERCLIP_CI_DEPLOY ->
+      # ServiceAccount paperclip/paperclip-ci-deploy. The authoritative grant is
+      # onprem-k8s paperclip/ci-deploy-rbac.yaml, where RoleBinding
+      # paperclip-ci-deploy -> Role/paperclip-ci-deploy carries
+      #   apiGroups: ["apps"], resources: ["deployments","statefulsets"],
+      #   verbs: ["get","list","watch","create","update","patch","delete"]
+      # in this namespace — because that is exactly what `helm upgrade` and the
+      # plan reconcile above require. So the probe's `replace` needs nothing
+      # this identity does not already hold; it moves the venue of the proof,
+      # not the bar.
+      #
+      # Cite the SCOPED Role above, not the older RoleBinding
+      # paperclip-ci-deploy-admin -> ClusterRole/admin. That binding still
+      # exists but carries a blockcast.net/deprecation annotation (BLO-20052):
+      # it is superseded by the scoped Role and is kept live only until a real
+      # CI deploy is verified green against it. Useful side effect: the can-i
+      # lines below run as the deploy identity on every release, which is
+      # precisely the verification that binding is waiting on — so this step
+      # helps retire it rather than depending on it.
+      #
+      # REPORTS, DOES NOT GATE, and `continue-on-error` is load-bearing rather
+      # than laziness. Two independent reasons:
+      #   1. It runs AFTER the rollout has landed and been verified, so no
+      #      probe outcome can delay or block a legitimate release.
+      #   2. It must not change the `deploy` job's CONCLUSION.
+      #      scheduled-production-deploy.yml decides whether production is
+      #      behind by scanning for the newest run with a job named `deploy`
+      #      whose `conclusion == "success"`. Failing the job here would make a
+      #      release that actually landed look undeployed, so the dispatcher
+      #      would re-request a human production approval on every schedule
+      #      tick, forever, against a cluster already at master. That is worse
+      #      than the missing receipt: it is an unbounded human-toil loop.
+      # The step still genuinely `exit 1`s, so an enforcement regression shows
+      # up as a failed step plus an ::error:: annotation instead of a silent
+      # pass — `continue-on-error` keeps `outcome: failure` and only overrides
+      # `conclusion`.
+      - name: Negative admission probe — production denial receipt (BLO-33027)
+        id: admission_denial_receipt
+        continue-on-error: true
+        env:
+          NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
+        run: |
+          # BEGIN ADMISSION_DENIAL_RECEIPT_PROBE
+          set -euo pipefail
+
+          # The name is load-bearing and deliberately a literal. The policy
+          # narrows to Deployment/paperclip-api via matchConditions and the
+          # Binding narrows again via resourceNames: [paperclip-api], so a
+          # suffixed probe name falls OUTSIDE the policy and is admitted for
+          # the wrong reason — which would read here as an enforcement failure.
+          # Same constant and same reasoning as onprem-k8s
+          # scripts/test-paperclip-image-approval-admission.sh.
+          probe_deployment="paperclip-api"
+
+          # Same repository as the real artifact, so the ONLY thing that can
+          # make this image untrusted is that its digest is unapproved.
+          # Well-formed against the policy's own ^sha256:[0-9a-f]{64}$ filter,
+          # so the denial stays attributable to non-approval rather than to
+          # malformed input. And obviously synthetic: no build can emit this
+          # digest, so it can never collide with a real release artifact and
+          # can never be approved by accident.
+          probe_repository="harbor.blockcast.net/paperclip/paperclip"
+          probe_digest="sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+          probe_image="${probe_repository}@${probe_digest}"
+
+          probe_err="$(mktemp)"
+
+          # Capability receipt from the seat that actually performs the probe.
+          # An impersonated `can-i --as=` from anywhere else would prove less:
+          # this is the identity itself, recorded on every release.
+          echo "probe identity: $(kubectl auth whoami \
+            -o jsonpath='{.status.userInfo.username}' 2>/dev/null || echo '<unknown>')"
+          echo "can-i create deployments.apps -n ${NS}: $(kubectl auth can-i \
+            create deployments.apps -n "${NS}" 2>/dev/null || true)"
+          echo "can-i update deployments.apps -n ${NS}: $(kubectl auth can-i \
+            update deployments.apps -n "${NS}" 2>/dev/null || true)"
+
+          # Probe through UPDATE semantics against the live object, mutating
+          # exactly ONE field: the container image. Taking the live Deployment
+          # as the base is what makes the denial attributable — an immutable
+          # field such as spec.selector is preserved byte-for-byte, so the
+          # policy's image validation is the only rule that can reject it.
+          # A hand-rolled skeleton would trip "field is immutable" instead and
+          # produce a denial from the wrong source.
+          #
+          # UPDATE rather than CREATE on purpose. Both are in the policy's and
+          # the Binding's `operations`, but `paperclip-api` already exists in
+          # production, so a CREATE would also engage the storage layer's
+          # AlreadyExists check. Validating admission does run first, so a
+          # CREATE probe should still be denied by the policy — but relying on
+          # that ordering buys nothing here and the reviewed kind-cluster suite
+          # already switches to `replace` once the Deployment exists.
+          verdict=inconclusive
+          gen_before=""
+          gen_after=""
+          attempt=0
+          while [ "${attempt}" -lt 3 ]; do
+            attempt=$((attempt + 1))
+
+            live_json="$(kubectl -n "${NS}" get deployment "${probe_deployment}" \
+              -o json 2>"${probe_err}")" || live_json=""
+            if [ -z "${live_json}" ]; then
+              sleep 2
+              continue
+            fi
+
+            gen_before="$(jq -r '.metadata.generation // empty' <<<"${live_json}")"
+            probe_manifest="$(jq --arg image "${probe_image}" '
+                del(.status, .metadata.managedFields)
+                | .spec.template.spec.containers = [
+                    .spec.template.spec.containers[] | .image = $image
+                  ]
+              ' <<<"${live_json}")" || probe_manifest=""
+            if [ -z "${probe_manifest}" ]; then
+              break
+            fi
+
+            # NEVER print probe_manifest: it is the live API Deployment and
+            # carries the full container env.
+            if printf '%s\n' "${probe_manifest}" \
+              | kubectl -n "${NS}" replace --dry-run=server -o name -f - \
+                  >/dev/null 2>"${probe_err}"; then
+              verdict=admitted
+              break
+            fi
+
+            # Both literal strings, exactly as onprem-k8s's expect_deny
+            # asserts. The policy NAME establishes attribution; the message
+            # fragment establishes that the image validation fired rather than
+            # the bootstrap-canary validation in the same policy.
+            if grep -Fq 'paperclip-api-image-approval' "${probe_err}" \
+              && grep -Fq 'approved immutable digest' "${probe_err}"; then
+              verdict=denied-by-policy
+              break
+            fi
+
+            # Optimistic-concurrency loss, not an admission outcome. Status
+            # writes bump resourceVersion, and a rollout that just landed is
+            # still settling, so re-read and probe again.
+            if grep -Fqi 'the object has been modified' "${probe_err}"; then
+              sleep 2
+              continue
+            fi
+
+            if grep -Fq 'denied request' "${probe_err}"; then
+              verdict=denied-by-other-policy
+              break
+            fi
+
+            break
+          done
+
+          gen_after="$(kubectl -n "${NS}" get deployment "${probe_deployment}" \
+            -o jsonpath='{.metadata.generation}' 2>/dev/null)" || gen_after=""
+
+          {
+            echo "### Admission denial receipt (BLO-33027)"
+            echo
+            echo "- Probe: \`replace --dry-run=server deployment/${probe_deployment}\` in \`${NS}\`"
+            echo "- Unapproved synthetic digest: \`${probe_digest}\`"
+            echo "- Verdict: \`${verdict}\` (after ${attempt} attempt(s))"
+            echo "- \`metadata.generation\`: \`${gen_before:-<unread>}\` -> \`${gen_after:-<unread>}\`"
+            echo
+            echo "Apiserver response:"
+            echo
+            echo '```'
+            cat "${probe_err}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+
+          echo "verdict: ${verdict} (after ${attempt} attempt(s))"
+          echo "generation: ${gen_before:-<unread>} -> ${gen_after:-<unread>}"
+          cat "${probe_err}"
+
+          # Side-effect freeness, proven rather than asserted. A denied request
+          # persists nothing by definition and --dry-run=server persists
+          # nothing even when admitted, so this must hold on every path; if it
+          # ever does not, that outranks the admission verdict.
+          if [ -n "${gen_before}" ] && [ -n "${gen_after}" ] \
+            && [ "${gen_before}" != "${gen_after}" ]; then
+            echo "::error::admission probe changed deployment/${probe_deployment} generation" \
+              "(${gen_before} -> ${gen_after}); the probe must be side-effect-free"
+            exit 1
+          fi
+          if [ -z "${gen_before}" ] || [ -z "${gen_after}" ]; then
+            echo "::warning::could not read deployment/${probe_deployment} generation on both" \
+              "sides of the probe; side-effect freeness is unverified for this run"
+          fi
+
+          case "${verdict}" in
+            denied-by-policy)
+              echo "Denial receipt captured: paperclip-api-image-approval denied an" \
+                "unapproved same-repository digest on the production apiserver."
+              ;;
+            admitted)
+              echo "::error::paperclip-api-image-approval ADMITTED an unapproved" \
+                "same-repository digest (${probe_digest}) in ${NS}. Image-approval" \
+                "enforcement is not effective on the production apiserver."
+              exit 1
+              ;;
+            denied-by-other-policy)
+              echo "::error::the probe was rejected, but not by" \
+                "paperclip-api-image-approval with its 'approved immutable digest'" \
+                "message. Attribution failed, so enforcement of THIS policy is" \
+                "unproven. See the apiserver response above."
+              exit 1
+              ;;
+            *)
+              # Neither an admission nor a denial: apiserver unreachable, auth
+              # failure, a jq/tooling error, or resourceVersion contention that
+              # outlasted the retries. Not evidence in either direction, and
+              # the release has already landed, so this must not read as an
+              # enforcement regression.
+              echo "::warning::admission probe inconclusive; no denial receipt" \
+                "captured for this release. Enforcement is neither confirmed nor" \
+                "refuted by this run."
+              ;;
+          esac
+          # END ADMISSION_DENIAL_RECEIPT_PROBE
 
       # BLO-31666. The approval above holds an in-flight lock from the moment it
       # rotates the ring until that digest's rollout actually lands, and only a

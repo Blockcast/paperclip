@@ -1,4 +1,4 @@
-import { and, asc, eq, isNull, like } from "drizzle-orm";
+import { and, asc, eq, isNull, like, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { plugins, pluginState } from "@paperclipai/db";
 import type {
@@ -6,7 +6,7 @@ import type {
   SetPluginState,
   ListPluginState,
 } from "@paperclipai/shared";
-import { notFound } from "../errors.js";
+import { conflict, notFound } from "../errors.js";
 import {
   assertPluginFencingGeneration,
   type ResolvedPluginFencingPrecondition,
@@ -40,6 +40,21 @@ import { recordGbrainRecallOutcome } from "./metrics.js";
  * visible over-count is not. Revisit if a second writer of this key appears.
  */
 const GBRAIN_CONTEXT_STATE_KEY = "gbrain-context";
+
+/**
+ * Error code returned when a `set()` carrying `ifMatch` finds the stored value
+ * is no longer the one the caller read. Marshalled to the worker as
+ * `details.code` — the same channel `fencing_generation_lost` uses — so a
+ * plugin can tell "I lost the race" from "the RPC failed" without matching
+ * prose.
+ */
+export const STATE_PRECONDITION_FAILED_CODE = "state_precondition_failed";
+
+/**
+ * The write surface `set()` needs, so the same body serves both the plain
+ * connection and a transaction handle without duplicating the statement.
+ */
+type StateWriteRunner = Pick<Db, "insert" | "update">;
 
 function maybeRecordGbrainRecallOutcome(input: SetPluginState): void {
   if (input.scopeKind !== "run" || input.stateKey !== GBRAIN_CONTEXT_STATE_KEY) return;
@@ -188,45 +203,96 @@ export function pluginStateStore(db: Db) {
      * (this write is rejected) or blocks on the lock until this write is done.
      * Without it the write is unconditional, exactly as before.
      *
+     * When `expectedValue` is supplied the write becomes a compare-and-swap and
+     * is applied only while the stored value is still the one the caller read.
+     * The two preconditions answer different questions and compose: the fence
+     * asks "am I still the owner?", `expectedValue` asks "is my read still
+     * current?" — a plugin can hold its generation and still be racing another
+     * writer of the same key.
+     *
      * @param pluginId - UUID of the owning plugin
      * @param input - Scope key and value to store
      * @param fencingPrecondition - Optional generation the caller must still hold
+     * @param expectedValue - Optional prior value the stored row must still equal
      */
     set: async (
       pluginId: string,
       input: SetPluginState,
       fencingPrecondition?: ResolvedPluginFencingPrecondition | null,
+      expectedValue?: unknown,
     ): Promise<void> => {
       await assertPluginExists(pluginId);
 
       const namespace = input.namespace ?? DEFAULT_NAMESPACE;
       const scopeId = input.scopeId ?? null;
 
-      const values = {
-        pluginId,
-        scopeKind: input.scopeKind,
-        scopeId,
-        namespace,
-        stateKey: input.stateKey,
-        valueJson: input.value,
-        updatedAt: new Date(),
-      };
-      const onConflict = {
-        target: [
-          pluginState.pluginId,
-          pluginState.scopeKind,
-          pluginState.scopeId,
-          pluginState.namespace,
-          pluginState.stateKey,
-        ],
-        set: {
-          valueJson: input.value,
-          updatedAt: new Date(),
-        },
+      /**
+       * Unconditional upsert, or — when `expectedValue` is supplied — a guarded
+       * UPDATE whose `WHERE` carries the caller's prior value.
+       *
+       * Deliberately NOT `onConflictDoUpdate({ ..., setWhere })`: that form
+       * still INSERTs when no row exists, which is the one case a
+       * compare-and-swap must refuse. A caller reached this path by reading a
+       * value; if the row is gone, the read it is about to write back is stale
+       * by definition, and silently resurrecting it would be exactly the lost
+       * update the guard exists to prevent.
+       *
+       * Postgres evaluates the predicate and performs the write in a single
+       * statement, so no concurrent writer can interleave between them. That is
+       * what makes this a compare-and-swap rather than a narrower version of
+       * the read-then-write window it replaces.
+       */
+      const applyWrite = async (runner: StateWriteRunner): Promise<void> => {
+        if (expectedValue === undefined) {
+          await runner
+            .insert(pluginState)
+            .values({
+              pluginId,
+              scopeKind: input.scopeKind,
+              scopeId,
+              namespace,
+              stateKey: input.stateKey,
+              valueJson: input.value,
+              updatedAt: new Date(),
+            })
+            .onConflictDoUpdate({
+              target: [
+                pluginState.pluginId,
+                pluginState.scopeKind,
+                pluginState.scopeId,
+                pluginState.namespace,
+                pluginState.stateKey,
+              ],
+              set: {
+                valueJson: input.value,
+                updatedAt: new Date(),
+              },
+            });
+          return;
+        }
+        const updated = await runner
+          .update(pluginState)
+          .set({ valueJson: input.value, updatedAt: new Date() })
+          .where(
+            and(
+              scopeConditions(pluginId, input.scopeKind, scopeId, namespace, input.stateKey),
+              // `value_json` is jsonb, so `=` is structural equality on the
+              // normalized document — key order and insignificant whitespace
+              // do not make an unchanged value compare unequal.
+              sql`${pluginState.valueJson} = ${JSON.stringify(expectedValue)}::jsonb`,
+            ),
+          )
+          .returning({ id: pluginState.id });
+        if (updated.length === 0) {
+          throw conflict("Plugin state changed since it was read; refusing the write", {
+            code: STATE_PRECONDITION_FAILED_CODE,
+            stateKey: input.stateKey,
+          });
+        }
       };
 
       if (!fencingPrecondition) {
-        await db.insert(pluginState).values(values).onConflictDoUpdate(onConflict);
+        await applyWrite(db);
         maybeRecordGbrainRecallOutcome(input);
         return;
       }
@@ -236,7 +302,7 @@ export function pluginStateStore(db: Db) {
         // is rejected before the upsert, and the share lock taken here is held
         // to commit so a steal cannot interleave with the write below.
         await assertPluginFencingGeneration(tx, fencingPrecondition);
-        await tx.insert(pluginState).values(values).onConflictDoUpdate(onConflict);
+        await applyWrite(tx as unknown as StateWriteRunner);
       });
       // Both write paths are counted, and both only after the write has
       // committed: a fencing rejection or a failed upsert throws above, so a

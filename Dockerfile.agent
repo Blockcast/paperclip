@@ -13,4 +13,7 @@ USER root
 COPY --chown=node:node --from=server /app /app
 COPY --from=server /opt/paperclip-bundled-adapters /opt/paperclip-bundled-adapters
 COPY --from=server /usr/local/bin/github-mcp-server /usr/local/bin/github-mcp-server
+COPY --from=server /opt/penstock/bin/penstock-agent-runtime.mjs /opt/penstock/bin/penstock-agent-runtime.mjs
+COPY --from=server /usr/local/bin/caveman-proxy /usr/local/bin/caveman-proxy
+COPY --from=server /opt/penstock/ponytail /opt/penstock/ponytail
 USER node
