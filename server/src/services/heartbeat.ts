@@ -15628,8 +15628,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    executor: Db | DbTransaction = db,
   ) {
-    return setRunStatusIfCurrentStatus(runId, "running", status, patch, "setRunStatusIfRunning");
+    return setRunStatusIfCurrentStatus(runId, "running", status, patch, "setRunStatusIfRunning", executor);
   }
 
   /**
@@ -15656,6 +15657,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: string,
     patchInput: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
     label: string,
+    // BLO-33019: the external-lifecycle finalizer runs this CAS inside a
+    // transaction that already holds the run row, so the write has to go
+    // through that transaction rather than the pool.
+    executor: Db | DbTransaction = db,
   ) {
     // PEN-3153: same chokepoint as `setRunStatus`. This is also the terminal
     // finalize path, so it is where adapter `resultJson` actually lands.
@@ -15713,7 +15718,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     try {
       updated = await runWithTransientDbRetry(
         () =>
-          db
+          executor
             .update(heartbeatRuns)
             .set({ ...statusPatch, updatedAt: new Date() })
             .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, expectedStatus)))
@@ -15750,7 +15755,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!current) {
       for (let attempt = 1; attempt <= 3; attempt += 1) {
         try {
-          current = await db
+          current = await executor
             .select()
             .from(heartbeatRuns)
             .where(eq(heartbeatRuns.id, runId))
@@ -23325,12 +23330,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
 
     const finalizationAgent = await getAgent(input.run.agentId);
-    const claim = await setRunStatusIfRunning(input.run.id, terminalOutcome.status, {
-      error: terminalOutcome.error,
-      errorCode: terminalOutcome.errorCode,
-      finishedAt: input.now,
-      resultJson,
+    // BLO-33019 (Ally review on #1808): the caller's reservation read is still
+    // check-then-act -- getAgent, the evidence evaluation and the GitHub probes
+    // above all sit between it and this write, and the owner re-arms in that
+    // window. Decide and write under one lock: take the run row FOR UPDATE
+    // (rearmExternalRuntimeReservationForRetry locks the same row, so a
+    // concurrent re-arm either committed before this read or waits behind the
+    // CAS and then sees the run is no longer `running`), re-read the
+    // reservation, and abort when the owner has moved past this Job.
+    const claim = await db.transaction(async (tx) => {
+      await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, input.run.id))
+        .for("update");
+      const reservation = await getActiveExternalRuntimeReservation(tx, input.run.id);
+      if (isTerminalExternalJobConsumedByReservation(reservation, input.jobStatus, input.now)) {
+        return { run: null, updated: false as const, consumedByOwner: true as const };
+      }
+      return setRunStatusIfRunning(input.run.id, terminalOutcome.status, {
+        error: terminalOutcome.error,
+        errorCode: terminalOutcome.errorCode,
+        finishedAt: input.now,
+        resultJson,
+      }, tx);
     });
+    if ("consumedByOwner" in claim) {
+      logger.debug(
+        { runId: input.run.id, jobName: input.jobStatus?.name ?? null, jobPhase: input.jobStatus?.phase ?? null },
+        "finalizeExternalLifecycleTerminalRun: reservation re-armed before terminal write; deferring to owner",
+      );
+      return false;
+    }
     if (!claim.updated) return false;
     let finalizedRun = claim.run;
     if (terminalOutcome.status === "failed" && finalizationAgent) {
@@ -24195,19 +24226,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * no active reservation (the owner released it and the run's own finalizer
    * decides) or when the reservation still names this exact Job.
    */
+  function isTerminalExternalJobConsumedByReservation(
+    reservation: Pick<
+      typeof externalRuntimeReservations.$inferSelect,
+      "state" | "jobName" | "jobUid" | "launchedAt" | "updatedAt"
+    > | null,
+    jobStatus: AgentJobRunStatus | null,
+    now: Date,
+  ) {
+    if (!reservation) return false;
+    if (isReplacementPendingReservation(reservation, now)) return true;
+    const terminalName = readNonEmptyString(jobStatus?.name);
+    const terminalUid = readNonEmptyString(jobStatus?.uid);
+    if (reservation.jobName && terminalName && reservation.jobName !== terminalName) return true;
+    if (reservation.jobUid && terminalUid && reservation.jobUid !== terminalUid) return true;
+    return false;
+  }
+
   async function isTerminalExternalJobConsumedByOwner(
     runId: string,
     jobStatus: AgentJobRunStatus,
     now: Date,
   ) {
-    const reservation = await getActiveExternalRuntimeReservation(db, runId);
-    if (!reservation) return false;
-    if (isReplacementPendingReservation(reservation, now)) return true;
-    const terminalName = readNonEmptyString(jobStatus.name);
-    const terminalUid = readNonEmptyString(jobStatus.uid);
-    if (reservation.jobName && terminalName && reservation.jobName !== terminalName) return true;
-    if (reservation.jobUid && terminalUid && reservation.jobUid !== terminalUid) return true;
-    return false;
+    return isTerminalExternalJobConsumedByReservation(
+      await getActiveExternalRuntimeReservation(db, runId),
+      jobStatus,
+      now,
+    );
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
