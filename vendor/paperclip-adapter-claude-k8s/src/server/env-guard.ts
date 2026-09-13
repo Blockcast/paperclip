@@ -857,11 +857,25 @@ for (const name of Object.keys(process.env).sort()) console.log(name);
 
 /**
  * Idempotent settings-merge script (runs via `node -`). Adds a Bash-matcher
- * PreToolUse hook to the runtime's `settings.json` only if an identical command
- * entry is not already present, preserving any existing hooks (e.g. Claude
- * Code's installed Stop hook).
+ * PreToolUse hook to the runtime's `settings.json`, preserving any existing
+ * hooks (e.g. Claude Code's installed Stop hook).
+ *
+ * Writes only when the resulting PreToolUse list actually differs (BLO-33641):
+ * `settings.json` lives in CLAUDE_CONFIG_DIR, which on the k8s adapter is the
+ * shared ReadWriteMany volume, so an unconditional write is an O_TRUNC on an
+ * inode contended by every agent pod. Steady state must be a pure read.
+ *
+ * Guard entries are matched by filename rather than full path so a pod whose
+ * `settings.json` still points at the old in-$HOME location is migrated to the
+ * per-pod path instead of accumulating a second entry.
  */
-const SETTINGS_MERGE_SCRIPT = String.raw`const fs=require("fs"),p=require("path");const dir=process.env.CLAUDE_CONFIG_DIR||(process.env.HOME||"/paperclip")+"/.claude";const f=p.join(dir,"settings.json");let s={};try{s=JSON.parse(fs.readFileSync(f,"utf8"))||{}}catch(e){}if(typeof s!=="object"||s===null)s={};s.hooks=s.hooks||{};const list=Array.isArray(s.hooks.PreToolUse)?s.hooks.PreToolUse:[];const cmd="node "+p.join(dir,"paperclip-env-guard.mjs");const has=list.some(g=>g&&Array.isArray(g.hooks)&&g.hooks.some(h=>h&&h.command===cmd));if(!has)list.push({matcher:"Bash",hooks:[{type:"command",command:cmd}]});s.hooks.PreToolUse=list;fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(f,JSON.stringify(s,null,2));`;
+const SETTINGS_MERGE_SCRIPT = String.raw`const fs=require("fs"),p=require("path");const dir=process.env.CLAUDE_CONFIG_DIR||(process.env.HOME||"/paperclip")+"/.claude";const sdir=process.env.PAPERCLIP_GUARD_SCRIPT_DIR||dir;const f=p.join(dir,"settings.json");let s={};try{s=JSON.parse(fs.readFileSync(f,"utf8"))||{}}catch(e){}if(typeof s!=="object"||s===null)s={};s.hooks=s.hooks||{};const list=Array.isArray(s.hooks.PreToolUse)?s.hooks.PreToolUse:[];const cmd="node "+p.join(sdir,"paperclip-env-guard.mjs");const isGuard=h=>h&&typeof h.command==="string"&&h.command.endsWith("paperclip-env-guard.mjs");const kept=list.filter(g=>!(g&&Array.isArray(g.hooks)&&g.hooks.some(isGuard)));const want=kept.concat([{matcher:"Bash",hooks:[{type:"command",command:cmd}]}]);if(JSON.stringify(list)!==JSON.stringify(want)){s.hooks.PreToolUse=want;fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(f,JSON.stringify(s,null,2));}`;
+
+/**
+ * Per-pod scratch for the guard scripts. Matches RUNTIME_CACHE_MOUNT_PATH in
+ * job-manifest.ts, which mounts an emptyDir at /runtime-cache unconditionally.
+ */
+const GUARD_SCRIPT_DIR_DEFAULT = "/runtime-cache/paperclip-guard";
 
 /**
  * Build a `;`-joinable shell fragment that installs the guard + safe helper and
@@ -869,6 +883,14 @@ const SETTINGS_MERGE_SCRIPT = String.raw`const fs=require("fs"),p=require("path"
  * so arbitrary JS survives `sh -c` with no quoting hazard. Runs in the MAIN
  * container (which has `node`; the init container is busybox). Fails open on
  * merge error so it can never block a run from starting.
+ *
+ * The two `.mjs` files go to per-pod scratch, NOT $HOME/.claude (BLO-33641).
+ * $HOME is the shared ReadWriteMany volume every agent pod mounts, so a `>`
+ * there is an O_TRUNC on a single inode contended by ~92 CephFS clients; that
+ * serialized every pod start behind one MDS capability and stalled agent
+ * startup past the 600s budget. The scripts are byte-identical for every pod
+ * and are only ever read locally, so nothing is lost by keeping them local.
+ * Falls back to $GUARD_DIR when the scratch path is unavailable.
  */
 export function buildEnvGuardSetupShell(): string {
   const guardB64 = Buffer.from(ENV_GUARD_SCRIPT, "utf8").toString("base64");
@@ -876,9 +898,11 @@ export function buildEnvGuardSetupShell(): string {
   const mergeB64 = Buffer.from(SETTINGS_MERGE_SCRIPT, "utf8").toString("base64");
   return [
     `GUARD_DIR="\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}"`,
+    `GUARD_SCRIPT_DIR="\${PAPERCLIP_GUARD_SCRIPT_DIR:-${GUARD_SCRIPT_DIR_DEFAULT}}"`,
+    `mkdir -p "\$GUARD_SCRIPT_DIR" 2>/dev/null || GUARD_SCRIPT_DIR="\$GUARD_DIR"`,
     `mkdir -p "\$GUARD_DIR"`,
-    `printf %s '${guardB64}' | base64 -d > "\$GUARD_DIR/paperclip-env-guard.mjs"`,
-    `printf %s '${helperB64}' | base64 -d > "\$GUARD_DIR/safe-env-inspect.mjs"`,
-    `printf %s '${mergeB64}' | base64 -d | node - 2>/dev/null || echo "[paperclip-env-guard] settings merge skipped" >&2`,
+    `printf %s '${guardB64}' | base64 -d > "\$GUARD_SCRIPT_DIR/paperclip-env-guard.mjs"`,
+    `printf %s '${helperB64}' | base64 -d > "\$GUARD_SCRIPT_DIR/safe-env-inspect.mjs"`,
+    `printf %s '${mergeB64}' | base64 -d | PAPERCLIP_GUARD_SCRIPT_DIR="\$GUARD_SCRIPT_DIR" node - 2>/dev/null || echo "[paperclip-env-guard] settings merge skipped" >&2`,
   ].join("; ");
 }
