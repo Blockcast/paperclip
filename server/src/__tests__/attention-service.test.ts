@@ -659,6 +659,20 @@ describeEmbeddedPostgres("attention service", () => {
     expect(feed.items.filter((item) => item.sourceKind === "failed_run")).toEqual([]);
   });
 
+  it("suppresses failed-run attention when the newer run uses taskId context", async () => {
+    const { companyId, workerId } = await seedCompany("ATQ");
+    const taskId = await insertIssue({ companyId, identifier: "ATQ-1", title: "Task", status: "in_progress" });
+    const failedAt = new Date("2026-07-09T12:00:00.000Z");
+    const failedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      { id: failedRunId, companyId, agentId: workerId, invocationSource: "automation", status: "failed", error: "adapter failed", contextSnapshot: { taskId }, createdAt: failedAt, updatedAt: failedAt, finishedAt: failedAt },
+      { id: randomUUID(), companyId, agentId: workerId, invocationSource: "automation", status: "succeeded", contextSnapshot: { taskId }, createdAt: new Date("2026-07-09T12:01:00.000Z"), updatedAt: new Date("2026-07-09T12:01:00.000Z"), finishedAt: new Date("2026-07-09T12:01:00.000Z") },
+    ]);
+    await db.insert(heartbeatRunEvents).values({ companyId, runId: failedRunId, agentId: workerId, seq: 1, eventType: "lifecycle", message: "Bounded retry exhausted", createdAt: new Date("2026-07-09T12:00:01.000Z") });
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    expect(feed.items.filter((item) => item.sourceKind === "failed_run")).toEqual([]);
+  });
+
   it("enriches interaction details with project, workspace, plan metadata, and images", async () => {
     const { companyId, workerId } = await seedCompany("ATE");
     const projectId = randomUUID();
