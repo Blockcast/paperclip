@@ -52,6 +52,48 @@ describe("buildIssueMonitorEligibilityPatch", () => {
     expect((patch.executionState as { monitor?: { status?: string; clearReason?: string } }).monitor)
       .toMatchObject({ status: "cleared", clearReason: "invalid_status" });
   });
+
+  // BLO-29974: `escalateStrandedAssignedIssue` writes a *computed* status, and it is a
+  // service-layer write, so nothing upstream clears a monitor the new status makes
+  // undeliverable. The caller therefore has to evaluate eligibility against the status
+  // it is about to write, not the one the row currently holds. Passing the unmodified
+  // row is the silent-failure mode this pins: the row still reads `in_progress`, the
+  // patch comes back `{}`, and the monitor survives as a false-live wake path.
+  it("clears when evaluated against a post-write escalation status the row does not hold yet", () => {
+    const armed = {
+      status: "in_progress",
+      assigneeAgentId: coderAgentId,
+      assigneeUserId: null,
+      monitorNextCheckAt: new Date("2026-09-19T10:07:00.000Z"),
+      executionPolicy: {
+        monitor: { nextCheckAt: "2026-09-19T10:07:00.000Z", scheduledBy: "assignee" },
+      },
+    };
+
+    // Evaluated against the row as-is, there is nothing to do — this is the trap.
+    expect(buildIssueMonitorEligibilityPatch(armed)).toEqual({});
+
+    const patch = buildIssueMonitorEligibilityPatch({ ...armed, status: "blocked" });
+    expect(patch.monitorNextCheckAt).toBeNull();
+    expect((patch.executionState as { monitor?: { status?: string; clearReason?: string } }).monitor)
+      .toMatchObject({ status: "cleared", clearReason: "invalid_status" });
+  });
+
+  // BLO-27635 leaves a capacity strand dispatchable rather than writing `blocked`. That
+  // branch must keep its monitor, so the unconditional spread has to stay a no-op there.
+  it("leaves the monitor armed when the escalation status still allows one", () => {
+    expect(
+      buildIssueMonitorEligibilityPatch({
+        status: "in_review",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        monitorNextCheckAt: new Date("2026-09-19T10:07:00.000Z"),
+        executionPolicy: {
+          monitor: { nextCheckAt: "2026-09-19T10:07:00.000Z", scheduledBy: "assignee" },
+        },
+      }),
+    ).toEqual({});
+  });
 });
 
 function makePolicy(
