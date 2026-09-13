@@ -224,7 +224,10 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
-import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
+import {
+  isStatusOnlyRecoveryContextSnapshot,
+  STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+} from "../services/recovery/model-profile-hint.js";
 import {
   enqueueCommentEffects,
   getEffectResult,
@@ -2045,78 +2048,10 @@ function applyActorMonitorScheduledBy(
   );
 }
 
-async function assertCanManageIssueMonitor(
-  accessSvc: ReturnType<typeof accessService>,
-  req: Request,
-  companyId: string,
-  issue: {
-    assigneeAgentId?: string | null;
-    checkoutRunId?: string | null;
-    executionRunId?: string | null;
-  },
-  monitorChanged: boolean,
-  options: {
-    // Set only by `PATCH /issues/:id`, and only once
-    // `assertAgentIssueMutationAllowed` has already allowed this mutation via
-    // `allow_productivity_review_grant` (BLO-19723). See the call site.
-    productivityReviewOwnerAuthorized?: boolean;
-    managerMonitorRearmAuthorized?: boolean;
-  } = {},
-) {
-  if (!monitorChanged) return;
-  if (req.actor.type === "board") return;
-  const runtimeDecision = await accessSvc.decide({
-    actor: req.actor,
-    action: "runtime:manage",
-    resource: { type: "company", companyId },
-  });
-  if (!runtimeDecision.allowed) {
-    throw forbidden(runtimeDecision.explanation, authorizationDeniedDetails(runtimeDecision));
-  }
-  if (req.actor.type === "agent" && req.actor.agentId && req.actor.agentId === issue.assigneeAgentId) return;
-  if (req.actor.type === "agent" && req.actor.agentId && isCurrentIssueExecutionRun(req, issue)) return;
-  // BLO-19723: this guard is a *second* gate, independent of the authorization
-  // boundary. #853 (BLO-19094) taught `authorization.ts` that an open
-  // productivity review grants its owner `issue:mutate` on the source issue,
-  // but this check never consults grants — it tests the assignee relation
-  // directly. So a reviewer cleared the boundary and then bounced off here,
-  // and re-arming a wedged monitor is the single remedy that actually resumes
-  // stalled work. Observed live on 2026-08-01 (BLO-20426): after #853 shipped,
-  // the denial changed from `deny_missing_grant` to this guard's message,
-  // which is what localized the residual gap to this function.
-  //
-  // Deliberately narrow, mirroring #853:
-  //   * opt-in per route — only `PATCH /issues/:id` passes the flag, so
-  //     monitor writes folded into issue *creation*
-  //     (`POST /companies/:companyId/issues`, `POST /issues/:id/children`,
-  //     `POST /issues/:id/accepted-plan-decompositions`) and the forced wake
-  //     `POST /issues/:id/monitor/check-now` stay closed to a reviewer.
-  //   * derived, not re-queried — the caller may only set this after
-  //     `assertAgentIssueMutationAllowed` returned `allow_productivity_review_grant`,
-  //     so the grant predicate (open review, agent-scoped, relation-scoped,
-  //     server-stamped `originId`) stays in exactly one place.
-  //   * still behind `runtime:manage` above — the review grant substitutes for
-  //     the assignee *relation*, not for the runtime capability.
-  if (options.productivityReviewOwnerAuthorized) return;
-  if (options.managerMonitorRearmAuthorized) return;
-  throw forbidden(
-    "Only the assignee agent or a board user can manage issue monitors",
-    {
-      issueAssigneeAgentId: issue.assigneeAgentId ?? null,
-      actorAgentId: req.actor.type === "agent" ? req.actor.agentId ?? null : null,
-      // AC #2 (BLO-19723): say which relations satisfy this gate rather than
-      // returning a bare 403, so a reviewer that lands here knows the review
-      // grant is honoured on `PATCH /issues/:id` and nowhere else.
-      allowedRelations: [
-        "board user",
-        "the issue's assignee agent",
-        "the agent holding the issue's current execution run",
-        "the owner of an open productivity review of this issue (PATCH /issues/:id only)",
-        "a manager in the assignee's reporting chain re-arming a triggered monitor (PATCH /issues/:id only)",
-      ],
-    },
-  );
-}
+// `assertCanManageIssueMonitor` moved into the `issueRoutes` factory (BLO-32774).
+// It now consults the actor's recovery run class, which needs `loadActorRunContext`
+// and `recordDeniedIssueWrite` — both factory-scoped, both closing over `db`, which
+// is only a *type* import at module level. Review the move with `git diff -w`.
 
 function isCurrentIssueExecutionRun(
   req: Request,
@@ -4736,6 +4671,7 @@ export function issueRoutes(
     | "deny_recovery_handoff_comment_only"
     | "deny_recovery_owner_comment_only"
     | "deny_resume_policy"
+    | "deny_status_only_recovery_monitor_arm"
     | "deny_structured_comment_fields"
     | "deny_task_watchdog_scope";
 
@@ -6829,15 +6765,10 @@ export function issueRoutes(
     return { scope, discovery, sourceIssue, watchdogIssue };
   }
 
-  function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
-    if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
-    const context = contextSnapshot as Record<string, unknown>;
-    return context.modelProfile === "cheap" &&
-      context.recoveryIntent === "status_only" &&
-      context.allowDeliverableWork === false &&
-      context.allowDocumentUpdates === false &&
-      context.resumeRequiresNormalModel === true;
-  }
+  // BLO-32774: the five keys used to be repeated here. They are now derived from
+  // `STATUS_ONLY_RECOVERY_GUARD_CONTEXT`, so editing the tuple can no longer
+  // leave this guard testing a stale shape and quietly failing open.
+  const isStatusOnlyCheapRecoveryContext = isStatusOnlyRecoveryContextSnapshot;
 
   function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
     if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
@@ -6902,6 +6833,155 @@ export function issueRoutes(
       });
     }
     return false;
+  }
+
+  /**
+   * Refuse monitor *arming* by a status-only recovery run (BLO-32774).
+   *
+   * A monitor fire declares `normal_model`, so `mergeCoalescedContextSnapshot`
+   * (BLO-32634 / #1718) correctly drops the recovery guard for it — the fire
+   * could not otherwise perform the write it was armed for. The residual closed
+   * here is *who may schedule that fire*: on a `stranded_assigned_issue`
+   * recovery the guarded agent IS the assignee, so it cleared the assignee
+   * early-return and could arm a monitor on its own issue, buying itself an
+   * unguarded normal-model run while its recovery action stayed `active` and
+   * un-dispositioned.
+   *
+   * The block belongs at the arming gate and NOT at the coalesce: a monitor
+   * armed earlier by a normal-model run must still fire and still drop the
+   * guard once a recovery action appears. Keying on the *arming* run rather
+   * than on fire time is what keeps BLO-32634's case working.
+   *
+   * `loadActorRunContext` returns null for non-agent actors, so this
+   * self-limits to agents and cannot affect board or user callers.
+   */
+  async function assertMonitorArmingAllowedByRunContext(
+    req: Request,
+    companyId: string,
+    issue: { id?: string | null },
+  ) {
+    const run = await loadActorRunContext(req, companyId);
+    if (!run || !isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return;
+
+    // Same shape as `assertCheapRecoveryIssueAssigneeProfileAllowed`: the
+    // refusal is unconditional and single-point, the audit row is best-effort
+    // and only where a persisted issue exists. Sites that mint the issue id
+    // *after* this gate runs have nothing to record against; they still refuse.
+    // Recorded before the throw, since the throw exits.
+    //
+    // `responseStatus` is the 403 literal rather than
+    // `responseStatusForDeniedWrite(res, 403)`: this gate throws instead of
+    // responding, so `res.statusCode` is still 200 here and the helper would
+    // return the same fallback — threading `res` through five call sites would
+    // buy nothing.
+    if (issue.id) {
+      await recordDeniedIssueWrite(req, { id: issue.id, companyId }, "issue:mutate", {
+        reason: "deny_status_only_recovery_monitor_arm",
+        responseStatus: 403,
+      });
+    }
+    throw forbidden(
+      "Cheap status-only recovery runs cannot arm issue monitors",
+      {
+        issueId: issue.id ?? null,
+        runId: run.id,
+        modelProfile: "cheap",
+        recoveryIntent: "status_only",
+        resumeRequiresNormalModel: true,
+        ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+      },
+    );
+  }
+
+  async function assertCanManageIssueMonitor(
+    accessSvc: ReturnType<typeof accessService>,
+    req: Request,
+    companyId: string,
+    issue: {
+      id?: string | null;
+      assigneeAgentId?: string | null;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
+    },
+    monitorChanged: boolean,
+    options: {
+      // Set only by `PATCH /issues/:id`, and only once
+      // `assertAgentIssueMutationAllowed` has already allowed this mutation via
+      // `allow_productivity_review_grant` (BLO-19723). See the call site.
+      productivityReviewOwnerAuthorized?: boolean;
+      managerMonitorRearmAuthorized?: boolean;
+      // BLO-32774. `monitorChanged` is also true for *clears*, and the
+      // run-class refusal below must not fire on those: clearing removes a wake
+      // path rather than buying an unguarded run, and refusing it would strand
+      // an issue whose stale monitor a status-only run is tidying up. Only
+      // `PATCH /issues/:id` conflates the two, so only it sets this flag.
+      // `undefined` means "treat as arming", so the routes that are already
+      // arm-specific keep strict behaviour unedited — fail-closed by default.
+      monitorArmed?: boolean;
+    } = {},
+  ) {
+    if (!monitorChanged) return;
+    if (req.actor.type === "board") return;
+    const runtimeDecision = await accessSvc.decide({
+      actor: req.actor,
+      action: "runtime:manage",
+      resource: { type: "company", companyId },
+    });
+    if (!runtimeDecision.allowed) {
+      throw forbidden(runtimeDecision.explanation, authorizationDeniedDetails(runtimeDecision));
+    }
+    // BLO-32774: checked BEFORE the relation early-returns, and deliberately
+    // independent of which relation would have admitted the actor. A manager or
+    // a productivity-review owner whose own run is status-only is buying itself
+    // an unguarded run just as much as the assignee is. That is what makes this
+    // one check rather than four — and what keeps a new arming route from
+    // missing it.
+    if (options.monitorArmed !== false) {
+      await assertMonitorArmingAllowedByRunContext(req, companyId, issue);
+    }
+    if (req.actor.type === "agent" && req.actor.agentId && req.actor.agentId === issue.assigneeAgentId) return;
+    if (req.actor.type === "agent" && req.actor.agentId && isCurrentIssueExecutionRun(req, issue)) return;
+    // BLO-19723: this guard is a *second* gate, independent of the authorization
+    // boundary. #853 (BLO-19094) taught `authorization.ts` that an open
+    // productivity review grants its owner `issue:mutate` on the source issue,
+    // but this check never consults grants — it tests the assignee relation
+    // directly. So a reviewer cleared the boundary and then bounced off here,
+    // and re-arming a wedged monitor is the single remedy that actually resumes
+    // stalled work. Observed live on 2026-08-01 (BLO-20426): after #853 shipped,
+    // the denial changed from `deny_missing_grant` to this guard's message,
+    // which is what localized the residual gap to this function.
+    //
+    // Deliberately narrow, mirroring #853:
+    //   * opt-in per route — only `PATCH /issues/:id` passes the flag, so
+    //     monitor writes folded into issue *creation*
+    //     (`POST /companies/:companyId/issues`, `POST /issues/:id/children`,
+    //     `POST /issues/:id/accepted-plan-decompositions`) and the forced wake
+    //     `POST /issues/:id/monitor/check-now` stay closed to a reviewer.
+    //   * derived, not re-queried — the caller may only set this after
+    //     `assertAgentIssueMutationAllowed` returned `allow_productivity_review_grant`,
+    //     so the grant predicate (open review, agent-scoped, relation-scoped,
+    //     server-stamped `originId`) stays in exactly one place.
+    //   * still behind `runtime:manage` above — the review grant substitutes for
+    //     the assignee *relation*, not for the runtime capability.
+    if (options.productivityReviewOwnerAuthorized) return;
+    if (options.managerMonitorRearmAuthorized) return;
+    throw forbidden(
+      "Only the assignee agent or a board user can manage issue monitors",
+      {
+        issueAssigneeAgentId: issue.assigneeAgentId ?? null,
+        actorAgentId: req.actor.type === "agent" ? req.actor.agentId ?? null : null,
+        // AC #2 (BLO-19723): say which relations satisfy this gate rather than
+        // returning a bare 403, so a reviewer that lands here knows the review
+        // grant is honoured on `PATCH /issues/:id` and nowhere else.
+        allowedRelations: [
+          "board user",
+          "the issue's assignee agent",
+          "the agent holding the issue's current execution run",
+          "the owner of an open productivity review of this issue (PATCH /issues/:id only)",
+          "a manager in the assignee's reporting chain re-arming a triggered monitor (PATCH /issues/:id only)",
+        ],
+      },
+    );
   }
 
   /**
@@ -11503,6 +11583,13 @@ export function issueRoutes(
         // pre-existing behaviour — fail-closed.
         productivityReviewOwnerAuthorized: productivityReviewSourceMutationAudit.current !== null,
         managerMonitorRearmAuthorized,
+        // BLO-32774: `monitorChanged` above is a policy *diff*, so it is true
+        // for clears as well as arms. This is the only call site that conflates
+        // them — the creation routes already pass `Boolean(executionPolicy?.monitor)`
+        // and `check-now` forces a fire. Naming the arm explicitly keeps the
+        // run-class refusal off clears, which remove a wake path rather than
+        // buying an unguarded run.
+        monitorArmed: Boolean(nextExecutionPolicy?.monitor),
       },
     );
 
