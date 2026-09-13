@@ -86,6 +86,7 @@ import {
 import {
   applyIssueMonitorPolicyTransition,
   buildIssueMonitorClearedPatch,
+  buildIssueMonitorEligibilityPatch,
   derivePersistedMonitorState,
   isMonitorNextCheckAtLive,
   normalizeIssueExecutionPolicy,
@@ -7203,10 +7204,28 @@ export function recoveryService(
         recoveryCause,
       });
 
+      const escalatedAssigneeAgentId = action.ownerAgentId ?? fresh.assigneeAgentId;
       const issueUpdate = {
         status: escalatedStatus,
         blockedByIssueIds: blockerIds,
-        assigneeAgentId: action.ownerAgentId ?? fresh.assigneeAgentId,
+        assigneeAgentId: escalatedAssigneeAgentId,
+        // BLO-29974: this is a service-layer write, so it bypasses the route-layer
+        // monitor transition — nothing in `issuesSvc.update` clears a monitor that
+        // the new status makes undeliverable. Left alone, an armed monitor survives
+        // reading `scheduled` with a future `nextCheckAt` while being structurally
+        // incapable of firing: a false liveness signal that also makes
+        // `hasActiveMonitorPath` skip the row. Measured 2026-09-13 — three rows
+        // parked here inside one 58-minute window, all false-live.
+        //
+        // Keyed on the *computed* `escalatedStatus`, not on `fresh.status`: the
+        // BLO-27635 branch deliberately leaves capacity strands dispatchable, and
+        // `buildIssueMonitorEligibilityPatch` returns `{}` whenever the resulting
+        // status still allows a monitor, so that path is unaffected.
+        ...buildIssueMonitorEligibilityPatch({
+          ...fresh,
+          status: escalatedStatus,
+          assigneeAgentId: escalatedAssigneeAgentId,
+        }),
         expectedCurrentStatus: fresh.status,
         // Keep the assignee snapshot as a belt-and-braces write precondition.
         expectedCurrentAssigneeAgentId: fresh.assigneeAgentId,
