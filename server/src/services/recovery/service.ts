@@ -123,6 +123,7 @@ import {
 import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
+  withStrandedRecoveryWakeWorkClass,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
@@ -767,6 +768,12 @@ type LatestIssueRun = Pick<
   | "usageJson"
   | "sessionIdBefore"
   | "scheduledRetryAttempt"
+  // BLO-32566: read by the stranded-lane wake sites to escalate off `status_only`
+  // after a refused document write. A hand-enumerated projection that omits this
+  // disables that escalation in production while every unit test still passes,
+  // because the tests construct the row literal rather than selecting it — which
+  // is why all three producers below now share `LATEST_ISSUE_RUN_COLUMNS`.
+  | "statusOnlyDocumentWriteRefusedAt"
   | "createdAt"
   | "finishedAt"
 > | null;
@@ -2187,6 +2194,12 @@ export function recoveryService(
 
   // Column set behind `LatestIssueRun`. Shared by every helper that produces
   // run evidence for the recovery classifiers so the shapes cannot drift apart.
+  //
+  // BLO-32566: that claim was aspirational until now — two of the three
+  // producers (`getLatestIssueRunForAgentStage`, `getLatestIssueRunSince`) had
+  // hand-copied this list instead of referencing it, so adding a column here
+  // left them silently short of the declared type. They now select this const,
+  // which is what makes the sentence above true.
   const LATEST_ISSUE_RUN_COLUMNS = {
     id: heartbeatRuns.id,
     agentId: heartbeatRuns.agentId,
@@ -2199,6 +2212,7 @@ export function recoveryService(
     usageJson: heartbeatRuns.usageJson,
     sessionIdBefore: heartbeatRuns.sessionIdBefore,
     scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+    statusOnlyDocumentWriteRefusedAt: heartbeatRuns.statusOnlyDocumentWriteRefusedAt,
     createdAt: heartbeatRuns.createdAt,
     finishedAt: heartbeatRuns.finishedAt,
   } as const;
@@ -2459,21 +2473,7 @@ export function recoveryService(
     stageId: string,
   ): Promise<LatestIssueRun> {
     return db
-      .select({
-        id: heartbeatRuns.id,
-        agentId: heartbeatRuns.agentId,
-        status: heartbeatRuns.status,
-        error: heartbeatRuns.error,
-        errorCode: heartbeatRuns.errorCode,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
-        livenessState: heartbeatRuns.livenessState,
-        resultJson: heartbeatRuns.resultJson,
-        usageJson: heartbeatRuns.usageJson,
-        sessionIdBefore: heartbeatRuns.sessionIdBefore,
-        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
-        createdAt: heartbeatRuns.createdAt,
-        finishedAt: heartbeatRuns.finishedAt,
-      })
+      .select(LATEST_ISSUE_RUN_COLUMNS)
       .from(heartbeatRuns)
       .where(
         and(
@@ -3002,21 +3002,7 @@ export function recoveryService(
     interactionId: string,
   ): Promise<LatestIssueRun> {
     return db
-      .select({
-        id: heartbeatRuns.id,
-        agentId: heartbeatRuns.agentId,
-        status: heartbeatRuns.status,
-        error: heartbeatRuns.error,
-        errorCode: heartbeatRuns.errorCode,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
-        livenessState: heartbeatRuns.livenessState,
-        resultJson: heartbeatRuns.resultJson,
-        usageJson: heartbeatRuns.usageJson,
-        sessionIdBefore: heartbeatRuns.sessionIdBefore,
-        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
-        createdAt: heartbeatRuns.createdAt,
-        finishedAt: heartbeatRuns.finishedAt,
-      })
+      .select(LATEST_ISSUE_RUN_COLUMNS)
       .from(heartbeatRuns)
       .where(
         and(
@@ -5845,6 +5831,38 @@ export function recoveryService(
       return queued;
     };
     const ownerIsNonAssignee = input.action.ownerAgentId !== input.issue.assigneeAgentId;
+    // BLO-32566: a status-only wake cannot write an issue document, so when the
+    // newest run on this issue was refused exactly that write, dispatching
+    // another status-only wake guarantees the identical 403. The issue then
+    // cannot self-heal: only a recorded disposition clears the recovery action,
+    // and while the action is active every wake on the issue is status-only —
+    // the trap the server's own `resumeGuidance` describes. Reproduced four
+    // times (BLO-31222 ×3, then on BLO-32566 itself, where a completed and
+    // verified instrument revision could not be landed).
+    //
+    // This is the same escalation BLO-23197 applied to the successful-run-handoff
+    // lane (`successful-run-handoff.ts`); that fix deliberately scoped this lane
+    // out as follow-up, and this is the follow-up. `planning_only` is the minimum
+    // that clears it: normal model with `allowDocumentUpdates: true`, while
+    // deliverable and annotation writes stay barred. A run refused a
+    // *deliverable* write is intentionally not escalated — that needs a wider
+    // grant than this detector should make on its own — which is why the stamp
+    // is scoped to documents at the point of refusal (`issues.ts`).
+    //
+    // Self-limiting rather than a ratchet: the stamp lives on the newest run
+    // row, and the escalated wake creates a new row that cannot carry it (a
+    // `planning_only` run is not `statusOnly`, and the stamp is only written on
+    // the `statusOnly` branch). So one refusal buys one escalated wake. If that
+    // escalated run dies without writing, the next wake is status-only again and
+    // may re-refuse — an alternation, not a loop, and still bounded by
+    // `maxAttempts` and the creation-anchored `timeoutAt` horizon.
+    //
+    // `Boolean(...)` guards an absent column, not `undefined`: the row type is
+    // `Date | null`, so the only way this reads falsy-by-accident is a
+    // projection that omits the field. All three `LatestIssueRun` producers now
+    // share `LATEST_ISSUE_RUN_COLUMNS` for that reason — before that, two had
+    // hand-copied the column list and would have silently disabled this.
+    const documentWriteWasRefused = Boolean(input.latestRun?.statusOnlyDocumentWriteRefusedAt);
     if (!input.hasNewActivitySinceLastAttempt && ownerIsNonAssignee && input.action.attemptCount > 1) {
       const assigneeAgentId = input.issue.assigneeAgentId;
       if (!assigneeAgentId) {
@@ -5856,17 +5874,17 @@ export function recoveryService(
         triggerDetail: "system",
         reason: "source_scoped_recovery_action",
         idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}:assignee_fallback`,
-        payload: withRecoveryModelProfileHint({
+        payload: withStrandedRecoveryWakeWorkClass({
           issueId: input.issue.id,
           sourceIssueId: input.issue.id,
           recoveryActionId: input.action.id,
           strandedRunId: input.latestRun?.id ?? null,
           recoveryCause: input.recoveryCause,
           suppressedNonAssigneeWake: true,
-        }, "status_only"),
+        }, documentWriteWasRefused),
         requestedByActorType: "system",
         requestedByActorId: null,
-        contextSnapshot: withRecoveryModelProfileHint({
+        contextSnapshot: withStrandedRecoveryWakeWorkClass({
           issueId: input.issue.id,
           taskId: input.issue.id,
           wakeReason: "source_scoped_recovery_action",
@@ -5877,7 +5895,7 @@ export function recoveryService(
           strandedRunId: input.latestRun?.id ?? null,
           recoveryCause: input.recoveryCause,
           suppressedNonAssigneeWake: true,
-        }, "status_only"),
+        }, documentWriteWasRefused),
         expectedLockOwnerState: input.expectedLockOwnerState,
       });
       return;
@@ -5893,16 +5911,16 @@ export function recoveryService(
       triggerDetail: "system",
       reason: "source_scoped_recovery_action",
       idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}`,
-      payload: withRecoveryModelProfileHint({
+      payload: withStrandedRecoveryWakeWorkClass({
         issueId: input.issue.id,
         sourceIssueId: input.issue.id,
         recoveryActionId: input.action.id,
         strandedRunId: input.latestRun?.id ?? null,
         recoveryCause: input.recoveryCause,
-      }, "status_only"),
+      }, documentWriteWasRefused),
       requestedByActorType: "system",
       requestedByActorId: null,
-      contextSnapshot: withRecoveryModelProfileHint({
+      contextSnapshot: withStrandedRecoveryWakeWorkClass({
         issueId: input.issue.id,
         taskId: input.issue.id,
         wakeReason: "source_scoped_recovery_action",
@@ -5912,7 +5930,7 @@ export function recoveryService(
         sourceIssueId: input.issue.id,
         strandedRunId: input.latestRun?.id ?? null,
         recoveryCause: input.recoveryCause,
-      }, "status_only"),
+      }, documentWriteWasRefused),
       expectedLockOwnerState: input.expectedLockOwnerState,
     });
   }
@@ -12716,22 +12734,52 @@ export function recoveryService(
       const idempotencyKey =
         `source_scoped_recovery_action:${candidate.actionId}:wake_backstop:${deliveryAttemptAt.getTime()}`;
 
+      // BLO-32566: same escalation as `enqueueSourceScopedStrandedRecoveryWake`,
+      // for the same reason. Both sites need it because they cover disjoint
+      // issue statuses: that one fires from `reconcileStrandedAssignedIssues`
+      // (todo/in_progress/in_review, re-escalating with an incremented
+      // `attemptCount` on each sweep), while this backstop is the only re-wake
+      // path for an action whose issue is `blocked` — see
+      // `STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES`. Gating one and not the
+      // other leaves the trap intact for half the status space.
+      //
+      // This site was NOT in the audit that produced this issue (that audit
+      // named only the two paths in `enqueueSourceScopedStrandedRecoveryWake`),
+      // so it is recorded here explicitly rather than left to be rediscovered.
+      //
+      // Read per candidate rather than joined into `queryCandidates`: it is one
+      // query, taken only for candidates that have passed every gate and won the
+      // claim — i.e. that are about to have a wake enqueued anyway — and this
+      // loop already performs several per-candidate awaits (`hasActiveExecutionPath`,
+      // `hasQueuedIssueWake`, `hasPendingWakeInteraction`). Keeping it out of the
+      // paginated candidate query also leaves the `count(*) over()` page
+      // accounting and the cursor semantics untouched.
+      //
+      // Inside the try deliberately. Everything between the claim above and this
+      // try used to be pure string building, so nothing there could throw; this
+      // is the first I/O in that window. Left outside, a transient failure would
+      // escape the per-candidate catch, abort the whole sweep for every remaining
+      // candidate, and leave this candidate's attempt claimed with no wake
+      // delivered. Inside, it degrades exactly like an enqueue failure: counted,
+      // logged, sweep continues.
       try {
+        const backstopLatestRun = await getLatestIssueRun(candidate.companyId, candidate.issueId);
+        const backstopEscalate = Boolean(backstopLatestRun?.statusOnlyDocumentWriteRefusedAt);
         const wake = await deps.enqueueWakeup(ownerAgentId, {
           source: "assignment",
           triggerDetail: "system",
           reason: "source_scoped_recovery_action",
           idempotencyKey,
-          payload: withRecoveryModelProfileHint({
+          payload: withStrandedRecoveryWakeWorkClass({
             issueId: candidate.issueId,
             sourceIssueId: candidate.issueId,
             recoveryActionId: candidate.actionId,
             recoveryCause: candidate.actionCause,
             backstop: "stranded_recovery_wake_backstop",
-          }, "status_only"),
+          }, backstopEscalate),
           requestedByActorType: "system",
           requestedByActorId: null,
-          contextSnapshot: withRecoveryModelProfileHint({
+          contextSnapshot: withStrandedRecoveryWakeWorkClass({
             issueId: candidate.issueId,
             taskId: candidate.issueId,
             wakeReason: "source_scoped_recovery_action",
@@ -12741,7 +12789,7 @@ export function recoveryService(
             sourceIssueId: candidate.issueId,
             recoveryCause: candidate.actionCause,
             backstop: "stranded_recovery_wake_backstop",
-          }, "status_only"),
+          }, backstopEscalate),
           expectedLockOwnerState: {
             executionRunId: candidate.executionRunId,
             checkoutRunId: candidate.checkoutRunId,
@@ -12779,6 +12827,16 @@ export function recoveryService(
             recoveryCause: candidate.actionCause,
             recoveryOwnerAgentId: ownerAgentId,
             idempotencyKey,
+            // BLO-32566 AC: the refusal must be discoverable without reading the
+            // blocked issue's own documents, which is the surface the previous
+            // two occurrences were reported on and lost. The refusal fact itself
+            // is queryable as `heartbeat_runs.status_only_document_write_refused_at`;
+            // this records the *consequence* on the company activity stream, so
+            // "which issues escalated off status-only, and when" is answerable
+            // without knowing which incident to go read.
+            recoveryWorkClass: backstopEscalate ? "planning_only" : "status_only",
+            escalatedAfterDocumentWriteRefusal: backstopEscalate,
+            documentWriteRefusedRunId: backstopEscalate ? backstopLatestRun?.id ?? null : null,
           },
         });
       } catch (err) {
