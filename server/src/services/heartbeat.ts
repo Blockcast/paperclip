@@ -267,6 +267,7 @@ import {
   resolveAgentEmptyWorkspaceSourceDir,
   resolveDefaultAgentWorkspaceDir,
   resolveManagedProjectWorkspaceDir,
+  resolvePaperclipInstanceRoot,
 } from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
@@ -303,6 +304,7 @@ import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outb
 import {
   ensureReferencedSharedDocsMaterialized,
   normalizeInstructionsEntryFile,
+  sharedDocSourceRoots,
 } from "@paperclipai/adapter-opencode-local/server";
 import {
   buildWorkspaceReadyComment,
@@ -5222,19 +5224,25 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
-async function materializeOpenCodeK8sSharedDocs(input: {
+// Both external-lifecycle k8s adapters launch a pod against this local execution
+// workspace, so both need the shared docs their AGENTS.md tells them to read to exist
+// on disk before the pod starts. Scoping this to opencode_k8s left every claude_k8s
+// agent reading whatever `docs/<name>.md` happened to be in the project repo.
+const SHARED_DOC_MATERIALIZING_ADAPTER_TYPES = new Set(["claude_k8s", "opencode_k8s"]);
+
+async function materializeExternalK8sSharedDocs(input: {
   adapterType: string;
   config: Record<string, unknown>;
   cwd: string;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
 }) {
-  if (input.adapterType !== "opencode_k8s") return;
+  if (!SHARED_DOC_MATERIALIZING_ADAPTER_TYPES.has(input.adapterType)) return;
   const instructionsRootPath = readNonEmptyString(input.config.instructionsRootPath);
   const instructionsFilePath = readNonEmptyString(input.config.instructionsFilePath);
   if (!instructionsRootPath && !instructionsFilePath) {
     await input.onLog(
       "stdout",
-      "[paperclip] Skipped opencode_k8s shared docs materialization: no instructions bundle configured.\n",
+      "[paperclip] Skipped external k8s shared docs materialization: no instructions bundle configured.\n",
     );
     return;
   }
@@ -5258,23 +5266,34 @@ async function materializeOpenCodeK8sSharedDocs(input: {
     if (code === "ENOENT") {
       await input.onLog(
         "stdout",
-        "[paperclip] Skipped opencode_k8s shared docs materialization: external instructions entry absent.\n",
+        "[paperclip] Skipped external k8s shared docs materialization: external instructions entry absent.\n",
       );
       return;
     } else {
       await input.onLog(
         "stderr",
-        `[paperclip] Skipped opencode_k8s shared docs materialization: failed to read instructions entry (${code ?? "unknown"}).\n`,
+        `[paperclip] Skipped external k8s shared docs materialization: failed to read instructions entry (${code ?? "unknown"}).\n`,
       );
       return;
     }
   }
   if (!instructionsContents) return;
 
+  const sharedDocSearchBoundaryPath = resolvePaperclipInstanceRoot();
+  if (!sharedDocSourceRoots(sourceRootPath, sharedDocSearchBoundaryPath).some((root) => root !== sourceRootPath)) {
+    // Not fatal: shared docs may genuinely live in the bundle. Logged because an external
+    // bundle configured outside the instance root silently loses the company-root lookup,
+    // and that is otherwise indistinguishable from "the doc does not exist".
+    await input.onLog(
+      "stdout",
+      `[paperclip] Shared-doc ancestor lookup disabled: instructions root ${sourceRootPath} is outside ${sharedDocSearchBoundaryPath}.\n`,
+    );
+  }
   await ensureReferencedSharedDocsMaterialized({
-    // opencode_k8s mounts this local execution workspace into the pod, so writes here are visible remotely.
+    // These adapters mount (or clone) this local execution workspace into the pod, so writes here are visible remotely.
     cwd: input.cwd,
     instructionsRootPath: sourceRootPath,
+    sharedDocSearchBoundaryPath,
     instructionsContents,
     onLog: input.onLog,
   });
@@ -28982,7 +29001,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : null,
         cwd: executionWorkspace.cwd,
       });
-      await materializeOpenCodeK8sSharedDocs({
+      await materializeExternalK8sSharedDocs({
         adapterType: agent.adapterType,
         config: runtimeConfig,
         cwd: executionWorkspace.cwd,

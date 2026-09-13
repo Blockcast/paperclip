@@ -60,7 +60,12 @@ export const sessionCodec: AdapterSessionCodec = {
   },
 };
 
-export { execute, ensureReferencedSharedDocsMaterialized, normalizeInstructionsEntryFile } from "./execute.js";
+export {
+  execute,
+  ensureReferencedSharedDocsMaterialized,
+  normalizeInstructionsEntryFile,
+  sharedDocSourceRoots,
+} from "./execute.js";
 export { listOpenCodeSkills, syncOpenCodeSkills } from "./skills.js";
 export { testEnvironment } from "./test.js";
 export {
