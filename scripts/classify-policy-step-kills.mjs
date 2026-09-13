@@ -294,7 +294,14 @@ export function selectCurrentJob(jobs, jobName) {
   return matches.find((job) => job?.status === "in_progress") ?? matches[matches.length - 1];
 }
 
-async function main() {
+/**
+ * Exported only so the suite can drive it. Two behaviours live nowhere else:
+ * the `payload?.jobs ?? []` selector paging the jobs list, and the precedence
+ * that keeps a truncation warning instead of overwriting it with the generic
+ * propagation message. Both are reachable only end to end; the `import.meta.url`
+ * guard below still decides whether the script self-runs.
+ */
+export async function main() {
   const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
   const repository = process.env.GITHUB_REPOSITORY;
   const runId = process.env.GITHUB_RUN_ID;
