@@ -359,12 +359,25 @@ workerProbes:
   #
   # BLO-19722 — why this is deliberately laxer than `probes.liveness` above.
   #
-  # What `/healthz` actually measures: nothing declares this route. No handler
-  # in `server/src` matches `/healthz` (the only one in the repo belongs to the
-  # MCP gateway), so the request falls through to the SPA catch-all at
-  # `server/src/app.ts:777-787`, which synchronously returns 200 + static HTML.
-  # It therefore probes exactly one thing — "is the event loop able to service
-  # a request right now" — and says nothing about database or heartbeat health.
+  # What `/healthz` actually measures: "is the event loop able to service a
+  # request right now", and nothing else. It says nothing about database or
+  # heartbeat health, and that is deliberate — see below.
+  #
+  # BLO-32164 update (2026-09-10). This used to read "nothing declares this
+  # route": the request fell through to the SPA catch-all, which answered 200
+  # with the UI shell after a synchronous `readFileSync` of index.html. There
+  # is now an explicit handler (`app.get("/healthz")`, mounted beside
+  # /metrics ahead of httpLogger, the hostname guard and actorMiddleware).
+  # The measured semantics are unchanged; what changed is that the probe no
+  # longer does blocking disk I/O on the path it is timing, no longer depends
+  # on the UI existing, and no longer needs the `Host: 127.0.0.1:3100` header
+  # to clear the private-hostname allowlist. `server/src/__tests__/healthz-probe-route.test.ts`
+  # pins the route against the probe paths in this file so the two cannot
+  # drift apart again.
+  #
+  # The "latent landmine" previously recorded here — a build serving no
+  # `ui-dist` skips the catch-all, so every probe 404s and CrashLoops the
+  # worker for a reason unrelated to its health — is closed by that handler.
   #
   # At the previous `timeoutSeconds: 5 / periodSeconds: 30 / failureThreshold: 3`
   # a ~90s event-loop stall was enough for kubelet to kill the pod. That is not
@@ -380,16 +393,22 @@ workerProbes:
   # stall tolerance at the cost of slower detection of a true wedge:
   # 6 × 30s ≈ 180s before a kill, versus ~90s previously.
   #
-  # Not fixed here: making `/healthz` un-blockable. Node runs our request
-  # handling on one thread, so any in-process endpoint is blocked by whatever
-  # blocks the loop; a genuinely independent health responder needs a worker
-  # thread (or a sidecar) and is a larger change than this issue should carry.
-  # Widening with the rationale recorded is the other branch this issue allows.
+  # Still not fixed, and now the dominant remaining cause: making `/healthz`
+  # un-blockable. Node runs our request handling on one thread, so any
+  # in-process endpoint is blocked by whatever blocks the loop; a genuinely
+  # independent health responder needs a worker thread (or a sidecar). The
+  # explicit handler removes the probe's *own* blocking work but cannot
+  # protect it from someone else's. Measured 2026-09-10 on `paperclip-0`:
+  # `exitCode: 137` at 08:09:25Z with memory steady at ~3 GiB against a 10 GiB
+  # limit (OOM excluded), i.e. a liveness kill at 6 × 30s — the widened
+  # threshold above bought time but did not remove the cause. Tracking as
+  # BLO-32164 (a); the stall's own mechanism is BLO-32668.
   #
-  # Latent landmine while we are here: because `/healthz` resolves via the SPA
-  # catch-all, a build serving no `ui-dist` (`app.ts:788-790` warns and skips
-  # the catch-all) would 404 every probe and CrashLoop the worker for a reason
-  # that has nothing to do with its health.
+  # Do NOT add a database check to this probe. BLO-32164 originally proposed
+  # exactly that; measured 2026-09-10, `/api/health` took 13.19s under pool
+  # saturation while `/healthz` answered in 6ms in the same second. A query
+  # here would import that stall onto the liveness path and kill the singleton
+  # worker for pool saturation, converting a latency problem into an outage.
   liveness:
     httpGet:
       path: /healthz

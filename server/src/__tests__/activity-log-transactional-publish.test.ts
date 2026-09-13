@@ -291,7 +291,9 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
           expect.any(Function),
         );
       });
-      await withTimeout(enqueueStarted, 1_000, "unannotated transaction global outbox enqueue");
+      // Hang guard (BLO-22985), not a latency budget — see the note at the other
+      // withTimeout call site. 15s stays under the 60s vitest testTimeout.
+      await withTimeout(enqueueStarted, 15_000, "unannotated transaction global outbox enqueue");
 
       const activityRows = await db.select().from(activityLog);
       expect(activityRows).toHaveLength(1);
@@ -403,7 +405,9 @@ describeEmbeddedPostgres("logActivity publication vs. an enclosing transaction",
     setPluginEventOutboxDb(blockedOutboxDb);
     try {
       pending = logActivity(db, activityInput(entityId));
-      await withTimeout(enqueueStarted, 1_000, "plain Db global outbox enqueue");
+      // Hang guard (BLO-22985): this only has to fail faster, and with a better
+      // message, than the 60s vitest testTimeout would.
+      await withTimeout(enqueueStarted, 15_000, "plain Db global outbox enqueue");
 
       let settled = false;
       void pending.then(() => {

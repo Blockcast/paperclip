@@ -893,16 +893,52 @@ export function isInfraClassStrandedFailure(latestRun: LatestIssueRun): boolean 
   // vanished pod -- the run never got to succeed or fail on its own merits, and
   // the cause is not something a retry can move.
   //
-  // Note for anyone reading this expecting behaviour: `infraClassCause` is
-  // AUDIT-ONLY. It is written once, in `buildStrandedRecoveryActionEvidence`,
-  // and read by nothing in production. It does NOT gate the attempt budget --
-  // `classifyContinuationFailure` does, on error-code set membership alone. The
-  // budget exemption for this class comes from routing it to
-  // `workspace_validation_failed`, not from this predicate. Widening this alone
-  // would relabel the evidence and change nothing an operator could feel.
+  // Note on blast radius, because the two halves of this predicate differ.
+  // The evidence field `infraClassCause` is audit-only: it is written once, in
+  // `buildStrandedRecoveryActionEvidence`, and gates nothing -- the attempt
+  // budget is `classifyContinuationFailure`, on error-code set membership
+  // alone. But the PREDICATE is also read by `resolveStrandedRecoveryRouting`,
+  // where it decides owner-vs-manager for a `stranded_assigned_issue`. Git
+  // transport runs never reach that test (they are re-caused to
+  // `workspace_validation_failed` first), so widening the git arm really does
+  // only relabel evidence. Widening the `claude_truncated` arm below does NOT:
+  // that cause stays `stranded_assigned_issue`, so it changes routing.
   if (isWorkspaceGitTransportStrandedFailure(latestRun)) return true;
   if (latestRun.errorCode !== "claude_truncated") return false;
-  return /pod is gone|pod was removed/i.test(latestRun.error ?? "");
+  // BLO-33223: the other pod-lifecycle death. When the container is read at
+  // exit rather than found missing, `describeTruncationCause` reports the k8s
+  // terminated state as `exit code <N>, reason=<Reason>`, and a kernel OOM kill
+  // arrives as `exit code 137, SIGKILL (commonly OOMKilled), reason=OOMKilled`.
+  //
+  // Anchored on the KILL, not on the reason word, and deliberately not on "the
+  // pod died" as the CTO's filing floated. Both shapes of this message are
+  // pod-lifecycle reads -- an agent-side crash is also a pod death, reported as
+  // `exit code 1, reason=Error` -- so "the pod died" does not discriminate, and
+  // inverting on it would make every `reason=` value except a hardcoded `Error`
+  // return to the lane, defaulting unknown/future k8s reasons to infra-class.
+  // What carries the meaning is whether the container CHOSE to exit or was
+  // killed: 137 is 128+SIGKILL, which no agent-side fault can produce for the
+  // container's own PID 1. That is a kernel-level invariant, so unlike a
+  // `reason=` enumeration it does not need extending when Kubernetes adds a
+  // reason string. `reason=OOMKilled` is kept alongside it only to cover an
+  // adapter that reports the reason without an exit code; the `SIGKILL (...)`
+  // gloss is excluded because it is this adapter's restatement of 137 and so
+  // adds no true-positive coverage, only false-collision surface -- the same
+  // narrowing BLO-20933 applied to the eviction/preemption wording above.
+  //
+  // Scan only the structured termination summary, never the whole error. Every
+  // field `describeTruncationCause` emits ahead of `message=` is machine-shaped
+  // (an exit code, a signal number, a k8s reason enum), but `message=` is the
+  // kubelet's free-form tail and is always appended last -- so cutting there
+  // keeps the whole signal and drops the whole hazard. Without the cut, a
+  // marker-shaped substring quoted inside that tail decides routing: an
+  // agent-side `exit code 1, reason=Error` crash whose message happens to
+  // contain `reason=OOMKilled` or `exit code 137` would be returned to the lane
+  // instead of escalating. That is not hypothetical here -- this fleet's agents
+  // discuss this exact failure shape in issue threads and logs, so the text is
+  // reachable, and the run that quotes it is precisely the one being classified.
+  const terminationSummary = (latestRun.error ?? "").split(/,\s*message=/i)[0];
+  return /pod is gone|pod was removed|exit code 137\b|reason=OOMKilled/i.test(terminationSummary);
 }
 
 function resolveStrandedRecoveryCause(
@@ -1331,6 +1367,34 @@ function isTerminalDispatchRaceRun(
   return (
     latestRun?.status === "cancelled" &&
     readNonEmptyString(latestRun.errorCode) === ISSUE_TERMINAL_STATUS_ERROR_CODE
+  );
+}
+
+// BLO-27463: `external_wait_yield` is the run cancelling ITSELF after it durably
+// persisted an external-service monitor (`routes/issues.ts`, the #1195 slot-yield
+// path). Nothing failed: the run gave its slot back precisely so the wait would not
+// hold a runtime seat, and the wake path it left behind is the monitor it just armed.
+//
+// The sweep read it as a lost execution path anyway, because the durable-wait-path
+// gate below only consults `hasPersistedDurableWaitPath` for a *succeeded* run. A
+// yield is `cancelled`, so an issue with a live monitor fell straight through to the
+// strand arms. Measured on BLO-33463 (2026-09-12, `critical`): yielded on a PR-checks
+// monitor, escalated `stranded_assigned_issue` and reassigned Ally -> CTO (12:36:34Z)
+// -> CEO (12:42:33Z), landing `blocked` with an empty blocker set. That state has no
+// wake path at all — `blocked` is skipped by the heartbeat and a monitor cannot hold
+// on it — so the escalation destroyed the one wake the run had correctly created, and
+// took the two issues this one `blocks` with it.
+//
+// #1195 shipped the yield half; this is the classification half, and they are
+// different layers.
+const EXTERNAL_WAIT_YIELD_ERROR_CODE = "external_wait_yield";
+
+function isExternalWaitYieldRun(
+  latestRun: LatestIssueRun,
+): latestRun is NonNullable<LatestIssueRun> {
+  return (
+    latestRun?.status === "cancelled" &&
+    readNonEmptyString(latestRun.errorCode) === EXTERNAL_WAIT_YIELD_ERROR_CODE
   );
 }
 
@@ -8003,6 +8067,11 @@ export function recoveryService(
       dependencyWaitEscalationSuppressedUnclassified: 0,
       providerQuotaMonitored: 0,
       recentProgressExempted: 0,
+      // BLO-28931: per-issue reconcile failures caught at the loop boundary below.
+      // Distinct from `skipped` (a deliberate no-op) -- a non-zero value here names a
+      // sweep that would previously have aborted at that issue and silently dropped
+      // every candidate ordered after it.
+      reconcileErrors: 0,
       skipped: 0,
       issueIds: [] as string[],
     };
@@ -8020,7 +8089,7 @@ export function recoveryService(
     const recoverySweepConfig = loadConfig();
     const lapsedMonitorGraceMs = recoverySweepConfig.lapsedMonitorGraceMs;
     const openPullRequestAttendanceGraceMs = recoverySweepConfig.openPullRequestAttendanceGraceMs;
-    for (const issue of candidates) {
+    const reconcileStrandedCandidate = async (issue: (typeof candidates)[number]) => {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
         : null;
@@ -8034,7 +8103,7 @@ export function recoveryService(
         : issue.assigneeAgentId;
       if (!agentId) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       if (await hasActiveExecutionPath(
@@ -8043,17 +8112,17 @@ export function recoveryService(
         issue.status === "in_review" ? agentId : null,
       )) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       if (await hasPendingWakeInteraction(issue.companyId, issue.id)) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       const newestIssueRun = await getLatestIssueRun(issue.companyId, issue.id);
@@ -8087,7 +8156,7 @@ export function recoveryService(
         // vanished mid-sweep. Either way there is nothing to recover.
         if (!adoptionHandover) {
           result.skipped += 1;
-          continue;
+          return;
         }
       }
       // BLO-19160 finding 1: on the handover path this issue is judged with NO
@@ -8213,14 +8282,23 @@ export function recoveryService(
           : await issuesSvc.update(issue.id, { status: nextStatus });
         if (updated) result.issueIds.push(issue.id);
         result.skipped += 1;
-        continue;
+        return;
       }
       if (issue.status !== "in_review" && !agentInvokable) {
         result.skipped += 1;
-        continue;
+        return;
       }
+      // BLO-27463: a deliberate external-wait yield is admitted here on the same terms
+      // as a succeeded run. Both are the assignee leaving the issue attended rather
+      // than broken, and neither is positive evidence that anything failed — which is
+      // the line `hasPersistedDurableWaitPath`'s docstring draws for consulting it.
+      //
+      // The predicate is still required to hold: if the monitor the yield armed has
+      // since lapsed (and no PR/blocker path replaces it), there really is no wake left
+      // and the strand arms below stay reachable. So this suppresses the misclassified
+      // population without creating a class of row that can never be recovered.
       if (
-        latestRun?.status === "succeeded" &&
+        (latestRun?.status === "succeeded" || isExternalWaitYieldRun(latestRun)) &&
         await hasPersistedDurableWaitPath(
           issue,
           lapsedMonitorGraceMs,
@@ -8228,11 +8306,11 @@ export function recoveryService(
         )
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
       if (isQuotaExhaustedTerminalRun(latestRun)) {
         result.skipped += 1;
-        continue;
+        return;
       }
       const recoveryNow = new Date();
       const participantLatestRunForRecovery = issue.status === "in_review" && participantAgentId &&
@@ -8249,7 +8327,7 @@ export function recoveryService(
         : latestRun;
       if (hasPendingProviderQuotaRecoveryMonitor(issue, providerQuotaMonitorRun, recoveryNow)) {
         result.skipped += 1;
-        continue;
+        return;
       }
       if (isStrandedIssueRecoveryIssue(issue) && isUnsuccessfulTerminalIssueRun(latestRun)) {
         // BLO-7521 (2026-05-25) / BLO-8050 (2026-05-28): if the operator just
@@ -8258,7 +8336,7 @@ export function recoveryService(
         // `latestRunPredatesLatestUnblock` for the full rationale.
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
           result.skipped += 1;
-          continue;
+          return;
         }
         const updated = await escalateStrandedRecoveryIssueInPlace({
           expectedLockOwnerState: adoptionHandoverLockGuard,
@@ -8272,7 +8350,7 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
 
       const adapterFailureClassification = issue.status !== "in_review" && latestRun && isUnsuccessfulTerminalIssueRun(latestRun)
@@ -8282,7 +8360,7 @@ export function recoveryService(
         const targetAgentId = getAdapterFailureRecoveryTargetAgentId(issue);
         if (!targetAgentId || latestRun.agentId !== targetAgentId) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         if (adapterFailureClassification.kind === "provider_quota") {
@@ -8295,10 +8373,10 @@ export function recoveryService(
             latestRun = await persistAdapterFailureRecoveryClassification(latestRun, adapterFailureClassification);
             result.providerQuotaMonitored += 1;
             result.issueIds.push(issue.id);
-            continue;
+            return;
           }
           result.skipped += 1;
-          continue;
+          return;
         } else {
           const isGitTransport = adapterFailureClassification.kind === "workspace_git_transport";
           const updated = await escalateStrandedAssignedIssue({
@@ -8330,7 +8408,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
       }
 
@@ -8360,7 +8438,7 @@ export function recoveryService(
           if (postResolutionClassification?.kind === "non_retryable") {
             if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestPostResolutionRun)) {
               result.skipped += 1;
-              continue;
+              return;
             }
             const failureSummary = summarizeRunFailureForIssueComment(latestPostResolutionRun);
             const updated = await escalateStrandedAssignedIssue({
@@ -8378,22 +8456,22 @@ export function recoveryService(
             } else {
               result.skipped += 1;
             }
-            continue;
+            return;
           }
 
           if (!agentInvokable) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           if (await hasQueuedIssueWake(issue.companyId, issue.id, agentId)) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           if (await isInvocationBudgetBlocked(issue, agentId)) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           const { consecutive } = await summarizeRecentContinuationRetries(
@@ -8408,7 +8486,7 @@ export function recoveryService(
             if (resolved) {
               result.waitingOnReviewResolved += 1;
               result.issueIds.push(issue.id);
-              continue;
+              return;
             }
 
             const updated = await escalateStrandedAssignedIssue({
@@ -8427,7 +8505,7 @@ export function recoveryService(
             } else {
               result.skipped += 1;
             }
-            continue;
+            return;
           }
 
           const queued = await enqueueStrandedIssueRecovery({
@@ -8453,14 +8531,14 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
       }
 
       if (issue.status === "in_review") {
         if (!participantAgentId || !pendingExecutionState?.currentStageId) {
           result.skipped += 1;
-          continue;
+          return;
         }
         const participantLatestRun = participantLatestRunForRecovery;
 
@@ -8489,7 +8567,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         const participantContinuationClassification = classifyContinuationFailure(participantLatestRun);
@@ -8528,11 +8606,11 @@ export function recoveryService(
         ) {
           if (queuedParticipantRecovery) {
             result.skipped += 1;
-            continue;
+            return;
           }
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, participantLatestRun)) {
             result.skipped += 1;
-            continue;
+            return;
           }
           const failureSummary = summarizeRunFailureForIssueComment(participantLatestRun);
           const updated = await escalateStrandedAssignedIssue({
@@ -8557,7 +8635,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         const participantAdapterFailureClassification = isUnsuccessfulTerminalIssueRun(participantLatestRun)
@@ -8579,7 +8657,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
         if (participantAdapterFailureClassification?.kind === "configuration_incomplete") {
           const updated = await escalateStrandedAssignedIssue({
@@ -8604,7 +8682,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (!agentInvokable) {
@@ -8628,12 +8706,12 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (queuedParticipantRecovery) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         if (didAutomaticRecoveryFail(participantLatestRun, EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON)) {
@@ -8657,17 +8735,17 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (await hasQueuedIssueWake(issue.companyId, issue.id, participantAgentId)) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         if (await isInvocationBudgetBlocked(issue, participantAgentId)) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         const queued = await enqueueStrandedIssueRecovery({
@@ -8691,19 +8769,19 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
 
       if (issue.status === "todo") {
         if (!latestRun) {
           if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           if (await isInvocationBudgetBlocked(issue, agentId)) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           const queued = await enqueueWithAssignmentRecoveryCapacity(issue, agentId, () =>
@@ -8715,7 +8793,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (latestRun.status === "succeeded") {
@@ -8767,7 +8845,7 @@ export function recoveryService(
           const todoHandoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
           if (!todoHandoffEvidence || !todoHandoffEvidence.exhausted) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
@@ -8777,7 +8855,7 @@ export function recoveryService(
             // never expires, so without this an operator moving the row back to `todo`
             // is met with an immediate re-flip to `blocked` on the same pre-unblock run.
             result.skipped += 1;
-            continue;
+            return;
           }
 
           const updated = await escalateStrandedAssignedIssue({
@@ -8794,14 +8872,14 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         const assignmentContinuationClassification = classifyContinuationFailure(latestRun);
         if (assignmentContinuationClassification.kind === "non_retryable") {
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
             result.skipped += 1;
-            continue;
+            return;
           }
           const failureSummary = summarizeRunFailureForIssueComment(latestRun);
           // BLO-32668: populate the readiness the dependency-wait gate classifies from,
@@ -8839,14 +8917,14 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (isNonRetryableTerminalRun(latestRun)) {
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
             result.skipped += 1;
-            continue;
+            return;
           }
           const updated = await escalateStrandedAssignedIssue({
             expectedLockOwnerState: adoptionHandoverLockGuard,
@@ -8861,7 +8939,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         const todoHistoricalAdapterType = await resolveSessionUnavailableRunAdapterType({ issue, latestRun });
@@ -8875,7 +8953,7 @@ export function recoveryService(
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
             result.skipped += 1;
-            continue;
+            return;
           }
           const updated = await escalateStrandedAssignedIssue({
             issue,
@@ -8892,7 +8970,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (
@@ -8905,7 +8983,7 @@ export function recoveryService(
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
             result.skipped += 1;
-            continue;
+            return;
           }
           if (isZeroTokenSessionResetRetryRun(latestRun)) {
             const updated = await escalateZeroTokenStartupFailureIssue({
@@ -8921,11 +8999,11 @@ export function recoveryService(
             } else {
               result.skipped += 1;
             }
-            continue;
+            return;
           }
           if (await isInvocationBudgetBlocked(issue, agentId)) {
             result.skipped += 1;
-            continue;
+            return;
           }
           const retried = await resetSessionAndRetryZeroTokenFailure({ issue, agent, latestRun });
           if (retried) {
@@ -8934,14 +9012,14 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
             result.skipped += 1;
-            continue;
+            return;
           }
           const failureSummary = summarizeRunFailureForIssueComment(latestRun);
           const updated = await escalateStrandedAssignedIssue({
@@ -8960,12 +9038,12 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (await isInvocationBudgetBlocked(issue, agentId)) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         const queued = await enqueueWithAssignmentRecoveryCapacity(issue, agentId, () =>
@@ -8985,7 +9063,7 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
 
       // No run evidence and no lock: nothing to recover from. A handover marker
@@ -9001,13 +9079,13 @@ export function recoveryService(
         !reopenedAfterTerminalDispatchRace
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
       const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
       if (handoffEvidence) {
         if (!handoffEvidence.exhausted) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         const updated = await escalateStrandedAssignedIssue({
@@ -9024,7 +9102,7 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
       if (isWaitingOnReviewContinuationRun(latestRun) && hasActiveMonitorPath(issue, lapsedMonitorGraceMs)) {
         const parkOutcome = await parkReviewWaitingContinuationIssue({
@@ -9040,7 +9118,7 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
       if (isSuccessfulInProgressContinuationRun(latestRun)) {
         const successfulRun = latestRun;
@@ -9072,13 +9150,13 @@ export function recoveryService(
               } else {
                 result.skipped += 1;
               }
-              continue;
+              return;
             }
             result.recentProgressExempted += 1;
           }
           if (await isInvocationBudgetBlocked(issue, agentId)) {
             result.skipped += 1;
-            continue;
+            return;
           }
           const queued = await enqueueStrandedIssueRecovery({
             expectedLockOwnerState: adoptionHandoverLockGuard,
@@ -9099,7 +9177,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
         // Non-productive succeeded run: most stranding pattern is the agent
         // exiting cleanly with no actionable output (plan_only / empty
@@ -9144,13 +9222,13 @@ export function recoveryService(
             result.skipped += 1;
           }
         }
-        continue;
+        return;
       }
       if (isNonRetryableTerminalRun(latestRun)) {
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
           // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
           result.skipped += 1;
-          continue;
+          return;
         }
         const updated = await escalateStrandedAssignedIssue({
           expectedLockOwnerState: adoptionHandoverLockGuard,
@@ -9165,7 +9243,7 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
       const continuationHistoricalAdapterType = latestRun
         ? await resolveSessionUnavailableRunAdapterType({ issue, latestRun })
@@ -9180,7 +9258,7 @@ export function recoveryService(
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
           // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
           result.skipped += 1;
-          continue;
+          return;
         }
         const updated = await escalateStrandedAssignedIssue({
           issue,
@@ -9197,7 +9275,7 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
       if (
         latestRun?.agentId === agentId &&
@@ -9209,7 +9287,7 @@ export function recoveryService(
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
           // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
           result.skipped += 1;
-          continue;
+          return;
         }
         if (isZeroTokenSessionResetRetryRun(latestRun)) {
           const updated = await escalateZeroTokenStartupFailureIssue({
@@ -9225,11 +9303,11 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
         if (await isInvocationBudgetBlocked(issue, agentId)) {
           result.skipped += 1;
-          continue;
+          return;
         }
         const retried = await resetSessionAndRetryZeroTokenFailure({ issue, agent, latestRun });
         if (retried) {
@@ -9238,13 +9316,13 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
       if (isUnsuccessfulTerminalIssueRun(latestRun)) {
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
           // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
           result.skipped += 1;
-          continue;
+          return;
         }
         const classification = classifyContinuationFailure(latestRun);
 
@@ -9253,7 +9331,7 @@ export function recoveryService(
           if (resolved) {
             result.waitingOnReviewResolved += 1;
             result.issueIds.push(issue.id);
-            continue;
+            return;
           }
           // BLO-16146: a genuine continuation cancellation that deliberately parked for
           // review/approval, with no dependency to wait on and no active monitor path.
@@ -9271,7 +9349,7 @@ export function recoveryService(
             if (parkOutcome === "parked") {
               result.reviewWaitingParked += 1;
               result.issueIds.push(issue.id);
-              continue;
+              return;
             }
             if (parkOutcome === "already_parked") {
               // BLO-18643: the common case on a re-run -- the issue was already parked
@@ -9280,11 +9358,11 @@ export function recoveryService(
               // falling through here previously let the second sweep pass clobber a
               // just-parked issue back to `blocked` 21s later.
               result.skipped += 1;
-              continue;
+              return;
             }
             if (parkOutcome === "lost_race") {
               result.skipped += 1;
-              continue;
+              return;
             }
             // `failed` is a genuine park failure (evidence-gate rejection
             // because there's nothing reviewable yet, or a transient update
@@ -9335,7 +9413,7 @@ export function recoveryService(
           if (readiness && !readiness.isDependencyReady) {
             result.dependencyWaitSkipped += 1;
             result.skipped += 1;
-            continue;
+            return;
           }
           if (readiness?.isDependencyReady && readiness.blockerIssueIds.length > 0) {
             const latestDependencyReadyAt = await latestDependencyReadinessTransitionAt(issue.companyId, readiness.blockerIssueIds);
@@ -9345,7 +9423,7 @@ export function recoveryService(
             ) {
               result.dependencyWaitSkipped += 1;
               result.skipped += 1;
-              continue;
+              return;
             }
           }
         }
@@ -9369,7 +9447,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         // BLO-16182: enter the cap+backoff block for any latest terminal run that
@@ -9405,7 +9483,7 @@ export function recoveryService(
             } else {
               result.skipped += 1;
             }
-            continue;
+            return;
           }
 
           if (classification.baseBackoffMs > 0 && latestFinishedAt) {
@@ -9414,7 +9492,7 @@ export function recoveryService(
               Math.pow(2, Math.max(0, consecutive - 1));
             if (elapsed < requiredDelay) {
               result.skipped += 1;
-              continue;
+              return;
             }
           }
         }
@@ -9422,7 +9500,7 @@ export function recoveryService(
 
       if (await isInvocationBudgetBlocked(issue, agentId)) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       const queued = await enqueueStrandedIssueRecovery({
@@ -9442,6 +9520,37 @@ export function recoveryService(
         result.issueIds.push(issue.id);
       } else {
         result.skipped += 1;
+      }
+    };
+
+    for (const issue of candidates) {
+      try {
+        await reconcileStrandedCandidate(issue);
+      } catch (err) {
+        // BLO-28931: per-issue error boundary. Without it, any throw from the body
+        // propagated out of the whole sweep -- and because candidates are ordered
+        // deterministically (companyId, assigneeAgentId, createdAt, id), every issue
+        // after the first thrower was silently left unreconciled on every tick, for
+        // as long as that issue kept throwing. Counted on its own field rather than
+        // folded into `skipped` so a truncated sweep is distinguishable from a clean
+        // one; the candidates that were never reached are simply absent from
+        // `issueIds`, which is why the old truncation was invisible in the counters.
+        //
+        // Catching here cannot turn an atomic write into a partial commit: no
+        // `db.transaction` appears lexically in this loop body, so every transaction
+        // on these paths opens and settles inside a callee and has already committed
+        // or rolled back before the error reaches this boundary.
+        result.reconcileErrors += 1;
+        logger.error(
+          {
+            err,
+            issueId: issue.id,
+            companyId: issue.companyId,
+            agentId: issue.assigneeAgentId,
+            status: issue.status,
+          },
+          "stranded assigned issue reconciliation failed; continuing with remaining candidates",
+        );
       }
     }
 
@@ -13431,7 +13540,16 @@ export function recoveryService(
     // candidate scan. The in-transaction revalidation below reads the memo
     // synchronously — issuing a k8s metrics call inside `db.transaction` would
     // hold a Postgres transaction open across a network round-trip.
-    const busySparedByRunId = new Map<string, boolean>();
+    //
+    // BLO-30245: the memo records ONLY what the probe saw — "this pod was busy
+    // when we asked" — never the derived spare decision. One run can hold locks
+    // on several candidates, `silentMs` is re-derived per candidate, and the
+    // candidates are walked sequentially, so the ceiling is the one input that
+    // can change between two reads of the same memo. Both read sites therefore
+    // evaluate it themselves. Folding it into the memoized value let a run
+    // probed at 2h58m answer a later candidate at 3h03m from the memo and keep
+    // that lock past the advertised bound for the rest of the invocation.
+    const podBusyAtProbeByRunId = new Map<string, boolean>();
     const isBusySparedRunningHolder = async (runId: string | null, lockedAt: Date | null) => {
       if (!runId) return false;
       const basis = runningLockStaleBasis(runId, lockedAt);
@@ -13440,21 +13558,28 @@ export function recoveryService(
       // Only holders that have actually crossed the sweeper's bound matter here;
       // anything younger is kept by the bound itself and must not cost a probe.
       if (silentMs < STALE_RUNNING_ISSUE_LOCK_MS) return false;
-      const memoized = busySparedByRunId.get(runId);
-      if (memoized !== undefined) return memoized;
       // Past the shared ceiling a busy pod is a CPU-burning zombie and loses its
       // lock regardless, exactly as the reaper kills it regardless — so the
       // BLO-19941 reclamation guarantee still has a bound.
-      const spared = silentMs < AGENT_POD_BUSY_MAX_STALE_MS
-        && (await probeAgentPodActivity(runId)) === "busy";
-      busySparedByRunId.set(runId, spared);
-      if (spared) {
+      //
+      // Evaluated BEFORE the memo so a holder that crossed the ceiling mid-loop
+      // cannot be answered from an earlier in-band spare. Deliberately does NOT
+      // write the memo: a past-ceiling candidate learns nothing about the pod,
+      // and `runningLockStaleBasis` falls back to the per-issue lock timestamp
+      // when a run has stamped no activity at all, so a later candidate of the
+      // same run can legitimately be in-band and is still owed its one probe.
+      if (silentMs >= AGENT_POD_BUSY_MAX_STALE_MS) return false;
+      const memoized = podBusyAtProbeByRunId.get(runId);
+      if (memoized !== undefined) return memoized;
+      const podBusy = (await probeAgentPodActivity(runId)) === "busy";
+      podBusyAtProbeByRunId.set(runId, podBusy);
+      if (podBusy) {
         logger.info(
           { runId, silentMs, staleBoundMs: STALE_RUNNING_ISSUE_LOCK_MS, ceilingMs: AGENT_POD_BUSY_MAX_STALE_MS },
           "sweepStaleIssueLocks: keeping issue lock — holder pod is executing a live subprocess (BLO-30087)",
         );
       }
-      return spared;
+      return podBusy;
     };
 
     for (const issue of candidates) {
@@ -13620,14 +13745,31 @@ export function recoveryService(
         const currentRunningLockSilent = (runId: string | null, lockedAt: Date | null) => {
           const basis = currentRunningLockStaleBasis(runId, lockedAt);
           if (!basis) return false;
-          if (Date.now() - basis.getTime() < STALE_RUNNING_ISSUE_LOCK_MS) return false;
+          const silentMs = Date.now() - basis.getTime();
+          if (silentMs < STALE_RUNNING_ISSUE_LOCK_MS) return false;
           // BLO-30087: mirror of the busy-pod spare in the pre-transaction scan.
           // Reads the memo rather than probing, so this stays synchronous and no
           // k8s round-trip happens while this transaction holds `issues` and
           // `heartbeat_runs` FOR UPDATE. Safe to key by runId alone: the
           // concurrent-bump bailouts above already guarantee
           // currentIssue.executionRunId === issue.executionRunId here.
-          if (runId && busySparedByRunId.get(runId) === true) return false;
+          //
+          // BLO-30245: the ceiling is re-derived here rather than inherited from
+          // the memo. The memo says only that the pod was busy WHEN PROBED; this
+          // revalidation necessarily runs later than that probe, so it has to
+          // re-ask whether the holder is still inside the band. Without this the
+          // pre-transaction hoist would only relocate the overshoot: a holder
+          // that crossed the ceiling mid-loop now reaches this transaction
+          // (where before it was filtered out earlier), and a memoized `true`
+          // would spare it here instead — one layer further down, where the
+          // hoist cannot see it.
+          if (
+            silentMs < AGENT_POD_BUSY_MAX_STALE_MS
+            && runId
+            && podBusyAtProbeByRunId.get(runId) === true
+          ) {
+            return false;
+          }
           return true;
         };
         const currentExecutionLockExpired = currentPreClaimLockExpired(
