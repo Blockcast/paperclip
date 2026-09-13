@@ -29194,6 +29194,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             statusReadError = error;
           }
           if (terminalStatus || statusReadError) {
+            // The counter and the log are this path's only two reporting
+            // channels, and both can throw exactly where the AC's "not lost
+            // silently" clause needs them not to: `ensureRegistry()` constructs
+            // its counters on first call, and a logger transport can fail. They
+            // are guarded independently rather than inside one `try`, so a
+            // metrics failure is still reported — through the log, as
+            // `metricErr` — instead of suppressing the log along with itself.
+            //
+            // Incremented BEFORE the sanitization block below, which awaits
+            // `getCurrentUserRedactionOptions()`. That await is guarded against
+            // *throws* but not against a *hang*: an instance-settings read that
+            // never settles would otherwise lose both channels at once. The
+            // counter is the cheaper and more reliable of the two, so it runs
+            // first and is never downstream of a DB await.
+            let metricError: unknown = null;
+            try {
+              recordHeartbeatPostTerminalRunEventDropped(terminalStatus);
+            } catch (error) {
+              metricError = error;
+            }
             // This log is the substitute for the row that is deliberately not
             // written, so it must not be a *less* redacted substitute than the
             // storage path. Mirror `appendRunEvent`'s four sanitizations in the
@@ -29219,19 +29239,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sanitizationError = error;
               sanitizedMessage = null;
               sanitizedPayload = null;
-            }
-            // The counter and the log are this path's only two reporting
-            // channels, and both can throw exactly where the AC's "not lost
-            // silently" clause needs them not to: `ensureRegistry()` constructs
-            // its counters on first call, and a logger transport can fail. They
-            // are guarded independently rather than inside one `try`, so a
-            // metrics failure is still reported — through the log, as
-            // `metricErr` — instead of suppressing the log along with itself.
-            let metricError: unknown = null;
-            try {
-              recordHeartbeatPostTerminalRunEventDropped(terminalStatus);
-            } catch (error) {
-              metricError = error;
             }
             try {
               logger.warn(
