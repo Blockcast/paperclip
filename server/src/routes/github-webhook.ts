@@ -359,6 +359,129 @@ function hasPrReviewerAgentRequestMarker(body: string | null | undefined): boole
   return typeof body === "string" && PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN.test(body);
 }
 
+// BLO-32381: onprem-k8s's review gate has a recovery path for
+// `review/ally-complete` sitting `pending` with no Ally review. Its terminal
+// state -- after one automatic re-request has already failed to produce a
+// review -- posts a PR comment saying, verbatim, "This will NOT retry again on
+// its own", and it NAMES the owning Paperclip issue it resolved from the PR
+// body. Nothing in Paperclip watched that surface, so the one signal that means
+// "automation has given up, a human/agent must look" landed where no assignee
+// could see it. Measured on onprem-k8s#2949: escalated 10:04:41Z, picked up
+// 17:54Z by an unrelated wake -- 7h50m merge-gated, and only found because that
+// run happened to read commit STATUSES rather than check-runs (all 31
+// check-runs were green, so the PR looked clean on the surface everyone reads).
+//
+// Two markers are matched, both anchored to literal byte 0, and matching BOTH
+// is deliberate:
+//
+//   1. `<!-- paperclip:review-gate-escalation head=<sha> -->` — the explicit
+//      routing marker the gate adds in onprem-k8s#3229, carrying the head as a
+//      named attribute.
+//   2. `<!-- review-gate:stale-escalation:<sha> -->` — what the gate has ALREADY
+//      emitted at byte 0 for every escalation to date (verified against the live
+//      comments on onprem-k8s#2949 and #3133).
+//
+// (2) is what makes this fix stand on its own. #3229 needs a human review
+// approval on onprem-k8s, and that gate is ~100 days deep; keying only on (1)
+// would mean the escalation stays unrouted until it clears. The head SHA is
+// already in (2), so the consumer needs nothing #3229 adds. When #3229 does
+// land, (1) matches first and the behaviour is identical -- PROVIDED it emits a
+// full 40-hex head, which is why both patterns below require exactly that.
+//
+// `stale-escalation` ONLY — never `stale-retry`. The retry is state 2, where the
+// gate is still handling the stall itself and has a re-request outstanding;
+// waking the assignee for it would page them for a stall that resolves on its
+// own 29 times out of 30 (measured over the 30 most recent retries in that
+// repo). Routing the retry would also re-create the unbounded retry loop the 2h
+// escalation threshold exists to bound.
+//
+// Anchoring is load-bearing for the same reason it is on the review-request
+// marker above: a body that merely QUOTES a marker while discussing one (this
+// repo's own PRs and issue comments do exactly that) must not be read as an
+// escalation. No `\s*` prefix, ever -- leading whitespace in Markdown is an
+// indented code block, i.e. the canonical way to render "here is the marker".
+//
+// Both patterns require a FULL 40-hex head, and that symmetry is load-bearing
+// rather than tidiness. The captured string is the dedup key
+// (buildReviewGateEscalationExternalKey) and the wake idempotency suffix, so two
+// spellings of the same head are two identities: a producer emitting both
+// markers during the #3229 migration with an abbreviated `head=` would route the
+// same escalation twice -- one comment and one wake per spelling -- which is
+// exactly the AC2 property this consumer exists to hold. The gate's own PROSE
+// renders abbreviated heads (`dcbcb6ca`), so an abbreviated marker is a
+// plausible producer bug, not a hypothetical one. Requiring {40} makes that bug
+// fail closed, and `escalation marker matched but head unreadable` below makes
+// the closure visible instead of silent.
+const REVIEW_GATE_ESCALATION_MARKER_PATTERN =
+  /^<!--[ \t]*paperclip:review-gate-escalation(?:[ \t][^>]*)?[ \t]*-->/i;
+const REVIEW_GATE_ESCALATION_MARKER_HEAD_PATTERN = /[ \t]head=([0-9a-f]{40})(?![0-9a-z])/i;
+const REVIEW_GATE_LEGACY_ESCALATION_MARKER_PATTERN =
+  /^<!--[ \t]*review-gate:stale-escalation:([0-9a-f]{40})[ \t]*-->/i;
+
+// The sole live producer of a review-gate escalation comment.
+//
+// `sweep-stale-pending` posts through the workflow's own `GITHUB_TOKEN`, so the
+// comment author is `github-actions[bot]` -- verified against the live
+// escalations on onprem-k8s#2949 and #3133. This is an ALLOWLIST, not a
+// heuristic: see isReviewGateEscalationProducer for why the reviewer-bot
+// identity is deliberately NOT on it.
+const REVIEW_GATE_ESCALATION_PRODUCER_LOGIN = "github-actions[bot]";
+
+// Returns the escalated head SHA (lowercased) when `body` is a review-gate
+// escalation comment, else null. The head is REQUIRED, not decorative: the
+// dedup record for "this escalation has been routed" is keyed on
+// (repo, pull, head), so an escalation whose head cannot be read is not
+// idempotent and is deliberately not routed rather than routed unsafely.
+function readReviewGateEscalationHeadSha(body: string | null | undefined): string | null {
+  if (typeof body !== "string") return null;
+  const routing = REVIEW_GATE_ESCALATION_MARKER_PATTERN.exec(body);
+  if (routing) {
+    const head = REVIEW_GATE_ESCALATION_MARKER_HEAD_PATTERN.exec(routing[0]);
+    return head ? head[1].toLowerCase() : null;
+  }
+  const legacy = REVIEW_GATE_LEGACY_ESCALATION_MARKER_PATTERN.exec(body);
+  return legacy ? legacy[1].toLowerCase() : null;
+}
+
+// Author guard for the escalation marker.
+//
+// Without this, the escalation classifier is the only one in the issue_comment
+// branch keyed on body alone -- `reviewerRequest` gates on
+// isConfiguredPrReviewerAuthor and `reviewFeedback` on
+// isActionablePrReviewComment(body, login, ...). A body-only predicate turns
+// "can comment on this PR" into "can mint a system comment on the owning
+// Paperclip issue plus an author wake", i.e. a full agent run. Per-head
+// idempotency does not bound it either: the head is taken verbatim from the
+// marker, so N fabricated SHAs are N distinct keys, N comments and N wakes.
+//
+// Two decisions worth stating, because both are the narrow choice:
+//
+//   * `type === "Bot"` is required but NOT sufficient. GitHub sets `type`, so a
+//     human account cannot spoof it -- but every App installed on the repo gets
+//     it, which is a larger trust set than the one producer here.
+//   * the reviewer-bot identity (`allyblockcast[bot]`) is deliberately NOT
+//     allowlisted, even though the fleet drives it and it is the credential the
+//     gate would most plausibly move to. Agents post PR comments through that
+//     App and they quote this marker while discussing it -- this repo's own
+//     review threads do exactly that. Anchoring stops a mid-body quote, but a
+//     paste that happens to lead with the marker would route. Agents already
+//     hold direct Paperclip write access, so allowlisting the App adds no
+//     capability they lack while adding a live accidental-trigger path.
+//
+// If the gate's credential ever changes, this fails CLOSED -- and the
+// `author not allowlisted` warning at the call site is what keeps that
+// closure visible rather than silent, which is the whole point of BLO-32381.
+function isReviewGateEscalationProducer(
+  login: string | null | undefined,
+  userType: string | null | undefined,
+): boolean {
+  if (typeof userType !== "string" || userType.toLowerCase() !== "bot") return false;
+  if (!login) return false;
+  const normalized = normalizeGithubLogin(login);
+  if (!normalized) return false;
+  return normalized === normalizeGithubLogin(REVIEW_GATE_ESCALATION_PRODUCER_LOGIN);
+}
+
 // BLO-23059: Claude Code Review posts its "this integration is paused/disabled"
 // org-settings notice as a FORMAL pull_request_review (state COMMENTED, commit_id
 // = current head), not as a plain comment. Measured 2026-08-07:
@@ -1000,6 +1123,22 @@ function resolveEventContextRaw(
       reviewState: string | null;
       reviewUrl: string | null;
     }) => void;
+    // BLO-32381: invoked when a well-formed review-gate escalation marker was
+    // dropped because its author is not the allowlisted producer. Its own
+    // callback rather than a `reason` on onSuppressedReviewRequest because the
+    // two are read for opposite purposes: that one reports a wake that SHOULD
+    // have fired, this one reports a wake that should NOT have and covers two
+    // very different situations -- a forged marker (working as intended) and the
+    // gate's credential having changed (a real escalation now going unrouted).
+    // Same callback-not-logger rationale as its siblings: keeps
+    // resolveEventContext pure and lets the drop be asserted directly.
+    onSuppressedEscalationAuthor?: (info: {
+      repoFullName: string | null;
+      prNumber: number | null;
+      headSha: string;
+      commentAuthorLogin: string | null;
+      commentAuthorType: string | null;
+    }) => void;
   } = {},
 ): ResolvedEventContext | null {
   const repository = payload.repository as Record<string, unknown> | undefined;
@@ -1169,6 +1308,52 @@ function resolveEventContextRaw(
         commentAuthorLogin,
         options.prReviewerBotLogin,
       );
+      // BLO-32381: the review gate's terminal "I have given up" state. See
+      // readReviewGateEscalationHeadSha for the marker contract and why the
+      // retry marker is deliberately excluded.
+      //
+      // This is checked LAST and is mutually exclusive with the two above by
+      // construction, which matters in one specific direction: an escalation
+      // must never be classified as a review REQUEST. Doing so would dispatch a
+      // third review pass -- i.e. re-arm the exact retry loop the escalation
+      // threshold exists to bound -- and it would do so silently, since the
+      // request path posts no issue comment. The gate already holds up its half:
+      // it suppresses the `@author` mention when the author login is one the
+      // dispatcher reads as a request (`@allyblockcast[bot]` matches the mention
+      // pattern, and most PRs in that repo are authored by exactly that
+      // identity). So today no escalation body carries a matching mention. That
+      // is a property of the gate's body text, though, not of this predicate,
+      // and it would break silently if the gate's wording ever changed -- hence
+      // the explicit precedence here plus a regression test asserting an
+      // escalation is never a request even when its body DOES carry `@ally`.
+      //
+      // The author guard is the third conjunct and is NOT optional -- see
+      // isReviewGateEscalationProducer for why a body-only predicate here is an
+      // unbounded agent-wake amplifier, and why the allowlist is exactly one
+      // login rather than "any Bot".
+      const reviewGateEscalationHeadSha = readReviewGateEscalationHeadSha(commentBody);
+      const reviewGateEscalationAuthorAllowed = isReviewGateEscalationProducer(
+        commentAuthorLogin,
+        (commentUser?.type as string | undefined) ?? null,
+      );
+      const reviewGateEscalation =
+        reviewGateEscalationHeadSha !== null &&
+        reviewGateEscalationAuthorAllowed &&
+        !reviewFeedback;
+      // A well-formed marker from an identity that is not the gate is either an
+      // attempt to drive a wake or the gate's credential having changed. Both
+      // need to be visible: the first is the abuse this guard exists to stop,
+      // the second is a real escalation now going unrouted -- which is the exact
+      // silence BLO-32381 was opened about, so it must never fail quietly.
+      if (reviewGateEscalationHeadSha !== null && !reviewGateEscalationAuthorAllowed) {
+        options.onSuppressedEscalationAuthor?.({
+          repoFullName,
+          prNumber: typeof issue.number === "number" ? issue.number : null,
+          headSha: reviewGateEscalationHeadSha,
+          commentAuthorLogin,
+          commentAuthorType: (commentUser?.type as string | undefined) ?? null,
+        });
+      }
       // BLO-18273: the drop above is the one failure mode in this file that is
       // completely invisible. A markerless agent request matches the @ally
       // mention, fails the author guard, is not review feedback either, and
@@ -1230,7 +1415,7 @@ function resolveEventContextRaw(
           });
         }
       }
-      if (!reviewerRequest && !reviewFeedback) return null;
+      if (!reviewerRequest && !reviewFeedback && !reviewGateEscalation) return null;
       // BLO-9293: on a PR's issue_comment payload, `issue.user.login` is the PR
       // author (the comment author is `comment.user.login`, captured separately).
       const issueUser = issue.user as Record<string, unknown> | undefined;
@@ -1267,9 +1452,26 @@ function resolveEventContextRaw(
           issue.body as string | undefined,
         ),
         owningIdentifiers: owning.owning,
-        wakeReason: reviewerRequest ? "github_pr_review_requested" : "github_pr_review_feedback",
+        // Escalation takes precedence over `reviewerRequest` deliberately, and
+        // this ternary is the whole enforcement of "an escalation never
+        // dispatches a review": shouldFirePrReviewerWake keys on wakeReason
+        // membership, and `github_pr_review_gate_escalation` is not in that set,
+        // so winning here is what keeps the reviewer wake from firing. See the
+        // reviewGateEscalation comment above for why relying on the gate's
+        // mention suppression instead would be a silent coupling.
+        wakeReason: reviewGateEscalation
+          ? "github_pr_review_gate_escalation"
+          : reviewerRequest
+            ? "github_pr_review_requested"
+            : "github_pr_review_feedback",
         prNumber,
         repoFullName,
+        // An issue_comment payload carries no `pull_request.head.sha` (see the
+        // note at the top of this file), which is exactly why the gate puts the
+        // head in the marker. It is the head the gate ESCALATED, not necessarily
+        // the head now -- the heartbeat directive already warns that a wake's
+        // head may be superseded.
+        ...(reviewGateEscalationHeadSha ? { headSha: reviewGateEscalationHeadSha } : {}),
         prTitle: issueTitle ?? null,
         prUrl,
         eventUrl: commentUrl ?? prUrl,
@@ -2226,6 +2428,27 @@ function wakeIdempotencySuffix(
     const identity = context.commentId ?? deliveryId ?? null;
     return {
       suffix: `${context.wakeReason}:comment:${identity ?? "unknown"}`,
+      scope: scopeFor(identity),
+    };
+  }
+  // BLO-32381: the escalation is keyed on the HEAD it escalated, not on the
+  // comment or the delivery, because head is the identity of the escalation
+  // itself -- the gate emits exactly one per head, guarded by its own
+  // `review-gate:stale-escalation:<sha>` marker. Comment-scoping would let a
+  // GitHub redelivery re-wake for a head already handled; the default
+  // repo+pr+reason `stable` key would collide two genuinely different
+  // escalations on two different heads onto one key.
+  //
+  // `request` scope is correct here (terminal statuses DO dedup): a completed
+  // wake for this head means the assignee already saw this escalation, so
+  // replaying it would redo work. A later escalation on a NEW head carries a
+  // different suffix and is unaffected, which is the property that stops this
+  // from being the "first completed wake blocks the PR forever" failure the
+  // scope doc warns about.
+  if (context.wakeReason === "github_pr_review_gate_escalation") {
+    const identity = context.headSha ?? null;
+    return {
+      suffix: `${context.wakeReason}:head:${identity ?? "unknown"}`,
       scope: scopeFor(identity),
     };
   }
@@ -3573,6 +3796,119 @@ async function hasExistingWakeWithIdempotencyKey(
   return Boolean(existing);
 }
 
+// BLO-32381: the (repo, pull, head) identity of one escalation. This is the
+// idempotency contract the AC names: a re-run of the gate's 15-minute scheduled
+// sweep, or a GitHub webhook redelivery, must not post a second comment for a
+// head that has already been routed -- mirroring the gate's own
+// `review-gate:stale-escalation:<sha>` marker discipline, which is what stops
+// it re-posting on GitHub.
+//
+// Keyed on head rather than on the comment id on purpose: the comment id is the
+// identity of a GitHub COMMENT, and if the gate ever re-posts an escalation for
+// the same head (a sweep re-run after a failed comment write, say) that is a
+// second comment id for one escalation. Head is the identity of the ESCALATION.
+function buildReviewGateEscalationExternalKey(context: ResolvedEventContext): string | null {
+  if (!context.headSha || context.prNumber === null || context.prNumber === undefined) return null;
+  const repo = context.repoFullName ?? "unknown";
+  return `github_pr_review_gate_escalation:${repo}:${context.prNumber}:${context.headSha}`;
+}
+
+function buildReviewGateEscalationComment(context: ResolvedEventContext): string {
+  const sourceUrl = context.commentUrl ?? context.eventUrl ?? context.prUrl;
+  const lines = [
+    "## Review gate escalated — Ally review is stuck, automation has stopped retrying",
+    "",
+    "The `review/ally-complete` gate on this PR has been `pending` with no Ally review " +
+      "long enough that the gate posted an automatic re-request AND that re-request also " +
+      "produced nothing. It will **not** retry again on its own, and **merge stays gated** " +
+      "until this is resolved.",
+    "",
+    ...(context.repoFullName && context.prNumber !== null
+      ? [`- PR: ${context.repoFullName}#${context.prNumber}`]
+      : []),
+    ...(sourceUrl ? [`- Escalation comment: ${sourceUrl}`] : []),
+    ...(context.headSha
+      ? [`- Escalated head SHA: \`${context.headSha}\` (may be superseded — confirm the current head)`]
+      : []),
+    "",
+    "This is not review feedback: there are no findings to address, because no review " +
+      "landed. Do not push a commit to \"address\" it.",
+    "",
+    "What to check, in order:",
+    "",
+    "1. Confirm the gate is still stuck at the CURRENT head — read the commit **statuses**, " +
+      "not just the check-runs. The check-runs can all be green while " +
+      "`review/ally-complete` sits `pending`/`failure`, which is why this state is easy to " +
+      "miss: `gh api repos/{owner}/{repo}/commits/{head}/status`.",
+    "2. If a review has since landed, this is already resolved — say so and move on.",
+    "3. If not, find out why the reviewer is not responding: reviewer availability, or a " +
+      "dispatch drop specific to this PR.",
+  ];
+  return lines.join("\n");
+}
+
+// Posts the escalation onto the owning issue exactly once per (repo, pull,
+// head). Mirrors the dedup shape used by the review-feedback and
+// dependabot-receipt writes: INSERT with the idempotencyKey set so it rides the
+// partial unique index (issue_comments_issue_system_idempotency_idx), then
+// ON CONFLICT DO NOTHING plus a follow-up read to resolve to whichever row won.
+//
+// Deliberately NOT a select-then-insert: two concurrent redeliveries would both
+// observe "no existing row" before either committed, so the same escalation
+// would post twice AND each racer would mint its own row id, leaving the
+// returned commentId unstable for the wake that carries it.
+async function insertReviewGateEscalationComment(
+  db: Db,
+  issue: MatchedGithubIssue,
+  context: ResolvedEventContext,
+  deliveryId: string | null,
+): Promise<{ commentId: string | null; commentInserted: boolean }> {
+  const externalKey = buildReviewGateEscalationExternalKey(context);
+  // No key means no head, and an escalation with no readable head cannot be
+  // deduped. readReviewGateEscalationHeadSha already refuses to classify such a
+  // body as an escalation, so this is unreachable defence rather than a live
+  // branch -- but posting an undedupable comment every 15 minutes is a bad
+  // enough failure mode to guard explicitly.
+  if (!externalKey) return { commentId: null, commentInserted: false };
+
+  const metadata = {
+    kind: "github_pr_review_gate_escalation",
+    source: "github",
+    externalKey,
+    repoFullName: context.repoFullName,
+    prNumber: context.prNumber,
+    headSha: context.headSha,
+    deliveryId,
+  } as never;
+
+  const inserted = await db
+    .insert(issueComments)
+    .values({
+      companyId: issue.companyId,
+      issueId: issue.id,
+      authorType: "system",
+      idempotencyKey: externalKey,
+      body: buildReviewGateEscalationComment(context),
+      metadata,
+    })
+    .onConflictDoNothing()
+    .returning({ id: issueComments.id })
+    .then((rows) => rows[0] ?? null);
+
+  if (inserted) return { commentId: inserted.id, commentInserted: true };
+
+  const existing = await db
+    .select({ id: issueComments.id })
+    .from(issueComments)
+    .where(and(
+      eq(issueComments.issueId, issue.id),
+      eq(issueComments.idempotencyKey, externalKey),
+    ))
+    .limit(1)
+    .then((rows) => rows[0]?.id ?? null);
+  return { commentId: existing, commentInserted: false };
+}
+
 // BLO-19497: writes the github_pr_review_feedback comment for EVERY distinct
 // actionable review, independent of the issue's current status. Before this
 // fix the whole function -- comment write included -- short-circuited unless
@@ -4121,6 +4457,35 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           "github webhook wakes skipped: claude[bot] submitted a formal review whose body is the " +
             "Claude Code Review paused/disabled org-settings notice, not findings (BLO-23059); " +
             "neither the reviewer counter-review wake nor the PR-author wake was enqueued",
+        );
+      },
+      // BLO-32381: `warn`, not `info`, and deliberately so. Unlike the
+      // Code-Review notice above there IS something to fix in one of the two
+      // situations this fires on, and the two are indistinguishable from the
+      // payload alone: either an identity that is not the gate posted an
+      // escalation marker (the abuse the guard exists to stop -- correct
+      // suppression, worth seeing), or the gate's own credential changed and a
+      // REAL escalation is now being dropped. The second is precisely the
+      // silence this row was opened about, so it cannot be logged at a level
+      // anyone filters out.
+      onSuppressedEscalationAuthor: (info) => {
+        logger.warn(
+          {
+            event: eventName,
+            deliveryId,
+            repoFullName: info.repoFullName,
+            prNumber: info.prNumber,
+            headSha: info.headSha,
+            commentAuthorLogin: info.commentAuthorLogin,
+            commentAuthorType: info.commentAuthorType,
+            expectedAuthorLogin: REVIEW_GATE_ESCALATION_PRODUCER_LOGIN,
+            suppressionReason: "escalation_marker_author_not_allowlisted",
+          },
+          "github webhook escalation routing skipped: a well-formed review-gate escalation marker was " +
+            "authored by an identity that is not the allowlisted gate producer (BLO-32381). Either the " +
+            "marker was forged -- suppression is correct -- or sweep-stale-pending's credential changed " +
+            "and a real escalation is going unrouted; if the latter, update " +
+            "REVIEW_GATE_ESCALATION_PRODUCER_LOGIN",
         );
       },
     });
@@ -5166,6 +5531,34 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     const wakes: Array<{ issueIdentifier: string | null; agentId: string }> = [];
     const skipped: Array<{ issueIdentifier: string | null; reason: string }> = [];
     const reopened: Array<{ issueIdentifier: string | null; commentId: string | null }> = [];
+    // BLO-32381: reported in the handler's summary log so an escalation that
+    // routed is visible without reading the issue thread -- and, more to the
+    // point, so one that did NOT route is too. `Silence is not health` is the
+    // whole reason this row exists; a routing path with no log line would
+    // reproduce the original defect one layer down.
+    //
+    // This list is INSERTS ONLY, so its length alone cannot carry AC3. A webhook
+    // redelivery of an already-routed escalation legitimately re-finds the
+    // existing comment and inserts nothing, which would log `routed: 0` -- byte
+    // identical to "escalated and nobody could be told", the one reading AC3
+    // exists to make legible. The counters below keep the three outcomes
+    // (`newly routed` / `already routed` / `nobody to tell`) distinguishable.
+    const reviewGateEscalationComments: Array<{
+      issueIdentifier: string | null;
+      commentId: string | null;
+    }> = [];
+    // Owning issues this delivery actually reached a routing decision for.
+    // ZERO is the AC3 signal -- "the gate escalated and no owning issue could be
+    // resolved" -- and unlike the insert count it is invariant under redelivery.
+    let reviewGateEscalationIssuesResolved = 0;
+    // Already carried this escalation from an earlier delivery. Non-zero here
+    // with `routed: 0` is steady-state success, not failure.
+    let reviewGateEscalationCommentsDeduped = 0;
+    // The comment write threw. Non-fatal for the wake (see the catch below), but
+    // it means the durable artifact is missing even though an owning issue WAS
+    // resolved, so it must not be folded into either count above.
+    let reviewGateEscalationCommentFailures = 0;
+
     const escalated: Array<{
       issueIdentifier: string | null;
       ownerAgentId: string | null;
@@ -5243,6 +5636,13 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     const getRecovery = () =>
       (recoveryInstance ??= recoveryService(db, { enqueueWakeup: heartbeat.wakeup }));
     const actionableReviewFeedback = isActionableReviewFeedbackContext(context);
+    // BLO-32381: reconstructed from wakeReason rather than threaded through as
+    // its own context field. resolveEventContext already made the decision (and
+    // enforced escalation-beats-request precedence there); reading it back off
+    // the reason keeps one source of truth, and the reason is what every
+    // downstream consumer -- isPrWake, wakeIdempotencySuffix, the heartbeat
+    // directive -- already keys on.
+    const reviewGateEscalation = context.wakeReason === "github_pr_review_gate_escalation";
 
     // synchronize and converted_to_draft are reviewer-lifecycle signals. The
     // reviewer wake above is PR-scoped for task affinity/coalescing, while
@@ -5454,6 +5854,47 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         }
       }
 
+      // BLO-32381: route the review gate's terminal escalation onto the owning
+      // issue. A wake ALONE is not enough here: only the actionable-feedback
+      // branch above writes an issue comment, so without this insert the
+      // escalation would wake the assignee with no record of what escalated --
+      // and if the wake were ever coalesced away, with no record at all. The
+      // comment is the durable artifact; the wake is what makes it timely.
+      //
+      // Note this is NOT gated on `commentInserted`. A redelivery legitimately
+      // re-finds the existing comment, and we still want `wakeCommentId` set so
+      // the wake points at it; the wake's own head-scoped idempotency key
+      // (wakeIdempotencySuffix) is what stops a duplicate run.
+      if (reviewGateEscalation) {
+        reviewGateEscalationIssuesResolved += 1;
+        try {
+          const escalationComment = await insertReviewGateEscalationComment(
+            db,
+            issue,
+            context,
+            deliveryId,
+          );
+          wakeCommentId = escalationComment.commentId;
+          if (escalationComment.commentInserted) {
+            reviewGateEscalationComments.push({
+              issueIdentifier: issue.identifier,
+              commentId: escalationComment.commentId,
+            });
+          } else {
+            reviewGateEscalationCommentsDeduped += 1;
+          }
+        } catch (err) {
+          reviewGateEscalationCommentFailures += 1;
+          // Non-fatal: a failed comment write must not swallow the wake. An
+          // escalation that wakes the assignee with no comment is degraded;
+          // one that does neither is the silence this row exists to kill.
+          logger.error(
+            { err, issueId: issue.id, prNumber: context.prNumber, headSha: context.headSha },
+            "review gate escalation comment insert failed (non-fatal, wake still attempted)",
+          );
+        }
+      }
+
       if (!effectiveAssigneeAgentId) {
         skipped.push({ issueIdentifier: issue.identifier, reason: "unassigned" });
         continue;
@@ -5597,6 +6038,40 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         reopenedCount: reopened.length,
         skippedCount: skipped.length,
         escalatedCount: escalated.length,
+        // BLO-32381: emitted on EVERY escalation delivery, including the ones
+        // that routed nowhere. Read `issuesResolved` for AC3, NOT `routed`:
+        //
+        //   issuesResolved: 0                  -> the gate escalated and NO owning
+        //                                         issue could be resolved. Nobody
+        //                                         was told. This is the failure the
+        //                                         row was opened about.
+        //   issuesResolved: n, routed: n       -> newly routed this delivery.
+        //   issuesResolved: n, routed: 0,
+        //     deduped: n                       -> already routed by an earlier
+        //                                         delivery. Steady-state success.
+        //   commentFailures: n                 -> an owning issue was resolved but
+        //                                         the durable comment write threw;
+        //                                         the wake was still attempted.
+        //
+        // `routed` alone cannot carry any of this: it counts INSERTS, so a
+        // redelivery collapses onto the same `0` as "nobody could be told".
+        //
+        // One more thing `routed` does not mean: DELIVERED. The comment is
+        // written before the `unassigned` skip below it, so an owning issue with
+        // no assignee counts as routed while no agent is woken. That ordering is
+        // deliberate -- the comment is the durable artifact and is worth having
+        // even with nobody to wake -- but it means `routed` is "a record exists",
+        // and `wakeCount` is the field that says anyone was actually reached.
+        ...(reviewGateEscalation
+          ? {
+              reviewGateEscalation: true,
+              reviewGateEscalationHeadSha: context.headSha,
+              reviewGateEscalationIssuesResolved,
+              reviewGateEscalationCommentsRouted: reviewGateEscalationComments.length,
+              reviewGateEscalationCommentsDeduped,
+              reviewGateEscalationCommentFailures,
+            }
+          : {}),
       },
       "github webhook drove issue wakes",
     );
@@ -5616,6 +6091,26 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       ...(foreignCommitNotices > 0 ? { foreignCommitNotices } : {}),
       ...(foreignCommitListingTruncated ? { foreignCommitListingTruncated } : {}),
       ...(escalated.length ? { escalated } : {}),
+      ...(reviewGateEscalationComments.length
+        ? { reviewGateEscalationComments }
+        : {}),
+      // BLO-32381: the same three-way disambiguation as the summary log, on the
+      // response, because this is where AC3 is actually observable. Keyed on
+      // `reviewGateEscalation` rather than on the comment list being non-empty
+      // -- the whole point is that an escalation which routed NOWHERE must be
+      // legible, and gating it on output would make the failure case the one
+      // with no field. See the log comment above for how to read the counts.
+      ...(reviewGateEscalation
+        ? {
+            reviewGateEscalationSummary: {
+              headSha: context.headSha ?? null,
+              issuesResolved: reviewGateEscalationIssuesResolved,
+              commentsRouted: reviewGateEscalationComments.length,
+              commentsDeduped: reviewGateEscalationCommentsDeduped,
+              commentFailures: reviewGateEscalationCommentFailures,
+            },
+          }
+        : {}),
     });
   });
 
@@ -5648,3 +6143,9 @@ export const __test_commentsContainBackLinkMarker = commentsContainBackLinkMarke
 export const __test_backLinkAbsoluteUrl = backLinkAbsoluteUrl;
 export const __test_isSelfReviewedPr = isSelfReviewedPr;
 export const __test_resolvePrCommentReviewGateWebhookTrigger = resolvePrCommentReviewGateWebhookTrigger;
+export const __test_readReviewGateEscalationHeadSha = readReviewGateEscalationHeadSha;
+export const __test_isActionablePrReviewComment = isActionablePrReviewComment;
+export const __test_isReviewGateEscalationProducer = isReviewGateEscalationProducer;
+export const __test_buildReviewGateEscalationExternalKey = buildReviewGateEscalationExternalKey;
+export const __test_buildReviewGateEscalationComment = buildReviewGateEscalationComment;
+export const __test_wakeIdempotencySuffix = wakeIdempotencySuffix;
