@@ -18,9 +18,42 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import {
+  HEARTBEAT_TIMER_CHECKED_METRIC,
+  HEARTBEAT_TIMER_ENQUEUED_METRIC,
   HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC,
   renderMetrics,
 } from "../services/metrics.js";
+
+/**
+ * Reads the unlabeled timer-loop counters (BLO-32269). Absolute values are
+ * shared across tests in this file, so callers compare deltas around a single
+ * `tickTimers` call rather than asserting a total.
+ */
+async function readTimerTickCounters(): Promise<{ checked: number; enqueued: number }> {
+  const { body } = await renderMetrics();
+  const read = (name: string) => {
+    const match = new RegExp(`^${name} (\\S+)$`, "m").exec(body);
+    if (!match) throw new Error(`${name} is absent from the exposition output`);
+    return Number(match[1]);
+  };
+  return {
+    checked: read(HEARTBEAT_TIMER_CHECKED_METRIC),
+    enqueued: read(HEARTBEAT_TIMER_ENQUEUED_METRIC),
+  };
+}
+
+/**
+ * Sums every labeled series of the exclusion counter. Used to pin the negative
+ * half of the BLO-32269 documented semantics: the exclusion counter cannot
+ * explain a zero `checked`, because it is only ever incremented after it.
+ */
+async function readSchedulerExclusionTotal(): Promise<number> {
+  const { body } = await renderMetrics();
+  const pattern = new RegExp(`^${HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC}\\{[^}]*\\} (\\S+)$`, "gm");
+  let total = 0;
+  for (const match of body.matchAll(pattern)) total += Number(match[1]);
+  return total;
+}
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -143,9 +176,21 @@ describeEmbeddedPostgres("opencode_k8s timer no-work suppression", () => {
     });
     await saturateAgentConcurrency({ companyId, agentId, now });
 
+    const before = await readTimerTickCounters();
     const result = await heartbeat.tickTimers(now);
 
     expect(result).toMatchObject({ checked: 1, enqueued: 0, skipped: 1 });
+
+    // BLO-32269 wiring check: the exported counters must advance by this very
+    // pass's own numbers. This pass is the healthy-idle shape the pair exists
+    // to name -- it examined a candidate and deliberately enqueued nothing, so
+    // `checked` must move while `enqueued` stays put. Asserted against the real
+    // tickTimers path rather than the recorder in isolation, because the
+    // failure mode being guarded is the call sitting in the wrong place (e.g.
+    // behind the `enqueued > 0` log gate, which would pin `checked` at zero).
+    const after = await readTimerTickCounters();
+    expect(after.checked - before.checked).toBe(result.checked);
+    expect(after.enqueued - before.enqueued).toBe(result.enqueued);
 
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(1);
@@ -230,6 +275,99 @@ describeEmbeddedPostgres("opencode_k8s timer no-work suppression", () => {
     expect(skipsAfterImmediateRetry).toHaveLength(1);
   });
 
+  it("records neither counter when scheduling is globally suppressed", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const now = new Date("2026-05-25T20:30:00.000Z");
+    // BLO-32269 design decision #3: the suppressed early return is deliberately
+    // NOT recorded as a tick, so a suppressed fleet reads dispatch-dark rather
+    // than healthy-idle. That decision had no regression guard; this is it.
+    const heartbeat = heartbeatService(db, {
+      runtimeEnv: { ...process.env, PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS: "1" },
+    });
+
+    await seedOpencodeK8sTimerAgent({
+      companyId,
+      agentId,
+      lastHeartbeatAt: new Date("2026-05-25T20:28:00.000Z"),
+    });
+
+    const before = await readTimerTickCounters();
+    const exclusionsBefore = await readSchedulerExclusionTotal();
+    const result = await heartbeat.tickTimers(now);
+
+    // The suppressed return omits `idleSkipped`, which every completed pass
+    // carries -- that is what proves this took the early return rather than
+    // running the body and finding nothing.
+    expect(result).toMatchObject({ checked: 0, enqueued: 0, skipped: 0 });
+    expect(result).not.toHaveProperty("idleSkipped");
+
+    const after = await readTimerTickCounters();
+    expect(after.checked - before.checked).toBe(0);
+    expect(after.enqueued - before.enqueued).toBe(0);
+
+    // Pins the negative half of cause (3) in the documented cause list: the
+    // exclusion counter is silent here too, because this return is above all
+    // four of its call sites. Any comment or help text claiming global
+    // suppression is observable through that counter is wrong, and this is
+    // what says so mechanically.
+    expect(await readSchedulerExclusionTotal()).toBe(exclusionsBefore);
+  });
+
+  it("completes a pass with checked=0 when every agent is filtered before the counter", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const now = new Date("2026-05-25T20:30:00.000Z");
+    const heartbeat = heartbeatService(db);
+
+    await seedOpencodeK8sTimerAgent({
+      companyId,
+      agentId,
+      lastHeartbeatAt: new Date("2026-05-25T20:28:00.000Z"),
+    });
+    // `!policy.enabled` is one of three `continue`s that sit ABOVE `checked += 1`.
+    // Override only `enabled` -- replacing `runtimeConfig` wholesale would drop
+    // the seeded `wakeOnDemand`/`maxConcurrentRuns` and let a different
+    // pre-counter filter satisfy the `checked === 0` assertion, so the test
+    // would stay green even if `enabled` stopped being honored.
+    const [seeded] = await db
+      .select({ runtimeConfig: agents.runtimeConfig })
+      .from(agents)
+      .where(eq(agents.id, agentId));
+    const seededHeartbeat = (seeded?.runtimeConfig as { heartbeat?: Record<string, unknown> })
+      ?.heartbeat;
+    expect(seededHeartbeat).toMatchObject({ wakeOnDemand: true, maxConcurrentRuns: 1 });
+    await db
+      .update(agents)
+      .set({
+        runtimeConfig: {
+          ...(seeded?.runtimeConfig as Record<string, unknown>),
+          heartbeat: { ...seededHeartbeat, enabled: false },
+        },
+      })
+      .where(eq(agents.id, agentId));
+
+    const before = await readTimerTickCounters();
+    const exclusionsBefore = await readSchedulerExclusionTotal();
+    const result = await heartbeat.tickTimers(now);
+
+    // The load-bearing assertion for the metric's documented semantics: this
+    // pass DID complete (it carries `idleSkipped`, unlike the suppressed early
+    // return) and still recorded `checked = 0`. So `checked = 0` must be read
+    // as "no candidate examined", NOT as "no tick completed" / "loop dead".
+    expect(result).toMatchObject({ checked: 0, enqueued: 0 });
+    expect(result).toHaveProperty("idleSkipped");
+
+    const after = await readTimerTickCounters();
+    expect(after.checked - before.checked).toBe(0);
+    expect(after.enqueued - before.enqueued).toBe(0);
+
+    // And the exclusion counter cannot explain the gap: every one of its
+    // increments happens after `checked += 1`, so it is silent here. This is
+    // why the help text must not send an operator there to corroborate a zero.
+    expect(await readSchedulerExclusionTotal()).toBe(exclusionsBefore);
+  });
+
   it("queues opencode_k8s timer ticks when the agent has assigned live work", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -254,9 +392,16 @@ describeEmbeddedPostgres("opencode_k8s timer no-work suppression", () => {
       identifier: `${issuePrefix}-1`,
     });
 
+    const before = await readTimerTickCounters();
     const result = await heartbeat.tickTimers(now);
 
     expect(result).toMatchObject({ checked: 1, enqueued: 1, skipped: 0 });
+
+    // BLO-32269: complement of the healthy-idle assertion in the sibling test
+    // above -- here the pass did enqueue, so both halves must advance together.
+    const after = await readTimerTickCounters();
+    expect(after.checked - before.checked).toBe(result.checked);
+    expect(after.enqueued - before.enqueued).toBe(result.enqueued);
 
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(2);

@@ -139,6 +139,74 @@ export const ISOLATED_RUN_STARTED_METRIC = "paperclip_k8s_isolated_run_started_t
 export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_deferred_total";
 export const HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC =
   "paperclip_heartbeat_timer_scheduler_exclusion_total";
+/**
+ * Heartbeat timer-loop liveness pair (BLO-32269). Incremented once per
+ * `tickTimers` pass with that pass's own `checked`/`enqueued` totals — the same
+ * two integers the worker already logs as
+ * `heartbeat timer tick enqueued runs {"checked":N,"enqueued":M}`.
+ *
+ * These exist so "the fleet has stopped dispatching" can be alerted on the
+ * dispatcher itself rather than on a downstream proxy. `PaperclipFleetDispatchDark`
+ * previously keyed on `absent(paperclip_agent_heartbeat_age_seconds)` (1-for-3:
+ * that gauge is conditionally emitted and blinks ~3x/day) and then on
+ * {@link ISOLATED_RUN_STARTED_METRIC}, which counts only *isolated* per-run k8s
+ * Job starts and would therefore read zero for a fleet running exclusively
+ * shared-isolation work. See BLO-32063.
+ *
+ * Read them as a pair — that is the whole point of exporting both:
+ *   - `checked > 0, enqueued = 0` — candidates were examined and the loop
+ *     deliberately enqueued nothing (none due, or every one gated). Healthy.
+ *   - `checked = 0` — *no candidate was examined*. See below; this is NOT by
+ *     itself evidence that the loop is dead.
+ * Those two states have different remediations and are indistinguishable from
+ * outside the process today.
+ *
+ * `checked = 0` is deliberately worded as "no candidate examined" rather than
+ * "no tick completed", because a tick can complete normally and still record
+ * zero. `checked` is only incremented after three `continue` filters in
+ * `tickTimers` (agent not invokable; heartbeat policy disabled or
+ * `intervalSec <= 0`; a `getWorktreeExecutionCutoff()` cutoff with no eligible
+ * issue behind it), so a fleet where every agent trips one of those yields a
+ * completed pass with `checked = 0`. The full cause list is therefore:
+ *   1. the loop is wedged or the process is dead — the case worth paging on;
+ *   2. every candidate was filtered out before the counter (above);
+ *   3. global scheduling suppression — the caller does not enter `tickTimers`
+ *      at all (`server/src/index.ts`), so nothing is recorded;
+ *   4. startup recovery is still pending (`heartbeatStartupRecoveryPending`);
+ *   5. the shutdown drain has begun (`heartbeatSchedulerStopped`);
+ *   6. the pass completed but {@link recordHeartbeatTimerTick} rejected it as
+ *      malformed and dropped **both** halves — see its own doc comment. This
+ *      should never happen (both inputs are integer accumulators) and is the
+ *      only cause of the six that emits a `logger.warn` naming the bad field,
+ *      so the worker log settles it outright.
+ * Only (1) warrants a restart, and note the trap: restarting for (4) re-enters
+ * (4). Rule out 2–6 first.
+ *
+ * There is no counter that attributes a zero `checked` to which of 2–6 caused
+ * it. {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC} does NOT close that
+ * gap and must not be read as doing so: every one of its increments happens
+ * *after* `checked += 1`, so it is silent in all five of those cases.
+ * Distinguish them from process state instead — worker uptime and the
+ * scheduling-suppression record for (1)/(3), and the worker log for (4)/(5)/(6).
+ *
+ * `checked` is also a composite: agents examined, plus `issueMonitors.checked`,
+ * plus `expiredIssueMonitors.checked`. A consumer cannot decompose it, so
+ * `checked > 0` can be carried entirely by due issue monitors with zero agents
+ * examined. That is fine for a liveness rule — the loop demonstrably ran — but
+ * do not read it as "agents were considered".
+ *
+ * Deliberately unlabeled: the consumer is `sum(increase(...[15m])) == 0`, so
+ * per-agent breakdown would add cardinality without adding signal. Per-agent
+ * detail for *due ticks that were then excluded* lives in
+ * {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC} — which, per the paragraph
+ * above, is a strictly narrower set than "candidates this loop skipped".
+ *
+ * Both counters are emitted by the *worker* (`StatefulSet/paperclip`), which is
+ * where the timer loop runs and which deploys independently of
+ * `Deployment/paperclip-api` (BLO-29004).
+ */
+export const HEARTBEAT_TIMER_CHECKED_METRIC = "paperclip_heartbeat_timer_checked_total";
+export const HEARTBEAT_TIMER_ENQUEUED_METRIC = "paperclip_heartbeat_timer_enqueued_total";
 
 /**
  * BLO-32553: count of adapter run events dropped because they arrived after the
@@ -1865,6 +1933,8 @@ let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
 let heartbeatTimerSchedulerExclusion: Counter<"reason"> | null = null;
 let heartbeatPostTerminalRunEventDropped: Counter<"status"> | null = null;
+let heartbeatTimerChecked: Counter | null = null;
+let heartbeatTimerEnqueued: Counter | null = null;
 let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = null;
 let externalRuntimeReservationEvents: Counter<"event"> | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
@@ -1977,6 +2047,8 @@ function ensureRegistry(): {
   capacityDeferredCounter: Counter<"adapter" | "provider">;
   heartbeatTimerSchedulerExclusionCounter: Counter<"reason">;
   heartbeatPostTerminalRunEventDroppedCounter: Counter<"status">;
+  heartbeatTimerCheckedCounter: Counter;
+  heartbeatTimerEnqueuedCounter: Counter;
   zeroTokenCompletedRunStreakGauge: Gauge<"agent_id" | "adapter">;
   externalRuntimeReservationEventsCounter: Counter<"event">;
   externalRuntimeReservationsActiveGauge: Gauge;
@@ -2033,6 +2105,8 @@ function ensureRegistry(): {
     || !ccrotateCapacityDeferred
     || !heartbeatTimerSchedulerExclusion
     || !heartbeatPostTerminalRunEventDropped
+    || !heartbeatTimerChecked
+    || !heartbeatTimerEnqueued
     || !agentZeroTokenCompletedRunStreak
     || !externalRuntimeReservationEvents
     || !externalRuntimeReservationsActive
@@ -2140,6 +2214,40 @@ function ensureRegistry(): {
         + "non-zero rate means an adapter is emitting from a continuation that outlives "
         + "execute() — expected only on the orphan-kill path.",
       labelNames: ["status"],
+    // Unlabeled on purpose (BLO-32269): consumed as
+    // `sum(increase(...[15m])) == 0`. prom-client zero-initializes an unlabeled
+    // counter at construction, so both series are present on the very first
+    // scrape after boot — a dispatch-dark rule must be able to tell "0 ticks"
+    // from "metric not published yet", and an absent series cannot.
+    heartbeatTimerChecked = new Counter({
+      name: HEARTBEAT_TIMER_CHECKED_METRIC,
+      help:
+        "Count of heartbeat timer-loop candidates examined, summed across completed "
+        + "tickTimers passes. Composite: agents examined + due issue monitors + expired "
+        + "issue monitors. Recorded on every completed pass, not only passes that "
+        + "enqueued something. Read with " + HEARTBEAT_TIMER_ENQUEUED_METRIC
+        + ": checked>0/enqueued=0 is a healthy idle loop. checked=0 means no candidate "
+        + "was examined, which is NOT by itself a dead loop -- a pass can complete with "
+        + "zero after every agent is filtered out, and the loop is also not entered "
+        + "under global scheduling suppression, during startup recovery, or during the "
+        + "shutdown drain. A completed pass is also dropped outright, both halves, if "
+        + "either input is not a non-negative finite number -- that is logged with the "
+        + "offending field and should never happen. "
+        + HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC + " cannot "
+        + "disambiguate these: it is only incremented after this counter, so it is "
+        + "silent in all of them. Rule them out from worker uptime and logs before "
+        + "restarting. Emitted by the worker, where the timer loop runs (BLO-32269).",
+      registers: [registry],
+    });
+    heartbeatTimerEnqueued = new Counter({
+      name: HEARTBEAT_TIMER_ENQUEUED_METRIC,
+      help:
+        "Count of heartbeat runs enqueued by the timer loop, summed across completed "
+        + "tickTimers passes. Mirrors the `enqueued` field of the "
+        + "'heartbeat timer tick enqueued runs' log line. Direct dispatcher-side "
+        + "replacement for the isolated-run proxy previously used by "
+        + "PaperclipFleetDispatchDark, which could not see shared-isolation work "
+        + "(BLO-32269 / BLO-32063).",
       registers: [registry],
     });
     agentZeroTokenCompletedRunStreak = new Gauge({
@@ -2818,6 +2926,8 @@ function ensureRegistry(): {
     capacityDeferredCounter: ccrotateCapacityDeferred,
     heartbeatTimerSchedulerExclusionCounter: heartbeatTimerSchedulerExclusion,
     heartbeatPostTerminalRunEventDroppedCounter: heartbeatPostTerminalRunEventDropped,
+    heartbeatTimerCheckedCounter: heartbeatTimerChecked,
+    heartbeatTimerEnqueuedCounter: heartbeatTimerEnqueued,
     zeroTokenCompletedRunStreakGauge: agentZeroTokenCompletedRunStreak,
     externalRuntimeReservationEventsCounter: externalRuntimeReservationEvents,
     externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
@@ -3025,6 +3135,66 @@ export function recordHeartbeatPostTerminalRunEventDropped(
       : "unknown";
   ensureRegistry().heartbeatPostTerminalRunEventDroppedCounter.inc({ status: normalized });
   return normalized;
+}
+
+export interface RecordHeartbeatTimerTickInput {
+  /** Candidates examined by this pass (the log line's `checked`). */
+  checked: number;
+  /** Runs enqueued by this pass (the log line's `enqueued`). */
+  enqueued: number;
+}
+
+/**
+ * Record one completed heartbeat timer pass (BLO-32269).
+ *
+ * Call this on every completed pass, including passes that enqueued nothing —
+ * that is precisely the case `HEARTBEAT_TIMER_CHECKED_METRIC` exists to make
+ * visible, and it is why this is not hung off the existing log line (which is
+ * gated on `enqueued > 0` and so would leave `_checked_total` pinned at zero on
+ * a healthy but idle fleet).
+ *
+ * Non-finite or negative inputs are dropped rather than clamped: a counter must
+ * be monotonic, and silently substituting 0 for a bad value would fabricate a
+ * "loop ran, found nothing" reading — the healthy signal — out of a bug. The
+ * drop is logged because a dropped tick is otherwise indistinguishable from a
+ * tick that never ran, which is the precise ambiguity this pair exists to
+ * remove. Both inputs are integer accumulators, so this should never fire —
+ * which is exactly why it is worth hearing about if it does.
+ *
+ * The drop is all-or-nothing across the pair, because the reading it protects
+ * is a property of the pair rather than of either field. Validating them
+ * independently would let a pass with a valid `checked` and a bad `enqueued`
+ * move `checked` while leaving `enqueued` flat — which is observationally
+ * identical to substituting 0 for the bad value, and lands on exactly the
+ * `checked > 0, enqueued = 0` shape documented above as *Healthy*. That is the
+ * worst available outcome: a fleet that has stopped enqueuing, reporting
+ * healthy-idle on the surface the alert rule reads. `enqueued` is the likelier
+ * half to break, since `tickTimers` composes it from a single field
+ * (`issueMonitors.triggered`) where `checked` sums three, so a refactor can
+ * yield `NaN` on `enqueued` alone. Dropping the pass as a unit leaves both
+ * series flat, which reads as dispatch-dark — the direction that alerts.
+ */
+export function recordHeartbeatTimerTick(input: RecordHeartbeatTimerTickInput): void {
+  const metrics = ensureRegistry();
+  const checkedValid = Number.isFinite(input.checked) && input.checked >= 0;
+  const enqueuedValid = Number.isFinite(input.enqueued) && input.enqueued >= 0;
+  if (!checkedValid || !enqueuedValid) {
+    logger.warn(
+      {
+        checked: input.checked,
+        enqueued: input.enqueued,
+        invalidFields: [
+          ...(checkedValid ? [] : ["checked"]),
+          ...(enqueuedValid ? [] : ["enqueued"]),
+        ],
+        metrics: [HEARTBEAT_TIMER_CHECKED_METRIC, HEARTBEAT_TIMER_ENQUEUED_METRIC],
+      },
+      "heartbeat timer tick metrics dropped as a pair: checked/enqueued must both be non-negative finite numbers",
+    );
+    return;
+  }
+  metrics.heartbeatTimerCheckedCounter.inc(input.checked);
+  metrics.heartbeatTimerEnqueuedCounter.inc(input.enqueued);
 }
 
 export interface RecordAgentZeroTokenCompletedRunStreakInput {
@@ -4080,6 +4250,8 @@ export function __resetMetricsForTest(): void {
   ccrotateCapacityDeferred = null;
   heartbeatTimerSchedulerExclusion = null;
   heartbeatPostTerminalRunEventDropped = null;
+  heartbeatTimerChecked = null;
+  heartbeatTimerEnqueued = null;
   agentZeroTokenCompletedRunStreak = null;
   zeroTokenStreakAdapterByAgentId.clear();
   externalRuntimeReservationEvents = null;
