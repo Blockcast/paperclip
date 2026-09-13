@@ -15,8 +15,10 @@ import {
   folders,
   heartbeatRuns,
   instanceSettings,
+  issueComments,
   issueInboxArchives,
   issueReadStates,
+  issueRelations,
   issues,
   projectWorkspaces,
   projects,
@@ -67,6 +69,13 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       process.env.PAPERCLIP_SECRETS_PROVIDER = originalSecretsProviderEnv;
     }
     await db.delete(activityLog);
+    // Before `issues`: `issue_comments.issue_id` has no ON DELETE CASCADE, so
+    // once the supersede path writes its explanatory comment the `issues`
+    // delete below raises an FK violation, this hook aborts partway, and every
+    // later table -- including `instance_settings` -- is left populated. That
+    // surfaces as ~30 unrelated tests failing on a duplicate singleton key,
+    // which points nowhere near the actual cause.
+    await db.delete(issueComments);
     await db.delete(issueInboxArchives);
     await db.delete(issueReadStates);
     await db.delete(secretAccessEvents);
@@ -1348,6 +1357,13 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
   // months-old run and only passing because run age was not being checked.
   // `startedAt` is left null for `queued` runs, matching production -- a run
   // that has not started has no start time, and its age comes from `createdAt`.
+  //
+  // BLO-31996: `issueCreatedAt` dates the FIRE, which is a third clock again --
+  // `runStartedAt` ages one run, `updatedAt` only orders the rows, and neither
+  // survives a retry. A retry is a fresh heartbeat_runs row whose age restarts
+  // at zero, so the fire age is the only clock that accumulates across a retry
+  // chain. Defaults to the issue's natural insert time ("just now") so existing
+  // fixtures keep seeding a young fire and stay inside the fire-age horizon.
   async function seedGatingExecutionIssue(params: {
     companyId: string;
     agentId: string;
@@ -1357,6 +1373,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     scheduledRetryAt?: Date | null;
     updatedAt: Date;
     runStartedAt?: Date;
+    issueCreatedAt?: Date;
     bindExecutionRun?: boolean;
   }) {
     const previousRunId = randomUUID();
@@ -1409,6 +1426,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
               executionLockedAt: params.updatedAt,
             }
           : {}),
+        ...(params.issueCreatedAt ? { createdAt: params.issueCreatedAt } : {}),
         updatedAt: params.updatedAt,
       })
       .where(eq(issues.id, issue.id));
@@ -1707,6 +1725,385 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       expect(getRoutineDispatchMetric("routine_dispatch_bypassed_stale_execution_issue")).toBe(0);
     });
   }
+
+  // BLO-31996: a fire whose run dies is retried, and each retry is a fresh
+  // heartbeat_runs row whose age clock restarts at zero. So the run-age horizon
+  // above -- which bounds ONE run -- never accumulates across the fire, and a
+  // fire that keeps dying holds the dispatch lock indefinitely in 6h increments
+  // while taking no measurement at all.
+  //
+  // Measured on routine d379fbc5 (6h cadence) for the 2026-09-05T00:23Z fire
+  // BLO-31881, whose runs were:
+  //   run 1  created 00:23:33  started 04:03:51  failed 04:06:06  job_failed
+  //   run 2  created 04:07:19  started 07:57:59  failed 08:13:01  process_lost
+  //   run 3  created 08:13:10  started 11:10:45  succeeded 11:24:53
+  // At the 06:23Z fire, run 2 was `queued` with `startedAt` still null, so it
+  // aged from its own `createdAt` of 04:07 -- 2.3h, comfortably inside the
+  // run-age horizon -- and the successor fire was `coalesced` into a run that
+  // had not started and would die. One fire held the lock ~11h on a 6h cadence,
+  // which is the two-interval blind window this issue exists to close.
+  //
+  // The fixture is that exact shape: an old fire whose current run is young.
+  const STALE_FIRE_AGE_MS = 11 * 60 * 60 * 1000;
+  const YOUNG_RETRY_AGE_MS = 2.3 * 60 * 60 * 1000;
+
+  it("fires when the execution issue's FIRE outlived its cadence even though its retry run is young", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "coalesce_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const wedged = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      // `queued` with a null startedAt is what a retry that has not begun looks
+      // like -- nothing is running, so nothing is protected by coalescing.
+      runStatus: "queued",
+      runStartedAt: new Date(Date.now() - YOUNG_RETRY_AGE_MS),
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+    });
+
+    resetRoutineDispatchMetrics();
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    // Before the fire-age bound this was `coalesced` and created no issue --
+    // the measurement the routine exists to take was simply never made.
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(wedged.issue.id);
+    // A stale FIRE and a stale RUN are different operational problems: one run
+    // stalling means an execution overran, a stale fire means the fire kept
+    // restarting and the routine has been silently disabled for two intervals.
+    expect(getRoutineDispatchMetric("routine_dispatch_bypassed_stale_fire_execution_issue")).toBe(1);
+    expect(getRoutineDispatchMetric("routine_dispatch_bypassed_stale_execution_issue")).toBe(0);
+    expect(getRoutineDispatchMetric("routine_dispatch_bypassed_parked_execution_issue")).toBe(0);
+  });
+
+  // The guard that keeps this from becoming always_enqueue: an old fire whose
+  // run is genuinely RUNNING is real in-flight work and must still gate. The
+  // measured wedge fails this waiver exactly as it should, because its holding
+  // run was `queued` with a null startedAt.
+  it("still gates an old fire whose run has actually started and is inside the run-age horizon", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const live = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "running",
+      runStartedAt: new Date(Date.now() - 5 * 60 * 1000),
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+    });
+
+    resetRoutineDispatchMetrics();
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("skipped");
+    expect(run.linkedIssueId).toBe(live.issue.id);
+    expect(getRoutineDispatchMetric("routine_dispatch_bypassed_stale_fire_execution_issue")).toBe(0);
+  });
+
+  // The other half of the guard: a young fire gates normally, so the new bound
+  // only ever engages once the fire has outlived the cadence it belongs to.
+  it("still gates a young fire whose run has not started", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "coalesce_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const live = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "queued",
+      runStartedAt: new Date(Date.now() - 5 * 60 * 1000),
+      issueCreatedAt: new Date(Date.now() - 10 * 60 * 1000),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+    });
+
+    resetRoutineDispatchMetrics();
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("coalesced");
+    expect(run.linkedIssueId).toBe(live.issue.id);
+    expect(getRoutineDispatchMetric("routine_dispatch_bypassed_stale_fire_execution_issue")).toBe(0);
+  });
+
+  // Aging a fire out of the GATE is only half the fix. `issues_open_routine_execution_uq`
+  // covers every open routine-execution row with a non-null execution_run_id, so
+  // a merely-bypassed row still fails the successor's INSERT with a 23505 --
+  // which the dispatch catch rethrows once the row no longer reads as live. The
+  // predecessor must be disposed of, not ignored. `cancelled` is correct for a
+  // superseded point-in-time probe: terminal (so the index frees), honest (no
+  // measurement was taken), and it does not create the BLO-27553 zero-wake-path
+  // strand that `blocked` does.
+  it("cancels the superseded fire rather than erroring or stranding it, when the row holds an execution run", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "coalesce_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const wedged = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "queued",
+      runStartedAt: new Date(Date.now() - YOUNG_RETRY_AGE_MS),
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      // Binds execution_run_id, putting the row inside the partial unique index.
+      bindExecutionRun: true,
+    });
+
+    resetRoutineDispatchMetrics();
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(wedged.issue.id);
+    expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(1);
+
+    const [predecessor] = await db.select().from(issues).where(eq(issues.id, wedged.issue.id));
+    // Terminal, and specifically NOT `blocked` -- a routine-execution row parked
+    // `blocked` with no blocker edge is unwakeable (BLO-27553), which is how the
+    // strands in this routine's history were produced.
+    expect(predecessor.status).toBe("cancelled");
+    expect(predecessor.cancelledAt).not.toBeNull();
+  });
+
+  // AC2 of BLO-31996, stated in its own terms: no routine-execution issue is
+  // left `blocked` with `blockedBy: []`. That is the exact state the platform
+  // recovery path left BLO-31881's dead fire in, and per BLO-27553 it has no
+  // wake path at all -- the heartbeat skips `blocked`, so nothing could ever
+  // select it again. `blocked` is an open status, so the supersede sweeps it:
+  // every subsequent fire is self-healing for this shape, which is what makes
+  // the guarantee durable rather than a one-time cleanup.
+  it("retires a predecessor already stranded `blocked` with no blocker edge", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "coalesce_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const stranded = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "queued",
+      runStartedAt: new Date(Date.now() - YOUNG_RETRY_AGE_MS),
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      bindExecutionRun: true,
+    });
+    // Exactly what the recovery path produced on BLO-31881: `blocked`, and no
+    // blocker edge to ever resolve.
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, stranded.issue.id));
+
+    resetRoutineDispatchMetrics();
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("issue_created");
+
+    const [predecessor] = await db.select().from(issues).where(eq(issues.id, stranded.issue.id));
+    expect(predecessor.status).toBe("cancelled");
+    expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(1);
+
+    // The explanatory comment is written inside a savepoint the supersede rolls
+    // back on failure, so a broken comment no longer fails the dispatch -- which
+    // means nothing else here would notice it silently vanishing. Assert it
+    // lands. The first version of this code passed the `routine_runs` id as the
+    // comment's `runId`, violating the `heartbeat_runs` FK on every supersede
+    // that actually fired; only a DB-backed assertion catches that class.
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, stranded.issue.id));
+    expect(comments).toHaveLength(1);
+    expect(comments[0].body).toContain("outlived its own cadence");
+    expect(comments[0].createdByRunId).toBeNull();
+  });
+
+  // The dangerous path for the supersede: `always_enqueue` leaves
+  // `gatesOnActiveIssue` false, so dispatch reaches the supersede with a live
+  // `activeIssue` still in hand. The fire-age filter alone does NOT protect it
+  // -- a legitimately long-running fire is old by definition -- so without the
+  // explicit `!activeIssue` guard this would cancel a genuinely running
+  // execution out from under its own run.
+  it("does not cancel a running execution issue on the always_enqueue path, where nothing gates", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "always_enqueue" })
+      .where(eq(routines.id, routine.id));
+
+    const running = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      // Genuinely in flight: started two minutes ago...
+      runStatus: "running",
+      runStartedAt: new Date(Date.now() - 2 * 60 * 1000),
+      // ...but the fire itself is older than the horizon, which is exactly the
+      // shape a long-running execution has.
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      bindExecutionRun: true,
+    });
+
+    resetRoutineDispatchMetrics();
+    await svc.runRoutine(routine.id, { source: "schedule" });
+
+    const [predecessor] = await db.select().from(issues).where(eq(issues.id, running.issue.id));
+    expect(predecessor.status).not.toBe("cancelled");
+    expect(predecessor.cancelledAt).toBeNull();
+    expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(0);
+  });
+
+  // Ally review, BLO-31996 -- regression test for the clock-divergence defect,
+  // and for the reason it was invisible to an otherwise green suite.
+  //
+  // Every other dispatch case here calls `runRoutine(..., { source: "schedule" })`,
+  // which passes `trigger: null` and no `triggeredAtOverride`. So `triggeredAt`
+  // equals wall clock and the horizon is always the flat fallback -- neither
+  // production input to the new code is exercised at all. This case drives
+  // `tickScheduledTriggers`, which supplies BOTH: a real schedule trigger (so
+  // the horizon is derived from the cron) and a historical `nextRunAt` as
+  // `triggeredAtOverride` (so `triggeredAt` is a past cron tick, not now).
+  //
+  // The original bug: the gate measured fire age from wall clock while the
+  // supersede measured it from `triggeredAt`, making the cancel set a strict
+  // subset of the bypass set. A predecessor whose `createdAt` fell BETWEEN the
+  // two cutoffs was bypassed by the gate but not cancelled, so the successor's
+  // INSERT hit `issues_open_routine_execution_uq`, the catch re-ran the gate,
+  // still found nothing live, and rethrew -- the run erroring with no
+  // measurement taken, strictly worse than the wedge it replaced. Catch-up
+  // after a stall is precisely when this fires, which is the scenario this
+  // whole change exists to recover.
+  //
+  // Hourly cron => horizon 1h - 60s jitter = 59m. With the tick 3h in the past:
+  //   buggy supersede cutoff = triggeredAt - 59m = now - 3h59m
+  //   gate (and fixed) cutoff = now - 59m
+  // A predecessor created 2h ago sits inside that window: older than the gate
+  // cutoff (so bypassed), younger than the buggy supersede cutoff (so NOT
+  // cancelled under the old code).
+  it("supersedes a predecessor when the fire is dispatched from a historical cron tick, not wall clock", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "coalesce_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const { trigger } = await svc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 * * * *",
+      timezone: "UTC",
+    }, {});
+
+    const wedged = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "queued",
+      runStartedAt: new Date(Date.now() - 10 * 60 * 1000),
+      issueCreatedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      bindExecutionRun: true,
+    });
+
+    // A tick three hours in the past becomes `triggeredAtOverride`, so
+    // `triggeredAt !== now` exactly as it is in a real catch-up burst.
+    await db
+      .update(routineTriggers)
+      .set({ nextRunAt: new Date(Date.now() - 3 * 60 * 60 * 1000) })
+      .where(eq(routineTriggers.id, trigger.id));
+
+    resetRoutineDispatchMetrics();
+    await svc.tickScheduledTriggers(new Date());
+
+    // Under the divergent clocks this row survived, the INSERT hit 23505, and
+    // dispatch threw instead of producing a fire.
+    const [predecessor] = await db.select().from(issues).where(eq(issues.id, wedged.issue.id));
+    expect(predecessor.status).toBe("cancelled");
+    expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(1);
+
+    const runs = await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id));
+    expect(runs.some((run) => run.status === "issue_created")).toBe(true);
+    // The failure mode is an errored run, so assert no run recorded a failure
+    // rather than only asserting the happy row exists.
+    expect(runs.filter((run) => run.status === "failed")).toHaveLength(0);
+  });
+
+  // Ally review, BLO-31996: the supersede predicate must not reach a row that
+  // has its own wake path. A `blocked` row with a GENUINE unresolved blocker
+  // edge is dependency-parked, not wedged -- it self-drains when the blocker
+  // closes -- so cancelling it would be a behaviour change in the unsafe
+  // direction. Contrast with the edge-less `blocked` row above, which has no
+  // wake path at all (BLO-27553) and is exactly what this change retires.
+  it("does not supersede a stale predecessor that has a genuine unresolved blocker edge", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "coalesce_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const dependencyParked = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "queued",
+      runStartedAt: new Date(Date.now() - YOUNG_RETRY_AGE_MS),
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      bindExecutionRun: true,
+    });
+
+    const blocker = await issueSvc.create(companyId, {
+      title: "Real blocker",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blocker.id,
+      relatedIssueId: dependencyParked.issue.id,
+      type: "blocks",
+    });
+    await db
+      .update(issues)
+      .set({ status: "blocked" })
+      .where(eq(issues.id, dependencyParked.issue.id));
+
+    resetRoutineDispatchMetrics();
+    await svc.runRoutine(routine.id, { source: "schedule" });
+
+    const [predecessor] = await db.select().from(issues).where(eq(issues.id, dependencyParked.issue.id));
+    expect(predecessor.status).toBe("blocked");
+    expect(predecessor.cancelledAt).toBeNull();
+    expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(0);
+  });
 
   // The run-age bound must not weaken the guarantee BLO-23379 established: a
   // bypassable row sorting ahead of a genuinely in-flight one must never let
@@ -2627,7 +3024,15 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     expect(await svc.tickScheduledTriggers(new Date("2026-07-16T02:30:00.000Z"))).toEqual({ triggered: 3 });
 
-    const runs = await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id));
+    // Ordered explicitly: the two assertions below are positional, and Postgres
+    // guarantees no row order without ORDER BY. This passed on heap order alone
+    // until BLO-31996 added cases earlier in the file, whose rows changed the
+    // layout and permuted the result -- the replay itself was never wrong.
+    const runs = await db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.routineId, routine.id))
+      .orderBy(routineRuns.triggeredAt);
     expect(runs).toHaveLength(3);
     expect(runs.filter((run) => run.status === "issue_created")).toHaveLength(1);
     expect(runs.filter((run) => run.status === "coalesced")).toHaveLength(2);
