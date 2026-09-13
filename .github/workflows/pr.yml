@@ -9,11 +9,19 @@ on:
       - checks_requested
 
 concurrency:
-  # Pull requests are stable by number. A merge-group head SHA changes every
-  # time GitHub re-stages the queue, so key the sole active build for each
-  # merge-queue base branch instead. The repository merge queue is configured
-  # with maximumEntriesToBuild=1; a newer generation must replace the old one.
-  group: pr-${{ github.event.pull_request.number || github.event.merge_group.base_ref || github.run_id }}
+  # Pull requests are stable by number. Merge groups key on `head_ref`, which is
+  # unique per queue entry AND per generation (`pr-1778-2ace7b68` vs
+  # `pr-1778-e34a14b0` after a re-stage). `base_ref` is a constant
+  # (`refs/heads/master`), so it collapses every merge-group build into one slot
+  # and, with cancel-in-progress, the newer entry kills the older one. That is
+  # invisible at maximumEntriesToBuild=1 but silently defeats any raise above 1:
+  # the head's build would be cancelled by the entry queued behind it (BLO-22902).
+  #
+  # Superseding a destroyed generation does not depend on this key. GitHub
+  # cancels a destroyed merge group's runs itself: run 08:48:57Z
+  # (pr-1770-2ace7b68) was cancelled at 09:05:23Z, 73s before any successor run
+  # existed, so no concurrency rule could have done it (measured 2026-09-13).
+  group: pr-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -375,6 +383,15 @@ jobs:
       - name: Test ffmpeg muxer detection (BLO-23128)
         if: ${{ !cancelled() }}
         run: node --test ./.github/scripts/tests/check-ffmpeg-muxer.test.mjs
+        timeout-minutes: 1
+
+      # Guards this workflow's own concurrency key. Keying merge_group on the
+      # constant `base_ref` is harmless at maximumEntriesToBuild=1 and silently
+      # caps the queue at serial the moment that is raised, so the regression
+      # would surface as unexplained latency rather than as a failure.
+      - name: Test merge-queue concurrency key (BLO-22902)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/pr-workflow-concurrency.test.mjs
         timeout-minutes: 1
 
       - name: Test production environment protection guard (BLO-22329)
