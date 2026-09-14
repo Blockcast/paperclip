@@ -15,6 +15,7 @@ import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 import { buildEnvGuardSetupShell } from "./env-guard.js";
 import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
+import { SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
 
 /**
  * Default path to the project-scope .mcp.json that paperclip's helm-chart seed-init
@@ -1001,10 +1002,12 @@ export interface JobBuildResult {
   /** Resolved ServiceAccount for the Job's pod template — echoed here so
    *  callers can log/report it without a cluster read (BLO-21812). */
   serviceAccountName: string;
-  /** Absolute paths backing this Job's nested rw `subPath` mounts. The caller
-   *  must create them before the Job: without fsGroup the kubelet creates a
-   *  missing subPath dir as root:root 0755, which the pod's uid 1000 cannot
-   *  write (BLO-32734). Empty when the run keeps the broad rw mount. */
+  /** Absolute paths, ON THE SERVER'S OWN FILESYSTEM, backing this Job's nested
+   *  rw `subPath` mounts. The caller must create them before the Job: without
+   *  fsGroup the kubelet creates a missing subPath dir as root:root 0755, which
+   *  the pod's uid 1000 cannot write (BLO-32734). Only ever populated when the
+   *  Job mounts the server's own PVC, so the server can reach them; empty when
+   *  the run keeps the broad rw mount. */
   scopedWritableDirs: string[];
 }
 
@@ -1643,7 +1646,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // `dataMountPath` and `${dataMountPath}/.claude`. There is nothing to derive a
   // scope from, and a read-only mount would fail the run at env-guard install.
   // Such runs keep today's broad rw mount — a stated residual, not a fix.
-  const narrowWritableSurface = isolation.enabled;
+  //
+  // Also gated on the Job's `data` volume being THIS server's own PVC. The
+  // `subPath` targets are pre-created by the server through its own mount (see
+  // `scopedWritableDirs`), and that only lands in the Job's volume when both
+  // name the same claim. A per-Job `emptyDir` (no claim) is never shared, so
+  // there is nothing to scope and nothing the server could pre-create; a
+  // foreign `workspaceVolumeClaim` is a volume this process does not hold, so
+  // the kubelet would create the targets root:root and uid 1000 would EACCES at
+  // init. Both keep the broad rw mount rather than emit a Job that cannot start.
+  const narrowWritableSurface =
+    isolation.enabled && dataClaimName !== "" && dataClaimName === selfPod.pvcClaimName;
   volumeMounts.push({
     name: "data",
     mountPath: dataMountPath,
@@ -1734,7 +1747,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // lets ownership inherit from the 2775 setgid parent instead. Deliberately NOT
   // fsGroup: on a whole-volume mount that recursively chowns ~1.5 TB of CephFS
   // on every pod start.
-  const scopedWritableDirs = scopedWritableMounts.map((m) => path.posix.join(dataMountPath, m.subPath));
+  //
+  // Addressed through the SERVER's mount of the volume, not the pod's: a
+  // `subPath` is relative to the volume root, and the server reaches that root
+  // at SELF_POD_DATA_MOUNT_PATH whatever `workspaceMountPath` the pod uses.
+  // Joining onto `dataMountPath` would, under a custom mount path, mkdir on the
+  // server's own root filesystem and leave the Job's volume untouched.
+  const scopedWritableDirs = scopedWritableMounts.map((m) => path.posix.join(SELF_POD_DATA_MOUNT_PATH, m.subPath));
   for (const mount of scopedWritableMounts) {
     volumeMounts.push({ name: "data", mountPath: mount.mountPath, subPath: mount.subPath });
   }
