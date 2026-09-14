@@ -233,13 +233,14 @@ describe("BLO-32695 — the structured verdict block as the primary source", () 
     ).toMatchObject({ state: "failure", outcome: "blocking_finding" });
   });
 
-  it("reads an explicitly empty findings object as a stated zero, not an omission", () => {
-    // The boundary of the missing-`findings` tightening below, pinned from the
+  it("reads an explicitly zeroed findings object as a stated zero", () => {
+    // The boundary of the missing-count tightening below, pinned from the
     // permissive side so the fix cannot quietly grow into rejecting a review
-    // that legitimately found nothing. `{}` is Ally saying "I counted, the
-    // answer was nothing"; omitting the key entirely is Ally saying nothing at
-    // all. Only the second may clear no head.
-    const emptyCounts = `${verdictBlock({ head: PR1675_HEAD, findings: {} })}\n## Ally — Consolidated PR Review`;
+    // that legitimately found nothing. Stating both blocking counts as `0` is
+    // Ally saying "I counted, the answer was nothing"; omitting either — or
+    // the whole object — is Ally saying nothing at all. Only the second may
+    // clear no head.
+    const emptyCounts = `${verdictBlock({ head: PR1675_HEAD, findings: { critical: 0, important: 0 } })}\n## Ally — Consolidated PR Review`;
     const parsed = parseAllyVerdictBlock(emptyCounts);
     expect(parsed.kind).toBe("ok");
     expect(hasActionablePrReviewFeedback(emptyCounts)).toBe(false);
@@ -663,10 +664,34 @@ describe("BLO-32695 — fail-closed on an unreadable block", () => {
       reason: /states no findings counts/,
     },
     {
+      // Same fail-open one level down, and strictly harder to spot: the object
+      // is present, well-typed and internally consistent, it simply never
+      // states the two counts that decide the gate. The blocking loop reads
+      // the absent keys as zero, so this cleared a head while claiming only
+      // that it found no suggestions.
+      name: "a findings object that omits the blocking counts",
+      body: `${verdictBlock({ head: PR1675_HEAD, findings: { suggestions: 0 } })}\n## Ally — Consolidated PR Review`,
+      reason: /omit the `critical` count/,
+    },
+    {
+      name: "a findings object that omits only one blocking count",
+      body: `${verdictBlock({ head: PR1675_HEAD, findings: { critical: 0 } })}\n## Ally — Consolidated PR Review`,
+      reason: /omit the `important` count/,
+    },
+    {
+      // `Number.isInteger(1e100)` is true, so this passed every type check and
+      // then hung extractAllyReportedFindingRefs, which enumerates 1..count.
+      // A malformed block must fail the gate, never stall the worker that
+      // evaluates it.
+      name: "a finding count past the tracking ceiling",
+      body: `${verdictBlock({ head: PR1675_HEAD, findings: { critical: 1e100, important: 0 } })}\n## Ally — Consolidated PR Review`,
+      reason: /exceeds 1000/,
+    },
+    {
       name: "a disposition missing its index",
       body: `${verdictBlock({
         head: PR1675_HEAD,
-        findings: {},
+        findings: { critical: 0, important: 0 },
         dispositions: [{ head: "583085d", severity: "important", verb: "fixed" }],
       })}\n## Ally — Consolidated PR Review`,
       reason: /dispositions are malformed/,

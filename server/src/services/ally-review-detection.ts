@@ -290,9 +290,10 @@ export type AllyVerdictBlockParse =
  * `asDispositions`. A missing `findings` is rejected by the caller rather than
  * defaulted to an empty map: defaulting is a fail-open path, because zero
  * counts read as a clean verdict, so a block that never stated its counts
- * would clear a head. The asymmetry is the contract's — `findings` is
- * mandatory, `dispositions` is genuinely absent on a review that retires
- * nothing.
+ * would clear a head. The same reason makes the blocking keys mandatory *within*
+ * a present object — see the loop at the end. The asymmetry is the contract's —
+ * `findings` is mandatory, `dispositions` is genuinely absent on a review that
+ * retires nothing.
  *
  * Returns the counts, or the reason they could not be read — the caller turns
  * that string into `unreadable`. A reason rather than a bare `null` because an
@@ -308,6 +309,12 @@ function asSeverityCounts(raw: unknown): Map<string, number> | string {
     if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
       return "ally-verdict findings are not severity counts";
     }
+    // `Number.isInteger(1e100)` is true, and the ref loops in
+    // extractAllyReportedFindingRefs enumerate 1..count. Without a ceiling a
+    // single malformed block hangs the gate worker instead of failing it.
+    if (value > MAX_VERDICT_FINDING_COUNT) {
+      return `ally-verdict findings count \`${severity.trim().toLowerCase()}\` exceeds ${MAX_VERDICT_FINDING_COUNT}`;
+    }
     const key = severity.trim().toLowerCase();
     // An unrecognized key must make the whole block unreadable, not be dropped.
     // Dropping it is a fail-open: no blocking check ever consults a severity
@@ -319,6 +326,18 @@ function asSeverityCounts(raw: unknown): Map<string, number> | string {
       return `ally-verdict findings name unsupported severity \`${key}\``;
     }
     counts.set(key, value);
+  }
+  // Absent counts are not zero counts — the same rule the caller applies to a
+  // missing `findings` object, applied one level down. `{}` and
+  // `{"suggestions": 0}` are both a block that never stated what it found, and
+  // both read as 0 Critical / 0 Important to the blocking loop, so a partial
+  // payload would clear a head it made no claim about. Only the blocking keys
+  // are required: `suggestions` cannot fail open, so demanding it would reject
+  // honest verdicts for nothing.
+  for (const severity of BLOCKING_SEVERITIES) {
+    if (!counts.has(severity)) {
+      return `ally-verdict findings omit the \`${severity}\` count`;
+    }
   }
   return counts;
 }
@@ -358,10 +377,11 @@ function asDispositions(raw: unknown): AllyStructuredDisposition[] | null {
  *   - Malformed JSON, or a missing/short `head`. A verdict that does not say
  *     which tree it examined attests nothing, so it must not be able to clear
  *     a head by default.
- *   - A missing `findings` object. Absent counts are not zero counts: zero is
- *     a clean verdict, so defaulting would let a partial payload clear a head
- *     it never made a claim about. An *empty* `findings` object still reads —
- *     that is Ally stating counts, not omitting them.
+ *   - A missing `findings` object, or one that omits a blocking count. Absent
+ *     counts are not zero counts: zero is a clean verdict, so defaulting would
+ *     let a partial payload clear a head it never made a claim about. `{}` and
+ *     `{"suggestions": 0}` are both omissions by that rule — only an explicit
+ *     `critical` and `important` state what was found.
  *   - A prose `Reviewed head:` line that reads cleanly and names a *different*
  *     head. The block would win here and the three prose-only readers would
  *     not, so the same review would attest two different trees depending on
@@ -543,6 +563,15 @@ const COUNTED_FINDINGS_BUCKET_PATTERN =
 // or it re-opens the unretirable carry from the other direction.
 const BLOCKING_SEVERITIES: ReadonlySet<string> = new Set(["critical", "important"]);
 
+// A finding count is a review's tally of one bucket, not an arbitrary integer.
+// Both ref loops in extractAllyReportedFindingRefs enumerate 1..count, so an
+// unbounded count is a hang: `1e100` from a structured block, `(99999999999)`
+// from a prose bucket heading. The structured path rejects anything past this
+// (fail closed, the producer is ours); the prose path clamps, because there the
+// refs are already a deliberate superset and a review with 1000 open findings
+// in one bucket is not a shape worth reddening a PR over.
+const MAX_VERDICT_FINDING_COUNT = 1000;
+
 // The full vocabulary a structured `findings` object may name. Derived from
 // BLOCKING_SEVERITIES so the subset relation cannot drift: adding a blocking
 // severity above automatically makes it readable here, and the only extra is
@@ -720,7 +749,10 @@ export function extractAllyReportedFindingRefs(
   for (const text of [body, withoutFencedCodeBlocks(body)]) {
     for (const [, severity, count] of text.matchAll(COUNTED_FINDINGS_BUCKET_PATTERN)) {
       const key = severity!.toLowerCase();
-      highestCount.set(key, Math.max(highestCount.get(key) ?? 0, Number(count)));
+      highestCount.set(
+        key,
+        Math.min(Math.max(highestCount.get(key) ?? 0, Number(count)), MAX_VERDICT_FINDING_COUNT),
+      );
     }
   }
   if (highestCount.size === 0) return null;
