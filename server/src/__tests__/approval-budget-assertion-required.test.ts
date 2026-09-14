@@ -96,6 +96,21 @@ function postApproval(app: express.Express, body: Record<string, unknown>) {
 /** A real `budget_policies.id`-shaped uuid. */
 const POLICY_ID = "a894e681-9691-4678-88ad-063059210a14";
 
+/** The extractor the guard delegates to, for asserting what it does *not* accept. */
+async function extractAssertions(payload: unknown) {
+  const { extractEnforcementAssertions } = await import("../services/approval-enforcement-reconciler.js");
+  return extractEnforcementAssertions(payload);
+}
+
+/** A valid declared assertion — the shape the guard demands. */
+const VALID_ASSERTION = {
+  kind: "budget_policy_amount",
+  policyId: POLICY_ID,
+  expected_usd: 32000,
+  from_usd: 19000,
+  label: "CTO",
+};
+
 /**
  * The `304ea443` payload shape, reduced to its load-bearing parts: figures as
  * prose, keyed by agent display name, with no policy id anywhere.
@@ -165,15 +180,15 @@ describe("budget_override_required requires an enforcement assertion (BLO-34008)
 
     // A budget card is filed when a cap is about to stop an agent, so the refusal
     // has to be self-describing: the requester must not need a second round trip,
-    // a doc lookup or a guess to satisfy it. Assert the error carries a payload
-    // that can be copied straight back, not just a complaint.
+    // a doc lookup or a guess to satisfy it. Assert the error carries an assertion
+    // fragment that can be copied straight back, not just a complaint.
     const refused = await postApproval(app, {
       type: "budget_override_required",
       payload: PROSE_ONLY_PAYLOAD,
     });
     expect(refused.status).toBe(422);
 
-    const [example] = refused.body.details.example.enforcement_assertions;
+    const [example] = refused.body.details.example_assertions;
     expect(example).toMatchObject({
       kind: "budget_policy_amount",
       policyId: expect.any(String),
@@ -183,6 +198,12 @@ describe("budget_override_required requires an enforcement assertion (BLO-34008)
     expect(example.expected_usd).toEqual(expect.any(Number));
     expect(example.from_usd).toEqual(expect.any(Number));
     expect(refused.body.details.remediation).toContain("budget_policies.id");
+
+    // `policyId` is the one field the server cannot know, so the fragment must not
+    // ship a plausible-looking one: copied verbatim it would pass this guard and
+    // then be refused by the reconciler as `missing_policy`, which is exactly the
+    // "covered but unverifiable" state the guard exists to prevent.
+    expect(await extractAssertions({ enforcement_assertions: [example] })).toEqual([]);
 
     const accepted = await postApproval(app, {
       type: "budget_override_required",
@@ -257,6 +278,92 @@ describe("budget_override_required requires an enforcement assertion (BLO-34008)
     });
 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Resubmit is the second door into `pending`, and guarding only creation left it
+  // open. `svc.resubmit()` writes `payload ?? existing.payload` and flips the card
+  // back to `pending` with no type-specific validation, so the whole failure mode
+  // was reachable in two calls: file a compliant card, have the board send it back
+  // as `revision_requested`, resubmit it prose-only, have it approved. The
+  // reconciler then sees zero assertions and BLO-34008 is live again.
+  // ---------------------------------------------------------------------------
+
+  function revisionRequestedBudgetCard(payload: Record<string, unknown>) {
+    return {
+      id: "approval-budget-1",
+      companyId: "company-1",
+      type: "budget_override_required",
+      status: "revision_requested",
+      payload,
+      requestedByAgentId: "agent-1",
+    };
+  }
+
+  function resubmit(app: express.Express, body: Record<string, unknown>) {
+    return request(app).post("/api/approvals/approval-budget-1/resubmit").send(body);
+  }
+
+  it("refuses a prose-only replacement payload on resubmit", async () => {
+    mockApprovalService.getById.mockResolvedValue(
+      revisionRequestedBudgetCard({ title: "Raise the CTO cap", enforcement_assertions: [VALID_ASSERTION] }),
+    );
+
+    const res = await resubmit(await createAgentApp(), { payload: PROSE_ONLY_PAYLOAD });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details.code).toBe("budget_approval_missing_enforcement_assertion");
+    expect(mockApprovalService.resubmit).not.toHaveBeenCalled();
+  });
+
+  it("refuses an empty resubmit that would restore a prose-only payload", async () => {
+    // The dangerous half: `resubmit` falls back to the stored payload when the
+    // caller sends none, so a card filed before this guard existed — every one of
+    // them, `304ea443` included — reaches `pending` again on an empty body, having
+    // passed through no check at all.
+    mockApprovalService.getById.mockResolvedValue(revisionRequestedBudgetCard(PROSE_ONLY_PAYLOAD));
+
+    const res = await resubmit(await createAgentApp(), {});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details.code).toBe("budget_approval_missing_enforcement_assertion");
+    expect(mockApprovalService.resubmit).not.toHaveBeenCalled();
+  });
+
+  it("accepts a resubmit that declares its figures, and does not deadlock the card", async () => {
+    mockApprovalService.getById.mockResolvedValue(revisionRequestedBudgetCard(PROSE_ONLY_PAYLOAD));
+    mockApprovalService.resubmit.mockImplementation(async (id: string, payload?: Record<string, unknown>) => ({
+      ...revisionRequestedBudgetCard(payload ?? {}),
+      id,
+      status: "pending",
+    }));
+
+    const res = await resubmit(await createAgentApp(), {
+      payload: { ...PROSE_ONLY_PAYLOAD, enforcement_assertions: [VALID_ASSERTION] },
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockApprovalService.resubmit).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves resubmit of every other approval type alone", async () => {
+    mockApprovalService.getById.mockResolvedValue({
+      ...revisionRequestedBudgetCard({ title: "Approve hosting spend" }),
+      type: "request_board_approval",
+    });
+    mockApprovalService.resubmit.mockResolvedValue({
+      id: "approval-budget-1",
+      companyId: "company-1",
+      type: "request_board_approval",
+      status: "pending",
+      payload: { title: "Approve hosting spend" },
+      requestedByAgentId: "agent-1",
+    });
+
+    const res = await resubmit(await createAgentApp(), { payload: { title: "Approve hosting spend" } });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockApprovalService.resubmit).toHaveBeenCalledTimes(1);
   });
 });
 
