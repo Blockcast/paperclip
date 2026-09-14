@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
@@ -134,4 +135,45 @@ test("API Deployment does not receive the worker-only readiness budget", () => {
     "persistence.existingClaim=paperclip-shared",
   ]);
   assert.doesNotMatch(rendered, /PENSTOCK_READY_TIMEOUT_MS/);
+});
+
+// BLO-33279, second half. Rendering the value onto the worker is necessary and
+// NOT sufficient: the claude_k8s adapter filters every inherited literal
+// through AGENT_ENV_ALLOWLIST (BLO-22514, k8s-client.ts), so a worker.extraEnv
+// literal whose name is not listed there reaches no agent pod at all. That is
+// how PENSTOCK_READY_TIMEOUT_MS shipped green on 2026-09-12 and changed
+// nothing — the test above passed, the sts carried the value, and every agent
+// Job still ran the 15000 ms default. The runbook asserted "there is no name
+// allowlist", which had been false since BLO-22514.
+//
+// ponytail: text-scrape of the allowlist rather than importing it — the module
+// is TypeScript in a vendored package and this is a dependency-free node:test
+// file. Upgrade to a real import if these tests ever gain a TS pipeline.
+test("every literal worker.extraEnv name is inheritable by agent Jobs", () => {
+  const values = readFileSync(`${repoRoot}/${blockcastValues}`, "utf8");
+  const workerBlock = values.match(/^worker:\n((?:[ \t].*\n|\n)*)/m)?.[1];
+  assert.ok(workerBlock, "worker: block not found in values.blockcast.yaml");
+
+  // Literals only. valueFrom entries travel a separate path.
+  const literals = [...workerBlock.matchAll(/- name: (\S+)\n\s+value:/g)].map((m) => m[1]);
+  assert.ok(literals.length > 0, "expected at least one literal in worker.extraEnv");
+
+  const allowlistSrc = readFileSync(
+    `${repoRoot}/vendor/paperclip-adapter-claude-k8s/src/server/inherit-allowlist.ts`,
+    "utf8",
+  );
+  const exactNames = allowlistSrc.match(/AGENT_ENV_ALLOWLIST[\s\S]*?\n\]\);/)?.[0];
+  const prefixes = allowlistSrc.match(/AGENT_ENV_ALLOWED_PREFIXES[\s\S]*?\n\];/)?.[0];
+  assert.ok(exactNames && prefixes, "could not locate the adapter allowlist declarations");
+
+  for (const name of literals) {
+    const inheritable =
+      exactNames.includes(`"${name}"`) ||
+      [...prefixes.matchAll(/"([A-Z_]+_)"/g)].some((m) => name.startsWith(m[1]));
+    assert.ok(
+      inheritable,
+      `worker.extraEnv sets ${name}, but AGENT_ENV_ALLOWLIST does not admit it — ` +
+        `the adapter will drop it and no agent pod will ever see the value`,
+    );
+  }
 });
