@@ -264,8 +264,15 @@ async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promi
       notInArray(issues.status, ["done", "cancelled"]),
       isNull(issues.monitorNextCheckAt),
       visibleIssueCondition(),
-      sql`jsonb_typeof(${issues.executionState} -> 'monitor' -> 'gateSignals') = 'array'`,
-      sql`jsonb_array_length(${issues.executionState} -> 'monitor' -> 'gateSignals') > 0`,
+      // One CASE, not two ANDed predicates: PostgreSQL does not promise to
+      // evaluate a WHERE conjunct only after its neighbour, so a separate
+      // `jsonb_typeof(...) = 'array'` guard does not stop the planner from
+      // calling `jsonb_array_length` on a malformed object/scalar `gateSignals`
+      // — and that raises, aborting the whole pass rather than skipping the one
+      // bad row. CASE is the documented construct that does guarantee it.
+      sql`case when jsonb_typeof(${issues.executionState} -> 'monitor' -> 'gateSignals') = 'array'
+            then jsonb_array_length(${issues.executionState} -> 'monitor' -> 'gateSignals')
+            else 0 end > 0`,
       sql`not exists (
         select 1 from issue_comments resolved_comment
         where resolved_comment.issue_id = ${issues.id}
