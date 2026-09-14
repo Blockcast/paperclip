@@ -66,6 +66,29 @@ describe("findMissingHookCommandPaths", () => {
     expect(calls.length).toBeGreaterThan(1);
   });
 
+  it("counts operators against the token budget, not only words", () => {
+    // Before this, only words consumed the cap, so a legacy row made of
+    // operators (`;;;;…`) grew the token array without limit — the allocation
+    // the cap exists to bound (BLO-29505 review). Every token now counts, so
+    // nothing past the 64th operator is read at all. `;;` is one two-character
+    // operator, so 200 semicolons are 100 tokens.
+    const stated: string[] = [];
+    expect(
+      findMissingHookCommandPaths(`${";".repeat(200)} node /app/gone.js`, {
+        fileExists: (p) => {
+          stated.push(p);
+          return false;
+        },
+      }),
+    ).toEqual([]);
+    expect(stated).toEqual([]);
+    // Non-vacuous: a few operators stay under the cap and the script after
+    // them is still audited.
+    expect(findMissingHookCommandPaths(";;; node /app/gone.js", fsWith())).toEqual([
+      "/app/gone.js",
+    ]);
+  });
+
   it("flags the exact BLO-28782 production command", () => {
     // The literal string that was stored in instance_settings.general and
     // produced 500/500 MODULE_NOT_FOUND fires between 2026-07-05 and
@@ -471,6 +494,107 @@ describe("findMissingHookCommandPaths — code options are interpreter-scoped", 
   });
 });
 
+// A here-document body is data the command reads, not commands the shell runs.
+// The tokenizer does not track the delimiter, so before this the body lines were
+// split into further simple commands and `/app/data.sh` on its own line was
+// stat'd as an argv[0] and reported missing on a correct configuration
+// (BLO-29505 review).
+describe("findMissingHookCommandPaths — here-documents", () => {
+  it("does not audit here-document body lines as commands", () => {
+    const stated: string[] = [];
+    expect(
+      findMissingHookCommandPaths("cat <<EOF\n/app/data.sh\nEOF", {
+        fileExists: (p) => {
+          stated.push(p);
+          return false;
+        },
+      }),
+    ).toEqual([]);
+    expect(stated).toEqual([]);
+  });
+
+  it("still audits the script that reads the here-document", () => {
+    expect(
+      findMissingHookCommandPaths("bash /app/gone.sh <<'EOF'\n/app/data.sh\nEOF", fsWith()),
+    ).toEqual(["/app/gone.sh"]);
+  });
+});
+
+// The whole option word was compared as one name, so a code option bundled with
+// other short flags matched nothing, was read as a plain flag, and the quoted
+// command string after it was stat'd as the script: `bash -ec "/app/gone.sh
+// --force"` reported a path with a space and a flag in it missing, on a correct
+// configuration — contradicting the documented `bash -c` skip (BLO-29505 review).
+describe("findMissingHookCommandPaths — bundled short options", () => {
+  const bundledCodeCases: { label: string; command: string }[] = [
+    { label: "bash -ec", command: `bash -ec "/app/gone.sh --force"` },
+    { label: "sh -exc", command: `sh -exc '/app/gone.sh'` },
+    { label: "perl -pe", command: `perl -pe "/app/gone.pl"` },
+    { label: "ruby -ne", command: `ruby -ne "/app/gone.rb"` },
+    { label: "node -pe", command: `node -pe "/app/gone.js"` },
+    { label: "python3 -Bc", command: `python3 -Bc "/app/gone.py"` },
+  ];
+
+  for (const { label, command } of bundledCodeCases) {
+    it(`still stops at ${label}: \`${command}\``, () => {
+      const stated: string[] = [];
+      expect(
+        findMissingHookCommandPaths(command, {
+          fileExists: (p) => {
+            stated.push(p);
+            return false;
+          },
+        }),
+      ).toEqual([]);
+      expect(stated).toEqual([]);
+    });
+  }
+
+  // A bundle of plain flags is still plain flags: the word after it is the
+  // script. Guards against "any bundle stops resolution", which would reopen
+  // the `bash -e` recall gap under a different spelling.
+  const bundledPlainCases: { command: string; expected: string }[] = [
+    { command: "bash -ex /app/hook.sh", expected: "/app/hook.sh" },
+    { command: "perl -wp /app/hook.pl", expected: "/app/hook.pl" },
+    { command: "python3 -Bu /app/hook.py", expected: "/app/hook.py" },
+  ];
+
+  for (const { command, expected } of bundledPlainCases) {
+    it(`audits the script behind a plain bundle: \`${command}\``, () => {
+      expect(findMissingHookCommandPaths(command, fsWith())).toEqual([expected]);
+    });
+  }
+
+  it("consumes an operand attached to, or following, a bundled option", () => {
+    // getopt: the first letter that takes an operand owns the rest of the word;
+    // a last letter that takes one consumes the next word instead.
+    const stated: string[] = [];
+    expect(
+      findMissingHookCommandPaths("python3 -Xutf8 /app/hook.py", {
+        fileExists: (p) => {
+          stated.push(p);
+          return false;
+        },
+      }),
+    ).toEqual(["/app/hook.py"]);
+    expect(stated).toEqual(["/app/hook.py"]);
+    expect(findMissingHookCommandPaths("perl -I/opt/lib /app/hook.pl", fsWith())).toEqual([
+      "/app/hook.pl",
+    ]);
+    expect(findMissingHookCommandPaths("python3 -BX utf8 /app/hook.py", fsWith())).toEqual([
+      "/app/hook.py",
+    ]);
+  });
+
+  it("does not split PowerShell's single-dash parameters into letters", () => {
+    // `-NonInteractive` spells a `c`, which is code to pwsh only as the whole
+    // parameter `-Command`; splitting it would end resolution before the script.
+    expect(findMissingHookCommandPaths("pwsh -NonInteractive /app/gone.ps1", fsWith())).toEqual([
+      "/app/gone.ps1",
+    ]);
+  });
+});
+
 // Documented skips: these stay silent on purpose. Asserting them keeps the
 // module header's stated limits honest — if a later change starts flagging one,
 // a test fails rather than an operator getting a warning we cannot stand behind.
@@ -495,6 +619,10 @@ describe("findMissingHookCommandPaths — documented deliberate skips", () => {
     { label: "perl -e inline code", command: `perl -e '/app/gone.pl'` },
     { label: "--eval= attached form", command: `node --eval="/app/gone.js"` },
     { label: "second operand of an interpreter", command: "node /app/ok.js /app/gone.js" },
+    // The body ends at a delimiter line the tokenizer does not track, so the
+    // scan stops at `<<` — a command after the body is a recall gap, not a
+    // finding.
+    { label: "command after a here-document body", command: "cat <<EOF\ndata\nEOF\nnode /app/gone.js" },
   ];
 
   for (const { label, command } of skipCases) {

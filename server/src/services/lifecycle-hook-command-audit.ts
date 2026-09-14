@@ -93,7 +93,9 @@
  *     so a script written after it is not audited either. Which options mean
  *     "code" is **per interpreter**: `-e` is code to node/perl/ruby but errexit
  *     to a shell, and `-p` is `--print` to node but a no-operand flag to perl,
- *     so `bash -e /app/hook.sh` and `perl -p /app/hook.pl` *are* audited;
+ *     so `bash -e /app/hook.sh` and `perl -p /app/hook.pl` *are* audited. A
+ *     code option bundled with other short flags (`bash -ec '…'`, `perl -pe
+ *     '…'`) is the same option to the interpreter and stops the same way;
  *   - the operand of an option that takes a *value* — `python3 -X utf8`,
  *     `perl -I /opt/lib`. Consumed so it cannot be mistaken for the script, but
  *     never stat'd: python does not open `utf8`, and perl ignores a missing
@@ -101,7 +103,12 @@
  *     treated as taking no operand, so an unmodelled `--opt value` form still
  *     shadows the script;
  *   - the second and later arguments of an interpreter — only the first non-flag
- *     argument is treated as the script.
+ *     argument is treated as the script;
+ *   - everything after a here-document operator (`<<`). The body is data the
+ *     command reads, not commands the shell runs, and it closes at a delimiter
+ *     line the tokenizer does not track, so a body line such as `/app/data.sh`
+ *     must not be read as an argv[0] and reported missing. The script *before*
+ *     the `<<` is still audited; commands after the body are not.
  *
  * A finding is therefore evidence, not a verdict, and no caller treats it as
  * one: the boot audit only logs and the write path only warns. The cost of a
@@ -126,13 +133,16 @@ export const LIFECYCLE_HOOK_COMMAND_SETTINGS = [
 export type LifecycleHookCommandSetting = (typeof LIFECYCLE_HOOK_COMMAND_SETTINGS)[number];
 
 /**
- * Hard ceiling on **words** tokenized per command. `fileExists` is a
- * *synchronous* stat, and the write path runs this inline in an HTTP handler, so
- * the word count is a direct multiplier on how long the API event loop blocks.
- * Each word can contribute at most one stat, so this is the stat bound too. The
- * validator caps the setting at 4 KiB, but the boot audit reads rows written
- * before that cap existed, so the bound is enforced here too (BLO-28872 review).
- * Do not remove it while narrowing detection — the two guards are independent.
+ * Hard ceiling on **tokens** — words *and* operators — read per command.
+ * `fileExists` is a *synchronous* stat, and the write path runs this inline in
+ * an HTTP handler, so the token count is a direct multiplier on how long the
+ * API event loop blocks and on how much is allocated per audit. Each word can
+ * contribute at most one stat, so this is the stat bound too. Operators count
+ * as well: a bound on words alone let an operator-heavy row (`;;;;…`) grow the
+ * token array without limit (BLO-29505 review). The validator caps the setting
+ * at 4 KiB, but the boot audit reads rows written before that cap existed, so
+ * the bound is enforced here too (BLO-28872 review). Do not remove it while
+ * narrowing detection — the two guards are independent.
  */
 const MAX_AUDITED_TOKENS = 64;
 
@@ -193,12 +203,6 @@ function isScriptInterpreter(basename: string): boolean {
 
 /** A leading `VAR=value` environment assignment, which precedes argv[0]. */
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
-
-/** `--require=/app/pre.js` -> `--require`; `-X` -> `-X`. */
-function optionName(option: string): string {
-  const equals = option.indexOf("=");
-  return equals === -1 ? option : option.slice(0, equals);
-}
 
 /**
  * Interpreter families, for options whose meaning depends on which binary is
@@ -261,8 +265,7 @@ const RUBY_CODE_OPTIONS = new Set(["-e"]);
 const PHP_CODE_OPTIONS = new Set(["-r"]);
 const POWERSHELL_CODE_OPTIONS = new Set(["-c", "-command"]);
 
-function takesCodeOperand(interpreter: string, option: string): boolean {
-  const name = optionName(option);
+function takesCodeOperand(interpreter: string, name: string): boolean {
   if (SHELL_INTERPRETER.test(interpreter)) return SHELL_CODE_OPTIONS.has(name);
   if (NODE_LIKE_INTERPRETER.test(interpreter)) return NODE_CODE_OPTIONS.has(name);
   if (PYTHON_LIKE_INTERPRETER.test(interpreter)) return PYTHON_CODE_OPTIONS.has(name);
@@ -319,6 +322,46 @@ function separateOperandKind(interpreter: string, name: string): "path" | "value
   return null;
 }
 
+interface OptionWord {
+  /** `--require`, `-c`, `-Command` — the name the interpreter dispatches on. */
+  name: string;
+  /** An operand carried in the same word (`--require=/x`, `-I/opt/lib`). */
+  inline: string | null;
+}
+
+/**
+ * The options one argv word spells. A long option is one name with an optional
+ * `=value`. A single-dash word is a POSIX **bundle** for every interpreter here
+ * except PowerShell — `-ec` is `-e` then `-c` — and the first letter that takes
+ * an operand owns the rest of the word as its attached operand (`-Xutf8`,
+ * `-I/opt/lib`), which is getopt's rule and each of these binaries' too.
+ *
+ * Before this, the whole word was compared as one name, so `bash -ec "…"`
+ * matched no option, was read as a plain flag, and the quoted command string
+ * after it was stat'd as the script — a false positive the header's `bash -c`
+ * skip claimed could not happen (BLO-29505 review). PowerShell is excluded
+ * because its parameters are single-dash words, not bundles: `-NonInteractive`
+ * spells a `c` that is not `-Command`.
+ */
+function splitOptionWord(interpreter: string, word: string): OptionWord[] {
+  if (word.startsWith("--") || word.length <= 2 || POWERSHELL_INTERPRETER.test(interpreter)) {
+    const equals = word.indexOf("=");
+    return equals === -1
+      ? [{ name: word, inline: null }]
+      : [{ name: word.slice(0, equals), inline: word.slice(equals + 1) }];
+  }
+  const options: OptionWord[] = [];
+  for (let k = 1; k < word.length; k++) {
+    const name = `-${word[k]}`;
+    if (takesCodeOperand(interpreter, name) || separateOperandKind(interpreter, name) !== null) {
+      options.push({ name, inline: k + 1 < word.length ? word.slice(k + 1) : null });
+      break;
+    }
+    options.push({ name, inline: null });
+  }
+  return options;
+}
+
 /**
  * Characters that make the shell rewrite a word before exec, so the text we see
  * is not the path that will be opened. Checked only where they appear
@@ -351,17 +394,18 @@ type ShellToken = { kind: "word"; word: ShellWord } | { kind: "operator"; value:
  * a space into unrelated fragments and discarded any token a metacharacter was
  * glued to (`/a.js;echo` yielded nothing rather than `/a.js`) — BLO-29505 Part B.
  *
- * `maxWords` is checked before each new word begins, so words are never
+ * `maxTokens` is checked before each new token begins, so words are never
  * truncated mid-path. Truncating one would invent a path that does not exist and
  * report it as missing, which is the failure mode a bound must not introduce.
+ * Operators consume the budget too; counting words alone left the token array
+ * unbounded on an operator-heavy input.
  */
-function tokenizeShellCommand(command: string, maxWords: number): ShellToken[] {
+function tokenizeShellCommand(command: string, maxTokens: number): ShellToken[] {
   const tokens: ShellToken[] = [];
   const length = command.length;
-  let words = 0;
   let i = 0;
 
-  while (i < length && words < maxWords) {
+  while (i < length && tokens.length < maxTokens) {
     const char = command[i];
 
     if (char === " " || char === "\t" || char === "\r") {
@@ -435,7 +479,6 @@ function tokenizeShellCommand(command: string, maxWords: number): ShellToken[] {
     }
 
     tokens.push({ kind: "word", word: { value, expandable } });
-    words++;
   }
 
   return tokens;
@@ -443,7 +486,10 @@ function tokenizeShellCommand(command: string, maxWords: number): ShellToken[] {
 
 /**
  * Group tokens into simple commands, dropping redirect targets. `(`/`)`/`;`/`&&`
- * end the current command; `>`/`<` consume the word after them.
+ * end the current command; `>`/`<` consume the word after them. A here-document
+ * (`<<`) ends the scan: its body is data the command reads, not commands the
+ * shell runs, and it closes at a delimiter line this tokenizer does not track,
+ * so body lines must not be read as further argv[0]s.
  */
 function splitSimpleCommands(tokens: ShellToken[]): ShellWord[][] {
   const commands: ShellWord[][] = [];
@@ -452,6 +498,7 @@ function splitSimpleCommands(tokens: ShellToken[]): ShellWord[][] {
 
   for (const token of tokens) {
     if (token.kind === "operator") {
+      if (token.value === "<<") break;
       if (REDIRECT_OPERATORS.has(token.value)) {
         dropNextWord = true;
         continue;
@@ -523,30 +570,28 @@ function resolveCommandPositionPaths(words: ShellWord[]): string[] {
       const argument = words[j];
 
       if (!argument.expandable && argument.value.startsWith("-")) {
-        const name = optionName(argument.value);
-        const kind = separateOperandKind(interpreter, name);
+        let consumesNextWord = false;
+        for (const { name, inline } of splitOptionWord(interpreter, argument.value)) {
+          // `bash -c`/`node -e`/`python3 -m` mean the operand is code or a
+          // module, not a path. Stop rather than stat a command string as a
+          // filename. Scoped per interpreter: `bash -e` and `perl -p` are plain
+          // flags, and stopping on those hid the script after them. Bundled
+          // (`bash -ec`) is the same option to the interpreter, so it stops too.
+          if (takesCodeOperand(interpreter, name)) return paths;
 
-        if (kind !== null) {
-          if (name.length < argument.value.length) {
-            // `--require=/app/pre.js` carries its operand in the same word, so
-            // the following word is still a script candidate.
-            const inline = argument.value.slice(name.length + 1);
+          const kind = separateOperandKind(interpreter, name);
+          if (kind === null) continue;
+          if (inline !== null) {
+            // `--require=/app/pre.js` / `-I/opt/lib` carry the operand in the
+            // same word, so the following word is still a script candidate.
             if (kind === "path" && inline.startsWith("/")) paths.push(inline);
-            j++;
           } else {
             const operand = words[j + 1];
             if (kind === "path" && operand && isAbsoluteLiteral(operand)) paths.push(operand.value);
-            j += 2;
+            consumesNextWord = true;
           }
-          continue;
         }
-
-        // `bash -c`/`node -e`/`python3 -m` mean the operand is code or a
-        // module, not a path. Stop rather than stat a command string as a
-        // filename. Scoped per interpreter: `bash -e` and `perl -p` are plain
-        // flags, and stopping on those hid the script after them.
-        if (takesCodeOperand(interpreter, argument.value)) return paths;
-        j++;
+        j += consumesNextWord ? 2 : 1;
         continue;
       }
 
