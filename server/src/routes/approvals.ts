@@ -21,6 +21,10 @@ import {
 } from "../services/index.js";
 import { actorCanReadAgentConfig, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { redactApprovalPayloadForDisplay, withholdAgentConfigFromApprovalPayload } from "../redaction.js";
+import {
+  BUDGET_POLICY_AMOUNT_ASSERTION,
+  extractEnforcementAssertions,
+} from "../services/approval-enforcement-reconciler.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
 import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
@@ -428,6 +432,62 @@ export function approvalRoutes(
     ) {
       res.status(422).json({
         error: "Generic hire approvals cannot bind an existing agent; use the agent hire endpoint",
+      });
+      return;
+    }
+
+    // BLO-34008: refuse a budget card that declares no machine-checkable target.
+    //
+    // Approving this type writes nothing to `budget_policies` — approvalService
+    // .approve() special-cases only `hire_agent` — so the only thing that can
+    // ever notice an approved-but-unapplied budget decision is the enforcement
+    // reconciler, and it can only see a card that declares its figures. Card
+    // `304ea443` is the cost of accepting one that does not: its eight decided
+    // figures went into `payload.raises`/`payload.cuts` as prose keyed by agent
+    // display name, it was approved, and all eight changes were still unapplied
+    // five days later with nothing able to raise a word. It remains unparseable
+    // and always will be. Refusing at creation is the only repair that does not
+    // reduce to regexing a figure out of English, which BLO-32796's first
+    // guardrail forbids outright.
+    //
+    // Deliberately scoped to this caller-supplied boundary. The budget watcher's
+    // own threshold cards are filed through insertApproval() (services/budgets.ts)
+    // and never reach this route — correctly, because such a card records that a
+    // cap was *crossed*, not a decided figure to raise it *to*. There is no target
+    // to declare until the board writes one at /costs, and inventing one here
+    // would be precisely the guess this refusal exists to prevent.
+    if (
+      approvalInput.type === "budget_override_required" &&
+      extractEnforcementAssertions(normalizedPayload).length === 0
+    ) {
+      res.status(422).json({
+        error:
+          "`budget_override_required` requires at least one machine-checkable entry in " +
+          "`payload.enforcement_assertions`; prose figures cannot be verified against enforcement",
+        details: {
+          code: "budget_approval_missing_enforcement_assertion",
+          // One corrected payload, copyable as-is. The refusal has to be fixable in
+          // a single retry: these cards are filed when a cap is about to stop an
+          // agent, so a guard that costs a round of guesswork is its own outage.
+          example: {
+            enforcement_assertions: [
+              {
+                kind: BUDGET_POLICY_AMOUNT_ASSERTION,
+                policyId: "00000000-0000-0000-0000-000000000000",
+                expected_usd: 32000,
+                from_usd: 19000,
+                label: "CTO",
+              },
+            ],
+          },
+          remediation:
+            "Add one entry per policy this decision changes. `policyId` is a `budget_policies.id` " +
+            "uuid — NOT an agent id; read it from the budget policy that enforces the cap. Give the " +
+            "target as `expected_usd` (dollars) or `expected_amount_cents` (integer cents), and the " +
+            "figure the change starts from as `from_usd` / `from_amount_cents`. The starting figure " +
+            "is what lets a later reader tell 'this was never applied' from 'it was applied and then " +
+            "superseded'; omit it and the card can only be reported as unverifiable, never acted on.",
+        },
       });
       return;
     }
