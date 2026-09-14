@@ -59,12 +59,15 @@ export function ProviderQuotaCard({
     let inputTokens = 0, outputTokens = 0, costCents = 0;
     let apiRunCount = 0, subRunCount = 0, subInputTokens = 0, subOutputTokens = 0;
     for (const r of rows) {
-      inputTokens += r.inputTokens;
+      // BLO-29842: cache writes are billed prompt tokens that used to be folded
+      // into inputTokens. Adding them back here keeps these volume totals
+      // measuring the same thing they did before the column was split out.
+      inputTokens += r.inputTokens + r.cacheCreationInputTokens;
       outputTokens += r.outputTokens;
       costCents += r.costCents;
       apiRunCount += r.apiRunCount;
       subRunCount += r.subscriptionRunCount;
-      subInputTokens += r.subscriptionInputTokens;
+      subInputTokens += r.subscriptionInputTokens + r.subscriptionCacheCreationInputTokens;
       subOutputTokens += r.subscriptionOutputTokens;
     }
     const totalTokens = inputTokens + outputTokens;
