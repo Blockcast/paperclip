@@ -137,12 +137,61 @@ const VERDICT_OPENER_RE = new RegExp(
 );
 const SUPPORTED_VERDICT_VERSION = 1;
 
+// Mirrors the same-named constants in ally-review-detection.ts. The block is
+// the authoritative statement of what a review found, so this auditor must read
+// the same fields the gate reads: a body whose prose buckets carry no `(N)`
+// counts is not evidence of a clean review once the block says otherwise.
+const MAX_VERDICT_FINDING_COUNT = 1000;
+const BLOCKING_SEVERITIES = ["critical", "important"];
+const VERDICT_SEVERITIES = new Set([...BLOCKING_SEVERITIES, "suggestions"]);
+const BLOCKING_PRIOR_DISPOSITIONS = new Set(["still-present"]);
+
+/**
+ * `true` when the block reports a Critical/Important finding, `false` when it
+ * explicitly reports none, `null` when the payload cannot be trusted.
+ *
+ * Absent counts are not zero counts, and an unknown severity key is not a key
+ * to drop: both are fail-open routes by which a block claiming a finding reads
+ * byte-identically to a clean one. See asSeverityCounts for the long form.
+ */
+function blockingFindingsIn(raw) {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const counts = new Map();
+  for (const [severity, value] of Object.entries(raw)) {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0) return null;
+    if (value > MAX_VERDICT_FINDING_COUNT) return null;
+    const key = severity.trim().toLowerCase();
+    if (!VERDICT_SEVERITIES.has(key)) return null;
+    counts.set(key, value);
+  }
+  if (!BLOCKING_SEVERITIES.every((severity) => counts.has(severity))) return null;
+  return BLOCKING_SEVERITIES.some((severity) => counts.get(severity) > 0);
+}
+
+/** `true`/`false` per the ledger, `null` when an entry is malformed. */
+function stillPresentIn(raw) {
+  if (raw === undefined) return false;
+  if (!Array.isArray(raw)) return null;
+  let stillPresent = false;
+  for (const item of raw) {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) return null;
+    const { head, severity, index, verb } = item;
+    if (typeof head !== "string" || !/^[0-9a-f]{7,40}$/i.test(head.trim())) return null;
+    if (typeof severity !== "string" || !severity.trim()) return null;
+    if (typeof verb !== "string" || !verb.trim()) return null;
+    if (typeof index !== "number" || !Number.isInteger(index) || index < 1) return null;
+    if (BLOCKING_PRIOR_DISPOSITIONS.has(verb.trim().toLowerCase())) stillPresent = true;
+  }
+  return stillPresent;
+}
+
 /**
  * `{ kind: "absent" }` when no block is present (fall back to prose),
  * `{ kind: "unreadable" }` when one is present but cannot be trusted (fail
- * closed — never fall back), or `{ kind: "ok", head }`.
+ * closed — never fall back), or
+ * `{ kind: "ok", head, blockingFindings, stillPresent }`.
  */
-function structuredVerdictHead(text) {
+function structuredVerdict(text) {
   const blocks = Array.from(text.matchAll(VERDICT_BLOCK_RE));
   const openers = Array.from(text.matchAll(VERDICT_OPENER_RE));
   // A truncated payload is a broken block, not an older review, so it must not
@@ -161,7 +210,10 @@ function structuredVerdictHead(text) {
   if (typeof head !== "string" || !/^[0-9a-f]{40}$/i.test(head.trim())) {
     return { kind: "unreadable" };
   }
-  return { kind: "ok", head: head.trim().toLowerCase() };
+  const blockingFindings = blockingFindingsIn(parsed?.findings);
+  const stillPresent = stillPresentIn(parsed?.dispositions);
+  if (blockingFindings === null || stillPresent === null) return { kind: "unreadable" };
+  return { kind: "ok", head: head.trim().toLowerCase(), blockingFindings, stillPresent };
 }
 
 /**
@@ -176,7 +228,7 @@ function structuredVerdictHead(text) {
  * back on the critical path.
  */
 function attestedHeadFrom(text) {
-  const block = structuredVerdictHead(text);
+  const block = structuredVerdict(text);
   if (block.kind === "unreadable") return null;
   const attestations = Array.from(text.matchAll(ATTESTED_HEAD_GLOBAL_RE));
   const proseHead = attestations.length === 1 ? attestations[0][1].toLowerCase() : null;
@@ -211,8 +263,44 @@ function isApproved(review) {
   return reviewState(review) === "APPROVED";
 }
 
+/**
+ * One fact from the structured block: `true`/`false` when the block states it,
+ * `null` when there is no block and the prose fallback should answer instead.
+ *
+ * The block is authoritative when present. Its `findings` counts are the
+ * producer's own tally, and the review template heads its buckets
+ * `### 🚨 Critical` with no `(N)`, so the prose readers see a blocking review as
+ * clean — that gap is the whole reason this reader exists.
+ *
+ * An unreadable block returns `true` rather than falling back. Every caller
+ * reads `true` as "report a violation", so that is the direction that cannot
+ * mask a finding, and it matches the gate: a block Ally tried and failed to
+ * state is not the same fact as a review that predates the block.
+ */
+function structuredBlocking(body, field) {
+  const block = structuredVerdict(String(body ?? ""));
+  if (block.kind === "unreadable") return true;
+  if (block.kind === "absent") return null;
+  return block[field];
+}
+
+/**
+ * I2a's fact: the body reports an open Critical/Important finding.
+ *
+ * Kept separate from reportsStillPresent because I2a and I2c name different
+ * defects, and a review must not be reported for the other one's cause.
+ */
+function reportsBlockingFindings(body) {
+  return structuredBlocking(body, "blockingFindings") ?? hasBlockingFindings(body);
+}
+
+/** I2c's fact: the body marks a prior finding as still standing. */
+function reportsStillPresent(body) {
+  return structuredBlocking(body, "stillPresent") ?? hasStillPresentDisposition(body);
+}
+
 function hasBlockingVerdict(body) {
-  return hasBlockingFindings(body) || hasStillPresentDisposition(body);
+  return reportsBlockingFindings(body) || reportsStillPresent(body);
 }
 
 function reviewDetails(reviews) {
@@ -465,12 +553,12 @@ export function findPrViolations(pr) {
         );
       }
 
-      if (isApproved(review) && hasBlockingFindings(review.body)) {
+      if (isApproved(review) && reportsBlockingFindings(review.body)) {
         violations.push(
           `I2a PR #${pr.number} @${short}: ${label} review ${review.id} is APPROVED but its body reports a Critical/Important finding`,
         );
       }
-      if (isApproved(review) && hasStillPresentDisposition(review.body)) {
+      if (isApproved(review) && reportsStillPresent(review.body)) {
         violations.push(
           `I2c PR #${pr.number} @${short}: ${label} review ${review.id} is APPROVED but its body marks a prior finding still-present`,
         );

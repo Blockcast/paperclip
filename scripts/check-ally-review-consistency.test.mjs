@@ -49,6 +49,16 @@ function canonicalBody(head = HEAD, extra = "") {
   return `## Ally — Consolidated PR Review\nReviewed head: ${head}\n${extra}`;
 }
 
+/**
+ * A body in the shape the live producer actually emits: canonical heading, the
+ * prose attestation, then the structured block. `findings` is passed verbatim
+ * so a test can state a partial payload.
+ */
+function verdictBody(findings, extra = "", dispositions = [], head = HEAD) {
+  const payload = JSON.stringify({ head, findings, dispositions }, null, 2);
+  return `## Ally — Consolidated PR Review\nReviewed head: ${head}\n\n<!-- ally-verdict:1\n${payload}\n-->\n${extra}`;
+}
+
 function appReview(overrides = {}) {
   return review({ user: { login: "allyblockcast[bot]", id: ALLY_APP_REVIEWER_ID, type: "Bot" }, ...overrides });
 }
@@ -329,6 +339,80 @@ describe("findPrViolations", () => {
     const violations = findPrViolations(pr);
     assert.equal(violations.length, 1);
     assert.match(violations[0], /^I2c PR #5 @ff1c72db: Ally App review 12 is APPROVED/);
+  });
+
+  // The producer's own template heads its buckets `### 🚨 Critical` with no
+  // `(N)`, so every prose reader here sees a blocking review as clean. The
+  // structured counts are the only place the finding is actually stated.
+  it("I2a: catches a structured blocking verdict whose prose carries no counted headings", () => {
+    const pr = {
+      number: 1721,
+      headSha: HEAD,
+      reviews: [
+        appReview({
+          id: 21,
+          state: "APPROVED",
+          body: verdictBody({ critical: 0, important: 1 }, "\n### ⚠️ Important\n- **[codex]** something real\n"),
+        }),
+      ],
+    };
+    const violations = findPrViolations(pr);
+    assert.equal(violations.length, 1);
+    assert.match(violations[0], /^I2a PR #1721 @ff1c72db: Ally App review 21 is APPROVED/);
+  });
+
+  it("I2c: catches a structured still-present disposition with no prose ledger line", () => {
+    const pr = {
+      number: 1722,
+      headSha: HEAD,
+      reviews: [
+        appReview({
+          id: 22,
+          state: "APPROVED",
+          body: verdictBody({ critical: 0, important: 0 }, "\n### ✅ Strengths\n- clean\n", [
+            { head: "d40c450", severity: "important", index: 1, verb: "still-present" },
+          ]),
+        }),
+      ],
+    };
+    const violations = findPrViolations(pr);
+    assert.equal(violations.length, 1);
+    assert.match(violations[0], /^I2c PR #1722 @ff1c72db: Ally App review 22 is APPROVED/);
+  });
+
+  // The control for the two above: the same uncounted prose with a verdict that
+  // explicitly reports nothing must stay clean, or the fix is just a blanket red.
+  it("allows an APPROVED whose structured verdict explicitly reports zero findings", () => {
+    const pr = {
+      number: 1723,
+      headSha: HEAD,
+      reviews: [
+        appReview({
+          id: 23,
+          state: "APPROVED",
+          body: verdictBody({ critical: 0, important: 0 }, "\n### 🚨 Critical\n### ⚠️ Important\n"),
+        }),
+      ],
+    };
+    assert.deepEqual(findPrViolations(pr), []);
+  });
+
+  // A block Ally tried and failed to state is not a review that predates the
+  // block, so it must not reach the prose path the block exists to replace.
+  it("I2a: fails closed on an APPROVED whose verdict block omits a blocking count", () => {
+    const pr = {
+      number: 1724,
+      headSha: HEAD,
+      reviews: [
+        appReview({
+          id: 24,
+          state: "APPROVED",
+          body: verdictBody({ suggestions: 0 }, "\n### ✅ Strengths\n- clean\n"),
+        }),
+      ],
+    };
+    const violations = findPrViolations(pr);
+    assert.ok(violations.some((v) => /^I2a PR #1724 /.test(v)), violations.join("\n"));
   });
 
   it("I3: validates the App attestation while GitHub's exact review commit establishes the User-seat head", () => {
