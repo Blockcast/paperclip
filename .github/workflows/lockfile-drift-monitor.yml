@@ -31,7 +31,7 @@ jobs:
       - name: Check pnpm-lock.yaml overrides/patchedDependencies consistency
         id: check
         continue-on-error: true
-        run: node ./scripts/check-lockfile-overrides-consistency.mjs
+        run: node -e 'console.error("DRILL BLO-27611: simulated lockfile drift"); process.exit(1)'
 
       - name: Push lockfile drift alert to Alertmanager
         if: steps.check.outcome == 'failure'
@@ -39,7 +39,7 @@ jobs:
           ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          DRIFT_SUMMARY: Lockfile overrides/patchedDependencies consistency check failed on master.
+          DRIFT_SUMMARY: "DRILL (BLO-27611) - simulated drift, NOT a real lockfile problem. Self-resolves in 2h."
         run: node ./.github/scripts/post-lockfile-drift-alert.mjs
 
       - name: Fail the run when lockfile drift is detected
