@@ -14,7 +14,7 @@ control plane.
 | Repository vendored from | <https://github.com/kkroo/paperclip-adapter-claude-k8s> |
 | Package | `paperclip-adapter-claude-k8s` |
 | Version at vendor time | `0.2.5-kkroo.6` |
-| Current version | `0.2.6-blockcast.5` — see [Versioning](#versioning) |
+| Current version | `0.2.6-blockcast.6` — see [Versioning](#versioning) |
 | Declared license | MIT, in `package.json` only — see the caveat below |
 
 Before this change the image built this package by cloning that repository at a
@@ -96,7 +96,7 @@ A manifest of `sha256(path)` over all 41 in-tree files, sorted by path under
 `LC_ALL=C`, itself hashes to:
 
 ```
-7fae556519779db711db4cb9f6f239f49fd3c788fec402874ecb1f35093daa95
+19e7a6ab402574380fd5b4937e7fd9c9a30ee7990b243c843f9939a4aef713df
 ```
 
 Regenerate with:
@@ -189,7 +189,7 @@ after the first Blockcast change that ships, the version alone could no longer
 tell you which code was running — provenance had to be established by grepping
 `dist/` for a token.
 
-This directory therefore versions itself: **`0.2.6-blockcast.5`**, set in
+This directory therefore versions itself: **`0.2.6-blockcast.6`**, set in
 `package.json` and `package-lock.json`. The `-blockcast.` prerelease channel
 says plainly that this is our tree, not an upstream release.
 
