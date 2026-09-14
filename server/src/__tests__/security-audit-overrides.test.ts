@@ -60,7 +60,7 @@ describe("PEN-1198 audit dependency remediation", () => {
       ">=6.27.0 <7",
     );
     expect(overrides["jsdom>undici"]).toBe(">=7.29.0 <8");
-    expect(overrides["js-yaml"]).toBe(">=4.3.1 <5");
+    expect(overrides["js-yaml"]).toBe(">=4.3.2 <5");
     expect(overrides.multer).toBe(">=2.3.0 <3");
     expect(serverPackageJson.dependencies.multer).toBe("^2.3.0");
   });
@@ -95,8 +95,11 @@ describe("PEN-1198 audit dependency remediation", () => {
       ]),
     });
     expect(remediations["js-yaml"]).toMatchObject({
-      patchedRange: ">=4.3.1 <5",
-      advisories: expect.arrayContaining(["GHSA-5p4m-2wfm-xmqj"]),
+      patchedRange: ">=4.3.2 <5",
+      advisories: expect.arrayContaining([
+        "GHSA-5p4m-2wfm-xmqj",
+        "GHSA-2883-xcg3-v3hh",
+      ]),
     });
   });
 
