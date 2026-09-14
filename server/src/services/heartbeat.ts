@@ -571,7 +571,6 @@ const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "time
 import { serverVersion } from "../version.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
-const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
 
@@ -2145,7 +2144,6 @@ const activeRunExecutions = new Set<string>();
 // flips to "running"; this grace prevents reaping that startup race. Mirrors
 // the 5-min grace in cleanupManagedJobsWithoutRun.
 const ORPHANED_MANAGED_POD_REAP_GRACE_MS = 5 * 60 * 1000;
-const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 const SESSION_ISOLATION_KEY_PARAM = "paperclipIsolationKey";
 
 type RuntimeConfigSecretResolver = Pick<
@@ -4116,30 +4114,13 @@ export function boundHeartbeatRunEventPayloadForStorage(payload: Record<string, 
   return parseObject(bounded) ?? { _truncated: true };
 }
 
-function redactInlineBase64ImageData(chunk: string) {
-  return chunk.replace(INLINE_BASE64_IMAGE_DATA_RE, (_match, prefix: string, data: string, suffix: string) =>
-    `${prefix}[omitted base64 image data: ${data.length} chars]${suffix}`,
-  );
-}
-
-export function compactRunLogChunk(chunk: string, maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS) {
-  const normalized = redactSensitiveText(redactInlineBase64ImageData(chunk));
-  if (normalized.length <= maxChars) return normalized;
-
-  const headChars = Math.max(0, Math.floor(maxChars * 0.6));
-  const tailChars = Math.max(0, Math.floor(maxChars * 0.25));
-  const omittedChars = Math.max(0, normalized.length - headChars - tailChars);
-  const marker = `\n[paperclip truncated run log chunk: omitted ${omittedChars} chars]\n`;
-  return `${normalized.slice(0, headChars)}${marker}${normalized.slice(normalized.length - tailChars)}`;
-}
-
-export function sanitizeRunLogChunkForStorage(
-  chunk: string,
-  currentUserRedactionOptions: Parameters<typeof redactCurrentUserText>[1],
-  maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS,
-) {
-  return compactRunLogChunk(redactCurrentUserText(chunk, currentUserRedactionOptions), maxChars);
-}
+// PEN-3205: `compactRunLogChunk` / `sanitizeRunLogChunkForStorage` now live in
+// `./log-chunk-sanitizer.js` so the workspace-operation write path can share the one
+// definition (importing them from here would close a cycle — see that module's header).
+// Imported for local use below and re-exported so existing importers and tests keep
+// their current entry point.
+import { compactRunLogChunk, sanitizeRunLogChunkForStorage } from "./log-chunk-sanitizer.js";
+export { compactRunLogChunk, sanitizeRunLogChunkForStorage };
 
 const SYNTHETIC_KEEPALIVE_RUN_LOG_LINE_RE =
   /^\[paperclip\] keepalive\b.*\bjob\b.*\brunning \(\d+s since last output\)$/;
