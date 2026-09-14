@@ -696,22 +696,34 @@ export function evaluateEvidence(
   }
 
   // The unlabeled fallback warns rather than blocks so the gate is not a chore
-  // for refactor/doc issues. When the operator turns the flag on, the ONE gap
-  // worth blocking on is a gap made entirely of shapes the agent cannot write
-  // itself — it means the work was narrated but never reviewed or landed. A
-  // mixed gap (e.g. the checklist is also missing) stays a warn: that part is
-  // the agent's own to fix and is what the fallback exists to tolerate.
+  // for refactor/doc issues.
   //
+  // A gap made ENTIRELY of truth shapes is treated the same way, and
+  // deliberately so on LABELED issues too. `deploy:landed` means merged, and
+  // `in_review` is the state where work waits FOR review — so requiring it to
+  // ENTER in_review would deadlock the normal flow for every code-completion
+  // label (the gate throws 422 on a block at that transition). It is the same
+  // reasoning that excludes the `pr` label in evidence-shapes.ts: an open PR
+  // awaiting a decision cannot also be a merged one.
+  //
+  // So the shapes are recorded and measurable from day one, and only the
+  // operator flag makes them binding — which is the measurement-first posture
+  // the rollout runbook depends on. Without this, the risky half of the change
+  // would ship ungated while the safe half shipped behind a flag.
+  //
+  // A MIXED gap is untouched: a labeled issue missing its screenshots still
+  // blocks on the screenshots, exactly as before.
+  const truthOnlyGap = missing.length > 0 && missing.every((s) => TRUTH_SHAPES.includes(s));
+  if (verdict === "block" && truthOnlyGap) {
+    verdict = "warn";
+    diagnostics.push("truth-gap-warn-only");
+  }
+
   // A failed probe suppresses the escalation outright. "The probe could not
   // reach GitHub" and "GitHub says this was never reviewed" are the same
   // `missing` list, and blocking on the first would make every GitHub outage
   // an estate-wide in_review freeze.
-  if (
-    verdict === "warn" &&
-    input.unlabeledTruthBlock === true &&
-    missing.length > 0 &&
-    missing.every((s) => TRUTH_SHAPES.includes(s))
-  ) {
+  if (verdict === "warn" && input.unlabeledTruthBlock === true && truthOnlyGap) {
     if (input.probeFailed === true) {
       diagnostics.push("unlabeled-truth-block-suppressed:probe-failed");
     } else {

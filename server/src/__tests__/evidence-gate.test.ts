@@ -1477,7 +1477,10 @@ describe("evaluateEvidence — truth shapes", () => {
       externalDetections: { "landing-artifact": false, "deploy:landed": true, "review:ally-clean": false },
     });
     expect(result.shapeDetections["landing-artifact"]).toBe(true);
-    expect(result.verdict).toBe("block");
+    // Truth-only gap, so warn rather than block — see the "never hard-blocks"
+    // describe below. The subject here is that `landing-artifact` survived a
+    // `false` from the probe.
+    expect(result.verdict).toBe("warn");
     expect(result.missing).toEqual(["review:ally-clean"]);
   });
 
@@ -1512,5 +1515,62 @@ describe("evaluateEvidence — truth shapes", () => {
     });
     expect(passing.verdict).toBe("pass");
     expect(passing.diagnostics).not.toContain("unlabeled-truth-block");
+  });
+});
+
+describe("evaluateEvidence — a truth-only gap never hard-blocks (BLO-32239)", () => {
+  const DONE_WHEN = "## Done when\n- a\n- b\n- c\n";
+  const complete = () =>
+    agentComment(
+      [
+        "![desktop](./shot_1440x900.png)",
+        "![mobile](./shot_390x844.png)",
+        LANDING_ARTIFACT,
+        "| Criterion | Status |",
+        "|---|---|",
+        "| a | ✅ |",
+        "| b | ✅ |",
+        "| c | ✅ |",
+      ].join("\n"),
+    );
+
+  it("a labeled issue with every text shape but an unmerged PR warns, it does not block", () => {
+    // `deploy:landed` means merged, and in_review is the state where work
+    // waits FOR review. Blocking here would make the transition unreachable.
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [{ name: "frontend" }] },
+      comments: [complete()],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(["review:ally-clean", "deploy:landed"]);
+    expect(result.diagnostics).toContain("truth-gap-warn-only");
+  });
+
+  it("a MIXED gap on a labeled issue still blocks on the shape the agent owns", () => {
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [{ name: "frontend" }] },
+      comments: [agentComment(`![desktop](./shot_1440x900.png)\n${LANDING_ARTIFACT}`)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("block");
+    expect(result.missing).toContain("screenshot:390x844");
+    expect(result.diagnostics).not.toContain("truth-gap-warn-only");
+  });
+
+  it("the flag makes a labeled truth-only gap binding, and a failed probe still suppresses it", () => {
+    const input = {
+      issue: { description: DONE_WHEN, labels: [{ name: "frontend" }] },
+      comments: [complete()],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      unlabeledTruthBlock: true,
+    };
+    expect(evaluateEvidence({ ...input, probeFailed: false }).verdict).toBe("block");
+    const failed = evaluateEvidence({ ...input, probeFailed: true });
+    expect(failed.verdict).toBe("warn");
+    expect(failed.diagnostics).toContain("unlabeled-truth-block-suppressed:probe-failed");
   });
 });
