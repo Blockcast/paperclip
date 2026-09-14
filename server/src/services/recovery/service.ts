@@ -961,29 +961,6 @@ function resolveStrandedRecoveryCause(
   return "stranded_assigned_issue";
 }
 
-/**
- * Whether `enqueueSourceScopedStrandedRecoveryWake` will actually dispatch, given the
- * recovery action and the resolved cause. Both of its arms used to live only inside that
- * function as early returns.
- *
- * BLO-32566 (review): the escalation activity row now records the work class the stranded
- * wake was dispatched at, so a refused document write is discoverable outside the blocked
- * issue's own documents. That row is written inside the escalation transaction, which
- * commits *before* the wake is enqueued — so the two sites have to agree on whether a wake
- * happens at all, or the row claims a work class for a wake that was never sent. Stated
- * once here instead of copied into the details block.
- *
- * `provider_quota` needs no arm of its own: its original guard was
- * `provider_quota && !ownerAgentId`, which the owner check already subsumes.
- */
-function strandedRecoveryWakeWillDispatch(
-  action: { ownerAgentId: string | null },
-  recoveryCause: StrandedRecoveryCause,
-): boolean {
-  if (!action.ownerAgentId) return false;
-  return recoveryCause !== "workspace_validation_failed" && recoveryCause !== "configuration_incomplete";
-}
-
 function readWorkspaceValidationPayload(latestRun: LatestIssueRun): Record<string, unknown> | null {
   const payload = parseObject(parseObject(latestRun?.resultJson).workspaceValidation);
   return Object.keys(payload).length > 0 ? payload : null;
@@ -5747,11 +5724,9 @@ export function recoveryService(
     hasNewActivitySinceLastAttempt: boolean;
     expectedLockOwnerState?: IssueLockOwnerState | null;
   }) {
-    // The owner arm is repeated from `strandedRecoveryWakeWillDispatch` so the
-    // narrowing reaches `reservedOwnerAgentId` below; the predicate itself is the
-    // shared statement of the rule.
+    if (input.recoveryCause === "provider_quota" && !input.action.ownerAgentId) return;
+    if (input.recoveryCause === "workspace_validation_failed" || input.recoveryCause === "configuration_incomplete") return;
     if (!input.action.ownerAgentId) return;
-    if (!strandedRecoveryWakeWillDispatch(input.action, input.recoveryCause)) return;
     // BLO-18996 (review follow-up): the attempt this wake spends was already committed.
     // `recoveryActionsSvc` runs on the outer `db`, not on `escalateStrandedAssignedIssue`'s
     // transaction, so `upsertSourceScoped`'s `attemptCount` increment is durable before we
@@ -5879,19 +5854,6 @@ export function recoveryService(
       }
       return;
     }
-    const enqueueOrRefundAttempt: typeof deps.enqueueWakeup = async (agentId, opts) => {
-      let queued: Awaited<ReturnType<typeof deps.enqueueWakeup>>;
-      try {
-        queued = await deps.enqueueWakeup(agentId, opts);
-      } catch (error) {
-        // Refund, then rethrow so the escalation still fails loudly.
-        await refundUnspentWakeAttempt("enqueue_threw", error);
-        throw error;
-      }
-      if (!queued) await refundUnspentWakeAttempt("enqueue_not_delivered");
-      return queued;
-    };
-    const ownerIsNonAssignee = input.action.ownerAgentId !== input.issue.assigneeAgentId;
     // BLO-32566: a status-only wake cannot write an issue document, so when the
     // newest run on this issue was refused exactly that write, dispatching
     // another status-only wake guarantees the identical 403. The issue then
@@ -5939,6 +5901,73 @@ export function recoveryService(
     // therefore resolves it from a direct newest-run read for this issue, the
     // same thing the backstop site does inline.
     const documentWriteWasRefused = input.documentWriteRefusedRunId !== null;
+    const enqueueOrRefundAttempt: typeof deps.enqueueWakeup = async (agentId, opts) => {
+      let queued: Awaited<ReturnType<typeof deps.enqueueWakeup>>;
+      try {
+        queued = await deps.enqueueWakeup(agentId, opts);
+      } catch (error) {
+        // Refund, then rethrow so the escalation still fails loudly.
+        await refundUnspentWakeAttempt("enqueue_threw", error);
+        throw error;
+      }
+      if (!queued) {
+        await refundUnspentWakeAttempt("enqueue_not_delivered");
+        return queued;
+      }
+      // BLO-32566 (review): the work class a stranded wake was DELIVERED at is recorded
+      // here, after `enqueueWakeup` returned a queued run, and nowhere earlier. The
+      // escalation activity row is written inside a transaction that commits before this
+      // function runs, so anything it says about delivery is a prediction: the exhaustion
+      // gate above, a missing assignee on the fallback branch, and every null/throw path
+      // out of `enqueueWakeup` all end with no wake reaching anyone. Writing the claim on
+      // the only path that has a run id makes it true by construction, for the same
+      // reason the backstop lane writes its row after its enqueue. The escalation row
+      // keeps the gate INPUT (`documentWriteRefusedRunId` — a refusal happened); this row
+      // is the OUTCOME (a planning-capable wake went out because of it). Read-only
+      // consumers correlate the two on `recoveryActionId` + `recoveryActionAttemptCount`.
+      //
+      // Logging failure must not surface as an escalation failure: the wake is queued and
+      // the attempt is correctly spent, so a rethrow here would re-enter the sweep against
+      // a delivered wake. Warn and return the run.
+      try {
+        await logActivity(db, {
+          companyId: input.issue.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId,
+          runId: null,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: input.issue.id,
+          details: {
+            source: "recovery.stranded_recovery_wake_dispatched",
+            identifier: input.issue.identifier,
+            wakeupRunId: queued.id,
+            recoveryActionId: input.action.id,
+            recoveryActionAttemptCount: input.action.attemptCount,
+            recoveryCause: input.recoveryCause,
+            recoveryOwnerAgentId: reservedOwnerAgentId,
+            idempotencyKey: opts?.idempotencyKey ?? null,
+            recoveryWorkClass: documentWriteWasRefused ? "planning_only" : "status_only",
+            escalatedAfterDocumentWriteRefusal: documentWriteWasRefused,
+            documentWriteRefusedRunId: input.documentWriteRefusedRunId,
+          },
+        });
+      } catch (error) {
+        logger.warn(
+          {
+            err: error,
+            companyId: input.issue.companyId,
+            issueId: input.issue.id,
+            recoveryActionId: input.action.id,
+            wakeupRunId: queued.id,
+          },
+          "stranded recovery wake was delivered but its dispatch activity failed to log",
+        );
+      }
+      return queued;
+    };
+    const ownerIsNonAssignee = input.action.ownerAgentId !== input.issue.assigneeAgentId;
     if (!input.hasNewActivitySinceLastAttempt && ownerIsNonAssignee && input.action.attemptCount > 1) {
       const assigneeAgentId = input.issue.assigneeAgentId;
       if (!assigneeAgentId) {
@@ -7541,18 +7570,6 @@ export function recoveryService(
         }
       }
 
-      // BLO-32566 (review): both telemetry fields below key off whether a stranded wake
-      // is actually dispatched for this escalation, so derive them from one evaluation of
-      // the predicate rather than letting the boolean read the raw refusal id. A refused
-      // document write on a cause that dispatches no wake at all
-      // (`workspace_validation_failed`, `configuration_incomplete`, or a
-      // null-owner action) is a refusal that was recorded, not an escalation that was
-      // delivered, and counting it as the latter overstates exactly the behaviour this
-      // signal exists to measure.
-      const recoveryWorkClass = strandedRecoveryWakeWillDispatch(action, recoveryCause)
-        ? (documentWriteRefusedRunId ? "planning_only" : "status_only")
-        : null;
-
       const publishEscalationActivity = await logActivity(tx as unknown as Db, {
         companyId: fresh.companyId,
         actorType: "system",
@@ -7607,21 +7624,14 @@ export function recoveryService(
           blockerIssueIds: blockerIds,
           // BLO-32566 AC: the refusal must be discoverable without reading the blocked
           // issue's own documents — the surface the first two occurrences were reported
-          // on and lost. The wake backstop records the same three fields, but it only
-          // covers `blocked` issues; this lane covers todo/in_progress/in_review, which
-          // is where every reported occurrence happened. Recording it on only one lane
-          // left "which issues escalated off status-only, and when" unanswerable for the
-          // majority of them.
-          //
-          // `null` work class means no stranded wake is dispatched for this escalation at
-          // all — distinct from one dispatched status-only.
-          recoveryWorkClass,
-          // Derived from the work class, not from `documentWriteRefusedRunId` directly:
-          // this asserts a planning-capable wake was dispatched *because of* a refusal.
-          // `documentWriteRefusedRunId` below stays the raw fact — a refusal happened —
-          // so a refusal on a non-dispatching cause remains queryable without being
-          // counted as a delivered escalation.
-          escalatedAfterDocumentWriteRefusal: recoveryWorkClass === "planning_only",
+          // on and lost. This is the gate INPUT only: the newest run on the issue was
+          // refused a document write. Whether a planning-capable wake actually went out
+          // because of it (`recoveryWorkClass`, `escalatedAfterDocumentWriteRefusal`) is
+          // recorded by `enqueueSourceScopedStrandedRecoveryWake` on the
+          // `recovery.stranded_recovery_wake_dispatched` row, after the enqueue returned a
+          // run. This row commits before that enqueue runs, so a delivery claim written
+          // here would be a prediction — false on the exhaustion gate, on a missing
+          // fallback assignee, and on every null/throw path out of `enqueueWakeup`.
           documentWriteRefusedRunId,
         },
       }, {
@@ -7639,8 +7649,8 @@ export function recoveryService(
         blockerIds,
         publishEscalationActivity,
         // BLO-32566 (review): the wake dispatched below must key off the same locked read
-        // the activity row was written from, or the two disagree about whether this
-        // escalation was planning-capable.
+        // this row recorded the refusal from, or the dispatch row and this row name
+        // different refused runs for one escalation.
         documentWriteRefusedRunId,
         // BLO-21395: the scheduler-side failure heartbeat is cross-posted after this
         // transaction commits, and `prefix` is only derived in here — threading it out
