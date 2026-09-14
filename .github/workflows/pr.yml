@@ -98,6 +98,45 @@ jobs:
     # re-measured 2026-09-05. 1.1m is the margin against the conservative
     # model; 5.3m is the margin against the worst run anyone has observed.
     #
+    # RE-MEASURED 2026-09-14 ON REBASE, AND THE ATTRIBUTION HAS INVERTED.
+    # 198 `policy` jobs / 179 successes, 2026-09-12..09-14 (the window this
+    # repo's run volume gives for 200 runs). 15 is still the right number, but
+    # NOT for the reason the model above gives:
+    #
+    #   `Setup pnpm` p100     4.27m -> 0.88m   (p50 0.35m, stable across all
+    #                                           three days -- a ~5x structural
+    #                                           drop, not sampling noise. This
+    #                                           is the ARC-image fix the
+    #                                           residuals below are parked on,
+    #                                           arriving before this PR landed)
+    #   gate work p100        4.80m -> 5.88m   (master added ~8 test steps to
+    #                                           this job in the interim)
+    #   checkout p100         4.57m -> 4.65m   (unchanged; still the dominant
+    #                                           setup term, so the 6m bound
+    #                                           below keeps its basis)
+    #   worst combined setup  8.10m -> 5.13m
+    #   total job step-time   9.73m -> 9.38m   p100
+    #
+    # So the headline above -- "Setup, not the gate work, is what spends this
+    # budget" -- was true when written and is now FALSE: gate work (5.88m) has
+    # overtaken worst-observed combined setup (5.13m). The original reasoning is
+    # kept rather than rewritten, per this comment's own convention, because the
+    # SHAPE of the argument is what generalises: one bimodal, unbounded term
+    # dominates, and which term it is drifts.
+    #
+    # The case for 15 is stronger now, not weaker. Total step-time p100 9.38m
+    # against the OLD 10m cap is 94%, and the window carries FOUR cap deaths --
+    # 10.20m, 10.22m, 10.28m, 10.43m (runs 34800812997, 34748511811,
+    # 34726656593, 34853657581) -- against 2 in the original 75. The other nine
+    # `cancelled` jobs in the window land at 1.27-6.17m, so the superseded-push
+    # split still separates cleanly. Against 15m the current terms sum to
+    # 4.65 + 0.88 + 5.88 + 1.0 = 12.4m, and measured p100 sits at 63%.
+    #
+    # This also supersedes the 176-vs-181 success-count discrepancy an earlier
+    # review flagged at the attribution note below: both denominators describe a
+    # window that no longer characterises this job, and neither is re-derivable
+    # now. Re-measure rather than reconciling them.
+    #
     # That is the worst OBSERVED case, and observed is all it is. An earlier
     # revision of this comment claimed the 6m checkout bound below ALSO bounds
     # the worst case from above; that was wrong, and the correction is worth

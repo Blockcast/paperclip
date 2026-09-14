@@ -197,12 +197,14 @@ test("every job that sets up pnpm clears the measured setup floor", async () => 
           budget >= MIN_TIMEOUT_MINUTES_FOR_RETRY,
           `${name} job "${job.name}" sets up pnpm with timeout-minutes: ${budget}` +
             (perVariantKey ? ` (via matrix.${perVariantKey})` : "") +
-            `, below the ${MIN_TIMEOUT_MINUTES_FOR_RETRY}m floor. A slow-but-successful setup ` +
-            `alone measured 8.1m (worst observed checkout + pnpm combined, NOT the sum of ` +
-            `the two p100s), and on \`policy\`, the job this floor was measured against, ` +
-            `gate work adds up to 4.8m on top, so a budget under the floor leaves too little ` +
-            `for the job's own work \u2014 the job dies at its cap as an unattributable ` +
-            `\`cancelled\` (BLO-31690)`,
+            `, below the ${MIN_TIMEOUT_MINUTES_FOR_RETRY}m floor. On \`policy\`, the job ` +
+            `this floor was measured against, total job step-time p100 is 9.4m over 179 ` +
+            `successful jobs (2026-09-14) \u2014 94% of the old 10m cap, with four cap ` +
+            `deaths in that same window. Which TERM spends the budget drifts (setup ` +
+            `dominated when this floor was first sized; gate work does now), so the floor ` +
+            `is sized against the total rather than against any one leg. A budget under it ` +
+            `leaves too little for the job's own work \u2014 the job dies at its cap as an ` +
+            `unattributable \`cancelled\` (BLO-31690)`,
         );
       }
     }
