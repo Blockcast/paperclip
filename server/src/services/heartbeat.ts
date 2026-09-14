@@ -23871,6 +23871,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (activePrelaunchReservation) {
           continue;
         }
+        // BLO-33820: the bound above is measured from reservedAt and requires NO
+        // liveness evidence, so a run still preparing inside THIS process
+        // (worktree provisioning, preRun hooks, plugin prefetch, MCP setup) is
+        // reaped alive at exactly reservedAt+15m. Measured 2026-09-14 on three
+        // consecutive reaps -- 15m04s / 15m15s / 15m20s, every one carrying
+        // `preAdapterJobLiveness: "unknown"` -- because no Job exists yet to be
+        // observed "alive", so the alive-only guard below cannot protect the
+        // pre-Job window at all. The run then throws
+        // "reservation no longer owns launch" at markExternalRuntimeReservationLaunching(),
+        // which is why kube_job_status_failed stays 0: no Job is ever created.
+        //
+        // Before a Job exists, in-process ownership is the ONLY liveness signal,
+        // and it is authoritative rather than merely suggestive: nothing else can
+        // be driving a pre-adapter run, and activeRunExecutions dies with the
+        // process, so a server-restart orphan still reaps on the next process
+        // exactly as before. That is why the line-23833 rationale for ignoring
+        // this Set does not apply here -- every case it cites (hung await on a
+        // vanished Job, preRun grandchildren holding pipes) presupposes a Job.
+        // Bounded by the same hard ceiling a live-but-silent Job gets, so a
+        // genuinely wedged executor still converges.
+        const inProcessPrelaunchOwner = Boolean(
+          reservation
+          && (reservation.state === "reserved" || reservation.state === "launching")
+          && reservation.jobName === null
+          && reservation.jobUid === null
+          && activeRunExecutions.has(run.id)
+          && Number.isFinite(reservationReservedAt)
+          && reservationReservedAt > 0
+          && now.getTime() - reservationReservedAt < EXTERNAL_LIFECYCLE_HARD_STALE_MS,
+        );
+        if (inProcessPrelaunchOwner) {
+          continue;
+        }
         // BLO-13176: past the grace, DO NOT blindly declare the run orphaned.
         // Workspace provisioning (image pull, repo clone, opencode/claude cold
         // boot) can exceed 5 min while the k8s Job is perfectly alive and simply
