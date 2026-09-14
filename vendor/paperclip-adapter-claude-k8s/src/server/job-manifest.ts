@@ -1657,6 +1657,33 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // init. Both keep the broad rw mount rather than emit a Job that cannot start.
   const narrowWritableSurface =
     isolation.enabled && dataClaimName !== "" && dataClaimName === selfPod.pvcClaimName;
+  // Every one of those fallbacks used to be silent, so whether a production Job
+  // actually got the narrowed mount depended on runtime config nobody could
+  // read off the cluster. Name the reason the gate fell through — once as a
+  // structured server-side warn, once as a Job annotation (see `metadata`) so
+  // it is observable per Job. Classification only: the decision above is the
+  // gate, this merely says which leg of it did not hold.
+  const broadDataMountReason: "isolation_disabled" | "no_claim" | "foreign_claim" | null = narrowWritableSurface
+    ? null
+    : !isolation.enabled
+      ? "isolation_disabled"
+      : dataClaimName === ""
+        ? "no_claim"
+        : "foreign_claim";
+  if (broadDataMountReason !== null) {
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        event: "claude_k8s.data_mount_broad_rw",
+        msg: "data volume mounted broad rw; BLO-32734 subPath narrowing not applied",
+        reason: broadDataMountReason,
+        runId,
+        jobName,
+        dataClaimName,
+        selfPvcClaimName: selfPod.pvcClaimName ?? "",
+      }),
+    );
+  }
   volumeMounts.push({
     name: "data",
     mountPath: dataMountPath,
@@ -2231,6 +2258,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       annotations: {
         "paperclip.io/adapter-type": "claude_k8s",
         "paperclip.io/agent-name": agent.name,
+        // `scoped` when the BLO-32734 read-only-plus-subPath narrowing applied,
+        // `broad:<reason>` when the gate fell through to the whole-PVC rw mount.
+        "paperclip.io/data-mount-scope":
+          broadDataMountReason === null ? "scoped" : `broad:${broadDataMountReason}`,
       },
     },
     spec: {
