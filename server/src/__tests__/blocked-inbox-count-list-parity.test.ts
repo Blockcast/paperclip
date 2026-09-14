@@ -189,6 +189,78 @@ describeEmbeddedPostgres("blocked-inbox count/list parity (BLO-31839)", () => {
     return { companyId, parkedId };
   }
 
+  /** The same shape, but `count` rows in ONE company — the helper above creates a company per row. */
+  async function seedParkedRows(prefix: string, count: number) {
+    const { companyId, agentId } = await createCompany(prefix);
+    for (let index = 0; index < count; index += 1) {
+      const parkedId = await insertIssue({
+        companyId,
+        identifier: `${prefix}-${index * 2 + 1}`,
+        title: `Externally parked row ${index}`,
+        status: "blocked",
+        assigneeAgentId: agentId,
+        description: parkDeclaredEarly(),
+      });
+      const blockerId = await insertIssue({
+        companyId,
+        identifier: `${prefix}-${index * 2 + 2}`,
+        title: `Blocker ${index}`,
+        status: "todo",
+        parentId: parkedId,
+        assigneeAgentId: agentId,
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: parkedId,
+        type: "blocks",
+      });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        status: "running",
+        contextSnapshot: { issueId: blockerId },
+      });
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, blockerId));
+    }
+    return { companyId };
+  }
+
+  /**
+   * BLO-33741: the truncation signal on `GET /companies/:id/issues` is an over-fetch probe — ask
+   * the service for `limit + 1`, and for a restricted actor scan forward from `offset + limit` for
+   * the next readable row. Both steps assume `svc.list` actually applies `limit` and `offset`.
+   *
+   * `attention=blocked` never reaches the paginated query builder: it short-circuits into
+   * `listBlockedInboxIssues`, which queries the whole blocked population and paginates by slicing
+   * the *enriched* result at the end. That slice is the only thing making the contract hold on this
+   * route. Drop it and the forward scan replays the first window forever, reporting truncation that
+   * is not there — the false-signal class BLO-33741 exists to kill, re-entering through the one
+   * filter that bypasses the pagination everything else shares.
+   *
+   * Pinned at the service, not the route: every route-level truncation test mocks `svc.list`
+   * wholesale, so none of them can see this.
+   */
+  it("applies limit and offset on the attention=blocked path, which bypasses the paginated query builder", async () => {
+    const { companyId } = await seedParkedRows("PGN", 3);
+    const filters = { attention: "blocked" as const, status: "blocked" };
+
+    // Derive the expected order from the service itself: `compareBlockedInboxRows` owns it, and
+    // hardcoding a guess here would make this a test of the ordering rather than of the slicing.
+    const order = (await svc.list(companyId, filters)).map((row) => row.id);
+    expect(order).toHaveLength(3);
+
+    const firstPage = await svc.list(companyId, { ...filters, limit: 2 });
+    expect(firstPage.map((row) => row.id)).toEqual(order.slice(0, 2));
+
+    // The load-bearing assertion: a window past the first page must not replay it. This is what
+    // fails if the trailing slice is ever removed in favour of returning the full population.
+    const secondPage = await svc.list(companyId, { ...filters, limit: 2, offset: 2 });
+    expect(secondPage.map((row) => row.id)).toEqual(order.slice(2));
+  });
+
   it("counts and enumerates the same rows when a park is declared past the description cutoff", async () => {
     const { companyId, parkedId } = await seedExternallyParkedRowWithCoveredBlocker(
       "PKL",
