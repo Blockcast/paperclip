@@ -3261,17 +3261,51 @@ export async function reconcileContendedPrReviewerWakes(
     // attempt counter and the `retried` metric, because this is not an attempt
     // that happened — counting it would overstate retries and hide the
     // supersession.
-    if (replay.context.headSha && replay.context.repoFullName) {
-      const replayAttestation = await allyReviewAlreadyAttestsHead({
-        repoFullName: replay.context.repoFullName,
-        prNumber: replay.context.prNumber,
-        headSha: replay.context.headSha,
-        botLogin: config.prReviewerBotLogin,
-        ...(config.listPrReviewsForAttestation
-          ? { listPrReviews: config.listPrReviewsForAttestation }
-          : {}),
-      });
-      if (replayAttestation.outcome === "attested") {
+    //
+    // Ask about the LIVE head, not the one frozen into the row. `context.headSha`
+    // was resolved when the webhook arrived, and this replay can run up to
+    // PR_REVIEWER_UNAVAILABLE_MAX_WAIT_MS later; `taskKey` is PR-scoped, so the
+    // wake it replays reviews whatever the head is now, regardless of which head
+    // it was queued for. Comparing against the frozen head would answer "is the
+    // OLD head attested?" — and when the PR moved and was already reviewed at
+    // its new head, that answer is `not_attested`, the replay proceeds, and the
+    // reviewer posts the very multi-hour duplicate this block exists to stop.
+    // One extra API call on a path that is already rare and already making one.
+    // If the head cannot be re-resolved, fall back to the frozen head so the
+    // check degrades to the old behaviour rather than being skipped.
+    if (replay.context.repoFullName) {
+      let liveHeadSha: string | null = null;
+      try {
+        liveHeadSha = await (config.resolvePrReviewHeadSha ?? githubFetchPrHeadSha)({
+          repoFullName: replay.context.repoFullName,
+          prNumber: replay.context.prNumber,
+        });
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            taskKey: replay.taskKey,
+            deliveryId: replay.deliveryId,
+            repoFullName: replay.context.repoFullName,
+            prNumber: replay.context.prNumber,
+            recordedHeadSha: replay.context.headSha ?? null,
+          },
+          "contended PR-reviewer replay could not re-resolve the live PR head; checking attestation against the head recorded at webhook time (BLO-32198)",
+        );
+      }
+      const attestHeadSha = liveHeadSha ?? replay.context.headSha ?? null;
+      const replayAttestation = attestHeadSha
+        ? await allyReviewAlreadyAttestsHead({
+          repoFullName: replay.context.repoFullName,
+          prNumber: replay.context.prNumber,
+          headSha: attestHeadSha,
+          botLogin: config.prReviewerBotLogin,
+          ...(config.listPrReviewsForAttestation
+            ? { listPrReviews: config.listPrReviewsForAttestation }
+            : {}),
+        })
+        : null;
+      if (replayAttestation?.outcome === "attested") {
         await retireContendedRow(
           db,
           row.id,
@@ -3285,7 +3319,8 @@ export async function reconcileContendedPrReviewerWakes(
             deliveryId: replay.deliveryId,
             repoFullName: replay.context.repoFullName,
             prNumber: replay.context.prNumber,
-            headSha: replay.context.headSha,
+            headSha: attestHeadSha,
+            recordedHeadSha: replay.context.headSha ?? null,
             attestingReviewCount: replayAttestation.attestingReviewCount,
           },
           "contended PR-reviewer wake superseded: this head was reviewed while the retry was deferred (BLO-32198)",
