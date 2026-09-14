@@ -498,11 +498,13 @@ const CLAUDE_EVENT_SUBTYPE_RE = /"subtype"\s*:\s*"([^"\r\n]*)"/;
  * relay model or tool text.
  *
  * That trust is STRUCTURAL, not a sample. The surface this reads has exactly
- * one writer: the `tee` in the pipeline `job-manifest.ts` builds at `:1862` —
+ * one writer: the `tee` in the pipeline `job-manifest.ts` builds in
+ * `claudeInvocation` —
  * `cat … | claude … | tee <podLogPath> | <failFastFilter> > /dev/null` — which
  * carries no `2>&1` on any stage. The file therefore receives Claude's stdout
  * and nothing else. Hook stderr, MCP-server stderr and the fail-fast
- * `[wrapper]` line (written to `/dev/stderr` at `job-manifest.ts:1708`, and
+ * `[wrapper]` line (written to `/dev/stderr` by `job-manifest.ts`'s
+ * `failFastFilter`, and
  * downstream of the `tee` regardless) all bypass it by construction, as does
  * the prompt. Operator- and MCP-authored text cannot reach this predicate as a
  * bare line at all — which is why trusting bare lines is safe, rather than
@@ -511,7 +513,8 @@ const CLAUDE_EVENT_SUBTYPE_RE = /"subtype"\s*:\s*"([^"\r\n]*)"/;
  *
  * Two edits would void this, and neither shows a diff at this call site:
  *
- *   1. Adding `2>&1` before the `tee` at `job-manifest.ts:1862` — an entirely
+ *   1. Adding `2>&1` before the `tee` in `job-manifest.ts`'s
+ *      `claudeInvocation` — an entirely
  *      reasonable change, e.g. to capture CLI diagnostics in the pod log —
  *      which starts routing operator-authored stderr here as bare, TRUSTED
  *      lines.
