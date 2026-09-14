@@ -1638,6 +1638,63 @@ describe("handleWebhook — closure authorship across cycles (BLO-31736)", () =>
     );
   });
 
+  it("clears resolvedAt on a re-fire whose issue read failed, so escalation still runs", async () => {
+    // `resolvedAt` is also the escalation sweep's kill-switch —
+    // `advanceIssueLadder` bails on it before any rung. Freezing it to protect
+    // the authorship fallback left an open, firing issue un-escalatable until a
+    // later delivery happened to apply a decision: one `repeat_interval` of
+    // paging nobody. A failed read must leave our recorded authorship alone AND
+    // must not leave the alert reading as "cleared".
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    const world = mkCycleWorld(mocks, { issueStatus: "todo", state: freshlyFiredState() });
+
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-29T10:00:00Z"));
+    expect(world.issue.status).toBe("cancelled");
+
+    mocks.issues.get.mockRejectedValueOnce(new Error("issues.get exploded"));
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(world.state.resolvedAt).toBeNull();
+    expect(world.state.escalationComplete).toBe(false);
+    expect(Date.parse(world.state.nextEscalationAt as string)).toBeGreaterThan(Date.now());
+    expect(world.state.pluginClosedAt).toBe("2026-04-29T10:00:00Z");
+
+    // The next readable re-fire still knows the close was ours.
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(world.issue.status).toBe("todo");
+  });
+
+  it("carries a legacy row's inferred authorship across a failed issue read", async () => {
+    // A row from before `pluginClosedAt` existed has only `resolvedAt` to say
+    // who closed it. Clearing that on a delivery that applied nothing would turn
+    // our own close into an apparent operator close and mute the next re-fire;
+    // freezing it mutes escalation instead (test above). So the write records
+    // what the fallback would have concluded, and clears `resolvedAt` anyway.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    const world = mkCycleWorld(mocks, {
+      issueStatus: "cancelled",
+      state: {
+        ...freshlyFiredState(),
+        resolvedAt: "2026-04-29T10:00:00Z",
+        pluginClosedAt: undefined,
+      },
+    });
+
+    mocks.issues.get.mockRejectedValueOnce(new Error("issues.get exploded"));
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(world.state.resolvedAt).toBeNull();
+    expect(world.state.pluginClosedAt).toBe("2026-04-29T10:00:00Z");
+
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(world.issue.status).toBe("todo");
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.firing.suppressed",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
   // -------------------------------------------------------------------------
   // The tests above are single-*fingerprint*, which is the same blind spot one
   // level up from the single-*shot* tests that let the original defect ship.
@@ -1650,7 +1707,7 @@ describe("handleWebhook — closure authorship across cycles (BLO-31736)", () =>
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ autoCloseOnResolve: true });
     const AGG = "CiliumPolicyDropsHigh|critical";
-    const memberState = (fingerprint: string): AlertStateRecord => ({
+    const memberState = (): AlertStateRecord => ({
       ...freshlyFiredState(),
       paperclipIssueId: "issue-shared",
       aggregateKey: AGG,
@@ -1664,8 +1721,8 @@ describe("handleWebhook — closure authorship across cycles (BLO-31736)", () =>
     // One shared issue, one state row per member fingerprint, and a members
     // table that reports a sibling unresolved until both have cleared.
     const rows: Record<string, AlertStateRecord> = {
-      "alert-a": memberState("alert-a"),
-      "alert-b": memberState("alert-b"),
+      "alert-a": memberState(),
+      "alert-b": memberState(),
     };
     const resolvedMembers = new Set<string>();
     const issue = { id: "issue-shared", status: "todo" };
