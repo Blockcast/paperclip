@@ -1271,6 +1271,20 @@ describe("githubListReviewerSurfacesAtPr", () => {
     expect(await githubListReviewerSurfacesAtPr({ repoFullName, prNumber })).toEqual({ error: "no_bot_login" });
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  // A bare user-seat login matches no App row, so without this guard the helper
+  // returns empty surfaces and the caller cannot tell a misconfiguration from a
+  // review that carried no finding.
+  it("errors without querying GitHub when the configured login is the bare user seat", async () => {
+    setCreds();
+    h.cfg.prReviewerBotLogin = "allyblockcast";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await githubListReviewerSurfacesAtPr({ repoFullName, prNumber })).toEqual({
+      error: "bot_login_not_app_form",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("githubHasReviewerEvidenceForPr after delegating to the shared grammar", () => {
