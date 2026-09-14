@@ -3307,19 +3307,36 @@ describeEmbeddedPostgres("productivity review service", () => {
   // used it poorly; before this a reviewer had to reconstruct saturation from
   // Kubernetes and then force one of those four anyway.
   describe("assignee concurrency evidence (BLO-27698 C1/C2)", () => {
-    // Seeds `count` `running` rows for the agent on OTHER issues — the slots
-    // that starve this issue are held by other work, which is exactly why the
-    // count must not be issue-scoped.
-    async function occupySlots(input: { companyId: string; agentId: string; count: number }) {
-      if (input.count === 0) return;
+    // Seeds `running` rows for the agent on OTHER issues — the slots that
+    // starve this issue are held by other work, which is exactly why the count
+    // must not be issue-scoped.
+    //
+    // `count` rows are stamped fresh (1 min before `now`) and so occupy a slot;
+    // `staleCount` rows are stamped an hour back, past RUN_STALE_SILENCE_MS
+    // (15 min), and so do NOT — the dispatcher's slot gate excludes them, so
+    // the report must too. Freshness is explicit here rather than incidental:
+    // these rows previously carried an hour-old `startedAt` and passed only
+    // because the count was unconditional.
+    async function occupySlots(input: {
+      companyId: string;
+      agentId: string;
+      now: Date;
+      count: number;
+      staleCount?: number;
+    }) {
+      const rows = [
+        ...Array.from({ length: input.count }, () => input.now.getTime() - 60 * 1000),
+        ...Array.from({ length: input.staleCount ?? 0 }, () => input.now.getTime() - 60 * 60 * 1000),
+      ];
+      if (rows.length === 0) return;
       await db.insert(heartbeatRuns).values(
-        Array.from({ length: input.count }, () => ({
+        rows.map((startedAtMs) => ({
           id: randomUUID(),
           companyId: input.companyId,
           agentId: input.agentId,
           status: "running" as const,
           invocationSource: "assignment" as const,
-          startedAt: new Date("2026-04-28T11:00:00.000Z"),
+          startedAt: new Date(startedAtMs),
           contextSnapshot: { issueId: randomUUID() },
         })),
       );
@@ -3327,6 +3344,7 @@ describeEmbeddedPostgres("productivity review service", () => {
 
     async function reviewFor(opts: {
       slots: number;
+      staleSlots?: number;
       adapterType?: string;
       runtimeConfig?: Record<string, unknown>;
     }) {
@@ -3344,7 +3362,13 @@ describeEmbeddedPostgres("productivity review service", () => {
           })
           .where(eq(agents.id, seeded.coderId));
       }
-      await occupySlots({ companyId: seeded.companyId, agentId: seeded.coderId, count: opts.slots });
+      await occupySlots({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        now,
+        count: opts.slots,
+        staleCount: opts.staleSlots,
+      });
 
       await productivityReviewService(db).reconcileProductivityReviews({
         now,
@@ -3401,6 +3425,26 @@ describeEmbeddedPostgres("productivity review service", () => {
       expect(review?.description).toContain("- Assignee live concurrency: 0/4 running runs");
       expect(review?.description).not.toContain("Route to platform/SRE as a capacity/dispatch constraint");
       // The four assignee-directed verdicts are still offered.
+      expect(review?.description).toContain("- Request decomposition");
+    });
+
+    it("excludes stale running rows from the occupancy count (C1/C2 regression)", async () => {
+      // The dispatcher's slot gate counts only NON-stale running rows
+      // (BLO-12990): a row silent past RUN_STALE_SILENCE_MS does not starve new
+      // work. Counting every `running` row here reported `2/2 … saturated` and
+      // offered the capacity verdict while dispatch would still have admitted a
+      // turn — a false capacity explanation, which is worse than none because
+      // it reads as measurement and excuses inactivity that was never excused.
+      // Both rows below are silent for an hour, so every effective slot is in
+      // fact free.
+      const review = await reviewFor({
+        slots: 0,
+        staleSlots: 2,
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 2 } },
+      });
+      expect(review?.description).toContain("- Assignee live concurrency: 0/2 running runs");
+      expect(review?.description).not.toContain("**saturated**");
+      expect(review?.description).not.toContain("Route to platform/SRE as a capacity/dispatch constraint");
       expect(review?.description).toContain("- Request decomposition");
     });
   });

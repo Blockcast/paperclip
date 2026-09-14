@@ -8,6 +8,7 @@ import {
   type HeartbeatPreset,
 } from "@paperclipai/shared/validators/agent";
 import { asBoolean, asNumber, parseObject } from "../adapters/utils.js";
+import { RUN_STALE_SILENCE_MS } from "./issue-run-holding.js";
 
 /**
  * The agent-concurrency ceiling, extracted out of `heartbeat.ts` (BLO-27698 C1)
@@ -130,4 +131,61 @@ export function resolveEffectiveMaxConcurrentRuns(agent: {
     concurrencyEnabled: policy.concurrencyEnabled,
     externalLifecycle,
   };
+}
+
+/** The run fields that decide whether a `running` row still occupies a slot. */
+export type SlotOccupancySignals = {
+  startedAt?: Date | string | null;
+  lastOutputAt?: Date | string | null;
+  lastUsefulActionAt?: Date | string | null;
+};
+
+function signalMs(value: Date | string | null | undefined): number {
+  if (!value) return 0;
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+/**
+ * Whether a `running` row counts against the agent's slot ceiling.
+ *
+ * BLO-12990 Fix #1: stale/silent running runs must not block new high-priority
+ * work. A run is stale once its most-recent signal is older than
+ * `RUN_STALE_SILENCE_MS` — a k8s Job silent for >15 min should not starve
+ * newly-queued work indefinitely.
+ *
+ * BLO-20775: the NEWEST stamp, NOT the first non-null. The old chain
+ * (`lastUsefulActionAt ?? lastOutputAt ?? startedAt`, still correct for the
+ * issue-ownership question in `issue-run-holding.ts`) encodes an invariant
+ * nothing enforces — that `lastUsefulActionAt` is never older than
+ * `lastOutputAt`. That is false on TERMINAL rows, where
+ * `classifyAndPersistRunLiveness` stamps `lastUsefulActionAt` to an often
+ * hours-old concrete *evidence* time while `lastOutputAt` stays fresh. Such a
+ * row is reachable in dispatch: a terminal local row can be resurrected to
+ * `running` by `reapOrphanedRuns`, carrying its terminal-path stamp with it,
+ * and it genuinely occupies a slot. Under the old chain it read as stale,
+ * dropped out of the count, and a second run could dispatch on top of a live
+ * one. Null/unparseable stamps map to 0, i.e. dropped rather than propagated.
+ *
+ * `updatedAt` is deliberately excluded: unrelated subsystems bump it on a run
+ * under review, which let a dead orphan masquerade as recently active
+ * (BLO-8827).
+ *
+ * BLO-27698 C1: shared with the productivity review so a *reported* saturation
+ * can never disagree with the *enforced* slot gate. Counting stale rows there
+ * would say "N/N saturated" — and offer the capacity verdict — while dispatch
+ * would still admit a turn, which is a false capacity explanation.
+ */
+export function isRunOccupyingSlot(run: SlotOccupancySignals, nowMs: number): boolean {
+  const newest = Math.max(
+    signalMs(run.lastUsefulActionAt),
+    signalMs(run.lastOutputAt),
+    signalMs(run.startedAt),
+  );
+  return newest >= nowMs - RUN_STALE_SILENCE_MS;
+}
+
+/** How many of these `running` rows count against the agent's slot ceiling. */
+export function countRunsOccupyingSlots(runs: SlotOccupancySignals[], nowMs: number): number {
+  return runs.filter((run) => isRunOccupyingSlot(run, nowMs)).length;
 }

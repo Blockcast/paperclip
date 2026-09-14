@@ -358,6 +358,7 @@ import {
 } from "./issue-tree-control.js";
 import { RUN_STALE_SILENCE_MS } from "./issue-run-holding.js";
 import {
+  countRunsOccupyingSlots,
   resolveAgentConcurrencyPolicy,
   resolveExternalLifecycleConcurrency,
 } from "./agent-concurrency.js";
@@ -23586,7 +23587,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // (claude_k8s, opencode_k8s). Those two sets are disjoint, so that resurrection
     // cannot produce a divergent row on the external-lifecycle path. It IS reachable
     // for the dispatcher slot gate, whose query is adapter-agnostic — see
-    // nonStaleRunningRuns, where that rationale properly lives.
+    // `isRunOccupyingSlot` in agent-concurrency.ts, where that rationale properly
+    // lives.
     //
     // What this guards instead: a FUTURE deliberate decoupling of the two stamps
     // (or a future external-lifecycle transition that preserves terminal stamps).
@@ -26558,42 +26560,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (hasExternalLifecycle(agent.adapterType)) {
         await reapOrphanedRuns({ suppressDispatchAfterReap: true });
       }
-      // BLO-12990 Fix #1: stale/silent running runs must not block new high-priority
-      // work. Fetch full run rows so we can partition into active vs. stale using
-      // the same silence metric the reaper uses (EXTERNAL_LIFECYCLE_STALE_MS). A run
-      // is stale when its most-recent signal — the NEWEST of lastUsefulActionAt /
-      // lastOutputAt / startedAt — is older than the threshold. Only non-stale runs
-      // count toward the slot gate — a k8s Job that has been silent for >15 min
-      // should not starve newly-queued high-priority work indefinitely.
+      // BLO-12990 Fix #1 / BLO-20775: stale/silent running runs must not block new
+      // high-priority work. Fetch full run rows so `isRunOccupyingSlot` can partition
+      // them into active vs. stale on the same silence metric the reaper uses. That
+      // predicate lives in `agent-concurrency.ts` alongside the ceiling it is compared
+      // against, so the productivity review reports the same slot population dispatch
+      // enforces (BLO-27698 C1) — its rationale, including why this uses the NEWEST
+      // stamp rather than the first non-null, is documented there.
       const dispatchNow = new Date();
-      const staleFloorMs = dispatchNow.getTime() - EXTERNAL_LIFECYCLE_STALE_MS;
       const runningRunRows = await listRunningRunsForAgent(agentId);
-      const nonStaleRunningRuns = runningRunRows.filter((r) => {
-        // BLO-20775: newest stamp, NOT the first non-null. The old chain
-        // (lastUsefulActionAt ? … : lastOutputAt ? …) encodes an invariant nothing
-        // enforces — that lastUsefulActionAt is never older than lastOutputAt. That
-        // is false on TERMINAL rows, where classifyAndPersistRunLiveness stamps
-        // lastUsefulActionAt to an often-hours-old concrete *evidence* time while
-        // lastOutputAt stays fresh.
-        //
-        // Unlike the external-lifecycle reaper helper, that divergent row IS
-        // reachable here. listRunningRunsForAgent filters on agentId + status only,
-        // with no adapter predicate, so it returns sessioned-local rows too — and a
-        // terminal local row can be resurrected to `running` by the unguarded
-        // setRunStatus(id, "running") in reapOrphanedRuns (gated on processPidAlive →
-        // isTrackedLocalChildProcessAdapter), carrying its terminal-path stamp with
-        // it. Such a run genuinely occupies a slot; under the old chain it read as
-        // stale, dropped out of the count, and a second run could dispatch on top of
-        // a live one. runTimestampMs maps null/NaN to 0, so an unparseable stamp is
-        // dropped rather than propagated.
-        const signalMs = Math.max(
-          runTimestampMs(r.lastUsefulActionAt),
-          runTimestampMs(r.lastOutputAt),
-          runTimestampMs(r.startedAt),
-        );
-        return signalMs >= staleFloorMs;
-      });
-      const runningCount = nonStaleRunningRuns.length;
+      const runningCount = countRunsOccupyingSlots(runningRunRows, dispatchNow.getTime());
 
       const externalLifecycle = hasExternalLifecycle(agent.adapterType);
       const externalConcurrency = resolveExternalLifecycleConcurrency(policy);
