@@ -7934,17 +7934,25 @@ export function issueRoutes(
       compute: async () => {
         // BLO-33741: probe one row past the page so truncation is detectable.
         // `listFilters` keeps the caller's `limit` because it feeds the cache
-        // key — only the service call is widened. Truncation is resolved on the
-        // raw rows, before ACL filtering, because filtering shortens the page
-        // and would otherwise read as "not truncated".
+        // key — only the service call is widened.
+        //
+        // ACL-filter the WHOLE probed window before resolving truncation, so
+        // the signal counts only rows this actor may read. Deriving it from the
+        // raw rows instead would leak: a restricted actor whose visible rows fit
+        // the page would still see `X-Result-Truncated`, disclosing that more
+        // matching issues exist outside its readable scope. Over-fetching first
+        // is what makes the filtered count trustworthy — filtering a page that
+        // was already sliced to `limit` can only ever shorten it, which is why
+        // the order here is probe -> filter -> slice, never probe -> slice ->
+        // filter.
         const probed = await svc.list(companyId, {
           ...listFilters,
           limit: issueListProbeLimit(limit),
         });
-        const { rows: rawResult, truncated } = resolveIssueListTruncation(probed, limit);
-        const result = await actorCanReadCompanyScope(req, companyId)
-          ? rawResult
-          : await filterIssuesForActor(req, rawResult);
+        const readable = await actorCanReadCompanyScope(req, companyId)
+          ? probed
+          : await filterIssuesForActor(req, probed);
+        const { rows: result, truncated } = resolveIssueListTruncation(readable, limit);
         const issueIds = result.map((issue) => issue.id);
         if (compactView) {
           const [handoffStates, recoveryActionByIssue] = await Promise.all([

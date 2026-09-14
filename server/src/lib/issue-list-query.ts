@@ -52,10 +52,13 @@ export function issueListProbeLimit(limit: number): number {
  * Split an over-fetched result into the page the caller asked for and whether
  * more rows exist beyond it.
  *
- * MUST run on the raw service rows, BEFORE any per-actor ACL filtering:
- * filtering drops rows, so a filtered page shorter than `limit` says nothing
- * about whether the underlying query was truncated. Slicing here also keeps the
- * emitted body byte-identical to the pre-BLO-33741 response.
+ * MUST run on the full probed window (see {@link issueListProbeLimit}), and
+ * AFTER any per-actor ACL filtering — never on a page already sliced to
+ * `limit`. Slicing first makes the filtered length meaningless (it can only
+ * shorten), so truncation would read as false; filtering after the split leaks
+ * instead, reporting truncation a restricted actor cannot see the rows for.
+ * Feeding the filtered probe window through here gets both: the signal counts
+ * only readable rows, and the over-fetch keeps it honest.
  */
 export function resolveIssueListTruncation<T>(
   rows: T[],
