@@ -2151,6 +2151,117 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.errorCode).toBe("process_lost");
   });
 
+  // BLO-33385: a pre-adapter process_lost destroys a ONE-SHOT issue wake
+  // (issue_comment_mentioned, missing_issue_comment, ...). Nothing redelivers
+  // those, so before this fix the issue was released and stranded. Only
+  // PR-review runs were retried; these two pin the widened gate and the
+  // BLO-7913 boundary it must not cross.
+  it("retries an issue-scoped pre-adapter process_lost exactly once so the one-shot wake survives (BLO-33385)", async () => {
+    const { agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      lastOutputAt: null,
+      // Deliberately NOT a pr_review context: this is the shape that got no
+      // retry before the fix.
+      contextSnapshot: { wakeReason: "issue_comment_mentioned" },
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    expect(result.runIds).toContain(runId);
+
+    const lostRun = await heartbeat.getRun(runId);
+    expect(lostRun?.status).toBe("failed");
+    expect(lostRun?.errorCode).toBe("process_lost");
+    expect(lostRun?.error).toContain("retrying once");
+    // The parent carries the spent budget, so a second loss on the retry
+    // chain fails the `< 1` bound and stays terminal.
+    expect(lostRun?.processLossRetryCount).toBe(1);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    const retryRuns = runs.filter((row) => row.retryOfRunId === runId);
+    expect(retryRuns).toHaveLength(1);
+    expect(["queued", "running"]).toContain(retryRuns[0]?.status);
+    expect(retryRuns[0]?.processLossRetryCount).toBe(1);
+    expect(retryRuns[0]?.contextSnapshot).toMatchObject({
+      wakeReason: "process_lost_retry",
+      retryOfRunId: runId,
+      issueId,
+    });
+
+    // The retry is the SINGLE continuation for this issue: promotion is
+    // suppressed, so no second runnable path is created beside it.
+    expect(runs).toHaveLength(2);
+  });
+
+  it("leaves a pre-adapter process_lost with no issue id terminal, with no retry (BLO-7913 non-regression)", async () => {
+    // Timer/maintenance runs self-redeliver, so retrying them only leaks.
+    const { agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    expect(result.runIds).toContain(runId);
+
+    const lostRun = await heartbeat.getRun(runId);
+    expect(lostRun?.status).toBe("failed");
+    expect(lostRun?.errorCode).toBe("process_lost");
+    expect(lostRun?.error).not.toContain("retrying once");
+    expect(lostRun?.processLossRetryCount ?? 0).toBe(0);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.filter((row) => row.retryOfRunId === runId)).toHaveLength(0);
+    expect(runs).toHaveLength(1);
+  });
+
+  it(
+    "leaves a pre-adapter process_lost monitor dispatch terminal while a future monitor wake remains (BLO-33385 review)",
+    async () => {
+      // The widened pre-adapter gate must not swallow `issue_monitor_due`: that
+      // wake is redelivered by the monitor, so a retry here would race the
+      // scheduled redelivery and produce two continuations for one issue. The
+      // sibling test above covers the same wake reason on a NON-external adapter,
+      // which never reaches this branch -- `opencode_k8s` is what makes it
+      // pre-adapter, and is the shape the review flagged as unguarded.
+      const { companyId, agentId, runId, issueId } = await seedRunFixture({
+        adapterType: "opencode_k8s",
+        agentStatus: "idle",
+        processPid: null,
+        processGroupId: null,
+        lastOutputAt: null,
+        contextSnapshot: { wakeReason: "issue_monitor_due" },
+      });
+      await db
+        .update(issues)
+        .set({ monitorNextCheckAt: new Date("2099-03-19T00:00:00.000Z") })
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)));
+
+      const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+      expect(result.runIds).toContain(runId);
+
+      const lostRun = await heartbeat.getRun(runId);
+      expect(lostRun?.status).toBe("failed");
+      expect(lostRun?.errorCode).toBe("process_lost");
+      expect(lostRun?.error).not.toContain("retrying once");
+      expect(lostRun?.processLossRetryCount ?? 0).toBe(0);
+
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs.filter((row) => row.retryOfRunId === runId)).toHaveLength(0);
+      expect(runs).toHaveLength(1);
+
+      // The wake that survives is the monitor's own, untouched by the reap.
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((r) => r[0]);
+      expect(issue?.monitorNextCheckAt?.toISOString()).toBe("2099-03-19T00:00:00.000Z");
+    },
+  );
+
   it("immediately reaps a fresh exact-missing Job and records that adapter invocation started", async () => {
     const jobName = "agent-opencode-restart-missing";
     const { companyId, agentId, runId } = await seedRunFixture({
