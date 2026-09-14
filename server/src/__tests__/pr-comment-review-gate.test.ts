@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 // @ts-expect-error -- plain-JS census script; imported for its own predicate so
@@ -808,6 +811,55 @@ describe("evaluateCommentReviewGate — quoted review bodies", () => {
         comments: [allyComment(indented, "2026-09-05T00:00:00Z")],
       }),
     ).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+});
+
+/**
+ * A counted bucket heading is a verdict only where a verdict can appear: at
+ * the start of a line. Quoted inline, it is a reviewer naming the format, and
+ * on a parser whose own reviews must quote that format to say anything useful
+ * that distinction gates the fix for itself (BLO-32443).
+ */
+describe("hasActionablePrReviewFeedback — counted buckets are line-anchored", () => {
+  // Verbatim from paperclip#1681's `c57fafa` review, which declares 0
+  // Critical / 0 Important and whose gate went red 11 seconds later. This is
+  // the negative control: it fails before the anchor, so a green here cannot
+  // be produced by a blanket relaxation.
+  const PR1681_REVIEW = readFileSync(
+    path.join(import.meta.dirname, "fixtures", "ally-review-pr1681-2026-09-06T112146Z.md"),
+    "utf8",
+  );
+
+  it("does not read a bucket quoted inside an inline-code span as a finding", () => {
+    // The body carries four bucket matches: the two real 0/0 headings, plus
+    // two inline-code illustrations of a truncation failure mode, one of them
+    // `### Important Issues (1)`. Only the headings are verdicts.
+    expect(PR1681_REVIEW).toContain("`### Important Issues (1)` is cut");
+    expect(hasActionablePrReviewFeedback(PR1681_REVIEW)).toBe(false);
+  });
+
+  it("still enumerates the real 0/0 buckets, so the head is not unenumerable", () => {
+    // Anchoring must narrow what counts as a verdict without blinding the
+    // carry-forward enumeration — a null here would read as "no buckets
+    // declared", which is a different and worse verdict than clean.
+    expect(extractAllyReportedFindingRefs(PR1681_REVIEW)).toEqual([]);
+  });
+
+  it.each([
+    ["markdown heading", "### Critical Issues (1)"],
+    ["bold run", "**Important Issues (2)**"],
+    ["list item", "- Critical Issues (1)"],
+    ["blockquoted heading", "> ### Important Issues (1)"],
+  ])("still blocks on a bucket in canonical position: %s", (_shape, heading) => {
+    expect(hasActionablePrReviewFeedback(reviewBody(CURRENT_HEAD, [heading]))).toBe(true);
+  });
+
+  it.each([
+    ["decision line", "decision: changes_requested"],
+    ["bare phrase", "The reviewer left changes requested on this head."],
+    ["uncounted heading", "### Critical Issues"],
+  ])("leaves the other blocking clauses intact: %s", (_shape, line) => {
+    expect(hasActionablePrReviewFeedback(reviewBody(CURRENT_HEAD, [line]))).toBe(true);
   });
 });
 

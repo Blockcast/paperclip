@@ -207,8 +207,34 @@ const PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp(
 // Ally numbers findings within a bucket from 1, and its ledger entries name
 // that same (severity, index) pair, so these counts enumerate exactly which
 // finding identities a head raised.
-const COUNTED_FINDINGS_BUCKET_PATTERN =
-  /\b(Critical|Important)\s+Issues\b[*_]*\s*\((\d+)\)/gi;
+//
+// Line-anchored and indentation-bounded like every other structural pattern
+// here, which this one was missing (BLO-32443). Unanchored it read a bucket
+// heading quoted mid-sentence inside an inline-code span as a verdict, and
+// withoutFencedCodeBlocks cannot help: it strips *fenced* spans only, and
+// hasActionablePrReviewFeedback unions the raw and stripped readings anyway,
+// so an inline span is scanned on both passes. Measured on paperclip#1681
+// `c57fafa`, where Ally declared 0 Critical / 0 Important and the gate went
+// red 11 seconds later on `### Important Issues (1)` typed as an illustration
+// of a truncation failure mode.
+//
+// That makes this the one pattern whose false positive is self-referential: a
+// review of this file must quote bucket headings to say anything useful, so
+// unanchored it gates its own PR — and the PR fixing it, and BLO-31446's.
+//
+// Anchoring narrows on *position*, which is the property that separates a
+// verdict from a quotation. Stripping inline code before scanning would not:
+// it would also drop a real finding a reviewer happened to format as code,
+// which is the fail-open direction this module must never take (BLO-29711).
+//
+// `[#>]+` repeats rather than matching once so a blockquoted heading
+// (`> ### Important Issues (1)`) still reads — quoting for emphasis is not
+// quoting as an example. UNCOUNTED_FINDINGS_HEADING_REGEX permits one such
+// run only; keep that in mind if the two are ever unified.
+const COUNTED_FINDINGS_BUCKET_PATTERN = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE} {0,3}(?:[#>]+[ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(Critical|Important)\s+Issues\b[*_]*\s*\((\d+)\)`,
+  "gim",
+);
 
 // Ally's disposition vocabulary is three words: `fixed` and
 // `no-longer-applicable` retire a prior finding, `still-present` asserts it
@@ -359,8 +385,14 @@ export function extractAllyReportedFindingRefs(
 }
 
 function carriesBlockingFeedback(text: string): boolean {
-  for (const bucket of text.matchAll(/\b(?:Critical|Important)\s+Issues\b[*_]*\s*\((\d+)\)/gi)) {
-    if (Number(bucket[1]) > 0) return true;
+  // Shares COUNTED_FINDINGS_BUCKET_PATTERN with extractAllyReportedFindingRefs
+  // rather than restating it, so the two cannot drift: a body this reads as
+  // blocking is exactly one that yields finding identities there. They were
+  // byte-identical copies until BLO-32443 had to anchor both, which is the
+  // second time this file has paid for two patterns disagreeing about what
+  // counts as quoted text.
+  for (const [, , count] of text.matchAll(COUNTED_FINDINGS_BUCKET_PATTERN)) {
+    if (Number(count) > 0) return true;
   }
   if (UNCOUNTED_FINDINGS_HEADING_REGEX.test(text)) return true;
   if (/^[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*$/im.test(text)) return true;
