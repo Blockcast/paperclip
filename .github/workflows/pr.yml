@@ -1022,7 +1022,26 @@ jobs:
     # caps bite today. Bring 110 back down when it lands.
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
-      fail-fast: false
+      # BLO-33021: fail-fast is right for `pull_request` (one push, show the
+      # author every red at once) and wrong for `merge_group`, where there is
+      # exactly one landing candidate under maximumEntriesToBuild=1 and the
+      # only question is pass/fail. Measured on merge group
+      # gh-readonly-queue/master/pr-1393-7cf49b59 (run 34759050138): the
+      # `workspaces-b` leg failed at 13:34:05Z -- 18 minutes in -- and the four
+      # 110-minute `server n/4` legs kept running for another 40+ minutes,
+      # because the merge queue cannot evict a candidate until the required
+      # check reports. Six of the 22 merge-group attempts in the preceding 26h
+      # failed that way, each burning a full group duration (server-shard p100
+      # is 89.7m per the timeout table below) on a verdict already decided.
+      # Queue depth was 28 and the head had waited 26.3h.
+      #
+      # Cancelling the siblings does not soften the gate: `needs.general_tests
+      # .result` is `failure` whenever any leg failed regardless of cancelled
+      # peers, so the `verify` lane's `success | cancelled | skipped` pass-case
+      # is not reachable through this change. A cancelled leg can only reach
+      # `scripts/classify-lane-failures.mjs`, which by its own contract may
+      # change the wording of a red run and never the gate.
+      fail-fast: ${{ github.event_name == 'merge_group' }}
       # Every matrix entry gets an isolated ARC pod/database. Serializing this
       # matrix only lengthens the critical path and leaves on-prem capacity
       # unused when it is available.
