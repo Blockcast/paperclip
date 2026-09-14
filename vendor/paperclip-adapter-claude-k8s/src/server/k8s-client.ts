@@ -7,6 +7,14 @@ import {
 } from "./inherit-allowlist.js";
 
 /**
+ * Where the Paperclip server container mounts the shared `data` PVC. This is
+ * the ONLY path through which this process can reach that volume, so anything
+ * the server must create inside it (BLO-32734 `subPath` targets) is addressed
+ * relative to this, never to the agent pod's own `workspaceMountPath`.
+ */
+export const SELF_POD_DATA_MOUNT_PATH = "/paperclip";
+
+/**
  * Cached self-pod introspection result. Queried once on first execute(),
  * then reused for all subsequent Job builds so every Job inherits the
  * Deployment's image, imagePullSecrets, DNS config, PVC claim, and scheduling.
@@ -177,10 +185,10 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
     throw new Error(`claude_k8s: pod ${hostname} has no container image`);
   }
 
-  // Find PVC claim name from volumes mounted at /paperclip
+  // Find PVC claim name from volumes mounted at SELF_POD_DATA_MOUNT_PATH
   let pvcClaimName: string | null = null;
   const dataMount = mainContainer.volumeMounts?.find(
-    (vm) => vm.mountPath === "/paperclip",
+    (vm) => vm.mountPath === SELF_POD_DATA_MOUNT_PATH,
   );
   if (dataMount) {
     const volume = spec.volumes?.find((v) => v.name === dataMount.name);
