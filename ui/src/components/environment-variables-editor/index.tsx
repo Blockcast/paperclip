@@ -362,6 +362,7 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
         existing.name = key;
         existing.source = "text";
         existing.textValue = pairValue;
+        existing.masked = false;
         existing.secretId = "";
         existing.sensitiveDismissed = false;
         existing.userSecretKey = "";

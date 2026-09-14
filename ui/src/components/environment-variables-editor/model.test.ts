@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { CompanySecret, UserSecretDefinition } from "@paperclipai/shared";
+import { REDACTED_SENTINEL, type CompanySecret, type UserSecretDefinition } from "@paperclipai/shared";
 import {
+  canStoreValueAsSecret,
   computeDuplicateNames,
   computeRowHealth,
   computeUserSecretRowHealth,
@@ -253,6 +254,55 @@ describe("planSourceSwitch (§6.3)", () => {
   it("does not offer undo on Secret→Text when no secret was bound", () => {
     const plan = planSourceSwitch({ ...emptyRow(), source: "secret" }, "text");
     expect(plan).toEqual({ kind: "to-text", undoFrom: null });
+  });
+
+  it("routes a withheld row to the picker instead of storing the placeholder (PEN-3033)", () => {
+    // The mask is non-empty, so the ordinary `textValue.trim()` test would send this down
+    // `open-store` and create a company secret holding `***REDACTED***`.
+    const row = { ...emptyRow(), name: "GH_TOKEN", source: "text" as const, textValue: REDACTED_SENTINEL, masked: true };
+    expect(planSourceSwitch(row, "secret")).toEqual({ kind: "to-secret" });
+  });
+
+  it("still stores a value the user typed over the mask", () => {
+    // `masked` is cleared on edit, so this is an ordinary non-empty value again.
+    const row = { ...emptyRow(), name: "GH_TOKEN", source: "text" as const, textValue: "real", masked: false };
+    expect(planSourceSwitch(row, "secret")).toEqual({ kind: "open-store", name: "gh_token", value: "real" });
+  });
+});
+
+describe("withheld-value handling (PEN-3033)", () => {
+  it("flags a masked plain-string binding", () => {
+    const [row] = rowsFromValue({ GH_TOKEN: REDACTED_SENTINEL });
+    expect(row.masked).toBe(true);
+    expect(row.textValue).toBe(REDACTED_SENTINEL);
+  });
+
+  it("flags a masked plain-object binding", () => {
+    const [row] = rowsFromValue({ GH_TOKEN: { type: "plain", value: REDACTED_SENTINEL } });
+    expect(row.masked).toBe(true);
+  });
+
+  it("does not flag an ordinary value", () => {
+    const [row] = rowsFromValue({ GH_TOKEN: "real" });
+    expect(row.masked).toBe(false);
+  });
+
+  it("re-emits the sentinel on save so the server can merge the stored value back", () => {
+    // `valueFromRows` must NOT drop or blank a withheld row: `restoreMaskedEnvBindings` matches on
+    // this exact string to restore the real binding. Emitting anything else destroys it.
+    const rows = rowsFromValue({ GH_TOKEN: REDACTED_SENTINEL });
+    expect(valueFromRows(rows)).toEqual({ GH_TOKEN: { type: "plain", value: REDACTED_SENTINEL } });
+  });
+
+  it("refuses to store a withheld value as a secret, and allows it once edited", () => {
+    const masked = { ...emptyRow(), source: "text" as const, textValue: REDACTED_SENTINEL, masked: true };
+    expect(canStoreValueAsSecret(masked)).toBe(false);
+    // What the value input's onChange produces once the user types over the mask.
+    expect(canStoreValueAsSecret({ ...masked, textValue: "real", masked: false })).toBe(true);
+  });
+
+  it("refuses on an empty row, so the predicate is not merely a mask test", () => {
+    expect(canStoreValueAsSecret({ ...emptyRow(), source: "text", textValue: "  " })).toBe(false);
   });
 });
 
