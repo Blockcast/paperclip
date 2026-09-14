@@ -1,6 +1,10 @@
 import type { Request } from "express";
 import type {
   ExecutionWorkspace,
+  ExecutionWorkspaceCloseReadiness,
+  ExecutionWorkspaceConfig,
+  ExecutionWorkspaceStrategy,
+  ProjectExecutionWorkspacePolicy,
   ProjectWorkspace,
   WorkspaceOperation,
   WorkspaceRuntimeService,
@@ -70,6 +74,68 @@ import type { accessService } from "../services/index.js";
  * `workspace-response-withholding-guard.test.ts` proves the door is USED, never that it is CLOSED.
  * Anything added to `ExecutionWorkspace` or `ProjectWorkspace` carrying operator text has to be
  * named here or it is disclosed silently.
+ *
+ * ## PEN-3073 — what "operator-authored command" means, decided once
+ *
+ * The revision above withheld `workspaceRuntime` because that is the field the door-by-door series
+ * kept FINDING. Its stated rationale — "service commands, working directories and the environment
+ * those commands run with" — is a rationale about a CLASS, and five sibling carriers of that same
+ * class rode through untouched, under four different nouns:
+ *
+ *   1. `ExecutionWorkspaceConfig.provisionCommand` / `.teardownCommand` / `.cleanupCommand`
+ *   2. `ProjectWorkspace.setupCommand` / `.cleanupCommand`  (top-level columns, NOT in `runtimeConfig`)
+ *   3. `ExecutionWorkspaceStrategy.provisionCommand` / `.teardownCommand` / `.worktreeParentDir`
+ *   4. `ProjectExecutionWorkspacePolicy.workspaceStrategy` + `.workspaceRuntime`
+ *   5. `ExecutionWorkspaceCloseReadiness.plannedActions[].command` for the operator-authored kinds
+ *
+ * The decision: **a string this control plane hands to a shell is withheld, wherever it is stored
+ * and whatever it is named.** `provisionCommand` is executed as `bash -lc <string>`
+ * (`services/environment-run-orchestrator.ts`), which makes an inline `FOO_TOKEN=… ./deploy.sh` an
+ * ordinary idiom — the same idiom `publicRuntimeServices` below already withholds `command` for.
+ * Being a typed column bounds the KEY SET; it says nothing about the VALUE. `company-portability.ts`
+ * had already reached this conclusion independently from the other side: it refuses `setupCommand`
+ * on safe import and drops it from export when it carries an absolute path.
+ *
+ * (3) and (4) matter because they are not reachable from this module's row types at all. The same
+ * two command strings live a second time on the *strategy* object, which reaches responses via
+ * `issue.executionWorkspaceSettings.workspaceStrategy` and `project.executionWorkspacePolicy` — the
+ * derived-view trap of (1) above at a third and fourth remove. `GET /issues/:id` served
+ * `currentExecutionWorkspace.config.workspaceRuntime` masked and
+ * `project.executionWorkspacePolicy.workspaceRuntime` in the clear, in one response body.
+ *
+ * ### Deliberately NOT withheld, and why — so the next door does not relitigate it
+ *
+ *  - `environmentId` — a UUID foreign key. Closed shape; carries no operator-authored text.
+ *  - `desiredState` / `serviceStates` — enum-validated on the way out of the runtime-config reader
+ *    (`WorkspaceRuntimeDesiredState`). Closed shape, same reason.
+ *  - `hasWorkspaceRuntimeConfig` — the compensating existence flag. Withheld-is-not-absent.
+ *  - `ExecutionWorkspace.cwd` / `agentCwd`, `ProjectWorkspace.cwd` — the path the agent runtime must
+ *    `cd` into to do its job. Disclosing it is the feature; this is a live product decision, not an
+ *    unexamined pass-through, and it is why `plannedActions` masking below is by action KIND rather
+ *    than blanket: `git worktree remove --force <path>` is Paperclip-generated from a path the
+ *    caller already holds, while `cleanup_command` is the operator's own string.
+ *  - `ExecutionWorkspaceStrategy.type` / `.runScope` — closed enums. `.baseRef` / `.branchTemplate`
+ *    are git refs and templates the branch-naming UI renders and the agent needs to name its branch.
+ *  - `stdoutExcerpt` / `stderrExcerpt` / `logRef` on operations — command *output*, not a copy of a
+ *    declared-withheld value (CTO Ruling F §4, BLO-33407). Unchanged by this ticket.
+ *
+ * ### ⚠️ KNOWN OPEN CARRIER, deliberately not closed here — `issues.executionWorkspaceSettings`
+ *
+ * The issue row holds a per-issue override of the SAME two objects the project policy holds:
+ * `workspaceStrategy` (the command strings above) and `workspaceRuntime` (the open operator record).
+ * `buildReusedExecutionWorkspaceConfigPatchFromIssueSettings` (`services/issues.ts`) copies both
+ * straight onto the execution workspace's own config, so they are the same bytes, not merely the
+ * same class. It is a raw JSONB column on a row this module has no projection for, and issue
+ * responses are SPREADS — so it does not pass this boundary at all. That makes it a BYPASS of the
+ * shipped boundary rather than a gap in this mask's width, and it is filed separately for that
+ * reason.
+ *
+ * It is named here, in the module that would otherwise read as having closed the class, because the
+ * honest scope of the fix below is "every carrier reachable through a workspace or project row" —
+ * NOT "every carrier". The settings column reaches responses from ELEVEN sites in `routes/issues.ts`
+ * (`GET /issues/:id`, create ×2, children, PATCH, DELETE, checkout, release ×2, admin force-release,
+ * recovery-actions/resolve) plus the company-export bundle, none of which the CI guard covers.
+ * Masking one of twelve would read as closure and be worse than masking none.
  */
 
 export interface WorkspaceRuntimeViewer {
@@ -95,6 +161,60 @@ export async function resolveWorkspaceRuntimeViewer(
   return { revealRuntimeConfig: decision.allowed };
 }
 
+/**
+ * PEN-3073. Masked rather than nulled, for the same reason `publicRuntimeServices` masks: a withheld
+ * reader must still be able to tell "no provision command is configured" from "the provision command
+ * was withheld". `workspaceRuntime` stays `null` rather than joining them because
+ * `hasWorkspaceRuntimeConfig` already carries that distinction for it, and because a nested record
+ * has no single sentinel to stand in for it.
+ *
+ * Enumerated over a spread on purpose: a field added to `ExecutionWorkspaceConfig` later has to be
+ * classified here before it can ship, instead of riding out by default.
+ */
+export function publicExecutionWorkspaceConfig(
+  config: ExecutionWorkspaceConfig | null,
+  viewer: WorkspaceRuntimeViewer,
+): ExecutionWorkspaceConfig | null {
+  if (config === null) return null;
+  if (viewer.revealRuntimeConfig) return config;
+  return {
+    ...config,
+    provisionCommand: maskWorkspaceRuntimeTextForRead(config.provisionCommand),
+    teardownCommand: maskWorkspaceRuntimeTextForRead(config.teardownCommand),
+    cleanupCommand: maskWorkspaceRuntimeTextForRead(config.cleanupCommand),
+    workspaceRuntime: null,
+  };
+}
+
+/**
+ * PEN-3073. The strategy object carries the SAME two command strings as
+ * `ExecutionWorkspaceConfig` — `buildReusedExecutionWorkspaceConfigPatchFromIssueSettings`
+ * (`services/issues.ts`) copies `settings.workspaceStrategy.provisionCommand` straight onto
+ * `config.provisionCommand`, so they are not merely the same class, they are the same bytes.
+ *
+ * `worktreeParentDir` joins them: it is an operator-authored host path, and unlike `workspace.cwd`
+ * no caller needs it to reach its own tree — it is the parent directory the runtime allocates under.
+ */
+export function publicExecutionWorkspaceStrategy(
+  strategy: ExecutionWorkspaceStrategy | null | undefined,
+  viewer: WorkspaceRuntimeViewer,
+): ExecutionWorkspaceStrategy | null | undefined {
+  if (strategy === null || strategy === undefined) return strategy;
+  if (viewer.revealRuntimeConfig) return strategy;
+  return {
+    ...strategy,
+    ...(strategy.worktreeParentDir === undefined
+      ? {}
+      : { worktreeParentDir: maskWorkspaceRuntimeTextForRead(strategy.worktreeParentDir) }),
+    ...(strategy.provisionCommand === undefined
+      ? {}
+      : { provisionCommand: maskWorkspaceRuntimeTextForRead(strategy.provisionCommand) }),
+    ...(strategy.teardownCommand === undefined
+      ? {}
+      : { teardownCommand: maskWorkspaceRuntimeTextForRead(strategy.teardownCommand) }),
+  };
+}
+
 export function publicExecutionWorkspace(
   workspace: ExecutionWorkspace,
   viewer: WorkspaceRuntimeViewer,
@@ -102,7 +222,7 @@ export function publicExecutionWorkspace(
   if (viewer.revealRuntimeConfig) return workspace;
   return {
     ...workspace,
-    config: workspace.config === null ? null : { ...workspace.config, workspaceRuntime: null },
+    config: publicExecutionWorkspaceConfig(workspace.config, viewer),
     metadata: null,
     runtimeServices:
       workspace.runtimeServices && publicRuntimeServices(workspace.runtimeServices, viewer),
@@ -229,6 +349,11 @@ export function publicProjectWorkspace(
   if (viewer.revealRuntimeConfig) return workspace;
   return {
     ...workspace,
+    // PEN-3073. `ProjectWorkspaceRuntimeConfig` has no command fields, so the runtime config here is
+    // already as closed as its type permits — but the row carries the same class of string one level
+    // UP, as top-level columns. Reading the asymmetry off the two *config* types alone misses them.
+    setupCommand: maskWorkspaceRuntimeTextForRead(workspace.setupCommand),
+    cleanupCommand: maskWorkspaceRuntimeTextForRead(workspace.cleanupCommand),
     runtimeConfig:
       workspace.runtimeConfig === null ? null : { ...workspace.runtimeConfig, workspaceRuntime: null },
     metadata: null,
@@ -249,14 +374,29 @@ export function publicProjectWorkspaces(
  * the same `toWorkspace` mapper — so a project read is a second exit for exactly the same material,
  * and `GET /companies/:companyId/projects` is the widest one in the codebase. Found by running this
  * ticket's own method clause against the workspace-route fix rather than by re-reading it.
+ *
+ * PEN-3073 adds `executionWorkspacePolicy`. It is not a workspace row and does not reach this module
+ * through one, which is exactly why the first revision missed it: the project row carries its own
+ * `workspaceRuntime` — the same open operator-authored `Record<string, unknown>` — plus a
+ * `workspaceStrategy`. Both rode out on the widest exit while the embedded workspaces beside them
+ * were masked.
  */
 export function publicProject<T extends {
   workspaces: ProjectWorkspace[];
   primaryWorkspace: ProjectWorkspace | null;
+  executionWorkspacePolicy?: ProjectExecutionWorkspacePolicy | null;
 }>(project: T, viewer: WorkspaceRuntimeViewer): T {
   if (viewer.revealRuntimeConfig) return project;
   return {
     ...project,
+    ...(project.executionWorkspacePolicy === undefined
+      ? {}
+      : {
+          executionWorkspacePolicy: publicProjectExecutionWorkspacePolicy(
+            project.executionWorkspacePolicy,
+            viewer,
+          ),
+        }),
     workspaces: publicProjectWorkspaces(project.workspaces, viewer),
     primaryWorkspace: project.primaryWorkspace
       ? publicProjectWorkspace(project.primaryWorkspace, viewer)
@@ -267,6 +407,86 @@ export function publicProject<T extends {
 export function publicProjects<T extends {
   workspaces: ProjectWorkspace[];
   primaryWorkspace: ProjectWorkspace | null;
+  executionWorkspacePolicy?: ProjectExecutionWorkspacePolicy | null;
 }>(projects: T[], viewer: WorkspaceRuntimeViewer): T[] {
   return projects.map((project) => publicProject(project, viewer));
+}
+
+/**
+ * PEN-3073. The project-level default for everything the two workspace rows carry per-instance, and
+ * the source `getCloseReadiness` falls back to for a teardown command
+ * (`config?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand`). Same bytes, one
+ * noun over.
+ *
+ * `workspaceRuntime` goes through the deny-by-default walk rather than to `null`: unlike the
+ * workspace rows there is no `hasWorkspaceRuntimeConfig` flag beside it here, so nulling would erase
+ * the operator's ability to see that a policy exists at all. The walk keeps key NAMES and structure
+ * and elides values — PEN-2370 ask 1.
+ *
+ * `branchPolicy` / `pullRequestPolicy` / `runtimePolicy` / `cleanupPolicy` are open records too and
+ * get the same walk, for the same reason `metadata` does on the operation projection: a name list
+ * cannot cover a key that does not exist yet. `authorizationPolicy` is a closed trust-boundary shape
+ * read by the low-trust review path and carries no operator free text, so it crosses intact.
+ */
+export function publicProjectExecutionWorkspacePolicy(
+  policy: ProjectExecutionWorkspacePolicy | null,
+  viewer: WorkspaceRuntimeViewer,
+): ProjectExecutionWorkspacePolicy | null {
+  if (policy === null) return null;
+  if (viewer.revealRuntimeConfig) return policy;
+  const maskOpenRecord = (value: Record<string, unknown> | null | undefined) =>
+    value === null || value === undefined
+      ? value
+      : (maskWorkspaceRuntimeForRead(value) as Record<string, unknown>);
+  return {
+    ...policy,
+    ...(policy.workspaceStrategy === undefined
+      ? {}
+      : { workspaceStrategy: publicExecutionWorkspaceStrategy(policy.workspaceStrategy, viewer) }),
+    ...(policy.workspaceRuntime === undefined
+      ? {}
+      : { workspaceRuntime: maskOpenRecord(policy.workspaceRuntime) }),
+    ...(policy.branchPolicy === undefined ? {} : { branchPolicy: maskOpenRecord(policy.branchPolicy) }),
+    ...(policy.pullRequestPolicy === undefined
+      ? {}
+      : { pullRequestPolicy: maskOpenRecord(policy.pullRequestPolicy) }),
+    ...(policy.runtimePolicy === undefined
+      ? {}
+      : { runtimePolicy: maskOpenRecord(policy.runtimePolicy) }),
+    ...(policy.cleanupPolicy === undefined
+      ? {}
+      : { cleanupPolicy: maskOpenRecord(policy.cleanupPolicy) }),
+  };
+}
+
+/**
+ * PEN-3073. `GET /execution-workspaces/:id/close-readiness` answers `{ ...readiness, runtimeServices:
+ * publicRuntimeServices(…) }` — it masks the service rows and spreads everything else, so
+ * `plannedActions[].command` handed back `config.cleanupCommand`, the project workspace's
+ * `cleanupCommand` and the resolved `teardownCommand` verbatim, beside the very services it had just
+ * masked.
+ *
+ * Masked by action KIND, not blanket. `cleanup_command` and `teardown_command` carry the operator's
+ * own string. The rest are Paperclip-generated previews of what closing will do
+ * (`git worktree remove --force <path>`, `rm -rf <path>`) built from a path the caller already holds
+ * on the row, and they are the entire point of the readiness preview — blanking them would break the
+ * confirm-before-destroy UI to hide a string the operator never wrote. `description` for those kinds
+ * is generated the same way and stays.
+ */
+const OPERATOR_AUTHORED_CLOSE_ACTION_KINDS = new Set(["cleanup_command", "teardown_command"]);
+
+export function publicExecutionWorkspaceCloseReadiness(
+  readiness: ExecutionWorkspaceCloseReadiness,
+  viewer: WorkspaceRuntimeViewer,
+): ExecutionWorkspaceCloseReadiness {
+  if (viewer.revealRuntimeConfig) return readiness;
+  return {
+    ...readiness,
+    plannedActions: readiness.plannedActions.map((action) =>
+      OPERATOR_AUTHORED_CLOSE_ACTION_KINDS.has(action.kind)
+        ? { ...action, command: maskWorkspaceRuntimeTextForRead(action.command) }
+        : action,
+    ),
+    runtimeServices: publicRuntimeServices(readiness.runtimeServices, viewer),
+  };
 }

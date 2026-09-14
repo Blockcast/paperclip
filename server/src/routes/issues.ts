@@ -152,6 +152,7 @@ import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import {
   executionWorkspaceIdentity,
   publicExecutionWorkspace,
+  publicProjectExecutionWorkspacePolicy,
   publicProjects,
   publicProjectWorkspace,
   resolveWorkspaceRuntimeViewer,
@@ -7631,8 +7632,16 @@ export function issueRoutes(
       repoRef: workspace.repoRef,
       defaultRef: workspace.defaultRef,
       visibility: workspace.visibility,
-      setupCommand: workspace.setupCommand,
-      cleanupCommand: workspace.cleanupCommand,
+      // PEN-3073: `ProjectWorkspaceRuntimeConfig` carries no command fields, but the ROW does —
+      // these two are top-level columns, and both are operator-authored shell strings of the same
+      // class as `config.provisionCommand` on the execution-workspace side. Reading the
+      // execution/project asymmetry off the two runtime-config types alone misses them.
+      setupCommand: viewer.revealRuntimeConfig
+        ? workspace.setupCommand
+        : maskWorkspaceRuntimeTextForRead(workspace.setupCommand),
+      cleanupCommand: viewer.revealRuntimeConfig
+        ? workspace.cleanupCommand
+        : maskWorkspaceRuntimeTextForRead(workspace.cleanupCommand),
       remoteProvider: workspace.remoteProvider,
       remoteWorkspaceRef: workspace.remoteWorkspaceRef,
       sharedWorkspaceKey: workspace.sharedWorkspaceKey,
@@ -7705,7 +7714,15 @@ export function issueRoutes(
       env: null,
       pauseReason: project.pauseReason,
       pausedAt: project.pausedAt,
-      executionWorkspacePolicy: project.executionWorkspacePolicy,
+      // PEN-3073: the project-level default for the same two objects the workspace rows carry
+      // per-instance — `workspaceRuntime` (open operator record) and `workspaceStrategy` (the same
+      // provision/teardown command strings). It is not a workspace row, so nothing in the PEN-2852
+      // boundary reached it: this response served `currentExecutionWorkspace.config.workspaceRuntime`
+      // masked and `project.executionWorkspacePolicy.workspaceRuntime` in the clear.
+      executionWorkspacePolicy: publicProjectExecutionWorkspacePolicy(
+        project.executionWorkspacePolicy ?? null,
+        viewer,
+      ),
       codebase: project.codebase,
       workspaces: (project.workspaces ?? []).map((workspace) =>
         compactIssueProjectWorkspace(workspace, viewer),
@@ -7790,9 +7807,21 @@ export function issueRoutes(
       config: workspace.config
         ? {
             environmentId: workspace.config.environmentId,
-            provisionCommand: workspace.config.provisionCommand,
-            teardownCommand: workspace.config.teardownCommand,
-            cleanupCommand: workspace.config.cleanupCommand,
+            // PEN-3073: the three sibling scalars of `workspaceRuntime`, and the same class of
+            // value — `provisionCommand` is executed as `bash -lc <string>`. Masked here on the
+            // same composition rule as `workspaceRuntime` below (BLO-33407): the gate has already
+            // decided, this layer only survives a gate regression. Note these are NOT redundant
+            // with the gate for an entitled reader — values cross by design there, and the
+            // workspace editor depends on it.
+            provisionCommand: viewer.revealRuntimeConfig
+              ? workspace.config.provisionCommand
+              : maskWorkspaceRuntimeTextForRead(workspace.config.provisionCommand),
+            teardownCommand: viewer.revealRuntimeConfig
+              ? workspace.config.teardownCommand
+              : maskWorkspaceRuntimeTextForRead(workspace.config.teardownCommand),
+            cleanupCommand: viewer.revealRuntimeConfig
+              ? workspace.config.cleanupCommand
+              : maskWorkspaceRuntimeTextForRead(workspace.config.cleanupCommand),
             // PEN-2846 (door #12): `workspaceRuntime` is an open
             // `Record<string, unknown>` an operator authors by hand, and this
             // function is a withholding boundary — it enumerates its fields and

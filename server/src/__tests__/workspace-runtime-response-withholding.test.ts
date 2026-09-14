@@ -16,6 +16,8 @@ import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
 import { projectRoutes } from "../routes/projects.js";
 import {
   publicExecutionWorkspace,
+  publicExecutionWorkspaceCloseReadiness,
+  publicProjectExecutionWorkspacePolicy,
   publicProjectWorkspace,
   publicWorkspaceOperation,
   WITHHELD_WORKSPACE_RUNTIME_VIEWER,
@@ -52,6 +54,25 @@ const SERVICE_CWD_SENTINEL = "/fixture/sentinel-service-cwd";
 const OPERATION_COMMAND_SENTINEL = "TOKEN_FIXTURE=sentinel-operation-command-not-a-real-credential npm run build";
 const OPERATION_CWD_SENTINEL = "/fixture/sentinel-operation-cwd";
 const OPERATION_METADATA_SENTINEL = "/fixture/sentinel-operation-worktree-path";
+
+/**
+ * PEN-3073. The lifecycle command scalars that sit BESIDE `workspaceRuntime` on the same config
+ * object, and their siblings on the three nouns that carry the same strings elsewhere. Each gets its
+ * own sentinel for the reason stated above: a passing assertion has to name the exit it closed.
+ *
+ * Before this ticket every one of these fixture fields was `null`, which is why the suite went green
+ * while the values crossed — a fixture that carries nothing cannot show a mask that does nothing.
+ * All invented; shaped like the inline-assignment idiom `bash -lc` makes ordinary.
+ */
+const CONFIG_PROVISION_SENTINEL = "TOKEN_FIXTURE=sentinel-provision-not-a-real-credential ./provision.sh";
+const CONFIG_TEARDOWN_SENTINEL = "TOKEN_FIXTURE=sentinel-teardown-not-a-real-credential ./teardown.sh";
+const CONFIG_CLEANUP_SENTINEL = "TOKEN_FIXTURE=sentinel-cleanup-not-a-real-credential ./cleanup.sh";
+const PROJECT_SETUP_SENTINEL = "TOKEN_FIXTURE=sentinel-project-setup-not-a-real-credential pnpm install";
+const PROJECT_CLEANUP_SENTINEL = "TOKEN_FIXTURE=sentinel-project-cleanup-not-a-real-credential ./drop.sh";
+const STRATEGY_PROVISION_SENTINEL = "TOKEN_FIXTURE=sentinel-strategy-provision-not-a-real-credential ./boot.sh";
+const STRATEGY_TEARDOWN_SENTINEL = "TOKEN_FIXTURE=sentinel-strategy-teardown-not-a-real-credential ./halt.sh";
+const STRATEGY_PARENT_DIR_SENTINEL = "/fixture/sentinel-worktree-parent-dir";
+const POLICY_RUNTIME_SENTINEL = "sentinel-project-policy-runtime-must-not-egress";
 
 function workspaceOperationFixture(overrides: Record<string, unknown> = {}): WorkspaceOperation {
   return {
@@ -121,7 +142,31 @@ function closeReadinessFixture(runtimeServices = [runtimeServiceFixture()]) {
     blockingReasons: [],
     warnings: [],
     linkedIssues: [],
-    plannedActions: [],
+    // PEN-3073. `plannedActions` was `[]` before this ticket, which is the same blind spot the
+    // `runtimeServices` fixture had: the route spreads `readiness`, so an empty array cannot show
+    // that a populated one crosses. The two operator-authored kinds carry the operator's own string;
+    // the generated preview below must SURVIVE, because blanking it would break the
+    // confirm-before-destroy UI to hide a string the operator never wrote.
+    plannedActions: [
+      {
+        kind: "cleanup_command",
+        label: "Run workspace cleanup command",
+        description: "Workspace-specific cleanup runs before teardown.",
+        command: CONFIG_CLEANUP_SENTINEL,
+      },
+      {
+        kind: "teardown_command",
+        label: "Run teardown command",
+        description: "Teardown runs after cleanup commands during workspace close.",
+        command: STRATEGY_TEARDOWN_SENTINEL,
+      },
+      {
+        kind: "git_worktree_remove",
+        label: "Remove git worktree",
+        description: "Paperclip will run git worktree cleanup.",
+        command: "git worktree remove --force /fixture/cwd",
+      },
+    ],
     isDestructiveCloseAllowed: true,
     isSharedWorkspace: false,
     isProjectPrimaryWorkspace: false,
@@ -215,9 +260,9 @@ function executionWorkspaceFixture(): ExecutionWorkspace {
     cleanupReason: null,
     config: {
       environmentId: null,
-      provisionCommand: null,
-      teardownCommand: null,
-      cleanupCommand: null,
+      provisionCommand: CONFIG_PROVISION_SENTINEL,
+      teardownCommand: CONFIG_TEARDOWN_SENTINEL,
+      cleanupCommand: CONFIG_CLEANUP_SENTINEL,
       workspaceRuntime: runtime,
       desiredState: "running",
       serviceStates: null,
@@ -248,8 +293,8 @@ function projectWorkspaceFixture(): ProjectWorkspace {
     repoRef: null,
     defaultRef: null,
     visibility: "shared",
-    setupCommand: null,
-    cleanupCommand: null,
+    setupCommand: PROJECT_SETUP_SENTINEL,
+    cleanupCommand: PROJECT_CLEANUP_SENTINEL,
     remoteProvider: null,
     remoteWorkspaceRef: null,
     sharedWorkspaceKey: null,
@@ -383,6 +428,133 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       expect(withheld.config?.desiredState).toBe("running");
       expect(withheld.cwd).toBe("/fixture/cwd");
       expect(withheld.status).toBe("active");
+    });
+
+    /**
+     * PEN-3073. The three scalars that sit beside `workspaceRuntime` on the same object and carried
+     * the same class of value — `provisionCommand` is executed as `bash -lc <string>`.
+     */
+    it("withholds the lifecycle command scalars beside workspaceRuntime", () => {
+      const withheld = publicExecutionWorkspace(
+        executionWorkspaceFixture(),
+        WITHHELD_WORKSPACE_RUNTIME_VIEWER,
+      );
+
+      const serialized = JSON.stringify(withheld);
+      expect(serialized).not.toContain(CONFIG_PROVISION_SENTINEL);
+      expect(serialized).not.toContain(CONFIG_TEARDOWN_SENTINEL);
+      expect(serialized).not.toContain(CONFIG_CLEANUP_SENTINEL);
+      // Masked, not nulled: a withheld reader must still tell "none configured" from "withheld",
+      // the same contract `hasWorkspaceRuntimeConfig` carries for the blob.
+      expect(withheld.config?.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+      expect(withheld.config?.teardownCommand).toBe(REDACTED_EVENT_VALUE);
+      expect(withheld.config?.cleanupCommand).toBe(REDACTED_EVENT_VALUE);
+    });
+
+    it("preserves null rather than masking it, so absent stays distinguishable from withheld", () => {
+      const raw = executionWorkspaceFixture();
+      const withheld = publicExecutionWorkspace(
+        { ...raw, config: { ...raw.config!, provisionCommand: null } },
+        WITHHELD_WORKSPACE_RUNTIME_VIEWER,
+      );
+
+      expect(withheld.config?.provisionCommand).toBeNull();
+      expect(withheld.config?.teardownCommand).toBe(REDACTED_EVENT_VALUE);
+    });
+
+    /**
+     * PEN-3073. `ProjectWorkspaceRuntimeConfig` has no command fields, so reading the
+     * execution/project asymmetry off the two *runtime-config* types says the project side is
+     * already closed. It is not: the ROW carries the same class one level up, as columns.
+     */
+    it("withholds the project workspace's own command columns", () => {
+      const withheld = publicProjectWorkspace(
+        projectWorkspaceFixture(),
+        WITHHELD_WORKSPACE_RUNTIME_VIEWER,
+      );
+
+      const serialized = JSON.stringify(withheld);
+      expect(serialized).not.toContain(PROJECT_SETUP_SENTINEL);
+      expect(serialized).not.toContain(PROJECT_CLEANUP_SENTINEL);
+      expect(withheld.setupCommand).toBe(REDACTED_EVENT_VALUE);
+      expect(withheld.cleanupCommand).toBe(REDACTED_EVENT_VALUE);
+      // The identity fields a caller needs to keep addressing the workspace are untouched.
+      expect(withheld.name).toBe("Primary");
+      expect(withheld.hasWorkspaceRuntimeConfig).toBe(true);
+    });
+
+    /**
+     * PEN-3073. The project-level default for the same two objects the workspace rows carry
+     * per-instance. It is not a workspace row, so nothing in the shipped boundary reached it.
+     */
+    it("withholds the project execution-workspace policy's strategy commands and runtime blob", () => {
+      const withheld = publicProjectExecutionWorkspacePolicy(
+        {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          environmentId: "environment-1",
+          workspaceStrategy: {
+            type: "git_worktree",
+            baseRef: "main",
+            branchTemplate: "agent/{issue}",
+            worktreeParentDir: STRATEGY_PARENT_DIR_SENTINEL,
+            provisionCommand: STRATEGY_PROVISION_SENTINEL,
+            teardownCommand: STRATEGY_TEARDOWN_SENTINEL,
+            runScope: "per_issue",
+          },
+          workspaceRuntime: { services: [{ name: "web", env: { TOKEN_FIXTURE: POLICY_RUNTIME_SENTINEL } }] },
+        },
+        WITHHELD_WORKSPACE_RUNTIME_VIEWER,
+      );
+
+      const serialized = JSON.stringify(withheld);
+      expect(serialized).not.toContain(STRATEGY_PROVISION_SENTINEL);
+      expect(serialized).not.toContain(STRATEGY_TEARDOWN_SENTINEL);
+      expect(serialized).not.toContain(STRATEGY_PARENT_DIR_SENTINEL);
+      expect(serialized).not.toContain(POLICY_RUNTIME_SENTINEL);
+      // Names and structure survive the runtime walk — PEN-2370 ask 1.
+      expect(serialized).toContain("TOKEN_FIXTURE");
+      // Closed-shape siblings cross intact, per the module's stated non-withholding list.
+      expect(withheld?.enabled).toBe(true);
+      expect(withheld?.environmentId).toBe("environment-1");
+      expect(withheld?.workspaceStrategy?.type).toBe("git_worktree");
+      expect(withheld?.workspaceStrategy?.baseRef).toBe("main");
+      expect(withheld?.workspaceStrategy?.branchTemplate).toBe("agent/{issue}");
+    });
+
+    /**
+     * PEN-3073. Masked by action KIND. Blanket masking would have hidden the generated preview that
+     * is the entire point of a confirm-before-destroy readiness check.
+     */
+    it("withholds only the operator-authored planned-action commands on close-readiness", () => {
+      const withheld = publicExecutionWorkspaceCloseReadiness(
+        closeReadinessFixture() as never,
+        WITHHELD_WORKSPACE_RUNTIME_VIEWER,
+      );
+      const byKind = Object.fromEntries(withheld.plannedActions.map((a) => [a.kind, a.command]));
+
+      expect(JSON.stringify(withheld)).not.toContain(CONFIG_CLEANUP_SENTINEL);
+      expect(JSON.stringify(withheld)).not.toContain(STRATEGY_TEARDOWN_SENTINEL);
+      expect(byKind.cleanup_command).toBe(REDACTED_EVENT_VALUE);
+      expect(byKind.teardown_command).toBe(REDACTED_EVENT_VALUE);
+      expect(byKind.git_worktree_remove).toBe("git worktree remove --force /fixture/cwd");
+      // The service rows the earlier revision already masked stay masked.
+      expect(JSON.stringify(withheld)).not.toContain(SERVICE_COMMAND_SENTINEL);
+    });
+
+    it("discloses every PEN-3073 field to an entitled viewer", () => {
+      const raw = executionWorkspaceFixture();
+      const disclosed = publicExecutionWorkspace(raw, { revealRuntimeConfig: true });
+      const project = publicProjectWorkspace(projectWorkspaceFixture(), { revealRuntimeConfig: true });
+
+      // The runtime EDITORS read these back into a form and PATCH them. Masking them for an
+      // entitled operator would not merely hide the value, it would let the editor write the
+      // sentinel over the real one — the failure the entitlement split exists to prevent.
+      expect(disclosed.config?.provisionCommand).toBe(CONFIG_PROVISION_SENTINEL);
+      expect(disclosed.config?.teardownCommand).toBe(CONFIG_TEARDOWN_SENTINEL);
+      expect(disclosed.config?.cleanupCommand).toBe(CONFIG_CLEANUP_SENTINEL);
+      expect(project.setupCommand).toBe(PROJECT_SETUP_SENTINEL);
+      expect(project.cleanupCommand).toBe(PROJECT_CLEANUP_SENTINEL);
     });
 
     it("does not copy the input when the viewer is entitled", () => {

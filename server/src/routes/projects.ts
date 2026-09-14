@@ -33,12 +33,14 @@ import {
 import { assertCanManageProjectWorkspaceRuntimeServices } from "./workspace-runtime-service-authz.js";
 import {
   publicProject,
+  publicProjectExecutionWorkspacePolicy,
   publicProjects,
   publicProjectWorkspace,
   publicProjectWorkspaces,
   publicWorkspaceOperation,
   resolveWorkspaceRuntimeViewer,
 } from "./workspace-response.js";
+import { parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { appendWithCap } from "../adapters/utils.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
@@ -687,9 +689,12 @@ export function projectRoutes(db: Db) {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
     if (!existing) return;
-    // `svc.remove` returns the bare deleted row — no `workspaces` / `primaryWorkspace` — so there is
-    // no withheld material on this response. Named `deletedProjectRow` rather than `project` so that
-    // is legible at the response site instead of being an unexplained exemption in the CI guard.
+    // `svc.remove` returns the bare deleted row — no `workspaces` / `primaryWorkspace`. That used to
+    // mean "no withheld material on this response"; PEN-3073 falsified it. `executionWorkspacePolicy`
+    // is a COLUMN on the project row, so it survives the absence of the embedded workspaces and
+    // carries both the open `workspaceRuntime` record and the strategy's command strings. Named
+    // `deletedProjectRow` rather than `project` so the narrowing is legible at the response site
+    // instead of being an unexplained exemption in the CI guard.
     const deletedProjectRow = await svc.remove(id);
     if (!deletedProjectRow) {
       res.status(404).json({ error: "Project not found" });
@@ -707,7 +712,13 @@ export function projectRoutes(db: Db) {
       entityId: deletedProjectRow.id,
     });
 
-    res.json(deletedProjectRow);
+    res.json({
+      ...deletedProjectRow,
+      executionWorkspacePolicy: publicProjectExecutionWorkspacePolicy(
+        parseProjectExecutionWorkspacePolicy(deletedProjectRow.executionWorkspacePolicy),
+        await resolveWorkspaceRuntimeViewer(access, req, deletedProjectRow.companyId),
+      ),
+    });
   });
 
   return router;
