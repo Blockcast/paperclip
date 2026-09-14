@@ -50,15 +50,19 @@ export function issueListProbeLimit(limit: number): number {
 
 /**
  * Split an over-fetched result into the page the caller asked for and whether
- * more rows exist beyond it.
+ * the database has more matching rows beyond it.
  *
- * MUST run on the full probed window (see {@link issueListProbeLimit}), and
- * AFTER any per-actor ACL filtering — never on a page already sliced to
- * `limit`. Slicing first makes the filtered length meaningless (it can only
- * shorten), so truncation would read as false; filtering after the split leaks
- * instead, reporting truncation a restricted actor cannot see the rows for.
- * Feeding the filtered probe window through here gets both: the signal counts
- * only readable rows, and the over-fetch keeps it honest.
+ * Runs on the RAW probed window (see {@link issueListProbeLimit}). `rows` is
+ * the raw page — the same `offset`/`limit` window a caller pages by — and
+ * `truncated` says a matching row exists past it. For an actor who may read
+ * every row that is the whole answer. For a restricted actor it is NOT: the
+ * page still has to be ACL-filtered, and "a row exists beyond" has to become
+ * "a row THIS ACTOR MAY READ exists beyond", which the route settles by
+ * scanning forward (`actorHasReadableIssueFrom` in routes/issues.ts). Deriving
+ * the restricted signal from the filtered page length instead is wrong in both
+ * directions: filtering can only shorten the page, so a full raw window with
+ * sparse readable rows reads as "complete" while readable rows sit past it,
+ * and counting unreadable probe rows leaks their existence.
  */
 export function resolveIssueListTruncation<T>(
   rows: T[],

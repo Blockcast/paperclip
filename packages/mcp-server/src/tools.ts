@@ -350,9 +350,9 @@ export function applyIssueListTruncationEnvelope(data: unknown, headers: Headers
     appliedLimit: Number.isFinite(appliedLimit) ? appliedLimit : null,
     returnedCount: rows.length,
     note:
-      `TRUNCATED: the server capped this result at ${rows.length} rows and MORE MATCH. ` +
+      `TRUNCATED: this response holds ${rows.length} rows and MORE MATCH beyond it. ` +
       "This is a prefix, not the population — do not report a count from it. " +
-      "Page with limit/offset, or narrow the filters.",
+      "Page with limit/offset (offset += appliedLimit), or narrow the filters.",
     issues: rows,
   };
 }

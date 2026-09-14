@@ -5294,6 +5294,34 @@ export function issueRoutes(
     return readable;
   }
 
+  /**
+   * BLO-33741: does `req.actor` have a readable row at raw position `offset`
+   * or later? The over-fetch probe proves a matching row exists past the page,
+   * but a restricted actor may not be allowed to read THAT row while readable
+   * rows sit further on — so keep scanning raw windows until one turns up or
+   * the population runs out. Only the restricted path pays for this; a
+   * company-scope reader's probe row is its own answer.
+   *
+   * ponytail: O(remaining rows) per request for a restricted actor whose
+   * readable rows are sparse; the durable fix is the actor-readable predicate
+   * in the service query.
+   */
+  async function actorHasReadableIssueFrom(
+    req: Request,
+    companyId: string,
+    filters: IssueFilters,
+    offset: number,
+  ) {
+    for (;;) {
+      const rows = await svc.list(companyId, { ...filters, limit: ISSUE_LIST_MAX_LIMIT, offset });
+      for (const row of rows) {
+        if ((await decideIssueAccess(req, row, "issue:read")).allowed) return true;
+      }
+      if (rows.length < ISSUE_LIST_MAX_LIMIT) return false;
+      offset += rows.length;
+    }
+  }
+
   async function actorCanReadCompanyScope(req: Request, companyId: string, scopedDb?: Db) {
     const decision = await (scopedDb ? accessService(scopedDb) : access).decide({
       actor: req.actor,
@@ -8099,23 +8127,27 @@ export function issueRoutes(
         // `listFilters` keeps the caller's `limit` because it feeds the cache
         // key — only the service call is widened.
         //
-        // ACL-filter the WHOLE probed window before resolving truncation, so
-        // the signal counts only rows this actor may read. Deriving it from the
-        // raw rows instead would leak: a restricted actor whose visible rows fit
-        // the page would still see `X-Result-Truncated`, disclosing that more
-        // matching issues exist outside its readable scope. Over-fetching first
-        // is what makes the filtered count trustworthy — filtering a page that
-        // was already sliced to `limit` can only ever shorten it, which is why
-        // the order here is probe -> filter -> slice, never probe -> slice ->
-        // filter.
+        // The page is the RAW `offset`/`limit` window, ACL-filtered — the same
+        // window the caller pages by, so `offset += limit` never skips or
+        // repeats a readable row. The signal is a separate question: does a
+        // matching row THIS ACTOR MAY READ exist past that window? For a
+        // company-scope reader the probe row answers it. For a restricted actor
+        // the probe row may itself be unreadable while readable rows sit further
+        // on, so scan forward until one turns up or the population runs out.
+        // Deriving the signal from the filtered page length is wrong both ways:
+        // counting unreadable rows leaks their existence (first #1844 review),
+        // and a full raw window with sparse readable rows reads as complete
+        // while readable rows sit beyond it (second #1844 review).
         const probed = await svc.list(companyId, {
           ...listFilters,
           limit: issueListProbeLimit(limit),
         });
-        const readable = await actorCanReadCompanyScope(req, companyId)
-          ? probed
-          : await filterIssuesForActor(req, probed);
-        const { rows: result, truncated } = resolveIssueListTruncation(readable, limit);
+        const { rows: rawPage, truncated: rawHasMore } = resolveIssueListTruncation(probed, limit);
+        const restricted = !(await actorCanReadCompanyScope(req, companyId));
+        const result = restricted ? await filterIssuesForActor(req, rawPage) : rawPage;
+        const truncated = restricted && rawHasMore
+          ? await actorHasReadableIssueFrom(req, companyId, listFilters, offset + limit)
+          : rawHasMore;
         const issueIds = result.map((issue) => issue.id);
         if (compactView) {
           const [handoffStates, recoveryActionByIssue] = await Promise.all([
@@ -8205,9 +8237,10 @@ export function issueRoutes(
     // BLO-33741: the body is a bare array with nowhere to carry a flag, so the
     // truncation signal rides on headers. `X-Applied-Limit` is always present
     // (a caller learns the effective cap even when it did not bite);
-    // `X-Result-Truncated` appears ONLY when rows were dropped, so its absence
-    // is the "you have everything" signal. Set before the 304 branch below —
-    // a revalidating client must still learn it is holding a truncated page.
+    // `X-Result-Truncated` appears ONLY when more rows this actor may read exist
+    // past the page, so its absence is the "you have everything" signal. Set
+    // before the 304 branch below — a revalidating client must still learn it
+    // is holding a truncated page.
     res.setHeader(ISSUE_LIST_APPLIED_LIMIT_HEADER, String(coordinated.response.appliedLimit));
     if (coordinated.response.truncated) {
       res.setHeader(ISSUE_LIST_TRUNCATED_HEADER, "true");

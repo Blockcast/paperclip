@@ -81,16 +81,21 @@ function seedIssues(count: number) {
 }
 
 /**
- * Stand in for the database: honour whatever limit the route asks for. The
- * route must over-fetch for truncation to be detectable at all, so a mock that
- * ignored `limit` (as the pre-BLO-33741 fixtures did) would make this suite
- * pass against a broken route.
+ * Stand in for the database: honour whatever limit AND offset the route asks
+ * for. The route must over-fetch for truncation to be detectable at all, so a
+ * mock that ignored `limit` (as the pre-BLO-33741 fixtures did) would make this
+ * suite pass against a broken route; and the restricted-actor scan pages
+ * forward by `offset`, so a mock that ignored it would replay the first window
+ * forever.
  */
 function serveFromPopulation(population: number) {
-  mockIssueService.list.mockImplementation(async (_companyId: string, filters?: { limit?: number }) => {
-    const limit = filters?.limit ?? population;
-    return seedIssues(Math.min(population, limit));
-  });
+  mockIssueService.list.mockImplementation(
+    async (_companyId: string, filters?: { limit?: number; offset?: number }) => {
+      const offset = filters?.offset ?? 0;
+      const limit = filters?.limit ?? population;
+      return seedIssues(population).slice(offset, offset + limit);
+    },
+  );
 }
 
 async function buildApp() {
@@ -246,6 +251,34 @@ describe("BLO-33741 issue-list truncation signal", () => {
       // issues this actor cannot read exist.
       expect(res.headers[ISSUE_LIST_TRUNCATED_HEADER.toLowerCase()]).toBeUndefined();
       expect(res.headers[ISSUE_LIST_APPLIED_LIMIT_HEADER.toLowerCase()]).toBe(String(CAP));
+    });
+
+    /**
+     * Ally review (#1844, second pass): filtering the probe window is not
+     * enough. When the actor's readable rows are sparse, the first `limit + 1`
+     * raw rows can hold fewer than `limit` readable ones while more readable
+     * rows sit past the window — a bare array there is a false "complete".
+     * The page stays the raw `offset`/`limit` window (so `offset += limit`
+     * paging is coherent); the signal has to look past it.
+     */
+    it("signals truncation to a restricted actor whose next readable rows lie past the raw probe window", async () => {
+      serveFromPopulation(CAP * 3);
+      // One readable row inside the page window; the rest well past the probe.
+      allowOnlyIssues(["issue-0", `issue-${CAP * 2}`, `issue-${CAP * 2 + 1}`]);
+      const app = await buildApp();
+
+      const res = await request(app)
+        .get("/api/companies/company-1/issues")
+        .query({ limit: String(CAP) });
+
+      expect(res.status).toBe(200);
+      expect(res.body.map((row: { id: string }) => row.id)).toEqual(["issue-0"]);
+      expect(res.headers[ISSUE_LIST_TRUNCATED_HEADER.toLowerCase()]).toBe("true");
+      // The scan for a readable row started where the page ended, not at 0.
+      expect(mockIssueService.list).toHaveBeenCalledWith(
+        "company-1",
+        expect.objectContaining({ offset: CAP }),
+      );
     });
 
     it("still signals truncation to a restricted actor that really has more readable rows", async () => {
