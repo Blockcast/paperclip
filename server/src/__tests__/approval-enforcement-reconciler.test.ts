@@ -44,6 +44,16 @@ const CARD_6F45844E_PAYLOAD = {
   recurrence_note: "free-form prose the reconciler must ignore",
 };
 
+/**
+ * Card `6f45844e` was decided at this instant. Everything the classifier does in
+ * its terminal branch is a comparison against it.
+ */
+const CARD_6F45844E_DECIDED_AT = new Date("2026-08-10T17:51:20.638Z");
+/** A policy write that happened after the decision — i.e. a real supersession. */
+const TOUCHED_AFTER_DECISION = new Date("2026-08-18T23:07:40.381Z");
+/** A policy untouched since before the decision: nothing can have superseded it. */
+const TOUCHED_BEFORE_DECISION = new Date("2026-08-04T10:04:45.877Z");
+
 function enforcedFrom(
   key: "from_usd" | "to_usd",
   overrides: Record<string, Partial<EnforcedBudgetPolicy>> = {},
@@ -54,6 +64,7 @@ function enforcedFrom(
       policyId: change.policyId,
       amount: Math.round(change[key] * 100),
       isActive: true,
+      updatedAt: TOUCHED_AFTER_DECISION,
       ...(overrides[change.policyId] ?? {}),
     });
   }
@@ -231,11 +242,24 @@ describe("classifyEnforcementAssertion — supersession (BLO-32796)", () => {
   const ALLY = "a894e681-9691-4678-88ad-063059210a14";
   const SRE = "37c1fefd-b8bd-4a45-a61c-c2b2c8a4afb1";
 
-  const policy = (id: string, amountUsd: number): EnforcedBudgetPolicy => ({
+  const policy = (
+    id: string,
+    amountUsd: number,
+    updatedAt: Date | null = TOUCHED_AFTER_DECISION,
+  ): EnforcedBudgetPolicy => ({
     policyId: id,
     amount: Math.round(amountUsd * 100),
     isActive: true,
+    updatedAt,
   });
+  const classify = (
+    assertion: Parameters<typeof classifyEnforcementAssertion>[0],
+    enforced: EnforcedBudgetPolicy | null,
+  ) => classifyEnforcementAssertion(assertion, enforced, CARD_6F45844E_DECIDED_AT);
+  const diff = (
+    assertionList: Parameters<typeof diffEnforcementAssertions>[0],
+    enforced: Map<string, EnforcedBudgetPolicy | null>,
+  ) => diffEnforcementAssertions(assertionList, enforced, CARD_6F45844E_DECIDED_AT);
 
   it("reads the card's recorded starting figure", () => {
     expect(byPolicy(CTO).priorAmountCents).toBe(1_900_000);
@@ -244,21 +268,45 @@ describe("classifyEnforcementAssertion — supersession (BLO-32796)", () => {
   });
 
   it("separates the three states from the same two-way disagreement", () => {
-    expect(classifyEnforcementAssertion(byPolicy(CTO), policy(CTO, 32000))).toBe("applied");
-    expect(classifyEnforcementAssertion(byPolicy(CTO), policy(CTO, 19000))).toBe("never_applied");
+    expect(classify(byPolicy(CTO), policy(CTO, 32000))).toBe("applied");
+    expect(classify(byPolicy(CTO), policy(CTO, 19000))).toBe("never_applied");
     // Neither the starting figure nor the decided one: a later decision set it.
-    expect(classifyEnforcementAssertion(byPolicy(CTO), policy(CTO, 56000))).toBe("superseded");
+    expect(classify(byPolicy(CTO), policy(CTO, 56000))).toBe("superseded");
   });
 
   it("is silent on the live 2026-09-14 state of card 6f45844e", () => {
     // The regression this exists to prevent. Five applied, three superseded by
     // later raises; the pre-fix comparison reported three drifts here and
     // re-filed an issue for them every sweep.
+    //
+    // Also the guard on the fix below: those three caps were all written after
+    // 2026-08-10, so the time split must still read them as supersessions.
     const enforced = enforcedFrom("to_usd");
     enforced.set(CTO, policy(CTO, 56000));
     enforced.set(ALLY, policy(ALLY, 110000));
     enforced.set(SRE, policy(SRE, 20000));
-    expect(diffEnforcementAssertions(assertions, enforced)).toEqual([]);
+    expect(diff(assertions, enforced)).toEqual([]);
+  });
+
+  it("reports an untouched policy that matches neither figure, rather than assuming supersession", () => {
+    // Ally's finding on #1846: `from_usd` is free-form payload text that nothing
+    // validated at decision time, so a *wrong* prior lands in the terminal
+    // branch and would have silently become `superseded` — a real enforcement
+    // gap erased by an untrusted field. `budget_policies.updated_at` is the
+    // fact the database owns: nothing has written this row since the decision,
+    // so there is no later decision for it to have been superseded by.
+    const stale = policy(CTO, 56000, TOUCHED_BEFORE_DECISION);
+    expect(classify(byPolicy(CTO), stale)).toBe("never_applied");
+    const enforced = enforcedFrom("to_usd");
+    enforced.set(CTO, stale);
+    expect(diff(assertions, enforced)).toHaveLength(1);
+  });
+
+  it("treats an unknown write time as unclassifiable, not as either answer", () => {
+    // Both directions are dangerous to guess: `superseded` hides a real gap,
+    // `never_applied` licenses the executor to revert a raise. Report and
+    // refuse instead.
+    expect(classify(byPolicy(CTO), policy(CTO, 56000, null))).toBe("unverifiable_mismatch");
   });
 
   it("still fires when a superseded policy is reverted to the starting figure", () => {
@@ -266,7 +314,7 @@ describe("classifyEnforcementAssertion — supersession (BLO-32796)", () => {
     // `from` figure the decision is once again unapplied, and that is drift.
     const enforced = enforcedFrom("to_usd");
     enforced.set(CTO, policy(CTO, 19000));
-    const drifts = diffEnforcementAssertions(assertions, enforced);
+    const drifts = diff(assertions, enforced);
     expect(drifts).toHaveLength(1);
     expect(drifts[0]?.assertion.label).toBe("CTO");
   });
@@ -282,12 +330,8 @@ describe("classifyEnforcementAssertion — supersession (BLO-32796)", () => {
       ],
     });
     expect(declared?.priorAmountCents).toBeNull();
-    expect(classifyEnforcementAssertion(declared!, policy(CTO, 56000))).toBe(
-      "unverifiable_mismatch",
-    );
-    expect(
-      diffEnforcementAssertions([declared!], new Map([[CTO, policy(CTO, 56000)]])),
-    ).toHaveLength(1);
+    expect(classify(declared!, policy(CTO, 56000))).toBe("unverifiable_mismatch");
+    expect(diff([declared!], new Map([[CTO, policy(CTO, 56000)]]))).toHaveLength(1);
   });
 
   it("carries a declared from_usd through when the card records one", () => {
@@ -303,14 +347,14 @@ describe("classifyEnforcementAssertion — supersession (BLO-32796)", () => {
       ],
     });
     expect(declared?.priorAmountCents).toBe(1_900_000);
-    expect(classifyEnforcementAssertion(declared!, policy(CTO, 56000))).toBe("superseded");
+    expect(classify(declared!, policy(CTO, 56000))).toBe("superseded");
   });
 
   it("keeps missing and inactive policies ahead of the amount comparison", () => {
-    expect(classifyEnforcementAssertion(byPolicy(CTO), null)).toBe("missing_policy");
-    expect(
-      classifyEnforcementAssertion(byPolicy(CTO), { ...policy(CTO, 32000), isActive: false }),
-    ).toBe("inactive_policy");
+    expect(classify(byPolicy(CTO), null)).toBe("missing_policy");
+    expect(classify(byPolicy(CTO), { ...policy(CTO, 32000), isActive: false })).toBe(
+      "inactive_policy",
+    );
   });
 });
 
