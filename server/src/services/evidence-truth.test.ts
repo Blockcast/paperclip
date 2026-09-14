@@ -251,12 +251,55 @@ describe("buildGithubTruthProbe", () => {
     expect(r.probeFailed).toBe(true);
   });
 
+  it("a blocking verdict on either surface beats a clean one on the other", async () => {
+    // Comment surface red, formal surface clean at the same head. The merge
+    // gate publishes from the comment surface, so reading this clean would put
+    // the two gates in opposite states on one head.
+    const a = await buildGithubTruthProbe(
+      deps({
+        listReviewerSurfaces: async () => ({
+          reviews: [{ login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: null }],
+          comments: [{ login: ALLY, body: dirty, createdAt: "2026-09-06T00:00:00Z" }],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(a.detections["review:ally-clean"]).toBeUndefined();
+    expect(a.probeFailed).toBe(false);
+
+    // And the mirror: formal review red, comment clean.
+    const b = await buildGithubTruthProbe(
+      deps({
+        listReviewerSurfaces: async () => ({
+          reviews: [{ login: ALLY, body: "nope", state: "CHANGES_REQUESTED", commitId: HEAD, submittedAt: null }],
+          comments: [{ login: ALLY, body: clean, createdAt: "2026-09-06T00:00:00Z" }],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(b.detections["review:ally-clean"]).toBeUndefined();
+  });
+
   it("exceeding the deadline fails the probe rather than returning a partial answer", async () => {
     const slow = deps({ fetchHeadSha: () => new Promise((res) => setTimeout(() => res(HEAD), 200)) });
     const r = await buildGithubTruthProbe(slow, { deadlineMs: 50, perCallMs: 20 })({ workProducts: [wp()] });
     expect(r.probeFailed).toBe(true);
     expect(r.diagnostics).toContain("truth-probe-deadline");
     expect(r.detections).toEqual({});
+  });
+
+  it("the deadline cancels the reads still in flight", async () => {
+    let observed: AbortSignal | undefined;
+    const slow = deps({
+      fetchHeadSha: (ref) =>
+        new Promise((res) => {
+          observed = ref.signal;
+          setTimeout(() => res(HEAD), 500);
+        }),
+    });
+    // perCallMs far beyond the deadline, so an abort here can only have come
+    // from the probe-wide controller.
+    const r = await buildGithubTruthProbe(slow, { deadlineMs: 50, perCallMs: 60_000 })({ workProducts: [wp()] });
+    expect(r.diagnostics).toContain("truth-probe-deadline");
+    expect(observed?.aborted).toBe(true);
   });
 
   it("a dep that throws is a probe failure, not an unhandled rejection", async () => {

@@ -8,10 +8,8 @@
  *        │          deploy:landed     = webhookMerged || getPullRequestGate().merged
  *        │          review:ally-clean = head := fetchHeadSha()          <- CURRENT head
  *        │                              surfaces := listReviewerSurfaces()
- *        │                              clean if the newest comment-shaped review
- *        │                              attesting THAT head is clean, or the newest
- *        │                              formal review AT that head carries no
- *        │                              actionable feedback
+ *        │                              clean if either surface attests THAT head
+ *        │                              clean and NEITHER surface blocks it
  *        ▼
  *   {detections, diagnostics, probeFailed}
  *
@@ -126,11 +124,18 @@ interface PerPr {
   diagnostics: string[];
 }
 
-async function probeOne(deps: GithubTruthDeps, ref: PrRef, perCallMs: number): Promise<PerPr> {
+async function probeOne(
+  deps: GithubTruthDeps,
+  ref: PrRef,
+  perCallMs: number,
+  probeSignal: AbortSignal,
+): Promise<PerPr> {
   const tag = `${ref.repoFullName}#${ref.prNumber}`;
   const out: PerPr = { merged: false, clean: false, failed: false, diagnostics: [] };
   const call = { repoFullName: ref.repoFullName, prNumber: ref.prNumber };
-  const sig = (): AbortSignal => AbortSignal.timeout(perCallMs);
+  // Two independent cancels: this call's own budget, and the whole-probe
+  // deadline. Either one ends the read.
+  const sig = (): AbortSignal => AbortSignal.any([probeSignal, AbortSignal.timeout(perCallMs)]);
 
   try {
     if (ref.webhookMerged) {
@@ -170,18 +175,28 @@ async function probeOne(deps: GithubTruthDeps, ref: PrRef, perCallMs: number): P
       reviewerBotLogin: deps.reviewerBotLogin,
     });
     const commentClean = commentVerdict.state === "success" && commentVerdict.outcome === "clean";
+    // `blocking_finding` and `carried_finding` — the two outcomes that make the
+    // merge-visible gate red. `not_evaluated` is silence, not a verdict.
+    const commentBlocking = commentVerdict.state === "failure";
 
-    // Surface 2: a formal review object. Each surface is individually blind to
-    // the other — Ally files a formal review on some PRs and only a comment on
-    // others — so "no review objects" is not evidence of no review, and the
-    // two are OR'd.
+    // Surface 2: a formal review object.
     const atHead = surfaces.reviews
       .filter((r) => (r.commitId ?? "").trim().toLowerCase() === normalizedHead)
       .sort((a, b) => (b.submittedAt ?? "").localeCompare(a.submittedAt ?? ""));
     const newest = atHead[0];
-    const formalClean = newest !== undefined && !hasActionablePrReviewFeedback(newest.body, newest.state);
+    const formalBlocking = newest !== undefined && hasActionablePrReviewFeedback(newest.body, newest.state);
+    const formalClean = newest !== undefined && !formalBlocking;
 
-    out.clean = commentClean || formalClean;
+    // Each surface is individually blind to the other — Ally files a formal
+    // review on some PRs and only a comment on others — so SILENCE on one is
+    // not evidence, and the clean verdicts are OR'd.
+    //
+    // A BLOCKING verdict is not silence, and it wins outright over the other
+    // surface's clean. Without that veto a duplicate or concurrent review lets
+    // this shape read `review:ally-clean` at the same head the merge gate is
+    // publishing red from — the two-verdicts-for-one-grammar divergence this
+    // module exists to avoid, arriving through the OR instead of a parser.
+    out.clean = !commentBlocking && !formalBlocking && (commentClean || formalClean);
   } catch {
     // A throw is an inability to ask, which is exactly `probeFailed` — never
     // let it escape and turn one bad socket into a failed PATCH.
@@ -221,7 +236,8 @@ export function buildGithubTruthProbe(
       );
     }
 
-    const work = Promise.all(refs.map((r) => probeOne(deps, r, perCallMs)));
+    const abort = new AbortController();
+    const work = Promise.all(refs.map((r) => probeOne(deps, r, perCallMs, abort.signal)));
     // probeOne never rejects, but keep the guard so a future edit that lets one
     // through cannot become an unhandled rejection after the deadline wins.
     work.catch(() => undefined);
@@ -231,6 +247,11 @@ export function buildGithubTruthProbe(
     });
     const result = await Promise.race([work, deadline]).finally(() => {
       if (timer) clearTimeout(timer);
+      // Returning is not finishing: without this, every read still in flight
+      // keeps its socket and its share of the request's GitHub budget for up to
+      // its own per-call timeout, after the PATCH has already answered. A no-op
+      // when `work` won, since every call has settled by then.
+      abort.abort();
     });
     if (result === "deadline") {
       return { detections: {}, diagnostics: [...diagnostics, "truth-probe-deadline"], probeFailed: true };
