@@ -113,11 +113,17 @@ const listIssuesSchema = z.object({
   // BLO-33741: without these an MCP caller could neither raise the 500 default
   // nor page past it, so learning a page was truncated left nothing to do
   // about it. They pass straight through as query params.
+  //
+  // Deliberately NO `.max()`: the REST endpoint clamps an oversized `limit` to
+  // ISSUE_LIST_MAX_LIMIT (`clampIssueListLimit`) and 400s only on a
+  // non-positive / non-integer value. A schema bound here would reject the
+  // oversized request this very description tells callers is clamped, so they
+  // could never observe `appliedLimit: 1000`. Keep the client permissive and
+  // let the server's clamp be the single source of truth.
   limit: z
     .number()
     .int()
     .positive()
-    .max(1000)
     .optional()
     .describe(
       "Rows to return. Defaults to 500; the server hard-caps it at 1000 and a larger value is silently clamped to 1000, NOT rejected. When the cap bites, the response is an object `{truncated: true, appliedLimit, returnedCount, note, issues: [...]}` instead of the usual bare array — so a plain array back is itself the proof that you have every matching row. Page the remainder with `offset`.",

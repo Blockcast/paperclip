@@ -7,6 +7,7 @@ import {
   issueListProbeLimit,
   resolveIssueListTruncation,
 } from "../lib/issue-list-query.ts";
+import { ISSUE_LIST_MAX_LIMIT } from "../services/issues.ts";
 
 /**
  * Regression test for BLO-33741.
@@ -35,6 +36,10 @@ import {
 const CAP = 50;
 
 const mockIssueService = vi.hoisted(() => ({ list: vi.fn() }));
+// Shared so a test can vary the verdict per action/row: the truncation signal
+// has to be correct for a restricted actor too, and an always-allow stub can
+// never exercise that path.
+const mockAccess = vi.hoisted(() => ({ decide: vi.fn() }));
 
 vi.mock("../services/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/index.js")>();
@@ -42,12 +47,7 @@ vi.mock("../services/index.js", async (importOriginal) => {
     ...actual,
     accessService: () => ({
       canUser: vi.fn(),
-      decide: vi.fn(async () => ({
-        allowed: true,
-        action: "company_scope:read",
-        reason: "allow_company_agent",
-        explanation: "Allowed by test.",
-      })),
+      decide: mockAccess.decide,
       hasPermission: vi.fn(),
     }),
     agentService: () => ({ getById: vi.fn() }),
@@ -120,9 +120,39 @@ async function buildApp() {
   return app;
 }
 
+/**
+ * Company-scope reader: sees every row, never hits `filterIssuesForActor`.
+ */
+function allowEverything() {
+  mockAccess.decide.mockImplementation(async ({ action }: { action: string }) => ({
+    allowed: true,
+    action,
+    reason: "allow_company_agent",
+    explanation: "Allowed by test.",
+  }));
+}
+
+/**
+ * A restricted actor: denied company scope, so the route falls through to
+ * per-row `issue:read` filtering, and may read only `readableIds`.
+ */
+function allowOnlyIssues(readableIds: string[]) {
+  const readable = new Set(readableIds);
+  mockAccess.decide.mockImplementation(
+    async ({ action, resource }: { action: string; resource?: { issueId?: string } }) => ({
+      allowed: action === "company_scope:read" ? false : readable.has(resource?.issueId ?? ""),
+      action,
+      reason: "test",
+      explanation: "Allowed by test.",
+    }),
+  );
+}
+
 describe("BLO-33741 issue-list truncation signal", () => {
   beforeEach(() => {
     mockIssueService.list.mockReset();
+    mockAccess.decide.mockReset();
+    allowEverything();
   });
 
   describe("the over-fetch probe itself", () => {
@@ -195,6 +225,84 @@ describe("BLO-33741 issue-list truncation signal", () => {
         seedIssues(CAP).map((row) => row.id),
       );
     });
+
+    /**
+     * Ally review (#1844): the signal must describe the page the ACTOR got, not
+     * the page the database returned. Resolving truncation on unfiltered rows
+     * turns the header into an oracle for rows outside the actor's scope.
+     */
+    it("does not signal truncation to a restricted actor whose visible rows fit the page", async () => {
+      serveFromPopulation(CAP + 1);
+      allowOnlyIssues(["issue-0", "issue-1", "issue-2"]);
+      const app = await buildApp();
+
+      const res = await request(app)
+        .get("/api/companies/company-1/issues")
+        .query({ limit: String(CAP) });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveLength(3);
+      // The DB had CAP + 1 matching rows. Saying so here would disclose that
+      // issues this actor cannot read exist.
+      expect(res.headers[ISSUE_LIST_TRUNCATED_HEADER.toLowerCase()]).toBeUndefined();
+      expect(res.headers[ISSUE_LIST_APPLIED_LIMIT_HEADER.toLowerCase()]).toBe(String(CAP));
+    });
+
+    it("still signals truncation to a restricted actor that really has more readable rows", async () => {
+      serveFromPopulation(CAP + 1);
+      // Denied company scope (so the per-row filter runs) but permitted every
+      // row: suppressing the signal here would reintroduce the silent
+      // under-return for exactly the actors the fix above protects.
+      allowOnlyIssues(seedIssues(CAP + 1).map((row) => row.id));
+      const app = await buildApp();
+
+      const res = await request(app)
+        .get("/api/companies/company-1/issues")
+        .query({ limit: String(CAP) });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveLength(CAP);
+      expect(res.headers[ISSUE_LIST_TRUNCATED_HEADER.toLowerCase()]).toBe("true");
+    });
+
+    /**
+     * Ally review (#1844): the CAP=50 cases above never exercise the clamp, so
+     * they cannot catch a probe that overflows the real ceiling. Drive the
+     * production maximum: an oversized `limit` clamps to ISSUE_LIST_MAX_LIMIT
+     * and the probe asks for exactly one row past it.
+     */
+    it("clamps an oversized limit to the production cap and probes one row past it", async () => {
+      serveFromPopulation(ISSUE_LIST_MAX_LIMIT + 1);
+      const app = await buildApp();
+
+      const res = await request(app)
+        .get("/api/companies/company-1/issues")
+        .query({ limit: "3000" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.list).toHaveBeenCalledWith(
+        "company-1",
+        expect.objectContaining({ limit: ISSUE_LIST_MAX_LIMIT + 1 }),
+      );
+      expect(res.body).toHaveLength(ISSUE_LIST_MAX_LIMIT);
+      expect(res.headers[ISSUE_LIST_TRUNCATED_HEADER.toLowerCase()]).toBe("true");
+      expect(res.headers[ISSUE_LIST_APPLIED_LIMIT_HEADER.toLowerCase()]).toBe(
+        String(ISSUE_LIST_MAX_LIMIT),
+      );
+    });
+
+    it("at exactly the production cap: returns every row and omits the signal", async () => {
+      serveFromPopulation(ISSUE_LIST_MAX_LIMIT);
+      const app = await buildApp();
+
+      const res = await request(app)
+        .get("/api/companies/company-1/issues")
+        .query({ limit: "3000" });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveLength(ISSUE_LIST_MAX_LIMIT);
+      expect(res.headers[ISSUE_LIST_TRUNCATED_HEADER.toLowerCase()]).toBeUndefined();
+    });
   });
 
   describe("MCP — paperclipListIssues", () => {
@@ -265,6 +373,47 @@ describe("BLO-33741 issue-list truncation signal", () => {
       expect(listTool).toBeDefined();
       expect(listTool!.description).toMatch(/500/);
       expect(listTool!.description).toMatch(/1000/);
+    });
+
+    /**
+     * Ally review (#1844): the description promises an oversized `limit` is
+     * clamped, not rejected. A client-side `.max()` would make that promise
+     * untestable — the caller never reaches the server to see
+     * `appliedLimit: 1000`.
+     */
+    it("accepts an oversized limit so the server's clamp is observable", async () => {
+      const { createToolDefinitions } = await import("../../../packages/mcp-server/src/tools.ts");
+      const requestJsonWithHeaders = vi.fn(async () => ({ data: [], headers: new Headers() }));
+      const tools = createToolDefinitions({
+        resolveCompany: async () => "company-1",
+        requestJsonWithHeaders,
+      } as never);
+      const listTool = tools.find((tool) => tool.name === "paperclipListIssues")!;
+
+      const oversized = ISSUE_LIST_MAX_LIMIT + 2000;
+      const result = await listTool.execute({ companyId: "company-1", limit: oversized });
+
+      // A schema `.max()` would short-circuit here: the request would never be
+      // issued, and the caller would see a validation error instead of the
+      // clamped page the description promises.
+      expect((result as { isError?: boolean }).isError).toBeUndefined();
+      expect(requestJsonWithHeaders).toHaveBeenCalledTimes(1);
+      expect(String(requestJsonWithHeaders.mock.calls[0]?.[1])).toContain(`limit=${oversized}`);
+    });
+
+    it("still rejects a non-positive limit", async () => {
+      const { createToolDefinitions } = await import("../../../packages/mcp-server/src/tools.ts");
+      const requestJsonWithHeaders = vi.fn(async () => ({ data: [], headers: new Headers() }));
+      const tools = createToolDefinitions({
+        resolveCompany: async () => "company-1",
+        requestJsonWithHeaders,
+      } as never);
+      const listTool = tools.find((tool) => tool.name === "paperclipListIssues")!;
+
+      const result = await listTool.execute({ companyId: "company-1", limit: 0 });
+
+      expect((result as { isError?: boolean }).isError).toBe(true);
+      expect(requestJsonWithHeaders).not.toHaveBeenCalled();
     });
   });
 });
