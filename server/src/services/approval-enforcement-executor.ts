@@ -1,0 +1,338 @@
+/**
+ * Post-decision execution for approved cards (BLO-32796).
+ *
+ * The companion to `approval-enforcement-reconciler.ts`. That file *detects*
+ * approved decisions that never reached the object enforcing them; this one
+ * lets the requester close the gap without a second human touch.
+ *
+ * The CEO ruling that authorised it (BLO-24631, 2026-09-07) is narrow and its
+ * guardrail is quoted here verbatim because every clause of it is implemented
+ * below and none is negotiable:
+ *
+ * > such a route may write **only the exact values the approved card
+ * > recorded**, only once `status = approved`, and never an agent's own budget.
+ *
+ * So this is not a budget-setting route that happens to check an approval. It
+ * is a *replay* of a decision a board actor already made, and it can express
+ * nothing else: there is no amount in the request body at all. The only inputs
+ * are an approval id and the caller's identity. Every figure written comes out
+ * of `payload`, parsed by the reconciler's own `extractEnforcementAssertions`
+ * so the executor and the detector cannot disagree about what a card says.
+ *
+ * ## Why `never_applied` and nothing else
+ *
+ * Applying every assertion whose enforced value merely *differs* from the
+ * decided one is destructive, and measurably so. On approval `6f45844e` — the
+ * only card in production carrying machine-readable assertions — a verbatim
+ * apply on 2026-09-14 would have written CTO $56,000 -> $32,000, Ally
+ * $110,000 -> $38,000 and PlatformSREEngineer $20,000 -> $13,000: a $103,000
+ * reduction of caps that humans raised *after* the card was decided, reverting
+ * three board decisions in the name of executing a fourth.
+ *
+ * "Already applied" and "legitimately superseded" are indistinguishable to a
+ * decided-vs-enforced comparison, which is why the idempotency guard the issue
+ * originally specified could not have caught this: both are "enforced !=
+ * decided". `classifyEnforcementAssertion` separates them using the `from_usd`
+ * the card already records, and this route writes only the `never_applied`
+ * ones.
+ *
+ * ## Why a superseded assertion refuses the whole card
+ *
+ * Card `6f45844e` states the rule itself: *"ALL EIGHT OR NONE ... Applying only
+ * the 4 raises grows the envelope by +$29,100 — that IS new money and is not
+ * what you approved."* A reallocation approved as net-zero is not net-zero in
+ * any subset. So a card with any assertion this route will not write is
+ * refused whole, and the caller is told which. Completing the *unapplied
+ * remainder* of a card whose other assertions already hold is not a subset —
+ * it reaches the exact end state the card recorded — so that is allowed, and is
+ * what makes a retry after a partial failure converge.
+ */
+import { and, eq, inArray } from "drizzle-orm";
+import type { Db } from "@paperclipai/db";
+import { approvals, budgetPolicies } from "@paperclipai/db";
+import { conflict, forbidden, unprocessable } from "../errors.js";
+import { logActivity } from "./activity-log.js";
+import { agentService } from "./agents.js";
+import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
+import {
+  classifyEnforcementAssertion,
+  extractEnforcementAssertions,
+  type AssertionEnforcementState,
+  type EnforcedBudgetPolicy,
+} from "./approval-enforcement-reconciler.js";
+
+/** Machine-readable refusal codes, surfaced in `HttpError.details.code`. */
+export type ApplyApprovalRefusalCode =
+  | "approval_not_approved"
+  | "no_resolvable_assertions"
+  | "not_requester"
+  | "self_budget_application"
+  | "assertion_superseded"
+  | "assertion_unverifiable"
+  | "policy_missing"
+  | "policy_inactive";
+
+export interface AppliedAssertion {
+  policyId: string;
+  scopeId: string;
+  label: string | null;
+  fromAmountCents: number;
+  toAmountCents: number;
+}
+
+export interface ApplyApprovalEnforcementResult {
+  approvalId: string;
+  /** Assertions this call wrote. Empty on an idempotent replay. */
+  applied: AppliedAssertion[];
+  /** Assertions already holding the decided figure before this call. */
+  alreadyApplied: string[];
+}
+
+function refuse(
+  code: ApplyApprovalRefusalCode,
+  message: string,
+  build: (m: string, d: unknown) => Error,
+  details: Record<string, unknown> = {},
+): Error {
+  return build(message, { code, ...details });
+}
+
+/**
+ * Apply the values an approved card recorded to the rows that enforce them.
+ *
+ * Runs the whole classify-then-write sequence inside one transaction, and
+ * re-reads `budget_policies` *inside* it. Classifying against a read taken
+ * outside the transaction would be a stale-read bug of exactly the kind this
+ * route exists to avoid: a concurrent cap change between the check and the
+ * write would be invisible, and the executor would overwrite it having
+ * classified it as `never_applied` a moment earlier.
+ */
+export async function applyApprovalEnforcement(
+  db: Db,
+  approvalId: string,
+  actor: {
+    actorType: "user" | "agent" | "system";
+    actorId: string;
+    agentId: string | null;
+    isBoard: boolean;
+  },
+  hooks: { cancelWorkForScope: (scope: BudgetEnforcementScope) => Promise<void> },
+): Promise<ApplyApprovalEnforcementResult> {
+  const approval = await db
+    .select({
+      id: approvals.id,
+      companyId: approvals.companyId,
+      status: approvals.status,
+      payload: approvals.payload,
+      requestedByAgentId: approvals.requestedByAgentId,
+    })
+    .from(approvals)
+    .where(eq(approvals.id, approvalId))
+    .then((rows) => rows[0] ?? null);
+
+  if (!approval) throw unprocessable("Approval not found");
+
+  // Guardrail 2: only once `status = approved`. Never on pending,
+  // revision_requested or rejected — this route executes a decision, it is
+  // never a way to make one.
+  if (approval.status !== "approved") {
+    throw refuse(
+      "approval_not_approved",
+      `Approval is \`${approval.status}\`; only an approved card can be applied`,
+      conflict,
+      { status: approval.status },
+    );
+  }
+
+  // Guardrail: requester-scoped. Board actors retain reach, matching
+  // `/approvals/:id/withdraw` and `/approvals/:id/resubmit`.
+  if (!actor.isBoard && actor.agentId !== approval.requestedByAgentId) {
+    throw refuse(
+      "not_requester",
+      "Only the requesting agent can apply this approval",
+      forbidden,
+    );
+  }
+
+  const assertions = extractEnforcementAssertions(approval.payload);
+  if (assertions.length === 0) {
+    // Guardrail 1: no recomputation, no "closest sensible figure". A card whose
+    // figures are prose is not a card this route can execute, and saying so is
+    // the correct outcome rather than a reason to start parsing prose.
+    throw refuse(
+      "no_resolvable_assertions",
+      "Approval payload carries no machine-readable enforcement assertion to apply",
+      unprocessable,
+    );
+  }
+
+  // Guardrail 3: never an agent's own budget. Checked before the transaction
+  // and against the *decided* target set, so a self-application is refused even
+  // when it would have been a no-op — the point is that this route can never be
+  // a path to one's own cap, not merely that it cannot raise it today.
+  const policyIds = assertions.map((assertion) => assertion.policyId);
+
+  const deferredCancellations: BudgetEnforcementScope[] = [];
+  const result = await db.transaction(async (tx) => {
+    const txDb = tx as unknown as Db;
+    const rows = await txDb
+      .select({
+        id: budgetPolicies.id,
+        scopeType: budgetPolicies.scopeType,
+        scopeId: budgetPolicies.scopeId,
+        amount: budgetPolicies.amount,
+        isActive: budgetPolicies.isActive,
+        windowKind: budgetPolicies.windowKind,
+      })
+      .from(budgetPolicies)
+      .where(
+        and(
+          eq(budgetPolicies.companyId, approval.companyId),
+          inArray(budgetPolicies.id, [...new Set(policyIds)]),
+        ),
+      );
+    const byId = new Map(rows.map((row) => [row.id, row]));
+
+    const applied: AppliedAssertion[] = [];
+    const alreadyApplied: string[] = [];
+    const toWrite: Array<{ row: (typeof rows)[number]; toAmountCents: number; label: string | null }> =
+      [];
+
+    for (const assertion of assertions) {
+      const row = byId.get(assertion.policyId) ?? null;
+      const enforced: EnforcedBudgetPolicy | null = row
+        ? { policyId: row.id, amount: row.amount, isActive: row.isActive }
+        : null;
+
+      if (row && row.scopeType === "agent" && row.scopeId === actor.agentId) {
+        throw refuse(
+          "self_budget_application",
+          "This approval targets the calling agent's own budget policy; self-application is not permitted",
+          forbidden,
+          { policyId: assertion.policyId },
+        );
+      }
+
+      const state: AssertionEnforcementState = classifyEnforcementAssertion(assertion, enforced);
+      switch (state) {
+        case "applied":
+          alreadyApplied.push(assertion.policyId);
+          continue;
+        case "never_applied":
+          if (row!.scopeType !== "agent" || row!.windowKind !== "calendar_month_utc") {
+            // The only enforcing write implemented is the monthly agent cap.
+            // Refuse rather than route a company- or project-scoped figure
+            // through an agent-shaped write.
+            throw refuse(
+              "assertion_unverifiable",
+              `Policy \`${assertion.policyId}\` is ${row!.scopeType}/${row!.windowKind}; only agent monthly caps can be applied`,
+              unprocessable,
+              { policyId: assertion.policyId },
+            );
+          }
+          toWrite.push({ row: row!, toAmountCents: assertion.expectedAmountCents, label: assertion.label });
+          continue;
+        case "superseded":
+          throw refuse(
+            "assertion_superseded",
+            `Policy \`${assertion.policyId}\` enforces ${row!.amount} cents, which is neither the card's recorded starting figure (${assertion.priorAmountCents}) nor its decided figure (${assertion.expectedAmountCents}); a later decision moved it and this card must not revert that`,
+            conflict,
+            { policyId: assertion.policyId, enforcedAmountCents: row!.amount },
+          );
+        case "unverifiable_mismatch":
+          throw refuse(
+            "assertion_unverifiable",
+            `Policy \`${assertion.policyId}\` disagrees with the card, but the card records no starting figure, so "never applied" cannot be told from "superseded"`,
+            unprocessable,
+            { policyId: assertion.policyId, enforcedAmountCents: row!.amount },
+          );
+        case "missing_policy":
+          throw refuse(
+            "policy_missing",
+            `Policy \`${assertion.policyId}\` does not exist in this company`,
+            unprocessable,
+            { policyId: assertion.policyId },
+          );
+        case "inactive_policy":
+          throw refuse(
+            "policy_inactive",
+            `Policy \`${assertion.policyId}\` is inactive and enforces nothing`,
+            unprocessable,
+            { policyId: assertion.policyId },
+          );
+      }
+    }
+
+    // Process termination is irreversible and uses the outer connection. Defer
+    // it until the transaction commits, so a failed write cannot leave work
+    // cancelled for a cap change that rolled back. Same reasoning, same shape,
+    // as `PATCH /agents/:agentId/budgets`.
+    const txAgents = agentService(txDb);
+    const txBudgets = budgetService(txDb, {
+      cancelWorkForScope: async (scope) => {
+        deferredCancellations.push(scope);
+      },
+    });
+
+    for (const { row, toAmountCents, label } of toWrite) {
+      // Both objects, in this order, per BLO-27626: the mirror alone binds
+      // nothing and the policy alone leaves the UI lying. `recordRevision`
+      // is what closes the attribution gap BLO-20121 named — without it the
+      // audit trail cannot say who applied the card.
+      await txAgents.update(
+        row.scopeId,
+        { budgetMonthlyCents: toAmountCents },
+        {
+          recordRevision: {
+            createdByAgentId: actor.agentId,
+            createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+            source: "approval-apply",
+          },
+        },
+      );
+      await txBudgets.upsertPolicy(
+        approval.companyId,
+        {
+          scopeType: "agent",
+          scopeId: row.scopeId,
+          amount: toAmountCents,
+          windowKind: "calendar_month_utc",
+        },
+        actor.actorType === "user" ? actor.actorId : null,
+      );
+      applied.push({
+        policyId: row.id,
+        scopeId: row.scopeId,
+        label,
+        fromAmountCents: row.amount,
+        toAmountCents,
+      });
+    }
+
+    await logActivity(txDb, {
+      companyId: approval.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      action: "approval.enforcement_applied",
+      entityType: "approval",
+      entityId: approval.id,
+      details: {
+        applied: applied.map((entry) => ({
+          policyId: entry.policyId,
+          fromAmountCents: entry.fromAmountCents,
+          toAmountCents: entry.toAmountCents,
+        })),
+        alreadyAppliedCount: alreadyApplied.length,
+      },
+    });
+
+    return { approvalId: approval.id, applied, alreadyApplied };
+  });
+
+  for (const scope of deferredCancellations) {
+    await hooks.cancelWorkForScope(scope);
+  }
+
+  return result;
+}

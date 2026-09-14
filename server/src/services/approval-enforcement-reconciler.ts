@@ -105,6 +105,15 @@ export interface BudgetPolicyAmountAssertion {
   kind: typeof BUDGET_POLICY_AMOUNT_ASSERTION;
   policyId: string;
   expectedAmountCents: number;
+  /**
+   * The amount the card recorded as the *starting* figure (`from_usd`), in
+   * cents, or null when the payload recorded none.
+   *
+   * Load-bearing, not decoration: it is the only thing that separates "this
+   * decision was never applied" from "it was applied and a later decision moved
+   * the figure again". See `classifyEnforcementAssertion`.
+   */
+  priorAmountCents: number | null;
   /** Human label for the drift message (agent name); never used for matching. */
   label: string | null;
   /** Which payload shape this came from — surfaced in the raised issue. */
@@ -206,6 +215,21 @@ function readAmountCents(entry: Record<string, unknown>): number | null {
 }
 
 /**
+ * The pre-decision figure, when the card recorded one.
+ *
+ * Optional by design: a payload that omits it is not malformed, it is merely
+ * unclassifiable, and `classifyEnforcementAssertion` degrades to the old
+ * two-way comparison for it rather than guessing.
+ */
+function readPriorAmountCents(entry: Record<string, unknown>): number | null {
+  const cents = asFiniteNumber(entry.from_amount_cents ?? entry.fromAmountCents);
+  if (cents !== null) return cents < 0 ? null : Math.round(cents);
+  const usd = asFiniteNumber(entry.from_usd ?? entry.fromUsd);
+  if (usd === null || usd < 0) return null;
+  return usdToCents(usd);
+}
+
+/**
  * Extract machine-checkable assertions from an approval payload.
  *
  * Two accepted shapes:
@@ -247,6 +271,7 @@ export function extractEnforcementAssertions(payload: unknown): EnforcementAsser
       kind: BUDGET_POLICY_AMOUNT_ASSERTION,
       policyId,
       expectedAmountCents,
+      priorAmountCents: readPriorAmountCents(entry),
       label: asNonEmptyString(entry.label ?? entry.agent ?? entry.scopeName),
       source: "declared",
     });
@@ -265,6 +290,7 @@ export function extractEnforcementAssertions(payload: unknown): EnforcementAsser
       kind: BUDGET_POLICY_AMOUNT_ASSERTION,
       policyId,
       expectedAmountCents,
+      priorAmountCents: readPriorAmountCents(entry),
       label: asNonEmptyString(entry.agent ?? entry.label ?? entry.scopeName),
       source: "legacy_exact_changes",
     });
@@ -274,12 +300,65 @@ export function extractEnforcementAssertions(payload: unknown): EnforcementAsser
 }
 
 /**
+ * What the enforcing row says happened to one decided assertion.
+ *
+ * `superseded` is the state this enum exists for. Comparing only *decided* to
+ * *enforced* yields a boolean — agree or disagree — and "never applied" and
+ * "applied, then moved again by a later decision" both land in `disagree`.
+ * Those need opposite handling: the first is the failure BLO-24631 detects, the
+ * second is the system working, and treating the second as the first is what
+ * filed BLO-33160, BLO-33397, BLO-33416 and BLO-33772 — four issues on approval
+ * `6f45844e` in four days, each costing an adjudication run to close as "yes,
+ * superseded, do not apply".
+ *
+ * The card already records the third number needed to tell them apart: the
+ * figure the change started from. Three-way:
+ *
+ * - `enforced == decided` → **applied**.
+ * - `enforced == prior`   → **never_applied**. Nobody moved it; the decision
+ *   never landed. Real drift. (A deliberate revert back to the starting figure
+ *   reads as this too — correctly: the decision is once again unapplied.)
+ * - otherwise             → **superseded**. The enforced figure is neither
+ *   where the decision started nor where it said to land, so something decided
+ *   later put it there. Re-asserting a stale figure over it is exactly the
+ *   "silently applying a five-day-old figure over whatever a human since set"
+ *   hazard this reconciler's own docstring refuses to commit.
+ *
+ * With no recorded prior, the three-way collapses back to the two-way and the
+ * answer is `unverifiable_mismatch` — reported as drift, because failing to
+ * report a real gap is worse than reporting a supersession we cannot rule out.
+ */
+export type AssertionEnforcementState =
+  | "applied"
+  | "never_applied"
+  | "superseded"
+  | "unverifiable_mismatch"
+  | "missing_policy"
+  | "inactive_policy";
+
+export function classifyEnforcementAssertion(
+  assertion: EnforcementAssertion,
+  policy: EnforcedBudgetPolicy | null,
+): AssertionEnforcementState {
+  if (!policy) return "missing_policy";
+  if (!policy.isActive) return "inactive_policy";
+  if (policy.amount === assertion.expectedAmountCents) return "applied";
+  if (assertion.priorAmountCents === null) return "unverifiable_mismatch";
+  if (policy.amount === assertion.priorAmountCents) return "never_applied";
+  return "superseded";
+}
+
+/**
  * Compare decided assertions against enforced state.
  *
  * `enforced` maps policyId -> the enforcing row, or `null`/absent when no such
  * row exists. An absent row is drift, not a skip: "the policy this decision
  * names does not exist" is exactly as broken as a wrong figure, and silently
  * ignoring it would reproduce the original failure mode one level down.
+ *
+ * A `superseded` assertion is deliberately NOT drift — see
+ * `classifyEnforcementAssertion`. It is the one state where the enforcing
+ * object is right and the decision is stale.
  */
 export function diffEnforcementAssertions(
   assertions: readonly EnforcementAssertion[],
@@ -288,16 +367,28 @@ export function diffEnforcementAssertions(
   const drifts: EnforcementDrift[] = [];
   for (const assertion of assertions) {
     const policy = enforced.get(assertion.policyId) ?? null;
-    if (!policy) {
-      drifts.push({ assertion, actualAmountCents: null, reason: "missing_policy" });
-      continue;
-    }
-    if (!policy.isActive) {
-      drifts.push({ assertion, actualAmountCents: policy.amount, reason: "inactive_policy" });
-      continue;
-    }
-    if (policy.amount !== assertion.expectedAmountCents) {
-      drifts.push({ assertion, actualAmountCents: policy.amount, reason: "amount_mismatch" });
+    switch (classifyEnforcementAssertion(assertion, policy)) {
+      case "applied":
+      case "superseded":
+        continue;
+      case "missing_policy":
+        drifts.push({ assertion, actualAmountCents: null, reason: "missing_policy" });
+        continue;
+      case "inactive_policy":
+        drifts.push({
+          assertion,
+          actualAmountCents: policy?.amount ?? null,
+          reason: "inactive_policy",
+        });
+        continue;
+      case "never_applied":
+      case "unverifiable_mismatch":
+        drifts.push({
+          assertion,
+          actualAmountCents: policy?.amount ?? null,
+          reason: "amount_mismatch",
+        });
+        continue;
     }
   }
   return drifts;
