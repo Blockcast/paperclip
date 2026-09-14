@@ -133,6 +133,13 @@ export interface EnforcedBudgetPolicy {
   policyId: string;
   amount: number;
   isActive: boolean;
+  /**
+   * When the enforcing row was last written. `null` means "unknown", which is
+   * not the same as "never" — see `classifyEnforcementAssertion`, where an
+   * unknown touch time downgrades to `unverifiable_mismatch` rather than
+   * guessing in either direction.
+   */
+  updatedAt: Date | null;
 }
 
 export interface ApprovalEnforcementReconcileResult {
@@ -318,11 +325,21 @@ export function extractEnforcementAssertions(payload: unknown): EnforcementAsser
  * - `enforced == prior`   → **never_applied**. Nobody moved it; the decision
  *   never landed. Real drift. (A deliberate revert back to the starting figure
  *   reads as this too — correctly: the decision is once again unapplied.)
- * - otherwise             → **superseded**. The enforced figure is neither
- *   where the decision started nor where it said to land, so something decided
- *   later put it there. Re-asserting a stale figure over it is exactly the
- *   "silently applying a five-day-old figure over whatever a human since set"
- *   hazard this reconciler's own docstring refuses to commit.
+ * - otherwise             → the enforced figure is neither where the decision
+ *   started nor where it said to land. `from_usd` is free-form payload text
+ *   that nothing validated when the card was written, so a *wrong* prior lands
+ *   here too — and calling that `superseded` would let a bad figure in an
+ *   untrusted field make a real enforcement gap disappear. Split it on a fact
+ *   the database owns instead of on the field under suspicion:
+ *   - `policy.updatedAt > decidedAt` → **superseded**. Something wrote the row
+ *     after the decision, so a later decision put it where it is. Re-asserting
+ *     a stale figure over that is exactly the "silently applying a five-day-old
+ *     figure over whatever a human since set" hazard this reconciler refuses.
+ *   - `policy.updatedAt <= decidedAt` → **never_applied**. Nothing has touched
+ *     the row since the decision, so there is no later decision to be superseded
+ *     by; the card's recorded prior was simply wrong, and the gap is real.
+ *   - either timestamp unknown → `unverifiable_mismatch`. Reported, never
+ *     written.
  *
  * With no recorded prior, the three-way collapses back to the two-way and the
  * answer is `unverifiable_mismatch` — reported as drift, because failing to
@@ -336,16 +353,42 @@ export type AssertionEnforcementState =
   | "missing_policy"
   | "inactive_policy";
 
+/**
+ * Was the enforcing row written after the decision was made?
+ *
+ * `null` when either side is unknown or unparseable — the caller must not
+ * collapse that into `false`, which would read "we have no idea" as "nothing
+ * has touched it".
+ */
+function policyTouchedAfterDecision(
+  updatedAt: Date | null,
+  decidedAt: Date | string | null,
+): boolean | null {
+  const touched = toEpochMs(updatedAt);
+  const decided = toEpochMs(decidedAt);
+  if (touched === null || decided === null) return null;
+  return touched > decided;
+}
+
+function toEpochMs(value: Date | string | null): number | null {
+  if (value === null) return null;
+  const ms = value instanceof Date ? value.getTime() : new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
 export function classifyEnforcementAssertion(
   assertion: EnforcementAssertion,
   policy: EnforcedBudgetPolicy | null,
+  decidedAt: Date | string | null,
 ): AssertionEnforcementState {
   if (!policy) return "missing_policy";
   if (!policy.isActive) return "inactive_policy";
   if (policy.amount === assertion.expectedAmountCents) return "applied";
   if (assertion.priorAmountCents === null) return "unverifiable_mismatch";
   if (policy.amount === assertion.priorAmountCents) return "never_applied";
-  return "superseded";
+  const touchedAfter = policyTouchedAfterDecision(policy.updatedAt, decidedAt);
+  if (touchedAfter === null) return "unverifiable_mismatch";
+  return touchedAfter ? "superseded" : "never_applied";
 }
 
 /**
@@ -363,11 +406,12 @@ export function classifyEnforcementAssertion(
 export function diffEnforcementAssertions(
   assertions: readonly EnforcementAssertion[],
   enforced: ReadonlyMap<string, EnforcedBudgetPolicy | null>,
+  decidedAt: Date | string | null,
 ): EnforcementDrift[] {
   const drifts: EnforcementDrift[] = [];
   for (const assertion of assertions) {
     const policy = enforced.get(assertion.policyId) ?? null;
-    switch (classifyEnforcementAssertion(assertion, policy)) {
+    switch (classifyEnforcementAssertion(assertion, policy, decidedAt)) {
       case "applied":
       case "superseded":
         continue;
@@ -504,6 +548,7 @@ export async function loadEnforcedBudgetPolicies(
       policyId: budgetPolicies.id,
       amount: budgetPolicies.amount,
       isActive: budgetPolicies.isActive,
+      updatedAt: budgetPolicies.updatedAt,
     })
     .from(budgetPolicies)
     .where(and(eq(budgetPolicies.companyId, companyId), inArray(budgetPolicies.id, unique)));
@@ -513,6 +558,7 @@ export async function loadEnforcedBudgetPolicies(
       policyId: row.policyId,
       amount: row.amount,
       isActive: row.isActive,
+      updatedAt: row.updatedAt,
     });
   }
   return result;
@@ -858,7 +904,7 @@ export async function reconcileApprovalEnforcement(
         const enforced =
           enforcedByCompany.get(approval.companyId) ??
           new Map<string, EnforcedBudgetPolicy | null>();
-        const drifts = diffEnforcementAssertions(assertions, enforced);
+        const drifts = diffEnforcementAssertions(assertions, enforced, approval.decidedAt);
         if (drifts.length === 0) continue;
         drifted += 1;
 

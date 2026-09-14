@@ -101,6 +101,12 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
     /** Strip the structured assertion, leaving prose only. */
     proseOnly?: boolean;
     isActive?: boolean;
+    /**
+     * Override `budget_policies.updated_at`. Left unset the column defaults to
+     * now, which is after the fixture's `decidedAt` and therefore reads as a
+     * post-decision write.
+     */
+    policyUpdatedAt?: Date;
   }) {
     const companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: `co-${companyId.slice(0, 8)}` });
@@ -137,6 +143,7 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
       windowKind: "calendar_month_utc",
       amount: options.enforcedCents,
       isActive: options.isActive ?? true,
+      ...(options.policyUpdatedAt ? { updatedAt: options.policyUpdatedAt } : {}),
     });
 
     const decidedCents = options.decidedCents ?? DECIDED_CENTS;
@@ -334,7 +341,8 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
     // The measured hazard: applying card 6f45844e verbatim on 2026-09-14 would
     // have written the CTO $56,000 -> $32,000, reverting a cap a human raised
     // after the card was decided. The enforced value is neither the card's
-    // starting figure nor its decided one, so something newer set it.
+    // starting figure nor its decided one, AND the row was written after the
+    // decision — so something newer set it.
     const { requesterId, policyId, approvalId } = await seed({
       enforcedCents: SUPERSEDING_CENTS,
     });
@@ -345,6 +353,22 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
       409,
     );
     expect(await enforcedAmount(policyId)).toBe(SUPERSEDING_CENTS);
+  });
+
+  it("applies a policy untouched since the decision even when the card's recorded prior is wrong", async () => {
+    // Same two-way disagreement as the test above, opposite disposition. Ally's
+    // finding on #1846: `from_usd` is unvalidated payload text, so a wrong prior
+    // must not be able to disguise a real enforcement gap as a supersession.
+    // Nothing has written this row since the decision, so there is no later
+    // decision to protect — the gap is real and applying it reverts nothing.
+    const { requesterId, policyId, approvalId } = await seed({
+      enforcedCents: SUPERSEDING_CENTS,
+      policyUpdatedAt: new Date(Date.now() - 48 * 60 * 60 * 1000),
+    });
+    const { hooks } = collectingHooks();
+    const result = await applyApprovalEnforcement(db, approvalId, requester(requesterId), hooks);
+    expect(result.applied).toHaveLength(1);
+    expect(await enforcedAmount(policyId)).toBe(DECIDED_CENTS);
   });
 
   it("refuses a mismatch it cannot classify, rather than guessing", async () => {
