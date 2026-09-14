@@ -55,6 +55,69 @@ describe("isClaudeModelNotFoundError", () => {
   });
 });
 
+describe("isClaudeTransientUpstreamError — transcript independence (PEN-3223)", () => {
+  // Deliberately omits "Failed to authenticate": this adapter's
+  // CLAUDE_AUTH_REQUIRED_RE matches that phrase, so including it would make the
+  // login veto return false and the test would pass without exercising the
+  // haystack narrowing at all.
+  const entitlement403 = {
+    type: "result",
+    subtype: "success",
+    is_error: true,
+    api_error_status: 403,
+    result:
+      "API Error: 403 The connected subscription for org 'org_penstock' provider 'anthropic' " +
+      "is not entitled to serve this request; re-entitle the seat and retry",
+  };
+
+  const poisonedStdout = [
+    '{"type":"system","subtype":"init","session_id":"s1","model":"claude-opus-4-6"}',
+    '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result",' +
+      '"content":"upstream returned 429 rate_limit_error; the pool was throttled and temporarily unavailable"}]}}',
+  ].join("\n");
+
+  it("does not classify a permanent 403 as transient when the transcript discusses rate limits", () => {
+    expect(
+      isClaudeTransientUpstreamError({ parsed: entitlement403, stdout: poisonedStdout }),
+    ).toBe(false);
+  });
+
+  it("classifies that 403 identically with and without the poisoned transcript", () => {
+    expect(isClaudeTransientUpstreamError({ parsed: entitlement403, stdout: poisonedStdout })).toBe(
+      isClaudeTransientUpstreamError({ parsed: entitlement403, stdout: "" }),
+    );
+  });
+
+  it("still classifies a genuine upstream throttle from the terminal result event", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: 429,
+          result: "API Error: Request rejected (429) · All Claude subscription capacity is rate-limited",
+        },
+        stdout: '{"type":"system","subtype":"init","session_id":"s1"}',
+      }),
+    ).toBe(true);
+  });
+
+  it("reads api_error_status so the verdict does not rest solely on CLI prose", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: 503,
+          result: "The request could not be completed.",
+        },
+      }),
+    ).toBe(true);
+  });
+});
+
 describe("isClaudeTransientUpstreamError", () => {
   it("classifies the 'out of extra usage' subscription window failure as provider quota", () => {
     expect(
