@@ -4682,8 +4682,21 @@ interface WakeupOptions {
 type UsageTotals = {
   inputTokens: number;
   cachedInputTokens: number;
+  /** BLO-29842: cache WRITE, billed 1.25x-2x input. Never part of inputTokens. */
+  cacheCreationInputTokens: number;
   outputTokens: number;
 };
+
+/**
+ * BLO-29842: prompt tokens that were NOT served from cache — fresh input plus
+ * cache creation. This is what `inputTokens` alone meant before cache creation
+ * was split out of it, so every consumer that cared about "context size, not
+ * cache reads" (session rotation above all) must go through this rather than
+ * reading `inputTokens` directly, or its threshold silently loosens.
+ */
+function nonCachedInputTokens(usage: Pick<UsageTotals, "inputTokens" | "cacheCreationInputTokens">) {
+  return usage.inputTokens + usage.cacheCreationInputTokens;
+}
 
 type SessionCompactionDecision = {
   rotate: boolean;
@@ -5438,9 +5451,26 @@ function stripAdapterProviderCapacityResetMetadata(
   return sanitized;
 }
 
-function zeroTokenUsage(usage: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number } | undefined) {
+function zeroTokenUsage(
+  usage:
+    | {
+        inputTokens?: number;
+        outputTokens?: number;
+        cachedInputTokens?: number;
+        cacheCreationInputTokens?: number;
+      }
+    | undefined,
+) {
   if (!usage) return true;
-  return (usage.inputTokens ?? 0) <= 0 && (usage.outputTokens ?? 0) <= 0 && (usage.cachedInputTokens ?? 0) <= 0;
+  // BLO-29842: cache creation is billed model work. Omitting it here would let a
+  // run that only wrote cache read as "zero tokens" and be misclassified as a
+  // throttled/idle run that never reached the model.
+  return (
+    (usage.inputTokens ?? 0) <= 0 &&
+    (usage.outputTokens ?? 0) <= 0 &&
+    (usage.cachedInputTokens ?? 0) <= 0 &&
+    (usage.cacheCreationInputTokens ?? 0) <= 0
+  );
 }
 
 export function isRetryableK8sCcrotateThrottleResult(result: {
@@ -5449,7 +5479,12 @@ export function isRetryableK8sCcrotateThrottleResult(result: {
   errorFamily?: string | null;
   retryNotBefore?: string | null;
   resultJson?: Record<string, unknown> | null;
-  usage?: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number };
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cachedInputTokens?: number;
+    cacheCreationInputTokens?: number;
+  };
 }) {
   if (!zeroTokenUsage(result.usage)) return false;
   if (result.errorFamily === "rate_limit_exhausted") return true;
@@ -6236,9 +6271,14 @@ export function resolveLedgerCostStatus(input: {
   costUsd: number | null | undefined;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheCreationInputTokens?: number;
   outputTokens: number;
 }): CostStatus {
-  const hasTokenUsage = input.inputTokens > 0 || input.cachedInputTokens > 0 || input.outputTokens > 0;
+  const hasTokenUsage =
+    input.inputTokens > 0 ||
+    input.cachedInputTokens > 0 ||
+    (input.cacheCreationInputTokens ?? 0) > 0 ||
+    input.outputTokens > 0;
   return input.costUsd == null && hasTokenUsage ? "unpriced" : "reported";
 }
 
@@ -6350,6 +6390,7 @@ function normalizeUsageTotals(usage: UsageSummary | null | undefined): UsageTota
   return {
     inputTokens: Math.max(0, Math.floor(asNumber(usage.inputTokens, 0))),
     cachedInputTokens: Math.max(0, Math.floor(asNumber(usage.cachedInputTokens, 0))),
+    cacheCreationInputTokens: Math.max(0, Math.floor(asNumber(usage.cacheCreationInputTokens, 0))),
     outputTokens: Math.max(0, Math.floor(asNumber(usage.outputTokens, 0))),
   };
 }
@@ -6366,18 +6407,25 @@ function readRawUsageTotals(usageJson: unknown): UsageTotals | null {
     0,
     Math.floor(asNumber(parsed.rawCachedInputTokens, asNumber(parsed.cachedInputTokens, 0))),
   );
+  const cacheCreationInputTokens = Math.max(
+    0,
+    Math.floor(
+      asNumber(parsed.rawCacheCreationInputTokens, asNumber(parsed.cacheCreationInputTokens, 0)),
+    ),
+  );
   const outputTokens = Math.max(
     0,
     Math.floor(asNumber(parsed.rawOutputTokens, asNumber(parsed.outputTokens, 0))),
   );
 
-  if (inputTokens <= 0 && cachedInputTokens <= 0 && outputTokens <= 0) {
+  if (inputTokens <= 0 && cachedInputTokens <= 0 && cacheCreationInputTokens <= 0 && outputTokens <= 0) {
     return null;
   }
 
   return {
     inputTokens,
     cachedInputTokens,
+    cacheCreationInputTokens,
     outputTokens,
   };
 }
@@ -6392,6 +6440,9 @@ function deriveNormalizedUsageDelta(current: UsageTotals | null, previous: Usage
   const cachedInputTokens = current.cachedInputTokens >= previous.cachedInputTokens
     ? current.cachedInputTokens - previous.cachedInputTokens
     : current.cachedInputTokens;
+  const cacheCreationInputTokens = current.cacheCreationInputTokens >= previous.cacheCreationInputTokens
+    ? current.cacheCreationInputTokens - previous.cacheCreationInputTokens
+    : current.cacheCreationInputTokens;
   const outputTokens = current.outputTokens >= previous.outputTokens
     ? current.outputTokens - previous.outputTokens
     : current.outputTokens;
@@ -6399,6 +6450,7 @@ function deriveNormalizedUsageDelta(current: UsageTotals | null, previous: Usage
   return {
     inputTokens: Math.max(0, inputTokens),
     cachedInputTokens: Math.max(0, cachedInputTokens),
+    cacheCreationInputTokens: Math.max(0, cacheCreationInputTokens),
     outputTokens: Math.max(0, outputTokens),
   };
 }
@@ -6503,6 +6555,10 @@ function heartbeatRunTokenUsage(usageJson: Record<string, unknown> | null): Usag
       0,
       Math.floor(asNumber(parsed.rawCachedInputTokens, asNumber(parsed.cachedInputTokens, asNumber(parsed.cached_input_tokens, 0)))),
     ),
+    cacheCreationInputTokens: Math.max(
+      0,
+      Math.floor(asNumber(parsed.rawCacheCreationInputTokens, asNumber(parsed.cacheCreationInputTokens, asNumber(parsed.cache_creation_input_tokens, 0)))),
+    ),
     outputTokens: Math.max(
       0,
       Math.floor(asNumber(parsed.rawOutputTokens, asNumber(parsed.outputTokens, asNumber(parsed.output_tokens, 0)))),
@@ -6516,7 +6572,12 @@ function isZeroTokenCompletedRun(run: {
 }): boolean {
   if (!isHeartbeatRunTerminalStatus(run.status)) return false;
   const usage = heartbeatRunTokenUsage(run.usageJson);
-  return usage.inputTokens === 0 && usage.cachedInputTokens === 0 && usage.outputTokens === 0;
+  return (
+    usage.inputTokens === 0 &&
+    usage.cachedInputTokens === 0 &&
+    usage.cacheCreationInputTokens === 0 &&
+    usage.outputTokens === 0
+  );
 }
 
 export function countConsecutiveZeroTokenCompletedRuns(
@@ -15364,7 +15425,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reason = computeSessionCompactionReason({
       policy,
       runsCount: runs.length,
-      latestRawInputTokens: latestRawUsage?.inputTokens ?? null,
+      // BLO-29842: fresh input + cache creation. Cache creation used to be summed
+      // into inputTokens upstream, so reading inputTokens alone here would quietly
+      // shrink the rotation trigger's input by the whole cache-write volume and
+      // rotate far later than the policy asks for. The threshold is unchanged.
+      latestRawInputTokens: latestRawUsage ? nonCachedInputTokens(latestRawUsage) : null,
       sessionAgeHours,
       consecutiveFailedOrZeroTokenResumes,
     });
@@ -26955,13 +27020,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const inputTokens = usage?.inputTokens ?? 0;
     const outputTokens = usage?.outputTokens ?? 0;
     const cachedInputTokens = usage?.cachedInputTokens ?? 0;
+    const cacheCreationInputTokens = usage?.cacheCreationInputTokens ?? 0;
     const billingType = normalizeLedgerBillingType(result.billingType);
     const additionalCostCents = normalizeBilledCostCents(result.costUsd, billingType);
-    const hasTokenUsage = inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0;
+    const hasTokenUsage =
+      inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0 || cacheCreationInputTokens > 0;
     const costStatus = resolveLedgerCostStatus({
       costUsd: result.costUsd,
       inputTokens,
       cachedInputTokens,
+      cacheCreationInputTokens,
       outputTokens,
     });
     const provider = result.provider ?? "unknown";
@@ -27032,6 +27100,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         model: result.model ?? "unknown",
         inputTokens,
         cachedInputTokens,
+        cacheCreationInputTokens,
         outputTokens,
         costCents: additionalCostCents,
         occurredAt: new Date(),
@@ -32246,6 +32315,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ...(rawUsage ? {
                 rawInputTokens: rawUsage.inputTokens,
                 rawCachedInputTokens: rawUsage.cachedInputTokens,
+                rawCacheCreationInputTokens: rawUsage.cacheCreationInputTokens,
                 rawOutputTokens: rawUsage.outputTokens,
               } : {}),
               ...(sessionUsageResolution.derivedFromSessionTotals
@@ -32274,6 +32344,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 costUsd: adapterResult.costUsd,
                 inputTokens: normalizedUsage?.inputTokens ?? 0,
                 cachedInputTokens: normalizedUsage?.cachedInputTokens ?? 0,
+                cacheCreationInputTokens: normalizedUsage?.cacheCreationInputTokens ?? 0,
                 outputTokens: normalizedUsage?.outputTokens ?? 0,
               }),
               billingType: normalizeLedgerBillingType(adapterResult.billingType),
