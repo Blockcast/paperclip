@@ -15,9 +15,9 @@ permissions:
 # stays consistent afterward (an admin merge, a branch-protection bypass,
 # or a bug in the guard could still let drift through undetected). This
 # job re-runs the same dependency-free checker directly against master on
-# a schedule, independent of any PR, so drift on master itself fails a
-# job and alerts via Actions notifications instead of surfacing only when
-# the next PR's `pnpm install --frozen-lockfile` dies.
+# a schedule, independent of any PR. Failures are delivered to Alertmanager
+# with stable labels so they reach a named operational route and deduplicate
+# while the drift persists, rather than relying on Actions notifications.
 jobs:
   check-master-lockfile-overrides:
     runs-on: default
@@ -29,4 +29,19 @@ jobs:
           ref: master
 
       - name: Check pnpm-lock.yaml overrides/patchedDependencies consistency
+        id: check
+        continue-on-error: true
         run: node ./scripts/check-lockfile-overrides-consistency.mjs
+
+      - name: Push lockfile drift alert to Alertmanager
+        if: steps.check.outcome == 'failure'
+        env:
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRIFT_SUMMARY: Lockfile overrides/patchedDependencies consistency check failed on master.
+        run: node ./.github/scripts/post-lockfile-drift-alert.mjs
+
+      - name: Fail the run when lockfile drift is detected
+        if: steps.check.outcome == 'failure'
+        run: exit 1
