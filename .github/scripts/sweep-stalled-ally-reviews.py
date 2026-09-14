@@ -831,8 +831,11 @@ def refire_still_permitted(owner, repo, number, head_sha, token, api_base_url, n
     Order is by cost, and every branch that declines is a branch that will not
     write -- so the paid read is reached only when the two free checks have
     both passed. The cooldown and the comment surface are free (the comments
-    are already in hand); only the reviews surface costs a request, bounded at
-    MAX_REFIRES_PER_RUN per run against a 1,000/hour budget.
+    are already in hand); only the reviews surface costs a request. That cost
+    is bounded by the number of PRs that pass both free checks -- NOT by
+    MAX_REFIRES_PER_RUN, because a write this guard withholds leaves its budget
+    slot free (see sweep()) -- against a 1,000/hour budget. In practice small:
+    cooldown-blocked PRs short-circuit before the paid read.
 
     The check is deliberately head-exact, not "has Ally reviewed at all".
     ally_has_reviewed_head demands a consolidated report attesting THIS head,
@@ -1147,6 +1150,15 @@ def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry
             # Posting the marker comment alone would still double the re-ask
             # trail and push the cooldown out for the next run, so gating only
             # request_review would leave half the defect in place.
+            if prefix == REVIEWED_SKIP_REASON_PREFIX:
+                # Same fact the scan normalizes above (ally_has_reviewed_head
+                # -> pending_since = None), just discovered minutes later:
+                # Ally answered THIS head, so the PR is not stranded. Without
+                # this, is_alarming counts the guard's healthiest outcome and
+                # main() fails the run red on it. The contended branch keeps
+                # pending_since on purpose -- that PR genuinely is still
+                # waiting, and must still be able to alarm.
+                pending_since = None
             return (pr, head_sha, pending_since, False, "%s -- %s" % (prefix, withheld))
         requested = request_review(owner, repo, number, token, api_base_url)
         body = build_comment_body(

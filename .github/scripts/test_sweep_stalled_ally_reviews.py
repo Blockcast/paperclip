@@ -11,6 +11,7 @@ import importlib.util
 import io
 import os
 import tempfile
+import time
 import unittest
 import urllib.error
 
@@ -1608,6 +1609,43 @@ class TestPreWriteAllyReviewedGuard(unittest.TestCase):
 
         self.assertFalse(outcome[3], "a withheld write must not read as a re-fire")
 
+    # -- (e) an answered skip is a healthy PR, not a stranded one ------------
+
+    def test_an_answered_skip_is_not_alarming(self):
+        """The guard's success case must not fail the run red.
+
+        The scan normalizes `pending_since = None` when ally_has_reviewed_head
+        is true. The guard discovers the SAME fact minutes later, so it must
+        do the same -- otherwise main()'s `alarming` list counts a PR the
+        guard just proved is not stranded, the step summary reports it twice
+        in contradictory terms, and the job exits EXIT_ALARM on the healthiest
+        outcome the guard can produce. The fixture is pending 10h against a
+        5.5h alarm threshold, so an un-normalized tuple alarms here.
+        """
+        self._install(reread_reviews=[formal_review(commit_id=self.PR_HEAD)])
+
+        _pr_payload, _head, pending, refire, reason = self._consider()
+
+        self.assertFalse(refire)
+        self.assertTrue(reason.startswith(sweep.REVIEWED_SKIP_REASON_PREFIX), reason)
+        self.assertIsNone(pending, "an answered head is not pending, exactly as on the scan path")
+        self.assertFalse(sweep.is_alarming({"is_draft": False, "pending_since": pending}, self._now()))
+
+    def test_a_contended_skip_still_carries_pending_since_so_it_can_alarm(self):
+        """Negative control for the test above: normalize the answered branch
+        ONLY. A contended PR is still genuinely waiting on Ally -- a concurrent
+        writer re-asked, nobody answered -- so silencing its alarm would hide a
+        stranded PR behind the guard.
+        """
+        self._install(reread_comments=[{"body": sweep.MARKER + "\nre-ask", "created_at": "2026-09-01T09:59:00Z"}])
+
+        _pr_payload, _head, pending, refire, reason = self._consider()
+
+        self.assertFalse(refire)
+        self.assertTrue(reason.startswith(sweep.REREAD_SKIP_REASON_PREFIX), reason)
+        self.assertIsNotNone(pending)
+        self.assertTrue(sweep.is_alarming({"is_draft": False, "pending_since": pending}, self._now()))
+
     def test_a_failed_reviews_reread_withholds_the_write_rather_than_writing_blind(self):
         """Fail-closed, matching the cooldown re-read's contract.
 
@@ -1729,16 +1767,49 @@ class TestGuardSkipsAreVisibleInTheStepSummary(unittest.TestCase):
 
     def _summary_for(self, results):
         sweep.sweep = lambda *a, **k: results
+        self.exit_code = 0
         try:
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 sweep.main([])
-        except SystemExit:
-            pass
+        except SystemExit as exc:
+            self.exit_code = exc.code
         with open(self.summary_path, encoding="utf-8") as handle:
             return handle.read()
 
-    def _skip(self, number, prefix, detail):
-        return (_pr(number), "%040x" % number, None, False, "%s -- %s" % (prefix, detail))
+    def _skip(self, number, prefix, detail, pending_since=None):
+        # `pending_since` defaults to None, which is what _consider_pr returns
+        # for an ANSWERED skip; pass a real epoch to model a CONTENDED one,
+        # which keeps the stale wait so it can still alarm.
+        return (_pr(number), "%040x" % number, pending_since, False, "%s -- %s" % (prefix, detail))
+
+    def test_a_contended_skip_past_the_alarm_threshold_still_alarms(self):
+        """The two guard outcomes carry different `pending_since`, and the
+        alarm follows it. A contended PR (a concurrent writer re-asked, nobody
+        answered) is still stranded, so it appears in BOTH the guard section
+        and the alarm section -- the same PR, consistently -- and the run exits
+        EXIT_ALARM. Contrast the answered case below.
+        """
+        stale = time.time() - sweep.ALARM_THRESHOLD_SECONDS - HOUR
+        summary = self._summary_for([
+            self._skip(1, sweep.REREAD_SKIP_REASON_PREFIX, "re-asked 3s ago", pending_since=stale),
+        ])
+
+        self.assertIn("1 contended", summary)
+        self.assertIn(":rotating_light:", summary)
+        self.assertEqual(self.exit_code, sweep.EXIT_ALARM)
+
+    def test_an_answered_skip_never_reaches_the_alarm_section(self):
+        """An answered skip arrives with `pending_since=None` (pinned on the
+        real tuple in TestPreWriteAllyReviewedGuard), so main() must not
+        report the same PR as both healthy and stranded, nor exit red on it.
+        """
+        summary = self._summary_for([
+            self._skip(1, sweep.REVIEWED_SKIP_REASON_PREFIX, "consolidated report on the comment surface"),
+        ])
+
+        self.assertIn("1 answered", summary)
+        self.assertNotIn(":rotating_light:", summary)
+        self.assertEqual(self.exit_code, 0)
 
     def test_a_contended_skip_is_named_as_concurrency_evidence(self):
         summary = self._summary_for([
