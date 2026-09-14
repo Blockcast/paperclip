@@ -409,12 +409,8 @@ const CLAUDE_HARNESS_AUTHORED_EVENT_TYPES: ReadonlySet<string> = new Set([
 //
 // Measured against the v2.1.210 binary this adapter runs, `system` carries at
 // least six subtypes — `init`, `status`, `compact_boundary`, `hook_started`,
-// `hook_response`, `mcp_status`. Only the first two are admitted:
+// `hook_response`, `mcp_status`. Only `init` is admitted:
 //   - `init`   — session_id, model, tool names; the startup line itself.
-//   - `status` — `status`/`uuid`/`session_id`. Emitted before the first turn;
-//                observed only under `--include-partial-messages`, which is
-//                also the mode in which `init -> status -> death` is a real
-//                startup shape, so the entry is load-bearing there.
 // `hook_response` is the concrete reason this gate exists rather than being
 // future-proofing: the binary constructs it as
 // `{type:"system",subtype:"hook_response",…,output,stdout,stderr}` — i.e. it
@@ -430,10 +426,20 @@ const CLAUDE_HARNESS_AUTHORED_EVENT_TYPES: ReadonlySet<string> = new Set([
 // version. Corroborated behaviourally: a hook exiting 3 with stderr output
 // still emits `subtype:"hook_response"` with `exit_code:3`.)
 //
-// `status` is admitted despite its own `compact_result`/`compact_error` fields,
-// which carry compaction summaries derived from model output: compaction cannot
-// occur before the first turn, so any transcript reaching it also contains an
-// `assistant` line, which this guard rejects independently.
+// `status` is NOT admitted, and was until BLO-31955. It carries
+// `compact_result`/`compact_error`, compaction summaries derived from model
+// output, and the earlier justification for admitting it anyway — "compaction
+// cannot occur before the first turn, so any such transcript also contains an
+// `assistant` line, which this guard rejects independently" — was a
+// whole-transcript-veto argument. Under per-line attribution (below) an
+// `assistant` line elsewhere rejects nothing, so a `status` line whose
+// `compact_result` quoted the trigger phrase would have been attributed to the
+// harness and classified `skill_not_found`: permanent retry suppression, the
+// asymmetry every other decision here is careful about. Nor is the entry
+// load-bearing any more: in the `init -> status -> death` startup shape (seen
+// under `--include-partial-messages`) the death is the bare error line, which
+// is trusted on its own, and a `status` line that does not carry the phrase is
+// never consulted. So `status` fails closed like every other subtype.
 //
 // A `system` line with no readable subtype fails closed, like any unrecognised
 // type. Truncation drops the tail, not the head, so a genuine `init` line is
@@ -443,7 +449,6 @@ const CLAUDE_HARNESS_AUTHORED_EVENT_TYPES: ReadonlySet<string> = new Set([
 // closed on that read regardless of what its severed tail contained.
 const CLAUDE_HARNESS_AUTHORED_SYSTEM_SUBTYPES: ReadonlySet<string> = new Set([
   "init",
-  "status",
 ]);
 
 // The first `"type":"…"` on a line. Whitespace-tolerant because this matches
