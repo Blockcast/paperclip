@@ -68,7 +68,13 @@ function maskBinding(binding: EnvBinding): EnvBinding {
 
 export function maskEnvBindings<T extends AgentEnvConfig | null | undefined>(env: T): T {
   if (!env || typeof env !== "object") return env;
-  const masked: AgentEnvConfig = {};
+  // Null-prototype accumulator: `ENV_KEY_RE` (`services/secrets.ts`) is /^[A-Za-z_][A-Za-z0-9_]*$/,
+  // which admits `__proto__`, and JSON.parse hands it over as an ordinary own property. On a `{}`
+  // accumulator `masked[key] = ...` would then be a PROTOTYPE write: the binding would vanish with
+  // no own property and nothing serialized. A dropped binding discloses nothing, so this is a
+  // correctness fix rather than a disclosure one — but silently losing a row is the wrong failure
+  // mode for the module whose job is to round-trip every binding it is handed.
+  const masked: AgentEnvConfig = Object.create(null);
   for (const [key, binding] of Object.entries(env)) {
     masked[key] = maskBinding(binding as EnvBinding);
   }
@@ -115,14 +121,18 @@ export function restoreMaskedEnvBindings(
   stored: AgentEnvConfig | null | undefined,
 ): AgentEnvConfig {
   if (!incoming || typeof incoming !== "object") return incoming;
-  const merged: AgentEnvConfig = {};
+  // Null-prototype for the same reason as the mask above, and one more specific to this half: the
+  // stored lookup must be an OWN-property read. `stored["__proto__"]` on an ordinary object returns
+  // `Object.prototype` rather than `undefined`, so an `!== undefined` guard treats "nothing stored"
+  // as "something stored" and hands a non-binding to `plainValueOf`.
+  const merged: AgentEnvConfig = Object.create(null);
   for (const [key, binding] of Object.entries(incoming)) {
     const incomingPlain = plainValueOf(binding as EnvBinding);
     if (incomingPlain !== PROJECT_ENV_VALUE_MASK) {
       merged[key] = binding as EnvBinding;
       continue;
     }
-    const storedBinding = stored?.[key];
+    const storedBinding = stored && Object.hasOwn(stored, key) ? stored[key] : undefined;
     if (storedBinding !== undefined && plainValueOf(storedBinding) !== null) {
       merged[key] = storedBinding;
       continue;

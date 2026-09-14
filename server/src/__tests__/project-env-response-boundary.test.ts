@@ -235,6 +235,84 @@ describe("project env disclosure boundary (PEN-3033)", () => {
     });
   });
 
+  describe("the `__proto__` key, which the env key regex admits", () => {
+    // ENV_KEY_RE is /^[A-Za-z_][A-Za-z0-9_]*$/, so `__proto__` is a WELL-FORMED env key, and
+    // JSON.parse gives it to us as an ordinary own property rather than as a prototype write. A
+    // plain-object accumulator then turns `acc[key] = binding` into a prototype assignment: the
+    // binding vanishes, silently, with no own property and nothing serialized.
+    //
+    // That is a correctness bug in this module rather than a disclosure one — a dropped binding
+    // discloses nothing — but "the mask silently loses a row" is the wrong failure mode for a
+    // module whose whole job is to round-trip every binding it is handed.
+    const protoIncoming = () =>
+      JSON.parse(`{"__proto__":{"type":"plain","value":"${PROJECT_ENV_VALUE_MASK}"}}`);
+    const protoStored = () => JSON.parse(`{"__proto__":{"type":"plain","value":"${PLAIN_SENTINEL}"}}`);
+
+    it("hands the mask a genuine own `__proto__` property — the premise of the rest of this block", () => {
+      expect(Object.hasOwn(protoStored(), "__proto__")).toBe(true);
+    });
+
+    it("masks a `__proto__` binding as an OWN property instead of dropping it", () => {
+      const masked = maskEnvBindings(protoStored()) as Record<string, any>;
+      expect(Object.hasOwn(masked, "__proto__")).toBe(true);
+      expect(Object.getOwnPropertyDescriptor(masked, "__proto__")?.value).toEqual({
+        type: "plain",
+        value: PROJECT_ENV_VALUE_MASK,
+      });
+      // The value is masked, so it is absent from the wire either way — assert it directly rather
+      // than inferring safety from the drop.
+      expect(JSON.stringify(masked)).not.toContain(PLAIN_SENTINEL);
+    });
+
+    it("restores a stored `__proto__` binding instead of dropping the row on save", () => {
+      const merged = restoreMaskedEnvBindings(protoIncoming(), protoStored()) as Record<string, any>;
+      expect(Object.hasOwn(merged, "__proto__")).toBe(true);
+      expect(Object.getOwnPropertyDescriptor(merged, "__proto__")?.value).toEqual({
+        type: "plain",
+        value: PLAIN_SENTINEL,
+      });
+    });
+
+    it("pollutes nothing globally, on either accumulator", () => {
+      maskEnvBindings(protoStored());
+      restoreMaskedEnvBindings(protoIncoming(), protoStored());
+      expect(({} as Record<string, unknown>).type).toBeUndefined();
+      expect(Object.prototype).not.toHaveProperty("value");
+    });
+
+    it("treats an inherited Object.prototype member as NOTHING stored", () => {
+      // `stored["__proto__"]`/`["constructor"]` on an ordinary object return an inherited member
+      // rather than `undefined`, so the own-property guard is what keeps "nothing stored" honest.
+      // Today `plainValueOf` rejects every inherited member anyway, so this pins behaviour that is
+      // currently correct for a second reason — if that ever narrows, this test says so.
+      for (const key of ["__proto__", "constructor", "toString"]) {
+        const merged = restoreMaskedEnvBindings(
+          JSON.parse(`{"${key}":{"type":"plain","value":"${PROJECT_ENV_VALUE_MASK}"}}`),
+          {},
+        ) as Record<string, any>;
+        expect(Object.getOwnPropertyDescriptor(merged, key)?.value).toEqual({
+          type: "plain",
+          value: PROJECT_ENV_VALUE_MASK,
+        });
+      }
+    });
+
+    it("does NOT by itself make the key persistable — normalizeEnvConfig drops it downstream", () => {
+      // Pinned deliberately: `services/secrets.ts` accumulates into `{}` on the same key, so a
+      // `__proto__` binding still cannot reach storage. Closing that is a change to a function
+      // shared with the agent and environment paths, and is not bundled into this PR. This
+      // assertion is what makes that boundary visible instead of assumed — if the shared path is
+      // ever hardened, this is the test that says so.
+      const downstream: Record<string, unknown> = {};
+      for (const [key, binding] of Object.entries(
+        maskEnvBindings(protoStored()) as Record<string, unknown>,
+      )) {
+        downstream[key] = binding;
+      }
+      expect(Object.hasOwn(downstream, "__proto__")).toBe(false);
+    });
+  });
+
   describe("route exits", () => {
     it("masks on GET /projects/:id", async () => {
       const res = await request(createApp()).get("/api/projects/project-1");
