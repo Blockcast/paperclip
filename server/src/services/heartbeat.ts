@@ -24053,8 +24053,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const monitorNextCheckAt = runIssueId
         ? monitorNextCheckAtByIssue.get(`${run.companyId}:${runIssueId}`)
         : undefined;
+      // A monitor-due wake is NOT one-shot: the monitor redelivers it. Retry is
+      // therefore decided solely by `monitorDispatchLostWithoutFutureWake`
+      // below, and the pre-adapter gate excludes this wake reason so it cannot
+      // short-circuit that predicate (BLO-33385 review).
+      const isMonitorDueWake = readNonEmptyString(runContext.wakeReason) === "issue_monitor_due";
       const monitorDispatchLostWithoutFutureWake =
-        readNonEmptyString(runContext.wakeReason) === "issue_monitor_due" &&
+        isMonitorDueWake &&
         monitorNextCheckAt !== undefined &&
         (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= now.getTime());
       const unmanagedBackgroundTaskEvidence = descendantOnlyCleanup
@@ -24119,10 +24124,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // id keeps timer/maintenance runs terminal (BLO-7913): those self-
         // redeliver, so retrying them only leaks. Same shape as the
         // k8s_concurrent_run_blocked rule above (`isIssueRun || isPrReview...`).
+        // `issue_monitor_due` is excluded for the same reason as BLO-7913: it
+        // self-redelivers. Retrying it here would bypass
+        // `monitorDispatchLostWithoutFutureWake` -- which deliberately retries a
+        // lost monitor dispatch ONLY when no future wake remains -- and race a
+        // queued retry against the monitor's own scheduled redelivery. The
+        // no-future-wake case is still covered, by that third disjunct.
         (
           externalLifecyclePreAdapter &&
           (run.processLossRetryCount ?? 0) < 1 &&
-          (prReviewRetry || !!runIssueId)
+          (prReviewRetry || (!!runIssueId && !isMonitorDueWake))
         ) ||
         ((run.processLossRetryCount ?? 0) < 1 && monitorDispatchLostWithoutFutureWake);
       const baseMessage = externalLifecyclePreAdapter
