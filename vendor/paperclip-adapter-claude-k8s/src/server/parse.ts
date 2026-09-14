@@ -409,12 +409,8 @@ const CLAUDE_HARNESS_AUTHORED_EVENT_TYPES: ReadonlySet<string> = new Set([
 //
 // Measured against the v2.1.210 binary this adapter runs, `system` carries at
 // least six subtypes — `init`, `status`, `compact_boundary`, `hook_started`,
-// `hook_response`, `mcp_status`. Only the first two are admitted:
+// `hook_response`, `mcp_status`. Only `init` is admitted:
 //   - `init`   — session_id, model, tool names; the startup line itself.
-//   - `status` — `status`/`uuid`/`session_id`. Emitted before the first turn;
-//                observed only under `--include-partial-messages`, which is
-//                also the mode in which `init -> status -> death` is a real
-//                startup shape, so the entry is load-bearing there.
 // `hook_response` is the concrete reason this gate exists rather than being
 // future-proofing: the binary constructs it as
 // `{type:"system",subtype:"hook_response",…,output,stdout,stderr}` — i.e. it
@@ -430,10 +426,20 @@ const CLAUDE_HARNESS_AUTHORED_EVENT_TYPES: ReadonlySet<string> = new Set([
 // version. Corroborated behaviourally: a hook exiting 3 with stderr output
 // still emits `subtype:"hook_response"` with `exit_code:3`.)
 //
-// `status` is admitted despite its own `compact_result`/`compact_error` fields,
-// which carry compaction summaries derived from model output: compaction cannot
-// occur before the first turn, so any transcript reaching it also contains an
-// `assistant` line, which this guard rejects independently.
+// `status` is NOT admitted, and was until BLO-31955. It carries
+// `compact_result`/`compact_error`, compaction summaries derived from model
+// output, and the earlier justification for admitting it anyway — "compaction
+// cannot occur before the first turn, so any such transcript also contains an
+// `assistant` line, which this guard rejects independently" — was a
+// whole-transcript-veto argument. Under per-line attribution (below) an
+// `assistant` line elsewhere rejects nothing, so a `status` line whose
+// `compact_result` quoted the trigger phrase would have been attributed to the
+// harness and classified `skill_not_found`: permanent retry suppression, the
+// asymmetry every other decision here is careful about. Nor is the entry
+// load-bearing any more: in the `init -> status -> death` startup shape (seen
+// under `--include-partial-messages`) the death is the bare error line, which
+// is trusted on its own, and a `status` line that does not carry the phrase is
+// never consulted. So `status` fails closed like every other subtype.
 //
 // A `system` line with no readable subtype fails closed, like any unrecognised
 // type. Truncation drops the tail, not the head, so a genuine `init` line is
@@ -443,7 +449,6 @@ const CLAUDE_HARNESS_AUTHORED_EVENT_TYPES: ReadonlySet<string> = new Set([
 // closed on that read regardless of what its severed tail contained.
 const CLAUDE_HARNESS_AUTHORED_SYSTEM_SUBTYPES: ReadonlySet<string> = new Set([
   "init",
-  "status",
 ]);
 
 // The first `"type":"…"` on a line. Whitespace-tolerant because this matches
@@ -491,6 +496,34 @@ const CLAUDE_EVENT_SUBTYPE_RE = /"subtype"\s*:\s*"([^"\r\n]*)"/;
  * model token and tool result is wrapped in a JSON event, so a line carrying no
  * type is the CLI speaking outside the protocol rather than a payload that can
  * relay model or tool text.
+ *
+ * That trust is STRUCTURAL, not a sample. The surface this reads has exactly
+ * one writer: the `tee` in the pipeline `job-manifest.ts` builds at `:1862` —
+ * `cat … | claude … | tee <podLogPath> | <failFastFilter> > /dev/null` — which
+ * carries no `2>&1` on any stage. The file therefore receives Claude's stdout
+ * and nothing else. Hook stderr, MCP-server stderr and the fail-fast
+ * `[wrapper]` line (written to `/dev/stderr` at `job-manifest.ts:1708`, and
+ * downstream of the `tee` regardless) all bypass it by construction, as does
+ * the prompt. Operator- and MCP-authored text cannot reach this predicate as a
+ * bare line at all — which is why trusting bare lines is safe, rather than
+ * merely observed to be safe. The 6893-line production sample recorded in
+ * PROVENANCE.md corroborates that; it is not what establishes it.
+ *
+ * Two edits would void this, and neither shows a diff at this call site:
+ *
+ *   1. Adding `2>&1` before the `tee` at `job-manifest.ts:1862` — an entirely
+ *      reasonable change, e.g. to capture CLI diagnostics in the pod log —
+ *      which starts routing operator-authored stderr here as bare, TRUSTED
+ *      lines.
+ *   2. Feeding a merged container-log read into the parse surface. Container
+ *      logs interleave both streams, so `readPodContainerLogTail`
+ *      (`execute.ts:894`, via `readNamespacedPodLog`) must stay confined to
+ *      diagnostics. Today `stdout` is assigned only from `podLogPath`
+ *      (`execute.ts:2248` tail, `:2261` on-disk), so both paths read the same
+ *      single-writer file.
+ *
+ * Either one re-opens BLO-7991's hole with no diff on this guard — the failure
+ * mode every prior iteration in this family took (BLO-7991 → #1525 → BLO-31794).
  */
 function claudeLineIsHarnessAuthored(line: string): boolean {
   const match = CLAUDE_EVENT_TYPE_RE.exec(line);
@@ -554,8 +587,8 @@ function claudeTranscriptHasHarnessAuthoredSkillPhrase(stdout: string): boolean 
 /**
  * Detect Claude's "Skill "<name>" not found" death (BLO-7991 AC3).
  *
- * Deliberately does NOT read `stdout`. `stdout` is the entire pod log — every
- * intermediate assistant message — so an agent that merely *discusses* a
+ * Deliberately does NOT read `stdout`. `stdout` is the pod log's stdout stream
+ * — every intermediate assistant message — so an agent that merely *discusses* a
  * missing skill would match. Unlike the transient families, where a false
  * positive costs one extra retry, `skill_not_found` is listed in
  * NON_RETRYABLE_CONTINUATION_ERROR_CODES and is excluded from the zero-token
@@ -642,8 +675,8 @@ export function isClaudeSkillNotFoundStartupFailure(input: {
   // Cheap whole-transcript phrase test before the per-line walk. Both are pure
   // and neither regex is `/g`, so this is semantically a pre-filter only: the
   // walk below re-tests each line and is what actually decides. The phrase is
-  // absent on the overwhelming majority of failed runs, and `stdout` is the
-  // entire pod log, so this skips the eager `split` outright on that common path.
+  // absent on the overwhelming majority of failed runs, and `stdout` is the pod
+  // log's stdout stream, so this skips the eager `split` outright on that path.
   if (!CLAUDE_SKILL_NOT_FOUND_RE.test(input.stdout)) return false;
   return claudeTranscriptHasHarnessAuthoredSkillPhrase(input.stdout);
 }
