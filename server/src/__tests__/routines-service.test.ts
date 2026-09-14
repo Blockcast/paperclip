@@ -33,6 +33,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import * as activityLogModule from "../services/activity-log.js";
+import { logger } from "../middleware/logger.js";
 import { issueService } from "../services/issues.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import * as providerRegistry from "../secrets/provider-registry.js";
@@ -1980,6 +1981,97 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(0);
   });
 
+  // Ally review, BLO-31996: the `!activeIssue` guard is a snapshot the gate
+  // took, and the supersede then cancelled without re-reading `heartbeat_runs`.
+  // A heartbeat checking the row out inside that window had its execution
+  // cancelled out from under it. No other case here can catch it -- every one
+  // of them holds the run status still for the whole dispatch, so the snapshot
+  // is never wrong.
+  //
+  // The interleaving is forced rather than hoped for. A second connection opens
+  // a transaction, writes the issue row (taking its lock) and flips the run
+  // live, then holds. The gate reads committed data, so it still sees the old
+  // stalled run and emits its bypass warning -- which is the one hook that
+  // lands between the liveness read and the supersede, and is where the held
+  // transaction is released. The supersede's `for update` then BLOCKS on that
+  // lock, so it cannot win the race by luck: it resumes only after the
+  // checkout-shaped write commits, and its liveness read is a fresh statement
+  // snapshot taken while it holds the row.
+  it("does not cancel a stale predecessor whose run goes live between the liveness read and the supersede", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    const stalled = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      // Live status, but the run phase is older than the 6h run-age horizon, so
+      // the gate bypasses it and the supersede would retire it. That shape is
+      // required: the bypass scan inner-joins on live run statuses, so a
+      // terminal run produces no warning and there would be no hook.
+      runStatus: "running",
+      runStartedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      bindExecutionRun: true,
+    });
+
+    let lockHeld!: () => void;
+    let releaseLock!: () => void;
+    const lockTaken = new Promise<void>((resolve) => {
+      lockHeld = resolve;
+    });
+    const lockReleased = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+
+    const racingCheckout = db.transaction(async (tx) => {
+      // The write a real checkout makes, which is why locking the issue row is
+      // the right thing for the supersede to serialise on.
+      await tx
+        .update(issues)
+        .set({ executionLockedAt: new Date() })
+        .where(eq(issues.id, stalled.issue.id));
+      await tx
+        .update(heartbeatRuns)
+        .set({ status: "running", startedAt: new Date() })
+        .where(eq(heartbeatRuns.id, stalled.heartbeatRunId));
+      lockHeld();
+      await lockReleased;
+    });
+    await lockTaken;
+
+    let raced = false;
+    const logWarn = logger.warn.bind(logger);
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(((...args: unknown[]) => {
+      if (!raced && args.some((arg) => typeof arg === "string" && arg.includes("bypassing"))) {
+        raced = true;
+        releaseLock();
+      }
+      return (logWarn as (...rest: unknown[]) => unknown)(...args);
+    }) as never);
+    // Safety valve: if the bypass warning never fires the supersede would block
+    // on the held lock forever. `raced` is asserted below so releasing here
+    // fails the test rather than passing it quietly.
+    const valve = setTimeout(() => releaseLock(), 10_000);
+
+    try {
+      resetRoutineDispatchMetrics();
+      await svc.runRoutine(routine.id, { source: "schedule" });
+    } finally {
+      clearTimeout(valve);
+      releaseLock();
+      warnSpy.mockRestore();
+      await racingCheckout;
+    }
+
+    expect(raced).toBe(true);
+    const [predecessor] = await db.select().from(issues).where(eq(issues.id, stalled.issue.id));
+    expect(predecessor.status).not.toBe("cancelled");
+    expect(predecessor.cancelledAt).toBeNull();
+    expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(0);
+  });
+
   // Ally review, BLO-31996 -- regression test for the clock-divergence defect,
   // and for the reason it was invisible to an otherwise green suite.
   //
@@ -2111,9 +2203,17 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
   // transaction. That is not best-effort: a failed INSERT aborts the whole
   // transaction, so the cancellation UPDATE rolls back with it and dispatch
   // dies on the successor INSERT with 25P02 -- the wedge returns, reached from
-  // the disposal path instead of the gate. The failure here is a real SQL
-  // error on the dispatch executor, not a JS rejection, so the transaction is
-  // genuinely aborted and only `rollback to savepoint` can restore it.
+  // the disposal path instead of the gate.
+  //
+  // The second version wrapped each receipt in `savepoint` / `rollback to
+  // savepoint`, which is the textbook answer and still fails HERE: postgres.js
+  // `begin` records the first failed query of the scope in `uncaughtError` and
+  // rethrows it once the callback resolves, so the rolled-back statement still
+  // aborts the transaction at commit. This case is what caught that -- the
+  // failure it injects is a real SQL error on the dispatch executor, not a JS
+  // rejection, which is the only shape that reaches the driver's bookkeeping.
+  // The receipts are now written after the transaction commits, so a failed one
+  // can only cost the receipt.
   it("keeps the cancellation and dispatches the successor when the supersede activity row cannot be written", async () => {
     const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
 
@@ -2160,7 +2260,8 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       expect(predecessor.status).toBe("cancelled");
       expect(predecessor.cancelledAt).not.toBeNull();
 
-      // The on-row comment has its own savepoint, so the broken activity row
+      // The on-row comment is written independently of the activity row, so the
+      // broken activity row
       // does not take it down too.
       const comments = await db
         .select()

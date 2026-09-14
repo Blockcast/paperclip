@@ -1820,50 +1820,6 @@ export function routineService(
   // pending interaction, none of which are heartbeat runs.
   const SUPERSEDE_PROTECTED_STATUSES = ["in_review"];
 
-  // Best-effort side effect on the dispatch transaction. A bare try/catch does
-  // NOT deliver best-effort inside a transaction: a failed statement aborts the
-  // whole thing, so every later statement raises 25P02 and the catch merely
-  // hides which one broke. Dispatch then dies on the successor INSERT with an
-  // error naming neither the side effect nor the routine, and the cancellation
-  // rolls back with it -- the wedge returns. `rollback to savepoint` is the one
-  // statement that restores a usable transaction -- same reasoning, and the
-  // same measured behaviour, as the guard in `pr-review-duplicate-issue-guard.ts`.
-  //
-  // Every supersede receipt goes through here. The first version protected
-  // only the comment and left `logActivity` in exactly the bare try/catch
-  // described above (Ally review, BLO-31996).
-  async function runSupersedeSideEffect(input: {
-    executor: Db;
-    savepoint: string;
-    issueId: string;
-    what: string;
-    run: () => Promise<unknown>;
-  }) {
-    const savepoint = sql.raw(input.savepoint);
-    let savepointOpen = false;
-    try {
-      await input.executor.execute(sql`savepoint ${savepoint}`);
-      savepointOpen = true;
-      await input.run();
-      await input.executor.execute(sql`release savepoint ${savepoint}`);
-    } catch (err) {
-      logger.warn({ err, issueId: input.issueId }, `failed to ${input.what} superseded routine execution issue`);
-      if (!savepointOpen) return;
-      try {
-        await input.executor.execute(sql`rollback to savepoint ${savepoint}`);
-      } catch (rollbackErr) {
-        // Nothing left to try: this is the only statement that could have
-        // restored the transaction. The failure surfaces on the first
-        // unguarded statement after it -- the successor INSERT -- rather than
-        // being silently carried forward.
-        logger.warn(
-          { err: rollbackErr, issueId: input.issueId },
-          `failed to roll back superseded-issue savepoint ${input.savepoint}`,
-        );
-      }
-    }
-  }
-
   async function supersedeStaleExecutionIssues(input: {
     routine: typeof routines.$inferSelect;
     executor: Db;
@@ -1876,6 +1832,72 @@ export function routineService(
   }) {
     const fingerprintCondition = routineExecutionFingerprintCondition(input.dispatchFingerprint);
     const fireAgeCutoff = new Date(input.now.getTime() - input.fireAgeHorizonMs);
+    const liveRunCondition = liveHeartbeatRunConditionForRoutineDispatch(input.now, input.fireAgeHorizonMs);
+    const staleCondition = and(
+      eq(issues.companyId, input.routine.companyId),
+      eq(issues.originKind, input.originKind),
+      eq(issues.originId, input.originId),
+      inArray(issues.status, OPEN_ISSUE_STATUSES),
+      not(inArray(issues.status, SUPERSEDE_PROTECTED_STATUSES)),
+      visibleIssueCondition(),
+      // Mirrors the unique index predicate: a row with no execution run is
+      // not blocking the successor's INSERT and may simply be a fire that
+      // has not been dispatched yet, so it must not be cancelled.
+      isNotNull(issues.executionRunId),
+      lte(issues.createdAt, fireAgeCutoff),
+      // A row with a genuine unresolved blocker edge is dependency-parked,
+      // not wedged: it self-drains via `issue_blockers_resolved_sweep` when
+      // the blocker closes. Only the edge-less `blocked` row -- the
+      // BLO-27553 zero-wake-path strand this change targets -- is retired.
+      // `cancelled` blockers do not count as resolved, matching the
+      // dependency semantics used everywhere else.
+      //
+      // The self-join is written as raw SQL rather than with drizzle's
+      // `alias()` on purpose: interpolating an aliased table into a `sql`
+      // fragment emits only the alias NAME, so the join reads
+      // `join "supersede_blocker"` -- a table that does not exist. That is
+      // a runtime 42P01 inside the dispatch transaction, not a type error,
+      // so it compiles clean and only shows up when the supersede actually
+      // matches. Aliasing here is mandatory, not cosmetic: an unaliased
+      // second `issues` in the subquery would shadow the outer statement's
+      // target and make `issues.id` below self-correlate.
+      sql`not exists (
+            select 1
+            from ${issueRelations}
+            join ${issues} as supersede_blocker
+              on supersede_blocker.id = ${issueRelations.issueId}
+            where ${issueRelations.relatedIssueId} = ${issues.id}
+              and ${issueRelations.type} = 'blocks'
+              and supersede_blocker.status <> 'done'
+          )`,
+      ...(fingerprintCondition ? [fingerprintCondition] : []),
+    );
+
+    // Ally review, BLO-31996: the caller's `!activeIssue` guard is a snapshot
+    // `findLiveExecutionIssue` took BEFORE this runs, and nothing re-read
+    // `heartbeat_runs` in between. A heartbeat that checked the row out inside
+    // that window had its execution cancelled out from under it -- exactly the
+    // `running` + young `startedAt` shape the fire-age arm deliberately
+    // protects. Re-stating the liveness predicate on the cancelling UPDATE is
+    // NOT enough on its own: if that statement blocks on a row lock the
+    // concurrent checkout already holds, its EvalPlanQual recheck re-reads the
+    // updated `issues` tuple but keeps the statement's ORIGINAL snapshot for
+    // `heartbeat_runs`, so the new run stays invisible and the cancel lands.
+    //
+    // So take the lock first and decide after. `for update` blocks until any
+    // in-flight checkout of these rows commits; the liveness read below is then
+    // a fresh statement snapshot taken while we hold them, so it sees that
+    // checkout's run and cannot be raced by another. Checkout always writes the
+    // issue row, which is what makes the issue lock the right one to serialise
+    // on. Two statements instead of one is the cost of the cancellation
+    // decision and the liveness decision being the same decision.
+    const locked = await input.executor
+      .select({ id: issues.id })
+      .from(issues)
+      .where(staleCondition)
+      .for("update");
+    if (locked.length === 0) return [];
+
     const stale = await input.executor
       .update(issues)
       .set({
@@ -1886,43 +1908,27 @@ export function routineService(
       })
       .where(
         and(
-          eq(issues.companyId, input.routine.companyId),
-          eq(issues.originKind, input.originKind),
-          eq(issues.originId, input.originId),
-          inArray(issues.status, OPEN_ISSUE_STATUSES),
-          not(inArray(issues.status, SUPERSEDE_PROTECTED_STATUSES)),
-          visibleIssueCondition(),
-          // Mirrors the unique index predicate: a row with no execution run is
-          // not blocking the successor's INSERT and may simply be a fire that
-          // has not been dispatched yet, so it must not be cancelled.
-          isNotNull(issues.executionRunId),
-          lte(issues.createdAt, fireAgeCutoff),
-          // A row with a genuine unresolved blocker edge is dependency-parked,
-          // not wedged: it self-drains via `issue_blockers_resolved_sweep` when
-          // the blocker closes. Only the edge-less `blocked` row -- the
-          // BLO-27553 zero-wake-path strand this change targets -- is retired.
-          // `cancelled` blockers do not count as resolved, matching the
-          // dependency semantics used everywhere else.
-          //
-          // The self-join is written as raw SQL rather than with drizzle's
-          // `alias()` on purpose: interpolating an aliased table into a `sql`
-          // fragment emits only the alias NAME, so the join reads
-          // `join "supersede_blocker"` -- a table that does not exist. That is
-          // a runtime 42P01 inside the dispatch transaction, not a type error,
-          // so it compiles clean and only shows up when the supersede actually
-          // matches. Aliasing here is mandatory, not cosmetic: an unaliased
-          // second `issues` in the subquery would shadow the outer UPDATE
-          // target and make `issues.id` below self-correlate.
+          inArray(
+            issues.id,
+            locked.map((row) => row.id),
+          ),
+          // The two arms mirror the gate's two joins: the row's own
+          // `executionRunId`, and a run whose context snapshot names the issue.
+          // Mirroring is load-bearing -- the cancel set must stay exactly the
+          // gate's bypass set, or dispatch hard-errors on 23505.
           sql`not exists (
             select 1
-            from ${issueRelations}
-            join ${issues} as supersede_blocker
-              on supersede_blocker.id = ${issueRelations.issueId}
-            where ${issueRelations.relatedIssueId} = ${issues.id}
-              and ${issueRelations.type} = 'blocks'
-              and supersede_blocker.status <> 'done'
+            from ${heartbeatRuns}
+            where ${inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES)}
+              and (
+                ${heartbeatRuns.id} = ${issues.executionRunId}
+                or (
+                  ${heartbeatRuns.companyId} = ${issues.companyId}
+                  and ${heartbeatRuns.contextSnapshot} ->> 'issueId' = cast(${issues.id} as text)
+                )
+              )
+              and ${liveRunCondition}
           )`,
-          ...(fingerprintCondition ? [fingerprintCondition] : []),
         ),
       )
       .returning({ id: issues.id, identifier: issues.identifier, createdAt: issues.createdAt });
@@ -1939,68 +1945,85 @@ export function routineService(
         },
         "cancelled routine execution issue whose fire outlived its cadence so the successor fire can dispatch",
       );
-      // Ally review, BLO-31996: a `logger.warn` plus an activity row leaves the
-      // disposal invisible on the row a reviewer is actually looking at. Same
-      // receipt principle as BLO-27572.
-      //
-      // The actor carries NO `runId`: `issue_comments.created_by_run_id` is FK
-      // to `heartbeat_runs`, and `supersededByRunId` is a `routine_runs` id.
-      // Passing it violated that FK on every supersede that actually fired --
-      // caught only because the DB-backed regression tests exercise the path.
-      // The routine run is named in the body instead.
-      await runSupersedeSideEffect({
-        executor: input.executor,
-        savepoint: "routine_supersede_comment",
-        issueId: row.id,
-        what: "comment on",
-        run: () =>
-          issueSvc.addComment(
-            row.id,
-            [
-              "Cancelled: this routine fire outlived its own cadence and was superseded.",
-              "",
-              `- Fire created: \`${row.createdAt.toISOString()}\``,
-              `- Fire-age horizon: \`${Math.round(input.fireAgeHorizonMs / 1000)}s\``,
-              `- Superseded by routine run: \`${input.supersededByRunId}\``,
-              "",
-              "A scheduled fire is a point-in-time probe, so once its replacement is due it can no",
-              "longer take a useful measurement — and while it stayed open it held the single-owner",
-              "dispatch lock and suppressed the next fire. It is cancelled rather than left `blocked`",
-              "so it does not become a zero-wake-path strand.",
-            ].join("\n"),
-            {},
-            { authorType: "system" },
-            input.executor,
-          ),
-      });
-      // Its own savepoint, not the comment's: the two receipts are
-      // independently best-effort, so a broken activity insert does not also
-      // erase the on-row comment a reviewer is looking at.
-      await runSupersedeSideEffect({
-        executor: input.executor,
-        savepoint: "routine_supersede_activity",
-        issueId: row.id,
-        what: "log activity for",
-        run: () =>
-          logActivity(input.executor, {
-            companyId: input.routine.companyId,
-            actorType: "system",
-            actorId: "routine-scheduler",
-            action: "issue.cancelled",
-            entityType: "issue",
-            entityId: row.id,
-            details: {
-              routineId: input.routine.id,
-              reason: "routine_execution_fire_superseded",
-              fireCreatedAt: row.createdAt.toISOString(),
-              fireAgeHorizonMs: input.fireAgeHorizonMs,
-              supersededByRunId: input.supersededByRunId,
-            },
-          }),
-      });
     }
 
     return stale;
+  }
+
+  // Ally review, BLO-31996: a `logger.warn` plus an activity row leaves the
+  // disposal invisible on the row a reviewer is actually looking at, so each
+  // cancellation gets an on-row comment too. Same receipt principle as
+  // BLO-27572.
+  //
+  // Written AFTER the dispatch transaction commits, and against `db` rather
+  // than `txDb`, because a best-effort write inside that transaction is not
+  // achievable with this driver. `savepoint` + `rollback to savepoint` is the
+  // right instinct and it is not enough: postgres.js's `begin` handler records
+  // the FIRST failed query of the scope in `uncaughtError`
+  // (`postgres/src/index.js:295`) and rethrows it after the callback resolves
+  // (`:265`), so a statement we caught and rolled back still aborts the whole
+  // transaction at commit time -- taking the cancellation with it and returning
+  // the wedge. The savepoint version of this passed typecheck and review and
+  // was only caught by the DB-backed test that injects a real SQL error.
+  //
+  // Out here a failed receipt can only cost the receipt. The trade is that the
+  // cancellation is briefly visible with no explanation on it, which is
+  // strictly better than a cancellation that silently did not happen.
+  //
+  // The comment actor carries NO `runId`: `issue_comments.created_by_run_id` is
+  // FK to `heartbeat_runs`, and `supersededByRunId` is a `routine_runs` id.
+  // Passing it violated that FK on every supersede that actually fired. The
+  // routine run is named in the body instead.
+  async function writeSupersedeReceipts(input: {
+    routine: typeof routines.$inferSelect;
+    rows: { id: string; identifier: string | null; createdAt: Date }[];
+    fireAgeHorizonMs: number;
+    supersededByRunId: string;
+  }) {
+    for (const row of input.rows) {
+      try {
+        await issueSvc.addComment(
+          row.id,
+          [
+            "Cancelled: this routine fire outlived its own cadence and was superseded.",
+            "",
+            `- Fire created: \`${row.createdAt.toISOString()}\``,
+            `- Fire-age horizon: \`${Math.round(input.fireAgeHorizonMs / 1000)}s\``,
+            `- Superseded by routine run: \`${input.supersededByRunId}\``,
+            "",
+            "A scheduled fire is a point-in-time probe, so once its replacement is due it can no",
+            "longer take a useful measurement — and while it stayed open it held the single-owner",
+            "dispatch lock and suppressed the next fire. It is cancelled rather than left `blocked`",
+            "so it does not become a zero-wake-path strand.",
+          ].join("\n"),
+          {},
+          { authorType: "system" },
+        );
+      } catch (err) {
+        logger.warn({ err, issueId: row.id }, "failed to comment on superseded routine execution issue");
+      }
+      // Independently best-effort: a broken activity insert must not also erase
+      // the on-row comment a reviewer is looking at.
+      try {
+        await logActivity(db, {
+          companyId: input.routine.companyId,
+          actorType: "system",
+          actorId: "routine-scheduler",
+          action: "issue.cancelled",
+          entityType: "issue",
+          entityId: row.id,
+          details: {
+            routineId: input.routine.id,
+            reason: "routine_execution_fire_superseded",
+            fireCreatedAt: row.createdAt.toISOString(),
+            fireAgeHorizonMs: input.fireAgeHorizonMs,
+            supersededByRunId: input.supersededByRunId,
+          },
+        });
+      } catch (err) {
+        logger.warn({ err, issueId: row.id }, "failed to log activity for superseded routine execution issue");
+      }
+    }
   }
 
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
@@ -2237,7 +2260,8 @@ export function routineService(
       title,
       description,
     });
-    let supersededStaleIssueCount = 0;
+    let supersededStaleIssues: { id: string; identifier: string | null; createdAt: Date }[] = [];
+    let supersededFireAgeHorizonMs = 0;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
@@ -2373,7 +2397,8 @@ export function routineService(
             now: dispatchNow,
             supersededByRunId: createdRun.id,
           });
-          supersededStaleIssueCount = superseded.length;
+          supersededStaleIssues = superseded;
+          supersededFireAgeHorizonMs = fireAgeHorizonMs;
         }
 
         try {
@@ -2492,8 +2517,19 @@ export function routineService(
     // UPDATE has committed. Bumped inside the supersede loop it attested a
     // disposal that a later abort undid -- least useful exactly when a wedge
     // is recurring.
-    for (let i = 0; i < supersededStaleIssueCount; i += 1) {
+    for (let i = 0; i < supersededStaleIssues.length; i += 1) {
       incrementRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue");
+    }
+    // Same reason the counter is out here: these are best-effort receipts for a
+    // cancellation that has already committed, and inside the transaction a
+    // failed one would take the cancellation down with it.
+    if (supersededStaleIssues.length > 0) {
+      await writeSupersedeReceipts({
+        routine: input.routine,
+        rows: supersededStaleIssues,
+        fireAgeHorizonMs: supersededFireAgeHorizonMs,
+        supersededByRunId: run.id,
+      });
     }
 
     if (input.source === "schedule" || input.source === "webhook") {
