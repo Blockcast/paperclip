@@ -1362,9 +1362,19 @@ function isDependencyBlockedClosableTriggerSet(triggers: unknown) {
 // silence under a resolved gate is still worth a manager's attention.
 //
 // Set form, and every trigger must be closable: a review that also fired a
-// non-closable trigger still files. That is what keeps this from becoming an
-// evasion — an assignee who armed a monitor on an already-merged PR cannot
-// retire an accountability artifact with it.
+// non-closable trigger still files.
+//
+// State the limit honestly rather than claiming more than the code does. This
+// bounds an evasion; it does not close it. Three things stand between a
+// declared gate and a silenced review: the set must be purely
+// `long_active_duration` (any conduct trigger alongside it still files); the
+// cited PR must be a webhook-promoted GitHub work product *of this issue*
+// (`listResolvedTerminalGates`); and the suppression is bounded by
+// `longActiveMs`. What remains open is that *any* such work product qualifies —
+// an assignee whose issue legitimately owns a merged PR can arm a monitor on it
+// after the fact and buy a bounded `long_active_duration` suppression it did
+// not spend the time on. "Tied to the issue's intended work" is not mechanically
+// expressible here, so the binding is webhook provenance, and that is weaker.
 function isTerminalGateClosableTriggerSet(triggers: unknown) {
   return Array.isArray(triggers) && triggers.length > 0
     && triggers.every((trigger) => trigger === "long_active_duration");

@@ -255,6 +255,8 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     agentId: string;
     identifier: string;
     gateSignals: string[];
+    /** Overrides what is STORED in the JSONB, to seed malformed shapes. */
+    storedGateSignals?: unknown;
     status?: string;
     monitorNextCheckAt?: Date | null;
   }) {
@@ -292,7 +294,7 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
           attemptCount: 3,
           notes: "merged=NO",
           scheduledBy: "assignee",
-          gateSignals: input.gateSignals,
+          gateSignals: "storedGateSignals" in input ? input.storedGateSignals : input.gateSignals,
           gateSource: "gates",
           convergenceCount: 3,
           clearedAt: null,
@@ -383,6 +385,42 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
       monitorNextCheckAt: null,
       monitorWakeRequestedAt: null,
     });
+  });
+
+  it("survives a malformed `gateSignals` (object or scalar) and still reconciles the valid candidate", async () => {
+    const { companyId, agentId } = await createCompany("TGM");
+    // Hand-edited or legacy execution state. The candidate query must not call
+    // `jsonb_array_length` on these — that raises and aborts the entire pass,
+    // taking the healthy row below with it.
+    await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TGM-1",
+      gateSignals: ["pr:blockcast/paperclip#1281:merged"],
+      storedGateSignals: { "pr:blockcast/paperclip#1281:merged": true },
+    });
+    await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TGM-2",
+      gateSignals: ["pr:blockcast/paperclip#1281:merged"],
+      storedGateSignals: "pr:blockcast/paperclip#1281:merged",
+    });
+    const healthyId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TGM-3",
+      gateSignals: ["pr:blockcast/paperclip#1281:merged"],
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/paperclip#1281"])),
+    });
+
+    // Skipped, not scanned-and-failed: the malformed rows never become candidates.
+    expect(result).toMatchObject({ scanned: 1, resolved: 1 });
+    expect(await commentsFor(healthyId)).toHaveLength(1);
   });
 
   it("is idempotent — a second pass neither re-comments nor re-reads GitHub", async () => {
