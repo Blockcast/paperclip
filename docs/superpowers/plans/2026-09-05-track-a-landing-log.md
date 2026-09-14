@@ -504,8 +504,8 @@ Routine `8b764d66-b598-4517-a249-e9a1dee82f06`
 (*Weekly governance sweep — AC/verifying-signal + human-gated ageing*), located by title with
 exactly one match among the company's 18 routines, moved `paused` → `active`.
 
-It had not fired since **2026-08-17T09:00:12Z**, so it missed three Mondays (08-24, 08-31, and
-09-07 pending at the time of writing). That silence is cause (4) in the plan: nothing was ageing
+It had not fired since **2026-08-17T09:00:12Z**, so it had missed two Mondays (08-24 and 08-31),
+with a third (09-07) due at 09:00Z on the day of the write. That silence is cause (4) in the plan: nothing was ageing
 the human-assigned `in_review` queue while 101 issues sat on one human for 22–87 days.
 
 **Invariants asserted against the LIVE description before activating.** Counts are fixed-string
@@ -536,11 +536,27 @@ model context. Read back live after the write:
   re-asserted at the same counts afterwards
 - trigger `0606ff6f-5445-4f1e-b835-9da8dcf2fc58`: `0 9 * * 1` UTC, `enabled: true` — **unchanged**
 
-**Why un-pausing with three missed fires is safe.** Both policies were confirmed *before* the
-write: `catchUpPolicy: skip_missed` (missed Mondays are not replayed) and
-`concurrencyPolicy: skip_if_active` (no overlapping runs). Exactly one fire was therefore due, at
-2026-09-07T09:00:00Z. Had catch-up been a replaying policy, un-pausing would have queued three
-sweeps at once.
+**Why un-pausing with two missed fires is safe — and what actually fired.** Both policies were
+confirmed *before* the write: `catchUpPolicy: skip_missed` (missed Mondays are not replayed) and
+`concurrencyPolicy: skip_if_active` (no overlapping runs). The pre-write prediction was that exactly
+one fire was due, at 2026-09-07T09:00:00Z, and that a replaying catch-up policy would instead have
+queued three sweeps at once.
+
+**Observed, from `GET /api/routines/8b764d66-…/runs` after the fact — recorded because the
+mechanism was not the one predicted: activation itself fired the routine immediately.** Run
+`b711b104-125d-4615-8246-9305eef620f4` was created at `2026-09-07T08:31:31.993Z`, 65 seconds
+*before* the C4 capture below, with `source: schedule` and `triggeredAt: 2026-08-24T09:00:00.000Z`
+(`__paperclipRoutineWindowClosesAt: 2026-09-07T09:00:00.000Z`) — a catch-up run stamped with the
+08-24 slot, not a fire at the cron boundary. The 08-31 slot was not replayed. The 09:00:00Z boundary
+fire (run `358312e5-7c6c-47eb-96fd-431f083e2d81`, created 09:00:05Z) was then `skipped` with
+`coalescedIntoRunId: b711b104-…`, consistent with `skip_if_active` — `b711b104` was still running and
+only completed at `18:45:53.410Z`. All 16 prior executions of this routine (2026-05-04 → 2026-08-17)
+triggered between `09:00:04` and `09:00:34`; this is the only one that has ever fired off-boundary.
+
+The safety *outcome* held — one execution, not three, and nothing was cancelled — but
+`skip_missed` did not mean "no run until the next cron slot". The next agent to un-pause a routine
+should plan for one immediate fire on activation, and should verify it against `/runs`, not against
+the routine row (see the C4 note below).
 
 ## C4 — routine evidence
 
@@ -613,7 +629,25 @@ Captured to `/tmp/track-c-evidence.json` at 2026-09-07T08:32:37Z and reproduced 
 }
 ```
 
+**Three fields in that block were already stale at `capturedAt`.** The capture at `08:32:37Z` is 65
+seconds *after* run `b711b104` was created at `08:31:31.993Z`, yet `lastTriggeredAt` and
+`lastEnqueuedAt` still read `2026-08-17T09:00:12.695Z`, and `firstFireDueAt` records the 09:00
+prediction rather than the fire that had already happened. The JSON is left verbatim above; the
+corrected values are: first fire at `2026-09-07T08:31:31.993Z` (run `b711b104-…`), and the routine
+row's `lastTriggeredAt` = `lastEnqueuedAt` now read `2026-09-07T09:00:00.000Z` (live 2026-09-14) —
+the boundary run's stamp. That is the cause worth one line: the routine row's `lastTriggeredAt` was
+not advanced by the on-activation catch-up run at all, so a capture keyed off the routine row cannot
+see that fire. Tracks B/D/E reusing this capture pattern should read `/api/routines/<id>/runs`
+alongside the routine row.
+
 ### First fire after un-pausing
 
-The sweep had **not fired yet as of 2026-09-07T08:38Z**; its first post-un-pause fire was due
-the same day at 09:00:00Z UTC. The observed rows are appended below when that fire lands.
+An earlier revision of this section stated the sweep had **not** fired as of 2026-09-07T08:38Z.
+**That was wrong** — it had fired about 6.5 minutes before that observation. Run
+`b711b104-125d-4615-8246-9305eef620f4` (created `2026-09-07T08:31:31.993Z`, `source: schedule`,
+`triggeredAt: 2026-08-24T09:00:00.000Z`, `completed` at `18:45:53.410Z`) minted report issue
+[BLO-32535](https://paperclip.blockcast.net/BLO/issues/BLO-32535) at `08:31:32.147Z`
+(`originKind: routine_execution`, `originId: 8b764d66-…`, `originRunId: b711b104-…`). BLO-32535
+started at `15:32:01.144Z` and is `done` (`completedAt: 2026-09-07T18:45:52.507Z`). The 09:00:00Z
+boundary run `358312e5-7c6c-47eb-96fd-431f083e2d81` was `skipped` and coalesced into `b711b104`.
+The human-gated ageing rows are BLO-32535's own output and are deliberately not transcribed here.
