@@ -68,6 +68,7 @@ import { summarizeStrandedRecoveryHandBackPass } from "./services/recovery/servi
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createApiTierPluginWorkerManagerStub } from "./services/plugin-worker-manager-stub.js";
+import { createSingleFlight } from "./services/single-flight.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -1080,6 +1081,19 @@ export async function startServer(): Promise<StartedServer> {
   // crashed run and handing that lock to the retry — exactly the interleaving
   // the in-tick `await` was added to remove.
   let crashReconcileSweepInFlight = false;
+  // Single-flight latch for the periodic recovery chain (BLO-30203). Same
+  // argument as the latch above, which was only ever applied to the
+  // crash-reconcile pair: `setInterval` does not wait for the previous
+  // callback, and this chain is far slower than one tick. Its first stage
+  // alone (`reconcileStrandedAssignedIssues`) selects every stranded issue
+  // with no LIMIT and then issues ~5 awaited queries per candidate, and the
+  // liveness classifier it calls scans the whole `issues` table twice per
+  // pass. Overlapping copies therefore each retain a full hydrated snapshot
+  // of the issue graph, which is how the worker reaches the 6 GiB
+  // --max-old-space-size ceiling and SIGABRTs. Skipping a tick while the
+  // previous pass is still running is safe: every stage is an idempotent
+  // sweep, so a skipped tick reconciles on the next one.
+  const runRecoveryChainOnce = createSingleFlight();
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -1604,7 +1618,11 @@ export async function startServer(): Promise<StartedServer> {
 
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
-          trackHeartbeatSchedulerWork(heartbeat
+          // BLO-30203: single-flighted. Still registered with
+          // trackHeartbeatSchedulerWork when it actually starts, so shutdown
+          // drains it, and deliberately NOT awaited by the passes above so
+          // they keep their own cadence.
+          const recoveryPass = runRecoveryChainOnce(() => heartbeat
             .resumeRunningExternalRuntimeRuns()
             .then(() => heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 }))
             .then(() => heartbeat.promoteDueScheduledRetries())
@@ -1700,6 +1718,7 @@ export async function startServer(): Promise<StartedServer> {
             .catch((err) => {
               logger.error({ err }, "periodic heartbeat recovery failed");
             }));
+          if (recoveryPass) trackHeartbeatSchedulerWork(recoveryPass);
         }
       })();
     }, config.heartbeatSchedulerIntervalMs);
