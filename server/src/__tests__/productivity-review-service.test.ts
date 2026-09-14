@@ -1857,8 +1857,15 @@ describeEmbeddedPostgres("productivity review service", () => {
   // `startedAt`, and `insertRuns`'s default (`startedAt = createdAt = now`)
   // reports a 0m episode, which pins nothing.
   const dispatchedThirtyMinutesAgo = (now: Date) => new Date(now.getTime() - 30 * 60 * 1000);
-  const ELAPSED_LINE_30M_UNATTENDED =
-    "- Elapsed accounting: 0m monitor-gated, 30m unattended (no monitor armed during this episode)";
+  // BLO-27698 B1: `insertRuns` backdates `startedAt` without backdating
+  // `finishedAt`, so these runs' live spans cover the whole episode and the 30m
+  // lands in `executing` rather than `unattended`. Both BLO-22887 cells below
+  // still pin the *same* split with and without the blocker, which is the
+  // property they exist to guard — the dependency bucket is reported beside the
+  // elapsed figures, never folded into them. Which bucket carries the 30m is
+  // B1's business, not theirs.
+  const ELAPSED_LINE_30M_EXECUTING =
+    "- Elapsed accounting: 0m monitor-gated, 30m executing, 0m unattended (no monitor armed during this episode)";
 
   it("reports a dependency-blocked bucket alongside the elapsed split when a review still fires on a non-closable trigger (BLO-22887)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
@@ -1884,10 +1891,10 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(1);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain(DEPENDENCY_LINE_ONE_BLOCKER);
-    // Reported next to the elapsed split, never folded into it: the unattended
-    // figure is the same 30m the resolved-blocker cell below reports with no
+    // Reported next to the elapsed split, never folded into it: the split is
+    // byte-identical to the one the resolved-blocker cell below reports with no
     // dependency line at all.
-    expect(review?.description).toContain(ELAPSED_LINE_30M_UNATTENDED);
+    expect(review?.description).toContain(ELAPSED_LINE_30M_EXECUTING);
   });
 
   // BLO-22887 AC2 over-reporting guard, and the counterpart to BLO-22436's
@@ -1924,7 +1931,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).not.toContain("Dependency accounting");
     // Same seeding as the cell above minus the unresolved blocker, same
     // elapsed split: the bucket is never subtracted from the wall-clock figures.
-    expect(review?.description).toContain(ELAPSED_LINE_30M_UNATTENDED);
+    expect(review?.description).toContain(ELAPSED_LINE_30M_EXECUTING);
   });
 
   // BLO-22887 AC2: a `done` blocker whose execution workspace has not finalized
@@ -3785,10 +3792,19 @@ describeEmbeddedPostgres("productivity review service", () => {
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
     // Anchored at the last dispatch (09:44), not at checkout (21:42).
-    expect(review?.description).toContain("9h 16m unattended");
+    // BLO-27698 B1: the anchored span now reads as `executing` rather than
+    // `unattended` — the run is `running` and emitting, so it covers the whole
+    // episode. Only the bucket label moved; the quantity under test is the same,
+    // the review still fires (`created: 1` above, because the suppression gate
+    // compares `unattendedMs + executingMs`), and the 21h 18m guard below is
+    // asserted against BOTH buckets so it cannot be evaded through the new one.
+    // A 9h 16m unbroken executing span is the runaway case B3b must relocate to a
+    // named runtime/cost trigger before B3 narrows the gate to `unattendedMs`.
+    expect(review?.description).toContain("9h 16m executing");
     // The regression this exists to catch: charging the whole 21h 18m
     // checkout-to-now span, queue wait included, to the assignee.
     expect(review?.description).not.toContain("21h 18m unattended");
+    expect(review?.description).not.toContain("21h 18m executing");
   });
 
   it("does not exclude a queue wait that overlapped another run's live work (BLO-25722)", async () => {
@@ -3832,9 +3848,16 @@ describeEmbeddedPostgres("productivity review service", () => {
 
     // 430m episode, anchored at 12:00. The 6h 50m overlapping queue wait stays
     // in: a live run was working the issue throughout.
+    //
+    // BLO-27698 B1: "stays in" is still the assertion — the span is not excused
+    // from the episode — but it now reads as `executing`, because the run
+    // covering it is `running` and emitting. `created: 1` is unchanged: the
+    // suppression gate compares `unattendedMs + executingMs`, so B1 moves the
+    // label without moving the verdict. B3 is what narrows that gate, and B3b is
+    // where this shape has to resurface as a runtime/cost trigger.
     expect(result.created).toBe(1);
     const [review] = await listProductivityReviews(seeded.companyId);
-    expect(review?.description).toContain("7h 0m unattended");
+    expect(review?.description).toContain("7h 0m executing");
     expect(review?.description).not.toContain("Excluded as non-live execution hold");
   });
 
@@ -7004,6 +7027,160 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain(
       `- Elapsed accounting: 0m monitor-gated, 7h 0m unattended (no monitor armed during this episode; previous monitor lapsed at ${priorLapseAt.toISOString()}, before it began)`,
     );
+  });
+
+  // BLO-27698 B1: executing time is a third bucket, not a share of "unattended".
+  // A run that was demonstrably executing means the assignee had its turn and was
+  // taking it — the opposite reader action from "nobody was watching" — so
+  // collapsing the two tells an adjudicating manager the wrong thing.
+  //
+  // Note the fixture shape: `activeStartedAt` is the most recent *dispatch*
+  // (`mostRecentDispatchAt`), so a run seeded mid-episode silently redefines the
+  // episode to start at itself. The run therefore starts exactly at
+  // `issue.startedAt`, which is also the real shape — the current run's live span
+  // begins at the episode boundary by construction.
+  //
+  // 10h episode, monitor lapsed 2h in, run live for the first 3h. Executing is
+  // scoped to the unwatched suffix, so only the run's third hour (the part past
+  // the lapse) counts: 2h gated + 1h executing + 7h unattended === 10h, the
+  // `gatedMs + executingMs + unattendedMs === elapsedMs` invariant in rendered
+  // form. The first two executing hours stay inside the gated prefix on purpose —
+  // the monitor was accounting for them.
+  //
+  // Still fires, deliberately: the suppression gate compares
+  // `unattendedMs + executingMs` (8h) against the 6h bar, bit-identical to the
+  // pre-B1 `unattendedMs` it replaced. Narrowing that to the 7h unattended bucket
+  // is B3's job, in its own PR — doing it here would be the compute-without-
+  // consult failure BLO-27225 exists to document.
+  it("reports executing time as a third elapsed bucket distinct from gated and unattended", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 10 * 60 * 60 * 1000);
+    const monitorLastTriggeredAt = new Date(startedAt.getTime() + 2 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorScheduledBy: "assignee",
+      monitorLastTriggeredAt,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      finishedAt: new Date(startedAt.getTime() + 3 * 60 * 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      `- Elapsed accounting: 2h 0m monitor-gated, 1h 0m executing, 7h 0m unattended (monitor fired on schedule at ${monitorLastTriggeredAt.toISOString()} and enqueued a successor run`,
+    );
+  });
+
+  // The no-monitor branch attributes the whole episode to the unwatched suffix,
+  // so the entire live span comes out of it: 0 + 3 + 7 === 10.
+  it("carves executing time out of a wholly unattended episode", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 10 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      finishedAt: new Date(startedAt.getTime() + 3 * 60 * 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      "- Elapsed accounting: 0m monitor-gated, 3h 0m executing, 7h 0m unattended (no monitor armed during this episode)",
+    );
+  });
+
+  // The still-armed branch must be untouched by B1, and this is the guard that
+  // pins it. Executing time is carved out of the unwatched suffix only, and that
+  // branch has none — the whole episode is the gated prefix — so a live run must
+  // leave the line reading exactly as it did before, `unattendedMs` still 0 and
+  // `gatedIsUpperBound` still true.
+  //
+  // Carving the overlap out of the gated prefix instead would shrink `gatedMs`
+  // below the episode and break the "≤15h monitor-gated, ≥0m unattended" upper
+  // bound the B3a regression guard above depends on — the indefinite-suppression
+  // hazard BLO-22331 AC2 forbids, reachable through a bucket change rather than
+  // through the predicate.
+  it("leaves the still-armed upper-bound split unchanged when a run was executing", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 15 * 60 * 60 * 1000);
+    const armedUntil = new Date(now.getTime() + 30 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: armedUntil,
+      monitorScheduledBy: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      finishedAt: new Date(startedAt.getTime() + 6 * 60 * 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      `- Elapsed accounting: ≤15h 0m monitor-gated, ≥0m unattended (monitor armed until ${armedUntil.toISOString()}`,
+    );
+    // Scoped to the bucket's rendered form: the prose elsewhere in the report
+    // uses the bare word, so a `not.toContain("executing")` would fail on text
+    // this change never touches.
+    expect(review?.description).not.toContain(" executing,");
   });
 
   it("does not suppress no-comment productivity reviews for future monitor waits", async () => {

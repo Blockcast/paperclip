@@ -387,6 +387,10 @@ type ProductivityReviewEvidence = {
   nonLiveHoldMs: number;
   monitorGating: {
     gatedMs: number;
+    // BLO-27698 B1: episode time a run was demonstrably executing, taken out of
+    // `unattendedMs` (never out of `gatedMs`). The three buckets partition the
+    // episode: `gatedMs + executingMs + unattendedMs === elapsedMs`.
+    executingMs: number;
     unattendedMs: number;
     lapsedAt: Date | null;
     priorLapseAt: Date | null;
@@ -1057,6 +1061,40 @@ function monitorGatingBreakdown(
   const armedUntil = coerceDate(issue.monitorNextCheckAt);
   const lastTriggeredAt = coerceDate(issue.monitorLastTriggeredAt);
 
+  // BLO-27698 B1: time a run was demonstrably executing is neither a deliberate
+  // monitor-gated wait nor an unattended stall — the assignee had its turn and
+  // was taking it. Reported as a third bucket so a manager reading the split
+  // does not have to reconstruct it from run rows.
+  //
+  // Scoped to the *unwatched* window: the monitor-gated prefix keeps its overlap,
+  // and only the suffix nobody was accounting for is split into executing vs
+  // unattended. That is the question the split exists to answer — "nobody was
+  // watching; was anything still happening?" — and executing time inside the
+  // gated prefix is unremarkable, because the monitor was accounting for it.
+  // Since `activeStartedAt` is the most recent dispatch, the current run's live
+  // span starts at the episode boundary, so this is the tail of that span.
+  //
+  // Leaving the gated prefix whole also keeps `unattendedMs + executingMs`
+  // exactly equal to the pre-B1 `unattendedMs`, which is what lets the BLO-22331
+  // AC2 suppression gate below stay bit-identical while this lands. Reporting
+  // only: B3 is the separate change that makes the trigger fire on the narrowed
+  // bucket, and folding it in here is the compute-without-consult failure
+  // BLO-27225 documents.
+  const episodeStartMs = activeStartedAt.getTime();
+  const episodeEndMs = episodeStartMs + elapsedMs;
+  const liveSpans = latestRuns
+    .map((run) => runLiveInterval(run, now))
+    .filter((span): span is { start: number; end: number } => span !== null);
+  /** Splits an episode whose monitor-gated prefix is `gatedMs` into the three buckets. */
+  const splitExecuting = (gatedMs: number) => {
+    const boundaryMs = Math.min(episodeEndMs, episodeStartMs + gatedMs);
+    const executingMs =
+      episodeEndMs > boundaryMs
+        ? episodeEndMs - boundaryMs - msOutsideLiveSpans(boundaryMs, episodeEndMs, liveSpans)
+        : 0;
+    return { gatedMs, executingMs, unattendedMs: Math.max(0, elapsedMs - gatedMs) - executingMs };
+  };
+
   // Still armed for a future check. There is no arm-time column, so a monitor
   // armed seconds ago is indistinguishable from one armed at `activeStartedAt`
   // and the whole episode is attributed to gating — flagged as an upper bound,
@@ -1064,8 +1102,7 @@ function monitorGatingBreakdown(
   // accounted for when only the last 90s provably was.
   if (armedUntil && armedUntil.getTime() > now.getTime()) {
     return {
-      gatedMs: elapsedMs,
-      unattendedMs: 0,
+      ...splitExecuting(elapsedMs),
       lapsedAt: null,
       priorLapseAt: null,
       armedUntil,
@@ -1081,8 +1118,7 @@ function monitorGatingBreakdown(
   const lapseCandidates = [lastTriggeredAt, armedUntil].filter((d): d is Date => Boolean(d));
   if (lapseCandidates.length === 0) {
     return {
-      gatedMs: 0,
-      unattendedMs: elapsedMs,
+      ...splitExecuting(0),
       lapsedAt: null,
       priorLapseAt: null,
       armedUntil: null,
@@ -1099,8 +1135,7 @@ function monitorGatingBreakdown(
   // print a timestamp from before `activeStartedAt`.
   if (lapsedAt.getTime() <= activeStartedAt.getTime()) {
     return {
-      gatedMs: 0,
-      unattendedMs: elapsedMs,
+      ...splitExecuting(0),
       lapsedAt: null,
       priorLapseAt: lapsedAt,
       armedUntil: null,
@@ -1146,8 +1181,7 @@ function monitorGatingBreakdown(
       ? lapsedAt
       : null;
   return {
-    gatedMs,
-    unattendedMs: Math.max(0, elapsedMs - gatedMs),
+    ...splitExecuting(gatedMs),
     lapsedAt,
     priorLapseAt: null,
     armedUntil: null,
@@ -1163,7 +1197,11 @@ function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["mon
   // carry a qualifier so neither half of the split reads as measured.
   const gated = `${gating.gatedIsUpperBound ? "≤" : ""}${msToHumanFine(gating.gatedMs)} monitor-gated`;
   const unattended = `${gating.gatedIsUpperBound ? "≥" : ""}${msToHumanFine(gating.unattendedMs)} unattended`;
-  const split = `${gated}, ${unattended}`;
+  // BLO-27698 B1: executing time is measured from run spans, so it carries no
+  // qualifier even when the gated half is an upper bound. Omitted entirely at
+  // zero so the common no-overlap case reads exactly as it did before.
+  const executing = gating.executingMs > 0 ? `${msToHumanFine(gating.executingMs)} executing, ` : "";
+  const split = `${gated}, ${executing}${unattended}`;
   if (gating.armedUntil) {
     return `${split} (monitor armed until ${gating.armedUntil.toISOString()}; arm time is not recorded, so monitor-gated time is an upper bound)`;
   }
@@ -3923,7 +3961,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       trigger === "long_active_duration" &&
       monitorGating &&
       !monitorGating.gatedIsUpperBound &&
-      monitorGating.unattendedMs < thresholds.longActiveMs
+      // BLO-27698 B1: `unattendedMs` no longer includes executing time, so it is
+      // re-added here to keep this gate bit-identical to its pre-B1 behaviour.
+      // B3 is the deliberate, separately-reviewed change that drops the addend
+      // and lets the trigger fire on the narrowed bucket; do not drop it here.
+      monitorGating.unattendedMs + monitorGating.executingMs < thresholds.longActiveMs
     ) {
       return null;
     }
