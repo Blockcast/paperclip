@@ -13,6 +13,7 @@ import {
 import type { ExecutionWorkspace, ExecutionWorkspaceSummary, WorkspaceRuntimeDesiredState, WorkspaceRuntimeServiceStateMap } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { accessService, executionWorkspaceService, heartbeatService, logActivity, workspaceOperationService } from "../services/index.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import { mergeExecutionWorkspaceConfig, readExecutionWorkspaceConfig } from "../services/execution-workspaces.js";
 import { parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
 import { readProjectWorkspaceRuntimeConfig } from "../services/project-workspace-runtime-config.js";
@@ -32,6 +33,7 @@ import {
   collectExecutionWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import { assertCanManageExecutionWorkspaceRuntimeServices } from "./workspace-runtime-service-authz.js";
+import { redactCurrentUserValue } from "../log-redaction.js";
 import {
   publicExecutionWorkspace,
   publicExecutionWorkspaces,
@@ -51,6 +53,13 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
   const svc = executionWorkspaceService(db);
   const access = accessService(db);
   const workspaceOperationsSvc = workspaceOperationService(db);
+  const instanceSettings = instanceSettingsService(db);
+
+  async function getCurrentUserRedactionOptions() {
+    return {
+      enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+    };
+  }
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
@@ -151,7 +160,15 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     if (!(await assertExecutionWorkspaceReadAllowed(req, res, workspace.companyId))) return;
     const operations = await workspaceOperationsSvc.listForExecutionWorkspace(id);
     const viewer = await resolveWorkspaceRuntimeViewer(access, req, workspace.companyId);
-    res.json(publicWorkspaceOperations(operations, viewer));
+    // PEN-3205: same username censoring as the sibling list route on `routes/agents.ts`. Both
+    // answer with the same historical `WorkspaceOperation` rows including `stdoutExcerpt` /
+    // `stderrExcerpt`, which `publicWorkspaceOperation` deliberately does NOT withhold, so
+    // censoring on one route and not the other left the same bytes legible one URL over.
+    // New rows are censored at write time as well; this still covers rows stored before that.
+    res.json(redactCurrentUserValue(
+      publicWorkspaceOperations(operations, viewer),
+      await getCurrentUserRedactionOptions(),
+    ));
   });
 
   async function handleExecutionWorkspaceRuntimeCommand(req: Request, res: Response) {
