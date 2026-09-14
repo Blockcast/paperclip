@@ -1,10 +1,9 @@
 import path from "node:path";
 import fs from "node:fs";
 import pino from "pino";
-import { pinoHttp } from "pino-http";
 import { readConfigFile } from "../config-file.js";
 import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
-import { buildHttpLogProps, shouldSilenceHttpSuccessLog } from "./http-log-policy.js";
+import { createHttpLogger } from "./http-log-policy.js";
 
 function resolveServerLogDir(): string {
   const envOverride = process.env.PAPERCLIP_LOG_DIR?.trim();
@@ -45,25 +44,4 @@ export const logger = pino({
   ],
 }));
 
-export const httpLogger = pinoHttp({
-  logger,
-  customLogLevel(_req, res, err) {
-    if (shouldSilenceHttpSuccessLog(_req.method, _req.url, res.statusCode)) {
-      return "silent";
-    }
-    if (err || res.statusCode >= 500) return "error";
-    if (res.statusCode >= 400) return "warn";
-    return "info";
-  },
-  customSuccessMessage(req, res) {
-    return `${req.method} ${req.url} ${res.statusCode}`;
-  },
-  customErrorMessage(req, res, err) {
-    const ctx = (res as any).__errorContext;
-    const errMsg = ctx?.error?.message || err?.message || (res as any).err?.message || "unknown error";
-    return `${req.method} ${req.url} ${res.statusCode} — ${errMsg}`;
-  },
-  customProps(req, res) {
-    return buildHttpLogProps(req as never, res as never);
-  },
-});
+export const httpLogger = createHttpLogger(logger);

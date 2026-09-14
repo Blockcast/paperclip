@@ -1,3 +1,5 @@
+import type pino from "pino";
+import { pinoHttp } from "pino-http";
 import { redactSensitive } from "./redact-sensitive.js";
 
 const SILENCED_SUCCESS_METHODS = new Set(["GET", "HEAD"]);
@@ -68,6 +70,13 @@ export function shouldSilenceHttpSuccessLog(method: string | undefined, url: str
 // log shape instead of content. Top-level key *names* are kept: they are the
 // diagnostic that makes the line worth having ("did a `challenge` arrive?")
 // and a name is not the credential the sender put in its value.
+//
+// The query string is sender-authored on these URLs too — this route reads
+// `req.query.companyId`, so senders do put data there, and a `?token=…` is
+// one field over from the body with bare `token` equally absent from the
+// denylist. So wherever the URL or query reaches a log line (`reqQuery`, the
+// message's URL, pino-http's serialized `req`) it is dropped alongside the
+// body; `shouldOmitRequestBodyFromLog` governs both.
 const UNLOGGABLE_REQUEST_BODY_PATHS = [
   // Both forms are matched on purpose. `httpLogger` is installed app-wide but
   // Express rewrites `req.url` to the mount-relative path while a mounted
@@ -85,6 +94,21 @@ export function shouldOmitRequestBodyFromLog(url: string | undefined): boolean {
 }
 
 const MAX_SUMMARIZED_KEYS = 40;
+// Key names on these routes are sender-authored too, so each one is bounded
+// as well as the count; otherwise `{"<64 KiB string>": 1}` lands verbatim.
+const MAX_SUMMARIZED_KEY_LENGTH = 64;
+const OMITTED_QUERY = "[OMITTED: untrusted webhook query]";
+
+function summarizeKeys(field: string, value: Record<string, unknown>): Record<string, unknown> {
+  const keys = Object.keys(value).sort();
+  const summary: Record<string, unknown> = {
+    [`${field}Keys`]: keys
+      .slice(0, MAX_SUMMARIZED_KEYS)
+      .map((k) => (k.length > MAX_SUMMARIZED_KEY_LENGTH ? `${k.slice(0, MAX_SUMMARIZED_KEY_LENGTH)}…` : k)),
+  };
+  if (keys.length > MAX_SUMMARIZED_KEYS) summary[`${field}KeysTruncated`] = keys.length - MAX_SUMMARIZED_KEYS;
+  return summary;
+}
 
 // A bounded stand-in for an omitted body: enough to debug a rejection
 // (how big was it, what shape was it) with no sender-supplied value in it.
@@ -101,11 +125,7 @@ export function summarizeOmittedRequestBody(body: unknown): Record<string, unkno
   if (bytes !== undefined) summary.reqBodyBytes = bytes;
 
   if (body && typeof body === "object" && !Array.isArray(body)) {
-    const keys = Object.keys(body as Record<string, unknown>).sort();
-    summary.reqBodyKeys = keys.slice(0, MAX_SUMMARIZED_KEYS);
-    if (keys.length > MAX_SUMMARIZED_KEYS) {
-      summary.reqBodyKeysTruncated = keys.length - MAX_SUMMARIZED_KEYS;
-    }
+    Object.assign(summary, summarizeKeys("reqBody", body as Record<string, unknown>));
   } else if (Array.isArray(body)) {
     summary.reqBodyArrayLength = body.length;
   }
@@ -113,7 +133,19 @@ export function summarizeOmittedRequestBody(body: unknown): Record<string, unkno
   return summary;
 }
 
-type LoggedRequest = {
+export function summarizeOmittedRequestQuery(query: unknown): Record<string, unknown> {
+  const summary: Record<string, unknown> = { reqQuery: OMITTED_QUERY };
+  if (query && typeof query === "object" && !Array.isArray(query)) {
+    Object.assign(summary, summarizeKeys("reqQuery", query as Record<string, unknown>));
+  }
+  return summary;
+}
+
+// Structural subsets of what pino-http hands `customProps` (an
+// IncomingMessage/ServerResponse that is Express's Request/Response at
+// runtime). Kept assignable from those base types so the production call
+// site in createHttpLogger needs no cast and stays type-checked.
+export type LoggedRequest = {
   url?: string;
   originalUrl?: string;
   body?: unknown;
@@ -122,7 +154,7 @@ type LoggedRequest = {
   route?: { path?: string };
 };
 
-type LoggedResponse = {
+export type LoggedResponse = {
   statusCode: number;
   __errorContext?: { error?: unknown; reqBody?: unknown; reqParams?: unknown; reqQuery?: unknown };
 };
@@ -140,28 +172,82 @@ export function buildHttpLogProps(req: LoggedRequest, res: LoggedResponse): Reco
   // Keyed on >= 400, so a readiness guard answering 503 is logged exactly the
   // same way a 400 was. That is why BLO-28659's 400 -> 503 change did not fix
   // this leak, and why the omission below is keyed on the route, not the code.
-  const omitBody = shouldOmitRequestBodyFromLog(req.originalUrl ?? req.url);
+  const omitSenderInput = shouldOmitRequestBodyFromLog(req.originalUrl ?? req.url);
 
   const ctx = res.__errorContext;
   if (ctx) {
     return {
       errorContext: ctx.error,
-      ...(omitBody
+      ...(omitSenderInput
         ? summarizeOmittedRequestBody(ctx.reqBody)
         : { reqBody: redactSensitive(ctx.reqBody) }),
+      // reqParams stays: pluginId/endpointKey come from the route path, not
+      // from the sender. The query string does not, so it goes with the body.
       reqParams: redactSensitive(ctx.reqParams),
-      reqQuery: redactSensitive(ctx.reqQuery),
+      ...(omitSenderInput
+        ? summarizeOmittedRequestQuery(ctx.reqQuery)
+        : { reqQuery: redactSensitive(ctx.reqQuery) }),
     };
   }
 
   const props: Record<string, unknown> = {};
-  if (omitBody) {
+  if (omitSenderInput) {
     Object.assign(props, summarizeOmittedRequestBody(req.body));
   } else if (hasEntries(req.body)) {
     props.reqBody = redactSensitive(req.body);
   }
   if (hasEntries(req.params)) props.reqParams = redactSensitive(req.params);
-  if (hasEntries(req.query)) props.reqQuery = redactSensitive(req.query);
+  if (hasEntries(req.query)) {
+    if (omitSenderInput) Object.assign(props, summarizeOmittedRequestQuery(req.query));
+    else props.reqQuery = redactSensitive(req.query);
+  }
   if (req.route?.path) props.routePath = req.route.path;
   return props;
+}
+
+// The URL as it may appear in a log line: query string dropped on routes
+// whose sender input is unloggable, untouched everywhere else.
+function urlForLog(url: string | undefined): string | undefined {
+  return url !== undefined && shouldOmitRequestBodyFromLog(url) ? normalizePath(url) : url;
+}
+
+// Lives here rather than in logger.ts so a test can drive the real pino-http
+// wiring over a real Express request with an in-memory pino, without that
+// module opening transports and creating a log directory at import time.
+export function createHttpLogger(logger: pino.Logger) {
+  return pinoHttp({
+    logger,
+    serializers: {
+      // pino-http wraps this around pino-std-serializers' request serializer,
+      // so `req` is already the serialized shape: `url` is req.originalUrl —
+      // query string included — and `query` the parsed form. Both reach the
+      // file target, which does not `ignore` req the way stdout does.
+      req(req: { url?: string; query?: unknown }) {
+        if (req.url && shouldOmitRequestBodyFromLog(req.url)) {
+          req.url = normalizePath(req.url);
+          req.query = OMITTED_QUERY;
+        }
+        return req;
+      },
+    },
+    customLogLevel(req, res, err) {
+      if (shouldSilenceHttpSuccessLog(req.method, req.url, res.statusCode)) {
+        return "silent";
+      }
+      if (err || res.statusCode >= 500) return "error";
+      if (res.statusCode >= 400) return "warn";
+      return "info";
+    },
+    customSuccessMessage(req, res) {
+      return `${req.method} ${urlForLog(req.url)} ${res.statusCode}`;
+    },
+    customErrorMessage(req, res, err) {
+      const ctx = (res as any).__errorContext;
+      const errMsg = ctx?.error?.message || err?.message || (res as any).err?.message || "unknown error";
+      return `${req.method} ${urlForLog(req.url)} ${res.statusCode} — ${errMsg}`;
+    },
+    customProps(req, res) {
+      return buildHttpLogProps(req, res);
+    },
+  });
 }
