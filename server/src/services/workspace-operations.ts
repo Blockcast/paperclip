@@ -6,6 +6,7 @@ import { asc, desc, eq, inArray, isNull, or, and } from "drizzle-orm";
 import { notFound } from "../errors.js";
 import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { sanitizeRunLogChunkForStorage } from "./log-chunk-sanitizer.js";
 import { getWorkspaceOperationLogStore } from "./workspace-operation-log-store.js";
 
 type WorkspaceOperationRow = typeof workspaceOperations.$inferSelect;
@@ -123,7 +124,16 @@ export function workspaceOperationService(db: Db) {
           let stderrExcerpt = "";
           const append = async (stream: "stdout" | "stderr" | "system", chunk: string | null | undefined) => {
             if (!chunk) return;
-            const sanitizedChunk = redactCurrentUserText(chunk, currentUserRedactionOptions);
+            // PEN-3205: this used to be `redactCurrentUserText` alone — username censoring,
+            // not a secret scrub — so captured command output reached BOTH durable sinks in
+            // the clear. It matters here specifically because `buildWorkspaceCommandEnv`
+            // hands operator provision/cleanup/teardown commands `{ ...process.env }`
+            // wholesale, so a command under `set -x`, or any tool that dumps its environment
+            // on failure, writes the server environment into a company-readable channel.
+            // Sanitize ONCE, before the excerpt fork, so the excerpt columns and the
+            // log-store body cannot diverge — scrubbing one and not the other is the exact
+            // half-control this replaced.
+            const sanitizedChunk = sanitizeRunLogChunkForStorage(chunk, currentUserRedactionOptions);
             if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
             if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
             await logStore.append(handle, {
@@ -140,8 +150,18 @@ export function workspaceOperationService(db: Db) {
             heartbeatRunId: input.heartbeatRunId ?? null,
             issueId: input.issueId ?? null,
             phase: recordInput.phase,
-            command: recordInput.command ?? null,
-            cwd: recordInput.cwd ?? null,
+            // PEN-3205: `command` and `cwd` were stored raw while `metadata` beside them was
+            // censored, so a cwd under a censored user's home was masked in one column and
+            // legible in the next. `command` additionally gets the secret scrub: an operator
+            // provision command can carry a credential as an inline argument.
+            // Null/undefined still store null and "" still stores "" — the transform applies
+            // to the value, it does not reclassify an empty command as an absent one.
+            command: recordInput.command == null
+              ? null
+              : sanitizeRunLogChunkForStorage(recordInput.command, currentUserRedactionOptions),
+            cwd: recordInput.cwd == null
+              ? null
+              : redactCurrentUserText(recordInput.cwd, currentUserRedactionOptions),
             status: "running",
             logStore: handle.store,
             logRef: handle.logRef,
@@ -253,8 +273,15 @@ export function workspaceOperationService(db: Db) {
         store: operation.logStore,
         logRef: operation.logRef,
         ...result,
-        // Workspace-operation log chunks are sanitized before append-time storage.
-        // Returning the stored chunk avoids another whole-string rewrite per poll.
+        // Workspace-operation log chunks are scrubbed for secret material AND
+        // username-censored before append-time storage, by the same
+        // `sanitizeRunLogChunkForStorage` the run-log path uses. Returning the stored chunk
+        // avoids another whole-string rewrite per poll.
+        //
+        // PEN-3205: before that fix this comment read "sanitized", which overstated a
+        // username-censor-only transform — the same overstatement PEN-3139 corrected on the
+        // run-log path. It is accurate as written now; if the append path above ever stops
+        // calling the shared sanitizer, correct this line in the same change.
         content: result.content,
       };
     },
