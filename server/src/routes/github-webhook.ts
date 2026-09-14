@@ -4898,6 +4898,12 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         prMergedAt: context.prMergedAt ?? null,
         prUpdatedAt: context.prUpdatedAt ?? null,
         action: context.prAction ?? "",
+        // The row is written for every issue the PR references (see the
+        // targets list above), so the row alone cannot say which issue the PR
+        // is actually FOR. Carry the resolved owning set onto it so consumers
+        // that need attribution do not have to re-derive it from a body this
+        // row never stores.
+        owningIdentifiers: context.owningIdentifiers ?? null,
       });
       const workProducts = workProductService(db);
       for (const issue of pullRequestWorkProductTargets) {
