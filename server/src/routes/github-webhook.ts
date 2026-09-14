@@ -1541,7 +1541,18 @@ function resolveEventContextRaw(
         // head in the marker. It is the head the gate ESCALATED, not necessarily
         // the head now -- the heartbeat directive already warns that a wake's
         // head may be superseded.
-        ...(reviewGateEscalationHeadSha ? { headSha: reviewGateEscalationHeadSha } : {}),
+        //
+        // Keyed on the GUARDED classification, not on the parsed marker. A
+        // marker-led body that is also actionable feedback (reachable from any
+        // author: hasAllyConsolidatedReviewHeader is un-anchored and carries no
+        // author requirement) resolves as `github_pr_review_feedback`, and on
+        // that path the head must come from the live-head lookup in the route
+        // (`resolvePrReviewHeadSha`), which only runs when `headSha` is absent.
+        // Spreading the marker head here would hand a comment-body-supplied SHA
+        // to a feedback wake AND suppress the lookup that exists to prevent it.
+        ...(reviewGateEscalation && reviewGateEscalationHeadSha
+          ? { headSha: reviewGateEscalationHeadSha }
+          : {}),
         prTitle: issueTitle ?? null,
         prUrl,
         eventUrl: commentUrl ?? prUrl,

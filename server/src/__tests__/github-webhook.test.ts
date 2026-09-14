@@ -1960,7 +1960,28 @@ describe("github-webhook pure helpers", () => {
       // Feedback wins. Routing this as an escalation would drop real findings on
       // the floor: the escalation path posts a "the reviewer is not responding"
       // comment, which is the opposite of what happened.
-      expect(escalationEvent(body)?.wakeReason).toBe("github_pr_review_feedback");
+      const ctx = escalationEvent(body);
+      expect(ctx?.wakeReason).toBe("github_pr_review_feedback");
+      // And the marker's SHA must NOT ride along. On the feedback path the head
+      // comes from the live-head lookup in the route, which runs only when
+      // `headSha` is absent -- a comment-body-supplied SHA here would both send
+      // the woken agent at the wrong tree and suppress the lookup that exists
+      // to prevent exactly that (BLO-32381 follow-up Important 1).
+      expect(ctx).not.toHaveProperty("headSha");
+    });
+
+    it("isReviewGateEscalationProducer: type must be Bot, and the reviewer bot is not the producer", () => {
+      // Direct unit case for the two documented decisions on the guard. The
+      // route-level tests below prove the wiring; this one is where the intent
+      // survives if someone later "helpfully" widens the allowlist.
+      expect(__test_isReviewGateEscalationProducer("github-actions[bot]", "Bot")).toBe(true);
+      // GitHub sets `type`; a human account cannot spoof it, so a matching
+      // login with the wrong type is not the producer.
+      expect(__test_isReviewGateEscalationProducer("github-actions[bot]", "User")).toBe(false);
+      expect(__test_isReviewGateEscalationProducer("github-actions[bot]", null)).toBe(false);
+      // Deliberately NOT allowlisted: agents quote the marker through this App.
+      expect(__test_isReviewGateEscalationProducer("allyblockcast[bot]", "Bot")).toBe(false);
+      expect(__test_isReviewGateEscalationProducer(null, "Bot")).toBe(false);
     });
 
     // -- Important 1: the author guard ------------------------------------
