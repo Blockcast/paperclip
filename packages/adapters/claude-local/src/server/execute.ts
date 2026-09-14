@@ -1290,6 +1290,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         return {
           inputTokens: asNumber(usageObj.input_tokens, 0),
           cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
+          // BLO-29842: keep cache WRITE out of inputTokens; billed 1.25x-2x.
+          cacheCreationInputTokens: asNumber(usageObj.cache_creation_input_tokens, 0),
           outputTokens: asNumber(usageObj.output_tokens, 0),
         };
       })();
