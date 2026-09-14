@@ -619,14 +619,14 @@ prometheusRule:
   processLostLivenessNullWindowCount: 5
   # -- How long the reaper-blind-to-kube condition must persist before warning.
   processLostSignalBlindFor: 15m
-  # -- Warn when more than this many recovery actions per rolling 24h reached their wake horizon with attemptCount 0 (PEN-3000). The counter is zero-initialised, so 0 is a real 0 and any expiry counts; a never-delivered expiry means every wake sweep for the action's current owner was refused by the wake channel, which is a scheduler-side fault, not an owner who failed to converge.
-  recoveryHorizonNeverDeliveredWarnPerDay: 0
-  # -- How long the elevated never-delivered count must persist before warning.
-  recoveryHorizonNeverDeliveredElevatedFor: 10m
-  # -- Page when never-delivered horizon expiries exceed this many per rolling 24h (PEN-3000 measured 19 of 25 live expired actions at 0 on 2026-09-07).
-  recoveryHorizonNeverDeliveredPagePerDay: 5
-  # -- How long the high never-delivered count must be sustained before paging.
-  recoveryHorizonNeverDeliveredPageFor: 1h
+  # -- Warn when more than this many recovery actions per rolling 24h reached their wake horizon with attemptCount 0 (PEN-3000). The counter is zero-initialised, so 0 is a real 0 and any expiry counts; such an expiry means every wake sweep for the action's current owner was refused by the wake channel, which is a scheduler-side fault, not an owner who failed to converge. Owner churn restarts attemptCount, so this is scoped to the current owner's tenure, not the row's whole life.
+  recoveryHorizonNoWakeToCurrentOwnerWarnPerDay: 0
+  # -- How long the elevated no-wake-to-current-owner count must persist before warning.
+  recoveryHorizonNoWakeToCurrentOwnerElevatedFor: 10m
+  # -- Page when horizon expiries with no wake delivered to the current owner exceed this many per rolling 24h (PEN-3000 measured 19 of 25 live expired actions at 0 on 2026-09-07).
+  recoveryHorizonNoWakeToCurrentOwnerPagePerDay: 5
+  # -- How long the high no-wake-to-current-owner count must be sustained before paging.
+  recoveryHorizonNoWakeToCurrentOwnerPageFor: 1h
   # -- Warn when more than this many ac-* agent pods are Unschedulable for unschedulableFor (node-pool scheduling starvation, BLO-16224). Reuses agentJobNameRegex to match agent pods.
   unschedulablePodThreshold: 0
   # -- How long agent pods must stay Unschedulable before warning (transient blips self-resolve; this catches sustained starvation).

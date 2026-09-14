@@ -101,8 +101,8 @@ export type BackstopSkipReason = (typeof BACKSTOP_SKIP_REASONS)[number];
  */
 export const PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC = "paperclip_plugin_webhook_delivery_rejected_total";
 /**
- * PEN-3000: recovery actions retired by `escalateExpiredWakeHorizons`, split by whether the
- * action ever delivered a wake.
+ * PEN-3000: recovery actions retired by `escalateExpiredWakeHorizons`, split by whether a wake
+ * was delivered to the action's CURRENT owner.
  *
  * These are two different events that render identically today. `attemptCount` is the count
  * of wakes that actually REACHED THE QUEUE, not the count of sweeps: `upsertSourceScoped`
@@ -124,7 +124,7 @@ export const PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC = "paperclip_plugin_webhook
  * population PEN-3000 measured and gating on it would silence the series.
  *
  * Splitting them is what makes the first alertable. `never_delivered` is a scheduler-side
- * fault and should page (`PaperclipRecoveryHorizonNeverDelivered{Elevated,Sustained}` in
+ * fault and should page (`PaperclipRecoveryHorizonNoWakeToCurrentOwner{Elevated,Sustained}` in
  * `deploy/helm/paperclip/templates/prometheusrule.yaml`); `delivered` is a genuine
  * unresolvable stranding and is expected to occur at a low background rate. Measured
  * motivation (PEN-3000, fleet sweep of 2026-09-07): 19 of 25 live expired actions were at
@@ -2958,7 +2958,7 @@ function ensureRegistry(): {
       name: RECOVERY_HORIZON_EXPIRED_METRIC,
       help:
         "Recovery actions retired at their auto-recovery wake horizon, labeled by whether a "
-        + "wake was ever delivered to the action's CURRENT owner. delivery=\"never_delivered\" "
+        + "wake was delivered to the action's CURRENT owner. delivery=\"never_delivered\" "
         + "means attemptCount reached the horizon at 0 — every sweep since the current owner "
         + "took over reserved an attempt and refunded it because enqueueWakeup delivered "
         + "nothing, so no wake reached the queue for that owner. Owner churn restarts the "
