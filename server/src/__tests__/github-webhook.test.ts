@@ -4518,6 +4518,9 @@ describeEmbeddedPostgres("github-webhook route", () => {
           webhookSecret,
           prReviewerAgentIds: [reviewerId],
           prReviewerBotLogin: "allyblockcast[bot]",
+          // Live head unresolvable: the check must fall back to the head
+          // recorded on the row, not skip.
+          resolvePrReviewHeadSha: async () => null,
           listPrReviewsForAttestation: async () => {
             listed += 1;
             return [
@@ -4543,6 +4546,89 @@ describeEmbeddedPostgres("github-webhook route", () => {
       // Not counted as a retry attempt — it never attempted anything.
       expect(await deliveryCount("retried")).toBe(0);
       expect(await deliveryCount("dead_lettered")).toBe(0);
+    }, 30_000);
+
+    // BLO-32198. The row's head is frozen at webhook time, but the replay can
+    // run hours later and `taskKey` is PR-scoped, so the wake it replays reviews
+    // the CURRENT head. If the PR moved and was already reviewed at its new head,
+    // asking "is the old head attested?" answers no, the replay proceeds, and
+    // the reviewer posts a duplicate at the new head. The check has to ask
+    // about the live head.
+    it("checks a deferred replay against the live PR head, not the head frozen at webhook time (BLO-32198)", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+      const prNumber = 22199;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+      const frozenHead = "0ff1ce0000000000000000000000000000000001";
+      const liveHead = "0ff1ce0000000000000000000000000000000002";
+
+      const app = buildApp({
+        prReviewerAgentIds: [reviewerId],
+        prReviewerBotLogin: "allyblockcast[bot]",
+        listPrReviewsForAttestation: async () => [],
+      });
+      const { body, signature } = signedRequest({
+        action: "opened",
+        pull_request: {
+          number: prNumber,
+          title: "Deferred replay outlives its head",
+          body: null,
+          head: { ref: "blo-32198-moved-head", sha: frozenHead },
+        },
+        repository: { full_name: REPO },
+      });
+      const res = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-32198-moved-head")
+        .set("content-type", "application/json")
+        .send(body);
+      expect(res.status).toBe(200);
+      expect(res.body.reviewerWakeFired).toBe(false);
+      const retryRows = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(retryRows).toHaveLength(1);
+
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, reviewerId));
+
+      // While deferred: the branch was pushed (head is now `liveHead`) and Ally
+      // reviewed THAT head. Nothing attests `frozenHead`.
+      const resolved: Array<{ repoFullName: string; prNumber: number }> = [];
+      const reconciled = await reconcileContendedPrReviewerWakes(
+        db,
+        {
+          webhookSecret,
+          prReviewerAgentIds: [reviewerId],
+          prReviewerBotLogin: "allyblockcast[bot]",
+          resolvePrReviewHeadSha: async (input) => {
+            resolved.push(input);
+            return liveHead;
+          },
+          listPrReviewsForAttestation: async () => [
+            {
+              login: "allyblockcast[bot]",
+              body: `## Ally — Consolidated PR Review\n\nReviewed head: ${liveHead}\n`,
+              createdAt: "2026-09-06T10:00:00Z",
+            },
+          ],
+          heartbeatOptions: {
+            penstockAvailabilityGate: allowPenstockGate,
+            skipQueuedRunDispatch: true,
+          },
+        },
+        new Date(Date.now() + 60_000),
+      );
+
+      expect(resolved).toEqual([{ repoFullName: REPO, prNumber }]);
+      // Against the frozen head this would read `not_attested` and replay,
+      // producing the duplicate; against the live head it is superseded.
+      expect(reconciled).toMatchObject({ recovered: 0, superseded: 1, exhausted: 0 });
+      expect(await runsForTask(taskKey)).toHaveLength(0);
+      expect(await deliveryCount("retried")).toBe(0);
     }, 30_000);
 
     it("does not retry a paused reviewer whose reporting chain is invalid", async () => {
