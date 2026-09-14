@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { readFileSync } from "node:fs";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -182,6 +183,24 @@ vi.mock("../routes/workspace-runtime-service-authz.js", () => ({
   assertCanManageExecutionWorkspaceRuntimeServices: vi.fn(async () => undefined),
 }));
 
+/**
+ * PEN-3205: the workspace-operations route now reads `censorUsernameInLogs` per request, to apply
+ * the username censoring the sibling list route in `routes/agents.ts` already applied. These apps
+ * mount `{}` as `db`, so the real service's `getGeneral()` throws and the route answers 500 —
+ * stubbing it is what keeps the withholding boundary below drivable at all.
+ *
+ * Default OFF so the censor is a no-op: the withholding assertions in this file measure
+ * `publicWorkspaceOperation`, and a censor running underneath them could mask a sentinel and make
+ * a withholding test pass for the wrong reason. The censor has its own coverage below, which
+ * turns it on explicitly and pairs it with the off-case as the discriminator.
+ */
+const mockInstanceGeneralSettings = vi.hoisted(() => ({ censorUsernameInLogs: false }));
+vi.mock("../services/instance-settings.js", () => ({
+  instanceSettingsService: () => ({
+    getGeneral: async () => ({ ...mockInstanceGeneralSettings }),
+  }),
+}));
+
 function runtimeBlob(): Record<string, unknown> {
   return {
     services: [{ name: "web", command: SECRET_SENTINEL, env: { TOKEN_FIXTURE: SECOND_SENTINEL } }],
@@ -327,6 +346,7 @@ function createApp(mount: "execution-workspaces" | "projects") {
 describe("workspace runtime withholding boundary (PEN-2852)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockInstanceGeneralSettings.censorUsernameInLogs = false;
     decideAsUnprivilegedReader();
     mockExecutionWorkspaceService.getById.mockResolvedValue(executionWorkspaceFixture());
     mockExecutionWorkspaceService.list.mockResolvedValue([executionWorkspaceFixture()]);
@@ -645,6 +665,51 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       expect(res.status).toBe(200);
       expect(res.body[0].command).toBe(OPERATION_COMMAND_SENTINEL);
       expect(res.body[0].cwd).toBe(OPERATION_CWD_SENTINEL);
+    });
+
+    /**
+     * PEN-3205, read side. `publicWorkspaceOperation` masks `command`/`cwd`/`metadata` and spreads
+     * the rest, so `stdoutExcerpt` crosses this route UNMASKED by design — the username censor is
+     * the only control standing over it here, and `routes/agents.ts` was already applying it on
+     * the sibling list route while this one answered with a bare `res.json`.
+     *
+     * The home directory comes from `os.homedir()` rather than a literal because that is the same
+     * value `defaultHomeDirs` derives its (module-cached) candidate list from, so this is
+     * deterministic on any runner without reaching into that cache. The pair is the point: the
+     * setting is the sole discriminator between the two cases, so neither passes if the censor is
+     * dropped from the route, and neither passes if it is replaced by blanket blanking.
+     */
+    it("censors the current user's home directory in the excerpt when the setting is on", async () => {
+      mockInstanceGeneralSettings.censorUsernameInLogs = true;
+      const homeDir = os.homedir();
+      mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
+        workspaceOperationFixture({ stdoutExcerpt: `cloned into ${homeDir}/checkout` }),
+      ]);
+
+      const res = await request(createApp("execution-workspaces")).get(
+        "/api/execution-workspaces/workspace-1/workspace-operations",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body[0].stdoutExcerpt).not.toContain(homeDir);
+      // Censored, not blanked: the surrounding line survives so the excerpt stays readable.
+      expect(res.body[0].stdoutExcerpt).toContain("cloned into ");
+      expect(res.body[0].stdoutExcerpt).toContain("/checkout");
+    });
+
+    it("leaves the excerpt alone when the setting is off", async () => {
+      mockInstanceGeneralSettings.censorUsernameInLogs = false;
+      const homeDir = os.homedir();
+      mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
+        workspaceOperationFixture({ stdoutExcerpt: `cloned into ${homeDir}/checkout` }),
+      ]);
+
+      const res = await request(createApp("execution-workspaces")).get(
+        "/api/execution-workspaces/workspace-1/workspace-operations",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body[0].stdoutExcerpt).toBe(`cloned into ${homeDir}/checkout`);
     });
 
     /**
