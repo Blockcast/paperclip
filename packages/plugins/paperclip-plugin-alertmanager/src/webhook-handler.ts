@@ -22,6 +22,7 @@ import {
   buildIssueDescription,
   buildIssueTitle,
   effectiveAlertStatus,
+  isTerminalSeverity,
   severityToPriority,
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
@@ -1423,10 +1424,16 @@ export async function handleFiring(
   //
   // This is the same `state ?? recover-from-issue` fallback the resolved path
   // has always used; only the firing path was missing it.
-  const existing = stateRecord ?? (await recoverStateFromIssue(ctx, config, alert));
   const nowIso = new Date().toISOString();
   const alertname = alert.labels.alertname ?? "UnnamedAlert";
   const severity = alert.labels.severity ?? "unknown";
+  // BLO-24177: a terminal severity (e.g. `none`, Prometheus's always-firing
+  // `Watchdog` dead-man's-switch) must never become agent-actionable work.
+  // Computed before the state read so the recovery lookup can adopt an
+  // already-terminal row rather than minting a second permanent evidence row.
+  const terminal = isTerminalSeverity(severity, config.terminalSeverities);
+  const existing =
+    stateRecord ?? (await recoverStateFromIssue(ctx, config, alert, terminal));
   const storedAggregateKey = existing
     ? (existing.aggregateKey ??
       (await findAggregateMemberKey(
@@ -1591,7 +1598,19 @@ export async function handleFiring(
           existing.paperclipIssueId,
           existing.paperclipCompanyId,
         );
-        decision = decideRefire(issue, existing, config, Date.now());
+        // BLO-24177: a terminal severity never consults `decideRefire`. That
+        // helper reads any `done`/`cancelled` row as an *operator* close
+        // (BLO-24234), which would mute this fingerprint for the suppression
+        // window and then re-open it as `todo` once the window expired —
+        // re-manufacturing exactly the agent-actionable row this exists to
+        // prevent. A terminal close is the plugin's own doing, not an
+        // operator's, so there is no operator intent to honour and no
+        // suppression anchor to bank.
+        decision = terminal
+          ? issue
+            ? { kind: "refresh" }
+            : { kind: "issue_missing" }
+          : decideRefire(issue, existing, config, Date.now());
 
         // Barrier before the first issue mutation. Placed *after* the reads
         // above so the window between proving ownership and acting on it holds
@@ -1600,7 +1619,27 @@ export async function handleFiring(
         // of them. The reads are unguarded on purpose — they mutate nothing.
         await assertFiringGeneration(ctx, companyId, aggregateKey, firingToken);
 
-        if (decision.kind === "reopen") {
+        if (terminal && issue) {
+          // Never agent-actionable, regardless of the row's prior status —
+          // route straight to `done` instead of reopening as `todo`, so
+          // stranded-issue recovery and orphan sweeps never see it as unowned
+          // work. Still touch the row on every re-fire (whether it is already
+          // terminal or not) so `updatedAt` keeps proving the in-cluster
+          // delivery leg accepts POSTs — the row stays live evidence, it just
+          // never becomes work.
+          await ctx.issues.update(
+            existing.paperclipIssueId,
+            {
+              ...(issue.status !== "done" ? { status: "done" as const } : {}),
+              description: newDescription,
+              assigneeAgentId: null,
+              assigneeUserId: null,
+            },
+            existing.paperclipCompanyId,
+            undefined,
+            { fencing: firingFence(companyId, aggregateKey, firingToken) },
+          );
+        } else if (decision.kind === "reopen") {
           if (decision.reason === "plugin_resolved") {
             // A different firing in this aggregate may already have created a
             // live winner while this fingerprint was resolved. Rebind to that
@@ -1748,6 +1787,11 @@ export async function handleFiring(
         ctx.logger.warn(
           `Failed to re-sync existing issue ${existing.paperclipIssueId} on re-fire: ${String(err)}`,
         );
+        // BLO-24177: for a terminal severity the re-sync IS the whole delivery
+        // — it is what keeps the row `done` and unassigned. Swallowing the
+        // failure here would acknowledge a delivery that left an
+        // agent-actionable row behind, so fail it and let Alertmanager retry.
+        if (terminal) throw err;
       }
 
       // Ladder restart keeps its original trigger — the alert going
@@ -1787,6 +1831,11 @@ export async function handleFiring(
 
       const updated: AlertStateRecord = {
         ...tracked,
+        // BLO-24177: the row above was just forced unassigned, so the state
+        // record must agree — otherwise the next resolve/escalation read would
+        // wake an owner this severity is never allowed to have.
+        assigneeUserId: terminal ? null : tracked.assigneeUserId,
+        assigneeAgentId: terminal ? null : tracked.assigneeAgentId,
         aggregateKey,
         alertname,
         severity,
@@ -1834,8 +1883,8 @@ export async function handleFiring(
           labels: alert.labels,
           annotations: alert.annotations,
           paperclipIssueId: tracked.paperclipIssueId,
-          assigneeUserId: tracked.assigneeUserId,
-          assigneeAgentId: tracked.assigneeAgentId ?? null,
+          assigneeUserId: updated.assigneeUserId,
+          assigneeAgentId: updated.assigneeAgentId ?? null,
           reFired: true,
         },
         { ownershipCheck: firingFence(companyId, aggregateKey, firingToken) },
@@ -1879,7 +1928,12 @@ export async function handleFiring(
   // First time we've seen this fingerprint — create a new issue. `companyId` is
   // already resolved and non-empty; it scoped the state read above.
   let retainedIssue = await findActiveAggregateIssue(ctx, companyId, aggregateKey);
-  const issueRouteResolution = resolveIssueRoute(alert, config.issueRouteMap);
+  // BLO-24177: a terminal-severity alert is never agent-actionable, so
+  // owner-map and issue-route resolution are skipped entirely rather than
+  // resolved and then discarded — no assignee or route should ever apply to it.
+  const issueRouteResolution = terminal
+    ? { route: null, source: null }
+    : resolveIssueRoute(alert, config.issueRouteMap);
   const issueRoute = issueRouteResolution.route;
   const routeAssigneeAgentId = nonEmptyString(issueRoute?.assigneeAgentId);
   const routeHasAssigneeUserId = Object.prototype.hasOwnProperty.call(
@@ -1893,7 +1947,7 @@ export async function handleFiring(
   let createAssigneeUserId: string | undefined;
   let assigneeResolutionSource = "aggregate-winner";
   let resolvedTarget = "(aggregate-winner)";
-  if (!retainedIssue) {
+  if (!retainedIssue && !terminal) {
     const { assigneeUserId, assigneeAgentId, resolution } =
       await resolveAssigneeUserId(ctx, alert, config.ownerMap);
     const ownerOverride =
@@ -1916,7 +1970,7 @@ export async function handleFiring(
         : resolution.email ?? "(none)";
   }
   const fallbackResolution =
-    retainedIssue || createAssigneeAgentId || createAssigneeUserId
+    terminal || retainedIssue || createAssigneeAgentId || createAssigneeUserId
       ? undefined
       : await resolveFallbackAgentIdMemoized(
           ctx,
@@ -1926,7 +1980,12 @@ export async function handleFiring(
         );
   const fallbackAssigneeAgentId = fallbackResolution?.agentId;
   const finalAssigneeAgentId = createAssigneeAgentId ?? fallbackAssigneeAgentId;
-  if (!retainedIssue && !finalAssigneeAgentId && !createAssigneeUserId) {
+  // BLO-24177: the ownerless-creation refusal below exists to stop a real alert
+  // landing with nobody paged. A terminal severity is the one case where an
+  // ownerless row is the *intended* outcome, so it is exempt — without this the
+  // fallback-owner guard would throw on every Watchdog delivery and the
+  // heartbeat evidence row would never be created at all.
+  if (!terminal && !retainedIssue && !finalAssigneeAgentId && !createAssigneeUserId) {
     // Only `terminated` / wrong-name / genuinely-ambiguous is unfixable by
     // retrying. A `paused` or `pending_approval` fallback owner becomes
     // invokable without anyone editing config, and Alertmanager's retry window
@@ -1970,10 +2029,16 @@ export async function handleFiring(
   const routeProjectId = nonEmptyString(issueRoute?.projectId);
   const routeGoalId = nonEmptyString(issueRoute?.goalId);
   const routeStatus = issueRoute?.status;
+  // BLO-24177: terminal severities always create `done` — never left `todo`
+  // where stranded-issue recovery and orphan sweeps would eventually assign
+  // it, resuming exactly the loop this exists to break.
+  const createStatus = terminal ? "done" : routeStatus;
   const resolvedAssignee =
     finalAssigneeAgentId ?? createAssigneeUserId ?? "(no assignee)";
   ctx.logger.debug(
-    `Owner resolution for ${alertname}: ${assigneeResolutionSource} → ${resolvedTarget} → ${resolvedAssignee}`,
+    terminal
+      ? `Owner resolution for ${alertname}: skipped (terminal severity "${severity}", BLO-24177)`
+      : `Owner resolution for ${alertname}: ${assigneeResolutionSource} → ${resolvedTarget} → ${resolvedAssignee}`,
   );
   if (issueRouteResolution.source) {
     ctx.logger.debug(
@@ -2027,7 +2092,7 @@ export async function handleFiring(
           originFingerprint: aggregateKey,
           ...(routeProjectId ? { projectId: routeProjectId } : {}),
           ...(routeGoalId ? { goalId: routeGoalId } : {}),
-          ...(routeStatus ? { status: routeStatus } : {}),
+          ...(createStatus ? { status: createStatus } : {}),
           ...(createAssigneeUserId ? { assigneeUserId: createAssigneeUserId } : {}),
           ...(finalAssigneeAgentId ? { assigneeAgentId: finalAssigneeAgentId } : {}),
           ...(billingCode ? { billingCode } : {}),
@@ -2418,6 +2483,7 @@ async function recoverStateFromIssue(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
+  includeTerminalIssue = false,
 ): Promise<AlertStateRecord | null> {
   const companyId = config.defaultCompanyId;
   if (!companyId) return null;
@@ -2434,7 +2500,17 @@ async function recoverStateFromIssue(
   // let that historical row mask the aggregate membership fallback: state
   // loss must recover the live aggregate binding, not conclude that the alert
   // is unknown merely because its first origin match is terminal.
-  if (!issue || issue.status === "done" || issue.status === "cancelled") {
+  //
+  // `includeTerminalIssue` is the one deliberate exception (BLO-24177). For a
+  // terminal severity that ambiguity does not exist: the plugin closes those
+  // rows itself on every delivery and never leaves them open, so a closed row
+  // cannot encode an operator's intent to mute. Falling through would mint a
+  // second permanent evidence row per state loss, so it adopts instead.
+  if (
+    !issue ||
+    (!includeTerminalIssue &&
+      (issue.status === "done" || issue.status === "cancelled"))
+  ) {
     return recoverStateFromAggregateMember(ctx, config, alert);
   }
 
