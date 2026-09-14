@@ -51,6 +51,18 @@ export interface EvaluateEvidenceInput {
   allowedPrRepos?: readonly string[];
   /** Caller-derived history signal: a prior description had Done-when bullets, current does not. */
   doneWhenBulletsRemoved?: boolean;
+  /**
+   * Detections computed outside this pure evaluator — in practice the GitHub
+   * truth probe (`evidence-truth.ts`). `true` ADDS a detection; `false` and
+   * `undefined` are ignored on purpose. A probe that cannot reach GitHub must
+   * never be able to subtract evidence the text detectors genuinely found,
+   * because that turns an outage into a block on correct work.
+   */
+  externalDetections?: Partial<Record<EvidenceShape, boolean>>;
+  /** True when the probe could not establish truth (GitHub error, deadline, cap). Suppresses escalation to block. */
+  probeFailed?: boolean;
+  /** Wired from loadConfig().evidenceGateUnlabeledTruthBlock. Default off. */
+  unlabeledTruthBlock?: boolean;
 }
 
 export interface EvaluateEvidenceResult {
@@ -90,7 +102,17 @@ const ALL_SHAPES: readonly EvidenceShape[] = [
   "e2e-script",
   "e2e-run",
   "migration-output",
+  "review:ally-clean",
+  "deploy:landed",
 ] as const;
+
+/**
+ * The shapes no comment text can produce. They are set only through
+ * `externalDetections`, from a probe that reads GitHub — so an agent cannot
+ * satisfy them by writing about its own work. `unlabeledTruthBlock` only ever
+ * escalates a gap that is *entirely* within this set.
+ */
+export const TRUTH_SHAPES: readonly EvidenceShape[] = ["review:ally-clean", "deploy:landed"];
 
 /**
  * Compute the required-shape set for an issue by unioning the registry
@@ -589,6 +611,10 @@ function detectAll(input: {
     "e2e-script": detectE2eScript(text, workProducts),
     "e2e-run": detectE2eRun(workProducts, text),
     "migration-output": detectMigrationOutput(text),
+    // Not derivable from text by design — see TRUTH_SHAPES. Set only by the
+    // caller merging `externalDetections` after this returns.
+    "review:ally-clean": false,
+    "deploy:landed": false,
   };
   const found = ALL_SHAPES.filter((s) => detections[s]);
   return { detections, found };
@@ -642,12 +668,19 @@ export function evaluateEvidence(
     diagnostics.push("unmatched-labels-used-fallback");
   }
 
-  const { detections, found } = detectAll({
+  const { detections } = detectAll({
     issueDescription: input.issue.description,
     text,
     workProducts: input.workProducts,
     allowedPrRepos: input.allowedPrRepos,
   });
+
+  // Additive only. See `externalDetections` on the input type for why a `false`
+  // is ignored rather than clearing the text detector's finding.
+  for (const [shape, hit] of Object.entries(input.externalDetections ?? {})) {
+    if (hit === true && shape in detections) detections[shape as EvidenceShape] = true;
+  }
+  const foundAll = ALL_SHAPES.filter((s) => detections[s]);
 
   const missing = required.filter((s) => !detections[s]);
   const requiredFound = required.filter((s) => detections[s]);
@@ -662,12 +695,37 @@ export function evaluateEvidence(
     verdict = "block";
   }
 
+  // The unlabeled fallback warns rather than blocks so the gate is not a chore
+  // for refactor/doc issues. When the operator turns the flag on, the ONE gap
+  // worth blocking on is a gap made entirely of shapes the agent cannot write
+  // itself — it means the work was narrated but never reviewed or landed. A
+  // mixed gap (e.g. the checklist is also missing) stays a warn: that part is
+  // the agent's own to fix and is what the fallback exists to tolerate.
+  //
+  // A failed probe suppresses the escalation outright. "The probe could not
+  // reach GitHub" and "GitHub says this was never reviewed" are the same
+  // `missing` list, and blocking on the first would make every GitHub outage
+  // an estate-wide in_review freeze.
+  if (
+    verdict === "warn" &&
+    input.unlabeledTruthBlock === true &&
+    missing.length > 0 &&
+    missing.every((s) => TRUTH_SHAPES.includes(s))
+  ) {
+    if (input.probeFailed === true) {
+      diagnostics.push("unlabeled-truth-block-suppressed:probe-failed");
+    } else {
+      verdict = "block";
+      diagnostics.push("unlabeled-truth-block");
+    }
+  }
+
   return {
     verdict,
     missing,
     evidenceFound: requiredFound,
     requiredFound,
-    allDetected: found,
+    allDetected: foundAll,
     shapeDetections: detections,
     unlabeledFallback,
     diagnostics,
