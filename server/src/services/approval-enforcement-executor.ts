@@ -33,8 +33,10 @@
  * decided-vs-enforced comparison, which is why the idempotency guard the issue
  * originally specified could not have caught this: both are "enforced !=
  * decided". `classifyEnforcementAssertion` separates them using the `from_usd`
- * the card already records, and this route writes only the `never_applied`
- * ones.
+ * the card already records plus `budget_policies.updated_at` — the card's field
+ * alone is untrusted free-form text, so a wrong prior must not be able to make a
+ * real gap read as a supersession — and this route writes only the
+ * `never_applied` ones.
  *
  * ## Why a superseded assertion refuses the whole card
  *
@@ -124,6 +126,7 @@ export async function applyApprovalEnforcement(
       companyId: approvals.companyId,
       status: approvals.status,
       payload: approvals.payload,
+      decidedAt: approvals.decidedAt,
       requestedByAgentId: approvals.requestedByAgentId,
     })
     .from(approvals)
@@ -183,6 +186,7 @@ export async function applyApprovalEnforcement(
         amount: budgetPolicies.amount,
         isActive: budgetPolicies.isActive,
         windowKind: budgetPolicies.windowKind,
+        updatedAt: budgetPolicies.updatedAt,
       })
       .from(budgetPolicies)
       .where(
@@ -190,7 +194,16 @@ export async function applyApprovalEnforcement(
           eq(budgetPolicies.companyId, approval.companyId),
           inArray(budgetPolicies.id, [...new Set(policyIds)]),
         ),
-      );
+      )
+      // Under READ COMMITTED — Postgres' default, and this transaction's — an
+      // unlocked read is only a snapshot: a concurrent cap write can commit
+      // between classification and `upsertPolicy`, and the executor would then
+      // write the decided figure over a raise it classified as absent. That is
+      // the precise revert this route was built to refuse, arriving through the
+      // one gap the classifier cannot see. Locking the rows makes the
+      // classify-then-write pair atomic against any other writer of the same
+      // policies.
+      .for("update");
     const byId = new Map(rows.map((row) => [row.id, row]));
 
     const applied: AppliedAssertion[] = [];
@@ -201,7 +214,7 @@ export async function applyApprovalEnforcement(
     for (const assertion of assertions) {
       const row = byId.get(assertion.policyId) ?? null;
       const enforced: EnforcedBudgetPolicy | null = row
-        ? { policyId: row.id, amount: row.amount, isActive: row.isActive }
+        ? { policyId: row.id, amount: row.amount, isActive: row.isActive, updatedAt: row.updatedAt }
         : null;
 
       if (row && row.scopeType === "agent" && row.scopeId === actor.agentId) {
@@ -213,7 +226,11 @@ export async function applyApprovalEnforcement(
         );
       }
 
-      const state: AssertionEnforcementState = classifyEnforcementAssertion(assertion, enforced);
+      const state: AssertionEnforcementState = classifyEnforcementAssertion(
+        assertion,
+        enforced,
+        approval.decidedAt,
+      );
       switch (state) {
         case "applied":
           alreadyApplied.push(assertion.policyId);
@@ -242,7 +259,7 @@ export async function applyApprovalEnforcement(
         case "unverifiable_mismatch":
           throw refuse(
             "assertion_unverifiable",
-            `Policy \`${assertion.policyId}\` disagrees with the card, but the card records no starting figure, so "never applied" cannot be told from "superseded"`,
+            `Policy \`${assertion.policyId}\` disagrees with the card, and neither the card's recorded starting figure nor the policy's last-written time can tell "never applied" from "superseded"`,
             unprocessable,
             { policyId: assertion.policyId, enforcedAmountCents: row!.amount },
           );
