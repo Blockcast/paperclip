@@ -4365,6 +4365,52 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  // Twin of the test above, and it guards a line no other test reaches: `claude_k8s`'s
+  // membership in SHARED_DOC_MATERIALIZING_ADAPTER_TYPES. Every other shared-doc test drives
+  // `opencode_k8s`, so dropping `claude_k8s` back out of that set would leave the whole suite
+  // green while silently restoring the defect this change exists to fix — every Penstock agent
+  // is `claude_k8s`, so materialization would stop running for all of them.
+  it("materializes missing claude_k8s shared docs before adapter dispatch", async () => {
+    const instructionsRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-k8s-docs-"));
+    await fs.writeFile(
+      path.join(instructionsRoot, "AGENTS.md"),
+      "Read: docs/architecture-template.md\n",
+      "utf8",
+    );
+
+    try {
+      const { agentId, runId } = await seedQueuedIssueRunFixture();
+      await db
+        .update(agents)
+        .set({
+          adapterType: "claude_k8s",
+          adapterConfig: {
+            instructionsBundleMode: "external",
+            instructionsRootPath: instructionsRoot,
+            instructionsFilePath: path.join(instructionsRoot, "AGENTS.md"),
+            instructionsEntryFile: "AGENTS.md",
+          },
+        })
+        .where(eq(agents.id, agentId));
+
+      await heartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(heartbeat, runId);
+
+      const adapterCall = mockAdapterExecute.mock.calls.find(([ctx]) => ctx.runId === runId)?.[0] as
+        | { context?: { paperclipWorkspace?: { cwd?: unknown } } }
+        | undefined;
+      const workspaceCwd = adapterCall?.context?.paperclipWorkspace?.cwd;
+      expect(workspaceCwd).toBeTypeOf("string");
+      const materialized = await fs.readFile(
+        path.join(workspaceCwd as string, "docs", "architecture-template.md"),
+        "utf8",
+      );
+      expect(materialized).toContain("# Missing Shared Documentation: docs/architecture-template.md");
+    } finally {
+      await fs.rm(instructionsRoot, { recursive: true, force: true });
+    }
+  });
+
   it("does not materialize opencode_k8s shared docs when instructions do not reference them", async () => {
     const instructionsRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-k8s-docs-"));
     await fs.writeFile(path.join(instructionsRoot, "AGENTS.md"), "No shared docs referenced here.\n", "utf8");
@@ -4421,7 +4467,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const settledRun = await waitForRunToSettle(heartbeat, runId);
 
       expect(settledRun?.stderrExcerpt ?? "").toContain(
-        "Skipped opencode_k8s shared docs materialization: failed to read instructions entry",
+        "Skipped external k8s shared docs materialization: failed to read instructions entry",
       );
       expect(settledRun?.stderrExcerpt ?? "").toContain("EISDIR");
     } finally {
