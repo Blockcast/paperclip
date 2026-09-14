@@ -224,6 +224,13 @@ export interface Config {
   // GitHub login of the PR-reviewer bot (the GitHub App's bot user, e.g.
   // "allyblockcast[bot]") used to filter reviews/comments during verification.
   prReviewerBotLogin: string;
+  // Escalate the UNLABELED evidence-gate warn to a block when the only thing
+  // missing is the two GitHub truth shapes (`review:ally-clean`,
+  // `deploy:landed`) AND the truth probe actually established that. Ships off;
+  // see docs/runbooks for the measurement the flip depends on. A failed probe
+  // never blocks, so turning this on cannot make a GitHub outage an
+  // estate-wide in_review freeze.
+  evidenceGateUnlabeledTruthBlock: boolean;
   // Capture is deployed one rollout before authority processing so every API
   // replica durably records deliveries before any replica can activate the gate.
   githubReviewGateCaptureEnabled: boolean;
@@ -1167,6 +1174,7 @@ export function loadConfig(): Config {
     githubAppInstallationId,
     githubAppPrivateKey,
     prReviewerBotLogin: process.env.PAPERCLIP_PR_REVIEWER_BOT_LOGIN ?? "allyblockcast[bot]",
+    evidenceGateUnlabeledTruthBlock: process.env.PAPERCLIP_EVIDENCE_UNLABELED_BLOCK === "1",
     prCommentReviewGateStatusContext: (process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT ?? "").trim(),
     githubReviewGateCaptureEnabled,
     githubReviewGateEnabled,
