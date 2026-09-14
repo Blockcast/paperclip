@@ -191,6 +191,32 @@ spec:
           annotations:
             summary: "Paperclip reaper is blind to kube Job liveness"
             description: "The reaper hit more than {{ .Values.prometheusRule.processLostLivenessNullWindowCount }} null kube Job-status lists in 15m, so it is falling back to the staleness heuristic while blind (BLO-16184 denominator guard). Any concurrent LOW process_lost count is UNRELIABLE — a 0 means 'could not see', not 'healthy'; a spike may be kube-outage-driven. Check the K8s API and the paperclip ServiceAccount RBAC."
+    - name: paperclip-recovery-horizon
+      rules:
+        # PEN-3000: keys on the never_delivered series of a counter that is zero-initialised at
+        # process start, so an absent series is a broken scrape and a 0 is a real 0. The label
+        # is scoped to the action's CURRENT owner (owner churn restarts attemptCount), so a
+        # firing here says the wake channel refused every sweep for that owner, not that the
+        # row never woke anyone in its life. The alert names and summaries say "current owner"
+        # rather than inheriting the bare series name, because a pager shows them with no
+        # metric HELP text attached and an unqualified "never delivered" would hand the
+        # operator a lifetime claim the data does not support.
+        - alert: PaperclipRecoveryHorizonNoWakeToCurrentOwnerElevated
+          expr: sum(increase(paperclip_recovery_horizon_expired_total{delivery="never_delivered"}[1d])) > {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerWarnPerDay }}
+          for: {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerElevatedFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip recovery actions expiring with no wake delivered to their current owner (>{{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerWarnPerDay }}/day)"
+            description: "More than {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerWarnPerDay }} recovery action(s) in the last 24h reached their auto-recovery wake horizon at attemptCount 0 (PEN-3000). attemptCount counts wakes that reached the queue for the current owner — every sweep reserves an attempt and refunds it when enqueueWakeup delivers nothing — so 0 means the wake channel (provider-capacity deferral, tree pause hold, wake disabled, cooldown) refused every sweep for that owner and the stranding was never worked. Owner churn restarts attemptCount, so an earlier owner may well have been woken; this does not claim the row never woke anyone in its life. This is a scheduler-side fault; compare against delivery=\"delivered\", which is the genuine unresolvable-stranding background rate. Action ids are on the paired 'recovery action passed its wake horizon' log line."
+        - alert: PaperclipRecoveryHorizonNoWakeToCurrentOwnerSustained
+          expr: sum(increase(paperclip_recovery_horizon_expired_total{delivery="never_delivered"}[1d])) > {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPagePerDay }}
+          for: {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPageFor }}
+          labels:
+            severity: critical
+          annotations:
+            summary: "Paperclip recovery wake channel refusing at scale (>{{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPagePerDay }} horizon expiries with no wake to the current owner/day for {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPageFor }})"
+            description: "Recovery horizon expiries with no wake delivered to the action's current owner exceeded {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPagePerDay }}/day sustained for {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPageFor }} (PEN-3000). Whole 6h recovery windows are burning without a single wake reaching the current owner's queue, so the recovery layer itself is stranded. Owner churn restarts attemptCount, so this is a claim about the current owner's tenure, not the row's whole life. Check provider-capacity deferral, tree pause holds, disabled wake and cooldown on the owning agents before treating any of these as owner non-convergence."
     - name: paperclip-github-delivery
       rules:
         - alert: PaperclipGithubReviewRequestDeadLettered
