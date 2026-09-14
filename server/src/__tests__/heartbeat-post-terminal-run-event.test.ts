@@ -16,6 +16,15 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
+import { waitForRunToFinish } from "./helpers/wait-for-run-to-finish.js";
+
+/**
+ * 20s was observed to be too tight on a loaded host — a run took ~68s to finish
+ * and the poll gave up first, failing on `status === "running"` and reading as a
+ * guard bug rather than as a slow machine. The enclosing `it` timeout is 120s and
+ * this only polls, so waiting longer costs nothing when the host is healthy.
+ */
+const RUN_FINISH_TIMEOUT_MS = 90_000;
 
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => ({ track: vi.fn() }) }));
 
@@ -59,25 +68,6 @@ async function droppedCount(status?: string): Promise<number> {
   return data.values
     .filter((entry) => (status ? entry.labels.status === status : true))
     .reduce((sum, entry) => sum + entry.value, 0);
-}
-
-async function waitForRunToFinish(
-  heartbeat: ReturnType<typeof heartbeatService>,
-  runId: string,
-  // 20s was observed to be too tight on a loaded host — a run took ~68s to
-  // finish and the poll gave up first, failing on `status === "running"` and
-  // reading as a guard bug rather than as a slow machine. The enclosing `it`
-  // timeout is 120s and this only polls, so waiting longer costs nothing when
-  // the host is healthy.
-  timeoutMs = 90_000,
-) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const run = await heartbeat.getRun(runId);
-    if (run && !["queued", "running"].includes(run.status)) return run;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return await heartbeat.getRun(runId);
 }
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -293,7 +283,7 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
 
       const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
       expect(run).not.toBeNull();
-      const finished = await waitForRunToFinish(heartbeat, run!.id);
+      const finished = await waitForRunToFinish(heartbeat, run!.id, RUN_FINISH_TIMEOUT_MS);
       expect(finished?.status).toBe("succeeded");
 
       // The on-time event persisted — this is the AC-3 no-regression anchor.
@@ -344,7 +334,7 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
 
       const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
       expect(run).not.toBeNull();
-      const finished = await waitForRunToFinish(heartbeat, run!.id);
+      const finished = await waitForRunToFinish(heartbeat, run!.id, RUN_FINISH_TIMEOUT_MS);
       expect(finished?.status).toBe("succeeded");
       expect(capturedOnEvent).toBeTypeOf("function");
 
@@ -400,7 +390,7 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
 
       const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
       expect(run).not.toBeNull();
-      const finished = await waitForRunToFinish(heartbeat, run!.id);
+      const finished = await waitForRunToFinish(heartbeat, run!.id, RUN_FINISH_TIMEOUT_MS);
       expect(finished?.status).toBe("succeeded");
       expect(capturedOnEvent).toBeTypeOf("function");
 
@@ -476,7 +466,7 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
 
       const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
       expect(run).not.toBeNull();
-      const finished = await waitForRunToFinish(heartbeat, run!.id);
+      const finished = await waitForRunToFinish(heartbeat, run!.id, RUN_FINISH_TIMEOUT_MS);
       expect(finished?.status).toBe("succeeded");
 
       // Settled, so the ordering assertion covers the run's whole event stream

@@ -21,6 +21,7 @@ import {
   projectWorkspaces,
   projects,
   workspaceRuntimeServices,
+  type Db,
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import {
@@ -29,6 +30,7 @@ import {
   cleanupExecutionWorkspaceArtifacts,
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
+  ensureGitWorktreeBranchCoherent,
   ensureRuntimeServicesForRun,
   executeProcessForTests,
   isProcessGroupAliveForTests,
@@ -191,6 +193,9 @@ async function expectPersistedBranchMismatchRejected(input: {
   executionWorkspaceId: string;
   expectedAncestryVerdict: "diverged" | "unknown";
   expectedReason?: string;
+  // For refusals whose reason embeds a path or a claimant list, so an exact
+  // match is not stable across fixtures.
+  expectedReasonContains?: string;
 }) {
   let error: unknown = null;
   try {
@@ -248,10 +253,200 @@ async function expectPersistedBranchMismatchRejected(input: {
           attempted: false,
           succeeded: false,
           ...(input.expectedReason ? { reason: input.expectedReason } : {}),
+          ...(input.expectedReasonContains
+            ? { reason: expect.stringContaining(input.expectedReasonContains) }
+            : {}),
         }),
       }),
     },
   });
+}
+
+// Companion to `expectPersistedBranchMismatchRejected` for the clean/diverged
+// shape (BLO-32628). The recorded branch is restored rather than adopted, so
+// forward reconciliation stays fail-closed here: the assertions below prove the
+// diverged branch was NOT adopted and its ref still points at the same commit.
+async function expectPersistedBranchMismatchRepaired(input: {
+  repoRoot: string;
+  worktreePath: string;
+  expectedBranch: string;
+  actualBranch: string;
+  issueId: string;
+  executionWorkspaceId: string;
+  expectedAncestryVerdict?: "diverged" | "unknown";
+}) {
+  const actualBranchShaBefore = await readGit(input.repoRoot, [
+    "rev-parse",
+    `refs/heads/${input.actualBranch}`,
+  ]);
+
+  const realized = await ensurePersistedExecutionWorkspaceAvailable({
+    base: {
+      baseCwd: input.repoRoot,
+      source: "project_primary",
+      projectId: "project-1",
+      workspaceId: "workspace-1",
+      repoUrl: null,
+      repoRef: "HEAD",
+    },
+    workspace: {
+      id: input.executionWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      cwd: input.worktreePath,
+      providerRef: input.worktreePath,
+      projectId: "project-1",
+      projectWorkspaceId: "workspace-1",
+      repoUrl: null,
+      baseRef: "HEAD",
+      branchName: input.expectedBranch,
+    },
+    issue: {
+      id: input.issueId,
+      identifier: "PAP-459",
+      title: "Restore the recorded branch over a diverged sibling",
+    },
+    agent: {
+      id: "agent-1",
+      name: "Codex Coder",
+      companyId: "company-1",
+    },
+    enableWorkspaceBranchReconcileForward: true,
+  });
+
+  // The recorded branch is restored, not replaced by the diverged branch.
+  expect(realized?.branchName).toBe(input.expectedBranch);
+  await expect(readGit(input.worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+    .resolves.toBe(input.expectedBranch);
+
+  // The no-loss guarantee: the diverged commits are still reachable.
+  await expect(readGit(input.repoRoot, ["rev-parse", `refs/heads/${input.actualBranch}`]))
+    .resolves.toBe(actualBranchShaBefore);
+
+  expect(realized?.warnings.join("\n")).toContain(input.actualBranch);
+  return { realized, actualBranchShaBefore };
+}
+
+// BLO-32628: the ordinary stacked-work shape — a clean worktree on a named
+// sibling branch that has genuinely diverged from the recorded branch. The
+// divergence is real git history rather than a stubbed ancestry verdict, so the
+// eligibility path under test runs the same `merge-base` checks production does;
+// stubbing the verdict would let these pass while the real check still refused.
+async function createCleanDivergedSiblingRepo(input: {
+  expectedBranch: string;
+  actualBranch: string;
+  // Leave the recorded branch checked out in the main worktree, so the
+  // held-elsewhere fact is true alongside whatever else the test is exercising.
+  holdRecordedBranchInMainWorktree?: boolean;
+}) {
+  const repoRoot = await createTempRepo();
+  const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", input.expectedBranch);
+
+  await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+  await runGit(repoRoot, ["branch", input.expectedBranch]);
+  await runGit(repoRoot, ["worktree", "add", "-b", input.actualBranch, worktreePath, "HEAD"]);
+
+  await runGit(repoRoot, ["checkout", input.expectedBranch]);
+  await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
+  await runGit(repoRoot, ["add", "recorded.txt"]);
+  await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+  if (input.holdRecordedBranchInMainWorktree !== true) {
+    await runGit(repoRoot, ["checkout", "main"]);
+  }
+
+  await fs.writeFile(path.join(worktreePath, "actual.txt"), "actual branch work\n", "utf8");
+  await runGit(worktreePath, ["add", "actual.txt"]);
+  await runGit(worktreePath, ["commit", "-m", "Add actual branch work"]);
+
+  await expect(execFileAsync(
+    "git",
+    ["merge-base", "--is-ancestor", input.expectedBranch, input.actualBranch],
+    { cwd: repoRoot },
+  )).rejects.toMatchObject({ code: 1 });
+  await expect(execFileAsync(
+    "git",
+    ["merge-base", "--is-ancestor", input.actualBranch, input.expectedBranch],
+    { cwd: repoRoot },
+  )).rejects.toMatchObject({ code: 1 });
+
+  return { repoRoot, worktreePath };
+}
+
+type ClaimantRow = { id: string; identifier: string | null; status: string };
+
+interface ClaimantQueryChain {
+  from: () => ClaimantQueryChain;
+  where: () => ClaimantQueryChain;
+  orderBy: () => ClaimantQueryChain;
+  limit: (count: number) => Promise<ClaimantRow[]>;
+  then: (
+    resolve: (rows: { companyId: string | null }[]) => unknown,
+    reject?: (error: unknown) => unknown,
+  ) => Promise<unknown>;
+}
+
+// Drizzle-shaped stub for the claimant lookup in
+// `inspectGitWorktreeBranchIncoherence`. Only the database is faked; the git
+// state in every caller below is real. A rejecting lookup cannot be produced
+// against a live Postgres without breaking every other query in the path, and
+// the fail-closed posture is precisely what needs proving.
+//
+// The claimant query is the only one that calls `.limit()`; `readIssueCompanyId`
+// awaits the builder directly, so `then` resolves empty and branch contention
+// short-circuits to null. That keeps the claimant lookup the only database fact
+// these tests depend on.
+//
+// `limit` honours its argument rather than returning the whole fixture. Postgres
+// would, and a stub that ignores it makes the production limit unobservable:
+// the saturation assertion below then passes whether or not the query reads the
+// extra row it needs to tell "exactly N" from "at least N".
+function createClaimantLookupDb(
+  outcome: { kind: "reject" } | { kind: "rows"; rows: ClaimantRow[] },
+): Db {
+  const chain: ClaimantQueryChain = {
+    from: () => chain,
+    where: () => chain,
+    orderBy: () => chain,
+    limit: (count: number) => (outcome.kind === "reject"
+      ? Promise.reject(new Error("claimant lookup unavailable"))
+      : Promise.resolve(outcome.rows.slice(0, count))),
+    then: (resolve, reject) => Promise.resolve([]).then(resolve, reject),
+  };
+  return { select: () => chain } as unknown as Db;
+}
+
+function claimantRow(identifier: string): ClaimantRow {
+  return { id: randomUUID(), identifier, status: "in_progress" };
+}
+
+// Drives the real eligibility computation and returns the thrown validation
+// failure, whose `resultJson.workspaceValidation` is the evidence payload the
+// stranded row would carry.
+async function captureBranchCoherenceRefusal(input: {
+  db: Db | null;
+  repoRoot: string;
+  worktreePath: string;
+  expectedBranch: string;
+}) {
+  let error: unknown = null;
+  try {
+    await ensureGitWorktreeBranchCoherent({
+      db: input.db,
+      repoRoot: input.repoRoot,
+      worktreePath: input.worktreePath,
+      expectedBranchName: input.expectedBranch,
+      sourceIssue: {
+        id: "issue-branch-coherence",
+        identifier: "PAP-462",
+        title: "Refuse an unprovable safe repair",
+      },
+      executionWorkspaceId: "execution-workspace-branch-coherence",
+      enableWorkspaceBranchReconcileForward: true,
+    });
+  } catch (err) {
+    error = err;
+  }
+  return error;
 }
 
 async function createClonedRepoWithRemote() {
@@ -2826,7 +3021,7 @@ describe("realizeExecutionWorkspace", () => {
       .resolves.toBe("allyblockcast[bot]");
   }, 15_000);
 
-  it("classifies persisted git worktree branch incoherence as diverged when the checked-out branch is not forward", async () => {
+  it("restores the recorded branch when a clean worktree sits on a diverged named sibling branch", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-457-recorded-work";
     const actualBranch = "PAP-457-sibling-work";
@@ -2840,10 +3035,115 @@ describe("realizeExecutionWorkspace", () => {
     await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
     await runGit(repoRoot, ["add", "recorded.txt"]);
     await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+    // Release the recorded branch from the main checkout: git refuses to check
+    // out a branch held by another worktree, and in production the main
+    // checkout sits on master while the task branch lives in the worktree.
+    await runGit(repoRoot, ["checkout", "main"]);
 
     await fs.writeFile(path.join(worktreePath, "actual.txt"), "actual branch work\n", "utf8");
     await runGit(worktreePath, ["add", "actual.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Add actual branch work"]);
+
+    // Guard the fixture: the divergence must be genuine, not an artefact of a
+    // stubbed ancestry verdict. Neither branch may contain the other.
+    await expect(execFileAsync("git", ["merge-base", "--is-ancestor", expectedBranch, actualBranch], { cwd: repoRoot }))
+      .rejects.toMatchObject({ code: 1 });
+    await expect(execFileAsync("git", ["merge-base", "--is-ancestor", actualBranch, expectedBranch], { cwd: repoRoot }))
+      .rejects.toMatchObject({ code: 1 });
+
+    // Read the sibling tip BEFORE the repair. The no-loss guarantee is that this
+    // exact commit still resolves afterwards, so it has to be captured here —
+    // comparing the ref to itself after the fact would assert nothing.
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
+
+    const { realized } = await expectPersistedBranchMismatchRepaired({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      issueId: "issue-diverged",
+      executionWorkspaceId: "execution-workspace-diverged",
+    });
+
+    // The sibling's commit is still on its own branch, and the file it added is
+    // gone from the restored worktree — proof the checkout really moved HEAD.
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+    await expect(readGit(repoRoot, ["log", "-1", "--format=%s", actualBranch]))
+      .resolves.toBe("Add actual branch work");
+    expect(existsSync(path.join(worktreePath, "actual.txt"))).toBe(false);
+    expect(existsSync(path.join(worktreePath, "recorded.txt"))).toBe(true);
+    expect(realized?.warnings.join("\n")).toContain("can be checked out again");
+  }, 15_000);
+
+  it("keeps a diverged worktree ineligible when the recorded branch is checked out in another worktree", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-457-held-recorded";
+    const actualBranch = "PAP-457-held-sibling";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, "HEAD"]);
+
+    // The main checkout keeps the recorded branch, so `git checkout` inside the
+    // linked worktree cannot succeed. Eligibility must say so up front rather
+    // than promising a repair that git will refuse.
+    await runGit(repoRoot, ["checkout", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
+    await runGit(repoRoot, ["add", "recorded.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+
+    await fs.writeFile(path.join(worktreePath, "actual.txt"), "actual branch work\n", "utf8");
+    await runGit(worktreePath, ["add", "actual.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add actual branch work"]);
+
+    await expectPersistedBranchMismatchRejected({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      issueId: "issue-held-elsewhere",
+      executionWorkspaceId: "execution-workspace-held-elsewhere",
+      expectedAncestryVerdict: "diverged",
+      // Name this refusal specifically. Asserting only `eligible: false` would
+      // also hold for the pre-fix "expected branch and current HEAD differ"
+      // fall-through, so the assertion would not distinguish this guard from
+      // the gap it was added to close.
+      expectedReasonContains: "recorded branch is already checked out in another worktree at ",
+    });
+
+    // Nothing moved: both worktrees keep the branch they had.
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+    await expect(readGit(repoRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(expectedBranch);
+  }, 15_000);
+
+  it("keeps a clean detached worktree HEAD ineligible when it diverged from the recorded branch", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-457-detached-recorded";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "--detach", worktreePath, "HEAD"]);
+
+    // Move the recorded branch forward so the detached HEAD is not an ancestor.
+    await runGit(repoRoot, ["checkout", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
+    await runGit(repoRoot, ["add", "recorded.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+    // Release the recorded branch so the git-level "already checked out
+    // elsewhere" refusal cannot fire: the detached-HEAD refusal must be the only
+    // thing keeping this ineligible, or the test proves nothing about ancestry.
+    await runGit(repoRoot, ["checkout", "main"]);
+
+    // Commit on the detached HEAD: no ref keeps these commits reachable, which
+    // is exactly why ancestry stays load-bearing for this shape.
+    await fs.writeFile(path.join(worktreePath, "detached.txt"), "detached work\n", "utf8");
+    await runGit(worktreePath, ["add", "detached.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add detached work"]);
 
     let error: unknown = null;
     try {
@@ -2857,7 +3157,7 @@ describe("realizeExecutionWorkspace", () => {
           repoRef: "HEAD",
         },
         workspace: {
-          id: "execution-workspace-diverged",
+          id: "execution-workspace-detached-diverged",
           mode: "isolated_workspace",
           strategyType: "git_worktree",
           cwd: worktreePath,
@@ -2869,9 +3169,9 @@ describe("realizeExecutionWorkspace", () => {
           branchName: expectedBranch,
         },
         issue: {
-          id: "issue-diverged",
+          id: "issue-detached-diverged",
           identifier: "PAP-457",
-          title: "Classify diverged branch incoherence",
+          title: "Keep detached diverged HEAD fail-closed",
         },
         agent: {
           id: "agent-1",
@@ -2889,23 +3189,258 @@ describe("realizeExecutionWorkspace", () => {
       resultJson: {
         workspaceValidation: expect.objectContaining({
           reason: "git_worktree_branch_incoherence",
-          sourceIssueId: "issue-diverged",
-          sourceIdentifier: "PAP-457",
-          executionWorkspaceId: "execution-workspace-diverged",
-          expectedBranch,
-          actualBranch,
+          actualBranch: null,
           cleanliness: "clean",
           provenance: expect.objectContaining({
             expectedBranchExists: true,
-            actualBranchExists: true,
-            sameHead: false,
+            actualBranchExists: null,
             ancestryVerdict: "diverged",
-            plainLanguageReason: expect.stringContaining("cannot prove a forward-only reconciliation"),
+          }),
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            attempted: false,
+            succeeded: false,
+            reason: "detached worktree HEAD is not provably forward of the recorded branch",
           }),
         }),
       },
     });
   }, 15_000);
+
+  it("keeps a dirty worktree on a diverged named sibling branch ineligible for safe repair", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-457-dirty-recorded";
+    const actualBranch = "PAP-457-dirty-sibling";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, "HEAD"]);
+
+    await runGit(repoRoot, ["checkout", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
+    await runGit(repoRoot, ["add", "recorded.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+    // Release the recorded branch so the git-level "already checked out
+    // elsewhere" refusal cannot fire. Without this the worktree would be
+    // ineligible for two independent reasons and the test could not show that
+    // the cleanliness guard is the one doing the work.
+    await runGit(repoRoot, ["checkout", "main"]);
+
+    await fs.writeFile(path.join(worktreePath, "actual.txt"), "actual branch work\n", "utf8");
+    await runGit(worktreePath, ["add", "actual.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add actual branch work"]);
+
+    // Uncommitted work is the one thing a checkout could destroy.
+    await fs.writeFile(path.join(worktreePath, "uncommitted.txt"), "not safe to switch\n", "utf8");
+
+    await expectPersistedBranchMismatchRejected({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      issueId: "issue-dirty-diverged",
+      executionWorkspaceId: "execution-workspace-dirty-diverged",
+      expectedAncestryVerdict: "diverged",
+      expectedReason: "worktree is not clean",
+    });
+
+    // The dirty file survives the refusal.
+    expect(existsSync(path.join(worktreePath, "uncommitted.txt"))).toBe(true);
+  }, 15_000);
+
+  // BLO-32628: `git bisect start` is the one interrupted operation that reads
+  // clean AND stays on a named branch, so neither `cleanliness` nor
+  // `actualBranchExists` screens it out — every conjunct of the new eligibility
+  // branch holds. The checkout would succeed and orphan nothing, so this is not
+  // a no-loss problem; it would leave live bisect state pointing at a branch the
+  // worktree is no longer on, for the next run to inherit silently.
+  it("keeps a clean diverged worktree ineligible while a git bisect is in progress", async () => {
+    const expectedBranch = "PAP-463-bisect-recorded";
+    const actualBranch = "PAP-463-bisect-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+
+    // Start a bisect and mark nothing, which is the state that reads clean.
+    await runGit(worktreePath, ["bisect", "start"]);
+
+    // Guard the fixture: without all three of these the test would be proving
+    // something other than the conjunct it was added for.
+    expect(existsSync(path.join(repoRoot, ".git", "worktrees", expectedBranch, "BISECT_LOG")))
+      .toBe(true);
+    await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"]))
+      .resolves.toBe("");
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+
+    await expectPersistedBranchMismatchRejected({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      issueId: "issue-bisect-diverged",
+      executionWorkspaceId: "execution-workspace-bisect-diverged",
+      expectedAncestryVerdict: "diverged",
+      expectedReason: "a git bisect is in progress in this worktree",
+    });
+
+    // The worktree keeps both its branch and its bisect state.
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+    expect(existsSync(path.join(repoRoot, ".git", "worktrees", expectedBranch, "BISECT_LOG")))
+      .toBe(true);
+  }, 20_000);
+
+  // BLO-32628: the claimant lookup used to swallow query errors and return `[]`,
+  // so `workspaceIsContended` computed `(0 > 1) === false` and the contention
+  // conjunct PASSED — a database error enabled exactly the repair the guard
+  // exists to prevent. `cleanliness` forty lines up resolves to "unknown" when
+  // `git status` fails and then refuses; this now takes the same posture.
+  it("refuses safe repair on a clean diverged worktree when the claimant lookup fails", async () => {
+    const expectedBranch = "PAP-464-lookup-recorded";
+    const actualBranch = "PAP-464-lookup-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb({ kind: "reject" }),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "clean",
+          workspaceClaimantLookup: "failed",
+          workspaceClaimants: null,
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            attempted: false,
+            succeeded: false,
+            reason: "execution workspace claimant lookup failed, so contention could not be ruled out",
+          }),
+        }),
+      },
+    });
+    // Nothing moved, so the refusal is a refusal and not a failed attempt.
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+
+    // The control that makes the assertion load-bearing: the SAME git state with
+    // a lookup that answers instead of failing repairs successfully. So the
+    // lookup outcome is the only thing refusing above — not the git state.
+    await expect(captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb({ kind: "rows", rows: [claimantRow("PAP-464")] }),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    })).resolves.toBeNull();
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(expectedBranch);
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+  }, 20_000);
+
+  // BLO-32628: the claimant query takes one row past its sample limit so a
+  // saturated result reads as "at least N" rather than rendering the cap as an
+  // exact count. A refusal message that looks precise and is wrong at scale is
+  // the same diagnosability defect as omitting the fact altogether.
+  it("reports a saturated claimant sample as a lower bound rather than an exact count", async () => {
+    const expectedBranch = "PAP-465-saturated-recorded";
+    const actualBranch = "PAP-465-saturated-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb({
+        kind: "rows",
+        // One more than the sample limit, which is what the extra selected row
+        // detects. Twelve would read identically, and that is the point.
+        rows: Array.from({ length: 11 }, (_unused, index) => claimantRow(`PAP-5${index}`)),
+      }),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          workspaceClaimantLookup: "ok",
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            reason: expect.stringContaining("claimed by at least 10 non-terminal issues"),
+          }),
+        }),
+      },
+    });
+    // The sample is capped even though the query read one row past the cap.
+    const validation = (error as { resultJson: { workspaceValidation: { workspaceClaimants: unknown[] } } })
+      .resultJson.workspaceValidation;
+    expect(validation.workspaceClaimants).toHaveLength(10);
+  }, 20_000);
+
+  // BLO-32628 / AC 4: eligibility checks several independent facts but only the
+  // first failing one reaches `safeRepair.reason`. Here contention and
+  // held-elsewhere are BOTH true and contention wins, so before
+  // `expectedBranchWorktreePath` was recorded unconditionally the held-elsewhere
+  // fact was absent from the payload entirely and that combination was not
+  // diagnosable from the evidence alone.
+  it("records the worktree holding the recorded branch even when contention refuses first", async () => {
+    const expectedBranch = "PAP-466-both-recorded";
+    const actualBranch = "PAP-466-both-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+      holdRecordedBranchInMainWorktree: true,
+    });
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb({
+        kind: "rows",
+        rows: [claimantRow("PAP-466"), claimantRow("PAP-467")],
+      }),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          // Contention wins the ordering...
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            reason: expect.stringContaining("claimed by 2 non-terminal issues"),
+          }),
+          // ...and the losing precondition is still on the payload.
+          expectedBranchWorktreePath: expect.any(String),
+        }),
+      },
+    });
+
+    // The recorded path really is the main checkout holding the branch. Compare
+    // through realpath: the payload keeps git's own path and the fixture root
+    // can reach the same directory through a symlinked temp dir.
+    const heldPath = (error as {
+      resultJson: { workspaceValidation: { expectedBranchWorktreePath: string } };
+    }).resultJson.workspaceValidation.expectedBranchWorktreePath;
+    expect(await fs.realpath(heldPath)).toBe(await fs.realpath(repoRoot));
+  }, 20_000);
 
   it("classifies persisted git worktree branch incoherence as unknown when the recorded branch was deleted", async () => {
     const repoRoot = await createTempRepo();
@@ -2987,7 +3522,7 @@ describe("realizeExecutionWorkspace", () => {
     });
   }, 15_000);
 
-  it("keeps forward reconciliation fail-closed for same-content rewritten history", async () => {
+  it("restores the recorded branch instead of adopting same-content rewritten history", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-459-recorded-content";
     const actualBranch = "PAP-459-rewritten-content";
@@ -3005,19 +3540,17 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(worktreePath, ["add", "same-content.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Add content on rewritten branch"]);
 
-    await expectPersistedBranchMismatchRejected({
+    await expectPersistedBranchMismatchRepaired({
       repoRoot,
       worktreePath,
       expectedBranch,
       actualBranch,
       issueId: "issue-rewritten-history",
       executionWorkspaceId: "execution-workspace-rewritten-history",
-      expectedAncestryVerdict: "diverged",
-      expectedReason: "expected branch and current HEAD differ",
     });
   }, 15_000);
 
-  it("keeps forward reconciliation fail-closed for an unrelated task branch", async () => {
+  it("restores the recorded branch instead of adopting an unrelated task branch", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-459-recorded-task";
     const actualBranch = "PAP-999-unrelated-task";
@@ -3035,19 +3568,17 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(worktreePath, ["add", "unrelated-task.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Add unrelated task work"]);
 
-    await expectPersistedBranchMismatchRejected({
+    await expectPersistedBranchMismatchRepaired({
       repoRoot,
       worktreePath,
       expectedBranch,
       actualBranch,
       issueId: "issue-unrelated-task",
       executionWorkspaceId: "execution-workspace-unrelated-task",
-      expectedAncestryVerdict: "diverged",
-      expectedReason: "expected branch and current HEAD differ",
     });
   }, 15_000);
 
-  it("keeps forward reconciliation fail-closed when the live branch is behind the recorded branch", async () => {
+  it("restores the recorded branch instead of adopting a live branch that is behind it", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-459-recorded-ahead";
     const actualBranch = "PAP-459-live-behind";
@@ -3061,16 +3592,15 @@ describe("realizeExecutionWorkspace", () => {
     await fs.writeFile(path.join(repoRoot, "recorded-ahead.txt"), "recorded branch moved ahead\n", "utf8");
     await runGit(repoRoot, ["add", "recorded-ahead.txt"]);
     await runGit(repoRoot, ["commit", "-m", "Move recorded branch ahead"]);
+    await runGit(repoRoot, ["checkout", "main"]);
 
-    await expectPersistedBranchMismatchRejected({
+    await expectPersistedBranchMismatchRepaired({
       repoRoot,
       worktreePath,
       expectedBranch,
       actualBranch,
       issueId: "issue-live-behind",
       executionWorkspaceId: "execution-workspace-live-behind",
-      expectedAncestryVerdict: "diverged",
-      expectedReason: "expected branch and current HEAD differ",
     });
   }, 15_000);
 
@@ -6946,6 +7476,108 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
     await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.not.toBe("");
   }, 20_000);
+
+  // BLO-32628: isolates the claimant-contention guard. Every other contended
+  // fixture in the repo — the dirty-quarantine ones above and the
+  // branch-containment suite — ALSO leaves the recorded branch checked out in
+  // the main worktree, so the git-level refusal fires there too and neither can
+  // prove this guard bites. Here the recorded branch is free and the tree is
+  // clean, so contention is the only thing left that can refuse; dropping the
+  // second claimant must flip the very same git state to a successful repair.
+  it("refuses safe repair on a clean diverged worktree that two non-terminal issues claim", async () => {
+    const expectedBranch = "PAP-460-contended-recorded";
+    const actualBranch = "PAP-460-contended-sibling";
+    const repoRoot = await createTempRepo();
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, "HEAD"]);
+
+    await runGit(repoRoot, ["checkout", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
+    await runGit(repoRoot, ["add", "recorded.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+    // Release the recorded branch: this is what makes the test load-bearing.
+    await runGit(repoRoot, ["checkout", "main"]);
+
+    await fs.writeFile(path.join(worktreePath, "actual.txt"), "actual branch work\n", "utf8");
+    await runGit(worktreePath, ["add", "actual.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add actual branch work"]);
+
+    // Captured before either attempt: the no-loss guarantee is about this exact
+    // commit surviving, so it must be read while the sibling is still the tip.
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
+
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-460",
+      claimant: "none",
+    });
+
+    const siblingIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: siblingIssueId,
+      companyId: ids.companyId,
+      projectId: ids.projectId,
+      projectWorkspaceId: ids.projectWorkspaceId,
+      title: "Same-workspace sibling",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: ids.agentId,
+      identifier: "PAP-461",
+      executionWorkspaceId: ids.sourceWorkspaceId,
+    });
+
+    await expect(restoreDirtyQuarantine({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      ids,
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "clean",
+          provenance: expect.objectContaining({
+            ancestryVerdict: "diverged",
+            actualBranchExists: true,
+          }),
+          workspaceClaimants: expect.arrayContaining([
+            expect.objectContaining({ issueIdentifier: "PAP-460", status: "in_progress" }),
+            expect.objectContaining({ issueIdentifier: "PAP-461", status: "in_progress" }),
+          ]),
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            attempted: false,
+            succeeded: false,
+            reason: expect.stringContaining("execution workspace is claimed by 2 non-terminal issues"),
+          }),
+        }),
+      },
+    });
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+
+    // Same git state, one claimant: the repair runs and restores the branch.
+    await db.delete(issues).where(eq(issues.id, siblingIssueId));
+    const realized = await restoreDirtyQuarantine({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      ids,
+    });
+    expect(realized?.branchName).toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(expectedBranch);
+    // The sibling ref still resolves to the commit captured before the repair.
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+  }, 30_000);
 });
 
 describeEmbeddedPostgres("workspace runtime service control persistence", () => {

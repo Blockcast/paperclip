@@ -10,7 +10,7 @@ import {
   workspaceOverviewQuerySchema,
   workspaceRuntimeControlTargetSchema,
 } from "@paperclipai/shared";
-import type { WorkspaceRuntimeDesiredState, WorkspaceRuntimeServiceStateMap } from "@paperclipai/shared";
+import type { ExecutionWorkspace, ExecutionWorkspaceSummary, WorkspaceRuntimeDesiredState, WorkspaceRuntimeServiceStateMap } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { accessService, executionWorkspaceService, heartbeatService, logActivity, workspaceOperationService } from "../services/index.js";
 import { mergeExecutionWorkspaceConfig, readExecutionWorkspaceConfig } from "../services/execution-workspaces.js";
@@ -32,6 +32,14 @@ import {
   collectExecutionWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import { assertCanManageExecutionWorkspaceRuntimeServices } from "./workspace-runtime-service-authz.js";
+import {
+  publicExecutionWorkspace,
+  publicExecutionWorkspaces,
+  publicRuntimeServices,
+  publicWorkspaceOperation,
+  publicWorkspaceOperations,
+  resolveWorkspaceRuntimeViewer,
+} from "./workspace-response.js";
 import { appendWithCap } from "../adapters/utils.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -86,7 +94,13 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     const workspaces = req.query.summary === "true"
       ? await svc.listSummaries(companyId, filters)
       : await svc.list(companyId, filters);
-    res.json(workspaces);
+    if (req.query.summary === "true") {
+      // Summaries carry no config/metadata at all — no withholding boundary to apply.
+      res.json(workspaces as ExecutionWorkspaceSummary[]);
+      return;
+    }
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, companyId);
+    res.json(publicExecutionWorkspaces(workspaces as ExecutionWorkspace[], viewer));
   });
 
   router.get("/companies/:companyId/workspace-overview", async (req, res) => {
@@ -112,7 +126,8 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     const workspace = await getAccessibleResource(req, res, svc.getById(id), "Execution workspace not found");
     if (!workspace) return;
     if (!(await assertExecutionWorkspaceReadAllowed(req, res, workspace.companyId))) return;
-    res.json(workspace);
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, workspace.companyId);
+    res.json(publicExecutionWorkspace(workspace, viewer));
   });
 
   router.get("/execution-workspaces/:id/close-readiness", async (req, res) => {
@@ -125,7 +140,8 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       res.status(404).json({ error: "Execution workspace not found" });
       return;
     }
-    res.json(readiness);
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, workspace.companyId);
+    res.json({ ...readiness, runtimeServices: publicRuntimeServices(readiness.runtimeServices, viewer) });
   });
 
   router.get("/execution-workspaces/:id/workspace-operations", async (req, res) => {
@@ -134,7 +150,8 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     if (!workspace) return;
     if (!(await assertExecutionWorkspaceReadAllowed(req, res, workspace.companyId))) return;
     const operations = await workspaceOperationsSvc.listForExecutionWorkspace(id);
-    res.json(operations);
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, workspace.companyId);
+    res.json(publicWorkspaceOperations(operations, viewer));
   });
 
   async function handleExecutionWorkspaceRuntimeCommand(req: Request, res: Response) {
@@ -472,9 +489,14 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       },
     });
 
+    // One viewer for both keys of this literal: `operation.command`/`.cwd` are recorded from the
+    // selected workspace command and `existing.cwd` above, so they are a verbatim copy of what
+    // `publicExecutionWorkspace` withholds on the sibling key. Masking one and not the other is the
+    // same exit, not a scope boundary (BLO-33568, CTO Ruling F on BLO-33407).
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, existing.companyId);
     res.json({
-      workspace,
-      operation,
+      workspace: publicExecutionWorkspace(workspace, viewer),
+      operation: publicWorkspaceOperation(operation, viewer),
     });
   }
 
@@ -567,7 +589,13 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         ));
     }
 
-    res.json(result);
+    res.json({
+      ...result,
+      workspace: publicExecutionWorkspace(
+        result.workspace,
+        await resolveWorkspaceRuntimeViewer(access, req, existing.companyId),
+      ),
+    });
   });
 
   router.patch("/execution-workspaces/:id", validate(updateExecutionWorkspaceSchema), async (req, res) => {
@@ -746,7 +774,12 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         ...(cleanupWarnings.length > 0 ? { cleanupWarnings } : {}),
       },
     });
-    res.json(workspace);
+    res.json(
+      publicExecutionWorkspace(
+        workspace,
+        await resolveWorkspaceRuntimeViewer(access, req, existing.companyId),
+      ),
+    );
   });
 
   return router;

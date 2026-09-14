@@ -9,8 +9,6 @@ import {
   activityLog,
   companies,
   createDb,
-  environmentLeases,
-  environments,
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
@@ -25,6 +23,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateCompanyScopedTestState } from "./helpers/truncate-company-scoped-test-state.js";
 import { errorHandler } from "../middleware/index.js";
 import { logger } from "../middleware/logger.js";
 import { issueRoutes } from "../routes/issues.js";
@@ -424,19 +423,21 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // Defensive: a test that arms the seam but never reaches it must not leak
     // the hook into the next test.
     pauseHoldSeam.onNextCheck = null;
-    await db.delete(issueRecoveryActions);
-    await db.delete(issueComments);
-    await db.delete(issueWorkProducts);
-    await db.delete(environmentLeases);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(environments);
-    await db.delete(routineRuns);
-    await db.delete(routines);
-    await db.delete(issues);
-    await db.delete(agents);
-    await db.delete(companies);
+    // BLO-33498: the hand-ordered DELETE list was correctly ordered (comments nine
+    // statements before issues) and still failed, because ordering only helps while
+    // nothing else is writing. `request(app)` resolves when the response is flushed,
+    // not when the handler has settled, so a best-effort trailing write can still be
+    // in flight when `afterEach` starts; landing between the child and parent delete
+    // it broke `issue_comments_issue_id_issues_id_fk`. Ordering was never the bug.
+    //
+    // This is the shared helper, not a local TRUNCATE, and the difference is
+    // load-bearing: a bare `TRUNCATE ... CASCADE` takes ACCESS EXCLUSIVE on the whole
+    // cascade and deadlocks (40P01) against those same stragglers — a hand-rolled one
+    // here failed 2/189 in a single run. The helper wraps it in a transaction-scoped
+    // advisory lock plus transient-deadlock retry (the "v513 saga"). `environments`
+    // declares no FK to `companies`, so the cascade cannot reach it and it has to be
+    // named as a second root.
+    await truncateCompanyScopedTestState(db, { extraTruncateTables: ["environments"] });
   });
 
   afterAll(async () => {
@@ -2220,6 +2221,81 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  // BLO-28931. The candidate loop had no per-issue error boundary, so any throw from
+  // one issue's reconcile body propagated out of the entire sweep. Candidates are
+  // ordered (companyId, assigneeAgentId, createdAt, id), which made the
+  // surviving-vs-dropped split deterministic rather than random: every candidate after
+  // the first thrower was silently left unreconciled, on every tick, for as long as
+  // that issue kept throwing. The counters could not show it either -- unreached
+  // candidates are simply absent from `issueIds` rather than counted as skipped or
+  // failed, so a truncated sweep was indistinguishable from a clean one.
+  it("continues reconciling later candidates when one issue's reconcile body throws", async () => {
+    const { companyId, coderId, sourceIssueId, prefix } = await seedCompany();
+    const laterIssueIds = [randomUUID(), randomUUID()];
+    await db
+      .update(issues)
+      .set({ createdAt: new Date("2026-07-26T10:00:00.000Z") })
+      .where(eq(issues.id, sourceIssueId));
+    await db.insert(issues).values(
+      laterIssueIds.map((id, index) => ({
+        id,
+        companyId,
+        title: `Later stranded candidate ${index + 1}`,
+        status: "in_progress" as const,
+        priority: "medium" as const,
+        assigneeAgentId: coderId,
+        issueNumber: index + 2,
+        identifier: `${prefix}-${index + 2}`,
+        createdAt: new Date(`2026-07-26T1${index + 1}:00:00.000Z`),
+      })),
+    );
+    for (const issueId of [sourceIssueId, ...laterIssueIds]) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "External lifecycle Job is missing while heartbeat run is still running",
+        errorCode: "job_missing",
+        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
+        contextSnapshot: { issueId },
+        startedAt: new Date("2026-07-26T13:45:00.000Z"),
+        finishedAt: new Date("2026-07-26T13:52:00.000Z"),
+      });
+    }
+    // Throw on the first wake only. Keyed on call order rather than on a named
+    // internal call site, so this asserts the loop boundary itself and does not pin
+    // the escalation path's current internals. Candidate ordering guarantees the
+    // first call belongs to the first candidate.
+    const enqueueWakeup = vi.fn(async () => {
+      if (enqueueWakeup.mock.calls.length === 1) {
+        throw new Error("synthetic non-409 failure raised by the first candidate");
+      }
+      return null;
+    });
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.reconcileErrors).toBe(1);
+    expect(result.escalated).toBe(2);
+    expect(result.issueIds).toEqual(expect.arrayContaining(laterIssueIds));
+    expect(result.issueIds).not.toContain(sourceIssueId);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(3);
+    // The boundary sits outside every transaction on this path -- no `db.transaction`
+    // appears lexically in the loop body, and the escalation's own transaction has
+    // already committed by the time the wake is enqueued. So all three candidates hold
+    // a committed recovery action and catching here converted nothing atomic into a
+    // partial commit. The thrower's action-committed-but-wake-not-enqueued state is
+    // pre-existing sequencing in that path, unchanged by the error boundary; it is
+    // asserted here so a future move of the wake inside the transaction is caught.
+    const actions = await db.select().from(issueRecoveryActions);
+    expect(actions.map((action) => action.sourceIssueId).sort()).toEqual(
+      [sourceIssueId, ...laterIssueIds].sort(),
+    );
+  });
+
   // PEN-2791. The sweep counted five attendance paths -- live run, deferred execution
   // wake, pending wake interaction, active monitor, unresolved blocker -- and none of
   // them was an external event wake. That put two platform controls in contradiction:
@@ -3215,7 +3291,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // improvement, and pinning equality would assert this mock's drain policy instead.
     expect(rounds).toBeLessThanOrEqual(Math.ceil((BURST - MAX_CONCURRENT) / MAX_CONCURRENT));
     expect(rounds).toBeGreaterThan(1); // a burst this size cannot drain in one pass
-  });
+    // BLO-33498: this test needs a per-test budget, and the default 60s is not it.
+    // It performs 117 real escalations (25 in the burst + 92 draining it over 8
+    // rounds), each a multi-statement transaction against embedded Postgres, measured
+    // at ~0.92s each / ~110s total on an IDLE local box. There is no artificial delay
+    // to remove — the cost is intrinsic to the load shape AC4 asks for, so no fix to
+    // the recovery service could have brought it under 60s. Budget is set for the
+    // contended ARC pool, which vitest.config.ts records as ~3-4x slower on
+    // embedded-postgres work. Vitest honours a per-test timeout over the global.
+  }, 600_000);
 
   it("stamps configured bounds when creating a wake-owner recovery action", async () => {
     const previousMaxAttempts = process.env.RECOVERY_ACTION_MAX_ATTEMPTS;

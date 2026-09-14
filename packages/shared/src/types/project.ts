@@ -53,6 +53,12 @@ export interface ProjectWorkspace {
   sharedWorkspaceKey: string | null;
   metadata: Record<string, unknown> | null;
   runtimeConfig: ProjectWorkspaceRuntimeConfig | null;
+  /**
+   * Whether this workspace carries its own `workspaceRuntime` block, independent of whether the
+   * reader is entitled to see its contents. See `ExecutionWorkspace.hasWorkspaceRuntimeConfig` —
+   * same contract, same reason (PEN-2852).
+   */
+  hasWorkspaceRuntimeConfig: boolean;
   isPrimary: boolean;
   runtimeServices?: WorkspaceRuntimeService[];
   createdAt: Date;
