@@ -2,12 +2,13 @@ import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import type { ExecutionWorkspace, ProjectWorkspace } from "@paperclipai/shared";
+import type { AgentEnvConfig, ExecutionWorkspace, ProjectWorkspace } from "@paperclipai/shared";
 import {
   WITHHELD_WORKSPACE_RUNTIME_VIEWER,
   publicExecutionWorkspace,
   publicProjectWorkspace,
 } from "../routes/workspace-response.js";
+import { PROJECT_ENV_VALUE_MASK, maskProjectEnv } from "../routes/project-env-response.js";
 
 /**
  * PEN-2852 / PEN-2370 ask 3 criterion (b2) — a control that closes a CLASS rather than the nine
@@ -121,9 +122,13 @@ function namesInDestructuringPattern(interior: string): string[] {
 }
 
 /** Locals in `source` bound to a workspace-bearing service call, e.g. `const result = await svc.x()`. */
-export function collectWorkspaceBearingLocals(source: string, receivers: string[] = []): string[] {
+export function collectWorkspaceBearingLocals(
+  source: string,
+  receivers: string[] = [],
+  producerMethods: string[] = WORKSPACE_BEARING_PRODUCERS,
+): string[] {
   const names = new Set<string>();
-  const producers = WORKSPACE_BEARING_PRODUCERS.join("|");
+  const producers = producerMethods.join("|");
   // The initializer is matched loosely — anywhere on the line — so the dominant idiom in these
   // modules, `const existing = await getAccessibleResource(req, res, svc.getById(id), ...)`, is
   // caught too. Loose matching over-collects rather than under-collects: a spurious noun makes CI
@@ -177,9 +182,12 @@ const WORKSPACE_SERVICE_EXPORTS = ["executionWorkspaceService", "projectService"
  * coverage, never excuse it, which is the same safe direction the loose initializer match above
  * takes.
  */
-export function collectWorkspaceServiceReceivers(source: string): string[] {
+export function collectWorkspaceServiceReceivers(
+  source: string,
+  serviceExports: string[] = WORKSPACE_SERVICE_EXPORTS,
+): string[] {
   const localNames = new Set<string>();
-  for (const exported of WORKSPACE_SERVICE_EXPORTS) {
+  for (const exported of serviceExports) {
     // `{ foo }` binds `foo`; `{ foo as bar }` binds `bar`. Both spellings appear in these modules.
     const imported = new RegExp(`\\b${exported}\\b(?:\\s+as\\s+([A-Za-z_$][\\w$]*))?`, "g");
     let match: RegExpExecArray | null;
@@ -291,9 +299,16 @@ const LOCAL_HELPER_DELEGATIONS: Array<{ module: string; wrapper: string; delegat
   },
 ];
 
-/** Extracts the body of `function <name>(` in `source` by brace matching, or null if absent. */
+/**
+ * Extracts the body of `function <name>(` in `source` by brace matching, or null if absent.
+ *
+ * The optional `<…>` span matters: the boundary helpers on the env axis are generic
+ * (`export function publicProject<T extends { … }>(`), and a version that required `(` immediately
+ * after the name returned null for them — which the pins below would have reported as "no such
+ * function" rather than as the delegation check they are.
+ */
 export function extractFunctionBody(source: string, name: string): string | null {
-  const declaration = new RegExp(`\\bfunction\\s+${name}\\s*\\(`).exec(source);
+  const declaration = new RegExp(`\\bfunction\\s+${name}\\s*(?:<[^(]*>)?\\s*\\(`).exec(source);
   if (!declaration) return null;
   const open = source.indexOf("{", declaration.index + declaration[0].length);
   if (open === -1) return null;
@@ -356,12 +371,28 @@ export function collectResponseSites(module: string, source: string): ResponseSi
 }
 
 /**
+ * Removes comments from an expression, so PROSE inside a response argument is not read as code.
+ *
+ * These handlers carry explanatory comments INSIDE the object literal they answer with, and those
+ * comments discuss the very nouns the scans below match on — `issues.ts:8724` sits inside a
+ * `res.json({ … })` argument and reads "these rows are FULL project workspaces". Left in, that
+ * sentence is an occurrence of `project` with no field access after it, i.e. indistinguishable from
+ * a bare hand-over. The env scan reported it as a violation until this ran first.
+ *
+ * Ordered before literal-stripping, and `[^:]` guards the `//` branch so a `https://…` inside a
+ * string is not mistaken for a line comment before that string has been collapsed.
+ */
+export function stripComments(expression: string): string {
+  return expression.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/[^\n]*/g, "$1 ");
+}
+
+/**
  * Removes string and template literals from an expression so the workspace test below matches
  * identifiers rather than prose. Without this, every `res.json({ error: "…workspace not found" })`
  * reads as a violation — the predicate would be satisfied by the error text it was meant to ignore.
  */
 export function stripLiterals(expression: string): string {
-  return expression
+  return stripComments(expression)
     .replace(/`(?:\\.|\$\{[^}]*\}|[^`\\])*`/g, "``")
     .replace(/"(?:\\.|[^"\\])*"/g, '""')
     .replace(/'(?:\\.|[^'\\])*'/g, "''");
@@ -456,6 +487,229 @@ export function findUnwithheldWorkspaceResponses(
     if (!nouns.some((noun) => escapesAsWholeValue(code, noun))) return false;
     if (helpers.some((helper) => code.includes(helper))) return false;
     return !EXEMPT_ARGUMENT_SHAPES.some((exempt) => exempt.pattern.test(site.argument.trim()));
+  });
+}
+
+/* ───────────────────────────── the project `env` axis (PEN-3033, door #17) ─────────────────────
+ *
+ * Everything above closes ONE disclosure axis: workspace runtime config. Door #17 travels on the
+ * same rows under a different field — a project's `env`, where `{ type: "plain", value }` is stored
+ * verbatim (`services/secrets.ts`) and was readable by every actor who passed
+ * `assertProjectReadAllowed`. Patching the four project exits is the "instance" fix; this scan is
+ * the "class" fix, and the two are not the same claim: the workspace scan stays green on a project
+ * response that omits `maskProjectEnv`, because a masked env is not what it looks at.
+ *
+ * Three deliberate differences from the workspace scan above, each one a limitation of that scan
+ * that this axis could not afford to inherit:
+ *
+ *  1. **Per-OCCURRENCE clearing, not per-argument.** Up there, one helper anywhere in the argument
+ *     vouches for every noun in it (see the third bullet of the header docstring). On this axis that
+ *     is not tolerable: `issues.ts:8706` answers with BOTH a project row and an execution workspace,
+ *     so `compactIssueExecutionWorkspace(…)` elsewhere in the same literal would vouch for an
+ *     unmasked `project:` sibling. Here a noun clears only if it sits INSIDE a masking call.
+ *  2. **No `COVERED_ROUTE_MODULES` list.** The workspace scan is file-scoped with a separate check
+ *     to catch a module joining the class; this one simply runs over every route module. A list that
+ *     cannot go stale is strictly better than a list plus a staleness check, and the value-shaped
+ *     classification below is precise enough to afford it — `linear-auth.ts`'s `projects:
+ *     projectMap.size` and `decision-training.ts`'s `projectId: parsed.data.project` are counts and
+ *     query echoes, and both classify clean without an exemption entry.
+ *  3. **An explicit field projection clears.** `{ id, name, status }` cannot carry `env` whatever
+ *     its source row held, so requiring a mask there would be noise. `env:` appearing in such a
+ *     projection with anything but `null` puts it straight back in the row bucket.
+ */
+
+/** Helpers that mask a project `env` (or delegate to something that does). */
+const ENV_WITHHOLDING_HELPERS = [
+  "maskProjectEnv",
+  "maskEnvBindings",
+  // `publicProject`/`publicProjects` do not mask inline — they call `maskProjectEnv` first thing.
+  // That claim is pinned by `ENV_HELPER_DELEGATIONS` below rather than trusted.
+  "publicProject",
+  "publicProjects",
+];
+
+/**
+ * Module-local projections that withhold `env` themselves. Same bargain as
+ * `LOCAL_HELPER_DELEGATIONS`: listing one is a claim, and the claim is checked below.
+ */
+const ENV_LOCAL_WITHHOLDING_HELPERS: Record<string, string[]> = {
+  "issues.ts": ["compactIssueProject"],
+};
+
+/**
+ * The delegation pins for this axis — the other half of the bargain the helper lists make.
+ *
+ * `compactIssueProject` is the interesting one: it withholds by writing `env: null` rather than by
+ * calling a mask, which is a THIRD spelling of this boundary. Nothing in the scan can tell that
+ * apart from an ordinary field projection, so editing that one line to `env: project.env` would
+ * re-open door #17 in the widest issue response with every scan still green. This is what fails
+ * instead.
+ */
+const ENV_BOUNDARY_PINS: Array<{ module: string; wrapper: string; contains: string }> = [
+  { module: "workspace-response.ts", wrapper: "publicProject", contains: "maskProjectEnv(" },
+  { module: "workspace-response.ts", wrapper: "publicProjects", contains: "publicProject(" },
+  { module: "issues.ts", wrapper: "compactIssueProject", contains: "env: null" },
+];
+
+const PROJECT_SERVICE_EXPORTS = ["projectService"];
+
+/**
+ * Producers whose result is a project ROW.
+ *
+ * Enumerated rather than derived from `WORKSPACE_BEARING_PRODUCERS`, and the difference is not
+ * cosmetic: spreading that list in drags `listWorkspaces` / `createWorkspace` / `updateWorkspace`
+ * along, whose results are project WORKSPACE rows. Those carry runtime config — the axis above —
+ * and no `env`, so tracking them here demanded an env mask at five workspace exits that cannot
+ * disclose one. Over-collection is the safe direction for the workspace scan, where a spurious
+ * noun only demands a wrapper; on this axis it is the noise that gets a guard deleted.
+ *
+ * `remove` is here and absent up there for the mirror-image reason: the deleted row it returns has
+ * no `workspaces[]`, so it sits outside `publicProject`'s constraint and outside the workspace axis
+ * entirely — but it still carries `env`, and `projects.ts:721` is exactly that exit.
+ */
+const PROJECT_ROW_PRODUCERS = ["getById", "list", "listByIds", "create", "update", "remove"];
+
+/** Locals in `source` bound to a project-row producer, e.g. `const deletedProjectRow = svc.remove()`. */
+export function collectProjectRowLocals(source: string): string[] {
+  const receivers = collectWorkspaceServiceReceivers(source, PROJECT_SERVICE_EXPORTS);
+  if (receivers.length === 0) return [];
+  return collectWorkspaceBearingLocals(source, receivers, PROJECT_ROW_PRODUCERS);
+}
+
+/**
+ * Replaces every `<helper>( … )` span with a neutral token, so a noun INSIDE a masking call is
+ * cleared and a noun BESIDE one is not. This is the mechanism behind difference (1) above:
+ * `publicProject(project, viewer)` clears `project`, while
+ * `{ a: publicProject(p, v), b: otherProject }` leaves `otherProject` exposed to the scan.
+ */
+export function elideMaskedCalls(code: string, helpers: string[]): string {
+  let out = code;
+  for (const helper of helpers) {
+    const call = new RegExp(`\\b${helper}\\s*\\(`, "g");
+    let match: RegExpExecArray | null;
+    while ((match = call.exec(out)) !== null) {
+      const open = match.index + match[0].length - 1;
+      let depth = 0;
+      let end = -1;
+      for (let i = open; i < out.length; i += 1) {
+        if (out[i] === "(") depth += 1;
+        else if (out[i] === ")") {
+          depth -= 1;
+          if (depth === 0) {
+            end = i;
+            break;
+          }
+        }
+      }
+      if (end === -1) break; // unbalanced — leave the rest of the argument to be scanned as-is
+      out = `${out.slice(0, match.index)}${MASKED_TOKEN}${out.slice(end + 1)}`;
+      call.lastIndex = 0;
+    }
+  }
+  return out;
+}
+
+const MASKED_TOKEN = "__MASKED__";
+
+/** The value expression that follows a `:`, to the depth-0 comma or the end of the literal. */
+function valueExpression(code: string): string {
+  let depth = 0;
+  for (let i = 0; i < code.length; i += 1) {
+    const char = code[i]!;
+    if ("{[(".includes(char)) depth += 1;
+    else if ("}])".includes(char)) {
+      if (depth === 0) return code.slice(0, i);
+      depth -= 1;
+    } else if (char === "," && depth === 0) return code.slice(0, i);
+  }
+  return code;
+}
+
+/** Splits `test ? consequent : alternate` at depth 0, or null when `expr` is not a ternary. */
+function splitTernary(expr: string): [string, string] | null {
+  let depth = 0;
+  for (let i = 0; i < expr.length; i += 1) {
+    const char = expr[i]!;
+    if ("{[(".includes(char)) depth += 1;
+    else if ("}])".includes(char)) depth -= 1;
+    else if (char === "?" && depth === 0 && expr[i + 1] !== "." && expr[i + 1] !== "?") {
+      let inner = 0;
+      for (let j = i + 1; j < expr.length; j += 1) {
+        const c = expr[j]!;
+        if ("{[(".includes(c)) inner += 1;
+        else if ("}])".includes(c)) inner -= 1;
+        else if (c === ":" && inner === 0) return [expr.slice(i + 1, j), expr.slice(j + 1)];
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * What a project-keyed value actually hands over.
+ *
+ * `row` is the only verdict that discloses: it means the expression can carry whatever `env` the
+ * source row held. A ternary is judged by its WORST branch, because the response takes one of them.
+ */
+export function classifyProjectValue(expression: string): "masked" | "projection" | "row" {
+  const value = expression.trim();
+  if (value === "") return "row";
+  if (value === MASKED_TOKEN) return "masked";
+  const branches = splitTernary(value);
+  if (branches) {
+    const verdicts = branches.map((branch) => classifyProjectValue(branch));
+    return verdicts.includes("row") ? "row" : "projection";
+  }
+  if (value.startsWith("{")) {
+    // A spread re-admits every field of the spread row, `env` included.
+    if (/\.\.\.\s*[A-Za-z_$][\w$]*/.test(value)) return "row";
+    const envKey = /(?:^|[,{])\s*env\s*:\s*([^,}]*)/.exec(value);
+    if (envKey && envKey[1]!.trim() !== "null") return "row";
+    return "projection";
+  }
+  // A count or a literal is not a row. `linear-auth.ts` answers `projects: projectMap.size`.
+  if (/^(?:null|undefined|true|false|\d+)$/.test(value)) return "projection";
+  if (/\.(?:size|length)\b/.test(value) && !value.includes("(")) return "projection";
+  return "row";
+}
+
+/**
+ * Project nouns handed to a response without passing through the `env` mask.
+ *
+ * An occurrence is judged by its immediate context: a KEY is judged by its value expression, a read
+ * off another object (`parsed.data.project`) discloses whatever that read lands in — which is itself
+ * another occurrence in the same argument — and anything else is the row itself.
+ */
+export function findUnmaskedProjectEnvResponses(
+  sites: ResponseSite[],
+  projectRowLocals: string[] = [],
+  localWithholdingHelpers: string[] = [],
+): ResponseSite[] {
+  const helpers = [...ENV_WITHHOLDING_HELPERS, ...localWithholdingHelpers];
+  const nouns = ["project", "projects", ...projectRowLocals];
+  return sites.filter((site) => {
+    const code = elideMaskedCalls(stripLiterals(site.argument), helpers);
+    for (const noun of nouns) {
+      // `[^\w$.?]` excludes `x.project` / `x?.project`: a read off another object is not itself a
+      // hand-over, and where it LANDS is a separate occurrence this same loop sees. `\.{3}` is the
+      // exception that has to be spelled out — a spread opens with the same character as a field
+      // read while doing the opposite, and `{ ...project }` is the shape three of the four real
+      // exits are one refactor away from.
+      const occurrences = new RegExp(`(?:^|\\.{3}|[^\\w$.?])${noun}\\b`, "g");
+      let match: RegExpExecArray | null;
+      while ((match = occurrences.exec(code)) !== null) {
+        const after = code.slice(match.index + match[0].length).replace(/^\s*/, "");
+        if (after.startsWith(":")) {
+          if (classifyProjectValue(valueExpression(after.slice(1))) === "row") return true;
+          continue;
+        }
+        // `?? null` hands the row over; `?.` and the ternary TEST do not.
+        if (after.startsWith("??")) return true;
+        if (after.startsWith(".") || after.startsWith("?")) continue;
+        return true;
+      }
+    }
+    return false;
   });
 }
 
@@ -882,4 +1136,206 @@ describe("workspace response withholding guard (PEN-2852, PEN-2370 (b2))", () =>
       expect(body).toContain(`${delegate}(`);
     },
   );
+});
+
+describe("project env withholding guard (PEN-3033 door #17, PEN-2370 (b2))", () => {
+  const routeModules = () => readdirSync(ROUTES_DIR).filter((file) => file.endsWith(".ts"));
+  const sitesFor = (source: string) => collectResponseSites("synthetic.ts", source);
+
+  it("detects a project row handed over unmasked — positive control for the detector itself", () => {
+    // Without these three, a green run over the real modules cannot be distinguished from a
+    // detector that matches nothing. Each is a spelling the four real exits actually use.
+    for (const leak of [
+      "  res.json(project);",
+      "  res.json({ project });",
+      "  res.json({ ...project, extra: 1 });",
+      "  res.json({ project: project ?? null });",
+    ]) {
+      expect(findUnmaskedProjectEnvResponses(sitesFor(leak)), leak).toHaveLength(1);
+    }
+  });
+
+  it("clears a project row that passes through the mask, under each helper spelling", () => {
+    for (const masked of [
+      "  res.json(maskProjectEnv(project));",
+      "  res.json(publicProject(project, viewer));",
+      "  res.json(publicProjects(projects, viewer));",
+      "  res.json({ ...detail, project: maskProjectEnv(detail.project) });",
+      "  res.json({ env: maskEnvBindings(project.env) });",
+    ]) {
+      expect(findUnmaskedProjectEnvResponses(sitesFor(masked)), masked).toEqual([]);
+    }
+  });
+
+  it("clears the masked noun only, not an unmasked sibling in the same response", () => {
+    // The difference that motivates this scan existing separately. The workspace scan above clears
+    // a whole argument when ANY helper appears in it, so this shape is green up there — and
+    // `issues.ts:8706` is exactly this shape: a project row beside an execution workspace.
+    const mixed = "  res.json({ a: publicProject(project, viewer), b: otherProject });";
+    const violations = findUnmaskedProjectEnvResponses(sitesFor(mixed), ["otherProject"]);
+    expect(violations).toHaveLength(1);
+
+    // Control for the control: the same site with BOTH nouns masked is clean, so the verdict above
+    // is about the unmasked sibling and not about the site being unreadable.
+    const both = "  res.json({ a: publicProject(project, viewer), b: maskProjectEnv(otherProject) });";
+    expect(findUnmaskedProjectEnvResponses(sitesFor(both), ["otherProject"])).toEqual([]);
+  });
+
+  it("reads an explicit field projection as carrying no env — and an `env` key as carrying one", () => {
+    // `compactIssueProject`'s shape: a hand-written field list cannot disclose `env` whatever the
+    // source row held, and demanding a mask there would be the noise that gets a guard deleted.
+    const projection = "  res.json({ project: project ? { id: project.id, name: project.name } : null });";
+    expect(findUnmaskedProjectEnvResponses(sitesFor(projection))).toEqual([]);
+
+    // ...unless it names `env`. This is the one-line edit that re-opens door #17 inside a shape the
+    // scan would otherwise wave through.
+    const reopened = "  res.json({ project: project ? { id: project.id, env: project.env } : null });";
+    expect(findUnmaskedProjectEnvResponses(sitesFor(reopened))).toHaveLength(1);
+
+    // `env: null` is the withholding spelling `compactIssueProject` uses, and stays clean.
+    const nulled = "  res.json({ project: project ? { id: project.id, env: null } : null });";
+    expect(findUnmaskedProjectEnvResponses(sitesFor(nulled))).toEqual([]);
+
+    // A ternary is judged by its WORST branch — the response takes one of them, not both.
+    const worstBranch = "  res.json({ project: project ? { id: project.id } : project });";
+    expect(findUnmaskedProjectEnvResponses(sitesFor(worstBranch))).toHaveLength(1);
+  });
+
+  it("tracks a project row bound to an opaque local, through its producer", () => {
+    // `projects.ts:721` — `svc.remove` returns a row with no `workspaces[]`, so it is outside the
+    // workspace axis entirely, and the local is not named after anything the noun list knows.
+    const synthetic = [
+      'import { projectService } from "../services/index.js";',
+      "const svc = projectService(db);",
+      "const deletedProjectRow = await svc.remove(id);",
+      "res.json(deletedProjectRow);",
+    ].join("\n");
+
+    // Name-only matching misses it: "deletedProjectRow" is not `\bproject\b`.
+    expect(findUnmaskedProjectEnvResponses(sitesFor(synthetic))).toEqual([]);
+    expect(collectProjectRowLocals(synthetic)).toContain("deletedProjectRow");
+    expect(
+      findUnmaskedProjectEnvResponses(sitesFor(synthetic), collectProjectRowLocals(synthetic)),
+    ).toHaveLength(1);
+  });
+
+  it("does not read a count, a query echo, or prose as a project row", () => {
+    // The three shapes that made a value-blind version of this scan report four phantom violations
+    // across `linear-auth.ts` and `decision-training.ts`. A guard that cries wolf gets switched off,
+    // so these are pinned against regression in the noisy direction as firmly as the leaks above.
+    const counts = "  res.json({ ok: true, imported, projects: projectMap.size, labels: labelCache.size });";
+    expect(findUnmaskedProjectEnvResponses(sitesFor(counts))).toEqual([]);
+
+    const queryEcho = "  res.json(await svc.list(companyId, { projectId: parsed.data.project }));";
+    expect(findUnmaskedProjectEnvResponses(sitesFor(queryEcho))).toEqual([]);
+
+    const prose = [
+      "  res.json({",
+      "    // these rows are FULL project workspaces, so the mapper is the boundary",
+      "    id: issue.id,",
+      "  });",
+    ].join("\n");
+    expect(findUnmaskedProjectEnvResponses(sitesFor(prose))).toEqual([]);
+    // And the reason it is clean is the comment stripping, not a noun that stopped matching.
+    expect(stripComments("a // project\nb")).not.toContain("project");
+  });
+
+  it("masks a plain binding for real — so a green scan is not vouching for a no-op mask", () => {
+    // Every assertion above is about TEXT. This one is about BEHAVIOUR: if `maskProjectEnv` stopped
+    // masking, the scans would still be green because the helper NAME is still at every exit. The
+    // sentinel is asserted by identity against the shared constant, never by a private copy.
+    const masked = maskProjectEnv({
+      id: "project-1",
+      env: {
+        PLAIN_OBJECT: { type: "plain", value: "invented-fixture-value" },
+        PLAIN_SHORTHAND: "invented-fixture-value",
+        POINTER: { type: "secret_ref", ref: "company/FIXTURE" },
+      },
+    } as { id: string; env: AgentEnvConfig });
+
+    expect(masked.env.PLAIN_OBJECT).toEqual({ type: "plain", value: PROJECT_ENV_VALUE_MASK });
+    // Shape-preserving: a shorthand stays a bare string, so the editor reads it the way it always did.
+    expect(masked.env.PLAIN_SHORTHAND).toBe(PROJECT_ENV_VALUE_MASK);
+    // A pointer carries no material and must survive untouched, or the round trip breaks.
+    expect(masked.env.POINTER).toEqual({ type: "secret_ref", ref: "company/FIXTURE" });
+    expect(JSON.stringify(masked)).not.toContain("invented-fixture-value");
+  });
+
+  it("finds project-shaped response sites in the modules that answer with project rows", () => {
+    // Non-vacuity for the scan below. It runs over every route module rather than a list, so the
+    // failure mode is not a stale list — it is a rename that leaves the scan matching nothing at
+    // all, everywhere, silently.
+    for (const module of ["projects.ts", "routines.ts", "issues.ts"]) {
+      const source = readFileSync(path.join(ROUTES_DIR, module), "utf8");
+      const projectShaped = collectResponseSites(module, source).filter((site) =>
+        /\bprojects?\b/i.test(stripLiterals(site.argument)),
+      );
+      expect(projectShaped.length, `${module} produced no project-shaped response sites`).toBeGreaterThan(0);
+    }
+  });
+
+  it.each(["projects.ts", "routines.ts"])(
+    "%s fails the scan when its mask is removed — the guard is load-bearing on real source",
+    (module) => {
+      // Mutation control against the REAL file, not a fixture: delete the mask the way a careless
+      // refactor would and the scan must go red. Without this, "the real modules are clean" could
+      // mean the scan never looks at them.
+      const source = readFileSync(path.join(ROUTES_DIR, module), "utf8");
+      const mutated = source
+        .replace(/maskProjectEnv\(([^()]*)\)/g, "$1")
+        .replace(/publicProjects?\(/g, "identity(");
+
+      const violations = findUnmaskedProjectEnvResponses(
+        collectResponseSites(module, mutated),
+        collectProjectRowLocals(mutated),
+        ENV_LOCAL_WITHHOLDING_HELPERS[module] ?? [],
+      );
+
+      expect(violations.length, `${module} stayed green with its mask removed`).toBeGreaterThan(0);
+    },
+  );
+
+  it("every route module answers with no unmasked project env row", () => {
+    // No `COVERED_ROUTE_MODULES` on this axis: a list that cannot go stale beats a list plus a
+    // staleness check. A module that starts answering with project rows is scanned the day it is
+    // added, with no edit here.
+    const violations = routeModules().flatMap((module) => {
+      const source = readFileSync(path.join(ROUTES_DIR, module), "utf8");
+      return findUnmaskedProjectEnvResponses(
+        collectResponseSites(module, source),
+        collectProjectRowLocals(source),
+        ENV_LOCAL_WITHHOLDING_HELPERS[module] ?? [],
+      );
+    });
+
+    expect(
+      violations.map((site) => `${site.module}:${site.line} → res.json(${site.argument})`),
+      "these responses can carry a project `env` without passing the mask — route them through " +
+        "`maskProjectEnv` (or project the fields explicitly) rather than deleting this assertion",
+    ).toEqual([]);
+  });
+
+  it.each(ENV_BOUNDARY_PINS)(
+    "$module: $wrapper withholds env via `$contains`",
+    ({ module, wrapper, contains }) => {
+      const source = readFileSync(path.join(ROUTES_DIR, module), "utf8");
+      const body = extractFunctionBody(source, wrapper);
+
+      // The scan treats these names as standing in for the mask. A renamed or gutted wrapper has to
+      // fail here rather than vanish into a name that no longer means anything.
+      expect(body, `${module} has no function ${wrapper}`).not.toBeNull();
+      expect(body, `${wrapper} no longer withholds env`).toContain(contains);
+    },
+  );
+
+  it("declares a local env helper only where that module defines one", () => {
+    // `ENV_LOCAL_WITHHOLDING_HELPERS` widens what clears the scan, so a stale entry is a silent
+    // hole: the name keeps clearing sites after the function behind it is gone.
+    for (const [module, helpers] of Object.entries(ENV_LOCAL_WITHHOLDING_HELPERS)) {
+      const source = readFileSync(path.join(ROUTES_DIR, module), "utf8");
+      for (const helper of helpers) {
+        expect(extractFunctionBody(source, helper), `${module} has no function ${helper}`).not.toBeNull();
+      }
+    }
+  });
 });

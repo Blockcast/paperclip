@@ -3,6 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { errorHandler } from "../middleware/index.js";
 import { projectRoutes } from "../routes/projects.js";
+import { routineRoutes } from "../routes/routines.js";
 import {
   PROJECT_ENV_VALUE_MASK,
   maskEnvBindings,
@@ -34,6 +35,7 @@ const mockProjectService = vi.hoisted(() => ({
 
 const mockAccessService = vi.hoisted(() => ({ decide: vi.fn() }));
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
+const mockRoutineService = vi.hoisted(() => ({ getDetail: vi.fn() }));
 const mockSecretService = vi.hoisted(() => ({
   normalizeEnvBindingsForPersistence: vi.fn(),
   syncEnvBindingsForTarget: vi.fn(async () => undefined),
@@ -42,6 +44,8 @@ const mockSecretService = vi.hoisted(() => ({
 vi.mock("../services/index.js", () => ({
   accessService: () => mockAccessService,
   projectService: () => mockProjectService,
+  routineService: () => mockRoutineService,
+  documentAnnotationService: () => ({}),
   heartbeatService: () => ({ wakeup: vi.fn() }),
   logActivity: mockLogActivity,
   workspaceOperationService: () => ({
@@ -88,6 +92,31 @@ function createApp() {
     next();
   });
   app.use("/api", projectRoutes({} as any));
+  app.use(errorHandler);
+  return app;
+}
+
+/**
+ * The routine-detail exit mounts a different router, so it needs its own app. It is the exit the
+ * narrow declared type hid — `RoutineProjectSummary` names five fields and no `env`, while the
+ * service populates it from a full-row `db.select()` — which is why it gets a behavioural test of
+ * its own rather than being assumed to travel with the project routes above.
+ */
+function createRoutinesApp() {
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    (req as any).actor = {
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      companyIds: ["company-1"],
+      source: "api_key",
+      isInstanceAdmin: false,
+    };
+    next();
+  });
+  app.use("/api", routineRoutes({} as any));
   app.use(errorHandler);
   return app;
 }
@@ -238,6 +267,51 @@ describe("project env disclosure boundary (PEN-3033)", () => {
       const res = await request(createApp()).delete("/api/projects/project-1");
       expect(res.status).toBe(200);
       expect(JSON.stringify(res.body)).not.toContain(PLAIN_SENTINEL);
+    });
+
+    it("masks on GET /routines/:id — the exit a five-field declared type hid", async () => {
+      // `RoutineProjectSummary` names five fields and no `env`, but the service builds it from a
+      // full-row `db.select()` and TypeScript strips nothing at runtime. A type-level reading of
+      // this handler says the material was never fetched; the wire says otherwise, so this asserts
+      // on the wire.
+      const fixture = projectFixture() as ReturnType<typeof projectFixture> & {
+        env: Record<string, unknown>;
+      };
+      mockRoutineService.getDetail.mockResolvedValue({
+        id: "routine-1",
+        companyId: "company-1",
+        title: "Nightly",
+        project: fixture,
+      });
+
+      const res = await request(createRoutinesApp()).get("/api/routines/routine-1");
+
+      expect(res.status).toBe(200);
+      expect(JSON.stringify(res.body)).not.toContain(PLAIN_SENTINEL);
+      expect(JSON.stringify(res.body)).not.toContain(SECOND_SENTINEL);
+      // Names survive: the diagnostic value of knowing WHICH variables are set is preserved.
+      expect(Object.keys(res.body.project.env)).toContain("PLAIN_FIXTURE");
+      // ...and the mask is non-destructive upstream — the row the service handed over still holds
+      // its values, so the two negatives above are about the response and not about a fixture that
+      // never carried anything.
+      expect(fixture.env.PLAIN_FIXTURE).toEqual({ type: "plain", value: PLAIN_SENTINEL });
+      expect(fixture.env.SHORTHAND_FIXTURE).toBe(SECOND_SENTINEL);
+    });
+
+    it("leaves a routine detail with no project untouched", async () => {
+      // The other branch of the handler's ternary. It answers with `detail` unwrapped, so a mask
+      // applied to the wrong branch would be invisible here and this pins that it still answers.
+      mockRoutineService.getDetail.mockResolvedValue({
+        id: "routine-1",
+        companyId: "company-1",
+        title: "Nightly",
+        project: null,
+      });
+
+      const res = await request(createRoutinesApp()).get("/api/routines/routine-1");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ id: "routine-1", project: null });
     });
   });
 
