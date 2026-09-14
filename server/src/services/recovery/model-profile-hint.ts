@@ -104,3 +104,47 @@ export function withRecoveryModelProfileHint<T extends Record<string, unknown>>(
 export function recoveryAssigneeAdapterOverrides(_workClass: Extract<RecoveryModelProfileWorkClass, "status_only">) {
   return { modelProfile: RECOVERY_MODEL_PROFILE_KEY };
 }
+
+/**
+ * BLO-32566. The stranded-recovery wake sites pick their work class at runtime
+ * rather than passing a literal: a status-only wake cannot write an issue
+ * document, so once the newest run on the issue has been refused exactly that
+ * write, re-dispatching status-only guarantees the same 403 and the issue can
+ * never self-heal (only a recorded disposition clears the recovery action, and
+ * while it is active every wake on the issue is status-only).
+ *
+ * A named boolean helper rather than a fourth `withRecoveryModelProfileHint`
+ * overload accepting the union: the overloads exist so each work class gets a
+ * precise return type, and a union-accepting overload would hand every caller a
+ * union return in exchange for a widened public API on a *cost guard*. Branching
+ * here keeps each arm resolving against its own precise overload, and keeps the
+ * escalation rule stated in one place instead of at six call sites.
+ *
+ * `planning_only` is the minimum escalation that clears the trap — normal model
+ * with `allowDocumentUpdates: true`, while deliverable and annotation writes stay
+ * barred. It is the same escalation BLO-23197 chose for the successful-run-handoff
+ * lane, which deliberately scoped this lane out as follow-up.
+ *
+ * Residual, tracked as BLO-32634: the four guard keys above are set explicitly on
+ * the `planning_only` arm and survive a coalesced merge intact, but `modelProfile`
+ * is scrub-only. So an escalated wake that coalesces with an already-queued
+ * status-only wake can carry `allowDocumentUpdates: true` while retaining
+ * `modelProfile: "cheap"` — the document write still succeeds, so the trap stays
+ * closed, but the run may execute on the cheap profile.
+ *
+ * The return type is annotated rather than inferred so the union is intentional:
+ * `modelProfile` exists on the status-only arm only, which makes reading it off the
+ * result a compile error instead of a silently-optional field.
+ */
+export function withStrandedRecoveryWakeWorkClass<T extends Record<string, unknown>>(
+  input: T,
+  escalateAfterRefusedDocumentWrite: boolean,
+):
+  | (WithoutRecoveryModelProfileHints<T> & typeof PLANNING_ONLY_RECOVERY_GUARD_CONTEXT)
+  | (WithoutRecoveryModelProfileHints<T> & typeof STATUS_ONLY_RECOVERY_GUARD_CONTEXT & {
+    modelProfile: typeof RECOVERY_MODEL_PROFILE_KEY;
+  }) {
+  return escalateAfterRefusedDocumentWrite
+    ? withRecoveryModelProfileHint(input, "planning_only")
+    : withRecoveryModelProfileHint(input, "status_only");
+}
