@@ -25,26 +25,32 @@ const mockCorePatchSecret = vi.fn();
 const mockCoreDeleteSecret = vi.fn();
 const mockReadSkillEntries = vi.hoisted(() => vi.fn());
 
-vi.mock("./k8s-client.js", () => ({
-  getLogApi: () => ({ log: mockLogFn }),
-  getBatchApi: () => ({
-    listNamespacedJob: mockBatchListJobs,
-    createNamespacedJob: mockBatchCreateJob,
-    readNamespacedJob: mockBatchReadJob,
-    deleteNamespacedJob: mockBatchDeleteJob,
-    patchNamespacedJob: mockBatchPatchJob,
-  }),
-  getCoreApi: () => ({
-    listNamespacedPod: mockCoreListPods,
-    readNamespacedPodLog: mockCoreReadPodLog,
-    createNamespacedSecret: mockCoreCreateSecret,
-    patchNamespacedSecret: mockCorePatchSecret,
-    deleteNamespacedSecret: mockCoreDeleteSecret,
-  }),
-  getAuthzApi: () => ({}),
-  getSelfPodInfo: mockGetSelfPodInfo,
-  resetCache: vi.fn(),
-}));
+// Partial mock via importOriginal, same reason as the server-utils mock below:
+// a whole-module replacement silently drops every export the module gains later
+// (BLO-32734 added SELF_POD_DATA_MOUNT_PATH and broke execute.test.ts that way).
+vi.mock("./k8s-client.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./k8s-client.js")>();
+  return Object.assign(Object.create(null), original, {
+    getLogApi: () => ({ log: mockLogFn }),
+    getBatchApi: () => ({
+      listNamespacedJob: mockBatchListJobs,
+      createNamespacedJob: mockBatchCreateJob,
+      readNamespacedJob: mockBatchReadJob,
+      deleteNamespacedJob: mockBatchDeleteJob,
+      patchNamespacedJob: mockBatchPatchJob,
+    }),
+    getCoreApi: () => ({
+      listNamespacedPod: mockCoreListPods,
+      readNamespacedPodLog: mockCoreReadPodLog,
+      createNamespacedSecret: mockCoreCreateSecret,
+      patchNamespacedSecret: mockCorePatchSecret,
+      deleteNamespacedSecret: mockCoreDeleteSecret,
+    }),
+    getAuthzApi: () => ({}),
+    getSelfPodInfo: mockGetSelfPodInfo,
+    resetCache: vi.fn(),
+  });
+});
 
 const mockPrepareBundle = vi.fn();
 // Partial mock via importOriginal, matching the server-utils mock below: only
