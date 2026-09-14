@@ -345,6 +345,24 @@ describe("registerWorkerTierProxyRoutes", () => {
     expect(res.body.error).toMatch(/worker tier unreachable/i);
   });
 
+  it("returns 504 — not 502 — when the worker tier is reachable but too slow", async () => {
+    // Regression guard for BLO-31945: a reachable-but-slow worker used to
+    // answer "Worker tier unreachable", which sent responders hunting for a
+    // missing Service endpoint that was never missing. The two causes must
+    // stay distinguishable from the status code alone.
+    worker = await startWorkerStub(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      return { status: 200, body: JSON.stringify({ ok: true }) };
+    });
+    const app = buildAppWithProxyOptions(worker.url, { requestTimeoutMs: 50 });
+
+    const res = await request(app).post("/api/plugins/ccrotate/disable").send({});
+
+    expect(res.status).toBe(504);
+    expect(res.body.error).toMatch(/did not respond within 50ms/i);
+    expect(res.body.error).not.toMatch(/unreachable/i);
+  });
+
   it("lets plugin scoped API actions run longer than the generic proxy timeout", async () => {
     let captured: CapturedRequest | undefined;
     worker = await startWorkerStub(async (req) => {
