@@ -1667,6 +1667,13 @@
       "when": 1789541100000,
       "tag": "0245_heartbeat_runs_first_output_at",
       "breakpoints": true
+    },
+    {
+      "idx": 246,
+      "version": "7",
+      "when": 1789541160000,
+      "tag": "0246_cost_events_cache_creation_tokens",
+      "breakpoints": true
     }
   ]
 }

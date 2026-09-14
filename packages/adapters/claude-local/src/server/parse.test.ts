@@ -511,7 +511,7 @@ describe("extractClaudeRetryNotBefore", () => {
 });
 
 describe("claudeModelUsageTotals", () => {
-  it("sums per-model usage across models and counts cache writes as input", () => {
+  it("reports cache writes separately from input instead of summing them in (BLO-29842)", () => {
     const totals = claudeModelUsageTotals({
       "claude-fable-5": {
         inputTokens: 100,
@@ -529,10 +529,14 @@ describe("claudeModelUsageTotals", () => {
       },
     });
     expect(totals).toEqual({
-      inputTokens: 4_650,
+      inputTokens: 150,
       outputTokens: 77_000,
       cachedInputTokens: 260_000,
+      cacheCreationInputTokens: 4_500,
     });
+    // The whole point of the split: cache writes are billed at 1.25x-2x, so they
+    // must not ride inside the 1x input figure the rate card fits against.
+    expect(totals?.inputTokens).not.toBe(4_650);
   });
 
   it("returns null for missing or empty modelUsage", () => {
@@ -567,9 +571,10 @@ describe("parseClaudeStreamJson usage extraction", () => {
       })}\n`,
     );
     expect(parsed.usage).toEqual({
-      inputTokens: 2_090,
+      inputTokens: 90,
       outputTokens: 77_000,
       cachedInputTokens: 300_000,
+      cacheCreationInputTokens: 2_000,
     });
     expect(parsed.usageBasis).toBe("per_run");
     expect(parsed.costUsd).toBeCloseTo(1.25);
@@ -581,6 +586,9 @@ describe("parseClaudeStreamJson usage extraction", () => {
       inputTokens: 10,
       outputTokens: 1_800,
       cachedInputTokens: 20,
+      // BLO-29842: absent cache-creation field reads as 0, not undefined, so
+      // providers that never cache-write keep working unchanged.
+      cacheCreationInputTokens: 0,
     });
     expect(parsed.usageBasis).toBe("per_run");
   });
