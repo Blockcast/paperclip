@@ -18,13 +18,13 @@
 import { describe, expect, it } from "vitest";
 import {
   BUDGET_POLICY_AMOUNT_ASSERTION,
+  classifyEnforcementAssertion,
   diffEnforcementAssertions,
   extractEnforcementAssertions,
   isApprovalEnforcementDriftConflict,
   parseJsonBodyStrict,
   type EnforcedBudgetPolicy,
 } from "../services/approval-enforcement-reconciler.ts";
-
 /** Verbatim payload.exact_changes from approval 6f45844e. */
 const CARD_6F45844E_EXACT_CHANGES = [
   { agent: "CTO", to_usd: 32000, from_usd: 19000, policyId: "eafeb342-8dfd-403f-a489-c7c91988612c", delta_usd: "+13000.00" },
@@ -211,6 +211,106 @@ describe("diffEnforcementAssertions — BLO-24631 regression fixture", () => {
 
   it("is silent for an approval carrying no assertions", () => {
     expect(diffEnforcementAssertions([], enforcedFrom("from_usd"))).toEqual([]);
+  });
+});
+
+/**
+ * Supersession vs never-applied (BLO-32796).
+ *
+ * The live state of approval `6f45844e` on 2026-09-14, which is what makes this
+ * worth pinning: five of its eight policies sit at the decided figure and three
+ * sit *above* it, because humans raised those caps after the card was decided.
+ * A decided-vs-enforced comparison calls all three drift, which is what filed
+ * BLO-33160, BLO-33397, BLO-33416 and BLO-33772 — four issues on one card in
+ * four days, each closed by hand as "superseded, do not apply".
+ */
+describe("classifyEnforcementAssertion — supersession (BLO-32796)", () => {
+  const assertions = extractEnforcementAssertions(CARD_6F45844E_PAYLOAD);
+  const byPolicy = (id: string) => assertions.find((a) => a.policyId === id)!;
+  const CTO = "eafeb342-8dfd-403f-a489-c7c91988612c";
+  const ALLY = "a894e681-9691-4678-88ad-063059210a14";
+  const SRE = "37c1fefd-b8bd-4a45-a61c-c2b2c8a4afb1";
+
+  const policy = (id: string, amountUsd: number): EnforcedBudgetPolicy => ({
+    policyId: id,
+    amount: Math.round(amountUsd * 100),
+    isActive: true,
+  });
+
+  it("reads the card's recorded starting figure", () => {
+    expect(byPolicy(CTO).priorAmountCents).toBe(1_900_000);
+    // 30011.4 -> 3001140, rounded not truncated, same as the target figure.
+    expect(byPolicy("34da6e60-3937-444a-a796-bc5565c186da").priorAmountCents).toBe(3_001_140);
+  });
+
+  it("separates the three states from the same two-way disagreement", () => {
+    expect(classifyEnforcementAssertion(byPolicy(CTO), policy(CTO, 32000))).toBe("applied");
+    expect(classifyEnforcementAssertion(byPolicy(CTO), policy(CTO, 19000))).toBe("never_applied");
+    // Neither the starting figure nor the decided one: a later decision set it.
+    expect(classifyEnforcementAssertion(byPolicy(CTO), policy(CTO, 56000))).toBe("superseded");
+  });
+
+  it("is silent on the live 2026-09-14 state of card 6f45844e", () => {
+    // The regression this exists to prevent. Five applied, three superseded by
+    // later raises; the pre-fix comparison reported three drifts here and
+    // re-filed an issue for them every sweep.
+    const enforced = enforcedFrom("to_usd");
+    enforced.set(CTO, policy(CTO, 56000));
+    enforced.set(ALLY, policy(ALLY, 110000));
+    enforced.set(SRE, policy(SRE, 20000));
+    expect(diffEnforcementAssertions(assertions, enforced)).toEqual([]);
+  });
+
+  it("still fires when a superseded policy is reverted to the starting figure", () => {
+    // Supersession suppression must not become a blanket amnesty: back at the
+    // `from` figure the decision is once again unapplied, and that is drift.
+    const enforced = enforcedFrom("to_usd");
+    enforced.set(CTO, policy(CTO, 19000));
+    const drifts = diffEnforcementAssertions(assertions, enforced);
+    expect(drifts).toHaveLength(1);
+    expect(drifts[0]?.assertion.label).toBe("CTO");
+  });
+
+  it("reports a mismatch it cannot classify, rather than assuming supersession", () => {
+    // A declared assertion with no recorded `from` collapses to the two-way
+    // comparison. Failing to report a real gap is worse than reporting a
+    // supersession we cannot rule out, so this stays drift.
+    const [declared] = extractEnforcementAssertions({
+      title: "t",
+      enforcement_assertions: [
+        { kind: BUDGET_POLICY_AMOUNT_ASSERTION, policyId: CTO, expected_usd: 32000 },
+      ],
+    });
+    expect(declared?.priorAmountCents).toBeNull();
+    expect(classifyEnforcementAssertion(declared!, policy(CTO, 56000))).toBe(
+      "unverifiable_mismatch",
+    );
+    expect(
+      diffEnforcementAssertions([declared!], new Map([[CTO, policy(CTO, 56000)]])),
+    ).toHaveLength(1);
+  });
+
+  it("carries a declared from_usd through when the card records one", () => {
+    const [declared] = extractEnforcementAssertions({
+      title: "t",
+      enforcement_assertions: [
+        {
+          kind: BUDGET_POLICY_AMOUNT_ASSERTION,
+          policyId: CTO,
+          expected_usd: 32000,
+          from_usd: 19000,
+        },
+      ],
+    });
+    expect(declared?.priorAmountCents).toBe(1_900_000);
+    expect(classifyEnforcementAssertion(declared!, policy(CTO, 56000))).toBe("superseded");
+  });
+
+  it("keeps missing and inactive policies ahead of the amount comparison", () => {
+    expect(classifyEnforcementAssertion(byPolicy(CTO), null)).toBe("missing_policy");
+    expect(
+      classifyEnforcementAssertion(byPolicy(CTO), { ...policy(CTO, 32000), isActive: false }),
+    ).toBe("inactive_policy");
   });
 });
 
