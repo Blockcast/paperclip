@@ -77,12 +77,6 @@ describe("isTerminalSeverity (BLO-24177)", () => {
     expect(isTerminalSeverity("NONE")).toBe(true);
     expect(isTerminalSeverity(" None ")).toBe(true);
   });
-
-  it("operator override replaces (not merges with) the default list", () => {
-    expect(isTerminalSeverity("none", ["debug"])).toBe(false);
-    expect(isTerminalSeverity("debug", ["debug"])).toBe(true);
-    expect(isTerminalSeverity("none", [])).toBe(false);
-  });
 });
 
 describe("buildIssueTitle", () => {

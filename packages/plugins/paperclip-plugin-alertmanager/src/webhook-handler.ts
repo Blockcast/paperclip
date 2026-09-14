@@ -1431,7 +1431,7 @@ export async function handleFiring(
   // `Watchdog` dead-man's-switch) must never become agent-actionable work.
   // Computed before the state read so the recovery lookup can adopt an
   // already-terminal row rather than minting a second permanent evidence row.
-  const terminal = isTerminalSeverity(severity, config.terminalSeverities);
+  const terminal = isTerminalSeverity(severity);
   const existing =
     stateRecord ?? (await recoverStateFromIssue(ctx, config, alert, terminal));
   const storedAggregateKey = existing

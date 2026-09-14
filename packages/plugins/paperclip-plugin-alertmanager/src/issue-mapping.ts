@@ -9,7 +9,7 @@
 
 import {
   DEFAULT_SEVERITY_TO_PRIORITY,
-  DEFAULT_TERMINAL_SEVERITIES,
+  TERMINAL_SEVERITIES,
   FALLBACK_PRIORITY,
   OBSERVABILITY_URL_KEYS,
   OBSERVABILITY_URL_LABELS,
@@ -53,22 +53,19 @@ export function severityToPriority(
  * Whether an alert's severity (BLO-24177) is one that must never become
  * agent-actionable work — e.g. `none`, the convention for Prometheus's
  * always-firing `Watchdog` dead-man's-switch heartbeat. Case-insensitive,
- * matched against the operator override list or `DEFAULT_TERMINAL_SEVERITIES`.
+ * matched against `TERMINAL_SEVERITIES`, which is deliberately a constant
+ * rather than a config key (see its docstring).
  *
  * Pure and side-effect-free like `severityToPriority` above, so the webhook
  * handler can decide — before doing any owner/route resolution or issue
  * creation — whether this alert should land in a terminal status instead of
  * the normal `todo` + assignee flow.
  */
-export function isTerminalSeverity(
-  severity: string | undefined,
-  override?: string[],
-): boolean {
+export function isTerminalSeverity(severity: string | undefined): boolean {
   if (!severity) return false;
   const key = severity.trim().toLowerCase();
   if (!key) return false;
-  const list = override ?? DEFAULT_TERMINAL_SEVERITIES;
-  return list.some((entry) => entry.trim().toLowerCase() === key);
+  return TERMINAL_SEVERITIES.some((entry) => entry.trim().toLowerCase() === key);
 }
 
 /**
