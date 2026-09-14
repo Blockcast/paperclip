@@ -718,6 +718,52 @@ describeEmbeddedPostgres("productivity review service", () => {
         expect(description).not.toContain("https://github.com/Blockcast/paperclip/pull/1741");
       });
 
+      // The attributed PR must be found however many unattributed PRs moved
+      // after it. An earlier revision paged the candidates 25 at a time before
+      // filtering for ownership, so a registry row name-dropped by 25 PRs
+      // inside one day would have had its own PR pushed off the page and read
+      // as "no second signal" — the false-negative twin of the PEN-3216 bug.
+      it("finds this issue's own PR behind 30 newer PRs belonging to other issues", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 5 * 60 * 60 * 1000),
+        });
+        await db.insert(issueWorkProducts).values(
+          Array.from({ length: 30 }, (_, i) => {
+            const touchedAt = new Date(now.getTime() - (60 - i) * 60 * 1000);
+            return {
+              companyId: seeded.companyId,
+              issueId: seeded.issueId,
+              type: "pull_request",
+              provider: "github",
+              externalId: `Blockcast/paperclip#${2000 + i}`,
+              title: `feat(other): unrelated work that mentions this row (ZZQ-${3000 + i})`,
+              url: `https://github.com/Blockcast/paperclip/pull/${2000 + i}`,
+              status: "ready_for_review",
+              metadata: { source: "github_pull_request_webhook", sourceEventOrder: 10 + i },
+              sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+              createdAt: touchedAt,
+              updatedAt: touchedAt,
+            };
+          }),
+        );
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now,
+        });
+
+        const service = productivityReviewService(db);
+        await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+        const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+        expect(description).toContain("The second signal is already present");
+        expect(description).toContain("https://github.com/Blockcast/paperclip/pull/806");
+        expect(description).not.toContain("NOT attributed to this issue");
+      });
+
       // The webhook records the resolved owning set at write time, which is the
       // only way a PR that claims its issue solely in a labeled BODY line can be
       // recognised here — the row never stores the body.
