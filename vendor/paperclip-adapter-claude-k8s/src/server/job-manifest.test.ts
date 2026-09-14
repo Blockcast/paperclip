@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
@@ -3043,5 +3043,72 @@ describe("scoped writable mounts (BLO-32734)", () => {
     expect(parent?.readOnly).toBeFalsy();
     expect(main.filter((m) => m.subPath)).toEqual([]);
     expect(result.scopedWritableDirs).toEqual([]);
+  });
+
+  // The three broad-rw fallbacks above are SILENT by construction: whether a
+  // production Job actually got the narrowed mount depends on runtime config
+  // that is invisible in the manifest, so the fix's coverage cannot be read off
+  // the cluster. Every fallback therefore names its reason twice — once as a
+  // structured warn on the server, once as a Job annotation — and the scoped
+  // path stamps `scoped`, so a missing warn is distinguishable from a Job that
+  // never reached the gate.
+  describe("names the reason whenever the broad rw mount is emitted", () => {
+    const SCOPE_ANNOTATION = "paperclip.io/data-mount-scope";
+    let warn: ReturnType<typeof vi.spyOn>;
+    beforeEach(() => {
+      warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    });
+    afterEach(() => {
+      warn.mockRestore();
+    });
+    function broadRwWarnings(): Record<string, unknown>[] {
+      return warn.mock.calls
+        .map(([line]) => (typeof line === "string" && line.startsWith("{") ? JSON.parse(line) : null))
+        .filter((entry) => entry?.event === "claude_k8s.data_mount_broad_rw");
+    }
+
+    it("isolation_disabled — a shared-isolation run", () => {
+      const ctx = makeCtx();
+      setRuntimeIsolation(ctx, { isolationMode: "shared", isolationKey: "agent-shared:agent-abc" });
+      const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+      expect(job.metadata?.annotations?.[SCOPE_ANNOTATION]).toBe("broad:isolation_disabled");
+      const entries = broadRwWarnings();
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({
+        reason: "isolation_disabled",
+        runId: "run-abc12345",
+        jobName: job.metadata?.name,
+        dataClaimName: "paperclip-data",
+        selfPvcClaimName: "paperclip-data",
+      });
+    });
+
+    it("no_claim — a per-Job emptyDir", () => {
+      const { job } = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod({ pvcClaimName: null }) });
+      expect(job.metadata?.annotations?.[SCOPE_ANNOTATION]).toBe("broad:no_claim");
+      const entries = broadRwWarnings();
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({ reason: "no_claim", dataClaimName: "", selfPvcClaimName: "" });
+    });
+
+    it("foreign_claim — names the Job's claim and the server's own", () => {
+      const ctx = isolatedCtx();
+      ctx.config.workspaceVolumeClaim = "some-other-claim";
+      const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod({ pvcClaimName: "paperclip-data" }) });
+      expect(job.metadata?.annotations?.[SCOPE_ANNOTATION]).toBe("broad:foreign_claim");
+      const entries = broadRwWarnings();
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({
+        reason: "foreign_claim",
+        dataClaimName: "some-other-claim",
+        selfPvcClaimName: "paperclip-data",
+      });
+    });
+
+    it("scoped — stamps `scoped` and warns nothing", () => {
+      const { job } = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
+      expect(job.metadata?.annotations?.[SCOPE_ANNOTATION]).toBe("scoped");
+      expect(broadRwWarnings()).toEqual([]);
+    });
   });
 });
