@@ -383,7 +383,7 @@ describe("resolveFallbackAgentId", () => {
         "company-1",
         "alert fallback",
       ),
-    ).resolves.toBe("agent-fallback");
+    ).resolves.toEqual({ agentId: "agent-fallback" });
     expect(agents.list).toHaveBeenCalledWith({ companyId: "company-1" });
   });
 
@@ -397,12 +397,14 @@ describe("resolveFallbackAgentId", () => {
     const logger = { warn: vi.fn() };
     const ctx = { agents, logger } as unknown as Parameters<typeof resolveFallbackAgentId>[0];
 
+    // Both are config facts a retry cannot change, so both must be `permanent`:
+    // two same-named invokable agents stay ambiguous, and a wrong name stays wrong.
     await expect(
       resolveFallbackAgentId(ctx, "company-1", "Alert Fallback"),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ refusal: "permanent" });
     await expect(
       resolveFallbackAgentId(ctx, "company-1", "Missing Agent"),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ refusal: "permanent" });
     expect(logger.warn).toHaveBeenCalledTimes(2);
   });
 });
@@ -518,45 +520,66 @@ describe("resolveFallbackAgentId", () => {
     ]);
     await expect(
       resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
-    ).resolves.toBe("agent-1");
+    ).resolves.toEqual({ agentId: "agent-1" });
   });
 
   it("matches case-insensitively after trimming", async () => {
     const { ctx } = mkAgentCtx([{ id: "agent-1", name: "  Ops Triage " }]);
     await expect(
       resolveFallbackAgentId(ctx, "company-1", "ops triage"),
-    ).resolves.toBe("agent-1");
+    ).resolves.toEqual({ agentId: "agent-1" });
   });
 
-  it("returns undefined without querying when no name is configured", async () => {
+  it("refuses permanently without querying when no name is configured", async () => {
     const { ctx, list } = mkAgentCtx([{ id: "agent-1", name: "Ops Triage" }]);
     await expect(
       resolveFallbackAgentId(ctx, "company-1", undefined),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ refusal: "permanent" });
     await expect(
       resolveFallbackAgentId(ctx, "company-1", "   "),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ refusal: "permanent" });
     expect(list).not.toHaveBeenCalled();
   });
 
-  it("returns undefined and warns when the name matches nothing", async () => {
+  it("refuses permanently and warns when the name matches nothing", async () => {
     const { ctx, logger } = mkAgentCtx([{ id: "agent-1", name: "Ops Triage" }]);
     await expect(
       resolveFallbackAgentId(ctx, "company-1", "Nobody"),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ refusal: "permanent" });
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("resolved to 0 invokable agents"),
     );
   });
 
-  it("returns undefined and warns when the name is ambiguous", async () => {
+  // An empty roster is the shape a degraded-but-non-throwing `agents.list`
+  // takes, and it is the one input the unmatched-name branch cannot tell from
+  // a genuine typo. A throwing list already retries (the caller's memo evicts
+  // and a plain Error propagates); this pins that the silent-failure variant of
+  // the *same* host fault gets the same survivable treatment rather than a
+  // permanent 200 drop.
+  //
+  // Paired deliberately with the wrong-name case directly above: same call,
+  // same "no match" outcome, opposite refusal class. Asserting only the empty
+  // case would not catch a change that made *both* transient and reinstated
+  // the retry burst on genuinely wrong config.
+  it("refuses transiently when the roster itself comes back empty", async () => {
+    const { ctx, logger } = mkAgentCtx([]);
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
+    ).resolves.toEqual({ refusal: "transient" });
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("roster came back empty"),
+    );
+  });
+
+  it("refuses permanently and warns when the name is ambiguous", async () => {
     const { ctx, logger } = mkAgentCtx([
       { id: "agent-1", name: "Ops Triage" },
       { id: "agent-2", name: "ops triage" },
     ]);
     await expect(
       resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ refusal: "permanent" });
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("resolved to 2 invokable agents"),
     );
@@ -576,20 +599,54 @@ describe("resolveFallbackAgentId", () => {
   // it or the ownerless-issue metric reads clean while the harm continues.
   // -------------------------------------------------------------------------
 
-  it.each(["paused", "pending_approval", "terminated"])(
-    "refuses a sole name match that is %s",
-    async (status) => {
-      const { ctx, logger } = mkAgentCtx([
-        { id: "agent-1", name: "Ops Triage", status },
-      ]);
-      await expect(
-        resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
-      ).resolves.toBeUndefined();
-      expect(logger.warn).toHaveBeenCalledWith(
-        expect.stringContaining("none are invokable"),
-      );
-    },
-  );
+  // Each status carries its own refusal class, so these are a table of
+  // (status, class) pairs rather than one shared `it.each` over statuses: a
+  // paused owner becomes invokable on its own and must keep Alertmanager's
+  // retry window, while a terminated one needs a roster edit and must not.
+  // Bundling them would assert only "refuses" and lose the distinction.
+  //
+  // ⚠️ The `terminated` row pins the map entry in isolation, not the
+  // production route. It injects a terminated agent into the mocked list, but
+  // the real `agents.list` filters those out (see the comment above), so in
+  // production a terminated owner is absent from the roster entirely and is
+  // refused by the unmatched-name branch instead — same `permanent` outcome,
+  // different code path. Keep the row as a guard on the map; do not read it as
+  // evidence that the classification ladder handles `terminated` live. The
+  // empty-roster case below covers the branch that does the real deciding.
+  it.each([
+    ["paused", "transient"],
+    ["pending_approval", "transient"],
+    ["terminated", "permanent"],
+  ])("refuses a sole name match that is %s as %s", async (status, refusal) => {
+    const { ctx, logger } = mkAgentCtx([
+      { id: "agent-1", name: "Ops Triage", status },
+    ]);
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
+    ).resolves.toEqual({ refusal });
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("none are invokable"),
+    );
+  });
+
+  it("refuses a status it does not recognise as transient", async () => {
+    // The one `REFUSAL_CLASS_BY_INVOKABILITY_REASON` entry with no other
+    // coverage, and the one that encodes the asymmetry policy stated at
+    // `owner-resolver.ts:226-229`: an unrecognised status means this resolver
+    // cannot claim the condition is unfixable, so it takes the survivable
+    // branch. Pinned so a later tidy-up does not read it as an arbitrary
+    // default and flip it — misclassifying transient-as-permanent drops an
+    // alert, which is the single outcome this whole path exists to prevent.
+    const { ctx, logger } = mkAgentCtx([
+      { id: "agent-1", name: "Ops Triage", status: "hibernating" },
+    ]);
+    await expect(
+      resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
+    ).resolves.toEqual({ refusal: "transient" });
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("agent-1=unknown_status"),
+    );
+  });
 
   it("names the blocking reason rather than reporting an unmatched name", async () => {
     // "paused" and "name is wrong" need different fixes, so an operator must
@@ -611,7 +668,7 @@ describe("resolveFallbackAgentId", () => {
       ]);
       await expect(
         resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
-      ).resolves.toBe("agent-1");
+      ).resolves.toEqual({ agentId: "agent-1" });
     },
   );
 
@@ -624,7 +681,7 @@ describe("resolveFallbackAgentId", () => {
     ]);
     await expect(
       resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
-    ).resolves.toBe("agent-live");
+    ).resolves.toEqual({ agentId: "agent-live" });
   });
 
   it("still refuses when two invokable agents share the name", async () => {
@@ -634,7 +691,7 @@ describe("resolveFallbackAgentId", () => {
     ]);
     await expect(
       resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ refusal: "permanent" });
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("resolved to 2 invokable agents"),
     );
@@ -652,9 +709,11 @@ describe("resolveFallbackAgentId", () => {
         reportsTo: "agent-gone",
       } as { id: string; name: string; status: string },
     ]);
+    // Transient, not permanent: the chain becomes valid again when the manager
+    // upstream is restored, with nobody editing this plugin's config.
     await expect(
       resolveFallbackAgentId(ctx, "company-1", "Ops Triage"),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ refusal: "transient" });
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("none are invokable"),
     );

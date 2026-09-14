@@ -42,6 +42,36 @@ export interface GitWorktreeBranchIncoherenceEvidence {
       issueIdentifier: string | null;
     } | null;
   } | null;
+  /**
+   * Non-terminal issues that reference this execution workspace. More than one
+   * claimant means the worktree is a shared resource, so restoring the recorded
+   * branch would move it off another issue's branch. Safe repair refuses in that
+   * case and routes to the workspace-binding recovery path instead. Optional so
+   * previously persisted evidence payloads stay valid.
+   */
+  workspaceClaimants?: {
+    issueId: string;
+    issueIdentifier: string | null;
+    status: string;
+  }[] | null;
+  /**
+   * Outcome of the claimant lookup, so a `null` `workspaceClaimants` stays
+   * readable. `failed` means the query errored and contention could not be ruled
+   * out, which refuses; `not-computable` means there was nothing to query (no
+   * database handle, or no execution workspace id yet on the fresh-worktree
+   * reuse path) and does not refuse. Optional so previously persisted evidence
+   * payloads stay valid.
+   */
+  workspaceClaimantLookup?: "ok" | "failed" | "not-computable";
+  /**
+   * Worktree that currently holds the recorded branch, when some worktree does.
+   * Recorded unconditionally rather than only when it is the refusing
+   * precondition: eligibility checks several independent facts and only the
+   * first failing one reaches `safeRepair.reason`, so without this the
+   * held-elsewhere path is absent from the payload whenever another refusal
+   * wins. Optional so previously persisted evidence payloads stay valid.
+   */
+  expectedBranchWorktreePath?: string | null;
   provenance: {
     expectedBranchRef: string;
     actualBranchRef: string | null;

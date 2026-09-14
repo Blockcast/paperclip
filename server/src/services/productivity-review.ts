@@ -4706,9 +4706,57 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
       )
-      .orderBy(asc(issues.updatedAt), asc(issues.id))
+      // BLO-30303: rotate on a least-recently-*scanned* watermark, not on
+      // `updatedAt`. Nothing in this file writes back to a scanned *source*
+      // row, so under the old `asc(updatedAt)` ordering the same oldest-250
+      // rows were re-selected on every pass forever and `created` was
+      // permanently 0 once the eligible population passed the cap. `desc` is
+      // not the fix either — a stalled issue's `updatedAt` stops advancing by
+      // definition, so it would sink out of the window exactly as it became
+      // interesting. Any static ordering on a field uncorrelated with
+      // eligibility starves at some cap; rotation makes that impossible by
+      // construction.
+      //
+      // Coalesce to `createdAt` rather than sorting NULLS FIRST (Ally review).
+      // NULLS FIRST is an *absolute* priority class: never-scanned rows always
+      // outrank every scanned row, so a sustained influx of >= MAX_CANDIDATE_ISSUES
+      // new eligible rows per pass would consume the whole window forever and
+      // an already-scanned row could never be revisited. That is the same
+      // starvation this fix exists to remove, just with a different victim —
+      // and the victim is the one that matters, since a row is scanned while it
+      // is still healthy and only becomes interesting once it later goes quiet.
+      // Treating "created" as the implicit first touch makes the key a strict
+      // FIFO: it advances only when a row is scanned, so the scan always takes
+      // the globally longest-waiting rows and new arrivals cannot jump the
+      // queue. Every eligible row is then evaluated within ceil(N/250) passes
+      // at any population and any arrival rate.
+      // `updatedAt`/`id` only break ties within one watermark value — a whole
+      // scan batch shares one `now`, so ties are common and must be stable.
+      .orderBy(
+        sql`coalesce(${issues.productivityScannedAt}, ${issues.createdAt}) asc`,
+        asc(issues.updatedAt),
+        asc(issues.id),
+      )
       .limit(MAX_CANDIDATE_ISSUES);
     result.scanned = candidates.length;
+
+    // Stamp before evaluating, not after: a candidate that throws mid-loop has
+    // already rotated out, so one poison row cannot wedge the window forever
+    // (the failure shape of BLO-30320). A bare column write — it does not
+    // touch `updatedAt`, so the `issues_sync_last_activity_at` trigger stays
+    // quiet and the watermark is invisible to the evidence signals this
+    // detector reads.
+    if (candidates.length > 0) {
+      await db
+        .update(issues)
+        .set({ productivityScannedAt: now })
+        .where(
+          inArray(
+            issues.id,
+            candidates.map((candidate) => candidate.id),
+          ),
+        );
+    }
 
     // BLO-22436: an issue with an unresolved blocker has its queued *routine*
     // runs cancelled by the dependency gate before dispatch (see

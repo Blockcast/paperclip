@@ -10,10 +10,26 @@ const repoRoot = path.resolve(
   "../../../..",
 );
 const dockerfile = readFileSync(path.join(repoRoot, "Dockerfile"), "utf8");
+const agentDockerfile = readFileSync(
+  path.join(repoRoot, "Dockerfile.agent"),
+  "utf8",
+);
+const dockerWorkflow = readFileSync(
+  path.join(repoRoot, ".github/workflows/docker.yml"),
+  "utf8",
+);
 const runbook = readFileSync(
   path.join(repoRoot, "docs/runbooks/penstock-claude-local-rollout.md"),
   "utf8",
 );
+
+function dockerStage(name) {
+  const lines = dockerfile.split("\n");
+  const start = lines.findIndex((line) => line === `FROM base AS ${name}`);
+  assert.notEqual(start, -1, `Dockerfile stage ${name} is present`);
+  const end = lines.findIndex((line, index) => index > start && /^FROM /.test(line));
+  return lines.slice(start, end === -1 ? lines.length : end).join("\n");
+}
 
 function renderStatefulSet() {
   return execFileSync(
@@ -33,20 +49,36 @@ function renderStatefulSet() {
   );
 }
 
-test("production image pins the standalone Penstock launcher and Caveman proxy", () => {
+test("production image packages the pinned launcher and Caveman proxy", () => {
+  const launcherStage = dockerStage("penstock-agent-runtime");
+  assert.match(
+    launcherStage,
+    /--mount=type=secret,id=penstock_runtime_token/,
+  );
+  assert.doesNotMatch(
+    launcherStage,
+    /--mount=type=secret,id=gh_token(?:[^_a-zA-Z0-9]|$)/,
+  );
+  assert.match(launcherStage, /test -s \/run\/secrets\/penstock_runtime_token/);
   assert.match(
     dockerfile,
-    /ARG PENSTOCK_RUNTIME_REF=2823acc1b4d730a86aded6b228f748aa12f40f53/,
+    /ARG PENSTOCK_RUNTIME_REF=9878ca2499ea8a8e24ec7d8bcf3222db65ac014a/,
   );
   assert.match(
     dockerfile,
-    /ARG PENSTOCK_RUNTIME_SHA256=fa6c923f78900919ec6fd3cbfe1c878078dab267e82e5faaa695d0c49f50f29e/,
+    /ARG PENSTOCK_RUNTIME_SHA256=961f38a5901fe5f775188d99ca542781f8dddec42f1e2ad0100a62b6bf409324/,
   );
-  assert.match(dockerfile, /--mount=type=secret,id=gh_token/);
-  assert.match(dockerfile, /--header @-/);
+  assert.match(
+    launcherStage,
+    /raw\.githubusercontent\.com\/Blockcast\/penstock-llm-proxy-core\//,
+  );
+  assert.match(
+    launcherStage,
+    /\$\{PENSTOCK_RUNTIME_REF\}\/scripts\/penstock-agent-runtime\.mjs/,
+  );
   assert.match(
     dockerfile,
-    /raw\.githubusercontent\.com\/Blockcast\/penstock-llm-proxy-core\/\$\{PENSTOCK_RUNTIME_REF\}\/scripts\/penstock-agent-runtime\.mjs/,
+    /COPY --from=penstock-agent-runtime \/opt\/penstock\/bin\/penstock-agent-runtime\.mjs/,
   );
   assert.match(dockerfile, /ARG CAVEMAN_RELEASE=bin-v1\.1\.6/);
   assert.match(
@@ -59,12 +91,68 @@ test("production image pins the standalone Penstock launcher and Caveman proxy",
   );
   assert.match(dockerfile, /SHA256 mismatch[\s\S]*expected[\s\S]*received/);
   assert.doesNotMatch(dockerfile, /sha256sum --check --status/);
+  assert.match(dockerfile, /COPY --from=caveman-proxy \/usr\/local\/bin\/caveman-proxy/);
+  assert.doesNotMatch(dockerfile, /PENSTOCK_API_KEY\s*=\s*[^$\s]/);
+  assert.doesNotMatch(dockerfile, /PENSTOCK_RUNTIME_TOKEN/);
+  assert.doesNotMatch(agentDockerfile, /PENSTOCK_API_KEY\s*=\s*[^$\s]/);
+});
+
+test("the Docker workflow keeps launcher credentials separate from vendor credentials", () => {
+  assert.match(
+    dockerWorkflow,
+    /gh_token=\$\{\{ secrets\.PAPERCLIP_BOARD_TOKEN \}\}/,
+  );
+  assert.match(
+    dockerWorkflow,
+    /uses: actions\/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2\.2\.2/,
+  );
+  assert.match(dockerWorkflow, /app-id: \$\{\{ vars\.COMMITPERCLIP_APP_ID \}\}/);
+  assert.match(
+    dockerWorkflow,
+    /private-key: \$\{\{ secrets\.COMMITPERCLIP_KEY \}\}/,
+  );
+  assert.match(dockerWorkflow, /owner: Blockcast/);
+  assert.match(dockerWorkflow, /repositories: penstock-llm-proxy-core/);
+  assert.match(dockerWorkflow, /permission-contents: read/);
+  assert.match(
+    dockerWorkflow,
+    /penstock_runtime_token=\$\{\{ steps\.penstock-runtime-token\.outputs\.token \}\}/,
+  );
+  assert.doesNotMatch(
+    dockerWorkflow,
+    /penstock_runtime_token=\$\{\{ secrets\.PAPERCLIP_BOARD_TOKEN \}\}/,
+  );
+  assert.doesNotMatch(dockerWorkflow, /secrets\.PENSTOCK_RUNTIME_TOKEN/);
+
+  const runtimeBuild = dockerWorkflow.indexOf("- name: Build and push stable runtime image");
+  const tokenMint = dockerWorkflow.indexOf("- name: Mint read-only Penstock runtime token");
+  const consumingBuild = dockerWorkflow.indexOf("- name: Build and push\n", tokenMint);
+  assert.ok(runtimeBuild >= 0 && runtimeBuild < tokenMint);
+  assert.ok(tokenMint < consumingBuild);
+});
+
+test("the agent overlay carries every packaged Penstock runtime asset", () => {
+  assert.ok(
+    agentDockerfile.includes(
+      "COPY --from=server /opt/penstock/bin/penstock-agent-runtime.mjs /opt/penstock/bin/penstock-agent-runtime.mjs",
+    ),
+  );
+  assert.match(
+    agentDockerfile,
+    /COPY --from=server \/usr\/local\/bin\/caveman-proxy \/usr\/local\/bin\/caveman-proxy/,
+  );
+  assert.match(
+    agentDockerfile,
+    /COPY --from=server \/opt\/penstock\/ponytail \/opt\/penstock\/ponytail/,
+  );
   assert.match(
     dockerfile,
-    /COPY --from=penstock-agent-runtime \/opt\/penstock\/bin\/penstock-agent-runtime\.mjs/,
+    /\/opt\/penstock\/ponytail\/\.claude-plugin\/plugin\.json/,
   );
-  assert.match(dockerfile, /COPY --from=caveman-proxy \/usr\/local\/bin\/caveman-proxy/);
-  assert.doesNotMatch(dockerfile, /PENSTOCK_API_KEY=/);
+  assert.match(
+    dockerfile,
+    /\/opt\/penstock\/ponytail\/\.opencode\/plugins\/ponytail\.mjs/,
+  );
 });
 
 test("production image carries a pinned Ponytail tree without shared activation", () => {
@@ -98,18 +186,26 @@ test("production image carries a pinned Ponytail tree without shared activation"
   assert.doesNotMatch(rendered, /DietrichGebert\/ponytail/);
 });
 
-test("rollout runbook requires one agent, a secret ref, and agent-scoped plugin loading", () => {
-  assert.match(runbook, /exactly one[\s\S]*`claude_local`/i);
-  assert.match(runbook, /BLO-26540/);
-  assert.match(runbook, /BLO-26695/);
-  assert.match(runbook, /\"type\": \"secret_ref\"/);
-  assert.match(runbook, /\"key\": \"PENSTOCK_API_KEY\"/);
-  assert.match(runbook, /\"engine\": \"cli\"/);
-  assert.match(runbook, /\"--plugin-dir\"/);
+test("rollout runbook requires one Kubernetes canary and adapter-specific plugin loading", () => {
+  assert.match(runbook, /Kubernetes-only/i);
+  assert.match(runbook, /one named non-production agent/i);
+  assert.match(runbook, /`claude_k8s`/);
+  assert.match(runbook, /`opencode_k8s`/);
+  assert.doesNotMatch(runbook, /`claude_local`/);
+  assert.match(runbook, /worker-only Kubernetes Secret binding/i);
+  assert.match(runbook, /worker:\n\s+extraEnv:[\s\S]*name: PENSTOCK_API_KEY/);
+  assert.match(runbook, /must not appear in the\s+API Deployment/i);
+  assert.match(runbook, /\/opt\/penstock\/ponytail`[\s\S]*Claude `--plugin-dir`/);
+  assert.match(
+    runbook,
+    /\/opt\/penstock\/ponytail\/\.opencode\/plugins\/ponytail\.mjs`[\s\S]*Generated OpenCode config/,
+  );
   assert.match(runbook, /PONYTAIL_DEFAULT_MODE/);
   assert.match(runbook, /127\.0\.0\.1/);
-  assert.match(runbook, /generic[\s\S]*deliberately skips its normal Claude hello\s+probe/i);
-  assert.match(runbook, /caveman\.json/);
-  assert.match(runbook, /real Caveman accepted caveman\.json/i);
+  assert.match(runbook, /\.ok == true|\"ok\": true/);
+  assert.match(runbook, /caveman\.proxy\.health\.v1/);
+  assert.match(runbook, /billing[\s\S]*byok/i);
+  assert.match(runbook, /successful completion cleanup[\s\S]*cancelled-run cleanup/i);
+  assert.match(runbook, /allocation_missing/);
   assert.doesNotMatch(runbook, /PENSTOCK_API_KEY\s*=\s*sk-/i);
 });

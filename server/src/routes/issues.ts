@@ -150,6 +150,15 @@ import {
 } from "./workspace-command-authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import {
+  executionWorkspaceIdentity,
+  publicExecutionWorkspace,
+  publicProjects,
+  publicProjectWorkspace,
+  resolveWorkspaceRuntimeViewer,
+  type ExecutionWorkspaceIdentity,
+  type WorkspaceRuntimeViewer,
+} from "./workspace-response.js";
+import {
   isInlineAttachmentContentType,
   normalizeIssueAttachmentMaxBytes,
   normalizeContentType,
@@ -187,7 +196,12 @@ import {
 import { findWakeIdempotencyReceipt } from "../services/wake-idempotency.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
-import { maskWorkspaceRuntimeForRead, redactEventPayload, redactSensitiveText } from "../redaction.js";
+import {
+  maskWorkspaceRuntimeForRead,
+  maskWorkspaceRuntimeTextForRead,
+  redactEventPayload,
+  redactSensitiveText,
+} from "../redaction.js";
 import {
   createCompanySearchRateLimiter,
   type CompanySearchRateLimiter,
@@ -4439,6 +4453,17 @@ export function issueRoutes(
   // live grant that fires on quotation, which is the hazard the paragraph above
   // refuses to accept from the parser side. The id is given separately, bare, on
   // the next clause; bare tokens grant nothing, which is the whole point.
+  //
+  // BLO-22742: the per-issue mention is the only *transferable* grant, and it
+  // does not scale. A sweep hit this deny on 216 issues at once and had no
+  // route out, because both remedies above are per-issue and neither is
+  // something the blocked agent can execute itself. There is a second standing
+  // authorization the text never mentioned: `allow_manager_chain`
+  // (services/authorization.ts) carries `issue:comment` to any agent above the
+  // assignee in the `reportsTo` chain, with no grant and no per-issue setup. A
+  // peer cannot self-serve it — that is the point — but it means "escalate to
+  // their manager" is a real, in-system answer to fan-out notification, not a
+  // workaround. Naming it here is what turns a 216-issue wall into one handoff.
   function issueCommentGrantRemediation(input: {
     actorAgentId: string;
     assigneeAgentId: string | null;
@@ -4454,7 +4479,10 @@ export function issueRoutes(
       `where <agent-id> is ${input.actorAgentId}. A bare agent://${input.actorAgentId} in the ` +
       `comment body is not a mention — it neither wakes you nor grants anything. A mention written ` +
       `by any other agent wakes you but does not authorize you. Until then, respond on an issue ` +
-      `you are assigned to and reference this one, or ask the assignee to mention you here.`
+      `you are assigned to and reference this one, or ask the assignee to mention you here. If ` +
+      `you need to reach this assignee across many issues at once, do not collect grants one ` +
+      `issue at a time: escalate the batch to an agent above them in the reportsTo chain, ` +
+      `which carries issue:comment on their assignees' issues without any grant.`
     );
   }
 
@@ -7377,11 +7405,17 @@ export function issueRoutes(
 
   function respondClosedIssueExecutionWorkspace(
     res: Response,
-    workspace: Pick<ExecutionWorkspace, "closedAt" | "id" | "mode" | "name" | "status">,
+    workspace: ExecutionWorkspaceIdentity,
   ) {
     res.status(409).json({
       error: getClosedIsolatedExecutionWorkspaceMessage(workspace),
-      executionWorkspace: workspace,
+      // The parameter type promises five fields, but every caller passes the full row returned by
+      // `executionWorkspacesSvc.getById` (a bare `db.select()` fed through `toExecutionWorkspace`,
+      // which sets `workspaceRuntime`). TypeScript does not strip excess properties at runtime, so
+      // `executionWorkspace: workspace` served the operator-authored `workspaceRuntime` on this 409
+      // — the same material `publicExecutionWorkspace` exists to withhold. The narrow declared type
+      // is what hid it; perform the narrowing instead of declaring it.
+      executionWorkspace: executionWorkspaceIdentity(workspace),
     });
   }
 
@@ -7444,8 +7478,27 @@ export function issueRoutes(
     return { project, goal: null };
   }
 
-  function compactIssueProjectWorkspace(workspace: ProjectWorkspace | null | undefined) {
-    if (!workspace) return null;
+  /**
+   * PEN-2852 / PEN-2370 — `GET /issues/:id` is a THIRD exit for workspace runtime config, and the
+   * one an agent reads most. The withholding boundary in `routes/workspace-response.ts` was wired
+   * into `routes/execution-workspaces.ts` and `routes/projects.ts`; this module answers with the
+   * same rows under different nouns (`project.workspaces[]`, `project.primaryWorkspace`,
+   * `currentExecutionWorkspace`, `mentionedProjects[]`), so the entitlement has to be applied here
+   * too or it is enforced on two of four doors.
+   *
+   * Applied by delegating to the same `public*` helpers rather than re-deriving the mask, so the
+   * two exits cannot drift: `runtimeConfig` and `config` are derived views over `metadata`, and a
+   * second implementation is how one of them ends up masked while the other is not.
+   *
+   * The compaction below already drops `metadata`, so the derived view is the only exit here — but
+   * the helper is still the right place to ask, because it owns which keys count as derived.
+   */
+  function compactIssueProjectWorkspace(
+    rawWorkspace: ProjectWorkspace | null | undefined,
+    viewer: WorkspaceRuntimeViewer,
+  ) {
+    if (!rawWorkspace) return null;
+    const workspace = publicProjectWorkspace(rawWorkspace, viewer);
     return {
       id: workspace.id,
       companyId: workspace.companyId,
@@ -7462,14 +7515,57 @@ export function issueRoutes(
       remoteProvider: workspace.remoteProvider,
       remoteWorkspaceRef: workspace.remoteWorkspaceRef,
       sharedWorkspaceKey: workspace.sharedWorkspaceKey,
-      runtimeConfig: workspace.runtimeConfig,
+      // PEN-2846 (door #12b): the second `workspaceRuntime` exit in this file.
+      // This projection is a withholding boundary too — it omits `metadata` and
+      // `runtimeServices` off the row rather than spreading it — but
+      // `runtimeConfig` is a *view onto that same omitted `metadata`*:
+      // `services/projects.ts` derives it via
+      // `readProjectWorkspaceRuntimeConfig(row.metadata)`, reading
+      // `metadata.runtimeConfig`. So passing it through verbatim handed back a
+      // slice of the column this projection drops.
+      //
+      // Only `workspaceRuntime` is open — an operator-authored
+      // `Record<string, unknown>` (`ProjectWorkspaceRuntimeConfig`), the same type
+      // and the same hazard as the execution-workspace side masked in
+      // `compactIssueExecutionWorkspace` below. `desiredState` and `serviceStates`
+      // are enum-validated on the way out of that reader, so they cross intact.
+      //
+      // Enumerated rather than spread so a field added to
+      // `ProjectWorkspaceRuntimeConfig` later has to be considered here first.
+      //
+      // PEN-2852 composition (BLO-33407): the gate decides *whether* the value is
+      // disclosed, the mask is a second layer that only survives if the gate
+      // regresses. `publicProjectWorkspace` above has already set
+      // `workspaceRuntime: null` for an unentitled viewer, so masking it would be a
+      // no-op; the mask's entire live effect was on the *entitled* path, where
+      // `workspace_runtime:read` exists for exactly this disclosure. Values cross
+      // by design for an entitled reader — the runtime editors depend on it. The
+      // same `viewer.revealRuntimeConfig` flag is re-read here rather than
+      // re-derived, so if the `publicProjectWorkspace` call is ever dropped or
+      // bypassed the mask still fires and only names and structure cross.
+      runtimeConfig: workspace.runtimeConfig
+        ? {
+            workspaceRuntime: viewer.revealRuntimeConfig
+              ? workspace.runtimeConfig.workspaceRuntime
+              : maskWorkspaceRuntimeForRead(workspace.runtimeConfig.workspaceRuntime),
+            desiredState: workspace.runtimeConfig.desiredState,
+            serviceStates: workspace.runtimeConfig.serviceStates,
+          }
+        : null,
+      // PEN-2852: the compensating existence flag. `workspace-response.ts` states callers keep
+      // this regardless of entitlement, so it is not withheld — it lets a masked caller tell
+      // "no runtime config" from "withheld". Composed with the PEN-2846 mask above per BLO-33407.
+      hasWorkspaceRuntimeConfig: workspace.hasWorkspaceRuntimeConfig,
       isPrimary: workspace.isPrimary,
       createdAt: workspace.createdAt,
       updatedAt: workspace.updatedAt,
     };
   }
 
-  function compactIssueProject(project: Awaited<ReturnType<typeof resolveIssueProjectAndGoal>>["project"]) {
+  function compactIssueProject(
+    project: Awaited<ReturnType<typeof resolveIssueProjectAndGoal>>["project"],
+    viewer: WorkspaceRuntimeViewer,
+  ) {
     if (!project) return null;
     return {
       id: project.id,
@@ -7490,8 +7586,10 @@ export function issueRoutes(
       pausedAt: project.pausedAt,
       executionWorkspacePolicy: project.executionWorkspacePolicy,
       codebase: project.codebase,
-      workspaces: (project.workspaces ?? []).map(compactIssueProjectWorkspace),
-      primaryWorkspace: compactIssueProjectWorkspace(project.primaryWorkspace),
+      workspaces: (project.workspaces ?? []).map((workspace) =>
+        compactIssueProjectWorkspace(workspace, viewer),
+      ),
+      primaryWorkspace: compactIssueProjectWorkspace(project.primaryWorkspace, viewer),
       managedByPlugin: project.managedByPlugin ?? null,
       taskCount: project.taskCount,
       budget: project.budget,
@@ -7515,9 +7613,18 @@ export function issueRoutes(
       status: service.status,
       lifecycle: service.lifecycle,
       reuseKey: service.reuseKey,
-      command: service.command,
-      cwd: service.cwd,
+      // `command`/`cwd` are the operator's own free text, copied onto this row
+      // from the `workspaceRuntime` entry that `compactIssueExecutionWorkspace`
+      // masks ~50 lines below. Emitting them here handed the same string back in
+      // cleartext in the same response body (PEN-2854, door #14). `command` runs
+      // through `sh -c`, so an inline `FOO_TOKEN=... npm run dev` is a normal
+      // idiom; `cwd` discloses host paths.
+      command: maskWorkspaceRuntimeTextForRead(service.command),
+      cwd: maskWorkspaceRuntimeTextForRead(service.cwd),
       port: service.port,
+      // `url` deliberately survives: `paperclipWaitForIssueWorkspaceService`
+      // returns it to the caller, and it is a generated local address rather
+      // than operator free text. `providerRef` is a pid.
       url: service.url,
       provider: service.provider,
       providerRef: service.providerRef,
@@ -7531,8 +7638,12 @@ export function issueRoutes(
     };
   }
 
-  function compactIssueExecutionWorkspace(workspace: ExecutionWorkspace | null) {
-    if (!workspace) return null;
+  function compactIssueExecutionWorkspace(
+    rawWorkspace: ExecutionWorkspace | null,
+    viewer: WorkspaceRuntimeViewer,
+  ) {
+    if (!rawWorkspace) return null;
+    const workspace = publicExecutionWorkspace(rawWorkspace, viewer);
     return {
       id: workspace.id,
       companyId: workspace.companyId,
@@ -7567,12 +7678,35 @@ export function issueRoutes(
             // sets `metadata: null` rather than spreading the row. Passing the
             // runtime config through verbatim handed every operator-authored key
             // in a service definition to three MCP tools any same-company agent
-            // holds. Names and structure still cross; values do not.
-            workspaceRuntime: maskWorkspaceRuntimeForRead(workspace.config.workspaceRuntime),
+            // holds.
+            //
+            // PEN-2852 composition (BLO-33407): the gate decides *whether* the
+            // value is disclosed, the mask is a second layer that only survives if
+            // the gate regresses. `publicExecutionWorkspace` above has already set
+            // `workspaceRuntime: null` for an unentitled viewer — the agent class
+            // this mask was written against — so masking it would be a no-op; the
+            // mask's entire live effect was on the *entitled* path, where
+            // `workspace_runtime:read` exists for exactly this disclosure. So: for
+            // an unentitled reader, nothing crosses at all; for an entitled one,
+            // values cross by design and the heartbeat-context runtime editors
+            // depend on it. The same `viewer.revealRuntimeConfig` flag is re-read
+            // here rather than re-derived, so if the `publicExecutionWorkspace`
+            // call is ever dropped or bypassed the mask still fires and only names
+            // and structure cross.
+            workspaceRuntime: viewer.revealRuntimeConfig
+              ? workspace.config.workspaceRuntime
+              : maskWorkspaceRuntimeForRead(workspace.config.workspaceRuntime),
             desiredState: workspace.config.desiredState,
             serviceStates: workspace.config.serviceStates,
           }
         : null,
+      // PEN-2852: the compensating existence flag, same contract as the project
+      // projection above — `workspace-response.ts` states callers keep this
+      // regardless of entitlement. This projection selects fields by name, so the
+      // flag survives only if it is named; without it a withheld caller reading
+      // `GET /issues/:id` or `/heartbeat-context` cannot tell "no runtime config"
+      // from "withheld", a distinction it had before withholding.
+      hasWorkspaceRuntimeConfig: workspace.hasWorkspaceRuntimeConfig,
       metadata: null,
       runtimeServices: (workspace.runtimeServices ?? [])
         .filter((service) => service.status === "starting" || service.status === "running")
@@ -8271,6 +8405,7 @@ export function issueRoutes(
       activeRecoveryAction,
     });
     const redactLowTrust = await shouldRedactLowTrustForHeartbeatContext(issue, getActorInfo(req));
+    const runtimeViewer = await resolveWorkspaceRuntimeViewer(access, req, issue.companyId);
     const safeWakeComment =
       wakeComment && wakeComment.issueId === issue.id
         ? redactLowTrust
@@ -8370,7 +8505,7 @@ export function issueRoutes(
           }
         : null,
       planReviewContext,
-      currentExecutionWorkspace: compactIssueExecutionWorkspace(currentExecutionWorkspace),
+      currentExecutionWorkspace: compactIssueExecutionWorkspace(currentExecutionWorkspace, runtimeViewer),
     });
   });
 
@@ -8567,6 +8702,7 @@ export function issueRoutes(
       ? await executionWorkspacesSvc.getById(issue.executionWorkspaceId)
       : null;
     const workProducts = await workProductsSvc.listForIssue(issue.id);
+    const runtimeViewer = await resolveWorkspaceRuntimeViewer(access, req, issue.companyId);
     res.json({
       ...issue,
       ...inboxArchiveFields,
@@ -8583,10 +8719,14 @@ export function issueRoutes(
       relatedWork: referenceSummary,
       referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
       ...documentPayload,
-      project: compactIssueProject(project),
+      project: compactIssueProject(project, runtimeViewer),
       goal: goal ?? null,
-      mentionedProjects,
-      currentExecutionWorkspace: compactIssueExecutionWorkspace(currentExecutionWorkspace),
+      // `listByIds` runs `attachWorkspaces`, so these rows are FULL project workspaces —
+      // uncompacted, carrying `metadata` as well as the derived `runtimeConfig`. The widest of the
+      // four exits in this response, and the only one where withholding the derived view alone
+      // would leave the same bytes one key over.
+      mentionedProjects: publicProjects(mentionedProjects, runtimeViewer),
+      currentExecutionWorkspace: compactIssueExecutionWorkspace(currentExecutionWorkspace, runtimeViewer),
       workProducts,
       linkedCases,
     });

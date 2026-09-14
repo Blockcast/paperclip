@@ -47,6 +47,7 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../services/execution-workspace-policy.ts";
+import { waitForRunToFinish } from "./helpers/wait-for-run-to-finish.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -164,16 +165,6 @@ async function createForwardBranchMismatch(input: {
   await writeFile(path.join(input.worktreePath, "actual-branch.txt"), "actual branch work\n", "utf8");
   await runGit(input.worktreePath, ["add", "actual-branch.txt"]);
   await runGit(input.worktreePath, ["commit", "-m", "Add actual branch work"]);
-}
-
-async function waitForRunToFinish(heartbeat: Heartbeat, runId: string, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const run = await heartbeat.getRun(runId);
-    if (run && run.status !== "queued" && run.status !== "running") return run;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return heartbeat.getRun(runId);
 }
 
 async function waitForHeartbeatIdle(db: Db, timeoutMs = 5_000) {
@@ -626,7 +617,17 @@ async function expectContainedWorkspaceBranchFailure(input: {
       eligible: false,
       attempted: false,
       succeeded: false,
-      reason: "expected branch and current HEAD differ",
+      // BLO-32628: a single-claimant worktree in this same git state now
+      // self-heals, so containment here rests on two other refusals — both
+      // real, and which one fires depends on what the call site knows.
+      // Persisted restore passes the execution workspace id, so claimant
+      // contention is visible (source + same-workspace sibling). Fresh-worktree
+      // reuse passes `executionWorkspaceId: null`, so contention cannot be
+      // computed and the refusal falls to the git-level fact that the fixture's
+      // main checkout still holds the recorded branch.
+      reason: input.sourceExecutionWorkspaceId
+        ? expect.stringContaining("execution workspace is claimed by 2 non-terminal issues")
+        : expect.stringContaining("recorded branch is already checked out in another worktree"),
     }),
   });
   if (input.sourceExecutionWorkspaceId !== undefined) {

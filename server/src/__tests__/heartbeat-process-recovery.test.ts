@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   PROCESS_LOST_LIVENESS_NULL_METRIC,
   PROCESS_LOST_TOTAL_METRIC,
+  HEARTBEAT_RUN_FAILED_METRIC,
   __resetMetricsForTest,
   renderMetrics,
 } from "../services/metrics.js";
@@ -1608,6 +1609,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("uses the persisted stage-exit cancellation in the setup-error terminal path", async () => {
+    __resetMetricsForTest();
     const { companyId, agentId, runId, wakeupRequestId } = await seedQueuedIssueRunFixture();
     const svc = secretService(db);
     const secret = await svc.create(companyId, {
@@ -1658,6 +1660,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       level: "warn",
       payload: expect.objectContaining({ errorCode: "pipeline_stage_exited" }),
     }));
+    // BLO-28648: the setup path increments the failure counter, but a stage-exit
+    // race turns this terminalization into a cancellation. No failure sample may
+    // be emitted for it, matching the liveness path.
+    const { body: metrics } = await renderMetrics();
+    expect(metrics).not.toContain(`${HEARTBEAT_RUN_FAILED_METRIC}{`);
+    __resetMetricsForTest();
   });
 
   it("uses the persisted stage-exit cancellation in external-lifecycle recovery", async () => {
@@ -2677,7 +2685,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       prNumber: 1648,
       headSha,
     });
-    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledTimes(1);
+    // BLO-28920: a miss at the wake's pinned head is now re-checked once against
+    // the PR's live head (`headSha: null` reuses the callee's own resolution).
+    // Both passes miss here, so this test's subject — a run's own summary is not
+    // outcome evidence — is unchanged; only the call count is.
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 1648,
+      headSha: null,
+    });
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledTimes(2);
     expect(await heartbeat.getRun(runId)).toMatchObject({
       status: "failed",
       errorCode: "job_missing",
@@ -5539,6 +5556,192 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_escalated")).toBe(true);
   });
 
+  // BLO-31913: the same exhausted handoff, but on an issue checkout-restore has
+  // already put back to `todo`. That restore is what makes this a distinct case
+  // rather than a duplicate of the test above -- it clears `checkoutRunId` and
+  // `executionRunId` and moves the issue out of the `in_progress` arm where the
+  // escalation lives, so before the fix the `todo` arm's bare `succeeded` skip
+  // swallowed it and nothing ever re-evaluated the issue again. Measured
+  // instance: BLO-31052, `todo` since 09-01 carrying a required handoff and no
+  // recovery action. Note this arm reaches only issues with NO existing
+  // recovery action -- an already-`escalated` one is reused per BLO-30743, so
+  // BLO-30577 stays skipped by design.
+  it("escalates an exhausted successful-run handoff after checkout-restore returns the issue to todo", async () => {
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "succeeded",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.successfulRunHandoffEscalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "todo",
+      retryReason: null,
+      cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+      kind: "missing_disposition",
+    });
+    expect(recoveryAction.evidence).toMatchObject({
+      sourceRunId,
+      missingDisposition: "clear_next_step",
+      latestRunStatus: "succeeded",
+      recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+    });
+
+    // Assert the disposition the issue ACTUALLY lands in, as the sibling
+    // `in_progress` test does. An earlier revision asserted only
+    // `recoveryAction.wakePolicy` here, which is a column on the recovery-action
+    // row rather than on the issue -- so it passed whatever status the issue
+    // ended up in, i.e. it did not test the one property its comment claimed.
+    // `resolveStrandedEscalationStatus` picks `blocked` here because the routed
+    // recovery owner is live; the owner assertion below is what makes that
+    // `blocked` + no-blockers shape a wake path rather than the BLO-27553
+    // permanent strand, so both halves are load-bearing together.
+    const escalatedIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(escalatedIssue?.status).toBe("blocked");
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+    expect(recoveryAction.wakePolicy).toMatchObject({ ownerAgentId: agentId });
+
+    // Non-recurrence for this shape: `blocked` is outside
+    // STRANDED_ASSIGNED_ISSUE_STATUSES, so the row leaves the sweep's status
+    // filter and a second pass must neither re-escalate nor re-fire the
+    // Slack-forwarded `needs_human_decision`. This pins the live-owner shape
+    // only -- the ownerless/wake-exhausted shape stays `todo` and re-enters
+    // this branch, bounded by `shouldReuseStrandedRecoveryAction` rather than
+    // by the status filter (see the arm's comment in recovery/service.ts).
+    const secondPass = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(secondPass.successfulRunHandoffEscalated).toBe(0);
+    expect(secondPass.escalated).toBe(0);
+    expect(secondPass.issueIds).toEqual([]);
+  });
+
+  // BLO-8050 gate on the BLO-31913 arm. The escalation test above and the
+  // deliberate-park guard below both discriminate on the handoff EVIDENCE;
+  // neither exercises the unblock gate, because both leave the run's
+  // `createdAt` at the schema default (wall clock) so no seeded unblock can
+  // ever precede it. That is why this needs its own test rather than a row on
+  // the BLO-8050 table at the bottom of this file: every row there is a
+  // `failed` run with an `errorCode`, and none reaches this branch, which
+  // requires a `succeeded` run carrying handoff markers on `contextSnapshot`.
+  //
+  // The failure mode being pinned: handoff evidence lives on the run's
+  // contextSnapshot and never expires, so an operator moving an escalated row
+  // back to `todo` would otherwise be met with an immediate re-flip to
+  // `blocked` on the very same pre-unblock run -- defeating the manual
+  // recovery exactly as BLO-7521 did. Deleting the guard at
+  // `recovery/service.ts` makes this test fail (successfulRunHandoffEscalated
+  // 1, issue `blocked`) -- that branch-specific counter, not `escalated`, is
+  // the one this arm increments; see the note at the assertions below.
+  // Without it the guard is unpinned and the suite stays green.
+  it("BLO-8050: skips the exhausted-handoff todo escalation when the run predates a manual unblock", async () => {
+    const { companyId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "succeeded",
+    });
+    const sourceRunId = randomUUID();
+    // Pin createdAt alongside the handoff markers: the fixture relies on the
+    // schema's defaultNow(), which would sort AFTER any unblock we seed here
+    // and silently make the gate untestable rather than failing loudly.
+    const handoffRunCreatedAt = new Date("2026-03-19T00:00:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        createdAt: handoffRunCreatedAt,
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    // Operator unblock recorded strictly AFTER the handoff run.
+    await db.insert(activityLog).values({
+      id: randomUUID(),
+      companyId,
+      actorType: "user",
+      actorId: "operator",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      details: { previousStatus: "blocked", status: "todo" },
+      createdAt: new Date("2026-03-19T01:00:00.000Z"),
+    });
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // Assert the branch-specific counter, not `escalated`: this arm increments
+    // `successfulRunHandoffEscalated`, so a test asserting only `escalated`
+    // would pass whether or not the guard fired.
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("todo");
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
+      .toHaveLength(0);
+  });
+
+  // BLO-31913 regression guard, and the more important half of the pair: a
+  // succeeded run on a `todo` issue is normally a DELIBERATE park -- the run
+  // chose `todo` and recorded why, which is the disposition this fleet's own
+  // guidance prescribes for a human-gated issue. Re-dispatching those would
+  // turn every parked issue into a hot loop. The discriminator is the handoff
+  // evidence, never the status, so with no handoff markers on the run this
+  // must skip byte-for-byte as it did before the fix.
+  it("leaves a deliberately parked todo issue untouched when its succeeded run recorded a disposition", async () => {
+    const { issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "succeeded",
+    });
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.assignmentDispatched).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("todo");
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
+      .toHaveLength(0);
+  });
+
   it("escalates an exhausted successful handoff run that still leaves no disposition", async () => {
     const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
@@ -6143,6 +6346,135 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(after.assigneeAgentId).toBe(agentId);
     expect(after.status).toBe("todo");
+  });
+
+  // BLO-32668: this gate used to emit one INFO line per suppressed issue — 2,758 lines in
+  // 10 min at the measured population (515 distinct issues per ~43 s pass) — and to read
+  // readiness for the label *inside* its own transaction, under the per-issue advisory
+  // lock. Both are gone; the classification the line carried survives as a three-way
+  // partition of `dependencyWaitEscalationSuppressed` on the sweep result.
+  //
+  // The two tests below assert ATTRIBUTION, not just the total, because the total cannot
+  // catch the regression that matters. The gate now classifies from readiness its CALLER
+  // threads in (`dependencyWaitReadiness`), so if a refactor drops that argument on either
+  // lane, every suppression falls to the `...Unclassified` arm — the partition still sums,
+  // `dependencyWaitEscalationSuppressed` still reads 1 and keeps passing in all four places
+  // it is already asserted above, and the BLO-27463 defect signal silently reads zero
+  // forever with nothing red. An attribution assertion is the only thing that fails.
+  it("attributes a todo-lane dependency-wait suppression to the resolved-blocker arm (BLO-32668)", async () => {
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "cancelled",
+      retryReason: "assignment_recovery",
+      runErrorCode: "issue_dependencies_blocked",
+      runError:
+        "Latest retry failure: provider rate-limit/quota window — the provider advertised " +
+        "availability no earlier than 2026-08-13T01:17:00.262Z (surfaced as `issue_dependencies_blocked`).",
+    });
+
+    // No issueRelations row: nothing has ever blocked this issue, so readiness is restored
+    // and this is the defect shape — "dependency-blocked" with nothing blocking it.
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitEscalationSuppressed).toBe(1);
+    // The signal worth acting on, and the one the removed per-issue line used to carry.
+    expect(result.dependencyWaitEscalationSuppressedDependencyReady).toBe(1);
+    expect(result.dependencyWaitEscalationSuppressedStillBlocked).toBe(0);
+    // Non-zero here would mean the `todo` lane stopped threading its pre-lock readiness.
+    expect(result.dependencyWaitEscalationSuppressedUnclassified).toBe(0);
+    // The partition invariant the derived still-blocked arm depends on.
+    expect(
+      result.dependencyWaitEscalationSuppressedDependencyReady +
+        result.dependencyWaitEscalationSuppressedStillBlocked +
+        result.dependencyWaitEscalationSuppressedUnclassified,
+    ).toBe(result.dependencyWaitEscalationSuppressed);
+    expect(result.escalated).toBe(0);
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(actions).toHaveLength(0);
+  });
+
+  it("attributes an in_progress-lane dependency-wait suppression to the resolved-blocker arm (BLO-32668)", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+      runError:
+        "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const doneBlockerId = randomUUID();
+
+    // A blocker that has since completed: the sweep's own preflight reads readiness as
+    // restored, so this row falls through `dependencyWaitSkipped` to the gate. The gate
+    // must classify it from that preflight read rather than repeating the query under the
+    // per-issue advisory lock — which is what makes this the lane where the threading is
+    // load-bearing.
+    await db.insert(issues).values({
+      id: doneBlockerId,
+      companyId,
+      title: "Upstream work that already finished",
+      status: "done",
+      priority: "medium",
+      issueNumber: 26,
+      identifier: `${issuePrefix}-26`,
+      completedAt: new Date(Date.now() - 10 * 60 * 1000),
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: doneBlockerId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitSkipped).toBe(0);
+    expect(result.dependencyWaitEscalationSuppressed).toBe(1);
+    expect(result.dependencyWaitEscalationSuppressedDependencyReady).toBe(1);
+    expect(result.dependencyWaitEscalationSuppressedStillBlocked).toBe(0);
+    expect(result.dependencyWaitEscalationSuppressedUnclassified).toBe(0);
+    expect(
+      result.dependencyWaitEscalationSuppressedDependencyReady +
+        result.dependencyWaitEscalationSuppressedStillBlocked +
+        result.dependencyWaitEscalationSuppressedUnclassified,
+    ).toBe(result.dependencyWaitEscalationSuppressed);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+
+    // Suppression must still leave the issue dispatchable and unmoved.
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after.status).toBe("in_progress");
+    expect(after.assigneeAgentId).toBe(agentId);
+  });
+
+  // A sweep that suppresses nothing must report an all-zero partition, so a stale non-zero
+  // sub-tally can never leak across passes. The three counters backing these fields are
+  // closure-scoped and shared by every sweep on this service instance — they are reported
+  // as a snapshot/diff per pass, and this pins that the diff, not the running total, is
+  // what lands on the result.
+  it("reports an all-zero dependency-wait partition on a sweep that suppresses nothing (BLO-32668)", async () => {
+    await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "job_failed",
+      runError: "External lifecycle Job failed: BackoffLimitExceeded",
+    });
+
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.dependencyWaitEscalationSuppressed).toBe(0);
+    expect(result.dependencyWaitEscalationSuppressedDependencyReady).toBe(0);
+    expect(result.dependencyWaitEscalationSuppressedStillBlocked).toBe(0);
+    expect(result.dependencyWaitEscalationSuppressedUnclassified).toBe(0);
   });
 
   // Boundary for the gate above. `issue_dependencies_blocked` is a member of
@@ -6789,6 +7121,75 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(result.escalated).toBe(0);
       expect(result.skipped).toBe(1);
       expect(result.issueIds).not.toContain(issueId);
+    },
+  );
+
+  it(
+    "BLO-27463: a run that yielded its slot for a live external wait is not stranded or reassigned",
+    async () => {
+      // BLO-33463 (2026-09-12, `critical`): Ally armed a PR-checks monitor, yielded the
+      // slot as #1195 intends, and the sweep escalated the resulting `cancelled` run as a
+      // stranded assignment — Ally -> CTO -> CEO in six minutes, coming to rest `blocked`
+      // with an empty blocker set, which destroyed the monitor that was the issue's only
+      // wake path and took the two issues it blocks with it.
+      //
+      // The durable-wait gate already knew this issue was attended; it just refused to
+      // look, because it only consulted the wait path for a *succeeded* run.
+      //
+      // Asserted on the acceptance criteria (no recovery action, no ownership move, status
+      // and monitor intact) rather than on a counter, so the test survives the mechanism
+      // moving between layers.
+      const monitorNextCheckAt = new Date(Date.now() + 60 * 60_000);
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        runErrorCode: "external_wait_yield",
+        runError: "Yielded after persisting an external-service wait",
+        monitorNextCheckAt,
+        resultJson: { yieldedExternalWait: true, issueId: null, serviceName: "github-actions" },
+      });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      expect(result.escalated).toBe(0);
+      expect(result.skipped).toBe(1);
+      expect(result.issueIds).not.toContain(issueId);
+
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(issue?.status).toBe("in_progress");
+      expect(issue?.assigneeAgentId).toBe(agentId);
+      expect(issue?.monitorNextCheckAt?.toISOString()).toBe(monitorNextCheckAt.toISOString());
+
+      const actions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(actions).toHaveLength(0);
+    },
+  );
+
+  it(
+    "BLO-27463: an external-wait yield whose monitor has lapsed is still seen by the sweep",
+    async () => {
+      // The bound on the fix above. Admitting the yield to the durable-wait gate must not
+      // create a row that can never be recovered: once the monitor it armed is past due and
+      // no PR or blocker path replaces it, the wait is no longer a wake path and the strand
+      // arms have to stay reachable. Same shape as the BLO-24782 past-due test.
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        runErrorCode: "external_wait_yield",
+        runError: "Yielded after persisting an external-service wait",
+        monitorNextCheckAt: new Date(Date.now() - 48 * 60 * 60_000),
+      });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      expect(result.skipped).toBe(0);
     },
   );
 
@@ -11578,16 +11979,50 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
     expect(results.every((result) => result.status === "fulfilled")).toBe(true);
 
+    // BLO-19124: this race spends the entire per-owner wake budget — 8 concurrent reserves
+    // against `defaultRecoveryActionMaxAttempts` — and reaching that budget is now TERMINAL:
+    // the wake path retires the row to `escalated` and stamps the bound that retired it.
+    //
+    // The invariant this test exists to protect is DEDUPE (one row, not eight), and that is
+    // unchanged. Only the query needed widening: `escalated` still holds
+    // `issue_recovery_actions_active_source_uq`, so counting both active statuses is still
+    // counting exactly the rows the uniqueness constraint governs, whereas filtering on
+    // `active` alone reads a correctly-retired row as a missing one.
     const actions = await db
       .select()
       .from(issueRecoveryActions)
       .where(and(
         eq(issueRecoveryActions.companyId, companyId),
         eq(issueRecoveryActions.sourceIssueId, issueId),
-        eq(issueRecoveryActions.status, "active"),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
       ));
     expect(actions).toHaveLength(1);
-    expect(actions[0]?.attemptCount).toBe(Math.min(8, defaultRecoveryActionMaxAttempts));
+    // BLO-33410: a BOUND, not an equality. `attemptCount` is not a gate — the reserve does a
+    // read-modify-write (`existing.attemptCount + 1`, issue-recovery-actions.ts), so it counts
+    // sweeps that landed, and the budget bounds WAKES rather than increments. 8 racing sweeps
+    // can therefore carry it past `defaultRecoveryActionMaxAttempts`; the old
+    // `.toBe(Math.min(8, defaultRecoveryActionMaxAttempts))` demanded exactly 5 of 8 land and
+    // failed ~2 runs in 3 on unchanged master (measured 6 and 7). 8 is the real ceiling — one
+    // increment per concurrent caller — so this still fails if a retry path double-increments.
+    expect(actions[0]?.attemptCount).toBeGreaterThanOrEqual(1);
+    expect(actions[0]?.attemptCount).toBeLessThanOrEqual(8);
+    // Pin WHICH bound retired it. The creation-anchored horizon is hours out here, so the
+    // budget is the only bound that can have fired — which makes this the one assertion that
+    // fails if the wake path ever goes back to hardcoding the bound on a disjunctive gate.
+    //
+    // Keyed on the OBSERVED attempt count, not on config. How many of the 8 concurrent
+    // reserves actually land is scheduling-dependent (measured 4, 6 and 7 on three runs of
+    // this suite against a budget of 5), so "was the budget exhausted?" is only answerable
+    // from the row itself. Both regimes are asserted rather than one being skipped, so the
+    // branch cannot rot into a silent no-op, and the pairing — retired iff the budget was
+    // reached — holds whichever way the race falls.
+    if ((actions[0]?.attemptCount ?? 0) >= defaultRecoveryActionMaxAttempts) {
+      expect(actions[0]?.status).toBe("escalated");
+      expect(actions[0]?.retiringBound).toBe("attempt_budget");
+    } else {
+      expect(actions[0]?.status).toBe("active");
+      expect(actions[0]?.retiringBound).toBeNull();
+    }
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
   });
 
@@ -12276,11 +12711,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.status).toBe("in_progress");
   });
 
-  // BLO-8050: generalize the BLO-7521 "operator-just-unblocked" gate to all
-  // six escalation callsites. Without these gates, an issue with a stale
+  // BLO-8050: generalize the BLO-7521 "operator-just-unblocked" gate across
+  // the escalation callsites. Without these gates, an issue with a stale
   // failing run gets re-flipped to `blocked` on the next sweep even though
   // the operator's unblock was supposed to grant a fresh run window.
   // Each row exercises one (status × escalation predicate) combination.
+  //
+  // Scope, because it is narrower than it looks: every row below seeds a
+  // `failed` run carrying an `errorCode`. The exhausted-successful-handoff
+  // arm (BLO-31913) needs a `succeeded` run with handoff markers on
+  // `contextSnapshot`, so no row here reaches it and its gate is pinned by
+  // its own test earlier in this file. Adding a row for it would also assert
+  // the wrong counter -- this table checks `escalated` /
+  // `zeroTokenStartupFailureBlocked`, while that arm increments
+  // `successfulRunHandoffEscalated`, so a naive row would pass either way.
+  // This table is therefore not the inventory of gated callsites; the grep in
+  // `latestRunPredatesLatestUnblock`'s docstring is.
   it.each([
     {
       label: "todo + non-retryable terminal run",

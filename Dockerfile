@@ -378,10 +378,22 @@ WORKDIR /vendor
 # Bumped 2026-08-08 to 6dca020 (#56/#58): retain those fixes and restore the
 # PEN-1305 shell-command parser on the current adapter line. The vendor build
 # runs the upstream env-guard and execute suites against this exact tree.
-# Bumped 2026-08-08 to ed03316 (#60): reattach to an exact persisted lifecycle
-# Job after worker recovery instead of recreating its prompt Secret and Job.
-# Running and terminal Jobs are both recovered by name, UID, and run label.
-ARG OPENCODE_K8S_REF=ed0331690432d3c37cd7ed190ca1066c840b30c3
+# Bumped 2026-09-09 to 87a865d: add optional Caveman/Penstock and Ponytail
+# launcher wiring plus server-side credential-inheritance hardening while
+# retaining the persisted lifecycle recovery above.
+# Re-pinned 2026-09-10 to 2075ae1 (BLO-33204): CONTENT-IDENTICAL to 87a865d,
+# which was that PR's branch head and was orphaned when #62 squash-merged.
+# `git diff 87a865d 2075ae1` is empty and both carry tree
+# cd60d8476f3de8a9a8a1bafd741e468de32fae3c, so the Caveman/Penstock and
+# Ponytail wiring and the credential-inheritance hardening above are preserved
+# exactly — this moves the pin onto a reachable ref, it does not move the code.
+# `git clone` fetches only ref-reachable objects, so the orphaned SHA broke
+# every build that missed the vendor-stage cache with
+# `fatal: unable to read tree (87a865de...)`. Builds reusing a pre-force-push
+# vendor layer kept passing, which is why the break looked commit-timed rather
+# than cache-timed. scripts/check-opencode-k8s-pin-reachable.mjs now fails a PR
+# for an unreachable pin instead of waiting for a cache miss to find it.
+ARG OPENCODE_K8S_REF=2075ae1ba249e97c49a77386c81a9d88b22c481d
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
@@ -471,17 +483,28 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 # Pin to a release tag — bump deliberately, not via :latest.
 FROM ghcr.io/github/github-mcp-server:v1.0.3 AS github-mcp
 
-# The Penstock launcher is deliberately kept as a standalone Node script. The
-# private source is fetched by immutable commit with the same BuildKit secret
-# used by the existing private adapter vendor stage. The secret never lands in
-# an image layer, and the content digest prevents a refetch from silently
-# changing what a Paperclip `claude_local` run executes.
+# BLO-32824: this stage previously reused `gh_token`, which is
+# `PAPERCLIP_BOARD_TOKEN` for the private `kkroo/*` vendor clone and cannot read
+# the Blockcast Penstock repository. Keep the launcher credential separate: an
+# absent or unreadable `penstock_runtime_token` must fail the build rather than
+# silently producing an agent image without the runtime.
+
+# The Penstock launcher is deliberately kept as a standalone Node script. It is
+# fetched at an immutable core commit with a credential dedicated to that
+# private repository. Do not reuse `gh_token`: that secret is
+# `PAPERCLIP_BOARD_TOKEN`, which is scoped to the private `kkroo/*` vendor
+# clone. The launcher credential is mounted only for this build step, and the
+# content digest prevents a refetch from silently changing the executable.
 FROM base AS penstock-agent-runtime
 USER root
-ARG PENSTOCK_RUNTIME_REF=2823acc1b4d730a86aded6b228f748aa12f40f53
-ARG PENSTOCK_RUNTIME_SHA256=fa6c923f78900919ec6fd3cbfe1c878078dab267e82e5faaa695d0c49f50f29e
-RUN --mount=type=secret,id=gh_token \
+ARG PENSTOCK_RUNTIME_REF=9878ca2499ea8a8e24ec7d8bcf3222db65ac014a
+ARG PENSTOCK_RUNTIME_SHA256=961f38a5901fe5f775188d99ca542781f8dddec42f1e2ad0100a62b6bf409324
+RUN --mount=type=secret,id=penstock_runtime_token \
     set -eu; \
+    test -s /run/secrets/penstock_runtime_token || { \
+      echo "penstock_runtime_token is required to package the pinned launcher" >&2; \
+      exit 1; \
+    }; \
     verify_sha256() { \
       expected="$1"; \
       file="$2"; \
@@ -492,7 +515,7 @@ RUN --mount=type=secret,id=gh_token \
       fi; \
     }; \
     install -d -m 0755 /opt/penstock/bin; \
-    { printf 'Authorization: Bearer '; cat /run/secrets/gh_token; printf '\n'; } | \
+    { printf 'Authorization: Bearer '; cat /run/secrets/penstock_runtime_token; printf '\n'; } | \
       curl --fail --location --retry 5 --header @- \
       "https://raw.githubusercontent.com/Blockcast/penstock-llm-proxy-core/${PENSTOCK_RUNTIME_REF}/scripts/penstock-agent-runtime.mjs" \
       -o /opt/penstock/bin/penstock-agent-runtime.mjs; \
@@ -549,6 +572,8 @@ RUN set -eu; \
     git -C /tmp/ponytail archive --format=tar "${PONYTAIL_REF}" \
       | tar -x -C /opt/penstock/ponytail; \
     verify_sha256 "${PONYTAIL_HOOKS_SHA256}" /opt/penstock/ponytail/hooks/claude-codex-hooks.json; \
+    test -f /opt/penstock/ponytail/.claude-plugin/plugin.json; \
+    test -f /opt/penstock/ponytail/.opencode/plugins/ponytail.mjs; \
     node -e "const fs=require('node:fs');const p=JSON.parse(fs.readFileSync('/opt/penstock/ponytail/.claude-plugin/plugin.json','utf8'));if(p.name!=='ponytail'||p.version!=='4.9.0'){console.error('unexpected Ponytail plugin identity');process.exit(1)}"; \
     chmod -R a+rX,go-w /opt/penstock/ponytail; \
     rm -rf /tmp/ponytail

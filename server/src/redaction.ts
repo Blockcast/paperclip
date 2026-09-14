@@ -230,7 +230,20 @@ function redactUriCredentialsInValue(value: string): string {
     .replace(URL_CREDENTIAL_PARAM_VALUE_RE, `$1${REDACTED_EVENT_VALUE}`);
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
+/**
+ * Exported because it is the admission gate for every sanitizer in this file:
+ * `sanitizeValue` and `redactAgentConfigPayload` both return their argument
+ * *by reference* when it fails this predicate. A caller that admits a payload
+ * on some weaker "is it an object" test therefore has a fail-open the sanitizer
+ * cannot see — it hands back the raw value and the caller spreads it.
+ *
+ * Gating on this is necessary but not sufficient: where the caller's assignment
+ * sits *inside* the gate, a failing gate leaves the raw value wherever it
+ * already was. The value has to be replaced with a contained one. See
+ * `containAgentConfig` in `routes/agents.ts`, which is the shared wrapper that
+ * does both and is what call sites there should use.
+ */
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
@@ -864,6 +877,36 @@ export function maskWorkspaceRuntimeForRead(value: unknown): unknown {
     out[key] = maskEntry(child, 1, false);
   }
   return out;
+}
+
+/**
+ * Mask one operator-authored free-text scalar that was *promoted out of*
+ * `workspaceRuntime` onto a typed column (PEN-2854, door #14).
+ *
+ * `maskWorkspaceRuntimeForRead` above already elides `command`/`cwd` where the
+ * operator wrote them — inside the runtime config. But the same strings are
+ * copied onto the `workspace_runtime_services` row when the service starts
+ * (`resolveRuntimeServiceReuseIdentity` reads `input.service.command` /
+ * `.cwd` from that very entry, `services/workspace-runtime.ts`), and
+ * `compactIssueRuntimeService` in `routes/issues.ts` emitted them verbatim.
+ * So a single response carried a masked copy and a cleartext copy of the same
+ * string, eight lines apart. Being a typed column bounds the *key set*; it says
+ * nothing about the *value*, which is the reasoning error this helper exists to
+ * correct.
+ *
+ * This is deliberately **not** `maskWorkspaceRuntimeForRead`: these are two
+ * scalars, not a nested map, and reusing the walk would mean either forcing
+ * scalars through an object traversal or copying its body — the duplication
+ * PEN-2839 (#1581) was extracted to prevent.
+ *
+ * `null` passes through rather than becoming the sentinel. It carries nothing,
+ * it is the honest "no command configured" that callers branch on, and
+ * `scoreWorkspaceRuntimeServiceMatch` in `packages/shared/src/workspace-commands.ts`
+ * guards on truthiness before comparing — turning `null` into a string would
+ * change matching behaviour rather than only hiding a value.
+ */
+export function maskWorkspaceRuntimeTextForRead(value: string | null): string | null {
+  return value === null ? null : REDACTED_EVENT_VALUE;
 }
 
 /**

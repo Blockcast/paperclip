@@ -325,6 +325,10 @@ export const agentMeRecoveryActionsQuerySchema = z.object({
   status: z.string().trim().min(1).optional().default("active,escalated"),
   kind: z.string().trim().min(1).optional(),
   limit: z.coerce.number().int().positive().max(500).optional().default(100),
+  // BLO-19124: `limit` alone cannot reach past row 500, so the oldest actions
+  // were unreachable. `order: "asc"` + `offset` is the drift-free walk.
+  offset: z.coerce.number().int().min(0).optional().default(0),
+  order: z.enum(["asc", "desc"]).optional().default("desc"),
 });
 
 export type AgentMeRecoveryActionsQuery = z.infer<typeof agentMeRecoveryActionsQuerySchema>;

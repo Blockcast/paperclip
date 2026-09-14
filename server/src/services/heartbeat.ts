@@ -188,6 +188,11 @@ import {
   taskKeysMatch,
 } from "./pr-review-duplicate-issue-guard.js";
 import { readOrphanedRunTerminalResult } from "./orphaned-run-terminal-result.js";
+import {
+  findTerminalResultEventInRunLogTail,
+  readRunLogTerminalTail,
+  type RunLogTailRead,
+} from "./run-log-terminal-result.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   deleteAgentJobExact,
@@ -378,6 +383,7 @@ import {
 import {
   buildExecutionWorkspaceAdapterConfig,
   executionWorkspaceUsesPerRunScope,
+  executionWorkspaceUsesGitWorktree,
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
@@ -403,6 +409,8 @@ import {
   recordAgentZeroTokenCompletedRunStreak,
   recordCcrotateCapacityDeferred,
   recordHeartbeatTimerSchedulerExclusion,
+  recordHeartbeatPostTerminalRunEventDropped,
+  recordHeartbeatTimerTick,
   recordConcurrentRunBlocked,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
@@ -723,6 +731,15 @@ const MAX_SWEPT_ISSUE_LOCK_RELEASES = 1;
 const TASK_SCOPE_COALESCIBLE_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
+/**
+ * BLO-32553: the terminal-status union, named so it can be threaded through
+ * `readTerminalRunStatus` into `recordHeartbeatPostTerminalRunEventDropped`.
+ * That callsite is what makes the metric's mirrored label list in `metrics.ts`
+ * a compile-time constraint: adding a sixth status here without adding it to
+ * `KNOWN_HEARTBEAT_POST_TERMINAL_RUN_STATUSES` is a type error rather than a
+ * silent collapse to the "unknown" label.
+ */
+type HeartbeatRunTerminalStatus = (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number];
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const OPEN_ROUTINE_EXECUTION_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
@@ -1592,7 +1609,25 @@ export function shouldScheduleAutomaticRunRetry(
 
   // Capacity refusals are safe to retry for durable issue work as well as PR
   // reviews. Timer and maintenance runs remain terminal to avoid retry leaks.
-  if (run.errorCode === "k8s_concurrent_run_blocked") {
+  //
+  // BLO-17938: `k8s_concurrency_guard_unreachable` belongs on this arm too. The
+  // claude-k8s adapter returns it from the `catch` around the concurrency
+  // guard's `listNamespacedJob` — a fail-closed refusal raised BEFORE the prompt
+  // bundle is assembled and before any Job is created, so no adapter invocation
+  // and no external work can have happened. It is the sibling of
+  // `k8s_concurrent_run_blocked` in the same guard (the `try` refuses, the
+  // `catch` cannot tell), differing only in that the K8s API was unreachable
+  // rather than busy — i.e. strictly more transient. It was nonetheless absent
+  // from every arm here, so it fell through to the `adapter_failed`/
+  // `process_lost` tail and was never retried at all, while `recovery/service.ts`
+  // already lists it in ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES — the platform
+  // treated it as a recoverable infra fault everywhere except the one place that
+  // could recover it. Same issue/PR-review scoping as its sibling; it takes the
+  // default bounded transient backoff from resolveAutomaticRunRetryOpts.
+  if (
+    run.errorCode === "k8s_concurrent_run_blocked" ||
+    run.errorCode === "k8s_concurrency_guard_unreachable"
+  ) {
     return isIssueRun || isPrReviewRetryContext(contextSnapshot);
   }
 
@@ -4904,8 +4939,24 @@ function retryAfterDelayMs(value: unknown): number | null {
 // Parsing it here, server-side, is deliberately where the fix goes: it is the
 // one point every adapter's output funnels through, so it covers the k8s
 // bundles we do not build without duplicating the local adapters' parser.
+//
+// BLO-32578: `reset(s) by <ISO>` is a second Penstock wording, not a variant of
+// the first. Its live subscription-capacity refusal reads
+//
+//   API Error: Request rejected (429) · All Claude subscription capacity for
+//   this tenant is rate-limited; the connected accounts reset by
+//   2026-09-07T19:00:00.000Z but seats rotate on this tenant, so capacity may
+//   return sooner
+//
+// which shares no phrase with `capacity may reset at` — note it says "may
+// return sooner", so even the `may` alternative above does not reach it. The
+// horizon was therefore dropped on every subscription-capacity 429 while being
+// parsed on every BYOS one, and the run took the flat 90s hop into a window
+// that stayed closed until BackoffLimitExceeded. The trailing ISO group is what
+// keeps the alternative narrow: unrelated prose ("connection reset by peer",
+// "the accounts reset by tomorrow") carries no timestamp and still returns null.
 const PROVIDER_CAPACITY_RESET_AT_PATTERN =
-  /(?:\b(?:resume_at|retry_not_before|retryNotBefore)\b[\\'"\s]*[:=][\\'"\s]*|\b(?:capacity\s+)?may\s+reset\s+at\s+)(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/i;
+  /(?:\b(?:resume_at|retry_not_before|retryNotBefore)\b[\\'"\s]*[:=][\\'"\s]*|\b(?:capacity\s+)?may\s+reset\s+at\s+|\breset(?:s)?\s+by\s+)(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/i;
 const PROVIDER_CAPACITY_RETRY_IN_PATTERN = /\bretry\s+in\s+(\d+(?:\.\d+)?)\s*(?:s\b|secs?\b|seconds?\b)/i;
 const PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE = "server_parse_provider_capacity_horizon";
 
@@ -6317,8 +6368,18 @@ export function isQueuedRunAdmissionDeferred(
   return isK8sIsolationRetryDeferred(context, now) || isBranchClaimRetryDeferred(context, now);
 }
 
+/**
+ * BLO-31443: the caller resolves the isolation identity and passes it in. This
+ * function used to resolve it itself when the caller omitted it, off an
+ * `isWorkspaceIsolated` it derived locally — and that derivation was *wider*
+ * than the `workspaceIsolationRequested` production feeds the same resolver, so
+ * the two could return different `isolationMode`s for equal input. Production
+ * has always injected the identity, so the fallback was reachable only from
+ * tests: a test-only path that could disagree with production is a test that
+ * passes while production does something else. `null` here means "not a K8s
+ * run" — `resolveK8sRunIsolationIdentity` is the single place that decides both.
+ */
 export function buildK8sRunIsolationDescriptor(input: {
-  adapterType: string | null | undefined;
   runId: string;
   companyId: string;
   agentId: string;
@@ -6326,35 +6387,15 @@ export function buildK8sRunIsolationDescriptor(input: {
   statelessPrReview: boolean;
   executionWorkspace: {
     cwd: string;
-    source: string;
     strategy?: string | null;
   };
   persistedExecutionWorkspaceId?: string | null;
-  persistedWorkspaceExplicitlySelected?: boolean;
-  effectiveMaxConcurrentRuns?: number;
-  effectiveExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode>;
-  isolationIdentity?: {
+  isolationIdentity: {
     isolationMode: "shared" | "run" | "workspace";
     isolationKey: string;
   } | null;
 }): AdapterRunIsolationDescriptor | null {
-  if (!isK8sAdapter(input.adapterType)) return null;
-
-  const isWorkspaceIsolated =
-    input.effectiveExecutionWorkspaceMode === "isolated_workspace" ||
-    input.effectiveExecutionWorkspaceMode === "operator_branch" ||
-    input.executionWorkspace.source === "task_session" ||
-    input.executionWorkspace.strategy === "git_worktree";
-  const isolationIdentity = input.isolationIdentity ?? resolveK8sRunIsolationIdentity({
-    adapterType: input.adapterType,
-    runId: input.runId,
-    agentId: input.agentId,
-    statelessPrReview: input.statelessPrReview,
-    isWorkspaceIsolated,
-    persistedExecutionWorkspaceId: input.persistedExecutionWorkspaceId,
-    persistedWorkspaceExplicitlySelected: input.persistedWorkspaceExplicitlySelected,
-    effectiveMaxConcurrentRuns: input.effectiveMaxConcurrentRuns ?? 1,
-  });
+  const { isolationIdentity } = input;
   if (!isolationIdentity) return null;
   const { isolationMode, isolationKey } = isolationIdentity;
   const persistentIsolationRoot = isolationMode === "workspace"
@@ -6392,14 +6433,22 @@ export function buildK8sRunIsolationDescriptor(input: {
   // branch of `resolveK8sRunIsolationIdentity` ahead of any persisted workspace
   // and must not be pinned to a durable checkout.
   //
-  // KNOWN, DELIBERATE NARROWING OF EXCLUSIVITY — read before widening this.
-  // The `run:<runId>` workspace path was unique *by construction*, so it also
-  // acted as a de-facto exclusion on the workspace. `cwd` under the default
+  // EXCLUSIVITY: closed by BLO-31443, do not re-derive this as a live defect.
+  // The `run:<runId>` workspace path used to be unique *by construction*, so it
+  // also acted as a de-facto exclusion on the workspace. `cwd` under the default
   // `per_issue` runScope is keyed by issue, not run, so that incidental
-  // exclusivity is gone: two runs of one issue hold distinct `run:` keys, both
-  // satisfy the single-writer guard on
-  // `external_runtime_reservations_active_isolation_writer_idx`, and both now
-  // resolve to the same worktree.
+  // exclusivity was lost here: two runs of one issue held distinct writer keys
+  // and both satisfied
+  // `external_runtime_reservations_active_isolation_writer_idx`.
+  //
+  // `resolveK8sRunIsolationIdentity` now also returns a `reservationKey` and
+  // keys the reservation off the tree instead, so same-issue runs collide on
+  // that index and the second is deferred. Nothing in THIS function changed --
+  // `isolationKey` below is still the run's own private identity, so every
+  // root, the `tmpRoot` hash and `sessionScope` all derive from
+  // `runId`/`persistedExecutionWorkspaceId` exactly as they did. Widening the
+  // key this function reads would break saved-session resume; see the two-role
+  // note on `K8sRunIsolationIdentity`.
   //
   // Same-issue concurrency is REACHABLE — do not assume the checkout lock
   // prevents it. `executionRunClaimCondition` is NOT skipped for an interaction
@@ -6430,11 +6479,13 @@ export function buildK8sRunIsolationDescriptor(input: {
   // of the same issue share that issue's own worktree" is the sharing model
   // `per_issue` runScope already describes.
   //
-  // The principled repair is to key the isolation reservation off the resolved
-  // workspace PATH rather than the run id, so different issues still get
+  // The narrowing above was accepted here rather than fixed here because the
+  // repair changes BLO-16842's invariant: key the reservation off the resolved
+  // workspace tree rather than the run id, so different issues still get
   // distinct keys (preserving BLO-16842 sibling concurrency) while same-issue
-  // runs serialize. That changes BLO-16842's invariant and is tracked in
-  // BLO-31443 rather than smuggled in here.
+  // runs serialize. That shipped as BLO-31443 in
+  // `resolveK8sRunIsolationIdentity`/`withTreeScopedReservationKey`, not in this
+  // function -- this one still only decides where the repo lives.
   const hasProvisionedWorktree =
     !input.statelessPrReview &&
     input.executionWorkspace.strategy === "git_worktree" &&
@@ -6507,6 +6558,34 @@ export function buildHeartbeatRunFailedMetricInput(input: {
   };
 }
 
+/**
+ * BLO-31443: the two isolation identities a K8s run carries. They answer
+ * different questions and are deliberately allowed to diverge.
+ *
+ * - `isolationKey` — this run's PRIVATE filesystem identity. Derives `tmpRoot`
+ *   and is stamped into `sessionScope`, where `sessionParamsMatchIsolation`
+ *   reads it to decide whether a saved adapter session may be resumed. It must
+ *   stay as unique as the roots it names, or a run resumes a session that was
+ *   never written under its own `sessionRoot`.
+ * - `reservationKey` — the SHARED MUTABLE RESOURCE this run will write. Binds
+ *   `external_runtime_reservations_active_isolation_writer_idx` and nothing
+ *   else. This is the one that may widen to a per-issue tree so two runs of one
+ *   issue serialize.
+ *
+ * They are equal except where `withTreeScopedReservationKey` widens the second.
+ */
+type K8sRunIsolationIdentity = {
+  isolationMode: "shared" | "run" | "workspace";
+  isolationKey: string;
+  reservationKey: string;
+};
+
+function runUniqueIdentity(
+  identity: { isolationMode: "shared" | "run" | "workspace"; isolationKey: string },
+): K8sRunIsolationIdentity {
+  return { ...identity, reservationKey: identity.isolationKey };
+}
+
 export function resolveK8sRunIsolationIdentity(input: {
   adapterType: string | null | undefined;
   runId: string;
@@ -6516,10 +6595,18 @@ export function resolveK8sRunIsolationIdentity(input: {
   persistedExecutionWorkspaceId?: string | null;
   persistedWorkspaceExplicitlySelected?: boolean;
   effectiveMaxConcurrentRuns: number;
-}): { isolationMode: "shared" | "run" | "workspace"; isolationKey: string } | null {
+  /**
+   * BLO-31443: stable identity of the durable per-issue tree this run will
+   * work in, or null when the run gets a tree nothing else can reach.
+   * Non-null makes the writer reservation follow the TREE instead of the RUN.
+   * Callers must pass null for `per_run` runScope and for stateless PR review,
+   * both of which are run-unique by construction.
+   */
+  perIssueWorkspaceTreeKey?: string | null;
+}): K8sRunIsolationIdentity | null {
   if (!isK8sAdapter(input.adapterType)) return null;
   if (input.statelessPrReview) {
-    return { isolationMode: "run", isolationKey: `run:${input.runId}` };
+    return runUniqueIdentity({ isolationMode: "run", isolationKey: `run:${input.runId}` });
   }
   // BLO-16960: when concurrency would otherwise force the `run:` fallback, a
   // persisted workspace the caller explicitly asked to reuse
@@ -6534,10 +6621,22 @@ export function resolveK8sRunIsolationIdentity(input: {
       (input.persistedWorkspaceExplicitlySelected && input.effectiveMaxConcurrentRuns > 1)
     )
   ) {
-    return {
-      isolationMode: "workspace",
+    const persistedIdentity = {
+      isolationMode: "workspace" as const,
       isolationKey: `workspace:${input.persistedExecutionWorkspaceId}`,
     };
+    // BLO-31443: an EXPLICITLY reused persisted workspace already names the tree
+    // itself, and several issues can point at one such workspace (that is what
+    // `executionWorkspacePreference: "reuse_existing"` and `shared_workspace`
+    // mode are for). Substituting a per-issue key here would LOOSEN exclusivity
+    // rather than tighten it: two different issues sharing one workspace would
+    // get two distinct keys and both write the same tree -- the same defect
+    // class this row exists to close, in the opposite direction. Only the
+    // run-unique key below (a per-run `randomUUID()` minted because the issue
+    // has no persisted workspace yet) is safe to replace.
+    return input.persistedWorkspaceExplicitlySelected
+      ? runUniqueIdentity(persistedIdentity)
+      : withTreeScopedReservationKey(persistedIdentity, input.perIssueWorkspaceTreeKey);
   }
   // Workspace intent without a persisted workspace id has no stable workspace
   // key yet. That pre-existing gap used to fall through to shared isolation;
@@ -6554,9 +6653,89 @@ export function resolveK8sRunIsolationIdentity(input: {
   // Runs targeting an explicitly reused persisted workspace (handled above)
   // never reach this branch, so anonymous siblings still get distinct keys.
   if (input.effectiveMaxConcurrentRuns > 1) {
-    return { isolationMode: "run", isolationKey: `run:${input.runId}` };
+    return withTreeScopedReservationKey(
+      { isolationMode: "run", isolationKey: `run:${input.runId}` },
+      input.perIssueWorkspaceTreeKey,
+    );
   }
-  return { isolationMode: "shared", isolationKey: `agent-shared:${input.agentId}` };
+  return runUniqueIdentity({ isolationMode: "shared", isolationKey: `agent-shared:${input.agentId}` });
+}
+
+/**
+ * BLO-31443: make the single-writer reservation follow the TREE, not the RUN.
+ *
+ * BLO-31282 (#1610) stopped overriding `workspaceRoot` for a run that already
+ * had a git worktree cut for it, which fixed base-checkout contamination but
+ * gave up an incidental exclusivity property. `run:<runId>` and
+ * `workspace:<freshUuid>` are both unique per RUN, whereas the worktree they
+ * resolve to is keyed by ISSUE under the default `per_issue` runScope. Two
+ * concurrent runs of one issue therefore held two distinct keys, both satisfied
+ * `external_runtime_reservations_active_isolation_writer_idx`, and both wrote
+ * the same tree. Substituting a per-issue key makes them collide on that index,
+ * so the second serializes instead.
+ *
+ * Two same-issue runs are reachable and this is NOT closable by config: the
+ * `executionRunClaimCondition` UPDATE matches zero rows for an interaction wake
+ * and that failure is deliberately tolerated (`allowsIssueInteractionWake`), so
+ * the second run never contends for `issues.executionRunId` at all.
+ *
+ * TWO KEYS, TWO ROLES -- do not collapse them back into one. `isolationKey`
+ * names the run's PRIVATE FILESYSTEM IDENTITY: it derives `tmpRoot` and is
+ * stamped into `sessionScope`, where `sessionParamsMatchIsolation` reads it to
+ * decide whether a saved adapter session may be resumed. `reservationKey` names
+ * the SHARED MUTABLE RESOURCE this run will write, and only ever binds the
+ * reservation. Only the second may be widened to a tree.
+ *
+ * The first draft of this change widened `isolationKey` itself and let the
+ * reservation read it. That flipped the session-resume guard from reject to
+ * accept in exactly the branches where it must reject, because `sessionRoot`
+ * stays per-run in both of them:
+ *
+ * - `run` mode: `sessionRoot` is `<ephemeralIsolationRoot>/session` =
+ *   `/runtime-cache/paperclip-runs/<runId>/session`, `storage.session:
+ *   "ephemeral"`. A new empty directory every run.
+ * - `workspace` mode reached WITHOUT explicit selection: `sessionRoot` is
+ *   `<persistentIsolationRoot>/session`, keyed by
+ *   `persistedExecutionWorkspaceId` -- but that branch is reachable only when
+ *   `persistedWorkspaceExplicitlySelected` is false, and `plannedExecution
+ *   WorkspaceId` is then a fresh `randomUUID()` per run. Also a new empty
+ *   directory every run.
+ *
+ * So a shared key would have handed run B run A's `sessionId` against a session
+ * root that never contained it -- a resume of a transcript that is not on disk.
+ * The durability argument for sharing ("the worktree really is the same tree
+ * next run") is a claim about `workspaceRoot`, and `workspaceRoot` is not what
+ * this key gates.
+ *
+ * THE INVARIANT for the reservation key: only ever replace a key that is
+ * RUN-UNIQUE. A key that already names a shared tree is at least as strict as
+ * the per-issue key, so substituting it would loosen exclusivity instead of
+ * tightening it. Three keys are therefore left alone, each for its own reason:
+ *
+ * - `shared` (`agent-shared:<agentId>`) is already STRICTER than per-tree — one
+ *   writer per agent. Substituting a per-tree key there would *loosen* it and
+ *   let an effective-concurrency-1 agent hold two reservations for different
+ *   issues, inverting BLO-16842's containment.
+ * - `workspace:<id>` for an EXPLICITLY reused persisted workspace already names
+ *   the tree, and several issues may share one such workspace, so a per-issue
+ *   key would let those issues write it concurrently. Gated at the call site in
+ *   `resolveK8sRunIsolationIdentity`, and guarded by
+ *   `heartbeat-external-runtime-retry.test.ts`, which binds an owner on
+ *   `workspace:<sharedId>` and requires a contender on a DIFFERENT issue to
+ *   collide with it.
+ * - stateless PR review never reaches this helper; it returns run-scoped
+ *   isolation ahead of every other branch and must stay fully ephemeral.
+ *
+ * `isolationMode` is untouched, so every filesystem root keeps deriving from
+ * `runId`/`persistedExecutionWorkspaceId` exactly as before.
+ */
+function withTreeScopedReservationKey(
+  identity: { isolationMode: "shared" | "run" | "workspace"; isolationKey: string },
+  perIssueWorkspaceTreeKey: string | null | undefined,
+): K8sRunIsolationIdentity {
+  const treeKey = readNonEmptyString(perIssueWorkspaceTreeKey ?? null);
+  if (!treeKey || identity.isolationMode === "shared") return runUniqueIdentity(identity);
+  return { ...identity, reservationKey: `workspace-tree:${treeKey}` };
 }
 
 const K8S_ISOLATION_OWNED_ENV_KEYS = new Set([
@@ -9172,11 +9351,70 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
 }
 
 type GithubReviewerEvidenceVerification =
-  | { status: "found"; via: "review" | "comment"; repoFullName: string; prNumber: number; headSha: string | null }
+  | {
+    status: "found";
+    via: "review" | "comment";
+    /**
+     * BLO-28920: true when the wake's pinned head found nothing and the review
+     * was matched on the PR's *live* head instead. Logged so a future reader of
+     * the run event can tell "review at the head we asked about" from "review at
+     * the head the reviewer actually saw" — the distinction whose absence made
+     * this defect invisible for 24 days.
+     */
+    viaLiveHead?: boolean;
+    repoFullName: string;
+    prNumber: number;
+    headSha: string | null;
+  }
   | { status: "not_found"; repoFullName: string; prNumber: number; headSha: string | null }
   | { status: "unavailable"; reason: string; repoFullName: string | null; prNumber: number | null; headSha: string | null };
 
-async function verifyGithubReviewerEvidence(
+/**
+ * Is there server-side GitHub evidence that the trusted reviewer App reviewed
+ * this PR? Run-output **attestation** — deliberately distinct from *merge
+ * authorization*, which rightly demands `APPROVED` (BLO-24056).
+ *
+ * Exported for the same reason as {@link probeStaleKillReviewEvidence}: the
+ * head-resolution contract below is the whole defect, and it must be unit-
+ * testable without standing up the external-lifecycle finalize path.
+ *
+ * ## Which head counts (BLO-28920)
+ *
+ * Two halves of the system disagree about which head is authoritative, and both
+ * are right about their own half:
+ *
+ *  - The **wake** pins a head at dispatch time (`contextSnapshot.githubHeadSha`,
+ *    back-filled by `github-webhook.ts` for marker requests), so essentially
+ *    every reviewer wake carries a *snapshot* SHA.
+ *  - The **reviewer** is required to re-resolve and review the PR's *live* head.
+ *
+ * So on any PR pushed to between dispatch and review completion the reviewer
+ * legitimately reviews head Y while the gate asks about head X — a guaranteed
+ * miss that failed the run for "no exact-head review" with a valid review
+ * sitting on the PR. Worse, `githubHeadSha` is a `GITHUB_PR_CONTEXT_KEYS`
+ * coalescing key, so the retry inherits the same stale X: deterministic, not
+ * transient, and each cycle re-posts a duplicate review.
+ *
+ * Both heads are ones a reviewer was legitimately handed, so accept either. A
+ * review at any *third* commit still fails, which is the stale-review case the
+ * guard exists for.
+ *
+ * ⚠ This widening belongs **here**, not in `githubHasReviewerEvidenceForPr`.
+ * That function has two other callers and both want the opposite:
+ *
+ *  | caller | wants |
+ *  |---|---|
+ *  | this function (both attestation sites) | either head |
+ *  | `probeStaleKillReviewEvidence` | wake head ONLY — a false negative there authorizes a retry, i.e. a double review (BLO-18030) |
+ *  | `github-status-delivery-outbox` | the status target's own SHA — a different question entirely |
+ *
+ * **Known widening, stated rather than glossed:** a run that posted nothing can
+ * now be credited with a *different* run's review at the live head. That matches
+ * the outcome we want — do not re-review a PR whose current head already carries
+ * a trusted review — but it is a real loosening. Tighten by gating the second
+ * check on the review being newer than the run's `startedAt` if that ever bites.
+ */
+export async function verifyGithubReviewerEvidence(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ): Promise<GithubReviewerEvidenceVerification> {
   const prReview = derivePaperclipPrReview(contextSnapshot);
@@ -9191,11 +9429,32 @@ async function verifyGithubReviewerEvidence(
   }
 
   try {
-    const verified = await githubHasReviewerEvidenceForPr({
+    let verified = await githubHasReviewerEvidenceForPr({
       repoFullName: prReview.repoFullName,
       prNumber: prReview.prNumber,
       headSha: prReview.headSha,
     });
+    // BLO-28920: the wake's head is a dispatch-time snapshot; the reviewer
+    // reviews the live head. Re-check once against the live head on a miss —
+    // `headSha: null` reuses the callee's own `fetchPrHeadSha` fallback, so this
+    // adds no new resolution path. Only fires when the first pass found nothing,
+    // and only when a pinned head was what we searched (a null pinned head
+    // already resolved live on the first pass, so re-running would be identical).
+    let viaLiveHead = false;
+    if (!("error" in verified) && !verified.found && prReview.headSha) {
+      const liveHeadVerified = await githubHasReviewerEvidenceForPr({
+        repoFullName: prReview.repoFullName,
+        prNumber: prReview.prNumber,
+        headSha: null,
+      });
+      // A failure of the *second* pass must not mask the first pass's clean
+      // `not_found`: the run genuinely has no evidence at its pinned head, and
+      // reporting `unavailable` here would convert that into a retry.
+      if (!("error" in liveHeadVerified) && liveHeadVerified.found) {
+        verified = liveHeadVerified;
+        viaLiveHead = true;
+      }
+    }
     if ("error" in verified) {
       return {
         status: "unavailable",
@@ -9207,7 +9466,7 @@ async function verifyGithubReviewerEvidence(
     }
     return {
       status: verified.found ? "found" : "not_found",
-      ...(verified.found ? { via: verified.via } : {}),
+      ...(verified.found ? { via: verified.via, ...(viaLiveHead ? { viaLiveHead: true } : {}) } : {}),
       repoFullName: prReview.repoFullName,
       prNumber: prReview.prNumber,
       headSha: prReview.headSha,
@@ -15618,6 +15877,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   /**
+   * BLO-32553: return the run's status if it is terminal, else null.
+   *
+   * Reads the row rather than trusting the in-memory `currentRun` snapshot,
+   * which was captured while the run was still "running" and is therefore
+   * useless for this question.
+   *
+   * Scope, stated precisely because the obvious reading is wrong: this is
+   * called only from the late-event branch of `onAdapterEvent`, which is
+   * unreachable until adapter execution has settled. So it does NOT observe a
+   * run terminalized by another process (cancel route, recovery sweep) *while*
+   * `execute()` is still running — those events take the fast path and are
+   * still appended. Covering that would need a status read per event on the
+   * hot path; it is a pre-existing gap, not one this guard closes.
+   *
+   * The return type is the terminal-status union rather than `string` so the
+   * value can be handed to `recordHeartbeatPostTerminalRunEventDropped`
+   * without widening its label domain.
+   */
+  async function readTerminalRunStatus(runId: string): Promise<HeartbeatRunTerminalStatus | null> {
+    const [row] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    const status = row?.status ?? null;
+    return status && isHeartbeatRunTerminalStatus(status) ? status : null;
+  }
+
+  /**
    * Allocate the next event sequence and append the event under one owner
    * (BLO-19722).
    *
@@ -21873,6 +22160,80 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  /**
+   * PEN-3129: recover the provider's own refusal for a Job the reconciler is
+   * about to book as `job_failed`.
+   *
+   * Agent Jobs carry `backoffLimit: 0`, so Kubernetes reports every non-zero
+   * exit as `BackoffLimitExceeded` — the same label for a 429 refusal, an OOM,
+   * a crash, and a clean `exit(1)`. `externalLifecycleTerminalOutcome` takes
+   * only the Job status, so the provider verdict is not lost through an
+   * oversight; it is unreachable by construction. It does survive in the run's
+   * own durable log, which is what this reads — see `readRunLogTerminalTail`
+   * for why the read seeks to the end rather than walking from byte zero.
+   *
+   * Deliberately narrow: only a 429 qualifies. That is the provider saying the
+   * subscription window is exhausted. A 529 means the server is overloaded and
+   * a 5xx/timeout is transient — attributing either to a capacity window would
+   * assert something the provider never said, and this value is interpolated
+   * into an issue comment other agents act on.
+   *
+   * Returns the narrow structured verdict only; no transcript text escapes, and
+   * the caller persists none.
+   */
+  async function readExternalLifecycleProviderCapacityRefusal(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "logStore" | "logRef" | "logBytes">,
+    fallbackNowMs: number,
+  ) {
+    if (run.logStore !== "local_file" || !run.logRef) return null;
+    const logRef = run.logRef;
+
+    let tailRead: RunLogTailRead;
+    try {
+      tailRead = await readRunLogTerminalTail((range) =>
+        runLogStore.read({ store: "local_file", logRef }, range),
+      );
+    } catch (err) {
+      // Never block finalization on a log read. Without a verdict the run keeps
+      // exactly the Job-level fields it has always had.
+      logger.warn(
+        { err, runId: run.id },
+        "failed to read run log while recovering external-lifecycle provider verdict",
+      );
+      return null;
+    }
+
+    if (tailRead.kind === "truncated") {
+      // A window that is not the end is not a tail — whether it is the prefix a
+      // size-less walk kept or the intermediate slice a seeked read was left
+      // holding when growth outran the cap. The terminal event sits at the END
+      // of the log, so parsing either would report "no provider verdict" from
+      // bytes that could not have contained one. Say the read was inconclusive
+      // instead of implying the provider was silent.
+      logger.warn(
+        { runId: run.id, scannedBytes: tailRead.scannedBytes },
+        "run log scan reached its cap before EOF; skipping provider-verdict recovery",
+      );
+      return null;
+    }
+
+    const terminal = findTerminalResultEventInRunLogTail(tailRead.tail);
+    if (!terminal) return null;
+
+    // Key on `is_error`, NOT on `subtype`. A capacity refusal is emitted as
+    // `{"subtype":"success","is_error":true,"api_error_status":429}` — the
+    // subtype describes the shape of the turn, not its outcome, so reading it
+    // as the verdict scores a refusal as a success.
+    if (terminal.event.is_error !== true) return null;
+
+    const statusEvidence = readProviderCapacityResetStatusEvidence(terminal.event);
+    if (statusEvidence?.statusCode !== 429) return null;
+
+    const emittedAtMs = terminal.emittedAtMs ?? fallbackNowMs;
+    const horizon = resolveProviderCapacityHorizon({ resultJson: terminal.event }, emittedAtMs);
+    return { statusEvidence, horizon, emittedAtMs };
+  }
+
   function externalLifecycleTerminalOutcome(
     jobStatus: AgentJobRunStatus | null,
     preserveRecordedOutcome = false,
@@ -22114,6 +22475,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             headSha: verification.headSha,
             outcome: verification.status,
             ...(verification.status === "found" ? { via: verification.via } : {}),
+            // BLO-28920: the review was matched on the PR's live head, not the
+            // head this wake pinned. Absent when they agreed.
+            ...(verification.status === "found" && verification.viaLiveHead ? { viaLiveHead: true } : {}),
             ...(verification.status === "unavailable" ? { reason: verification.reason } : {}),
           },
         });
@@ -22234,6 +22598,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
+    // PEN-3129: the Job label alone cannot say why the pod exited, so recover
+    // the provider's own refusal from the run's durable log before booking it.
+    //
+    // Read AFTER the container-diagnostics override, and only while the code is
+    // still `job_failed`: an OOM or a 137 is a different, already-named cause,
+    // and a pod killed for memory must not also be reported as throttled.
+    //
+    // This adds a DIMENSION; it deliberately does not relabel. `errorCode` is a
+    // census and consumer key here in a way `scheduledRetryReason` is not — it
+    // gates container diagnostics capture, retry admission, stranded-issue
+    // routing, an alerting gauge's label set and a dashboard series — so moving
+    // its value would silently corrupt all of them. Notably it is NOT paired
+    // with a top-level `errorFamily` write: that field short-circuits
+    // `shouldScheduleAutomaticRunRetry` above the `job_failed` arm, which would
+    // authorize an unconditional retry of possibly non-idempotent external work
+    // without the `adapterInvocationStarted === false` proof that arm exists to
+    // require. Retry admission, every metric bucket and the census stay
+    // bit-identical; only the run's recoverable explanation changes.
+    const providerCapacityRefusal = terminalOutcome.errorCode === "job_failed"
+      ? await readExternalLifecycleProviderCapacityRefusal(input.run, input.now.getTime())
+      : null;
+    const providerCapacityParkAt =
+      providerCapacityRefusal?.horizon.kind === "usable"
+        ? providerCapacityRefusal.horizon.at
+        : providerCapacityRefusal?.horizon.kind === "over_horizon"
+          ? providerCapacityRefusal.horizon.parkAt
+          : null;
+
     const terminalClaimToken = randomUUID();
     let resultJson = mergeRunStopMetadataForAgent(
       { adapterType: input.adapterType, adapterConfig: parseObject(input.adapterConfig) },
@@ -22241,6 +22633,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       {
         resultJson: {
           ...parseObject(input.run.resultJson),
+          // The paired server-provenance discriminator, written only by this
+          // server path — same contract as the adapter-owner finalize path, so
+          // the recovery reader trusts exactly one shape from exactly one
+          // writer. No transcript text is persisted: the instant, the observed
+          // status and its field, and where the horizon came from.
+          ...(providerCapacityParkAt
+            ? {
+                providerCapacityResetAt: providerCapacityParkAt.toISOString(),
+                providerCapacityResetProvenance: {
+                  source: PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE,
+                  errorFamily: "rate_limit_exhausted",
+                  observedStatusCode: providerCapacityRefusal?.statusEvidence.statusCode ?? null,
+                  observedStatusField: providerCapacityRefusal?.statusEvidence.field ?? null,
+                  observedCause: "rate_limit_exhausted",
+                  horizonSource: "server_run_log_terminal_result",
+                  // BLO-18285: an over-cap park is OUR checkpoint, not the
+                  // instant the provider named. Record what it actually asked
+                  // for, or the run says only "park at +cap" and the reason it
+                  // is not a verbatim park is unrecoverable.
+                  ...(providerCapacityRefusal?.horizon.kind === "over_horizon"
+                    ? {
+                        advertisedResetAt:
+                          providerCapacityRefusal.horizon.advertisedAt.toISOString(),
+                        horizonCapMs: PROVIDER_CAPACITY_MAX_HORIZON_MS,
+                      }
+                    : {}),
+                },
+              }
+            : {}),
           externalLifecycleRecovery: {
             terminalClaimToken,
             reason: terminalOutcome.recoveryReason,
@@ -22261,6 +22682,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 }
               : {}),
             ...(containerDiagnostics ? { containerDiagnostics } : {}),
+            // Recorded even when no horizon parsed: "the provider refused this
+            // with a 429" is the fact the Job label destroyed, and it is worth
+            // having on the row whether or not the refusal named a reset.
+            ...(providerCapacityRefusal
+              ? {
+                  providerRefusalStatusCode:
+                    providerCapacityRefusal.statusEvidence.statusCode,
+                  providerRefusalHorizon: providerCapacityRefusal.horizon.kind,
+                }
+              : {}),
           },
         },
         errorCode: terminalOutcome.errorCode,
@@ -27192,6 +27623,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ? randomUUID()
             : null
         );
+    // BLO-31443: the writer reservation must exclude on the TREE this run will
+    // work in, not on the run. The literal `cwd` is unavailable here -- it needs
+    // `repoRoot` from a `git rev-parse` against `resolvedWorkspace.cwd`, which is
+    // not resolved until ~700 lines below, and the reservation has to be bound
+    // before the workspace is realized. Under `per_issue` runScope the resolved
+    // path is a pure function of the issue (identifier + title -> branch name ->
+    // directory, with no run input), so the issue IS the equivalence class of
+    // that path: keying on it collides exactly when two runs would share a tree.
+    //
+    // Scoped by `projectWorkspaceId` because one issue can hold trees in several
+    // repos of a multi-repo project, and those are genuinely independent.
+    //
+    // Two deliberate exclusions:
+    // - `per_run` runScope appends a run token to the branch, hence to the
+    //   directory, so those runs are already tree-unique and must NOT collide.
+    // - a stateless PR review is run-unique by construction and is filtered in
+    //   the resolver ahead of every other branch.
+    //
+    // Conservative in the one case where issue and path disagree: an issue
+    // retitled between runs resolves to a NEW directory while keeping its id, so
+    // this over-serializes rather than under-serializes. Serializing two runs
+    // that could have been parallel costs latency; letting two runs share one
+    // tree corrupts a checkout.
+    const perIssueWorkspaceTreeKey =
+      issueRef?.id &&
+      paperclipPrReview === null &&
+      !executionWorkspaceUsesPerRunScopeForIssue &&
+      (
+        workspaceIsolationRequested ||
+        workspaceReuseRequest.existingExecutionWorkspaceAvailable ||
+        executionWorkspaceUsesGitWorktree({
+          agentConfig: config,
+          projectPolicy: projectExecutionWorkspacePolicy,
+          issueSettings: issueExecutionWorkspaceSettings,
+          mode: requestedExecutionWorkspaceMode,
+          legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
+          issueAdapterConfig: issueAssigneeOverrides?.adapterConfig ?? null,
+        })
+      )
+        ? `${issueRef.projectWorkspaceId ?? "no-project-workspace"}:${issueRef.id}`
+        : null;
     const k8sIsolationIdentity = resolveK8sRunIsolationIdentity({
       adapterType: agent.adapterType,
       runId: run.id,
@@ -27200,6 +27672,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       isWorkspaceIsolated: workspaceIsolationRequested,
       persistedExecutionWorkspaceId: plannedExecutionWorkspaceId,
       persistedWorkspaceExplicitlySelected: workspaceReuseRequest.existingExecutionWorkspaceAvailable,
+      perIssueWorkspaceTreeKey,
       effectiveMaxConcurrentRuns:
         resolveExternalLifecycleConcurrency(parseHeartbeatPolicy(agent)).effectiveMaxConcurrentRuns,
     });
@@ -27211,7 +27684,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         runId: run.id,
         reservationId: externalRuntimeReservation.id,
         isolationMode: k8sIsolationIdentity.isolationMode,
-        isolationKey: k8sIsolationIdentity.isolationKey,
+        // BLO-31443: `reservationKey`, never `isolationKey`. This binds the
+        // single-writer index, so it must name the shared tree this run will
+        // write. `isolationKey` names the run's own ephemeral roots and gates
+        // saved-session resume; widening that one instead would let a run
+        // resume a session that is not under its `sessionRoot`.
+        isolationKey: k8sIsolationIdentity.reservationKey,
       });
       if (externalRuntimeReservation.state !== "launched") {
         const realizingReservation = await markExternalRuntimeReservationLaunching(db, run.id);
@@ -28118,7 +28596,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       })
       .where(eq(heartbeatRuns.id, run.id));
     const k8sRunIsolation = buildK8sRunIsolationDescriptor({
-      adapterType: agent.adapterType,
       runId: run.id,
       companyId: agent.companyId,
       agentId: agent.id,
@@ -28126,7 +28603,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       statelessPrReview: paperclipPrReview !== null,
       executionWorkspace,
       persistedExecutionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
-      effectiveExecutionWorkspaceMode,
       isolationIdentity: k8sIsolationIdentity,
     });
     if (k8sRunIsolation) {
@@ -28346,6 +28822,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
 
     let seq = await nextRunEventSeq(run.id);
+    // BLO-32553: flipped in the `finally` that wraps adapter execution below.
+    // `onEvent` is only valid for the duration of `adapter.execute`; once that
+    // has settled (through every ccrotate retry), any further event is late by
+    // the adapter contract and must be checked against the run's real status
+    // before it is appended. Kept as a closure flag so the check costs nothing
+    // on the hot in-flight path.
+    let adapterExecutionSettled = false;
     let handle: RunLogHandle | null = null;
     let stdoutExcerpt = "";
     let stderrExcerpt = "";
@@ -28686,9 +29169,123 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       };
 
+      // BLO-32553: reject-and-count guard for events that arrive after the run
+      // has already terminalized.
+      //
+      // `onEvent` is contractually valid only for the duration of
+      // `adapter.execute`. An adapter that fires it from a detached continuation
+      // outliving execute() — the orphan-SIGKILL path — would otherwise append to
+      // a run at a terminal status. The damage is not just a stray row:
+      // `appendRunEvent`'s publish() gates its runtime-status write on
+      // `isHeartbeatRunRuntimeStatusActive(run.status)`, and `run.status` there is
+      // the stale in-memory `currentRun` snapshot taken while the run was still
+      // "running". A late append therefore passes that gate and resurrects the
+      // runtime status `setRunStatus` cleared on terminalization, leaving a
+      // phantom live run that nothing will clear again.
+      //
+      // Two tiers so the hot path pays nothing: the closure flag is free and
+      // false for every in-flight event, so only a genuinely late event reaches
+      // the status read. Note this deliberately does NOT throw — a rejected late
+      // event is therefore distinguishable at the adapter's callsite from a
+      // transport error, which does throw.
       const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
         const eventType = event.eventType.trim();
         if (!eventType) return;
+        if (adapterExecutionSettled) {
+          // Neither the status read nor the sanitization below may reject. Both
+          // touch the DB (`readTerminalRunStatus` selects the run;
+          // `getCurrentUserRedactionOptions` reads instance settings), and the
+          // caller on this path is by definition a continuation that outlived
+          // `adapter.execute` — so there may be nothing awaiting this promise
+          // and an escaping rejection would be an unhandled one.
+          //
+          // A read failure is treated as a drop rather than as "not terminal":
+          // the event is already outside the `onEvent` contract, and appending
+          // on an unverifiable status risks the runtime-status resurrection
+          // described above, which nothing else clears. Passing `null` to the
+          // counter collapses to its "unknown" label, so a read failure stays
+          // distinguishable from a confirmed post-terminal drop.
+          let terminalStatus: HeartbeatRunTerminalStatus | null = null;
+          let statusReadError: unknown = null;
+          try {
+            terminalStatus = await readTerminalRunStatus(currentRun.id);
+          } catch (error) {
+            statusReadError = error;
+          }
+          if (terminalStatus || statusReadError) {
+            // This log is the substitute for the row that is deliberately not
+            // written, so it must not be a *less* redacted substitute than the
+            // storage path. Mirror `appendRunEvent`'s four sanitizations in the
+            // same order: adapter-supplied message/payload are exactly the
+            // threat model those helpers exist for (secrets, size, user PII).
+            let sanitizedMessage: string | null = null;
+            let sanitizedPayload: Record<string, unknown> | null = null;
+            let sanitizationError: unknown = null;
+            try {
+              const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+              sanitizedMessage = event.message
+                ? redactCurrentUserText(event.message, currentUserRedactionOptions)
+                : null;
+              const boundedPayload = event.payload
+                ? boundHeartbeatRunEventPayloadForStorage(event.payload)
+                : null;
+              sanitizedPayload = boundedPayload
+                ? redactCurrentUserValue(redactEventPayload(boundedPayload), currentUserRedactionOptions)
+                : null;
+            } catch (error) {
+              // Sanitization failed, so nothing adapter-supplied is safe to log.
+              // Drop the message/payload rather than fall back to the raw values.
+              sanitizationError = error;
+              sanitizedMessage = null;
+              sanitizedPayload = null;
+            }
+            // The counter and the log are this path's only two reporting
+            // channels, and both can throw exactly where the AC's "not lost
+            // silently" clause needs them not to: `ensureRegistry()` constructs
+            // its counters on first call, and a logger transport can fail. They
+            // are guarded independently rather than inside one `try`, so a
+            // metrics failure is still reported — through the log, as
+            // `metricErr` — instead of suppressing the log along with itself.
+            let metricError: unknown = null;
+            try {
+              recordHeartbeatPostTerminalRunEventDropped(terminalStatus);
+            } catch (error) {
+              metricError = error;
+            }
+            try {
+              logger.warn(
+                {
+                  runId: currentRun.id,
+                  agentId: currentRun.agentId,
+                  companyId: currentRun.companyId,
+                  terminalStatus,
+                  // Truncated to match the storage path's `eventType.slice(0, 120)`
+                  // below. The log stands in for the row that is not written, so
+                  // an adapter must not be able to put a longer string through it
+                  // than storage would have accepted.
+                  eventType: eventType.slice(0, 120),
+                  stream: event.stream ?? null,
+                  level: event.level ?? null,
+                  message: sanitizedMessage,
+                  payload: sanitizedPayload,
+                  ...(statusReadError ? { err: statusReadError } : {}),
+                  ...(sanitizationError ? { sanitizationErr: sanitizationError } : {}),
+                  ...(metricError ? { metricErr: metricError } : {}),
+                },
+                statusReadError
+                  ? "dropped adapter run event after failing to read the run's status (BLO-32553)"
+                  : "dropped adapter run event delivered after the run reached a terminal status (BLO-32553)",
+              );
+            } catch {
+              // Both reporting channels have now failed, so there is nothing
+              // left that could record this drop. Rejecting instead would
+              // surface as an unhandled rejection in a continuation with nothing
+              // awaiting it — the precise failure this branch exists to avoid.
+              // The event is still correctly dropped; only its evidence is lost.
+            }
+            return;
+          }
+        }
         await appendRunEvent(currentRun, seq++, {
           eventType: eventType.slice(0, 120),
           stream: event.stream,
@@ -29277,6 +29874,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         throw adapterErr;
       } finally {
+        // BLO-32553: adapter execution has settled (returned or thrown, after
+        // every ccrotate retry). Anything `onEvent` delivers from here on is a
+        // late event from a continuation that outlived execute().
+        adapterExecutionSettled = true;
         if (branchClaimRenewalTimer) {
           clearInterval(branchClaimRenewalTimer);
         }
@@ -29635,6 +30236,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             headSha: verification.headSha,
             outcome: verification.status,
             ...(verification.status === "found" ? { via: verification.via } : {}),
+            // BLO-28920: the review was matched on the PR's live head, not the
+            // head this wake pinned. Absent when they agreed.
+            ...(verification.status === "found" && verification.viaLiveHead ? { viaLiveHead: true } : {}),
             ...(verification.status === "unavailable" ? { reason: verification.reason } : {}),
           },
         });
@@ -30479,7 +31083,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
             const failedAgent = setupFailureAgent ?? await getAgent(run.agentId).catch(() => null);
             if (failedAgent) {
+              // BLO-28648: pre-dispatch setup failures terminalize here rather than
+              // through the liveness finalization path, and this was the only
+              // `failed` write that never incremented the counter. The whole class
+              // was therefore invisible to Prometheus: `workspace_repo_mismatch`,
+              // `workspace_validation_failed`, `environment_not_found` and the
+              // `setup_failed` fallback have never produced a single sample, while
+              // adapter-returned codes (`k8s_job_create_failed`, …) always did.
+              // An alert written against this metric for a workspace refusal loaded
+              // healthy and could never fire — the failure mode is silence, so
+              // nothing surfaced the gap for 18 days. `k8sRunIsolation: null`
+              // matches the other out-of-try call site; the builder recovers
+              // isolation_mode from the run's persisted contextSnapshot.
+              // A stage-exit race converts this write into a cancellation, and a
+              // cancellation is not a failed run: the liveness path suppresses the
+              // same sample by coercing `outcome` to `cancelled`, so guard here to
+              // match rather than manufacture a false failure.
               if (!terminalDecision.pipelineStageExited) {
+                recordHeartbeatRunFailed(buildHeartbeatRunFailedMetricInput({
+                  agent: failedAgent,
+                  issueId: setupFailureIssueId,
+                  run: livenessRun,
+                  k8sRunIsolation: null,
+                }));
                 await refreshContinuationSummaryForRun(livenessRun, failedAgent).catch(() => undefined);
               }
               if (
@@ -35054,6 +35680,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * `errorDurationSeconds` is unaffected -- every agent still gets an entry,
    * so `paperclip_agent_status_error_duration_seconds` keeps its full series
    * set. Only the age/interval gauges are gated.
+   *
+   * BLO-22498 additionally derives the reason-bucketed aggregate pair
+   * (`paperclip_agent_status_error_agents` /
+   * `..._error_oldest_age_seconds`) from this SAME roster snapshot rather
+   * than adding a second `agents` scan. That was a deliberate call, not
+   * convenience: a separate reconcile pass would be a second reader of the
+   * same table on its own cadence, free to disagree with these gauges about
+   * how many agents are in `error` at a given instant. Sharing one snapshot
+   * makes the count and the per-agent durations arithmetically consistent by
+   * construction, and costs nothing — the reason column rides along in a
+   * query that already runs.
    */
   async function publishAgentLivenessGauges(now: Date) {
     try {
@@ -35064,6 +35701,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           name: agents.name,
           reportsTo: agents.reportsTo,
           status: agents.status,
+          // BLO-22498: bucketed into a bounded error_reason label inside
+          // setAgentLivenessMetrics. Never published raw — it is free text
+          // from the adapter CLI, so a label would be unbounded cardinality.
+          errorReason: agents.errorReason,
           runtimeConfig: agents.runtimeConfig,
           lastHeartbeatAt: agents.lastHeartbeatAt,
           updatedAt: agents.updatedAt,
@@ -35105,6 +35746,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           heartbeatAgeSeconds,
           heartbeatIntervalSeconds: policy.enabled ? policy.intervalSec : null,
           errorDurationSeconds,
+          errorReason: row.errorReason,
         };
       });
 
@@ -36733,6 +37375,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     tickTimers: async (now = new Date()) => {
       if ((await getSchedulingSuppression()).suppressed) {
+        // Deliberately NOT recorded as a tick (BLO-32269). Nothing was
+        // examined, so counting this would report a suppressed fleet as a
+        // live-but-idle one and defeat the dispatch-dark rule these counters
+        // exist for.
+        //
+        // That is a real observability gap, and
+        // paperclip_heartbeat_timer_scheduler_exclusion_total does NOT close
+        // it: every one of its call sites is below `checked += 1`, so none of
+        // them is reachable from this return. Its
+        // `heartbeat.scheduling_suppressed` label exists but is emitted from
+        // inside the per-agent loop, which this return skips -- so the label
+        // being present is not evidence the counter moves here. Global
+        // suppression is observable from the scheduling-suppression record and
+        // worker state instead; see the cause list on
+        // HEARTBEAT_TIMER_CHECKED_METRIC in metrics.ts.
         return {
           checked: 0,
           enqueued: 0,
@@ -36933,7 +37590,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const issueMonitors = await tickDueIssueMonitors(now);
       const expiredIssueMonitors = await tickExpiredIssueMonitors(now);
 
-      return {
+      const result = {
         checked: checked + issueMonitors.checked + expiredIssueMonitors.checked,
         enqueued: enqueued + issueMonitors.triggered,
         // Blocker-deferred monitors delivered no wake, so they belong on the
@@ -36943,6 +37600,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           expiredIssueMonitors.recovered,
         idleSkipped,
       };
+      // Recorded here rather than at the caller's log line, which is gated on
+      // `enqueued > 0` and would therefore leave `_checked_total` pinned at
+      // zero on a healthy-but-idle fleet — the exact reading the pair exists to
+      // distinguish from a dead loop (BLO-32269).
+      recordHeartbeatTimerTick(result);
+      return result;
     },
 
 

@@ -65,6 +65,41 @@ export const BACKSTOP_SKIP_REASONS = [
   "deferred_or_failed", "enqueue_failed",
 ] as const;
 export type BackstopSkipReason = (typeof BACKSTOP_SKIP_REASONS)[number];
+/**
+ * Webhook deliveries turned away at the ingestion readiness guard (BLO-28803).
+ *
+ * `POST /api/plugins/:pluginId/webhooks/:endpointKey` returns from that guard
+ * long before the `plugin_webhook_deliveries` insert, so a rejected delivery
+ * used to leave no row, no counter and no log. During the 2026-08-18 alert
+ * blackout ([BLO-20813]) the only surviving evidence that ~15h of alert
+ * batches had been turned away lived in *Alertmanager's* logs — Paperclip, the
+ * system of record for alerting, could not answer "how many did we bounce, and
+ * for which plugins?".
+ *
+ * This is the counter that answers it. It matters more since [BLO-28659]
+ * converted rejection from destruction into deferral: deliveries now pile up
+ * at the sender instead of failing loudly, so a plugin quietly bouncing every
+ * delivery for hours is otherwise indistinguishable from one receiving none.
+ * Silence is not health.
+ *
+ * `response_class` separates the two outcomes that must never aggregate:
+ * `retryable` (503 — the sender will come back, payloads are merely delayed)
+ * from `terminal` (410 — the plugin is gone and the payloads are being
+ * dropped on purpose). `plugin_status` carries the underlying cause.
+ *
+ * Cardinality guardrail — this route is public and unauthenticated, so the
+ * bound is load-bearing rather than decorative. Labels are read from the
+ * *resolved database row*, never from the caller-supplied `:pluginId` path
+ * parameter: a POST naming a plugin that does not exist is rejected 404 one
+ * step earlier and mints no series at all. On top of that,
+ * {@link boundWebhookRejectionPluginKey} admits at most
+ * {@link MAX_TRACKED_WEBHOOK_REJECTION_PLUGIN_KEYS} distinct keys per process
+ * and collapses the rest to {@link OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY}, so
+ * the hard ceiling is `(64 + 1) * 5` series — five because `ready` never
+ * reaches the guard — independent of the plugins table and of request volume.
+ * Abuse costs a counter increment on an existing series, never storage.
+ */
+export const PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC = "paperclip_plugin_webhook_delivery_rejected_total";
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
 /**
@@ -104,6 +139,104 @@ export const ISOLATED_RUN_STARTED_METRIC = "paperclip_k8s_isolated_run_started_t
 export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_deferred_total";
 export const HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC =
   "paperclip_heartbeat_timer_scheduler_exclusion_total";
+/**
+ * Heartbeat timer-loop liveness pair (BLO-32269). Incremented once per
+ * `tickTimers` pass with that pass's own `checked`/`enqueued` totals — the same
+ * two integers the worker already logs as
+ * `heartbeat timer tick enqueued runs {"checked":N,"enqueued":M}`.
+ *
+ * These exist so "the fleet has stopped dispatching" can be alerted on the
+ * dispatcher itself rather than on a downstream proxy. `PaperclipFleetDispatchDark`
+ * previously keyed on `absent(paperclip_agent_heartbeat_age_seconds)` (1-for-3:
+ * that gauge is conditionally emitted and blinks ~3x/day) and then on
+ * {@link ISOLATED_RUN_STARTED_METRIC}, which counts only *isolated* per-run k8s
+ * Job starts and would therefore read zero for a fleet running exclusively
+ * shared-isolation work. See BLO-32063.
+ *
+ * Read them as a pair — that is the whole point of exporting both:
+ *   - `checked > 0, enqueued = 0` — candidates were examined and the loop
+ *     deliberately enqueued nothing (none due, or every one gated). Healthy.
+ *   - `checked = 0` — *no candidate was examined*. See below; this is NOT by
+ *     itself evidence that the loop is dead.
+ * Those two states have different remediations and are indistinguishable from
+ * outside the process today.
+ *
+ * `checked = 0` is deliberately worded as "no candidate examined" rather than
+ * "no tick completed", because a tick can complete normally and still record
+ * zero. `checked` is only incremented after three `continue` filters in
+ * `tickTimers` (agent not invokable; heartbeat policy disabled or
+ * `intervalSec <= 0`; a `getWorktreeExecutionCutoff()` cutoff with no eligible
+ * issue behind it), so a fleet where every agent trips one of those yields a
+ * completed pass with `checked = 0`. The full cause list is therefore:
+ *   1. the loop is wedged or the process is dead — the case worth paging on;
+ *   2. every candidate was filtered out before the counter (above);
+ *   3. global scheduling suppression — the caller does not enter `tickTimers`
+ *      at all (`server/src/index.ts`), so nothing is recorded;
+ *   4. startup recovery is still pending (`heartbeatStartupRecoveryPending`);
+ *   5. the shutdown drain has begun (`heartbeatSchedulerStopped`);
+ *   6. the pass completed but {@link recordHeartbeatTimerTick} rejected it as
+ *      malformed and dropped **both** halves — see its own doc comment. This
+ *      should never happen (both inputs are integer accumulators) and is the
+ *      only cause of the six that emits a `logger.warn` naming the bad field,
+ *      so the worker log settles it outright.
+ * Only (1) warrants a restart, and note the trap: restarting for (4) re-enters
+ * (4). Rule out 2–6 first.
+ *
+ * There is no counter that attributes a zero `checked` to which of 2–6 caused
+ * it. {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC} does NOT close that
+ * gap and must not be read as doing so: every one of its increments happens
+ * *after* `checked += 1`, so it is silent in all five of those cases.
+ * Distinguish them from process state instead — worker uptime and the
+ * scheduling-suppression record for (1)/(3), and the worker log for (4)/(5)/(6).
+ *
+ * `checked` is also a composite: agents examined, plus `issueMonitors.checked`,
+ * plus `expiredIssueMonitors.checked`. A consumer cannot decompose it, so
+ * `checked > 0` can be carried entirely by due issue monitors with zero agents
+ * examined. That is fine for a liveness rule — the loop demonstrably ran — but
+ * do not read it as "agents were considered".
+ *
+ * Deliberately unlabeled: the consumer is `sum(increase(...[15m])) == 0`, so
+ * per-agent breakdown would add cardinality without adding signal. Per-agent
+ * detail for *due ticks that were then excluded* lives in
+ * {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC} — which, per the paragraph
+ * above, is a strictly narrower set than "candidates this loop skipped".
+ *
+ * Both counters are emitted by the *worker* (`StatefulSet/paperclip`), which is
+ * where the timer loop runs and which deploys independently of
+ * `Deployment/paperclip-api` (BLO-29004).
+ */
+export const HEARTBEAT_TIMER_CHECKED_METRIC = "paperclip_heartbeat_timer_checked_total";
+export const HEARTBEAT_TIMER_ENQUEUED_METRIC = "paperclip_heartbeat_timer_enqueued_total";
+
+/**
+ * BLO-32553: count of adapter run events dropped because they arrived after the
+ * run had already reached a terminal status.
+ *
+ * Labeled by the run's terminal status only. The event type is deliberately NOT
+ * a label: it is adapter-supplied and unbounded, so labeling on it would let any
+ * adapter mint arbitrary time series. The dropped event's type, message and
+ * payload are carried on the accompanying `logger.warn` instead, which is where
+ * the per-drop evidence lives.
+ */
+export const HEARTBEAT_POST_TERMINAL_RUN_EVENT_DROPPED_METRIC =
+  "paperclip_heartbeat_post_terminal_run_event_dropped_total";
+
+/**
+ * Bounded label domain for {@link HEARTBEAT_POST_TERMINAL_RUN_EVENT_DROPPED_METRIC}.
+ * Mirrors `HEARTBEAT_RUN_TERMINAL_STATUSES` in `heartbeat.ts` (including
+ * `interrupted`, which is what `isHeartbeatRunTerminalStatus` treats as terminal).
+ * Duplicated rather than imported to keep metrics.ts free of a heartbeat.ts import.
+ */
+export const KNOWN_HEARTBEAT_POST_TERMINAL_RUN_STATUSES = [
+  "succeeded",
+  "interrupted",
+  "failed",
+  "cancelled",
+  "timed_out",
+] as const;
+
+export type KnownHeartbeatPostTerminalRunStatus =
+  (typeof KNOWN_HEARTBEAT_POST_TERMINAL_RUN_STATUSES)[number];
 
 export const KNOWN_HEARTBEAT_TIMER_SCHEDULER_EXCLUSIONS = [
   "idle_circuit_breaker",
@@ -198,6 +331,29 @@ export const SCHEDULED_RETRY_PARK_HORIZON_METRIC =
   "paperclip_scheduled_retry_park_horizon_seconds";
 export const SCHEDULED_RETRY_PARK_HORIZON_REFRESH_SUCCESS_METRIC =
   "paperclip_scheduled_retry_park_horizon_refresh_success";
+/**
+ * postgres.js connection-pool occupancy, by `state` (BLO-33243).
+ *
+ * There was no pool instrumentation anywhere in this fleet, which made pool
+ * saturation unobservable by construction: the 9 h measurement that produced
+ * BLO-33243 could establish that two control-plane pods were timing out
+ * `/metrics` independently of each other and of their nodes -- the signature
+ * of a per-process pool -- but could not confirm the pool was the mechanism,
+ * because nothing exported it. Saturation reads as `idle == 0` and
+ * `active == max` with {@link DB_POOL_WAITING_QUERIES_METRIC} above 0.
+ *
+ * `max` is carried as a state rather than a separate gauge so headroom is a
+ * plain ratio inside one series, without a second metric to join against.
+ */
+export const DB_POOL_CONNECTIONS_METRIC = "paperclip_db_pool_connections";
+/**
+ * Statements holding no connection yet (BLO-33243). This is the saturation
+ * signal itself: postgres.js only enqueues a query here once every connection
+ * in the pool is busy, so a sustained non-zero value IS pool exhaustion, and a
+ * zero value rules it out. Separate from {@link DB_POOL_CONNECTIONS_METRIC}
+ * because it counts queries, not connections.
+ */
+export const DB_POOL_WAITING_QUERIES_METRIC = "paperclip_db_pool_waiting_queries";
 /** Queue wait observed when a sanctioned GitHub PR-review run starts. */
 export const PR_REVIEW_QUEUE_WAIT_METRIC = "paperclip_pr_review_queue_wait_seconds";
 export const PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS = [60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800];
@@ -1221,6 +1377,117 @@ export function normalizeAuthOutcome(outcome: string | null | undefined): AuthOu
     : "server_error";
 }
 
+/**
+ * How a webhook delivery rejected at the readiness guard looked to the sender
+ * (BLO-28803). These must stay separate in the exposition: `retryable` means
+ * the sender will bring the payload back, `terminal` means it will not and the
+ * data is being discarded deliberately. Summing them would hide exactly the
+ * distinction an incident reconstruction needs.
+ */
+export const KNOWN_WEBHOOK_REJECTION_RESPONSE_CLASSES = ["retryable", "terminal"] as const;
+export type WebhookRejectionResponseClass =
+  (typeof KNOWN_WEBHOOK_REJECTION_RESPONSE_CLASSES)[number];
+
+/**
+ * Hard ceiling on distinct `plugin_key` label values admitted by
+ * {@link PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC}.
+ *
+ * The resolved-row rule already bounds this by the plugins table, which is
+ * operator-controlled — an unknown plugin never reaches the guard. This cap is
+ * the second line: it holds the series count flat even if a future change lets
+ * an unresolved identifier through, so a public unauthenticated route can
+ * never turn into unbounded registry growth. Comfortably above any realistic
+ * install count (the fleet runs well under 20).
+ */
+export const MAX_TRACKED_WEBHOOK_REJECTION_PLUGIN_KEYS = 64;
+/** Label value standing in for keys beyond the cap, and for a missing key. */
+export const OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY = "other";
+
+const trackedWebhookRejectionPluginKeys = new Set<string>();
+
+/** Keep reject-path logs useful without making sender volume a log-volume DoS. */
+const WEBHOOK_REJECTION_LOG_INTERVAL_MS = 60_000;
+type WebhookRejectionLogState = {
+  lastLoggedAt: number;
+  suppressed: number;
+  latest: {
+    pluginId: string;
+    endpointKey: string;
+    pluginStatus: string;
+    httpStatus: number;
+  };
+};
+const webhookRejectionLogState = new Map<string, WebhookRejectionLogState>();
+
+/**
+ * Admit `pluginKey` as a label value, or collapse it to
+ * {@link OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY}. First-come-first-served up to
+ * the cap: real installs are few and long-lived, so they claim their slots on
+ * first rejection and keep them for the life of the process.
+ */
+export function boundWebhookRejectionPluginKey(pluginKey: string | null | undefined): string {
+  const key = typeof pluginKey === "string" ? pluginKey.trim() : "";
+  if (key.length === 0) return OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY;
+  if (trackedWebhookRejectionPluginKeys.has(key)) return key;
+  if (trackedWebhookRejectionPluginKeys.size >= MAX_TRACKED_WEBHOOK_REJECTION_PLUGIN_KEYS) {
+    return OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY;
+  }
+  trackedWebhookRejectionPluginKeys.add(key);
+  return key;
+}
+
+function logPluginWebhookDeliveryRejection(input: {
+  pluginKey: string;
+  pluginId: string;
+  endpointKey: string;
+  pluginStatus: string;
+  responseClass: WebhookRejectionResponseClass;
+  httpStatus: number;
+}): void {
+  const key = `${input.pluginKey}:${input.responseClass}`;
+  const now = Date.now();
+  const previous = webhookRejectionLogState.get(key);
+  const latest = {
+    pluginId: input.pluginId,
+    endpointKey: input.endpointKey,
+    pluginStatus: input.pluginStatus,
+    httpStatus: input.httpStatus,
+  };
+
+  if (previous && now - previous.lastLoggedAt < WEBHOOK_REJECTION_LOG_INTERVAL_MS) {
+    previous.suppressed += 1;
+    previous.latest = latest;
+    return;
+  }
+
+  if (previous?.suppressed) {
+    logger.warn(
+      {
+        pluginKey: input.pluginKey,
+        responseClass: input.responseClass,
+        suppressedCount: previous.suppressed,
+        ...previous.latest,
+      },
+      "plugin webhook rejection log summary",
+    );
+  }
+
+  webhookRejectionLogState.set(key, { lastLoggedAt: now, suppressed: 0, latest });
+  logger.warn(
+    {
+      pluginKey: input.pluginKey,
+      pluginId: input.pluginId,
+      endpointKey: input.endpointKey,
+      pluginStatus: input.pluginStatus,
+      responseClass: input.responseClass,
+      httpStatus: input.httpStatus,
+    },
+    input.responseClass === "retryable"
+      ? "plugin webhook delivery deferred: plugin is not ready, sender told to retry"
+      : "plugin webhook delivery dropped: plugin is gone, sender told not to retry",
+  );
+}
+
 export function classifyAuthOperation(requestUrl: string): AuthOperation {
   const pathname = requestUrl.split("?", 1)[0]?.replace(/\/+$/, "") ?? "";
   if (pathname.endsWith("/sign-in/oauth2")) return "oidc_start";
@@ -1562,6 +1829,95 @@ export const AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC = "paperclip_agent_heartbea
  */
 export const AGENT_ERROR_DURATION_SECONDS_METRIC = "paperclip_agent_status_error_duration_seconds";
 
+/**
+ * Bounded bucket set for the free-text `agents.errorReason` (BLO-22498).
+ *
+ * WHY A BUCKET AND NOT THE RAW STRING
+ * -----------------------------------
+ * `errorReason` is not a repo-defined enum: for this condition it is verbatim
+ * text from the opencode CLI, arriving via the session-recovery path in
+ * `packages/adapters/opencode-local/src/server/execute.ts` and landing in the
+ * column as `finalizeAgentStatus`'s `failureReason`. Putting that on a label
+ * would mint a new series per distinct upstream phrasing — the exact
+ * cardinality failure BLO-28616 catalogued (343 alert rows / 334 distinct
+ * pods). So it is collapsed to this fixed set, same idiom as
+ * {@link KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES}.
+ *
+ * `other` vs `none` are kept distinct deliberately: `other` means "in error
+ * for a reason we have not triaged into a bucket", `none` means "in error
+ * with no reason recorded at all". Conflating them would hide which is
+ * growing.
+ */
+export const AGENT_ERROR_REASON_SESSION_UNAVAILABLE = "session_unavailable";
+export const AGENT_ERROR_REASON_OTHER = "other";
+export const AGENT_ERROR_REASON_NONE = "none";
+
+export const KNOWN_AGENT_ERROR_REASON_BUCKETS = [
+  AGENT_ERROR_REASON_SESSION_UNAVAILABLE,
+  AGENT_ERROR_REASON_OTHER,
+  AGENT_ERROR_REASON_NONE,
+] as const;
+
+export type AgentErrorReasonBucket = (typeof KNOWN_AGENT_ERROR_REASON_BUCKETS)[number];
+
+/**
+ * Collapse a raw `agents.errorReason` into a {@link
+ * KNOWN_AGENT_ERROR_REASON_BUCKETS} member.
+ *
+ * The `session_unavailable` match is a case-insensitive SUBSTRING test, not
+ * equality. That is deliberate and load-bearing: the upstream text is not
+ * ours, and observed forms wrap the phrase in surrounding context rather than
+ * being exactly `"Session unavailable"`. An equality check would read as
+ * working — the series would exist and sit at a plausible 0 — while silently
+ * classifying every real occurrence as `other`. That failure is invisible on
+ * a dashboard, which is why the test pins a wrapped form and not just the
+ * bare phrase.
+ */
+export function classifyAgentErrorReason(
+  errorReason: string | null | undefined,
+): AgentErrorReasonBucket {
+  if (typeof errorReason !== "string") return AGENT_ERROR_REASON_NONE;
+  const trimmed = errorReason.trim();
+  if (trimmed.length === 0) return AGENT_ERROR_REASON_NONE;
+  return trimmed.toLowerCase().includes("session unavailable")
+    ? AGENT_ERROR_REASON_SESSION_UNAVAILABLE
+    : AGENT_ERROR_REASON_OTHER;
+}
+
+/**
+ * Count of agents currently in `status = 'error'`, bucketed by
+ * {@link classifyAgentErrorReason} (BLO-22498).
+ *
+ * This is the reason-resolved companion to
+ * {@link AGENT_ERROR_DURATION_SECONDS_METRIC}, which carries only `agent_id`
+ * and therefore cannot answer "are we in the BLO-18012 condition, or is some
+ * unrelated agent merely errored". BLO-22498's acceptance criteria require
+ * that distinction explicitly, so a generic error count cannot satisfy the
+ * panel.
+ *
+ * Every bucket is published on every pass, including empty ones, so an
+ * idle-healthy fleet reads an explicit `0` rather than dropping the series.
+ * A missing series and a healthy one look identical on a Grafana panel and on
+ * most `absent()`-less alert expressions — the zero-fill is what makes
+ * "recovered" distinguishable from "exporter broke".
+ */
+export const AGENT_ERROR_REASON_AGENTS_METRIC = "paperclip_agent_status_error_agents";
+
+/**
+ * Seconds the OLDEST agent in each {@link classifyAgentErrorReason} bucket has
+ * continuously held `status = 'error'`, 0 when the bucket is empty
+ * (BLO-22498).
+ *
+ * Max-within-bucket rather than a per-agent series so BLO-18012's bound
+ * ("time-to-recovery <= 2 min") is a direct single-series comparison instead
+ * of a `max()` the panel has to reconstruct. Inherits the `updatedAt`-as-
+ * proxy caveat documented on {@link AGENT_ERROR_DURATION_SECONDS_METRIC}: an
+ * unrelated write to a still-errored row understates the age, never
+ * overstates it, so this is a lower bound on true time-in-error.
+ */
+export const AGENT_ERROR_REASON_OLDEST_AGE_METRIC =
+  "paperclip_agent_status_error_oldest_age_seconds";
+
 let registry: Registry | null = null;
 let concurrentRunBlocked: Counter<"agent_id" | "reason" | "isolation_mode"> | null = null;
 let isolatedRunStarted: Counter<"agent_id" | "isolation_mode"> | null = null;
@@ -1576,6 +1932,9 @@ type HeartbeatRunFailedLabel =
 let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
 let heartbeatTimerSchedulerExclusion: Counter<"reason"> | null = null;
+let heartbeatPostTerminalRunEventDropped: Counter<"status"> | null = null;
+let heartbeatTimerChecked: Counter | null = null;
+let heartbeatTimerEnqueued: Counter | null = null;
 let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = null;
 let externalRuntimeReservationEvents: Counter<"event"> | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
@@ -1602,6 +1961,8 @@ let overdueScheduledRetryOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryAgeMetricsRefreshSuccess: Gauge | null = null;
 let scheduledRetryParkHorizon: Gauge<"agent_id"> | null = null;
 let scheduledRetryParkHorizonRefreshSuccess: Gauge | null = null;
+let dbPoolConnections: Gauge<"state"> | null = null;
+let dbPoolWaitingQueries: Gauge | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
 let pluginMetric: Counter<
   "plugin_id" | "plugin_key" | "metric" | PluginMetricPromotableTagKey
@@ -1668,10 +2029,15 @@ let gbrainRecallTotal: Counter<"status"> | null = null;
 let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
 let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
 let agentErrorDuration: Gauge<"agent_id"> | null = null;
+let agentErrorReasonAgents: Gauge<"error_reason"> | null = null;
+let agentErrorReasonOldestAge: Gauge<"error_reason"> | null = null;
 let projectPrimaryWorkspaceFallback: Counter | null = null;
 let backstopDeferredCandidates: Gauge<"source"> | null = null;
 let backstopSweepCompleted: Counter<"source"> | null = null;
 let backstopCandidatesSkipped: Counter<"source" | "reason"> | null = null;
+let pluginWebhookDeliveryRejected:
+  | Counter<"plugin_key" | "response_class" | "plugin_status">
+  | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -1680,6 +2046,9 @@ function ensureRegistry(): {
   failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
   heartbeatTimerSchedulerExclusionCounter: Counter<"reason">;
+  heartbeatPostTerminalRunEventDroppedCounter: Counter<"status">;
+  heartbeatTimerCheckedCounter: Counter;
+  heartbeatTimerEnqueuedCounter: Counter;
   zeroTokenCompletedRunStreakGauge: Gauge<"agent_id" | "adapter">;
   externalRuntimeReservationEventsCounter: Counter<"event">;
   externalRuntimeReservationsActiveGauge: Gauge;
@@ -1704,6 +2073,8 @@ function ensureRegistry(): {
   overdueScheduledRetryAgeMetricsRefreshSuccessGauge: Gauge;
   scheduledRetryParkHorizonGauge: Gauge<"agent_id">;
   scheduledRetryParkHorizonRefreshSuccessGauge: Gauge;
+  dbPoolConnectionsGauge: Gauge<"state">;
+  dbPoolWaitingQueriesGauge: Gauge;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
   pluginMetricCounter: Counter<
     "plugin_id" | "plugin_key" | "metric" | PluginMetricPromotableTagKey
@@ -1718,10 +2089,13 @@ function ensureRegistry(): {
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
   agentErrorDurationGauge: Gauge<"agent_id">;
+  agentErrorReasonAgentsGauge: Gauge<"error_reason">;
+  agentErrorReasonOldestAgeGauge: Gauge<"error_reason">;
   projectPrimaryWorkspaceFallbackCounter: Counter;
   backstopDeferredCandidatesGauge: Gauge<"source">;
   backstopSweepCompletedCounter: Counter<"source">;
   backstopCandidatesSkippedCounter: Counter<"source" | "reason">;
+  pluginWebhookDeliveryRejectedCounter: Counter<"plugin_key" | "response_class" | "plugin_status">;
 } {
   if (
     !registry
@@ -1730,6 +2104,9 @@ function ensureRegistry(): {
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
     || !heartbeatTimerSchedulerExclusion
+    || !heartbeatPostTerminalRunEventDropped
+    || !heartbeatTimerChecked
+    || !heartbeatTimerEnqueued
     || !agentZeroTokenCompletedRunStreak
     || !externalRuntimeReservationEvents
     || !externalRuntimeReservationsActive
@@ -1756,6 +2133,8 @@ function ensureRegistry(): {
     || !overdueScheduledRetryAgeMetricsRefreshSuccess
     || !scheduledRetryParkHorizon
     || !scheduledRetryParkHorizonRefreshSuccess
+    || !dbPoolConnections
+    || !dbPoolWaitingQueries
     || !pluginError
     || !pluginMetric
     || !pluginMetricDropped
@@ -1766,10 +2145,13 @@ function ensureRegistry(): {
     || !agentHeartbeatAge
     || !agentHeartbeatInterval
     || !agentErrorDuration
+    || !agentErrorReasonAgents
+    || !agentErrorReasonOldestAge
     || !projectPrimaryWorkspaceFallback
     || !backstopDeferredCandidates
     || !backstopSweepCompleted
     || !backstopCandidatesSkipped
+    || !pluginWebhookDeliveryRejected
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -1823,6 +2205,53 @@ function ensureRegistry(): {
       labelNames: ["reason"],
       registers: [registry],
     });
+    heartbeatPostTerminalRunEventDropped = new Counter({
+      name: HEARTBEAT_POST_TERMINAL_RUN_EVENT_DROPPED_METRIC,
+      help:
+        "Count of adapter run events dropped because they arrived after the run reached a "
+        + "terminal status, labeled by that terminal status (BLO-32553). Each increment has a "
+        + "matching logger.warn carrying the dropped event's type, message and payload. A "
+        + "non-zero rate means an adapter is emitting from a continuation that outlives "
+        + "execute() — expected only on the orphan-kill path.",
+      labelNames: ["status"],
+      registers: [registry],
+    });
+    // Unlabeled on purpose (BLO-32269): consumed as
+    // `sum(increase(...[15m])) == 0`. prom-client zero-initializes an unlabeled
+    // counter at construction, so both series are present on the very first
+    // scrape after boot — a dispatch-dark rule must be able to tell "0 ticks"
+    // from "metric not published yet", and an absent series cannot.
+    heartbeatTimerChecked = new Counter({
+      name: HEARTBEAT_TIMER_CHECKED_METRIC,
+      help:
+        "Count of heartbeat timer-loop candidates examined, summed across completed "
+        + "tickTimers passes. Composite: agents examined + due issue monitors + expired "
+        + "issue monitors. Recorded on every completed pass, not only passes that "
+        + "enqueued something. Read with " + HEARTBEAT_TIMER_ENQUEUED_METRIC
+        + ": checked>0/enqueued=0 is a healthy idle loop. checked=0 means no candidate "
+        + "was examined, which is NOT by itself a dead loop -- a pass can complete with "
+        + "zero after every agent is filtered out, and the loop is also not entered "
+        + "under global scheduling suppression, during startup recovery, or during the "
+        + "shutdown drain. A completed pass is also dropped outright, both halves, if "
+        + "either input is not a non-negative finite number -- that is logged with the "
+        + "offending field and should never happen. "
+        + HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC + " cannot "
+        + "disambiguate these: it is only incremented after this counter, so it is "
+        + "silent in all of them. Rule them out from worker uptime and logs before "
+        + "restarting. Emitted by the worker, where the timer loop runs (BLO-32269).",
+      registers: [registry],
+    });
+    heartbeatTimerEnqueued = new Counter({
+      name: HEARTBEAT_TIMER_ENQUEUED_METRIC,
+      help:
+        "Count of heartbeat runs enqueued by the timer loop, summed across completed "
+        + "tickTimers passes. Mirrors the `enqueued` field of the "
+        + "'heartbeat timer tick enqueued runs' log line. Direct dispatcher-side "
+        + "replacement for the isolated-run proxy previously used by "
+        + "PaperclipFleetDispatchDark, which could not see shared-isolation work "
+        + "(BLO-32269 / BLO-32063).",
+      registers: [registry],
+    });
     agentZeroTokenCompletedRunStreak = new Gauge({
       name: AGENT_NO_USAGE_STREAK_METRIC,
       help:
@@ -1867,6 +2296,25 @@ function ensureRegistry(): {
       registers: [registry],
     });
     scheduledRetryParkHorizonRefreshSuccess.set(0);
+    dbPoolConnections = new Gauge({
+      name: DB_POOL_CONNECTIONS_METRIC,
+      help:
+        "postgres.js connection-pool occupancy by state (BLO-33243): max (the configured cap), "
+        + "idle (connected, no query), active (serving or reserved), connecting (handshaking). "
+        + "Per-pod, because the pool is per-process -- which is what made the /metrics scrape "
+        + "timeouts independent across pods and across nodes. Saturation is idle=0 with "
+        + "active=max and " + DB_POOL_WAITING_QUERIES_METRIC + " above 0.",
+      labelNames: ["state"],
+      registers: [registry],
+    });
+    dbPoolWaitingQueries = new Gauge({
+      name: DB_POOL_WAITING_QUERIES_METRIC,
+      help:
+        "Statements queued with no pool connection yet (BLO-33243). postgres.js only enqueues "
+        + "here once every connection is busy, so a sustained non-zero value IS pool exhaustion "
+        + "and a zero value rules it out.",
+      registers: [registry],
+    });
     externalRuntimeReservationStrandedOldestAge = new Gauge({
       name: EXTERNAL_RUNTIME_RESERVATION_STRANDED_OLDEST_AGE_METRIC,
       help:
@@ -2384,6 +2832,44 @@ function ensureRegistry(): {
       labelNames: ["agent_id"],
       registers: [registry],
     });
+    agentErrorReasonAgents = new Gauge({
+      name: AGENT_ERROR_REASON_AGENTS_METRIC,
+      help:
+        "Count of agents currently in status='error', bucketed by a bounded error_reason "
+        + "label (session_unavailable | other | none) collapsed from the free-text "
+        + "agents.errorReason (BLO-22498). The reason-resolved companion to "
+        + AGENT_ERROR_DURATION_SECONDS_METRIC
+        + ", which carries only agent_id and so cannot distinguish the BLO-18012 "
+        + "'Session unavailable' condition from any unrelated errored agent. Fleet-wide and "
+        + "recomputed from the committed agents table on every heartbeat scheduler tick, so "
+        + "it is restart-safe and replica-invariant: aggregate across replicas with "
+        + "`max by (error_reason)`, NEVER a bare sum, or a second replica doubles the count. "
+        + "Every bucket publishes on every pass including empty ones, so a recovered fleet "
+        + "reads an explicit 0 instead of the series vanishing -- absent and healthy are "
+        + "indistinguishable on a panel, and that ambiguity is the whole failure this closes.",
+      labelNames: ["error_reason"],
+      registers: [registry],
+    });
+    agentErrorReasonOldestAge = new Gauge({
+      name: AGENT_ERROR_REASON_OLDEST_AGE_METRIC,
+      help:
+        "Seconds the OLDEST agent in each error_reason bucket has continuously held "
+        + "status='error', 0 when the bucket is empty (BLO-22498). Max-within-bucket so "
+        + "BLO-18012's <=120s time-to-recovery bound is a direct single-series comparison "
+        + "rather than one the panel reconstructs. Same replica-invariance and zero-fill "
+        + "contract as "
+        + AGENT_ERROR_REASON_AGENTS_METRIC
+        + ". Inherits the updatedAt-as-proxy caveat from "
+        + AGENT_ERROR_DURATION_SECONDS_METRIC
+        + ": an unrelated write to a still-errored row understates the age, so this is a "
+        + "lower bound on true time-in-error and can only under-report a bound breach.",
+      labelNames: ["error_reason"],
+      registers: [registry],
+    });
+    for (const bucket of KNOWN_AGENT_ERROR_REASON_BUCKETS) {
+      agentErrorReasonAgents.set({ error_reason: bucket }, 0);
+      agentErrorReasonOldestAge.set({ error_reason: bucket }, 0);
+    }
     projectPrimaryWorkspaceFallback = new Counter({
       name: PROJECT_PRIMARY_WORKSPACE_FALLBACK_METRIC,
       help:
@@ -2416,6 +2902,20 @@ function ensureRegistry(): {
     for (const source of BACKSTOP_SOURCES) {
       backstopDeferredCandidates.set({ source }, 0);
     }
+    pluginWebhookDeliveryRejected = new Counter({
+      name: PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC,
+      help:
+        "Count of inbound plugin webhook deliveries turned away at the ingestion "
+        + "readiness guard (BLO-28803), labeled by bounded plugin_key, response_class "
+        + "(retryable = 503, the sender will re-deliver; terminal = 410, the payload is "
+        + "dropped on purpose) and plugin_status. Before this counter a rejected delivery "
+        + "left no row, no counter and no log, so the 2026-08-18 alert blackout "
+        + "(BLO-20813) could only be reconstructed from Alertmanager's own logs. "
+        + "A sustained retryable rate means a plugin is bouncing every delivery; any "
+        + "terminal rate means payloads are being discarded.",
+      labelNames: ["plugin_key", "response_class", "plugin_status"],
+      registers: [registry],
+    });
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -2427,6 +2927,9 @@ function ensureRegistry(): {
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
     heartbeatTimerSchedulerExclusionCounter: heartbeatTimerSchedulerExclusion,
+    heartbeatPostTerminalRunEventDroppedCounter: heartbeatPostTerminalRunEventDropped,
+    heartbeatTimerCheckedCounter: heartbeatTimerChecked,
+    heartbeatTimerEnqueuedCounter: heartbeatTimerEnqueued,
     zeroTokenCompletedRunStreakGauge: agentZeroTokenCompletedRunStreak,
     externalRuntimeReservationEventsCounter: externalRuntimeReservationEvents,
     externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
@@ -2454,6 +2957,8 @@ function ensureRegistry(): {
     overdueScheduledRetryAgeMetricsRefreshSuccessGauge: overdueScheduledRetryAgeMetricsRefreshSuccess,
     scheduledRetryParkHorizonGauge: scheduledRetryParkHorizon,
     scheduledRetryParkHorizonRefreshSuccessGauge: scheduledRetryParkHorizonRefreshSuccess,
+    dbPoolConnectionsGauge: dbPoolConnections,
+    dbPoolWaitingQueriesGauge: dbPoolWaitingQueries,
     pluginErrorGauge: pluginError,
     pluginMetricCounter: pluginMetric,
     pluginMetricDroppedCounter: pluginMetricDropped,
@@ -2464,10 +2969,13 @@ function ensureRegistry(): {
     agentHeartbeatAgeGauge: agentHeartbeatAge,
     agentHeartbeatIntervalGauge: agentHeartbeatInterval,
     agentErrorDurationGauge: agentErrorDuration,
+    agentErrorReasonAgentsGauge: agentErrorReasonAgents,
+    agentErrorReasonOldestAgeGauge: agentErrorReasonOldestAge,
     projectPrimaryWorkspaceFallbackCounter: projectPrimaryWorkspaceFallback,
     backstopDeferredCandidatesGauge: backstopDeferredCandidates,
     backstopSweepCompletedCounter: backstopSweepCompleted,
     backstopCandidatesSkippedCounter: backstopCandidatesSkipped,
+    pluginWebhookDeliveryRejectedCounter: pluginWebhookDeliveryRejected,
   };
 }
 
@@ -2606,6 +3114,91 @@ export function recordHeartbeatTimerSchedulerExclusion(reason: string | null | u
   return normalized;
 }
 
+/**
+ * BLO-32553: record that a run event was dropped for arriving post-terminalization.
+ *
+ * `status` is the run's terminal status, narrowed to the mirrored label domain so
+ * a caller cannot widen the label set by construction — a new terminal status in
+ * `heartbeat.ts` that is not mirrored here fails to typecheck at the callsite
+ * instead of silently collapsing to "unknown".
+ *
+ * `null`/`undefined` is a meaningful input, not just defensive: the guard passes
+ * it when the status read itself failed, which records the drop under "unknown"
+ * and keeps it distinguishable from a confirmed terminal drop. The runtime
+ * membership check is retained for untyped (JS) callers.
+ */
+export function recordHeartbeatPostTerminalRunEventDropped(
+  status: KnownHeartbeatPostTerminalRunStatus | null | undefined,
+): string {
+  const normalized =
+    typeof status === "string"
+      && (KNOWN_HEARTBEAT_POST_TERMINAL_RUN_STATUSES as readonly string[]).includes(status)
+      ? status
+      : "unknown";
+  ensureRegistry().heartbeatPostTerminalRunEventDroppedCounter.inc({ status: normalized });
+  return normalized;
+}
+
+export interface RecordHeartbeatTimerTickInput {
+  /** Candidates examined by this pass (the log line's `checked`). */
+  checked: number;
+  /** Runs enqueued by this pass (the log line's `enqueued`). */
+  enqueued: number;
+}
+
+/**
+ * Record one completed heartbeat timer pass (BLO-32269).
+ *
+ * Call this on every completed pass, including passes that enqueued nothing —
+ * that is precisely the case `HEARTBEAT_TIMER_CHECKED_METRIC` exists to make
+ * visible, and it is why this is not hung off the existing log line (which is
+ * gated on `enqueued > 0` and so would leave `_checked_total` pinned at zero on
+ * a healthy but idle fleet).
+ *
+ * Non-finite or negative inputs are dropped rather than clamped: a counter must
+ * be monotonic, and silently substituting 0 for a bad value would fabricate a
+ * "loop ran, found nothing" reading — the healthy signal — out of a bug. The
+ * drop is logged because a dropped tick is otherwise indistinguishable from a
+ * tick that never ran, which is the precise ambiguity this pair exists to
+ * remove. Both inputs are integer accumulators, so this should never fire —
+ * which is exactly why it is worth hearing about if it does.
+ *
+ * The drop is all-or-nothing across the pair, because the reading it protects
+ * is a property of the pair rather than of either field. Validating them
+ * independently would let a pass with a valid `checked` and a bad `enqueued`
+ * move `checked` while leaving `enqueued` flat — which is observationally
+ * identical to substituting 0 for the bad value, and lands on exactly the
+ * `checked > 0, enqueued = 0` shape documented above as *Healthy*. That is the
+ * worst available outcome: a fleet that has stopped enqueuing, reporting
+ * healthy-idle on the surface the alert rule reads. `enqueued` is the likelier
+ * half to break, since `tickTimers` composes it from a single field
+ * (`issueMonitors.triggered`) where `checked` sums three, so a refactor can
+ * yield `NaN` on `enqueued` alone. Dropping the pass as a unit leaves both
+ * series flat, which reads as dispatch-dark — the direction that alerts.
+ */
+export function recordHeartbeatTimerTick(input: RecordHeartbeatTimerTickInput): void {
+  const metrics = ensureRegistry();
+  const checkedValid = Number.isFinite(input.checked) && input.checked >= 0;
+  const enqueuedValid = Number.isFinite(input.enqueued) && input.enqueued >= 0;
+  if (!checkedValid || !enqueuedValid) {
+    logger.warn(
+      {
+        checked: input.checked,
+        enqueued: input.enqueued,
+        invalidFields: [
+          ...(checkedValid ? [] : ["checked"]),
+          ...(enqueuedValid ? [] : ["enqueued"]),
+        ],
+        metrics: [HEARTBEAT_TIMER_CHECKED_METRIC, HEARTBEAT_TIMER_ENQUEUED_METRIC],
+      },
+      "heartbeat timer tick metrics dropped as a pair: checked/enqueued must both be non-negative finite numbers",
+    );
+    return;
+  }
+  metrics.heartbeatTimerCheckedCounter.inc(input.checked);
+  metrics.heartbeatTimerEnqueuedCounter.inc(input.enqueued);
+}
+
 export interface RecordAgentZeroTokenCompletedRunStreakInput {
   /** Agent id is bounded against the active company roster before emission. */
   agentId: string | null | undefined;
@@ -2738,6 +3331,32 @@ export function setScheduledRetryParkHorizonMetrics(
 
 export function setScheduledRetryParkHorizonRefreshSuccess(success: boolean): void {
   ensureRegistry().scheduledRetryParkHorizonRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+/** Snapshot of postgres.js pool occupancy (BLO-33243). Plain numbers — reading them touches no socket. */
+export interface DbPoolStats {
+  max: number;
+  idle: number;
+  active: number;
+  connecting: number;
+  waiting: number;
+}
+
+/**
+ * Publish a pool snapshot (BLO-33243). Called on the `/metrics` request path
+ * rather than from the background collector on purpose: the reading costs
+ * nothing (it is four in-memory queue lengths, no query, no await) and the
+ * moment worth sampling is scrape time. A collector tick blocked waiting for a
+ * connection is exactly when the pool is interesting and exactly when it would
+ * fail to report.
+ */
+export function setDbPoolStats(stats: DbPoolStats): void {
+  const { dbPoolConnectionsGauge, dbPoolWaitingQueriesGauge } = ensureRegistry();
+  dbPoolConnectionsGauge.set({ state: "max" }, stats.max);
+  dbPoolConnectionsGauge.set({ state: "idle" }, stats.idle);
+  dbPoolConnectionsGauge.set({ state: "active" }, stats.active);
+  dbPoolConnectionsGauge.set({ state: "connecting" }, stats.connecting);
+  dbPoolWaitingQueriesGauge.set(stats.waiting);
 }
 
 /**
@@ -3457,12 +4076,32 @@ export function setAgentLivenessMetrics(
     heartbeatAgeSeconds: number | null;
     heartbeatIntervalSeconds: number | null;
     errorDurationSeconds: number;
+    /**
+     * Raw `agents.errorReason`, collapsed to a bounded bucket here rather
+     * than by the caller so the classification lives next to the label set it
+     * feeds and cannot drift from it (BLO-22498). Only consulted for entries
+     * actually in `error` — see the aggregation below.
+     */
+    errorReason?: string | null;
   }>,
 ): void {
   const metrics = ensureRegistry();
   metrics.agentHeartbeatAgeGauge.reset();
   metrics.agentHeartbeatIntervalGauge.reset();
   metrics.agentErrorDurationGauge.reset();
+
+  // Zero every bucket up front, then accumulate. `reset()` alone would DELETE
+  // the series for a bucket that is currently empty, and an absent series is
+  // indistinguishable from a healthy one on a Grafana panel — the precise
+  // ambiguity BLO-22498 exists to remove. Recovery must render as a line
+  // returning to 0, not as a line that stops existing.
+  const bucketCounts = new Map<AgentErrorReasonBucket, number>();
+  const bucketOldestAge = new Map<AgentErrorReasonBucket, number>();
+  for (const bucket of KNOWN_AGENT_ERROR_REASON_BUCKETS) {
+    bucketCounts.set(bucket, 0);
+    bucketOldestAge.set(bucket, 0);
+  }
+
   for (const entry of entries) {
     if (typeof entry.agentId !== "string" || entry.agentId.length === 0) continue;
     if (entry.heartbeatEnabled && entry.heartbeatExpected) {
@@ -3476,9 +4115,31 @@ export function setAgentLivenessMetrics(
         );
       }
     }
-    metrics.agentErrorDurationGauge.set(
-      { agent_id: entry.agentId },
-      Number.isFinite(entry.errorDurationSeconds) ? Math.max(0, entry.errorDurationSeconds) : 0,
+    const errorDurationSeconds = Number.isFinite(entry.errorDurationSeconds)
+      ? Math.max(0, entry.errorDurationSeconds)
+      : 0;
+    metrics.agentErrorDurationGauge.set({ agent_id: entry.agentId }, errorDurationSeconds);
+
+    // `errorDurationSeconds > 0` is the in-error predicate, matching how the
+    // caller derives it (0 for every non-error status). Deliberately NOT
+    // keyed on `errorReason` being present: an agent in `error` with no
+    // reason recorded belongs in the `none` bucket, not omitted from the
+    // count. Note the boundary case this accepts — an agent that entered
+    // `error` in the same millisecond as this pass reads 0 and is missed
+    // until the next tick, which under-reports for at most one scrape
+    // interval and never invents a breach.
+    if (errorDurationSeconds > 0) {
+      const bucket = classifyAgentErrorReason(entry.errorReason);
+      bucketCounts.set(bucket, (bucketCounts.get(bucket) ?? 0) + 1);
+      bucketOldestAge.set(bucket, Math.max(bucketOldestAge.get(bucket) ?? 0, errorDurationSeconds));
+    }
+  }
+
+  for (const bucket of KNOWN_AGENT_ERROR_REASON_BUCKETS) {
+    metrics.agentErrorReasonAgentsGauge.set({ error_reason: bucket }, bucketCounts.get(bucket) ?? 0);
+    metrics.agentErrorReasonOldestAgeGauge.set(
+      { error_reason: bucket },
+      bucketOldestAge.get(bucket) ?? 0,
     );
   }
 }
@@ -3508,6 +4169,46 @@ export function recordBackstopSweepCompleted(source: BackstopSource): void {
 
 export function recordBackstopCandidateSkipped(source: BackstopSource, reason: BackstopSkipReason): void {
   ensureRegistry().backstopCandidatesSkippedCounter.inc({ source, reason });
+}
+
+/**
+ * Record a webhook delivery turned away at the ingestion readiness guard
+ * (BLO-28803).
+ *
+ * Two surfaces, deliberately: the counter answers "how many, for which plugin,
+ * over what window" from the scraped registry — alertable, and readable long
+ * after the fact without sender-side logs — while the paired log line carries
+ * the per-request detail (`pluginId` as the caller supplied it, `endpointKey`,
+ * the HTTP status actually sent) that must never become a label.
+ *
+ * Called on the reject path of a public unauthenticated route, so it must not
+ * throw: a metrics fault has no business converting a considered 503 into a
+ * 500 that the sender reads as something else entirely.
+ */
+export function recordPluginWebhookDeliveryRejected(input: {
+  /** Canonical key from the resolved plugins row — NOT the URL parameter. */
+  pluginKey: string | null | undefined;
+  /** Identifier as supplied by the caller; logged, never labeled. */
+  pluginId: string;
+  endpointKey: string;
+  pluginStatus: string;
+  responseClass: WebhookRejectionResponseClass;
+  httpStatus: number;
+}): void {
+  const pluginKey = boundWebhookRejectionPluginKey(input.pluginKey);
+  try {
+    ensureRegistry().pluginWebhookDeliveryRejectedCounter.inc({
+      plugin_key: pluginKey,
+      response_class: input.responseClass,
+      plugin_status: input.pluginStatus,
+    });
+  } catch (error) {
+    logger.error(
+      { err: error, pluginKey },
+      "failed to record plugin webhook delivery rejection metric",
+    );
+  }
+  logPluginWebhookDeliveryRejection({ ...input, pluginKey });
 }
 
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
@@ -3550,6 +4251,9 @@ export function __resetMetricsForTest(): void {
   heartbeatRunFailed = null;
   ccrotateCapacityDeferred = null;
   heartbeatTimerSchedulerExclusion = null;
+  heartbeatPostTerminalRunEventDropped = null;
+  heartbeatTimerChecked = null;
+  heartbeatTimerEnqueued = null;
   agentZeroTokenCompletedRunStreak = null;
   zeroTokenStreakAdapterByAgentId.clear();
   externalRuntimeReservationEvents = null;
@@ -3586,11 +4290,16 @@ export function __resetMetricsForTest(): void {
   agentHeartbeatAge = null;
   agentHeartbeatInterval = null;
   agentErrorDuration = null;
+  agentErrorReasonAgents = null;
+  agentErrorReasonOldestAge = null;
   projectPrimaryWorkspaceFallback = null;
   backstopDeferredCandidates = null;
   backstopSweepCompleted = null;
   backstopCandidatesSkipped = null;
   gbrainRecallTotal = null;
+  pluginWebhookDeliveryRejected = null;
+  trackedWebhookRejectionPluginKeys.clear();
+  webhookRejectionLogState.clear();
   resetDepBlockedMetrics();
   resetBlockerResolvedWakeMetrics();
   resetRoutineDispatchMetrics();

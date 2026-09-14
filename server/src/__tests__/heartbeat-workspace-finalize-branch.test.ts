@@ -37,6 +37,7 @@ import {
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import { waitForRunToFinish } from "./helpers/wait-for-run-to-finish.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -92,16 +93,6 @@ async function createGitRepo() {
   await runGit(repoRoot, ["add", "README.md"]);
   await runGit(repoRoot, ["commit", "-m", "initial"]);
   return repoRoot;
-}
-
-async function waitForRunToFinish(heartbeat: Heartbeat, runId: string, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const run = await heartbeat.getRun(runId);
-    if (run && run.status !== "queued" && run.status !== "running") return run;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return heartbeat.getRun(runId);
 }
 
 async function waitForHeartbeatIdle(db: Db, timeoutMs = 5_000) {
@@ -344,7 +335,7 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
     const run = await wakeIssue(heartbeat, agentId, issueId);
     expect(run).not.toBeNull();
 
-    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id, 10_000);
     expect(finishedRun).toMatchObject({
       status: "succeeded",
       errorCode: null,
@@ -433,7 +424,7 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
     const run = await wakeIssue(heartbeat, agentId, issueId);
     expect(run).not.toBeNull();
 
-    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id, 10_000);
     expect(finishedRun).toMatchObject({
       status: "succeeded",
       errorCode: null,
@@ -505,7 +496,7 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
     const run = await wakeIssue(heartbeat, agentId, issueId);
     expect(run).not.toBeNull();
 
-    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id, 10_000);
     expect(finishedRun).toMatchObject({
       status: "succeeded",
       errorCode: null,

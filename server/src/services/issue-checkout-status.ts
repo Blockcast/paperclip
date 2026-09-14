@@ -1,5 +1,5 @@
-import { and, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
-import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
+import { and, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
+import { heartbeatRuns, issueRelations, issues, type Db } from "@paperclipai/db";
 import { TERMINAL_HEARTBEAT_RUN_STATUS_VALUES } from "./issue-execution-lock.js";
 import { buildIssueMonitorEligibilityPatch } from "./issue-execution-policy.js";
 
@@ -167,9 +167,96 @@ const restorableCheckoutPromotion = and(
   )`,
 );
 
+/**
+ * Does this row have a blocker that can still reach `done`?
+ *
+ * `issue_relations` stores "X is blocked by Y" as `type = 'blocks'` with
+ * `issue_id = Y` and `related_issue_id = X`, so a row's own blockers are the
+ * edges pointing *at* it. A blocker counts as resolved only when it is `done`
+ * (`plugin-host-services.ts` filters `status !== "done"`), which is what
+ * `issue_blockers_resolved_sweep` waits for before waking the dependent.
+ */
+const hasPendingBlocker = sql`exists (
+  select 1
+  from ${issueRelations}
+  join ${issues} as blocker on blocker.id = ${issueRelations.issueId}
+  where ${issueRelations.relatedIssueId} = ${issues.id}
+    and ${issueRelations.companyId} = ${issues.companyId}
+    and ${issueRelations.type} = 'blocks'
+    and blocker.status not in ('done', 'cancelled')
+)`;
+
+/**
+ * A `cancelled` blocker never reaches `done`, so it can never resolve.
+ *
+ * The resolved sweep fires on the transition to "every blocker done"; one
+ * cancelled edge means that condition is unreachable, so the dependent waits
+ * forever. A cancelled edge is therefore worse than no edge — it looks like a
+ * live dependency on every triage surface.
+ */
+const hasCancelledBlocker = sql`exists (
+  select 1
+  from ${issueRelations}
+  join ${issues} as blocker on blocker.id = ${issueRelations.issueId}
+  where ${issueRelations.relatedIssueId} = ${issues.id}
+    and ${issueRelations.companyId} = ${issues.companyId}
+    and ${issueRelations.type} = 'blocks'
+    and blocker.status = 'cancelled'
+)`;
+
+/**
+ * BLO-33144 — the status to restore to, which is NOT always the recorded marker.
+ *
+ * `checkout` accepts `blocked` in `expectedStatuses`, so a row that was
+ * `blocked` when a run picked it up records `blocked` as its restore marker. The
+ * recovery path also *writes* `blocked` on a stranded row ("moving it to
+ * `blocked` so it is visible for intervention"), and a later checkout of that
+ * row records `blocked` in turn — so the marker is minted far more often than
+ * genuine dependency-blocking would suggest.
+ *
+ * Restoring `blocked` verbatim is only safe when a blocker edge will actually
+ * wake the row. The heartbeat skips `blocked`, so `blocked` with no resolvable
+ * edge has no wake path at all: not a slow queue, a one-way ratchet that is
+ * indistinguishable from a correctly-blocked row on every triage surface, so
+ * nobody comes looking (BLO-27553). Measured on the 2026-09-10 cohort this
+ * drain exists for: **141 of 141** rows whose marker was `blocked` had zero
+ * blocker edges. A verbatim restore would have converted 141 visible rows —
+ * rows that mint recovery actions and productivity reviews precisely *because*
+ * they are loud — into 141 silent permanent strands. That is a worse state than
+ * the bug, reached by something that looks like cleanup.
+ *
+ * So `blocked` is restored only when the row has at least one pending blocker
+ * and no cancelled one; otherwise the row lands in `todo`, which keeps it in
+ * `inbox-lite` and re-dispatchable. Every other marker restores verbatim.
+ */
+const checkoutRestoreTargetStatus = sql`case
+  when ${issues.checkoutRestoreStatus} <> 'blocked' then ${issues.checkoutRestoreStatus}
+  when ${hasPendingBlocker} and not ${hasCancelledBlocker} then 'blocked'
+  else 'todo'
+end`;
+
+/**
+ * BLO-29913 — `started_at` is part of the promotion, so undoing the promotion
+ * must clear it.
+ *
+ * `checkoutStartedAtForCurrentRow` stamps `started_at = now()` on exactly the
+ * transition this function reverses: it writes the clock only when checkout
+ * actually promotes a queue-tier row, and preserves the existing value when the
+ * row was already `in_progress`. The restore is therefore symmetric — it can
+ * only fire while `checkout_restore_status` is set, which is only true for a
+ * promotion that stamped the clock in the first place, so this never discards a
+ * timestamp some other writer owns.
+ *
+ * Leaving it set is the load-bearing half of the bug. `long_active_duration`
+ * measures wall-clock from `issues.started_at` to now, so a row restored to
+ * `todo` with a stale `started_at` keeps accruing active duration in a queue
+ * tier it is no longer being worked in, and mints a productivity review at 6h
+ * for an episode that ended when the run died.
+ */
 const restoreCheckoutPromotionSet = () => ({
-  status: sql`${issues.checkoutRestoreStatus}`,
+  status: checkoutRestoreTargetStatus,
   checkoutRestoreStatus: null,
+  startedAt: null,
   updatedAt: new Date(),
 });
 
@@ -349,6 +436,86 @@ export async function restoreCheckoutPromotedStatuses(
       and(
         inArray(issues.id, [...target.issueIds]),
         eq(issues.companyId, target.companyId),
+        restorableCheckoutPromotion,
+      ),
+    )
+    .returning(restoreReturning);
+
+  await reconcileRestoredMonitors(dbOrTx, restored as RestoredRow[]);
+
+  return restored.map((row: { id: string }) => row.id);
+}
+
+/**
+ * BLO-33144 — restore every promotion that no run can ever carry back.
+ *
+ * The reconciliation half of BLO-29913. That fix made `sweepStaleIssueLocks`
+ * restore the promotion when it clears a lock, which stops new strands, but it
+ * is forward-only and structurally cannot drain the ones already there: the
+ * sweep selects on `checkout_run_id is not null or execution_run_id is not
+ * null`, and an earlier sweep pass already nulled both columns on these rows
+ * without restoring the status. There is no lock left to find, so the fixed
+ * sweep never selects them. Measured 2026-09-10: **225 of 225** drainable rows
+ * had both lock columns NULL, i.e. every one was unreachable by the fix.
+ *
+ * Both-columns-NULL is exactly the condition that makes a row unreachable from
+ * every other call site — those all take their issue ids from run context, and
+ * a row with no run reference appears in none of them. So that is the predicate
+ * here, which also keeps this pass disjoint from the sweep's: a row whose lock
+ * still points at a terminal run is the sweep's to clear and restore in one
+ * pass, and is deliberately left alone.
+ *
+ * Guarded by the same {@link restorableCheckoutPromotion} the single-issue and
+ * batch forms use, so the drain and the steady-state path cannot diverge — a
+ * divergence would show up as a row demoted out from under a live run. That
+ * shared guard also makes this idempotent for free: the restore clears
+ * `checkout_restore_status`, so a drained row no longer matches and a second
+ * pass mutates nothing. The same property covers concurrent API replicas: two
+ * sweeps racing this statement serialize on the row lock, and the loser
+ * re-evaluates the predicate against the committed tuple and skips.
+ *
+ * Deliberately not company-scoped, unlike the two run-context forms. Those take
+ * an issue id from persisted context, where the id is not guaranteed to belong
+ * to the company whose lock the caller just released, so scoping is what makes a
+ * cross-company reset structurally impossible. This one takes no ids at all — it
+ * selects purely by shape, like the lock sweep it runs inside — so there is no
+ * caller-supplied id to mis-scope, and reconciliation has to span every company
+ * to do its job.
+ *
+ * An owner is required, and that is the same lesson as the `blocked` split
+ * above arriving from the other side (BLO-30095). Heartbeat selection is BY
+ * ASSIGNEE, so a `todo` row with neither an agent nor a user owner is returned
+ * by no inbox and nothing can ever select it again — the mirror of the
+ * `blocked`-with-no-edge strand, and quieter, because the row reads as a
+ * healthy actionable issue on every triage surface. The `in_progress` row it
+ * would replace is at least anomalous: it keeps `started_at` accruing and shows
+ * up in any status-shaped sweep. So an ownerless row is left loud rather than
+ * laundered into a silent one, and the promotion marker is left intact so a
+ * later restore is still possible once it has an owner. A *user* assignee is a
+ * real wake path — the row lands in that user's inbox — so only rows with
+ * neither are skipped. Measured 2026-09-10 on the cohort this drain exists for:
+ * 0 of 264 `in_progress` rows had neither owner, so this guard costs nothing
+ * today and exists because the drain is permanent and estate-wide.
+ *
+ * Scoped to this pass rather than the shared guard on purpose: the two
+ * run-context forms are driven by an actor that just held the row, and one of
+ * them (`issueService.release()`) strips the assignee deliberately as a
+ * hand-back to the pool. Only this pass selects rows nobody has any context
+ * for.
+ *
+ * @returns the ids actually restored.
+ */
+export async function restoreStrandedCheckoutPromotions(
+  dbOrTx: DbOrTransaction,
+): Promise<string[]> {
+  const restored = await dbOrTx
+    .update(issues)
+    .set(restoreCheckoutPromotionSet())
+    .where(
+      and(
+        isNull(issues.checkoutRunId),
+        isNull(issues.executionRunId),
+        sql`(${issues.assigneeAgentId} is not null or ${issues.assigneeUserId} is not null)`,
         restorableCheckoutPromotion,
       ),
     )

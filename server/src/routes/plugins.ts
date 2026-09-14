@@ -56,6 +56,7 @@ import {
   REPO_ROOT,
 } from "../services/plugin-loader.js";
 import { logActivity } from "../services/activity-log.js";
+import { recordPluginWebhookDeliveryRejected } from "../services/metrics.js";
 import { sseRegistry, writeSseFrame } from "../services/sse-registry.js";
 import { publishGlobalLiveEvent } from "../services/live-events.js";
 import { issueService } from "../services/issues.js";
@@ -3214,6 +3215,14 @@ export function pluginRoutes(
    * this route answers 410. That drift is known and deliberate for now: its
    * callers are plugin-authored clients rather than Alertmanager, so the
    * payload-loss stakes differ. It is the next guard to partition.
+   *
+   * Both arms of that guard increment
+   * {@link PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC} before responding, so the
+   * volume Paperclip turned away stays answerable from the scraped registry
+   * rather than only from the sender's logs (BLO-28803). Deferral makes this
+   * necessary: since deliveries are retried rather than destroyed, a plugin
+   * bouncing every batch for hours is otherwise indistinguishable from one
+   * receiving none.
    */
   router.post("/plugins/:pluginId/webhooks/:endpointKey", async (req, res) => {
     if (!webhookDeps) {
@@ -3237,12 +3246,34 @@ export function pluginRoutes(
     // including one this build has never heard of, answers 503 + Retry-After.
     // The request is well-formed and the fault is ours.
     if (plugin.status !== "ready") {
+      // Record before responding, on both arms. The insert at Step 6 is far
+      // below this guard, so without this a rejected delivery leaves no trace
+      // anywhere in Paperclip and the only evidence of a bounced batch lives in
+      // the sender's logs — which is exactly how the 2026-08-18 blackout
+      // (BLO-20813) became unreconstructable from here. Labels come from the
+      // resolved row, never from `pluginId`; see BLO-28803 for the bound.
+      const rejection = {
+        pluginKey: plugin.pluginKey,
+        pluginId,
+        endpointKey,
+        pluginStatus: plugin.status,
+      };
       if (WEBHOOK_TERMINAL_PLUGIN_STATUSES.has(plugin.status as PluginStatus)) {
+        recordPluginWebhookDeliveryRejected({
+          ...rejection,
+          responseClass: "terminal",
+          httpStatus: 410,
+        });
         res.status(410).json({
           error: `Plugin has been uninstalled (current status: ${plugin.status})`,
         });
         return;
       }
+      recordPluginWebhookDeliveryRejected({
+        ...rejection,
+        responseClass: "retryable",
+        httpStatus: 503,
+      });
       res.setHeader("Retry-After", String(WEBHOOK_NOT_READY_RETRY_AFTER_SECONDS));
       res.status(503).json({
         error: `Plugin is not ready (current status: ${plugin.status})`,

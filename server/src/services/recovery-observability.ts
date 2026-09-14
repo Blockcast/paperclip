@@ -1,6 +1,10 @@
-import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
+import {
+  RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY,
+  RESOLVED_ISSUE_STATUS_EVIDENCE_KEY,
+} from "./issue-recovery-actions.js";
 
 // Default alert threshold: the recovery rate that a regression like the 07-06
 // week (3.26% of runs) blew past while nobody noticed by feel. See the plan on
@@ -49,6 +53,13 @@ export type RecoveryHandoffSummary = {
   handedBack: number;
   ownerCompleted: number;
   otherTakeover: number;
+  /**
+   * Resolved takeovers with no resolution snapshot — resolved before the
+   * snapshot shipped (BLO-33600). Deliberately NOT folded into any other
+   * bucket and NOT in `resolvedTakeovers`: the ratios below are over decided
+   * rows only, and a large `unknownTakeover` means they cover a thin slice.
+   */
+  unknownTakeover: number;
   /** Original agent recovered its own issue (owner == original assignee). */
   selfRecovery: number;
   boardOwned: number;
@@ -66,6 +77,8 @@ export type RecoveryCauseRouting = {
   retriedByOriginalSucceeded: number;
   handedBack: number;
   ownerCompleted: number;
+  /** Resolved takeovers with no resolution snapshot. See `unknownTakeover`. */
+  unknown: number;
   escalated: number;
   falsePositive: number;
   cancelled: number;
@@ -98,8 +111,10 @@ export type RecoveryActionListItem = {
   cause: string;
   nextAction: string;
   attemptCount: number;
+  nonDeliverySweepCount: number;
   maxAttempts: number | null;
   timeoutAt: Date | null;
+  retiringBound: string | null;
   lastAttemptAt: Date | null;
   outcome: string | null;
   createdAt: Date;
@@ -111,6 +126,28 @@ export type RecoveryActionListOptions = {
   kind?: string;
   status?: string;
   limit?: number;
+  offset?: number;
+  /**
+   * BLO-19124: `desc` (default) answers "what just happened"; `asc` is what makes
+   * a census of the *legacy* tail possible. With `limit` hard-capped at 500, a
+   * newest-first-only list cannot reach row 501+ at all, so the oldest actions
+   * were unreachable through the API by construction — the surface built to make
+   * the drain measurable was blind to exactly the rows the drain is about.
+   *
+   * `asc` is not merely the reverse view: this subsystem inserts continuously (in
+   * bursts of tens per day), and inserts land at the *head* of a `desc` list, so
+   * paging `desc` shifts the tail deeper mid-walk and can skip rows. Oldest-first
+   * is stable against inserts, because they land at the *tail* of the walk.
+   *
+   * That is narrower than drift-free, and for a census the gap matters: `status`
+   * is filtered before ordering, so a row that leaves the filtered set mid-walk
+   * (`active` -> `resolved`) shrinks the already-walked prefix and slides the next
+   * page up by one, skipping an unwalked row per exit. Offset paging cannot see
+   * that. For an exact census, walk `order: "asc"` with NO `status` filter and
+   * bucket by status client-side — rows are never deleted and `createdAt` is never
+   * rewritten, so the unfiltered set is append-only and the walk is stable.
+   */
+  order?: "asc" | "desc";
 };
 
 export type HandoffClass =
@@ -119,15 +156,25 @@ export type HandoffClass =
   | "owner_completed"
   | "board_owned"
   | "active"
+  | "unknown"
   | "other";
+
+/**
+ * Where the source issue stood at the instant the action was resolved, captured
+ * by `resolveActiveForIssue`. `null` for every action resolved before that
+ * capture shipped — those are `unknown`, not a guess (BLO-33600).
+ */
+export type RecoveryResolutionSnapshot = {
+  assigneeAgentId: string | null;
+  issueStatus: string | null;
+};
 
 type RecoveryActionFacts = {
   status: string;
   outcome: string | null;
   ownerAgentId: string | null;
   returnOwnerAgentId: string | null;
-  finalAssigneeAgentId: string | null;
-  finalIssueStatus: string | null;
+  resolutionSnapshot: RecoveryResolutionSnapshot | null;
 };
 
 const ACTIVE_STATUSES = new Set(["active", "escalated"]);
@@ -138,10 +185,19 @@ const TERMINAL_ISSUE_STATUSES = new Set(["done", "in_review"]);
  *
  * The plan's `handed_back` vs `owner_completed` outcomes were never added to the
  * outcome vocabulary (recovery track 1 kept `restored`/`cancelled`/…), so we
- * derive the distinction from the durable relationship between the recovery
- * owner, the original assignee (`returnOwnerAgentId`), and where the source
- * issue actually landed. This directly measures the product goal — "managers
- * doing the work becomes rare".
+ * derive the distinction from the recovery owner, the original assignee
+ * (`returnOwnerAgentId`), and where the source issue stood AT RESOLUTION. This
+ * directly measures the product goal — "managers doing the work becomes rare".
+ *
+ * The first three classes read the action row only and are therefore stable by
+ * construction. The rest need the source issue, and reading it live made the
+ * class flip long after the action itself stopped changing: `landedElsewhere` is
+ * tested first, so any later reassignment permanently masked a genuine
+ * `owner_completed` — deflating exactly the number this is supposed to measure
+ * (BLO-33600). They read `resolutionSnapshot` instead, captured once by
+ * `resolveActiveForIssue`. Rows resolved before that capture shipped have no
+ * snapshot and are `unknown`; they are NOT re-derived from live state, which
+ * would launder a drifted read as a measurement.
  */
 export function classifyRecoveryHandoff(facts: RecoveryActionFacts): HandoffClass {
   if (ACTIVE_STATUSES.has(facts.status)) return "active";
@@ -149,11 +205,13 @@ export function classifyRecoveryHandoff(facts: RecoveryActionFacts): HandoffClas
   // Original agent recovered its own issue — the ideal per-cause routing, not a takeover.
   if (facts.ownerAgentId === facts.returnOwnerAgentId) return "self_recovery";
   // Genuine takeover: recovery owner differs from the original assignee.
+  const snapshot = facts.resolutionSnapshot;
+  if (!snapshot) return "unknown";
   const landedElsewhere =
-    facts.finalAssigneeAgentId != null && facts.finalAssigneeAgentId !== facts.ownerAgentId;
+    snapshot.assigneeAgentId != null && snapshot.assigneeAgentId !== facts.ownerAgentId;
   if (landedElsewhere) return "handed_back";
-  const ownerKept = facts.finalAssigneeAgentId === facts.ownerAgentId;
-  if (ownerKept && facts.finalIssueStatus && TERMINAL_ISSUE_STATUSES.has(facts.finalIssueStatus)) {
+  const ownerKept = snapshot.assigneeAgentId === facts.ownerAgentId;
+  if (ownerKept && snapshot.issueStatus && TERMINAL_ISSUE_STATUSES.has(snapshot.issueStatus)) {
     return "owner_completed";
   }
   return "other";
@@ -207,6 +265,7 @@ export function recoveryObservabilityService(db: Db) {
     }
 
     const limit = Math.min(500, Math.max(1, Math.floor(opts.limit ?? 100)));
+    const offset = Math.max(0, Math.floor(opts.offset ?? 0));
     return db
       .select({
         id: issueRecoveryActions.id,
@@ -223,8 +282,10 @@ export function recoveryObservabilityService(db: Db) {
         cause: issueRecoveryActions.cause,
         nextAction: issueRecoveryActions.nextAction,
         attemptCount: issueRecoveryActions.attemptCount,
+        nonDeliverySweepCount: issueRecoveryActions.nonDeliverySweepCount,
         maxAttempts: issueRecoveryActions.maxAttempts,
         timeoutAt: issueRecoveryActions.timeoutAt,
+        retiringBound: issueRecoveryActions.retiringBound,
         lastAttemptAt: issueRecoveryActions.lastAttemptAt,
         outcome: issueRecoveryActions.outcome,
         createdAt: issueRecoveryActions.createdAt,
@@ -234,8 +295,17 @@ export function recoveryObservabilityService(db: Db) {
       .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
       .leftJoin(agents, eq(agents.id, issueRecoveryActions.ownerAgentId))
       .where(and(...filters))
-      .orderBy(desc(issueRecoveryActions.createdAt))
-      .limit(limit);
+      .orderBy(
+        // `id` breaks ties: `createdAt` collides inside a burst (the sweeps that
+        // create these touch tens of rows per second), and without a second key
+        // the order of a tied group is database-defined, so a page boundary
+        // landing inside one can repeat or drop a row between calls.
+        ...(opts.order === "asc"
+          ? [asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id)]
+          : [desc(issueRecoveryActions.createdAt), desc(issueRecoveryActions.id)]),
+      )
+      .limit(limit)
+      .offset(offset);
   }
 
   async function report(
@@ -325,17 +395,27 @@ export function recoveryObservabilityService(db: Db) {
     }));
 
     // Hand-back accounting + per-cause routing. Recovery actions are inherently
-    // low-volume (they are the exception path), so we join to the source issue
-    // and classify each action in TS rather than encoding the derivation in SQL.
-    const facts = await db
+    // low-volume (they are the exception path), so we classify each action in TS
+    // rather than encoding the derivation in SQL.
+    //
+    // The `issues` join scopes the population to actions whose source issue still
+    // exists and is NOT a classification input — selecting `issues.assigneeAgentId`
+    // / `issues.status` here is what made the class drift (BLO-33600). The routing
+    // fields come from the action's own evidence snapshot.
+    const factRows = await db
       .select({
         cause: issueRecoveryActions.cause,
         status: issueRecoveryActions.status,
         outcome: issueRecoveryActions.outcome,
         ownerAgentId: issueRecoveryActions.ownerAgentId,
         returnOwnerAgentId: issueRecoveryActions.returnOwnerAgentId,
-        finalAssigneeAgentId: issues.assigneeAgentId,
-        finalIssueStatus: issues.status,
+        hasResolutionSnapshot: sql<boolean>`${issueRecoveryActions.evidence} ? ${RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY}`,
+        resolvedAssigneeAgentId: sql<
+          string | null
+        >`${issueRecoveryActions.evidence} ->> ${RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY}`,
+        resolvedIssueStatus: sql<
+          string | null
+        >`${issueRecoveryActions.evidence} ->> ${RESOLVED_ISSUE_STATUS_EVIDENCE_KEY}`,
       })
       .from(issueRecoveryActions)
       .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
@@ -346,11 +426,23 @@ export function recoveryObservabilityService(db: Db) {
         ),
       );
 
+    const facts: (RecoveryActionFacts & { cause: string })[] = factRows.map((row) => ({
+      cause: String(row.cause),
+      status: row.status,
+      outcome: row.outcome,
+      ownerAgentId: row.ownerAgentId,
+      returnOwnerAgentId: row.returnOwnerAgentId,
+      resolutionSnapshot: row.hasResolutionSnapshot
+        ? { assigneeAgentId: row.resolvedAssigneeAgentId, issueStatus: row.resolvedIssueStatus }
+        : null,
+    }));
+
     const handoff: RecoveryHandoffSummary = {
       resolvedTakeovers: 0,
       handedBack: 0,
       ownerCompleted: 0,
       otherTakeover: 0,
+      unknownTakeover: 0,
       selfRecovery: 0,
       boardOwned: 0,
       activeTakeovers: 0,
@@ -369,6 +461,7 @@ export function recoveryObservabilityService(db: Db) {
           retriedByOriginalSucceeded: 0,
           handedBack: 0,
           ownerCompleted: 0,
+          unknown: 0,
           escalated: 0,
           falsePositive: 0,
           cancelled: 0,
@@ -411,6 +504,10 @@ export function recoveryObservabilityService(db: Db) {
           handoff.ownerCompleted += 1;
           handoff.resolvedTakeovers += 1;
           routing.ownerCompleted += 1;
+          break;
+        case "unknown":
+          handoff.unknownTakeover += 1;
+          routing.unknown += 1;
           break;
         case "board_owned":
           handoff.boardOwned += 1;

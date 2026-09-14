@@ -534,7 +534,11 @@ describe("BLO-31857: the healthy isolated-tree shape must stay congruent (outage
     const elapsedMs = Date.now() - startedAt;
 
     expect(result.consistent).toBe(true);
-    expect(elapsedMs).toBeLessThan(1_000);
+    // The regression this catches is "slept through the ~28s recheck budget", so
+    // 5s still separates the fast path from it by ~5.7x while leaving room for
+    // merge-queue shard contention (BLO-22985). 1_000 was under-margined for a
+    // wall-clock read on a contended shard; not yet observed failing.
+    expect(elapsedMs).toBeLessThan(5_000);
   });
 
   it("lets a transient boot-install (absent)/(absent) settle instead of failing closed immediately", async () => {
