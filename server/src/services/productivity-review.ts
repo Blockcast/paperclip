@@ -78,13 +78,6 @@ const PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS = 5 * 60 * 1000;
  * block below (BLO-19566 AC4).
  */
 export const PRODUCTIVITY_REVIEW_PR_FRESH_MS = 24 * 60 * 60 * 1000;
-/**
- * How many fresh progress-eligible PR work products to page through when
- * looking for one attributed to the source row (PEN-3219). Bounds the read on
- * an issue that has accumulated many linked PRs; see the query for why a page
- * this size is generous for the set that can actually qualify.
- */
-const PRODUCTIVITY_REVIEW_PROGRESS_PR_CANDIDATE_LIMIT = 25;
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 // BLO-25410: NOT a lock predicate — this only counts recent runs for the review
 // narrative (`activeRunCount`), and never decides whether an issue is
@@ -1227,7 +1220,11 @@ function isFreshPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEv
   return pr !== null && pr.ageMs <= PRODUCTIVITY_REVIEW_PR_FRESH_MS;
 }
 
-function isProgressPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEvidence {
+// Deliberately NOT a type predicate: a false result means "not progress", not
+// "null", so narrowing `pr` to null on the false branch (as `pr is
+// PullRequestEvidence` would) makes the unattributed fall-through in
+// `pullRequestProgressNote` read as `never` and fails the build.
+function isProgressPullRequest(pr: PullRequestEvidence | null): boolean {
   return (
     isFreshPullRequest(pr) &&
     PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES.has(pr.status) &&
@@ -3607,14 +3604,16 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       //
       // PEN-3219: and it must be a PR that OWNS this row. Attribution cannot be
       // decided in SQL — `resolveOwningPaperclipIdentifiers` is a ranked
-      // tier-walk over title/body/branch — so this takes a bounded candidate
-      // page newest-first and picks the first attributed one in TS below. The
-      // page is generous relative to what can qualify: candidates are already
-      // narrowed to PRs that moved inside the 24h freshness window AND are in a
-      // progress-eligible state, and the pathological rows this exists for are
-      // wide in TOTAL work products (PEN-2370 held 44) rather than in
-      // simultaneously-moving ones. Exhausting the page loses a progress signal
-      // rather than inventing one, which is the safe direction.
+      // tier-walk over title/body/branch, and legacy rows carry no recorded
+      // owning set — so every candidate is read newest-first and the first
+      // attributed one is picked in TS below. There is deliberately NO row cap:
+      // a cap applied before the ownership filter would let N newer
+      // unattributed PRs (a registry issue name-dropped by many PRs at once)
+      // push this row's own PR off the page and withhold a real progress
+      // signal. The WHERE already bounds the read to this issue's trusted PR
+      // rows that moved inside the 24h freshness window AND sit in a
+      // progress-eligible state, which is small in practice (PEN-2370 held 44
+      // rows in TOTAL, not 44 moving inside one day).
       db
         .select(pullRequestEvidenceSelect)
         .from(issueWorkProducts)
@@ -3626,7 +3625,6 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           ),
         )
         .orderBy(desc(pullRequestEffectiveEventAtSql))
-        .limit(PRODUCTIVITY_REVIEW_PROGRESS_PR_CANDIDATE_LIMIT)
         .then((rows) => rows.find((row) => pullRequestOwnsIssue(row, sourceIssue.identifier)) ?? null),
     ]);
 
