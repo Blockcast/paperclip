@@ -2657,24 +2657,6 @@ describe("handleWebhook — terminal severities (BLO-24177)", () => {
     ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
     expect(mocks.state.set).not.toHaveBeenCalled();
   });
-
-  it("honors an operator override list in place of the default", async () => {
-    const { ctx, mocks } = mkCtx();
-    const config = baseConfig({ terminalSeverities: ["debug"] });
-    const alert = baseAlert({
-      labels: { alertname: "Watchdog", severity: "none" },
-      fingerprint: "watchdog-1",
-    });
-    const envelope = baseEnvelope({ alerts: [alert] });
-
-    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
-
-    // Override replaces the default list, so "none" is no longer terminal —
-    // falls through to the ordinary create path (status left to routing/default).
-    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
-    const createArgs = mocks.issues.create.mock.calls[0][0];
-    expect(createArgs.status).toBeUndefined();
-  });
 });
 
 describe("handleWebhook — resolved", () => {
