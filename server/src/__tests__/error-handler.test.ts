@@ -127,7 +127,14 @@ describe("errorHandler", () => {
   // advisory lock; under contention that wait is cancelled with 55P03 and used
   // to surface as a bare 500, indistinguishable from a permanent fault.
   describe("transient database conflicts", () => {
-    it("reports every transient SQLSTATE as a typed, retryable 503", () => {
+    const TRANSIENT_BODY = {
+      error:
+        "Database contention: the failing statement was rolled back. " +
+        "Earlier statements in this request may have applied — replay only if it is idempotent.",
+      code: "transient_db_conflict",
+    };
+
+    it("reports every transient SQLSTATE as a typed 503", () => {
       for (const code of TRANSIENT_DB_SQLSTATES) {
         const res = makeRes() as any;
         errorHandler(
@@ -139,9 +146,7 @@ describe("errorHandler", () => {
 
         expect(res.status).toHaveBeenCalledWith(503);
         expect(res.json).toHaveBeenCalledWith({
-          error: "Database contention: the write was rolled back and did not apply. Retry.",
-          code: "transient_db_conflict",
-          retryable: true,
+          ...TRANSIENT_BODY,
           details: { sqlstate: code },
         });
       }
@@ -160,9 +165,47 @@ describe("errorHandler", () => {
       expect(res.status).toHaveBeenCalledWith(503);
       expect(res.json.mock.calls[0][0]).toMatchObject({
         code: "transient_db_conflict",
-        retryable: true,
         details: { sqlstate: "55P03" },
       });
+    });
+
+    // This boundary is shared by every route, so it cannot prove the *request*
+    // is replay-safe even though the failing *statement* rolled back.
+    // `POST /issues/:id/comments` is the worked counterexample: `svc.addComment`
+    // "does not open its own transaction", so the comment INSERT autocommits and
+    // `syncComment` / `svc.update` / `logActivity` run after it. A transient
+    // failure in any of those leaves the comment committed, and `idempotencyKey`
+    // is optional on that route — so advertising `retryable` here would tell a
+    // caller to post a duplicate comment.
+    it("does not advertise retryability on a non-idempotent route", () => {
+      const res = makeRes() as any;
+      errorHandler(
+        Object.assign(new Error("deadlock detected"), { code: "40P01" }),
+        { ...makeReq(), method: "POST", originalUrl: "/api/issues/123/comments" } as any,
+        res,
+        vi.fn() as unknown as NextFunction,
+      );
+
+      expect(res.status).toHaveBeenCalledWith(503);
+      const body = res.json.mock.calls[0][0];
+      expect(body).not.toHaveProperty("retryable");
+      // The classification is still there — that is the part this fix delivers.
+      expect(body.code).toBe("transient_db_conflict");
+      expect(body.details).toEqual({ sqlstate: "40P01" });
+    });
+
+    it("finds the SQLSTATE behind a deeper, non-Error cause chain", () => {
+      // findPgError walks `.cause` 6 deep and the links need not be Errors.
+      const res = makeRes() as any;
+      errorHandler(
+        { cause: { cause: { code: "57014", message: "canceling statement due to statement timeout" } } },
+        makeReq(),
+        res,
+        vi.fn() as unknown as NextFunction,
+      );
+
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.json.mock.calls[0][0].details).toEqual({ sqlstate: "57014" });
     });
 
     it("still reports a non-transient database error as a bare 500", () => {
