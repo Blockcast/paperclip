@@ -2283,6 +2283,47 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(runs).toHaveLength(1);
   });
 
+  it(
+    "leaves a pre-adapter process_lost monitor dispatch terminal while a future monitor wake remains (BLO-33385 review)",
+    async () => {
+      // The widened pre-adapter gate must not swallow `issue_monitor_due`: that
+      // wake is redelivered by the monitor, so a retry here would race the
+      // scheduled redelivery and produce two continuations for one issue. The
+      // sibling test above covers the same wake reason on a NON-external adapter,
+      // which never reaches this branch -- `opencode_k8s` is what makes it
+      // pre-adapter, and is the shape the review flagged as unguarded.
+      const { companyId, agentId, runId, issueId } = await seedRunFixture({
+        adapterType: "opencode_k8s",
+        agentStatus: "idle",
+        processPid: null,
+        processGroupId: null,
+        lastOutputAt: null,
+        contextSnapshot: { wakeReason: "issue_monitor_due" },
+      });
+      await db
+        .update(issues)
+        .set({ monitorNextCheckAt: new Date("2099-03-19T00:00:00.000Z") })
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)));
+
+      const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+      expect(result.runIds).toContain(runId);
+
+      const lostRun = await heartbeat.getRun(runId);
+      expect(lostRun?.status).toBe("failed");
+      expect(lostRun?.errorCode).toBe("process_lost");
+      expect(lostRun?.error).not.toContain("retrying once");
+      expect(lostRun?.processLossRetryCount ?? 0).toBe(0);
+
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs.filter((row) => row.retryOfRunId === runId)).toHaveLength(0);
+      expect(runs).toHaveLength(1);
+
+      // The wake that survives is the monitor's own, untouched by the reap.
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((r) => r[0]);
+      expect(issue?.monitorNextCheckAt?.toISOString()).toBe("2099-03-19T00:00:00.000Z");
+    },
+  );
+
   it("immediately reaps a fresh exact-missing Job and records that adapter invocation started", async () => {
     const jobName = "agent-opencode-restart-missing";
     const { companyId, agentId, runId } = await seedRunFixture({
