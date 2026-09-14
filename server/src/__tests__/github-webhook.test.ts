@@ -33,6 +33,7 @@ import {
   __test_commentsContainBackLinkMarker,
   __test_extractPaperclipIdentifiers,
   __test_hasActionablePrReviewFeedback,
+  __test_isActionableReviewFeedbackContext,
   __test_isClaudeCodeReviewServiceNotice,
   __test_isReviewerSelfEchoReview,
   __test_isSelfReviewedPr,
@@ -9710,5 +9711,79 @@ describe("claude[bot] Code Review service notice suppression (BLO-23059)", () =>
         ),
       ).toBe(false);
     });
+  });
+});
+
+describe("github_pr_review_feedback is content-gated at its only producer (BLO-33854)", () => {
+  // BLO-33854 was filed on the reading that isActionableReviewFeedbackContext's
+  // bare `return true` for this wakeReason means a plain PR comment wakes the
+  // assignee with "## Changes Requested" whatever it says. It does not: the
+  // wakeReason has one producer, and that producer runs the same
+  // hasActionablePrReviewFeedback test on the RAW body before minting the
+  // context. These cases pin that invariant so the "symmetric" rewrite -- which
+  // would suppress every comment-shaped feedback wake, because `reviewBody` is
+  // undefined on this path -- cannot land green.
+  const comment = (body: string, login = "allyblockcast[bot]") =>
+    __test_resolveEventContext("issue_comment", {
+      action: "created",
+      issue: {
+        number: 1830,
+        title: "BLO-32396 selector/uid jq reads collapse abort into silence",
+        body: null,
+        html_url: "https://github.com/Blockcast/paperclip/pull/1830",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/1830" },
+      },
+      comment: {
+        id: 5656139623,
+        body,
+        html_url: "https://github.com/Blockcast/paperclip/pull/1830#issuecomment-5656139623",
+        user: { login },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    }, { prReviewerBotLogin: "allyblockcast[bot]" });
+
+  const ACTIONABLE = [
+    "## Ally — Consolidated PR Review",
+    "",
+    "### Critical Issues (1)",
+    "1. `probePort` is read before the config is loaded.",
+  ].join("\n");
+
+  it("a non-actionable PR comment produces NO context, so no author wake at all", () => {
+    // The AC's first bullet, already satisfied on master. `null` here is the
+    // common ancestor of every downstream wake -- strictly stronger than
+    // isActionableReviewFeedbackContext returning false would be.
+    for (const body of [
+      "Merged. Nothing further needed here.",
+      "Enqueued at position 47 of 47; terminal condition is state=MERGED.",
+      "LGTM",
+    ]) {
+      expect(comment(body), `body ${JSON.stringify(body)} must not mint a context`).toBeNull();
+    }
+  });
+
+  it("an actionable PR comment still mints the feedback context and classifies actionable", () => {
+    const ctx = comment(ACTIONABLE);
+    expect(ctx?.wakeReason).toBe("github_pr_review_feedback");
+    expect(__test_isActionableReviewFeedbackContext(ctx!)).toBe(true);
+  });
+
+  it("the marker review-request path is unaffected", () => {
+    const ctx = comment("<!-- paperclip:review-request -->\n@ally please re-review at head abc123");
+    expect(ctx?.wakeReason).toBe("github_pr_review_requested");
+    expect(__test_isActionableReviewFeedbackContext(ctx!)).toBe(false);
+  });
+
+  it("carries the actionable body on commentBody, NOT reviewBody -- why the symmetric rewrite is an outage", () => {
+    // This is the case that fails if someone routes the feedback branch through
+    // `hasActionablePrReviewFeedback(context.reviewBody, context.reviewState)`:
+    // both fields are undefined on a comment context, so the predicate returns
+    // false for every comment-shaped review ever delivered.
+    const ctx = comment(ACTIONABLE);
+    expect(ctx?.reviewBody).toBeUndefined();
+    expect(ctx?.reviewState).toBeUndefined();
+    expect(__test_hasActionablePrReviewFeedback(ctx?.reviewBody, ctx?.reviewState)).toBe(false);
+    // ...while the body the producer actually classified says otherwise.
+    expect(__test_hasActionablePrReviewFeedback(ctx?.commentBody)).toBe(true);
   });
 });

@@ -3413,6 +3413,34 @@ function prFeedbackAuthorLogin(context: ResolvedEventContext): string | null {
   return context.reviewAuthorLogin ?? context.commentAuthorLogin ?? null;
 }
 
+// BLO-33854: the two review-shaped branches below look asymmetric — one
+// classifies a body, the other returns true outright — and that asymmetry reads
+// like a missing content test. It is not. DO NOT "fix" it by routing the
+// feedback branch through hasActionablePrReviewFeedback.
+//
+// `github_pr_review_feedback` has exactly ONE producer (the issue_comment case
+// of resolveEventContext), and that producer reaches the wakeReason ternary only
+// when `reviewFeedback` is true — i.e. only when isActionablePrReviewComment,
+// and therefore hasActionablePrReviewFeedback, has ALREADY passed on the RAW
+// comment body. A non-actionable comment does not become a non-actionable
+// feedback context; it becomes no context at all (`return null`). So the
+// classification for this branch happened at resolve time, on better input, and
+// repeating it here is at best redundant.
+//
+// At worst it is a fleet-wide outage. The comment path populates `commentBody`
+// and leaves `reviewBody` UNDEFINED (prFeedbackBody exists precisely to coalesce
+// the two), so the literal symmetric rewrite —
+// `hasActionablePrReviewFeedback(context.reviewBody, context.reviewState)` —
+// evaluates `hasActionablePrReviewFeedback(undefined, undefined)`, which is
+// false for every comment-shaped review ever delivered. Reading `commentBody`
+// instead is only slightly better: it is clamped, so a finding past the clamp
+// boundary is silently dropped, against a raw-body verdict that already saw it.
+//
+// The live report that prompted this note (paperclip#1830 comment 5656139623)
+// was a false positive from hasActionablePrReviewFeedback itself — the
+// un-negated `Recommended Action … fix … before merg` clause, BLO-31446 — not
+// from a missing test here. Fix over-classification in the predicate, where both
+// wake paths benefit, not in this branch.
 function isActionableReviewFeedbackContext(context: ResolvedEventContext): boolean {
   if (context.wakeReason === "github_pr_review_feedback") return true;
   if (context.wakeReason !== "github_pr_review_submitted") return false;
@@ -5642,6 +5670,7 @@ export const __test_buildDependabotAlertIssueBody = buildDependabotAlertIssueBod
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
 export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;
 export const __test_isClaudeCodeReviewServiceNotice = isClaudeCodeReviewServiceNotice;
+export const __test_isActionableReviewFeedbackContext = isActionableReviewFeedbackContext;
 export const __test_buildPrReviewFeedbackComment = buildPrReviewFeedbackComment;
 export const __test_buildIssueBackLinkBody = buildIssueBackLinkBody;
 export const __test_commentsContainBackLinkMarker = commentsContainBackLinkMarker;
