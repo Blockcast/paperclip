@@ -79,10 +79,12 @@ const approvalPayloadSchema = z.object({
     "Include the starting figure (`from_usd`): it is what lets a later reader tell a decision " +
     "that was never applied from one that was applied and then superseded. REQUIRED, not " +
     "advisory, for `budget_override_required` — a card of that type carrying no parseable " +
-    "assertion is refused at creation with `budget_approval_missing_enforcement_assertion` " +
-    "(BLO-34008), because approving one writes nothing to `budget_policies` and an undeclared " +
-    "figure is therefore unverifiable forever. For every other type it stays optional; today " +
-    "only `budget_policy_amount` is checked, and unknown kinds are ignored.",
+    "assertion is refused with `budget_approval_missing_enforcement_assertion` (BLO-34008) on " +
+    "both creation and resubmit, because approving one writes nothing to `budget_policies` and " +
+    "an undeclared figure is therefore unverifiable forever. Resubmit is checked against the " +
+    "payload that will end up pending, so a card filed before this guard existed cannot return " +
+    "to `pending` on an empty resubmit body — send a corrected payload. For every other type it " +
+    "stays optional; today only `budget_policy_amount` is checked, and unknown kinds are ignored.",
 );
 
 export const createApprovalSchema = z.object({
