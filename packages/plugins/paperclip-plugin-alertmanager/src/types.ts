@@ -211,9 +211,12 @@ export interface AlertStateRecord {
    * resolved.
    *
    * `null` means the last terminal transition we know about was NOT the
-   * plugin's, so an operator close stands. `undefined` means the row predates
-   * this field and authorship is genuinely unknown — see `closedByPlugin` in
-   * webhook-handler.ts for how that is resolved without muting live alerts.
+   * plugin's, so an operator close stands. `undefined` means authorship is
+   * genuinely unknown: the row predates this field, or it is a member of an
+   * aggregate whose close this member deferred to a sibling (only the last
+   * member to resolve lands the shared issue's cancel, and it cannot reach
+   * back to this row). See `closedByPlugin` in webhook-handler.ts for how
+   * that is resolved without muting live alerts.
    */
   pluginClosedAt?: string | null;
   /**

@@ -404,7 +404,10 @@ observed the issue's status. Two details worth knowing when reading the table:
   recurrence.
   The fallback is asymmetric on purpose: reading our close as an operator's
   would *mute a live recurring alert* for a whole window, while the reverse
-  costs one unwanted re-open. Legacy rows drain on their first firing.
+  costs one unwanted re-open. Legacy rows drain on their first firing — even
+  one whose issue read fails: that write records what the fallback would have
+  concluded and still clears `resolvedAt`, which is also the escalation sweep's
+  bail-out and must not stay set against a firing alert.
 
 `alertmanager.firing.deduped` is still emitted on **every** re-fire, so existing
 dashboards keep working; the metrics above narrate what the re-fire actually did.

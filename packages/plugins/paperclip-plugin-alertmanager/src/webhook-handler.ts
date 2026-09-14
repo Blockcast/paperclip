@@ -1445,29 +1445,36 @@ export async function handleFiring(
       // Writing `null` there is what makes BLO-24234's suppression reachable
       // on the *next* re-fire for an alert that has resolved before: a later
       // hand-cancel of this row is then read as the operator close it is,
-      // rather than inheriting our stale authorship. It also drains legacy
-      // rows, whose `undefined` still falls back to `resolvedAt`.
+      // rather than inheriting our stale authorship.
       //
-      // `issue_missing` and a failed RPC learn nothing, so they must leave it
-      // alone. Clearing on those would let one transient `issues.get` failure
-      // convert our own close into an apparent operator close and mute a live
-      // recurring alert for a whole suppression window — the failure
-      // direction this ticket exists to remove, arriving from the other side.
+      // `issue_missing` and a failed RPC learn nothing, so they must leave an
+      // explicit record alone. Clearing on those would let one transient
+      // `issues.get` failure convert our own close into an apparent operator
+      // close and mute a live recurring alert for a whole suppression window —
+      // the failure direction this ticket exists to remove, arriving from the
+      // other side.
+      //
+      // A row with no record (`undefined`: legacy, or an aggregate member that
+      // deferred its close to a sibling) has that same exposure one field
+      // over, because `closedByPlugin` falls back to `resolvedAt` for it — and
+      // `resolvedAt` is cleared unconditionally below. So carry the inference
+      // across as a recorded value instead of freezing the field it is read
+      // from: this writes exactly what `closedByPlugin` would have concluded
+      // from the row as it stood, and the next applied delivery replaces it.
       const pluginClosureUpdate: Partial<Pick<AlertStateRecord, "pluginClosedAt">> =
         !decisionApplied || decision.kind === "issue_missing"
-          ? {}
+          ? existing.pluginClosedAt === undefined
+            ? { pluginClosedAt: existing.resolvedAt }
+            : {}
           : { pluginClosedAt: null };
-      // The same rule has to cover `resolvedAt`, or the guarantee above is only
-      // true for rows that already carry an explicit `pluginClosedAt`. For a
-      // legacy row (`pluginClosedAt: undefined`) `resolvedAt` *is* the
-      // authorship signal `closedByPlugin` falls back to, so clearing it on a
-      // delivery that applied nothing does exactly what the paragraph above
-      // refuses to do, one field over: one failed `issues.get` turns our own
-      // close into an apparent operator close and mutes the next re-fire.
-      // Leaving it untouched keeps the row's last real observation intact until
-      // a delivery that actually applied a decision replaces it.
-      const resolvedAtUpdate: Partial<Pick<AlertStateRecord, "resolvedAt">> =
-        !decisionApplied || decision.kind === "issue_missing" ? {} : { resolvedAt: null };
+      // `resolvedAt` is NOT under that rule. It means "the alert is currently
+      // cleared", which a firing delivery disproves whether or not its issue
+      // read succeeded — and the escalation sweep (`advanceIssueLadder` in
+      // escalation.ts) bails on a truthy `resolvedAt` before any rung.
+      // Preserving it on a not-applied delivery left an open, firing issue
+      // un-escalatable until the next delivery that did apply, i.e. one
+      // `repeat_interval` of paging nobody, with nothing logged. Hence the
+      // unconditional clear in the literal below.
 
       await upsertAggregateMember(
         ctx,
@@ -1484,7 +1491,7 @@ export async function handleFiring(
         alertname,
         severity,
         lastFiredAt: nowIso,
-        ...resolvedAtUpdate,
+        resolvedAt: null,
         ...pluginClosureUpdate,
         operatorSuppressedAt: suppressionAnchor,
         nextEscalationAt: ladderRestart
