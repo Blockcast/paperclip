@@ -77,6 +77,33 @@ import {
  * agreement test in `issue-execution-policy-routes.test.ts` relies on it to compare the
  * two callers' verdicts about one PR without racing the clock between them.
  */
+/**
+ * The row-qualifying conditions on their own, without the per-issue scoping.
+ *
+ * Exported because a third consumer is already in flight: PR #1834 (PEN-3198) extends the
+ * same ruling to the issue-graph liveness classifier, which needs these conditions to
+ * SELECT a whole attendance set in one pass rather than to ask about one issue. It
+ * currently defines an identically-named local function inside `recovery/service.ts`,
+ * which routes cannot import. Naming matches so the convergence is an import, not a
+ * judgement call — and so this row does not end up having created a second "single
+ * definition" of the very predicate it was filed about.
+ */
+export function openPullRequestWakePathConditions(freshSinceIso: string) {
+  return [
+    eq(issueWorkProducts.provider, "github"),
+    eq(issueWorkProducts.type, "pull_request"),
+    inArray(issueWorkProducts.status, [...OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES]),
+    sql`${issueWorkProducts.metadata}->>'source' = ${PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE}`,
+    sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
+    sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
+    // Bound as an ISO string with an explicit cast: postgres.js cannot serialize a Date
+    // interpolated into a raw `sql` fragment and throws ERR_INVALID_ARG_TYPE at bind
+    // time. Same hazard as `hasPositiveRunEvidence` and the work-product upsert, both of
+    // which were bitten by it.
+    sql`${issueWorkProducts.updatedAt} > ${freshSinceIso}::timestamptz`,
+  ];
+}
+
 export async function hasOpenPullRequestWakePath(
   db: Db,
   issue: { id: string; companyId: string },
@@ -91,17 +118,7 @@ export async function hasOpenPullRequestWakePath(
       and(
         eq(issueWorkProducts.companyId, issue.companyId),
         eq(issueWorkProducts.issueId, issue.id),
-        eq(issueWorkProducts.provider, "github"),
-        eq(issueWorkProducts.type, "pull_request"),
-        inArray(issueWorkProducts.status, [...OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES]),
-        sql`${issueWorkProducts.metadata}->>'source' = ${PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE}`,
-        sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
-        sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
-        // Bound as an ISO string with an explicit cast: postgres.js cannot serialize a
-        // Date interpolated into a raw `sql` fragment and throws ERR_INVALID_ARG_TYPE at
-        // bind time. Same hazard as `hasPositiveRunEvidence` and the work-product
-        // upsert, both of which were bitten by it.
-        sql`${issueWorkProducts.updatedAt} > ${freshSinceIso}::timestamptz`,
+        ...openPullRequestWakePathConditions(freshSinceIso),
       ),
     )
     .limit(1);
