@@ -609,6 +609,11 @@ export async function githubListReviewerSurfacesAtPr(input: {
 }): Promise<ReviewerSurfaces | { error: string }> {
   const botLogin = loadConfig().prReviewerBotLogin.trim();
   if (!botLogin) return { error: "no_bot_login" };
+  // A bare user-seat login (`allyblockcast`) is not the App identity, so
+  // `githubReviewerIdentityMatches` would filter EVERY row out and hand back
+  // empty surfaces — a misconfiguration that reads to the caller as "Ally
+  // reviewed and found nothing". Fail closed, as the predicate below does.
+  if (!githubReviewerAppSlug(botLogin)) return { error: "bot_login_not_app_form" };
   const token = await getInstallationToken();
   if (!token) return { error: "no_token" };
   const args = {
