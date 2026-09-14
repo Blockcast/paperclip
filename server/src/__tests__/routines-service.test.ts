@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -32,6 +32,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import * as activityLogModule from "../services/activity-log.js";
 import { issueService } from "../services/issues.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import * as providerRegistry from "../secrets/provider-registry.js";
@@ -2103,6 +2104,83 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(predecessor.status).toBe("blocked");
     expect(predecessor.cancelledAt).toBeNull();
     expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(0);
+  });
+
+  // Ally review, BLO-31996: the activity row is the second supersede receipt,
+  // and the first version left it in a bare try/catch inside the dispatch
+  // transaction. That is not best-effort: a failed INSERT aborts the whole
+  // transaction, so the cancellation UPDATE rolls back with it and dispatch
+  // dies on the successor INSERT with 25P02 -- the wedge returns, reached from
+  // the disposal path instead of the gate. The failure here is a real SQL
+  // error on the dispatch executor, not a JS rejection, so the transaction is
+  // genuinely aborted and only `rollback to savepoint` can restore it.
+  it("keeps the cancellation and dispatches the successor when the supersede activity row cannot be written", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "coalesce_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const wedged = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "queued",
+      runStartedAt: new Date(Date.now() - YOUNG_RETRY_AGE_MS),
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      bindExecutionRun: true,
+    });
+
+    const originalLogActivity = activityLogModule.logActivity;
+    const logActivitySpy = vi
+      .spyOn(activityLogModule, "logActivity")
+      .mockImplementation(async (executor, input, options) => {
+        if (input.action === "issue.cancelled" && input.details?.reason === "routine_execution_fire_superseded") {
+          // Aborts the dispatch transaction the way a failed INSERT would.
+          await executor.execute(sql`select 1 / 0`);
+        }
+        return originalLogActivity(executor, input, options);
+      });
+
+    try {
+      resetRoutineDispatchMetrics();
+      const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+      expect(run.status).toBe("issue_created");
+      expect(run.linkedIssueId).not.toBe(wedged.issue.id);
+      expect(logActivitySpy).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.cancelled", entityId: wedged.issue.id }),
+      );
+
+      const [predecessor] = await db.select().from(issues).where(eq(issues.id, wedged.issue.id));
+      expect(predecessor.status).toBe("cancelled");
+      expect(predecessor.cancelledAt).not.toBeNull();
+
+      // The on-row comment has its own savepoint, so the broken activity row
+      // does not take it down too.
+      const comments = await db
+        .select()
+        .from(issueComments)
+        .where(eq(issueComments.issueId, wedged.issue.id));
+      expect(comments).toHaveLength(1);
+      expect(comments[0].body).toContain("outlived its own cadence");
+
+      // The failed receipt is the only thing that rolled back.
+      const cancelledActivity = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, wedged.issue.id));
+      expect(cancelledActivity.filter((row) => row.action === "issue.cancelled")).toHaveLength(0);
+
+      // Counted after commit, so it attests a cancellation that persisted.
+      expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(1);
+    } finally {
+      logActivitySpy.mockRestore();
+    }
   });
 
   // The run-age bound must not weaken the guarantee BLO-23379 established: a

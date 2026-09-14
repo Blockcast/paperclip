@@ -1819,6 +1819,51 @@ export function routineService(
   // routine execution parked here is waiting on a reviewer, an approval, or a
   // pending interaction, none of which are heartbeat runs.
   const SUPERSEDE_PROTECTED_STATUSES = ["in_review"];
+
+  // Best-effort side effect on the dispatch transaction. A bare try/catch does
+  // NOT deliver best-effort inside a transaction: a failed statement aborts the
+  // whole thing, so every later statement raises 25P02 and the catch merely
+  // hides which one broke. Dispatch then dies on the successor INSERT with an
+  // error naming neither the side effect nor the routine, and the cancellation
+  // rolls back with it -- the wedge returns. `rollback to savepoint` is the one
+  // statement that restores a usable transaction -- same reasoning, and the
+  // same measured behaviour, as the guard in `pr-review-duplicate-issue-guard.ts`.
+  //
+  // Every supersede receipt goes through here. The first version protected
+  // only the comment and left `logActivity` in exactly the bare try/catch
+  // described above (Ally review, BLO-31996).
+  async function runSupersedeSideEffect(input: {
+    executor: Db;
+    savepoint: string;
+    issueId: string;
+    what: string;
+    run: () => Promise<unknown>;
+  }) {
+    const savepoint = sql.raw(input.savepoint);
+    let savepointOpen = false;
+    try {
+      await input.executor.execute(sql`savepoint ${savepoint}`);
+      savepointOpen = true;
+      await input.run();
+      await input.executor.execute(sql`release savepoint ${savepoint}`);
+    } catch (err) {
+      logger.warn({ err, issueId: input.issueId }, `failed to ${input.what} superseded routine execution issue`);
+      if (!savepointOpen) return;
+      try {
+        await input.executor.execute(sql`rollback to savepoint ${savepoint}`);
+      } catch (rollbackErr) {
+        // Nothing left to try: this is the only statement that could have
+        // restored the transaction. The failure surfaces on the first
+        // unguarded statement after it -- the successor INSERT -- rather than
+        // being silently carried forward.
+        logger.warn(
+          { err: rollbackErr, issueId: input.issueId },
+          `failed to roll back superseded-issue savepoint ${input.savepoint}`,
+        );
+      }
+    }
+  }
+
   async function supersedeStaleExecutionIssues(input: {
     routine: typeof routines.$inferSelect;
     executor: Db;
@@ -1883,7 +1928,6 @@ export function routineService(
       .returning({ id: issues.id, identifier: issues.identifier, createdAt: issues.createdAt });
 
     for (const row of stale) {
-      incrementRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue");
       logger.warn(
         {
           routineId: input.routine.id,
@@ -1899,80 +1943,61 @@ export function routineService(
       // disposal invisible on the row a reviewer is actually looking at. Same
       // receipt principle as BLO-27572.
       //
-      // Best-effort, and a bare try/catch does NOT deliver that inside a
-      // transaction: a failed statement aborts the whole thing, so every later
-      // statement raises 25P02 and the catch merely hides which one broke. The
-      // dispatch then dies on the successor INSERT with an error naming neither
-      // the comment nor the routine. `rollback to savepoint` is the one
-      // statement that restores a usable transaction -- same reasoning, and the
-      // same measured behaviour, as the guard in
-      // `pr-review-duplicate-issue-guard.ts`. Failing to explain a cancellation
-      // must not roll back the cancellation, or the wedge returns.
-      //
       // The actor carries NO `runId`: `issue_comments.created_by_run_id` is FK
       // to `heartbeat_runs`, and `supersededByRunId` is a `routine_runs` id.
       // Passing it violated that FK on every supersede that actually fired --
-      // caught only because the two DB-backed regression tests below exercise
-      // the path. The routine run is named in the body instead.
-      const commentSavepoint = sql.raw("routine_supersede_comment");
-      let savepointOpen = false;
-      try {
-        await input.executor.execute(sql`savepoint ${commentSavepoint}`);
-        savepointOpen = true;
-        await issueSvc.addComment(
-          row.id,
-          [
-            "Cancelled: this routine fire outlived its own cadence and was superseded.",
-            "",
-            `- Fire created: \`${row.createdAt.toISOString()}\``,
-            `- Fire-age horizon: \`${Math.round(input.fireAgeHorizonMs / 1000)}s\``,
-            `- Superseded by routine run: \`${input.supersededByRunId}\``,
-            "",
-            "A scheduled fire is a point-in-time probe, so once its replacement is due it can no",
-            "longer take a useful measurement — and while it stayed open it held the single-owner",
-            "dispatch lock and suppressed the next fire. It is cancelled rather than left `blocked`",
-            "so it does not become a zero-wake-path strand.",
-          ].join("\n"),
-          {},
-          { authorType: "system" },
-          input.executor,
-        );
-        await input.executor.execute(sql`release savepoint ${commentSavepoint}`);
-      } catch (err) {
-        logger.warn({ err, issueId: row.id }, "failed to comment on superseded routine execution issue");
-        if (savepointOpen) {
-          try {
-            await input.executor.execute(sql`rollback to savepoint ${commentSavepoint}`);
-          } catch (rollbackErr) {
-            // Nothing left to try: this is the only statement that could have
-            // restored the transaction, so the failure surfaces on the caller's
-            // next statement rather than being silently carried forward.
-            logger.warn(
-              { err: rollbackErr, issueId: row.id },
-              "failed to roll back superseded-issue comment savepoint",
-            );
-          }
-        }
-      }
-      try {
-        await logActivity(input.executor, {
-          companyId: input.routine.companyId,
-          actorType: "system",
-          actorId: "routine-scheduler",
-          action: "issue.cancelled",
-          entityType: "issue",
-          entityId: row.id,
-          details: {
-            routineId: input.routine.id,
-            reason: "routine_execution_fire_superseded",
-            fireCreatedAt: row.createdAt.toISOString(),
-            fireAgeHorizonMs: input.fireAgeHorizonMs,
-            supersededByRunId: input.supersededByRunId,
-          },
-        });
-      } catch (err) {
-        logger.warn({ err, issueId: row.id }, "failed to log superseded routine execution issue");
-      }
+      // caught only because the DB-backed regression tests exercise the path.
+      // The routine run is named in the body instead.
+      await runSupersedeSideEffect({
+        executor: input.executor,
+        savepoint: "routine_supersede_comment",
+        issueId: row.id,
+        what: "comment on",
+        run: () =>
+          issueSvc.addComment(
+            row.id,
+            [
+              "Cancelled: this routine fire outlived its own cadence and was superseded.",
+              "",
+              `- Fire created: \`${row.createdAt.toISOString()}\``,
+              `- Fire-age horizon: \`${Math.round(input.fireAgeHorizonMs / 1000)}s\``,
+              `- Superseded by routine run: \`${input.supersededByRunId}\``,
+              "",
+              "A scheduled fire is a point-in-time probe, so once its replacement is due it can no",
+              "longer take a useful measurement — and while it stayed open it held the single-owner",
+              "dispatch lock and suppressed the next fire. It is cancelled rather than left `blocked`",
+              "so it does not become a zero-wake-path strand.",
+            ].join("\n"),
+            {},
+            { authorType: "system" },
+            input.executor,
+          ),
+      });
+      // Its own savepoint, not the comment's: the two receipts are
+      // independently best-effort, so a broken activity insert does not also
+      // erase the on-row comment a reviewer is looking at.
+      await runSupersedeSideEffect({
+        executor: input.executor,
+        savepoint: "routine_supersede_activity",
+        issueId: row.id,
+        what: "log activity for",
+        run: () =>
+          logActivity(input.executor, {
+            companyId: input.routine.companyId,
+            actorType: "system",
+            actorId: "routine-scheduler",
+            action: "issue.cancelled",
+            entityType: "issue",
+            entityId: row.id,
+            details: {
+              routineId: input.routine.id,
+              reason: "routine_execution_fire_superseded",
+              fireCreatedAt: row.createdAt.toISOString(),
+              fireAgeHorizonMs: input.fireAgeHorizonMs,
+              supersededByRunId: input.supersededByRunId,
+            },
+          }),
+      });
     }
 
     return stale;
@@ -2212,6 +2237,7 @@ export function routineService(
       title,
       description,
     });
+    let supersededStaleIssueCount = 0;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
@@ -2334,7 +2360,7 @@ export function routineService(
         // keeps `always_enqueue`'s existing duplicate-suppression behaviour
         // untouched; stale rows are still retired on its no-live-issue path.
         if (!activeIssue) {
-          await supersedeStaleExecutionIssues({
+          const superseded = await supersedeStaleExecutionIssues({
             routine: input.routine,
             executor: txDb,
             originKind: issueOriginKind,
@@ -2347,6 +2373,7 @@ export function routineService(
             now: dispatchNow,
             supersededByRunId: createdRun.id,
           });
+          supersededStaleIssueCount = superseded.length;
         }
 
         try {
@@ -2459,6 +2486,15 @@ export function routineService(
         return failed ?? createdRun;
       }
     });
+
+    // Ally review, BLO-31996: the counter is process-local and does not roll
+    // back, so it is bumped only once the transaction carrying the cancellation
+    // UPDATE has committed. Bumped inside the supersede loop it attested a
+    // disposal that a later abort undid -- least useful exactly when a wedge
+    // is recurring.
+    for (let i = 0; i < supersededStaleIssueCount; i += 1) {
+      incrementRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue");
+    }
 
     if (input.source === "schedule" || input.source === "webhook") {
       const actorId = input.source === "schedule" ? "routine-scheduler" : "routine-webhook";
