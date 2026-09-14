@@ -74,9 +74,15 @@ const approvalPayloadSchema = z.object({
     "confirmed instances, one of which left every one of 8 budget changes unapplied for 5 days " +
     "while the affected agent approached an auto-pause. Prose alone cannot be checked. Shape: " +
     '`enforcement_assertions: [{ kind: "budget_policy_amount", policyId: "<uuid>", ' +
-    'expected_usd: 32000, label: "CTO" }]` (or `expected_amount_cents`). Today only ' +
-    "`budget_policy_amount` is checked; unknown kinds are ignored, so declaring one is never " +
-    "harmful and becomes useful when its resolver lands.",
+    'expected_usd: 32000, from_usd: 19000, label: "CTO" }]` (`expected_amount_cents` / ' +
+    "`from_amount_cents` also accepted). `policyId` is a `budget_policies.id`, NOT an agent id. " +
+    "Include the starting figure (`from_usd`): it is what lets a later reader tell a decision " +
+    "that was never applied from one that was applied and then superseded. REQUIRED, not " +
+    "advisory, for `budget_override_required` — a card of that type carrying no parseable " +
+    "assertion is refused at creation with `budget_approval_missing_enforcement_assertion` " +
+    "(BLO-34008), because approving one writes nothing to `budget_policies` and an undeclared " +
+    "figure is therefore unverifiable forever. For every other type it stays optional; today " +
+    "only `budget_policy_amount` is checked, and unknown kinds are ignored.",
 );
 
 export const createApprovalSchema = z.object({
