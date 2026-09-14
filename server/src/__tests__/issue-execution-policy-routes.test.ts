@@ -8,6 +8,34 @@ import {
 } from "../services/issue-execution-policy.js";
 
 /**
+ * Discriminates the work-products table by drizzle's own name symbol rather than by
+ * `===` against the imported table object. Identity looked like the obvious check and
+ * silently failed: this suite's `vi.doMock` registry can hand the route a different
+ * module instance of `@paperclipai/db` than the test file imports, so the comparison
+ * was false, the query fell through to the auth stub, and `.limit()` blew up as a 500.
+ */
+function isIssueWorkProductsTable(table: unknown): boolean {
+  return (table as Record<symbol, unknown> | null)?.[Symbol.for("drizzle:Name")] === "issue_work_products";
+}
+
+/**
+ * The one `select(...).from(...)` shape, shared by the hoisted stub and the `beforeEach`
+ * reset so the two cannot drift — which they silently did once already, and the failure
+ * pointed at the wrong place: `beforeEach` re-registered a table-blind implementation
+ * that discarded the routing entirely, and the symptom was a `500` from `.limit is not a
+ * function` several files away in the route under test.
+ */
+function selectFromStub(table: unknown) {
+  if (isIssueWorkProductsTable(table)) {
+    return { where: () => ({ limit: async () => mockOpenPullRequestRows.current }) } as never;
+  }
+  return {
+    where: mockDbSelectWhere,
+    leftJoin: vi.fn(() => ({ where: mockDbLeftJoinWhere })),
+  };
+}
+
+/**
  * PEN-2853: the `in_review` validator now requires a genuinely future `nextCheckAt`,
  * which turns every fixed future date in these fixtures into an *expiring* one. This
  * fixture was literally `2026-12-01T12:00:00.000Z` — future when it was written, and
@@ -64,10 +92,18 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
 // leftJoin, which no other route in this file uses — give it its own stub so a
 // test can seed blocker rows without disturbing the auth lookups above.
 const mockDbLeftJoinWhere = vi.hoisted(() => vi.fn(async () => [] as unknown[]));
-const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({
-  where: mockDbSelectWhere,
-  leftJoin: vi.fn(() => ({ where: mockDbLeftJoinWhere })),
-})));
+/**
+ * PEN-2853: rows the open-PR review path should see. Seeded per test.
+ *
+ * Given its own stub, routed by table name, rather than teaching the shared `where`
+ * stub above to answer `.limit()`. That shortcut looks tempting and is a trap: the
+ * shared stub resolves to a NON-EMPTY auth row, and eight other queries in these
+ * routes call `.limit()`, so a blanket passthrough would make every issue look like
+ * it carries an open pull request — turning the new review path green everywhere,
+ * including in the tests that exist to prove it refuses.
+ */
+const mockOpenPullRequestRows = vi.hoisted(() => ({ current: [] as unknown[] }));
+const mockDbSelectFrom = vi.hoisted(() => vi.fn((table: unknown) => selectFromStub(table)));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
 const mockDbInsertValues = vi.hoisted(() => vi.fn(async () => undefined));
 const mockDbInsert = vi.hoisted(() => vi.fn(() => ({ values: mockDbInsertValues })));
@@ -226,10 +262,11 @@ describe("issue execution policy routes", () => {
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
-    mockDbSelectFrom.mockImplementation(() => ({
-      where: mockDbSelectWhere,
-      leftJoin: vi.fn(() => ({ where: mockDbLeftJoinWhere })),
-    }));
+    // Must stay the table-aware implementation. This reset is authoritative -- it runs
+    // after the hoisted definition, so a table-blind stub here silently un-does the
+    // routing regardless of what the definition says.
+    mockDbSelectFrom.mockImplementation((table: unknown) => selectFromStub(table));
+    mockOpenPullRequestRows.current = [];
     mockDbLeftJoinWhere.mockResolvedValue([]);
     mockIssueService.listDependencyReadiness.mockResolvedValue(new Map());
     mockDbSelectWhere.mockImplementation(() => ({
@@ -843,6 +880,62 @@ describe("issue execution policy routes", () => {
    * accepts a superset. That asymmetry is safe in one direction only, and this pins
    * that direction: everything the validator admits, the sweep counts.
    */
+  /**
+   * PEN-2853 Finding 1, at the route seam.
+   *
+   * The commonest shape an agent finishes in — a green PR awaiting a human merge press —
+   * had no review path that described it honestly, so the only unilaterally satisfiable
+   * remedy was a monitor polling a gate no poll can move. This asserts the open PR is now
+   * that path.
+   *
+   * Deliberately paired with the refusal tests above, which seed no PR row: together they
+   * show the disjunct decides the outcome rather than admitting everything. The filters
+   * themselves (terminal status, webhook provenance, the `updatedAt` grace) are SQL and
+   * are proven against real postgres in `issue-recovery-actions.test.ts` — this stub
+   * returns whatever it is seeded, so it cannot and does not speak to them.
+   */
+  it("allows an agent-authored in_review transition with an open pull request work product", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-2853",
+      title: "Green PR awaiting a human merge press",
+      executionPolicy: null,
+      executionState: null,
+      monitorAttemptCount: 0,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      monitorNotes: null,
+      monitorScheduledBy: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockOpenPullRequestRows.current = [{ id: "11111111-1111-4111-8111-111111111111" }];
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({ status: "in_review" }),
+    );
+  });
+
   it("admits exactly the monitors the sweep's own definition calls live", async () => {
     const nowMs = Date.now();
     const cases: Array<{ label: string; nextCheckAt: Date }> = [

@@ -28,18 +28,13 @@ import {
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
-  issueWorkProducts,
   issues,
   routineRuns,
   routines,
   workspaceOperations,
 } from "@paperclipai/db";
 import { EXTERNAL_LIFECYCLE_ADAPTER_TYPES } from "@paperclipai/shared/validators/agent";
-import {
-  OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES,
-  PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
-  PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
-} from "../pull-request-work-products.js";
+import { hasOpenPullRequestWakePath } from "../open-pull-request-attendance.js";
 import { loadConfig } from "../../config.js";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -2702,6 +2697,18 @@ export function recoveryService(
       .then((rows) => Boolean(rows[0]));
   }
 
+  /**
+   * Consulted here ONLY on the succeeded-run gate, where the sweep is reasoning from
+   * absence of evidence. The failed/nonretryable arms escalate on positive evidence that
+   * something broke, and an open PR does not refute that -- widening this to them would
+   * suppress recovery from real faults.
+   *
+   * The predicate itself moved to `services/open-pull-request-attendance.ts` (PEN-2853
+   * Finding 1) once the write-side `in_review` validator became its second caller. Its
+   * rationale, filters and grace bound are documented there; this comment records only
+   * the scoping decision local to this call site, which is the sweep's and not the
+   * definition's.
+   */
   async function hasPersistedDurableWaitPath(
     issue: typeof issues.$inferSelect,
     graceMs: number,
@@ -2717,7 +2724,7 @@ export function recoveryService(
     // one definition of "the monitor is still a live wake path", and it is bounded.
     if (hasActiveMonitorPath(issue, graceMs)) return true;
 
-    if (await hasOpenPullRequestWakePath(issue, openPullRequestGraceMs)) return true;
+    if (await hasOpenPullRequestWakePath(db, issue, openPullRequestGraceMs)) return true;
 
     return db
       .select({ id: issueRelations.issueId })
@@ -2731,81 +2738,6 @@ export function recoveryService(
           eq(issues.companyId, issue.companyId),
           notInArray(issues.status, ["done", "cancelled"]),
           isNull(issues.hiddenAt),
-        ),
-      )
-      .limit(1)
-      .then((rows) => Boolean(rows[0]));
-  }
-
-  /**
-   * Whether an open GitHub PR recorded against this issue still constitutes an automatic
-   * path back to life.
-   *
-   * PEN-2791. Before this, the sweep counted five attendance paths -- a live run, a
-   * deferred execution wake, a pending wake interaction, an active monitor, and an
-   * unresolved blocker -- and **none of them was an external event wake**. That omission
-   * was not neutral: it put the convergence guard and the strandedness predicate in
-   * direct contradiction. The guard's whole job, on a gate it cannot move, is to stop
-   * re-arming and clear `monitorNextCheckAt` (`clearReason: trigger_stalled`); for an
-   * issue with no blockers that column WAS the only durable path, so the guard firing
-   * correctly is precisely what made the row eligible for seizure. An assignee reasoning
-   * correctly about when not to poll was the assignee most likely to lose its issue.
-   *
-   * Reported on PEN-2370 (2026-09-01): a `stranded_assigned_issue` action moved a
-   * `critical` security row from `in_progress` to `blocked` and unassigned its owner,
-   * with an evidence block naming no fault at all -- `latestRunStatus: succeeded`,
-   * `latestRunErrorCode: null`, `infraClassCause: false` -- i.e. it fired on the ABSENCE
-   * of a counted path rather than on anything going wrong. The owner heartbeated ~2.5
-   * minutes later. Those action-record details are the filer's, quoted from the issue;
-   * the recovery-action API is not readable from an agent seat, so they were not
-   * re-measured here.
-   *
-   * What WAS re-measured directly, and is the load-bearing half: at that instant the row
-   * carried two `ready_for_review` PR work products (`Blockcast/paperclip#1583`,
-   * `#1581`), written by the same webhook that had already woken that owner from those
-   * PRs earlier the same day, and its monitor was cleared (`monitorNextCheckAt: null`,
-   * `monitorAttemptCount: 8`). The evidence of attendance was on the row, in an indexed
-   * table, and nothing read it.
-   *
-   * Scoped to webhook-written rows by metadata source and system source-trust, mirroring
-   * the reverse lookup in `routes/github-webhook.ts`. This is the point of the predicate
-   * rather than defensive filtering: only a row the webhook itself wrote is evidence
-   * that the webhook will fire again. A hand-created PR work product (which the partial
-   * unique index explicitly allows) says someone typed a URL, which predicts no wake at
-   * all.
-   *
-   * Deliberately consulted ONLY on the succeeded-run gate, where the sweep is reasoning
-   * from absence of evidence. The failed/nonretryable arms escalate on positive evidence
-   * that something broke, and an open PR does not refute that -- widening this to them
-   * would suppress recovery from real faults.
-   *
-   * Bounded on `updatedAt` because an open PR proves a wake arrives when the PR next
-   * MOVES, not that one arrives on a schedule -- see `openPullRequestAttendanceGraceMs`
-   * for why the bound is days rather than the monitor's hours, and why it must exist.
-   */
-  async function hasOpenPullRequestWakePath(
-    issue: typeof issues.$inferSelect,
-    graceMs: number,
-  ) {
-    const freshSinceIso = new Date(Date.now() - graceMs).toISOString();
-    return db
-      .select({ id: issueWorkProducts.id })
-      .from(issueWorkProducts)
-      .where(
-        and(
-          eq(issueWorkProducts.companyId, issue.companyId),
-          eq(issueWorkProducts.issueId, issue.id),
-          eq(issueWorkProducts.provider, "github"),
-          eq(issueWorkProducts.type, "pull_request"),
-          inArray(issueWorkProducts.status, [...OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES]),
-          sql`${issueWorkProducts.metadata}->>'source' = ${PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE}`,
-          sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
-          sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
-          // Bound as an ISO string with an explicit cast: postgres.js cannot serialize a
-          // Date interpolated into a raw `sql` fragment and throws ERR_INVALID_ARG_TYPE
-          // at bind time. Same hazard as `hasPositiveRunEvidence` and the work-product
-          // upsert, both of which were bitten by it.
-          sql`${issueWorkProducts.updatedAt} > ${freshSinceIso}::timestamptz`,
         ),
       )
       .limit(1)
