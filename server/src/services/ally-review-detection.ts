@@ -733,13 +733,37 @@ export function extractAllyReportedFindingRefs(
 }
 
 function carriesBlockingFeedback(text: string): boolean {
+  let sawCountedBucket = false;
   for (const bucket of text.matchAll(/\b(?:Critical|Important)\s+Issues\b[*_]*\s*\((\d+)\)/gi)) {
+    sawCountedBucket = true;
     if (Number(bucket[1]) > 0) return true;
   }
   if (UNCOUNTED_FINDINGS_HEADING_REGEX.test(text)) return true;
   if (/^[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*$/im.test(text)) return true;
   if (hasNonNegatedMatch(text, /\bchanges\s+requested\b/i)) return true;
   if (hasNonNegatedMatch(text, /\brequest(?:ed|s)?\s+changes\b/i)) return true;
+
+  // The clause below keys on Ally's "Recommended Action" *template*, not on
+  // anything Ally asserted. That section is emitted on every consolidated
+  // review regardless of verdict, so it cannot separate a clean review from a
+  // blocking one on its own — no widening of it ever could. It stays only as a
+  // last resort for bodies that carry no count at all.
+  //
+  // A counted bucket is Ally's own machine-readable verdict for this body, so
+  // when one is present it decides and the template is not consulted. Reaching
+  // this line with sawCountedBucket means every bucket read zero.
+  //
+  // This is AC-3 of BLO-32695 applied to the fallback path: `blocking_finding`
+  // must not be reachable from boilerplate. The verdict block fixes bodies
+  // written after it ships; this fixes the block-less transition tail, where
+  // both measured instances of this clause live -- paperclip#1720 (`1. Fix
+  // Critical issues before merge`) and blockcast.github.io#126 (`1. No Critical
+  // issues to fix before merge`, counts 0/0, APPROVED). Note the second negates
+  // the boilerplate and still matched: the negation sits inside the matched
+  // span, and hasNonNegatedMatch only inspects text preceding a match, so
+  // wrapping this clause would not have helped. That is why this is a
+  // precedence rule rather than a fifth guard.
+  if (sawCountedBucket) return false;
   return /\bRecommended\s+Action\b[\s\S]{0,400}\bfix\b[\s\S]{0,400}\bbefore\s+merg(?:e|es|ed|ing)\b/i.test(text);
 }
 

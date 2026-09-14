@@ -30,6 +30,18 @@ const PR1675_CLEAN_REVIEW_BODY = readFileSync(
   "utf8",
 );
 
+/**
+ * Blockcast/blockcast.github.io#126, review 5193254543, APPROVED at this head.
+ * Counts 0/0/0, one prior finding dispositioned `fixed`, and no verdict block —
+ * it predates the emitter. Kept verbatim because the defect is in the exact
+ * wording of the template's third line.
+ */
+const PR126_HEAD = "1a1d9c1e8976e4359e6ba18bf8d7e3d09cc5749b";
+const PR126_CLEAN_REVIEW_BODY = readFileSync(
+  fileURLToPath(new URL("./fixtures/ally-review-blockcast-gh-io-pr126-2026-09-14T020111Z.md", import.meta.url)),
+  "utf8",
+);
+
 const ALLY_BOT_LOGIN = "allyblockcast[bot]";
 
 function allyComment(body: string, createdAt: string) {
@@ -748,6 +760,90 @@ describe("BLO-32695 — block-less bodies keep the prose fallback", () => {
         comments: [allyComment(prose, "2026-09-07T15:41:42Z")],
       }),
     ).toMatchObject({ state: "success", outcome: "clean" });
+  });
+});
+
+/**
+ * BLO-33818's instance, and the reason it is a precedence rule and not a guard.
+ *
+ * This body carries explicit `Critical Issues (0)` / `Important Issues (0)` and
+ * an APPROVED state, yet the live gate reported "carries an unresolved
+ * finding". The trip is the `Recommended Action` template heuristic, whose
+ * matched span here is:
+ *
+ *     "Recommended Action\n1. No Critical issues to fix before merge"
+ *
+ * Ally negated the boilerplate and it matched anyway — `fix` and `before merge`
+ * both survive the negation. The negation also sits *inside* the matched span,
+ * and `hasNonNegatedMatch` only inspects text *preceding* a match, so wrapping
+ * this clause would not have helped. That is the whole argument for keying on
+ * the count instead: the template is emitted unconditionally, so no rewording
+ * of it is separable from a real finding by pattern alone.
+ */
+describe("BLO-32695 — an explicit zero count outranks the Recommended Action template", () => {
+  it("does not read the negated boilerplate as a finding", () => {
+    expect(parseAllyVerdictBlock(PR126_CLEAN_REVIEW_BODY)).toEqual({ kind: "absent" });
+    expect(hasActionablePrReviewFeedback(PR126_CLEAN_REVIEW_BODY, "APPROVED")).toBe(false);
+  });
+
+  it("still reads the attestation and retires the prior finding", () => {
+    expect(extractAllyReviewedHeadSha(PR126_CLEAN_REVIEW_BODY)).toBe(PR126_HEAD);
+    expect(extractAllyPriorFindingDispositions(PR126_CLEAN_REVIEW_BODY)).toEqual([
+      { shortSha: "da2b878", severity: "important", index: 1, disposition: "fixed", kind: "retires" },
+    ]);
+    expect(extractAllyReportedFindingRefs(PR126_CLEAN_REVIEW_BODY)).toEqual([]);
+  });
+
+  it("resolves to clean/success end to end", () => {
+    expect(
+      evaluateCommentReviewGate({
+        headSha: PR126_HEAD,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: [allyComment(PR126_CLEAN_REVIEW_BODY, "2026-09-14T02:01:11Z")],
+      }),
+    ).toMatchObject({ state: "success", outcome: "clean" });
+  });
+
+  /**
+   * The fail-closed half. Skipping the template must cost nothing that
+   * actually carries signal, so each of these still blocks with `(0)` buckets
+   * present. Without them the change would be a fail-open regression of
+   * BLO-29711 rather than a precedence rule.
+   */
+  it.each([
+    ["a counted bucket above zero", "### Critical Issues (1)\n- boom"],
+    ["an uncounted findings heading", "### Critical Issues (0)\n### Important Issues\n- boom"],
+    ["a decision line", "### Critical Issues (0)\n### Important Issues (0)\ndecision: changes_requested"],
+    ["a changes-requested assertion", "### Critical Issues (0)\n### Important Issues (0)\nChanges requested."],
+  ])("still blocks on %s", (_label, tail) => {
+    const body = `## Ally — Consolidated PR Review\nReviewed head: ${PR126_HEAD}\n\n${tail}\n\n### Recommended Action\n1. No Critical issues to fix before merge`;
+    expect(hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("keeps the template as a last resort when no bucket is counted at all", () => {
+    const body = `## Ally — Consolidated PR Review\nReviewed head: ${PR126_HEAD}\n\n### Recommended Action\n1. Fix Critical issues before merge`;
+    expect(hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  /**
+   * A quoted clean review must not disarm a real one. The fence-stripped pass
+   * loses the quoted buckets, so the template is consulted there and the OR in
+   * hasActionablePrReviewFeedback still blocks.
+   */
+  it("does not let a fenced quote of zero counts clear a real boilerplate finding", () => {
+    const body = [
+      "## Ally — Consolidated PR Review",
+      `Reviewed head: ${PR126_HEAD}`,
+      "",
+      "```",
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+      "```",
+      "",
+      "### Recommended Action",
+      "1. Fix Critical issues before merge",
+    ].join("\n");
+    expect(hasActionablePrReviewFeedback(body)).toBe(true);
   });
 });
 
