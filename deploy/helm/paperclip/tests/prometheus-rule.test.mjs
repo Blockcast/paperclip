@@ -517,6 +517,59 @@ test("PaperclipPrReviewQueueWaitSaturated uses the bounded p95 histogram and run
   assert.match(rendered, /alert: PaperclipPrReviewQueueWaitSaturated[\s\S]*?runbook_url: "[^\"]*runbooks\/pr-review-queue-wait\.md"/);
 });
 
+test("PaperclipRuntimeResourceReconciliationStuck pins both backlog gauges and the worker-down backstop (BLO-21460)", () => {
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  assert.match(rendered, /alert: PaperclipRuntimeResourceReconciliationStuck/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipRuntimeResourceReconciliationStuck[\s\S]*?\n\s+expr: >-?\n([\s\S]*?)\n\s+for:/,
+  ) ?? [];
+  assert.ok(expr, "runtime-resource-reconciliation-stuck alert must render an expr");
+
+  assert.match(
+    expr,
+    /max\(paperclip_external_runtime_reservations_release_pending\) > 0/,
+    "must page on a stuck release-pending external-runtime reservation",
+  );
+  assert.match(
+    expr,
+    /max\(paperclip_environment_leases_orphaned_active\) > 0/,
+    "must page on an orphaned-active environment lease",
+  );
+  // The two count arms above read a healthy 0 when the sweep that publishes
+  // them throws, because prom-client gauges retain their last value and the
+  // process stays up. Without this arm the alert is silent during exactly the
+  // kube-API outage its own description tells the operator to check for.
+  assert.match(
+    expr,
+    /max\(paperclip_orphaned_runtime_resource_metrics_refresh_success\)\s*==\s*0/,
+    "must page when the reconciliation sweep stops refreshing the backlog gauges, so a stale 0 cannot read as healthy",
+  );
+  // max(), not a bare comparison: every control-plane pod exports the gauge
+  // but only the worker runs the sweep, so a bare `== 0` would fire forever on
+  // the api pods' untouched initial 0.
+  assert.doesNotMatch(
+    expr,
+    /(?<!max\()paperclip_orphaned_runtime_resource_metrics_refresh_success\s*==\s*0/,
+    "freshness arm must aggregate with max() so non-sweeping pods cannot hold it firing",
+  );
+  assert.match(
+    expr,
+    /max\(up\{job="paperclip-control-plane", service="paperclip-workers"\}\)\s*==\s*0/,
+    "must page when the worker scrape target is down",
+  );
+  assert.match(
+    expr,
+    /absent\(up\{job="paperclip-control-plane", service="paperclip-workers"\}\)/,
+    "must alert when the worker scrape target disappears entirely",
+  );
+  assert.doesNotMatch(
+    expr,
+    /max by \(job\)/,
+    "must scope availability to the worker service, not aggregate API and worker targets",
+  );
+});
+
 test("PaperclipAgentJobBackoffLimitExceeded is deleted, not just renamed (BLO-23413)", () => {
   // BLO-23413: this alert was verified structurally unable to fire on the
   // live cluster (kube-state-metrics only ever emits ONE post-failure
