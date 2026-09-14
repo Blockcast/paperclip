@@ -2755,6 +2755,110 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(hold.held).toBe(false);
   });
 
+  // BLO-27698 C1/C2: the assignee's live slot occupancy, and the capacity
+  // verdict cell that occupancy unlocks. The four fallback verdicts on a
+  // `long_active_duration` review all presuppose an agent that had a turn and
+  // used it poorly; before this a reviewer had to reconstruct saturation from
+  // Kubernetes and then force one of those four anyway.
+  describe("assignee concurrency evidence (BLO-27698 C1/C2)", () => {
+    // Seeds `count` `running` rows for the agent on OTHER issues — the slots
+    // that starve this issue are held by other work, which is exactly why the
+    // count must not be issue-scoped.
+    async function occupySlots(input: { companyId: string; agentId: string; count: number }) {
+      if (input.count === 0) return;
+      await db.insert(heartbeatRuns).values(
+        Array.from({ length: input.count }, () => ({
+          id: randomUUID(),
+          companyId: input.companyId,
+          agentId: input.agentId,
+          status: "running" as const,
+          invocationSource: "assignment" as const,
+          startedAt: new Date("2026-04-28T11:00:00.000Z"),
+          contextSnapshot: { issueId: randomUUID() },
+        })),
+      );
+    }
+
+    async function reviewFor(opts: {
+      slots: number;
+      adapterType?: string;
+      runtimeConfig?: Record<string, unknown>;
+    }) {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      });
+      if (opts.adapterType || opts.runtimeConfig) {
+        await db
+          .update(agents)
+          .set({
+            ...(opts.adapterType ? { adapterType: opts.adapterType } : {}),
+            ...(opts.runtimeConfig ? { runtimeConfig: opts.runtimeConfig } : {}),
+          })
+          .where(eq(agents.id, seeded.coderId));
+      }
+      await occupySlots({ companyId: seeded.companyId, agentId: seeded.coderId, count: opts.slots });
+
+      await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+      const [review] = await listProductivityReviews(seeded.companyId);
+      return review;
+    }
+
+    it("states the live running-runs-to-enforced-ceiling ratio (C1)", async () => {
+      // codex_local is not external-lifecycle, so the enforced ceiling is the
+      // raw policy value — no BLO-15959 clamp.
+      const review = await reviewFor({ slots: 2, runtimeConfig: { heartbeat: { maxConcurrentRuns: 5 } } });
+      expect(review?.description).toContain(
+        "- Assignee live concurrency: 2/5 running runs against the dispatcher's enforced ceiling",
+      );
+      // Not saturated: no capacity claim, and no capacity verdict offered.
+      expect(review?.description).not.toContain("**saturated**");
+    });
+
+    it("reports the external-lifecycle clamp, not the configured value, as the ceiling (C1)", async () => {
+      // BLO-15959: concurrencyEnabled defaults off, so a k8s agent configured
+      // for 8 is really held to 1. Reporting 8 here would tell a reviewer the
+      // agent had 7 free slots it declined to use — the exact inversion of the
+      // truth. This assertion is what makes the reported ceiling load-bearing
+      // rather than decorative.
+      const review = await reviewFor({
+        slots: 1,
+        adapterType: "claude_k8s",
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 8 } },
+      });
+      expect(review?.description).toContain("- Assignee live concurrency: 1/1 running runs");
+      expect(review?.description).toContain("held to 1 because external-lifecycle `concurrencyEnabled` is off");
+      expect(review?.description).toContain("**saturated**");
+    });
+
+    it("offers the capacity/platform verdict when the assignee is saturated (C2)", async () => {
+      const review = await reviewFor({ slots: 3, runtimeConfig: { heartbeat: { maxConcurrentRuns: 3 } } });
+      expect(review?.description).toContain("Route to platform/SRE as a capacity/dispatch constraint");
+      expect(review?.description).toContain("all 3 of the assignee's run slots occupied");
+      // The cell must precede the four assignee-directed verdicts, which are
+      // the wrong instruction for an agent that never got a turn.
+      expect(review!.description!.indexOf("Route to platform/SRE as a capacity/dispatch constraint"))
+        .toBeLessThan(review!.description!.indexOf("- Request decomposition"));
+    });
+
+    it("withholds the capacity verdict when the assignee had free slots (C2 negative control)", async () => {
+      // The important half. An always-present capacity cell would become the
+      // default verdict for every slow episode — the opposite failure to the
+      // one C2 fixes, and a strictly worse one, because it excuses real
+      // inactivity rather than merely failing to explain a stall.
+      const review = await reviewFor({ slots: 0, runtimeConfig: { heartbeat: { maxConcurrentRuns: 4 } } });
+      expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      expect(review?.description).toContain("- Assignee live concurrency: 0/4 running runs");
+      expect(review?.description).not.toContain("Route to platform/SRE as a capacity/dispatch constraint");
+      // The four assignee-directed verdicts are still offered.
+      expect(review?.description).toContain("- Request decomposition");
+    });
+  });
+
   // BLO-19848: `long_active_duration` measured raw wall-clock from
   // issues.started_at to now with no reference to whether anything was actually
   // executing, so an issue pinned by a non-live executionRunId kept accruing
