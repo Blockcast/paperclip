@@ -153,12 +153,15 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     // PEN-3000: the 0-attempt case is the one the ticket calls out, but the reason matters
     // and the old wording got it backwards. `attemptCount` counts DELIVERED wakes, not
     // sweeps — every sweep reserves +1 and refunds it when `enqueueWakeup` returns null — so
-    // 0 does not mean "nothing was ever scheduled", it means every sweep in the window was
-    // refused by the wake channel. Assert the note says so, because an operator who reads
-    // "never scheduled" goes looking at the wrong layer.
-    expect(comments[0]!.body).toContain("no wake for this action ever reached the queue");
+    // 0 does not mean "nothing was ever scheduled", it means every sweep since the current
+    // owner took over was refused by the wake channel. Assert the note says so, because an
+    // operator who reads "never scheduled" goes looking at the wrong layer — and assert it
+    // does NOT claim the whole window, because owner churn restarts the counter (see the
+    // churned-owner test below).
+    expect(comments[0]!.body).toContain("no wake reached the queue for this action's current owner");
     expect(comments[0]!.body).toContain("DELIVERED, not sweeps attempted");
     expect(comments[0]!.body).not.toContain("never made a single wake attempt");
+    expect(comments[0]!.body).not.toContain("across the whole window");
   });
 
   it("distinguishes a delivered-at-least-once expiry from a never-delivered one", async () => {
@@ -180,7 +183,55 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     expect(comments).toHaveLength(1);
     expect(comments[0]!.body).toContain("Attempts: 2 (budget 5)");
     expect(comments[0]!.body).toContain("reassigning will NOT restore the wake budget");
-    expect(comments[0]!.body).not.toContain("no wake for this action ever reached the queue");
+    expect(comments[0]!.body).not.toContain("no wake reached the queue for this action's current owner");
+  });
+
+  it("labels an owner-churned row at 0 attempts never_delivered, scoped to the current owner", async () => {
+    // Ally review on #1712: `attemptCount` RESTARTS on owner change
+    // (`attemptCount: isNewOwnerSequence ? 1 : existing.attemptCount + 1` in
+    // `upsertSourceScopedUnlocked`), so owner A woken three times → handoff to B → B's one
+    // reservation refunded → horizon expires also reads `attemptCount: 0`. The label
+    // therefore claims only that no wake reached the CURRENT owner's queue, and the
+    // operator note must say so rather than assert the whole window was refused.
+    //
+    // It is deliberately NOT gated on `previousOwnerAgentId === null`: the stranded sweep
+    // writes `previousOwnerAgentId: input.issue.assigneeAgentId` on the very FIRST insert
+    // (`recovery/service.ts`, `upsertSourceScoped` call in the stranded path), so the field
+    // is non-null on exactly the un-churned population PEN-3000 measured, and that gate
+    // would silence the paging series for the incident it exists to catch. This row carries
+    // a non-null previous owner distinct from the current one to pin that decision.
+    __resetMetricsForTest();
+    const seeded = await seed();
+    const previousOwnerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: previousOwnerAgentId,
+      companyId: seeded.companyId,
+      name: "Previous owner",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await insertAction(seeded, { attemptCount: 0, previousOwnerAgentId });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+    expect(result).toMatchObject({ escalated: 1, announced: 1, neverDelivered: 1 });
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 1`);
+    expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 0`);
+
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, seeded.sourceIssueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.body).toContain("no wake reached the queue for this action's current owner");
+    expect(comments[0]!.body).toContain("An earlier owner may have been woken");
+    expect(comments[0]!.body).not.toContain("across the whole window");
   });
 
   it("emits the horizon-expiry metric split by delivery, through the real sweep", async () => {

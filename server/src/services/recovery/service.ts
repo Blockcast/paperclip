@@ -12275,10 +12275,14 @@ export function recoveryService(
 
       // PEN-3000: `attemptCount` counts wakes that REACHED THE QUEUE, not sweeps — every
       // sweep reserves +1 and refunds it when `enqueueWakeup` returned null, so the counter
-      // freezes at the delivered count. 0 therefore means no wake was ever delivered across
-      // the entire horizon, which is a wake-channel fault rather than an owner who was woken
-      // and did not converge. Those are different incidents with different responders and
-      // they render identically without this split.
+      // freezes at the delivered count. It also restarts on owner change (`isNewOwnerSequence`
+      // in `upsertSourceScopedUnlocked`), so 0 means no wake was delivered to the CURRENT
+      // owner since it took over — not necessarily across the row's whole life. Within that
+      // scope it is a wake-channel fault rather than an owner who was woken and did not
+      // converge; those are different incidents with different responders and they render
+      // identically without this split. Not gated on `previousOwnerAgentId`: the stranded
+      // sweep writes it from the issue's assignee on the first insert (see `upsertSourceScoped`
+      // call above), so it is non-null on the un-churned rows this label exists to catch.
       const neverDelivered = action.attemptCount === 0;
       if (neverDelivered) result.neverDelivered += 1;
       recordRecoveryHorizonExpired(neverDelivered ? "never_delivered" : "delivered");
@@ -12332,12 +12336,15 @@ export function recoveryService(
             `- Auto-recovery horizon: ${horizonAt}`,
             `- Cause: \`${action.cause}\``,
             action.attemptCount === 0
-              ? "- Note: no wake for this action ever reached the queue. `Attempts` counts wakes that were " +
-                "DELIVERED, not sweeps attempted — each sweep reserves an attempt and refunds it when the " +
-                "wake is not delivered — so 0 means every sweep across the whole window above was refused " +
-                "by the wake channel (provider-capacity deferral, an active tree pause hold, wake disabled, " +
-                "or cooldown). The stranding this action was opened to repair was therefore never worked, " +
-                "and this is a scheduler-side fault rather than an owner who was woken and could not resolve it."
+              ? "- Note: no wake reached the queue for this action's current owner. `Attempts` counts wakes " +
+                "that were DELIVERED, not sweeps attempted — each sweep reserves an attempt and refunds it " +
+                "when the wake is not delivered, and the count restarts when ownership changes — so 0 means " +
+                "every sweep since the current owner took over was refused by the wake channel " +
+                "(provider-capacity deferral, an active tree pause hold, wake disabled, or cooldown). An " +
+                "earlier owner may have been woken; check the action's owner history before concluding the " +
+                "whole window was refused. Within the current owner's tenure the stranding this action was " +
+                "opened to repair was never worked, and that is a scheduler-side fault rather than an owner " +
+                "who was woken and could not resolve it."
               : "- Note: reassigning will NOT restore the wake budget — the horizon above is fixed for the life of " +
                 "the action, so a new owner does not get fresh attempts.",
             "- Next action: discharge or cancel this recovery action, or record an intentional manual resolution.",
@@ -13476,6 +13483,7 @@ export function recoveryService(
       strandedRecoveryWakeEnqueueFailed: 0,
       strandedRecoveryWakeIssueIds: [] as string[],
       expiredRecoveryHorizonsEscalated: 0,
+      expiredRecoveryHorizonsNeverDelivered: 0,
       expiredRecoveryHorizonsAnnounced: 0,
       expiredRecoveryHorizonIssueIds: [] as string[],
       issueIds: [] as string[],
@@ -13523,6 +13531,7 @@ export function recoveryService(
       now,
     });
     result.expiredRecoveryHorizonsEscalated = expiredHorizons.escalated;
+    result.expiredRecoveryHorizonsNeverDelivered = expiredHorizons.neverDelivered;
     result.expiredRecoveryHorizonsAnnounced = expiredHorizons.announced;
     result.expiredRecoveryHorizonIssueIds = expiredHorizons.issueIds;
 
