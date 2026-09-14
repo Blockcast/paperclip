@@ -127,15 +127,24 @@ import type { accessService } from "../services/index.js";
  * straight onto the execution workspace's own config, so they are the same bytes, not merely the
  * same class. It is a raw JSONB column on a row this module has no projection for, and issue
  * responses are SPREADS — so it does not pass this boundary at all. That makes it a BYPASS of the
- * shipped boundary rather than a gap in this mask's width, and it is filed separately for that
- * reason.
+ * shipped boundary rather than a gap in this mask's width.
+ *
+ * ⇒ **Tracked as PEN-3252** (filed from this change, with the full twelve-site inventory and a
+ * draft of the `publicIssueExecutionWorkspaceSettings` projection that closes it). Anyone reading
+ * this module to decide whether the class is closed should read that ticket first.
  *
  * It is named here, in the module that would otherwise read as having closed the class, because the
  * honest scope of the fix below is "every carrier reachable through a workspace or project row" —
- * NOT "every carrier". The settings column reaches responses from ELEVEN sites in `routes/issues.ts`
+ * NOT "every carrier", and NOT "every workspace-runtime response exit". An unentitled same-company
+ * agent still receives raw `workspaceStrategy` command strings and the raw `workspaceRuntime`
+ * record from the issue routes; that disclosure is open until PEN-3252 lands, and no claim in this
+ * module, its tests, or the change that introduced it should be read as covering it.
+ *
+ * The settings column reaches responses from ELEVEN sites in `routes/issues.ts`
  * (`GET /issues/:id`, create ×2, children, PATCH, DELETE, checkout, release ×2, admin force-release,
  * recovery-actions/resolve) plus the company-export bundle, none of which the CI guard covers.
- * Masking one of twelve would read as closure and be worse than masking none.
+ * Masking one of twelve would read as closure and be worse than masking none — which is why the
+ * split is by BYPASS-vs-WIDTH rather than by convenience.
  */
 
 export interface WorkspaceRuntimeViewer {
