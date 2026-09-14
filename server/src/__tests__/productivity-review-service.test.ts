@@ -9,6 +9,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  executionWorkspaces,
   heartbeatRuns,
   issueApprovals,
   issueComments,
@@ -17,6 +18,8 @@ import {
   issues,
   plugins,
   pluginState,
+  projects,
+  workspaceOperations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -194,6 +197,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     issuePrefix: string;
     blockedIssueId: string;
     blockerStatus?: "todo" | "done";
+    executionWorkspaceId?: string;
   }) {
     const blockerId = randomUUID();
     const createdAt = new Date("2026-04-28T09:00:00.000Z");
@@ -204,6 +208,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       status: input.blockerStatus ?? "todo",
       priority: "medium",
       originKind: "manual",
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
       issueNumber: 900,
       identifier: `${input.issuePrefix}-900`,
       createdAt,
@@ -1601,6 +1606,18 @@ describeEmbeddedPostgres("productivity review service", () => {
   // says so: the readiness map carries no edge timestamps, so subtracting an
   // unmeasured span from the wall-clock buckets would swap a known-wrong
   // attribution for an invented one.
+  // The full rendered line, not the count prefix: the "reviewed anyway" clause
+  // and the caveat are the part a reviewer cannot get from the source issue,
+  // and a prefix match passes with both deleted (Ally review, PR #1722).
+  const DEPENDENCY_LINE_ONE_BLOCKER =
+    "- Dependency accounting: 1 unresolved `blockedBy` blocker at this evidence pass; reviewed anyway because `high_churn` fired, which an unresolved blocker does not excuse — blocker state at this pass, not a measured span: the elapsed figures above are wall-clock and are NOT reduced by this, so read their unattended portion as covering dependency-blocked time of unrecorded length";
+  // Runs dispatched 30m ago: `activeStartedAt` anchors on the latest run
+  // `startedAt`, and `insertRuns`'s default (`startedAt = createdAt = now`)
+  // reports a 0m episode, which pins nothing.
+  const dispatchedThirtyMinutesAgo = (now: Date) => new Date(now.getTime() - 30 * 60 * 1000);
+  const ELAPSED_LINE_30M_UNATTENDED =
+    "- Elapsed accounting: 0m monitor-gated, 30m unattended (no monitor armed during this episode)";
+
   it("reports a dependency-blocked bucket alongside the elapsed split when a review still fires on a non-closable trigger (BLO-22887)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
@@ -1611,6 +1628,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       count: 10,
       now,
       withRunComments: true,
+      startedAt: dispatchedThirtyMinutesAgo(now),
     });
     await addBlocker({
       companyId: seeded.companyId,
@@ -1623,12 +1641,11 @@ describeEmbeddedPostgres("productivity review service", () => {
 
     expect(result.created).toBe(1);
     const [review] = await listProductivityReviews(seeded.companyId);
-    expect(review?.description).toContain("- Dependency accounting: 1 unresolved `blockedBy` blocker");
-    // Names the trigger that kept the review alive, so the line explains its
-    // own presence rather than reading as a contradiction of the suppression.
-    expect(review?.description).toContain("`high_churn`");
-    // The bucket is reported next to the elapsed split, never folded into it.
-    expect(review?.description).not.toContain("Dependency accounting: 0 ");
+    expect(review?.description).toContain(DEPENDENCY_LINE_ONE_BLOCKER);
+    // Reported next to the elapsed split, never folded into it: the unattended
+    // figure is the same 30m the resolved-blocker cell below reports with no
+    // dependency line at all.
+    expect(review?.description).toContain(ELAPSED_LINE_30M_UNATTENDED);
   });
 
   // BLO-22887 AC2 over-reporting guard, and the counterpart to BLO-22436's
@@ -1647,6 +1664,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       count: 10,
       now,
       withRunComments: true,
+      startedAt: dispatchedThirtyMinutesAgo(now),
     });
     await addBlocker({
       companyId: seeded.companyId,
@@ -1662,6 +1680,98 @@ describeEmbeddedPostgres("productivity review service", () => {
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `high_churn`");
     expect(review?.description).not.toContain("Dependency accounting");
+    // Same seeding as the cell above minus the unresolved blocker, same
+    // elapsed split: the bucket is never subtracted from the wall-clock figures.
+    expect(review?.description).toContain(ELAPSED_LINE_30M_UNATTENDED);
+  });
+
+  // BLO-22887 AC2: a `done` blocker whose execution workspace has not finalized
+  // is still unresolved (`listDependencyReadiness`'s workspace-finalize
+  // barrier), and the line says which kind it is — the remedy differs (wait
+  // for sync-back vs. chase the blocker's assignee).
+  it("names the done-but-awaiting-finalize subset in the dependency accounting line (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+    });
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId: seeded.companyId, name: "Finalize barrier" });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId: seeded.companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Finalize barrier workspace",
+    });
+    const blockerId = await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+      blockerStatus: "done",
+      executionWorkspaceId,
+    });
+    // The blocker's latest op on its workspace is not a succeeded
+    // `workspace_finalize`, so readiness keeps it unresolved.
+    await db.insert(workspaceOperations).values({
+      companyId: seeded.companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "worktree_prepare",
+      status: "succeeded",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      "- Dependency accounting: 1 unresolved `blockedBy` blocker at this evidence pass (1 `done` but awaiting workspace finalize); reviewed anyway because `high_churn` fired, which an unresolved blocker does not excuse — blocker state at this pass, not a measured span: the elapsed figures above",
+    );
+  });
+
+  // Ally review (PR #1722): `Elapsed accounting` renders only when
+  // `monitorGating` was computed, which needs an `in_progress` source — so
+  // every `todo` candidate carries the dependency line with no elapsed split
+  // above it (and the refresh comment, which prints no unconditional elapsed
+  // figure, with nothing at all). The caveat has to say so rather than point
+  // at figures that are not on the page.
+  it("does not point the dependency caveat at an elapsed split that was never rendered (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "todo" });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("- Current active elapsed time: unknown");
+    expect(review?.description).not.toContain("Elapsed accounting");
+    expect(review?.description).toContain(
+      "- Dependency accounting: 1 unresolved `blockedBy` blocker at this evidence pass; reviewed anyway because `high_churn` fired, which an unresolved blocker does not excuse — blocker state at this pass, not a measured span: no elapsed split was computed for this episode, so there is no wall-clock figure this reduces",
+    );
+    expect(review?.description).not.toContain("elapsed figures above");
   });
 
   // BLO-22887 AC2: the refresh comment is what lands in the manager's
@@ -1704,7 +1814,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(refreshed.updated).toBe(1);
     const refreshComments = await listRefreshComments(review!.id);
     expect(refreshComments.length).toBeGreaterThan(0);
-    expect(refreshComments.at(-1)?.body).toContain("- Dependency accounting: 1 unresolved `blockedBy` blocker");
+    expect(refreshComments.at(-1)?.body).toContain(DEPENDENCY_LINE_ONE_BLOCKER);
   });
 
   // BLO-22436: once the blocker resolves (or the edge is removed), the same

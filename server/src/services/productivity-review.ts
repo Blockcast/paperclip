@@ -1165,7 +1165,15 @@ function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["mon
 // split rather than subtracted from it. Reports blocker state and says so —
 // see `DependencyGating` for why there is no honest span to report here, and
 // why claiming one would be worse than the bug this replaces.
-function formatDependencyGating(gating: NonNullable<ProductivityReviewEvidence["dependencyGating"]>) {
+function formatDependencyGating(
+  gating: NonNullable<ProductivityReviewEvidence["dependencyGating"]>,
+  // Whether the `Elapsed accounting` split is rendered above this line. It is
+  // conditional on `monitorGating`, which is null whenever `elapsedMs` is —
+  // i.e. for every `todo` candidate, the most ordinary dependency-blocked
+  // shape there is — so the caveat below must not point at a figure that is
+  // not on the page (Ally review, PR #1722).
+  elapsedSplitRendered: boolean,
+) {
   const blockers = `${gating.unresolvedBlockerCount} unresolved \`blockedBy\` ${
     gating.unresolvedBlockerCount === 1 ? "blocker" : "blockers"
   } at this evidence pass`;
@@ -1179,7 +1187,10 @@ function formatDependencyGating(gating: NonNullable<ProductivityReviewEvidence["
   const survived = gating.nonClosableTriggers.length > 0
     ? `; reviewed anyway because ${gating.nonClosableTriggers.map((trigger) => `\`${trigger}\``).join(", ")} fired, which an unresolved blocker does not excuse`
     : "";
-  return `${blockers}${finalize}${survived} — blocker state at this pass, not a measured span: the elapsed figures above are wall-clock and are NOT reduced by this, so read their unattended portion as covering dependency-blocked time of unrecorded length`;
+  const caveat = elapsedSplitRendered
+    ? "the elapsed figures above are wall-clock and are NOT reduced by this, so read their unattended portion as covering dependency-blocked time of unrecorded length"
+    : "no elapsed split was computed for this episode, so there is no wall-clock figure this reduces";
+  return `${blockers}${finalize}${survived} — blocker state at this pass, not a measured span: ${caveat}`;
 }
 
 function isFreshPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEvidence {
@@ -4007,7 +4018,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         ? [`- No-executable-turn accounting: ${formatNoExecutableTurnGating(evidence.noExecutableTurnGating)}`]
         : []),
       ...(evidence.dependencyGating
-        ? [`- Dependency accounting: ${formatDependencyGating(evidence.dependencyGating)}`]
+        ? [`- Dependency accounting: ${formatDependencyGating(evidence.dependencyGating, evidence.monitorGating !== null)}`]
         : []),
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
@@ -4115,7 +4126,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         ? [`- No-executable-turn accounting: ${formatNoExecutableTurnGating(evidence.noExecutableTurnGating)}`]
         : []),
       ...(evidence.dependencyGating
-        ? [`- Dependency accounting: ${formatDependencyGating(evidence.dependencyGating)}`]
+        ? [`- Dependency accounting: ${formatDependencyGating(evidence.dependencyGating, evidence.monitorGating !== null)}`]
         : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
       `- Linked pull request: ${formatPullRequestEvidence(evidence.latestPullRequest)}`,
