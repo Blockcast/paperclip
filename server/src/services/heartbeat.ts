@@ -99,7 +99,6 @@ type AgentFinalizationResult =
   | { kind: "superseded"; reason: string }
   | { kind: "failed"; reason: string };
 import {
-  AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   MODEL_PROFILE_KEYS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
@@ -126,11 +125,8 @@ import {
   HEARTBEAT_POLICY_COOLDOWN_MAX_SEC,
   HEARTBEAT_POLICY_COOLDOWN_MIN_SEC,
   EXTERNAL_LIFECYCLE_ADAPTER_TYPES,
-  EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS,
   HEARTBEAT_POLICY_INTERVAL_MAX_SEC,
   HEARTBEAT_POLICY_INTERVAL_MIN_SEC,
-  HEARTBEAT_POLICY_MAX_CONCURRENT_MAX,
-  HEARTBEAT_POLICY_MAX_CONCURRENT_MIN,
   HEARTBEAT_PRESET_CONFIGS,
   type HeartbeatPreset,
 } from "@paperclipai/shared/validators/agent";
@@ -357,6 +353,11 @@ import {
   issueTreeControlService,
 } from "./issue-tree-control.js";
 import { RUN_STALE_SILENCE_MS } from "./issue-run-holding.js";
+import {
+  countRunsOccupyingSlots,
+  resolveAgentConcurrencyPolicy,
+  resolveExternalLifecycleConcurrency,
+} from "./agent-concurrency.js";
 import {
   continuationSummaryParksExecutor,
   getIssueContinuationSummaryDocument,
@@ -586,17 +587,6 @@ export function redactDetectedSuccessfulRunProgressSummaryForBoard(
 
 const MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS = 100;
 const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
-const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
-const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
-const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
-/**
- * Operational ceiling on simultaneous external-lifecycle (k8s) slots per
- * agent, applied on top of `maxConcurrentRuns` whenever `concurrencyEnabled`
- * is true (BLO-15959). Independent of the per-agent policy value so a
- * misconfigured `maxConcurrentRuns` cannot alone blow past what the cluster
- * is provisioned to run for one agent concurrently.
- */
-const EXTERNAL_LIFECYCLE_SLOT_CAPACITY = EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS;
 const STALE_QUEUED_MAINTENANCE_WAKE_MAX_AGE_MS = 30 * 60 * 1000;
 const STALE_QUEUED_MAINTENANCE_WAKE_BATCH_SIZE = 250;
 const STALE_QUEUED_MAINTENANCE_WAKE_REASONS = [
@@ -4168,12 +4158,6 @@ function normalizeHeartbeatCooldownSec(value: unknown, fallback: number) {
   return Math.max(HEARTBEAT_POLICY_COOLDOWN_MIN_SEC, Math.min(HEARTBEAT_POLICY_COOLDOWN_MAX_SEC, parsed));
 }
 
-function normalizeMaxConcurrentRuns(value: unknown, fallback: number = HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT) {
-  const parsed = Math.floor(asNumber(value, fallback));
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(HEARTBEAT_POLICY_MAX_CONCURRENT_MIN, Math.min(HEARTBEAT_POLICY_MAX_CONCURRENT_MAX, parsed));
-}
-
 function normalizeOptionalNonNegativeInteger(value: unknown) {
   if (value === null || value === undefined || value === "") return null;
   const normalized = Math.floor(asNumber(value, 0));
@@ -4215,14 +4199,10 @@ export function resolveHeartbeatPolicyForRuntimeConfig(runtimeConfigValue: unkno
     heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation,
     presetConfig?.wakeOnDemand ?? true,
   );
-  const maxConcurrentRuns = normalizeMaxConcurrentRuns(
-    heartbeat.maxConcurrentRuns,
-    presetConfig?.maxConcurrentRuns ?? HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT,
-  );
-  // BLO-15959: deliberately NOT influenced by preset — a preset tunes
-  // interval/cooldown/maxConcurrentRuns, but opting an agent into actual
-  // external-lifecycle concurrency must be an explicit, separate decision.
-  const concurrencyEnabled = asBoolean(heartbeat.concurrencyEnabled, false);
+  // BLO-27698 C1: `maxConcurrentRuns`/`concurrencyEnabled` are resolved by the
+  // shared leaf module so the productivity review can report the same ceiling
+  // this function feeds to dispatch, without importing back into heartbeat.ts.
+  const { maxConcurrentRuns, concurrencyEnabled } = resolveAgentConcurrencyPolicy(runtimeConfigValue);
   const desiredCooldownSec = normalizeHeartbeatCooldownSec(heartbeat.cooldownSec, presetConfig?.cooldownSec ?? 0);
   const cooldownSec = enabled ? Math.min(desiredCooldownSec, intervalSec) : desiredCooldownSec;
   const idleAutoPauseAfter = Math.max(0, asNumber(heartbeat.idleAutoPauseAfter, 0));
@@ -4249,39 +4229,11 @@ export function resolveHeartbeatPolicyForRuntimeConfig(runtimeConfigValue: unkno
 
 /**
  * Resolve the admitted concurrency ceiling for external-lifecycle (k8s)
- * adapters (BLO-15959). This is a separate, default-off eligibility gate on
- * top of the per-agent `maxConcurrentRuns` policy value:
- *
- * - Disabled (default): every external-lifecycle agent is held to exactly
- *   one concurrent run, regardless of what `maxConcurrentRuns` is configured
- *   to. This is the fallback/rollback posture — flipping the flag back off
- *   restores it immediately with no migration or data repair, because it is
- *   computed fresh from policy on every dispatch rather than persisted.
- * - Enabled: the effective ceiling is `min(maxConcurrentRuns,
- *   EXTERNAL_LIFECYCLE_SLOT_CAPACITY)` — the operator's configured value,
- *   further bounded by the operational slot ceiling so a high
- *   `maxConcurrentRuns` cannot alone exceed what the cluster is provisioned
- *   for one agent.
- *
- * Serialization of shared-workspace / same-isolation-key runs is a distinct,
- * already-enforced invariant (the unique active-isolation-writer constraint
- * in external_runtime_reservations, BLO-15956/BLO-15958) and is unaffected by
- * this gate either way.
+ * adapters (BLO-15959). Defined in `agent-concurrency.ts` (BLO-27698 C1) and
+ * re-exported here so existing callers and tests keep their import path; see
+ * that module for why it moved.
  */
-export function resolveExternalLifecycleConcurrency(
-  policy: Pick<ParsedHeartbeatPolicy, "concurrencyEnabled" | "maxConcurrentRuns">,
-): { effectiveMaxConcurrentRuns: number; concurrencyEnabled: boolean } {
-  if (!policy.concurrencyEnabled) {
-    return { effectiveMaxConcurrentRuns: 1, concurrencyEnabled: false };
-  }
-  return {
-    effectiveMaxConcurrentRuns: Math.max(
-      1,
-      Math.min(policy.maxConcurrentRuns, EXTERNAL_LIFECYCLE_SLOT_CAPACITY),
-    ),
-    concurrencyEnabled: true,
-  };
-}
+export { resolveExternalLifecycleConcurrency };
 
 /**
  * Decide whether the heartbeat cooldown should suppress a wakeup.
@@ -22948,7 +22900,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // (claude_k8s, opencode_k8s). Those two sets are disjoint, so that resurrection
     // cannot produce a divergent row on the external-lifecycle path. It IS reachable
     // for the dispatcher slot gate, whose query is adapter-agnostic — see
-    // nonStaleRunningRuns, where that rationale properly lives.
+    // `isRunOccupyingSlot` in agent-concurrency.ts, where that rationale properly
+    // lives.
     //
     // What this guards instead: a FUTURE deliberate decoupling of the two stamps
     // (or a future external-lifecycle transition that preserves terminal stamps).
@@ -25689,42 +25642,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (hasExternalLifecycle(agent.adapterType)) {
         await reapOrphanedRuns({ suppressDispatchAfterReap: true });
       }
-      // BLO-12990 Fix #1: stale/silent running runs must not block new high-priority
-      // work. Fetch full run rows so we can partition into active vs. stale using
-      // the same silence metric the reaper uses (EXTERNAL_LIFECYCLE_STALE_MS). A run
-      // is stale when its most-recent signal — the NEWEST of lastUsefulActionAt /
-      // lastOutputAt / startedAt — is older than the threshold. Only non-stale runs
-      // count toward the slot gate — a k8s Job that has been silent for >15 min
-      // should not starve newly-queued high-priority work indefinitely.
+      // BLO-12990 Fix #1 / BLO-20775: stale/silent running runs must not block new
+      // high-priority work. Fetch full run rows so `isRunOccupyingSlot` can partition
+      // them into active vs. stale on the same silence metric the reaper uses. That
+      // predicate lives in `agent-concurrency.ts` alongside the ceiling it is compared
+      // against, so the productivity review reports the same slot population dispatch
+      // enforces (BLO-27698 C1) — its rationale, including why this uses the NEWEST
+      // stamp rather than the first non-null, is documented there.
       const dispatchNow = new Date();
-      const staleFloorMs = dispatchNow.getTime() - EXTERNAL_LIFECYCLE_STALE_MS;
       const runningRunRows = await listRunningRunsForAgent(agentId);
-      const nonStaleRunningRuns = runningRunRows.filter((r) => {
-        // BLO-20775: newest stamp, NOT the first non-null. The old chain
-        // (lastUsefulActionAt ? … : lastOutputAt ? …) encodes an invariant nothing
-        // enforces — that lastUsefulActionAt is never older than lastOutputAt. That
-        // is false on TERMINAL rows, where classifyAndPersistRunLiveness stamps
-        // lastUsefulActionAt to an often-hours-old concrete *evidence* time while
-        // lastOutputAt stays fresh.
-        //
-        // Unlike the external-lifecycle reaper helper, that divergent row IS
-        // reachable here. listRunningRunsForAgent filters on agentId + status only,
-        // with no adapter predicate, so it returns sessioned-local rows too — and a
-        // terminal local row can be resurrected to `running` by the unguarded
-        // setRunStatus(id, "running") in reapOrphanedRuns (gated on processPidAlive →
-        // isTrackedLocalChildProcessAdapter), carrying its terminal-path stamp with
-        // it. Such a run genuinely occupies a slot; under the old chain it read as
-        // stale, dropped out of the count, and a second run could dispatch on top of
-        // a live one. runTimestampMs maps null/NaN to 0, so an unparseable stamp is
-        // dropped rather than propagated.
-        const signalMs = Math.max(
-          runTimestampMs(r.lastUsefulActionAt),
-          runTimestampMs(r.lastOutputAt),
-          runTimestampMs(r.startedAt),
-        );
-        return signalMs >= staleFloorMs;
-      });
-      const runningCount = nonStaleRunningRuns.length;
+      const runningCount = countRunsOccupyingSlots(runningRunRows, dispatchNow.getTime());
 
       const externalLifecycle = hasExternalLifecycle(agent.adapterType);
       const externalConcurrency = resolveExternalLifecycleConcurrency(policy);

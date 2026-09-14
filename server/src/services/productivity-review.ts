@@ -21,6 +21,7 @@ import {
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { countRunsOccupyingSlots, resolveEffectiveMaxConcurrentRuns } from "./agent-concurrency.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { budgetService } from "./budgets.js";
 import {
@@ -364,6 +365,28 @@ type ProductivityReviewEvidence = {
   // monitor-gated and unattended time. null when no run in the episode
   // classifies as one of those three mechanisms.
   noExecutableTurnGating: NoExecutableTurnGating | null;
+  // BLO-27698 C1: the assignee's live slot occupancy at evidence time —
+  // `running` runs against the ceiling the dispatcher actually enforces. The
+  // four fallback verdicts on a `long_active_duration` review all presuppose an
+  // agent that had a turn and used it poorly; a saturated agent had no turn to
+  // use, and until now a reviewer had to reconstruct that from Kubernetes. Null
+  // only when the effective ceiling cannot be resolved from the agent row.
+  //
+  // `runningRunCount` counts the agent's `running` rows that still occupy a
+  // slot, company-wide and NOT just this issue — saturation is an agent-level
+  // property and the whole point is that the other slots are held by *other*
+  // issues. Stale/silent rows are excluded by the same predicate the
+  // dispatcher's slot gate applies (`isRunOccupyingSlot`), so this cannot
+  // report saturation while dispatch would still admit a turn. It is the DB's
+  // view of live runs, deliberately not a Kubernetes read, and the rendered
+  // line says so rather than implying a cluster probe.
+  assigneeConcurrency: {
+    runningRunCount: number;
+    maxConcurrentRuns: number;
+    effectiveMaxConcurrentRuns: number;
+    concurrencyEnabled: boolean;
+    externalLifecycle: boolean;
+  } | null;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -1166,6 +1189,72 @@ function formatNoExecutableTurnGating(gating: NonNullable<ProductivityReviewEvid
     currentClause = `; current run \`${gating.currentRunId}\` failed with zero tokens executed`;
   }
   return `${msToHumanFine(gating.noExecutableTurnMs)} no-executable-turn time (${mix})${currentClause}`;
+}
+
+// BLO-27698 C2: whether the evidence pack itself shows the assignee was denied
+// an executable turn, from the two signals this service already measures — live
+// slot saturation (C1) and no-executable-turn time (BLO-23624). Deliberately
+// NOT a new measurement and NOT a heuristic: the capacity verdict is offered
+// only when one of those two already-computed facts is present, so it cannot
+// become a blanket excuse for every slow episode.
+//
+// The `noExecutableTurn` arm does not require dominance. The dominance test
+// gates *suppression* — withholding the review entirely — and must stay strict.
+// This gates whether a human reviewer is *shown the option*, where a
+// non-dominant but real capacity block is still the thing they need to know.
+function isCapacityConstrainedEvidence(evidence: ProductivityReviewEvidence) {
+  return (
+    (evidence.assigneeConcurrency !== null
+      && evidence.assigneeConcurrency.runningRunCount
+        >= evidence.assigneeConcurrency.effectiveMaxConcurrentRuns)
+    || (evidence.noExecutableTurnGating !== null
+      && evidence.noExecutableTurnGating.noExecutableTurnMs > 0)
+  );
+}
+
+function describeCapacityConstraint(evidence: ProductivityReviewEvidence) {
+  const parts: string[] = [];
+  if (
+    evidence.assigneeConcurrency
+    && evidence.assigneeConcurrency.runningRunCount
+      >= evidence.assigneeConcurrency.effectiveMaxConcurrentRuns
+  ) {
+    parts.push(
+      `all ${evidence.assigneeConcurrency.effectiveMaxConcurrentRuns} of the assignee's run slots occupied`,
+    );
+  }
+  if (evidence.noExecutableTurnGating && evidence.noExecutableTurnGating.noExecutableTurnMs > 0) {
+    parts.push(
+      `${msToHuman(evidence.noExecutableTurnGating.noExecutableTurnMs)} of no-executable-turn time`,
+    );
+  }
+  return parts.join("; ");
+}
+
+// BLO-27698 C1: the assignee's live slot occupancy, stated so a reviewer does
+// not have to reconstruct it from Kubernetes. Says "running runs" rather than
+// "pods" because it is a DB count, not a cluster probe — naming it "pods"
+// would claim a measurement this service never takes. The count excludes
+// stale/silent rows on the dispatcher's own predicate, so "saturated" here
+// means dispatch would genuinely have refused a turn.
+function formatAssigneeConcurrency(
+  concurrency: NonNullable<ProductivityReviewEvidence["assigneeConcurrency"]>,
+) {
+  const { runningRunCount, effectiveMaxConcurrentRuns, maxConcurrentRuns } = concurrency;
+  const saturated = runningRunCount >= effectiveMaxConcurrentRuns;
+  // Only worth explaining the ceiling when the enforced value differs from the
+  // configured one — otherwise the parenthetical is noise on every review.
+  const ceilingClause =
+    effectiveMaxConcurrentRuns === maxConcurrentRuns
+      ? ""
+      : concurrency.externalLifecycle && !concurrency.concurrencyEnabled
+        ? ` (configured \`maxConcurrentRuns\` ${maxConcurrentRuns}, held to 1 because external-lifecycle \`concurrencyEnabled\` is off — BLO-15959)`
+        : ` (configured \`maxConcurrentRuns\` ${maxConcurrentRuns}, bounded by the external-lifecycle slot ceiling)`;
+  return `${runningRunCount}/${effectiveMaxConcurrentRuns} running runs against the dispatcher's enforced ceiling${ceilingClause}${
+    saturated
+      ? " — **saturated**: the assignee could not have been dispatched a turn on this issue while this held"
+      : ""
+  }`;
 }
 
 // BLO-23624: the `longActive` trigger-reason qualifier — only rendered when
@@ -3262,6 +3351,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       costRow,
       latestPullRequestRow,
       progressPullRequestRow,
+      assigneeRunningRunRows,
     ] = await Promise.all([
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, oneHourAgo),
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, sixHoursAgo),
@@ -3337,11 +3427,49 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         .orderBy(desc(pullRequestEffectiveEventAtSql))
         .limit(1)
         .then((rows) => rows[0] ?? null),
+      // BLO-27698 C1: the assignee's live slot occupancy. Company-wide for the
+      // agent, NOT scoped to this issue — the slots that starve this issue are
+      // held by other issues, so an issue-scoped count would always read 1 and
+      // say nothing. `running` only: a `queued` or `scheduled_retry` run holds
+      // no pod and no slot.
+      //
+      // Selects the liveness stamps rather than `count(*)` because the
+      // dispatcher's slot gate counts only NON-STALE running rows
+      // (`isRunOccupyingSlot`). Counting every `running` row here would let a
+      // stale/silent row report `N/N … saturated` — and offer the C2 capacity
+      // verdict — while dispatch would still admit a turn. That is a false
+      // capacity explanation, which is worse than none: it reads as
+      // measurement. The row set is bounded by the agent's live runs, so
+      // filtering in JS against the shared predicate is cheaper than keeping a
+      // second copy of the staleness rule in SQL.
+      db
+        .select({
+          startedAt: heartbeatRuns.startedAt,
+          lastOutputAt: heartbeatRuns.lastOutputAt,
+          lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, sourceIssue.companyId),
+            eq(heartbeatRuns.agentId, sourceAgent.id),
+            eq(heartbeatRuns.status, "running"),
+          ),
+        ),
     ]);
 
     const activeRunCount = latestRuns.filter((run) =>
       ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number]),
     ).length;
+    // BLO-27698 C1: both halves resolved through the same leaf module the
+    // dispatcher's slot gate uses — the ceiling via
+    // `resolveEffectiveMaxConcurrentRuns`, the occupancy via
+    // `countRunsOccupyingSlots` — so neither a reported ceiling nor a reported
+    // occupancy can disagree with the enforced one.
+    const assigneeConcurrency = {
+      runningRunCount: countRunsOccupyingSlots(assigneeRunningRunRows, now.getTime()),
+      ...resolveEffectiveMaxConcurrentRuns(sourceAgent),
+    };
     // BLO-19604: a run stuck in `queued` never reaches `startedAt`, so it must not anchor
     // the episode. `mostRecentDispatchAt` is a direct `max(startedAt)` over every run
     // touching this issue (queried above, not derived from the createdAt-ordered
@@ -3668,6 +3796,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       nonLiveHoldMs,
       monitorGating,
       noExecutableTurnGating,
+      assigneeConcurrency,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -3779,6 +3908,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Total sampled issue-linked runs: ${evidence.totalRunCount}`,
       `- Terminal sampled runs: ${evidence.terminalRunCount}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
+      ...(evidence.assigneeConcurrency
+        ? [`- Assignee live concurrency: ${formatAssigneeConcurrency(evidence.assigneeConcurrency)}`]
+        : []),
       `- No-comment streak (terminal, turn-executing runs): ${evidence.noCommentStreak}`,
       `- Runtime-failure streak (terminal, never-executed runs): ${evidence.runtimeFailureStreak}`,
       `- Never-invoked runs excluded (terminal, no adapter ever created — \`usageJson\`/\`logStore\`/\`logRef\` null, \`logBytes\` null or 0, BLO-26165): ${evidence.neverInvokedRunCount}`,
@@ -3887,6 +4019,23 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             : []),
           "",
           "If none of these signals is present, the correct verdict is one of:",
+          // BLO-27698 C2: the four verdicts below all presuppose an agent that
+          // was given a turn and used it poorly — decompose, block, stop,
+          // snooze are all instructions to the *assignee*. An assignee that was
+          // saturated or fleet-starved had no turn to use, and with no cell for
+          // that case a reviewer had to force one of the four, which is how a
+          // platform-capacity episode gets recorded as assignee
+          // under-performance. Mirrors the "Route to platform/SRE" block the
+          // `runtime_failure_streak` branch already carries.
+          //
+          // Listed FIRST, and gated on measured evidence rather than always
+          // offered: an always-present capacity excuse would become the default
+          // verdict for every slow episode, which is the opposite failure.
+          ...(isCapacityConstrainedEvidence(evidence)
+            ? [
+              `- Route to platform/SRE as a capacity/dispatch constraint — the evidence above shows the assignee was not given an executable turn (${describeCapacityConstraint(evidence)}). None of the four verdicts below applies to an agent that had no turn; do not record this as assignee under-performance.`,
+            ]
+            : []),
           "- Request decomposition (the work is too large for a single heartbeat issue and needs to be split)",
           "- Block with an unblock owner (the work needs human direction; name the gate)",
           "- Stop/cancel (the work is not delivering value and should be wound down)",
