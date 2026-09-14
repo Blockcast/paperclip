@@ -31,7 +31,9 @@ jobs:
       - name: Check pnpm-lock.yaml overrides/patchedDependencies consistency
         id: check
         continue-on-error: true
-        run: node -e 'console.error("DRILL BLO-27611: simulated lockfile drift"); process.exit(1)'
+        run: |
+          echo 'DRILL BLO-27611 - simulated lockfile drift'
+          exit 1
 
       - name: Push lockfile drift alert to Alertmanager
         if: steps.check.outcome == 'failure'
