@@ -36709,21 +36709,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       const deleted = await deleteExactExternalRuntimeJob(cancelledRun);
       let releasedReservation = null;
-      if (deleted === "deleted" || deleted === "missing") {
-        if (strict) {
-          const jobName = activeReservation.jobName ?? activeReservation.expectedJobName;
-          const status = jobName ? await readAgentJobRunStatusByName(jobName) : null;
-          if (status?.phase === "missing") {
-            releasedReservation = await releaseExternalRuntimeReservation(db, {
-              runId: cancelledRun.id,
-              reason: `run_cancelled:${errorCode}`,
-            });
-          }
-        } else {
-          releasedReservation = await releaseExternalRuntimeReservationIfQuiesced(
-            cancelledRun.id,
-            `run_cancelled:${errorCode}`,
-          );
+      // BLO-21460: only the strict (repair) caller releases here. The normal
+      // cancel path must NOT, because this runs BEFORE the Job+pod quiescence
+      // probe: a Job that reads `missing` while pods are unobservable is not
+      // proven quiesced, and releasing on that evidence is fail-open twice
+      // over. It frees the capacity slot early, and it drops the reservation
+      // that `confirmStaleKilledJobQuiesced` reads the Job name from and that
+      // the no-active-reservation branch above reads as already-quiesced — so
+      // a later repair pass would release the retained lease on evidence
+      // nobody ever gathered. Leave the row `release_pending`; the
+      // quiescence-gated `releaseCancelledRunRuntimeResources` below (and the
+      // periodic sweep, which gauges and alerts on stuck rows) releases it
+      // once quiescence is actually proven.
+      if (strict && (deleted === "deleted" || deleted === "missing")) {
+        const jobName = activeReservation.jobName ?? activeReservation.expectedJobName;
+        const status = jobName ? await readAgentJobRunStatusByName(jobName) : null;
+        if (status?.phase === "missing") {
+          releasedReservation = await releaseExternalRuntimeReservation(db, {
+            runId: cancelledRun.id,
+            reason: `run_cancelled:${errorCode}`,
+          });
         }
       }
       logger.info(
@@ -36897,6 +36902,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // independent Job/pod probe decide quiescence rather than treating
         // that result as an automatic failure.
         externalRuntimeQuiesced = await confirmStaleKilledJobQuiesced(cancelled);
+        // BLO-21460: release the reservation only once the probe above has
+        // actually proven quiescence — see the note in cleanupExternalRuntime
+        // for why releasing before the probe is fail-open. Released here
+        // rather than via the reconciler in
+        // `releaseCancelledRunRuntimeResources`, because that sweep also
+        // promotes and dispatches a successor, which this path must gate on
+        // `externalRuntimeQuiesced` itself further down.
+        if (externalRuntimeQuiesced) {
+          await releaseExternalRuntimeReservationIfQuiesced(
+            cancelled.id,
+            `run_cancelled:${errorCode}`,
+          );
+        }
         logger.info(
           { runId: run.id, deletionResult: deleted, externalRuntimeQuiesced },
           "cancelRun: cascaded Job deletion for external-lifecycle adapter",

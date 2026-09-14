@@ -7772,10 +7772,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       // for release; see the first test in this block.
       mockListManagedAgentPods.mockResolvedValue([]);
 
-      // The run is already terminal, so this call takes the "already
-      // terminal, retry cleanup" branch rather than the normal cancel flow.
-      const result = await heartbeat.cancelRun(runId);
-      expect(result?.status).toBe("cancelled");
+      // The run is already terminal, so `cancelRun` is a no-op for it: the
+      // terminal-repair branch is reserved for the external-wait-yield retry
+      // (`repairTerminalRelease` + a matching errorCode). A crash-interrupted
+      // cancellation is healed by the periodic sweep instead, which is the
+      // path production actually takes.
+      await expect(heartbeat.cancelRun(runId)).resolves.toBeTruthy();
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
 
       const row = await getReservation(runId);
       expect(row?.state).toBe("released");
@@ -7847,7 +7850,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       // Observable cluster, no run-labelled pods — see the first test in this block.
       mockListManagedAgentPods.mockResolvedValue([]);
 
+      // Terminal run: `cancelRun` is a no-op, the sweep does the healing.
       await heartbeat.cancelRun(runId);
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
 
       const row = await getReservation(runId);
       expect(row?.state).toBe("released");
