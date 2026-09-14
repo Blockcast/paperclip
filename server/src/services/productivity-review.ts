@@ -21,7 +21,7 @@ import {
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
-import { resolveEffectiveMaxConcurrentRuns } from "./agent-concurrency.js";
+import { countRunsOccupyingSlots, resolveEffectiveMaxConcurrentRuns } from "./agent-concurrency.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { budgetService } from "./budgets.js";
 import {
@@ -463,12 +463,14 @@ type ProductivityReviewEvidence = {
   // use, and until now a reviewer had to reconstruct that from Kubernetes. Null
   // only when the effective ceiling cannot be resolved from the agent row.
   //
-  // `runningRunCount` counts every `running` row for the agent, company-wide,
-  // NOT just this issue — saturation is an agent-level property and the whole
-  // point is that the other slots are held by *other* issues. It is the DB's
-  // view of live pods, which is the same population the dispatcher's slot gate
-  // counts; it is deliberately not a Kubernetes read, and the rendered line
-  // says so rather than implying a cluster probe.
+  // `runningRunCount` counts the agent's `running` rows that still occupy a
+  // slot, company-wide and NOT just this issue — saturation is an agent-level
+  // property and the whole point is that the other slots are held by *other*
+  // issues. Stale/silent rows are excluded by the same predicate the
+  // dispatcher's slot gate applies (`isRunOccupyingSlot`), so this cannot
+  // report saturation while dispatch would still admit a turn. It is the DB's
+  // view of live runs, deliberately not a Kubernetes read, and the rendered
+  // line says so rather than implying a cluster probe.
   assigneeConcurrency: {
     runningRunCount: number;
     maxConcurrentRuns: number;
@@ -1483,9 +1485,10 @@ function describeCapacityConstraint(evidence: ProductivityReviewEvidence) {
 
 // BLO-27698 C1: the assignee's live slot occupancy, stated so a reviewer does
 // not have to reconstruct it from Kubernetes. Says "running runs" rather than
-// "pods" because it is a DB count, not a cluster probe — that is the same
-// population the dispatcher's slot gate counts, but naming it "pods" would
-// claim a measurement this service never takes.
+// "pods" because it is a DB count, not a cluster probe — naming it "pods"
+// would claim a measurement this service never takes. The count excludes
+// stale/silent rows on the dispatcher's own predicate, so "saturated" here
+// means dispatch would genuinely have refused a turn.
 function formatAssigneeConcurrency(
   concurrency: NonNullable<ProductivityReviewEvidence["assigneeConcurrency"]>,
 ) {
@@ -3757,7 +3760,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       costRow,
       latestPullRequestRow,
       progressPullRequestRow,
-      assigneeRunningRunCount,
+      assigneeRunningRunRows,
     ] = await Promise.all([
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, oneHourAgo),
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, sixHoursAgo),
@@ -3849,10 +3852,23 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // agent, NOT scoped to this issue — the slots that starve this issue are
       // held by other issues, so an issue-scoped count would always read 1 and
       // say nothing. `running` only: a `queued` or `scheduled_retry` run holds
-      // no pod and no slot, which is the same population the dispatcher's slot
-      // gate counts.
+      // no pod and no slot.
+      //
+      // Selects the liveness stamps rather than `count(*)` because the
+      // dispatcher's slot gate counts only NON-STALE running rows
+      // (`isRunOccupyingSlot`). Counting every `running` row here would let a
+      // stale/silent row report `N/N … saturated` — and offer the C2 capacity
+      // verdict — while dispatch would still admit a turn. That is a false
+      // capacity explanation, which is worse than none: it reads as
+      // measurement. The row set is bounded by the agent's live runs, so
+      // filtering in JS against the shared predicate is cheaper than keeping a
+      // second copy of the staleness rule in SQL.
       db
-        .select({ count: sql<number>`count(*)::int` })
+        .select({
+          startedAt: heartbeatRuns.startedAt,
+          lastOutputAt: heartbeatRuns.lastOutputAt,
+          lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+        })
         .from(heartbeatRuns)
         .where(
           and(
@@ -3860,17 +3876,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             eq(heartbeatRuns.agentId, sourceAgent.id),
             eq(heartbeatRuns.status, "running"),
           ),
-        )
-        .then((rows) => rows[0]?.count ?? 0),
+        ),
     ]);
 
     const activeRunCount = latestRuns.filter((run) =>
       ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number]),
     ).length;
-    // BLO-27698 C1: resolved through the same leaf module the dispatcher's slot
-    // gate uses, so a reported ceiling can never disagree with the enforced one.
+    // BLO-27698 C1: both halves resolved through the same leaf module the
+    // dispatcher's slot gate uses — the ceiling via
+    // `resolveEffectiveMaxConcurrentRuns`, the occupancy via
+    // `countRunsOccupyingSlots` — so neither a reported ceiling nor a reported
+    // occupancy can disagree with the enforced one.
     const assigneeConcurrency = {
-      runningRunCount: assigneeRunningRunCount,
+      runningRunCount: countRunsOccupyingSlots(assigneeRunningRunRows, now.getTime()),
       ...resolveEffectiveMaxConcurrentRuns(sourceAgent),
     };
     // BLO-19604: a run stuck in `queued` never reaches `startedAt`, so it must not anchor
