@@ -3438,8 +3438,13 @@ export function recoveryService(
     return { assigned, skipped, issueIds };
   }
 
-  async function getCompanyIssuePrefix(companyId: string) {
-    return db
+  // Runs on the caller's transaction when one is open. Two callers hold
+  // `lockIssueParentMutationCompany` (the company-wide issue-graph lock) when
+  // they get here; taking a second pool connection under that lock starved the
+  // 10-connection pool once the lock had enough waiters, and the holder then
+  // idled until a waiter hit lock_timeout (BLO-34207).
+  async function getCompanyIssuePrefix(companyId: string, dbOrTx: Db | DbTransaction = db) {
+    return dbOrTx
       .select({ issuePrefix: companies.issuePrefix })
       .from(companies)
       .where(eq(companies.id, companyId))
@@ -6499,7 +6504,7 @@ export function recoveryService(
       );
       if (!updated) return null;
 
-      const prefix = await getCompanyIssuePrefix(fresh.companyId);
+      const prefix = await getCompanyIssuePrefix(fresh.companyId, tx);
       await issuesSvc.addComment(
         fresh.id,
         buildRecoveryIssueInPlaceEscalationComment({
@@ -7579,7 +7584,7 @@ export function recoveryService(
         };
       }
 
-      const prefix = await getCompanyIssuePrefix(fresh.companyId);
+      const prefix = await getCompanyIssuePrefix(fresh.companyId, tx);
       const workspacePreflightHandoffCause = describeWorkspacePreflightRecoveryCause(input.latestRun);
       const recoveryOwner = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
       const sourceAssignee = fresh.assigneeAgentId ? await getAgent(fresh.assigneeAgentId) : null;
