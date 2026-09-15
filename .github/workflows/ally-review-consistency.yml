@@ -1,12 +1,18 @@
 name: Ally Review Consistency Guard
 
-# Asserts three things about every open PR: that it carries at most one
-# operative Ally review at its current head — except for the exact current-head
-# App/User approval pair required by protected merge, which must carry two
-# *distinct* bodies, since one body under both credentials is a single verdict
-# posted twice (BLO-22916); that no standing APPROVED masks a Critical/Important
-# finding; and that a review's body-attested head matches the commit GitHub
-# recorded it against.
+# Asserts four things about every open PR: that it carries at most one
+# operative Ally App review at its current head; that no operative review is
+# submitted from the User seat at all, which R4 (BLO-24056) retired because the
+# seat shares a login with the authoring App and so cannot be an independent
+# verdict; that no standing APPROVED masks a Critical/Important finding or
+# omits its `Reviewed head:` attestation; and that a review's body-attested
+# head matches the commit GitHub recorded it against.
+#
+# The seat prohibition subsumes BLO-22916, whose two defects were one verdict
+# submitted under both credentials and five content-free seat approvals that
+# attested no head at all. An earlier revision of this guard treated the
+# App/User pair as the required protected-merge shape and asked only that the
+# two bodies differ, which is why the second defect was invisible to it.
 # See scripts/check-ally-review-consistency.mjs and BLO-19778 for the incident
 # this guards.
 #
