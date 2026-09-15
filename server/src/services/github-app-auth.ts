@@ -423,6 +423,37 @@ export async function githubFetchPrHeadSha(input: {
 }
 
 /**
+ * Fetch a pull request's author login, for wake paths that carry the PR target
+ * but not the author.
+ *
+ * `prReviewOutputHasSelfReviewSkip` refuses to honour a self-review skip unless
+ * it can corroborate the claim against a PR author it did not get from the run's
+ * own text (BLO-9293). The webhook supplies that fact; assignment-sourced
+ * reviewer wakes do not, and `mergeCoalescedContextSnapshot` drops it on a
+ * different-PR coalesce. Resolving it from GitHub keeps the corroboration
+ * trustworthy — the author still never comes from the agent's summary.
+ */
+export async function githubFetchPrAuthorLogin(input: {
+  repoFullName: string;
+  prNumber: number;
+}): Promise<string | null> {
+  const token = await getInstallationToken();
+  if (!token) return null;
+  try {
+    const res = await ghFetch(
+      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/pulls/${input.prNumber}`,
+      { headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) return null;
+    const body = (await res.json().catch(() => null)) as { user?: { login?: string } } | null;
+    const login = body?.user?.login;
+    return typeof login === "string" && login.trim().length > 0 ? login : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Extract the head SHA a canonical consolidated Ally review attests to reviewing,
  * or null when the body is not that canonical shape. Requires the server-owned
  * heading AND exactly one standalone full-SHA `Reviewed head:` line: a request
