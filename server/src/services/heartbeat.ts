@@ -24625,11 +24625,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // and it is authoritative rather than merely suggestive: nothing else can
         // be driving a pre-adapter run, and activeRunExecutions dies with the
         // process, so a server-restart orphan still reaps on the next process
-        // exactly as before. That is why the line-23833 rationale for ignoring
-        // this Set does not apply here -- every case it cites (hung await on a
-        // vanished Job, preRun grandchildren holding pipes) presupposes a Job.
-        // Bounded by the same hard ceiling a live-but-silent Job gets, so a
-        // genuinely wedged executor still converges.
+        // exactly as before.
+        //
+        // The line-23833 rationale for ignoring this Set is only PARTLY
+        // inapplicable here, and the difference matters to whoever edits this
+        // next. Two of the three cases it cites -- a hung await on a vanished
+        // Job, an MCP RPC that never timed out -- presuppose a Job, so they
+        // cannot occur in the pre-Job window this guard shields. The third does
+        // NOT: the preRun hook runs at :28977, strictly before
+        // markExternalRuntimeReservationLaunching() at :29702, so a preRun hook
+        // whose grandchildren hold pipes hangs INSIDE this window and is now
+        // shielded where it previously was not. That is a deliberate trade --
+        // it is bounded by the same EXTERNAL_LIFECYCLE_HARD_STALE_MS ceiling a
+        // live-but-silent Job already gets, so a genuinely wedged executor
+        // still converges, and it buys back the ~44% of reservations that were
+        // being reaped alive at exactly reservedAt+15m.
         const inProcessPrelaunchOwner = Boolean(
           reservation
           && (reservation.state === "reserved" || reservation.state === "launching")
@@ -32162,13 +32172,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // Skip both so only the invocation that actually owns the terminal
           // outcome performs this cleanup.
           if (!abandonedForLiveOwnJob) {
+            // BLO-33820: keep this non-throwing. The `activeRunExecutions.delete`
+            // below is the only thing that clears the in-process ownership Set,
+            // and this diff makes that Set load-bearing for the reaper in the
+            // pre-Job window (see :23874) -- so an exception escaping here would
+            // leave a stale entry that now shields a run for up to
+            // EXTERNAL_LIFECYCLE_HARD_STALE_MS instead of being inert. The
+            // helper is already internally defensive (its only await is
+            // catch-wrapped at :12288 and it reports failure via its return
+            // value), so this matches the sibling below and pins that contract
+            // at the call site rather than fixing a live leak.
             await releaseEnvironmentLeasesForRun({
               runId: run.id,
               companyId: run.companyId,
               agentId: run.agentId,
               status: latestRun?.status,
               failureReason: latestRun?.error ?? undefined,
-            });
+            }).catch(() => undefined);
             await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
             if (runScratch && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
               const scratchForCleanup = runScratch;
