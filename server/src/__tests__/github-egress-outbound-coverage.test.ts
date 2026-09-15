@@ -28,9 +28,16 @@ import { describe, expect, it } from "vitest";
  * GitHub-touching binary in the agent sandbox, and `${LOCAL_BIN}` is first on
  * the PATH of every agent Job. Those launchers are the complete set of
  * interposition points available to us, so they are the complete set of places
- * an outbound scrub can live. This table requires each one to be classified,
- * and — for the ones claimed as scrubbed — asserts the launcher actually still
- * execs its egress runtime. Deleting the scrub from a wrapper fails here.
+ * an outbound control can live. This table requires each one to be classified,
+ * and — for the ones claimed as controlled — asserts the launcher actually
+ * still execs its egress runtime. Deleting the control from a wrapper fails
+ * here.
+ *
+ * Note that "controlled" covers two different mechanisms, and the `Coverage`
+ * union keeps them apart on purpose: `egress-scrubbed` rewrites the payload in
+ * flight and the caller still succeeds, while `egress-refused` (PEN-3156's git
+ * door) can only stop the publish, because by then the objects are
+ * content-addressed. Do not collapse the two kinds to simplify the table.
  *
  * It also enumerates the server-side write set, which is a second family
  * entirely: `paperclip-api` writes to GitHub over HTTP from `server/`, reaching
@@ -59,13 +66,30 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../
 const statefulSetPath = path.join(repoRoot, "deploy/helm/paperclip/templates/statefulset.yaml");
 const servicesDirectory = path.join(repoRoot, "server/src/services");
 
-/** The compiled entrypoints that carry a scrub, as the wrappers name them. */
+/** The compiled entrypoints that carry a control, as the wrappers name them. */
 const CLI_EGRESS_RUNTIME = "github-cli-egress-runtime.js";
 const MCP_EGRESS_RUNTIME = "github-mcp-egress-runtime.js";
+const GIT_EGRESS_RUNTIME = "github-git-egress-runtime.js";
 
 type Coverage =
   /** Agent-authored text on this path passes through `scrubGitHubEgressText`. */
   | { kind: "egress-scrubbed"; runtime: string }
+  /**
+   * Agent-authored text on this path is REFUSED, not rewritten, when it carries
+   * material `scrubGitHubEgressText` would remove.
+   *
+   * A deliberately separate `kind` from `egress-scrubbed`, because the two are
+   * not interchangeable and collapsing them would overstate the cover. A
+   * scrubbed door rewrites a payload in flight and the caller's request still
+   * succeeds. This door cannot: the objects are content-addressed by the time
+   * they exist, so editing a message or a blob changes every downstream SHA.
+   * The only available control is to stop the publish and name the offending
+   * object, which means the agent's command FAILS and it must go back and redo
+   * the object. Anything reading this table to answer "is this door covered"
+   * gets a yes; anything reading it to answer "does authored text reach GitHub
+   * unaltered here" needs the distinction.
+   */
+  | { kind: "egress-refused"; runtime: string; ticket: string; why: string }
   /** Reaches GitHub carrying authored text, with NO scrubber on the path. */
   | { kind: "unscrubbed"; ticket: string; why: string }
   /** Touches GitHub credentials but is not itself a path authored text travels. */
@@ -92,14 +116,18 @@ const WRAPPER_COVERAGE: Readonly<Record<string, Coverage>> = {
     runtime: MCP_EGRESS_RUNTIME,
   },
   git: {
-    kind: "unscrubbed",
+    kind: "egress-refused",
+    runtime: GIT_EGRESS_RUNTIME,
     ticket: "PEN-3156",
-    // Worded to avoid the literal command name: scripts/check-no-git-push.mjs
-    // scans this tree for it, and the marker that opts a line out asserts an
-    // operator-approved push path exists. No such path exists here — this is a
-    // description of a gap — so spending that escape hatch on a doc string
-    // would put a false claim inside a security control.
-    why: "token-injection wrapper only; pushing through it publishes commit messages and file contents — a strict superset of what create_or_update_file/push_files carry. Not fixable by in-flight redaction: commit objects are content-addressed, so altering a blob or message after the fact changes every downstream SHA. The fix shape is refusal at push time, which is its own rollout",
+    // Still worded to avoid the literal command name, for the SAME reason the
+    // `unscrubbed` row this replaces was: scripts/check-no-git-push.mjs scans
+    // server/src (see its DEFAULT_SCAN_ROOTS), so this very file is in scope,
+    // and the marker that opts a line out asserts an operator-approved publish
+    // path exists on it. This is a description of a control, not a path that
+    // publishes, so spending that escape hatch here would put a false claim
+    // inside a security control. Note the scanner matches `git-push` and
+    // `git_push` too, so hyphenating is not a way around it.
+    why: "guarded by github-git-egress-runtime.js, which the seed puts on BOTH interposition points: the ${LOCAL_BIN}/git launcher (inside the token wrapper, so credentials still reach it) and a pre-push hook it injects via core.hooksPath. It scans the outgoing commit range — messages, added file content including binary/textconv-laundered paths, and annotated tag messages — and refuses the publish naming the offending object and class, rather than rewriting it, because commit objects are content-addressed and altering one changes every downstream SHA. Failed reads refuse rather than pass unscanned",
   },
   "paperclip-github-token-env": {
     kind: "not-an-authored-text-path",
@@ -192,12 +220,14 @@ describe("outbound GitHub egress coverage", () => {
       expect(seeded).toEqual(classified);
     });
 
-    it("every launcher claimed as scrubbed still execs its egress runtime", () => {
+    it("every launcher claimed as controlled still execs its egress runtime", () => {
       // This is the regression guard for the control itself. Removing the
       // scrub from a wrapper — the change that would silently reopen
-      // PEN-2527's or PEN-3152's gap — fails right here.
+      // PEN-2527's or PEN-3152's gap — fails right here. `egress-refused` is
+      // included on the same footing: PEN-3156's guard is reached the same
+      // way, by the launcher exec'ing a runtime, so deleting it fails here too.
       for (const [name, coverage] of Object.entries(WRAPPER_COVERAGE)) {
-        if (coverage.kind !== "egress-scrubbed") continue;
+        if (coverage.kind !== "egress-scrubbed" && coverage.kind !== "egress-refused") continue;
         const body = readWrapperBody(name);
         expect(body, `${name} no longer execs ${coverage.runtime}`).toContain(coverage.runtime);
         expect(body, `${name} must exec its target, not merely mention the runtime`).toMatch(
@@ -219,12 +249,64 @@ describe("outbound GitHub egress coverage", () => {
       expect(runtimeAt).toBeGreaterThan(tokenAt);
     });
 
-    it("the two scrubbed doors use DIFFERENT runtimes for their two transports", () => {
-      // argv rewriting and JSON-RPC frame rewriting are not interchangeable.
-      // Pointing one wrapper at the other's runtime would produce a process
-      // that runs, scrubs nothing, and looks correct in this table.
+    it("each controlled door uses its OWN runtime, never a sibling's", () => {
+      // argv rewriting, JSON-RPC frame rewriting and commit-range refusal are
+      // not interchangeable. Pointing one wrapper at another's runtime would
+      // produce a process that runs, controls nothing, and looks correct in
+      // this table.
       expect(readWrapperBody("gh")).not.toContain(MCP_EGRESS_RUNTIME);
+      expect(readWrapperBody("gh")).not.toContain(GIT_EGRESS_RUNTIME);
       expect(readWrapperBody("github-mcp-server")).not.toContain(CLI_EGRESS_RUNTIME);
+      expect(readWrapperBody("github-mcp-server")).not.toContain(GIT_EGRESS_RUNTIME);
+      expect(readWrapperBody("git")).not.toContain(CLI_EGRESS_RUNTIME);
+      expect(readWrapperBody("git")).not.toContain(MCP_EGRESS_RUNTIME);
+    });
+  });
+
+  describe("the git publish door (PEN-3156)", () => {
+    // This door is the one `egress-refused` case, and unlike the scrubbed
+    // doors its control does not live in the launcher alone. The launcher
+    // handles the flags that would skip the hook; the hook is what actually
+    // sees the outgoing range. Both halves are asserted here because either
+    // one alone is not the control.
+
+    it("runs the guard INSIDE the token wrapper, so git keeps its credentials", () => {
+      // Same ordering constraint as github-mcp-server, and load-bearing for
+      // the same reason: a guard placed outside paperclip-github-token-env
+      // would leave git unauthenticated, and an authentication failure is the
+      // kind of breakage that gets a security control reverted, not fixed.
+      const body = readWrapperBody("git");
+      const tokenAt = body.indexOf("paperclip-github-token-env");
+      const runtimeAt = body.indexOf(GIT_EGRESS_RUNTIME);
+      expect(tokenAt).toBeGreaterThanOrEqual(0);
+      expect(runtimeAt).toBeGreaterThan(tokenAt);
+    });
+
+    it("seeds a pre-push hook that execs the same runtime", () => {
+      // The launcher can only see the argv it was handed. The hook is what
+      // git itself invokes with the outgoing ref updates on stdin, so it is
+      // the half that reads the range being published. Deleting it would
+      // leave a wrapper that still rejects hook-skipping flags while nothing
+      // downstream ever inspects a commit.
+      const source = readFileSync(statefulSetPath, "utf8");
+      const hookAt = source.indexOf('cat > "${GIT_HOOKS_DIR}/pre-push" <<\'EOF\'');
+      expect(hookAt, "the seed no longer writes a pre-push hook").toBeGreaterThanOrEqual(0);
+      const hookBody = source.slice(hookAt, source.indexOf("\n              EOF", hookAt));
+      expect(hookBody).toContain(GIT_EGRESS_RUNTIME);
+      expect(hookBody, "the hook must run the runtime in its hook mode").toContain(
+        "--pre-push-hook",
+      );
+    });
+
+    it("publishes the guarded launcher on the default PATH", () => {
+      // Without this the guard is decorative, and that is measured rather
+      // than theoretical: before PEN-3156, ${LOCAL_BIN}/git existed while a
+      // live agent Job pod resolved `command -v git` to /usr/bin/git, because
+      // ${LOCAL_BIN} is only prepended to PATH by a LOGIN shell and agent
+      // tool harnesses spawn non-login shells. Same defect PEN-2527 fixed for
+      // the gh wrapper — a choke point nothing traverses.
+      const source = readFileSync(statefulSetPath, "utf8");
+      expect(source).toContain('ln -sf "${LOCAL_BIN}/git" "${PATH_BIN}/git"');
     });
   });
 
@@ -269,12 +351,16 @@ describe("outbound GitHub egress coverage", () => {
   });
 
   describe("table hygiene", () => {
-    it("every unscrubbed door names a ticket that owns it", () => {
+    it("every door that names a ticket names a real one, with a reason", () => {
+      // `egress-refused` is held to this too, not just `unscrubbed`. A refusal
+      // door still owes the reader a ticket and an explanation of what it
+      // refuses, because "covered" here does not mean "behaves like a
+      // scrubbed door" — see the kind's own doc comment.
       for (const coverage of [
         ...Object.values(WRAPPER_COVERAGE),
         ...Object.values(SERVER_WRITE_COVERAGE),
       ]) {
-        if (coverage.kind !== "unscrubbed") continue;
+        if (coverage.kind !== "unscrubbed" && coverage.kind !== "egress-refused") continue;
         expect(coverage.ticket).toMatch(/^(PEN|BLO)-\d+$/);
         expect(coverage.why.length).toBeGreaterThan(40);
       }
