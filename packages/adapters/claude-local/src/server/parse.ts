@@ -659,12 +659,32 @@ export function isClaudeTransientUpstreamError(input: {
   if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed) || isClaudeImageProcessingError(parsed))) {
     return false;
   }
-  // The login and quota vetoes deliberately still read the whole transcript. Both
-  // can only ever SUPPRESS the transient label, so narrowing them would widen what
-  // this function grants — the opposite of this rule's defect. See PEN-3223.
+  // The login veto reads the same bounded surfaces as the haystack below, under
+  // the same `parsed` condition and for the same reason (PEN-3259). Twin of the
+  // change in `vendor/paperclip-adapter-claude-k8s/src/server/parse.ts`, which
+  // carries the full measurement. `detectClaudeLoginRequired` itself is unchanged
+  // and still reads `stdout` for its other callers, which ask whether the run
+  // needs re-authentication before any result event exists; what changes is what
+  // THIS rule passes it.
+  //
+  // This copy is the MORE exposed of the two, not the less. Its
+  // CLAUDE_AUTH_REQUIRED_RE does not match the bare word `unauthorized` (the k8s
+  // twin's does), but it does match `failed to authenticate` — which is ordinary
+  // output from git, gh, ssh and container registries rather than anything the
+  // Claude CLI says about its own session. Evaluating both copies' regexes over
+  // the same 446 reconstructed transcripts: this one fires on 308, the k8s twin
+  // on 91, and `failed to authenticate` alone accounts for 285 of the 308.
+  // (Those transcripts are k8s pod logs, so this is an exposure comparison of the
+  // two patterns against representative agent output, not a claim about runs this
+  // adapter served.)
+  //
+  // The quota veto below deliberately keeps the wide haystack: narrowing a second
+  // veto in the same change would grant a second retry family off one measurement,
+  // and `isClaudeProviderQuotaError` routes to a different outcome than this rule.
+  // Same latent shape, tracked separately rather than swept in.
   const loginMeta = detectClaudeLoginRequired({
     parsed,
-    stdout: input.stdout ?? "",
+    stdout: parsed ? "" : (input.stdout ?? ""),
     stderr: input.stderr ?? "",
   });
   if (loginMeta.requiresLogin) return false;

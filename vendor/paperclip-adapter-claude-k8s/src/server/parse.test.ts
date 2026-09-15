@@ -442,6 +442,124 @@ describe("isClaudeTransientUpstreamError — transcript independence (PEN-3223)"
   });
 });
 
+describe("isClaudeTransientUpstreamError — login veto transcript independence (PEN-3259)", () => {
+  // The byte-identical shape observed on the vetoed capacity refusals in the
+  // 2026-09-12 corpus: an unambiguous provider 429 on the terminal result event.
+  const capacity429 = {
+    type: "result",
+    subtype: "success",
+    is_error: true,
+    api_error_status: 429,
+    result:
+      "API Error: Request rejected (429) · All Claude subscription capacity for this tenant is " +
+      "rate-limited; capacity may reset at 2026-09-13T10:19:59.613Z; retry in 1106s",
+  };
+
+  // A transcript that merely *mentions* auth. `CLAUDE_AUTH_REQUIRED_RE` in this
+  // copy matches the bare word `unauthorized`, so an agent reading a 401 handler,
+  // tailing a log, or working on an auth ticket trips it — as this issue's own
+  // text would. None of this is the CLI asking to be logged in.
+  const authMentioningStdout = [
+    '{"type":"system","subtype":"init","session_id":"s1","model":"claude-opus-4-6"}',
+    '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result",' +
+      '"content":"src/auth.ts:42  if (!token) return res.status(401).send(\\"unauthorized\\");"}]}}',
+    '{"type":"assistant","message":{"id":"m1","content":[{"type":"text",' +
+      '"text":"That branch returns unauthorized when the header is absent."}]}}',
+  ].join("\n");
+
+  it("keeps a genuine 429 transient when the transcript merely mentions auth", () => {
+    expect(
+      isClaudeTransientUpstreamError({ parsed: capacity429, stdout: authMentioningStdout }),
+    ).toBe(true);
+  });
+
+  it("classifies that 429 identically with and without the auth-mentioning transcript", () => {
+    const withTranscript = isClaudeTransientUpstreamError({
+      parsed: capacity429,
+      stdout: authMentioningStdout,
+    });
+    const withoutTranscript = isClaudeTransientUpstreamError({
+      parsed: capacity429,
+      stdout: "",
+    });
+    expect(withTranscript).toBe(withoutTranscript);
+    expect(withTranscript).toBe(true);
+  });
+
+  it("routes that 429 to the transient retry family end to end", () => {
+    expect(
+      classifyClaudeUpstreamFailure({
+        failed: true,
+        zeroTokenProgress: false,
+        parsed: capacity429,
+        stdout: authMentioningStdout,
+        errorMessage: describeClaudeFailure(capacity429),
+      }),
+    ).toEqual({
+      family: "transient_upstream",
+      errorCode: "claude_transient_upstream",
+      capacityCode: null,
+    });
+  });
+
+  // The narrowing must not blind the veto to a REAL auth failure. When the run is
+  // genuinely unauthenticated the result event says so on its own bounded surface,
+  // which is still read.
+  it("still vetoes when the terminal result event itself reports a login requirement", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: 429,
+          result: "API Error: rate limited — not logged in; please run `claude login`",
+        },
+        stdout: "",
+      }),
+    ).toBe(false);
+  });
+
+  it("still vetoes on an auth failure reported through parsed.errors[]", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          result: "API Error: 503 service unavailable",
+          errors: [{ message: "authentication required" }],
+        },
+        stdout: "",
+      }),
+    ).toBe(false);
+  });
+
+  it("still vetoes on an auth failure reported on stderr", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: capacity429,
+        stdout: authMentioningStdout,
+        stderr: "Invalid API key · Please run `claude login`",
+      }),
+    ).toBe(false);
+  });
+
+  // The transcript read is retained where it is the only surface that can carry a
+  // login prompt: the CLI dying before it emits a result event. Unreachable from
+  // `classifyClaudeUpstreamFailure` in this copy, live in the `claude-local` twin.
+  it("still vetoes a transcript login prompt when no result event ever arrived", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: "API Error: 429 rate_limit_error\nNot logged in. Please run `claude login`.",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(false);
+  });
+});
+
 describe("matchClaudeUpstreamCapacityCode", () => {
   it("returns the penstock exhaustion code from Claude's embedded provider JSON", () => {
     expect(

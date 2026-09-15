@@ -394,21 +394,56 @@ export function isClaudeTransientUpstreamError(input: {
   )) {
     return false;
   }
-  // The login veto deliberately still reads the whole transcript, and that is a
-  // scope line rather than a clean bill of health. It can only ever SUPPRESS the
-  // transient label, so narrowing it would widen what this function grants — the
-  // opposite of this rule's defect — and a login prompt is emitted before any
-  // result event, where this classifier is unreachable anyway.
+  // The login veto reads the same bounded surfaces as the haystack below, under
+  // the same `parsed` condition and for the same reason (PEN-3259, the follow-up
+  // this comment used to defer). `stdout` is the whole pod log, so a veto that
+  // reads it suppresses the transient label from *transcript content* rather than
+  // from the fault — the mirror image of PEN-3223's defect, aimed at a true label
+  // instead of a false one.
   //
-  // It does carry the same defect mirrored into suppression, and that is live, not
-  // theoretical: in the PEN-3223 corpus 2 of the 9 genuine `api_error_status: 429`
-  // capacity refusals are vetoed here despite their own bounded surfaces matching,
-  // because an auth-shaped token appears somewhere in their transcript. Tracked
-  // separately rather than fixed alongside, because relaxing a veto grants retry
-  // families and needs its own evidence.
+  // Measured on 446 failed runs carrying a terminal result event (retained pod
+  // logs from 2026-09-12 on; 403 ×281, 429 ×95, 503 ×70). On that population the
+  // transcript-reading veto fires 91 times and the bounded-surface veto fires
+  // **0** times — i.e. not one run in the corpus reports an auth failure on its
+  // own result event, so every firing was transcript-only. 89 of the 91 are the
+  // bare word `unauthorized`, which any agent reading a 401 handler or tailing a
+  // log will write; this issue's own text would do it.
+  //
+  // What narrowing admits, enumerated rather than counted: 27 runs move from "no
+  // family at all" to `transient_upstream` — 19 Penstock capacity refusals ("All
+  // Claude subscription capacity for this tenant is rate-limited", each carrying
+  // an explicit reset timestamp) and 8 Anthropic 503s ("Service temporarily
+  // unavailable. This is a server-side issue, usually temporary"). Both families
+  // are transient by definition. **No 403 is admitted** — after PEN-3223 a 403's
+  // bounded surfaces do not match the transient regex, so the veto was doing no
+  // work on the other 64 firings. Nothing moves the other way: 0 runs lose a
+  // transient label. The widening is exactly those two families and nothing else.
+  //
+  // THAT SAFETY PROPERTY IS INHERITED FROM PEN-3223, NOT INTRINSIC — so do not
+  // cherry-pick this hunk ahead of it. Measured as a counterfactual on the same
+  // 446 runs: on the pre-PEN-3223 wide haystack this narrowing alone takes the
+  // transient label from 237 runs to 301, and the 403s in it from 99 to **136**.
+  // Without the haystack narrowing in front of it, relaxing the veto makes
+  // PEN-3223's defect worse rather than fixing this one; with it, 403s go to 0.
+  //
+  // Note what is NOT changed: `detectClaudeLoginRequired` is shared and is correct
+  // as written. Its other callers ask "does this run need re-authentication?"
+  // before any result event exists, where the transcript is the only surface that
+  // carries the prompt. What changes is what THIS rule passes it.
+  //
+  // Narrowing a veto grants retry families, so it is gated on the same `parsed`
+  // condition rather than applied unconditionally: with no result event there are
+  // no bounded surfaces, the CLI's login prompt is emitted before any result
+  // event, and that is exactly the shape the transcript read exists to catch.
+  //
+  // `stderr` is deliberately retained, matching `buildClaudeTerminalResultHaystack`.
+  // It is measured inert rather than assumed so: on all 446 runs, including or
+  // excluding it changes the verdict 0 times. It is kept because it is bounded
+  // CLI diagnostic output, so it is the right surface for a login prompt on a run
+  // that did produce a result event.
   const loginMeta = detectClaudeLoginRequired({
     parsed,
-    stdout: input.stdout ?? "",
+    stdout: parsed ? "" : (input.stdout ?? ""),
     stderr: input.stderr ?? "",
   });
   if (loginMeta.requiresLogin) return false;

@@ -156,6 +156,69 @@ describe("isClaudeTransientUpstreamError — transcript independence (PEN-3223)"
   });
 });
 
+describe("isClaudeTransientUpstreamError — login veto transcript independence (PEN-3259)", () => {
+  const capacity429 = {
+    type: "result",
+    subtype: "success",
+    is_error: true,
+    api_error_status: 429,
+    result:
+      "API Error: Request rejected (429) · All Claude subscription capacity for this tenant is " +
+      "rate-limited; capacity may reset at 2026-09-13T10:19:59.613Z; retry in 1106s",
+  };
+
+  // This copy's CLAUDE_AUTH_REQUIRED_RE does NOT match the bare word
+  // `unauthorized` — unlike the k8s twin's — so the transcript here quotes a
+  // phrase this copy actually matches (`failed to authenticate`). Picking a token
+  // the regex ignores would make the test pass without exercising the change.
+  const authMentioningStdout = [
+    '{"type":"system","subtype":"init","session_id":"s1","model":"claude-opus-4-6"}',
+    '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result",' +
+      '"content":"deploy.log: worker failed to authenticate against the registry, retrying"}]}}',
+  ].join("\n");
+
+  it("keeps a genuine 429 transient when the transcript merely mentions auth", () => {
+    expect(
+      isClaudeTransientUpstreamError({ parsed: capacity429, stdout: authMentioningStdout }),
+    ).toBe(true);
+  });
+
+  it("classifies that 429 identically with and without the auth-mentioning transcript", () => {
+    expect(isClaudeTransientUpstreamError({ parsed: capacity429, stdout: authMentioningStdout })).toBe(
+      isClaudeTransientUpstreamError({ parsed: capacity429, stdout: "" }),
+    );
+  });
+
+  it("still vetoes when the terminal result event itself reports a login requirement", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: 429,
+          result: "API Error: rate limited — not logged in; please run `claude login`",
+        },
+        stdout: "",
+      }),
+    ).toBe(false);
+  });
+
+  // This path is LIVE in this copy (unlike the k8s twin): execute.ts calls the
+  // classifier directly from its `!parsed` fallback, where the transcript is the
+  // only surface that can carry the CLI's login prompt.
+  it("still vetoes a transcript login prompt when no result event ever arrived", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: "API Error: 429 rate_limit_error\nNot logged in. Please run `claude login`.",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(false);
+  });
+});
+
 describe("isClaudeTransientUpstreamError", () => {
   it("classifies the 'out of extra usage' subscription window failure as provider quota", () => {
     expect(
