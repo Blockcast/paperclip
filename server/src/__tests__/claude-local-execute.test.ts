@@ -1036,7 +1036,14 @@ describe("claude execute", () => {
 
       expect(result.exitCode).toBe(0);
       expect(result.errorMessage).toBeNull();
-      expect(result.usage).toEqual({ inputTokens: 1, cachedInputTokens: 0, outputTokens: 1 });
+      // BLO-29842: the fake emits no `cache_creation_input_tokens`, so the execute
+      // path must report 0 rather than omitting the field.
+      expect(result.usage).toEqual({
+        inputTokens: 1,
+        cachedInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        outputTokens: 1,
+      });
       expect(result.usageBasis).toBe("per_run");
       expect(result.costUsd).toBeNull();
       expect(loggedCommand).toBe(commandPath);
