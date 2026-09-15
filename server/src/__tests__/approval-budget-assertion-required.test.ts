@@ -93,6 +93,33 @@ function postApproval(app: express.Express, body: Record<string, unknown>) {
   return request(app).post("/api/companies/company-1/approvals").send(body);
 }
 
+/**
+ * A board operator. Needed for the watcher-card cases: those have no
+ * `requestedByAgentId`, and the resubmit route's ownership check 403s any agent
+ * on a card it did not file, so a human is the only actor that reaches them.
+ */
+async function createUserApp() {
+  const [{ errorHandler }, { approvalRoutes }] = await Promise.all([
+    import("../middleware/index.js"),
+    import("../routes/approvals.js"),
+  ]);
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    (req as any).actor = {
+      type: "user",
+      userId: "user-1",
+      companyIds: ["company-1"],
+      source: "session",
+      isInstanceAdmin: false,
+    };
+    next();
+  });
+  app.use("/api", approvalRoutes(createRouteDb()));
+  app.use(errorHandler);
+  return app;
+}
+
 /** A real `budget_policies.id`-shaped uuid. */
 const POLICY_ID = "a894e681-9691-4678-88ad-063059210a14";
 
@@ -363,6 +390,86 @@ describe("budget_override_required requires an enforcement assertion (BLO-34008)
     const res = await resubmit(await createAgentApp(), { payload: { title: "Approve hosting spend" } });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockApprovalService.resubmit).toHaveBeenCalledTimes(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // Ally's review of `ee43166`: the stored-payload half of the guard reached the
+  // budget watcher's own threshold cards, which is the one card class that
+  // cannot satisfy it. Such a card records that a cap was *crossed*, not a
+  // figure to raise it *to*, so it has no target to declare — the same reason
+  // creation exempts it. The board UI's only resubmit affordance sends no
+  // payload, so the refusal left a legacy watcher card recoverable by API only.
+  // Both `budget_override_required` cards in `revision_requested` when this was
+  // written (`29015e50`, `170097eb`) are watcher cards.
+  // -------------------------------------------------------------------------
+
+  /** Filed by insertApproval(): both requester columns null. Unforgeable via the route. */
+  function watcherThresholdCard(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "approval-budget-1",
+      companyId: "company-1",
+      type: "budget_override_required",
+      status: "revision_requested",
+      // `29015e50`, trimmed: a policyId and a crossed threshold, no target.
+      payload: {
+        title: "Budget override: Players Engineer crossed billed_cents warn threshold",
+        policyId: "bd555693-cb3f-4f4d-9e18-51ad1dc44068",
+        thresholdType: "soft",
+        budgetAmount: 430000,
+        observedAmount: 344480,
+      },
+      requestedByAgentId: null,
+      requestedByUserId: null,
+      ...overrides,
+    };
+  }
+
+  it("lets the board resubmit a watcher threshold card it sent back", async () => {
+    const card = watcherThresholdCard();
+    mockApprovalService.getById.mockResolvedValue(card);
+    mockApprovalService.resubmit.mockResolvedValue({ ...card, status: "pending" });
+
+    // The empty body the board UI actually sends. Before this carve-out it was a
+    // 422 demanding a payload no UI surface can supply and no figure exists for.
+    const res = await resubmit(await createUserApp(), {});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockApprovalService.resubmit).toHaveBeenCalledTimes(1);
+  });
+
+  it("still checks a payload the board supplies on a watcher card", async () => {
+    mockApprovalService.getById.mockResolvedValue(watcherThresholdCard());
+
+    // The exemption is for having no figure, not for stating an uncheckable one:
+    // an operator who writes a target has written one that must be verifiable.
+    const res = await resubmit(await createUserApp(), { payload: PROSE_ONLY_PAYLOAD });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details.code).toBe("budget_approval_missing_enforcement_assertion");
+    expect(mockApprovalService.resubmit).not.toHaveBeenCalled();
+  });
+
+  it("answers a wrong-status resubmit on status, not on the missing assertion", async () => {
+    // The guard used to precede svc.resubmit()'s status check, so an already-
+    // approved prose card was told to declare an assertion when its actual
+    // problem is that it cannot be resubmitted at all.
+    mockApprovalService.getById.mockResolvedValue({
+      ...revisionRequestedBudgetCard(PROSE_ONLY_PAYLOAD),
+      status: "approved",
+    });
+    const { unprocessable } = await import("../errors.js");
+    mockApprovalService.resubmit.mockRejectedValue(
+      unprocessable("Only revision requested approvals can be resubmitted", {
+        approvalId: "approval-budget-1",
+        status: "approved",
+      }),
+    );
+
+    const res = await resubmit(await createAgentApp(), {});
+
+    expect(res.status).toBe(422);
+    expect(JSON.stringify(res.body)).not.toContain("budget_approval_missing_enforcement_assertion");
     expect(mockApprovalService.resubmit).toHaveBeenCalledTimes(1);
   });
 });
