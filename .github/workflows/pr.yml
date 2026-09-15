@@ -320,6 +320,11 @@ jobs:
         run: node --test ./scripts/ally-agent-idempotency-contract.test.mjs
         timeout-minutes: 1
 
+      - name: Test scheduled-guard liveness detector (PEN-3281)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-scheduled-guard-liveness.test.mjs
+        timeout-minutes: 1
+
       - name: Reject git push in adapter/runtime code
         if: ${{ !cancelled() }}
         run: node ./scripts/check-no-git-push.mjs

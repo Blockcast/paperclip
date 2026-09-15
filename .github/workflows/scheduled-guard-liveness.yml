@@ -1,0 +1,193 @@
+# PEN-3281: a scheduled guard that STOPS RUNNING emits no signal anywhere.
+#
+# THE GAP
+#
+# A GitHub Actions run sitting in `queued` has no `conclusion`. It is not
+# `failure`, not `cancelled`, not `timed_out` — it is nothing. So on every
+# dashboard and in every rollup, a control that has silently ceased to enforce
+# is indistinguishable from a control that ran and found nothing to report.
+#
+# Measured 2026-09-15: six scheduled guards on this repo — review-gate-sweep,
+# Ally Review Consistency Guard, CODEOWNERS Guard, Relay SSL Multicert Guard,
+# Lockfile Drift Monitor, Adapter Pin Drift Monitor — had not executed since
+# 03:41Z because the `arc-default` ARC listener was gone (PEN-3272). Two of
+# them are security controls. Nothing went red for ten hours.
+#
+# THIS IS RECURRENT, NOT A ONE-OFF. Reading the completion history of all six
+# back to 2026-09-11 turns up two earlier instances of the same silent stop,
+# neither of which was noticed at the time:
+#
+#   2026-09-14  15:34Z -> 20:41Z   all six, 213-305 min, resumed within 4 min
+#   2026-09-11  12:4xZ -> 14:3xZ   five of six, 106-118 min, resumed within 2 min
+#
+# Six independent hourly crons do not resume within four minutes of each other
+# by chance; that signature is a shared lane outage. So the detection gap has
+# already cost at least two unobserved coverage outages before this one.
+#
+# WHAT THIS WATCHES: LIVENESS, NOT VERDICT — AND WHY THAT IS THE CHOICE
+#
+# PEN-3281 asked whether to alarm on age-since-last-SUCCESS or on run state.
+# Neither. This job alarms on AGE SINCE LAST COMPLETION, any conclusion.
+#
+#   * Run-state polling (the `queued` scan in onprem-k8s's
+#     detect-wedged-review-gate-runs.yaml) only sees a run that exists and is
+#     stuck. It is blind to a workflow that was disabled, descheduled, renamed,
+#     or never triggered at all — all of which stop enforcement just as dead.
+#
+#   * Age-since-last-SUCCESS is the stronger-sounding invariant and is the one
+#     PEN-3281 guessed at, but on THIS repo it is unusable, and not
+#     hypothetically: `ally-review-consistency` has 0 successes in its last 100
+#     runs (88 failures), `review-gate-sweep` fails 18 of every 90, and
+#     `production-environment-protection-guard` is 61 failures out of 61
+#     completed runs — zero successes, ever. A since-success detector would
+#     therefore be born permanently red on three of the seven watched guards —
+#     which is precisely the defect PEN-2847 already documents about one of
+#     them: "a permanently-red auditor cannot signal a new violation." Adopting
+#     it would reproduce PEN-2847 inside the detector meant to fix PEN-3281.
+#
+# So liveness and verdict are kept orthogonal. This job answers only "did the
+# control execute?". Whether it PASSED is a separate question with separate
+# owners (PEN-2847 for ally-review-consistency). A guard that runs and reports
+# a real failure is enforcing correctly and must not also trip this alarm.
+#
+# THRESHOLDS ARE MEASURED PER GUARD, NOT GUESSED AND NOT SHARED
+#
+# Each watched guard gets the threshold its OWN cadence justifies. The six
+# hourly guards share 4h; production-environment-protection-guard runs twice
+# daily and gets 16h. A single global number was the first shape of this job and
+# it silently assumed everything watched was hourly — true only by accident of
+# which workflows PEN-3281 happened to name. The full per-guard derivations,
+# including the uncomfortably narrow window on the 16h one, are in
+# WATCHED_GUARDS in scripts/check-scheduled-guard-liveness.mjs.
+#
+# For the hourly six: every completion gap across all six back to 2026-09-11 was
+# enumerated and the distribution is sharply bimodal:
+#
+#   ordinary jitter   <= 118 min   scattered; a recurring ~90-110 min band
+#                                  overnight, consistent with GitHub dropping
+#                                  scheduled runs under load
+#   outage clusters   213-305 min  the two events named above, all six
+#                                  workflows moving together
+#
+# 4h sits at 2.03x the observed jitter ceiling and below every observed outage
+# gap but one. The first draft of this job used 4h derived from the *raw* max
+# healthy gap of 305 min — which was wrong, because that 305 min sample WAS the
+# 2026-09-14 outage. Baselining on the incident would have set the bar above the
+# thing it must catch. The clusters were separated before the number was chosen.
+#
+# They are deliberately not tighter. This job's whole value is being believed; an
+# alarm that fires on ordinary cron jitter gets muted, and a muted liveness
+# alarm reproduces the exact failure mode it exists to prevent.
+#
+# Detection is per-EVENT, not per-workflow: any one guard breaching is enough to
+# red the job. Against the 2026-09-14 event, five of six breached 4h
+# (lockfile-drift-monitor reached only 213 min), so the event would have been
+# reported even though one leg of it would not have been. That known miss is
+# asserted, not just described, in the colocated test.
+#
+# WHY arc-light AND NOT default
+#
+# All six watched guards run on `default` (verified by reading their `runs-on`,
+# not assumed). A detector on `default` dies with exactly the fault it exists to
+# catch, and would have been silent through all three outages above. `arc-light`
+# is a different ARC pool and was dispatching normally throughout;
+# master-health.yml already runs `gh api` on arc-light with
+# GH_TOKEN: ${{ github.token }}, so this is established in-repo practice.
+#
+# RESIDUAL, STATED PLAINLY
+#
+#   1. A total arc-light stall silences this job. No in-repo detector can
+#      escape needing a runner; this only ensures the detector does not share a
+#      failure domain with its subject.
+#
+#      This job also does NOT watch itself, and that is a limit rather than an
+#      omission: every self-stop mode — starved, disabled_inactivity, renamed,
+#      descheduled — stops the job from running, and a job that does not run
+#      cannot report on itself. Listing itself would not close that; it would
+#      only guarantee a red on its first execution after merge, when it has no
+#      completed run yet, which is the born-red defect argued against above.
+#      The one self-stop mode that IS catchable — the file being renamed out
+#      from under the watched list — is caught at PR time by the enumeration
+#      test, not at 03:00 by this job.
+#
+#   2. CLOSED (was: the watched set could silently drift out of date).
+#      scripts/check-scheduled-guard-liveness.test.mjs now enumerates every
+#      workflow in .github/workflows carrying both `schedule:` and
+#      `runs-on: default`, and asserts each is either watched or explicitly
+#      exempted with a reason. A new scheduled guard on the starvable lane fails
+#      that test in its own PR.
+#
+#      This was not theoretical. Writing that test immediately found the set
+#      incomplete: production-environment-protection-guard — a security control
+#      whose protection shape has already drifted silently three times
+#      (BLO-22329) — is scheduled on `default` and was unwatched, because the
+#      list had been transcribed from the six workflows PEN-3281 happened to
+#      name. It is watched now, on its own 16h threshold. refresh-shard-manifest
+#      is exempted deliberately and in writing.
+#
+# Logic and its tests: scripts/check-scheduled-guard-liveness.mjs
+# Cost is at most 12 read-only API calls an hour.
+name: Scheduled Guard Liveness
+
+on:
+  schedule:
+    # :47 — clear of the minutes the watched guards already occupy
+    # (:09 x2, :17, :23, :31, :41) so this does not pile onto their burst.
+    - cron: "47 * * * *"
+  workflow_dispatch:
+    inputs:
+      stale_hours:
+        description: "hours since last completion before a guard is called stopped"
+        required: false
+        default: "4"
+
+permissions:
+  # Read-only. Enumerating workflows and their runs is all this needs, and
+  # notably NOT `issues: write` — see the uniqueness argument in
+  # onprem-k8s's detect-wedged-review-gate-runs.yaml.
+  #
+  # `contents: read` is required because a workflow-level `permissions:` block
+  # sets every unlisted scope to `none`, and the checkout below needs contents.
+  # Without it this job works only while the repo is public — an incidental
+  # property, not a guarantee. The day it goes private, or this file is copied
+  # into a private repo, checkout 403s and the liveness detector stops: the
+  # silent-stop failure this job exists to catch, landing on the watchman.
+  contents: read
+  actions: read
+
+# No `concurrency` block, deliberately — BLO-31818, and the same reasoning that
+# removed one from review-gate-sweep.yml.
+#
+# An earlier revision of this file carried `group: scheduled-guard-liveness` with
+# `cancel-in-progress: true`. That is wrong here for the reason review raised: a
+# run queued behind an arc-light backlog is killed by the next hour's, so the job
+# yields no verdict for as long as the backlog lasts — and an arc-light backlog
+# is a plausible variant of the very condition being detected.
+#
+# The prescribed fix for that is `cancel-in-progress: false`, and this repo has
+# already assessed it and found it does not deliver: GitHub holds at most ONE
+# pending run per concurrency group, so a new arrival EVICTS the run occupying
+# the slot. `false` means "do not cancel a RUNNING job", not "never cancel" — it
+# only changes WHICH run dies, and is actively worse under a starved pool, where
+# each new run re-enters the queue from the back. An hourly cadence is exactly
+# the exposure that made this bite review-gate-sweep.
+#
+# With no group at all, runs accumulate instead of evicting, matching the four
+# sibling guards on this schedule. At a 10-minute timeout and ~14 read-only API
+# calls a run, overlap is cheap; losing the verdict is not.
+
+jobs:
+  check-guard-liveness:
+    name: scheduled guards have executed recently
+    runs-on: arc-light
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Report scheduled guards that have stopped executing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GUARD_LIVENESS_REPO: ${{ github.repository }}
+          GUARD_LIVENESS_STALE_HOURS: ${{ inputs.stale_hours || '4' }}
+        run: node scripts/check-scheduled-guard-liveness.mjs
