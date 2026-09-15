@@ -38,6 +38,13 @@
  * real gap read as a supersession — and this route writes only the
  * `never_applied` ones.
  *
+ * With one subtraction. A cap a later decision moved *back* to the card's
+ * starting figure classifies as `never_applied` too, and the detector is right
+ * to say so — that decision is once again unapplied, and reporting it costs
+ * nothing. Writing it reverts the later decision, so the executor takes the
+ * same hazard from the other side and refuses any `never_applied` assertion
+ * whose amount moved after the decision, whatever figure it landed on.
+ *
  * ## Why a superseded assertion refuses the whole card
  *
  * Card `6f45844e` states the rule itself: *"ALL EIGHT OR NONE ... Applying only
@@ -59,6 +66,7 @@ import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import {
   classifyEnforcementAssertion,
   extractEnforcementAssertions,
+  policyAmountChangedAfterDecision,
   type AssertionEnforcementState,
   type EnforcedBudgetPolicy,
 } from "./approval-enforcement-reconciler.js";
@@ -169,10 +177,11 @@ export async function applyApprovalEnforcement(
     );
   }
 
-  // Guardrail 3: never an agent's own budget. Checked before the transaction
-  // and against the *decided* target set, so a self-application is refused even
-  // when it would have been a no-op — the point is that this route can never be
-  // a path to one's own cap, not merely that it cannot raise it today.
+  // Guardrail 3: never an agent's own budget. Enforced per assertion inside the
+  // transaction below, before classification, and against the *decided* target
+  // set — so a self-application is refused even when it would have been a
+  // no-op. The point is that this route can never be a path to one's own cap,
+  // not merely that it cannot raise it today.
   const policyIds = assertions.map((assertion) => assertion.policyId);
 
   const deferredCancellations: BudgetEnforcementScope[] = [];
@@ -240,7 +249,40 @@ export async function applyApprovalEnforcement(
         case "applied":
           alreadyApplied.push(assertion.policyId);
           continue;
-        case "never_applied":
+        case "never_applied": {
+          // `classifyEnforcementAssertion` answers `never_applied` for
+          // `enforced == prior` before it consults any timestamp, and for the
+          // *detector* that is right: a cap sitting at the card's starting
+          // figure is once again unapplied however it got there, and saying so
+          // is non-destructive. Writing it is not. A board actor who decided
+          // the raise was wrong and put the cap back lands on exactly that
+          // classification, so replaying the card here would revert their
+          // decision — the same "silently applying a five-day-old figure over
+          // whatever a human since set" hazard the header refuses, with the
+          // sign flipped. What separates a revert from a decision that never
+          // landed is whether the amount moved *after* the decision, and that
+          // fact is already on the locked row. So the detector keeps reporting
+          // this and the executor declines to write it.
+          const movedAfter = policyAmountChangedAfterDecision(
+            row!.amountUpdatedAt,
+            approval.decidedAt,
+          );
+          if (movedAfter === true) {
+            throw refuse(
+              "assertion_superseded",
+              `Policy \`${assertion.policyId}\` enforces the card's recorded starting figure (${assertion.priorAmountCents}) but its amount was changed after this card was decided; a later decision put it there and this card must not revert that`,
+              conflict,
+              { policyId: assertion.policyId, enforcedAmountCents: row!.amount },
+            );
+          }
+          if (movedAfter === null) {
+            throw refuse(
+              "assertion_unverifiable",
+              `Policy \`${assertion.policyId}\` enforces the card's recorded starting figure, but without both the decision time and the policy's last amount-change time this cannot tell "never applied" from "reverted by a later decision"`,
+              unprocessable,
+              { policyId: assertion.policyId, enforcedAmountCents: row!.amount },
+            );
+          }
           if (row!.scopeType !== "agent" || row!.windowKind !== "calendar_month_utc") {
             // The only enforcing write implemented is the monthly agent cap.
             // Refuse rather than route a company- or project-scoped figure
@@ -254,6 +296,7 @@ export async function applyApprovalEnforcement(
           }
           toWrite.push({ row: row!, toAmountCents: assertion.expectedAmountCents, label: assertion.label });
           continue;
+        }
         case "superseded":
           throw refuse(
             "assertion_superseded",
@@ -312,7 +355,7 @@ export async function applyApprovalEnforcement(
           },
         },
       );
-      await txBudgets.upsertPolicy(
+      const written = await txBudgets.upsertPolicy(
         approval.companyId,
         {
           scopeType: "agent",
@@ -322,6 +365,23 @@ export async function applyApprovalEnforcement(
         },
         actor.actorType === "user" ? actor.actorId : null,
       );
+      // `upsertPolicy` finds its row by (company, scopeType, scopeId, metric,
+      // windowKind) rather than by id, and defaults `metric` to "billed_cents".
+      // A policy carrying any other metric would therefore be *inserted* as a
+      // new row while the asserted one kept its old figure — and `applied`
+      // would report a success that enforced nothing. `BUDGET_METRICS` has one
+      // member today so this is unreachable, but the column is plain text with
+      // a default and the failure mode is a silent false success on a money
+      // path. Checking the id the write actually landed on costs one clause and
+      // does not care which lookup column diverged.
+      if (written.policyId !== row.id) {
+        throw refuse(
+          "assertion_unverifiable",
+          `Applying policy \`${row.id}\` landed on a different row (\`${written.policyId}\`); refusing rather than reporting a success that enforced nothing`,
+          unprocessable,
+          { policyId: row.id, writtenPolicyId: written.policyId },
+        );
+      }
       applied.push({
         policyId: row.id,
         scopeId: row.scopeId,
@@ -331,23 +391,29 @@ export async function applyApprovalEnforcement(
       });
     }
 
-    await logActivity(txDb, {
-      companyId: approval.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      action: "approval.enforcement_applied",
-      entityType: "approval",
-      entityId: approval.id,
-      details: {
-        applied: applied.map((entry) => ({
-          policyId: entry.policyId,
-          fromAmountCents: entry.fromAmountCents,
-          toAmountCents: entry.toAmountCents,
-        })),
-        alreadyAppliedCount: alreadyApplied.length,
-      },
-    });
+    // Only when this call actually wrote something. An idempotent replay
+    // changes nothing, and logging it anyway accumulates one
+    // `approval.enforcement_applied` row carrying `applied: []` per retry —
+    // an audit trail that records non-events is a worse audit trail.
+    if (applied.length > 0) {
+      await logActivity(txDb, {
+        companyId: approval.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "approval.enforcement_applied",
+        entityType: "approval",
+        entityId: approval.id,
+        details: {
+          applied: applied.map((entry) => ({
+            policyId: entry.policyId,
+            fromAmountCents: entry.fromAmountCents,
+            toAmountCents: entry.toAmountCents,
+          })),
+          alreadyAppliedCount: alreadyApplied.length,
+        },
+      });
+    }
 
     return { approvalId: approval.id, applied, alreadyApplied };
   });

@@ -378,7 +378,7 @@ export type AssertionEnforcementState =
  * collapse that into `false`, which would read "we have no idea" as "the amount
  * has not moved".
  */
-function policyAmountChangedAfterDecision(
+export function policyAmountChangedAfterDecision(
   amountUpdatedAt: Date | null,
   decidedAt: Date | string | null,
 ): boolean | null {
