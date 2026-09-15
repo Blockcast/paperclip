@@ -4093,12 +4093,20 @@ describe("realizeExecutionWorkspace", () => {
     // clear of the 30s stall, so the timeout being tested still fires decisively
     // rather than racing the stall it is supposed to outlive.
     //
-    // Per-test caps are 60_000 (the global `testTimeout`) for the same reason:
-    // these cases do real `git` work and the widened probes make them slower, so
-    // a cap is a runtime bound, not the invariant. Every case here fails on its
-    // assertions when the behaviour regresses -- a fail-open override degrades a
-    // healthy checkout immediately, long before any cap -- so widening the cap
-    // removes flake without removing coverage.
+    // The stall cases carry `120_000`, matching the sibling repair case below.
+    // Vitest honors a per-test timeout over the global in both directions (see
+    // `server/vitest.config.ts`), so the 60_000 global is a default, not a
+    // ceiling. Measured unloaded on a 64-core host, the slowest of these is the
+    // salvaged-stall case at ~7.2s -- of which ~6s is the three 2_000ms probe
+    // timeouts and only ~1.2s is real `git` work -- so 120_000 is ~16x clear
+    // unloaded, and still ~5.8x clear of the 20.8s that case took under
+    // merge-queue contention. A cap is a runtime bound, not the invariant:
+    // every case here fails on its assertions when the behaviour regresses --
+    // a fail-open override degrades a healthy checkout immediately, long before
+    // any cap -- so a generous cap removes flake without removing coverage.
+    //
+    // The cases that do not touch the probe knobs run in under ~1.1s and carry
+    // no explicit cap at all: the global already gives them ~55x.
     it("repairs missing project_primary submodules before returning the workspace", async () => {
       const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
       const { recorder, operations } = createWorkspaceOperationRecorderDouble();
@@ -4298,7 +4306,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 60_000);
+    }, 120_000);
 
     it("still fails the run when the initial submodule inspection exits non-zero", async () => {
       // BLO-18784 follow-up: the timeout degrade must not widen into a general
@@ -4339,7 +4347,7 @@ describe("realizeExecutionWorkspace", () => {
       expect(
         operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
       ).toBe(false);
-    }, 60_000);
+    });
 
     it("still fails the run when the post-repair submodule verification exits non-zero", async () => {
       // The post-repair re-check has its own consumer, so it needs its own guard:
@@ -4422,7 +4430,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 60_000);
+    });
 
     it("still fails the run when a stalled probe already reported a conflicted submodule", async () => {
       // BLO-18784 follow-up: `git submodule status --recursive` flushes each entry
@@ -4503,7 +4511,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 60_000);
+    }, 120_000);
 
     it("still degrades when a stalled submodule probe produced no fault record", async () => {
       // The converse of the test above, and the property that keeps this from
@@ -4587,7 +4595,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 60_000);
+    }, 120_000);
 
     it("does not start a submodule inspection retry while the previous timed-out process group remains alive", async () => {
       // In the CephFS-stall case this change exists for, SIGKILL can be issued
@@ -4673,7 +4681,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 60_000);
+    }, 120_000);
 
     it("does not repair salvaged missing submodules while the timed-out process group remains alive", async () => {
       const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: false });
@@ -4766,7 +4774,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 60_000);
+    }, 120_000);
 
     it("reports both the submodule repair and the degradation when the post-repair re-check stalls", async () => {
       // The other timeout tests all stall the *initial* probe. This covers the
@@ -4867,7 +4875,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 60_000);
+    }, 120_000);
 
     it("reports both the submodule repair and the degradation when a salvaged initial stall is followed by a stalled re-check", async () => {
       // BLO-30301: this is the exact path CI drifted into when the sibling
@@ -4987,7 +4995,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 60_000);
+    }, 120_000);
 
     it("ignores a non-integer submodule inspection override instead of truncating it to zero", async () => {
       // `Math.trunc(0.5)` is 0, which does not fall back: 0 attempts skips the
@@ -5034,7 +5042,7 @@ describe("realizeExecutionWorkspace", () => {
         if (previousAttempts === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS;
         else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS = previousAttempts;
       }
-    }, 60_000);
+    });
 
     it("ignores an oversized submodule inspection timeout instead of letting Node clamp it to 1ms", async () => {
       // Node clamps any `setTimeout` delay above `2^31 - 1` ms to *1ms* with a
@@ -5085,7 +5093,7 @@ describe("realizeExecutionWorkspace", () => {
         if (previousTimeout === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
         else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = previousTimeout;
       }
-    }, 60_000);
+    });
 
     it("ignores an undersized submodule inspection timeout instead of turning the knob into a fail-open switch", async () => {
       // A budget too small to ever complete fails open exactly like the oversized
@@ -5135,7 +5143,7 @@ describe("realizeExecutionWorkspace", () => {
         if (previousTimeout === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
         else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = previousTimeout;
       }
-    }, 60_000);
+    });
   });
 
   it("repairs worktree submodules before running provision commands", async () => {
