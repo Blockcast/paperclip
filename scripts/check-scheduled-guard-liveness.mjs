@@ -26,13 +26,72 @@ import { fileURLToPath } from "node:url";
 
 export const DEFAULT_STALE_HOURS = 4;
 
-export const WATCHED_WORKFLOWS = [
-  "review-gate-sweep.yml",
-  "ally-review-consistency.yml",
-  "codeowners-guard.yml",
-  "relay-ssl-multicert-guard.yml",
-  "lockfile-drift-monitor.yml",
-  "adapter-pin-drift-monitor.yml",
+/**
+ * Every watched guard, with the threshold that guard's OWN cadence justifies.
+ *
+ * A single global threshold was the first shape of this file and it was wrong:
+ * it silently assumed every watched guard is hourly. That assumption held only
+ * because the watched set had been transcribed from the six workflows named in
+ * PEN-3281, which happened to be the hourly ones. See the enumeration test —
+ * the set is now checked against the repo rather than against that memory.
+ *
+ * Thresholds are measured per guard, never assumed, by the same method for
+ * each: enumerate real completion gaps, separate ordinary jitter from outage
+ * clusters, and place the bar above the jitter ceiling and below the outages
+ * it must catch.
+ */
+export const WATCHED_GUARDS = [
+  // Hourly guards. Gap distribution to 2026-09-11: ordinary jitter <= 118 min,
+  // outage clusters 213-305 min. 4h = 2.03x the jitter ceiling.
+  { workflow: "review-gate-sweep.yml", staleHours: 4 },
+  { workflow: "ally-review-consistency.yml", staleHours: 4 },
+  { workflow: "codeowners-guard.yml", staleHours: 4 },
+  { workflow: "relay-ssl-multicert-guard.yml", staleHours: 4 },
+  { workflow: "lockfile-drift-monitor.yml", staleHours: 4 },
+  { workflow: "adapter-pin-drift-monitor.yml", staleHours: 4 },
+
+  // Twice daily (cron "43 6,18"), so the 4h bar above would red it permanently.
+  // 39 measured gaps: ordinary band tops out at 14.60h (n=37); the two outliers
+  // are 17.71h (the 2026-09-15 PEN-3272 event this row was filed on) and 22.21h
+  // (2026-09-06, a wholly missed 06:43 cycle nobody noticed at the time).
+  //
+  // 16h is the honest number and it is the least comfortable one in this file:
+  // the admissible window is only (14.60h, 17.71h), so the margin is 1.10x the
+  // jitter ceiling where the hourly guards get 2.03x. Setting it any looser —
+  // 18h, say — would clear the jitter ceiling more safely but sail straight
+  // over the 17.71h event, which is the baseline-on-the-incident error this
+  // file already made once and corrected.
+  //
+  // What makes 16h acceptable rather than merely tight: this guard's age check
+  // is a BACKSTOP, not its primary coverage. A lane outage wide enough to stall
+  // it also stalls the six hourly guards, which detect the same event with
+  // hours of margin, and detection is per-EVENT. The failure modes unique to
+  // this guard — disabled, renamed, never completed — are decided on their own
+  // branches and are threshold-independent.
+  { workflow: "production-environment-protection-guard.yml", staleHours: 16 },
+];
+
+/** Back-compat / convenience view: just the workflow filenames. */
+export const WATCHED_WORKFLOWS = WATCHED_GUARDS.map((guard) => guard.workflow);
+
+/**
+ * Scheduled `default`-label workflows this job deliberately does NOT watch.
+ *
+ * Enumerated rather than left implicit so the colocated drift test can assert
+ * that every scheduled `default` workflow in the repo is either watched or
+ * exempted here. An unlisted new one fails that test at PR time, which is where
+ * the drift is introduced — not silently at 03:00, which is the whole failure
+ * mode PEN-3281 exists to close.
+ */
+export const EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS = [
+  {
+    workflow: "refresh-shard-manifest.yml",
+    reason:
+      "Not a guard. It opens a PR refreshing a shard-duration manifest (BLO-24241); nothing is " +
+      "enforced, so its stopping costs test-sharding accuracy rather than coverage. Its weekly " +
+      "cron also makes any liveness bar coarse to the point of noise — a threshold would have to " +
+      "exceed 7 days to clear ordinary jitter, by which point it reports nothing worth waking for.",
+  },
 ];
 
 /**
@@ -170,26 +229,106 @@ export function describeStopMode(queuedCount) {
 }
 
 /**
+ * Reasons that mean "this guard demonstrably is not enforcing".
+ *
+ * Kept distinct from the read-failure reasons below because they are DIFFERENT
+ * CLAIMS WITH DIFFERENT OWNERS. "The CODEOWNERS guard has stopped executing"
+ * pages whoever owns the runner lane; "I could not reach the GitHub API" is a
+ * statement about this job's own visibility and owns nothing. Both still exit
+ * non-zero — an API error must never read as health — but collapsing them into
+ * one headline makes the job assert, on a transient 5xx, that a perfectly
+ * healthy control has stopped. A liveness alarm that cries wolf gets muted, and
+ * a muted liveness alarm is exactly the failure mode this job exists to prevent.
+ */
+const STOPPED_REASONS = new Set(["stopped", "disabled", "never-completed"]);
+const UNREADABLE_REASONS = new Set(["unreadable", "runs-unreadable"]);
+
+/**
  * @param {ReturnType<typeof classifyGuard>[]} results
  */
-export function summarize(results, { staleHours = DEFAULT_STALE_HOURS } = {}) {
+export function summarize(results) {
   const stale = results.filter((r) => r.status === "stale");
+  const stopped = stale.filter((r) => STOPPED_REASONS.has(r.reason));
+  const unreadable = stale.filter((r) => UNREADABLE_REASONS.has(r.reason));
   const checked = results.length;
+
+  const clauses = [];
+  if (stopped.length > 0) {
+    clauses.push(`${stopped.length} of ${checked} watched scheduled guard(s) have stopped executing`);
+  }
+  if (unreadable.length > 0) {
+    clauses.push(
+      `${unreadable.length} of ${checked} could not be read from the GitHub API, so their liveness ` +
+        `is unknown (failing closed, not asserting they stopped)`,
+    );
+  }
 
   return {
     checked,
     staleCount: stale.length,
     stale,
+    stoppedCount: stopped.length,
+    unreadableCount: unreadable.length,
     exitCode: stale.length > 0 ? 1 : 0,
     headline:
       stale.length === 0
-        ? `All ${checked} watched scheduled guards have completed within ${staleHours}h.`
-        : `${stale.length} of ${checked} watched scheduled guard(s) have stopped executing.`,
+        ? `All ${checked} watched scheduled guards have completed within their liveness thresholds.`
+        : `${clauses.join("; ")}.`,
   };
 }
 
-function gh(args) {
-  return execFileSync("gh", args, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+/**
+ * The `stale_hours` workflow_dispatch input is free text, so it arrives as an
+ * arbitrary string. Left unguarded, `Number("abc")` is NaN, `age < NaN` is
+ * false, and EVERY guard is classified stale with detail text reading "past the
+ * NaNh liveness threshold" — a full-fleet false alarm from one typo. `"0"` is a
+ * truthy string, so it survives `||` and then classifies everything stale too.
+ *
+ * @param {string|undefined} raw
+ * @param {number} fallback
+ */
+export function resolveStaleHours(raw, fallback = DEFAULT_STALE_HOURS) {
+  if (raw === undefined || raw === null || String(raw).trim() === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * A 404 is a real, terminal answer — the workflow was renamed or deleted, which
+ * IS one of the stop-modes this job reports — so it must not be retried into a
+ * delay. Everything else (5xx, rate limiting, DNS, a dropped connection) is
+ * treated as transient.
+ *
+ * @param {unknown} error
+ */
+function isTerminalApiError(error) {
+  const text = `${error?.stderr ?? ""}${error?.stdout ?? ""}${error?.message ?? ""}`;
+  return /HTTP 404|Not Found/i.test(text);
+}
+
+/** Synchronous sleep. This script is sync end to end; Atomics.wait avoids reshaping it. */
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * At ~14 read calls an hour (~2,400 a week) a single unretried attempt makes an
+ * occasional transient failure a near-certainty, and every one of those would
+ * have surfaced as a stale verdict about a healthy guard. Three attempts with a
+ * short backoff costs at most ~3s on the terminal path and removes that class.
+ */
+function gh(args, { attempts = 3, backoffMs = 1000 } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return execFileSync("gh", args, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+    } catch (error) {
+      lastError = error;
+      if (isTerminalApiError(error) || attempt === attempts) break;
+      sleepSync(backoffMs * attempt);
+    }
+  }
+  throw lastError;
 }
 
 function observeWorkflow(repo, workflow) {
@@ -208,6 +347,17 @@ function observeWorkflow(repo, workflow) {
     // Newest COMPLETED run, any conclusion. per_page=1 on a server-side
     // filtered query: no pagination, so the 1000-item cap that bites
     // --paginate scans cannot truncate this.
+    //
+    // ON THE SORT KEY, which is deliberate and not an oversight: this endpoint
+    // orders by created_at, while the age below is computed from updated_at.
+    // Re-running an OLD run bumps its updated_at without moving it up that
+    // ordering, so a completion can land outside this single-item window and be
+    // missed. That is a KNOWN, ACCEPTED skew, kept because it errs in the safe
+    // direction — reporting a guard stale slightly early. The alternative,
+    // taking max(updated_at) over the newest N, trades it for an unsafe error:
+    // re-running one ancient run would then read as a fresh completion and mask
+    // a dead schedule indefinitely. For a control whose only value is being
+    // believed, false-early beats false-quiet.
     const raw = gh([
       "api",
       `repos/${repo}/actions/workflows/${workflow}/runs?status=completed&per_page=1`,
@@ -239,14 +389,25 @@ function countQueued(repo, workflow) {
 
 function main() {
   const repo = process.env.GUARD_LIVENESS_REPO || process.env.GITHUB_REPOSITORY || "Blockcast/paperclip";
-  const staleHours = Number(process.env.GUARD_LIVENESS_STALE_HOURS || DEFAULT_STALE_HOURS);
+
+  // An explicit override is a manual debugging dial (workflow_dispatch, or the
+  // live checks in the PR). It deliberately applies to EVERY guard, flattening
+  // the per-guard thresholds, so a dispatch at 1h reds the whole set on purpose.
+  const override = process.env.GUARD_LIVENESS_STALE_HOURS;
+  const overrideHours = override && String(override).trim() !== "" ? resolveStaleHours(override) : null;
+
   const watched = (process.env.GUARD_LIVENESS_WORKFLOWS || "").trim()
-    ? process.env.GUARD_LIVENESS_WORKFLOWS.trim().split(/\s+/)
-    : WATCHED_WORKFLOWS;
+    ? process.env.GUARD_LIVENESS_WORKFLOWS.trim()
+        .split(/\s+/)
+        .map((workflow) => ({ workflow, staleHours: overrideHours ?? DEFAULT_STALE_HOURS }))
+    : WATCHED_GUARDS;
 
   const now = Date.now();
-  const results = watched.map((workflow) =>
-    classifyGuard(workflow, observeWorkflow(repo, workflow), { now, staleHours }),
+  const results = watched.map(({ workflow, staleHours }) =>
+    classifyGuard(workflow, observeWorkflow(repo, workflow), {
+      now,
+      staleHours: overrideHours ?? staleHours,
+    }),
   );
 
   for (const result of results) {
@@ -281,7 +442,7 @@ function main() {
     console.log(`::error title=${titles[result.reason]}::${result.detail}`);
   }
 
-  const summary = summarize(results, { staleHours });
+  const summary = summarize(results);
   if (summary.exitCode === 0) {
     console.log(summary.headline);
     return;
