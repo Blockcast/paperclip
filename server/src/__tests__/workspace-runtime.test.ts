@@ -4193,8 +4193,8 @@ describe("realizeExecutionWorkspace", () => {
       await fs.chmod(shimPath, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
-      // 300ms matches the sibling shim tests: long enough that the budget is not
-      // racing process startup, short enough to keep two attempts cheap.
+      // Matches the sibling shim tests; see this block's budget rationale for why
+      // the probe is 2_000 rather than a number that just clears process startup.
       setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 2, retryDelayMs: 1 });
       // Pin the last scheduler-dependent branch. Four assertions below require the
       // *retry* path -- `attempts: 2`, "after 2 attempt(s)", and the exact probe
