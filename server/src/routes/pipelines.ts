@@ -69,6 +69,11 @@ import {
   type PipelineHealthFailedAutomationInput,
   type PipelineHealthStageInput,
 } from "@paperclipai/shared";
+import {
+  publicPipelineStageConfig,
+  resolveWorkspaceRuntimeViewer,
+  type WorkspaceRuntimeViewer,
+} from "./workspace-response.js";
 import { documentAnnotationService } from "../services/document-annotations.js";
 import { logActivity } from "../services/activity-log.js";
 import {
@@ -272,16 +277,21 @@ function withDerivedStageAutomation(
     latestRevisionId: string | null;
     latestRevisionNumber: number;
   }>,
+  viewer: WorkspaceRuntimeViewer,
 ) {
   const config = stage.config && typeof stage.config === "object" && !Array.isArray(stage.config)
     ? { ...(stage.config as Record<string, unknown>) }
     : {};
   const routineId = stageAutomationRoutineId(config);
   const routine = routineId ? routineById.get(routineId) : null;
-  if (!routine) return { ...stage, config };
+  // PEN-3266: the no-routine branch returns the STORED config, so it carries
+  // `onEnter.executionWorkspaceSettings` even though no derived `automation` block exists. It needs the
+  // projection just as much as the branch below — masking only the derived copy would leave the
+  // always-present carrier in the clear.
+  if (!routine) return { ...stage, config: publicPipelineStageConfig(config, viewer) };
   return {
     ...stage,
-    config: {
+    config: publicPipelineStageConfig({
       ...config,
       automation: {
         routineId,
@@ -293,8 +303,17 @@ function withDerivedStageAutomation(
         latestRoutineRevisionId: routine.latestRevisionId,
         latestRoutineRevisionNumber: routine.latestRevisionNumber,
       },
-    },
+    }, viewer),
   };
+}
+
+/**
+ * PEN-3266. The stage row as it leaves any route that answers with the row itself rather than through
+ * `withDerivedStageAutomation` — the company pipeline LIST, and the create/update stage responses.
+ * Those return `db.select()`ed rows, so `config` reaches the caller with every key it was stored with.
+ */
+function publicPipelineStage<T extends { config: unknown }>(stage: T, viewer: WorkspaceRuntimeViewer): T {
+  return { ...stage, config: publicPipelineStageConfig(stage.config, viewer) };
 }
 
 function extractIntakeFormFields(stage: typeof pipelineStages.$inferSelect | null) {
@@ -821,6 +840,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
   router.get("/companies/:companyId/pipelines", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertPipelineCompanyAccess(req, companyId);
+    const stageViewer = await resolveWorkspaceRuntimeViewer(access, req, companyId);
     const rows = await db
       .select({
         pipeline: pipelines,
@@ -857,7 +877,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     res.json(rows.map((row) => ({
       ...row.pipeline,
       stageCount: row.stageCount,
-      stages: stagesByPipelineId.get(row.pipeline.id) ?? [],
+      stages: (stagesByPipelineId.get(row.pipeline.id) ?? []).map((stage) => publicPipelineStage(stage, stageViewer)),
       openCaseCount: row.openCaseCount,
       attentionCount: row.attentionCount,
       inMotionCount: row.inMotionCount,
@@ -970,6 +990,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
   router.get("/pipelines/:pipelineId", async (req, res) => {
     const pipelineId = req.params.pipelineId as string;
     const companyId = await assertPipelineAccess(db, req, pipelineId);
+    const stageViewer = await resolveWorkspaceRuntimeViewer(access, req, companyId);
     const [pipeline, stages, transitions, documentKeys] = await Promise.all([
       db.select().from(pipelines).where(and(eq(pipelines.id, pipelineId), eq(pipelines.companyId, companyId))).then((rows) => rows[0] ?? null),
       db.select().from(pipelineStages).where(eq(pipelineStages.pipelineId, pipelineId)).orderBy(asc(pipelineStages.position)),
@@ -1008,7 +1029,14 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         latestRevisionNumber: row.latestRevisionNumber,
       },
     ]));
-    res.json({ ...pipeline, stages: stages.map((stage) => withDerivedStageAutomation(stage, routineById)), transitions, documentKeys });
+    res.json({
+      ...pipeline,
+      stages: stages.map((stage) =>
+        withDerivedStageAutomation(stage, routineById, stageViewer),
+      ),
+      transitions,
+      documentKeys,
+    });
   });
 
   // Setup-health warnings: surface any configuration that won't actually run
@@ -1018,6 +1046,10 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
   router.get("/pipelines/:pipelineId/health", async (req, res) => {
     const pipelineId = req.params.pipelineId as string;
     const companyId = await assertPipelineAccess(db, req, pipelineId);
+    // PEN-3266: `computePipelineHealth` derives diagnostics and does not echo `config` back, so this
+    // projection is inert for the response today. It is threaded anyway so the health route cannot
+    // become the exit that was missed if that function ever starts quoting the config it is handed.
+    const stageViewer = await resolveWorkspaceRuntimeViewer(access, req, companyId);
     const [pipeline, stages, instructionDocs, companyAgents, companyPipelines, companyStages, failedAutomationRows] = await Promise.all([
       db.select().from(pipelines)
         .where(and(eq(pipelines.id, pipelineId), eq(pipelines.companyId, companyId)))
@@ -1127,7 +1159,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     }
 
     const healthStages: PipelineHealthStageInput[] = stages.map((stage) => {
-      const stageWithAutomation = withDerivedStageAutomation(stage, routineById);
+      const stageWithAutomation = withDerivedStageAutomation(stage, routineById, stageViewer);
       const automation = (stageWithAutomation.config as { automation?: { instructionsBody?: string | null } }).automation;
       return {
         id: stage.id,
@@ -1202,7 +1234,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         config: req.body.config,
         actor,
       });
-      res.status(201).json(stage);
+      res.status(201).json(publicPipelineStage(stage, await resolveWorkspaceRuntimeViewer(access, req, companyId)));
     } catch (error) {
       codedConflictForUnique(error);
     }
@@ -1215,7 +1247,8 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
     const actor = actorForMutation(req);
     try {
-      res.json(await svc.updateStage({ companyId, pipelineId, stageId, patch: req.body, actor }));
+      const updatedStage = await svc.updateStage({ companyId, pipelineId, stageId, patch: req.body, actor });
+      res.json(publicPipelineStage(updatedStage, await resolveWorkspaceRuntimeViewer(access, req, companyId)));
     } catch (error) {
       codedConflictForUnique(error);
     }
