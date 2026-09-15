@@ -73,28 +73,30 @@
 # Detection is per-EVENT, not per-workflow: any one of the six breaching is
 # enough to red the job. Against the 2026-09-14 event, five of six breached 4h
 # (lockfile-drift-monitor reached only 213 min), so the event would have been
-# reported even though one leg of it would not have been.
+# reported even though one leg of it would not have been. That known miss is
+# asserted, not just described, in the colocated test.
 #
 # WHY arc-light AND NOT default
 #
-# All six watched guards run on `default`. A detector on `default` dies with
-# exactly the fault it exists to catch, and would have been silent through all
-# three outages above. `arc-light` is a different ARC pool and was dispatching
-# normally throughout; master-health.yml already runs `gh api` on arc-light
-# with GH_TOKEN: ${{ github.token }}, so this is established in-repo practice.
+# All six watched guards run on `default` (verified by reading their `runs-on`,
+# not assumed). A detector on `default` dies with exactly the fault it exists to
+# catch, and would have been silent through all three outages above. `arc-light`
+# is a different ARC pool and was dispatching normally throughout;
+# master-health.yml already runs `gh api` on arc-light with
+# GH_TOKEN: ${{ github.token }}, so this is established in-repo practice.
 #
 # RESIDUAL, STATED PLAINLY
 #
 #   1. A total arc-light stall silences this job. No in-repo detector can
 #      escape needing a runner; this only ensures the detector does not share a
 #      failure domain with its subject.
-#   2. WATCHED_WORKFLOWS below is an explicit list, NOT "all scheduled guards".
-#      A new scheduled guard added on `default` is unwatched until it is added
-#      here. Deriving the set by parsing workflow YAML was considered and
-#      rejected as more fragile than the gap it closes; the list is short and
-#      the failure is loud (see the unreadable-workflow branch, which reds
-#      rather than skipping).
+#   2. WATCHED_WORKFLOWS in the script is an explicit list, NOT "all scheduled
+#      guards". A new scheduled guard added on `default` is unwatched until it
+#      is added there. Deriving the set by parsing workflow YAML was considered
+#      and rejected as more fragile than the gap it closes; the list is short
+#      and the failure is loud (an unreadable workflow reds rather than skips).
 #
+# Logic and its tests: scripts/check-scheduled-guard-liveness.mjs
 # Cost is at most 12 read-only API calls an hour.
 name: Scheduled Guard Liveness
 
@@ -104,6 +106,11 @@ on:
     # (:09 x2, :17, :23, :31, :41) so this does not pile onto their burst.
     - cron: "47 * * * *"
   workflow_dispatch:
+    inputs:
+      stale_hours:
+        description: "hours since last completion before a guard is called stopped"
+        required: false
+        default: "4"
 
 permissions:
   # Read-only. Enumerating workflows and their runs is all this needs, and
@@ -121,103 +128,12 @@ jobs:
     runs-on: arc-light
     timeout-minutes: 10
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
       - name: Report scheduled guards that have stopped executing
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          STALE_HOURS: "4"
-          WATCHED_WORKFLOWS: >-
-            review-gate-sweep.yml
-            ally-review-consistency.yml
-            codeowners-guard.yml
-            relay-ssl-multicert-guard.yml
-            lockfile-drift-monitor.yml
-            adapter-pin-drift-monitor.yml
-        run: |
-          set -euo pipefail
-
-          now=$(date -u +%s)
-          cutoff=$(( now - STALE_HOURS * 3600 ))
-          stale=0
-          checked=0
-
-          for wf in $WATCHED_WORKFLOWS; do
-            checked=$(( checked + 1 ))
-
-            # A renamed, deleted or manually/inactivity-disabled workflow stops
-            # enforcing just as completely as a starved one, and is invisible to
-            # any run-state scan. Fail loudly rather than skipping: silently
-            # dropping a guard from the watched set is this row's whole defect.
-            if ! meta=$(gh api "repos/$REPO/actions/workflows/$wf" \
-              --jq '[.state, .name] | @tsv' 2>/dev/null); then
-              echo "::error title=Guard workflow unreadable::$wf could not be read from repos/$REPO/actions/workflows. It was renamed, deleted, or the token lost access. Either way this guard is no longer being watched: fix the path in WATCHED_WORKFLOWS in .github/workflows/scheduled-guard-liveness.yml, or remove it deliberately."
-              stale=$(( stale + 1 ))
-              continue
-            fi
-
-            IFS=$'\t' read -r state name <<< "$meta"
-
-            if [ "$state" != "active" ]; then
-              echo "::error title=Guard workflow disabled::$name ($wf) has state '$state', so its schedule no longer fires. GitHub sets disabled_inactivity automatically on scheduled workflows in dormant repositories; disabled_manually means a human turned it off. Re-enable it, or drop it from WATCHED_WORKFLOWS if it was retired on purpose."
-              stale=$(( stale + 1 ))
-              continue
-            fi
-
-            # Newest COMPLETED run, any conclusion. per_page=1 on a
-            # server-side-filtered query: no pagination, so the 1000-item cap
-            # that bites --paginate scans cannot truncate this.
-            if ! newest=$(gh api \
-              "repos/$REPO/actions/workflows/$wf/runs?status=completed&per_page=1" \
-              --jq '.workflow_runs[0] | [.updated_at, .conclusion, .html_url] | @tsv' 2>/dev/null); then
-              echo "::error title=Guard run history unreadable::could not enumerate completed runs for $name ($wf). Treating as stale: an API error must not read as health."
-              stale=$(( stale + 1 ))
-              continue
-            fi
-
-            if [ -z "${newest:-}" ] || [ "$newest" = "null" ]; then
-              echo "::error title=Guard has never completed::$name ($wf) is active but has no completed run at all. It has never enforced anything."
-              stale=$(( stale + 1 ))
-              continue
-            fi
-
-            IFS=$'\t' read -r completed conclusion url <<< "$newest"
-
-            # An unparsable timestamp must not silently drop a candidate.
-            if ! completed_epoch=$(date -u -d "$completed" +%s 2>/dev/null); then
-              echo "::warning title=Unparsable run timestamp::$name ($wf) has updated_at '$completed'; cannot age it"
-              continue
-            fi
-
-            if [ "$completed_epoch" -gt "$cutoff" ]; then
-              age_m=$(( ( now - completed_epoch ) / 60 ))
-              echo "ok: $name last completed ${age_m}m ago (conclusion=$conclusion)"
-              continue
-            fi
-
-            stale=$(( stale + 1 ))
-            age_h=$(( ( now - completed_epoch ) / 3600 ))
-
-            # Only now, and only for a guard already known stale, spend a call
-            # to distinguish the stop-modes. They have different owners:
-            # starved-behind-a-dead-lane is an ARC/infra fault, whereas nothing
-            # queued at all points at the schedule itself.
-            queued=$(gh api \
-              "repos/$REPO/actions/workflows/$wf/runs?status=queued&per_page=100" \
-              --jq '.workflow_runs | length' 2>/dev/null || echo "?")
-
-            if [ "$queued" != "0" ] && [ "$queued" != "?" ]; then
-              detail="$queued run(s) are sitting in 'queued' and have never started — the schedule is firing but nothing is dispatching them. That is a runner-lane fault: check the ARC listener for the 'default' label (cf. PEN-3272)."
-            else
-              detail="nothing is queued either, so the schedule itself is not producing runs. Check the workflow's cron and whether the default branch still carries it."
-            fi
-
-            echo "::error title=Scheduled guard has stopped executing::$name ($wf) last completed ${age_h}h ago (at $completed, conclusion=$conclusion), past the ${STALE_HOURS}h liveness threshold. $detail This guard is not enforcing anything right now, and a stopped guard reds nothing on its own — that silence is why this job exists (PEN-3281). Last run: $url"
-          done
-
-          if [ "$stale" -eq 0 ]; then
-            echo "All $checked watched scheduled guards have completed within ${STALE_HOURS}h."
-            exit 0
-          fi
-
-          echo "$stale of $checked watched scheduled guard(s) have stopped executing." >&2
-          exit 1
+          GUARD_LIVENESS_REPO: ${{ github.repository }}
+          GUARD_LIVENESS_STALE_HOURS: ${{ inputs.stale_hours || '4' }}
+        run: node scripts/check-scheduled-guard-liveness.mjs
