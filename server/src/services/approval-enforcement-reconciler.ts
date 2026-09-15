@@ -134,12 +134,18 @@ export interface EnforcedBudgetPolicy {
   amount: number;
   isActive: boolean;
   /**
-   * When the enforcing row was last written. `null` means "unknown", which is
-   * not the same as "never" — see `classifyEnforcementAssertion`, where an
-   * unknown touch time downgrades to `unverifiable_mismatch` rather than
-   * guessing in either direction.
+   * When the enforced *amount* last changed — `budget_policies.amount_updated_at`,
+   * not `updated_at`. `null` means "unknown", which is not the same as "never"
+   * — see `classifyEnforcementAssertion`, where an unknown change time
+   * downgrades to `unverifiable_mismatch` rather than guessing in either
+   * direction.
+   *
+   * It must be the amount-specific column. `updated_at` also moves for warn
+   * percent, hard stop, notify and active-state edits, so reading it here let
+   * an unrelated metadata toggle read as "a later decision moved the cap" and
+   * suppress a real enforcement gap (BLO-32796).
    */
-  updatedAt: Date | null;
+  amountUpdatedAt: Date | null;
 }
 
 export interface ApprovalEnforcementReconcileResult {
@@ -331,15 +337,27 @@ export function extractEnforcementAssertions(payload: unknown): EnforcementAsser
  *   here too — and calling that `superseded` would let a bad figure in an
  *   untrusted field make a real enforcement gap disappear. Split it on a fact
  *   the database owns instead of on the field under suspicion:
- *   - `policy.updatedAt > decidedAt` → **superseded**. Something wrote the row
- *     after the decision, so a later decision put it where it is. Re-asserting
- *     a stale figure over that is exactly the "silently applying a five-day-old
- *     figure over whatever a human since set" hazard this reconciler refuses.
- *   - `policy.updatedAt <= decidedAt` → **never_applied**. Nothing has touched
- *     the row since the decision, so there is no later decision to be superseded
- *     by; the card's recorded prior was simply wrong, and the gap is real.
+ *   - `policy.amountUpdatedAt > decidedAt` → **superseded**. Something moved the
+ *     enforced figure after the decision, so a later decision put it where it
+ *     is. Re-asserting a stale figure over that is exactly the "silently
+ *     applying a five-day-old figure over whatever a human since set" hazard
+ *     this reconciler refuses.
+ *   - `policy.amountUpdatedAt <= decidedAt` → **never_applied**. The amount has
+ *     not moved since the decision, so there is no later decision to be
+ *     superseded by; the card's recorded prior was simply wrong, and the gap is
+ *     real.
  *   - either timestamp unknown → `unverifiable_mismatch`. Reported, never
  *     written.
+ *
+ *   Reading the *amount-specific* column is load-bearing, not a nicety. This
+ *   split first shipped against `updated_at`, and `budgetService.upsertPolicy`
+ *   is the single edit path for warn percent, hard stop, notify and active
+ *   state as well as the amount — so an operator toggling warn percent on a
+ *   policy whose approved raise never landed pushed `updated_at` past
+ *   `decidedAt`, and a real enforcement gap read as a supersession: unreported
+ *   here, and unrepairable through the apply route. The suppressing edit need
+ *   not be related to the decision at all, which is what made that inference
+ *   unsound rather than merely imprecise (BLO-32796).
  *
  * With no recorded prior, the three-way collapses back to the two-way and the
  * answer is `unverifiable_mismatch` — reported as drift, because failing to
@@ -354,20 +372,20 @@ export type AssertionEnforcementState =
   | "inactive_policy";
 
 /**
- * Was the enforcing row written after the decision was made?
+ * Was the enforced *amount* changed after the decision was made?
  *
  * `null` when either side is unknown or unparseable — the caller must not
- * collapse that into `false`, which would read "we have no idea" as "nothing
- * has touched it".
+ * collapse that into `false`, which would read "we have no idea" as "the amount
+ * has not moved".
  */
-function policyTouchedAfterDecision(
-  updatedAt: Date | null,
+function policyAmountChangedAfterDecision(
+  amountUpdatedAt: Date | null,
   decidedAt: Date | string | null,
 ): boolean | null {
-  const touched = toEpochMs(updatedAt);
+  const changed = toEpochMs(amountUpdatedAt);
   const decided = toEpochMs(decidedAt);
-  if (touched === null || decided === null) return null;
-  return touched > decided;
+  if (changed === null || decided === null) return null;
+  return changed > decided;
 }
 
 function toEpochMs(value: Date | string | null): number | null {
@@ -386,9 +404,9 @@ export function classifyEnforcementAssertion(
   if (policy.amount === assertion.expectedAmountCents) return "applied";
   if (assertion.priorAmountCents === null) return "unverifiable_mismatch";
   if (policy.amount === assertion.priorAmountCents) return "never_applied";
-  const touchedAfter = policyTouchedAfterDecision(policy.updatedAt, decidedAt);
-  if (touchedAfter === null) return "unverifiable_mismatch";
-  return touchedAfter ? "superseded" : "never_applied";
+  const movedAfter = policyAmountChangedAfterDecision(policy.amountUpdatedAt, decidedAt);
+  if (movedAfter === null) return "unverifiable_mismatch";
+  return movedAfter ? "superseded" : "never_applied";
 }
 
 /**
@@ -548,7 +566,7 @@ export async function loadEnforcedBudgetPolicies(
       policyId: budgetPolicies.id,
       amount: budgetPolicies.amount,
       isActive: budgetPolicies.isActive,
-      updatedAt: budgetPolicies.updatedAt,
+      amountUpdatedAt: budgetPolicies.amountUpdatedAt,
     })
     .from(budgetPolicies)
     .where(and(eq(budgetPolicies.companyId, companyId), inArray(budgetPolicies.id, unique)));
@@ -558,7 +576,7 @@ export async function loadEnforcedBudgetPolicies(
       policyId: row.policyId,
       amount: row.amount,
       isActive: row.isActive,
-      updatedAt: row.updatedAt,
+      amountUpdatedAt: row.amountUpdatedAt,
     });
   }
   return result;

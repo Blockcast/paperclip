@@ -49,10 +49,10 @@ const CARD_6F45844E_PAYLOAD = {
  * its terminal branch is a comparison against it.
  */
 const CARD_6F45844E_DECIDED_AT = new Date("2026-08-10T17:51:20.638Z");
-/** A policy write that happened after the decision — i.e. a real supersession. */
-const TOUCHED_AFTER_DECISION = new Date("2026-08-18T23:07:40.381Z");
-/** A policy untouched since before the decision: nothing can have superseded it. */
-const TOUCHED_BEFORE_DECISION = new Date("2026-08-04T10:04:45.877Z");
+/** A cap that moved after the decision — i.e. a real supersession. */
+const AMOUNT_MOVED_AFTER_DECISION = new Date("2026-08-18T23:07:40.381Z");
+/** A cap unmoved since before the decision: nothing can have superseded it. */
+const AMOUNT_UNMOVED_SINCE_DECISION = new Date("2026-08-04T10:04:45.877Z");
 
 function enforcedFrom(
   key: "from_usd" | "to_usd",
@@ -64,7 +64,7 @@ function enforcedFrom(
       policyId: change.policyId,
       amount: Math.round(change[key] * 100),
       isActive: true,
-      updatedAt: TOUCHED_AFTER_DECISION,
+      amountUpdatedAt: AMOUNT_MOVED_AFTER_DECISION,
       ...(overrides[change.policyId] ?? {}),
     });
   }
@@ -245,12 +245,12 @@ describe("classifyEnforcementAssertion — supersession (BLO-32796)", () => {
   const policy = (
     id: string,
     amountUsd: number,
-    updatedAt: Date | null = TOUCHED_AFTER_DECISION,
+    amountUpdatedAt: Date | null = AMOUNT_MOVED_AFTER_DECISION,
   ): EnforcedBudgetPolicy => ({
     policyId: id,
     amount: Math.round(amountUsd * 100),
     isActive: true,
-    updatedAt,
+    amountUpdatedAt,
   });
   const classify = (
     assertion: Parameters<typeof classifyEnforcementAssertion>[0],
@@ -279,8 +279,9 @@ describe("classifyEnforcementAssertion — supersession (BLO-32796)", () => {
     // later raises; the pre-fix comparison reported three drifts here and
     // re-filed an issue for them every sweep.
     //
-    // Also the guard on the fix below: those three caps were all written after
-    // 2026-08-10, so the time split must still read them as supersessions.
+    // Also the guard on the fix below: those three caps were all raised after
+    // 2026-08-10, so the amount-change split must still read them as
+    // supersessions.
     const enforced = enforcedFrom("to_usd");
     enforced.set(CTO, policy(CTO, 56000));
     enforced.set(ALLY, policy(ALLY, 110000));
@@ -289,20 +290,41 @@ describe("classifyEnforcementAssertion — supersession (BLO-32796)", () => {
   });
 
   it("reports an untouched policy that matches neither figure, rather than assuming supersession", () => {
-    // Ally's finding on #1846: `from_usd` is free-form payload text that nothing
-    // validated at decision time, so a *wrong* prior lands in the terminal
-    // branch and would have silently become `superseded` — a real enforcement
-    // gap erased by an untrusted field. `budget_policies.updated_at` is the
-    // fact the database owns: nothing has written this row since the decision,
-    // so there is no later decision for it to have been superseded by.
-    const stale = policy(CTO, 56000, TOUCHED_BEFORE_DECISION);
+    // Ally's first finding on #1846: `from_usd` is free-form payload text that
+    // nothing validated at decision time, so a *wrong* prior lands in the
+    // terminal branch and would have silently become `superseded` — a real
+    // enforcement gap erased by an untrusted field. The database-owned
+    // amount-change time is the fact to split on: this cap has not moved since
+    // the decision, so there is no later decision for it to have been
+    // superseded by.
+    const stale = policy(CTO, 56000, AMOUNT_UNMOVED_SINCE_DECISION);
     expect(classify(byPolicy(CTO), stale)).toBe("never_applied");
     const enforced = enforcedFrom("to_usd");
     enforced.set(CTO, stale);
     expect(diff(assertions, enforced)).toHaveLength(1);
   });
 
-  it("treats an unknown write time as unclassifiable, not as either answer", () => {
+  it("is not fooled by a post-decision edit that left the cap alone", () => {
+    // Ally's second finding on #1846. The split first shipped against
+    // `budget_policies.updated_at`, which `budgetService.upsertPolicy` bumps
+    // for warn percent, hard stop, notify and active-state edits too. So an
+    // operator toggling warn percent — at `AMOUNT_MOVED_AFTER_DECISION` here,
+    // well after the decision — on a policy whose approved raise never landed
+    // moved `updated_at` past `decidedAt` and turned a real gap into a
+    // supersession: unreported by the sweep, and refused by the apply route.
+    //
+    // `amount_updated_at` only moves when the cap does, so the metadata edit is
+    // invisible to this classifier by construction. The distinguishing input is
+    // exactly the one this test pins: same enforced figure, same decided
+    // figure, same wrong prior, same *row* write time — only the amount-change
+    // time differs.
+    const metadataOnlyEdit = policy(CTO, 56000, AMOUNT_UNMOVED_SINCE_DECISION);
+    expect(classify(byPolicy(CTO), metadataOnlyEdit)).toBe("never_applied");
+    const capActuallyMoved = policy(CTO, 56000, AMOUNT_MOVED_AFTER_DECISION);
+    expect(classify(byPolicy(CTO), capActuallyMoved)).toBe("superseded");
+  });
+
+  it("treats an unknown amount-change time as unclassifiable, not as either answer", () => {
     // Both directions are dangerous to guess: `superseded` hides a real gap,
     // `never_applied` licenses the executor to revert a raise. Report and
     // refuse instead.
