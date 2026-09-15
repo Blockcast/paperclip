@@ -34,6 +34,7 @@ import { issueService } from "../services/issues.js";
 import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { buildPullRequestWorkProductFields } from "../services/pull-request-work-products.js";
+import { hasOpenPullRequestWakePath } from "../services/open-pull-request-attendance.js";
 import { loadConfig } from "../config.js";
 import {
   RECOVERY_SWEEP_COVERED_ISSUE_STATUSES,
@@ -2556,6 +2557,104 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(result.escalated).toBe(1);
       const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
       expect(updated?.status).toBe("blocked");
+    });
+
+    /**
+     * PEN-2853 Finding 1. The write-side `in_review` validator is this predicate's second
+     * caller, and this is the test that fails if the two ever stop agreeing.
+     *
+     * The expectation is not hand-written per row. Each is `hasOpenPullRequestWakePath`
+     * itself -- the single definition the sweep consults -- evaluated against the same
+     * real row the route just saw. So this asserts the route and the sweep read the same
+     * table the same way, and it goes red in EITHER direction: a validator that admits a
+     * PR the sweep discounts (PEN-2853 Finding 2's defect, relocated to a new column), or
+     * one that refuses a PR the sweep counts (a row stranded in `in_progress` while
+     * reading as actively worked).
+     *
+     * Driven through the real route against real postgres rather than a mocked db,
+     * because the filters that matter here -- terminal status, webhook provenance, the
+     * `updatedAt` grace -- live in SQL. A mock that returns rows regardless of the
+     * predicate's WHERE clause would assert nothing about any of them, and would pass
+     * just as happily with every filter deleted.
+     */
+    it("admits exactly the pull requests the sweep's own definition counts", async () => {
+      const graceMs = loadConfig().openPullRequestAttendanceGraceMs;
+      const fixtures: Array<{
+        label: string;
+        seed?: (input: { companyId: string; issueId: string }) => Promise<unknown>;
+      }> = [
+        { label: "no pull request at all" },
+        {
+          label: "an open, webhook-written pull request",
+          seed: ({ companyId, issueId }) =>
+            insertPullRequestWorkProduct({ companyId, issueId, prNumber: 1588 }),
+        },
+        {
+          label: "a merged pull request",
+          seed: ({ companyId, issueId }) =>
+            insertPullRequestWorkProduct({ companyId, issueId, prNumber: 1584, merged: true }),
+        },
+        {
+          label: "a hand-created pull request row",
+          seed: ({ companyId, issueId }) =>
+            insertPullRequestWorkProduct({ companyId, issueId, prNumber: 1581, handCreated: true }),
+        },
+        {
+          label: "an open pull request that has not moved within the grace",
+          seed: ({ companyId, issueId }) =>
+            insertPullRequestWorkProduct({
+              companyId,
+              issueId,
+              prNumber: 1449,
+              updatedAt: new Date(Date.now() - (graceMs + 60 * 60_000)),
+            }),
+        },
+      ];
+
+      for (const { label, seed } of fixtures) {
+        const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+        if (seed) await seed({ companyId, issueId: sourceIssueId });
+
+        // Hold the execution lock, or the route refuses with a 409 long before the
+        // disposition validator runs. That is worth stating because the 409 is a silent
+        // false green here: it is not 200, so a `refuses` fixture still compares equal
+        // and the case reads as agreement while proving nothing. The explicit 422 check
+        // below is what stops any non-validator status masquerading as a verdict.
+        const runId = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId,
+          agentId: coderId,
+          invocationSource: "assignment",
+          triggerDetail: "system",
+          status: "running",
+          startedAt: new Date(),
+          contextSnapshot: { issueId: sourceIssueId },
+        });
+        await db.update(issues)
+          .set({ checkoutRunId: runId, executionRunId: runId })
+          .where(eq(issues.id, sourceIssueId));
+
+        const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+        const sweepCountsIt = await hasOpenPullRequestWakePath(db, issue!, graceMs);
+
+        const res = await request(createApp({
+          type: "agent",
+          agentId: coderId,
+          companyId,
+          runId,
+          source: "agent_jwt",
+        }))
+          .patch(`/api/issues/${sourceIssueId}`)
+          .send({ status: "in_review" });
+
+        expect(sweepCountsIt, `${label} :: status=${res.status} body=${JSON.stringify(res.body).slice(0, 300)}`)
+          .toBe(res.status === 200);
+        if (!sweepCountsIt) {
+          expect(res.status, `${label} must be refused BY THE VALIDATOR, not incidentally`).toBe(422);
+          expect(res.body.details).toMatchObject({ code: "invalid_issue_disposition" });
+        }
+      }
     });
   });
 

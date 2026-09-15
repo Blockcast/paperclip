@@ -216,6 +216,8 @@ import {
   setIssueExecutionPolicyMonitorScheduledBy,
   type IssueMonitorConvergence,
 } from "../services/issue-execution-policy.js";
+import { hasOpenPullRequestWakePath } from "../services/open-pull-request-attendance.js";
+import { loadConfig } from "../config.js";
 import { monitorConvergenceComment } from "../services/issue-monitor-convergence-message.js";
 import type { IssueUnblockOwner } from "../services/issue-monitor-convergence-message.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
@@ -1924,7 +1926,10 @@ const INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE =
   "Keep working instead of moving to review, create a request_confirmation or ask_user_questions interaction, " +
   "link or request a pending approval, assign a human reviewer with assigneeUserId, set a typed executionState.currentParticipant through an execution policy, " +
   "or schedule an issue monitor for an external review/check with a nextCheckAt in the future — a lapsed or past-dated monitor is not a review path, " +
-  "because the strandedness sweep has already stopped counting it. After creating one of those review paths, retry the status update.";
+  "because the strandedness sweep has already stopped counting it. " +
+  "If the next action is a human merge press on a pull request, you do not need any of those: open the PR and let the GitHub webhook record it, " +
+  "and the open pull request itself is the review path — do not arm a monitor to poll a gate a poll cannot move. " +
+  "After creating one of those review paths, retry the status update.";
 
 function isPendingIssueThreadInteractionReviewPath(interaction: { kind: string; status: string }) {
   return interaction.status === "pending" && REVIEW_PATH_INTERACTION_KINDS.has(interaction.kind);
@@ -3952,6 +3957,31 @@ export function issueRoutes(
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.existing.id);
     if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return;
 
+    // PEN-2853 Finding 1. The five paths above share a blind spot: none of them is an
+    // external event wake, and none is an open pull request. For the commonest shape an
+    // agent finishes in -- "my deliverable is a green PR awaiting a human merge press" --
+    // there was no path that described the row honestly. There is nobody to ask a
+    // question of, a routine merge needs no board decision, merge is a press rather than
+    // a review assignment, and there is no execution policy. That left a scheduled
+    // monitor as the only unilaterally satisfiable remedy, i.e. this error's practical
+    // advice was to arm a poll against a gate no poll can move.
+    //
+    // The cost was not cosmetic. An agent was pushed either to game the check or to leave
+    // the row `in_progress`, which reads as "an agent is actively working this" when the
+    // truth is "waiting on a human" -- and, being uncounted, the row was then seizable by
+    // the strandedness sweep. That is PEN-2370's incident.
+    //
+    // Delegates to the sweep's own definition rather than restating it, which is the
+    // whole point: this row was filed because two independently-written predicates
+    // disagreed about the same path. See `open-pull-request-attendance.ts` for why the
+    // grace and provenance filters are inherited rather than relaxed here -- a validator
+    // that admitted a PR the sweep discounts would recreate that defect in a new column.
+    if (await hasOpenPullRequestWakePath(
+      db,
+      { id: input.existing.id, companyId: input.existing.companyId },
+      loadConfig().openPullRequestAttendanceGraceMs,
+    )) return;
+
     throw unprocessable(INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE, {
       code: "invalid_issue_disposition",
       missing: "review_path",
@@ -3961,6 +3991,7 @@ export function issueRoutes(
         "human_assignee_user_id",
         "typed_execution_state_current_participant",
         "scheduled_issue_monitor",
+        "open_pull_request_work_product",
       ],
     });
   }
