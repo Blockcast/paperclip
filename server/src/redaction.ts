@@ -931,6 +931,74 @@ export function maskWorkspaceRuntimeTextForRead(value: string | null): string | 
 }
 
 /**
+ * PEN-3266. The write-side counterpart to `publicPipelineStageConfig`
+ * (`routes/workspace-response.ts`), without which that read projection would be a
+ * regression rather than a partial fix.
+ *
+ * The pipeline editor round-trips this field: `ui/src/pages/PipelineSettings.tsx`
+ * seeds its form state from the GET response and writes the whole automation
+ * block back on save. So an editor holding `pipelines:write` but NOT
+ * `workspace_runtime:read` holds the masked sentinel where the operator-authored
+ * command is, and saving any unrelated field — the stage name — would persist
+ * that sentinel over the real command and destroy it.
+ *
+ * That shape has reached production here before: the `restoreRedactedAdapterValue`
+ * guard in `routes/agents.ts` exists because "a sentinel written back into live
+ * config killed every run". This is the same guard for the stage-config carrier.
+ *
+ * The check is viewer-INDEPENDENT by design — it asks what the incoming bytes
+ * say, not who sent them — because an entitled caller has no cause to send the
+ * sentinel and no legitimate configured value contains it. That keeps it correct
+ * even if the read projection and the write path ever disagree about entitlement.
+ *
+ * Substring rather than equality, matching the precedent: a masked value can sit
+ * inside a longer string, and an equality test would miss it and persist a broken
+ * value. `onEnter` and `automation` are enumerated rather than walked whole
+ * because the rest of `config` is unrelated operator prose that must round-trip
+ * byte-for-byte.
+ */
+export function restoreWithheldPipelineStageConfig(incoming: unknown, existing: unknown): unknown {
+  if (!isPlainObject(incoming)) return incoming;
+  const existingRecord = isPlainObject(existing) ? existing : {};
+
+  const restored: Record<string, unknown> = { ...incoming };
+  for (const key of ["onEnter", "automation"]) {
+    const block = restored[key];
+    if (!isPlainObject(block)) continue;
+    if (!("executionWorkspaceSettings" in block)) continue;
+    const existingBlock = isPlainObject(existingRecord[key])
+      ? (existingRecord[key] as Record<string, unknown>)
+      : {};
+    restored[key] = {
+      ...block,
+      executionWorkspaceSettings: restoreWithheldValue(
+        block.executionWorkspaceSettings,
+        existingBlock.executionWorkspaceSettings,
+      ),
+    };
+  }
+  return restored;
+}
+
+function restoreWithheldValue(incoming: unknown, existing: unknown): unknown {
+  if (typeof incoming === "string") {
+    return incoming.includes(REDACTED_EVENT_VALUE) ? existing : incoming;
+  }
+  if (Array.isArray(incoming)) {
+    const existingArray = Array.isArray(existing) ? existing : [];
+    return incoming.map((value, index) => restoreWithheldValue(value, existingArray[index]));
+  }
+  if (!isPlainObject(incoming)) return incoming;
+
+  const existingRecord = isPlainObject(existing) ? existing : {};
+  const restored: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(incoming)) {
+    restored[key] = restoreWithheldValue(value, existingRecord[key]);
+  }
+  return restored;
+}
+
+/**
  * Approval payloads are a human-facing escalation channel (BLO-20810), so a
  * field the scanner actually blanked must read differently from one the
  * filer simply left empty — a bare `***REDACTED***` is ambiguous on its own.
