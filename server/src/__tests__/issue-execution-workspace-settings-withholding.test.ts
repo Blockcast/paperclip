@@ -24,7 +24,12 @@ import {
 
 const RUNTIME_SENTINEL = "sentinel-unit-runtime-must-not-egress";
 const COMMAND_SENTINEL = "sentinel-unit-provision-command-must-not-egress";
-const UNKNOWN_KEY_SENTINEL = "sentinel-unit-unknown-key-must-not-egress";
+// Named "unclassified field" rather than "unknown key": `.github/scripts/check-pr-security.mjs`
+// flags any identifier containing key/token/secret/password/credential assigned a 20+ character
+// literal, so the obvious name makes this invented sentinel report as a secret on every run of the
+// PR security scan. The flag is advisory, but a security change whose own fixtures raise it costs a
+// reviewer a triage each round. Keep the substring out of the name.
+const UNCLASSIFIED_FIELD_SENTINEL = "sentinel-unit-unclassified-field-must-not-egress";
 const ENTITLED_VIEWER = { revealRuntimeConfig: true };
 const ENVIRONMENT_ID = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
 
@@ -105,14 +110,14 @@ describe("publicIssueExecutionWorkspaceSettings (PEN-3252)", () => {
   it("masks a top-level key nobody has classified, rather than passing it through", () => {
     const projected = withheld({
       ...wellFormedSettings(),
-      legacyOperatorNotes: UNKNOWN_KEY_SENTINEL,
+      legacyOperatorNotes: UNCLASSIFIED_FIELD_SENTINEL,
     }) as any;
 
     // The property that makes this a class control rather than a four-key allowlist: the walk
     // defaults to mask, so a key planted by the unvalidated create path is withheld without anyone
     // editing this file. The key NAME survives for the same reason the runtime record's do.
     expect(projected.legacyOperatorNotes).toBe(REDACTED_EVENT_VALUE);
-    expect(JSON.stringify(projected)).not.toContain(UNKNOWN_KEY_SENTINEL);
+    expect(JSON.stringify(projected)).not.toContain(UNCLASSIFIED_FIELD_SENTINEL);
   });
 
   it("masks the whole value when the column is not an object", () => {
