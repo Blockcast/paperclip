@@ -25,7 +25,7 @@ import {
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
 } from "../services/workspace-runtime.js";
-import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
+import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, runTranscriptReadGate } from "./authz.js";
 import { logger } from "../middleware/logger.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -39,6 +39,7 @@ import {
   publicWorkspaceOperation,
   publicWorkspaceOperations,
   resolveWorkspaceRuntimeViewer,
+  withholdUnentitledWorkspaceOperationOutput,
 } from "./workspace-response.js";
 import { appendWithCap } from "../adapters/utils.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
@@ -151,7 +152,18 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     if (!(await assertExecutionWorkspaceReadAllowed(req, res, workspace.companyId))) return;
     const operations = await workspaceOperationsSvc.listForExecutionWorkspace(id);
     const viewer = await resolveWorkspaceRuntimeViewer(access, req, workspace.companyId);
-    res.json(publicWorkspaceOperations(operations, viewer));
+    // PEN-3204: the widest of the three workspace-operation reads — it returns EVERY
+    // operation for the workspace, including those produced by other agents' heartbeat
+    // runs, so the captured output here is cross-agent transcript by construction. Same
+    // per-operation owner resolution and the same shared withholding as the run route;
+    // gating that one and leaving this open is the PEN-2777 failure exactly.
+    const owners = await workspaceOperationsSvc.owningAgentIdsByRunId(operations.map((op) => op.heartbeatRunId));
+    res.json(await withholdUnentitledWorkspaceOperationOutput(
+      publicWorkspaceOperations(operations, viewer),
+      owners,
+      runTranscriptReadGate(req, access, workspace.companyId),
+      req.actor.type === "board",
+    ));
   });
 
   async function handleExecutionWorkspaceRuntimeCommand(req: Request, res: Response) {

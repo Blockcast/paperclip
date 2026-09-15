@@ -4207,6 +4207,12 @@ const heartbeatRunSqlAsciiSafeColumns = {
 const heartbeatRunLogAccessColumns = {
   id: heartbeatRuns.id,
   companyId: heartbeatRuns.companyId,
+  // PEN-3142: the transcript decision is scoped to the run's OWNING AGENT
+  // (own-run / manager chain), so the log-access lookup has to carry it. Still
+  // a narrow projection — deliberately not `heartbeatRunSafeColumns`, which
+  // would pull `stdoutExcerpt` / `resultJson` into a path that only needs
+  // enough to authorize and locate the log.
+  agentId: heartbeatRuns.agentId,
   logStore: heartbeatRuns.logStore,
   logRef: heartbeatRuns.logRef,
 } as const;
@@ -30359,8 +30365,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     ...metadata,
                     managedGitWorktreeBranch: finalizeBranchMetadata,
                     managedGitWorktreeBranchRepair: finalizeBranchRepairMetadata,
+                    // PEN-3204: write the named payload or nothing — never the raw
+                    // `resultJson` blob. `metadata` on a workspace operation is
+                    // company-readable by the PEN-3202 ruling, while `resultJson` is
+                    // transcript that the run row projects; the `?? resultJson` fallback
+                    // that used to sit here would have spread the unprojected blob into
+                    // the readable key, routing around that projection one table over.
+                    //
+                    // It is unreachable from today's six `WorkspaceValidationFailure`
+                    // constructions, which all set `.workspaceValidation` — but
+                    // `isWorkspaceValidationFailure` is a STRUCTURAL guard that also
+                    // admits any duck-typed `{ code, resultJson }`, and nothing requires
+                    // that shape to carry the key. So this was one thrower away from
+                    // live, not one refactor away.
                     ...(workspaceValidationFailure?.resultJson
-                      ? { workspaceValidation: workspaceValidationFailure.resultJson.workspaceValidation ?? workspaceValidationFailure.resultJson }
+                      ? { workspaceValidation: workspaceValidationFailure.resultJson.workspaceValidation ?? null }
                       : {}),
                   },
                   run: async () => ({
