@@ -269,6 +269,17 @@ githubApp:
   # that still requires the old name satisfied. Comma-separated.
   prCommentReviewGateRetiredStatusContexts: ""
 
+# -- Evidence-gate rollout flags. See docs/runbooks/evidence-gate-unlabeled-block.md.
+evidenceGate:
+  # -- "1" escalates an issue whose ONLY missing evidence is `review:ally-clean`
+  # from `warn` to `block` at the `in_review` transition, and only when the
+  # GitHub truth probe ran clean (a failed probe always stays `warn`).
+  # `deploy:landed` is never blocking at any value of this flag: the gate runs
+  # only on the transition INTO `in_review` and `deploy:landed` means merged, so
+  # it is unsatisfiable at the one moment it is evaluated. Keep "0" until the
+  # runbook's baseline, seven-day measurement and flip criteria pass.
+  unlabeledTruthBlock: "0"
+
 # -- Pod spec knobs.
 pod:
   # -- Share the process namespace so tini (pid 1) reaps orphaned child processes spawned by Claude agents.
