@@ -147,14 +147,15 @@ const VERDICT_SEVERITIES = new Set([...BLOCKING_SEVERITIES, "suggestions"]);
 const BLOCKING_PRIOR_DISPOSITIONS = new Set(["still-present"]);
 
 /**
- * `true` when the block reports a Critical/Important finding, `false` when it
- * explicitly reports none, `null` when the payload cannot be trusted.
+ * The block's per-severity counts, or `null` when the payload cannot be
+ * trusted. Per-severity rather than a bare "does it block": the count rule
+ * below needs to know which severity states zero, and a boolean cannot say.
  *
  * Absent counts are not zero counts, and an unknown severity key is not a key
  * to drop: both are fail-open routes by which a block claiming a finding reads
  * byte-identically to a clean one. See asSeverityCounts for the long form.
  */
-function blockingFindingsIn(raw) {
+function severityCountsIn(raw) {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
   const counts = new Map();
   for (const [severity, value] of Object.entries(raw)) {
@@ -165,7 +166,62 @@ function blockingFindingsIn(raw) {
     counts.set(key, value);
   }
   if (!BLOCKING_SEVERITIES.every((severity) => counts.has(severity))) return null;
-  return BLOCKING_SEVERITIES.some((severity) => counts.get(severity) > 0);
+  return counts;
+}
+
+/**
+ * A counted bucket the review *emits* that names a positive number of a
+ * severity the block states zero of — mirroring proseCountContradicting in
+ * ally-review-detection.ts.
+ *
+ * Here because the gate treats this as unreadable and this reader did not, so
+ * the same body attested a head here while reading as a broken verdict there —
+ * the cross-reader divergence BLO-31730 is about, on the field that decides
+ * whether a merge is blocked.
+ *
+ * Anchored to the emitted heading form for the reason the module's copy is: an
+ * unanchored bucket matches a sentence *referencing* an earlier pass's counts,
+ * and over-matching fails a clean review closed.
+ */
+const EMITTED_BUCKET_RE = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>)(?:#{1,6}[ \t]*)?[*_]{0,3}` +
+    String.raw`(Critical|Important)[ \t]+Issues[ \t]*[*_]{0,3}[ \t]*\((\d+)\)[*_]{0,3}[ \t]*$`,
+  "gim",
+);
+
+/**
+ * Fenced spans blanked, so a quoted bucket cannot fail a block closed.
+ *
+ * Deliberately simpler than withoutFencedCodeBlocks in the gate: a line-level
+ * toggle on ``` only, with no tilde fences, no fence-length matching and no
+ * info-string rule. The bound is stated rather than implied — a body using
+ * those forms is read here as emitted structure and by the gate as a quote.
+ * Applied only to this cross-check, not to the block or attestation patterns
+ * above, whose own fence divergence is the documented residual on
+ * NOT_INDENTED_CODE and is unchanged by this.
+ */
+function withoutFencedSpans(text) {
+  if (!text.includes("```")) return text;
+  let fenced = false;
+  return text
+    .split("\n")
+    .map((line) => {
+      if (/^ {0,3}```/.test(line)) {
+        fenced = !fenced;
+        return "";
+      }
+      return fenced ? "" : line;
+    })
+    .join("\n");
+}
+
+function proseCountContradicts(text, counts) {
+  for (const [, severity, count] of withoutFencedSpans(text).matchAll(EMITTED_BUCKET_RE)) {
+    const key = severity.toLowerCase();
+    if (!BLOCKING_SEVERITIES.includes(key)) continue;
+    if (Number(count) > 0 && counts.get(key) === 0) return true;
+  }
+  return false;
 }
 
 /** `true`/`false` per the ledger, `null` when an entry is malformed. */
@@ -210,10 +266,16 @@ function structuredVerdict(text) {
   if (typeof head !== "string" || !/^[0-9a-f]{40}$/i.test(head.trim())) {
     return { kind: "unreadable" };
   }
-  const blockingFindings = blockingFindingsIn(parsed?.findings);
+  const counts = severityCountsIn(parsed?.findings);
   const stillPresent = stillPresentIn(parsed?.dispositions);
-  if (blockingFindings === null || stillPresent === null) return { kind: "unreadable" };
-  return { kind: "ok", head: head.trim().toLowerCase(), blockingFindings, stillPresent };
+  if (counts === null || stillPresent === null) return { kind: "unreadable" };
+  if (proseCountContradicts(text, counts)) return { kind: "unreadable" };
+  return {
+    kind: "ok",
+    head: head.trim().toLowerCase(),
+    blockingFindings: BLOCKING_SEVERITIES.some((severity) => counts.get(severity) > 0),
+    stillPresent,
+  };
 }
 
 /**

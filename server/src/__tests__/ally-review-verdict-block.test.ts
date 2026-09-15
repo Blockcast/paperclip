@@ -1178,6 +1178,145 @@ describe("BLO-32695 — the block and the prose must not name different counts",
     );
     expect(parseAllyVerdictBlock(quoted).kind).toBe("ok");
   });
+
+  /**
+   * Peer review of #1721, Important 1 — the rule read the unanchored bucket
+   * pattern `extractAllyReportedFindingRefs` uses, so a *reference* to some
+   * other pass's counts failed a clean review closed. Over-matching here is
+   * the false red this row exists to retire, so the cross-check now reads only
+   * the emitted heading form.
+   */
+  it("does not fire on a sentence referencing a prior pass's counts", () => {
+    const referencing = body(
+      { head: PR1675_HEAD, findings: { critical: 0, important: 0 } },
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+      "",
+      "Both Critical Issues (2) from the previous pass at `abc1234` are fixed.",
+    );
+    expect(parseAllyVerdictBlock(referencing).kind).toBe("ok");
+    // Control: the same body with that sentence replaced by an emitted bucket
+    // still fails closed, so the rule was narrowed rather than disabled.
+    expect(
+      parseAllyVerdictBlock(
+        body(
+          { head: PR1675_HEAD, findings: { critical: 0, important: 0 } },
+          "### Critical Issues (2)",
+        ),
+      ).kind,
+    ).toBe("unreadable");
+  });
+
+  it("does not fire on a blockquoted or inline-code bucket", () => {
+    // Every sibling pattern in the module carries its own `(?![ \t]*>)`;
+    // fencing is not the only way to quote an earlier review.
+    for (const quoted of ["> ### Critical Issues (2)", "`### Critical Issues (2)` is what it said"]) {
+      expect(
+        parseAllyVerdictBlock(
+          body({ head: PR1675_HEAD, findings: { critical: 0, important: 0 } }, quoted),
+        ).kind,
+      ).toBe("ok");
+    }
+  });
+
+  it("still reads the emphasis Ally wraps its own headings in", () => {
+    for (const emitted of ["**Critical Issues (2)**", "### **Critical Issues (2)**"]) {
+      expect(
+        parseAllyVerdictBlock(
+          body({ head: PR1675_HEAD, findings: { critical: 0, important: 0 } }, emitted),
+        ).kind,
+      ).toBe("unreadable");
+    }
+  });
+});
+
+/**
+ * Peer review of #1721, Critical 1 — `allyClaimedReviewHead` answered with the
+ * *first* head it found, but two of the parse's `unreadable` reasons are
+ * literally "this body makes more than one head claim". First-wins invented an
+ * answer the parse had declined to give, the head-scoping branch stood down at
+ * the evaluated head, and an older clean review became authoritative over a
+ * newer review carrying a structured Critical — #1675 in the fail-open
+ * direction.
+ */
+describe("BLO-32695 — a body making two head claims claims neither", () => {
+  const HEAD_A = PR1675_HEAD;
+  const HEAD_B = "b".repeat(40);
+
+  const olderCleanB = [
+    "## Ally — Consolidated PR Review",
+    `Reviewed head: ${HEAD_B}`,
+    "### Critical Issues (0)",
+    "### Important Issues (0)",
+  ].join("\n");
+
+  /** Block says HEAD_A and carries a Critical; the prose says HEAD_B. */
+  const blockVsProse = [
+    verdictBlock({ head: HEAD_A, findings: { critical: 1, important: 0 } }),
+    "",
+    "## Ally — Consolidated PR Review",
+    `Reviewed head: ${HEAD_B}`,
+  ].join("\n");
+
+  /** AC-5's literal case: two blocks, two heads. */
+  const twoBlocks = [
+    verdictBlock({ head: HEAD_A, findings: { critical: 0, important: 0 } }),
+    verdictBlock({ head: HEAD_B, findings: { critical: 1, important: 0 } }),
+    "",
+    "## Ally — Consolidated PR Review",
+  ].join("\n");
+
+  it("positive control: both bodies really are unreadable", () => {
+    expect(parseAllyVerdictBlock(blockVsProse).kind).toBe("unreadable");
+    expect(parseAllyVerdictBlock(twoBlocks).kind).toBe("unreadable");
+  });
+
+  it("claims no head at all", () => {
+    expect(allyClaimedReviewHead(blockVsProse)).toBeNull();
+    expect(allyClaimedReviewHead(twoBlocks)).toBeNull();
+  });
+
+  it("does not let an older clean review outrank it", () => {
+    // The finding. Before the fix both of these resolved to success/clean off
+    // the older review, while the newest review of that head states a Critical.
+    for (const disagreeing of [blockVsProse, twoBlocks]) {
+      expect(
+        evaluateCommentReviewGate({
+          headSha: HEAD_B,
+          reviewerBotLogin: ALLY_BOT_LOGIN,
+          comments: [
+            allyComment(olderCleanB, "2026-09-07T03:46:19Z"),
+            allyComment(disagreeing, "2026-09-07T15:41:42Z"),
+          ],
+        }),
+      ).toMatchObject({ state: "failure", outcome: "unreadable_verdict" });
+    }
+  });
+
+  it("reds the unrelated head too, which is the cost of the rule", () => {
+    // Stated rather than buried: a body that will not say which tree it
+    // examined might have examined this one, so it reds every head — the same
+    // rule `brokenNamingNothing` already applies, and the trade this fix makes
+    // against the head-scoping it narrows.
+    expect(
+      evaluateCommentReviewGate({
+        headSha: "c".repeat(40),
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: [allyComment(blockVsProse, "2026-09-07T15:41:42Z")],
+      }),
+    ).toMatchObject({ state: "failure", outcome: "unreadable_verdict" });
+  });
+
+  it("control: a body whose claims agree still names its head", () => {
+    const agreeing = [
+      verdictBlock({ head: HEAD_A, findings: { critical: 0 } }),
+      "",
+      "## Ally — Consolidated PR Review",
+      `Reviewed head: ${HEAD_A}`,
+    ].join("\n");
+    expect(parseAllyVerdictBlock(agreeing).kind).toBe("unreadable");
+    expect(allyClaimedReviewHead(agreeing)).toBe(HEAD_A);
+  });
 });
 
 /**

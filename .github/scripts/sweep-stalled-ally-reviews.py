@@ -93,6 +93,85 @@ VERDICT_OPENER_PATTERN = re.compile(
 SUPPORTED_VERDICT_VERSION = 1
 FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 
+# Mirrors BLOCKING_SEVERITIES / VERDICT_SEVERITIES / MAX_VERDICT_FINDING_COUNT
+# in ally-review-detection.ts. A block whose counts that reader rejects must be
+# unreadable here too, or this sweep sees an attestation where the gate sees a
+# broken verdict -- and then declines to re-request the one review that could
+# clear the red.
+BLOCKING_SEVERITIES = ("critical", "important")
+VERDICT_SEVERITIES = frozenset(BLOCKING_SEVERITIES + ("suggestions",))
+MAX_VERDICT_FINDING_COUNT = 1000
+
+# A counted bucket the review *emits*, e.g. `### Critical Issues (2)`. Anchored
+# to the emitted heading form for the reason the module's copy is: an
+# unanchored bucket also matches a sentence *referencing* an earlier pass's
+# counts, and over-matching fails a clean review closed.
+EMITTED_BUCKET_PATTERN = re.compile(
+    r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)(?:#{1,6}[ \t]*)?[*_]{0,3}"
+    r"(Critical|Important)[ \t]+Issues[ \t]*[*_]{0,3}[ \t]*\((\d+)\)[*_]{0,3}[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+FENCE_PATTERN = re.compile(r"^ {0,3}```")
+
+
+def without_fenced_spans(text):
+    """Blank fenced spans so a quoted bucket cannot fail a block closed.
+
+    Deliberately simpler than withoutFencedCodeBlocks in the gate: a line-level
+    toggle on ``` only, with no tilde fences, no fence-length matching and no
+    info-string rule. Stated rather than implied -- a body using those forms is
+    read here as emitted structure and by the gate as a quote. Applied only to
+    the count cross-check, not to the block or attestation patterns, whose own
+    fence handling is unchanged by this.
+    """
+    if "```" not in text:
+        return text
+    lines = []
+    fenced = False
+    for line in text.split("\n"):
+        if FENCE_PATTERN.match(line):
+            fenced = not fenced
+            lines.append("")
+        else:
+            lines.append("" if fenced else line)
+    return "\n".join(lines)
+
+
+def severity_counts(raw):
+    """Per-severity counts, or None when the payload cannot be trusted.
+
+    Absent counts are not zero counts and an unknown severity key is not a key
+    to drop; both are routes by which a block claiming a finding reads
+    identically to a clean one.
+    """
+    if not isinstance(raw, dict):
+        return None
+    counts = {}
+    for severity, value in raw.items():
+        # bool is an int subclass in Python; the JS readers reject a non-number
+        # outright, so `true` must not read as 1 here.
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        if value < 0 or value > MAX_VERDICT_FINDING_COUNT:
+            return None
+        key = severity.strip().lower() if isinstance(severity, str) else None
+        if key not in VERDICT_SEVERITIES:
+            return None
+        counts[key] = value
+    if any(severity not in counts for severity in BLOCKING_SEVERITIES):
+        return None
+    return counts
+
+
+def prose_count_contradicts(text, counts):
+    """A positive emitted bucket against a stated zero -- mirrors
+    proseCountContradicting in ally-review-detection.ts."""
+    for severity, count in EMITTED_BUCKET_PATTERN.findall(without_fenced_spans(text)):
+        key = severity.lower()
+        if key in BLOCKING_SEVERITIES and int(count) > 0 and counts.get(key) == 0:
+            return True
+    return False
+
 # Same latitude the previous `startswith("## Ally") and "Consolidated PR Review"
 # in body` pair allowed, minus the first-byte anchor.
 CONSOLIDATED_HEADING_PATTERN = re.compile(
@@ -133,6 +212,16 @@ def parse_verdict_block_head(body):
         return ("unreadable", None)
     head = parsed.get("head")
     if not isinstance(head, str) or not FULL_SHA_PATTERN.match(head.strip()):
+        return ("unreadable", None)
+    # The counts the gate reads, read here too. A block whose findings that
+    # reader rejects -- or whose own emitted buckets contradict it -- is a
+    # broken verdict, and a broken verdict attests nothing. Without this the
+    # gate is red on `unreadable_verdict` while this sweep sees a review that
+    # already happened and never re-requests the one that would clear it.
+    counts = severity_counts(parsed.get("findings"))
+    if counts is None:
+        return ("unreadable", None)
+    if prose_count_contradicts(text, counts):
         return ("unreadable", None)
     return ("ok", head.strip().lower())
 

@@ -235,6 +235,42 @@ describe("attestedHead", () => {
     const body = `> ${block(HEAD).split("\n").join("\n> ")}\nReviewed head: ${HEAD}`;
     assert.equal(attestedHead(body), HEAD);
   });
+
+  // Peer review of #1721, Important 2 — the count rule landed in one reader of
+  // three. The merge gate treats a block contradicted by its own emitted
+  // buckets as unreadable; this script read the same body as a good
+  // attestation, so the two disagreed about the field that decides whether a
+  // merge is blocked.
+  const counted = (findings, ...prose) =>
+    [
+      `<!-- ally-verdict:1\n{"head":"${HEAD}","findings":${findings}}\n-->`,
+      "",
+      "## Ally — Consolidated PR Review",
+      ...prose,
+    ].join("\n");
+
+  it("fails closed when an emitted bucket contradicts the block's zero", () => {
+    assert.equal(attestedHead(counted('{"critical":0,"important":0}', "### Critical Issues (2)")), null);
+  });
+
+  it("control: agreeing counts still attest", () => {
+    assert.equal(
+      attestedHead(counted('{"critical":0,"important":0}', "### Critical Issues (0)")),
+      HEAD,
+    );
+  });
+
+  it("does not fail closed on a referenced, quoted or fenced bucket", () => {
+    // Over-matching here reds a clean review, which is the false red this row
+    // retires — so the cross-check reads only the emitted heading form.
+    for (const prose of [
+      "Both Critical Issues (2) from the previous pass are fixed.",
+      "> ### Critical Issues (2)",
+      "```\n### Critical Issues (2)\n```",
+    ]) {
+      assert.equal(attestedHead(counted('{"critical":0,"important":0}', prose)), HEAD, prose);
+    }
+  });
 });
 
 describe("operativeAllyReviews", () => {

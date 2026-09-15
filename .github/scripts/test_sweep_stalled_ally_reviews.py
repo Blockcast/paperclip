@@ -1083,7 +1083,7 @@ class TestParseReviewedHead(unittest.TestCase):
         re-requests a review that already happened. Two parsers disagreeing
         about one body is the BLO-31730 failure, not a formatting nicety.
         """
-        body = '<!-- ally-verdict:01\n{"head":"%s"}\n-->' % self.HEAD
+        body = '<!-- ally-verdict:01\n{"head":"%s","findings":{"critical":0,"important":0}}\n-->' % self.HEAD
         self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
 
     def test_a_space_after_the_colon_is_the_block_it_plainly_is(self):
@@ -1094,7 +1094,7 @@ class TestParseReviewedHead(unittest.TestCase):
         to match neither the block nor the opener pattern, so it read `absent`
         and fell through to the prose path this row retires.
         """
-        body = '<!-- ally-verdict: 1\n{"head":"%s"}\n-->' % self.HEAD
+        body = '<!-- ally-verdict: 1\n{"head":"%s","findings":{"critical":0,"important":0}}\n-->' % self.HEAD
         self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
 
     def test_a_garbled_version_fails_closed_rather_than_vanishing(self):
@@ -1117,6 +1117,58 @@ class TestParseReviewedHead(unittest.TestCase):
         self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
 
 
+class TestVerdictCountsMirrorTheGate(unittest.TestCase):
+    """Peer review of #1721, Important 2 -- the count rule landed in one reader
+    of three.
+
+    A block whose counts the merge gate rejects is red there with
+    `unreadable_verdict`, whose only escape is one more review. This sweep is
+    what asks for that review, and it used to read the same body as a perfectly
+    good attestation -- so the red had no escape route at all.
+    """
+
+    HEAD = "c" * 40
+
+    def body(self, findings, *prose):
+        return "\n".join(
+            [
+                '<!-- ally-verdict:1\n{"head":"%s","findings":%s}\n-->' % (self.HEAD, findings),
+                "",
+                "## Ally — Consolidated PR Review",
+            ]
+            + list(prose)
+        )
+
+    def test_a_positive_bucket_against_a_stated_zero_is_unreadable(self):
+        body = self.body('{"critical":0,"important":0}', "### Critical Issues (2)")
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_control_agreeing_counts_still_attest(self):
+        body = self.body('{"critical":0,"important":0}', "### Critical Issues (0)")
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_a_sentence_referencing_a_prior_pass_does_not_fail_it_closed(self):
+        body = self.body(
+            '{"critical":0,"important":0}',
+            "### Critical Issues (0)",
+            "",
+            "Both Critical Issues (2) from the previous pass are fixed.",
+        )
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_a_quoted_bucket_does_not_fail_it_closed(self):
+        for quoted in ("> ### Critical Issues (2)", "```\n### Critical Issues (2)\n```"):
+            body = self.body('{"critical":0,"important":0}', quoted)
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, quoted)
+
+    def test_findings_the_gate_rejects_are_rejected_here_too(self):
+        # Absent counts are not zero counts; an unknown severity is not a key to
+        # drop; and `true` is not 1, however Python spells its bools.
+        for findings in ('{}', '{"critical":0}', '{"critical":0,"important":0,"typo":0}',
+                         '{"critical":true,"important":0}', '{"critical":-1,"important":0}'):
+            self.assertIsNone(sweep.parse_reviewed_head(self.body(findings)), findings)
+
+
 class TestIsConsolidatedAllyCommentForHead(unittest.TestCase):
     HEAD = "c" * 40
 
@@ -1125,7 +1177,7 @@ class TestIsConsolidatedAllyCommentForHead(unittest.TestCase):
 
         `body.startswith("## Ally")` rejected Ally's own emitted bodies.
         """
-        body = '<!-- ally-verdict:1\n{"head":"%s"}\n-->\n\n## Ally — Consolidated PR Review\nReviewed head: %s\n' % (
+        body = '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0}}\n-->\n\n## Ally — Consolidated PR Review\nReviewed head: %s\n' % (
             self.HEAD,
             self.HEAD,
         )

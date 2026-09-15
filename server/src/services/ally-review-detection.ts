@@ -524,27 +524,42 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
  * some *other* tree. A null answer therefore means "cannot tell", and the
  * caller must fail closed on it.
  *
- * Reads the block's own `head` field first — a block that fails on its version
- * or its counts usually still states which tree it read — and falls back to
- * the prose line. Both are read without trusting anything else in the body.
+ * Reads every head claim the body makes — each block's `head` field, plus the
+ * prose line — and answers only when they agree. Unanimity rather than
+ * first-wins because two of the `unreadable` reasons above literally *are*
+ * "this body makes more than one head claim" (a block disagreeing with the
+ * prose line, and two blocks), and picking a winner among claims the parse
+ * deliberately declined to pick among invents an answer the body never gave.
+ * When the invented answer is some other head, the caller stands down and a
+ * review carrying a structured Critical goes invisible at the head it
+ * concerns — #1675 again, in the fail-open direction.
+ *
+ * A disagreeing body therefore reds every head, including ones it has nothing
+ * to do with. That is the same rule already applied to a body that claims no
+ * head at all, and for the same reason: a review that will not say which tree
+ * it examined might have examined this one.
  */
 export function allyClaimedReviewHead(body: string | null | undefined): string | null {
   const text = emittedReviewText(body);
   if (text === null) return null;
+  const claims = new Set<string>();
   for (const [, , rawPayload] of text.matchAll(ALLY_VERDICT_BLOCK_PATTERN)) {
     try {
       const parsed: unknown = JSON.parse(rawPayload!.trim());
       if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
         const { head } = parsed as Record<string, unknown>;
         if (typeof head === "string" && /^[0-9a-f]{40}$/i.test(head.trim())) {
-          return head.trim().toLowerCase();
+          claims.add(head.trim().toLowerCase());
         }
       }
     } catch {
-      // Unreadable payload — fall through to the prose line.
+      // A payload that does not parse states no head. The claims it does not
+      // make cannot disagree with anything; the rest of the body still decides.
     }
   }
-  return soleProseAttestedHead(text);
+  const proseHead = soleProseAttestedHead(text);
+  if (proseHead !== null) claims.add(proseHead);
+  return claims.size === 1 ? claims.values().next().value! : null;
 }
 
 /**
@@ -578,7 +593,7 @@ export function allyClaimedReviewHead(body: string | null | undefined): string |
  * the claim, and this only cross-checks it.
  */
 function proseCountContradicting(text: string, counts: Map<string, number>): string | null {
-  for (const [, severity, count] of text.matchAll(COUNTED_FINDINGS_BUCKET_PATTERN)) {
+  for (const [, severity, count] of text.matchAll(EMITTED_COUNTED_FINDINGS_BUCKET_PATTERN)) {
     const key = severity!.toLowerCase();
     if (!BLOCKING_SEVERITIES.has(key)) continue;
     if (Number(count) > 0 && counts.get(key) === 0) {
@@ -645,6 +660,34 @@ const PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp(
 // finding identities a head raised.
 const COUNTED_FINDINGS_BUCKET_PATTERN =
   /\b(Critical|Important)\s+Issues\b[*_]*\s*\((\d+)\)/gi;
+
+// The same buckets, but only where the review *emits* one as a heading of its
+// own — the form that states what this review found, as opposed to a sentence
+// mentioning what some earlier pass found.
+//
+// proseCountContradicting must not share the unanchored pattern above.
+// `extractAllyReportedFindingRefs` wants a superset and over-matching there
+// only carries extra findings forward; here over-matching fails a *clean*
+// review closed, which is the false red this row exists to retire. A sentence
+// such as "the previous pass reported Critical Issues (2)" reads as a
+// contradiction of a block stating zero, and so does a blockquoted or
+// inline-code bucket — which is why every sibling pattern in this file carries
+// its own `(?![ \t]*>)` and indentation bound, and this one now does too.
+//
+// Strict because the emitted form measured strict: across six recent PRs'
+// Ally bodies, all 64 genuinely emitted buckets are `### <Severity> Issues
+// (N)` — heading, line-anchored, bucket ending the line — and every match that
+// was not one of those was prose, a fenced example, a blockquote, or inline
+// code. Emphasis is allowed around the heading because Ally has chosen it
+// elsewhere. If the emitted form ever grows decoration this does not cover,
+// the rule stops firing and the block is trusted as it was before this
+// cross-check existed; that degrades to the prior behaviour rather than
+// opening something new, whereas a loose pattern reds clean reviews.
+const EMITTED_COUNTED_FINDINGS_BUCKET_PATTERN = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}(?:#{1,6}[ \t]*)?[*_]{0,3}` +
+    String.raw`(Critical|Important)[ \t]+Issues[ \t]*[*_]{0,3}[ \t]*\((\d+)\)[*_]{0,3}[ \t]*$`,
+  "gim",
+);
 
 // The severities that block a merge, named once so the structured path and the
 // prose path cannot disagree about the vocabulary. The prose readers get this
