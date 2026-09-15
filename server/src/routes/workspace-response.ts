@@ -328,6 +328,54 @@ export function publicIssueExecutionWorkspaceSettings(
   return projected;
 }
 
+/**
+ * PEN-3266. The THIRD carrier of the same schema, and the first that is not a column.
+ *
+ * `pipeline_stages.config` is a `jsonb` blob, and `validators/pipeline.ts` declares
+ * `executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema` on BOTH of its
+ * automation-shaped schemas — `pipelineStageOnEnterSchema` and `pipelineStageAutomationSchema`. That is
+ * the same schema `publicIssueExecutionWorkspaceSettings` above exists to withhold, so this reuses it
+ * rather than re-deriving a second walk. The PEN-3252 sweep could not see this one because it was
+ * scoped to the `execution_workspace_settings` COLUMN, which exists on exactly one table
+ * (`packages/db/src/schema/issues.ts`); here the same bytes cross under a parent key instead.
+ *
+ * ## Why both keys, and why the raw `onEnter` one is the primary
+ *
+ * `onEnter` is what is STORED and what the write path round-trips. `automation` is a derived copy the
+ * route builds from `onEnter` for the editor. Masking only the derived copy would leave the stored one
+ * in the clear, and `withDerivedStageAutomation` returns the raw config verbatim whenever the stage has
+ * no backing routine — so the derived block is not even reliably present, while `onEnter` always is.
+ * Masking only `automation` would therefore have masked the copy that is sometimes absent and left the
+ * one that is always there, which is precisely the "one exit masked and another not" failure this
+ * series keeps finding.
+ *
+ * Enumerated over a walk on purpose: `config` holds unrelated operator prose (`variables`,
+ * `disabledReason`, breakdown templates) that is not workspace-runtime material and must survive
+ * intact, so a blanket mask over the blob would be wrong in the other direction.
+ */
+export function publicPipelineStageConfig(config: unknown, viewer: WorkspaceRuntimeViewer): unknown {
+  if (viewer.revealRuntimeConfig) return config;
+  if (!isPlainObject(config)) return config;
+
+  const projected: Record<string, unknown> = { ...config };
+  for (const key of ["onEnter", "automation"]) {
+    const block = projected[key];
+    if (!isPlainObject(block)) continue;
+    if (!("executionWorkspaceSettings" in block)) continue;
+    projected[key] = {
+      ...block,
+      executionWorkspaceSettings: publicIssueExecutionWorkspaceSettings(block.executionWorkspaceSettings, viewer),
+    };
+  }
+  return projected;
+}
+
+/**
+ * PEN-3266. The read projection above is only half of the fix; the write-side counterpart that keeps
+ * it from destroying the values it masks is `restoreWithheldPipelineStageConfig` in `../redaction.ts`.
+ * It lives there rather than here because `services/pipelines.ts` is what has to call it, and services
+ * do not import from the route layer.
+ */
 export function publicExecutionWorkspace(
   workspace: ExecutionWorkspace,
   viewer: WorkspaceRuntimeViewer,
