@@ -299,7 +299,11 @@ import {
   type ActivityPublish,
   type LogActivityInput,
 } from "./activity-log.js";
-import { githubGetPullRequestGate, githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
+import {
+  githubFetchPrAuthorLogin,
+  githubGetPullRequestGate,
+  githubHasReviewerEvidenceForPr,
+} from "./github-app-auth.js";
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
 import { pullRequestExternalId } from "./pull-request-work-products.js";
@@ -9975,6 +9979,39 @@ export async function verifyGithubReviewerEvidence(
       headSha: prReview.headSha,
     };
   }
+}
+
+/**
+ * Re-run the evidence classifier once with a GitHub-resolved PR author.
+ *
+ * A reviewer run that correctly declines to review its own PR is recognised only
+ * by `prReviewOutputHasSelfReviewSkip`, which short-circuits when the wake carried
+ * no `githubPrAuthorLogin`. Assignment-sourced wakes never carry it, so a correct
+ * self-skip fell through to `pr_review_output_missing` and forced the run to
+ * `failed`. GitHub re-verification cannot rescue it either: the run posted nothing,
+ * so there is no review to find.
+ *
+ * Only reached on a `missing` verdict, so the common paths pay no extra API call.
+ */
+export async function resolvePrReviewEvidenceWithGithubAuthor<T extends { status: string }>(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  output: { resultJson?: Record<string, unknown> | null; summary?: string | null },
+  evidence: T,
+) {
+  if (evidence.status !== "missing") return evidence;
+  const prReview = derivePaperclipPrReview(contextSnapshot);
+  if (!prReview || prReview.prAuthorLogin) return evidence;
+  if (!prReview.repoFullName || prReview.prNumber === null) return evidence;
+  const authorLogin = await githubFetchPrAuthorLogin({
+    repoFullName: prReview.repoFullName,
+    prNumber: prReview.prNumber,
+  });
+  if (!authorLogin) return evidence;
+  const reevaluated = evaluatePrReviewCompletionEvidence(
+    { ...(contextSnapshot ?? {}), githubPrAuthorLogin: authorLogin },
+    output,
+  );
+  return reevaluated.status === "self_review_skipped" ? (reevaluated as unknown as T) : evidence;
 }
 
 function unavailablePrReviewVerification(reason: string) {
@@ -23213,6 +23250,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         parseObject(input.run.contextSnapshot),
         { resultJson: parseObject(input.run.resultJson) },
       );
+      reviewEvidence = await resolvePrReviewEvidenceWithGithubAuthor(
+        parseObject(input.run.contextSnapshot),
+        { resultJson: parseObject(input.run.resultJson) },
+        reviewEvidence,
+      );
       const claimedReview =
         reviewEvidence.status === "posted_review" || reviewEvidence.status === "already_reviewed";
       if (reviewEvidence.status === "missing" || claimedReview) {
@@ -31562,6 +31604,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           summary: adapterResult.summary ?? null,
         })
         : { status: "not_applicable" as const };
+      prReviewCompletionEvidence = await resolvePrReviewEvidenceWithGithubAuthor(
+        context,
+        { resultJson: adapterResult.resultJson ?? null, summary: adapterResult.summary ?? null },
+        prReviewCompletionEvidence,
+      );
       // BLO-10448/BLO-19573: GitHub is authoritative for both missing evidence
       // and local "posted/already reviewed" claims. The latter must not complete
       // a task when the side effect came from an ineligible user-seat identity.
