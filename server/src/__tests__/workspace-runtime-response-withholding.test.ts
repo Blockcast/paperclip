@@ -152,6 +152,11 @@ const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockWorkspaceOperationService = vi.hoisted(() => ({
   listForExecutionWorkspace: vi.fn(),
   createRecorder: vi.fn(),
+  // PEN-3204 added the run-transcript gate to this route, and the gate resolves each
+  // operation's owning agent through this method. It is stubbed here rather than left
+  // off because a barrel mock that omits a method the handler calls fails as a 500,
+  // which reads as a route defect instead of an incomplete double.
+  owningAgentIdsByRunId: vi.fn(),
 }));
 const mockHeartbeatService = vi.hoisted(() => ({ wakeup: vi.fn() }));
 
@@ -337,6 +342,10 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       project: { id: "project-1", companyId: "company-1" },
     });
     mockProjectService.listWorkspaces.mockResolvedValue([projectWorkspaceFixture()]);
+    // Matches what the real service returns for this file's fixture: its `heartbeatRunId`
+    // is null, and `owningAgentIdsByRunId` resolves only ids it finds, so an unowned
+    // operation is absent from the map rather than mapped to null.
+    mockWorkspaceOperationService.owningAgentIdsByRunId.mockResolvedValue(new Map<string, string>());
   });
 
   describe("projection helpers", () => {
