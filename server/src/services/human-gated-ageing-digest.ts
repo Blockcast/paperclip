@@ -577,6 +577,18 @@ export const humanGatedAgeingProducer: DigestProducer = {
     return {
       key: "human-gated-ageing",
       markdown,
+      // Item *mentions* across the two rendered sections, not distinct rows.
+      // Before PEN-3089 the two addends were disjoint — every resolved-but-open
+      // row was withheld from the age-ranked list — so the sum was an exact row
+      // count. Now an action-owed resolved row is rendered in both sections and
+      // counted twice, and since escalation also requires passing the silence
+      // threshold, that overlap covers most of the newly-escalated population.
+      // Left as a sum deliberately: this value is telemetry (a digest-size
+      // signal and a log field), never control flow, and an exact distinct
+      // count would mean plumbing the over-threshold issue ids out of
+      // `selectAgedHumanGatedIssues` to serve a number nothing branches on. The
+      // meaning is recorded here so the next reader does not mistake it for a
+      // row count.
       itemCount: report.totalOverThreshold + revalidation.counts["resolved-but-open"],
     };
   },
