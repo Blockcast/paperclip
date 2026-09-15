@@ -780,6 +780,76 @@ describe("createPenstockAvailabilityGate", () => {
       "https://api.penstock.run/v1/pools/default/capacity?provider=anthropic&model=claude-opus-5",
     );
   });
+
+  it("probes with credentials that arrive only as resolved adapterConfig bindings", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          state: "rate_limited",
+          reason: "penstock.capacity_rate_limited",
+          resume_at: "2026-06-30T08:05:00.000Z",
+          retry_after_seconds: 300,
+        }),
+        { status: 200 },
+      ),
+    );
+    const gate = gateWith(fetchMock as unknown as typeof fetch);
+
+    // Production shape: `resolveAdapterConfigForRuntime` flattens the agent's
+    // env bindings to plain strings and the heartbeat passes no `env`
+    // override, so the credential must be read from adapterConfig alone.
+    const result = await gate.checkAdapter({
+      adapterType: "opencode_k8s",
+      agentId: "agent-ally",
+      adapterConfig: {
+        model: "anthropic/claude-opus-5",
+        env: {
+          PENSTOCK_PROVIDER: "anthropic",
+          ANTHROPIC_BASE_URL: "https://api.penstock.run/anthropic",
+          ANTHROPIC_API_KEY: "psk_resolved_binding",
+        },
+      },
+      now: new Date("2026-06-30T08:00:00.000Z"),
+    });
+
+    expect(result).toMatchObject({ allow: false, provider: "anthropic" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0]![0])).toBe(
+      "https://api.penstock.run/v1/pools/default/capacity?provider=anthropic&model=claude-opus-5",
+    );
+  });
+
+  it("strips any opencode provider segment from the probed model id", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ state: "available", reason: "penstock.capacity_available" }),
+        { status: 200 },
+      ),
+    );
+    const gate = gateWith(fetchMock as unknown as typeof fetch);
+
+    // A custom opencode provider name forced onto the anthropic pool: the
+    // prefix is not one of the built-ins but would 404 the probe just the same.
+    const result = await gate.checkAdapter({
+      adapterType: "opencode_k8s",
+      agentId: "agent-ally",
+      adapterConfig: {
+        model: "penstock/claude-opus-5",
+        env: {
+          PENSTOCK_PROVIDER: "Anthropic",
+          ANTHROPIC_BASE_URL: "https://api.penstock.run/anthropic",
+          ANTHROPIC_API_KEY: "psk_test",
+        },
+      },
+      now: new Date("2026-06-30T08:00:00.000Z"),
+    });
+
+    expect(result).toEqual({ allow: true });
+    expect(String(fetchMock.mock.calls[0]![0])).toBe(
+      "https://api.penstock.run/v1/pools/default/capacity?provider=anthropic&model=claude-opus-5",
+    );
+  });
+
 });
 
 describe("mapAdapterToPenstockProvider", () => {
@@ -811,6 +881,10 @@ describe("mapAdapterToPenstockProvider", () => {
       "anthropic",
     );
     expect(mapAdapterToPenstockProvider("opencode_k8s", { model: "openai/gpt-5.5" })).toBe("codex");
+    // Prefix matching is case-insensitive, like the PENSTOCK_PROVIDER value.
+    expect(mapAdapterToPenstockProvider("opencode_k8s", { model: "Anthropic/Claude-Opus-5" })).toBe(
+      "anthropic",
+    );
     // A secret-ref binding is unreadable here and must not mask the prefix.
     expect(
       mapAdapterToPenstockProvider("opencode_k8s", {
