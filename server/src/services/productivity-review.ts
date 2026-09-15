@@ -138,6 +138,18 @@ const CAPACITY_RETRY_ERROR_CODE = "rate_limit_exhausted";
 // a fresh episode) always suppresses, while an episode that was already long
 // *before* it started still fires on its own unattended time.
 const NO_EXECUTABLE_TURN_DOMINANT_SHARE = 0.5;
+
+/**
+ * BLO-27698 B2: the one dominance shape, shared by both mechanisms that can
+ * account for an episode instead of assignee inactivity — no-executable-turn
+ * time (BLO-23248/BLO-23624) and executing time (B1). Extracted rather than
+ * re-written so a change to what "dominant" means cannot apply to one and not
+ * the other, which would leave the two gates disagreeing about the same
+ * episode.
+ */
+function isDominantEpisodeShare(partMs: number, elapsedMs: number | null) {
+  return elapsedMs !== null && elapsedMs > 0 && partMs / elapsedMs > NO_EXECUTABLE_TURN_DOMINANT_SHARE;
+}
 // BLO-26165: `heartbeatRuns.issueCommentStatus` defaults to (and is explicitly
 // re-stamped) `not_applicable` by `finalizeIssueCommentPolicy` (heartbeat.ts).
 // It is NOT an invocation signal and must never be used as one — see
@@ -182,7 +194,12 @@ type ProductivityReviewTrigger =
   | "no_comment_streak"
   | "long_active_duration"
   | "high_churn"
-  | "runtime_failure_streak";
+  | "runtime_failure_streak"
+  // BLO-27698 B3b: one run that has been executing, uninterrupted and still
+  // live, for at least `longActiveMs`. Distinct from `long_active_duration`,
+  // which after B3 measures only time nobody was accounting for — a runaway run
+  // is the opposite shape (the turn was taken and never given back).
+  | "runaway_execution";
 
 type ProductivityReviewThresholds = {
   noCommentStreakRuns: number;
@@ -1360,6 +1377,7 @@ function choosePrimaryTrigger(input: {
   noComment: boolean;
   longActive: boolean;
   highChurn: boolean;
+  runawayExecution: boolean;
 }): ProductivityReviewTrigger | null {
   // Runtime failure takes priority: if the sampled window is dominated by
   // runs that never got a model turn, that is the root cause worth surfacing
@@ -1374,6 +1392,14 @@ function choosePrimaryTrigger(input: {
   if (input.runtimeFailure) return "runtime_failure_streak";
   if (input.noComment) return "no_comment_streak";
   if (input.highChurn) return "high_churn";
+  // BLO-27698 B3b: directly above `long_active_duration`, and that position is
+  // the whole point. B3 narrows `long_active_duration` to the *unattended*
+  // bucket, which by construction stops it firing on an episode a run spent
+  // executing — so without a trigger that outranks it, a genuinely runaway run
+  // would become undetectable instead of merely reclassified. Below the two
+  // streak triggers and `high_churn` because those describe the whole sampled
+  // window; this one describes a single run inside it.
+  if (input.runawayExecution) return "runaway_execution";
   if (input.longActive) return "long_active_duration";
   return null;
 }
@@ -1434,6 +1460,7 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
   if (trigger === "no_comment_streak") return "No-comment streak";
   if (trigger === "high_churn") return "High churn";
   if (trigger === "runtime_failure_streak") return "Runtime failure streak";
+  if (trigger === "runaway_execution") return "Runaway execution";
   return "Long active duration";
 }
 
@@ -1459,6 +1486,7 @@ const PRODUCTIVITY_REVIEW_TRIGGERS: readonly ProductivityReviewTrigger[] = [
   "long_active_duration",
   "high_churn",
   "runtime_failure_streak",
+  "runaway_execution",
 ];
 
 // BLO-22105: `buildReviewMarkdown` bakes the trigger that produced it into the
@@ -3567,9 +3595,29 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       : null;
     const noExecutableTurnDominant = Boolean(
       noExecutableTurnGating
-        && elapsedMs !== null
-        && elapsedMs > 0
-        && noExecutableTurnGating.noExecutableTurnMs / elapsedMs > NO_EXECUTABLE_TURN_DOMINANT_SHARE,
+        && isDominantEpisodeShare(noExecutableTurnGating.noExecutableTurnMs, elapsedMs),
+    );
+    // BLO-27698 B2/B3b: the longest execution span in this episode that is
+    // *still live as of `now`*. `runLiveInterval` caps a `running` row at its
+    // last signal + NON_LIVE_EXECUTION_SILENCE_MS, so a row that went silent
+    // stops counting here — "still executing" means signalling, not merely
+    // still holding the `running` status.
+    //
+    // This is the liveness half of both B-group gates, and it is deliberately
+    // the same shape as `currentBlockOpen` above: a dominance share alone would
+    // let an episode that executed hard and then went quiet suppress itself
+    // forever, which is the indefinite-suppression hazard BLO-22331 AC2
+    // forbids. Clamped to the episode so a span that predates it cannot inflate
+    // either gate.
+    const liveExecutingMs = Math.max(
+      0,
+      ...latestRuns.map((run) => {
+        if (run.status !== "running") return 0;
+        const span = runLiveInterval(run, now);
+        if (!span || span.end < now.getTime()) return 0;
+        const start = attributableStartAt ? Math.max(span.start, attributableStartAt.getTime()) : span.start;
+        return Math.max(0, span.end - start);
+      }),
     );
     // Only suppress while the run currently heading the episode is still
     // actually blocked (`currentBlockOpen`) — e.g. a capacity retry genuinely
@@ -3617,7 +3665,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
       runCountLastSixHours >= thresholds.highChurnSixHours ||
       assigneeRunCommentCountLastSixHours >= thresholds.highChurnSixHours;
-    const trigger = choosePrimaryTrigger({ runtimeFailure, noComment, longActive, highChurn });
+    // BLO-27698 B3b: the escape hatch B3 owes. Keyed on a single run's own
+    // still-live execution span, not on the episode, so it survives B3's
+    // narrowing of `long_active_duration` to the unattended bucket — an episode
+    // spent executing has almost no unattended time by construction, which is
+    // exactly the case that would otherwise vanish.
+    //
+    // Reuses `longActiveMs` rather than adding a knob: both are "this has gone
+    // on too long" bars over the same episode, and two independently-tunable
+    // constants for one question is how a raised bar silently stops covering a
+    // case (the A3 defect on this same issue). Split them if a fleet ever needs
+    // a runaway bar below the long-active one.
+    const runawayExecution = liveExecutingMs >= thresholds.longActiveMs;
+    const trigger = choosePrimaryTrigger({ runtimeFailure, noComment, longActive, highChurn, runawayExecution });
     if (!trigger) return null;
 
     // BLO-22436 (Ally follow-up): recorded in `choosePrimaryTrigger`'s ladder
@@ -3628,6 +3688,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     if (runtimeFailure) firedTriggers.push("runtime_failure_streak");
     if (noComment) firedTriggers.push("no_comment_streak");
     if (highChurn) firedTriggers.push("high_churn");
+    if (runawayExecution) firedTriggers.push("runaway_execution");
     if (longActive) firedTriggers.push("long_active_duration");
 
     const triggerReasons: string[] = [];
@@ -3646,6 +3707,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         ? ` (${neverInvokedRunCount} run(s) in the sampled window never had an adapter created and are excluded, not counted toward this streak; these mostly overlap the non-executing runs reported separately, so the two counts do not sum)`
         : "";
       triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment${neverInvokedNote}`);
+    }
+    if (runawayExecution) {
+      triggerReasons.push(
+        `a single run has been executing continuously for ${msToHuman(liveExecutingMs)} and is still signalling; the assignee has had its turn and has not given it back`,
+      );
     }
     if (longActive) {
       // BLO-23624: this only fires while no-executable-turn-dominant when the
@@ -3762,11 +3828,32 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       trigger === "long_active_duration" &&
       monitorGating &&
       !monitorGating.gatedIsUpperBound &&
-      // BLO-27698 B1: `unattendedMs` no longer includes executing time, so it is
-      // re-added here to keep this gate bit-identical to its pre-B1 behaviour.
-      // B3 is the deliberate, separately-reviewed change that drops the addend
-      // and lets the trigger fire on the narrowed bucket; do not drop it here.
-      monitorGating.unattendedMs + monitorGating.executingMs < thresholds.longActiveMs
+      // BLO-27698 B3/B3a: fires on the *unattended* bucket. B1's addend is gone,
+      // so executing time no longer counts toward the trigger it was never
+      // evidence for. Still guarded by `!gatedIsUpperBound` above — the
+      // still-armed branch reports `unattendedMs: 0` as a deliberate upper
+      // bound, and treating that as measured would exempt any issue with a
+      // monitor armed however briefly (BLO-22331 AC2). B3b's
+      // `runaway_execution` is what keeps the case this narrowing drops
+      // detectable; it outranks this trigger, so an episode that qualifies
+      // never reaches this gate at all.
+      (monitorGating.unattendedMs < thresholds.longActiveMs ||
+        // BLO-27698 B2: the episode is more than half executing time. Same
+        // dominance shape as `noExecutableTurnDominant`, through the shared
+        // `isDominantEpisodeShare`, because both answer one question: is this
+        // episode better explained by something other than assignee inactivity?
+        //
+        // Deliberately NOT also gated on a run being live right now, which is
+        // where `noExecutableTurnDominantAndOpen` gets its bound. That guard
+        // would make this clause unreachable rather than conservative: a run
+        // that is live now started at or before the episode anchor
+        // (`mostRecentDispatchAt`), so its span covers the whole episode,
+        // `unattendedMs` is then ~0, and the first arm above has already
+        // suppressed. The bound here is the share test itself — as unattended
+        // time grows the ratio falls, and suppression lapses for good once the
+        // episode reaches twice the executing time. Bounded and self-clearing,
+        // which is what BLO-22331 AC2 requires; see the paired boundedness test.
+        isDominantEpisodeShare(monitorGating.executingMs, elapsedMs))
     ) {
       return null;
     }
@@ -4028,6 +4115,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           "- Diagnose and fix the underlying dispatch/runtime fault (crashloop, provider outage, retry exhaustion)",
           "- Confirm the fault has cleared and let the issue continue unattended (no assignee action needed)",
           "- If the fault persists, escalate for infrastructure remediation instead of reassigning or cancelling the source work",
+        ]
+        : evidence.trigger === "runaway_execution"
+        // BLO-27698 B3b: the four verdicts below all ask whether the assignee
+        // showed progress signals during time it was *not* working. That
+        // question is wrong here by construction — this trigger fires because a
+        // run is still executing right now — so asking it would invite a
+        // "close as productive" on a run nobody has bounded.
+        ? [
+          "A single run has held its turn longer than the whole-episode bar and is still signalling, so this is a runtime/cost question, not an assignee-inactivity one.",
+          "",
+          "Decide one of:",
+          "- Let it finish (the work genuinely needs a long turn; say so and snooze, naming the expected finish)",
+          "- Bound it (the run has no stopping condition — interrupt it and require the assignee to decompose the work before re-dispatching)",
+          "- Route to platform/SRE (the run is wedged rather than working: a live signal stream with no run comments and no cost growth is the shape to look for)",
         ]
         : [
           "A \"Close as productive\" verdict requires at least ONE of the following concrete progress signals:",
