@@ -2151,6 +2151,67 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.errorCode).toBe("process_lost");
   });
 
+  it("keeps a past-grace pre-adapter run whose executor is still in-process (BLO-33820)", async () => {
+    // The reservation shield above is measured from reservedAt and needs no
+    // liveness evidence, so a run whose workspace/preRun preparation crosses
+    // 15 min was reaped alive with `preAdapterJobLiveness: "unknown"` -- there
+    // is no Job yet for the alive-only guard to observe. In-process ownership
+    // is the only liveness signal available before Job creation.
+    const reservedAt = new Date(Date.now() - 16 * 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+    });
+    const reservation = await seedPrelaunchReservation({
+      companyId,
+      agentId,
+      runId,
+      state: "reserved",
+      reservedAt,
+    });
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).not.toContain(runId);
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBeNull();
+    const persistedReservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.id, reservation.id))
+      .then((rows) => rows[0]);
+    expect(persistedReservation?.releasedAt).toBeNull();
+  });
+
+  it("reaps an in-process pre-adapter run past the hard ceiling (BLO-33820 wedge bound)", async () => {
+    const reservedAt = new Date(Date.now() - 46 * 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+    });
+    await seedPrelaunchReservation({
+      companyId,
+      agentId,
+      runId,
+      state: "reserved",
+      reservedAt,
+    });
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect((await heartbeat.getRun(runId))?.errorCode).toBe("process_lost");
+  });
+
   it("immediately reaps a fresh exact-missing Job and records that adapter invocation started", async () => {
     const jobName = "agent-opencode-restart-missing";
     const { companyId, agentId, runId } = await seedRunFixture({

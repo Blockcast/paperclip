@@ -24496,6 +24496,58 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (activePrelaunchReservation) {
           continue;
         }
+        // BLO-33820: the bound above is measured from reservedAt and requires NO
+        // liveness evidence, so a run still preparing inside THIS process
+        // (worktree provisioning, preRun hooks, plugin prefetch, MCP setup) is
+        // reaped alive at exactly reservedAt+15m. Measured 2026-09-14 on three
+        // consecutive reaps -- 15m04s / 15m15s / 15m20s, every one carrying
+        // `preAdapterJobLiveness: "unknown"` -- because no Job exists yet to be
+        // observed "alive", so the alive-only guard below cannot protect the
+        // pre-Job window at all. The run then throws
+        // "reservation no longer owns launch" at markExternalRuntimeReservationLaunching(),
+        // which is why kube_job_status_failed stays 0: no Job is ever created.
+        //
+        // Before a Job exists, in-process ownership is the ONLY liveness signal,
+        // and it is authoritative rather than merely suggestive: nothing else can
+        // be driving a pre-adapter run, and activeRunExecutions dies with the
+        // process, so a server-restart orphan still reaps on the next process
+        // exactly as before.
+        //
+        // The `activeRunExecutions` bypass rationale above is only PARTLY
+        // inapplicable here, and the difference matters to whoever edits this
+        // next. Two of the three cases it cites -- a hung await on a vanished
+        // Job, an MCP RPC that never timed out -- presuppose a Job, so they
+        // cannot occur in the pre-Job window this guard shields. The third does
+        // NOT: `runLifecycleHook({ kind: "preRun" })` is awaited BETWEEN the two
+        // `markExternalRuntimeReservationLaunching()` call sites -- the
+        // k8s-isolation binding path marks before it, the launch path after --
+        // and this guard shields `reserved` OR `launching`, so the hook sits
+        // inside the shielded window on either path and is now protected where
+        // it previously was not.
+        //
+        // That exposure is narrower than the rationale implies. lifecycle-hook.ts
+        // spawns the hook `detached` and SIGKILLs the whole process GROUP at
+        // PRE_RUN_TIMEOUT_MS (30s), which reaches exactly the grandchildren it
+        // names (ccrotate -> Codex CLI): `close` fires and the run unblocks in
+        // 30s. Only a grandchild that ESCAPES the group (setsid, double-fork)
+        // keeps the pipe write-ends open -- the timer kills but does not itself
+        // resolve the promise, so `close` never fires -- and only that case
+        // reaches the EXTERNAL_LIFECYCLE_HARD_STALE_MS ceiling. Deliberate
+        // trade: the same ceiling a live-but-silent Job already gets, and it
+        // buys back the ~44% of reservations reaped alive at reservedAt+15m.
+        const inProcessPrelaunchOwner = Boolean(
+          reservation
+          && (reservation.state === "reserved" || reservation.state === "launching")
+          && reservation.jobName === null
+          && reservation.jobUid === null
+          && activeRunExecutions.has(run.id)
+          && Number.isFinite(reservationReservedAt)
+          && reservationReservedAt > 0
+          && now.getTime() - reservationReservedAt < EXTERNAL_LIFECYCLE_HARD_STALE_MS,
+        );
+        if (inProcessPrelaunchOwner) {
+          continue;
+        }
         // BLO-13176: past the grace, DO NOT blindly declare the run orphaned.
         // Workspace provisioning (image pull, repo clone, opencode/claude cold
         // boot) can exceed 5 min while the k8s Job is perfectly alive and simply
@@ -31996,13 +32048,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // Skip both so only the invocation that actually owns the terminal
           // outcome performs this cleanup.
           if (!abandonedForLiveOwnJob) {
+            // BLO-33820: keep this non-throwing. The `activeRunExecutions.delete`
+            // below is the only thing that clears the in-process ownership Set,
+            // and this diff makes that Set load-bearing for the reaper in the
+            // pre-Job window (see :23874) -- so an exception escaping here would
+            // leave a stale entry that now shields a run for up to
+            // EXTERNAL_LIFECYCLE_HARD_STALE_MS instead of being inert. The
+            // helper is already internally defensive (its only await is
+            // catch-wrapped at :12288 and it reports failure via its return
+            // value), so this matches the sibling below and pins that contract
+            // at the call site rather than fixing a live leak.
             await releaseEnvironmentLeasesForRun({
               runId: run.id,
               companyId: run.companyId,
               agentId: run.agentId,
               status: latestRun?.status,
               failureReason: latestRun?.error ?? undefined,
-            });
+            }).catch(() => undefined);
             await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
             if (runScratch && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
               const scratchForCleanup = runScratch;
