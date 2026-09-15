@@ -27,8 +27,20 @@ const mockCoreListPods = vi.fn();
 const mockCoreReadPodLog = vi.fn();
 const mockCoreCreateSecret = vi.fn();
 const mockCoreReadSecret = vi.fn();
-const mockCoreReplaceSecret = vi.fn();
 const mockCorePatchSecret = vi.fn();
+
+/**
+ * Adoption became a merge PATCH in BLO-32424 (the service account holds
+ * `patch` on secrets but not `update`, so the old PUT was refused 403 on every
+ * collision).  That lands it on the same `patchNamespacedSecret` the
+ * ownerReference attach already uses, so a raw call count now conflates two
+ * unrelated writes.  They are distinguishable by body shape: the
+ * ownerReference attach sends a JSON Patch *array*, adoption sends a
+ * merge-patch *object*.
+ */
+function adoptPatchCalls(): { name: string; body: { metadata?: { resourceVersion?: string } } }[] {
+  return mockCorePatchSecret.mock.calls.map((c) => c[0]).filter((arg) => !Array.isArray(arg?.body));
+}
 const mockCoreDeleteSecret = vi.fn();
 // vi.hoisted ensures a single vi.fn() instance shared between the mock factory
 // (which runs at hoist time) and the test body (which calls mockResolvedValue).
@@ -53,7 +65,6 @@ vi.mock("./k8s-client.js", () => ({
     readNamespacedPodLog: mockCoreReadPodLog,
     createNamespacedSecret: mockCoreCreateSecret,
     readNamespacedSecret: mockCoreReadSecret,
-    replaceNamespacedSecret: mockCoreReplaceSecret,
     patchNamespacedSecret: mockCorePatchSecret,
     deleteNamespacedSecret: mockCoreDeleteSecret,
   }),
@@ -1142,7 +1153,7 @@ describe("execute: job creation", () => {
     // undefined` from the read and a TypeError masked into a secret-create
     // failure — the exact trap the comment above was written about.
     mockCoreReadSecret.mockResolvedValue({ metadata: { resourceVersion: "1" } });
-    mockCoreReplaceSecret.mockResolvedValue({});
+    mockCorePatchSecret.mockResolvedValue({});
   });
 
   it("returns k8s_job_create_failed when createNamespacedJob throws", async () => {
@@ -1199,12 +1210,12 @@ describe("execute: job creation", () => {
         labels: { "app.kubernetes.io/managed-by": "paperclip", "paperclip.io/run-id": "run-test-001" },
       },
     });
-    mockCoreReplaceSecret.mockResolvedValue({});
+    mockCorePatchSecret.mockResolvedValue({});
 
     const result = await execute(largePromptCtx());
 
     expect(result.errorCode).not.toBe("k8s_prompt_secret_create_failed");
-    expect(mockCoreReplaceSecret).toHaveBeenCalledTimes(1);
+    expect(adoptPatchCalls()).toHaveLength(1);
     expect(mockBatchCreateJob).toHaveBeenCalled();
   });
 
@@ -1217,7 +1228,7 @@ describe("execute: job creation", () => {
     const result = await execute(largePromptCtx());
 
     expect(result.errorCode).not.toBe("k8s_prompt_secret_create_failed");
-    expect(mockCoreReplaceSecret).not.toHaveBeenCalled();
+    expect(adoptPatchCalls()).toHaveLength(0);
     expect(mockBatchCreateJob).toHaveBeenCalled();
   });
 
@@ -1233,7 +1244,7 @@ describe("execute: job creation", () => {
 
     expect(result.errorCode).toBe("k8s_prompt_secret_create_failed");
     expect(result.errorMessage).toContain("belongs to run some-other-run");
-    expect(mockCoreReplaceSecret).not.toHaveBeenCalled();
+    expect(adoptPatchCalls()).toHaveLength(0);
     expect(mockBatchCreateJob).not.toHaveBeenCalled();
   });
 
@@ -1248,7 +1259,7 @@ describe("execute: job creation", () => {
         labels: { "app.kubernetes.io/managed-by": "paperclip", "paperclip.io/run-id": "run-test-001" },
       },
     });
-    mockCoreReplaceSecret.mockResolvedValue({});
+    mockCorePatchSecret.mockResolvedValue({});
 
     const result = await execute(envSecretCtx());
 
@@ -1256,8 +1267,8 @@ describe("execute: job creation", () => {
     // The Secret that 409'd must be the env one, or this test is silently
     // re-testing the prompt path with different scaffolding.
     expect(mockCoreCreateSecret.mock.calls[0][0].body.metadata.name).toMatch(/-env$/);
-    expect(mockCoreReplaceSecret).toHaveBeenCalledTimes(1);
-    expect(mockCoreReplaceSecret.mock.calls[0][0].name).toMatch(/-env$/);
+    expect(adoptPatchCalls()).toHaveLength(1);
+    expect(adoptPatchCalls()[0].name).toMatch(/-env$/);
     expect(mockBatchCreateJob).toHaveBeenCalled();
   });
 
@@ -1291,7 +1302,7 @@ describe("execute: job creation", () => {
     mockCoreCreateSecret.mockResolvedValue({});
     mockCoreDeleteSecret.mockResolvedValue({});
     mockCoreReadSecret.mockResolvedValue({ metadata: { resourceVersion: "1" } });
-    mockCoreReplaceSecret.mockResolvedValue({});
+    mockCorePatchSecret.mockResolvedValue({});
   }
 
   /**

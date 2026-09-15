@@ -1,3 +1,4 @@
+import { PatchStrategy, setHeaderOptions } from "@kubernetes/client-node";
 import type { KubeClients } from "./kube-client.js";
 
 export interface CreatePerRunSecretInput {
@@ -105,17 +106,27 @@ export async function createPerRunSecret(clients: KubeClients, input: CreatePerR
       throw new Error(`Secret ${input.namespace}/${input.secretName} already exists with unexpected Paperclip identity`);
     }
 
-    await clients.core.replaceNamespacedSecret({
-      namespace: input.namespace,
-      name: input.secretName,
-      body: {
-        ...body,
-        metadata: {
-          ...body.metadata,
-          resourceVersion: existing.metadata?.resourceVersion,
+    // A merge PATCH, not `replaceNamespacedSecret`. A replace is a PUT, i.e.
+    // the `update` verb, and the in-cluster service account this plugin runs
+    // as holds `create`/`patch`/`delete`/`get` on secrets but NOT `update` —
+    // so the replace refused 403 on every collision (BLO-32424, measured on
+    // the vendored claude_k8s sibling that had the identical call).
+    // `resourceVersion` is still carried, so a concurrent writer still
+    // surfaces as a 409 rather than being silently clobbered.
+    await clients.core.patchNamespacedSecret(
+      {
+        namespace: input.namespace,
+        name: input.secretName,
+        body: {
+          ...body,
+          metadata: {
+            ...body.metadata,
+            resourceVersion: existing.metadata?.resourceVersion,
+          },
         },
       },
-    });
+      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+    );
   }
 }
 
