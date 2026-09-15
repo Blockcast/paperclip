@@ -415,10 +415,14 @@ export function evaluateCommentReviewGate(input: {
     // gate description is identical either way, so a silent regression back
     // onto the prose path — the exact thing this change retires — would be
     // invisible on the PR.
+    // Both phrasings are kept inside MAX_COMMIT_STATUS_DESCRIPTION. The writer
+    // in github-app-auth.ts slices at 140 before the POST, so an overlong
+    // description is never rejected — it is silently cut, and what it cuts is
+    // the tail, which is where the source attribution lives. Pinned by test.
     const source =
       parseAllyVerdictBlock(forHead.comment.body).kind === "ok"
         ? "its structured ally-verdict block"
-        : "prose fallback parsing (no ally-verdict block)";
+        : "prose fallback (no ally-verdict block)";
     return {
       state: "success",
       outcome: "clean",
