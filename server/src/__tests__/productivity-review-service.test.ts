@@ -8246,6 +8246,119 @@ describeEmbeddedPostgres("productivity review service", () => {
 
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description ?? "").not.toContain("Primary trigger: `runaway_execution`");
+    // Ally review follow-up: anchor the negative. Asserting only the absence of a
+    // trigger name would also pass if review generation broke outright for an
+    // unrelated reason, which would make this test stop discriminating silently.
+    //
+    // Nothing fires here, and that is the B3 + B3b design meeting rather than a
+    // gap: `runLiveInterval` caps this run at last-signal + 2h, so ~12h of the
+    // 13h episode is still attributed to *executing* — which leaves `unattendedMs`
+    // ~1h, below the bar, so B3 declines `long_active_duration` — while the span
+    // ends an hour before `now`, so it is not live and B3b declines
+    // `runaway_execution`. A wedged-but-silent holder is `no_comment_streak`'s
+    // case, not either B-group trigger's.
+    expect(result.created).toBe(0);
+  });
+
+  // BLO-27698 B3b (Ally review follow-up) — pins the human-gate opt-out that
+  // outranking `long_active_duration` creates. Every suppression gate in this
+  // file is keyed on `trigger === "long_active_duration"`, so selecting
+  // `runaway_execution` bypasses the approval gate, the pending-monitor
+  // suppression and the A1 progress-PR gate at once. That is intended — a run
+  // burning compute past the bar is not excused by a monitor that says "wake me
+  // later" — but it was previously unstated and unpinned: every other runaway
+  // fixture sets `monitorNextCheckAt: null`, so nothing would have caught a
+  // silent flip in either direction.
+  //
+  // Fires the trigger *through* an armed future monitor, which is exactly the
+  // configuration that suppresses `long_active_duration` in the sibling test
+  // below. If someone later decides a monitor should suppress runaway runs,
+  // this test must be changed deliberately rather than discovered broken.
+  it("fires runaway_execution through an armed monitor that would suppress long_active_duration", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      // Armed, in the future, and never yet fired — the shape
+      // `currentPendingMonitorForReviewSuppression` holds a review back on.
+      monitorNextCheckAt: new Date(now.getTime() + 60 * 60 * 1000),
+      monitorLastTriggeredAt: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      lastOutputAt: new Date(now.getTime() - 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `runaway_execution`");
+    // Not merely "a review fired" — it must not have been recorded as a
+    // monitor-suppressed review, which is the shape the gate would have produced.
+    expect(review?.description).not.toContain("Suppressed by a scheduled monitor");
+  });
+
+  // BLO-27698 B3b (Ally review follow-up) — `reconcileProductivityReviews`
+  // selects candidates in `["todo", "in_progress"]`, but `elapsedMs` is null for
+  // anything not `in_progress`. Without the `elapsedMs !== null` guard,
+  // `runaway_execution` keys purely on a live run span and so fires on a `todo`
+  // issue that still carries a signalling `running` row — an issue released back
+  // to `todo` mid-run, or a checkout that never landed. `long_active_duration`
+  // is structurally incapable of producing that report, so this trigger must not
+  // introduce it: such a review renders "Current active elapsed time: unknown"
+  // with no `Elapsed accounting` line, i.e. it would be evidence-free as well as
+  // wrong.
+  it("does not fire runaway_execution on a todo issue with a live running row", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "todo",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      // Signalling as of `now`, so the span IS live — the guard, not staleness,
+      // is what has to stop this. Restoring the unguarded predicate turns this red.
+      lastOutputAt: new Date(now.getTime() - 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description ?? "").not.toContain("Primary trigger: `runaway_execution`");
+    expect(result.created).toBe(0);
   });
 
   it("does not suppress no-comment productivity reviews for future monitor waits", async () => {
