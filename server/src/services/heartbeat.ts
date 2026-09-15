@@ -23888,19 +23888,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // process, so a server-restart orphan still reaps on the next process
         // exactly as before.
         //
-        // The line-23833 rationale for ignoring this Set is only PARTLY
+        // The `activeRunExecutions` bypass rationale above is only PARTLY
         // inapplicable here, and the difference matters to whoever edits this
         // next. Two of the three cases it cites -- a hung await on a vanished
         // Job, an MCP RPC that never timed out -- presuppose a Job, so they
         // cannot occur in the pre-Job window this guard shields. The third does
-        // NOT: the preRun hook runs at :28977, strictly before
-        // markExternalRuntimeReservationLaunching() at :29702, so a preRun hook
-        // whose grandchildren hold pipes hangs INSIDE this window and is now
-        // shielded where it previously was not. That is a deliberate trade --
-        // it is bounded by the same EXTERNAL_LIFECYCLE_HARD_STALE_MS ceiling a
-        // live-but-silent Job already gets, so a genuinely wedged executor
-        // still converges, and it buys back the ~44% of reservations that were
-        // being reaped alive at exactly reservedAt+15m.
+        // NOT: `runLifecycleHook({ kind: "preRun" })` is awaited BETWEEN the two
+        // `markExternalRuntimeReservationLaunching()` call sites -- the
+        // k8s-isolation binding path marks before it, the launch path after --
+        // and this guard shields `reserved` OR `launching`, so the hook sits
+        // inside the shielded window on either path and is now protected where
+        // it previously was not.
+        //
+        // That exposure is narrower than the rationale implies. lifecycle-hook.ts
+        // spawns the hook `detached` and SIGKILLs the whole process GROUP at
+        // PRE_RUN_TIMEOUT_MS (30s), which reaches exactly the grandchildren it
+        // names (ccrotate -> Codex CLI): `close` fires and the run unblocks in
+        // 30s. Only a grandchild that ESCAPES the group (setsid, double-fork)
+        // keeps the pipe write-ends open -- the timer kills but does not itself
+        // resolve the promise, so `close` never fires -- and only that case
+        // reaches the EXTERNAL_LIFECYCLE_HARD_STALE_MS ceiling. Deliberate
+        // trade: the same ceiling a live-but-silent Job already gets, and it
+        // buys back the ~44% of reservations reaped alive at reservedAt+15m.
         const inProcessPrelaunchOwner = Boolean(
           reservation
           && (reservation.state === "reserved" || reservation.state === "launching")
