@@ -1,0 +1,223 @@
+# PEN-3281: a scheduled guard that STOPS RUNNING emits no signal anywhere.
+#
+# THE GAP
+#
+# A GitHub Actions run sitting in `queued` has no `conclusion`. It is not
+# `failure`, not `cancelled`, not `timed_out` — it is nothing. So on every
+# dashboard and in every rollup, a control that has silently ceased to enforce
+# is indistinguishable from a control that ran and found nothing to report.
+#
+# Measured 2026-09-15: six scheduled guards on this repo — review-gate-sweep,
+# Ally Review Consistency Guard, CODEOWNERS Guard, Relay SSL Multicert Guard,
+# Lockfile Drift Monitor, Adapter Pin Drift Monitor — had not executed since
+# 03:41Z because the `arc-default` ARC listener was gone (PEN-3272). Two of
+# them are security controls. Nothing went red for ten hours.
+#
+# THIS IS RECURRENT, NOT A ONE-OFF. Reading the completion history of all six
+# back to 2026-09-11 turns up two earlier instances of the same silent stop,
+# neither of which was noticed at the time:
+#
+#   2026-09-14  15:34Z -> 20:41Z   all six, 213-305 min, resumed within 4 min
+#   2026-09-11  12:4xZ -> 14:3xZ   five of six, 106-118 min, resumed within 2 min
+#
+# Six independent hourly crons do not resume within four minutes of each other
+# by chance; that signature is a shared lane outage. So the detection gap has
+# already cost at least two unobserved coverage outages before this one.
+#
+# WHAT THIS WATCHES: LIVENESS, NOT VERDICT — AND WHY THAT IS THE CHOICE
+#
+# PEN-3281 asked whether to alarm on age-since-last-SUCCESS or on run state.
+# Neither. This job alarms on AGE SINCE LAST COMPLETION, any conclusion.
+#
+#   * Run-state polling (the `queued` scan in onprem-k8s's
+#     detect-wedged-review-gate-runs.yaml) only sees a run that exists and is
+#     stuck. It is blind to a workflow that was disabled, descheduled, renamed,
+#     or never triggered at all — all of which stop enforcement just as dead.
+#
+#   * Age-since-last-SUCCESS is the stronger-sounding invariant and is the one
+#     PEN-3281 guessed at, but on THIS repo it is unusable, and not
+#     hypothetically: `ally-review-consistency` has 0 successes in its last 100
+#     runs (88 failures), and `review-gate-sweep` fails 18 of every 90. A
+#     since-success detector would therefore be born permanently red — which is
+#     precisely the defect PEN-2847 already documents about that very guard:
+#     "a permanently-red auditor cannot signal a new violation." Adopting it
+#     would reproduce PEN-2847 inside the detector meant to fix PEN-3281.
+#
+# So liveness and verdict are kept orthogonal. This job answers only "did the
+# control execute?". Whether it PASSED is a separate question with separate
+# owners (PEN-2847 for ally-review-consistency). A guard that runs and reports
+# a real failure is enforcing correctly and must not also trip this alarm.
+#
+# THE 4-HOUR THRESHOLD IS MEASURED, NOT GUESSED
+#
+# All six guards are hourly. Every completion gap across all six back to
+# 2026-09-11 was enumerated and the distribution is sharply bimodal:
+#
+#   ordinary jitter   <= 118 min   scattered; a recurring ~90-110 min band
+#                                  overnight, consistent with GitHub dropping
+#                                  scheduled runs under load
+#   outage clusters   213-305 min  the two events named above, all six
+#                                  workflows moving together
+#
+# 4h sits at 2.03x the observed jitter ceiling and below every observed outage
+# gap but one. The first draft of this job used 4h derived from the *raw* max
+# healthy gap of 305 min — which was wrong, because that 305 min sample WAS the
+# 2026-09-14 outage. Baselining on the incident would have set the bar above
+# the thing it must catch. The clusters were separated before the number was
+# chosen.
+#
+# It is deliberately not tighter. This job's whole value is being believed; an
+# alarm that fires on ordinary cron jitter gets muted, and a muted liveness
+# alarm reproduces the exact failure mode it exists to prevent.
+#
+# Detection is per-EVENT, not per-workflow: any one of the six breaching is
+# enough to red the job. Against the 2026-09-14 event, five of six breached 4h
+# (lockfile-drift-monitor reached only 213 min), so the event would have been
+# reported even though one leg of it would not have been.
+#
+# WHY arc-light AND NOT default
+#
+# All six watched guards run on `default`. A detector on `default` dies with
+# exactly the fault it exists to catch, and would have been silent through all
+# three outages above. `arc-light` is a different ARC pool and was dispatching
+# normally throughout; master-health.yml already runs `gh api` on arc-light
+# with GH_TOKEN: ${{ github.token }}, so this is established in-repo practice.
+#
+# RESIDUAL, STATED PLAINLY
+#
+#   1. A total arc-light stall silences this job. No in-repo detector can
+#      escape needing a runner; this only ensures the detector does not share a
+#      failure domain with its subject.
+#   2. WATCHED_WORKFLOWS below is an explicit list, NOT "all scheduled guards".
+#      A new scheduled guard added on `default` is unwatched until it is added
+#      here. Deriving the set by parsing workflow YAML was considered and
+#      rejected as more fragile than the gap it closes; the list is short and
+#      the failure is loud (see the unreadable-workflow branch, which reds
+#      rather than skipping).
+#
+# Cost is at most 12 read-only API calls an hour.
+name: Scheduled Guard Liveness
+
+on:
+  schedule:
+    # :47 — clear of the minutes the watched guards already occupy
+    # (:09 x2, :17, :23, :31, :41) so this does not pile onto their burst.
+    - cron: "47 * * * *"
+  workflow_dispatch:
+
+permissions:
+  # Read-only. Enumerating workflows and their runs is all this needs, and
+  # notably NOT `issues: write` — see the uniqueness argument in
+  # onprem-k8s's detect-wedged-review-gate-runs.yaml.
+  actions: read
+
+concurrency:
+  group: scheduled-guard-liveness
+  cancel-in-progress: true
+
+jobs:
+  check-guard-liveness:
+    name: scheduled guards have executed recently
+    runs-on: arc-light
+    timeout-minutes: 10
+    steps:
+      - name: Report scheduled guards that have stopped executing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          STALE_HOURS: "4"
+          WATCHED_WORKFLOWS: >-
+            review-gate-sweep.yml
+            ally-review-consistency.yml
+            codeowners-guard.yml
+            relay-ssl-multicert-guard.yml
+            lockfile-drift-monitor.yml
+            adapter-pin-drift-monitor.yml
+        run: |
+          set -euo pipefail
+
+          now=$(date -u +%s)
+          cutoff=$(( now - STALE_HOURS * 3600 ))
+          stale=0
+          checked=0
+
+          for wf in $WATCHED_WORKFLOWS; do
+            checked=$(( checked + 1 ))
+
+            # A renamed, deleted or manually/inactivity-disabled workflow stops
+            # enforcing just as completely as a starved one, and is invisible to
+            # any run-state scan. Fail loudly rather than skipping: silently
+            # dropping a guard from the watched set is this row's whole defect.
+            if ! meta=$(gh api "repos/$REPO/actions/workflows/$wf" \
+              --jq '[.state, .name] | @tsv' 2>/dev/null); then
+              echo "::error title=Guard workflow unreadable::$wf could not be read from repos/$REPO/actions/workflows. It was renamed, deleted, or the token lost access. Either way this guard is no longer being watched: fix the path in WATCHED_WORKFLOWS in .github/workflows/scheduled-guard-liveness.yml, or remove it deliberately."
+              stale=$(( stale + 1 ))
+              continue
+            fi
+
+            IFS=$'\t' read -r state name <<< "$meta"
+
+            if [ "$state" != "active" ]; then
+              echo "::error title=Guard workflow disabled::$name ($wf) has state '$state', so its schedule no longer fires. GitHub sets disabled_inactivity automatically on scheduled workflows in dormant repositories; disabled_manually means a human turned it off. Re-enable it, or drop it from WATCHED_WORKFLOWS if it was retired on purpose."
+              stale=$(( stale + 1 ))
+              continue
+            fi
+
+            # Newest COMPLETED run, any conclusion. per_page=1 on a
+            # server-side-filtered query: no pagination, so the 1000-item cap
+            # that bites --paginate scans cannot truncate this.
+            if ! newest=$(gh api \
+              "repos/$REPO/actions/workflows/$wf/runs?status=completed&per_page=1" \
+              --jq '.workflow_runs[0] | [.updated_at, .conclusion, .html_url] | @tsv' 2>/dev/null); then
+              echo "::error title=Guard run history unreadable::could not enumerate completed runs for $name ($wf). Treating as stale: an API error must not read as health."
+              stale=$(( stale + 1 ))
+              continue
+            fi
+
+            if [ -z "${newest:-}" ] || [ "$newest" = "null" ]; then
+              echo "::error title=Guard has never completed::$name ($wf) is active but has no completed run at all. It has never enforced anything."
+              stale=$(( stale + 1 ))
+              continue
+            fi
+
+            IFS=$'\t' read -r completed conclusion url <<< "$newest"
+
+            # An unparsable timestamp must not silently drop a candidate.
+            if ! completed_epoch=$(date -u -d "$completed" +%s 2>/dev/null); then
+              echo "::warning title=Unparsable run timestamp::$name ($wf) has updated_at '$completed'; cannot age it"
+              continue
+            fi
+
+            if [ "$completed_epoch" -gt "$cutoff" ]; then
+              age_m=$(( ( now - completed_epoch ) / 60 ))
+              echo "ok: $name last completed ${age_m}m ago (conclusion=$conclusion)"
+              continue
+            fi
+
+            stale=$(( stale + 1 ))
+            age_h=$(( ( now - completed_epoch ) / 3600 ))
+
+            # Only now, and only for a guard already known stale, spend a call
+            # to distinguish the stop-modes. They have different owners:
+            # starved-behind-a-dead-lane is an ARC/infra fault, whereas nothing
+            # queued at all points at the schedule itself.
+            queued=$(gh api \
+              "repos/$REPO/actions/workflows/$wf/runs?status=queued&per_page=100" \
+              --jq '.workflow_runs | length' 2>/dev/null || echo "?")
+
+            if [ "$queued" != "0" ] && [ "$queued" != "?" ]; then
+              detail="$queued run(s) are sitting in 'queued' and have never started — the schedule is firing but nothing is dispatching them. That is a runner-lane fault: check the ARC listener for the 'default' label (cf. PEN-3272)."
+            else
+              detail="nothing is queued either, so the schedule itself is not producing runs. Check the workflow's cron and whether the default branch still carries it."
+            fi
+
+            echo "::error title=Scheduled guard has stopped executing::$name ($wf) last completed ${age_h}h ago (at $completed, conclusion=$conclusion), past the ${STALE_HOURS}h liveness threshold. $detail This guard is not enforcing anything right now, and a stopped guard reds nothing on its own — that silence is why this job exists (PEN-3281). Last run: $url"
+          done
+
+          if [ "$stale" -eq 0 ]; then
+            echo "All $checked watched scheduled guards have completed within ${STALE_HOURS}h."
+            exit 0
+          fi
+
+          echo "$stale of $checked watched scheduled guard(s) have stopped executing." >&2
+          exit 1
