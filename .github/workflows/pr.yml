@@ -1748,6 +1748,13 @@ jobs:
           }
           CONF
 
+      # Without a built bundle the e2e server falls back to Vite dev middleware
+      # and serves the UI as an unbundled module graph, costing 12-41s per
+      # navigation (BLO-33478). Build once so the suite exercises the same
+      # static bundle production serves.
+      - name: Build UI bundle for e2e
+        run: pnpm --filter @paperclipai/ui build
+
       - name: Run e2e tests
         env:
           PAPERCLIP_E2E_SKIP_LLM: "true"

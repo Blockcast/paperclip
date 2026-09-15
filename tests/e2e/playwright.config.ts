@@ -15,6 +15,20 @@ const PAPERCLIP_TOOL_ACTION_SIGNING_SECRET =
   process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET ?? "playwright-e2e-tool-action-signing-secret";
 const PLAYWRIGHT_CHANNEL = process.env.PAPERCLIP_PLAYWRIGHT_CHANNEL;
 
+// `paperclipai run` auto-enables Vite dev middleware whenever the server runs
+// from source (cli/src/commands/run.ts:143), which is how the e2e webServer
+// below starts. Dev middleware serves the UI as an unbundled ES module graph,
+// and every test gets a fresh browser context with an empty HTTP cache, so each
+// navigation refetches the whole graph: measured 12-41s from document to the
+// app's first request across all 26 navigations of one CI run (BLO-33478),
+// flat over the run and unchanged on repeat hits to the same route. Nothing
+// renders in that window — CloudAccessGate holds `Loading...` until /api/health
+// resolves — so any assertion on post-boot DOM races it. Serve the built bundle
+// when one exists; a checkout without `pnpm --filter @paperclipai/ui build`
+// keeps the dev-middleware behaviour.
+const UI_DIST_INDEX = path.resolve(import.meta.dirname, "../../ui/dist/index.html");
+const UI_DEV_MIDDLEWARE = fs.existsSync(UI_DIST_INDEX) ? "false" : "true";
+
 process.env.PAPERCLIP_HOME = PAPERCLIP_HOME;
 process.env.PAPERCLIP_CONFIG = PAPERCLIP_CONFIG;
 process.env.PAPERCLIP_AGENT_JWT_SECRET = PAPERCLIP_AGENT_JWT_SECRET;
@@ -81,6 +95,7 @@ export default defineConfig({
       PAPERCLIP_AGENT_JWT_SECRET,
       PAPERCLIP_TOOL_ACTION_SIGNING_SECRET,
       PAPERCLIP_BIND: "loopback",
+      PAPERCLIP_UI_DEV_MIDDLEWARE: UI_DEV_MIDDLEWARE,
       PAPERCLIP_DEPLOYMENT_MODE: "local_trusted",
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "private",
     },
