@@ -5,6 +5,7 @@ import {
   PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH,
   PLUGIN_METRIC_NAME_BUDGET,
   PLUGIN_METRIC_OVERFLOW_NAME,
+  PLUGIN_METRIC_PROMOTABLE_TAG_KEYS,
   PLUGIN_METRIC_TAG_LABEL_PREFIX,
   PLUGIN_METRIC_TOTAL_METRIC,
   __resetMetricsForTest,
@@ -606,6 +607,67 @@ describe("recordPluginMetric — never throws", () => {
           ...patch,
         } as Parameters<typeof recordPluginMetric>[0]),
       ).not.toThrow();
+    }
+  });
+});
+
+/**
+ * BLO-32163 — a wedged aggregate lifecycle fence must be nameable from the
+ * page alone.
+ *
+ * The promotion gate is two-sided by construction (see
+ * PLUGIN_METRIC_PROMOTABLE_TAG_KEYS): a tag becomes a label only if BOTH this
+ * allow-list and the emitting plugin's manifest `metricLabels` carry the key.
+ * That means either side regressing drops the label while the metric keeps
+ * publishing — the series still exists, the rule still evaluates, and the page
+ * simply stops saying which aggregate is stuck. There is no error and no gap
+ * in the graph, so both sides are pinned.
+ *
+ * This file pins the PLATFORM half only. The alertmanager plugin is
+ * deliberately not a server dependency, so the manifest half is pinned inside
+ * that package instead (`manifest-metric-labels.test.ts`) rather than pulled
+ * across the package boundary for one assertion.
+ */
+describe("BLO-32163 — fence-blocked labels survive the two-sided promotion gate", () => {
+  // Mirrors the alertmanager manifest's `metricLabels`. Held as a literal
+  // because importing it would make a plugin a dependency of the server.
+  const MANIFEST_METRIC_LABELS = [
+    "aggregate_key",
+    "alertname",
+    "phase",
+    "severity",
+    "version",
+  ];
+
+  it("promotes aggregate_key and phase for the fence-blocked shape", async () => {
+    recordPluginMetric({
+      ...PLUGIN,
+      name: "alertmanager.aggregate.fence_blocked",
+      value: 930,
+      tags: {
+        alertname: "ArgoAppOutOfSyncTooLong",
+        aggregate_key: 'alert-aggregate:v1:["ArgoAppOutOfSyncTooLong",null]',
+        phase: "firing",
+      },
+      declaredLabels: MANIFEST_METRIC_LABELS,
+    });
+
+    const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
+    expect(series).toHaveLength(1);
+    expect(series[0]).toContain('metric="alertmanager.aggregate.fence_blocked"');
+    // The identifying label. Asserted on the rendered exposition, so a change
+    // that promotes the key but mangles the value still fails here.
+    expect(series[0]).toContain(
+      `${PLUGIN_METRIC_TAG_LABEL_PREFIX}aggregate_key="alert-aggregate:v1:[\\"ArgoAppOutOfSyncTooLong\\",null]"`,
+    );
+    expect(series[0]).toContain(`${PLUGIN_METRIC_TAG_LABEL_PREFIX}phase="firing"`);
+  });
+
+  it("admits both keys to the platform allow-list", () => {
+    // Guards the silent-degradation path: dropping either key from the
+    // allow-list leaves a fence page that cannot name the wedged aggregate.
+    for (const key of ["aggregate_key", "phase"] as const) {
+      expect(PLUGIN_METRIC_PROMOTABLE_TAG_KEYS).toContain(key);
     }
   });
 });

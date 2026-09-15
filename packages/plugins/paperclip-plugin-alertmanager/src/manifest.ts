@@ -54,7 +54,16 @@ const manifest: PaperclipPluginManifestV1 = {
   // `alertname` is the load-bearing one — it is what distinguishes "one rule
   // cannot be owned" from "delivery is broken", a distinction that cost 89h on
   // PEN-2581. Bounded by the number of alert rules, not by traffic.
-  metricLabels: ["alertname", "severity", "version"],
+  //
+  // BLO-32163 adds `aggregate_key` and `phase`, which is what makes a wedged
+  // aggregate lifecycle fence nameable from the page alone. Without
+  // `aggregate_key` the fence signal publishes but identifies nothing: two
+  // aggregates of the same rule differing only by dedupe-domain are distinct
+  // fences that wedge independently, so `alertname` cannot single out the one
+  // that is actually stuck. `phase` names which half of the lifecycle is
+  // holding (`firing` vs `cancelling`), which is the first thing a responder
+  // needs and is a closed four-value vocabulary.
+  metricLabels: ["aggregate_key", "alertname", "phase", "severity", "version"],
   entrypoints: {
     worker: "./dist/worker.js",
   },
