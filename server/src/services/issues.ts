@@ -7894,12 +7894,16 @@ export function issueService(db: Db) {
     /**
      * Authoritative per-agent open-assignment census for one company.
      *
-     * Why this exists: `GET /companies/:id/issues` silently clamps `limit` to
-     * {@link ISSUE_LIST_MAX_LIMIT} and returns a bare array — no total, no
-     * cursor — so a caller cannot distinguish "1000 rows is everything" from
-     * "1000 rows is a truncated prefix", and offset paging over a mutating
-     * collection duplicates and drops rows. Callers that need exact counts must
-     * not derive them from that population.
+     * Why this exists: `GET /companies/:id/issues` clamps `limit` to
+     * {@link ISSUE_LIST_MAX_LIMIT} and returns a bare array, and offset paging
+     * over a mutating collection duplicates and drops rows. Callers that need
+     * exact counts must not derive them from that population.
+     *
+     * BLO-33741 made the clamp visible — the route now reports it via the
+     * `X-Result-Truncated`/`X-Applied-Limit` response headers, so a caller can
+     * at least tell "1000 rows is everything" from "1000 rows is a prefix".
+     * That is a detection signal, NOT a substitute for this census: knowing a
+     * page was truncated still leaves you paging a moving collection.
      *
      * The completeness guarantee is structural, not advisory: the whole census
      * is computed by ONE SQL statement. Postgres evaluates a statement against
