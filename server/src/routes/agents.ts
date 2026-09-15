@@ -63,6 +63,7 @@ import {
 } from "../services/index.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, decideRunTranscriptRead, getAccessibleResource, getActorInfo, hasCompanyAccess, runTranscriptReadGate } from "./authz.js";
+import type { RunTranscriptReadOutcome } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
@@ -118,7 +119,7 @@ import { assertEnvironmentSelectionForCompany } from "./environment-selection.js
 import { recoveryService } from "../services/recovery/service.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
 import { readObject } from "../lib/objects.js";
-import { publicWorkspaceOperations, resolveWorkspaceRuntimeViewer } from "./workspace-response.js";
+import { publicWorkspaceOperations, resolveWorkspaceRuntimeViewer, withholdUnentitledWorkspaceOperationOutput } from "./workspace-response.js";
 import { listInvalidOrgChainDescendantIds } from "../services/agent-invokability.js";
 import {
   AGENT_PROFILE_CHANGE_CONSENT_FIELDS,
@@ -389,6 +390,51 @@ export function agentRoutes(
         offset: opts.offset,
         limitBytes: opts.limitBytes,
         logStore: run.logStore,
+      },
+    });
+  }
+
+  /**
+   * PEN-3204: `GET /workspace-operations/:operationId/log` had NEITHER half of
+   * the control pair — no read-side gate and no access audit. PEN-3140's table
+   * gave `/log` an audit and `/events` a projection, and this sibling path was
+   * simply absent from it; it must not come out of this change with only one.
+   *
+   * A distinct action from `heartbeat.run_log_accessed` for the same reason
+   * `heartbeat.run_events_accessed` is: the paths are separately reachable and a
+   * forensic reader needs to know which one a caller used. Entity is the
+   * operation, and `runId` carries the operation's owning run rather than the
+   * actor's, so an audit row points at the transcript that was read.
+   *
+   * `ownerAgentId` is recorded because it is the subject the decision was made
+   * about, and `null` there is the fail-closed branch — it tells a reader the
+   * access was decided with no resolvable owner rather than against one.
+   */
+  async function logWorkspaceOperationLogAccessAudit(
+    req: Request,
+    operation: { id: string; companyId: string; heartbeatRunId: string | null; logStore: string | null },
+    result: "allowed" | "denied",
+    opts: { offset: number; limitBytes: number; ownerAgentId?: string | null },
+  ) {
+    const actor = getRunLogAuditActor(req);
+    await logActivity(db, {
+      companyId: operation.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: operation.heartbeatRunId,
+      action: "workspace_operation.log_accessed",
+      entityType: "workspace_operation",
+      entityId: operation.id,
+      details: {
+        result,
+        actorSource: actor.actorSource,
+        actorRunId: actor.actorRunId,
+        offset: opts.offset,
+        limitBytes: opts.limitBytes,
+        logStore: operation.logStore,
+        heartbeatRunId: operation.heartbeatRunId,
+        ownerAgentId: opts.ownerAgentId ?? null,
       },
     });
   }
@@ -5171,8 +5217,22 @@ export function agentRoutes(
     // `WorkspaceOperation` rows carrying the same copied `command`/`cwd`, gated only on company
     // scope, so withholding on one route and not the other leaves the exit open one URL over.
     const viewer = await resolveWorkspaceRuntimeViewer(access, req, run.companyId);
-    res.json(redactCurrentUserValue(
+    // PEN-3204: second, orthogonal gate — the captured OUTPUT narrows to the
+    // run-transcript decision while the operation row stays company-readable.
+    //
+    // Scoped per operation rather than per route: `listForRun` deliberately also
+    // returns run-less workspace-scoped cleanup rows, so the rows in this one
+    // response do not all share this run's owner, and `run.agentId` is the wrong
+    // answer for the cleanup ones.
+    const owners = await workspaceOperations.owningAgentIdsByRunId(operations.map((op) => op.heartbeatRunId));
+    const projected = await withholdUnentitledWorkspaceOperationOutput(
       publicWorkspaceOperations(operations, viewer),
+      owners,
+      runTranscriptReadGate(req, access, run.companyId),
+      req.actor.type === "board",
+    );
+    res.json(redactCurrentUserValue(
+      projected,
       await getCurrentUserRedactionOptions(),
     ));
   });
@@ -5184,8 +5244,39 @@ export function agentRoutes(
 
     const offset = Number(req.query.offset ?? 0);
     const limitBytes = readRunLogLimitBytes(req.query.limitBytes);
+    const normalizedOffset = Number.isFinite(offset) ? offset : 0;
+
+    // PEN-3204: this entire body is captured command output — transcript, not
+    // state — so it is gated on the same decision as the run transcript rather
+    // than projected. Mirrors `GET /heartbeat-runs/:runId/log` above: 403 with
+    // the decider's named boundary vocabulary, and the cross-tenant 404 from
+    // `getAccessibleResource` left untouched, since that is the case where the
+    // operation's existence is itself the secret.
+    //
+    // The path carries a bare operation id with no run in it, so the owning
+    // agent is resolved through `heartbeatRunId`. Unresolvable owner means
+    // withhold — see `withholdUnentitledWorkspaceOperationOutput` for why that
+    // is decided here rather than handed to the decider, which would fall
+    // through to the company-wide grant on a null agent id.
+    const owners = await workspaceOperations.owningAgentIdsByRunId([operation.heartbeatRunId]);
+    const ownerAgentId = operation.heartbeatRunId ? owners.get(operation.heartbeatRunId) : undefined;
+    const transcriptAccess: RunTranscriptReadOutcome = ownerAgentId
+      ? await decideRunTranscriptRead(req, access, { companyId: operation.companyId, agentId: ownerAgentId })
+      : { allowed: req.actor.type === "board", decision: null };
+
+    if (!transcriptAccess.allowed) {
+      await logWorkspaceOperationLogAccessAudit(req, operation, "denied", { offset: normalizedOffset, limitBytes, ownerAgentId: ownerAgentId ?? null });
+      throw forbidden(
+        transcriptAccess.decision?.explanation ?? "Workspace operation output access is not permitted for this actor.",
+        transcriptAccess.decision
+          ? authorizationDeniedDetails(transcriptAccess.decision)
+          : { reason: "deny_unresolved_run_owner" as const },
+      );
+    }
+
+    await logWorkspaceOperationLogAccessAudit(req, operation, "allowed", { offset: normalizedOffset, limitBytes, ownerAgentId: ownerAgentId ?? null });
     const result = await workspaceOperations.readLog(operationId, {
-      offset: Number.isFinite(offset) ? offset : 0,
+      offset: normalizedOffset,
       limitBytes,
     });
 

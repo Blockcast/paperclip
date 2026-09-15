@@ -34,8 +34,14 @@ const mockHeartbeatService = vi.hoisted(() => ({
 
 const mockWorkspaceOperationService = vi.hoisted(() => ({
   listForRun: vi.fn(),
+  listForExecutionWorkspace: vi.fn(),
   getById: vi.fn(),
   readLog: vi.fn(),
+  owningAgentIdsByRunId: vi.fn(),
+}));
+
+const mockExecutionWorkspaceService = vi.hoisted(() => ({
+  getById: vi.fn(),
 }));
 
 const mockInstanceSettingsService = vi.hoisted(() => ({
@@ -95,6 +101,7 @@ function registerModuleMocks() {
     secretService: () => ({}),
     syncInstructionsBundleConfigFromFilePath: vi.fn((_agent, config) => config),
     workspaceOperationService: () => mockWorkspaceOperationService,
+    executionWorkspaceService: () => mockExecutionWorkspaceService,
   }));
 
   vi.doMock("../adapters/index.js", () => ({
@@ -122,6 +129,14 @@ const peerAgentActor = {
   runId: "actor-run-1",
 };
 
+const ownerAgentActor = {
+  type: "agent",
+  agentId: runOwnerAgentId,
+  companyId: "company-1",
+  source: "agent_key",
+  runId: "run-1",
+};
+
 async function createApp(actor: Record<string, unknown> = boardActor) {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
@@ -137,6 +152,30 @@ async function createApp(actor: Record<string, unknown> = boardActor) {
     next();
   });
   app.use("/api", agentRoutes({} as any, {} as any));
+  app.use(errorHandler);
+  return app;
+}
+
+/**
+ * PEN-3204: the third read route lives in a different router, so it needs its own
+ * app. Mounting only `agentRoutes` is exactly how a gate gets added to two of
+ * three sibling paths and the third is never exercised.
+ */
+async function createWorkspaceApp(actor: Record<string, unknown> = boardActor) {
+  const [{ executionWorkspaceRoutes }, { errorHandler }] = await Promise.all([
+    vi.importActual<typeof import("../routes/execution-workspaces.js")>("../routes/execution-workspaces.js"),
+    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+  ]);
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    (req as any).actor = {
+      ...actor,
+      companyIds: Array.isArray(actor.companyIds) ? [...actor.companyIds] : actor.companyIds,
+    };
+    next();
+  });
+  app.use("/api", executionWorkspaceRoutes({} as any, {} as any));
   app.use(errorHandler);
   return app;
 }
@@ -193,6 +232,53 @@ function auditCallsFor(action: string) {
   return mockLogActivity.mock.calls.filter((call) => call[1]?.action === action);
 }
 
+/**
+ * PEN-3204 fixtures. `WORKSPACE_OP_CANARY` is the string that must never reach an
+ * unentitled reader through any of the three workspace-operation read routes.
+ *
+ * `runAttachedOperation` has an owning agent reachable via `heartbeatRunId`;
+ * `runlessCleanupOperation` has `heartbeatRunId: null`, which `listForRun`
+ * deliberately returns for workspace-scoped cleanup and which no owner lookup can
+ * resolve. The second one is the fail-closed branch and is the reason the map-miss
+ * must withhold rather than fall open.
+ */
+const WORKSPACE_OP_CANARY = "npm ERR! authToken=npm_not-a-real-token";
+
+const runAttachedOperation = {
+  id: "op-1",
+  companyId: "company-1",
+  executionWorkspaceId: "workspace-1",
+  heartbeatRunId: "run-1",
+  issueId: "issue-1",
+  phase: "workspace_provision",
+  command: "git clone https://github.com/example/repo.git",
+  cwd: "/workspaces/repo",
+  status: "succeeded",
+  exitCode: 0,
+  logStore: "db",
+  logRef: "op-1.log",
+  logBytes: 2048,
+  logSha256: "abc123",
+  logCompressed: false,
+  stdoutExcerpt: WORKSPACE_OP_CANARY,
+  stderrExcerpt: `stderr also carries it: ${WORKSPACE_OP_CANARY}`,
+  metadata: { worktreePath: "/workspaces/repo" },
+  startedAt: new Date("2026-09-10T03:50:00.000Z"),
+  finishedAt: new Date("2026-09-10T03:51:00.000Z"),
+  createdAt: new Date("2026-09-10T03:50:00.000Z"),
+  updatedAt: new Date("2026-09-10T03:51:00.000Z"),
+};
+
+const runlessCleanupOperation = {
+  ...runAttachedOperation,
+  id: "op-2",
+  heartbeatRunId: null,
+  issueId: null,
+  phase: "workspace_cleanup",
+  command: "rm -rf /workspaces/repo",
+  exitCode: 0,
+};
+
 describe("run transcript scoping (PEN-3142)", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -203,6 +289,7 @@ describe("run transcript scoping (PEN-3142)", () => {
     vi.doUnmock("../services/issues.js");
     vi.doUnmock("../adapters/index.js");
     vi.doUnmock("../routes/agents.js");
+    vi.doUnmock("../routes/execution-workspaces.js");
     vi.doUnmock("../routes/authz.js");
     registerModuleMocks();
     vi.clearAllMocks();
@@ -360,9 +447,38 @@ describe("run transcript scoping (PEN-3142)", () => {
       },
     ]);
 
+    // PEN-3204: the fixture this row replaces was `{ id, companyId, kind, status }` —
+    // no command, no excerpts — so it was SILENT on whether captured output crosses
+    // the boundary, which is why a green run did not catch what Ally caught. It now
+    // carries both halves: transcript that must go, and state that must survive.
     mockWorkspaceOperationService.listForRun.mockResolvedValue([
-      { id: "op-1", companyId: "company-1", kind: "clone", status: "succeeded" },
+      runAttachedOperation,
+      runlessCleanupOperation,
     ]);
+    mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
+      runAttachedOperation,
+      runlessCleanupOperation,
+    ]);
+    mockWorkspaceOperationService.getById.mockResolvedValue(runAttachedOperation);
+    mockWorkspaceOperationService.readLog.mockResolvedValue({
+      content: WORKSPACE_OP_CANARY,
+      offset: 0,
+      nextOffset: 64,
+      eof: true,
+    });
+    // Only `run-1` resolves to an owning agent. The cleanup row's `heartbeatRunId`
+    // is null, so it is absent from this map — the fail-closed branch.
+    mockWorkspaceOperationService.owningAgentIdsByRunId.mockImplementation(
+      async (runIds: (string | null)[]) => {
+        const owners = new Map<string, string>();
+        for (const runId of runIds) if (runId === "run-1") owners.set("run-1", runOwnerAgentId);
+        return owners;
+      },
+    );
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+    });
   });
 
   describe("GET /heartbeat-runs/:runId/log", () => {
@@ -595,8 +711,233 @@ describe("run transcript scoping (PEN-3142)", () => {
       );
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(res.body).toHaveLength(1);
+      expect(res.body).toHaveLength(2);
       expect(res.body[0]).toMatchObject({ id: "op-1", status: "succeeded" });
+    });
+  });
+
+  /**
+   * PEN-3204, implementing the PEN-3202 ruling. A workspace operation is a MIX:
+   * the captured OUTPUT narrows to this gate, the operation ROW stays
+   * company-readable.
+   *
+   * Every case asserts BOTH directions on one response — the excerpt is gone AND
+   * `phase` / `status` / `exitCode` / `command` survived beside it. A
+   * withhold-only assertion would still pass if the projection nulled the whole
+   * row, which would silently break fleet diagnosis while looking like a fix.
+   *
+   * All three read routes are covered, because gating two and leaving the third
+   * is the PEN-2777 failure the `authz.ts` comment exists to prevent.
+   */
+  describe("workspace-operation captured output is scoped to the transcript gate (PEN-3204)", () => {
+    function expectStateSurvived(operation: Record<string, unknown>) {
+      // The row itself must be intact — withholding the operator's text is the
+      // point, hiding that an operation ran is not.
+      expect(operation.phase).toBeTruthy();
+      expect(operation.status).toBe("succeeded");
+      expect(operation.exitCode).toBe(0);
+      expect(operation.command).toBeTruthy();
+      expect(operation.logBytes).toBe(2048);
+      expect(operation.logRef).toBe("op-1.log");
+    }
+
+    it("withholds the excerpts from an unentitled peer on the run route, keeping state beside them", async () => {
+      const res = await requestApp(
+        await createApp(peerAgentActor),
+        (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/workspace-operations"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toHaveLength(2);
+      const [attached] = res.body;
+      expect(attached.stdoutExcerpt).toBeNull();
+      expect(attached.stderrExcerpt).toBeNull();
+      expect(attached.withheldFields).toEqual(["stdoutExcerpt", "stderrExcerpt"]);
+      expectStateSurvived(attached);
+      // The canary must not appear ANYWHERE in the body, not merely on the key
+      // the projection nulls.
+      expect(JSON.stringify(res.body)).not.toContain(WORKSPACE_OP_CANARY);
+    });
+
+    it("withholds the RUN-LESS cleanup row too — the fail-closed branch", async () => {
+      const res = await requestApp(
+        await createApp(peerAgentActor),
+        (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/workspace-operations"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const runless = res.body.find((op: { id: string }) => op.id === "op-2");
+      // `heartbeatRunId` is null, so no owner can be resolved. Falling open here
+      // would hand every cleanup operation's output to any company peer.
+      expect(runless.heartbeatRunId).toBeNull();
+      expect(runless.stdoutExcerpt).toBeNull();
+      expect(runless.stderrExcerpt).toBeNull();
+      expectStateSurvived(runless);
+    });
+
+    it("gives the run's owning agent its own captured output back", async () => {
+      mockDecide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: "allow_self",
+        explanation: "Allowed because the actor owns the run whose transcript it is reading.",
+      }));
+
+      const res = await requestApp(
+        await createApp(ownerAgentActor),
+        (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/workspace-operations"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const attached = res.body.find((op: { id: string }) => op.id === "op-1");
+      expect(attached.stdoutExcerpt).toBe(WORKSPACE_OP_CANARY);
+      expect(attached.withheldFields).toBeUndefined();
+    });
+
+    it("asks the decider about the operation's OWNING agent, not the caller", async () => {
+      await requestApp(
+        await createApp(peerAgentActor),
+        (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/workspace-operations"),
+      );
+
+      expect(mockDecide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "runs:read_transcript",
+        resource: expect.objectContaining({ type: "agent", agentId: runOwnerAgentId }),
+      }));
+    });
+
+    it("withholds on the execution-workspace route, the widest of the three", async () => {
+      // This route returns EVERY operation for the workspace, including other
+      // agents' runs, and PR #1741 did not touch its file at all. Gating the run
+      // route and leaving this one open is the exact PEN-2777 shape.
+      //
+      // The actor under test is the one that matters: it HOLDS `company_scope:read`
+      // — so it legitimately reaches the route and sees the operation rows — and
+      // lacks only the transcript entitlement. Denying company scope instead would
+      // make this pass at the door and never exercise the projection.
+      mockDecide.mockImplementation(async (input: { action?: string }) => (
+        input.action === "company_scope:read"
+          ? { allowed: true, action: input.action, reason: "allow_company_member", explanation: "Company member." }
+          : {
+            allowed: false,
+            action: input.action,
+            reason: "deny_missing_grant",
+            explanation: "Missing permission: runs:read_transcript.",
+          }
+      ));
+
+      const res = await requestApp(
+        await createWorkspaceApp(peerAgentActor),
+        (baseUrl) => request(baseUrl).get("/api/execution-workspaces/workspace-1/workspace-operations"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toHaveLength(2);
+      for (const operation of res.body) {
+        expect(operation.stdoutExcerpt).toBeNull();
+        expect(operation.stderrExcerpt).toBeNull();
+        expectStateSurvived(operation);
+      }
+      expect(JSON.stringify(res.body)).not.toContain(WORKSPACE_OP_CANARY);
+    });
+
+    it("403s the /log body for an unentitled peer and audits the denial", async () => {
+      const res = await requestApp(
+        await createApp(peerAgentActor),
+        (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-1/log?offset=0&limitBytes=64"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(JSON.stringify(res.body)).not.toContain(WORKSPACE_OP_CANARY);
+      // Named boundary vocabulary, not a new client-indistinguishable string.
+      expect(res.body.details).toMatchObject({ reason: "deny_missing_grant" });
+      // This path had NEITHER half of the control pair before this row.
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "workspace_operation.log_accessed",
+          entityType: "workspace_operation",
+          entityId: "op-1",
+          details: expect.objectContaining({ result: "denied" }),
+        }),
+      );
+    });
+
+    it("serves the /log body to the owning agent and audits the allow", async () => {
+      mockDecide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: "allow_self",
+        explanation: "Allowed because the actor owns the run whose transcript it is reading.",
+      }));
+
+      const res = await requestApp(
+        await createApp(ownerAgentActor),
+        (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-1/log?offset=0&limitBytes=64"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.content).toBe(WORKSPACE_OP_CANARY);
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "workspace_operation.log_accessed",
+          details: expect.objectContaining({ result: "allowed", ownerAgentId: runOwnerAgentId }),
+        }),
+      );
+    });
+
+    it("403s the /log of a RUN-LESS operation even for a grant holder", async () => {
+      // The decider would ALLOW this: with a null agent id both relational
+      // allows in `authorization.ts` are skipped and it falls through to the
+      // company-wide `runs:read_transcript` grant. There is no owner to decide
+      // about, so the route must be tighter than the decider here — this case
+      // fails if the null-owner branch is ever handed to `decideRunTranscriptRead`.
+      mockWorkspaceOperationService.getById.mockResolvedValue(runlessCleanupOperation);
+      mockDecide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: "allow_grant",
+        explanation: "Allowed by an explicit runs:read_transcript grant.",
+      }));
+
+      const res = await requestApp(
+        await createApp(peerAgentActor),
+        (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-2/log"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ reason: "deny_unresolved_run_owner" });
+      expect(JSON.stringify(res.body)).not.toContain(WORKSPACE_OP_CANARY);
+    });
+
+    it("keeps the run-less /log readable for a human operator", async () => {
+      // The fail-closed branch withholds from every AGENT actor, but a human
+      // operator is the class this whole design keeps — and the operator UI
+      // renders these excerpts.
+      mockWorkspaceOperationService.getById.mockResolvedValue(runlessCleanupOperation);
+
+      const res = await requestApp(
+        await createApp(boardActor),
+        (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-2/log"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.content).toBe(WORKSPACE_OP_CANARY);
+    });
+
+    it("keeps the cross-tenant 404 rather than exposing the new 403", async () => {
+      mockWorkspaceOperationService.getById.mockResolvedValue({
+        ...runAttachedOperation,
+        companyId: "company-2",
+      });
+
+      const res = await requestApp(
+        await createApp(peerAgentActor),
+        (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-1/log"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(404);
     });
   });
 

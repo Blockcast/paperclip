@@ -721,8 +721,9 @@ Agent env vars now support secret references. By default, secret values are stor
 
 ### Who may read a run transcript
 
-Run *transcript content* — the `GET /api/heartbeat-runs/:runId/log` body, and the
-`message` / `payload` of `GET /api/heartbeat-runs/:runId/events` — is scoped to
+Run *transcript content* — the `GET /api/heartbeat-runs/:runId/log` body, the
+`message` / `payload` of `GET /api/heartbeat-runs/:runId/events`, and the
+captured output of a workspace operation — is scoped to
 the run's owning agent, that agent's manager chain, human board members of the
 company, and any principal holding the `runs:read_transcript` grant (PEN-3142,
 implementing the decision on PEN-3140). Company-wide peer read was withdrawn
@@ -731,8 +732,43 @@ incidents and the scrub protecting it runs only at write time.
 
 Run *state* is unchanged and stays company-readable: `GET
 /api/heartbeat-runs/:runId` (status, exit/park reason, retry edge, error text,
-`lastActivityAt`), watchdog decisions, and
-`GET /api/heartbeat-runs/:runId/workspace-operations`.
+`lastActivityAt`) and watchdog decisions.
+
+### Workspace operations are a mix
+
+A `workspace_operations` row is **partly state and partly transcript**
+(PEN-3204, implementing the ruling on PEN-3202). Do not treat the whole row as
+either.
+
+| field | treatment |
+|---|---|
+| `phase`, `status`, `exitCode`, `command`, `cwd`, `metadata`, the ids, the timestamps, and the log volume/location/digest (`logStore`, `logRef`, `logBytes`, `logSha256`, `logCompressed`) | **state** — company-readable |
+| `stdoutExcerpt`, `stderrExcerpt` | **transcript** — scoped as above |
+| `GET /api/workspace-operations/:operationId/log` body | **transcript** — scoped as above |
+
+The excerpts are withheld on **all three** read routes, or the boundary is not
+closed: `GET /api/heartbeat-runs/:runId/workspace-operations`,
+`GET /api/execution-workspaces/:id/workspace-operations` (the widest — it
+returns every operation for a workspace, including other agents' runs), and the
+per-operation `/log` above. Withheld rows carry
+`withheldFields: ["stdoutExcerpt", "stderrExcerpt"]`, so a client can tell "not
+entitled" from "this operation captured no output"; every state field survives
+beside them, because hiding the operator's text is the point and hiding that an
+operation ran is not.
+
+`command` / `cwd` / `metadata` are separately masked by an **orthogonal** gate,
+`workspace_runtime:read` (`routes/workspace-response.ts`). The two compose and
+neither covers the other: one answers "may you see the operator's command?", the
+other "may you see what it printed?". A route applying only one is half-gated.
+
+**Owner resolution fails closed.** `workspace_operations` has no owning-agent
+column, so the owner is resolved through `heartbeatRunId → heartbeat_runs.agentId`.
+That edge is `onDelete: "set null"` and is never set by the POST runtime-command
+recorders, so an unresolvable owner is normal — and the captured output is then
+withheld from **every agent actor, including a `runs:read_transcript` grant
+holder**, because there is no owner for the grant to be about. Human operators
+keep the read. `issues.assigneeAgentId` is not an acceptable substitute for the
+run edge: assignees move.
 
 The two transcript routes deny differently, on purpose:
 
@@ -760,11 +796,16 @@ and denied reads:
 |---|---|
 | `GET /api/heartbeat-runs/:runId/log` | `heartbeat.run_log_accessed` |
 | `GET /api/heartbeat-runs/:runId/events` | `heartbeat.run_events_accessed` |
+| `GET /api/workspace-operations/:operationId/log` | `workspace_operation.log_accessed` |
 
-**Both actions exist and a consumer needs both.** They are separately reachable
-paths over the same material; wiring an alert or digest to one and not the other
-reproduces the blindness that got this audit rejected as a standalone
-compensating control on PEN-3140.
+**All three actions exist and a consumer needs all three.** They are separately
+reachable paths over the same material; wiring an alert or digest to some and
+not the others reproduces the blindness that got this audit rejected as a
+standalone compensating control on PEN-3140. The workspace-operation path is the
+one that had *neither* half of the control pair — no gate and no audit — until
+PEN-3204; its row is keyed `entity_type = workspace_operation` and carries the
+operation's owning run in `runId`, plus `details.ownerAgentId`, where `null`
+records the fail-closed branch (decided with no resolvable owner).
 
 The audit row records the actor type/id, company id, heartbeat run id, timestamp
 (`activity_log.created_at`), access result, and the requested window (byte

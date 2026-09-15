@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { workspaceOperations } from "@paperclipai/db";
+import { workspaceOperations, heartbeatRuns } from "@paperclipai/db";
 import type { WorkspaceOperation, WorkspaceOperationPhase, WorkspaceOperationStatus } from "@paperclipai/shared";
 import { asc, desc, eq, inArray, isNull, or, and } from "drizzle-orm";
 import { notFound } from "../errors.js";
@@ -85,6 +85,38 @@ export function workspaceOperationService(db: Db) {
 
   return {
     getById,
+
+    /**
+     * PEN-3204: resolve the agent that OWNS each operation's captured output.
+     *
+     * `workspace_operations` has no owning-agent column, so the only sound edge
+     * is `heartbeatRunId → heartbeat_runs.agentId`. That edge is
+     * `onDelete: "set null"` and is never set at all by the two POST
+     * runtime-command recorders, so a null is normal rather than exceptional —
+     * which is exactly why callers must treat "absent from this map" as
+     * withhold rather than allow.
+     *
+     * `issues.assigneeAgentId` is deliberately NOT a fallback: assignees move,
+     * so it would hand an operation's output to whoever happens to hold the
+     * issue today rather than to the agent that produced it.
+     *
+     * Returns only the ids it could resolve; a run whose row is gone, or whose
+     * `agentId` is null, is simply absent, so there is one fail-closed shape
+     * for the caller to handle instead of two.
+     */
+    owningAgentIdsByRunId: async (runIds: (string | null)[]) => {
+      const unique = [...new Set(runIds.filter((id): id is string => typeof id === "string" && id.length > 0))];
+      const owners = new Map<string, string>();
+      if (unique.length === 0) return owners;
+      const rows = await db
+        .select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, unique));
+      for (const row of rows) {
+        if (row.agentId) owners.set(row.id, row.agentId);
+      }
+      return owners;
+    },
 
     createRecorder(input: {
       companyId: string;

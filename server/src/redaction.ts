@@ -1096,6 +1096,57 @@ export function withholdRunTranscriptStateContent<T extends Record<string, unkno
   return { ...(out as T), withheldFields };
 }
 
+/**
+ * PEN-3204, implementing the PEN-3202 ruling: a `workspace_operations` row is a
+ * MIX, and only the captured command OUTPUT narrows.
+ *
+ * Kept company-readable, deliberately: `phase`, `status`, `exitCode`, the log
+ * volume/location/digest (`logStore`, `logRef`, `logBytes`, `logSha256`,
+ * `logCompressed`), the ids and the timestamps — and `command`, `cwd` and
+ * `metadata`, which PEN-3202 rules stay readable here and which are already
+ * masked one projection over by `publicWorkspaceOperation` under the ORTHOGONAL
+ * workspace-runtime gate (CTO Ruling F / BLO-33568). Two gates land on these
+ * rows for different reasons; this one must not quietly absorb the other's
+ * fields, and an unentitled reader must still be able to see that an operation
+ * ran and how it ended.
+ *
+ * Only `stdoutExcerpt` / `stderrExcerpt` are transcript. They are the same
+ * class of material as `heartbeat_runs.stdoutExcerpt` above — the captured
+ * output of a command run inside an agent's own execution — and they reach the
+ * wire through three read routes with no projection at all today. The docblock
+ * on `publicWorkspaceOperation` records that they were deliberately left out of
+ * THAT gate as command output rather than a copied operator string; this gate
+ * is the one that was missing, not a reversal of that call.
+ *
+ * `logRef` deliberately survives: it is a pointer, and the body it points at is
+ * gated separately on `GET /workspace-operations/:operationId/log`. Withholding
+ * the pointer would hide that captured output exists without protecting a byte
+ * of it.
+ *
+ * Same `withheldFields` contract as `withholdRunTranscriptStateContent`, so a
+ * client can tell "not entitled" from "this operation captured no output".
+ */
+const WITHHELD_WORKSPACE_OPERATION_CONTENT_KEYS = [
+  "stdoutExcerpt",
+  "stderrExcerpt",
+] as const;
+
+export function withholdWorkspaceOperationCapturedOutput<T extends object>(
+  operation: T,
+): T & { withheldFields: string[] } {
+  const out: Record<string, unknown> = { ...(operation as Record<string, unknown>) };
+  const withheldFields: string[] = [];
+
+  for (const key of WITHHELD_WORKSPACE_OPERATION_CONTENT_KEYS) {
+    if (key in out) {
+      if (out[key] !== null && out[key] !== undefined) withheldFields.push(key);
+      out[key] = null;
+    }
+  }
+
+  return { ...(out as T), withheldFields };
+}
+
 
 /**
  * `commands` / `services` / `jobs` are the three arrays `listWorkspaceCommandDefinitions`

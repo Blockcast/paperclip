@@ -224,10 +224,23 @@ export type RunTranscriptReadOutcome = {
  * Shared "may this actor see a run's TRANSCRIPT?" test (PEN-3142).
  *
  * Run *state* — status, exit/park reason, the retry edge, watchdog decisions,
- * `lastActivityAt`, error text, workspace operations — stays company-readable
- * and must not be routed through here. This gate covers transcript *content*
- * only: the `GET /heartbeat-runs/:runId/log` body, and the `message` /
- * `payload` of `GET /heartbeat-runs/:runId/events`.
+ * `lastActivityAt`, error text — stays company-readable and must not be routed
+ * through here. This gate covers transcript *content* only: the
+ * `GET /heartbeat-runs/:runId/log` body, the `message` / `payload` of
+ * `GET /heartbeat-runs/:runId/events`, and — per the PEN-3202 ruling
+ * implemented by PEN-3204 — the captured OUTPUT of a workspace operation
+ * (`stdoutExcerpt` / `stderrExcerpt` and the
+ * `GET /workspace-operations/:operationId/log` body).
+ *
+ * A workspace operation is a MIX rather than a counterexample: the operation
+ * ROW stays company-readable — `phase`, `status`, `exitCode`, `command`, `cwd`,
+ * `metadata`, the log digest and the timestamps — and only the captured output
+ * narrows. Operations carry no owning-agent column, so callers resolve the
+ * owner through `heartbeatRunId → heartbeat_runs.agentId` and withhold when
+ * that cannot be resolved; see `withholdUnentitledWorkspaceOperationOutput`
+ * (`routes/workspace-response.ts`), which is deliberately tighter than this
+ * function on a null agent id, because the grant fallback below would otherwise
+ * admit a grant holder for an operation with no owner to decide about.
  *
  * Same shape as `actorCanReadAgentConfig` above, and for the same reason:
  * human board members of the company keep the read, agent actors get own-run
