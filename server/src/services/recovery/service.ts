@@ -2256,8 +2256,10 @@ export function recoveryService(
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
 
-  async function getAgent(agentId: string) {
-    return db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
+  // Same rule as `getCompanyIssuePrefix`: under `lockIssueParentMutationCompany`
+  // this must read on the caller's transaction, not a second pool connection.
+  async function getAgent(agentId: string, dbOrTx: Db | DbTransaction = db) {
+    return dbOrTx.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
   }
 
   async function isAgentInvokable(agent: typeof agents.$inferSelect | null | undefined) {
@@ -5776,7 +5778,7 @@ export function recoveryService(
       recoveryCause !== "workspace_validation_failed" &&
       recoveryCause !== "configuration_incomplete";
     const sourceAssignee = input.issue.assigneeAgentId
-      ? await getAgent(input.issue.assigneeAgentId)
+      ? await getAgent(input.issue.assigneeAgentId, dbOrTx)
       : null;
     const now = new Date();
     const boundsAtCreation = wakesOwner ? recoveryActionBoundsAtCreation(now) : null;
@@ -7586,8 +7588,8 @@ export function recoveryService(
 
       const prefix = await getCompanyIssuePrefix(fresh.companyId, tx);
       const workspacePreflightHandoffCause = describeWorkspacePreflightRecoveryCause(input.latestRun);
-      const recoveryOwner = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
-      const sourceAssignee = fresh.assigneeAgentId ? await getAgent(fresh.assigneeAgentId) : null;
+      const recoveryOwner = action.ownerAgentId ? await getAgent(action.ownerAgentId, tx) : null;
+      const sourceAssignee = fresh.assigneeAgentId ? await getAgent(fresh.assigneeAgentId, tx) : null;
       let notice: SuccessfulRunHandoffNotice | null = null;
       if (recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON && input.successfulRunHandoffEvidence) {
         notice = buildSuccessfulRunHandoffExhaustedNotice({
