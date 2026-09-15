@@ -458,19 +458,42 @@ export function probeBlockerPremise(input: GateEvidenceInput): ProbeResult | nul
 export function probeApprovalGate(input: GateEvidenceInput): ProbeResult | null {
   if (input.approvals.length === 0) return null;
 
-  const live = input.approvals.filter(
+  // Two reasons a gate reads as live, kept apart because they mean different
+  // things to whoever reads the digest: a card nobody has decided yet, and a
+  // card carrying a status this module has never heard of. Both fail toward
+  // `still-gated` (property 2), so the safety behaviour is identical — but
+  // reporting schema drift as "still undecided" would describe a real card
+  // state that is not the one observed, and the digest is the surface where
+  // that drift would be noticed.
+  const undecided = input.approvals.filter((approval) =>
+    APPROVAL_UNDECIDED.has(approval.approvalStatus),
+  );
+  const unrecognised = input.approvals.filter(
     (approval) =>
-      APPROVAL_UNDECIDED.has(approval.approvalStatus) ||
-      (!APPROVAL_GRANTED.has(approval.approvalStatus) &&
-        !APPROVAL_REFUSED.has(approval.approvalStatus) &&
-        !APPROVAL_ABANDONED.has(approval.approvalStatus)),
+      !APPROVAL_UNDECIDED.has(approval.approvalStatus) &&
+      !APPROVAL_GRANTED.has(approval.approvalStatus) &&
+      !APPROVAL_REFUSED.has(approval.approvalStatus) &&
+      !APPROVAL_ABANDONED.has(approval.approvalStatus),
   );
 
-  if (live.length > 0) {
+  if (undecided.length > 0 || unrecognised.length > 0) {
+    const total = input.approvals.length;
+    const plural = total === 1 ? "" : "s";
+    const clauses: string[] = [];
+    if (undecided.length > 0) {
+      clauses.push(
+        `${undecided.length} of ${total} linked approval${plural} still undecided: ${undecided.map(describeApproval).join(", ")}`,
+      );
+    }
+    if (unrecognised.length > 0) {
+      clauses.push(
+        `${unrecognised.length} of ${total} linked approval${plural} carr${unrecognised.length === 1 ? "ies" : "y"} a status this module does not recognise, so the gate is read as live rather than resolved: ${unrecognised.map(describeApproval).join(", ")}`,
+      );
+    }
     return {
       probe: "approval-gate",
       verdict: "still-gated",
-      evidence: `${live.length} of ${input.approvals.length} linked approval${input.approvals.length === 1 ? "" : "s"} still undecided: ${live.map(describeApproval).join(", ")}`,
+      evidence: clauses.join("; "),
     };
   }
 
@@ -904,6 +927,37 @@ const RESOLUTION_KIND_HEADINGS: Record<GateResolutionKind, string> = {
 };
 
 /**
+ * Render rank per resolution kind — lower renders first.
+ *
+ * A `Record<GateResolutionKind, …>` rather than an ordered array so the
+ * compiler refuses a new union member that nobody gave a rank. The previous
+ * plain array could not: adding a kind left it absent from the render order,
+ * and rows of that kind rendered *nowhere* in the digest. A silent omission
+ * from the escalation surface is precisely the failure PEN-3089 exists to fix,
+ * so the next person to widen the union should not have to remember this list.
+ *
+ * Ranks 0-2 intentionally mirror {@link NON_SELF_CLEARING_RESOLUTION_KINDS}:
+ * the kinds whose counterparty is gone lead, because they are the ones a reader
+ * must act on rather than notice.
+ */
+const RESOLUTION_KIND_RENDER_RANK: Record<GateResolutionKind, number> = {
+  "blocker-cancelled-edge-stuck": 0,
+  "interaction-abandoned": 1,
+  "approval-abandoned": 2,
+  "approval-granted": 3,
+  "blocker-done-row-not-moved": 4,
+  "approval-refused": 5,
+  "interaction-answered": 6,
+};
+
+/** Every resolution kind, in render order. Total by construction. */
+function resolutionKindRenderOrder(): GateResolutionKind[] {
+  return (Object.keys(RESOLUTION_KIND_RENDER_RANK) as GateResolutionKind[]).sort(
+    (a, b) => RESOLUTION_KIND_RENDER_RANK[a] - RESOLUTION_KIND_RENDER_RANK[b],
+  );
+}
+
+/**
  * One line per `unverifiable` reason, phrased as what a reader should conclude.
  *
  * The first two are contradictions the reader can act on directly; the rest are
@@ -1056,27 +1110,39 @@ export function formatGateRevalidationSections(
     "Each row below had its gate re-tested and the gate is no longer live. That is *not* the same as 'no longer waiting': where the resolution left an action owed, the row is marked ⛔ and still appears in the age-ranked list. Only the unmarked rows are withheld from it.",
   );
 
-  // Order by resolution kind so the ones that cannot self-clear lead.
-  const kindOrder: GateResolutionKind[] = [
-    ...NON_SELF_CLEARING_RESOLUTION_KINDS,
-    "approval-granted",
-    "blocker-done-row-not-moved",
-    "approval-refused",
-    "interaction-answered",
-  ];
+  // The rendered disposition is read from the *same* set that drives the
+  // exclusion filter, rather than recomputed from the elected `resolutionKind`
+  // (PEN-3089). Those two inputs disagree: escalation reads every probe on the
+  // row, while the election picks one kind to file the row under, and
+  // `approval-granted` is the one action-owed kind that can lose that election
+  // (it is absent from `NON_SELF_CLEARING_RESOLUTION_KINDS`, so it only wins by
+  // being `resolved[0]`, and `probeBlockerPremise` runs first). A row with
+  // every blocker `done` plus one granted card is therefore filed under
+  // `blocker-done-row-not-moved` while being escalated — and labelling it from
+  // its kind printed "withheld from the age-ranked list" over a row that was in
+  // that list. Deriving from `withheld` makes the label unable to contradict
+  // the filter by construction, which is the whole point of this module.
+  const withheld = withheldFromAgeRankingIssueIds(report);
+  const isEscalated = (classification: GateClassification): boolean =>
+    !withheld.has(classification.issueId);
 
   let listed = 0;
-  for (const kind of kindOrder) {
+  for (const kind of resolutionKindRenderOrder()) {
     const inKind = resolved.filter((classification) => classification.resolutionKind === kind);
     if (inKind.length === 0) continue;
 
-    // Stated per kind rather than once at the top: the escalation consequence
-    // is a property of the kind, and a reader scanning one block should not
-    // have to hold the legend in their head to know whether these rows reached
-    // the list below.
-    const disposition = ACTION_OWED_RESOLUTION_KINDS.has(kind)
-      ? "⛔ still escalated — an action is owed"
-      : "withheld from the age-ranked list";
+    // The heading is now a grouping label only. Its disposition summary is a
+    // tally of the per-row verdicts below, so a block that is genuinely mixed
+    // says so instead of asserting one disposition over rows that do not share
+    // it. A reader scanning one block still learns the consequence without
+    // holding the legend in their head.
+    const escalatedCount = inKind.filter(isEscalated).length;
+    const disposition =
+      escalatedCount === inKind.length
+        ? "⛔ still escalated — an action is owed"
+        : escalatedCount === 0
+          ? "withheld from the age-ranked list"
+          : `⛔ ${escalatedCount} still escalated · ${inKind.length - escalatedCount} withheld from the age-ranked list`;
     body.push("", `**${RESOLUTION_KIND_HEADINGS[kind]} — ${inKind.length}** (${disposition})`);
     for (const classification of inKind) {
       if (listed >= maxListed) break;
@@ -1086,7 +1152,11 @@ export function formatGateRevalidationSections(
       );
       const ageDays = ages?.get(classification.issueId);
       const age = typeof ageDays === "number" ? ` (${ageDays.toFixed(1)}d silent)` : "";
-      body.push(`- ${ref}${age} — ${boundEvidence(classification.evidence)}`);
+      // Per-row marker, as the section legend above already promises. The
+      // heading tally can be scanned; this is what makes an individual row
+      // unambiguous when the block is mixed.
+      const mark = isEscalated(classification) ? "⛔ " : "";
+      body.push(`- ${mark}${ref}${age} — ${boundEvidence(classification.evidence)}`);
       listed += 1;
     }
   }
