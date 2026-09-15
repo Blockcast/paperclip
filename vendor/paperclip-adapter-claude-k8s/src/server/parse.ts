@@ -259,6 +259,76 @@ function buildClaudeTransientHaystack(input: {
     .join("\n");
 }
 
+/**
+ * The bounded error surfaces of a *finished* run: the terminal `result` event and
+ * the failure message derived from it. Deliberately does NOT read `stdout`.
+ *
+ * `stdout` is the entire pod log — every assistant message, every tool result,
+ * every file the agent read — so a haystack containing it decides the label from
+ * *transcript content* rather than from the fault. Measured on 964 retained run
+ * logs (2026-09-12 onward, PEN-3223): of the 41 runs whose terminal event carries
+ * `api_error_status: 403`, **20 classified `claude_transient_upstream`** off tokens
+ * that appear only in the transcript (`429` ×13, `503` ×3, `throttled` ×2, `529`,
+ * `rate-limited`, `throttling`). None of those 41 match on these surfaces. An agent
+ * working on a rate-limit ticket poisons its own failure label; this issue's own
+ * text would do it.
+ *
+ * Narrowing costs no detection, on three independent legs:
+ *  1. STRUCTURAL — `classifyClaudeUpstreamFailure` is only reachable with a truthy
+ *     `parsed` (its sole call site, execute.ts:2551, sits after the `!parsed`
+ *     branch returns at :2503). The one case where `stdout` is genuinely the only
+ *     surface — the CLI dying before it emits a `result` event — never consults
+ *     this classifier at all. That is the case
+ *     `isClaudeSkillNotFoundStartupFailure` exists to serve, and it keeps its own
+ *     transcript scan under the `claudeLineIsHarnessAuthored` line guard.
+ *  2. EMPIRICAL — every run in that corpus carrying an authoritative upstream
+ *     status keeps its signal here: `api_error_status: 429` 9/9, `503` 6/6.
+ *  3. THE ONE STRUCTURAL CANDIDATE IS ABSENT — `rate_limit_event` is the only
+ *     harness-authored event type that could carry a rate-limit verdict outside
+ *     the result event. It occurs **0 times** in the corpus's 93,336 event lines
+ *     (positive control, same scan: `assistant` 36873, `user` 18193, `system`
+ *     9374, `result` 466). The CLI this adapter runs never emits one.
+ *
+ * Line-level attribution — reusing `claudeLineIsHarnessAuthored`, as the skill
+ * rule does — was measured and rejected for THIS rule: it leaves 29 of the 95
+ * transcript-403 runs still mislabelled, because a line with no `"type"` is
+ * admitted as harness-authored by design (the CLI's own untyped prose is exactly
+ * what that rule must detect), and the untyped lines here are `[paperclip]`
+ * operational text quoting upstream statuses. That guard is right for a
+ * distinctive phrase and wrong for an alternation of bare numbers.
+ *
+ * Unlike `isClaudeSkillNotFoundError`, `result` is NOT gated on a non-`success`
+ * subtype. A genuine upstream refusal is reported as `subtype: "success"` with
+ * `is_error: true` and `api_error_status: 429`, so that gate would discard the
+ * true positives this rule exists for — all 15 of the 429/503 runs above are
+ * `subtype: "success"`. The asymmetry is the reverse of the skill rule's: there a
+ * false positive suppresses retries permanently, here it *grants* them.
+ *
+ * `api_error_status` is included so the verdict does not rest solely on CLI prose.
+ */
+function buildClaudeTerminalResultHaystack(input: {
+  parsed?: Record<string, unknown> | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): string {
+  const parsed = input.parsed ?? null;
+  const resultText = parsed ? asString(parsed.result, "") : "";
+  const parsedErrors = parsed ? extractClaudeErrorMessages(parsed) : [];
+  const apiErrorStatus = parsed ? asNumber(parsed.api_error_status, 0) : 0;
+  return [
+    input.errorMessage ?? "",
+    resultText,
+    ...parsedErrors,
+    apiErrorStatus > 0 ? `api_error_status=${apiErrorStatus}` : "",
+    input.stderr ?? "",
+  ]
+    .join("\n")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
 function retryNotBeforeFromObject(value: Record<string, unknown>): string | null {
   const raw = value.retryNotBefore ?? value.retry_not_before ?? value.resumeAt ?? value.resume_at;
   if (typeof raw !== "string" && typeof raw !== "number") return null;
@@ -324,6 +394,18 @@ export function isClaudeTransientUpstreamError(input: {
   )) {
     return false;
   }
+  // The login veto deliberately still reads the whole transcript, and that is a
+  // scope line rather than a clean bill of health. It can only ever SUPPRESS the
+  // transient label, so narrowing it would widen what this function grants — the
+  // opposite of this rule's defect — and a login prompt is emitted before any
+  // result event, where this classifier is unreachable anyway.
+  //
+  // It does carry the same defect mirrored into suppression, and that is live, not
+  // theoretical: in the PEN-3223 corpus 2 of the 9 genuine `api_error_status: 429`
+  // capacity refusals are vetoed here despite their own bounded surfaces matching,
+  // because an auth-shaped token appears somewhere in their transcript. Tracked
+  // separately rather than fixed alongside, because relaxing a veto grants retry
+  // families and needs its own evidence.
   const loginMeta = detectClaudeLoginRequired({
     parsed,
     stdout: input.stdout ?? "",
@@ -331,7 +413,16 @@ export function isClaudeTransientUpstreamError(input: {
   });
   if (loginMeta.requiresLogin) return false;
 
-  const haystack = buildClaudeTransientHaystack(input);
+  // Narrow to the terminal-result surfaces only when a `result` event actually
+  // exists. In THIS copy that is the only reachable case — leg 1 above — so the
+  // `parsed: null` branch is defensive rather than live. It is kept because the
+  // `claude-local` twin IS reachable that way from its `!parsed` fallback, and a
+  // silent divergence between the two copies is what this rule's own defect grew
+  // out of. With `parsed` null there are no bounded surfaces to read, so the
+  // transcript is the only evidence available.
+  const haystack = parsed
+    ? buildClaudeTerminalResultHaystack(input)
+    : buildClaudeTransientHaystack(input);
   if (!haystack) return false;
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
 }
@@ -353,6 +444,21 @@ const CLAUDE_UPSTREAM_CAPACITY_EXHAUSTED_RE =
 /**
  * Return the penstock pool-exhaustion code present in a failed run's output, or
  * `null`. Matches the code token anywhere in the failure haystack.
+ *
+ * Still reads the transcript, and that is a deliberate scope line rather than an
+ * oversight (PEN-3223). This rule carries the same latent defect — in the same
+ * 964-log corpus, 11 runs have a capacity code in `stdout` and nowhere else, and
+ * all 48 such lines are `type: "user"` `tool_result` payloads, i.e. agents reading
+ * files that merely *mention* the token. But it is not reachable: the sole call
+ * site gates on `zeroTokenProgress` (:680), and **0 of those 11 runs are
+ * zero-token** — every one had substantial tool output, so none could arrive here.
+ *
+ * It is also not safely narrowable on present evidence: the corpus contains zero
+ * *legitimate* occurrences of these codes (none reached `parsed.result`), so a
+ * narrowed version could not be shown to still work. Narrowing it would trade a
+ * latent, gated false positive for an unvalidated regression in the one direction
+ * that fails a run permanently. Left as-is, deliberately and with the measurement
+ * recorded, rather than swept in.
  */
 export function matchClaudeUpstreamCapacityCode(input: {
   parsed?: Record<string, unknown> | null;

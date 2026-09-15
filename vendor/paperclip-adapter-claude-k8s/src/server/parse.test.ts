@@ -323,6 +323,125 @@ describe("isClaudeTransientUpstreamError", () => {
   });
 });
 
+describe("isClaudeTransientUpstreamError — transcript independence (PEN-3223)", () => {
+  // The byte-identical body observed on 41 runs in the 2026-09-12 corpus. A
+  // permanent authorization failure: no retry can succeed without re-entitlement.
+  const entitlement403 = {
+    type: "result",
+    subtype: "success",
+    is_error: true,
+    api_error_status: 403,
+    result:
+      "API Error: 403 The connected subscription for org 'org_penstock' provider 'anthropic' " +
+      "is not entitled to serve this request; re-entitle the seat and retry",
+  };
+
+  // A transcript that merely *discusses* rate limiting — an agent reading this
+  // very issue, or a tool_result quoting a log. 20 of those 41 runs were
+  // relabelled `claude_transient_upstream` by exactly this text.
+  const poisonedStdout = [
+    '{"type":"system","subtype":"init","session_id":"s1","model":"claude-opus-4-6"}',
+    '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result",' +
+      '"content":"upstream returned 429 rate_limit_error; the pool was throttled and temporarily unavailable"}]}}',
+    '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"Looks like a 503 overloaded error."}]}}',
+  ].join("\n");
+
+  it("does not classify a permanent 403 as transient when the transcript discusses rate limits", () => {
+    expect(
+      isClaudeTransientUpstreamError({ parsed: entitlement403, stdout: poisonedStdout }),
+    ).toBe(false);
+  });
+
+  it("classifies that 403 identically with and without the poisoned transcript", () => {
+    const withTranscript = isClaudeTransientUpstreamError({
+      parsed: entitlement403,
+      stdout: poisonedStdout,
+    });
+    const withoutTranscript = isClaudeTransientUpstreamError({ parsed: entitlement403, stdout: "" });
+    expect(withTranscript).toBe(withoutTranscript);
+    expect(withTranscript).toBe(false);
+  });
+
+  it("still classifies a genuine upstream throttle from the terminal result event", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: 429,
+          result: "API Error: Request rejected (429) · All Claude subscription capacity is rate-limited",
+        },
+        stdout: '{"type":"system","subtype":"init","session_id":"s1"}',
+      }),
+    ).toBe(true);
+  });
+
+  it("reads api_error_status so the verdict does not rest solely on CLI prose", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: 503,
+          result: "The request could not be completed.",
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("routes the poisoned 403 to the generic fallback, not a retry family", () => {
+    expect(
+      classifyClaudeUpstreamFailure({
+        failed: true,
+        zeroTokenProgress: false,
+        parsed: entitlement403,
+        stdout: poisonedStdout,
+        errorMessage: describeClaudeFailure(entitlement403),
+      }),
+    ).toEqual({ family: null, errorCode: null, capacityCode: null });
+  });
+
+  // The narrowing above must not reach the no-result-event case. In THIS copy
+  // `classifyClaudeUpstreamFailure` cannot be called with `parsed: null` (the
+  // `!parsed` branch in execute.ts returns first), but the `claude-local` twin
+  // calls `isClaudeTransientUpstreamError` directly from exactly that path. These
+  // pin the shared contract in both copies so the two cannot drift apart again.
+  it("still classifies a transcript-only 429 when no result event ever arrived", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: "API Error: 429 rate_limit_error — upstream is rate limited",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(true);
+  });
+
+  it("still classifies a transcript-only 503 when no result event ever arrived", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: "API Error: 503 upstream temporarily unavailable",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not invent a transient label when the no-result transcript is clean", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: '{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}',
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(false);
+  });
+});
+
 describe("matchClaudeUpstreamCapacityCode", () => {
   it("returns the penstock exhaustion code from Claude's embedded provider JSON", () => {
     expect(

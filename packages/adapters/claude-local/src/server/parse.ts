@@ -391,6 +391,61 @@ function buildClaudeTransientHaystack(input: {
     .join("\n");
 }
 
+/**
+ * The bounded error surfaces of a *finished* run: the terminal `result` event and
+ * the failure message derived from it. Deliberately does NOT read `stdout`.
+ *
+ * Twin of the guard in `vendor/paperclip-adapter-claude-k8s/src/server/parse.ts`,
+ * which carries the full measurement (PEN-3223). In short: `stdout` is the entire
+ * pod log, so a haystack containing it decides the label from *transcript content*
+ * rather than from the fault. Measured on 964 retained run logs, 20 of the 41 runs
+ * whose terminal event carries `api_error_status: 403` were labelled
+ * `claude_transient_upstream` off tokens present only in the transcript — buying
+ * paid retries for an authorization that cannot succeed. Narrowing costs no
+ * detection on that population: every 429 (9/9) and 503 (6/6) in that corpus
+ * keeps its signal on these surfaces.
+ *
+ * This builder is for the terminal-result case ONLY, and its caller selects it on
+ * `parsed` being present. In THIS adapter (unlike the k8s twin) the classifier is
+ * also reachable with `parsed: null`, from the `!parsed` fallback in
+ * `execute.ts`; applying this builder there would leave only `errorMessage` and
+ * `stderr` and would lose a stdout-only transient signal. That path keeps the wide
+ * builder deliberately.
+ *
+ * `result` is deliberately NOT gated on a non-`success` subtype the way
+ * `isClaudeSkillNotFoundError` gates it: a genuine upstream refusal arrives as
+ * `subtype: "success"` with `is_error: true` and `api_error_status: 429`, so that
+ * gate would discard the true positives this rule exists for.
+ *
+ * The transcript-reading callers below (`isClaudeImmutableThinkingBlockError`,
+ * `isClaudeProviderQuotaError`, `extractClaudeRetryNotBefore`) keep the wide
+ * builder on purpose: the first two can only ever SUPPRESS a transient label, and
+ * the third extracts a timestamp once a family is already decided. None of them
+ * grants a retry family off transcript text.
+ */
+function buildClaudeTerminalResultHaystack(input: {
+  parsed?: Record<string, unknown> | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): string {
+  const parsed = input.parsed ?? null;
+  const resultText = parsed ? asString(parsed.result, "") : "";
+  const parsedErrors = parsed ? extractClaudeErrorMessages(parsed) : [];
+  const apiErrorStatus = parsed ? asNumber(parsed.api_error_status, 0) : 0;
+  return [
+    input.errorMessage ?? "",
+    resultText,
+    ...parsedErrors,
+    apiErrorStatus > 0 ? `api_error_status=${apiErrorStatus}` : "",
+    input.stderr ?? "",
+  ]
+    .join("\n")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
 export function isClaudeImmutableThinkingBlockError(input: {
   parsed?: Record<string, unknown> | null;
   stdout?: string | null;
@@ -604,6 +659,9 @@ export function isClaudeTransientUpstreamError(input: {
   if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed) || isClaudeImageProcessingError(parsed))) {
     return false;
   }
+  // The login and quota vetoes deliberately still read the whole transcript. Both
+  // can only ever SUPPRESS the transient label, so narrowing them would widen what
+  // this function grants — the opposite of this rule's defect. See PEN-3223.
   const loginMeta = detectClaudeLoginRequired({
     parsed,
     stdout: input.stdout ?? "",
@@ -611,7 +669,17 @@ export function isClaudeTransientUpstreamError(input: {
   });
   if (loginMeta.requiresLogin) return false;
 
-  const haystack = buildClaudeTransientHaystack(input);
+  // Only a run that produced a terminal `result` event has bounded surfaces worth
+  // narrowing to. `execute.ts`'s `!parsed` fallback calls this with `parsed: null`
+  // when the CLI died without emitting one; there `result`, `errors[]` and
+  // `api_error_status` are all empty, so the narrowed haystack would be reduced to
+  // `errorMessage` + `stderr` and would silently drop a transient signal that only
+  // ever reached stdout. Keep the wide transcript haystack on that path: the
+  // transcript is the only evidence it has, and the defect this rule fixes cannot
+  // occur there (it is defined by an `api_error_status` that requires `parsed`).
+  const haystack = parsed
+    ? buildClaudeTerminalResultHaystack(input)
+    : buildClaudeTransientHaystack(input);
   if (!haystack) return false;
   if (isClaudeProviderQuotaError(input)) return false;
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
