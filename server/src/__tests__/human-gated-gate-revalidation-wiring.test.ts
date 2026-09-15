@@ -228,7 +228,7 @@ describeEmbeddedPostgres("gate re-validation (wired into the digest producer)", 
     const markdown = section!.markdown;
 
     // Reported in its own section...
-    expect(markdown).toContain("Resolved but still open — 1");
+    expect(markdown).toContain("Gate resolved but row still open — 1");
     expect(markdown).toContain("GRW-1 (41.0d silent)");
     expect(markdown).toContain("GRW-2=done");
     // ...and NOT aged as if still blocked.
@@ -354,7 +354,75 @@ describeEmbeddedPostgres("gate re-validation (wired into the digest producer)", 
     await linkApproval(companyId, stale, "approved");
 
     const markdown = (await collect(companyId))!.markdown;
-    expect(markdown).toContain("Every linked approval has been decided");
+    expect(markdown).toContain("resolved-but-open 1");
+    expect(markdown).toContain(
+      "The board granted the ask and the row has not moved since — authorised, unperformed",
+    );
+  });
+
+  it("escalates a granted-but-unperformed row instead of exempting it (PEN-3089)", async () => {
+    // PEN-2526's shape: the board approved, the founder posted the
+    // instruction-to-begin, and the row then sat `todo` for 19 days. The gate
+    // really did resolve — into work nobody performed — and the digest read
+    // that resolution as "this row is not still waiting" and dropped it from
+    // the one list the founder reads. `threshold (1)` is the whole fix: the
+    // pre-PEN-3089 producer rendered `(0)` for exactly this input.
+    const { companyId } = await createCompany("GRG");
+    const authorised = await insertIssue({
+      companyId,
+      identifier: "GRG-1",
+      status: "in_review",
+      createdAt: daysAgo(41),
+    });
+    await linkApproval(companyId, authorised, "approved");
+
+    const markdown = (await collect(companyId))!.markdown;
+    expect(markdown).toContain("Human-gated work past its human-silence threshold (1)");
+    expect(markdown).toContain("GRG-1");
+    // Still rendered in the resolved section too, carrying its age — being
+    // escalated must not cost the reader the diagnosis of *why* it is stalled.
+    expect(markdown).toContain("GRG-1 (41.0d silent)");
+    expect(markdown).toContain("⛔ still escalated");
+  });
+
+  it("escalates a row whose only board card the requester withdrew (PEN-3089)", async () => {
+    // PEN-2224's shape, end to end. `withdrawn` used to render identically to
+    // `approved` — the probe had no abandoned branch at all — so the root
+    // blocker of a critical credential-exposure chain sat 26 days inside a
+    // section headed "these are not still waiting".
+    const { companyId } = await createCompany("GRD");
+    const dropped = await insertIssue({
+      companyId,
+      identifier: "GRD-1",
+      status: "in_review",
+      createdAt: daysAgo(41),
+    });
+    await linkApproval(companyId, dropped, "withdrawn");
+
+    const markdown = (await collect(companyId))!.markdown;
+    expect(markdown).toContain(
+      "Every board card was withdrawn or cancelled — the board was asked and never answered",
+    );
+    expect(markdown).toContain("someone must re-ask or drop the row");
+    expect(markdown).toContain("Human-gated work past its human-silence threshold (1)");
+  });
+
+  it("still exempts a refused ask from the age-ranked list (PEN-3089)", async () => {
+    // The narrowing has to stay a narrowing. A rejection is a real answer: the
+    // ask is over and the row needs closing, not escalating. If this one ever
+    // starts escalating, the change has stopped discriminating and the digest
+    // is on its way back to being muted.
+    const { companyId } = await createCompany("GRR");
+    const refused = await insertIssue({
+      companyId,
+      identifier: "GRR-1",
+      status: "in_review",
+      createdAt: daysAgo(41),
+    });
+    await linkApproval(companyId, refused, "rejected");
+
+    const markdown = (await collect(companyId))!.markdown;
+    expect(markdown).toContain("The board refused the ask");
     expect(markdown).toContain("Human-gated work past its human-silence threshold (0)");
   });
 
@@ -389,7 +457,7 @@ describeEmbeddedPostgres("gate re-validation (wired into the digest producer)", 
 
     const section = await collect(companyId);
     expect(section).not.toBeNull();
-    expect(section!.markdown).toContain("Resolved but still open — 1");
+    expect(section!.markdown).toContain("Gate resolved but row still open — 1");
   });
 
   it("reports an unreadable-clock row as malformed instead of throwing the producer", async () => {
@@ -421,7 +489,7 @@ describeEmbeddedPostgres("gate re-validation (wired into the digest producer)", 
     const section = await collect(companyId);
     // The producer survived, and the readable row is still classified.
     expect(section).not.toBeNull();
-    expect(section!.markdown).toContain("Resolved but still open — 1");
+    expect(section!.markdown).toContain("Gate resolved but row still open — 1");
     expect(section!.markdown).toContain("GRM-1");
   });
 
