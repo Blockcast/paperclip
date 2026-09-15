@@ -1,0 +1,79 @@
+name: Merge Queue Eviction Detector
+
+# BLO-23395: a PR evicted from the merge queue by an un-stageable rebase
+# (CONFLICTING/DIRTY) emits zero merge_group runs, no check-run, and no PR
+# comment -- the only trace is a removed_from_merge_queue timeline event.
+# GitHub's own `pull_request` webhook fires action=dequeued for every queue
+# removal (including a successful merge), so this classifies the cause and
+# notifies the PR author only when the removal was NOT a merge. See
+# scripts/merge-queue-eviction-detector.mjs and
+# runbooks/merge-queue-stalled-head.md ("Silent eviction: un-stageable
+# rebase").
+
+on:
+  pull_request:
+    types:
+      - dequeued
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to classify (manual replay)"
+        required: true
+      repo:
+        description: "owner/name"
+        required: false
+        default: "Blockcast/paperclip"
+      comment:
+        description: "Post the classification as a PR comment"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: write
+  actions: read
+
+concurrency:
+  group: merge-queue-eviction-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  classify:
+    runs-on: arc-light
+    timeout-minutes: 5
+    steps:
+      # Checkout the base branch explicitly, never the PR's own ref: this
+      # job runs with `pull-requests: write` on a `pull_request` trigger, so
+      # executing PR-controlled script content here would let a PR author
+      # script their own eviction notification.
+      - name: Checkout repository (base branch, not PR head)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}
+
+      # BLO-23395 (Ally review #1220, 4th pass): the run's own creation
+      # timestamp reflects when GitHub received the `dequeued` webhook, not
+      # when a runner became free to execute this job -- unlike `Date.now()`
+      # inside the script, it isn't skewed by ARC capacity delays (this fleet
+      # has had real ones: BLO-25481/BLO-24992/BLO-25596). Only meaningful on
+      # the real `pull_request` trigger; `workflow_dispatch` manual replay
+      # has no run to look up and isn't racing a live queue anyway.
+      - name: Resolve trigger timestamp
+        id: trigger_time
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          created_at=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" --jq .created_at)
+          echo "created_at=$created_at" >> "$GITHUB_OUTPUT"
+
+      - name: Classify eviction and notify PR author
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node scripts/merge-queue-eviction-detector.mjs \
+            --repo "${{ github.event.pull_request.base.repo.full_name || inputs.repo }}" \
+            --pr "${{ github.event.pull_request.number || inputs.pr_number }}" \
+            --triggered-at "${{ steps.trigger_time.outputs.created_at }}" \
+            --comment "${{ github.event_name == 'pull_request' && 'true' || inputs.comment }}"
