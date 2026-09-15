@@ -610,6 +610,16 @@ jobs:
         run: node --test ./scripts/check-lockfile-overrides-consistency.test.mjs
         timeout-minutes: 1
 
+      # BLO-27611. The escalation half of the guard above: the hourly drift
+      # monitor's only recipient. Its delivery path runs exclusively inside the
+      # scheduled job, and only on the branch where master is ALREADY drifted,
+      # so a regression there is invisible until the one run that needed it —
+      # and the failure mode is silence, which is what the issue is about.
+      - name: Test lockfile drift alert delivery (BLO-27611)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/post-lockfile-drift-alert.test.mjs
+        timeout-minutes: 1
+
       - name: Validate dependency resolution when manifests change
         id: regen_lockfile
         if: ${{ !cancelled() }}
