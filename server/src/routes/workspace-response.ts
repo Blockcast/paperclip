@@ -305,7 +305,18 @@ export function publicIssueExecutionWorkspaceSettings(
   if (!isPlainObject(settings)) return maskWorkspaceRuntimeForRead(settings);
 
   const parsed = parseIssueExecutionWorkspaceSettings(settings, { includeEnvironmentId: true });
-  const projected: Record<string, unknown> = {};
+  // Null-prototype, because the accumulator below is keyed by operator-authored strings and an
+  // ordinary `{}` inherits `Object.prototype`. The CREATE writer stores the caller's object
+  // byte-for-byte and `JSON.parse` makes even `__proto__` an OWN key, so a settings row really can
+  // carry `constructor` / `toString` / `valueOf` / `hasOwnProperty` / `__proto__` at the top level.
+  // On an inheriting accumulator each of those is DROPPED instead of masked — twice over: the
+  // already-classified guard sees the inherited member, and assigning `__proto__` hits the inherited
+  // setter and re-parents the object rather than adding a key. Both failures disclose strictly less,
+  // so neither leaks; what they break is the withheld-is-not-absent rule stated above, which is the
+  // one thing this walk exists to hold. `Object.create(null)` removes the inherited members, which
+  // fixes both. The own-key guard below is then belt-and-braces: it keeps the loop correct if this
+  // seed is ever changed back, which the `__proto__` case alone would not (see PEN-3073 tests).
+  const projected: Record<string, unknown> = Object.create(null);
 
   if (parsed?.mode !== undefined) {
     projected.mode = parsed.mode;
@@ -322,7 +333,7 @@ export function publicIssueExecutionWorkspaceSettings(
   }
 
   for (const [key, value] of Object.entries(settings)) {
-    if (key in projected) continue;
+    if (Object.prototype.hasOwnProperty.call(projected, key)) continue;
     projected[key] = maskWorkspaceRuntimeForRead(value);
   }
   return projected;
