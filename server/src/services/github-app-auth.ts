@@ -435,6 +435,41 @@ export async function githubFetchPrHeadSha(input: {
 }
 
 /**
+ * Fetch a pull request's author login, for wake paths that carry the PR target
+ * but not the author.
+ *
+ * `prReviewOutputHasSelfReviewSkip` refuses to honour a self-review skip unless
+ * it can corroborate the claim against a PR author it did not get from the run's
+ * own text (BLO-9293). The webhook supplies that fact; assignment-sourced
+ * reviewer wakes do not, and `mergeCoalescedContextSnapshot` drops it on a
+ * different-PR coalesce. Resolving it from GitHub keeps the corroboration
+ * trustworthy — the author still never comes from the agent's summary.
+ */
+export async function githubFetchPrAuthorLogin(input: {
+  repoFullName: string;
+  prNumber: number;
+  signal?: AbortSignal;
+}): Promise<string | null> {
+  const token = await getInstallationToken();
+  if (!token) return null;
+  try {
+    const res = await ghFetch(
+      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/pulls/${input.prNumber}`,
+      {
+        headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` },
+        signal: input.signal,
+      },
+    );
+    if (!res.ok) return null;
+    const body = (await res.json().catch(() => null)) as { user?: { login?: string } } | null;
+    const login = body?.user?.login;
+    return typeof login === "string" && login.trim().length > 0 ? login : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Whether a comment is Ally emitting a consolidated review that attests to this
  * exact head. Both halves are required: a request comment can quote an arbitrary
  * SHA, so a loose substring match is not durable evidence the review side effect
