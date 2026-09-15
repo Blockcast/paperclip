@@ -1573,4 +1573,39 @@ describe("evaluateEvidence — a truth-only gap never hard-blocks (BLO-32239)", 
     expect(failed.verdict).toBe("warn");
     expect(failed.diagnostics).toContain("unlabeled-truth-block-suppressed:probe-failed");
   });
+
+  // The gap the test above leaves open: there BOTH truth shapes are missing, so
+  // blocking is right — `review:ally-clean` is genuinely absent and genuinely
+  // satisfiable. These two pin the case where the ONLY thing missing is the one
+  // shape no flag can make satisfiable at this transition.
+  it("the flag never makes `deploy:landed` binding alone — labeled, Ally-clean at head, PR open", () => {
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [{ name: "frontend" }] },
+      comments: [complete()],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      unlabeledTruthBlock: true,
+      probeFailed: false,
+      externalDetections: { "review:ally-clean": true },
+    });
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(["deploy:landed"]);
+    expect(result.diagnostics).toContain("truth-gap-warn-only");
+    expect(result.diagnostics).not.toContain("unlabeled-truth-block");
+  });
+
+  it("the flag never makes `deploy:landed` binding alone — unlabeled fallback", () => {
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [] },
+      comments: [complete()],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      unlabeledTruthBlock: true,
+      probeFailed: false,
+      externalDetections: { "review:ally-clean": true },
+    });
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(["deploy:landed"]);
+    expect(result.diagnostics).not.toContain("unlabeled-truth-block");
+  });
 });
