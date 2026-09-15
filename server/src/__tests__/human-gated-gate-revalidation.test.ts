@@ -178,6 +178,26 @@ describe("probeApprovalGate", () => {
     );
     expect(result?.verdict).toBe("still-gated");
     expect(result?.evidence).toContain("a1=escalated_to_board");
+    // Schema drift must not be reported as a real card state. "Still
+    // undecided" describes a pending card, which this is not; the digest is
+    // where an unrecognised status would be noticed, so it has to say so.
+    expect(result?.evidence).toContain("does not recognise");
+    expect(result?.evidence).not.toContain("still undecided");
+  });
+
+  it("names undecided and unrecognised cards separately on a mixed row", () => {
+    const result = probeApprovalGate(
+      evidence({
+        approvals: [
+          { approvalId: "a1", approvalStatus: "pending" },
+          { approvalId: "a2", approvalStatus: "escalated_to_board" },
+        ],
+      }),
+    );
+    expect(result?.verdict).toBe("still-gated");
+    expect(result?.evidence).toContain("1 of 2 linked approvals still undecided: a1=pending");
+    expect(result?.evidence).toContain("does not recognise");
+    expect(result?.evidence).toContain("a2=escalated_to_board");
   });
 
   it("stays gated while any one of several cards is undecided", () => {
@@ -587,6 +607,34 @@ describe("withheldFromAgeRankingIssueIds (PEN-3089)", () => {
     expect(withheldFromAgeRankingIssueIds(report).has("mixed")).toBe(false);
   });
 
+  it("escalates a granted card that lost the kind election to a blocker-done probe", () => {
+    // The only shape where the election and the exemption come apart, so the
+    // only one that actually tests "reads every probe". `approval-granted` is
+    // the single `ACTION_OWED_RESOLUTION_KINDS` member absent from
+    // `NON_SELF_CLEARING_RESOLUTION_KINDS`, so it wins the election only by
+    // being `resolved[0]` — and `probeBlockerPremise` runs first, so a
+    // blocker-done probe takes the heading instead.
+    //
+    // The sibling test above cannot detect this: its withdrawn card elects
+    // `approval-abandoned`, which is non-self-clearing and therefore *wins*, so
+    // a predicate reading the elected kind would pass it too.
+    const report = revalidateGates([
+      evidence({
+        issueId: "granted-behind-blocker",
+        blockers: [{ blockerIssueId: "b", blockerStatus: "done" }],
+        approvals: [{ approvalId: "a", approvalStatus: "approved" }],
+      }),
+    ]);
+    const [classification] = report.classifications;
+    // Guard the premise: if the election ever stops picking the blocker probe,
+    // this test silently stops exercising the divergence it is named for.
+    expect(classification?.resolutionKind).toBe("blocker-done-row-not-moved");
+    expect(classification?.probes.map((probe) => probe.resolutionKind)).toContain(
+      "approval-granted",
+    );
+    expect(withheldFromAgeRankingIssueIds(report).has("granted-behind-blocker")).toBe(false);
+  });
+
   it("never withholds a row that is still gated or unverifiable", () => {
     const report = revalidateGates([
       evidence({ issueId: "gated", approvals: [{ approvalId: "a", approvalStatus: "pending" }] }),
@@ -648,6 +696,43 @@ describe("formatGateRevalidationSections", () => {
     expect(markdown).not.toContain("these are not still waiting");
     expect(markdown).toContain("authorised, unperformed — 1** (⛔ still escalated");
     expect(markdown).toContain("needs closing, not re-asking — 1** (withheld");
+  });
+
+  it("marks the row, not the kind, so an escalated row under a withheld kind is not mislabelled (PEN-3089)", () => {
+    // The divergence the per-kind label reintroduced. Both rows elect
+    // `blocker-done-row-not-moved` — a kind that is *not* action-owed — but the
+    // first also carries a granted card, so `withheldFromAgeRankingIssueIds`
+    // keeps it escalated. Labelling the block from its kind printed "withheld
+    // from the age-ranked list" over a row that was in that list, which is the
+    // same false claim this ticket removed from the global heading.
+    const report = revalidateGates([
+      evidence({
+        issueId: "escalated",
+        identifier: "PEN-3000",
+        blockers: [{ blockerIssueId: "b", blockerStatus: "done" }],
+        approvals: [{ approvalId: "a1", approvalStatus: "approved" }],
+      }),
+      evidence({
+        issueId: "withheld",
+        identifier: "PEN-3001",
+        blockers: [{ blockerIssueId: "c", blockerStatus: "done" }],
+      }),
+    ]);
+    const markdown = formatGateRevalidationSections(report);
+
+    // One heading, holding rows with opposite dispositions: it must report the
+    // split rather than assert either disposition over both.
+    expect(markdown).toContain("never moved — 2** (⛔ 1 still escalated · 1 withheld");
+    // The escalated row is marked; the withheld one is not.
+    expect(markdown).toContain("- ⛔ PEN-3000");
+    expect(markdown).toContain("- PEN-3001");
+    expect(markdown).not.toContain("- ⛔ PEN-3001");
+
+    // The label can never disagree with the filter: every marked row is absent
+    // from `withheld`, and every unmarked one is in it.
+    const withheld = withheldFromAgeRankingIssueIds(report);
+    expect(withheld.has("escalated")).toBe(false);
+    expect(withheld.has("withheld")).toBe(true);
   });
 
   it("leads with the resolution kind that cannot clear itself", () => {
