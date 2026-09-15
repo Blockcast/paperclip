@@ -783,6 +783,13 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             isActive: nextIsActive,
             updatedByUserId: actorUserId,
             updatedAt: now,
+            // Only when the enforced figure actually moved. This is the single
+            // edit path for warn percent, hard stop, notify and active state as
+            // well, and `approval-enforcement-reconciler.ts` reads this column
+            // as "a later decision moved the cap" — so stamping it on a metadata
+            // toggle would let that toggle hide a real enforcement gap
+            // (BLO-32796).
+            ...(amount === existing.amount ? {} : { amountUpdatedAt: now }),
           })
           .where(eq(budgetPolicies.id, existing.id))
           .returning()
@@ -1144,6 +1151,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             isActive: true,
             updatedByUserId: actorUserId,
             updatedAt: now,
+            ...(nextAmount === policy.amount ? {} : { amountUpdatedAt: now }),
           })
           .where(eq(budgetPolicies.id, policy.id));
 
