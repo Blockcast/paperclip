@@ -3077,10 +3077,19 @@ export function issueRoutes(
    * One helper rather than the projection inlined at each exit: the column leaves this file from
    * eleven sites, and a per-site copy is how one of eleven ends up unprojected. Call it on every
    * response body that carries an issue row.
+   *
+   * The empty-column early return is an optimization that cannot widen what crosses:
+   * `publicIssueExecutionWorkspaceSettings` returns `null`/`undefined` unchanged on BOTH viewer
+   * branches, so resolving the viewer first could only ever produce the same body. It matters because
+   * most issue rows carry no override at all, and `GET /issues/:id` is the most-read agent endpoint in
+   * the product — without it every such response pays an authorization decision to mask nothing.
    */
   async function withPublicIssueWorkspaceSettings<
     T extends { companyId: string; executionWorkspaceSettings?: unknown },
   >(req: Request, row: T): Promise<T> {
+    if (row.executionWorkspaceSettings === null || row.executionWorkspaceSettings === undefined) {
+      return row;
+    }
     const runtimeViewer = await resolveWorkspaceRuntimeViewer(access, req, row.companyId);
     return {
       ...row,
