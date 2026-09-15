@@ -80,6 +80,7 @@ import {
   type ResolvedPluginFencingPrecondition,
 } from "./plugin-fencing.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
+import { TERMINAL_RUN_STATUSES } from "./agent-scorecards.js";
 import {
   checkoutRestoreStatusExpression,
   lockIssueOwnership,
@@ -1507,6 +1508,7 @@ async function listPendingFinalizeBlockerIssueIds(
     .select({
       issueId: workspaceOperations.issueId,
       executionWorkspaceId: workspaceOperations.executionWorkspaceId,
+      heartbeatRunId: workspaceOperations.heartbeatRunId,
       phase: workspaceOperations.phase,
       status: workspaceOperations.status,
       startedAt: workspaceOperations.startedAt,
@@ -1520,8 +1522,14 @@ async function listPendingFinalizeBlockerIssueIds(
       ),
     );
 
-  const latestAttributedByBlockerWorkspace = new Map<string, { phase: string; status: string; startedAt: Date }>();
-  const latestUnattributedByWorkspace = new Map<string, { phase: string; status: string; startedAt: Date }>();
+  type LatestOperation = {
+    phase: string;
+    status: string;
+    startedAt: Date;
+    heartbeatRunId: string | null;
+  };
+  const latestAttributedByBlockerWorkspace = new Map<string, LatestOperation>();
+  const latestUnattributedByWorkspace = new Map<string, LatestOperation>();
   for (const row of rows) {
     if (!row.executionWorkspaceId) continue;
     if (row.issueId) {
@@ -1533,6 +1541,7 @@ async function listPendingFinalizeBlockerIssueIds(
           phase: row.phase,
           status: row.status,
           startedAt: row.startedAt,
+          heartbeatRunId: row.heartbeatRunId,
         });
       }
       continue;
@@ -1544,8 +1553,35 @@ async function listPendingFinalizeBlockerIssueIds(
         phase: row.phase,
         status: row.status,
         startedAt: row.startedAt,
+        heartbeatRunId: row.heartbeatRunId,
       });
     }
+  }
+
+  // The barrier waits for a finalize that only a *run* can deliver. Resolve the
+  // status of the run that owes each unfinalized operation so a run that can no
+  // longer deliver one does not gate its dependents forever (see below).
+  const owingRunIds = new Set<string>();
+  for (const pair of blockerWorkspacePairs) {
+    const latest = latestAttributedByBlockerWorkspace.get(`${pair.blockerIssueId}:${pair.executionWorkspaceId}`)
+      ?? latestUnattributedByWorkspace.get(pair.executionWorkspaceId);
+    if (!latest) continue;
+    if (latest.phase === "workspace_finalize" && latest.status === "succeeded") continue;
+    if (latest.heartbeatRunId) owingRunIds.add(latest.heartbeatRunId);
+  }
+
+  const owingRunStatusById = new Map<string, string>();
+  if (owingRunIds.size > 0) {
+    const runRows = await dbOrTx
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.id, [...owingRunIds]),
+        ),
+      );
+    for (const row of runRows) owingRunStatusById.set(row.id, row.status);
   }
 
   for (const pair of blockerWorkspacePairs) {
@@ -1553,6 +1589,24 @@ async function listPendingFinalizeBlockerIssueIds(
       ?? latestUnattributedByWorkspace.get(pair.executionWorkspaceId);
     if (!latest) continue; // no ops recorded -> nothing to finalize for this blocker
     if (latest.phase === "workspace_finalize" && latest.status === "succeeded") continue;
+    // PEN-3255: the barrier had no terminal condition. Only a run writes a
+    // `workspace_finalize` op, so once the run that owed one has reached a
+    // terminal status no finalize can ever arrive — the comment on the caller
+    // promising that "a subsequent finalize wake will re-evaluate readiness"
+    // is false for that case, and the dependent stays gated forever rather
+    // than transiently. Measured instance: PEN-2969's finalize failed at
+    // 2026-09-06T02:27:34Z ("External runtime reservation no longer owns
+    // execution for run 9c34deb7…") 96s AFTER that run itself ended `failed`,
+    // and the single stuck edge then refused checkout and every
+    // `status=in_progress` write on three dependents for 9 days.
+    //
+    // Release only on positive evidence that the owing run is over. An op with
+    // no `heartbeat_run_id`, or one naming a run we cannot read, leaves the
+    // gate closed: absence of a run row is not evidence the work is finished,
+    // and a live/resumable run (`queued`, `running`, `scheduled_retry`,
+    // `interrupted`) may still deliver the finalize.
+    const owingRunStatus = latest.heartbeatRunId ? owingRunStatusById.get(latest.heartbeatRunId) : undefined;
+    if (owingRunStatus && (TERMINAL_RUN_STATUSES as readonly string[]).includes(owingRunStatus)) continue;
     pending.add(pair.blockerIssueId);
   }
 
