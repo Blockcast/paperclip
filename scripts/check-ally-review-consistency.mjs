@@ -15,30 +15,34 @@
  * Observed on Blockcast/paperclip#876 (BLO-19778): two runs dispatched 43 ms
  * apart both submitted at head ff1c72db, 34 s apart, with opposite verdicts.
  *
- *   I1  At most one operative App review and one operative User-seat approval
- *       per (PR, head SHA). One review in each separate lane is valid; an
- *       exact App/User pair is therefore not a duplicate, but retries within
- *       either lane remain fatal. A same-lane duplicate also reports whether
- *       the bodies are identical or differ (`sameLaneBodyRelation`), because
- *       that — not the gap between submissions — is what says whether the
- *       missing control is submit idempotency or reviewer exclusion.
+ *   I1  At most one operative App review per (PR, head SHA). A same-lane
+ *       duplicate also reports whether the bodies are identical or differ
+ *       (`sameLaneBodyRelation`), because that — not the gap between
+ *       submissions — is what says whether the missing control is submit
+ *       idempotency or reviewer exclusion.
  *   I2  No operative APPROVED review whose own body reports a Critical or
  *       Important finding, no User-seat APPROVED review coexisting with a
- *       blocking App review, and no clean App approval without a `Reviewed
- *       head:` attestation. The User-seat lane is human evidence and may use
- *       plain exact-head prose; it must not be forced to imitate the App's
- *       machine-readable review template.
+ *       blocking App review, and no App approval without a `Reviewed head:`
+ *       attestation.
  *   I3  An operative App review has exactly one canonical body and its
  *       body-attested `Reviewed head:` matches the commit GitHub recorded it
- *       against. The User-seat lane relies on GitHub's exact `commit_id`.
- *   I4  A clean App verdict and a User-seat approval are formal `APPROVED`
- *       reviews. The sole exception is an App-authored PR: GitHub prevents
- *       the App from approving its own PR, so its clean canonical self-review
- *       is necessarily `COMMENTED`. A clean App `COMMENTED` review cannot
- *       satisfy the App lane for any independently authored PR.
+ *       against.
+ *   I4  A clean App verdict is a formal `APPROVED` review. The sole exception
+ *       is an App-authored PR: GitHub prevents the App from approving its own
+ *       PR, so its clean canonical self-review is necessarily `COMMENTED`. A
+ *       clean App `COMMENTED` review cannot satisfy the App lane for any
+ *       independently authored PR.
  *   I5  A review using an Ally canonical login and account type must also
  *       carry the immutable REST ID for that principal. A lookalike identity
  *       must never become valid evidence merely by copying the login string.
+ *   I6  No operative User-seat review at all. R4 (BLO-24056, ratified on
+ *       BLO-29559) made the seat a flat prohibition: it shares a login with
+ *       the authoring App, so a seat verdict is self-approval wearing a second
+ *       hat. An earlier revision of this file treated the seat as a second
+ *       lane of "human evidence" that "may use plain exact-head prose" and so
+ *       need not attest a head — which is exactly why BLO-22916 Defect 2, five
+ *       content-free seat APPROVEDs carrying no `Reviewed head:` line, was
+ *       invisible to every check here.
  *
  * On I3's mechanism. An earlier revision of this file said `gh pr review`
  * binds a review to the head at submit time, so a mid-review push "certifies a
@@ -353,6 +357,13 @@ const SAME_LANE_RELATION_NOTES = {
 };
 
 /**
+ * POLICY-OBSOLETE, retained only for its existing regression coverage: this
+ * encodes the pre-R4 rule that an independently-authored PR needs formal
+ * approval in BOTH the App and User-seat lanes. R4 (BLO-24056) retired the
+ * seat verdict entirely, and findPrViolations now reports every operative seat
+ * review as I6. Nothing in production calls this. Do not re-derive the current
+ * credential rule from it.
+ *
  * The only permitted two-review shape: one current-head clean review from the
  * required App identity and one from the required User seat. Independently
  * authored PRs require formal approval in both lanes. For an App-authored PR,
@@ -432,6 +443,23 @@ export function findPrViolations(pr) {
     for (const review of reviews) {
       const blocking = hasBlockingVerdict(review.body);
 
+      // R4 (BLO-24056, ratified by the CEO ruling on BLO-29559): the User seat
+      // shares a login with the authoring App, so a seat verdict is the same
+      // head both writing a change and clearing it. It never submits a review,
+      // an approval, or a REQUEST_CHANGES under any condition. Its only
+      // sanctioned operation is dismissing a stale approval, and a DISMISSED
+      // review is already excluded from the operative set above.
+      //
+      // This subsumes BLO-22916 Defect 2: the five content-free approvals that
+      // carried no `Reviewed head:` line were all seat submissions, and the
+      // App-only I2d check below could never see them.
+      if (lane === "seat") {
+        violations.push(
+          `I6 PR #${pr.number} @${short}: ${label} review ${review.id} is ${reviewState(review)} — the User seat (uid ${ALLY_USER_REVIEWER_ID}) never submits a verdict (R4, BLO-24056); only the App (uid ${ALLY_APP_REVIEWER_ID}) may carry one`,
+        );
+        continue;
+      }
+
       if (lane === "app") {
         const canonicalHead = canonicalReviewHead(review.body);
         const attested = attestedHead(review.body);
@@ -454,13 +482,9 @@ export function findPrViolations(pr) {
         }
       }
 
-      if (
-        !isApproved(review) &&
-        (lane === "seat" || (!blocking && !(lane === "app" && isCleanAppSelfReview(pr, review))))
-      ) {
-        const requirement = lane === "app" ? "clean App evidence" : "User-seat evidence";
+      if (!isApproved(review) && !blocking && !isCleanAppSelfReview(pr, review)) {
         violations.push(
-          `I4 PR #${pr.number} @${short}: ${label} review ${review.id} is ${reviewState(review)} but ${requirement} must be APPROVED`,
+          `I4 PR #${pr.number} @${short}: ${label} review ${review.id} is ${reviewState(review)} but clean App evidence must be APPROVED`,
         );
       }
 
