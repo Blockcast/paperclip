@@ -18,6 +18,7 @@ import {
   extractAllyPriorFindingDispositions,
   extractAllyReportedFindingRefs,
   extractAllyReviewedHeadSha,
+  allyClaimedReviewHead,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
   parseAllyVerdictBlock,
@@ -345,30 +346,53 @@ export function evaluateCommentReviewGate(input: {
   const comments = input.comments ?? [];
   const normalizedHead = headSha.toLowerCase();
 
-  // Checked before anything else, and scoped to the newest review only.
+  // Checked before anything else, scoped to the newest review, and scoped to
+  // this head.
   //
-  // Scoped, because an unreadable block anywhere in history would wedge the PR
-  // permanently with no route out — the same unretirable trap BLO-31446 and
-  // BLO-31947 document. Bounded to the newest review, Ally clears it by
-  // posting one more readable review, which is a route that always exists.
+  // Scoped to the newest review, because an unreadable block anywhere in
+  // history would wedge the PR permanently with no route out — the same
+  // unretirable trap BLO-31446 and BLO-31947 document.
   //
-  // First, because the alternative is silence: an unreadable block attests no
-  // head, so without this branch the newest review is invisible and an *older*
-  // review of the same head stays authoritative. That is not hypothetical —
-  // it is exactly how paperclip#1675 reported a finding Ally had withdrawn.
-  // The 15:41:42Z clean review failed to attest, so the 03:46:19Z review of
-  // the same head kept its `Important Issues (1)`, and the gate published
-  // `blocking_finding` against a verdict that had already been superseded.
+  // Checked first, because the alternative is silence: an unreadable block
+  // attests no head, so without this branch the newest review is invisible and
+  // an *older* review of the same head stays authoritative. That is not
+  // hypothetical — it is exactly how paperclip#1675 reported a finding Ally
+  // had withdrawn. The 15:41:42Z clean review failed to attest, so the
+  // 03:46:19Z review of the same head kept its `Important Issues (1)`, and the
+  // gate published `blocking_finding` against a superseded verdict.
+  //
+  // Scoped to this head, because "newest" is not "at this head" and the
+  // difference is a real red on a tree nobody reviewed.
+  // newestAllyConsolidatedReviewComment has no head filter, so unscoped this
+  // branch lets a malformed block from three pushes ago decide the current
+  // head — where the same PR with no comments at all is `not_evaluated`, i.e.
+  // green. A stale broken block must not be worse for an author than no review
+  // (found in peer review of #1721 at 11a52e9a). It matters most on the
+  // designed upgrade path: SUPPORTED_ALLY_VERDICT_VERSION is bumped by a
+  // server rollout, but the producer is a prompt that takes effect the moment
+  // it merges, so between those two moments an unscoped branch reds every open
+  // PR at once — including PRs whose current head was never reviewed.
+  //
+  // The scoping test is asymmetric and fails closed, which is what keeps AC-5:
+  // the branch is skipped only when the review *positively* names some other
+  // tree. allyClaimedReviewHead returning null means "cannot tell which head
+  // this examined", and that is an ambiguity, not an exemption — a review of
+  // this head whose verdict we could not read is precisely the case that must
+  // not resolve to success. Only a head we can read, and that is not this one,
+  // makes the unreadable verdict somebody else's problem.
   const newestReview = newestAllyConsolidatedReviewComment(comments, reviewerBotLogin);
   if (newestReview) {
-    const block = parseAllyVerdictBlock(newestReview.body);
-    if (block.kind === "unreadable") {
-      return {
-        state: "failure",
-        outcome: "unreadable_verdict",
-        reason: `Ally's newest review carries an unreadable verdict block: ${block.reason}.`,
-        commentCreatedAt: new Date(toEpochMs(newestReview.createdAt)).toISOString(),
-      };
+    const claimedHead = allyClaimedReviewHead(newestReview.body);
+    if (claimedHead === null || claimedHead === normalizedHead) {
+      const block = parseAllyVerdictBlock(newestReview.body);
+      if (block.kind === "unreadable") {
+        return {
+          state: "failure",
+          outcome: "unreadable_verdict",
+          reason: `Ally's newest review carries an unreadable verdict block: ${block.reason}.`,
+          commentCreatedAt: new Date(toEpochMs(newestReview.createdAt)).toISOString(),
+        };
+      }
     }
   }
 

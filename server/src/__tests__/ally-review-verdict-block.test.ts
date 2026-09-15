@@ -7,6 +7,7 @@ import {
   extractAllyPriorFindingDispositions,
   extractAllyReportedFindingRefs,
   extractAllyReviewedHeadSha,
+  allyClaimedReviewHead,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
   parseAllyVerdictBlock,
@@ -521,6 +522,15 @@ describe("BLO-32695 — an unknown severity key fails closed, not open", () => {
     `${verdictBlock({ head: PR1675_HEAD, findings })}\n## Ally — Consolidated PR Review\n` +
     `Reviewed head: ${PR1675_HEAD}\n\n### Critical Issues (1)\n- something is badly wrong`;
 
+  // The same body with prose that agrees with a zeroed block. The controls
+  // below need a block that is well-formed *and* uncontradicted: `typod`'s
+  // body enumerates a Critical, so passing it honest zero counts is now its
+  // own unreadable case (the count-disagreement rule), which would make the
+  // control pass for the wrong reason.
+  const agreeing = (findings: unknown) =>
+    `${verdictBlock({ head: PR1675_HEAD, findings })}\n## Ally — Consolidated PR Review\n` +
+    `Reviewed head: ${PR1675_HEAD}\n\n### Critical Issues (0)\n### Important Issues (0)`;
+
   it("reads a misspelled blocking severity as unreadable, naming the key", () => {
     expect(parseAllyVerdictBlock(typod({ critcal: 1, important: 0 }))).toMatchObject({
       kind: "unreadable",
@@ -560,13 +570,13 @@ describe("BLO-32695 — an unknown severity key fails closed, not open", () => {
     // `[]` is "reviewed, found nothing"; `null` is "we could not read it".
     // Collapsing the two is what let the typo pass as a clean review.
     expect(extractAllyReportedFindingRefs(typod({ critcal: 1, important: 0 }))).toBeNull();
-    expect(extractAllyReportedFindingRefs(typod({ critical: 0, important: 0 }))).toEqual([]);
+    expect(extractAllyReportedFindingRefs(agreeing({ critical: 0, important: 0 }))).toEqual([]);
   });
 
   // Controls against over-tightening in either direction.
   it("still reads every supported key, including non-blocking suggestions", () => {
     expect(
-      parseAllyVerdictBlock(typod({ critical: 0, important: 0, suggestions: 2 })),
+      parseAllyVerdictBlock(agreeing({ critical: 0, important: 0, suggestions: 2 })),
     ).toMatchObject({ kind: "ok" });
   });
 
@@ -931,5 +941,313 @@ describe("BLO-32695 — the Step 4 template satisfies the heading the gate requi
     expect(
       hasAllyConsolidatedReviewHeading("## 🔍 Automated Review — PR #1721 @ bd489d5"),
     ).toBe(false);
+  });
+});
+
+/**
+ * Peer review of #1721 at 11a52e9a, Critical 1 — the unreadable branch was not
+ * head-scoped.
+ *
+ * `newestAllyConsolidatedReviewComment` has no head filter, so a malformed
+ * block on a review of head A decided the gate for head B — while the same PR
+ * carrying no comments at all resolved `not_evaluated`/success. A stale broken
+ * block was strictly worse for an author than no review.
+ *
+ * The scoping added for it is asymmetric, and these cases pin both sides. Only
+ * a review that *positively names some other tree* is exempt. "Cannot tell
+ * which head this examined" is an ambiguity, not an exemption, so every case
+ * in the fail-closed suite above — a sole review of this head whose verdict is
+ * unreadable — stays red. Relaxing that instead would have satisfied the
+ * Critical by re-opening AC-5.
+ */
+describe("BLO-32695 — an unreadable block reds only the head it concerns", () => {
+  const HEAD_A = PR1675_HEAD;
+  const HEAD_B = "a".repeat(40);
+
+  /** Unreadable — truncated payload — but it still says which tree it read. */
+  const brokenNamingHeadA = [
+    `<!-- ally-verdict:1 {"head": "${HEAD_A}"`,
+    "",
+    "## Ally — Consolidated PR Review",
+    `Reviewed head: ${HEAD_A}`,
+  ].join("\n");
+
+  /** Unreadable *and* silent about its head: the ambiguous case. */
+  const brokenNamingNothing = [
+    `<!-- ally-verdict:1 {"critical":`,
+    "",
+    "## Ally — Consolidated PR Review",
+  ].join("\n");
+
+  function gateAt(headSha: string, comments: ReturnType<typeof allyComment>[]) {
+    return evaluateCommentReviewGate({ headSha, reviewerBotLogin: ALLY_BOT_LOGIN, comments });
+  }
+
+  it("positive control: both bodies really are unreadable", () => {
+    expect(parseAllyVerdictBlock(brokenNamingHeadA).kind).toBe("unreadable");
+    expect(parseAllyVerdictBlock(brokenNamingNothing).kind).toBe("unreadable");
+  });
+
+  it("reads the claimed head off a body whose verdict it cannot read", () => {
+    // The prose line survives a truncated block, and the block's own `head`
+    // field survives every failure that is not a JSON one. Neither is an
+    // attestation — extractAllyReviewedHeadSha still refuses — which is the
+    // distinction the two functions exist to keep.
+    expect(allyClaimedReviewHead(brokenNamingHeadA)).toBe(HEAD_A);
+    expect(extractAllyReviewedHeadSha(brokenNamingHeadA)).toBeNull();
+    expect(allyClaimedReviewHead(brokenNamingNothing)).toBeNull();
+  });
+
+  it("does not red a head the broken review names another tree for", () => {
+    // The finding itself. Before the fix this was `failure`/`unreadable_verdict`
+    // while the control below was `success`.
+    expect(gateAt(HEAD_B, [allyComment(brokenNamingHeadA, "2026-09-07T15:41:42Z")])).toMatchObject({
+      state: "success",
+      outcome: "not_evaluated",
+    });
+  });
+
+  it("control: the no-comments case it must not be worse than", () => {
+    expect(gateAt(HEAD_B, [])).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  it("still reds the head that review does name", () => {
+    expect(gateAt(HEAD_A, [allyComment(brokenNamingHeadA, "2026-09-07T15:41:42Z")])).toMatchObject({
+      state: "failure",
+      outcome: "unreadable_verdict",
+    });
+  });
+
+  it("fails closed when the broken review names no head at all", () => {
+    // AC-5. An unreadable verdict that will not say which tree it examined is
+    // the ambiguity the gate must not resolve to success, and it is the shape
+    // every case in the fail-closed suite takes.
+    expect(gateAt(HEAD_B, [allyComment(brokenNamingNothing, "2026-09-07T15:41:42Z")])).toMatchObject({
+      state: "failure",
+      outcome: "unreadable_verdict",
+    });
+  });
+
+  it("still supersedes an older clean review of the same head", () => {
+    // The #1675 shape, and the reason the branch is checked first: without it
+    // the older clean review stays authoritative and the newest — which may
+    // have found something — is invisible.
+    const olderClean = [
+      "## Ally — Consolidated PR Review",
+      `Reviewed head: ${HEAD_A}`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ].join("\n");
+    expect(
+      gateAt(HEAD_A, [
+        allyComment(olderClean, "2026-09-07T03:46:19Z"),
+        allyComment(brokenNamingHeadA, "2026-09-07T15:41:42Z"),
+      ]),
+    ).toMatchObject({ state: "failure", outcome: "unreadable_verdict" });
+  });
+
+  it("leaves a finding carried from the head it names, rather than masking it", () => {
+    // Evaluated at HEAD_B with the broken review naming HEAD_A: the unreadable
+    // branch stands down, and the red comes from the carried finding — which
+    // names the head an author can act on, where `unreadable_verdict` names
+    // none.
+    const olderBlocking = [
+      "## Ally — Consolidated PR Review",
+      `Reviewed head: ${HEAD_A}`,
+      "### Important Issues (1)",
+      "1. Something unresolved.",
+    ].join("\n");
+    expect(
+      gateAt(HEAD_B, [
+        allyComment(olderBlocking, "2026-09-07T03:46:19Z"),
+        allyComment(brokenNamingHeadA, "2026-09-07T15:41:42Z"),
+      ]),
+    ).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
+  it("does not let an OLDER broken block shadow a newer clean review", () => {
+    const newerClean = [
+      "## Ally — Consolidated PR Review",
+      `Reviewed head: ${HEAD_A}`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ].join("\n");
+    expect(
+      gateAt(HEAD_A, [
+        allyComment(brokenNamingHeadA, "2026-09-07T03:46:19Z"),
+        allyComment(newerClean, "2026-09-07T15:41:42Z"),
+      ]),
+    ).toMatchObject({ state: "success", outcome: "clean" });
+  });
+});
+
+/**
+ * Peer review of #1721, Important 1 — head disagreement was fatal and count
+ * disagreement was not.
+ *
+ * The counts outrank every prose clause in `hasActionablePrReviewFeedback`, so
+ * a block stating zero silently beat an emitted `### Critical Issues (2)` and
+ * resolved clean/success: the BLO-29711 direction arriving through the
+ * structured path, as a green rather than a red.
+ */
+describe("BLO-32695 — the block and the prose must not name different counts", () => {
+  function body(payload: unknown, ...prose: string[]) {
+    return [
+      verdictBlock(payload),
+      "",
+      "## Ally — Consolidated PR Review",
+      `Reviewed head: ${PR1675_HEAD}`,
+      ...prose,
+    ].join("\n");
+  }
+
+  const contradicting = body(
+    { head: PR1675_HEAD, findings: { critical: 0, important: 0 } },
+    "### Critical Issues (2)",
+    "1. A real finding.",
+  );
+
+  it("fails closed when the block states zero and the prose enumerates a finding", () => {
+    expect(parseAllyVerdictBlock(contradicting)).toMatchObject({
+      kind: "unreadable",
+      reason: expect.stringContaining("critical"),
+    });
+  });
+
+  it("does not resolve that body to success", () => {
+    expect(
+      evaluateCommentReviewGate({
+        headSha: PR1675_HEAD,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: [allyComment(contradicting, "2026-09-07T15:41:42Z")],
+      }).state,
+    ).not.toBe("success");
+  });
+
+  it("does not report it as a finding: the body's verdict was never read", () => {
+    // AC-3. `blocking_finding` must stay reachable only from a counted
+    // structured finding — an unreadable block is reported under its own
+    // outcome, not attributed to the author as a finding.
+    expect(hasActionablePrReviewFeedback(contradicting)).toBe(false);
+  });
+
+  it("is asymmetric like the head rule: agreeing zeroes stay readable", () => {
+    // The #1675 control. Its own buckets read `(0)`, so this rule never fires
+    // on the body the whole row exists for.
+    expect(
+      parseAllyVerdictBlock(
+        body(
+          { head: PR1675_HEAD, findings: { critical: 0, important: 0 } },
+          "### Critical Issues (0)",
+          "### Important Issues (0)",
+        ),
+      ).kind,
+    ).toBe("ok");
+  });
+
+  it("is asymmetric like the head rule: absent buckets stay readable", () => {
+    expect(
+      parseAllyVerdictBlock(body({ head: PR1675_HEAD, findings: { critical: 0, important: 0 } })).kind,
+    ).toBe("ok");
+  });
+
+  it("does not fire when the block states the finding the prose enumerates", () => {
+    const agreeing = body(
+      { head: PR1675_HEAD, findings: { critical: 2, important: 0 } },
+      "### Critical Issues (2)",
+    );
+    expect(parseAllyVerdictBlock(agreeing).kind).toBe("ok");
+    // And it blocks, through the counted path rather than the prose one.
+    expect(hasActionablePrReviewFeedback(agreeing)).toBe(true);
+  });
+
+  it("does not fire on a suggestions bucket, which cannot fail open", () => {
+    const suggestions = body(
+      { head: PR1675_HEAD, findings: { critical: 0, important: 0, suggestions: 0 } },
+      "### Suggestions (3)",
+    );
+    expect(parseAllyVerdictBlock(suggestions).kind).toBe("ok");
+  });
+
+  it("ignores a fenced bucket, so a quoted example cannot red a clean block", () => {
+    const quoted = body(
+      { head: PR1675_HEAD, findings: { critical: 0, important: 0 } },
+      "```markdown",
+      "### Critical Issues (2)",
+      "```",
+    );
+    expect(parseAllyVerdictBlock(quoted).kind).toBe("ok");
+  });
+});
+
+/**
+ * Peer review of #1721, Important 2 — the opener guard only covered a missing
+ * `-->`, so the four likeliest prefix drifts missed both patterns and read
+ * `absent`, silently degrading to the prose path this row retires.
+ *
+ * The producer is a model transcribing a template out of a fenced markdown
+ * example. Pretty-printing a space after the colon is the likeliest single
+ * drift there is; `v1` is the second. The opener is now version-agnostic, so
+ * the strict block pattern stays the only reader of the version and every way
+ * of garbling it lands on `openers > blocks`.
+ */
+describe("BLO-32695 — prefix drift fails closed rather than vanishing", () => {
+  const prose = [
+    "",
+    "## Ally — Consolidated PR Review",
+    `Reviewed head: ${PR1675_HEAD}`,
+    "### Critical Issues (0)",
+    "### Important Issues (0)",
+  ].join("\n");
+
+  const payload = JSON.stringify(PR1675_VERDICT, null, 2);
+
+  it("reads a space after the colon as the block it plainly is", () => {
+    const spaced = `<!-- ally-verdict: 1\n${payload}\n-->${prose}`;
+    expect(parseAllyVerdictBlock(spaced)).toMatchObject({ kind: "ok" });
+    expect(extractAllyReviewedHeadSha(spaced)).toBe(PR1675_HEAD);
+  });
+
+  it.each([
+    ["a `v`-prefixed version", `<!-- ally-verdict:v1\n${payload}\n-->`],
+    ["no version at all", `<!-- ally-verdict {"head": "${PR1675_HEAD}"}\n-->`],
+  ])("fails closed on %s rather than falling through to prose", (_label, opener) => {
+    // Before the fix each of these matched neither pattern, read `absent`, and
+    // cleared the gate off the very prose the block exists to stop trusting.
+    expect(parseAllyVerdictBlock(`${opener}${prose}`).kind).toBe("unreadable");
+    expect(
+      evaluateCommentReviewGate({
+        headSha: PR1675_HEAD,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: [
+          allyComment(`${opener}${prose}`, "2026-09-07T15:41:42Z"),
+          // Shadowed, so the unreadable branch is reachable at all — see the
+          // head-scoping suite above.
+          allyComment(`## Ally — Consolidated PR Review\nReviewed head: ${PR1675_HEAD}\n### Critical Issues (0)`, "2026-09-07T03:46:19Z"),
+        ],
+      }).state,
+    ).not.toBe("success");
+  });
+
+  it("reads a zero-padded version, so the three readers cannot split on it", () => {
+    // Suggestion 1 of the same review: the Python sweep compared the version
+    // as a string while both JS readers use Number(), so `:01` was readable
+    // here and unreadable there — and the sweep would then re-request a review
+    // that had already happened. Pinned on both sides.
+    const padded = `<!-- ally-verdict:01\n${payload}\n-->${prose}`;
+    expect(parseAllyVerdictBlock(padded)).toMatchObject({ kind: "ok" });
+  });
+
+  it("keeps the line anchor: an inline marker is still absent, not an opener", () => {
+    // Deliberate and unchanged. Un-anchoring would let a review *of this file*
+    // mint a phantom opener out of a quoted marker and wedge its own gate,
+    // which is the worse of the two failures.
+    expect(parseAllyVerdictBlock(`see <!-- ally-verdict:1 mid-line${prose}`)).toEqual({
+      kind: "absent",
+    });
+  });
+
+  it("still counts the emitter's own exact form as one block, not two", () => {
+    expect(parseAllyVerdictBlock(`${verdictBlock(PR1675_VERDICT)}${prose}`).kind).toBe("ok");
   });
 });

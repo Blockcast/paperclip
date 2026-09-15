@@ -1073,6 +1073,42 @@ class TestParseReviewedHead(unittest.TestCase):
             )
         )
 
+    def test_a_zero_padded_version_reads_the_same_here_as_in_the_two_js_readers(self):
+        """Peer review of #1721, Suggestion 1 -- the version compare diverged.
+
+        This compared `raw_version != str(1)` while ally-review-detection.ts and
+        check-ally-review-consistency.mjs both use `Number(raw) !== 1`, so
+        `ally-verdict:01` was readable to the merge gate and unreadable here.
+        The sweep then treats the review as no signal for that head and
+        re-requests a review that already happened. Two parsers disagreeing
+        about one body is the BLO-31730 failure, not a formatting nicety.
+        """
+        body = '<!-- ally-verdict:01\n{"head":"%s"}\n-->' % self.HEAD
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_a_space_after_the_colon_is_the_block_it_plainly_is(self):
+        """Peer review of #1721, Important 2.
+
+        The emitter is a model transcribing a template out of a fenced example,
+        so pretty-printing a space here is the likeliest single drift. It used
+        to match neither the block nor the opener pattern, so it read `absent`
+        and fell through to the prose path this row retires.
+        """
+        body = '<!-- ally-verdict: 1\n{"head":"%s"}\n-->' % self.HEAD
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_a_garbled_version_fails_closed_rather_than_vanishing(self):
+        """The opener is version-agnostic so the strict pattern can be the only
+        reader of the version. `:v1` and a missing version previously missed
+        both patterns and degraded silently to prose."""
+        for opener in ('<!-- ally-verdict:v1', '<!-- ally-verdict '):
+            body = '%s\n{"head":"%s"}\n-->\nReviewed head: %s' % (
+                opener,
+                self.HEAD,
+                self.HEAD,
+            )
+            self.assertIsNone(sweep.parse_reviewed_head(body), opener)
+
     def test_quoted_block_is_a_body_discussing_one_not_emitting_one(self):
         body = "> <!-- ally-verdict:1\n> {\"head\":\"%s\"}\n> -->\nReviewed head: %s" % (
             "d" * 40,

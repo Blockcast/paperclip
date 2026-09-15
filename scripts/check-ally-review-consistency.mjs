@@ -128,11 +128,11 @@ const ATTESTED_HEAD_GLOBAL_RE = new RegExp(ATTESTED_HEAD_RE.source, "gim");
 // cannot disagree about which tree was reviewed. The prose line above is the
 // fallback for a body carrying no block.
 const VERDICT_BLOCK_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:(\d+)([\s\S]*?)-->`,
+  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:[ \t]*(\d+)([\s\S]*?)-->`,
   "gm",
 );
 const VERDICT_OPENER_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:(?:\d+)`,
+  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict\b`,
   "gm",
 );
 const SUPPORTED_VERDICT_VERSION = 1;

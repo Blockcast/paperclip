@@ -233,7 +233,7 @@ export function extractAllyReviewedHeadSha(body: string | null | undefined): str
  * holding a diff hunk or a regex) could, and would have to encode it.
  */
 const ALLY_VERDICT_BLOCK_PATTERN = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:(\d+)([\s\S]*?)-->`,
+  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:[ \t]*(\d+)([\s\S]*?)-->`,
   "gm",
 );
 
@@ -247,8 +247,24 @@ const ALLY_VERDICT_BLOCK_PATTERN = new RegExp(
 // block is truncated but whose prose happens to read clean would clear the
 // gate on the strength of the very prose the block exists to stop trusting,
 // which is a fail-open path through the fail-closed branch.
+//
+// So the opener is deliberately laxer than the block: everything after
+// `ally-verdict` is dropped, including the version and its colon. The block
+// pattern is the strict reader, and every way of garbling the prefix that the
+// opener still recognizes — `ally-verdict:v1`, a version-less
+// `ally-verdict {…}` — lands on `openers > blocks` and fails closed, rather
+// than missing both patterns and vanishing into `absent`. That matters because
+// the emitter is a model transcribing a template out of a fenced example, so
+// prefix drift is the likeliest drift there is; the two patterns previously
+// shared the `:(\d+)` prefix, which meant any drift in it moved them together
+// and the guard could not fire.
+//
+// Still anchored to the line start, and that bound is kept: an inline
+// `… prose. <!-- ally-verdict:1 … -->` reads `absent`. Un-anchoring would let
+// a review *of this file* mint a phantom opener out of a quoted marker and
+// wedge its own gate, which is the worse failure.
 const ALLY_VERDICT_OPENER_PATTERN = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:(?:\d+)`,
+  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict\b`,
   "gm",
 );
 
@@ -387,9 +403,12 @@ function asDispositions(raw: unknown): AllyStructuredDisposition[] | null {
  *     not, so the same review would attest two different trees depending on
  *     who asked. Only disagreement is fatal; prose that is absent or that this
  *     file cannot parse is the #1675 case the block exists to survive.
- *   - An opener with no `-->` terminator. A truncated payload is Ally trying
- *     to state a verdict and failing, which is not the same fact as a review
- *     that predates the block — and only the latter may use the prose path.
+ *   - A counted prose bucket naming a *positive* number of a blocking severity
+ *     the block states zero of. Same rule, same reason, applied to the field
+ *     that decides `blocking_finding` — see proseCountContradicting.
+ *   - An opener with no readable version, or no `-->` terminator. A payload
+ *     Ally failed to serialize is not the same fact as a review that predates
+ *     the block — and only the latter may use the prose path.
  *
  * Note the asymmetry with the prose fallback: an unreadable *block* is red,
  * whereas an unreadable *body* with no block keeps the historical behavior.
@@ -401,14 +420,16 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
   const text = emittedReviewText(body);
   if (text === null) return { kind: "absent" };
   const blocks = [...text.matchAll(ALLY_VERDICT_BLOCK_PATTERN)];
-  // Openers without a matching complete block mean a truncated payload, not an
-  // older review. Checked before the `absent` return so a broken block can
-  // never fall through to the prose parser it exists to replace.
+  // Openers without a matching complete block mean Ally tried to state a
+  // verdict and the payload did not survive — a missing `-->`, or a version
+  // the strict pattern rejects (`:v1`, or none at all). Not an older review.
+  // Checked before the `absent` return so a broken block can never fall
+  // through to the prose parser it exists to replace.
   const openers = [...text.matchAll(ALLY_VERDICT_OPENER_PATTERN)];
   if (openers.length > blocks.length) {
     return {
       kind: "unreadable",
-      reason: `${openers.length - blocks.length} ally-verdict opener(s) have no \`-->\` terminator`,
+      reason: `${openers.length - blocks.length} ally-verdict opener(s) state no readable version or have no \`-->\` terminator`,
     };
   }
   if (blocks.length === 0) return { kind: "absent" };
@@ -478,10 +499,93 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
     };
   }
 
+  const countDisagreement = proseCountContradicting(text, counts);
+  if (countDisagreement !== null) return { kind: "unreadable", reason: countDisagreement };
+
   return {
     kind: "ok",
     verdict: { head: attestedHead, findings: counts, dispositions: ledger },
   };
+}
+
+/**
+ * Best-effort: the head a body *claims* to have examined, even when its
+ * verdict block is unreadable.
+ *
+ * Deliberately not `extractAllyReviewedHeadSha`, which returns null for an
+ * unreadable block and must keep doing so — an unreadable verdict attests
+ * nothing, and letting one attest a head would let a broken block clear or
+ * carry findings. This answers a different, weaker question: *which tree was
+ * this review looking at*, for the sole purpose of deciding whether an
+ * unreadable verdict is relevant to the head being evaluated.
+ *
+ * Weaker on purpose, so the two cannot be confused at a call site: the result
+ * is never used as an attestation, only to establish that a review is about
+ * some *other* tree. A null answer therefore means "cannot tell", and the
+ * caller must fail closed on it.
+ *
+ * Reads the block's own `head` field first — a block that fails on its version
+ * or its counts usually still states which tree it read — and falls back to
+ * the prose line. Both are read without trusting anything else in the body.
+ */
+export function allyClaimedReviewHead(body: string | null | undefined): string | null {
+  const text = emittedReviewText(body);
+  if (text === null) return null;
+  for (const [, , rawPayload] of text.matchAll(ALLY_VERDICT_BLOCK_PATTERN)) {
+    try {
+      const parsed: unknown = JSON.parse(rawPayload!.trim());
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const { head } = parsed as Record<string, unknown>;
+        if (typeof head === "string" && /^[0-9a-f]{40}$/i.test(head.trim())) {
+          return head.trim().toLowerCase();
+        }
+      }
+    } catch {
+      // Unreadable payload — fall through to the prose line.
+    }
+  }
+  return soleProseAttestedHead(text);
+}
+
+/**
+ * The head rule above, applied to the field that actually decides
+ * `blocking_finding`.
+ *
+ * The counts outrank every prose clause in `hasActionablePrReviewFeedback` —
+ * that is the point of the block — so without this a body whose block states
+ * zero while its own prose enumerates `### Critical Issues (2)` resolves
+ * `clean`/`success`. That is the BLO-29711 direction arriving through the
+ * structured path, and it arrives silently: a green, not a red.
+ *
+ * The premise is the same one the head rule rests on. The producer is a model
+ * following a prompt rather than a serializer, so a prompt edit that renumbers
+ * or renames a count field lands before the parser that understands it does
+ * (the prompt is `.planning/ally-agent/AGENTS.md`, which takes effect on
+ * merge; this file ships on the server's own rollout). Disagreement between
+ * the two things the same review says is the only signal available in that
+ * window.
+ *
+ * Asymmetric exactly like the head rule, and for the same reason: only a
+ * *positive* prose count against a stated zero is fatal. An absent or
+ * unparseable bucket is the #1675 case the block exists to survive, and a
+ * block reporting more than the prose does cannot fail open. The #1675 body
+ * reads `Critical Issues (0)` / `Important Issues (0)`, so this never fires on
+ * it — the fixture is the control.
+ *
+ * Reads the emitted text, so a quoted or fenced bucket cannot fail a block
+ * closed. Unlike `hasActionablePrReviewFeedback`, which reads the raw body
+ * too, the fail-open direction here is already covered: the block itself is
+ * the claim, and this only cross-checks it.
+ */
+function proseCountContradicting(text: string, counts: Map<string, number>): string | null {
+  for (const [, severity, count] of text.matchAll(COUNTED_FINDINGS_BUCKET_PATTERN)) {
+    const key = severity!.toLowerCase();
+    if (!BLOCKING_SEVERITIES.has(key)) continue;
+    if (Number(count) > 0 && counts.get(key) === 0) {
+      return `ally-verdict states 0 \`${key}\` but the review enumerates ${count}`;
+    }
+  }
+  return null;
 }
 
 // Negation cues flip an otherwise-actionable bare phrase into a confirmation

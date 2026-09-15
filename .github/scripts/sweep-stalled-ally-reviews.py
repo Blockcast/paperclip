@@ -84,11 +84,11 @@ REVIEWED_HEAD_PATTERN = re.compile(
 # cannot disagree about which tree was reviewed. The prose line above is the
 # fallback for a body that carries no block.
 VERDICT_BLOCK_PATTERN = re.compile(
-    r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)<!--[ \t]*ally-verdict:(\d+)(.*?)-->",
+    r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)<!--[ \t]*ally-verdict:[ \t]*(\d+)(.*?)-->",
     re.MULTILINE | re.DOTALL,
 )
 VERDICT_OPENER_PATTERN = re.compile(
-    r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)<!--[ \t]*ally-verdict:\d+", re.MULTILINE
+    r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)<!--[ \t]*ally-verdict\b", re.MULTILINE
 )
 SUPPORTED_VERDICT_VERSION = 1
 FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
@@ -119,7 +119,11 @@ def parse_verdict_block_head(body):
     if len(blocks) > 1:
         return ("unreadable", None)
     raw_version, raw_payload = blocks[0]
-    if raw_version != str(SUPPORTED_VERDICT_VERSION):
+    # int, not string: the two JS readers use `Number(raw)`, so a string
+    # compare would split them on `ally-verdict:01` -- readable to the gate,
+    # unreadable here, and this sweep would re-request a review that already
+    # happened. Cross-reader divergence is the BLO-31730 failure.
+    if int(raw_version) != SUPPORTED_VERDICT_VERSION:
         return ("unreadable", None)
     try:
         parsed = json.loads(raw_payload.strip())
