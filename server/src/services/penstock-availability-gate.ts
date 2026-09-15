@@ -276,7 +276,7 @@ export function mapAdapterToPenstockProvider(
     const envProvider = readConfigEnvString(asRecord(config?.env), "PENSTOCK_PROVIDER")?.toLowerCase();
     if (envProvider === "anthropic") return "anthropic";
     if (envProvider === "openai") return "codex";
-    const model = readNonEmptyString(config?.model);
+    const model = readNonEmptyString(config?.model)?.toLowerCase();
     if (model?.startsWith("anthropic/")) return "anthropic";
     if (model?.startsWith("openai/")) return "codex";
     return "codex";
@@ -289,11 +289,13 @@ export function mapAdapterToPenstockProvider(
  * (`anthropic/claude-opus-5`) that the runtime strips before calling the
  * provider, and Penstock's catalog is keyed on the bare id. Probe with what
  * the runtime sends: a prefixed id 404s on the messages probe and fails open,
- * so the fallback would never see a real 429. Results and logs keep the
- * configured string.
+ * so the fallback would never see a real 429. Any leading provider segment is
+ * stripped, not just the two built-ins: PENSTOCK_PROVIDER can route a custom
+ * opencode provider name (`penstock/claude-opus-5`) to a pool, and that prefix
+ * would 404 just the same. Results and logs keep the configured string.
  */
 function penstockModelId(model: string): string {
-  return model.replace(/^(anthropic|openai)\//, "");
+  return model.replace(/^[^/\s]+\//, "");
 }
 
 /**
