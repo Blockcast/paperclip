@@ -506,6 +506,119 @@ const REVIEWER_EVIDENCE_MAX_PAGES = 10;
  * unresolved required head returns `{found:false}` and never accepts arbitrary
  * review evidence.
  */
+/** One PR commit, reduced to the fields foreign-commit detection decides on (BLO-19528). */
+export type GitHubPullRequestCommit = {
+  sha: string;
+  authorEmail: string | null;
+  authorName: string | null;
+  parentCount: number;
+};
+
+/**
+ * `truncated` means "this listing is not provably complete" -- see
+ * {@link GITHUB_PR_COMMITS_ENDPOINT_LIMIT}. It is NOT an error: the commits
+ * that were read are still usable, and dropping them would notify about
+ * nothing rather than about most things. Callers must surface it, because a
+ * silently short list is indistinguishable from a PR with no foreign commits.
+ */
+export type GitHubPullRequestCommitsResult =
+  | { commits: GitHubPullRequestCommit[]; truncated: boolean }
+  | { error: string };
+
+/** Cap on `/pulls/{n}/commits` pages. GitHub itself truncates this endpoint at 250 commits. */
+export const GITHUB_PR_COMMITS_MAX_PAGES = 3;
+
+/**
+ * GitHub's own ceiling on `/pulls/{n}/commits`: "Lists a maximum of 250
+ * commits for a pull request." It is announced nowhere in the response -- the
+ * endpoint just stops, so a 250-commit page-out looks exactly like a PR that
+ * has 250 commits and no more. This ceiling, not {@link
+ * GITHUB_PR_COMMITS_MAX_PAGES}, is what actually truncates in practice: 250 <
+ * 3 * 100, so the page loop always breaks on a short page first and never
+ * reaches its own cap. Both are still checked -- the page cap is the one that
+ * bites if `per_page` or the cap is ever retuned.
+ */
+export const GITHUB_PR_COMMITS_ENDPOINT_LIMIT = 250;
+
+/**
+ * List a PR's commits with their **git author** identity (BLO-19528).
+ *
+ * Reads `commit.author.email`, not `author.login`: every agent pod pushes with
+ * the same shared App credential, so the login names the App for all of them
+ * alike, while the git author email is provisioned per agent (BLO-23894).
+ *
+ * `parents.length` is carried through so the caller can exclude merge/squash
+ * commits, which the GitHub merge API creates and legitimately App-attributes.
+ *
+ * Returns `truncated: true` when the listing cannot be proven complete. A
+ * truncated read is *unproven*, never absence -- the caller still gets every
+ * commit that was read and must report the gap rather than treat the short
+ * list as the whole PR.
+ */
+export async function githubListPullRequestCommits(input: {
+  repoFullName: string;
+  prNumber: number;
+}): Promise<GitHubPullRequestCommitsResult> {
+  const token = await getInstallationToken();
+  if (!token) return { error: "no_token" };
+
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  const commits: GitHubPullRequestCommit[] = [];
+  let truncated = false;
+
+  for (let page = 1; page <= GITHUB_PR_COMMITS_MAX_PAGES; page += 1) {
+    const url =
+      `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/commits`
+      + `?per_page=100&page=${page}`;
+    let res: Response;
+    try {
+      res = await ghFetch(url, { headers });
+    } catch {
+      return { error: "pr_commits_fetch_failed" };
+    }
+    if (!res.ok) {
+      const classified = await classifyGithubHttpFailure("pr_commits", res);
+      return { error: classified.reason };
+    }
+
+    let batch: Array<Record<string, unknown>>;
+    try {
+      batch = (await res.json()) as Array<Record<string, unknown>>;
+    } catch {
+      return { error: "pr_commits_parse_failed" };
+    }
+    if (!Array.isArray(batch)) return { error: "pr_commits_unexpected_shape" };
+
+    for (const entry of batch) {
+      const sha = typeof entry.sha === "string" ? entry.sha : null;
+      if (!sha) continue;
+      const commit = entry.commit as Record<string, unknown> | undefined;
+      const author = commit?.author as Record<string, unknown> | undefined;
+      const parents = Array.isArray(entry.parents) ? entry.parents : [];
+      commits.push({
+        sha,
+        authorEmail: typeof author?.email === "string" ? author.email : null,
+        authorName: typeof author?.name === "string" ? author.name : null,
+        parentCount: parents.length,
+      });
+    }
+
+    if (batch.length < 100) break;
+    // A full last page with no pages left: our own cap cut the listing short.
+    if (page === GITHUB_PR_COMMITS_MAX_PAGES) truncated = true;
+  }
+
+  // GitHub's 250 ceiling reports itself as a short page, so the loop above
+  // exits believing it read to the end. Landing on the ceiling is the only
+  // signal there is, and it is deliberately fail-closed: a PR with exactly
+  // 250 commits is flagged too, because nothing in the response distinguishes
+  // it from one with 400.
+  if (commits.length >= GITHUB_PR_COMMITS_ENDPOINT_LIMIT) truncated = true;
+
+  return { commits, truncated };
+}
+
 export async function githubHasReviewerEvidenceForPr(input: {
   repoFullName: string;
   prNumber: number;
@@ -860,6 +973,68 @@ export async function githubPostCommitStatusDetailed(input: {
     return { ok: false, ...classified, statusCode: res.status };
   } catch {
     return { ok: false, retryable: true, reason: "commit_status_write_fetch_failed" };
+  }
+}
+
+/**
+ * Conclusions a completed check-run may carry. Only the three this codebase
+ * publishes are listed; the rest of GitHub's enum is unused here.
+ *
+ * `neutral` is the reason check-runs exist in this file at all. A legacy commit
+ * status has only success/failure/pending/error, so a verdict that is neither
+ * "reviewed and clean" nor "blocking" has no honest state to occupy: `pending`
+ * and `failure` block merge, and `success` is indistinguishable from a real
+ * pass. `neutral` renders distinctly and does not block (BLO-33657).
+ */
+export type GitHubCheckRunConclusion = "success" | "failure" | "neutral";
+
+/**
+ * Publish a completed check-run as the GitHub App.
+ *
+ * Requires the installation's `checks: write` permission — a commit status is
+ * `statuses: write` and the two are independent, so a deployment that can post
+ * statuses is not thereby able to post check-runs.
+ *
+ * ponytail: creates a new run per call rather than looking up and PATCHing the
+ * existing one for this name+sha. GitHub takes the latest per name, and commit
+ * statuses already append the same way, so repeated evaluations of one head
+ * leave several rows. Switch to find-then-PATCH if that noise ever matters.
+ */
+export async function githubPostCheckRun(input: {
+  repoFullName: string;
+  sha: string;
+  name: string;
+  conclusion: GitHubCheckRunConclusion;
+  title: string;
+  summary: string;
+  detailsUrl?: string | null;
+}): Promise<GitHubCommitStatusPostResult> {
+  const token = await getInstallationTokenResult();
+  if (!token.ok) return asCommitStatusFailure(token);
+  const headers = {
+    ...GITHUB_API_HEADERS,
+    authorization: `Bearer ${token.token}`,
+    "content-type": "application/json",
+  };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  try {
+    const res = await ghFetch(`${apiBase}/repos/${input.repoFullName}/check-runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        name: input.name,
+        head_sha: input.sha,
+        status: "completed",
+        conclusion: input.conclusion,
+        output: { title: input.title, summary: input.summary },
+        ...(input.detailsUrl ? { details_url: input.detailsUrl } : {}),
+      }),
+    });
+    if (res.ok) return { ok: true, statusCode: res.status };
+    const classified = await classifyGithubHttpFailure("check_run_write", res);
+    return { ok: false, ...classified, statusCode: res.status };
+  } catch {
+    return { ok: false, retryable: true, reason: "check_run_write_fetch_failed" };
   }
 }
 

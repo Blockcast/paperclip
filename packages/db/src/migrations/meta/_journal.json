@@ -1639,6 +1639,13 @@
       "when": 1788560180000,
       "tag": "0241_issue_recovery_action_delivery_bounds",
       "breakpoints": true
+    },
+    {
+      "idx": 242,
+      "version": "7",
+      "when": 1788560240000,
+      "tag": "0242_issue_productivity_scanned_at",
+      "breakpoints": true
     }
   ]
 }

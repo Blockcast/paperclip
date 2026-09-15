@@ -48,6 +48,7 @@ import {
   TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
   TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS,
 } from "../services/ccrotate-capacity-retry.js";
+import { waitForRunToFinish } from "./helpers/wait-for-run-to-finish.js";
 
 /**
  * PEN-2509: a retry floor is no longer adopted verbatim as `dueAt`.
@@ -130,20 +131,6 @@ if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping embedded Postgres heartbeat retry scheduling tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
-}
-
-async function waitForRunToFinish(
-  heartbeat: ReturnType<typeof heartbeatService>,
-  runId: string,
-  timeoutMs = 5_000,
-) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const run = await heartbeat.getRun(runId);
-    if (run && !["queued", "running"].includes(run.status)) return run;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return await heartbeat.getRun(runId);
 }
 
 describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
@@ -3118,6 +3105,58 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         contextSnapshot: {},
       }),
     ).toBe(false);
+  });
+
+  // BLO-17938: the concurrency guard's `catch` sibling. Raised before the prompt
+  // bundle is assembled and before any Job exists, so it is retryable on exactly
+  // the same terms as `k8s_concurrent_run_blocked` — and was previously retried
+  // on none, falling through to the adapter_failed/process_lost tail.
+  it("retries k8s_concurrency_guard_unreachable for issue-backed and pr_review runs", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(true);
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: { reviewKind: "pr_review" },
+      }),
+    ).toBe(true);
+  });
+
+  it("does not retry k8s_concurrency_guard_unreachable without an issue or PR-review context", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: {},
+      }),
+    ).toBe(false);
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: { wakeReason: "heartbeat_timer" },
+      }),
+    ).toBe(false);
+  });
+
+  // BLO-17938 guardrail pin: widening the guard-unreachable arm must not reach
+  // the job_failed family, whose retry still requires proof nothing began.
+  it("leaves the job_failed adapterInvocationStarted guardrail intact", () => {
+    for (const errorCode of ["job_failed", "oom_killed", "exit_137"]) {
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode,
+          resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+        }),
+      ).toBe(false);
+    }
   });
 
   it.each(["job_failed", "oom_killed", "exit_137"])(

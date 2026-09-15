@@ -37,6 +37,7 @@ import {
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
+import { startEventLoopStallLogging } from "./event-loop-stall-log.js";
 import { logger } from "./middleware/logger.js";
 import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
@@ -269,6 +270,10 @@ export async function startServer(): Promise<StartedServer> {
   // Tracing must be active (or have failed and logged) before the first DB
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
+  // Scrape-independent stall evidence (BLO-32668). The disposer is discarded
+  // deliberately: the sampler is idempotent and unref'd, so repeated in-process
+  // `startServer()` calls start exactly one, and it cannot outlive the process.
+  startEventLoopStallLogging();
   let config = loadConfig();
   if (config.githubPrReviewerAgentIds.length > 0) {
     if (!githubReviewerAppSlug(config.prReviewerBotLogin)) {
@@ -1279,6 +1284,12 @@ export async function startServer(): Promise<StartedServer> {
         }
 
         const reviewed = await heartbeat.reconcileProductivityReviews();
+        // BLO-30303 AC4: log the funnel counters unconditionally. Gating this
+        // on `created|updated|failed > 0` discarded the one record that
+        // explains a zero — which is how a fleet-wide hard zero looked
+        // identical to a healthy fleet for 23 days. `scanned` plus the
+        // suppression breakdown is what tells those two apart.
+        logger.info({ ...reviewed }, "startup productivity reconciliation funnel");
         if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
         }
@@ -1286,6 +1297,14 @@ export async function startServer(): Promise<StartedServer> {
         const blockerDependentsSwept = await heartbeat.reconcileResolvedBlockerDependents();
         if (blockerDependentsSwept.woken > 0 || blockerDependentsSwept.failed > 0) {
           logger.warn({ ...blockerDependentsSwept }, "startup resolved-blocker-dependents sweep enqueued wakes");
+        }
+
+        const deadMonitors = await heartbeat.reconcileUndeliverableIssueMonitors();
+        if (deadMonitors.cleared > 0 || deadMonitors.failed > 0) {
+          logger.warn(
+            { ...deadMonitors },
+            "startup undeliverable-monitor reconciliation cleared monitors armed on ineligible issues (BLO-33539)",
+          );
         }
 
         const failedWakeDispatches = await heartbeat.reconcileFailedWakeDispatches();
@@ -1591,6 +1610,36 @@ export async function startServer(): Promise<StartedServer> {
               logger.error({ err }, "periodic detached-queued-run sweeper failed");
             }));
 
+          if (heartbeatSchedulerStopped) return;
+
+          // BLO-33539: producer-agnostic backstop for a monitor armed on an
+          // issue the scheduler can never select. Transition-time guards each
+          // cover one demotion path; this pass covers the rest, including
+          // recovery parks that have no guard of their own.
+          //
+          // Deliberately NOT a link in the long recovery chain below. That
+          // chain is serial with a single terminal catch, so a rejection in any
+          // earlier pass silently skips every later one — and the conditions
+          // that make an unrelated recovery pass throw are exactly the
+          // conditions that strand monitors. A backstop that only runs when
+          // nothing else is broken is not a backstop. It needs no ordering
+          // against those passes either: the clear is a CAS on the eligibility
+          // tuple, so a concurrent status or assignee change loses the race and
+          // is skipped rather than clobbered.
+          trackHeartbeatSchedulerWork(heartbeat
+            .reconcileUndeliverableIssueMonitors()
+            .then((deadMonitors) => {
+              if (deadMonitors.cleared > 0 || deadMonitors.failed > 0) {
+                logger.warn(
+                  { ...deadMonitors },
+                  "periodic undeliverable-monitor reconciliation cleared monitors armed on ineligible issues",
+                );
+              }
+            })
+            .catch((err) => {
+              logger.error({ err }, "periodic undeliverable-monitor reconciliation failed");
+            }));
+
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat
@@ -1643,6 +1692,8 @@ export async function startServer(): Promise<StartedServer> {
             })
             .then(async () => {
               const reviewed = await heartbeat.reconcileProductivityReviews();
+              // BLO-30303 AC4: unconditional — see the startup pass above.
+              logger.info({ ...reviewed }, "periodic productivity reconciliation funnel");
               if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
                 logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
               }

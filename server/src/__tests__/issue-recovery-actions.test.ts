@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -9,8 +9,6 @@ import {
   activityLog,
   companies,
   createDb,
-  environmentLeases,
-  environments,
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
@@ -25,6 +23,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateCompanyScopedTestState } from "./helpers/truncate-company-scoped-test-state.js";
 import { errorHandler } from "../middleware/index.js";
 import { logger } from "../middleware/logger.js";
 import { issueRoutes } from "../routes/issues.js";
@@ -424,19 +423,21 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // Defensive: a test that arms the seam but never reaches it must not leak
     // the hook into the next test.
     pauseHoldSeam.onNextCheck = null;
-    await db.delete(issueRecoveryActions);
-    await db.delete(issueComments);
-    await db.delete(issueWorkProducts);
-    await db.delete(environmentLeases);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(environments);
-    await db.delete(routineRuns);
-    await db.delete(routines);
-    await db.delete(issues);
-    await db.delete(agents);
-    await db.delete(companies);
+    // BLO-33498: the hand-ordered DELETE list was correctly ordered (comments nine
+    // statements before issues) and still failed, because ordering only helps while
+    // nothing else is writing. `request(app)` resolves when the response is flushed,
+    // not when the handler has settled, so a best-effort trailing write can still be
+    // in flight when `afterEach` starts; landing between the child and parent delete
+    // it broke `issue_comments_issue_id_issues_id_fk`. Ordering was never the bug.
+    //
+    // This is the shared helper, not a local TRUNCATE, and the difference is
+    // load-bearing: a bare `TRUNCATE ... CASCADE` takes ACCESS EXCLUSIVE on the whole
+    // cascade and deadlocks (40P01) against those same stragglers — a hand-rolled one
+    // here failed 2/189 in a single run. The helper wraps it in a transaction-scoped
+    // advisory lock plus transient-deadlock retry (the "v513 saga"). `environments`
+    // declares no FK to `companies`, so the cascade cannot reach it and it has to be
+    // named as a second root.
+    await truncateCompanyScopedTestState(db, { extraTruncateTables: ["environments"] });
   });
 
   afterAll(async () => {
@@ -1503,6 +1504,62 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).toHaveBeenCalledWith(coderId, expect.anything());
   });
 
+  // BLO-33223: the same family, one pod-death reason later. A container killed by
+  // the kernel OOM killer is read at exit (not found missing), so it carries the
+  // `exit code 137 … reason=OOMKilled` shape rather than the pod-removal sentence,
+  // and used to classify `infraClassCause: false` and escalate to the manager.
+  // Measured live on recovery action `cf5f83a6-…`, which stranded BLO-31945 four
+  // times. The negative control for this case is the test immediately below: an
+  // agent-side crash is `exit code 1, reason=Error` and must still escalate.
+  it("re-dispatches an OOMKilled claude_truncated failure to the existing assignee instead of the manager", async () => {
+    const { managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Claude run was truncated mid-stream — assistant produced content but no result " +
+        "event arrived; exit code 137, SIGKILL (commonly OOMKilled), reason=OOMKilled",
+      errorCode: "claude_truncated",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(action).toMatchObject({
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      ownerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+    });
+    expect(action?.ownerAgentId).toBe(action?.returnOwnerAgentId);
+    expect(action?.ownerAgentId).not.toBe(managerId);
+    // BLO-33655: `claude_truncated` is in NEITHER error-code set, so the message arm is
+    // the only thing that can carry this row. Asserting the arm (not just the union)
+    // keeps BLO-33223's narrowing -- anchored on the kill, not on the `reason=` enum --
+    // auditable from evidence alone.
+    expect(action?.evidence).toMatchObject({
+      infraClassCause: true,
+      infraClassCauseByMessage: true,
+    });
+  });
+
   it("still escalates a claude_truncated failure without pod-removal evidence to the manager", async () => {
     const { managerId, coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn<
@@ -1540,7 +1597,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       ownerAgentId: managerId,
       returnOwnerAgentId: coderId,
     });
-    expect(action?.evidence).toMatchObject({ infraClassCause: false });
+    // BLO-33655 negative control: a genuine agent-side fault matches NEITHER arm --
+    // `claude_truncated` is absent from `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES`, and
+    // `exit code 1, reason=Error` is not a kill. If widening the recorded field into the
+    // union had made it vacuously true, this is the assertion that fails.
+    expect(action?.evidence).toMatchObject({
+      infraClassCause: false,
+      infraClassCauseByMessage: false,
+    });
 
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
     expect(updatedIssue).toMatchObject({
@@ -1548,6 +1612,76 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       assigneeAgentId: managerId,
     });
     expect(enqueueWakeup).toHaveBeenCalledWith(managerId, expect.anything());
+  });
+
+  // BLO-33655: the OTHER arm of the routing union. `k8s_pod_schedule_failed` is
+  // infra-class by error code ALONE -- it is in `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES`,
+  // and `isInfraClassStrandedFailure` never matches it (that predicate only fires on
+  // `k8s_job_deleted_externally`, a git transport fault, or `claude_truncated` carrying
+  // pod-lifecycle wording). So this run routes to the lane on the error-code arm while
+  // matching no message marker at all.
+  //
+  // Until 2026-09-13 the evidence recorded only the message arm, so this exact row --
+  // correctly returned to its assignee -- stamped `infraClassCause: false`. Two senior
+  // lanes read that column on live queues, correctly inferred the classifier was not
+  // discriminating, and escalated it; the remediation both proposed (widen the message
+  // predicate over the whole error-code set) would have been a routing no-op that
+  // re-added the false-collision surface BLO-20933 and BLO-33223 each narrowed away.
+  //
+  // Mutation check: `infraClassCause` is asserted `true` here and this fails against the
+  // pre-fix code, so the fixture is known to exercise the defect rather than pass
+  // vacuously. The error text is deliberately marker-free -- if it accidentally carried
+  // pod-removal wording the message arm would carry the assertion and the error-code arm
+  // would go untested. `infraClassCauseByMessage: false` pins that.
+  it("records the error-code arm of the infra-class union in evidence (BLO-33655)", async () => {
+    const { managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Pod startup failed: Timed out waiting for pod containers to start (600s): " +
+        "phase=Pending, init/write-prompt: waiting (PodInitializing), claude: waiting " +
+        "(PodInitializing)",
+      errorCode: "k8s_pod_schedule_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    // The routing half, asserted first so the evidence assertion below is known to be
+    // describing a row that really was returned to its lane.
+    expect(action).toMatchObject({
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      ownerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+    });
+    expect(action?.ownerAgentId).toBe(action?.returnOwnerAgentId);
+    expect(action?.ownerAgentId).not.toBe(managerId);
+    // The labelling half: the field an operator reads now agrees with that routing, and
+    // the narrow message arm is still separately readable.
+    expect(action?.evidence).toMatchObject({
+      infraClassCause: true,
+      infraClassCauseByMessage: false,
+      latestRunErrorCode: "k8s_pod_schedule_failed",
+    });
   });
 
   it("keeps the original return owner after a temporary invocability fallback", async () => {
@@ -1798,6 +1932,65 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           error: "pod is gone — Job pod was removed (eviction, preemption, or external delete)",
         }),
       ).toBe(false);
+    });
+
+    // BLO-33223. The live message is pinned verbatim; the two below it pin that
+    // each marker carries on its own, since an adapter that reports the reason
+    // without an exit code (or vice versa) must not fall back to escalation.
+    it("is true for the adapter's OOMKilled termination sentence", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: "Claude run was truncated mid-stream — assistant produced content but no " +
+            "result event arrived; exit code 137, SIGKILL (commonly OOMKilled), reason=OOMKilled",
+        }),
+      ).toBe(true);
+    });
+
+    it.each([
+      ["exit code alone", "exit code 137, reason=Error"],
+      ["reason alone", "reason=OOMKilled"],
+    ])("is true for a SIGKILLed container reported by %s", (_label, tail) => {
+      expect(
+        isInfraClassStrandedFailure({ ...baseRun, errorCode: "claude_truncated", error: tail }),
+      ).toBe(true);
+    });
+
+    // The discriminator is the KILL, not the pod death: an agent-side crash is
+    // also a pod-lifecycle termination and must keep escalating. `exit code 13`
+    // guards the word-boundary — a prefix match on "137" would swallow it. The
+    // last two guard the kubelet's free-form `message=` tail: a marker-shaped
+    // substring quoted there (agents in this fleet discuss OOMKills routinely)
+    // must not decide routing, which a whole-string scan would let it do.
+    it.each([
+      ["an agent-side crash", "exit code 1, reason=Error, message=panic: nil pointer dereference"],
+      ["an exit code that merely starts with 13", "exit code 13, reason=Error"],
+      ["a message that merely mentions OOM", "exit code 2, reason=Error, message=parser hit an OOMKilled log line"],
+      ["a message quoting the reason marker", "exit code 1, reason=Error, message=observed reason=OOMKilled in logs"],
+      ["a message quoting the exit code marker", "exit code 1, reason=Error, message=child died with exit code 137 mid-parse"],
+    ])("is false for %s", (_label, tail) => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: `Claude run was truncated mid-stream — ${tail}`,
+        }),
+      ).toBe(false);
+    });
+
+    // The cut must not cost a true positive: a real OOM kill still classifies
+    // when the kubelet attaches its own diagnostic tail, which it routinely does.
+    it("is true for a real OOM kill carrying a kubelet message tail", () => {
+      expect(
+        isInfraClassStrandedFailure({
+          ...baseRun,
+          errorCode: "claude_truncated",
+          error: "Claude run was truncated mid-stream — assistant produced content but no " +
+            "result event arrived; exit code 137, SIGKILL (commonly OOMKilled), " +
+            "reason=OOMKilled, message=Memory cgroup out of memory",
+        }),
+      ).toBe(true);
     });
   });
 
@@ -2110,6 +2303,81 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(updatedRun?.errorCode).toBe("adapter_failed");
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
     expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  // BLO-28931. The candidate loop had no per-issue error boundary, so any throw from
+  // one issue's reconcile body propagated out of the entire sweep. Candidates are
+  // ordered (companyId, assigneeAgentId, createdAt, id), which made the
+  // surviving-vs-dropped split deterministic rather than random: every candidate after
+  // the first thrower was silently left unreconciled, on every tick, for as long as
+  // that issue kept throwing. The counters could not show it either -- unreached
+  // candidates are simply absent from `issueIds` rather than counted as skipped or
+  // failed, so a truncated sweep was indistinguishable from a clean one.
+  it("continues reconciling later candidates when one issue's reconcile body throws", async () => {
+    const { companyId, coderId, sourceIssueId, prefix } = await seedCompany();
+    const laterIssueIds = [randomUUID(), randomUUID()];
+    await db
+      .update(issues)
+      .set({ createdAt: new Date("2026-07-26T10:00:00.000Z") })
+      .where(eq(issues.id, sourceIssueId));
+    await db.insert(issues).values(
+      laterIssueIds.map((id, index) => ({
+        id,
+        companyId,
+        title: `Later stranded candidate ${index + 1}`,
+        status: "in_progress" as const,
+        priority: "medium" as const,
+        assigneeAgentId: coderId,
+        issueNumber: index + 2,
+        identifier: `${prefix}-${index + 2}`,
+        createdAt: new Date(`2026-07-26T1${index + 1}:00:00.000Z`),
+      })),
+    );
+    for (const issueId of [sourceIssueId, ...laterIssueIds]) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "External lifecycle Job is missing while heartbeat run is still running",
+        errorCode: "job_missing",
+        resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
+        contextSnapshot: { issueId },
+        startedAt: new Date("2026-07-26T13:45:00.000Z"),
+        finishedAt: new Date("2026-07-26T13:52:00.000Z"),
+      });
+    }
+    // Throw on the first wake only. Keyed on call order rather than on a named
+    // internal call site, so this asserts the loop boundary itself and does not pin
+    // the escalation path's current internals. Candidate ordering guarantees the
+    // first call belongs to the first candidate.
+    const enqueueWakeup = vi.fn(async () => {
+      if (enqueueWakeup.mock.calls.length === 1) {
+        throw new Error("synthetic non-409 failure raised by the first candidate");
+      }
+      return null;
+    });
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.reconcileErrors).toBe(1);
+    expect(result.escalated).toBe(2);
+    expect(result.issueIds).toEqual(expect.arrayContaining(laterIssueIds));
+    expect(result.issueIds).not.toContain(sourceIssueId);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(3);
+    // The boundary sits outside every transaction on this path -- no `db.transaction`
+    // appears lexically in the loop body, and the escalation's own transaction has
+    // already committed by the time the wake is enqueued. So all three candidates hold
+    // a committed recovery action and catching here converted nothing atomic into a
+    // partial commit. The thrower's action-committed-but-wake-not-enqueued state is
+    // pre-existing sequencing in that path, unchanged by the error boundary; it is
+    // asserted here so a future move of the wake inside the transaction is caught.
+    const actions = await db.select().from(issueRecoveryActions);
+    expect(actions.map((action) => action.sourceIssueId).sort()).toEqual(
+      [sourceIssueId, ...laterIssueIds].sort(),
+    );
   });
 
   // PEN-2791. The sweep counted five attendance paths -- live run, deferred execution
@@ -2942,6 +3210,180 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       );
     expect(repeatedAnnouncements).toHaveLength(1);
   });
+
+  // BLO-19124 AC4 (burst safety): "creating N recovery actions for one owner in a short
+  // window does not depend on that owner absorbing N wakes. Demonstrate with N >= 20
+  // against an owner whose maxConcurrentRuns is 3."
+  //
+  // The burst is the load shape that produced the original defect: 59 one-shot wakes landed
+  // on one owner in a day, the owner could absorb 3, and the rest were stranded forever. The
+  // guarantee under test is that a wake the owner CANNOT absorb costs the action nothing —
+  // the reserved attempt is refunded and the non-delivery is recorded in the separate
+  // dimension, so the deferred actions still hold their whole budget when capacity frees.
+  //
+  // `enqueueWakeup` is the seam, and null is not a stand-in for capacity here: null is
+  // literally how the real one reports every non-delivery path, capacity deferral included
+  // (see `enqueueOrRefundAttempt`, recovery/service.ts:5799). What this does NOT cover is
+  // whether the real dispatcher defers at exactly `maxConcurrentRuns` — that is the
+  // heartbeat's contract and has its own tests. The agent is still seeded with the AC's
+  // capacity so the mock's ceiling is read from the fixture rather than a magic literal.
+  //
+  // The capacity goes on the MANAGER, not the coder: this path routes the wake to
+  // `resolveStrandedIssueRecoveryOwnerAgentId`, which takes the assignee's `reportsTo`
+  // before the assignee. Seeding the coder would configure an agent this path never wakes,
+  // and the test would still pass — the AC says "an owner whose maxConcurrentRuns is 3",
+  // so the mock asserts it is that owner being woken before applying the ceiling.
+  it("refunds a burst of wakes one owner cannot absorb instead of spending their budget (BLO-19124 AC4)", async () => {
+    const BURST = 25;
+    const MAX_CONCURRENT = 3;
+    expect(BURST).toBeGreaterThanOrEqual(20);
+
+    const { companyId, managerId, coderId, prefix, sourceIssue } = await seedCompany();
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: MAX_CONCURRENT } } })
+      .where(eq(agents.id, managerId));
+    const [owner] = await db.select().from(agents).where(eq(agents.id, managerId));
+    const capacity =
+      (owner!.runtimeConfig as { heartbeat?: { maxConcurrentRuns?: number } })?.heartbeat
+        ?.maxConcurrentRuns ?? 0;
+    expect(capacity).toBe(MAX_CONCURRENT);
+
+    // seedCompany already made issue #1; fill the burst out to BURST on the same owner.
+    const extraIds = Array.from({ length: BURST - 1 }, () => randomUUID());
+    await db.insert(issues).values(
+      extraIds.map((id, index) => ({
+        id,
+        companyId,
+        title: `Burst issue ${index + 2}`,
+        status: "in_progress" as const,
+        priority: "medium" as const,
+        assigneeAgentId: coderId,
+        issueNumber: index + 2,
+        identifier: `${prefix}-${index + 2}`,
+      })),
+    );
+    const burstIssues = [
+      sourceIssue,
+      ...(await db.select().from(issues).where(inArray(issues.id, extraIds))),
+    ];
+    expect(burstIssues).toHaveLength(BURST);
+
+    let inFlight = 0;
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string } | null>
+    >(async (agentId) => {
+      // The ceiling is only meaningful if it is the routed owner's ceiling.
+      expect(agentId).toBe(managerId);
+      if (inFlight >= capacity) return null; // owner is saturated — woke nobody
+      inFlight += 1;
+      return { id: randomUUID() };
+    });
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const escalate = (issue: (typeof burstIssues)[number]) =>
+      recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_progress",
+        latestRun: {
+          id: randomUUID(),
+          agentId: coderId,
+          status: "failed",
+          error: "agent is not invokable",
+          errorCode: "agent_not_invokable",
+          contextSnapshot: { retryReason: "issue_continuation_needed" },
+          livenessState: "needs_followup",
+          resultJson: null,
+          usageJson: null,
+          createdAt: new Date(),
+        },
+        comment: "Automatic continuation recovery failed.",
+      });
+
+    for (const issue of burstIssues) await escalate(issue);
+
+    const readActions = async () =>
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, companyId));
+    const afterBurst = await readActions();
+    expect(afterBurst).toHaveLength(BURST);
+
+    // (a) every action in the burst is bounded, so none can sit active forever.
+    for (const action of afterBurst) {
+      expect(action.maxAttempts !== null || action.timeoutAt !== null).toBe(true);
+    }
+
+    // The burst split exactly on what the owner could absorb.
+    const delivered = afterBurst.filter((action) => action.attemptCount > 0);
+    const deferred = afterBurst.filter((action) => action.attemptCount === 0);
+    expect(delivered).toHaveLength(MAX_CONCURRENT);
+    expect(deferred).toHaveLength(BURST - MAX_CONCURRENT);
+
+    // The load-bearing assertion. Without the refund every one of these carries
+    // attemptCount 1 for a wake that reached nobody, which is how a single burst used to
+    // eat 1/5 of 22 budgets at once. The two dimensions must not be conflated: the
+    // non-delivery is counted, just not against the budget.
+    for (const action of deferred) {
+      expect(action).toMatchObject({
+        attemptCount: 0,
+        nonDeliverySweepCount: 1,
+        status: "active",
+        retiringBound: null,
+      });
+    }
+    for (const action of delivered) {
+      expect(action).toMatchObject({ attemptCount: 1, nonDeliverySweepCount: 0 });
+    }
+
+    // AC4 itself: the burst must not have made the deferred work depend on having been
+    // absorbed by that first pass. A real owner frees its slots as runs finish, so drain
+    // the deferred set over successive sweep rounds with capacity released between them,
+    // and count the rounds — that count is the thing the 6h horizon has to accommodate.
+    const deferredIssueIds = new Set(deferred.map((action) => action.sourceIssueId));
+    const roundCap = BURST; // generous; the real number is asserted below
+    let rounds = 0;
+    let outstanding = [...deferredIssueIds];
+    while (outstanding.length > 0 && rounds < roundCap) {
+      rounds += 1;
+      inFlight = 0; // the owner's runs from the previous round have completed
+      // Re-read every round: the first sweep moved these to `blocked`, and the production
+      // sweep always reads current state. Passing the stale in_progress rows would be
+      // testing a shape that never reaches this path.
+      const refreshed = await db.select().from(issues).where(inArray(issues.id, outstanding));
+      for (const issue of refreshed) await escalate(issue);
+      const stillZero = await readActions();
+      outstanding = stillZero
+        .filter((row) => deferredIssueIds.has(row.sourceIssueId) && row.attemptCount === 0)
+        .map((row) => row.sourceIssueId);
+    }
+
+    // Every deferred action was eventually reached, and the burst cost it nothing: exactly
+    // one delivered wake out of a budget of `maxAttempts`, with every non-delivery it
+    // absorbed on the way counted in the other dimension instead.
+    const recovered = (await readActions()).filter((row) =>
+      deferredIssueIds.has(row.sourceIssueId),
+    );
+    expect(recovered).toHaveLength(BURST - MAX_CONCURRENT);
+    for (const action of recovered) {
+      expect(action.status).toBe("active");
+      expect(action.attemptCount).toBe(1);
+      expect(action.attemptCount).toBeLessThan(action.maxAttempts ?? Number.POSITIVE_INFINITY);
+      expect(action.nonDeliverySweepCount).toBeGreaterThanOrEqual(1);
+    }
+
+    // The number that matters to the horizon: draining a burst of N against capacity C
+    // takes at most ceil((N - C) / C) rounds, and the action has to stay alive across all
+    // of them. Bounded rather than pinned — a sweep that drains more per round is an
+    // improvement, and pinning equality would assert this mock's drain policy instead.
+    expect(rounds).toBeLessThanOrEqual(Math.ceil((BURST - MAX_CONCURRENT) / MAX_CONCURRENT));
+    expect(rounds).toBeGreaterThan(1); // a burst this size cannot drain in one pass
+    // BLO-33498: this test needs a per-test budget, and the default 60s is not it.
+    // It performs 117 real escalations (25 in the burst + 92 draining it over 8
+    // rounds), each a multi-statement transaction against embedded Postgres, measured
+    // at ~0.92s each / ~110s total on an IDLE local box. There is no artificial delay
+    // to remove — the cost is intrinsic to the load shape AC4 asks for, so no fix to
+    // the recovery service could have brought it under 60s. Budget is set for the
+    // contended ARC pool, which vitest.config.ts records as ~3-4x slower on
+    // embedded-postgres work. Vitest honours a per-test timeout over the global.
+  }, 600_000);
 
   it("stamps configured bounds when creating a wake-owner recovery action", async () => {
     const previousMaxAttempts = process.env.RECOVERY_ACTION_MAX_ATTEMPTS;

@@ -47,6 +47,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { awaitRateLimitWindow } from "./helpers/rate-limit-window.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -2454,6 +2455,7 @@ rl.on("line", (line) => {
       });
       const rateToolName = (await gateway.listToolsForSession(session.token))
         .find((tool) => tool.connectionId === rateTool.connection.id)!.name;
+      await awaitRateLimitWindow();
       await expect(gateway.executeTool({
         sessionToken: session.token,
         tool: rateToolName,

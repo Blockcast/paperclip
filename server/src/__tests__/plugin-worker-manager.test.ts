@@ -2,6 +2,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
+
+// BLO-33419 asserts on the host's own log records, so the real pino logger is
+// replaced wholesale. `child()` hands back the same record every time, which is
+// what lets the test read the bindings created inside createPluginWorkerHandle.
+vi.mock("../middleware/logger.js", () => {
+  const record = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+  return { logger: { ...record, child: vi.fn(() => record) } };
+});
+
 import {
   createHostClientHandlers,
   JsonRpcCallError,
@@ -17,6 +26,20 @@ import {
   shouldDropDroppableMessage,
   MAX_WORKER_STDIN_BACKLOG_BYTES,
 } from "../services/plugin-worker-manager.js";
+import { logger } from "../middleware/logger.js";
+import { HttpError } from "../errors.js";
+
+type LogSpy = ReturnType<typeof vi.fn>;
+const logSpies = (logger as unknown as {
+  child: () => { error: LogSpy; warn: LogSpy };
+}).child();
+
+/** Structured fields logged alongside `message`, across all calls to `spy`. */
+function fieldsLoggedAs(spy: LogSpy, message: string): Record<string, unknown>[] {
+  return spy.mock.calls
+    .filter((call: unknown[]) => call[1] === message)
+    .map((call: unknown[]) => call[0] as Record<string, unknown>);
+}
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const DELAYED_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-delayed.cjs");
@@ -798,5 +821,99 @@ describe("plugin host company context guards", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
+  });
+});
+
+/**
+ * BLO-33419 — a host-call denial is an expected, plugin-handled outcome, not a
+ * host fault. Before this, every one was an ERROR whose reason lived under the
+ * pino-pretty-reserved `err` key, so pretty-printing hoisted it onto a
+ * continuation line that Loki ingests as a separate, level-less, message-less
+ * entry. ~450 reasonless ERROR lines/hour on paperclip-0, measured 2026-09-12.
+ */
+describe("host-call denial logging", () => {
+  async function callSecretsResolve(resolveImpl: () => Promise<never>) {
+    logSpies.error.mockClear();
+    logSpies.warn.mockClear();
+
+    const hostHandlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["secrets.read-ref"],
+      services: {
+        config: { get: vi.fn(async () => ({})) },
+        secrets: { resolve: vi.fn(resolveImpl) },
+      } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers,
+    });
+
+    try {
+      await handle.start();
+      await handle.call("performAction", {
+        key: "probe",
+        params: {
+          mode: "echo",
+          hostMethod: "secrets.resolve",
+          requestedCompanyId: "company-a",
+        },
+        actorContext: {
+          type: "agent",
+          userId: null,
+          agentId: "agent-1",
+          runId: "run-1",
+          companyId: "company-a",
+        },
+        renderEnvironment: null,
+      }).catch(() => undefined);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }
+
+  it("logs a denied host call once, below ERROR, with the reason on the same record", async () => {
+    // The exact production shape: plugin-secrets-handler raises a 422 carrying
+    // `binding_missing` when a secret is not bound to the calling plugin.
+    await callSecretsResolve(async () => {
+      throw new HttpError(
+        422,
+        "Secret is not bound to plugin:test.plugin at apiKeyRef",
+        { code: "binding_missing" },
+      );
+    });
+
+    expect(fieldsLoggedAs(logSpies.error, "host handler error")).toEqual([]);
+
+    const denied = fieldsLoggedAs(logSpies.warn, "host call denied");
+    expect(denied).toHaveLength(1);
+    expect(denied[0]).toMatchObject({
+      method: "secrets.resolve",
+      reason: "Secret is not bound to plugin:test.plugin at apiKeyRef",
+      reasonCode: "binding_missing",
+    });
+    // `err` is reserved by pino-pretty and gets hoisted off this record.
+    expect(denied[0]).not.toHaveProperty("err");
+  });
+
+  it("still logs a genuine host fault at ERROR, with the reason on the same record", async () => {
+    // Negative control: the fix must not be "stop logging host failures".
+    await callSecretsResolve(async () => {
+      throw new TypeError("host database handle is closed");
+    });
+
+    expect(fieldsLoggedAs(logSpies.warn, "host call denied")).toEqual([]);
+
+    const faults = fieldsLoggedAs(logSpies.error, "host handler error");
+    expect(faults).toHaveLength(1);
+    expect(faults[0]).toMatchObject({
+      method: "secrets.resolve",
+      reason: "host database handle is closed",
+    });
+    expect(faults[0]).not.toHaveProperty("err");
   });
 });

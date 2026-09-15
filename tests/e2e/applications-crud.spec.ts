@@ -91,6 +91,15 @@ async function gotoApps(page: Page, prefix: string) {
 }
 
 test.describe.serial("applications lifecycle", () => {
+  // These tests declare more assertion budget than the 60s suite default can honour:
+  // "connected app detail..." alone sums 130s (30s + 15s x4 + 20s x2) and
+  // "not-connected app advanced..." sums 70s. Under load the cap fires on whichever
+  // await is holding the clock -- observed as a bare 60s timeout on the last step
+  // (the "Remove app" click, :166) while the same file's :109 ran 29.7s then 42.3s
+  // on two runs of identical code. Raise the ceiling so the declared per-assertion
+  // budgets are actually reachable (BLO-33320).
+  test.setTimeout(180_000);
+
   let mock: MockMcpServer;
   let seed: SeedResult;
 

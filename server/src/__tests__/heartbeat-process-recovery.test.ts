@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   PROCESS_LOST_LIVENESS_NULL_METRIC,
   PROCESS_LOST_TOTAL_METRIC,
+  HEARTBEAT_RUN_FAILED_METRIC,
   __resetMetricsForTest,
   renderMetrics,
 } from "../services/metrics.js";
@@ -1608,6 +1609,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("uses the persisted stage-exit cancellation in the setup-error terminal path", async () => {
+    __resetMetricsForTest();
     const { companyId, agentId, runId, wakeupRequestId } = await seedQueuedIssueRunFixture();
     const svc = secretService(db);
     const secret = await svc.create(companyId, {
@@ -1658,6 +1660,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       level: "warn",
       payload: expect.objectContaining({ errorCode: "pipeline_stage_exited" }),
     }));
+    // BLO-28648: the setup path increments the failure counter, but a stage-exit
+    // race turns this terminalization into a cancellation. No failure sample may
+    // be emitted for it, matching the liveness path.
+    const { body: metrics } = await renderMetrics();
+    expect(metrics).not.toContain(`${HEARTBEAT_RUN_FAILED_METRIC}{`);
+    __resetMetricsForTest();
   });
 
   it("uses the persisted stage-exit cancellation in external-lifecycle recovery", async () => {
@@ -2515,6 +2523,240 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("tells the linked Paperclip issue when a reviewer run ends without a confirmed review (BLO-33589)", async () => {
+    // The commit status is the ONLY place this outcome was ever written. On
+    // Blockcast/libmmt#444 that status said "ended ambiguously and was not
+    // replayed" at 2026-09-12T20:02:59Z and nothing in Paperclip ever learned
+    // it: no wake, no comment, no retry. The requesting agent had already ended
+    // its run believing it handed off, so the PR read as ordinary reviewer
+    // latency for 10h06m while four sibling PRs were reviewed in 5-10 minutes.
+    //
+    // Asserted on the Paperclip side (issue comment + wake) rather than on the
+    // GitHub status fixture, which is what the existing test above covers.
+    const jobName = "agent-opencode-ambiguous-review-notifies-issue";
+    const headSha = "ae43eed59d9a2fb0c21fe1b1dad7b013a9d02668";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      // No issue on the reviewer run itself: a PR-review wake for an external
+      // repo is not bound to a Paperclip issue, which is exactly the `!issue`
+      // finalizer branch #444 took.
+      includeIssue: false,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/libmmt:444:${headSha}`,
+        githubRepoFullName: "Blockcast/libmmt",
+        githubPrNumber: 444,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { summary: `Posted the consolidated Ally review on #444 at ${headSha}.` } })
+      .where(eq(heartbeatRuns.id, runId));
+
+    // The requesting side: a separate issue owned by a separate agent, linked
+    // to the PR by its `pull_request` work product, parked `in_review` waiting
+    // for exactly this review.
+    const authorAgentId = randomUUID();
+    const authorIssueId = randomUUID();
+    await db.insert(agents).values({
+      id: authorAgentId,
+      companyId,
+      name: "PlayersEngineer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: authorIssueId,
+      companyId,
+      title: "BLO-32722 layer ownership carries media",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: authorAgentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 444,
+      identifier: "TAUTHOR-444",
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId,
+      issueId: authorIssueId,
+      type: "pull_request",
+      provider: "github",
+      externalId: "Blockcast/libmmt#444",
+      title: "BLO-32722 layer ownership carries media",
+      url: "https://github.com/Blockcast/libmmt/pull/444",
+      status: "ready_for_review",
+    });
+
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: false });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+    const previousGateContext = process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+    process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = "review/ally-complete";
+    try {
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    } finally {
+      if (previousGateContext === undefined) {
+        delete process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+      } else {
+        process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = previousGateContext;
+      }
+    }
+
+    const [comments, wakeups, gateDeliveries] = await Promise.all([
+      db.select().from(issueComments).where(eq(issueComments.issueId, authorIssueId)),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, authorAgentId)),
+      db
+        .select()
+        .from(githubCommitStatusDeliveries)
+        .where(eq(githubCommitStatusDeliveries.sourceRunId, runId)),
+    ]);
+
+    // The GitHub half still happens — this adds a reader, it does not move one.
+    expect(gateDeliveries).toHaveLength(1);
+    expect(gateDeliveries[0]).toMatchObject({ sha: headSha, state: "failure" });
+
+    const notice = comments.filter((comment) =>
+      comment.body.includes("Ally review did not land on")
+    );
+    expect(notice).toHaveLength(1);
+    expect(notice[0]?.authorType).toBe("system");
+    expect(notice[0]?.body).toContain("Blockcast/libmmt#444");
+    expect(notice[0]?.body).toContain(headSha);
+    // The terminal fact itself, in words, not just a link to a red check.
+    expect(notice[0]?.body).toContain("No review was posted, and none is coming for this head");
+
+    // The comment is the durable artifact; the wake is what actually reaches an
+    // agent. `in_review` is excluded from inbox-lite by design, so without this
+    // the issue would sit exactly as silently as it did on #444.
+    const gateWakes = wakeups.filter((wakeup) => wakeup.reason === "github_pr_review_gate_failed");
+    expect(gateWakes).toHaveLength(1);
+    expect(gateWakes[0]?.payload).toMatchObject({
+      issueId: authorIssueId,
+      repoFullName: "Blockcast/libmmt",
+      prNumber: 444,
+      headSha,
+      prReviewGateFailureReason: "non_retryable_external_lifecycle",
+      reviewerRunId: runId,
+    });
+  });
+
+  it("does not enqueue a second wake when another finalizer already claimed the notice (BLO-33589)", async () => {
+    // Concurrent finalization of ONE reviewer run. The wake used to be gated on
+    // a read of `agentWakeupRequests` by idempotency key — check-then-act, on a
+    // table with no unique index on that column, so both racers saw no row and
+    // both enqueued. The claim is now the system comment, whose partial unique
+    // index on (issue_id, idempotency_key) lets Postgres pick one winner.
+    //
+    // This drives the LOSER: the winner's comment is already committed under
+    // the shared key when the terminalizer runs, so `addComment` comes back
+    // `deduplicated` and the wake must not fire. Under the old code the wake
+    // row is absent at that point and it fires — the duplicate this closes.
+    const jobName = "agent-opencode-ambiguous-review-concurrent-claim";
+    const headSha = "bb1d4a7c0f2e46318a5c9d0e7b3f81624ad5e909";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      includeIssue: false,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/libmmt:446:${headSha}`,
+        githubRepoFullName: "Blockcast/libmmt",
+        githubPrNumber: 446,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+
+    const authorAgentId = randomUUID();
+    const authorIssueId = randomUUID();
+    await db.insert(agents).values({
+      id: authorAgentId,
+      companyId,
+      name: "PlayersEngineerConcurrent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: authorIssueId,
+      companyId,
+      title: "BLO-33589 concurrent finalization",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: authorAgentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 446,
+      identifier: "TAUTHOR-446",
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId,
+      issueId: authorIssueId,
+      type: "pull_request",
+      provider: "github",
+      externalId: "Blockcast/libmmt#446",
+      title: "BLO-33589 concurrent finalization",
+      url: "https://github.com/Blockcast/libmmt/pull/446",
+      status: "ready_for_review",
+    });
+    // The race winner, committed before this finalizer reaches the claim.
+    await db.insert(issueComments).values({
+      companyId,
+      issueId: authorIssueId,
+      authorType: "system",
+      idempotencyKey: `pr_review_gate_failed:${runId}:${authorIssueId}`,
+      body: "## Ally review did not land on `Blockcast/libmmt#446`",
+    });
+
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: false });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+    const previousGateContext = process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+    process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = "review/ally-complete";
+    try {
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    } finally {
+      if (previousGateContext === undefined) {
+        delete process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+      } else {
+        process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = previousGateContext;
+      }
+    }
+
+    const [comments, wakeups] = await Promise.all([
+      db.select().from(issueComments).where(eq(issueComments.issueId, authorIssueId)),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, authorAgentId)),
+    ]);
+    // One notice, from the winner — the loser neither posts nor wakes.
+    expect(
+      comments.filter((comment) => comment.body.includes("Ally review did not land on")),
+    ).toHaveLength(1);
+    expect(
+      wakeups.filter((wakeup) => wakeup.reason === "github_pr_review_gate_failed"),
+    ).toHaveLength(0);
+  });
+
   it.each(["pr_review_output_missing", "pr_review_verification_unavailable"])(
     "terminalizes the PR gate for non-retryable %s after adapter invocation",
     async (errorCode) => {
@@ -2677,7 +2919,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       prNumber: 1648,
       headSha,
     });
-    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledTimes(1);
+    // BLO-28920: a miss at the wake's pinned head is now re-checked once against
+    // the PR's live head (`headSha: null` reuses the callee's own resolution).
+    // Both passes miss here, so this test's subject — a run's own summary is not
+    // outcome evidence — is unchanged; only the call count is.
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledWith({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 1648,
+      headSha: null,
+    });
+    expect(mockGithubHasReviewerEvidenceForPr).toHaveBeenCalledTimes(2);
     expect(await heartbeat.getRun(runId)).toMatchObject({
       status: "failed",
       errorCode: "job_missing",
@@ -7104,6 +7355,75 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(result.escalated).toBe(0);
       expect(result.skipped).toBe(1);
       expect(result.issueIds).not.toContain(issueId);
+    },
+  );
+
+  it(
+    "BLO-27463: a run that yielded its slot for a live external wait is not stranded or reassigned",
+    async () => {
+      // BLO-33463 (2026-09-12, `critical`): Ally armed a PR-checks monitor, yielded the
+      // slot as #1195 intends, and the sweep escalated the resulting `cancelled` run as a
+      // stranded assignment — Ally -> CTO -> CEO in six minutes, coming to rest `blocked`
+      // with an empty blocker set, which destroyed the monitor that was the issue's only
+      // wake path and took the two issues it blocks with it.
+      //
+      // The durable-wait gate already knew this issue was attended; it just refused to
+      // look, because it only consulted the wait path for a *succeeded* run.
+      //
+      // Asserted on the acceptance criteria (no recovery action, no ownership move, status
+      // and monitor intact) rather than on a counter, so the test survives the mechanism
+      // moving between layers.
+      const monitorNextCheckAt = new Date(Date.now() + 60 * 60_000);
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        runErrorCode: "external_wait_yield",
+        runError: "Yielded after persisting an external-service wait",
+        monitorNextCheckAt,
+        resultJson: { yieldedExternalWait: true, issueId: null, serviceName: "github-actions" },
+      });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      expect(result.escalated).toBe(0);
+      expect(result.skipped).toBe(1);
+      expect(result.issueIds).not.toContain(issueId);
+
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(issue?.status).toBe("in_progress");
+      expect(issue?.assigneeAgentId).toBe(agentId);
+      expect(issue?.monitorNextCheckAt?.toISOString()).toBe(monitorNextCheckAt.toISOString());
+
+      const actions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(actions).toHaveLength(0);
+    },
+  );
+
+  it(
+    "BLO-27463: an external-wait yield whose monitor has lapsed is still seen by the sweep",
+    async () => {
+      // The bound on the fix above. Admitting the yield to the durable-wait gate must not
+      // create a row that can never be recovered: once the monitor it armed is past due and
+      // no PR or blocker path replaces it, the wait is no longer a wake path and the strand
+      // arms have to stay reachable. Same shape as the BLO-24782 past-due test.
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "cancelled",
+        runErrorCode: "external_wait_yield",
+        runError: "Yielded after persisting an external-service wait",
+        monitorNextCheckAt: new Date(Date.now() - 48 * 60 * 60_000),
+      });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      expect(result.skipped).toBe(0);
     },
   );
 
@@ -11901,8 +12221,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // unchanged. Only the query needed widening: `escalated` still holds
     // `issue_recovery_actions_active_source_uq`, so counting both active statuses is still
     // counting exactly the rows the uniqueness constraint governs, whereas filtering on
-    // `active` alone reads a correctly-retired row as a missing one. The budget is also
-    // still not over-spendable by the race — `attemptCount` is asserted below unchanged.
+    // `active` alone reads a correctly-retired row as a missing one.
     const actions = await db
       .select()
       .from(issueRecoveryActions)
@@ -11912,7 +12231,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         inArray(issueRecoveryActions.status, ["active", "escalated"]),
       ));
     expect(actions).toHaveLength(1);
-    expect(actions[0]?.attemptCount).toBe(Math.min(8, defaultRecoveryActionMaxAttempts));
+    // BLO-33410: a BOUND, not an equality. `attemptCount` is not a gate — the reserve does a
+    // read-modify-write (`existing.attemptCount + 1`, issue-recovery-actions.ts), so it counts
+    // sweeps that landed, and the budget bounds WAKES rather than increments. 8 racing sweeps
+    // can therefore carry it past `defaultRecoveryActionMaxAttempts`; the old
+    // `.toBe(Math.min(8, defaultRecoveryActionMaxAttempts))` demanded exactly 5 of 8 land and
+    // failed ~2 runs in 3 on unchanged master (measured 6 and 7). 8 is the real ceiling — one
+    // increment per concurrent caller — so this still fails if a retry path double-increments.
+    expect(actions[0]?.attemptCount).toBeGreaterThanOrEqual(1);
+    expect(actions[0]?.attemptCount).toBeLessThanOrEqual(8);
     // Pin WHICH bound retired it. The creation-anchored horizon is hours out here, so the
     // budget is the only bound that can have fired — which makes this the one assertion that
     // fails if the wake path ever goes back to hardcoding the bound on a disjunctive gate.

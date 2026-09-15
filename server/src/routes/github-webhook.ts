@@ -64,10 +64,16 @@ import {
 } from "../services/paperclip-identifiers.js";
 import {
   githubFetchPrHeadSha,
+  githubListPullRequestCommits,
   githubReviewerIdentityMatches,
   githubListIssueCommentBodies,
   githubPostIssueComment,
 } from "../services/github-app-auth.js";
+import {
+  buildForeignCommitNoticeBody,
+  foreignCommitNoticeIdempotencyKey,
+  selectForeignCommits,
+} from "../services/foreign-commit-notice.js";
 import {
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
@@ -173,6 +179,17 @@ export interface GithubWebhookConfig {
    * behavior is verified without contacting GitHub.
    */
   runPrCommentReviewGateCheck?: typeof runPrCommentReviewGateCheck;
+  /**
+   * Lists a PR's commits with their git-author identity, for the foreign-commit
+   * notice (BLO-19528). Production uses the GitHub App lookup; route tests
+   * supply a deterministic seam so the notice is verified without contacting
+   * GitHub. When unset and App creds are absent, the notice self-gates off.
+   */
+  listPullRequestCommits?: typeof githubListPullRequestCommits;
+  /**
+   * Gate for the foreign-commit notice (BLO-19528). Defaults to enabled.
+   */
+  notifyForeignCommits?: boolean;
   /**
    * Absolute public origin of this Paperclip deployment (PAPERCLIP_PUBLIC_URL),
    * used to build the absolute issue URL posted back onto PRs (BLO-13353). When
@@ -959,14 +976,17 @@ function resolveEventContextRaw(
       commentId: number | null;
       commentAuthorLogin: string | null;
       commentUrl: string | null;
-      // BLO-21618: two distinct drops share this callback. "missing_marker" is
+      // BLO-21618: three distinct drops share this callback. "missing_marker" is
       // the original BLO-18273 case (bare alias, no marker at all).
       // "marker_disqualified_by_heading" is a marker-bearing agent request
       // whose body ALSO happens to contain a standalone Ally-consolidated-
       // review-heading line (see hasAllyConsolidatedReviewHeading) — the same
       // exclusion that correctly silences Ally's own review echoes also
       // silences this genuine request, and until now did so with zero trace.
-      reason: "missing_marker" | "marker_disqualified_by_heading";
+      // BLO-33589: "missing_mention" is a marker-bearing agent request that
+      // never names the reviewer, so `reviewerRequest` fails on the mention
+      // conjunct rather than on the marker one.
+      reason: "missing_marker" | "marker_disqualified_by_heading" | "missing_mention";
     }) => void;
     // BLO-23059: invoked when a pull_request_review.submitted delivery was
     // dropped as a Claude Code Review service notice. Separate from
@@ -1188,6 +1208,54 @@ function resolveEventContextRaw(
         hasPrReviewerAgentRequestMarker(commentBody) &&
         hasAllyConsolidatedReviewHeading(commentBody) &&
         hasPrReviewerRequestMention(commentBody);
+      // BLO-33589: the THIRD invisible drop, and the last one. `reviewerRequest`
+      // is a conjunction of the marker path AND the mention; the two reports
+      // above both only ever fire on a body that HAS the mention, so a
+      // marker-prefixed agent request that simply never names the reviewer fell
+      // out of here as silent `null`. Measured on Blockcast/libmmt 2026-09-11..12:
+      // 4 such comments across #436/#442/#444, and on #444 they were the only
+      // surviving wake path because the automatic `opened` wake had already been
+      // lost, so the PR sat 10h06m with zero reviews.
+      //
+      // Cannot reclassify either existing report: `hasPrReviewerBareAliasMention`
+      // is a strict subset of `hasPrReviewerRequestMention` (bare `@ally` matches
+      // both patterns), so `!hasPrReviewerRequestMention` excludes the
+      // missing_marker branch, and `markerRequestDisqualifiedByHeading` requires
+      // the mention outright. Not gated on the heading: Ally's own output is
+      // never marker-prefixed (the marker must be the literal first byte), so
+      // this cannot fire on a self-echo whether or not a heading is present —
+      // and a marker+heading body with no mention is blocked by the missing
+      // mention first, which is the actionable half.
+      const markerRequestMissingMention =
+        commentAuthorIsReviewerBot &&
+        hasPrReviewerAgentRequestMarker(commentBody) &&
+        !hasPrReviewerRequestMention(commentBody);
+      // Exhaustive over bot-authored bodies that do NOT wake the reviewer, by
+      // (marker, mention, heading):
+      //   marker=0, mention=1            -> missing_marker (BLO-18273)
+      //   marker=1, mention=1, heading=1 -> marker_disqualified_by_heading (BLO-21618)
+      //   marker=1, mention=0            -> missing_mention (BLO-33589)
+      //   marker=0, mention=0            -> INTENTIONALLY UNLOGGED. Addresses
+      //     nobody and carries no marker: an ordinary PR comment, not a dropped
+      //     request. Reporting it would log every bot comment in the repo.
+      //   marker=0, mention=1 via the LONG login only (`@allyblockcast[bot]`,
+      //     not bare `@ally`) -> INTENTIONALLY UNLOGGED. That is the
+      //     commitperclip template gate greeting the bot account; suppressing it
+      //     is the fix for the #583 loop, not a lost handoff. See
+      //     PR_REVIEWER_BARE_ALIAS_MENTION_PATTERN.
+      // (marker=1, mention=1, heading=0 is the waking path and reaches neither
+      // report, by construction.)
+      //
+      // Scope note, measured 2026-09-13: the BLO-33589 sweep reported 4
+      // marker-without-mention comments on Blockcast/libmmt in the window. Three
+      // are bot-authored (#442 once, #444 twice) and are what the new branch
+      // covers. The fourth, on #436 at 2026-09-11T03:21:04Z, was authored by the
+      // HUMAN `kkroo`. A human's marker-only body is dropped for the same reason
+      // (the mention is the missing conjunct) but was never in the author-guard
+      // suppression class this callback reports on — every reason here is
+      // prefixed `reviewer_bot_authored_`. Left uncovered deliberately rather
+      // than by oversight; widening the callback to non-bot authors is a
+      // separate decision with a different blast radius.
       if (!reviewerRequest && !reviewFeedback) {
         if (
           commentAuthorIsReviewerBot &&
@@ -1210,6 +1278,15 @@ function resolveEventContextRaw(
             commentAuthorLogin,
             commentUrl: readStringField(comment, "html_url"),
             reason: "marker_disqualified_by_heading",
+          });
+        } else if (markerRequestMissingMention) {
+          options.onSuppressedReviewRequest?.({
+            repoFullName,
+            prNumber: (issue.number as number | undefined) ?? null,
+            commentId: (comment?.id as number | undefined) ?? null,
+            commentAuthorLogin,
+            commentUrl: readStringField(comment, "html_url"),
+            reason: "missing_mention",
           });
         }
       }
@@ -4051,21 +4128,45 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
 
     let context = resolveEventContext(eventName, payload, {
       prReviewerBotLogin: config.prReviewerBotLogin,
-      // BLO-18273/BLO-21618: surface both silent drops in this handler — an
-      // agent request missing the marker, and a marker-bearing agent request
-      // disqualified by an incidental heading match (see the two reasons on
-      // `onSuppressedReviewRequest`). Neither produces a wake or an error
-      // otherwise; this callback is the only trace either ever leaves.
+      // BLO-18273/BLO-21618/BLO-33589: surface all three silent drops in this
+      // handler — an agent request missing the marker, a marker-bearing request
+      // disqualified by an incidental heading match, and a marker-bearing
+      // request that never names the reviewer (see the three reasons on
+      // `onSuppressedReviewRequest`). None produces a wake or an error
+      // otherwise; this callback is the only trace any of them ever leaves.
       onSuppressedReviewRequest: (info) => {
-        const message =
-          info.reason === "marker_disqualified_by_heading"
-            ? "github webhook reviewer wake skipped: @ally request carries a valid start-of-body " +
+        // Keyed by reason rather than chained ternaries on purpose: a future
+        // fourth reason then fails to typecheck here instead of silently
+        // inheriting the missing_marker text and counter, which is exactly how
+        // BLO-33589's drop stayed invisible.
+        const report: Record<
+          typeof info.reason,
+          { suppressionReason: string; message: string }
+        > = {
+          marker_disqualified_by_heading: {
+            suppressionReason: "reviewer_bot_authored_request_disqualified_by_heading",
+            message:
+              "github webhook reviewer wake skipped: @ally request carries a valid start-of-body " +
               "<!-- paperclip:review-request --> marker, but its body also contains a standalone Ally " +
               "consolidated-review heading, so the self-echo guard (BLO-15799/BLO-18865) treated it as the " +
-              "reviewer's own output (BLO-21618); no review was requested"
-            : "github webhook reviewer wake skipped: @ally request authored by the reviewer bot login carries no " +
+              "reviewer's own output (BLO-21618); no review was requested",
+          },
+          missing_marker: {
+            suppressionReason: "reviewer_bot_authored_request_missing_marker",
+            message:
+              "github webhook reviewer wake skipped: @ally request authored by the reviewer bot login carries no " +
               "start-of-body <!-- paperclip:review-request --> marker, so it is indistinguishable from the " +
-              "reviewer's own output (BLO-18865/BLO-18273); no review was requested";
+              "reviewer's own output (BLO-18865/BLO-18273); no review was requested",
+          },
+          missing_mention: {
+            suppressionReason: "reviewer_bot_authored_request_missing_mention",
+            message:
+              "github webhook reviewer wake skipped: request carries a valid start-of-body " +
+              "<!-- paperclip:review-request --> marker but never mentions the reviewer, and the marker alone " +
+              "does not request a review (BLO-33589); no review was requested",
+          },
+        };
+        const { suppressionReason, message } = report[info.reason];
         logger.warn(
           {
             event: eventName,
@@ -4075,10 +4176,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             commentId: info.commentId,
             commentAuthorLogin: info.commentAuthorLogin,
             commentUrl: info.commentUrl,
-            suppressionReason:
-              info.reason === "marker_disqualified_by_heading"
-                ? "reviewer_bot_authored_request_disqualified_by_heading"
-                : "reviewer_bot_authored_request_missing_marker",
+            suppressionReason,
           },
           message,
         );
@@ -4962,6 +5060,168 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     }
 
+    // Foreign-commit notice (BLO-19528). When another agent pushes to a branch
+    // whose linked issue is assigned to somebody else, tell the assignee. The
+    // hazard is silent drift: on trafficcontrol#1292 a teammate's commit landed
+    // on the CTO's branch and the CTO's next status comment still described a
+    // PR it believed it solely authored -- the same drift that earlier nearly
+    // caused a force-push over that teammate's work.
+    //
+    // Trigger is `pull_request.synchronize`, not `push`. synchronize fires once
+    // per push to a PR branch and is already a subscribed, handled event here,
+    // so this needs no new webhook subscription and is inherently PR-scoped.
+    //
+    // Scoped to OWNING identifiers (BLO-20886): a PR that merely mentions an
+    // issue in a `Related:` line must not wake that issue's assignee.
+    //
+    // Best-effort throughout: any failure is logged and never breaks the wake
+    // path, mirroring the back-link and work-product blocks above.
+    let foreignCommitNotices = 0;
+    let foreignCommitListingTruncated = false;
+    // One entry per notice that was freshly inserted by THIS delivery. The
+    // wake is fired below, once `heartbeat` exists -- a notice nobody is woken
+    // for is just a row: `synchronize` sets suppressAuthorWake, so the
+    // assignee's normal PR wake is deliberately off on exactly the event this
+    // notice rides on. Carrying the comment id is what puts the notice body in
+    // the wake directive (deriveCommentId -> wakeCommentContext).
+    const foreignCommitWakes: Array<{
+      issueId: string;
+      issueIdentifier: string | null;
+      agentId: string;
+      commentId: string;
+      idempotencyKey: string;
+      sha: string;
+    }> = [];
+    const foreignCommitAction = readStringField(payload, "action");
+    const foreignCommitRepo = context.repoFullName;
+    const foreignCommitPrNumber = context.prNumber;
+    const foreignCommitPrUrl = context.prUrl ?? null;
+    if (
+      config.notifyForeignCommits !== false &&
+      eventName === "pull_request" &&
+      (foreignCommitAction === "synchronize" || foreignCommitAction === "opened") &&
+      foreignCommitRepo !== null &&
+      foreignCommitPrNumber !== null &&
+      matched.length > 0
+    ) {
+      const owning = context.owningIdentifiers ?? context.identifiers;
+      const owningMatched = matched.filter(
+        (issue) => issue.identifier && owning.includes(issue.identifier),
+      );
+
+      if (owningMatched.length > 0) {
+        try {
+          const listCommits = config.listPullRequestCommits ?? githubListPullRequestCommits;
+          const commitsResult = await listCommits({
+            repoFullName: foreignCommitRepo,
+            prNumber: foreignCommitPrNumber,
+          });
+
+          if ("error" in commitsResult) {
+            logger.warn(
+              {
+                reason: commitsResult.error,
+                prNumber: foreignCommitPrNumber,
+                repoFullName: foreignCommitRepo,
+              },
+              "foreign-commit notice: PR commit listing failed (non-fatal)",
+            );
+          } else {
+            // A short listing is unproven, not empty. Notify on what was read
+            // -- dropping it would trade "missed the oldest commits" for
+            // "missed all of them" -- but say so, because the whole hazard
+            // this notice exists for is an assignee trusting a silent gap.
+            if (commitsResult.truncated) {
+              foreignCommitListingTruncated = true;
+              logger.warn(
+                {
+                  prNumber: foreignCommitPrNumber,
+                  repoFullName: foreignCommitRepo,
+                  commitsRead: commitsResult.commits.length,
+                },
+                "foreign-commit notice: PR commit listing truncated, older commits cannot be checked",
+              );
+            }
+            const companyIds = Array.from(new Set(owningMatched.map((i) => i.companyId)));
+            const roster = await db
+              .select({ id: agents.id, name: agents.name, companyId: agents.companyId })
+              .from(agents)
+              .where(inArray(agents.companyId, companyIds));
+
+            for (const issue of owningMatched) {
+              // No assignee, nobody to tell. The notice body asserts "which is
+              // assigned to you", and there is no wake target either, so an
+              // unassigned issue would collect a row addressed to no one.
+              const noticeAssigneeAgentId = issue.assigneeAgentId;
+              if (!noticeAssigneeAgentId) continue;
+              // Same rule as the author-wake loop below: a teammate's commit is
+              // not a reason to reopen `done`/`cancelled` work.
+              if (issue.status === "done" || issue.status === "cancelled") continue;
+              const selection = selectForeignCommits({
+                commits: commitsResult.commits,
+                assigneeAgentId: noticeAssigneeAgentId,
+                agents: roster.filter((a) => a.companyId === issue.companyId),
+              });
+
+              for (const foreign of selection.notify) {
+                const idempotencyKey = foreignCommitNoticeIdempotencyKey({
+                  repoFullName: foreignCommitRepo,
+                  prNumber: foreignCommitPrNumber,
+                  sha: foreign.sha,
+                });
+                const inserted = await db
+                  .insert(issueComments)
+                  .values({
+                    companyId: issue.companyId,
+                    issueId: issue.id,
+                    authorType: "system",
+                    idempotencyKey,
+                    body: buildForeignCommitNoticeBody({
+                      commit: foreign,
+                      repoFullName: foreignCommitRepo,
+                      prNumber: foreignCommitPrNumber,
+                      prUrl: foreignCommitPrUrl,
+                    }),
+                    metadata: {
+                      kind: "github_foreign_commit_notice",
+                      source: "github",
+                      idempotencyKey,
+                      repoFullName: foreignCommitRepo,
+                      prNumber: foreignCommitPrNumber,
+                      commitSha: foreign.sha,
+                      committingAgentId: foreign.agentId,
+                      deliveryId,
+                    } as never,
+                  })
+                  .onConflictDoNothing()
+                  .returning({ id: issueComments.id })
+                  .then((rows) => rows[0] ?? null);
+                // A replay inserts nothing, so the wake is deduped by the same
+                // (repo, pr, sha) key the row is -- no separate precheck, and a
+                // force-push replaying a known SHA cannot re-wake either.
+                if (inserted) {
+                  foreignCommitNotices += 1;
+                  foreignCommitWakes.push({
+                    issueId: issue.id,
+                    issueIdentifier: issue.identifier,
+                    agentId: noticeAssigneeAgentId,
+                    commentId: inserted.id,
+                    idempotencyKey,
+                    sha: foreign.sha,
+                  });
+                }
+              }
+            }
+          }
+        } catch (err) {
+          logger.warn(
+            { err, prNumber: foreignCommitPrNumber, repoFullName: foreignCommitRepo },
+            "foreign-commit notice failed (non-fatal)",
+          );
+        }
+      }
+    }
+
     if (matched.length === 0) {
       respond(200, {
         ok: true,
@@ -4993,6 +5253,73 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       ownerType: "agent" | "board";
       cycles: number;
     }> = [];
+    // BLO-19528: fire the wake for each notice inserted above. Without this the
+    // notice is a row nobody is scheduled to read: `synchronize` sets
+    // suppressAuthorWake below, so the assignee's ordinary PR wake is
+    // deliberately off on exactly the event this notice rides on, and the
+    // assignee would not see it until its next timer tick -- by which time the
+    // force-push this exists to prevent may already have happened.
+    //
+    // Deliberately NOT routed through issueService.addComment: that function
+    // inserts and bumps updatedAt, and schedules no wake at all (the keyed
+    // comment-effect ledger that does is constructed inside routes/issues.ts,
+    // over that module's own svc/heartbeat closure, and is not reachable here).
+    // Insert + explicit heartbeat.wakeup is this file's established pattern --
+    // reopenInReviewIssueForActionablePrFeedback does exactly the same.
+    //
+    // `reason` deliberately does not start with `github_pr_`: that prefix is
+    // what makes derivePaperclipPrReview classify a run as PR-review-shaped, and
+    // this is an author-directed notice, not a review.
+    for (const notice of foreignCommitWakes) {
+      try {
+        await heartbeat.wakeup(notice.agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "github_foreign_commit",
+          // Same (repo, pr, sha) identity as the notice row. A replay inserts no
+          // comment so never reaches here; this keys the concurrent-delivery case.
+          idempotencyKey: notice.idempotencyKey,
+          payload: {
+            issueId: notice.issueId,
+            commentId: notice.commentId,
+            wakeCommentId: notice.commentId,
+            source: "github",
+            event: eventName,
+            deliveryId,
+            prNumber: foreignCommitPrNumber,
+            repoFullName: foreignCommitRepo,
+            prUrl: foreignCommitPrUrl,
+            commitSha: notice.sha,
+          },
+          contextSnapshot: {
+            issueId: notice.issueId,
+            taskId: notice.issueId,
+            wakeReason: "github_foreign_commit",
+            wakeSource: "automation",
+            wakeTriggerDetail: "system",
+            commentSource: "github",
+            // Carries the notice body into the run's directive via
+            // deriveCommentId -> wakeCommentContext.
+            wakeCommentId: notice.commentId,
+            commentId: notice.commentId,
+            githubEvent: eventName,
+            githubDeliveryId: deliveryId,
+            githubPrNumber: foreignCommitPrNumber,
+            githubRepoFullName: foreignCommitRepo,
+          },
+        });
+        wakes.push({ issueIdentifier: notice.issueIdentifier, agentId: notice.agentId });
+      } catch (err) {
+        // Best-effort like the notice itself: the row is already durable, so a
+        // failed wake degrades to "seen on the next tick", never to a 500.
+        logger.warn(
+          { err, issueId: notice.issueId, agentId: notice.agentId, sha: notice.sha },
+          "foreign-commit notice wake failed (non-fatal)",
+        );
+        skipped.push({ issueIdentifier: notice.issueIdentifier, reason: "foreign_commit_wake_threw" });
+      }
+    }
+
     let recoveryInstance: ReturnType<typeof recoveryService> | null = null;
     const getRecovery = () =>
       (recoveryInstance ??= recoveryService(db, { enqueueWakeup: heartbeat.wakeup }));
@@ -5367,6 +5694,8 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       reviewerRunsCancelled,
       ...(workProductsUpserted > 0 ? { workProductsUpserted } : {}),
       ...(backLinked.length ? { backLinked } : {}),
+      ...(foreignCommitNotices > 0 ? { foreignCommitNotices } : {}),
+      ...(foreignCommitListingTruncated ? { foreignCommitListingTruncated } : {}),
       ...(escalated.length ? { escalated } : {}),
     });
   });

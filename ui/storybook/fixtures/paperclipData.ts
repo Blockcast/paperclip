@@ -390,6 +390,7 @@ export const storybookProjectWorkspaces: Project["workspaces"] = [
     remoteWorkspaceRef: null,
     sharedWorkspaceKey: "board-ui",
     metadata: null,
+    hasWorkspaceRuntimeConfig: true,
     runtimeConfig: {
       workspaceRuntime: storybookWorkspaceRuntime,
       desiredState: "running" as const,
@@ -417,6 +418,7 @@ export const storybookProjectWorkspaces: Project["workspaces"] = [
     remoteWorkspaceRef: "vcsb_storybook_docs_0420",
     sharedWorkspaceKey: "docs-preview",
     metadata: { region: "iad1", ttlHours: 8 },
+    hasWorkspaceRuntimeConfig: true,
     runtimeConfig: {
       workspaceRuntime: {
         commands: [
@@ -478,6 +480,7 @@ export const storybookProjectWorkspaces: Project["workspaces"] = [
     remoteWorkspaceRef: null,
     sharedWorkspaceKey: "release-smoke",
     metadata: null,
+    hasWorkspaceRuntimeConfig: true,
     runtimeConfig: {
       workspaceRuntime: {
         commands: [
@@ -524,6 +527,7 @@ export const storybookExecutionWorkspaces: ExecutionWorkspace[] = [
     closedAt: null,
     cleanupEligibleAt: null,
     cleanupReason: null,
+    hasWorkspaceRuntimeConfig: false,
     config: null,
     metadata: null,
     runtimeServices: storybookProjectWorkspaces[0]!.runtimeServices,
@@ -553,6 +557,7 @@ export const storybookExecutionWorkspaces: ExecutionWorkspace[] = [
     closedAt: recent(118),
     cleanupEligibleAt: recent(115),
     cleanupReason: "release smoke finished but the local worktree still has generated artifacts",
+    hasWorkspaceRuntimeConfig: true,
     config: {
       provisionCommand: null,
       teardownCommand: "pnpm dev:stop && rm -rf ui/storybook-static",

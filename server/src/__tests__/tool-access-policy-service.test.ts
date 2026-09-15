@@ -28,6 +28,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { awaitRateLimitWindow } from "./helpers/rate-limit-window.js";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
@@ -909,6 +910,7 @@ describeEmbeddedPostgres("tool access policy service", () => {
       consumeRateLimit: true,
     };
 
+    await awaitRateLimitWindow();
     const first = await toolAccessPolicyService(db).decide(input);
     const second = await toolAccessPolicyService(db).decide(input);
 
@@ -945,6 +947,7 @@ describeEmbeddedPostgres("tool access policy service", () => {
       consumeRateLimit: true,
     };
 
+    await awaitRateLimitWindow();
     const decisions = await Promise.all([
       toolAccessPolicyService(db).decide(input),
       toolAccessPolicyService(db).decide(input),
