@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
-import { clampIssueRequestDepth } from "@paperclipai/shared";
+import { clampIssueRequestDepth, ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS } from "@paperclipai/shared";
+import type { IssueProductivityReviewTrigger } from "@paperclipai/shared";
 import {
   activityLog,
   agentWakeupRequests,
@@ -225,16 +226,13 @@ export const MONITOR_LAPSE_SERVICE_GRACE_MS = DEFAULT_PRODUCTIVITY_REVIEW_MONITO
 type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
-type ProductivityReviewTrigger =
-  | "no_comment_streak"
-  | "long_active_duration"
-  | "high_churn"
-  | "runtime_failure_streak"
-  // BLO-27698 B3b: one run that has been executing, uninterrupted and still
-  // live, for at least `longActiveMs`. Distinct from `long_active_duration`,
-  // which after B3 measures only time nobody was accounting for — a runaway run
-  // is the opposite shape (the turn was taken and never given back).
-  | "runaway_execution";
+// BLO-34216: derived from the single `ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS` tuple
+// in `@paperclipai/shared`. `runaway_execution` (BLO-27698 B3b) is one run that
+// has been executing, uninterrupted and still live, for at least `longActiveMs`
+// — distinct from `long_active_duration`, which after B3 measures only time
+// nobody was accounting for (a runaway run is the opposite shape: the turn was
+// taken and never given back).
+type ProductivityReviewTrigger = IssueProductivityReviewTrigger;
 
 type ProductivityReviewThresholds = {
   noCommentStreakRuns: number;
@@ -1912,11 +1910,14 @@ function isDependencyBlockedClosableRecord(trigger: unknown, firedTriggers: unkn
   return isDependencyBlockedClosableTriggerSet(firedTriggers);
 }
 
-// Exhaustive by type, not by if-ladder (Ally review on BLO-27698 2e95b50b): the
-// previous form fell through to "Long active duration" as its default, so a new
-// trigger would render under an existing trigger's name — a silently wrong
-// evidence pack rather than a compile error. `runaway_execution` in particular
-// would have been labelled as the very trigger it was split out from.
+// Exhaustive by construction, not by if-ladder (Ally review on BLO-27698
+// 2e95b50b): the previous form fell through to "Long active duration" as its
+// default, so a new trigger would render under an existing trigger's name — a
+// silently wrong evidence pack rather than a compile error. `runaway_execution`
+// in particular would have been labelled as the very trigger it was split out
+// from. Since BLO-34216 the key type derives from
+// `ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS`, so a trigger added to the tuple with no
+// entry here is a typecheck failure.
 const TRIGGER_LABELS: Record<ProductivityReviewTrigger, string> = {
   no_comment_streak: "No-comment streak",
   long_active_duration: "Long active duration",
@@ -1929,24 +1930,16 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
   return TRIGGER_LABELS[trigger];
 }
 
-const PRODUCTIVITY_REVIEW_TRIGGERS: readonly ProductivityReviewTrigger[] = [
-  "no_comment_streak",
-  "long_active_duration",
-  "high_churn",
-  "runtime_failure_streak",
-  "runaway_execution",
-];
-
 // BLO-22105: `buildReviewMarkdown` bakes the trigger that produced it into the
 // `- Primary trigger:` line. Reading it back out of the persisted description
 // (rather than, say, the last activity-log entry) means the comparison is
 // against exactly what a reader currently sees, so a refresh regenerates
 // precisely when the visible Manager Decision guidance is actually stale.
-function extractReviewTriggerFromDescription(description: string | null): ProductivityReviewTrigger | null {
+export function extractReviewTriggerFromDescription(description: string | null): ProductivityReviewTrigger | null {
   if (!description) return null;
   const match = description.match(/^- Primary trigger: `([a-z_]+)`/m);
   const candidate = match?.[1];
-  return PRODUCTIVITY_REVIEW_TRIGGERS.find((trigger) => trigger === candidate) ?? null;
+  return ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS.find((trigger) => trigger === candidate) ?? null;
 }
 
 // BLO-22097: manager-facing evidence text must not claim a measured "0

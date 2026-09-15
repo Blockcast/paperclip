@@ -1,14 +1,17 @@
 import { Eye } from "lucide-react";
-import type { IssueProductivityReview } from "@paperclipai/shared";
+import type { IssueProductivityReview, IssueProductivityReviewTrigger } from "@paperclipai/shared";
 import { Link } from "../lib/router";
 import { cn } from "../lib/utils";
 import { createIssueDetailPath } from "../lib/issueDetailBreadcrumb";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
-// Keyed on the trigger union, not `string` (Ally review on BLO-27698 2e95b50b):
-// adding a trigger must fail to compile here rather than fall through to the
-// generic "Productivity review" label at runtime.
-const TRIGGER_LABELS: Record<NonNullable<IssueProductivityReview["trigger"]>, string> = {
+// Keyed on the trigger union, not `string` (Ally review on BLO-27698 2e95b50b),
+// and since BLO-34216 that union is derived from
+// `ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS`: a trigger added to the tuple with no
+// entry here is a typecheck failure, not the generic "Productivity review"
+// label at runtime. The `??` below stays for version skew: a deployed API can
+// send a trigger this bundle predates, which no type can rule out.
+const TRIGGER_LABELS: Record<IssueProductivityReviewTrigger, string> = {
   no_comment_streak: "No-comment streak",
   long_active_duration: "Long active duration",
   high_churn: "High churn",
