@@ -300,6 +300,7 @@ import {
 import { githubGetPullRequestGate, githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
+import { pullRequestExternalId } from "./pull-request-work-products.js";
 import {
   ensureReferencedSharedDocsMaterialized,
   normalizeInstructionsEntryFile,
@@ -480,6 +481,8 @@ import {
 import { clearAgentTaskSessions } from "./recovery/session-reset.js";
 import {
   recoveryAssigneeAdapterOverrides,
+  RECOVERY_GUARD_CONTEXT_KEYS,
+  RECOVERY_WORK_CLASS_KEY,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { recoveryService, STALE_PRE_CLAIM_ISSUE_LOCK_MS } from "./recovery/service.js";
@@ -8652,6 +8655,50 @@ export function mergeCoalescedContextSnapshot(
       if (!(key in incoming)) delete merged[key];
     }
   }
+  // BLO-32634: same ownership idiom, applied to the recovery cost guard. A wake
+  // that DECLARES its run class (`withRecoveryModelProfileHint`, any of the three
+  // classes) owns the whole guard block: whatever it does not re-supply is
+  // cleared, not inherited.
+  //
+  // Without this, a monitor fire coalescing into a run row already stamped
+  // `status_only` kept the full tuple, and the monitor's own scheduled work was
+  // then write-refused by `isStatusOnlyCheapRecoveryContext` — the monitor could
+  // not do the thing it was armed to do. The scrub-only `normal_model` path could
+  // not displace it either, because deleting keys from the INCOMING snapshot says
+  // nothing to a spread that reads the EXISTING one.
+  //
+  // The narrower patch — dropping the block whenever it appears — fails in the
+  // expensive direction: a wake silent about run class would strip the guard off
+  // a genuinely status-only run and put it back on the normal model, unbounded.
+  // Keying on an explicit declaration is what keeps silence inheriting. It also
+  // makes the three classes mutually exclusive ACROSS a coalesce, which the
+  // spread alone did not: `planning_only` supplies no `modelProfile`, so an
+  // inherited `cheap` used to ride along beside `recoveryIntent: planning_only`
+  // as a tuple no caller can construct directly.
+  //
+  // INTENDED, with a known residual (BLO-32774). Clearing the block lifts cost
+  // containment, and on a `stranded_assigned_issue` recovery the guarded agent IS
+  // the assignee — `assertCanManageIssueMonitor` returns early for the assignee, so
+  // it can arm a monitor on its own issue and get back one unguarded run while its
+  // recovery action stays active. That is accepted here rather than patched here:
+  // the block belongs at the ARMING gate, where the actor's run class is known, not
+  // at the merge, which only sees a wake that has already been scheduled. Bounded
+  // meanwhile by deliberate action (no automatic path), one run per fire (the next
+  // recovery wake is status-only again), the `in_progress`/`in_review` arming
+  // precondition, and the convergence guard capping repeated self-arming at 3.
+  //
+  // Do NOT "fix" it by pinning `modelProfile`/`allowDeliverableWork` through the
+  // drop. That yields cheap-model-plus-deliverable-writes — the one tuple the
+  // system never otherwise builds, worse than either endpoint — because
+  // `allowDeliverableWork` is never read standalone, only as a conjunct of
+  // `isStatusOnlyCheapRecoveryContext`/`isPlanningOnlyRecoveryContext`; and it
+  // reintroduces the partial tuple this block exists to prevent.
+  const declaresRecoveryWorkClass = readNonEmptyString(incoming[RECOVERY_WORK_CLASS_KEY]) !== null;
+  if (declaresRecoveryWorkClass) {
+    for (const key of RECOVERY_GUARD_CONTEXT_KEYS) {
+      if (!(key in incoming)) delete merged[key];
+    }
+  }
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
@@ -12092,6 +12139,180 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         headSha: target.sha,
       },
     });
+    await notifyLinkedIssuesOfFailedPrReviewGate(run, target, reason).catch((error) => {
+      logger.warn(
+        { err: error, runId: run.id, repoFullName: target.repoFullName, prNumber: target.prNumber },
+        "failed to notify Paperclip issues linked to a failed PR-review gate",
+      );
+    });
+  }
+
+  /**
+   * BLO-33589: make a reviewer run that terminated without a confirmed review
+   * readable INSIDE Paperclip, not only as a GitHub commit status.
+   *
+   * `queueFailedPrReviewGateStatus` turns the wedge into a red check on the PR,
+   * which is the right thing for a human reading GitHub and useless to the agent
+   * that asked for the review: it ended its own run believing it had handed off,
+   * and nothing in Paperclip ever learns the handoff died. Measured on
+   * Blockcast/libmmt#444 — "ended ambiguously and was not replayed" was written
+   * to a commit status at 2026-09-12T20:02:59Z and to nothing else, and the PR
+   * read to its owner as ordinary reviewer latency for 10h06m.
+   *
+   * So: one system comment per linked issue (the durable artifact) plus one wake
+   * of its assignee (the part that actually reaches an agent — an issue parked
+   * `in_review` waiting on this very review is excluded from `inbox-lite` by
+   * design, so a comment alone would leave exactly the silence this fixes).
+   *
+   * The link is the `pull_request` work product, matched on company + PR
+   * identity only. Deliberately NOT narrowed to system-promoted rows the way
+   * the webhook's `previouslyLinkedPullRequestIssues` lookup is: that lookup
+   * gates a wake that acts on webhook-supplied content, whereas this one only
+   * reports a fact this server itself just derived, and agent-registered PR work
+   * products are the common case (the Paperclip skill tells agents to create
+   * one). Narrowing it here would drop most real links.
+   */
+  async function notifyLinkedIssuesOfFailedPrReviewGate(
+    run: typeof heartbeatRuns.$inferSelect,
+    target: NonNullable<ReturnType<typeof resolvePrReviewGateStatusTarget>>,
+    reason: "retry_exhausted" | "non_retryable_external_lifecycle",
+  ) {
+    const linked = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issueWorkProducts)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.id, issueWorkProducts.issueId),
+          eq(issues.companyId, issueWorkProducts.companyId),
+        ),
+      )
+      .where(
+        and(
+          eq(issueWorkProducts.companyId, run.companyId),
+          eq(issueWorkProducts.provider, "github"),
+          eq(issueWorkProducts.type, "pull_request"),
+          eq(
+            issueWorkProducts.externalId,
+            pullRequestExternalId(target.repoFullName, target.prNumber),
+          ),
+        ),
+      );
+    if (linked.length === 0) {
+      logger.info(
+        { runId: run.id, repoFullName: target.repoFullName, prNumber: target.prNumber },
+        "failed PR-review gate has no linked Paperclip issue to notify",
+      );
+      return;
+    }
+
+    const shortSha = target.sha.slice(0, 7);
+    const cause = reason === "retry_exhausted"
+      ? "exhausted its automatic retries"
+      : "ended ambiguously and was not replayed";
+    const body = [
+      `## Ally review did not land on \`${target.repoFullName}#${target.prNumber}\``,
+      "",
+      `The Paperclip reviewer run for head \`${shortSha}\` ${cause}. **No review was posted, and none is coming for this head** — this is a terminal outcome, not reviewer latency.`,
+      "",
+      `- Head: \`${target.sha}\``,
+      `- Gate status: \`${target.context}\` set to \`failure\` on that commit`,
+      ...(target.prUrl ? [`- PR: ${target.prUrl}`] : []),
+      `- Reviewer run: \`${run.id}\``,
+      "",
+      "Re-request the review on the PR (a start-of-body `<!-- paperclip:review-request -->` marker **and** a bare `@ally` mention — the marker alone is silently dropped), or push a new head.",
+    ].join("\n");
+
+    for (const issue of linked) {
+      // Per-issue, so one unnotifiable issue (paused assignee, wake dispatch
+      // error) cannot silently swallow the notification for its siblings. That
+      // is the exact invisible-drop shape this function exists to remove.
+      await notifyOneLinkedIssueOfFailedPrReviewGate(run, target, reason, issue, body)
+        .catch((error) => {
+          logger.warn(
+            { err: error, runId: run.id, issueId: issue.id },
+            "failed to notify one Paperclip issue linked to a failed PR-review gate",
+          );
+        });
+    }
+  }
+
+  async function notifyOneLinkedIssueOfFailedPrReviewGate(
+    run: typeof heartbeatRuns.$inferSelect,
+    target: NonNullable<ReturnType<typeof resolvePrReviewGateStatusTarget>>,
+    reason: "retry_exhausted" | "non_retryable_external_lifecycle",
+    issue: { id: string; status: string; assigneeAgentId: string | null },
+    body: string,
+  ) {
+    const wakeIdempotencyKey = `pr_review_gate_failed:${run.id}:${issue.id}`;
+    const comment = await issuesSvc.addComment(
+      issue.id,
+      body,
+      { runId: run.id },
+      {
+        authorType: "system",
+        // Keyed on the run, so re-finalizing the same terminal run cannot
+        // post twice, while a genuinely new failed reviewer run on the same
+        // head still reports.
+        idempotencyKey: wakeIdempotencyKey,
+      },
+    );
+
+    // The comment insert IS the claim on the wake, and that is the whole reason
+    // it is read here rather than discarded (BLO-33589 review). `issue_comments`
+    // carries a partial unique index on (issue_id, idempotency_key) for
+    // system-authored rows, so under concurrent finalization of the same
+    // reviewer run Postgres picks exactly one winner and every loser comes back
+    // `deduplicated`. Reading a `agentWakeupRequests` row first instead would be
+    // check-then-act: that table has no unique index on `idempotencyKey` (and
+    // must not grow one — recurring wake keys legitimately recur), so both
+    // racers would observe no row and both would enqueue.
+    //
+    // Consequence to know about: if the wake below throws, the claim is already
+    // committed and a later re-finalization of this same run will not retry it.
+    // `wakeupWithDispatchRetry` owns that retry, and the caller logs the
+    // failure per issue. A compensating claim release would trade a rare lost
+    // wake for a rare duplicate run; neither is worth the machinery.
+    if ("deduplicated" in comment) return;
+
+    // A comment does not wake anyone. Only a live-status issue with an agent
+    // assignee has somewhere for a wake to land.
+    if (!issue.assigneeAgentId) return;
+    if (issue.status !== "todo" && issue.status !== "in_progress" && issue.status !== "in_review") {
+      return;
+    }
+    await wakeupWithDispatchRetry(issue.assigneeAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "github_pr_review_gate_failed",
+      idempotencyKey: wakeIdempotencyKey,
+      payload: {
+        issueId: issue.id,
+        source: "github",
+        repoFullName: target.repoFullName,
+        prNumber: target.prNumber,
+        prUrl: target.prUrl,
+        headSha: target.sha,
+        statusContext: target.context,
+        prReviewGateFailureReason: reason,
+        reviewerRunId: run.id,
+      },
+      contextSnapshot: {
+        issueId: issue.id,
+        wakeReason: "github_pr_review_gate_failed",
+        githubRepoFullName: target.repoFullName,
+        githubPrNumber: target.prNumber,
+        githubPrUrl: target.prUrl,
+        githubHeadSha: target.sha,
+        prReviewGateFailureReason: reason,
+        reviewerRunId: run.id,
+      },
+    });
   }
 
   async function escalatePlanApprovalResumeFailureNeedsAttention(input: {
@@ -13595,7 +13816,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         triggerDetail: input.triggerDetail,
         reason: wakeReason,
         idempotencyKey: `issue-monitor:${claimed.id}:${scheduledAtIso}`,
-        payload: {
+        payload: withRecoveryModelProfileHint({
           issueId: claimed.id,
           nextCheckAt: scheduledAtIso,
           monitorAttemptCount: nextAttemptCount,
@@ -13603,10 +13824,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...monitorMetadata,
           ...reviewRecoveryContext,
           source: input.activitySource,
-        },
+        }, "normal_model"),
         requestedByActorType: input.actorType,
         requestedByActorId: input.actorId,
-        contextSnapshot: {
+        // BLO-32634: a monitor fire is assignee-scheduled work, never a recovery
+        // wake — declare that explicitly rather than leaving the snapshot merely
+        // silent. Silence is inherited by `mergeCoalescedContextSnapshot`, so a
+        // fire landing on a run row stamped `status_only` used to come back
+        // guarded and have its own scheduled write refused. Declared on the
+        // payload too, matching the 11 recovery dispatch sites: neither spread
+        // above carries `modelProfile` today, but
+        // `normalizeModelProfileWakeContext` copies `payload.modelProfile` into a
+        // snapshot that has none, so the pair is what keeps that bleed shut.
+        contextSnapshot: withRecoveryModelProfileHint({
           issueId: claimed.id,
           source: isProviderQuotaReviewMonitor ? "issue.execution_review_recovery" : "issue.monitor",
           wakeReason,
@@ -13616,7 +13846,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...monitorMetadata,
           ...reviewRecoveryContext,
           manualTrigger: input.activitySource === "manual",
-        },
+        }, "normal_model"),
       }, monitorSuppression);
 
       // The wake was parked behind an unresolved blocker, so no turn ran. Keep

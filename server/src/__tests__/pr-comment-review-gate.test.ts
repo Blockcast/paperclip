@@ -12,6 +12,8 @@ import {
   hasAllyConsolidatedReviewHeading,
 } from "../services/ally-review-detection.js";
 import {
+  commentReviewGateCheckConclusion,
+  commentReviewGateCheckTitle,
   commentReviewGateRetirementDescription,
   commentReviewGateRetirementStatus,
   commentReviewGateVerdictIsMisreadable,
@@ -989,5 +991,77 @@ describe("retired context supersede", () => {
       expect(description).toMatch(/"[^"]*…"\.$/);
       expect(description.split('"').length - 1).toBe(2);
     }
+  });
+});
+
+describe("commentReviewGateCheckConclusion", () => {
+  const notEvaluated = evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments: [] });
+  const clean = evaluateCommentReviewGate({
+    headSha: CURRENT_HEAD,
+    comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
+  });
+  const blocking = evaluateCommentReviewGate({
+    headSha: CURRENT_HEAD,
+    comments: [allyComment(blockingReview(CURRENT_HEAD), "2026-08-04T20:09:19Z")],
+  });
+  const carried = evaluateCommentReviewGate({
+    headSha: CURRENT_HEAD,
+    comments: [allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z")],
+  });
+
+  it("renders not-evaluated differently from reviewed-and-clean without reading the description", () => {
+    // The defect this exists to close: on the commit-status surface both of
+    // these are `success`, so the only thing separating "reviewed, clean" from
+    // "nothing reviewed this head" is prose nobody reads (BLO-33657).
+    expect(notEvaluated.state).toBe(clean.state);
+
+    expect(commentReviewGateCheckConclusion(clean)).toBe("success");
+    expect(commentReviewGateCheckConclusion(notEvaluated)).toBe("neutral");
+    expect(commentReviewGateCheckConclusion(notEvaluated)).not.toBe(
+      commentReviewGateCheckConclusion(clean),
+    );
+  });
+
+  it("keeps the not-evaluated conclusion non-blocking", () => {
+    // BLO-29711's constraint, pinned so a later change cannot answer the
+    // distinguishability requirement by reintroducing pending/failure-on-absence
+    // and deadlocking every formally-reviewed PR.
+    expect(["success", "neutral"]).toContain(commentReviewGateCheckConclusion(notEvaluated));
+  });
+
+  it("still blocks on a finding, at this head or carried from an earlier one", () => {
+    expect(commentReviewGateCheckConclusion(blocking)).toBe("failure");
+    expect(commentReviewGateCheckConclusion(carried)).toBe("failure");
+  });
+
+  it("covers every not-established shape, not just the empty-comment one", () => {
+    const cases = [
+      // No head supplied to evaluate against.
+      evaluateCommentReviewGate({ headSha: "", comments: [] }),
+      // An Ally review that attests some other head.
+      evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        comments: [allyComment(cleanReview(INTERMEDIATE_HEAD), "2026-08-04T21:09:19Z")],
+      }),
+      // A clean review of this head from someone who is not the reviewer.
+      evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        comments: [
+          { authorLogin: "someone-else", body: cleanReview(CURRENT_HEAD), createdAt: "2026-08-04T21:09:19Z" },
+        ],
+      }),
+    ];
+
+    for (const verdict of cases) {
+      expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+      expect(commentReviewGateCheckConclusion(verdict)).toBe("neutral");
+    }
+  });
+
+  it("gives each outcome its own title so the conclusion is legible unopened", () => {
+    const titles = [notEvaluated, clean, blocking, carried].map(commentReviewGateCheckTitle);
+
+    expect(new Set(titles).size).toBe(titles.length);
+    expect(commentReviewGateCheckTitle(notEvaluated)).toMatch(/not evaluated/i);
   });
 });

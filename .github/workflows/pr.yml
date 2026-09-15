@@ -433,6 +433,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s .github/scripts -p 'test_sweep_*.py' -v
 
+      # BLO-31492. The floor guards above only ever see whatever the lockfiles
+      # resolved -- one known-good version -- so a dropped advisory or a
+      # flipped range bound stays green. This pins both edges of every derived
+      # range and the fail-closed behaviour of the version parser.
+      - name: Test fast-uri advisory range table
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/fast-uri-advisory.test.js
+        timeout-minutes: 1
+
       - name: Validate Designer fast-uri security floor
         if: ${{ !cancelled() }}
         run: node ./scripts/designer-fast-uri-security.test.js

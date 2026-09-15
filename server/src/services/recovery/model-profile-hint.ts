@@ -2,6 +2,18 @@ export const RECOVERY_MODEL_PROFILE_KEY = "cheap" as const;
 
 export type RecoveryModelProfileWorkClass = "status_only" | "planning_only" | "normal_model";
 
+// BLO-32634: the declared run class of a wake, stamped for ALL THREE classes —
+// including `normal_model`, which writes no other key.
+//
+// The guard tuple is otherwise indistinguishable from silence at the merge:
+// `withRecoveryModelProfileHint(x, "normal_model")` only DELETES keys, so a wake
+// that had deliberately declared itself normal-model looked exactly like a wake
+// that had never considered the question. `mergeCoalescedContextSnapshot` could
+// not tell them apart and inherited the guard into both. This key is what makes
+// "I am normal-model" a positive statement the merge can act on; its ABSENCE
+// still means "silent about run class", which must keep inheriting.
+export const RECOVERY_WORK_CLASS_KEY = "recoveryWorkClass" as const;
+
 export const STATUS_ONLY_RECOVERY_GUARD_CONTEXT = {
   recoveryIntent: "status_only",
   allowDeliverableWork: false,
@@ -29,11 +41,21 @@ export const PLANNING_ONLY_RECOVERY_GUARD_CONTEXT = {
 // assembled a complete board-ordered approval payload, each was refused, and each read this flag as
 // a retry that would arrive. None did. State the reachable exits instead of implying an unreachable
 // one — the caller can always take one of them in the run that is refused.
+//
+// BLO-32634: this string is scoped to the wakes the RECOVERY ACTION raises, not to "every wake on
+// this issue". Since a wake that declares its own run class now owns the guard block at
+// `mergeCoalescedContextSnapshot`, a declared normal-model wake on an issue with a live recovery
+// action is reachable, and the older universal phrasing asserted an invariant the merge falsifies.
+// The caller-facing point is unchanged and still exactly true: nothing you can WAIT for turns into
+// a normal-model run, because only a recorded disposition clears the action. The narrower phrasing
+// is deliberate in both directions — it must not go stale again, and it must not read to a refused
+// agent as an instruction to go arm itself an unguarded run (that residual is BLO-32774).
 export const STATUS_ONLY_RECOVERY_RESUME_GUIDANCE = {
   normalModelResumeIsAutomatic: false,
   resumeGuidance:
-    "No normal-model run is dispatched for this issue on its own: while its recovery action is " +
-    "active, every wake on it is status-only. Reachable exits from this run: record a valid issue " +
+    "No normal-model run is dispatched for this issue on its own: every wake the recovery action " +
+    "itself raises is status-only, and only a recorded disposition clears that action — so waiting " +
+    "for a normal-model run never ends. Reachable exits from this run: record a valid issue " +
     "disposition to clear the recovery action, or file a `request_board_approval` linked to the " +
     "run context's source issue.",
 } as const;
@@ -45,7 +67,15 @@ const RECOVERY_MODEL_PROFILE_HINT_KEYS = [
   "allowDeliverableWork",
   "allowDocumentUpdates",
   "resumeRequiresNormalModel",
+  RECOVERY_WORK_CLASS_KEY,
 ] as const;
+
+// The block `mergeCoalescedContextSnapshot` drops as a unit when the incoming
+// wake declares a run class. Exported so the merge and this module cannot drift:
+// a key added here without the merge knowing about it is exactly the partial
+// tuple this block exists to prevent.
+export const RECOVERY_GUARD_CONTEXT_KEYS: readonly RecoveryModelProfileHintKey[] =
+  RECOVERY_MODEL_PROFILE_HINT_KEYS;
 
 type RecoveryModelProfileHintKey = (typeof RECOVERY_MODEL_PROFILE_HINT_KEYS)[number];
 type WithoutRecoveryModelProfileHints<T> = Omit<T, RecoveryModelProfileHintKey>;
@@ -63,34 +93,44 @@ export function scrubRecoveryModelProfileHints<T extends Record<string, unknown>
 export function withRecoveryModelProfileHint<T extends Record<string, unknown>>(
   input: T,
   workClass: "normal_model",
-): WithoutRecoveryModelProfileHints<T>;
+): WithoutRecoveryModelProfileHints<T> & { [RECOVERY_WORK_CLASS_KEY]: "normal_model" };
 export function withRecoveryModelProfileHint<T extends Record<string, unknown>>(
   input: T,
   workClass: "planning_only",
-): WithoutRecoveryModelProfileHints<T> & typeof PLANNING_ONLY_RECOVERY_GUARD_CONTEXT;
+): WithoutRecoveryModelProfileHints<T> & typeof PLANNING_ONLY_RECOVERY_GUARD_CONTEXT & {
+  [RECOVERY_WORK_CLASS_KEY]: "planning_only";
+};
 export function withRecoveryModelProfileHint<T extends Record<string, unknown>>(
   input: T,
   workClass: "status_only",
 ): WithoutRecoveryModelProfileHints<T> & typeof STATUS_ONLY_RECOVERY_GUARD_CONTEXT & {
   modelProfile: typeof RECOVERY_MODEL_PROFILE_KEY;
+  [RECOVERY_WORK_CLASS_KEY]: "status_only";
 };
 export function withRecoveryModelProfileHint<T extends Record<string, unknown>>(
   input: T,
   workClass: RecoveryModelProfileWorkClass,
 ):
-  | WithoutRecoveryModelProfileHints<T>
-  | (WithoutRecoveryModelProfileHints<T> & typeof PLANNING_ONLY_RECOVERY_GUARD_CONTEXT)
+  | (WithoutRecoveryModelProfileHints<T> & { [RECOVERY_WORK_CLASS_KEY]: "normal_model" })
+  | (WithoutRecoveryModelProfileHints<T> & typeof PLANNING_ONLY_RECOVERY_GUARD_CONTEXT & {
+    [RECOVERY_WORK_CLASS_KEY]: "planning_only";
+  })
   | (WithoutRecoveryModelProfileHints<T> & typeof STATUS_ONLY_RECOVERY_GUARD_CONTEXT & {
     modelProfile: typeof RECOVERY_MODEL_PROFILE_KEY;
+    [RECOVERY_WORK_CLASS_KEY]: "status_only";
   }) {
   if (workClass === "normal_model") {
-    return scrubRecoveryModelProfileHints(input);
+    return {
+      ...scrubRecoveryModelProfileHints(input),
+      [RECOVERY_WORK_CLASS_KEY]: "normal_model",
+    };
   }
 
   if (workClass === "planning_only") {
     return {
       ...scrubRecoveryModelProfileHints(input),
       ...PLANNING_ONLY_RECOVERY_GUARD_CONTEXT,
+      [RECOVERY_WORK_CLASS_KEY]: "planning_only",
     };
   }
 
@@ -98,6 +138,7 @@ export function withRecoveryModelProfileHint<T extends Record<string, unknown>>(
     ...scrubRecoveryModelProfileHints(input),
     ...STATUS_ONLY_RECOVERY_GUARD_CONTEXT,
     modelProfile: RECOVERY_MODEL_PROFILE_KEY,
+    [RECOVERY_WORK_CLASS_KEY]: "status_only",
   };
 }
 

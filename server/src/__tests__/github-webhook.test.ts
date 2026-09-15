@@ -1427,6 +1427,120 @@ describe("github-webhook pure helpers", () => {
     expect(selfEcho.suppressed).toHaveLength(0);
   });
 
+  it("reports a marker-prefixed agent request that never mentions the reviewer (BLO-33589)", () => {
+    // The THIRD invisible drop, and the last one in this file. `reviewerRequest`
+    // is a conjunction — the marker path AND the mention — but both existing
+    // suppression reports only ever fire on a body that HAS the mention
+    // (missing_marker requires the bare alias; marker_disqualified_by_heading
+    // requires the general mention). So a marker-prefixed agent request that
+    // simply forgot to name the reviewer fell out as silent `null`.
+    //
+    // Measured on Blockcast/libmmt 2026-09-11..12: 4 such comments across
+    // #436/#442/#444. On #444 the automatic `opened` wake had already been lost
+    // to an ambiguous reviewer run, so these two re-requests were the ONLY
+    // surviving path and the PR sat 10h06m with zero reviews while four sibling
+    // PRs in the same repo were reviewed in 5 to 10 minutes.
+    const resolve = (body: string, login = "allyblockcast[bot]") => {
+      const suppressed: { reason: string }[] = [];
+      const context = __test_resolveEventContext(
+        "issue_comment",
+        {
+          action: "created",
+          issue: {
+            number: 444,
+            title: "BLO-32722 layer ownership carries media",
+            pull_request: { url: "https://api.github.com/repos/Blockcast/libmmt/pulls/444" },
+          },
+          comment: {
+            id: 5190001,
+            body,
+            user: { login },
+            html_url: "https://github.com/Blockcast/libmmt/pull/444#issuecomment-5190001",
+          },
+          repository: { full_name: "Blockcast/libmmt" },
+        },
+        {
+          prReviewerBotLogin: "allyblockcast[bot]",
+          onSuppressedReviewRequest: (info) => suppressed.push(info as { reason: string }),
+        },
+      );
+      return { context, suppressed };
+    };
+
+    // The #444 shape: valid start-of-body marker, a real ask, no @ally.
+    const dropped = resolve(
+      "<!-- paperclip:review-request -->\nRe-requesting review at head `ae43eed59d9a2fb0c21fe1b1dad7b013a9d02668`.",
+    );
+    expect(dropped.context).toBeNull();
+    expect(dropped.suppressed).toHaveLength(1);
+    expect(dropped.suppressed[0]).toMatchObject({
+      repoFullName: "Blockcast/libmmt",
+      prNumber: 444,
+      commentId: 5190001,
+      commentAuthorLogin: "allyblockcast[bot]",
+      commentUrl: "https://github.com/Blockcast/libmmt/pull/444#issuecomment-5190001",
+      reason: "missing_mention",
+    });
+
+    // Behaviour is unchanged: still no wake. The report is the whole fix.
+    expect(dropped.context).toBeNull();
+
+    // Marker + mention is the honoured path, untouched.
+    const honoured = resolve(
+      "<!-- paperclip:review-request -->\n@ally please review at head ae43eed.",
+    );
+    expect(honoured.context).toMatchObject({ wakeReason: "github_pr_review_requested" });
+    expect(honoured.suppressed).toHaveLength(0);
+
+    // Marker + heading + no mention: the missing mention is what blocks it
+    // first and is the actionable half, so it classifies as missing_mention
+    // rather than marker_disqualified_by_heading (which requires the mention).
+    const headingNoMention = resolve(
+      "<!-- paperclip:review-request -->\nRe-requesting.\n\n## Ally — Consolidated PR Review\nwas your last pass.",
+    );
+    expect(headingNoMention.context).toBeNull();
+    expect(headingNoMention.suppressed).toHaveLength(1);
+    expect(headingNoMention.suppressed[0]).toMatchObject({ reason: "missing_mention" });
+
+    // NO RECLASSIFICATION of the two existing branches. `hasPrReviewerBareAliasMention`
+    // is a strict subset of `hasPrReviewerRequestMention`, so a markerless bare-alias
+    // body cannot reach the new branch.
+    const stillMissingMarker = resolve("@ally please review the layer ownership change");
+    expect(stillMissingMarker.suppressed).toHaveLength(1);
+    expect(stillMissingMarker.suppressed[0]).toMatchObject({ reason: "missing_marker" });
+
+    const stillDisqualified = resolve(
+      "<!-- paperclip:review-request -->\n@ally re-review.\n\n## Ally — Consolidated PR Review\nprior pass.",
+    );
+    expect(stillDisqualified.suppressed).toHaveLength(1);
+    expect(stillDisqualified.suppressed[0]).toMatchObject({
+      reason: "marker_disqualified_by_heading",
+    });
+
+    // The two documented intentionally-unlogged combinations stay quiet.
+    // No marker, no mention: an ordinary bot comment, not a dropped request.
+    const ordinary = resolve("Pushed a fixup for the headroom filter.");
+    expect(ordinary.context).toBeNull();
+    expect(ordinary.suppressed).toHaveLength(0);
+
+    // Marker-less greeting of the bot LOGIN: the commitperclip gate nudge that
+    // drove the #583 loop. Suppressing it is correct and must stay unreported.
+    const gateNudge = resolve("Hey @allyblockcast[bot]! Before this PR can be reviewed...");
+    expect(gateNudge.context).toBeNull();
+    expect(gateNudge.suppressed).toHaveLength(0);
+
+    // Ally's own marker-less output: still not a request, still unreported.
+    const selfEcho = resolve("## Ally — Consolidated PR Review\n\nNo blocking findings.");
+    expect(selfEcho.context).toBeNull();
+    expect(selfEcho.suppressed).toHaveLength(0);
+
+    // A HUMAN's marker-only, mention-less comment is not a reviewer-bot drop at
+    // all — the author guard never applied to it, so there is nothing to report.
+    const human = resolve("<!-- paperclip:review-request -->\nRe-requesting review.", "kkroo");
+    expect(human.context).toBeNull();
+    expect(human.suppressed).toHaveLength(0);
+  });
+
   it("keeps the #583 self-refire loop closed: a quoted or reviewer-output marker is not a request (BLO-18865)", () => {
     const botComment = (id: number, body: string) =>
       __test_resolveEventContext("issue_comment", {

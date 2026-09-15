@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { FAST_URI_ADVISORY, isVulnerableFastUri } from "./fast-uri-advisory.js";
+import {
+  fastUriAdvisoriesFor,
+  fastUriLockfileVersions,
+  isVulnerableFastUri,
+} from "./fast-uri-advisory.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = new URL("..", import.meta.url);
@@ -42,7 +46,12 @@ async function main() {
     });
 
     await runPnpm(
-      ["install", "--lockfile-only", "--frozen-lockfile=false", "--ignore-scripts"],
+      [
+        "install",
+        "--lockfile-only",
+        "--frozen-lockfile=false",
+        "--ignore-scripts",
+      ],
       fixtureRoot,
     );
 
@@ -51,18 +60,21 @@ async function main() {
     );
     assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.6");
 
-    const lockfile = await readFile(join(fixtureRoot, "pnpm-lock.yaml"), "utf8");
-    const fastUriResolutions = [
-      ...lockfile.matchAll(/^  fast-uri@(\d+\.\d+\.\d+):$/gm),
-    ].map((match) => match[1]);
+    const lockfile = await readFile(
+      join(fixtureRoot, "pnpm-lock.yaml"),
+      "utf8",
+    );
+    // Scan + count cross-check live in fast-uri-advisory.js, where the CI-run
+    // test pins every key shape. This file is referenced by no workflow.
+    const fastUriEntries = fastUriLockfileVersions(lockfile);
     assert.ok(
-      fastUriResolutions.length > 0,
+      fastUriEntries.length > 0,
       "lockfile missing fast-uri resolution",
     );
-    for (const version of fastUriResolutions) {
+    for (const version of fastUriEntries) {
       assert.ok(
         !isVulnerableFastUri(version),
-        `lockfile resolved fast-uri ${version}, vulnerable per ${FAST_URI_ADVISORY}`,
+        `lockfile resolved fast-uri ${version}, vulnerable per ${fastUriAdvisoriesFor(version).join(", ")}`,
       );
     }
 
@@ -90,7 +102,7 @@ async function main() {
     for (const [path, fastUri] of designerResolutions) {
       assert.ok(
         !isVulnerableFastUri(fastUri.version),
-        `designer lockfile ${path} resolved fast-uri ${fastUri.version}, vulnerable per ${FAST_URI_ADVISORY}`,
+        `designer lockfile ${path} resolved fast-uri ${fastUri.version}, vulnerable per ${fastUriAdvisoriesFor(fastUri.version).join(", ")}`,
       );
     }
     assertIncludes(lockfile, "undici@6.27.0:", "lockfile");
@@ -99,8 +111,15 @@ async function main() {
     assertIncludes(lockfile, "'@babel/core@7.29.7':", "lockfile");
     assertIncludes(lockfile, "esbuild@0.28.1:", "lockfile");
     assertIncludes(lockfile, "js-yaml@4.3.1:", "lockfile");
-    const uiViteConfig = await readFile(join(fixtureRoot, "ui/vite.config.ts"), "utf8");
-    assertIncludes(uiViteConfig, 'const UI_ESBUILD_TARGET = "es2022";', "ui vite config");
+    const uiViteConfig = await readFile(
+      join(fixtureRoot, "ui/vite.config.ts"),
+      "utf8",
+    );
+    assertIncludes(
+      uiViteConfig,
+      'const UI_ESBUILD_TARGET = "es2022";',
+      "ui vite config",
+    );
     assertIncludes(uiViteConfig, "optimizeDeps", "ui vite config");
     assert.match(
       lockfile,
@@ -113,7 +132,11 @@ async function main() {
       "jsdom must resolve undici 7.29.0",
     );
 
-    const audit = await runPnpm(["audit", "--prod", "--json"], fixtureRoot, true);
+    const audit = await runPnpm(
+      ["audit", "--prod", "--json"],
+      fixtureRoot,
+      true,
+    );
     const auditJson = JSON.parse(audit.stdout);
     assert.equal(auditJson.metadata.vulnerabilities.moderate, 0);
     assert.equal(auditJson.metadata.vulnerabilities.high, 0);
