@@ -34,6 +34,7 @@ import {
 import { assertCanManageExecutionWorkspaceRuntimeServices } from "./workspace-runtime-service-authz.js";
 import {
   publicExecutionWorkspace,
+  publicExecutionWorkspaceCloseReadiness,
   publicExecutionWorkspaces,
   publicRuntimeServices,
   publicWorkspaceOperation,
@@ -141,7 +142,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       return;
     }
     const viewer = await resolveWorkspaceRuntimeViewer(access, req, workspace.companyId);
-    res.json({ ...readiness, runtimeServices: publicRuntimeServices(readiness.runtimeServices, viewer) });
+    res.json(publicExecutionWorkspaceCloseReadiness(readiness, viewer));
   });
 
   router.get("/execution-workspaces/:id/workspace-operations", async (req, res) => {
@@ -645,9 +646,15 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       }
 
       if (readiness.state === "blocked") {
+        // PEN-3073: the same readiness body the GET route masks. `runtime:manage` gates this
+        // handler, and that action sits in the blanket same-company agent allow-list — the exact
+        // trap `workspace-response.ts` documents — so an ordinary agent can reach this 409.
         res.status(409).json({
           error: readiness.blockingReasons[0] ?? "Execution workspace cannot be closed right now",
-          closeReadiness: readiness,
+          closeReadiness: publicExecutionWorkspaceCloseReadiness(
+            readiness,
+            await resolveWorkspaceRuntimeViewer(access, req, existing.companyId),
+          ),
         });
         return;
       }

@@ -33,6 +33,7 @@ import {
 import type { StorageService } from "../storage/types.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "./company-import-paths.js";
+import { resolveWorkspaceRuntimeViewer } from "./workspace-response.js";
 
 export function companyRoutes(db: Db, storage?: StorageService) {
   const router = Router();
@@ -246,7 +247,12 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     const companyId = req.params.companyId as string;
     await assertSameCompanyCeoAgentOrBoard(req, companyId, "company exports");
     const body = companyPortabilityExportSchema.parse(req.body);
-    const result = await portability.exportBundle(companyId, body);
+    const result = await portability.exportBundle(companyId, body, {
+      // PEN-3252. `assertSameCompanyCeoAgentOrBoard` admits a same-company CEO agent, which is not
+      // the entitlement that discloses operator-authored runtime config.
+      revealWorkspaceRuntime: (await resolveWorkspaceRuntimeViewer(access, req, companyId))
+        .revealRuntimeConfig,
+    });
     res.json(result);
   });
 
@@ -306,7 +312,10 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     const companyId = req.params.companyId as string;
     await assertSameCompanyCeoAgentOrBoard(req, companyId, "company exports");
     const body = companyPortabilityExportSchema.parse(req.body);
-    const preview = await portability.previewExport(companyId, body);
+    const preview = await portability.previewExport(companyId, body, {
+      revealWorkspaceRuntime: (await resolveWorkspaceRuntimeViewer(access, req, companyId))
+        .revealRuntimeConfig,
+    });
     res.json(preview);
   });
 
@@ -314,7 +323,10 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     const companyId = req.params.companyId as string;
     await assertSameCompanyCeoAgentOrBoard(req, companyId, "company exports");
     const body = companyPortabilityExportSchema.parse(req.body);
-    const result = await portability.exportBundle(companyId, body);
+    const result = await portability.exportBundle(companyId, body, {
+      revealWorkspaceRuntime: (await resolveWorkspaceRuntimeViewer(access, req, companyId))
+        .revealRuntimeConfig,
+    });
     res.json(result);
   });
 

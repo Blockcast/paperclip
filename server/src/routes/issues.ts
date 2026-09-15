@@ -152,6 +152,8 @@ import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import {
   executionWorkspaceIdentity,
   publicExecutionWorkspace,
+  publicIssueExecutionWorkspaceSettings,
+  publicProjectExecutionWorkspacePolicy,
   publicProjects,
   publicProjectWorkspace,
   resolveWorkspaceRuntimeViewer,
@@ -3047,6 +3049,43 @@ export function issueRoutes(
   const svc = issueService(db);
   const efficiencySvc = issueEfficiencyService(db);
   const access = accessService(db);
+
+  /**
+   * PEN-3252. Projects the raw `executionWorkspaceSettings` JSONB column off an issue row on its way
+   * out of a response.
+   *
+   * Exists because the issue routes answer with the ROW — `res.json(issue)` or `{...issue}` — rather
+   * than through a projection, so this column never passed the `routes/workspace-response.ts`
+   * withholding boundary at all. It carries the same `workspaceStrategy` command strings and the same
+   * open `workspaceRuntime` record that boundary exists to withhold; not merely the same class, the
+   * same bytes, since `buildReusedExecutionWorkspaceConfigPatchFromIssueSettings` copies them
+   * straight onto the execution workspace's own config.
+   *
+   * One helper rather than the projection inlined at each exit: the column leaves this file from
+   * eleven sites, and a per-site copy is how one of eleven ends up unprojected. Call it on every
+   * response body that carries an issue row.
+   *
+   * The empty-column early return is an optimization that cannot widen what crosses:
+   * `publicIssueExecutionWorkspaceSettings` returns `null`/`undefined` unchanged on BOTH viewer
+   * branches, so resolving the viewer first could only ever produce the same body. It matters because
+   * most issue rows carry no override at all, and `GET /issues/:id` is the most-read agent endpoint in
+   * the product — without it every such response pays an authorization decision to mask nothing.
+   */
+  async function withPublicIssueWorkspaceSettings<
+    T extends { companyId: string; executionWorkspaceSettings?: unknown },
+  >(req: Request, row: T): Promise<T> {
+    if (row.executionWorkspaceSettings === null || row.executionWorkspaceSettings === undefined) {
+      return row;
+    }
+    const runtimeViewer = await resolveWorkspaceRuntimeViewer(access, req, row.companyId);
+    return {
+      ...row,
+      executionWorkspaceSettings: publicIssueExecutionWorkspaceSettings(
+        row.executionWorkspaceSettings,
+        runtimeViewer,
+      ),
+    };
+  }
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
@@ -7590,8 +7629,16 @@ export function issueRoutes(
       repoRef: workspace.repoRef,
       defaultRef: workspace.defaultRef,
       visibility: workspace.visibility,
-      setupCommand: workspace.setupCommand,
-      cleanupCommand: workspace.cleanupCommand,
+      // PEN-3073: `ProjectWorkspaceRuntimeConfig` carries no command fields, but the ROW does —
+      // these two are top-level columns, and both are operator-authored shell strings of the same
+      // class as `config.provisionCommand` on the execution-workspace side. Reading the
+      // execution/project asymmetry off the two runtime-config types alone misses them.
+      setupCommand: viewer.revealRuntimeConfig
+        ? workspace.setupCommand
+        : maskWorkspaceRuntimeTextForRead(workspace.setupCommand),
+      cleanupCommand: viewer.revealRuntimeConfig
+        ? workspace.cleanupCommand
+        : maskWorkspaceRuntimeTextForRead(workspace.cleanupCommand),
       remoteProvider: workspace.remoteProvider,
       remoteWorkspaceRef: workspace.remoteWorkspaceRef,
       sharedWorkspaceKey: workspace.sharedWorkspaceKey,
@@ -7664,7 +7711,15 @@ export function issueRoutes(
       env: null,
       pauseReason: project.pauseReason,
       pausedAt: project.pausedAt,
-      executionWorkspacePolicy: project.executionWorkspacePolicy,
+      // PEN-3073: the project-level default for the same two objects the workspace rows carry
+      // per-instance — `workspaceRuntime` (open operator record) and `workspaceStrategy` (the same
+      // provision/teardown command strings). It is not a workspace row, so nothing in the PEN-2852
+      // boundary reached it: this response served `currentExecutionWorkspace.config.workspaceRuntime`
+      // masked and `project.executionWorkspacePolicy.workspaceRuntime` in the clear.
+      executionWorkspacePolicy: publicProjectExecutionWorkspacePolicy(
+        project.executionWorkspacePolicy ?? null,
+        viewer,
+      ),
       codebase: project.codebase,
       workspaces: (project.workspaces ?? []).map((workspace) =>
         compactIssueProjectWorkspace(workspace, viewer),
@@ -7749,9 +7804,21 @@ export function issueRoutes(
       config: workspace.config
         ? {
             environmentId: workspace.config.environmentId,
-            provisionCommand: workspace.config.provisionCommand,
-            teardownCommand: workspace.config.teardownCommand,
-            cleanupCommand: workspace.config.cleanupCommand,
+            // PEN-3073: the three sibling scalars of `workspaceRuntime`, and the same class of
+            // value — `provisionCommand` is executed as `bash -lc <string>`. Masked here on the
+            // same composition rule as `workspaceRuntime` below (BLO-33407): the gate has already
+            // decided, this layer only survives a gate regression. Note these are NOT redundant
+            // with the gate for an entitled reader — values cross by design there, and the
+            // workspace editor depends on it.
+            provisionCommand: viewer.revealRuntimeConfig
+              ? workspace.config.provisionCommand
+              : maskWorkspaceRuntimeTextForRead(workspace.config.provisionCommand),
+            teardownCommand: viewer.revealRuntimeConfig
+              ? workspace.config.teardownCommand
+              : maskWorkspaceRuntimeTextForRead(workspace.config.teardownCommand),
+            cleanupCommand: viewer.revealRuntimeConfig
+              ? workspace.config.cleanupCommand
+              : maskWorkspaceRuntimeTextForRead(workspace.config.cleanupCommand),
             // PEN-2846 (door #12): `workspaceRuntime` is an open
             // `Record<string, unknown>` an operator authors by hand, and this
             // function is a withholding boundary — it enumerates its fields and
@@ -8809,6 +8876,13 @@ export function issueRoutes(
       currentExecutionWorkspace: compactIssueExecutionWorkspace(currentExecutionWorkspace, runtimeViewer),
       workProducts,
       linkedCases,
+      // PEN-3252. Last in the literal, after every spread above, so no later spread can reintroduce
+      // the raw column — this response already served `currentExecutionWorkspace.config
+      // .workspaceRuntime` masked while `...issue` handed the same bytes back one key over.
+      executionWorkspaceSettings: publicIssueExecutionWorkspaceSettings(
+        issue.executionWorkspaceSettings,
+        runtimeViewer,
+      ),
     });
   });
 
@@ -9148,10 +9222,15 @@ export function issueRoutes(
       }
     }
 
+    const runtimeViewer = await resolveWorkspaceRuntimeViewer(access, req, result.issue.companyId);
     res.json({
       issue: {
         ...result.issue,
         activeRecoveryAction: null,
+        executionWorkspaceSettings: publicIssueExecutionWorkspaceSettings(
+          result.issue.executionWorkspaceSettings,
+          runtimeViewer,
+        ),
       },
       recoveryAction: result.recoveryAction,
     });
@@ -10585,7 +10664,7 @@ export function issueRoutes(
       }
       const referenceSummary = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
       res.status(200).json({
-        ...issue,
+        ...(await withPublicIssueWorkspaceSettings(req, issue)),
         deduplicated: true,
         deduplicationReason,
         duplicateCandidates: [],
@@ -10738,7 +10817,7 @@ export function issueRoutes(
     });
 
     res.status(201).json({
-      ...issue,
+      ...(await withPublicIssueWorkspaceSettings(req, issue)),
       duplicateCandidates,
       relatedWork: referenceSummary,
       referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
@@ -10916,7 +10995,7 @@ export function issueRoutes(
     });
     await queueTaskWatchdogEvaluation(issue, actor.runId);
 
-    res.status(201).json(issue);
+    res.status(201).json(await withPublicIssueWorkspaceSettings(req, issue));
   });
 
   router.get("/issues/:id/accepted-plan-decompositions", async (req, res) => {
@@ -12996,7 +13075,7 @@ export function issueRoutes(
     })();
 
     await queueTaskWatchdogEvaluation(issue, actor.runId);
-    res.json({ ...issueResponse, comment });
+    res.json({ ...(await withPublicIssueWorkspaceSettings(req, issueResponse)), comment });
   });
 
   router.delete("/issues/:id", async (req, res) => {
@@ -13043,7 +13122,7 @@ export function issueRoutes(
     });
 
     await queueTaskWatchdogEvaluation(existing, actor.runId);
-    res.json(issue);
+    res.json(await withPublicIssueWorkspaceSettings(req, issue));
   });
 
   router.post("/issues/:id/checkout", validate(checkoutIssueSchema), async (req, res) => {
@@ -13265,7 +13344,7 @@ export function issueRoutes(
         .catch((err) => logger.warn({ err, issueId: issue.id }, "failed to wake assignee on issue checkout"));
     }
 
-    res.json(updated);
+    res.json(await withPublicIssueWorkspaceSettings(req, updated));
   });
 
   router.post("/issues/:id/release", async (req, res) => {
@@ -13296,7 +13375,7 @@ export function issueRoutes(
         entityType: "issue",
         entityId: released.id,
       });
-      res.json(released);
+      res.json(await withPublicIssueWorkspaceSettings(req, released));
       return;
     }
 
@@ -13328,7 +13407,7 @@ export function issueRoutes(
       entityId: released.id,
     });
 
-    res.json(released);
+    res.json(await withPublicIssueWorkspaceSettings(req, released));
   });
 
   router.post("/issues/:id/admin/force-release", async (req, res) => {
@@ -13371,7 +13450,7 @@ export function issueRoutes(
       },
     });
 
-    res.json(result);
+    res.json({ ...result, issue: await withPublicIssueWorkspaceSettings(req, result.issue) });
   });
 
   router.get("/issues/:id/comments", async (req, res) => {
