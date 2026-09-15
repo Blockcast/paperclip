@@ -1399,6 +1399,21 @@ function choosePrimaryTrigger(input: {
   // would become undetectable instead of merely reclassified. Below the two
   // streak triggers and `high_churn` because those describe the whole sampled
   // window; this one describes a single run inside it.
+  //
+  // ⚠ Outranking `long_active_duration` also opts this trigger OUT of every
+  // suppression gate keyed on `trigger === "long_active_duration"` — the
+  // approval gate, `currentPendingMonitorForReviewSuppression`, the A1
+  // progress-PR gate, and the final TOCTOU revalidation. That is deliberate,
+  // not an oversight: those gates all answer "is this elapsed time explained by
+  // something other than assignee inactivity?", and a run that has been
+  // *live-executing* past the bar is burning real compute regardless of the
+  // answer. It is the same argument this file already makes one line above for
+  // `high_churn` — a human gate does not excuse cost being burned against it.
+  // An armed monitor means "wake me later", not "this run may execute
+  // indefinitely". Pinned by the monitor-armed + live-runaway test; if you ever
+  // want a monitor to suppress this, change the test first — a silent flip here
+  // would re-open exactly the indefinite-suppression hazard BLO-22331 AC2
+  // forbids, from the other direction.
   if (input.runawayExecution) return "runaway_execution";
   if (input.longActive) return "long_active_duration";
   return null;
@@ -3597,18 +3612,25 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       noExecutableTurnGating
         && isDominantEpisodeShare(noExecutableTurnGating.noExecutableTurnMs, elapsedMs),
     );
-    // BLO-27698 B2/B3b: the longest execution span in this episode that is
+    // BLO-27698 B3b: the longest execution span in this episode that is
     // *still live as of `now`*. `runLiveInterval` caps a `running` row at its
     // last signal + NON_LIVE_EXECUTION_SILENCE_MS, so a row that went silent
     // stops counting here — "still executing" means signalling, not merely
     // still holding the `running` status.
     //
-    // This is the liveness half of both B-group gates, and it is deliberately
-    // the same shape as `currentBlockOpen` above: a dominance share alone would
-    // let an episode that executed hard and then went quiet suppress itself
-    // forever, which is the indefinite-suppression hazard BLO-22331 AC2
-    // forbids. Clamped to the episode so a span that predates it cannot inflate
-    // either gate.
+    // Read by `runawayExecution` only. Scoped deliberately: B2's dominance gate
+    // reads `monitorGating.executingMs`, which carries no liveness requirement
+    // at all, and locates its bound in the share test instead — see the comment
+    // on that clause. An earlier version of this docblock claimed to be "the
+    // liveness half of both B-group gates" and credited BLO-22331 AC2
+    // boundedness to it; that was wrong for B2 and is corrected here, because a
+    // reader trusting it could remove B2's share-test bound believing liveness
+    // still covered it.
+    //
+    // For B3b the liveness requirement is what keeps `runaway_execution`
+    // bounded: a run that executed hard and then went quiet stops counting, so
+    // the trigger cannot latch on a dead span. Clamped to the episode so a span
+    // that predates it cannot inflate the gate.
     const liveExecutingMs = Math.max(
       0,
       ...latestRuns.map((run) => {
@@ -3676,7 +3698,25 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // constants for one question is how a raised bar silently stops covering a
     // case (the A3 defect on this same issue). Split them if a fleet ever needs
     // a runaway bar below the long-active one.
-    const runawayExecution = liveExecutingMs >= thresholds.longActiveMs;
+    //
+    // Guarded on `elapsedMs !== null && attributableStartAt !== null`, matching
+    // `longActive` above. Both are required and neither is redundant:
+    //   - `elapsedMs` is null for any issue not `in_progress` (see the episode
+    //     attribution above), yet `reconcileProductivityReviews` selects over
+    //     `["todo", "in_progress"]`. Without this, a `todo` issue still carrying
+    //     a signalling `running` row — released back to `todo` mid-run, or a
+    //     checkout that never landed — would produce a review that
+    //     `long_active_duration` is structurally incapable of producing.
+    //   - `attributableStartAt` null is the BLO-22016 `currentHolderNeverDispatched`
+    //     shape. The clamp in `liveExecutingMs` degrades to the raw `span.start`
+    //     there, so the run's entire lifetime counts rather than its episode
+    //     share — the opposite of what that docblock promises. Guarding here
+    //     makes the clamp unconditional in every case that can reach this bar.
+    // Such reports also render "Current active elapsed time: unknown" with no
+    // `Elapsed accounting` line (`monitorGatingBreakdown` returns null on a null
+    // `elapsedMs`), so firing on them would be evidence-free as well as wrong.
+    const runawayExecution =
+      elapsedMs !== null && attributableStartAt !== null && liveExecutingMs >= thresholds.longActiveMs;
     const trigger = choosePrimaryTrigger({ runtimeFailure, noComment, longActive, highChurn, runawayExecution });
     if (!trigger) return null;
 
@@ -3732,9 +3772,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
     const routineOnlySamplingWindow = latestRuns.length > 0 && latestRuns.every(isRoutineOriginRun);
 
-    // Only `long_active_duration` is suppressible by a human gate. `no_comment_streak` and
-    // `high_churn` stay live: an agent burning runs against a gate it cannot clear is exactly
-    // the waste worth reviewing, and a gate does not excuse silent runs.
+    // Only `long_active_duration` is suppressible by a human gate. `no_comment_streak`,
+    // `high_churn` and `runaway_execution` stay live: an agent burning runs against a gate
+    // it cannot clear is exactly the waste worth reviewing, and a gate does not excuse
+    // silent runs — nor a single run executing past the long-active bar (BLO-27698 B3b;
+    // see the opt-out note in `choosePrimaryTrigger`).
     //
     // The suppression is deliberately bounded and forward-only: it lapses once the approval ages
     // past `approvalGateMaxAgeMs`, and it never closes a review that already fired (see
