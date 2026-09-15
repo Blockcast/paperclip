@@ -1009,5 +1009,278 @@ class TestCommentBodyIsModeAware(unittest.TestCase):
         self.assertIn("awaiting review", body)
 
 
+class TestCooldownArithmeticIsShared(unittest.TestCase):
+    """cooldown_blocks_refire is the single definition of the cooldown.
+
+    should_refire (scan) and refire_still_permitted (pre-write re-read) both
+    call it. A second copy would be free to drift, and a guard that disagreed
+    with the decision it guards would be worse than no guard at all.
+    """
+
+    def test_no_markers_never_blocks(self):
+        blocked, reason = sweep.cooldown_blocks_refire([], 0.0)
+        self.assertFalse(blocked)
+        self.assertIsNone(reason)
+
+    def test_marker_inside_the_cooldown_blocks_and_says_why(self):
+        now = 10 * HOUR
+        blocked, reason = sweep.cooldown_blocks_refire([now - 60.0], now)
+        self.assertTrue(blocked)
+        self.assertIn("cooldown", reason)
+
+    def test_marker_outside_the_cooldown_does_not_block(self):
+        now = 10 * HOUR
+        blocked, _ = sweep.cooldown_blocks_refire([now - (sweep.REFIRE_COOLDOWN_SECONDS + 1)], now)
+        self.assertFalse(blocked)
+
+    def test_the_newest_marker_wins_not_the_oldest(self):
+        """An old marker must not license a re-fire when a recent one exists."""
+        now = 10 * HOUR
+        epochs = [now - 5 * HOUR, now - 30.0, now - 4 * HOUR]
+        blocked, _ = sweep.cooldown_blocks_refire(epochs, now)
+        self.assertTrue(blocked)
+
+    def test_marker_epochs_are_extracted_by_prefix_only(self):
+        comments = [
+            {"body": sweep.MARKER + "\n@ally please re-review", "created_at": "2026-09-01T00:00:00Z"},
+            {"body": "an ordinary human comment", "created_at": "2026-09-01T01:00:00Z"},
+            {"body": None, "created_at": "2026-09-01T02:00:00Z"},
+            {"body": "prose that merely mentions " + sweep.MARKER, "created_at": "2026-09-01T03:00:00Z"},
+        ]
+        epochs = sweep.marker_epochs_from_comments(comments)
+        self.assertEqual(epochs, [sweep._parse_iso("2026-09-01T00:00:00Z")])
+
+
+class TestPreWriteRereadGuard(unittest.TestCase):
+    """BLO-31908: the re-fire cooldown was check-then-act.
+
+    The markers are read during the scan and the write happens later with no
+    re-read, so two sweeps executing concurrently both observed
+    `since_last >= REFIRE_COOLDOWN_SECONDS` and both fired. That is worse than
+    a duplicate comment: request_review DELETEs before it POSTs, so
+    `A-DELETE / A-POST / B-DELETE / B-POST` also leaves a window in which the
+    PR carries no pending review request at all.
+
+    The race is not reproducible against live GitHub on demand -- it needs a
+    runner-starvation backlog released together -- so these tests ARE the
+    acceptance evidence. They simulate the interleaving by returning different
+    comment pages to the scan read and to the pre-write re-read.
+    """
+
+    def setUp(self):
+        self._real_request = sweep._request
+        self._real_fetch = sweep._fetch_paginated
+        self.calls = []
+        self.comment_pages = []
+        self.comment_fetches = 0
+
+    def tearDown(self):
+        sweep._request = self._real_request
+        sweep._fetch_paginated = self._real_fetch
+
+    def _install(self, scan_comments, reread_comments, already_requested=True):
+        """Serve `scan_comments` to the scan read and `reread_comments` to the
+        pre-write re-read -- i.e. a marker that landed in between."""
+        self.comment_pages = [scan_comments, reread_comments]
+
+        def fake_fetch(api_base_url, path, token):
+            if "/statuses" in path:
+                return [status("pending", "2026-09-01T00:00:00Z")]
+            if "/comments" in path:
+                index = min(self.comment_fetches, len(self.comment_pages) - 1)
+                self.comment_fetches += 1
+                return self.comment_pages[index]
+            return []
+
+        def fake_request(url, token, method="GET", payload=None):
+            self.calls.append((method, url))
+            if method == "GET":
+                return {
+                    "requested_reviewers": [{"login": "allyblockcast"}] if already_requested else []
+                }
+            return {}
+
+        sweep._fetch_paginated = fake_fetch
+        sweep._request = fake_request
+
+    def _now(self):
+        # Well past STALL_THRESHOLD_SECONDS, so should_refire says yes on the
+        # scan and only the guard can stop the write.
+        return sweep._parse_iso("2026-09-01T00:00:00Z") + 10 * HOUR
+
+    def _marker(self, at):
+        return [{"body": sweep.MARKER + "\nre-ask", "created_at": at}]
+
+    def _writes(self):
+        return [(method, url) for method, url in self.calls if method != "GET"]
+
+    def test_marker_landing_between_scan_and_write_withholds_the_refire(self):
+        """The headline case: a concurrent sweep posted a marker mid-run."""
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=self._marker("2026-09-01T09:59:00Z"))
+
+        pr, _head, _pending, refire, reason = sweep._consider_pr(
+            "o", "r", _pr(1), "tok", "https://api.github.com", now
+        )
+
+        self.assertFalse(refire, "the guard must decline once the cooldown no longer permits")
+        self.assertTrue(reason.startswith(sweep.REREAD_SKIP_REASON_PREFIX), reason)
+        self.assertEqual(self._writes(), [], "no DELETE and no POST may be issued")
+
+    def test_both_writes_are_withheld_not_just_the_review_request(self):
+        """Gating only request_review would leave half the defect in place.
+
+        The marker comment is what the cooldown is derived from, so posting it
+        alone would still double the re-ask trail and push the cooldown out for
+        the next run.
+        """
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=self._marker("2026-09-01T09:59:00Z"))
+
+        sweep._consider_pr("o", "r", _pr(1), "tok", "https://api.github.com", now)
+
+        self.assertEqual(
+            [url for _m, url in self.calls if "/issues/" in url and "comments" in url],
+            [],
+            "the marker comment POST must be withheld too",
+        )
+
+    def test_unchanged_markers_still_permit_the_write(self):
+        """Negative control.
+
+        Without this, the test above would pass just as happily if the guard
+        broke the write path outright and the sweep never re-fired anything.
+        """
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=[])
+
+        _pr_payload, _head, _pending, refire, _reason = sweep._consider_pr(
+            "o", "r", _pr(1), "tok", "https://api.github.com", now
+        )
+
+        self.assertTrue(refire)
+        methods = [method for method, _url in self.calls]
+        self.assertIn("DELETE", methods)
+        self.assertIn("POST", methods)
+        self.assertLess(methods.index("DELETE"), methods.index("POST"))
+
+    def test_a_marker_older_than_the_cooldown_does_not_block(self):
+        """The guard re-applies the cooldown, it does not veto on any marker.
+
+        A stale marker is exactly the state a legitimate re-fire starts from,
+        so treating any marker as blocking would wedge the sweep permanently.
+        """
+        now = self._now()
+        stale = self._marker("2026-09-01T04:00:00Z")  # 6h before now, cooldown is 2h
+        self._install(scan_comments=stale, reread_comments=stale)
+
+        _pr_payload, _head, _pending, refire, _reason = sweep._consider_pr(
+            "o", "r", _pr(1), "tok", "https://api.github.com", now
+        )
+
+        self.assertTrue(refire)
+        self.assertNotEqual(self._writes(), [])
+
+    def test_the_guard_reads_comments_again_rather_than_trusting_the_scan(self):
+        """Pins the extra read itself.
+
+        If a later refactor were to reuse the scan's comment list, every test
+        above would still pass while the race was fully reopened -- the guard
+        would be re-checking the very data whose staleness is the defect.
+        """
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=[])
+
+        sweep._consider_pr("o", "r", _pr(1), "tok", "https://api.github.com", now)
+
+        self.assertGreaterEqual(
+            self.comment_fetches, 2,
+            "the write path must issue a fresh comments read, not reuse the scan's",
+        )
+
+    def test_a_failed_reread_withholds_the_write_rather_than_writing_blind(self):
+        """Fail-closed, and loudly.
+
+        request_review swallows its own transport failures because the marker
+        comment is still a durable trail. The guard must NOT: if it cannot be
+        evaluated, the safe direction is to withhold the write and let sweep()
+        isolate and report the PR.
+        """
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=[])
+        real_fetch = sweep._fetch_paginated
+
+        def fetch_then_die(api_base_url, path, token):
+            if "/comments" in path and self.comment_fetches >= 1:
+                raise urllib.error.URLError("connection reset")
+            return real_fetch(api_base_url, path, token)
+
+        sweep._fetch_paginated = fetch_then_die
+
+        with self.assertRaises(urllib.error.URLError):
+            sweep._consider_pr("o", "r", _pr(1), "tok", "https://api.github.com", now)
+
+        self.assertEqual(self._writes(), [], "a guard that cannot be evaluated must not write")
+
+    def test_a_guard_skip_does_not_consume_a_refire_budget_slot(self):
+        """MAX_REFIRES_PER_RUN counts writes, not candidates (BLO-31908 AC4).
+
+        sweep() decrements on the returned re-fire flag, so a PR the guard
+        withheld leaves the slot available for the next stranded PR -- the cap
+        keeps its existing meaning rather than quietly tightening.
+        """
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=self._marker("2026-09-01T09:59:00Z"))
+
+        outcome = sweep._consider_pr("o", "r", _pr(1), "tok", "https://api.github.com", now)
+
+        self.assertFalse(outcome[3], "a withheld write must not read as a re-fire")
+
+    def test_the_guard_is_not_consulted_when_the_budget_is_already_spent(self):
+        """Deferred PRs are not going to be written, so do not spend a request.
+
+        Call volume is the binding constraint on this job.
+        """
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=[])
+
+        _pr_payload, _head, _pending, refire, reason = sweep._consider_pr(
+            "o", "r", _pr(1), "tok", "https://api.github.com", now, may_refire=False
+        )
+
+        self.assertFalse(refire)
+        self.assertTrue(reason.startswith(sweep.DEFERRED_REASON_PREFIX))
+        self.assertEqual(self.comment_fetches, 1, "only the scan read, no guard read")
+
+    def test_dry_run_issues_no_guard_read_and_no_writes(self):
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=[])
+
+        _pr_payload, _head, _pending, refire, reason = sweep._consider_pr(
+            "o", "r", _pr(1), "tok", "https://api.github.com", now, dry_run=True
+        )
+
+        self.assertTrue(refire, "the plan still reports what a live run would do")
+        self.assertIn("DRY-RUN", reason)
+        self.assertEqual(self._writes(), [])
+        self.assertEqual(self.comment_fetches, 1, "only the scan read, no guard read")
+
+
+class TestRereadGuardResidualIsStated(unittest.TestCase):
+    """AC2: the residual must be stated, not claimed away.
+
+    The guard narrows the window from the whole scan to the gap between the
+    re-read and the POST; it cannot close it, because the GitHub comment API
+    offers no compare-and-set. This repo's failure mode of record is asserting
+    a guarantee the code does not provide, so the honesty of that docstring is
+    itself worth pinning.
+    """
+
+    def test_the_docstring_says_the_race_is_narrowed_not_eliminated(self):
+        doc = sweep.refire_still_permitted.__doc__ or ""
+        self.assertIn("RESIDUAL", doc)
+        self.assertIn("does NOT close it", doc)
+
+
 if __name__ == "__main__":
     unittest.main()
