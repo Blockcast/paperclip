@@ -519,6 +519,69 @@ describe("githubHasReviewerEvidenceForPr", () => {
     });
   });
 
+  // BLO-32695 cross-reader agreement. This reader and the merge gate resolve
+  // the attested tree from the same body, so a body one credits the other must
+  // not read as "no review at head". Before this, each carried its own prose
+  // regexes and #1675 — a real clean review whose attestation line trails a
+  // parenthetical — was invisible here while the gate credited its block.
+  it("BLO-32695: credits a block-backed review whose prose attestation trails a parenthetical", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: [
+            "## Ally — Consolidated PR Review",
+            "",
+            `Reviewed head: ${headSha} (unchanged since my last pass — no new commits)`,
+            "",
+            `<!-- ally-verdict:1`,
+            JSON.stringify({
+              head: headSha,
+              findings: { critical: 0, important: 0, suggestions: 0 },
+            }),
+            "-->",
+          ].join("\n"),
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: true,
+      via: "comment",
+    });
+  });
+
+  it("BLO-32695: still fails closed when the block and a clean prose line disagree", async () => {
+    setCreds();
+    // The asymmetry is the design: an unreadable prose line falls back to the
+    // block, but a *readable* one naming another tree is two conflicting
+    // claims and must not credit either.
+    stubGithub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: [
+            "## Ally — Consolidated PR Review",
+            "",
+            `Reviewed head: ${"1".repeat(40)}`,
+            "",
+            `<!-- ally-verdict:1`,
+            JSON.stringify({
+              head: headSha,
+              findings: { critical: 0, important: 0, suggestions: 0 },
+            }),
+            "-->",
+          ].join("\n"),
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
+    });
+  });
+
   it("accepts the App-prefixed reviewer identity variant", async () => {
     setCreds();
     stubGithub({

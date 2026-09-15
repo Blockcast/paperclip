@@ -20,6 +20,10 @@
 import { createSign } from "node:crypto";
 
 import { loadConfig } from "../config.js";
+import {
+  extractAllyReviewedHeadSha,
+  hasAllyConsolidatedReviewHeading,
+} from "./ally-review-detection.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 
 const GITHUB_HOST = "github.com";
@@ -425,19 +429,27 @@ export async function githubFetchPrHeadSha(input: {
 /**
  * Extract the head SHA a canonical consolidated Ally review attests to reviewing,
  * or null when the body is not that canonical shape. Requires the server-owned
- * heading AND exactly one standalone full-SHA `Reviewed head:` line: a request
- * comment can quote an arbitrary SHA, so a loose substring match is not durable
- * evidence that the review side effect actually happened.
+ * heading AND an unambiguous attestation: a request comment can quote an
+ * arbitrary SHA, so a loose substring match is not durable evidence that the
+ * review side effect actually happened.
+ *
+ * Both halves delegate to ally-review-detection so this reader and the merge
+ * gate resolve the same tree from the same body. Until BLO-32695 this file
+ * carried its own heading and attestation regexes, and that duplication is
+ * what let a block-backed review be credited by the gate while reading as "no
+ * review at head" here — the #1675 false red, reproduced one layer down. The
+ * shared heading pattern is the wider of the two (it admits the bold and
+ * alternate-dash forms Ally actually emits); forgery is not the risk it
+ * guards, because `githubHasReviewerEvidenceForPr` credits a body only after
+ * matching the reviewer App identity.
+ *
+ * An unreadable block yields null here, exactly as it does in the gate: no
+ * evidence re-runs the reviewer, whereas crediting a verdict nothing could
+ * parse would let a run that died mid-flow self-attest.
  */
 function consolidatedReviewHead(body: string): string | null {
-  if (!/(?:^|\n)\s*## Ally — Consolidated PR Review\s*(?=\n|$)/.test(body)) {
-    return null;
-  }
-  const attestations = Array.from(
-    body.matchAll(/(?:^|\n)\s*_?\s*reviewed head:\s*`?([0-9a-f]{40})`?\s*_?\s*(?=\n|$)/gi),
-    (match) => match[1]!.toLowerCase(),
-  );
-  return attestations.length === 1 ? attestations[0]! : null;
+  if (!hasAllyConsolidatedReviewHeading(body)) return null;
+  return extractAllyReviewedHeadSha(body);
 }
 
 /**

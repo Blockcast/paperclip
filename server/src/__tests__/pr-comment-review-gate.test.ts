@@ -1065,3 +1065,55 @@ describe("commentReviewGateCheckConclusion", () => {
     expect(commentReviewGateCheckTitle(notEvaluated)).toMatch(/not evaluated/i);
   });
 });
+
+describe("commit-status description budget", () => {
+  // GitHub caps a commit-status description at 140 characters and
+  // `githubPostCommitStatusDetailed` slices to that before the POST, so an
+  // overlong reason is never rejected — it is silently cut. What gets cut is
+  // the tail, and the tail of the clean reason is the source attribution, the
+  // one field that says whether the structured block or the prose fallback
+  // produced the green (BLO-32695). Losing it is exactly the silent regression
+  // the attribution exists to make visible.
+  const MAX = 140;
+
+  // Both branches of the `source` ternary, driven through the real evaluator
+  // rather than re-rendered here: a copy of the sentence would keep passing
+  // after the real one grew.
+  const structured = evaluateCommentReviewGate({
+    headSha: CURRENT_HEAD,
+    comments: [
+      allyComment(
+        [
+          "## Ally — Consolidated PR Review",
+          "",
+          "<!-- ally-verdict:1",
+          JSON.stringify({
+            head: CURRENT_HEAD,
+            findings: { critical: 0, important: 0, suggestions: 0 },
+            dispositions: [],
+          }),
+          "-->",
+          "",
+          `Reviewed head: ${CURRENT_HEAD}`,
+        ].join("\n"),
+        "2026-08-04T21:09:19Z",
+      ),
+    ],
+  });
+  const prose = evaluateCommentReviewGate({
+    headSha: CURRENT_HEAD,
+    comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
+  });
+
+  it("keeps both clean descriptions inside GitHub's cap", () => {
+    // Positive control: assert we actually exercised both branches, so a
+    // regression that collapses them to one phrasing cannot pass vacuously.
+    expect(structured).toMatchObject({ state: "success", outcome: "clean" });
+    expect(prose).toMatchObject({ state: "success", outcome: "clean" });
+    expect(structured.reason).not.toBe(prose.reason);
+
+    for (const verdict of [structured, prose]) {
+      expect(verdict.reason.length).toBeLessThanOrEqual(MAX);
+    }
+  });
+});

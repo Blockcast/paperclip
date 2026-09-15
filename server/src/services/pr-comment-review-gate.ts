@@ -18,8 +18,10 @@ import {
   extractAllyPriorFindingDispositions,
   extractAllyReportedFindingRefs,
   extractAllyReviewedHeadSha,
+  allyClaimedReviewHead,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
+  parseAllyVerdictBlock,
   type AllyFindingRef,
   type AllyPriorFindingDisposition,
 } from "./ally-review-detection.js";
@@ -72,6 +74,13 @@ export type CommentReviewGateOutcome =
   | "blocking_finding"
   /** No comment attests this head, but a finding from an earlier head stands undispositioned. */
   | "carried_finding"
+  /**
+   * The newest Ally review carries a structured verdict block this parser
+   * cannot read. Distinct from every other outcome on purpose: it is neither
+   * evidence of review nor evidence of a finding, and conflating it with
+   * either is the misreport BLO-32695 exists to end.
+   */
+  | "unreadable_verdict"
   /** Nothing established a comment-shaped review of this head. Not evidence of review. */
   | "not_evaluated";
 
@@ -79,6 +88,7 @@ export type CommentReviewGateVerdict =
   | { state: "success"; outcome: "clean"; reason: string }
   | { state: "success"; outcome: "not_evaluated"; reason: string }
   | { state: "failure"; outcome: "blocking_finding"; reason: string; commentCreatedAt: string }
+  | { state: "failure"; outcome: "unreadable_verdict"; reason: string; commentCreatedAt: string }
   | {
       state: "failure";
       outcome: "carried_finding";
@@ -290,6 +300,31 @@ function headsWithUndispositionedFinding(
 }
 
 /**
+ * The newest Ally consolidated-review comment, whatever it attests.
+ *
+ * Deliberately not filtered by attestation: the point is to reach a review
+ * whose head could not be established, which is precisely the case
+ * latestAttestingAllyComment skips.
+ */
+function newestAllyConsolidatedReviewComment(
+  comments: CommentReviewGateComment[],
+  reviewerBotLogin: string,
+): CommentReviewGateComment | null {
+  let newest: CommentReviewGateComment | null = null;
+  let newestTime = -Infinity;
+  for (const comment of comments) {
+    if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
+    const commentTime = toEpochMs(comment.createdAt);
+    if (!Number.isFinite(commentTime)) continue;
+    if (commentTime >= newestTime) {
+      newest = comment;
+      newestTime = commentTime;
+    }
+  }
+  return newest;
+}
+
+/**
  * Evaluate only the comment-shaped review surface for one exact PR head.
  * Formal reviews remain owned by GitHub's normal reviewDecision path.
  */
@@ -310,6 +345,57 @@ export function evaluateCommentReviewGate(input: {
 
   const comments = input.comments ?? [];
   const normalizedHead = headSha.toLowerCase();
+
+  // Checked before anything else, scoped to the newest review, and scoped to
+  // this head.
+  //
+  // Scoped to the newest review, because an unreadable block anywhere in
+  // history would wedge the PR permanently with no route out — the same
+  // unretirable trap BLO-31446 and BLO-31947 document.
+  //
+  // Checked first, because the alternative is silence: an unreadable block
+  // attests no head, so without this branch the newest review is invisible and
+  // an *older* review of the same head stays authoritative. That is not
+  // hypothetical — it is exactly how paperclip#1675 reported a finding Ally
+  // had withdrawn. The 15:41:42Z clean review failed to attest, so the
+  // 03:46:19Z review of the same head kept its `Important Issues (1)`, and the
+  // gate published `blocking_finding` against a superseded verdict.
+  //
+  // Scoped to this head, because "newest" is not "at this head" and the
+  // difference is a real red on a tree nobody reviewed.
+  // newestAllyConsolidatedReviewComment has no head filter, so unscoped this
+  // branch lets a malformed block from three pushes ago decide the current
+  // head — where the same PR with no comments at all is `not_evaluated`, i.e.
+  // green. A stale broken block must not be worse for an author than no review
+  // (found in peer review of #1721 at 11a52e9a). It matters most on the
+  // designed upgrade path: SUPPORTED_ALLY_VERDICT_VERSION is bumped by a
+  // server rollout, but the producer is a prompt that takes effect the moment
+  // it merges, so between those two moments an unscoped branch reds every open
+  // PR at once — including PRs whose current head was never reviewed.
+  //
+  // The scoping test is asymmetric and fails closed, which is what keeps AC-5:
+  // the branch is skipped only when the review *positively* names some other
+  // tree. allyClaimedReviewHead returning null means "cannot tell which head
+  // this examined", and that is an ambiguity, not an exemption — a review of
+  // this head whose verdict we could not read is precisely the case that must
+  // not resolve to success. Only a head we can read, and that is not this one,
+  // makes the unreadable verdict somebody else's problem.
+  const newestReview = newestAllyConsolidatedReviewComment(comments, reviewerBotLogin);
+  if (newestReview) {
+    const claimedHead = allyClaimedReviewHead(newestReview.body);
+    if (claimedHead === null || claimedHead === normalizedHead) {
+      const block = parseAllyVerdictBlock(newestReview.body);
+      if (block.kind === "unreadable") {
+        return {
+          state: "failure",
+          outcome: "unreadable_verdict",
+          reason: `Ally's newest review carries an unreadable verdict block: ${block.reason}.`,
+          commentCreatedAt: new Date(toEpochMs(newestReview.createdAt)).toISOString(),
+        };
+      }
+    }
+  }
+
   const forHead = latestAttestingAllyComment(comments, reviewerBotLogin, normalizedHead);
 
   if (forHead) {
@@ -322,11 +408,25 @@ export function evaluateCommentReviewGate(input: {
         commentCreatedAt: new Date(toEpochMs(forHead.comment.createdAt)).toISOString(),
       };
     }
+    // Name the source that decided this, because "clean" from a counted
+    // structured block and "clean" from the prose fallback are different
+    // claims with different failure modes, and the whole point of BLO-32695
+    // is being able to tell which one you are looking at. Without this the
+    // gate description is identical either way, so a silent regression back
+    // onto the prose path — the exact thing this change retires — would be
+    // invisible on the PR.
+    // Both phrasings are kept inside MAX_COMMIT_STATUS_DESCRIPTION. The writer
+    // in github-app-auth.ts slices at 140 before the POST, so an overlong
+    // description is never rejected — it is silently cut, and what it cuts is
+    // the tail, which is where the source attribution lives. Pinned by test.
+    const source =
+      parseAllyVerdictBlock(forHead.comment.body).kind === "ok"
+        ? "its structured ally-verdict block"
+        : "prose fallback (no ally-verdict block)";
     return {
       state: "success",
       outcome: "clean",
-      reason:
-        "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
+      reason: `Ally's most recent consolidated-review comment for this head reports no unresolved findings, per ${source}.`,
     };
   }
 
@@ -405,6 +505,13 @@ export function commentReviewGateCheckTitle(
       return "Unresolved finding at this head";
     case "carried_finding":
       return "Unresolved finding carried from an earlier head";
+    // Deliberately does not say "finding": this outcome is neither evidence of
+    // review nor evidence of a finding, and the title is the surface a reader
+    // sees before opening the check. Calling it a finding here would re-commit
+    // the misreport BLO-32695 exists to end, on the one line most likely to be
+    // read in isolation.
+    case "unreadable_verdict":
+      return "Verdict block unreadable — no finding asserted";
     case "not_evaluated":
       return "Not evaluated — no comment-shaped review attests this head";
   }
