@@ -297,6 +297,32 @@ test("Step 4 emits the structured verdict block the gate reads first", () => {
     + " spaces — the parser's opener is line-anchored and will not see it otherwise");
 });
 
+test("the template leads with the heading, not the verdict block", () => {
+  const { template } = step4Template();
+
+  const heading = template.indexOf("## Ally — Consolidated PR Review");
+  const block = template.indexOf("<!-- ally-verdict:1");
+  assert.notEqual(heading, -1, "positive control: the canonical heading is present");
+  assert.notEqual(block, -1, "positive control: the block is present");
+
+  // Every reader in THIS repo is line-anchored (`gim`), so either order parses
+  // here — which is exactly why the order has to be pinned by a test rather
+  // than discovered. Ally's live one-review-per-head guard is a managed bundle
+  // outside this repo and matches the heading at the FIRST BYTE, so a
+  // block-first body reads as "not yet reviewed" and the next wake re-reviews
+  // the same head. A COMMENTED review cannot be dismissed, so each duplicate
+  // is permanent until the head moves.
+  //
+  // Measured on paperclip#1721 (2026-09-15): of 17 reviews, the 4 whose body
+  // led with the block produced same-head duplicates at 2 heads (a8096107,
+  // d40c450b); the 13 that led with the heading produced 0.
+  assert.ok(heading < block,
+    "the `## Ally — Consolidated PR Review` heading must come BEFORE the"
+    + " ally-verdict block — a first-byte heading reader outside this repo"
+    + " misses a block-first body and re-reviews the head, and the duplicate"
+    + " COMMENTED review it files can never be dismissed");
+});
+
 test("the template's severity counts are all severities the gate can act on", () => {
   const { template } = step4Template();
 

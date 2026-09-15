@@ -162,6 +162,8 @@ If either pipeline errors out (model unavailable, tool failure, etc.), continue 
 Merge findings from both pipelines into one consolidated review. Follow this structure:
 
 ```markdown
+## Ally — Consolidated PR Review
+
 <!-- ally-verdict:1
 {
   "head": "<full 40-character lowercase HEAD_SHA>",
@@ -171,8 +173,6 @@ Merge findings from both pipelines into one consolidated review. Follow this str
   ]
 }
 -->
-
-## Ally — Consolidated PR Review
 
 _🔍 Automated Review — PR #<N> @ <sha-short>_
 
@@ -206,6 +206,8 @@ Reviewed head: <full 40-character lowercase HEAD_SHA>
 **Dedup rule**: if both pipelines flag the same line for similar reasons, merge into one bullet with both `[pipeline]` tags. Don't double-count.
 
 **The `Ally — Consolidated PR Review` heading is mandatory, and it gates everything below.** `hasAllyConsolidatedReviewHeading` (`server/src/services/ally-review-detection.ts`) is the first thing the gate applies, and a body that fails it is not treated as a review at all — so a perfectly well-formed `ally-verdict:1` block inside it is never even looked for. That makes this the one field whose mismatch is silent on *both* sides: the block still parses in isolation, and the gate simply never sees the comment. Keep any friendlier title as secondary prose underneath, not in place of it.
+
+**Emit the heading FIRST, before the `ally-verdict:1` block.** Every reader in this repo is line-anchored, so either order parses here — which is what makes getting it wrong silent. Ally's live one-review-per-head guard is a managed bundle *outside* this repo and matches the heading at the **first byte**, so a body that leads with the block reads as "not yet reviewed" and the next wake re-reviews the same head. A `COMMENTED` review cannot be dismissed, so each duplicate is permanent until the head moves. Measured on paperclip#1721 (2026-09-15): of 17 reviews, the 4 that led with the block produced same-head duplicates at 2 heads (`a8096107`, `d40c450b`); the 13 that led with the heading produced 0. Pinned by `scripts/ally-agent-idempotency-contract.test.mjs`.
 
 **`Reviewed head:` is mandatory, in every state.** It is the immutable attestation Step 2 reads, and it is the *only* thing that makes the skip work — the heading's `<sha-short>` is not a substitute. Emit the full 40-character lowercase SHA on its own line. Omit it and Step 2 counts zero forever, so every wake re-reviews the same head; that is one of the two ways this guard has previously gone inert, and it is invisible until duplicate reviews pile up.
 
