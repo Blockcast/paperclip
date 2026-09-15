@@ -188,6 +188,10 @@ function arraysEqual<T>(left: readonly T[], right: readonly T[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 async function missingPrerequisites(
   sql: ReturnType<typeof postgres>,
   spec: ConcurrentIndexSpec,
@@ -358,15 +362,31 @@ export async function ensurePendingConcurrentIndexes(
       });
     }
   } finally {
+    // Every step here is best-effort. A throw out of this `finally` would
+    // replace the original index-build error — the diagnostic naming the
+    // offending index and the DDL to inspect it — with a generic connection
+    // error, and would skip `sql.end()`, leaking the pool into the deploy
+    // bootstrap that runs ahead of applyPendingMigrations. Swallowing loses
+    // nothing: the timeouts are session state, and so is the advisory lock,
+    // both of which the server drops when `sql.end()` closes the connection.
     if (lockAcquired) {
       try {
         await sql.unsafe("SET statement_timeout = 0");
         await sql.unsafe("SET lock_timeout = 0");
-      } finally {
+      } catch (error) {
+        log(`failed to reset session timeouts during cleanup: ${describeError(error)}`);
+      }
+      try {
         await releaseSerializingLock(sql);
+      } catch (error) {
+        log(`failed to release the "${SERIALIZING_LOCK_KEY}" advisory lock during cleanup: ${describeError(error)}`);
       }
     }
-    await sql.end();
+    try {
+      await sql.end();
+    } catch (error) {
+      log(`failed to close the concurrent-index-guard connection: ${describeError(error)}`);
+    }
   }
 
   return results;
