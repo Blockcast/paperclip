@@ -475,15 +475,25 @@ export interface IssueBlockedInboxAttention {
   };
 }
 
-export type IssueProductivityReviewTrigger =
-  | "no_comment_streak"
-  | "long_active_duration"
-  | "high_churn"
-  | "runtime_failure_streak"
+// BLO-34216: the single source of truth for the productivity-review trigger
+// set. The union type below, both runtime parse-side allowlists (issues.ts,
+// productivity-review.ts) and both label maps derive from this tuple, so adding
+// a trigger is a one-line change here. The trigger round-trips through markdown
+// via `extractReviewTriggerFromDescription` rather than a DB enum, so a
+// hand-maintained allowlist that drifted failed quietly — it silently stopped
+// parsing an already-written review rather than failing a typecheck.
+export const ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS = [
+  "no_comment_streak",
+  "long_active_duration",
+  "high_churn",
+  "runtime_failure_streak",
   // BLO-27698 B3b: one still-live run has held its turn longer than the
   // long-active bar. Kept distinct from `long_active_duration`, which measures
   // time nobody was accounting for.
-  | "runaway_execution";
+  "runaway_execution",
+] as const;
+
+export type IssueProductivityReviewTrigger = (typeof ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS)[number];
 
 export interface IssueProductivityReview {
   reviewIssueId: string;

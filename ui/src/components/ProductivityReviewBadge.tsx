@@ -1,11 +1,15 @@
 import { Eye } from "lucide-react";
-import type { IssueProductivityReview } from "@paperclipai/shared";
+import type { IssueProductivityReview, IssueProductivityReviewTrigger } from "@paperclipai/shared";
 import { Link } from "../lib/router";
 import { cn } from "../lib/utils";
 import { createIssueDetailPath } from "../lib/issueDetailBreadcrumb";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
-const TRIGGER_LABELS: Record<string, string> = {
+// BLO-34216: exhaustive by construction — a trigger added to
+// `ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS` with no entry here is a typecheck
+// failure. The `??` below stays for version skew: a deployed API can send a
+// trigger this bundle predates, which is a runtime fact no type can rule out.
+const TRIGGER_LABELS: Record<IssueProductivityReviewTrigger, string> = {
   no_comment_streak: "No-comment streak",
   long_active_duration: "Long active duration",
   high_churn: "High churn",

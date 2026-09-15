@@ -22,7 +22,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
+import { ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS, MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
 import {
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
   DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
@@ -31,6 +31,7 @@ import {
   PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS,
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
+  extractReviewTriggerFromDescription,
   productivityReviewService,
 } from "../services/productivity-review.js";
 import { logActivity } from "../services/activity-log.js";
@@ -67,6 +68,26 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string) {
     if (timeout) clearTimeout(timeout);
   });
 }
+
+// BLO-34216: the trigger round-trips through markdown, not a DB enum, so a
+// trigger the parser cannot read back fails quietly — it stops refreshing an
+// already-written review rather than failing a typecheck or a migration. This
+// asserts every member of the single source-of-truth tuple survives the
+// round-trip, so a trigger whose name the `[a-z_]+` pattern cannot match (a
+// digit, a dash) fails the build instead.
+describe("productivity review trigger round-trip", () => {
+  it("parses every trigger back out of the rendered primary-trigger line", () => {
+    expect(ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS.length).toBeGreaterThan(0);
+    for (const trigger of ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS) {
+      const description = [
+        "Some preamble.",
+        `- Primary trigger: \`${trigger}\` (Display label)`,
+        "- Something else: value",
+      ].join("\n");
+      expect(extractReviewTriggerFromDescription(description)).toBe(trigger);
+    }
+  });
+});
 
 describeEmbeddedPostgres("productivity review service", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;

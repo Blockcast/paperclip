@@ -640,6 +640,7 @@ export type {
   IssueWatchdogStatus,
   IssueWatchdogSummary,
 } from "./issue.js";
+export { ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS } from "./issue.js";
 export type {
   IssueTreeControlPreview,
   IssueTreeHold,

@@ -69,6 +69,7 @@ import {
   issueCommentPresentationSchema,
   isAgentStatusInvokable,
   isUuidLike,
+  ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   SYSTEM_ISSUE_DOCUMENT_KEYS,
   ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
@@ -2581,13 +2582,6 @@ const PRODUCTIVITY_REVIEW_ACTIVITY_ACTIONS = [
   "issue.productivity_review_source_mutation",
   "issue.productivity_review_updated",
 ];
-const PRODUCTIVITY_REVIEW_TRIGGERS: readonly IssueProductivityReviewTrigger[] = [
-  "no_comment_streak",
-  "long_active_duration",
-  "high_churn",
-  "runtime_failure_streak",
-  "runaway_execution",
-];
 
 function lowTrustBoundaryIssueCondition(
   companyId: string,
@@ -3006,7 +3000,7 @@ async function terminalExplicitBlockersByRoot(
 
 function readProductivityReviewTrigger(value: unknown): IssueProductivityReviewTrigger | null {
   if (typeof value !== "string") return null;
-  return PRODUCTIVITY_REVIEW_TRIGGERS.includes(value as IssueProductivityReviewTrigger)
+  return ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS.includes(value as IssueProductivityReviewTrigger)
     ? (value as IssueProductivityReviewTrigger)
     : null;
 }
