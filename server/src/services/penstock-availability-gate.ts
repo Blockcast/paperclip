@@ -191,7 +191,7 @@ export function createPenstockAvailabilityGate(
 
   return {
     async checkAdapter(input: PenstockAvailabilityGateCheckInput): Promise<PenstockAvailabilityGateResult> {
-      const provider = mapAdapterToPenstockProvider(input.adapterType);
+      const provider = mapAdapterToPenstockProvider(input.adapterType, input.adapterConfig);
       if (!provider) return { allow: true };
 
       const resolved = resolvePenstockCheck(input, provider);
@@ -260,11 +260,40 @@ export function createPenstockAvailabilityGate(
  * exists to defer k8s *dispatch*, and the `*_local` adapters do not dispatch
  * through it. Returning `null` means "not covered by this gate" and results
  * in an unconditional allow.
+ *
+ * `opencode_k8s` picks its provider per agent (BLO-34116): `PENSTOCK_PROVIDER`
+ * in `adapterConfig.env` wins, then the `provider/` prefix opencode puts on its
+ * model ids, then the historical `codex` default. A secret-ref binding for the
+ * env var is unreadable here and falls through to the model prefix.
  */
-export function mapAdapterToPenstockProvider(adapterType: string): PenstockProvider | null {
+export function mapAdapterToPenstockProvider(
+  adapterType: string,
+  adapterConfig?: unknown,
+): PenstockProvider | null {
   if (adapterType === "claude_k8s") return "anthropic";
-  if (adapterType === "opencode_k8s") return "codex";
+  if (adapterType === "opencode_k8s") {
+    const config = asRecord(adapterConfig);
+    const envProvider = readConfigEnvString(asRecord(config?.env), "PENSTOCK_PROVIDER")?.toLowerCase();
+    if (envProvider === "anthropic") return "anthropic";
+    if (envProvider === "openai") return "codex";
+    const model = readNonEmptyString(config?.model);
+    if (model?.startsWith("anthropic/")) return "anthropic";
+    if (model?.startsWith("openai/")) return "codex";
+    return "codex";
+  }
   return null;
+}
+
+/**
+ * Model id as Penstock sees it. Opencode model ids carry a `provider/` prefix
+ * (`anthropic/claude-opus-5`) that the runtime strips before calling the
+ * provider, and Penstock's catalog is keyed on the bare id. Probe with what
+ * the runtime sends: a prefixed id 404s on the messages probe and fails open,
+ * so the fallback would never see a real 429. Results and logs keep the
+ * configured string.
+ */
+function penstockModelId(model: string): string {
+  return model.replace(/^(anthropic|openai)\//, "");
 }
 
 /**
@@ -307,7 +336,7 @@ function resolvePenstockCheck(
 
   try {
     return {
-      capacityUrl: buildCapacityUrl(baseUrl, model, provider),
+      capacityUrl: buildCapacityUrl(baseUrl, penstockModelId(model), provider),
       // The secondary probe is an Anthropic Messages call; there is no codex
       // equivalent implemented, so codex relies on the capacity readback alone.
       messagesUrl: provider === "anthropic" ? buildMessagesUrl(baseUrl) : null,
@@ -570,7 +599,7 @@ async function probePenstockAnthropicModel(input: {
         "anthropic-version": ANTHROPIC_API_VERSION,
       },
       body: JSON.stringify({
-        model: input.model,
+        model: penstockModelId(input.model),
         max_tokens: 1,
         messages: [{ role: "user", content: "ping" }],
       }),
