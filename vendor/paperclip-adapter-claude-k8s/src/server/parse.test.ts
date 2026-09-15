@@ -402,6 +402,44 @@ describe("isClaudeTransientUpstreamError — transcript independence (PEN-3223)"
       }),
     ).toEqual({ family: null, errorCode: null, capacityCode: null });
   });
+
+  // The narrowing above must not reach the no-result-event case. In THIS copy
+  // `classifyClaudeUpstreamFailure` cannot be called with `parsed: null` (the
+  // `!parsed` branch in execute.ts returns first), but the `claude-local` twin
+  // calls `isClaudeTransientUpstreamError` directly from exactly that path. These
+  // pin the shared contract in both copies so the two cannot drift apart again.
+  it("still classifies a transcript-only 429 when no result event ever arrived", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: "API Error: 429 rate_limit_error — upstream is rate limited",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(true);
+  });
+
+  it("still classifies a transcript-only 503 when no result event ever arrived", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: "API Error: 503 upstream temporarily unavailable",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not invent a transient label when the no-result transcript is clean", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: '{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}',
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("matchClaudeUpstreamCapacityCode", () => {

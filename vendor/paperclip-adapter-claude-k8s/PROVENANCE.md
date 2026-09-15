@@ -96,7 +96,7 @@ A manifest of `sha256(path)` over all 41 in-tree files, sorted by path under
 `LC_ALL=C`, itself hashes to:
 
 ```
-7fae556519779db711db4cb9f6f239f49fd3c788fec402874ecb1f35093daa95
+11d9dc9bd0f4539f02cb83959fd3857bae53eec8a5b59f17d5e0505fda5c148e
 ```
 
 Regenerate with:

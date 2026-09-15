@@ -413,7 +413,16 @@ export function isClaudeTransientUpstreamError(input: {
   });
   if (loginMeta.requiresLogin) return false;
 
-  const haystack = buildClaudeTerminalResultHaystack(input);
+  // Narrow to the terminal-result surfaces only when a `result` event actually
+  // exists. In THIS copy that is the only reachable case — leg 1 above — so the
+  // `parsed: null` branch is defensive rather than live. It is kept because the
+  // `claude-local` twin IS reachable that way from its `!parsed` fallback, and a
+  // silent divergence between the two copies is what this rule's own defect grew
+  // out of. With `parsed` null there are no bounded surfaces to read, so the
+  // transcript is the only evidence available.
+  const haystack = parsed
+    ? buildClaudeTerminalResultHaystack(input)
+    : buildClaudeTransientHaystack(input);
   if (!haystack) return false;
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
 }

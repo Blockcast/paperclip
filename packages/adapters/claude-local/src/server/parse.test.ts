@@ -116,6 +116,44 @@ describe("isClaudeTransientUpstreamError — transcript independence (PEN-3223)"
       }),
     ).toBe(true);
   });
+
+  // `execute.ts`'s `!parsed` fallback calls this with `parsed: null`, `stdout` and
+  // `stderr` when the CLI died without emitting a result event. The narrowing must
+  // not reach that path: with no result event there are no bounded surfaces, and
+  // `parseFallbackErrorMessage` derives only from stderr, so a transient signal
+  // that reached stdout alone would otherwise be dropped and lose its retry family.
+  it("still classifies a transcript-only 429 when no result event ever arrived", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: "API Error: 429 rate_limit_error — upstream is rate limited",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(true);
+  });
+
+  it("still classifies a transcript-only 503 when no result event ever arrived", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: "API Error: 503 upstream temporarily unavailable",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not invent a transient label when the no-result transcript is clean", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: '{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}',
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("isClaudeTransientUpstreamError", () => {

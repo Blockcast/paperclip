@@ -402,8 +402,15 @@ function buildClaudeTransientHaystack(input: {
  * whose terminal event carries `api_error_status: 403` were labelled
  * `claude_transient_upstream` off tokens present only in the transcript — buying
  * paid retries for an authorization that cannot succeed. Narrowing costs no
- * detection: this classifier is only reachable once a `result` event exists, and
- * every 429 (9/9) and 503 (6/6) in that corpus keeps its signal on these surfaces.
+ * detection on that population: every 429 (9/9) and 503 (6/6) in that corpus
+ * keeps its signal on these surfaces.
+ *
+ * This builder is for the terminal-result case ONLY, and its caller selects it on
+ * `parsed` being present. In THIS adapter (unlike the k8s twin) the classifier is
+ * also reachable with `parsed: null`, from the `!parsed` fallback in
+ * `execute.ts`; applying this builder there would leave only `errorMessage` and
+ * `stderr` and would lose a stdout-only transient signal. That path keeps the wide
+ * builder deliberately.
  *
  * `result` is deliberately NOT gated on a non-`success` subtype the way
  * `isClaudeSkillNotFoundError` gates it: a genuine upstream refusal arrives as
@@ -662,7 +669,17 @@ export function isClaudeTransientUpstreamError(input: {
   });
   if (loginMeta.requiresLogin) return false;
 
-  const haystack = buildClaudeTerminalResultHaystack(input);
+  // Only a run that produced a terminal `result` event has bounded surfaces worth
+  // narrowing to. `execute.ts`'s `!parsed` fallback calls this with `parsed: null`
+  // when the CLI died without emitting one; there `result`, `errors[]` and
+  // `api_error_status` are all empty, so the narrowed haystack would be reduced to
+  // `errorMessage` + `stderr` and would silently drop a transient signal that only
+  // ever reached stdout. Keep the wide transcript haystack on that path: the
+  // transcript is the only evidence it has, and the defect this rule fixes cannot
+  // occur there (it is defined by an `api_error_status` that requires `parsed`).
+  const haystack = parsed
+    ? buildClaudeTerminalResultHaystack(input)
+    : buildClaudeTransientHaystack(input);
   if (!haystack) return false;
   if (isClaudeProviderQuotaError(input)) return false;
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
