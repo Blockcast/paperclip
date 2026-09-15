@@ -77,6 +77,30 @@ const PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS = 5 * 60 * 1000;
  * block below (BLO-19566 AC4).
  */
 export const PRODUCTIVITY_REVIEW_PR_FRESH_MS = 24 * 60 * 60 * 1000;
+/**
+ * BLO-27698 A3: window in which an assignee `Next action:` comment counts as a
+ * live progress signal, matching the "in the last 6h" wording in the Manager
+ * Decision block below.
+ *
+ * Deliberately its own constant rather than `thresholds.longActiveMs`. Those two
+ * numbers happen to share the 6h default, but they answer different questions —
+ * one is the bar an episode must cross to be *reviewed*, the other is how far
+ * back evidence stays *relevant*. Keying the evidence lookback off the trigger
+ * bar meant raising the bar silently widened the search, so an operator tuning
+ * `longActiveMs` up to 12h would also, invisibly, have started accepting 12h-old
+ * comments as current. Not overridable: it tracks the rubric text a human
+ * reviewer is asked to apply, so drifting it out of step with that wording would
+ * make the printed criterion and the evaluated one disagree.
+ */
+export const PRODUCTIVITY_REVIEW_NEXT_ACTION_COMMENT_FRESH_MS = 6 * 60 * 60 * 1000;
+/**
+ * BLO-27698 A2: window in which an issue the assignee filed against this one
+ * counts as a progress signal. Shared with `PRODUCTIVITY_REVIEW_PR_FRESH_MS` by
+ * intent, not coincidence — A2 suppresses "on the same terms as A1", so the two
+ * deliverable-shaped progress signals must age out together. A reader comparing
+ * the two gates should not have to check whether 24h means the same 24h.
+ */
+const PRODUCTIVITY_REVIEW_LINKED_ISSUE_FRESH_MS = PRODUCTIVITY_REVIEW_PR_FRESH_MS;
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 // BLO-25410: NOT a lock predicate — this only counts recent runs for the review
 // narrative (`activeRunCount`), and never decides whether an issue is
@@ -3152,15 +3176,25 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => rows[0]?.count ?? 0);
   }
 
+  /**
+   * Newest assignee comment carrying a `Next action:` line, within
+   * `PRODUCTIVITY_REVIEW_NEXT_ACTION_COMMENT_FRESH_MS`.
+   *
+   * Returns the row rather than a bare string because BLO-27698 A3 gives this
+   * signal a caller in the generation path, and that caller needs one fact the
+   * string cannot carry: whether the comment is **run-linked**. The Manager
+   * Decision rubric asks for "an assignee run-linked comment in the last 6h",
+   * and suppression must apply the criterion as written — see the gate in
+   * `collectEvidence` for why the unlinked case is reported but not acted on.
+   */
   async function findCommentNextAction(
     sourceIssue: IssueRow,
     sourceAgent: AgentRow,
-    thresholds: ProductivityReviewThresholds,
     now: Date,
-  ) {
-    const lookbackStart = new Date(now.getTime() - thresholds.longActiveMs);
+  ): Promise<{ line: string; runLinked: boolean } | null> {
+    const lookbackStart = new Date(now.getTime() - PRODUCTIVITY_REVIEW_NEXT_ACTION_COMMENT_FRESH_MS);
     const rows = await db
-      .select({ body: issueComments.body })
+      .select({ body: issueComments.body, createdByRunId: issueComments.createdByRunId })
       .from(issueComments)
       .where(
         and(
@@ -3174,9 +3208,100 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
       .limit(MAX_NEXT_ACTION_COMMENT_CANDIDATES);
 
-    return rows
-      .map((comment) => extractNextActionFromText(comment.body))
-      .find((line): line is string => Boolean(line)) ?? null;
+    for (const comment of rows) {
+      const line = extractNextActionFromText(comment.body);
+      // The regex above is a cheap *candidate* filter; `extractNextActionFromText`
+      // is what actually decides a comment states a next action. Only the latter
+      // may be treated as the signal — otherwise a comment merely containing the
+      // words would suppress a review.
+      if (line) return { line, runLinked: comment.createdByRunId !== null };
+    }
+    return null;
+  }
+
+  /**
+   * BLO-27698 A2: an issue the assignee filed against this one during the
+   * episode, as a progress signal.
+   *
+   * Decomposing a too-large issue, or filing the human row that a blocker needs,
+   * is deliverable work — but it leaves no trace in any signal this detector
+   * reads. The work-product query is hard-scoped `type = "pull_request"`, so an
+   * assignee who decomposes on contact with a blocker scored exactly zero and
+   * looked identical to one doing nothing.
+   *
+   * "References the source issue" is read **structurally** — a parent link or an
+   * `issue_relations` edge in either direction — never by matching the source
+   * identifier in free text. An identifier is quoted in ordinary prose all the
+   * time (this very comment does it), so a text match would let an assignee
+   * suppress its own review by mentioning the issue it is already working on.
+   * Both structural forms are load-bearing and neither subsumes the other:
+   * decomposition writes `parentId`, while follow-up work the source blocks
+   * writes a relation edge and no parent.
+   *
+   * Restricted to `originKind = 'manual'`, which is the single most important
+   * line in this function. The productivity review row is ITSELF written as a
+   * child of the source issue with `createdByAgentId` set to the assignee, so
+   * without this filter a generated review would satisfy A2 and suppress the
+   * next one — the detector would switch itself off 24h after firing once, which
+   * is precisely the indefinite-suppression hazard BLO-22331 AC2 forbids. Three
+   * existing `assignment wake` replay tests caught exactly this.
+   *
+   * An allowlist rather than a denylist of known platform origins, so that a
+   * recovery/routine/plugin origin kind added later is excluded by default: the
+   * failure direction is then "a review still generates", not "the detector went
+   * quiet for a reason nobody can see".
+   */
+  async function findFreshLinkedProgressIssue(
+    sourceIssue: IssueRow,
+    sourceAgent: AgentRow,
+    episodeStartAt: Date | null,
+    now: Date,
+  ) {
+    // Bounded by construction, per BLO-22331 AC2. The episode bound alone would
+    // NOT be bounded: an episode grows without limit, so one sub-issue filed in
+    // its first hour would suppress every review for the rest of the episode,
+    // however long. Intersecting it with the same 24h freshness bar A1 uses is
+    // what makes the signal age out.
+    const freshCutoff = new Date(now.getTime() - PRODUCTIVITY_REVIEW_LINKED_ISSUE_FRESH_MS);
+    const createdSince = episodeStartAt && episodeStartAt.getTime() > freshCutoff.getTime()
+      ? episodeStartAt
+      : freshCutoff;
+    const rows = await db
+      .select({ id: issues.id, identifier: issues.identifier, title: issues.title, createdAt: issues.createdAt })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, sourceIssue.companyId),
+          eq(issues.createdByAgentId, sourceAgent.id),
+          eq(issues.originKind, "manual"),
+          // A soft-deleted row is not a deliverable, and a `harnessKind` row is
+          // test scaffolding. Reuses the shared predicate rather than restating
+          // `hidden_at is null`, so this ages with the visibility rule.
+          visibleIssueCondition(),
+          // Progress-*eligibility*, mirroring `isProgressPullRequest`: A1 keys on
+          // status rather than mere freshness, so that a PR the assignee closed
+          // without merging is not progress however recently it moved. A sub-issue
+          // filed and then cancelled is the same shape. `done` is deliberately
+          // still eligible — completed work is the strongest progress there is.
+          sql`${issues.status} <> 'cancelled'`,
+          sql`${issues.id} <> ${sourceIssue.id}`,
+          sql`${issues.createdAt} >= ${createdSince.toISOString()}::timestamptz`,
+          or(
+            eq(issues.parentId, sourceIssue.id),
+            sql`exists (
+              select 1 from ${issueRelations} r
+              where r.company_id = ${sourceIssue.companyId}
+                and (
+                  (r.issue_id = ${issues.id} and r.related_issue_id = ${sourceIssue.id})
+                  or (r.issue_id = ${sourceIssue.id} and r.related_issue_id = ${issues.id})
+                )
+            )`,
+          ),
+        ),
+      )
+      .orderBy(desc(issues.createdAt), desc(issues.id))
+      .limit(1);
+    return rows[0] ?? null;
   }
 
   async function collectEvidence(
@@ -3701,6 +3826,46 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       return null;
     }
 
+    // BLO-19604: `run.nextAction` is only populated when that specific run's own
+    // liveness classification saw the text. Computed here — above the two gates
+    // below rather than at its point of use further down — because it is a pure
+    // scan of already-loaded rows, and hoisting it lets the comment query below
+    // stay lazy for the callers that never needed it.
+    const structuredNextAction = latestRuns.find((run) => run.nextAction)?.nextAction ?? null;
+
+    // BLO-27698 A3: the comment progress signal, evaluated rather than only
+    // printed. The Manager Decision rubric has told reviewers for three releases
+    // that a run-linked `Next action:` comment in the last 6h means "close as
+    // productive", while no code read it — so an assignee that posted exactly the
+    // artifact the rubric asks for still had the review generated against it.
+    //
+    // Queried here (not at the `nextAction` fallback below) because the gate needs
+    // it whether or not the structured field is populated: `run.nextAction` has no
+    // freshness bound of its own, so a stale structured value must not stand in
+    // for a fresh comment. Kept lazy for every other trigger, which is the access
+    // pattern the fallback below was written for.
+    const nextActionComment = trigger === "long_active_duration" || !structuredNextAction
+      ? await findCommentNextAction(sourceIssue, sourceAgent, now)
+      : null;
+    // Run-linked only, exactly as the rubric words it. An assignee comment with no
+    // `createdByRunId` is still *reported* (the fallback below prints it), but it
+    // is not evidence that a turn happened — and this gate's whole claim is that
+    // the assignee attended the issue. Bounded per BLO-22331 AC2 by the 6h window:
+    // stop commenting and the trigger fires, so this cannot suppress indefinitely.
+    if (trigger === "long_active_duration" && nextActionComment?.runLinked) {
+      return null;
+    }
+
+    // BLO-27698 A2: an issue filed against this one during the episode is
+    // deliverable progress on the same terms as a fresh PR. Structural edges only
+    // — see `findFreshLinkedProgressIssue`.
+    const linkedProgressIssue = trigger === "long_active_duration"
+      ? await findFreshLinkedProgressIssue(sourceIssue, sourceAgent, attributableStartAt, now)
+      : null;
+    if (linkedProgressIssue) {
+      return null;
+    }
+
     // BLO-25877: computed once here — after both suppression gates above have had
     // their chance to hold this review back — and reused as-is for the report-text
     // field further down, rather than recomputed there.
@@ -3729,23 +3894,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       return null;
     }
 
-    // BLO-19604: `run.nextAction` is only populated when that specific run's own
-    // liveness classification saw the text (e.g. a comment posted after that run had
-    // already been classified is invisible to it). Before reporting "none recorded" —
-    // which reads as "the assignee left no next step" — fall back to scanning the
-    // assignee's own recent comments directly, the same way run-liveness classification
-    // would have. This is a genuine fallback, not just a relabelled null: it recovers a
-    // `Next action:`/`Next:` line the structured field missed. Sourced from
-    // `findCommentNextAction` (queried directly against `issueComments`, no join on
-    // `heartbeatRuns`) rather than `latestComments`, since a plain assignee comment with no
-    // `createdByRunId` is exactly the kind of comment this fallback exists to recover, and
-    // `latestComments`'s inner join excludes it. Keep that fallback lazy and projected: the
-    // common structured path should not transfer or parse the assignee's full comment window.
-    const structuredNextAction = latestRuns.find((run) => run.nextAction)?.nextAction ?? null;
-    const commentNextAction = structuredNextAction
-      ? null
-      : await findCommentNextAction(sourceIssue, sourceAgent, thresholds, now);
-    const nextAction = structuredNextAction ?? commentNextAction;
+    // BLO-19604: before reporting "none recorded" — which reads as "the assignee
+    // left no next step" — fall back to the assignee's own recent comments, the
+    // same way run-liveness classification would have. This is a genuine fallback,
+    // not a relabelled null: it recovers a `Next action:`/`Next:` line the
+    // structured field missed. Sourced from `findCommentNextAction` (queried
+    // directly against `issueComments`, no join on `heartbeatRuns`) rather than
+    // `latestComments`, since a plain assignee comment with no `createdByRunId` is
+    // exactly the kind this fallback exists to recover, and `latestComments`'s
+    // inner join excludes it. That unlinked case is why the A3 gate above checks
+    // `runLinked` while this line does not: reporting a next action is useful to a
+    // reviewer at a lower bar than suppressing the review outright.
+    const nextAction = structuredNextAction ?? nextActionComment?.line ?? null;
 
     // Queued-but-never-dispatched runs are excluded from the elapsed-time figure but
     // reported explicitly, so a reviewer has an explanation for why the episode looks
