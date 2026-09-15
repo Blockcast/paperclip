@@ -74,9 +74,21 @@ const approvalPayloadSchema = z.object({
     "confirmed instances, one of which left every one of 8 budget changes unapplied for 5 days " +
     "while the affected agent approached an auto-pause. Prose alone cannot be checked. Shape: " +
     '`enforcement_assertions: [{ kind: "budget_policy_amount", policyId: "<uuid>", ' +
-    'expected_usd: 32000, label: "CTO" }]` (or `expected_amount_cents`). Today only ' +
-    "`budget_policy_amount` is checked; unknown kinds are ignored, so declaring one is never " +
-    "harmful and becomes useful when its resolver lands.",
+    'expected_usd: 32000, from_usd: 19000, label: "CTO" }]` (`expected_amount_cents` / ' +
+    "`from_amount_cents` also accepted). `policyId` is a `budget_policies.id`, NOT an agent id. " +
+    "Record the starting figure (`from_usd`) when you have it — it is retained on the card so a " +
+    "later reader can tell a decision that was never applied from one that was applied and then " +
+    "superseded — but nothing reads it yet, so never invent one. The `enforcement_assertions` " +
+    "array itself is REQUIRED, not " +
+    "advisory, for `budget_override_required` — a card of that type carrying no parseable " +
+    "assertion is refused with `budget_approval_missing_enforcement_assertion` (BLO-34008) on " +
+    "both creation and resubmit, because approving one writes nothing to `budget_policies` and " +
+    "an undeclared figure is therefore unverifiable forever. Resubmit is checked against the " +
+    "payload that will end up pending, so a card filed before this guard existed cannot return " +
+    "to `pending` on an empty resubmit body — send a corrected payload. The budget watcher's own " +
+    "threshold cards are exempt: they record that a cap was crossed, not a figure to raise it to. " +
+    "For every other type it " +
+    "stays optional; today only `budget_policy_amount` is checked, and unknown kinds are ignored.",
 );
 
 export const createApprovalSchema = z.object({

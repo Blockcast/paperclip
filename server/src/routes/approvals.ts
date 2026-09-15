@@ -21,6 +21,10 @@ import {
 } from "../services/index.js";
 import { actorCanReadAgentConfig, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { redactApprovalPayloadForDisplay, withholdAgentConfigFromApprovalPayload } from "../redaction.js";
+import {
+  BUDGET_POLICY_AMOUNT_ASSERTION,
+  extractEnforcementAssertions,
+} from "../services/approval-enforcement-reconciler.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
 import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
@@ -77,6 +81,69 @@ function approvalResolutionResponse<T extends { type: string; payload: Record<st
 // Deliberately create-only: resubmit/withdraw/comment never pass a requested type, so they stay
 // barred regardless of the target approval's type.
 const BOARD_ESCALATION_APPROVAL_TYPE = "request_board_approval";
+
+// BLO-34008: refuse a budget card that declares no machine-checkable target.
+//
+// Approving this type writes nothing to `budget_policies` — approvalService
+// .approve() special-cases only `hire_agent` — so the only thing that can ever
+// notice an approved-but-unapplied budget decision is the enforcement reconciler,
+// and it can only see a card that declares its figures. Card `304ea443` is the
+// cost of accepting one that does not: its eight decided figures went into
+// `payload.raises`/`payload.cuts` as prose keyed by agent display name, it was
+// approved, and all eight changes were still unapplied five days later with
+// nothing able to raise a word. It remains unparseable and always will be.
+// Refusing is the only repair that does not reduce to regexing a figure out of
+// English, which BLO-32796's first guardrail forbids outright.
+//
+// Shared by create and resubmit because the guard has to hold on every route that
+// can leave a card `pending`, not just the one that files it. Resubmit replaces the
+// payload wholesale and returns the card to `pending`, so guarding creation alone
+// left the whole failure mode reachable in two calls: file a compliant card, have
+// the board send it back, then resubmit it prose-only and have it approved.
+//
+// Deliberately scoped to caller-supplied payloads. The budget watcher's own
+// threshold cards are filed through insertApproval() (services/budgets.ts) and
+// reach neither route — correctly, because such a card records that a cap was
+// *crossed*, not a decided figure to raise it *to*. There is no target to declare
+// until the board writes one at /costs, and inventing one here would be precisely
+// the guess this refusal exists to prevent.
+function budgetAssertionRefusal(type: string, payload: unknown) {
+  if (type !== "budget_override_required") return null;
+  if (extractEnforcementAssertions(payload).length > 0) return null;
+
+  return {
+    error:
+      "`budget_override_required` requires at least one machine-checkable entry in " +
+      "`payload.enforcement_assertions`; prose figures cannot be verified against enforcement",
+    details: {
+      code: "budget_approval_missing_enforcement_assertion",
+      // The `enforcement_assertions` fragment to merge into the payload — not a
+      // whole card. The refusal has to be fixable in a single retry: these cards
+      // are filed when a cap is about to stop an agent, so a guard that costs a
+      // round of guesswork is its own outage. `policyId` is the one field the
+      // server cannot supply, so it is spelled to be unusable rather than
+      // plausible: a copied placeholder passes here and is then refused by the
+      // reconciler as `missing_policy`, which is coverage in name only.
+      example_assertions: [
+        {
+          kind: BUDGET_POLICY_AMOUNT_ASSERTION,
+          policyId: "<replace with the budget_policies.id uuid>",
+          expected_usd: 32000,
+          from_usd: 19000,
+          label: "CTO",
+        },
+      ],
+      remediation:
+        "Add one entry per policy this decision changes, under `payload.enforcement_assertions`. " +
+        "`policyId` is a `budget_policies.id` uuid — NOT an agent id; read it from the budget " +
+        "policy that enforces the cap. Give the target as `expected_usd` (dollars) or " +
+        "`expected_amount_cents` (integer cents). If you have the figure the change starts from, " +
+        "record it as `from_usd` / `from_amount_cents`: it is retained on the card so a later " +
+        "reader can tell 'never applied' from 'applied and then superseded'. Nothing reads it " +
+        "yet, so never invent one — only the target is required.",
+    },
+  };
+}
 
 function statusOnlyEscalationSourceIssueId(contextSnapshot: unknown): string | null {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
@@ -432,6 +499,12 @@ export function approvalRoutes(
       return;
     }
 
+    const budgetRefusal = budgetAssertionRefusal(approvalInput.type, normalizedPayload);
+    if (budgetRefusal) {
+      res.status(422).json(budgetRefusal);
+      return;
+    }
+
     const actor = getActorInfo(req);
     const requestedByAgentId = actor.actorType === "agent" ? actor.actorId : null;
     const requestedByUserId = actor.actorType === "user" ? actor.actorId : null;
@@ -655,6 +728,41 @@ export function approvalRoutes(
         normalizedPayload = { ...normalizedPayload, agentId: existing.linkedAgentId };
       }
     }
+    // Guard the payload that will actually end up `pending`. `svc.resubmit()` keeps
+    // the existing one when the caller supplies none, so checking only the supplied
+    // payload would let a card filed before this guard existed — every one of them,
+    // including `304ea443` — walk back to `pending` unverifiable on an empty body.
+    //
+    // Two carve-outs, both from Ally's review of `ee43166`:
+    //
+    // Status first, because only a `revision_requested` card can reach `pending`.
+    // Anything else fails in `svc.resubmit()` on status, and answering that with an
+    // assertion complaint points the caller at the wrong problem. The transactional
+    // check in the service stays authoritative; this only picks the error.
+    //
+    // Then: the stored-payload half must not apply to the budget watcher's own
+    // threshold cards. Those record that a cap was *crossed*, not a figure to raise
+    // it *to*, so they have no target to declare — the same reason creation exempts
+    // them (they are filed through insertApproval() and never reach that route).
+    // Applying it here refused the board's only resubmit affordance (ApprovalDetail
+    // sends no payload) for a card no payload can satisfy, leaving it recoverable
+    // only by API — and both `budget_override_required` cards sitting in
+    // `revision_requested` today are watcher cards. Server-filed is not forgeable:
+    // the create route derives requester identity from the authenticated actor and
+    // always populates exactly one of the two columns, so both-null means
+    // insertApproval(). A *supplied* payload is still checked — an operator who
+    // states a figure has stated one that must be verifiable.
+    const serverFiled = !existing.requestedByAgentId && !existing.requestedByUserId;
+    const skipBudgetGuard =
+      existing.status !== "revision_requested" || (serverFiled && normalizedPayload === undefined);
+    const budgetRefusal = skipBudgetGuard
+      ? null
+      : budgetAssertionRefusal(existing.type, normalizedPayload ?? existing.payload);
+    if (budgetRefusal) {
+      res.status(422).json(budgetRefusal);
+      return;
+    }
+
     const approval = await svc.resubmit(id, normalizedPayload);
     const actor = getActorInfo(req);
     await logActivity(db, {
