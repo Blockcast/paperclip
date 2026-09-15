@@ -242,12 +242,15 @@ describe("buildGithubTruthProbe", () => {
     expect(r).toEqual({ detections: {}, diagnostics: ["no-linked-pull-request"], probeFailed: false });
   });
 
-  it("more than 5 linked PRs → probes the 5 highest, names the rest, and fails the probe", async () => {
+  it("more than 5 linked PRs → probes the 5 highest, names the rest, and withholds every detection", async () => {
     const many = [1, 2, 3, 4, 5, 6].map((n) => wp({ prNumber: n, merged: true }));
     const r = await buildGithubTruthProbe(deps())({ workProducts: many });
     expect(r.diagnostics).toContain("too-many-linked-prs:6:skipped=Blockcast/paperclip#1");
     // An unread PR could be the unmerged one, so a capped read cannot claim
-    // the whole set landed.
+    // the whole set landed. All six here ARE merged, so without the cap guard
+    // the surviving five would set `deploy:landed` and read as a full landing —
+    // `probeFailed` does not stop that, because it never reaches the `pass` path.
+    expect(r.detections).toEqual({});
     expect(r.probeFailed).toBe(true);
   });
 

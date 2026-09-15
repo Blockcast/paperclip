@@ -121,6 +121,11 @@ export const DEFAULT_EVIDENCE_REGISTRY: EvidenceRegistry = {
  * themselves change the verdict: an unlabeled issue missing them still only
  * warns, unless `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK` is on AND the probe
  * actually established truth — see `unlabeledTruthBlock` in `evidence-gate.ts`.
+ *
+ * And even then the flag reaches only `review:ally-clean`. A gap of solely
+ * `deploy:landed` warns at every flag setting, because the gate runs on the
+ * transition INTO `in_review`, where a merged PR is unsatisfiable by
+ * construction — see `BLOCKABLE_TRUTH_SHAPES` in `evidence-gate.ts`.
  */
 export const DEFAULT_UNLABELED_REQUIRED: EvidenceShape[] = [
   "checklist:done-when",

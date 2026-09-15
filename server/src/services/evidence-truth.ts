@@ -223,7 +223,8 @@ export function buildGithubTruthProbe(
     let probeFailed = false;
     const sorted = [...all].sort((a, b) => b.prNumber - a.prNumber);
     const refs = sorted.slice(0, MAX_LINKED_PRS);
-    if (sorted.length > MAX_LINKED_PRS) {
+    const capped = sorted.length > MAX_LINKED_PRS;
+    if (capped) {
       // A skipped PR could be the unmerged or unreviewed one, so a capped read
       // cannot honestly claim the set landed clean. Name what was dropped —
       // silent truncation reads as full coverage.
@@ -264,8 +265,17 @@ export function buildGithubTruthProbe(
     const detections: Partial<Record<EvidenceShape, boolean>> = {};
     // Every linked PR must satisfy the shape. One unmerged PR means the work
     // is not fully landed, and the issue should not read as though it were.
-    if (result.every((r) => r.merged)) detections["deploy:landed"] = true;
-    if (result.every((r) => r.clean)) detections["review:ally-clean"] = true;
+    //
+    // Withheld entirely on a capped read, for the reason the cap guard states:
+    // the top 5 landing clean says nothing about the PR that was never read.
+    // `probeFailed` alone does not cover this — it suppresses the escalation
+    // branch, not the `pass` path, so an empty `missing` still passes. Narrow to
+    // the cap on purpose: an individual `probeOne` failure is already safe,
+    // since its result stays `merged: false, clean: false` and fails `every`.
+    if (!capped) {
+      if (result.every((r) => r.merged)) detections["deploy:landed"] = true;
+      if (result.every((r) => r.clean)) detections["review:ally-clean"] = true;
+    }
     return { detections, diagnostics, probeFailed };
   };
 }
