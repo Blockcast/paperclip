@@ -1,3 +1,4 @@
+import { REDACTED_SENTINEL } from "@paperclipai/shared";
 import type { CompanySecret, EnvBinding, SecretVersionSelector, UserSecretDefinition } from "@paperclipai/shared";
 
 export type RowSource = "text" | "secret" | "user_secret";
@@ -15,6 +16,20 @@ export interface EnvRow {
   version: SecretVersionSelector;
   /** Session-local dismissal of the sensitive-value suggestion (§6.6). */
   sensitiveDismissed?: boolean;
+  /**
+   * The server withheld this row's value (PEN-3033): `textValue` holds
+   * {@link REDACTED_SENTINEL}, not anything the user typed or is entitled to.
+   *
+   * Set once at {@link rowsFromValue} rather than re-derived by comparing `textValue` at each use
+   * site, for two reasons. First, a user whose literal value happens to equal the sentinel would
+   * otherwise have their real binding treated as withheld. Second, and the reason it is a field
+   * rather than a helper: every consumer that treats `textValue` as *the user's value* has to ask
+   * this question, and a flag on the row makes forgetting to ask visible at the type level in a way
+   * that an easily-omitted `isMasked(row)` call does not.
+   *
+   * Cleared the moment the user edits the value — at that point `textValue` is theirs again.
+   */
+  masked?: boolean;
 }
 
 let rowCounter = 0;
@@ -70,7 +85,7 @@ export function rowsFromValue(value: Record<string, EnvBinding> | null | undefin
   if (!value || typeof value !== "object") return [];
   return Object.entries(value).map(([name, binding]) => {
     if (typeof binding === "string") {
-      return { ...emptyRow(), name, textValue: binding };
+      return { ...emptyRow(), name, textValue: binding, masked: binding === REDACTED_SENTINEL };
     }
     if (isSecretRef(binding)) {
       const version: SecretVersionSelector = typeof binding.version === "number" ? binding.version : "latest";
@@ -94,11 +109,16 @@ export function rowsFromValue(value: Record<string, EnvBinding> | null | undefin
       };
     }
     if (isPlainObj(binding)) {
+      const value = typeof binding.value === "string" ? binding.value : "";
       return {
         ...emptyRow(),
         name,
         source: "text" as const,
-        textValue: typeof binding.value === "string" ? binding.value : "",
+        textValue: value,
+        // Keep the sentinel in `textValue`: `valueFromRows` re-emits every row on save and the
+        // server's `restoreMaskedEnvBindings` matches on it to merge the stored value back. The
+        // flag is what stops the rest of the editor treating it as the user's own value.
+        masked: value === REDACTED_SENTINEL,
       };
     }
     return { ...emptyRow(), name };
@@ -190,7 +210,7 @@ export type SourceSwitchPlan =
   | { kind: "noop" }
   /** Text → Secret with a non-empty value: never discard it — open Store-as-secret. */
   | { kind: "open-store"; name: string; value: string }
-  /** Text → Secret with an empty value: switch and open the picker. */
+  /** Text → Secret with an empty or withheld value: switch and open the picker. */
   | { kind: "to-secret" }
   /** Secret → Text: clear the ref; offer undo when a secret was bound. */
   | { kind: "to-text"; undoFrom: EnvRow | null };
@@ -198,12 +218,29 @@ export type SourceSwitchPlan =
 export function planSourceSwitch(row: EnvRow, next: RowSource): SourceSwitchPlan {
   if (next === row.source) return { kind: "noop" };
   if (next === "secret") {
-    if (row.textValue.trim()) {
+    // A withheld row is the EMPTY case, not the non-empty one. `textValue` holds the sentinel, and
+    // `open-store` would pre-fill it into a read-only field and create a company secret holding the
+    // placeholder — silently destroying the very binding the mask exists to protect (the mask is
+    // read-only from the client's side, so there is nothing here it is entitled to store). Route to
+    // the picker instead: binding an existing secret is the one convert that is still meaningful.
+    if (!row.masked && row.textValue.trim()) {
       return { kind: "open-store", name: secretNameFromKey(row.name) || "secret", value: row.textValue };
     }
     return { kind: "to-secret" };
   }
   return { kind: "to-text", undoFrom: row.secretId ? { ...row } : null };
+}
+
+/**
+ * Whether a row's `textValue` is the user's to store as a secret.
+ *
+ * The editor reaches `onCreateSecret` from three places — the source switch, the sensitive-value
+ * suggestion, and the ⋯ menu — and each one independently decided to trust `textValue`. This is the
+ * single question all three must ask, so that a fourth entry point added later is a call to a named
+ * predicate rather than another open-coded `row.textValue` read.
+ */
+export function canStoreValueAsSecret(row: EnvRow): boolean {
+  return row.source === "text" && !row.masked && row.textValue.trim().length > 0;
 }
 
 export interface SecretHealth {
