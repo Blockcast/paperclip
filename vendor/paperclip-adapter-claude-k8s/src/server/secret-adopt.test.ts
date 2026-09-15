@@ -59,6 +59,9 @@ function makeCoreApi(overrides: Partial<Record<string, ReturnType<typeof vi.fn>>
   const api = {
     createNamespacedSecret: vi.fn().mockResolvedValue({}),
     readNamespacedSecret: vi.fn(),
+    patchNamespacedSecret: vi.fn().mockResolvedValue({}),
+    // Kept wired so the merge-PATCH test can assert the PUT is NOT used.
+    // Removing it would make that assertion vacuously pass on `undefined`.
     replaceNamespacedSecret: vi.fn().mockResolvedValue({}),
     ...overrides,
   };
@@ -140,13 +143,125 @@ describe("createOrAdoptRunSecret", () => {
 
     await expect(createOrAdoptRunSecret(coreApi, INPUT)).resolves.toBe("adopted");
 
-    expect(coreApi.replaceNamespacedSecret).toHaveBeenCalledTimes(1);
-    const call = coreApi.replaceNamespacedSecret.mock.calls[0][0];
+    expect(coreApi.patchNamespacedSecret).toHaveBeenCalledTimes(1);
+    const call = coreApi.patchNamespacedSecret.mock.calls[0][0];
     expect(call.name).toBe(NAME);
-    // resourceVersion must be carried through, or the replace races blind.
+    // resourceVersion must be carried through, or the write races blind.
     expect(call.body.metadata.resourceVersion).toBe("12345");
     expect(call.body.metadata.labels[RUN_ID_LABEL]).toBe(RUN_ID);
     expect(call.body.stringData).toEqual({ FOO: "bar" });
+  });
+
+  it("writes the adoption as a merge PATCH, because the SA has no `update` verb", async () => {
+    // BLO-32424. This is the load-bearing assertion of that fix, and it is
+    // about the HTTP verb, not about a race. `replaceNamespacedSecret` is a
+    // PUT == the `update` verb, and the adapter's service account was measured
+    // holding create/patch/delete/get on secrets but NOT update:
+    //
+    //   secrets create -> true   secrets update -> false
+    //   secrets patch  -> true   (control: zzzfakeres update -> false)
+    //
+    // so the old replace returned 403 on EVERY collision, deterministically,
+    // never reaching the races the rest of this file guards. Two live agents
+    // were failing to launch on exactly that. If someone reverts to a PUT, or
+    // drops the explicit Content-Type (the client's default for patch is
+    // json-patch+json, which would reject this object body), this fails.
+    const coreApi = makeCoreApi({
+      createNamespacedSecret: vi.fn().mockRejectedValue(apiException(409, "AlreadyExists")),
+      readNamespacedSecret: vi.fn().mockResolvedValue({
+        metadata: { name: NAME, resourceVersion: "12345", labels: { [RUN_ID_LABEL]: RUN_ID } },
+      }),
+    });
+
+    await expect(createOrAdoptRunSecret(coreApi, INPUT)).resolves.toBe("adopted");
+
+    expect(coreApi.replaceNamespacedSecret).not.toHaveBeenCalled();
+
+    // `setHeaderOptions` returns middleware closures, so the header is only
+    // observable by running them. The middleware does nothing but call
+    // `setHeaderParam`, so a two-line stub is the whole harness.
+    const [, options] = coreApi.patchNamespacedSecret.mock.calls[0];
+    const headers: Record<string, string> = {};
+    for (const mw of options.middleware) {
+      mw.pre({ setHeaderParam: (k: string, v: string) => void (headers[k] = v) });
+    }
+    expect(headers["Content-Type"]).toBe("application/merge-patch+json");
+  });
+
+  it("re-creates when the Secret is deleted between the read and the adoption write", async () => {
+    // AC1. The reaper freeing the name in the read->write gap used to throw
+    // from inside `catch`, escaping the retry loop entirely and surfacing as
+    // the very k8s_*_secret_create_failed the adoption path exists to prevent.
+    const create = vi.fn().mockRejectedValueOnce(apiException(409, "AlreadyExists")).mockResolvedValueOnce({});
+    const coreApi = makeCoreApi({
+      createNamespacedSecret: create,
+      readNamespacedSecret: vi.fn().mockResolvedValue({
+        metadata: { name: NAME, resourceVersion: "12345", labels: { [RUN_ID_LABEL]: RUN_ID } },
+      }),
+      patchNamespacedSecret: vi.fn().mockRejectedValueOnce(apiException(404, "NotFound")),
+    });
+
+    await expect(createOrAdoptRunSecret(coreApi, INPUT)).resolves.toBe("recreated");
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-reads and retries when the carried resourceVersion has gone stale", async () => {
+    // AC2. A concurrent writer bumps resourceVersion, so the optimistic-
+    // concurrency precondition fails 409. Correct move is to re-read the fresh
+    // version and try again inside the same loop — not to die, and not to drop
+    // resourceVersion to dodge the conflict.
+    const create = vi.fn().mockRejectedValue(apiException(409, "AlreadyExists"));
+    const read = vi
+      .fn()
+      .mockResolvedValueOnce({ metadata: { name: NAME, resourceVersion: "1", labels: { [RUN_ID_LABEL]: RUN_ID } } })
+      .mockResolvedValueOnce({ metadata: { name: NAME, resourceVersion: "2", labels: { [RUN_ID_LABEL]: RUN_ID } } });
+    const patch = vi.fn().mockRejectedValueOnce(apiException(409, "Conflict")).mockResolvedValueOnce({});
+    const coreApi = makeCoreApi({
+      createNamespacedSecret: create,
+      readNamespacedSecret: read,
+      patchNamespacedSecret: patch,
+    });
+
+    await expect(createOrAdoptRunSecret(coreApi, INPUT)).resolves.toBe("adopted");
+    expect(read).toHaveBeenCalledTimes(2);
+    // The retry must carry the *fresh* version, else it loses the same race again.
+    expect(patch.mock.calls[1][0].body.metadata.resourceVersion).toBe("2");
+  });
+
+  it("gives up with the original 409 when the adoption write keeps conflicting", async () => {
+    // AC3. The new paths reuse the loop's existing `attempt === 0` bound, so a
+    // permanently-contended name is capped at two passes rather than spinning.
+    // Pinning the counts is what stops a later change raising the budget quietly.
+    const err = apiException(409, "AlreadyExists");
+    const patch = vi.fn().mockRejectedValue(apiException(409, "Conflict"));
+    const coreApi = makeCoreApi({
+      createNamespacedSecret: vi.fn().mockRejectedValue(err),
+      readNamespacedSecret: vi.fn().mockResolvedValue({
+        metadata: { name: NAME, resourceVersion: "1", labels: { [RUN_ID_LABEL]: RUN_ID } },
+      }),
+      patchNamespacedSecret: patch,
+    });
+
+    await expect(createOrAdoptRunSecret(coreApi, INPUT)).rejects.toBe(err);
+    expect(coreApi.createNamespacedSecret).toHaveBeenCalledTimes(2);
+    expect(patch).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed with its own error when the adoption write is neither 404 nor 409", async () => {
+    // AC4. A 403 is the shape actually observed in production before this fix.
+    // It must surface with its own identity, not be laundered into a retry.
+    const boom = new Error("HTTP-Code: 403\nMessage: Forbidden");
+    const create = vi.fn().mockRejectedValue(apiException(409, "AlreadyExists"));
+    const coreApi = makeCoreApi({
+      createNamespacedSecret: create,
+      readNamespacedSecret: vi.fn().mockResolvedValue({
+        metadata: { name: NAME, resourceVersion: "1", labels: { [RUN_ID_LABEL]: RUN_ID } },
+      }),
+      patchNamespacedSecret: vi.fn().mockRejectedValue(boom),
+    });
+
+    await expect(createOrAdoptRunSecret(coreApi, INPUT)).rejects.toBe(boom);
+    expect(create).toHaveBeenCalledTimes(1);
   });
 
   it("adopts an unlabelled Secret written by an older adapter build", async () => {
@@ -159,7 +274,7 @@ describe("createOrAdoptRunSecret", () => {
     });
 
     await expect(createOrAdoptRunSecret(coreApi, INPUT)).resolves.toBe("adopted");
-    expect(coreApi.replaceNamespacedSecret).toHaveBeenCalledTimes(1);
+    expect(coreApi.patchNamespacedSecret).toHaveBeenCalledTimes(1);
   });
 
   it("fails closed when the existing Secret belongs to a different run", async () => {
@@ -171,7 +286,7 @@ describe("createOrAdoptRunSecret", () => {
     });
 
     await expect(createOrAdoptRunSecret(coreApi, INPUT)).rejects.toThrow(/belongs to run some-other-run/);
-    expect(coreApi.replaceNamespacedSecret).not.toHaveBeenCalled();
+    expect(coreApi.patchNamespacedSecret).not.toHaveBeenCalled();
   });
 
   it("fails closed when the existing Secret is managed by something else", async () => {
@@ -183,7 +298,7 @@ describe("createOrAdoptRunSecret", () => {
     });
 
     await expect(createOrAdoptRunSecret(coreApi, INPUT)).rejects.toThrow(/managed by helm/);
-    expect(coreApi.replaceNamespacedSecret).not.toHaveBeenCalled();
+    expect(coreApi.patchNamespacedSecret).not.toHaveBeenCalled();
   });
 
   it("re-creates when the Secret is deleted between the create and the read", async () => {
@@ -201,7 +316,7 @@ describe("createOrAdoptRunSecret", () => {
 
     await expect(createOrAdoptRunSecret(coreApi, INPUT)).resolves.toBe("recreated");
     expect(create).toHaveBeenCalledTimes(2);
-    expect(coreApi.replaceNamespacedSecret).not.toHaveBeenCalled();
+    expect(coreApi.patchNamespacedSecret).not.toHaveBeenCalled();
   });
 
   it("adopts when the re-created name is taken again by a second racer", async () => {
@@ -222,7 +337,7 @@ describe("createOrAdoptRunSecret", () => {
 
     await expect(createOrAdoptRunSecret(coreApi, INPUT)).resolves.toBe("adopted");
     expect(create).toHaveBeenCalledTimes(2);
-    expect(coreApi.replaceNamespacedSecret).toHaveBeenCalledTimes(1);
+    expect(coreApi.patchNamespacedSecret).toHaveBeenCalledTimes(1);
   });
 
   it("gives up with the original 409 rather than spinning on a churning name", async () => {
@@ -236,7 +351,7 @@ describe("createOrAdoptRunSecret", () => {
 
     await expect(createOrAdoptRunSecret(coreApi, INPUT)).rejects.toBe(err);
     expect(coreApi.createNamespacedSecret).toHaveBeenCalledTimes(2);
-    expect(coreApi.replaceNamespacedSecret).not.toHaveBeenCalled();
+    expect(coreApi.patchNamespacedSecret).not.toHaveBeenCalled();
   });
 
   it("rethrows a non-409 create failure untouched", async () => {
@@ -254,6 +369,6 @@ describe("createOrAdoptRunSecret", () => {
     });
 
     await expect(createOrAdoptRunSecret(coreApi, INPUT)).rejects.toThrow(/already exists and could not be read/);
-    expect(coreApi.replaceNamespacedSecret).not.toHaveBeenCalled();
+    expect(coreApi.patchNamespacedSecret).not.toHaveBeenCalled();
   });
 });
