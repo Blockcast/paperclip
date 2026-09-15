@@ -9,7 +9,8 @@ import type {
   WorkspaceOperation,
   WorkspaceRuntimeService,
 } from "@paperclipai/shared";
-import { maskWorkspaceRuntimeForRead, maskWorkspaceRuntimeTextForRead } from "../redaction.js";
+import { isPlainObject, maskWorkspaceRuntimeForRead, maskWorkspaceRuntimeTextForRead } from "../redaction.js";
+import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { accessService } from "../services/index.js";
 
 /**
@@ -119,32 +120,37 @@ import type { accessService } from "../services/index.js";
  *  - `stdoutExcerpt` / `stderrExcerpt` / `logRef` on operations — command *output*, not a copy of a
  *    declared-withheld value (CTO Ruling F §4, BLO-33407). Unchanged by this ticket.
  *
- * ### ⚠️ KNOWN OPEN CARRIER, deliberately not closed here — `issues.executionWorkspaceSettings`
+ * ### PEN-3252 — the bypass this module recorded as open, now closed
  *
  * The issue row holds a per-issue override of the SAME two objects the project policy holds:
  * `workspaceStrategy` (the command strings above) and `workspaceRuntime` (the open operator record).
  * `buildReusedExecutionWorkspaceConfigPatchFromIssueSettings` (`services/issues.ts`) copies both
  * straight onto the execution workspace's own config, so they are the same bytes, not merely the
- * same class. It is a raw JSONB column on a row this module has no projection for, and issue
- * responses are SPREADS — so it does not pass this boundary at all. That makes it a BYPASS of the
- * shipped boundary rather than a gap in this mask's width.
+ * same class. It is a raw JSONB column on a row this module had no projection for, and issue
+ * responses are SPREADS — so it did not pass this boundary at all. That made it a BYPASS of the
+ * shipped boundary rather than a gap in this mask's width, which is why it was split out of PEN-3073
+ * instead of being masked at one of its twelve sites: masking one of twelve would have read as
+ * closure and been worse than masking none.
  *
- * ⇒ **Tracked as PEN-3252** (filed from this change, with the full twelve-site inventory and a
- * draft of the `publicIssueExecutionWorkspaceSettings` projection that closes it). Anyone reading
- * this module to decide whether the class is closed should read that ticket first.
+ * `publicIssueExecutionWorkspaceSettings` below closes it, applied at all twelve: eleven response
+ * sites in `routes/issues.ts` (`GET /issues/:id`, create ×2, children, PATCH, DELETE, checkout,
+ * release ×2, admin force-release, recovery-actions/resolve) via the `withPublicIssueWorkspaceSettings`
+ * helper there, plus the company-export bundle in `services/company-portability.ts`. The export is the
+ * one exit that OMITS rather than masks, because a bundle is round-trippable and a sentinel would be
+ * imported as a literal command string; see that call site for the reasoning.
  *
- * It is named here, in the module that would otherwise read as having closed the class, because the
- * honest scope of the fix below is "every carrier reachable through a workspace or project row" —
- * NOT "every carrier", and NOT "every workspace-runtime response exit". An unentitled same-company
- * agent still receives raw `workspaceStrategy` command strings and the raw `workspaceRuntime`
- * record from the issue routes; that disclosure is open until PEN-3252 lands, and no claim in this
- * module, its tests, or the change that introduced it should be read as covering it.
+ * With that, the honest scope of this module is every carrier reachable through a workspace row, a
+ * project row, or an issue row. It is still NOT a claim about "every workspace-runtime response exit"
+ * in the product — a carrier on some other row type would bypass this module exactly as the issue
+ * column did, and the lesson of PEN-3252 is that the question to ask of a new exit is "does the
+ * response body pass THROUGH this boundary", not "is the value the same class as one it withholds".
  *
- * The settings column reaches responses from ELEVEN sites in `routes/issues.ts`
- * (`GET /issues/:id`, create ×2, children, PATCH, DELETE, checkout, release ×2, admin force-release,
- * recovery-actions/resolve) plus the company-export bundle, none of which the CI guard covers.
- * Masking one of twelve would read as closure and be worse than masking none — which is why the
- * split is by BYPASS-vs-WIDTH rather than by convenience.
+ * List paths are deliberately untouched and must stay that way: `issueListSelect`
+ * (`services/issues.ts`) already projects `executionWorkspaceSettings` to SQL `null`, so
+ * `GET /issues` and `GET /companies/:companyId/issues` never carry the column in either their compact
+ * or their full branch. An audit that re-derives the inventory from `res.json({...issue})` shapes
+ * alone will flag the full list branch as a thirteenth site; it is not one, and the reason is in the
+ * SELECT rather than in the route.
  */
 
 export interface WorkspaceRuntimeViewer {
@@ -222,6 +228,104 @@ export function publicExecutionWorkspaceStrategy(
       ? {}
       : { teardownCommand: maskWorkspaceRuntimeTextForRead(strategy.teardownCommand) }),
   };
+}
+
+/**
+ * PEN-3252. The per-issue override of the same two objects the project policy holds, closing the
+ * BYPASS this module's header previously recorded as open.
+ *
+ * ## Why this one cannot be a spread, unlike every other projection above
+ *
+ * Every sibling here projects a *typed* row: the type bounds the key set, so `{...row, <overrides>}`
+ * is safe because the only keys that can exist are ones a reviewer classified. `issues.
+ * executionWorkspaceSettings` is a raw `jsonb` column with **no shape guarantee at any layer** —
+ * `packages/db/src/schema/issues.ts` declares `$type<Record<string, unknown>>()`, which Drizzle emits
+ * no runtime check for, and the column has no `DEFAULT` and no `CHECK`
+ * (`packages/db/src/migrations/0027_tranquil_tenebrous.sql`).
+ *
+ * That is not theoretical. The UPDATE writers rebuild the object through
+ * `parseIssueExecutionWorkspaceSettings` and are closed, but the CREATE writer
+ * (`services/issues.ts`, `insert(issues)`) gates on **truthiness only** and stores the caller's value
+ * byte-for-byte. Two callers reach it without a strict schema — the portability import
+ * (`validators/company-portability.ts`, an open `z.record`) and the plugin host
+ * (`services/plugin-host-services.ts`, no runtime validation at all). So the stored value can be a
+ * non-object, can carry unknown top-level keys, can hold a `workspaceStrategy` that is a string or an
+ * array, and can hold a `mode` outside the enum. Children then inherit it verbatim
+ * (`services/issues.ts` spreads the parent row's raw settings). The codebase already assumes this:
+ * migration `0121_instance_scoped_environments.sql` guards its rewrite on
+ * `jsonb_typeof(...) = 'object'`.
+ *
+ * Hence: **enumerate and walk, default to mask.** A key nobody has classified is withheld rather than
+ * disclosed, which is the property the `{...spread}` projections above buy from their types and this
+ * one has to buy from its control flow.
+ *
+ * ## Reuse, not re-derivation
+ *
+ * Normalization is `parseIssueExecutionWorkspaceSettings` — the same parser the write path uses — and
+ * command masking is `publicExecutionWorkspaceStrategy` above. Neither is reimplemented here. A second
+ * implementation of either is exactly how one exit ends up masked and the other not, which is the
+ * failure this series keeps finding; and the parser is what makes the enum/shape normalization below
+ * a single source of truth rather than a copy that can drift from the writer's.
+ *
+ * What crosses intact, and why each is genuinely closed *after* the parser has run:
+ *  - `mode` — the parser emits it only when it matches the known enum (normalizing the two legacy
+ *    aliases) and omits it otherwise, so an unparseable `mode` falls to the mask below.
+ *  - `environmentId` — a UUID foreign key, matching the non-withholding call recorded for
+ *    `config.environmentId`. The parser accepts *any* string here, so the UUID shape is checked
+ *    below rather than assumed: on a typed column the declared type would settle it, and on this
+ *    column it settles nothing. "Being a typed column bounds the KEY SET; it says nothing about the
+ *    VALUE" applies with full force to a column whose type is a compile-time cast.
+ *  - `workspaceStrategy` — only after `parseExecutionWorkspaceStrategy` has dropped it entirely
+ *    unless `type` is one of the four known literals, stripped every key outside the seven the
+ *    shared schema declares, and dropped an out-of-enum `runScope`. What survives is a genuine
+ *    `ExecutionWorkspaceStrategy`, which is the precondition `publicExecutionWorkspaceStrategy`'s
+ *    spread needs in order to be safe.
+ *
+ * Everything else — `workspaceRuntime` above all, plus any key the parser dropped and any key nobody
+ * has classified — goes through `maskWorkspaceRuntimeForRead`. Masked rather than deleted, so a
+ * withheld reader can still tell "withheld" from "never set"; that distinction is this module's
+ * standing rule and the walk preserves it at the top level.
+ *
+ * The one place the distinction is NOT preserved is an unknown key *nested inside* a
+ * `workspaceStrategy` that otherwise parses: the shared parser drops it before this function sees it.
+ * That is safe by construction — dropping discloses strictly less than masking — and it matches what
+ * the write path already does to the same key, so the read and write shapes agree.
+ */
+const ISSUE_WORKSPACE_SETTINGS_ENVIRONMENT_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function publicIssueExecutionWorkspaceSettings(
+  settings: unknown,
+  viewer: WorkspaceRuntimeViewer,
+): unknown {
+  if (settings === null || settings === undefined) return settings;
+  if (viewer.revealRuntimeConfig) return settings;
+  // Fails closed on the array/scalar rows the CREATE writer admits: there is no key set to walk, so
+  // the value is masked whole rather than spread (spreading a string would emit its characters).
+  if (!isPlainObject(settings)) return maskWorkspaceRuntimeForRead(settings);
+
+  const parsed = parseIssueExecutionWorkspaceSettings(settings, { includeEnvironmentId: true });
+  const projected: Record<string, unknown> = {};
+
+  if (parsed?.mode !== undefined) {
+    projected.mode = parsed.mode;
+  }
+  if (
+    parsed?.environmentId === null ||
+    (typeof parsed?.environmentId === "string" &&
+      ISSUE_WORKSPACE_SETTINGS_ENVIRONMENT_ID_PATTERN.test(parsed.environmentId))
+  ) {
+    projected.environmentId = parsed.environmentId;
+  }
+  if (parsed?.workspaceStrategy) {
+    projected.workspaceStrategy = publicExecutionWorkspaceStrategy(parsed.workspaceStrategy, viewer);
+  }
+
+  for (const [key, value] of Object.entries(settings)) {
+    if (key in projected) continue;
+    projected[key] = maskWorkspaceRuntimeForRead(value);
+  }
+  return projected;
 }
 
 export function publicExecutionWorkspace(

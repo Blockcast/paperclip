@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
+import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
@@ -8,6 +9,7 @@ import {
   companyMemberships,
   createDb,
   executionWorkspaces,
+  heartbeatRuns,
   issues,
   projects,
   projectWorkspaces,
@@ -47,6 +49,15 @@ import { issueRoutes } from "../routes/issues.js";
 const PROJECT_WS_SENTINEL = "sentinel-project-workspace-runtime-must-not-egress";
 const MENTIONED_WS_SENTINEL = "sentinel-mentioned-workspace-runtime-must-not-egress";
 const EXECUTION_WS_SENTINEL = "sentinel-execution-workspace-runtime-must-not-egress";
+/**
+ * PEN-3252 — the issue row's OWN copy of the same material, on a raw JSONB column that never passed
+ * the boundary at all because the issue routes answer with spreads. Distinct sentinels from the
+ * three above, so a failure names which carrier regressed.
+ */
+const ISSUE_SETTINGS_RUNTIME_SENTINEL = "sentinel-issue-settings-runtime-must-not-egress";
+const ISSUE_SETTINGS_COMMAND_SENTINEL = "sentinel-issue-settings-command-must-not-egress";
+const ISSUE_SETTINGS_UNKNOWN_SENTINEL = "sentinel-issue-settings-unknown-key-must-not-egress";
+const ISSUE_SETTINGS_ENVIRONMENT_ID = "6f9619ff-8b86-d011-b42d-00c04fc964ff";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -78,13 +89,13 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
    * board actor here would be entitled and every assertion below would pass vacuously — which is
    * why the entitled case at the end uses a separate actor and asserts the opposite.
    */
-  function agentActor(companyId: string, agentId: string) {
+  function agentActor(companyId: string, agentId: string, runId: string = randomUUID()) {
     return {
       type: "agent" as const,
       agentId,
       companyId,
       source: "agent_key" as const,
-      runId: randomUUID(),
+      runId,
     };
   }
 
@@ -212,6 +223,33 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
       assigneeAgentId: agentId,
       executionWorkspaceId,
       createdByUserId: "cloud-user-1",
+      // PEN-3252. The raw JSONB settings column, non-null on every carrier the projection
+      // classifies, plus one key nobody has. A `null` or `{}` fixture would pass with or without
+      // the mask.
+      executionWorkspaceSettings: {
+        mode: "isolated_workspace",
+        environmentId: ISSUE_SETTINGS_ENVIRONMENT_ID,
+        workspaceStrategy: {
+          type: "git_worktree",
+          baseRef: "main",
+          provisionCommand: ISSUE_SETTINGS_COMMAND_SENTINEL,
+          teardownCommand: `${ISSUE_SETTINGS_COMMAND_SENTINEL}-teardown`,
+          worktreeParentDir: `${ISSUE_SETTINGS_COMMAND_SENTINEL}-parent`,
+        },
+        workspaceRuntime: {
+          services: [
+            {
+              name: "settings-web",
+              command: ISSUE_SETTINGS_RUNTIME_SENTINEL,
+              env: { TOKEN_FIXTURE: ISSUE_SETTINGS_RUNTIME_SENTINEL },
+            },
+          ],
+        },
+        // The unvalidated CREATE path (portability import / plugin host) can plant a key the parser
+        // does not know. Seeded directly because no HTTP body could carry it past the strict
+        // schema — which is exactly why the walk must default to mask.
+        legacyOperatorNotes: ISSUE_SETTINGS_UNKNOWN_SENTINEL,
+      },
     });
 
     return { companyId, agentId, issueId, projectId, mentionedProjectId };
@@ -336,5 +374,72 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
 
     expect(res.status).toBe(200);
     expect(JSON.stringify(res.body)).toContain(EXECUTION_WS_SENTINEL);
+  });
+
+  /**
+   * PEN-3252. `executionWorkspaceSettings` is the carrier PEN-3073 deliberately left open: it reaches
+   * responses on a raw JSONB column through `{...issue}` spreads, so it BYPASSED the boundary rather
+   * than slipping through a gap in its width. These assert on the serialized body of the real routes,
+   * because the failure was a response that carried the material — not a call site that looked wrong.
+   */
+  it("withholds executionWorkspaceSettings from an agent on GET /issues/:id", async () => {
+    const { companyId, agentId, issueId } = await seedScenario();
+
+    const res = await request(createApp(agentActor(companyId, agentId))).get(`/api/issues/${issueId}`);
+
+    expect(res.status).toBe(200);
+    const settings = res.body.executionWorkspaceSettings;
+    // Withheld, not deleted — the closed-shape fields the UI actually reads still cross.
+    expect(settings.mode).toBe("isolated_workspace");
+    expect(settings.environmentId).toBe(ISSUE_SETTINGS_ENVIRONMENT_ID);
+    expect(settings.workspaceStrategy.baseRef).toBe("main");
+    // …while every operator-authored string is elided, key names intact.
+    expect(settings.workspaceStrategy.provisionCommand).not.toBe(ISSUE_SETTINGS_COMMAND_SENTINEL);
+    expect(settings.workspaceRuntime.services[0].name).toBe("settings-web");
+    expect(settings.workspaceRuntime.services[0].command).not.toBe(ISSUE_SETTINGS_RUNTIME_SENTINEL);
+    // Whole-body, not per-field: this response served `currentExecutionWorkspace.config
+    // .workspaceRuntime` masked while handing the same bytes back under `executionWorkspaceSettings`,
+    // and only a whole-body assertion catches a carrier one key over.
+    const body = JSON.stringify(res.body);
+    expect(body).not.toContain(ISSUE_SETTINGS_RUNTIME_SENTINEL);
+    expect(body).not.toContain(ISSUE_SETTINGS_COMMAND_SENTINEL);
+    expect(body).not.toContain(ISSUE_SETTINGS_UNKNOWN_SENTINEL);
+  });
+
+  it("withholds executionWorkspaceSettings on a mutation exit (PATCH /issues/:id)", async () => {
+    const { companyId, agentId, issueId } = await seedScenario();
+    // PATCH enforces the single-assignee checkout invariant, so the actor has to hold the run lock.
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running" });
+    await db
+      .update(issues)
+      .set({ checkoutRunId: runId, executionRunId: runId })
+      .where(eq(issues.id, issueId));
+
+    const res = await request(createApp(agentActor(companyId, agentId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ priority: "high" });
+
+    // The ten mutation exits answer with `.returning()` rows rather than the detail row, so a fix
+    // applied only to `GET /issues/:id` would leave every one of them open. This pins one end-to-end.
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const body = JSON.stringify(res.body);
+    expect(body).not.toContain(ISSUE_SETTINGS_RUNTIME_SENTINEL);
+    expect(body).not.toContain(ISSUE_SETTINGS_COMMAND_SENTINEL);
+    expect(body).not.toContain(ISSUE_SETTINGS_UNKNOWN_SENTINEL);
+    expect(res.body.executionWorkspaceSettings.mode).toBe("isolated_workspace");
+  });
+
+  it("still discloses executionWorkspaceSettings to an entitled owner member", async () => {
+    const { companyId, issueId } = await seedScenario();
+
+    const res = await request(createApp(ownerActor(companyId))).get(`/api/issues/${issueId}`);
+
+    expect(res.status).toBe(200);
+    // Without this the two above would also pass on a projection that masked unconditionally.
+    const body = JSON.stringify(res.body);
+    expect(body).toContain(ISSUE_SETTINGS_RUNTIME_SENTINEL);
+    expect(body).toContain(ISSUE_SETTINGS_COMMAND_SENTINEL);
+    expect(body).toContain(ISSUE_SETTINGS_UNKNOWN_SENTINEL);
   });
 });
