@@ -120,6 +120,49 @@ describe("publicIssueExecutionWorkspaceSettings (PEN-3252)", () => {
     expect(JSON.stringify(projected)).not.toContain(UNCLASSIFIED_FIELD_SENTINEL);
   });
 
+  it("masks a top-level key named after an Object.prototype member, rather than dropping it", () => {
+    // Built by parsing raw JSON TEXT, which is both how the column actually arrives (jsonb ->
+    // JSON.parse) and the only way to get this fixture right. `__proto__` in an object literal sets
+    // the prototype instead of creating an own key, so the obvious
+    // `JSON.parse(JSON.stringify({ __proto__: ... }))` spelling silently produces a row WITHOUT the
+    // key under test and asserts nothing. JSON.parse defines it as a real own property.
+    const row = JSON.parse(
+      `{"mode":"isolated_workspace",` +
+        `"constructor":"${UNCLASSIFIED_FIELD_SENTINEL}",` +
+        `"toString":"${UNCLASSIFIED_FIELD_SENTINEL}",` +
+        `"valueOf":"${UNCLASSIFIED_FIELD_SENTINEL}",` +
+        `"hasOwnProperty":"${UNCLASSIFIED_FIELD_SENTINEL}",` +
+        `"__proto__":{"nested":"${UNCLASSIFIED_FIELD_SENTINEL}"}}`,
+    );
+    // Guards the fixture itself: if any of these stopped being an own key the assertions below would
+    // pass vacuously, having asserted nothing about the projection.
+    expect(Object.keys(row)).toContain("__proto__");
+    expect(Object.keys(row)).toContain("constructor");
+
+    const projected = withheld(row) as any;
+
+    // These are the keys an inheriting accumulator silently DROPS: the already-classified guard sees
+    // the inherited member, and `__proto__` additionally hits the inherited setter and re-parents the
+    // accumulator instead of adding a key. Dropping leaks nothing, but it makes withheld
+    // indistinguishable from never-set, which is the invariant this module holds everywhere else.
+    // Masked, not absent.
+    for (const key of ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__"]) {
+      expect(Object.prototype.hasOwnProperty.call(projected, key)).toBe(true);
+    }
+    for (const key of ["constructor", "toString", "valueOf", "hasOwnProperty"]) {
+      expect(projected[key]).toBe(REDACTED_EVENT_VALUE);
+    }
+    // `__proto__` holds an object, so it is masked in DEPTH rather than replaced wholesale — the same
+    // names-survive/values-elide treatment `workspaceRuntime` gets above, which is what proves it
+    // went through the ordinary catch-all walk rather than a special case.
+    expect(projected.__proto__).toEqual({ nested: REDACTED_EVENT_VALUE });
+    expect(projected.mode).toBe("isolated_workspace");
+    expect(JSON.stringify(projected)).not.toContain(UNCLASSIFIED_FIELD_SENTINEL);
+    // The masked `__proto__` has to survive serialization as a KEY — the response is JSON, so a value
+    // that re-parented the accumulator instead of landing on it would vanish here.
+    expect(Object.keys(JSON.parse(JSON.stringify(projected)))).toContain("__proto__");
+  });
+
   it("masks the whole value when the column is not an object", () => {
     // The create writer gates on truthiness only, so a string or array reaches the column intact.
     // Spreading one would emit its characters as numbered keys — a bypass dressed as a projection.
