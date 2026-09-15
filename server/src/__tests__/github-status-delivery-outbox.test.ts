@@ -255,6 +255,44 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     expect(events.at(-1)?.message).toContain("Set PR-review gate status review/ally-complete to failure");
   });
 
+  it("scrubs a credential straddling the 140-char cap before persisting it (PEN-3157)", async () => {
+    // Ally caught this on #1754: the enqueue truncated to 140 characters and
+    // only the SEND scrubbed, so a credential crossing the cut lost the tail
+    // its detector needs. The fragment then matched nothing, was persisted, and
+    // was republished on every replay — the durable path was the one place the
+    // scrub-before-trim guarantee did not hold.
+    //
+    // Sized so trim-then-scrub cannot pass by accident: the filler ends in a
+    // space (VENDOR_KEY_RE is `\b`-anchored) and leaves fewer than the 20 tail
+    // characters the detector needs, so truncating first yields no marker at
+    // all. Assembled from parts so no credential-shaped literal is committed.
+    setCreds();
+    const { companyId, runId } = await seedRun();
+    const token = ["gh", "p_", "A1b2C3d4E5f6G7h8I9j0K1l2"].join("");
+    const filler = `${"x".repeat(116)} `;
+
+    const delivery = await enqueueGithubCommitStatusDelivery(db, {
+      companyId,
+      sourceRunId: runId,
+      repoFullName: "Blockcast/hang",
+      sha: "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      context: "review/straddle",
+      state: "failure",
+      description: `${filler}${token}`,
+      targetUrl: null,
+      prNumber: 7,
+      prUrl: "https://github.com/Blockcast/hang/pull/7",
+    });
+
+    const persisted = await readDelivery(delivery.id);
+    expect(persisted?.description).not.toContain(token);
+    // The marker is the discriminator. Truncating first would also have removed
+    // the token — by cutting it, not by detecting it — so absence alone would
+    // pass for the wrong reason.
+    expect(persisted?.description).toContain("[paperclip-egress-scrub");
+    expect((persisted?.description ?? "").length).toBeLessThanOrEqual(140);
+  });
+
   it("does not double-process one delivery when pollers race", async () => {
     setCreds();
     const { delivery } = await seedRun();
