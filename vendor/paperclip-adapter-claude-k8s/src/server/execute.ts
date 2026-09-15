@@ -33,6 +33,7 @@ import {
   type JobIsolation,
 } from "./job-manifest.js";
 import type * as k8s from "@kubernetes/client-node";
+import { PatchStrategy, setHeaderOptions } from "@kubernetes/client-node";
 
 const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
@@ -690,11 +691,39 @@ export async function createOrAdoptRunSecret(
         );
       }
 
-      await coreApi.replaceNamespacedSecret({
-        namespace: input.namespace,
-        name: input.name,
-        body: { ...body, metadata: { ...body.metadata, resourceVersion: existing.metadata?.resourceVersion } },
-      });
+      try {
+        // A merge PATCH, not `replaceNamespacedSecret`.  A replace is a PUT,
+        // i.e. the `update` verb, and this adapter's service account holds
+        // `create`/`patch`/`delete`/`get` on secrets but NOT `update` — so the
+        // replace this call used to make was refused 403 on *every* collision,
+        // deterministically, before it could ever reach the races guarded
+        // below (BLO-32424).  Merge semantics are also the closer fit for what
+        // adoption means here: assert this run's keys and labels.  Keys are
+        // re-derived byte-identically per (agentId, runId) and the Job reads
+        // env through per-key `secretKeyRef`, so a key left behind by an older
+        // adapter build is inert rather than something we must delete.
+        // `resourceVersion` is still carried, so a concurrent writer is still
+        // surfaced as a 409 instead of being silently clobbered.
+        await coreApi.patchNamespacedSecret(
+          {
+            namespace: input.namespace,
+            name: input.name,
+            body: { ...body, metadata: { ...body.metadata, resourceVersion: existing.metadata?.resourceVersion } },
+          },
+          setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+        );
+      } catch (writeErr) {
+        // 404: the reaper freed the name between our read and this write, so
+        // the name is takeable again — go re-create.  409: `resourceVersion`
+        // went stale under a concurrent writer — go re-read.  Both route back
+        // through the loop's existing bound rather than adding a third code
+        // path, so the retry budget is unchanged.
+        if (!isK8s404(writeErr) && !isK8s409(writeErr)) throw writeErr;
+        if (attempt === 0) continue;
+        // Twice in a row means something is actively churning this name.
+        // Surface the original 409, matching the read-404 branch above.
+        throw err;
+      }
       return "adopted";
     }
   }
