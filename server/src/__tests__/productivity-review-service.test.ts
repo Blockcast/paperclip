@@ -1134,6 +1134,387 @@ describeEmbeddedPostgres("productivity review service", () => {
         expect(review?.description).toContain("Primary trigger: `long_active_duration`");
       });
     });
+
+    // BLO-27698 A2: an issue the assignee filed against this one is deliverable
+    // progress. Every case below asserts non-generation (or generation), never
+    // that a line was rendered — the defect this AC closes is precisely a signal
+    // that was computed and printed but never consulted.
+    describe("a fresh assignee-filed linked issue (A2)", () => {
+      async function seedLinkedIssue(opts: {
+        companyId: string;
+        createdByAgentId: string | null;
+        createdAt: Date;
+        parentId?: string | null;
+        blockedByIssueId?: string | null;
+      }) {
+        const linkedId = randomUUID();
+        await db.insert(issues).values({
+          id: linkedId,
+          companyId: opts.companyId,
+          title: "Decomposed: wire the adapter",
+          status: "todo",
+          parentId: opts.parentId ?? null,
+          createdByAgentId: opts.createdByAgentId,
+          createdAt: opts.createdAt,
+          updatedAt: opts.createdAt,
+        });
+        if (opts.blockedByIssueId) {
+          // `type: "blocks"` reads issueId -> relatedIssueId, so this is
+          // "the source blocks the new issue".
+          await db.insert(issueRelations).values({
+            companyId: opts.companyId,
+            issueId: opts.blockedByIssueId,
+            relatedIssueId: linkedId,
+            type: "blocks",
+            createdByAgentId: opts.createdByAgentId,
+            createdAt: opts.createdAt,
+            updatedAt: opts.createdAt,
+          });
+        }
+        return linkedId;
+      }
+
+      it("does not generate a long-active review while a fresh sub-issue exists", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+        await seedLinkedIssue({
+          companyId: seeded.companyId,
+          createdByAgentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          parentId: seeded.issueId,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(0);
+        expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+      });
+
+      // The second arm of the structural OR, and it is not redundant with the
+      // first: an assignee that files follow-up work and records the dependency
+      // writes an `issue_relations` edge and NO `parentId`.
+      //
+      // Edge direction is deliberate and load-bearing. It is the SOURCE that
+      // blocks the new issue, not the reverse. An unresolved blocker pointing AT
+      // the source would make the source dependency-blocked, and generation
+      // already skips those outright (`productivity-review.ts:5071-5073`,
+      // BLO-22436) — so that fixture would go green without A2's gate existing at
+      // all. Which is also the honest scope note for this AC: the "block with an
+      // unblock owner" shape needs no gate here, because it is already exempt.
+      it("does not generate while a fresh relation-linked issue exists, with no parent link", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+        await seedLinkedIssue({
+          companyId: seeded.companyId,
+          createdByAgentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          parentId: null,
+          blockedByIssueId: seeded.issueId,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(0);
+      });
+
+      // BLO-22331 AC2 boundedness guard. The episode bound alone does not bound
+      // anything — an episode grows without limit — so this proves the 24h
+      // freshness intersection is what actually makes the suppression lapse.
+      it("still fires once the linked issue ages past the freshness window", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 31 * 60 * 60 * 1000),
+        });
+        await seedLinkedIssue({
+          companyId: seeded.companyId,
+          createdByAgentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+          parentId: seeded.issueId,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      });
+
+      // Negative control for the reference test. An assignee filing unrelated
+      // work in the same company is not progress on THIS issue; without a
+      // structural edge the gate must not engage. Guards against the cheap
+      // implementation that counts any issue the agent created.
+      it("still fires for a fresh assignee-created issue that does not reference the source", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+        await seedLinkedIssue({
+          companyId: seeded.companyId,
+          createdByAgentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          parentId: null,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+      });
+
+      // The creator is load-bearing too: a linked issue somebody ELSE filed says
+      // nothing about whether the assignee is working.
+      it("still fires when the linked issue was created by another agent", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+        await seedLinkedIssue({
+          companyId: seeded.companyId,
+          createdByAgentId: seeded.managerId,
+          createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          parentId: seeded.issueId,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+      });
+
+      // The defect this gate almost shipped with, pinned directly rather than
+      // left to the three `assignment wake` replay tests that happened to catch
+      // it. A productivity review row is written as a CHILD of its source issue
+      // with `createdByAgentId` set to the assignee, so a naive "assignee filed a
+      // linked issue" predicate scores the review itself as progress — and the
+      // detector switches itself off 24h after firing once. Fixture mirrors the
+      // real row: same parent + creator as A2's positive case, differing only in
+      // `originKind`.
+      it("does not count a generated productivity review as the assignee's progress", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+        await insertProductivityReview({
+          seeded,
+          createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          issueNumber: 2,
+          identifier: `${seeded.issuePrefix}-2`,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+      });
+    });
+
+    // BLO-27698 A3: the rubric has told reviewers for three releases that a
+    // run-linked `Next action:` comment in the last 6h means "close as
+    // productive". These assert that code now applies the same criterion.
+    describe("a fresh run-linked `Next action:` comment (A3)", () => {
+      async function seedNextActionComment(opts: {
+        companyId: string;
+        issueId: string;
+        agentId: string;
+        createdAt: Date;
+        runLinked: boolean;
+        now: Date;
+        episodeStartAt?: Date;
+      }) {
+        const [run] = opts.runLinked
+          ? await insertRuns({
+            companyId: opts.companyId,
+            agentId: opts.agentId,
+            issueId: opts.issueId,
+            count: 1,
+            now: opts.now,
+            nextAction: null,
+            // Anchored to the episode start, and this is load-bearing rather
+            // than cosmetic. `activeStartedAt` takes `max(run.startedAt)` when
+            // that is at or after the episode start, so a run stamped `now` —
+            // `insertRuns`'s default — resets the episode clock and collapses
+            // `elapsedMs` to 0. `long_active_duration` then cannot fire at all,
+            // and every assertion here would pass without the A3 gate existing:
+            // the suppression cases vacuously, the "still fires" cases not at
+            // all. A3 is the one AC whose signal REQUIRES a run, so it is the
+            // one place this bites.
+            startedAt: opts.episodeStartAt ?? opts.now,
+          })
+          : [null];
+        await db.insert(issueComments).values({
+          companyId: opts.companyId,
+          issueId: opts.issueId,
+          authorAgentId: opts.agentId,
+          createdByRunId: run?.id ?? null,
+          body: "Rebased onto master.\n\nNext action: land the migration once CI clears.",
+          createdAt: opts.createdAt,
+          updatedAt: opts.createdAt,
+        });
+      }
+
+      // Non-vacuity control for the suppression case below, and the reason it
+      // exists: the identical fixture minus the comment MUST generate. Without
+      // this, a fixture whose episode clock had collapsed would report
+      // `created: 0` for a reason having nothing to do with A3, and the
+      // suppression test would pass while asserting nothing.
+      it("control: the same fixture with no next-action comment still fires", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const episodeStartAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+        const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStartAt });
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: 1,
+          now,
+          nextAction: null,
+          startedAt: episodeStartAt,
+          withRunComments: true,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      });
+
+      it("does not generate a long-active review over a fresh run-linked next action", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+        await seedNextActionComment({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          agentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+          runLinked: true,
+          now,
+          episodeStartAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(0);
+        expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+      });
+
+      // BLO-22331 AC2 boundedness guard: stop commenting and the trigger returns.
+      it("still fires once the next-action comment ages past the 6h window", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 9 * 60 * 60 * 1000),
+        });
+        await seedNextActionComment({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          agentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - (6 * 60 + 30) * 60 * 1000),
+          runLinked: true,
+          now,
+          episodeStartAt: new Date(now.getTime() - 9 * 60 * 60 * 1000),
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+      });
+
+      // The rubric says "run-linked", so the gate must too. An unlinked comment
+      // is still REPORTED (the `Current next action:` fallback exists precisely
+      // to recover it) but is not evidence that a turn happened — so this asserts
+      // both halves: the review fires, and the line is printed anyway.
+      it("still fires for an unlinked next-action comment, while still reporting it", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+        await seedNextActionComment({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          agentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+          runLinked: false,
+          now,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("land the migration once CI clears");
+      });
+
+      // The decoupling itself, which is the half of A3 that is not a gate.
+      // Raising the trigger bar to 12h must NOT widen the evidence lookback: a
+      // 7h-old comment is stale at any bar. Before the split, one constant fed
+      // both, so this fixture would have suppressed.
+      it("does not widen the comment lookback when `longActiveMs` is raised", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 13 * 60 * 60 * 1000),
+        });
+        await seedNextActionComment({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          agentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+          runLinked: true,
+          now,
+          episodeStartAt: new Date(now.getTime() - 13 * 60 * 60 * 1000),
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+          thresholds: { longActiveMs: 12 * 60 * 60 * 1000 },
+        });
+
+        expect(result.created).toBe(1);
+      });
+    });
   });
 
   // BLO-21769: a run that crashlooped, hit an upstream 503 storm, was killed
