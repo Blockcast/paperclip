@@ -75,8 +75,10 @@ import {
   selectForeignCommits,
 } from "../services/foreign-commit-notice.js";
 import {
+  classifyPrReviewActionability,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
+  type PrReviewActionabilityDecision,
 } from "../services/ally-review-detection.js";
 import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.js";
 import { enqueueGithubCommitStatusDelivery } from "../services/github-status-delivery-outbox.js";
@@ -830,7 +832,13 @@ interface ResolvedEventContext {
   // Classification must use the raw review body. reviewBody is deliberately
   // clamped for heartbeat context size, but a findings heading can occur
   // after the clamp boundary (as in frr#61 review 4968003838).
-  reviewHasActionableFeedback?: boolean;
+  //
+  // BLO-30420: one field, not two. The routing boolean and the named reason are
+  // both projections of this single decision, so they cannot drift apart --
+  // which is the failure class this issue exists to remove, and keeping a
+  // parallel `reviewHasActionableFeedback` boolean would have reintroduced it
+  // in miniature.
+  reviewActionability?: PrReviewActionabilityDecision;
   reviewState?: string | null;
   // pull_request_review.submitted only — the numeric GitHub review id.
   // Preferred over reviewUrl for the feedback-comment dedupe key (BLO-19497):
@@ -1379,6 +1387,7 @@ function resolveEventContextRaw(
         });
         return null;
       }
+      const reviewActionability = classifyPrReviewActionability(rawReviewBody, reviewState);
       return {
         identifiers: collected.ids,
         owningIdentifiers: collected.owning.owning,
@@ -1391,7 +1400,7 @@ function resolveEventContextRaw(
         headSha: reviewCommitId ?? collected.headSha,
         prAuthorLogin: collected.authorLogin,
         reviewBody,
-        reviewHasActionableFeedback: hasActionablePrReviewFeedback(rawReviewBody, reviewState),
+        reviewActionability,
         reviewState,
         reviewId,
         reviewAuthorLogin,
@@ -3476,8 +3485,52 @@ function prFeedbackAuthorLogin(context: ResolvedEventContext): string | null {
 function isActionableReviewFeedbackContext(context: ResolvedEventContext): boolean {
   if (context.wakeReason === "github_pr_review_feedback") return true;
   if (context.wakeReason !== "github_pr_review_submitted") return false;
-  if (context.reviewHasActionableFeedback !== undefined) return context.reviewHasActionableFeedback;
+  if (context.reviewActionability) return context.reviewActionability.actionable;
   return hasActionablePrReviewFeedback(context.reviewBody, context.reviewState);
+}
+
+// BLO-30420: name why a submitted review did NOT become actionable feedback.
+//
+// Without this the only evidence of a classifier no-op is the ABSENCE of a
+// `github_pr_review_feedback` comment, which is indistinguishable from a
+// status-based suppression, a dropped delivery, or a review that never
+// arrived. That ambiguity is what left frr#61's no-wake undiagnosable: the
+// review WAS declined by the classifier, but nothing said so.
+//
+// Scoped to review submissions only. Every other PR wake reason
+// (opened/synchronize/review_requested) is non-actionable by construction, not
+// by a classifier decision, so reporting a suppression reason for those would
+// be noise that buries the one case worth reading.
+//
+// Reported ONLY from the decision the delivery path already made on the raw
+// body. There is deliberately no recompute fallback: context.reviewBody is
+// clamped (see the field comment), and re-classifying a clamped body can land
+// the clamp BETWEEN two bucket headings -- `### Critical Issues (0)` surviving
+// while `### Important Issues (1)` is cut. extractAllyReportedFindingRefs then
+// returns non-null-but-empty and the classifier names `all_zero`, the HEALTHY
+// reason, for a body that was truncated with findings lost. The frr#61
+// specimen's buckets are 25 bytes apart (4248/4273), so that window is narrow
+// but real. Emitting no reason is recoverable; emitting a confidently wrong one
+// rebuilds the exact ambiguity this issue exists to remove.
+//
+// The reason/predicate pair is projected straight out of the classifier's
+// non-actionable variant rather than widened to `string`. This is the boundary
+// where the value becomes a published contract (log field, response field,
+// `contextSnapshot` key), so it is the boundary that has to hold the taxonomy:
+// a reason added to the classifier, or a typo in a hand-built decision, must
+// fail to compile here rather than ship a name nothing documents.
+type PrReviewFeedbackSuppression = Pick<
+  Extract<PrReviewActionabilityDecision, { actionable: false }>,
+  "reason" | "predicate"
+>;
+
+function resolveReviewFeedbackSuppression(
+  context: ResolvedEventContext,
+): PrReviewFeedbackSuppression | null {
+  if (context.wakeReason !== "github_pr_review_submitted") return null;
+  const decision = context.reviewActionability;
+  if (!decision || decision.actionable) return null;
+  return { reason: decision.reason, predicate: decision.predicate };
 }
 
 function buildPrFeedbackExternalKey(context: ResolvedEventContext, deliveryId: string | null): string | null {
@@ -5324,6 +5377,35 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     const getRecovery = () =>
       (recoveryInstance ??= recoveryService(db, { enqueueWakeup: heartbeat.wakeup }));
     const actionableReviewFeedback = isActionableReviewFeedbackContext(context);
+    // BLO-30420: record the classifier's decision to decline BEFORE the wake
+    // loop, and independently of it. Emitting inside the loop would lose the
+    // diagnostic in precisely the cases that need it most -- no owning issue,
+    // terminal status, unassigned -- where the loop body never runs and the
+    // delivery leaves no trace at all.
+    //
+    // This is a diagnostic only: it reads the already-computed verdict and
+    // changes no wake, comment, dedupe or escalation behavior.
+    const reviewFeedbackSuppression = resolveReviewFeedbackSuppression(context);
+    if (reviewFeedbackSuppression) {
+      logger.info(
+        {
+          deliveryId,
+          event: eventName,
+          wakeReason: context.wakeReason,
+          prNumber: context.prNumber,
+          repoFullName: context.repoFullName,
+          reviewId: context.reviewId,
+          reviewUrl: context.reviewUrl,
+          reviewState: context.reviewState,
+          reviewAuthorLogin: context.reviewAuthorLogin,
+          headSha: context.headSha,
+          matchedIdentifiers: matched.map((m) => m.identifier),
+          suppressionReason: reviewFeedbackSuppression.reason,
+          suppressionPredicate: reviewFeedbackSuppression.predicate,
+        },
+        "github webhook declined PR review feedback delivery: classifier found no actionable findings",
+      );
+    }
 
     // synchronize and converted_to_draft are reviewer-lifecycle signals. The
     // reviewer wake above is PR-scoped for task affinity/coalescing, while
@@ -5630,6 +5712,17 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               ? { githubPrReviewAuthorLogin: reviewAuthorLogin }
               : {}),
             ...(actionableReviewFeedback ? { githubReviewFeedbackActionable: true } : {}),
+            // BLO-30420: persist the declined-classification reason alongside
+            // the wake it accompanies. The author is still woken for a
+            // non-actionable review (it is a real review event), but with no
+            // feedback comment -- so without this the run has no way to tell
+            // "the reviewer found nothing" from "the findings were lost".
+            ...(reviewFeedbackSuppression
+              ? {
+                  githubReviewFeedbackSuppressionReason: reviewFeedbackSuppression.reason,
+                  githubReviewFeedbackSuppressionPredicate: reviewFeedbackSuppression.predicate,
+                }
+              : {}),
             // BLO-19522: carry the request comment onto the AUTHOR wake too,
             // not just the reviewer wake. The review-request directive says
             // who asked and shows the ask, which is the difference between
@@ -5692,6 +5785,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       // on the early-exit paths.
       reviewerWakeFired,
       reviewerRunsCancelled,
+      // BLO-30420: returned as well as logged so the decision is assertable
+      // from the delivery response, not only from log scraping. Omitted
+      // entirely when the review was actionable, so its presence is itself the
+      // signal that feedback delivery was declined.
+      ...(reviewFeedbackSuppression ? { reviewFeedbackSuppressed: reviewFeedbackSuppression } : {}),
       ...(workProductsUpserted > 0 ? { workProductsUpserted } : {}),
       ...(backLinked.length ? { backLinked } : {}),
       ...(foreignCommitNotices > 0 ? { foreignCommitNotices } : {}),
@@ -5722,6 +5820,8 @@ export const __test_buildPrReviewerTaskLockKeys = buildPrReviewerTaskLockKeys;
 export const __test_buildDependabotAlertIssueBody = buildDependabotAlertIssueBody;
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
 export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;
+export const __test_classifyPrReviewActionability = classifyPrReviewActionability;
+export const __test_resolveReviewFeedbackSuppression = resolveReviewFeedbackSuppression;
 export const __test_isClaudeCodeReviewServiceNotice = isClaudeCodeReviewServiceNotice;
 export const __test_buildPrReviewFeedbackComment = buildPrReviewFeedbackComment;
 export const __test_buildIssueBackLinkBody = buildIssueBackLinkBody;
@@ -5729,3 +5829,9 @@ export const __test_commentsContainBackLinkMarker = commentsContainBackLinkMarke
 export const __test_backLinkAbsoluteUrl = backLinkAbsoluteUrl;
 export const __test_isSelfReviewedPr = isSelfReviewedPr;
 export const __test_resolvePrCommentReviewGateWebhookTrigger = resolvePrCommentReviewGateWebhookTrigger;
+
+// Exported so the frr#61 truncation fixtures pin their bucket offsets to the
+// real clamp instead of a copied `4096`. The assertions stay valid either way,
+// but a retuned clamp would silently stop them reproducing the past-the-clamp
+// shape their comments claim — the regression would pass while testing nothing.
+export const __test_REVIEW_BODY_MAX_BYTES = REVIEW_BODY_MAX_BYTES;
