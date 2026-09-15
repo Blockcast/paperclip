@@ -434,9 +434,10 @@ import {
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
-import { mapAdapterToCcrotateTarget } from "./ccrotate-target.js";
+import { mapAdapterToCcrotateTarget, mapPenstockProviderToCcrotateTarget } from "./ccrotate-target.js";
 import {
   createPenstockAvailabilityGate,
+  mapAdapterToPenstockProvider,
   type PenstockAvailabilityGate,
   type PenstockAvailabilityGateDenyResult,
 } from "./penstock-availability-gate.js";
@@ -12750,7 +12751,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     heartbeatRunId?: string | null;
   }) {
     let adapterConfig = parseObject(input.agent.adapterConfig);
-    if (input.agent.adapterType === "claude_k8s") {
+    // Resolve secret bindings for every Penstock-gated adapter, not only
+    // claude_k8s: an opencode_k8s agent binds its Penstock credential the same
+    // way, and an unresolved binding makes the gate fail open (BLO-34116).
+    if (mapAdapterToPenstockProvider(input.agent.adapterType, adapterConfig) !== null) {
       try {
         const resolved = await secretsSvc.resolveAdapterConfigForRuntime(
           input.agent.companyId,
@@ -18983,7 +18987,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       if (!penstockCapacity.allow) {
         capacity = {
-          target: "claude",
+          target: mapPenstockProviderToCcrotateTarget(penstockCapacity.provider),
           reason: penstockCapacity.reason,
           resumeAt: penstockCapacity.resumeAt,
           penstockProvider: penstockCapacity.provider,
@@ -33738,6 +33742,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         wakeTriggerDetail: triggerDetail,
         penstockProvider: gateResult.provider,
         penstockModel: gateResult.model,
+        // Pin the escalation key to the pool that denied. Without it the
+        // promotion path falls back to the adapter default, which is `codex`
+        // for an opencode_k8s agent that deferred on the anthropic pool.
+        ccrotateTarget: mapPenstockProviderToCcrotateTarget(gateResult.provider),
         ...(githubReviewWakeReason !== null ? { githubReviewWakeReason } : {}),
         ...(resumeAtIso ? { penstockResumeAt: resumeAtIso } : {}),
         ...(advertisedResumeAtIso ? { penstockAdvertisedResumeAt: advertisedResumeAtIso } : {}),
