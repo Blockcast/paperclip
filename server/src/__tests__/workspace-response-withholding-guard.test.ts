@@ -57,6 +57,13 @@ const ROUTES_DIR = path.join(HERE, "..", "routes");
 /** Route modules that answer with execution-workspace or project-workspace rows. */
 const COVERED_ROUTE_MODULES = ["execution-workspaces.ts", "projects.ts", "issues.ts"];
 
+/**
+ * Helpers that clear the WORKSPACE-RUNTIME axis. This is not the file's only helper list, and the
+ * omission readers notice first is deliberate: the project `env` axis has its own
+ * {@link ENV_WITHHOLDING_HELPERS}, and `maskProjectEnv` / `maskEnvBindings` must NOT be added here.
+ * The reason is measured rather than asserted — see "keeps the env masks out of the workspace
+ * helper list" below, which fails if anyone makes that edit.
+ */
 const WITHHOLDING_HELPERS = [
   "publicExecutionWorkspace",
   "publicExecutionWorkspaces",
@@ -714,6 +721,40 @@ export function findUnmaskedProjectEnvResponses(
 }
 
 describe("workspace response withholding guard (PEN-2852, PEN-2370 (b2))", () => {
+  it("keeps the env masks out of the workspace helper list — the two axes clear differently", () => {
+    // This file holds TWO scans. `WITHHOLDING_HELPERS` clears the workspace-runtime axis;
+    // `ENV_WITHHOLDING_HELPERS` clears the project `env` axis (door #17). Reading the first list
+    // alone invites a one-line "fix" — add `maskProjectEnv` / `maskEnvBindings` so "the" guard
+    // covers env too — and that edit REGRESSES this axis rather than widening it. The workspace
+    // scan clears per ARGUMENT (third bullet of the header docstring): one recognised helper
+    // anywhere in a response vouches for every noun in it. Admitting an env mask therefore lets a
+    // masked project vouch for a RAW workspace sibling in the same literal.
+    //
+    // Pinned as a measurement, not as prose, because prose is what gets overruled in review.
+    expect(WITHHOLDING_HELPERS).not.toContain("maskProjectEnv");
+    expect(WITHHOLDING_HELPERS).not.toContain("maskEnvBindings");
+
+    const mixed = "  res.json({ project: maskProjectEnv(project), workspace });";
+    const sites = collectResponseSites("synthetic.ts", mixed);
+
+    // As shipped, the raw workspace sibling is caught.
+    expect(findUnwithheldWorkspaceResponses(sites, ["workspace"])).toHaveLength(1);
+    // Admitting the env mask to this axis' helper list — the tempting edit — silences that catch.
+    // The third argument is appended to `WITHHOLDING_HELPERS`, so this simulates the edit exactly.
+    expect(
+      findUnwithheldWorkspaceResponses(sites, ["workspace"], ["maskProjectEnv"]),
+      "adding an env mask to WITHHOLDING_HELPERS hid a raw workspace row",
+    ).toEqual([]);
+
+    // The env axis is not left uncovered by that separation: it recognises the same mask under its
+    // own list, with per-OCCURRENCE clearing, which is why the same response classifies correctly
+    // there. Coverage of `maskProjectEnv` lives in that scan — it is not missing, it is elsewhere.
+    expect(ENV_WITHHOLDING_HELPERS).toEqual(
+      expect.arrayContaining(["maskProjectEnv", "maskEnvBindings"]),
+    );
+    expect(findUnmaskedProjectEnvResponses(sites)).toEqual([]);
+  });
+
   it("detects an unwrapped workspace response — positive control for the detector itself", () => {
     const synthetic = [
       'router.get("/synthetic", async (req, res) => {',
