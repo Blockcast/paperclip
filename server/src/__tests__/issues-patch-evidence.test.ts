@@ -235,9 +235,14 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
         .send({ status: "in_review" });
 
       expect(response.status, JSON.stringify(response.body)).toBe(200);
+      // BLO-32239: a `frontend` issue now also requires the two GitHub truth
+      // shapes, and this one has no linked PR. `missing` being EXACTLY those
+      // two is what proves every text shape was still detected. A truth-only
+      // gap warns rather than blocks while the flag is off — blocking would
+      // make the in_review transition unreachable before merge.
       expect(response.body.lastEvidenceVerdict).toMatchObject({
-        verdict: "pass",
-        missing: [],
+        verdict: "warn",
+        missing: ["review:ally-clean", "deploy:landed"],
       });
       // The frozen 11:48:19Z evaluation must have been superseded.
       expect(
@@ -398,9 +403,13 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
         .patch(`/api/issues/${issueId}`)
         .send({ status: "in_review" });
       expect(inReview.status, JSON.stringify(inReview.body)).toBe(200);
+      // BLO-32239: warn, not pass — no linked PR, so the two truth shapes are
+      // missing. The point of the case is the unlabeled fallback and the
+      // re-evaluation below, both unchanged.
       expect(inReview.body.lastEvidenceVerdict).toMatchObject({
-        verdict: "pass",
+        verdict: "warn",
         unlabeledFallback: true,
+        missing: ["review:ally-clean", "deploy:landed"],
       });
 
       const labeled = await request(createApp())

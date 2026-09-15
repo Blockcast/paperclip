@@ -25,7 +25,9 @@ export type EvidenceShape =
   | "ci-green"
   | "e2e-script"
   | "e2e-run"
-  | "migration-output";
+  | "migration-output"
+  | "review:ally-clean"
+  | "deploy:landed";
 
 export interface EvidenceRegistryEntry {
   required: EvidenceShape[];
@@ -64,19 +66,33 @@ export type EvidenceRegistry = Record<string, EvidenceRegistryEntry>;
  *     state that can't be fabricated the same way, and some ops changes are
  *     legitimately applied ahead of a PR landing (e.g. emergency kubectl
  *     edits later backfilled into IaC).
+ *   - `review:ally-clean` / `deploy:landed` (BLO-32239): the two shapes an
+ *     agent cannot type into existence. Every other shape is a regex over the
+ *     agent's OWN comment, so a fabricated comment satisfies it — which is what
+ *     both fabrication incidents above did. These two are computed by
+ *     `evidence-truth.ts` against GitHub, off the PR work products Paperclip
+ *     linked; no comment text can produce them.
+ *
+ *     Policy (eng review 2026-09-06, D13): they apply to unlabeled issues and
+ *     to the code-completion labels. `pr` is deliberately excluded — it
+ *     delivers an OPEN PR for a human to decide on, so requiring "merged"
+ *     would make the label unsatisfiable by construction. `infra` and
+ *     `cms-data-op` are excluded for the same reason `landing-artifact` skips
+ *     them: they deliver live state with no PR, and their existing shapes
+ *     already demand a real probe.
  */
 export const DEFAULT_EVIDENCE_REGISTRY: EvidenceRegistry = {
   frontend: {
-    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when", "landing-artifact"],
+    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when", "landing-artifact", "review:ally-clean", "deploy:landed"],
   },
   ui: {
-    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when", "landing-artifact"],
+    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when", "landing-artifact", "review:ally-clean", "deploy:landed"],
   },
   "cms-published": {
-    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when", "landing-artifact"],
+    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when", "landing-artifact", "review:ally-clean", "deploy:landed"],
   },
   backend: {
-    required: ["test-output", "checklist:done-when", "landing-artifact"],
+    required: ["test-output", "checklist:done-when", "landing-artifact", "review:ally-clean", "deploy:landed"],
   },
   infra: {
     required: ["kubectl-state", "probe-output"],
@@ -88,17 +104,31 @@ export const DEFAULT_EVIDENCE_REGISTRY: EvidenceRegistry = {
     required: ["pr-link"],
   },
   "db-migration": {
-    required: ["migration-output", "landing-artifact"],
+    required: ["migration-output", "landing-artifact", "review:ally-clean", "deploy:landed"],
   },
   migration: {
-    required: ["migration-output", "landing-artifact"],
+    required: ["migration-output", "landing-artifact", "review:ally-clean", "deploy:landed"],
   },
 };
 
 /**
- * Required evidence for issues that match no registry entry. Single weak
- * shape so the gate's verdict is `warn` (not `block`) for unlabeled work —
- * historically not every issue gets labeled, and we don't want the gate to
- * become a chore for refactor / doc-only issues.
+ * Required evidence for issues that match no registry entry. The checklist is
+ * a weak shape, so the gate's verdict for unlabeled work is `warn` (not
+ * `block`) — historically not every issue gets labeled, and we don't want the
+ * gate to become a chore for refactor / doc-only issues.
+ *
+ * The two truth shapes are required here as well (D13). They do not by
+ * themselves change the verdict: an unlabeled issue missing them still only
+ * warns, unless `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK` is on AND the probe
+ * actually established truth — see `unlabeledTruthBlock` in `evidence-gate.ts`.
+ *
+ * And even then the flag reaches only `review:ally-clean`. A gap of solely
+ * `deploy:landed` warns at every flag setting, because the gate runs on the
+ * transition INTO `in_review`, where a merged PR is unsatisfiable by
+ * construction — see `BLOCKABLE_TRUTH_SHAPES` in `evidence-gate.ts`.
  */
-export const DEFAULT_UNLABELED_REQUIRED: EvidenceShape[] = ["checklist:done-when"];
+export const DEFAULT_UNLABELED_REQUIRED: EvidenceShape[] = [
+  "checklist:done-when",
+  "review:ally-clean",
+  "deploy:landed",
+];
