@@ -477,6 +477,13 @@ export function commentReviewGateCheckTitle(
       return "Unresolved finding at this head";
     case "carried_finding":
       return "Unresolved finding carried from an earlier head";
+    // Deliberately does not say "finding": this outcome is neither evidence of
+    // review nor evidence of a finding, and the title is the surface a reader
+    // sees before opening the check. Calling it a finding here would re-commit
+    // the misreport BLO-32695 exists to end, on the one line most likely to be
+    // read in isolation.
+    case "unreadable_verdict":
+      return "Verdict block unreadable — no finding asserted";
     case "not_evaluated":
       return "Not evaluated — no comment-shaped review attests this head";
   }

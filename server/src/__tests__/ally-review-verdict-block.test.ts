@@ -11,7 +11,7 @@ import {
   hasAllyConsolidatedReviewHeading,
   parseAllyVerdictBlock,
 } from "../services/ally-review-detection.js";
-import { evaluateCommentReviewGate } from "../services/pr-comment-review-gate.js";
+import { evaluateCommentReviewGate, commentReviewGateCheckTitle } from "../services/pr-comment-review-gate.js";
 
 /**
  * The verbatim body of Ally's 2026-09-07T15:41:42Z review of paperclip#1675
@@ -536,6 +536,24 @@ describe("BLO-32695 — an unknown severity key fails closed, not open", () => {
         comments: [allyComment(typod({ critcal: 1, important: 0 }), "2026-09-07T15:41:42Z")],
       }),
     ).toMatchObject({ state: "failure", outcome: "unreadable_verdict" });
+  });
+
+  it("does not call the unreadable block a finding in the check-run title", () => {
+    // The title is what a reader sees before opening the check, so it is the
+    // line most likely to be read in isolation — and `unreadable_verdict` is
+    // neither evidence of review nor evidence of a finding. Master's title
+    // switch predates this outcome (BLO-33657); the case was added when the
+    // two branches met. Asserting the wording, not just exhaustiveness,
+    // because the compiler cannot tell a correct title from a misleading one.
+    const verdict = evaluateCommentReviewGate({
+      headSha: PR1675_HEAD,
+      reviewerBotLogin: ALLY_BOT_LOGIN,
+      comments: [allyComment(typod({ critcal: 1, important: 0 }), "2026-09-07T15:41:42Z")],
+    });
+
+    const title = commentReviewGateCheckTitle(verdict);
+    expect(title).toMatch(/unreadable/i);
+    expect(title).not.toMatch(/unresolved finding/i);
   });
 
   it("is now distinguishable from clean: null refs, not an empty list", () => {
