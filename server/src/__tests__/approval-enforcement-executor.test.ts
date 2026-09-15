@@ -103,9 +103,12 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
     proseOnly?: boolean;
     isActive?: boolean;
     /**
-     * Override `budget_policies.amount_updated_at`. Left unset the column
-     * defaults to now, which is after the fixture's `decidedAt` and therefore
-     * reads as a cap moved after the decision.
+     * Override `budget_policies.amount_updated_at`. Defaults to *before* the
+     * fixture's `decidedAt`, which is the realistic shape for a decision that
+     * never landed: the cap has been sitting at its figure since before the
+     * card was decided, so nothing has moved it since. A test that needs "a
+     * later decision moved this" sets a stamp after `decidedAt` explicitly —
+     * the executor refuses to write those, whatever figure they landed on.
      */
     policyAmountUpdatedAt?: Date;
   }) {
@@ -144,7 +147,7 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
       windowKind: "calendar_month_utc",
       amount: options.enforcedCents,
       isActive: options.isActive ?? true,
-      ...(options.policyAmountUpdatedAt ? { amountUpdatedAt: options.policyAmountUpdatedAt } : {}),
+      amountUpdatedAt: options.policyAmountUpdatedAt ?? new Date(Date.now() - 48 * 60 * 60 * 1000),
     });
 
     const decidedCents = options.decidedCents ?? DECIDED_CENTS;
@@ -266,7 +269,7 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
   });
 
   it("is idempotent: a second apply is a no-op success, not a double write", async () => {
-    const { requesterId, policyId, approvalId } = await seed({
+    const { companyId, requesterId, policyId, approvalId } = await seed({
       enforcedCents: PRE_APPROVAL_CENTS,
     });
     const { hooks } = collectingHooks();
@@ -278,6 +281,19 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
     expect(second.applied).toEqual([]);
     expect(second.alreadyApplied).toEqual([policyId]);
     expect(await enforcedAmount(policyId)).toBe(DECIDED_CENTS);
+
+    // And the replay left no trace: an activity row per retry, each recording
+    // `applied: []`, would accumulate without describing anything that happened.
+    const activity = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, "approval.enforcement_applied"),
+        ),
+      );
+    expect(activity).toHaveLength(1);
   });
 
   it("refuses a card that is not approved", async () => {
@@ -351,6 +367,7 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
     // decision — so something newer set it.
     const { requesterId, policyId, approvalId } = await seed({
       enforcedCents: SUPERSEDING_CENTS,
+      policyAmountUpdatedAt: new Date(),
     });
     const { hooks } = collectingHooks();
     await expectRefusal(
@@ -359,6 +376,49 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
       409,
     );
     expect(await enforcedAmount(policyId)).toBe(SUPERSEDING_CENTS);
+  });
+
+  it("refuses to re-raise a cap a later decision put back at the card's starting figure", async () => {
+    // The same hazard as the test above with its sign flipped, and the reason
+    // the executor cannot just consume the classifier's verdict. `enforced ==
+    // prior` is `never_applied` however the cap got there — correct for the
+    // detector, which only reports, and destructive here: a board actor decided
+    // $32,000 was wrong and put the cap back, and replaying the card would
+    // overwrite that later decision with a figure it already rejected. The
+    // whole sequence runs through the real write path, so `amount_updated_at`
+    // is stamped by `upsertPolicy` rather than seeded.
+    const { companyId, requesterId, targetId, policyId, approvalId } = await seed({
+      enforcedCents: PRE_APPROVAL_CENTS,
+    });
+    const { hooks } = collectingHooks();
+
+    const first = await applyApprovalEnforcement(db, approvalId, requester(requesterId), hooks);
+    expect(first.applied).toHaveLength(1);
+    expect(await enforcedAmount(policyId)).toBe(DECIDED_CENTS);
+
+    await budgetService(db).upsertPolicy(
+      companyId,
+      {
+        scopeType: "agent",
+        scopeId: targetId,
+        amount: PRE_APPROVAL_CENTS, // the later decision: put it back
+        windowKind: "calendar_month_utc",
+      },
+      null,
+    );
+    expect(await enforcedAmount(policyId)).toBe(PRE_APPROVAL_CENTS);
+
+    await expectRefusal(
+      applyApprovalEnforcement(db, approvalId, requester(requesterId), hooks),
+      "assertion_superseded",
+      409,
+    );
+    expect(await enforcedAmount(policyId)).toBe(PRE_APPROVAL_CENTS);
+
+    // The detector is deliberately NOT relaxed to match: reporting a decision
+    // that is once again unapplied is non-destructive and still true.
+    const sweep = await reconcileApprovalEnforcement(db);
+    expect(sweep.drifted).toBe(1);
   });
 
   it("applies a policy whose cap has not moved since the decision even when the card's recorded prior is wrong", async () => {
