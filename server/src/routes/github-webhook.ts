@@ -5624,6 +5624,10 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         if (entries.length > 0) {
           const repoFullName = context.repoFullName;
           const prNumber = context.prNumber;
+          // Hoisted for the same reason as the two above: the guard on this
+          // block narrows these, but narrowing on a property access does not
+          // survive into the closure below.
+          const publicBaseUrl = config.publicBaseUrl;
           // The marker only makes this idempotent if the read and the post are
           // atomic against a concurrent delivery of the same event; hold the
           // per-PR lock across both. See pr-issue-backlink-lock.ts.
@@ -5634,7 +5638,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             const posted = await githubPostIssueComment({
               repoFullName,
               prNumber,
-              body: buildIssueBackLinkBody(config.publicBaseUrl, entries),
+              body: buildIssueBackLinkBody(publicBaseUrl, entries),
             });
             return posted ? entries.map((e) => e.identifier) : [];
           });

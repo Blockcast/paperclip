@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createDb } from "@paperclipai/db";
+import { sql } from "drizzle-orm";
+import { createDb, POSTGRES_POOL_MAX } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -69,6 +70,17 @@ function fakePrCommentSurface() {
   };
 }
 
+/** Walk the cause chain for a Postgres SQLSTATE, which Drizzle wraps. */
+function postgresErrorCode(err: unknown): string | null {
+  let current: unknown = err;
+  for (let depth = 0; current && depth < 10; depth += 1) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string") return code;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return null;
+}
+
 describeEmbeddedPostgres("PR→issue back-link is posted at most once per PR (PEN-2865)", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -126,7 +138,10 @@ describeEmbeddedPostgres("PR→issue back-link is posted at most once per PR (PE
   it("scopes the lock per PR, so a different PR is not blocked behind it", async () => {
     // Each critical section waits for the other to enter. If the lock were
     // scoped wider than one PR they would deadlock; the timeout turns that
-    // into a named failure instead of a hang.
+    // into a named failure instead of a hang. It is deliberately short: a
+    // regression here is a deadlock, which is immediate and total, so waiting
+    // longer cannot turn a failure into a pass — it would only burn most of
+    // the worker timeout before reporting what it already knew.
     let enteredA!: () => void;
     let enteredB!: () => void;
     const aEntered = new Promise<void>((resolve) => (enteredA = resolve));
@@ -147,11 +162,82 @@ describeEmbeddedPostgres("PR→issue back-link is posted at most once per PR (PE
       Promise.race([
         bothRan,
         new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("distinct PRs deadlocked: the lock is scoped too widely")), 15_000),
+          setTimeout(() => reject(new Error("distinct PRs deadlocked: the lock is scoped too widely")), 2_000),
         ),
       ]),
     ).resolves.toBeDefined();
   }, 30_000);
+
+  it("bounds a waiter's queue time, so a hung GitHub call cannot pin the pool", async () => {
+    // The critical section performs uncapped GitHub I/O (neither
+    // githubListIssueCommentBodies nor githubPostIssueComment passes an
+    // AbortSignal), so the holder sits idle-in-transaction pinning a pool
+    // connection — and every delivery queued behind it on an *untimed*
+    // pg_advisory_xact_lock pins one too. A burst of concurrent PR-open
+    // deliveries would then occupy the whole pool and starve unrelated work,
+    // and because the holder could no longer get a connection to finish, the
+    // lock would never be released. Reproduced here against the real
+    // production pool size (createDb uses POSTGRES_POOL_MAX), so this is the
+    // burst the finding names rather than a scaled-down proxy: a holder whose
+    // GitHub call never returns, and enough concurrent deliveries to fill the
+    // rest of the pool.
+    const poolDb = createDb(tempDb!.connectionString);
+    const ref = { repoFullName: "Blockcast/paperclip", prNumber: 1741 };
+
+    let releaseHungCall!: () => void;
+    const hungCall = new Promise<void>((resolve) => (releaseHungCall = resolve));
+    let holderEntered!: () => void;
+    const entered = new Promise<void>((resolve) => (holderEntered = resolve));
+
+    const holder = withPrIssueBackLinkLock(
+      poolDb,
+      ref,
+      async () => {
+        holderEntered();
+        await hungCall;
+      },
+      // Long hold bound: this test is about the waiters, so the holder must
+      // still be stuck when they are asserted on.
+      { holdMs: 60_000 },
+    );
+
+    try {
+      await entered;
+
+      const waiters = Array.from({ length: POSTGRES_POOL_MAX - 1 }, () =>
+        withPrIssueBackLinkLock(poolDb, ref, async () => "posted", { waitMs: 300 }),
+      );
+      const settled = await Promise.allSettled(waiters);
+
+      // The bound fired: each waiter gave its connection back instead of
+      // queueing on the hung holder forever. 55P03 is lock_not_available, i.e.
+      // lock_timeout specifically — not some incidental failure that would let
+      // this pass for the wrong reason. Drizzle wraps the driver error, so the
+      // code is read off the cause chain rather than the thrown object.
+      for (const outcome of settled) {
+        expect(outcome.status).toBe("rejected");
+        const reason = outcome.status === "rejected" ? outcome.reason : null;
+        expect(postgresErrorCode(reason)).toBe("55P03");
+      }
+
+      // ...and the pool is usable for unrelated work while the holder is still
+      // hung, which is the property the bound exists to preserve.
+      await expect(
+        Promise.race([
+          poolDb.execute(sql`select 1 as ok`),
+          new Promise((_, reject) =>
+            setTimeout(
+              () => reject(new Error("unrelated DB work starved: lock waiters pinned the pool")),
+              5_000,
+            ),
+          ),
+        ]),
+      ).resolves.toBeDefined();
+    } finally {
+      releaseHungCall();
+      await holder.catch(() => {});
+    }
+  }, 60_000);
 
   it("keys the lock on the normalized repo and the PR number", () => {
     expect(__test_prIssueBackLinkLockKey({ repoFullName: "  Blockcast/Paperclip ", prNumber: 1738 })).toBe(
