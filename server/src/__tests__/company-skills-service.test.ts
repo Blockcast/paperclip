@@ -1841,6 +1841,300 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     );
   });
 
+  // BLO-32167. `materializeRuntimeSkillFiles` used to publish in place:
+  // `fs.rm(skillDir, {recursive:true})` -> `mkdir` -> per-file `writeFile`. That
+  // left the *published* path observable in a state where the directory exists
+  // and `SKILL.md` does not — and unlike the BLO-32055 branch, that state raises
+  // no syscall error in any reader. `hashPathContents` in the claude-k8s adapter
+  // hashes it happily and mints a cache key over an unusable tree, so the run is
+  // silently degraded rather than classified (live capture: CEO run ff67a1b1,
+  // 2026-09-06T00:35Z, where a pod's copy of `investigate--9debdeaf08` was an
+  // empty directory while the shared store held all 24,209 bytes).
+  //
+  // The assertion is about what a CONCURRENT READER can see, not about how the
+  // writer is implemented — so it samples the published directory from inside
+  // `fs.writeFile`, before the write lands, and is agnostic to whether the fix
+  // stages elsewhere or writes in place.
+  it("never publishes a runtime skill directory without SKILL.md (BLO-32167)", async () => {
+    const companyId = randomUUID();
+    const skillId = randomUUID();
+    const skillKey = `company/${companyId}/atomic-publish`;
+    const missingSkillDir = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-atomic-publish-")), "gone");
+    cleanupDirs.add(path.dirname(missingSkillDir));
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: skillKey,
+      slug: "atomic-publish",
+      name: "Atomic Publish",
+      description: null,
+      markdown: "# Atomic Publish\n\nMaterialized from DB.\n",
+      sourceType: "local_path",
+      sourceLocator: missingSkillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { sourceKind: "local_path" },
+    });
+    await db.insert(agents).values({
+      id: randomUUID(),
+      companyId,
+      name: "Runner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: { paperclipSkillSync: { desiredSkills: [skillKey] } },
+    });
+
+    // First pass establishes the published tree and tells us its path. The
+    // sampled window below is therefore a RE-materialization — the case that
+    // matters, because a reader mid-sweep is reading a skill that already
+    // worked a moment ago.
+    const first = await svc.listRuntimeSkillEntries(companyId);
+    const publishedDir = first.find((candidate) => candidate.key === skillKey)!.source;
+    await expect(fs.readFile(path.join(publishedDir, "SKILL.md"), "utf8")).resolves.toContain("Atomic Publish");
+
+    const samples: Array<{ exists: boolean; hasSkillFile: boolean; entries: string[] }> = [];
+    const realWriteFile = fs.writeFile;
+    const spy = vi.spyOn(fs, "writeFile").mockImplementation(async (target, ...rest) => {
+      const entries = await fs.readdir(publishedDir).catch(() => null);
+      samples.push({
+        exists: entries !== null,
+        hasSkillFile: entries?.includes("SKILL.md") ?? false,
+        entries: entries ?? [],
+      });
+      return (realWriteFile as never)(target, ...rest);
+    });
+
+    try {
+      const second = await svc.listRuntimeSkillEntries(companyId);
+      expect(second.find((candidate) => candidate.key === skillKey)).toMatchObject({
+        key: skillKey,
+        sourceStatus: "available",
+      });
+    } finally {
+      spy.mockRestore();
+    }
+
+    // Guards a vacuous pass: if the writer stops calling `fs.writeFile`, or the
+    // second listing stops re-materializing, there is no window being sampled
+    // and an all-clear below would mean nothing.
+    expect(samples.length).toBeGreaterThan(0);
+
+    // The invariant. The published directory may be absent (the one-syscall gap
+    // between the two renames — an ENOENT, which every reader already classifies
+    // as retryable `skill_materialization_pending` per BLO-32055/#1669), or it
+    // may be a complete tree. "Present but no SKILL.md" is the state that has no
+    // error for anyone to catch, and it must never be observable.
+    const degraded = samples.filter((sample) => sample.exists && !sample.hasSkillFile);
+    expect(degraded).toEqual([]);
+
+    await expect(fs.readFile(path.join(publishedDir, "SKILL.md"), "utf8")).resolves.toContain("Atomic Publish");
+  });
+
+  // BLO-32167. The staging and retired trees are siblings of the published
+  // directory inside `__runtime__`, so a leak would accumulate there forever and
+  // — worse — could be picked up as a skill by anything that enumerates the
+  // root. Dot-prefixing is what makes them unmistakable; this asserts both that
+  // they are cleaned up and that nothing undotted is left behind.
+  it("leaves no staging or retired trees behind in __runtime__ (BLO-32167)", async () => {
+    const companyId = randomUUID();
+    const skillKey = `company/${companyId}/staging-cleanup`;
+    const missingSkillDir = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-staging-cleanup-")), "gone");
+    cleanupDirs.add(path.dirname(missingSkillDir));
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companySkills).values({
+      id: randomUUID(),
+      companyId,
+      key: skillKey,
+      slug: "staging-cleanup",
+      name: "Staging Cleanup",
+      description: null,
+      markdown: "# Staging Cleanup\n\nMaterialized from DB.\n",
+      sourceType: "local_path",
+      sourceLocator: missingSkillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { sourceKind: "local_path" },
+    });
+    await db.insert(agents).values({
+      id: randomUUID(),
+      companyId,
+      name: "Runner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: { paperclipSkillSync: { desiredSkills: [skillKey] } },
+    });
+
+    // Three passes: the first publishes, the rest exercise the retire-and-swap
+    // path where both a staging and a retired tree exist transiently.
+    let publishedDir = "";
+    for (let pass = 0; pass < 3; pass += 1) {
+      const entries = await svc.listRuntimeSkillEntries(companyId);
+      publishedDir = entries.find((candidate) => candidate.key === skillKey)!.source;
+    }
+
+    const runtimeRoot = path.dirname(publishedDir);
+    const leftovers = await fs.readdir(runtimeRoot);
+    expect(leftovers).toEqual([path.basename(publishedDir)]);
+  });
+
+  // Seeds a DB-backed skill whose local source is gone, so every
+  // `listRuntimeSkillEntries` call re-materializes it into `__runtime__`, and
+  // returns the tree it publishes to.
+  async function seedRematerializingSkill(companyId: string, slug: string) {
+    const skillId = randomUUID();
+    const skillKey = `company/${companyId}/${slug}`;
+    const missingSkillDir = path.join(await fs.mkdtemp(path.join(os.tmpdir(), `paperclip-${slug}-`)), "gone");
+    cleanupDirs.add(path.dirname(missingSkillDir));
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: skillKey,
+      slug,
+      name: slug,
+      description: null,
+      markdown: `# ${slug}\n\nMaterialized from DB.\n`,
+      sourceType: "local_path",
+      sourceLocator: missingSkillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { sourceKind: "local_path" },
+    });
+    await db.insert(agents).values({
+      id: randomUUID(),
+      companyId,
+      name: "Runner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: { paperclipSkillSync: { desiredSkills: [skillKey] } },
+    });
+
+    const entries = await svc.listRuntimeSkillEntries(companyId);
+    const publishedDir = entries.find((candidate) => candidate.key === skillKey)!.source;
+    await expect(fs.readFile(path.join(publishedDir, "SKILL.md"), "utf8")).resolves.toContain("Materialized from DB");
+    return { skillId, skillKey, publishedDir };
+  }
+
+  // Records every `fs.rm` target while passing the call through, so a test can
+  // assert the published path itself is never torn down in place.
+  function recordRmTargets() {
+    const targets: string[] = [];
+    const realRm = fs.rm;
+    const spy = vi.spyOn(fs, "rm").mockImplementation(async (target, ...rest) => {
+      targets.push(String(target));
+      return realRm(target, ...rest);
+    });
+    return { targets, restore: () => spy.mockRestore() };
+  }
+
+  // BLO-32167. A concurrent publisher that lands between the two renames must
+  // be retired by rename like any other outgoing tree — `rm` in place is a walk,
+  // and a reader mid-walk sees the shrinking directory the swap exists to rule
+  // out. The rival is real: it is created inside the `rename` that would have
+  // published ours, so the ENOTEMPTY comes from the kernel, not from a stub.
+  it("retires a concurrently published tree by rename on collision, never rm in place (BLO-32167)", async () => {
+    const companyId = randomUUID();
+    const { skillKey, publishedDir } = await seedRematerializingSkill(companyId, "collision");
+
+    let collided = false;
+    const realRename = fs.rename;
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (!collided && String(to) === publishedDir) {
+        collided = true;
+        await fs.mkdir(publishedDir, { recursive: true });
+        await fs.writeFile(path.join(publishedDir, "SKILL.md"), "# rival\n", "utf8");
+      }
+      return realRename(from, to);
+    });
+    const rm = recordRmTargets();
+
+    try {
+      const entries = await svc.listRuntimeSkillEntries(companyId);
+      expect(entries.find((candidate) => candidate.key === skillKey)).toMatchObject({ sourceStatus: "available" });
+    } finally {
+      renameSpy.mockRestore();
+      rm.restore();
+    }
+
+    expect(collided).toBe(true);
+    expect(rm.targets).not.toContain(publishedDir);
+    await expect(fs.readFile(path.join(publishedDir, "SKILL.md"), "utf8")).resolves.toContain("Materialized from DB");
+    expect(await fs.readdir(path.dirname(publishedDir))).toEqual([path.basename(publishedDir)]);
+  });
+
+  // BLO-32167. Any other failure of the publish rename must put the previous
+  // complete tree back and leave nothing else in `__runtime__`.
+  it("restores the previous tree when the publish rename fails (BLO-32167)", async () => {
+    const companyId = randomUUID();
+    const { publishedDir } = await seedRematerializingSkill(companyId, "rollback");
+
+    let failed = false;
+    const realRename = fs.rename;
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (!failed && String(to) === publishedDir) {
+        failed = true;
+        throw Object.assign(new Error("EIO: injected"), { code: "EIO" });
+      }
+      return realRename(from, to);
+    });
+
+    try {
+      await svc.listRuntimeSkillEntries(companyId);
+    } finally {
+      renameSpy.mockRestore();
+    }
+
+    expect(failed).toBe(true);
+    await expect(fs.readFile(path.join(publishedDir, "SKILL.md"), "utf8")).resolves.toContain("Materialized from DB");
+    expect(await fs.readdir(path.dirname(publishedDir))).toEqual([path.basename(publishedDir)]);
+  });
+
+  // BLO-32167. When the stored SKILL.md can no longer be materialized the
+  // published tree must stop being served, but it was complete and live a
+  // moment ago — it has to vanish in one rename, not be unlinked file by file.
+  it("retires the published tree by rename when SKILL.md can no longer be materialized (BLO-32167)", async () => {
+    const companyId = randomUUID();
+    const { skillId, skillKey, publishedDir } = await seedRematerializingSkill(companyId, "entrypoint-gone");
+    await db.update(companySkills).set({ fileInventory: [] }).where(eq(companySkills.id, skillId));
+    const rm = recordRmTargets();
+
+    try {
+      const entries = await svc.listRuntimeSkillEntries(companyId, { reconcileInventory: false });
+      expect(entries.find((candidate) => candidate.key === skillKey)).toBeUndefined();
+    } finally {
+      rm.restore();
+    }
+
+    expect(rm.targets).not.toContain(publishedDir);
+    await expect(fs.access(publishedDir)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readdir(path.dirname(publishedDir))).toEqual([]);
+  });
+
   it("falls back to stored markdown when reading SKILL.md from a missing local source", async () => {
     const companyId = randomUUID();
     const skillId = randomUUID();
