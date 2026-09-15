@@ -5,14 +5,20 @@ import { ApiException } from "@kubernetes/client-node";
 // execute.ts reaches for the cluster at import time only through these three
 // factories, so a minimal stub is enough to load the module. The unit under
 // test takes its CoreV1Api as a parameter, so nothing here is ever called.
-vi.mock("./k8s-client.js", () => ({
-  getLogApi: () => ({ log: vi.fn() }),
-  getBatchApi: () => ({}),
-  getCoreApi: () => ({}),
-  getAuthzApi: () => ({}),
-  getSelfPodInfo: vi.fn(),
-  resetCache: vi.fn(),
-}));
+// Partial mock via importOriginal: a whole-module replacement silently drops
+// every export the module gains later (BLO-32734 added SELF_POD_DATA_MOUNT_PATH
+// and broke execute.test.ts that way).
+vi.mock("./k8s-client.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./k8s-client.js")>();
+  return Object.assign(Object.create(null), original, {
+    getLogApi: () => ({ log: vi.fn() }),
+    getBatchApi: () => ({}),
+    getCoreApi: () => ({}),
+    getAuthzApi: () => ({}),
+    getSelfPodInfo: vi.fn(),
+    resetCache: vi.fn(),
+  });
+});
 
 const { isK8s409, createOrAdoptRunSecret } = await import("./execute.js");
 
