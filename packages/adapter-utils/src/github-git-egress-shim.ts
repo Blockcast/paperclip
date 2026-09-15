@@ -720,8 +720,8 @@ export function scanCommit(commit: string, runGit: GitReader): GitPushFinding[] 
  * `commitsForRefUpdate` peels a tag to the commits it reaches, because that is
  * what `rev-list` does — measured: `rev-list <tag-sha> --not --remotes` returns
  * the tagged COMMIT and never the tag object itself. So a tag object's own
- * message is reachable by nothing `scanCommit` reads, while `git push
- * refs/tags/<tag>` publishes that object verbatim, free-form message included.
+ * message is reachable by nothing `scanCommit` reads, while a ref update naming
+ * `refs/tags/<tag>` publishes that object verbatim, free-form message included.
  * A generated release tag that interpolates build environment into its message
  * is the PEN-2526 class exactly, on a ref update whose commits are all clean.
  *
