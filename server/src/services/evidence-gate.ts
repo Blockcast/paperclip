@@ -61,7 +61,17 @@ export interface EvaluateEvidenceInput {
   externalDetections?: Partial<Record<EvidenceShape, boolean>>;
   /** True when the probe could not establish truth (GitHub error, deadline, cap). Suppresses escalation to block. */
   probeFailed?: boolean;
-  /** Wired from loadConfig().evidenceGateUnlabeledTruthBlock. Default off. */
+  /**
+   * Wired from loadConfig().evidenceGateUnlabeledTruthBlock. Default off.
+   *
+   * NAME IS NARROWER THAN THE BEHAVIOUR: the env var is
+   * `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK`, but the escalation applies to any
+   * truth-only gap, labeled or unlabeled. Kept as-is rather than renamed — the
+   * name is load-bearing in the Helm chart, the rollout runbook and the
+   * measurement baseline, and a rename buys nothing behavioural.
+   *
+   * It governs `review:ally-clean` ONLY. See BLOCKABLE_TRUTH_SHAPES.
+   */
   unlabeledTruthBlock?: boolean;
 }
 
@@ -113,6 +123,27 @@ const ALL_SHAPES: readonly EvidenceShape[] = [
  * escalates a gap that is *entirely* within this set.
  */
 export const TRUTH_SHAPES: readonly EvidenceShape[] = ["review:ally-clean", "deploy:landed"];
+
+/**
+ * The subset of `TRUTH_SHAPES` the operator flag may make binding.
+ *
+ * `deploy:landed` is deliberately NOT here, and no flag value may add it. The
+ * gate runs on exactly one transition — INTO `in_review` (doc/EVIDENCE_GATE.md
+ * L3/L15) — and `deploy:landed` means merged. `in_review` is the state a PR
+ * occupies BEFORE it merges, so the shape is unsatisfiable at the only moment
+ * it would ever be evaluated. Making it binding does not raise the bar, it
+ * makes the transition unreachable.
+ *
+ * `review:ally-clean` is a different kind of shape despite sitting next to it
+ * in the registry: an OPEN PR can be at head with 0 Critical / 0 Important, so
+ * it is satisfiable exactly when the gate fires. That asymmetry is the whole
+ * reason this list exists rather than the flag simply reading `TRUTH_SHAPES`.
+ *
+ * A flag can defer an inconvenience; it cannot defer an impossibility. Gating
+ * `deploy:landed` behind `unlabeledTruthBlock` would not make it safe — it
+ * would schedule the deadlock for whoever flips the flag.
+ */
+export const BLOCKABLE_TRUTH_SHAPES: readonly EvidenceShape[] = ["review:ally-clean"];
 
 /**
  * Compute the required-shape set for an issue by unioning the registry
@@ -723,7 +754,13 @@ export function evaluateEvidence(
   // reach GitHub" and "GitHub says this was never reviewed" are the same
   // `missing` list, and blocking on the first would make every GitHub outage
   // an estate-wide in_review freeze.
-  if (verdict === "warn" && input.unlabeledTruthBlock === true && truthOnlyGap) {
+  //
+  // The gap must also contain a shape the flag is ALLOWED to bind — see
+  // BLOCKABLE_TRUTH_SHAPES. A gap of only `deploy:landed` stays a warn at every
+  // flag setting: it is informational by construction, feeding the scorecards
+  // and the rollout measurement without ever gating the transition.
+  const blockableGap = missing.some((s) => BLOCKABLE_TRUTH_SHAPES.includes(s));
+  if (verdict === "warn" && input.unlabeledTruthBlock === true && truthOnlyGap && blockableGap) {
     if (input.probeFailed === true) {
       diagnostics.push("unlabeled-truth-block-suppressed:probe-failed");
     } else {
