@@ -163,6 +163,28 @@ describe("publicIssueExecutionWorkspaceSettings (PEN-3252)", () => {
     expect(Object.keys(JSON.parse(JSON.stringify(projected)))).toContain("__proto__");
   });
 
+  it("masks a NESTED `__proto__` key inside the runtime record, rather than dropping it", () => {
+    // The top-level case above is closed by this projection's own accumulator. This one is closed by
+    // the shared `maskWorkspaceRuntimeForRead` walk it delegates to, which had the identical defect a
+    // level down: `out["__proto__"] = …` on an inheriting accumulator hits the inherited setter and
+    // re-parents `out` instead of adding the key. Fixing only the top level would have left the
+    // invariant broken everywhere the runtime record actually lives.
+    const row = JSON.parse(
+      `{"mode":"isolated_workspace","workspaceRuntime":{` +
+        `"__proto__":{"command":"${RUNTIME_SENTINEL}"},` +
+        `"web":"${RUNTIME_SENTINEL}"}}`,
+    );
+    expect(Object.keys(row.workspaceRuntime)).toContain("__proto__");
+
+    const projected = withheld(row) as any;
+
+    expect(Object.prototype.hasOwnProperty.call(projected.workspaceRuntime, "__proto__")).toBe(true);
+    // Masked in depth, so the operator's key name survives and the command does not.
+    expect(projected.workspaceRuntime.__proto__).toEqual({ command: REDACTED_EVENT_VALUE });
+    expect(projected.workspaceRuntime.web).toBe(REDACTED_EVENT_VALUE);
+    expect(JSON.stringify(projected)).not.toContain(RUNTIME_SENTINEL);
+  });
+
   it("masks the whole value when the column is not an object", () => {
     // The create writer gates on truthiness only, so a string or array reaches the column intact.
     // Spreading one would emit its characters as numbered keys — a bypass dressed as a projection.
