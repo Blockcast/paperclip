@@ -273,8 +273,18 @@ const COUNTED_SEVERITIES = ["critical", "important"] as const;
 // (`> ### Important Issues (1)`) still reads — quoting for emphasis is not
 // quoting as an example. UNCOUNTED_FINDINGS_HEADING_REGEX permits one such
 // run only; keep that in mind if the two are ever unified.
+//
+// Every separator is horizontal (`[ \t]`), never `\s`, because `\s` crosses a
+// newline and an anchor that only pins the *start* of the match is not
+// line-local: `### Critical\nIssues (1)` read as a counted bucket. Worse, the
+// two patterns then disagreed — on `### Critical Issues\n(0)` this one saw a
+// zero bucket while UNCOUNTED_FINDINGS_HEADING_REGEX, whose
+// `(?![*_]*[ \t]*\()` lookahead cannot see a paren across a newline, saw an
+// uncounted heading and blocked. That contradiction is the exact failure the
+// header above warns about, so both now read horizontal whitespace only and
+// classify such a body the same way.
 const COUNTED_FINDINGS_BUCKET_PATTERN = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE} {0,3}(?:[#>]+[ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(${COUNTED_SEVERITIES.join("|")})\s+Issues\b[*_]*\s*\((\d+)\)`,
+  String.raw`^${NOT_INDENTED_CODE} {0,3}(?:[#>]+[ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(${COUNTED_SEVERITIES.join("|")})[ \t]+Issues\b[*_]*[ \t]*\((\d+)\)`,
   "gim",
 );
 

@@ -863,6 +863,28 @@ describe("hasActionablePrReviewFeedback — counted buckets are line-anchored", 
   ])("leaves the other blocking clauses intact: %s", (_shape, line) => {
     expect(hasActionablePrReviewFeedback(reviewBody(CURRENT_HEAD, [line]))).toBe(true);
   });
+
+  // Anchoring the start of the match is only half of line-local: every
+  // separator inside it has to be horizontal too. With `\s+` the pattern
+  // walked off the end of its own anchored line and read the next one.
+  it("does not join a severity word to an `Issues (n)` on the following line", () => {
+    expect(hasActionablePrReviewFeedback(reviewBody(CURRENT_HEAD, ["### Critical", "Issues (1)"]))).toBe(
+      false,
+    );
+  });
+
+  // The subtler half: a split count used to make the two patterns contradict
+  // each other. This one saw a zero bucket and cleared, while the uncounted
+  // heading regex — whose lookahead cannot see a paren across a newline — saw
+  // a bare heading and blocked. They must agree, and on an ambiguous split
+  // this module's stated asymmetry says agree the fail-closed way: it blocks,
+  // and declares no enumerable bucket (null, "none declared" — not [], which
+  // would assert the head genuinely reported zero findings).
+  it("classifies a bucket whose count is on the next line as an uncounted heading", () => {
+    const split = reviewBody(CURRENT_HEAD, ["### Critical Issues", "(0)"]);
+    expect(hasActionablePrReviewFeedback(split)).toBe(true);
+    expect(extractAllyReportedFindingRefs(split)).toBeNull();
+  });
 });
 
 /**
