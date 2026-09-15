@@ -306,10 +306,65 @@ env:
 # Worker tier also runs plugin workers and scheduled plugin jobs. Linear's
 # periodic sync can transiently burn CPU over large BLO backlogs; keep enough
 # headroom for Alertmanager webhooks and health probes to complete.
+#
+# NOTE: this ONE block renders into BOTH tiers — templates/statefulset.yaml
+# (paperclip-0, the singleton worker) and templates/deployment-api.yaml
+# (paperclip-api, 2 replicas) both do `toYaml .Values.resources`. There is no
+# `api.resources`. So any change here multiplies by 3 pods, not 1.
 resources:
   requests:
     cpu: 1500m
-    memory: 2Gi
+    # 7Gi (was 2Gi) — PEN-2957 / PEN-2943. Pinned by
+    # tests/worker-memory-request.test.mjs, which also asserts the two invariants
+    # below (request >= heap ceiling, request < limit) on both tiers.
+    #
+    # WHY: Burstable pods are ranked for eviction by usage-above-request. At
+    # 2Gi the worker — heartbeat scheduler + plugin-worker host for every
+    # claude_local agent — peaked at ~3x its request, so the most load-bearing
+    # pod in the namespace was the first one the kubelet would kill under node
+    # pressure. This is a RELIABILITY change and reclaims nothing.
+    #
+    # WHY 7Gi, NOT THE 5Gi PEN-2943 PROPOSED: measured 2026-09-04, 14d
+    # max_over_time(container_memory_working_set_bytes) — the signal the kubelet
+    # ranks eviction on (NOT container_memory_usage_bytes, which adds reclaimable
+    # page cache and read 6.19 GiB on the same selector that day):
+    #   paperclip-0 (worker)  peak 5.86 GiB
+    #   paperclip-api         peak 4.70 GiB across replicas
+    # 5Gi is below that peak AND below the --max-old-space-size=6144 heap ceiling
+    # pinned in NODE_OPTIONS above, so it would have left the same failure mode
+    # in place under exactly the load that triggers it. 7Gi clears both and
+    # stays 3Gi under the 10Gi limit, so the pod remains Burstable — which is
+    # what makes the eviction-ranking argument apply at all. Same sizing as
+    # paperclip-pg on PEN-2956.
+    #
+    # COST: this block renders on the worker AND both API replicas (see NOTE
+    # above), so +5Gi here is +15 GiB of RESERVATION (not usage) at steady
+    # state; an API rollout (maxSurge 1, maxUnavailable 0, DoNotSchedule
+    # hostname spread) transiently needs a 7Gi slot on a third distinct host.
+    # The API tier is over-provisioned at its ~0.85 GiB steady state; splitting
+    # `api.resources` out of the chart is the cleaner fix, deliberately not
+    # bundled here.
+    #
+    # AFFORDABILITY is a check to re-run at merge time, not a figure to trust
+    # from a comment: every headroom number pinned in earlier revisions of this
+    # block was wrong within hours. What binds is a FULL 7Gi request fitting on
+    # the node a pod lands on — the scheduler re-evaluates the whole request on
+    # every reschedule, not the +5Gi delta. So: the workload=paperclip pool
+    # needs a node with phase-filtered headroom >= 7Gi for the worker, and one
+    # more on a host without an API replica for the surge pod. Fewer than that
+    # means re-deciding this value, not merging. Re-derive with:
+    #   sum by (node) (kube_node_status_allocatable{resource="memory"})
+    #   - sum by (node) (
+    #       kube_pod_container_resource_requests{resource="memory"}
+    #       * on (namespace,pod) group_left()
+    #       (max by (namespace,pod) (kube_pod_status_phase{phase=~"Running|Pending"} == 1))
+    #     )
+    # The phase join is mandatory: unfiltered, the query also counts requests
+    # of Succeeded and Failed pods that hold no memory, which under-reports
+    # headroom by tens of GiB on the worst node and GROWS with retained Job
+    # history (the retention PEN-2957 item B capped). Direction and cause are
+    # durable; the magnitude is not, so none is written here.
+    memory: 7Gi
   limits:
     cpu: "4"
     # 10Gi steady-state limit: off-heap bursts measured up to ~5Gi (and a 6Gi
