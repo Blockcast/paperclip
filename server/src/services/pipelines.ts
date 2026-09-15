@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
+import { restoreWithheldPipelineStageConfig } from "../redaction.js";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -4345,13 +4346,20 @@ export function pipelineService(
     }) {
       await getPipelineOrThrow(db, input.companyId, input.pipelineId);
       const existing = await getStageOrThrow(db, input.pipelineId, input.stageId);
+      // PEN-3266: the pipeline editor round-trips the stage config, so a caller that read this stage
+      // WITHOUT `workspace_runtime:read` holds the masked sentinel where the operator-authored command
+      // is, and saving any unrelated field would otherwise persist that sentinel over the real command.
+      // Restore from the stored row before anything downstream reads the patch.
+      const patchConfig = input.patch.config === undefined
+        ? undefined
+        : restoreWithheldPipelineStageConfig(input.patch.config, stageConfig(existing)) as PipelineStageConfig;
       const kind = normalizeStageKind(input.patch.kind ?? existing.kind);
       const previousRoutineId = stageAutomationRoutineIdFromConfig(stageConfig(existing));
-      const automationRequest = input.patch.config !== undefined
-        ? readStageAutomationRequest(input.patch.config)
+      const automationRequest = patchConfig !== undefined
+        ? readStageAutomationRequest(patchConfig)
         : null;
       const stageName = input.patch.name ?? existing.name;
-      let config = normalizeStageConfig(kind, input.patch.config !== undefined ? input.patch.config : stageConfig(existing));
+      let config = normalizeStageConfig(kind, patchConfig !== undefined ? patchConfig : stageConfig(existing));
       if (automationRequest) {
         config = reconcilePipelineStageConfigVariables(config, [
           automationRequest.titleTemplate ?? PIPELINE_AUTOMATION_DEFAULT_TITLE_TEMPLATE,
