@@ -1646,6 +1646,13 @@
       "when": 1788560240000,
       "tag": "0242_issue_productivity_scanned_at",
       "breakpoints": true
+    },
+    {
+      "idx": 243,
+      "version": "7",
+      "when": 1788560300000,
+      "tag": "0243_cost_events_cache_creation_tokens",
+      "breakpoints": true
     }
   ]
 }

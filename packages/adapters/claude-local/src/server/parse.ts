@@ -30,24 +30,33 @@ const CLAUDE_RELATIVE_RETRY_RE =
  * event's top-level `usage` reflects only the main-loop message chain, so it
  * undercounts output tokens whenever subagents or sidechains ran; `modelUsage`
  * is the CLI's authoritative per-model accounting (it is what backs /cost).
- * Cache-creation tokens are billed prompt tokens, so they count as input.
+ *
+ * Cache-creation tokens are billed prompt tokens, but NOT at the fresh-input
+ * price — Anthropic charges 1.25x (5m TTL) / 2x (1h TTL) for creation against
+ * 1x for fresh input and 0.1x for reads. Until BLO-29842 they were summed into
+ * `inputTokens` here, which priced them at 1x and left three prices visible
+ * only through two columns. They are now reported separately and are NOT part
+ * of `inputTokens`; callers that need "everything except cache reads" must add
+ * the two back together (see `latestRawInputTokens` in heartbeat.ts).
  */
 export function claudeModelUsageTotals(modelUsage: unknown): UsageSummary | null {
   const byModel = parseObject(modelUsage);
   let inputTokens = 0;
   let outputTokens = 0;
   let cachedInputTokens = 0;
+  let cacheCreationInputTokens = 0;
   let sawEntry = false;
   for (const value of Object.values(byModel)) {
     const entry = parseObject(value);
     if (Object.keys(entry).length === 0) continue;
     sawEntry = true;
-    inputTokens += asNumber(entry.inputTokens, 0) + asNumber(entry.cacheCreationInputTokens, 0);
+    inputTokens += asNumber(entry.inputTokens, 0);
+    cacheCreationInputTokens += asNumber(entry.cacheCreationInputTokens, 0);
     outputTokens += asNumber(entry.outputTokens, 0);
     cachedInputTokens += asNumber(entry.cacheReadInputTokens, 0);
   }
   if (!sawEntry) return null;
-  return { inputTokens, outputTokens, cachedInputTokens };
+  return { inputTokens, outputTokens, cachedInputTokens, cacheCreationInputTokens };
 }
 
 export function parseClaudeStreamJson(stdout: string) {
@@ -107,6 +116,9 @@ export function parseClaudeStreamJson(stdout: string) {
   const usage: UsageSummary = modelUsageTotals ?? {
     inputTokens: asNumber(usageObj.input_tokens, 0),
     cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
+    // BLO-29842: raw Anthropic payloads spell this snake_case. Absent for any
+    // provider that does not cache-write, which reads as 0.
+    cacheCreationInputTokens: asNumber(usageObj.cache_creation_input_tokens, 0),
     outputTokens: asNumber(usageObj.output_tokens, 0),
   };
   const costRaw = finalResult.total_cost_usd;
