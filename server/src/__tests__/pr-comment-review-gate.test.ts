@@ -883,6 +883,39 @@ describe("hasActionablePrReviewFeedback — counted buckets are line-anchored", 
     expect(hasActionablePrReviewFeedback(split)).toBe(true);
     expect(extractAllyReportedFindingRefs(split)).toBeNull();
   });
+
+  // The anchor's marker run must consume one `#`/`>` per iteration. Written as
+  // `(?:[#>]+[ \t]*)*` it is `(x+)*`, and a leading marker run that then fails
+  // the rest of the pattern costs 2^(n-1) — 757ms at n=40, doubling every two
+  // characters. The body reaching this is raw webhook input on a
+  // single-threaded API, so the blowup stalls the event loop, not one request.
+  // n=64 is ~10^7x the n=40 cost, so any wall-clock bound separates the two.
+  it("matches a long leading marker run in linear time", () => {
+    const started = performance.now();
+    expect(hasActionablePrReviewFeedback("#".repeat(64) + "x")).toBe(false);
+    expect(hasActionablePrReviewFeedback(">".repeat(64) + "x")).toBe(false);
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  // Same run, but a shape that genuinely is a bucket: collapsing the nested
+  // quantifier must not narrow the accepted language.
+  it("still blocks on a bucket behind a mixed marker run", () => {
+    expect(hasActionablePrReviewFeedback("> > ### Critical Issues (1)")).toBe(true);
+  });
+
+  // Adopting NOT_INDENTED_CODE moved this case: the unanchored pattern used to
+  // block on it. Four-space indentation is a code block, so this reads as
+  // quoted — consistent with every other pattern in the file. But it is a
+  // move in the fail-open direction on a module whose header says never to
+  // take that direction unexamined, so it is pinned rather than incidental.
+  // UNCOUNTED_FINDINGS_HEADING_REGEX does not catch the fallthrough either:
+  // its `(?![*_]*[ \t]*\()` lookahead sees the `(1)` and declines.
+  it("treats a bucket in an indented code block as quoted, not as a verdict", () => {
+    const indented = reviewBody(CURRENT_HEAD, ["    ### Critical Issues (1)"]);
+    expect(hasActionablePrReviewFeedback(indented)).toBe(false);
+    // Fail-closed on the enumeration side: "none declared", never a claimed [].
+    expect(extractAllyReportedFindingRefs(indented)).toBeNull();
+  });
 });
 
 /**

@@ -227,10 +227,13 @@ const PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp(
 // it would also drop a real finding a reviewer happened to format as code,
 // which is the fail-open direction this module must never take (BLO-29711).
 //
-// `[#>]+` repeats rather than matching once so a blockquoted heading
+// The marker group repeats so a blockquoted heading
 // (`> ### Important Issues (1)`) still reads — quoting for emphasis is not
 // quoting as an example. UNCOUNTED_FINDINGS_HEADING_REGEX permits one such
-// run only; keep that in mind if the two are ever unified.
+// run only, and the two therefore leave a gap: `> ### Critical Issues`,
+// blockquoted *and* uncounted, is matched by neither. That is pre-existing
+// and deliberately unchanged here, but it is the case a future unification
+// would silently alter, so weigh it before merging the two patterns.
 //
 // Every separator is horizontal (`[ \t]`), never `\s`, because `\s` crosses a
 // newline and an anchor that only pins the *start* of the match is not
@@ -241,8 +244,18 @@ const PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp(
 // uncounted heading and blocked. That contradiction is the exact failure the
 // header above warns about, so both now read horizontal whitespace only and
 // classify such a body the same way.
+//
+// The marker run is `(?:[#>][ \t]*)*` — one `[#>]` per iteration — and not
+// `(?:[#>]+[ \t]*)*`. The latter is `(x+)*`, a nested quantifier over a
+// non-empty group: a line opening with a run of `#`/`>` that then fails the
+// rest of the pattern drives the engine through all 2^(n-1) ways of splitting
+// that run, so `"#".repeat(40) + "x"` took 757ms here against 0.1ms for this
+// form. That is reachable from unclamped webhook input on a single-threaded
+// API, so it stalls the event loop rather than one request. Consuming exactly
+// one marker per iteration removes the ambiguity; the accepted language is
+// unchanged, since a run of markers is still matched one character at a time.
 const COUNTED_FINDINGS_BUCKET_PATTERN = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE} {0,3}(?:[#>]+[ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(Critical|Important)[ \t]+Issues\b[*_]*[ \t]*\((\d+)\)`,
+  String.raw`^${NOT_INDENTED_CODE} {0,3}(?:[#>][ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(Critical|Important)[ \t]+Issues\b[*_]*[ \t]*\((\d+)\)`,
   "gim",
 );
 
