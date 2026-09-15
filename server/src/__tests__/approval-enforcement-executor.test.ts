@@ -39,6 +39,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { applyApprovalEnforcement } from "../services/approval-enforcement-executor.ts";
 import { reconcileApprovalEnforcement } from "../services/approval-enforcement-reconciler.ts";
+import { budgetService } from "../services/budgets.ts";
 import { HttpError } from "../errors.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -102,11 +103,11 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
     proseOnly?: boolean;
     isActive?: boolean;
     /**
-     * Override `budget_policies.updated_at`. Left unset the column defaults to
-     * now, which is after the fixture's `decidedAt` and therefore reads as a
-     * post-decision write.
+     * Override `budget_policies.amount_updated_at`. Left unset the column
+     * defaults to now, which is after the fixture's `decidedAt` and therefore
+     * reads as a cap moved after the decision.
      */
-    policyUpdatedAt?: Date;
+    policyAmountUpdatedAt?: Date;
   }) {
     const companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: `co-${companyId.slice(0, 8)}` });
@@ -143,7 +144,7 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
       windowKind: "calendar_month_utc",
       amount: options.enforcedCents,
       isActive: options.isActive ?? true,
-      ...(options.policyUpdatedAt ? { updatedAt: options.policyUpdatedAt } : {}),
+      ...(options.policyAmountUpdatedAt ? { amountUpdatedAt: options.policyAmountUpdatedAt } : {}),
     });
 
     const decidedCents = options.decidedCents ?? DECIDED_CENTS;
@@ -186,6 +187,11 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
       .from(budgetPolicies)
       .where(eq(budgetPolicies.id, policyId));
     return row?.amount ?? null;
+  }
+
+  async function policyRow(policyId: string) {
+    const [row] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policyId));
+    return row!;
   }
 
   async function expectRefusal(promise: Promise<unknown>, code: string, status: number) {
@@ -355,20 +361,64 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
     expect(await enforcedAmount(policyId)).toBe(SUPERSEDING_CENTS);
   });
 
-  it("applies a policy untouched since the decision even when the card's recorded prior is wrong", async () => {
+  it("applies a policy whose cap has not moved since the decision even when the card's recorded prior is wrong", async () => {
     // Same two-way disagreement as the test above, opposite disposition. Ally's
     // finding on #1846: `from_usd` is unvalidated payload text, so a wrong prior
     // must not be able to disguise a real enforcement gap as a supersession.
-    // Nothing has written this row since the decision, so there is no later
-    // decision to protect — the gap is real and applying it reverts nothing.
+    // The cap has not moved since the decision, so there is no later decision
+    // to protect — the gap is real and applying it reverts nothing.
     const { requesterId, policyId, approvalId } = await seed({
       enforcedCents: SUPERSEDING_CENTS,
-      policyUpdatedAt: new Date(Date.now() - 48 * 60 * 60 * 1000),
+      policyAmountUpdatedAt: new Date(Date.now() - 48 * 60 * 60 * 1000),
     });
     const { hooks } = collectingHooks();
     const result = await applyApprovalEnforcement(db, approvalId, requester(requesterId), hooks);
     expect(result.applied).toHaveLength(1);
     expect(await enforcedAmount(policyId)).toBe(DECIDED_CENTS);
+  });
+
+  it("is not blinded by a post-decision edit that changed everything except the cap", async () => {
+    // Ally's second finding on #1846, through the real write path rather than a
+    // seeded timestamp. The split first shipped against
+    // `budget_policies.updated_at`, and `upsertPolicy` is the single edit path
+    // for warn percent, hard stop, notify and active state as well as the
+    // amount — so a warn-percent toggle bumped `updated_at` past `decidedAt`
+    // and a never-applied raise read as a supersession: unreported by the
+    // sweep, refused here. `amount_updated_at` is stamped only when the cap
+    // actually moves, so the toggle is invisible to the classifier.
+    const { requesterId, policyId, approvalId, companyId, targetId } = await seed({
+      enforcedCents: SUPERSEDING_CENTS,
+      policyAmountUpdatedAt: new Date(Date.now() - 48 * 60 * 60 * 1000),
+    });
+
+    const before = await policyRow(policyId);
+    await budgetService(db).upsertPolicy(
+      companyId,
+      {
+        scopeType: "agent",
+        scopeId: targetId,
+        amount: SUPERSEDING_CENTS, // unchanged — this edit is metadata only
+        windowKind: "calendar_month_utc",
+        warnPercent: 55,
+      },
+      null,
+    );
+    const after = await policyRow(policyId);
+    expect(after.warnPercent).toBe(55);
+    // The row was written — this is what used to mislead the classifier...
+    expect(after.updatedAt.getTime()).toBeGreaterThan(before.updatedAt.getTime());
+    // ...and the cap was not, which is the only fact the classifier reads.
+    expect(after.amountUpdatedAt.getTime()).toBe(before.amountUpdatedAt.getTime());
+
+    const { hooks } = collectingHooks();
+    const result = await applyApprovalEnforcement(db, approvalId, requester(requesterId), hooks);
+    expect(result.applied).toHaveLength(1);
+    expect(await enforcedAmount(policyId)).toBe(DECIDED_CENTS);
+
+    // And a genuine cap move through the same path does stamp it, so the
+    // supersession guard still has something to fire on.
+    const applied = await policyRow(policyId);
+    expect(applied.amountUpdatedAt.getTime()).toBeGreaterThan(before.amountUpdatedAt.getTime());
   });
 
   it("refuses a mismatch it cannot classify, rather than guessing", async () => {

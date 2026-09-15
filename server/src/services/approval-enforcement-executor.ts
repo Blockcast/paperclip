@@ -33,7 +33,7 @@
  * decided-vs-enforced comparison, which is why the idempotency guard the issue
  * originally specified could not have caught this: both are "enforced !=
  * decided". `classifyEnforcementAssertion` separates them using the `from_usd`
- * the card already records plus `budget_policies.updated_at` — the card's field
+ * the card already records plus `budget_policies.amount_updated_at` — the card's field
  * alone is untrusted free-form text, so a wrong prior must not be able to make a
  * real gap read as a supersession — and this route writes only the
  * `never_applied` ones.
@@ -186,7 +186,7 @@ export async function applyApprovalEnforcement(
         amount: budgetPolicies.amount,
         isActive: budgetPolicies.isActive,
         windowKind: budgetPolicies.windowKind,
-        updatedAt: budgetPolicies.updatedAt,
+        amountUpdatedAt: budgetPolicies.amountUpdatedAt,
       })
       .from(budgetPolicies)
       .where(
@@ -214,7 +214,12 @@ export async function applyApprovalEnforcement(
     for (const assertion of assertions) {
       const row = byId.get(assertion.policyId) ?? null;
       const enforced: EnforcedBudgetPolicy | null = row
-        ? { policyId: row.id, amount: row.amount, isActive: row.isActive, updatedAt: row.updatedAt }
+        ? {
+          policyId: row.id,
+          amount: row.amount,
+          isActive: row.isActive,
+          amountUpdatedAt: row.amountUpdatedAt,
+        }
         : null;
 
       if (row && row.scopeType === "agent" && row.scopeId === actor.agentId) {
@@ -259,7 +264,7 @@ export async function applyApprovalEnforcement(
         case "unverifiable_mismatch":
           throw refuse(
             "assertion_unverifiable",
-            `Policy \`${assertion.policyId}\` disagrees with the card, and neither the card's recorded starting figure nor the policy's last-written time can tell "never applied" from "superseded"`,
+            `Policy \`${assertion.policyId}\` disagrees with the card, and neither the card's recorded starting figure nor the policy's last amount-change time can tell "never applied" from "superseded"`,
             unprocessable,
             { policyId: assertion.policyId, enforcedAmountCents: row!.amount },
           );
