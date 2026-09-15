@@ -115,9 +115,23 @@ export type GateProbeKind =
  *   ever answered and no answer is now coming. The row reads as "waiting on a
  *   human" while the thing it was waiting on no longer exists. Like a stuck
  *   edge it cannot self-clear — someone has to re-ask or drop the row.
+ * - `approval-abandoned` (PEN-3089) is the approval-side twin of
+ *   `interaction-abandoned`: every linked card was `withdrawn` by its own
+ *   requester or `cancelled`, so the board never answered and no answer is
+ *   coming. Before PEN-3089 these rows were reported as `approval-decided` —
+ *   identically to an `approved` card — which is how PEN-2224, the root blocker
+ *   of a critical credential-exposure chain, spent 26 days inside a section
+ *   headed "these are not still waiting".
  * - `blocker-done-row-not-moved` is a row whose blockers all completed; the
  *   platform already considers it dependency-ready and it is merely still open.
- * - `approval-decided` is a row whose every linked approval has been answered.
+ * - `approval-granted` is a row whose board gate opened: at least one linked
+ *   approval is `approved`. The gate really did resolve — but what it resolved
+ *   *into* is an instruction to perform, so the row is now authorised and
+ *   unperformed. See {@link ACTION_OWED_RESOLUTION_KINDS} for why that is kept
+ *   in the escalation list rather than withheld from it.
+ * - `approval-refused` is a row whose board gate closed with a `rejected` card
+ *   and no grant. The ask was answered "no"; nothing further is owed by the
+ *   gate and the row needs closing, not escalating.
  * - `interaction-answered` is a row where at least one question card got a real
  *   human decision (accepted / rejected / answered) and which is still open
  *   anyway. Deliberately *not* "every card": a row whose remaining cards were
@@ -127,8 +141,10 @@ export type GateProbeKind =
 export type GateResolutionKind =
   | "blocker-cancelled-edge-stuck"
   | "interaction-abandoned"
+  | "approval-abandoned"
   | "blocker-done-row-not-moved"
-  | "approval-decided"
+  | "approval-granted"
+  | "approval-refused"
   | "interaction-answered";
 
 /**
@@ -167,6 +183,32 @@ const BLOCKER_TERMINAL_NON_RESOLVING_STATUSES: ReadonlySet<string> = new Set(["c
 
 /** Approval statuses that mean the board has not answered yet. */
 const APPROVAL_UNDECIDED: ReadonlySet<string> = new Set(["pending", "revision_requested"]);
+
+/**
+ * Approval statuses where the board actually answered (PEN-3089).
+ *
+ * Split into grant and refusal because the two resolve the gate into opposite
+ * obligations. A grant is an instruction to perform, so it leaves work owed by
+ * whoever the row is assigned to; a refusal ends the ask outright. The digest
+ * treats them differently — see {@link ACTION_OWED_RESOLUTION_KINDS}.
+ */
+const APPROVAL_GRANTED: ReadonlySet<string> = new Set(["approved"]);
+const APPROVAL_REFUSED: ReadonlySet<string> = new Set(["rejected"]);
+
+/**
+ * Approval statuses where the ask went away *without* a board answer.
+ *
+ * `withdrawn` is the requesting agent retracting its own card — routinely and
+ * correctly, to keep a human queue honest — and `cancelled` is the same shape
+ * from the platform side. Neither is a decision: `decidedByUserId` is `null` on
+ * both, and the exact mechanism that keeps the queue honest is what used to
+ * delete the row from this digest.
+ *
+ * Mirrors {@link INTERACTION_ABANDONED}, which the interaction probe has
+ * distinguished since BLO-30627. The approval probe simply never grew the
+ * branch.
+ */
+const APPROVAL_ABANDONED: ReadonlySet<string> = new Set(["withdrawn", "cancelled"]);
 
 /**
  * Interaction statuses that mean a human still owes an answer.
@@ -393,27 +435,79 @@ export function probeBlockerPremise(input: GateEvidenceInput): ProbeResult | nul
  * Reads the linked cards' own statuses. For `gate.kind: github_actions_run`
  * cards that status is already maintained against the live run by
  * `approval-gate-reconciler.ts`, so this needs no GitHub call of its own.
+ *
+ * Four outcomes (PEN-3089 split the last three out of one):
+ *
+ * - any card still undecided, **or carrying a status this module does not
+ *   recognise** → `still-gated`;
+ * - otherwise, any card `approved` → `approval-granted`;
+ * - otherwise, any card `rejected` → `approval-refused`;
+ * - otherwise every card was withdrawn or cancelled → the board was asked and
+ *   never answered (`approval-abandoned`).
+ *
+ * Grant beats refusal on a mixed row for the same reason unknown beats
+ * everything: a single live authorisation means work is owed, and the
+ * escalation surface must not lose it behind a sibling refusal.
+ *
+ * The unknown-status branch is property 2 (fail toward `still-gated`) applied
+ * to schema drift. `approvals.status` is a plain `text` column, and before
+ * PEN-3089 this probe read *every* non-undecided value as a resolution — the
+ * exact inversion of the default {@link probePendingInteraction} has honoured
+ * since BLO-30627, in the same file.
  */
 export function probeApprovalGate(input: GateEvidenceInput): ProbeResult | null {
   if (input.approvals.length === 0) return null;
 
-  const undecided = input.approvals.filter((approval) =>
-    APPROVAL_UNDECIDED.has(approval.approvalStatus),
+  const live = input.approvals.filter(
+    (approval) =>
+      APPROVAL_UNDECIDED.has(approval.approvalStatus) ||
+      (!APPROVAL_GRANTED.has(approval.approvalStatus) &&
+        !APPROVAL_REFUSED.has(approval.approvalStatus) &&
+        !APPROVAL_ABANDONED.has(approval.approvalStatus)),
   );
 
-  if (undecided.length > 0) {
+  if (live.length > 0) {
     return {
       probe: "approval-gate",
       verdict: "still-gated",
-      evidence: `${undecided.length} of ${input.approvals.length} linked approval${input.approvals.length === 1 ? "" : "s"} still undecided: ${undecided.map(describeApproval).join(", ")}`,
+      evidence: `${live.length} of ${input.approvals.length} linked approval${input.approvals.length === 1 ? "" : "s"} still undecided: ${live.map(describeApproval).join(", ")}`,
     };
   }
 
+  const granted = input.approvals.filter((approval) =>
+    APPROVAL_GRANTED.has(approval.approvalStatus),
+  );
+
+  if (granted.length > 0) {
+    return {
+      probe: "approval-gate",
+      verdict: "resolved-but-open",
+      resolutionKind: "approval-granted",
+      evidence: `${granted.map(describeApproval).join(", ")} — ${granted.length} of ${input.approvals.length} linked approval${input.approvals.length === 1 ? " was" : "s were"} granted and the row has not moved since, so it is authorised and unperformed: the gate opened and whoever the row is assigned to still owes the work`,
+    };
+  }
+
+  const refused = input.approvals.filter((approval) =>
+    APPROVAL_REFUSED.has(approval.approvalStatus),
+  );
+
+  if (refused.length > 0) {
+    return {
+      probe: "approval-gate",
+      verdict: "resolved-but-open",
+      resolutionKind: "approval-refused",
+      evidence: `all ${input.approvals.length} linked approval${input.approvals.length === 1 ? " was" : "s were"} answered and none was granted: ${input.approvals.map(describeApproval).join(", ")} — the ask was refused, so this row needs closing rather than re-asking`,
+    };
+  }
+
+  // The card refs lead, as they do in the cancelled-blocker and abandoned-
+  // interaction branches: the rendered evidence is length-bounded, and *which*
+  // ask died is the only part a reader can act on.
   return {
     probe: "approval-gate",
     verdict: "resolved-but-open",
-    resolutionKind: "approval-decided",
-    evidence: `all ${input.approvals.length} linked approval${input.approvals.length === 1 ? " has" : "s have"} been decided: ${input.approvals.map(describeApproval).join(", ")}`,
+    resolutionKind: "approval-abandoned",
+    evidence: `${input.approvals.map(describeApproval).join(", ")} — all ${input.approvals.length} linked approval${input.approvals.length === 1 ? " was" : "s were"} withdrawn or cancelled, so the board was asked and never answered and no answer is coming; someone must re-ask or drop the row`,
   };
 }
 
@@ -496,14 +590,61 @@ const PROBES: ReadonlyArray<(input: GateEvidenceInput) => ProbeResult | null> = 
 /**
  * Resolution kinds that can never clear themselves, most severe first.
  *
- * Both describe a gate whose counterparty is gone: a cancelled blocker edge no
- * `done` can ever satisfy, and a question every card for which was withdrawn.
- * They are reported ahead of the merely-finished kinds because they are the
- * ones a reader has to *act* on rather than notice.
+ * Each describes a gate whose counterparty is gone: a cancelled blocker edge no
+ * `done` can ever satisfy, a question every card for which was withdrawn, and a
+ * board ask every card for which was withdrawn or cancelled. They are reported
+ * ahead of the merely-finished kinds because they are the ones a reader has to
+ * *act* on rather than notice.
+ *
+ * This ordering also decides which kind a multi-probe row is filed under
+ * ({@link combineProbeVerdicts}), so membership here is what makes PEN-2224 —
+ * an abandoned board card plus an answered question card — report as abandoned
+ * rather than as answered.
  */
 const NON_SELF_CLEARING_RESOLUTION_KINDS: readonly GateResolutionKind[] = Object.freeze([
   "blocker-cancelled-edge-stuck",
   "interaction-abandoned",
+  "approval-abandoned",
+]);
+
+/**
+ * Resolution kinds that leave an action owed, so the row keeps its place in the
+ * age-ranked escalation list (PEN-3089).
+ *
+ * This is the set {@link withheldFromAgeRankingIssueIds} inverts, and the
+ * distinction it draws is the one the caller used to get wrong. "The gate
+ * blocking this row resolved" and "this row is not still waiting" are different
+ * propositions, and for human-gated work they come apart completely: a row
+ * whose gate cleared and which has *not moved since* is not the least deserving
+ * of escalation, it is the most — the thing that explained its silence is gone
+ * and nothing replaced it.
+ *
+ * Two reasons land a kind here, and only one of them is "the counterparty is
+ * gone":
+ *
+ * - every {@link NON_SELF_CLEARING_RESOLUTION_KINDS} kind — nobody answered and
+ *   nobody will, so someone must re-ask or clear the edge;
+ * - `approval-granted` — somebody *did* answer, and the answer was "yes, do it".
+ *   An authorisation is not a completion. Approving is also the single write
+ *   that removes the card from the pending-approval queue, so the grant
+ *   simultaneously ends the only other surface that was watching the ask; if
+ *   the digest exempts the row too, authorised-but-unperformed work becomes
+ *   unobserved by construction. Resolution does fire a one-shot wake at the
+ *   *requesting* agent (`REQUESTER_WAKE_REASONS`, `approval-resolution.ts`),
+ *   but a single wake at decision time is not a standing watch, and it reaches
+ *   the asker rather than whoever the row is assigned to.
+ *
+ * Deliberately excluded, so this stays a narrowing and not an "escalate
+ * everything": `approval-refused` (the ask was answered "no" — nothing further
+ * is owed by the gate), `interaction-answered` (a human engaged and the answer
+ * is on the row), and `blocker-done-row-not-moved` (the platform already treats
+ * the row as dependency-ready, so it is ordinary un-started work that every
+ * agent-side sweep can already see). All three keep rendering in the
+ * resolved-but-open section with their age; they are simply not escalated.
+ */
+const ACTION_OWED_RESOLUTION_KINDS: ReadonlySet<GateResolutionKind> = new Set<GateResolutionKind>([
+  ...NON_SELF_CLEARING_RESOLUTION_KINDS,
+  "approval-granted",
 ]);
 
 /** Statuses whose `unverifiable` residual is a contradiction, not an absence. */
@@ -663,8 +804,10 @@ export function revalidateGates(
   const countsByResolutionKind: Record<GateResolutionKind, number> = {
     "blocker-cancelled-edge-stuck": 0,
     "interaction-abandoned": 0,
+    "approval-abandoned": 0,
     "blocker-done-row-not-moved": 0,
-    "approval-decided": 0,
+    "approval-granted": 0,
+    "approval-refused": 0,
     "interaction-answered": 0,
   };
   const countsByUnverifiableReason: Record<UnverifiableReason, number> = {
@@ -694,11 +837,44 @@ export function revalidateGates(
   };
 }
 
-/** Ids the caller must withhold from the age-ranked list (AC2). */
+/** Ids whose gate re-tested as resolved, so the renderer can carry their age. */
 export function resolvedButOpenIssueIds(report: GateRevalidationReport): Set<string> {
   return new Set(
     report.classifications
       .filter((classification) => classification.verdict === "resolved-but-open")
+      .map((classification) => classification.issueId),
+  );
+}
+
+/**
+ * Ids the caller may withhold from the age-ranked escalation list (PEN-3089).
+ *
+ * A strict subset of {@link resolvedButOpenIssueIds}, and the two must stay
+ * distinct: every resolved-but-open row is still *rendered* with its age, but
+ * only the ones whose resolution left nothing owed are *exempted* from
+ * escalation. Collapsing the two is the defect this function exists to fix —
+ * `verdict === "resolved-but-open"` was read as "this row is not still
+ * waiting", and so an ask the requester withdrew silently deleted its row from
+ * the founder's only attention list.
+ *
+ * The predicate reads **every probe on the row**, not the single
+ * `resolutionKind` {@link combineProbeVerdicts} elected as primary. That
+ * election is a display choice — it picks the most severe kind to file the row
+ * under — and hanging an exemption off it would mean a row's escalation
+ * depended on which of two resolved probes happened to win a heading. Reading
+ * all of them makes the exemption independent of probe order: any single
+ * action-owed probe keeps the row escalated.
+ */
+export function withheldFromAgeRankingIssueIds(report: GateRevalidationReport): Set<string> {
+  return new Set(
+    report.classifications
+      .filter(
+        (classification) =>
+          classification.verdict === "resolved-but-open" &&
+          !classification.probes.some(
+            (probe) => probe.resolutionKind && ACTION_OWED_RESOLUTION_KINDS.has(probe.resolutionKind),
+          ),
+      )
       .map((classification) => classification.issueId),
   );
 }
@@ -711,8 +887,12 @@ const RESOLUTION_KIND_HEADINGS: Record<GateResolutionKind, string> = {
     "Blocker edge is cancelled — permanently un-checkoutable until an operator clears it",
   "interaction-abandoned":
     "Every question card was withdrawn or expired — the human was asked and never answered",
+  "approval-abandoned":
+    "Every board card was withdrawn or cancelled — the board was asked and never answered",
   "blocker-done-row-not-moved": "Every blocker is done — the row simply never moved",
-  "approval-decided": "Every linked approval has been decided",
+  "approval-granted":
+    "The board granted the ask and the row has not moved since — authorised, unperformed",
+  "approval-refused": "The board refused the ask — this row needs closing, not re-asking",
   // Not "every card was answered": the branch that assigns this kind fires
   // whenever *at least one* card got a real decision, so the rest may have been
   // cancelled, expired, or failed. The evidence line already says "closed, N by
@@ -871,14 +1051,17 @@ export function formatGateRevalidationSections(
 
   body.push(
     "",
-    `#### Resolved but still open — ${resolved.length} (withheld from the age-ranked list; these are not still waiting)`,
+    `#### Gate resolved but row still open — ${resolved.length}`,
+    "",
+    "Each row below had its gate re-tested and the gate is no longer live. That is *not* the same as 'no longer waiting': where the resolution left an action owed, the row is marked ⛔ and still appears in the age-ranked list. Only the unmarked rows are withheld from it.",
   );
 
   // Order by resolution kind so the ones that cannot self-clear lead.
   const kindOrder: GateResolutionKind[] = [
     ...NON_SELF_CLEARING_RESOLUTION_KINDS,
+    "approval-granted",
     "blocker-done-row-not-moved",
-    "approval-decided",
+    "approval-refused",
     "interaction-answered",
   ];
 
@@ -887,7 +1070,14 @@ export function formatGateRevalidationSections(
     const inKind = resolved.filter((classification) => classification.resolutionKind === kind);
     if (inKind.length === 0) continue;
 
-    body.push("", `**${RESOLUTION_KIND_HEADINGS[kind]} — ${inKind.length}**`);
+    // Stated per kind rather than once at the top: the escalation consequence
+    // is a property of the kind, and a reader scanning one block should not
+    // have to hold the legend in their head to know whether these rows reached
+    // the list below.
+    const disposition = ACTION_OWED_RESOLUTION_KINDS.has(kind)
+      ? "⛔ still escalated — an action is owed"
+      : "withheld from the age-ranked list";
+    body.push("", `**${RESOLUTION_KIND_HEADINGS[kind]} — ${inKind.length}** (${disposition})`);
     for (const classification of inKind) {
       if (listed >= maxListed) break;
       const ref = formatRef(
