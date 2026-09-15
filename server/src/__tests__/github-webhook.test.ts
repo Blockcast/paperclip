@@ -9325,6 +9325,35 @@ describe("hasActionablePrReviewFeedback — reviewer taxonomy", () => {
     expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);
   });
 
+  // BLO-33880 / onprem-k8s#3490: a 0/0/0 review whose Recommended Action reads
+  // "No Critical issues to fix before merge" was published as a red. The span
+  // heuristic matched from the heading, so the negation sitting immediately
+  // before `fix` was never consulted.
+  it("is not actionable when the recommended action NEGATES the fix-before-merge directive", () => {
+    const body = [
+      "## Ally — Consolidated PR Review",
+      "### Critical Issues (0)",
+      "",
+      "### Important Issues (0)",
+      "",
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+      "2. No Important issues to address this cycle.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(false);
+  });
+
+  // The negation must not become a mask: a genuine directive later in the same
+  // list still has to block, or the false-RED fix would open a fail-open hole.
+  it("stays actionable when a negated line precedes a real fix-before-merge directive", () => {
+    const body = [
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+      "2. Fix the Important issue before merge.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
   it("does not mask a non-zero bucket that follows a zero-count bucket", () => {
     const body = "### Critical Issues (0)\n### Important Issues (2)\n- one\n- two";
     expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);

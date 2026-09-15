@@ -159,6 +159,11 @@ const NEGATION_CUE_REGEX =
   /\b(?:no|not|zero|none|never|without|isn't|aren't|doesn't|didn't|won't|cannot)\b/i;
 const NEGATION_LOOKBACK_WORDS = 8;
 
+// "Recommended Action" + the two 400-character hops the directive heuristic
+// allows, plus the heading itself. Keeps the scan window identical to the span
+// regex it replaced, so narrowing the negation anchor cannot also narrow reach.
+const RECOMMENDED_ACTION_REACH = 840;
+
 // Uncounted findings must begin a heading/list line. An unanchored pattern
 // would incorrectly flag prose such as "No Critical or Important issues".
 const UNCOUNTED_FINDINGS_HEADING_REGEX =
@@ -366,7 +371,23 @@ function carriesBlockingFeedback(text: string): boolean {
   if (/^[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*$/im.test(text)) return true;
   if (hasNonNegatedMatch(text, /\bchanges\s+requested\b/i)) return true;
   if (hasNonNegatedMatch(text, /\brequest(?:ed|s)?\s+changes\b/i)) return true;
-  return /\bRecommended\s+Action\b[\s\S]{0,400}\bfix\b[\s\S]{0,400}\bbefore\s+merg(?:e|es|ed|ing)\b/i.test(text);
+  // The directive form ("fix X before merge") is blocking only when it is not
+  // negated. A clean review's Recommended Action routinely reads "No Critical
+  // issues to fix before merge", and matching the whole span from the heading
+  // read that as a finding — publishing a red over a 0/0/0 review (BLO-33880,
+  // onprem-k8s#3490). The negation lookback has to be anchored at `fix`, not at
+  // the heading: hasNonNegatedMatch walks back only to the start of the local
+  // sentence, so checking from the heading looks past the clause that negates.
+  // It scans every `fix` in the section and blocks on the first non-negated
+  // one, so a negated line cannot mask a real directive later in the same list.
+  for (const heading of text.matchAll(/\bRecommended\s+Action\b/gi)) {
+    // Same reach as the span this replaces: heading + two 400-character hops.
+    const section = text.slice(heading.index, heading.index + RECOMMENDED_ACTION_REACH);
+    if (hasNonNegatedMatch(section, /\bfix\b[\s\S]{0,400}?\bbefore\s+merg(?:e|es|ed|ing)\b/i)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** Return whether a formal or comment-shaped review contains blocking feedback. */
