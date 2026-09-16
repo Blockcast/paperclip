@@ -1160,6 +1160,7 @@ async function buildAgentContext(
         billingType: costEvents.billingType,
         model: costEvents.model,
         inputTokens: costEvents.inputTokens,
+        cacheCreationInputTokens: costEvents.cacheCreationInputTokens,
         cachedInputTokens: costEvents.cachedInputTokens,
         outputTokens: costEvents.outputTokens,
         costCents: costEvents.costCents,
@@ -1211,7 +1212,10 @@ async function buildAgentContext(
         billers: uniqueNonEmpty(runCosts.map((row) => row.biller)),
         billingTypes: uniqueNonEmpty(runCosts.map((row) => row.billingType)),
         models: uniqueNonEmpty(runCosts.map((row) => row.model)),
-        inputTokens: runCosts.reduce((sum, row) => sum + row.inputTokens, 0),
+        // BLO-29842: cache writes used to live inside input_tokens. This is a
+        // volume figure, not a rate-card regressor, so sum both to keep it
+        // measuring what it measured before the column was split out.
+        inputTokens: runCosts.reduce((sum, row) => sum + row.inputTokens + row.cacheCreationInputTokens, 0),
         cachedInputTokens: runCosts.reduce((sum, row) => sum + row.cachedInputTokens, 0),
         outputTokens: runCosts.reduce((sum, row) => sum + row.outputTokens, 0),
         costCents: runCosts.reduce((sum, row) => sum + row.costCents, 0),
