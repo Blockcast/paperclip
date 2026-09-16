@@ -406,18 +406,42 @@ test("every reader the document names by symbol still exists", () => {
   // merging master carried the rename into the code while leaving the doc
   // pointing at a dead name. Same family as the stale-identity guard above —
   // one dead identifier, and the guard reading it matches nothing.
-  const pairs = [...agentsDoc.matchAll(
-    /`([A-Za-z_][A-Za-z0-9_]*)` in `([\w./-]+\.(?:ts|mjs|py))`/g)];
+  //
+  // Two registries, because the list is duplicated and fixing one copy does not
+  // fix the other. The first pass of this guard covered only the doc; the twin
+  // in the source module kept a name (`HEAD_ATTESTATION_RE`) that had never
+  // existed, and Ally found it by hand in review of #1721 at 97b4ddd1. The
+  // source comment is the more authoritative of the two, since it is the one an
+  // editor of the grammar reads before touching it.
+  const registries = [
+    [".planning/ally-agent/AGENTS.md", agentsDoc],
+    [
+      "server/src/services/ally-review-detection.ts",
+      readFileSync(join(here, "../server/src/services/ally-review-detection.ts"), "utf8"),
+    ],
+  ];
 
-  // Positive control: the extraction found the reader list, so the per-pair
-  // assertions below cannot pass vacuously on an empty match set.
-  assert.ok(pairs.length >= 3,
-    `expected the doc to name >=3 readers as \`symbol\` in \`file\`, got ${pairs.length}`);
+  for (const [registry, text] of registries) {
+    // The path is backticked in Markdown prose and bare in the source comment,
+    // and must contain a directory: both files also mention a symbol "in
+    // github-app-auth.ts" as ordinary prose, which resolves against the repo
+    // root to a file that does not exist. Requiring a repo-relative path is
+    // what separates a registry entry from a passing reference, and costs no
+    // coverage — the same symbol is registered with its full path.
+    const pairs = [...text.matchAll(
+      /`([A-Za-z_][A-Za-z0-9_]*)` in `?([\w.-]+(?:\/[\w.-]+)+\.(?:ts|mjs|py))`?/g)];
 
-  for (const [, symbol, relPath] of pairs) {
-    const source = readFileSync(join(here, "..", relPath), "utf8");
-    assert.ok(source.includes(symbol),
-      `${relPath} no longer defines \`${symbol}\` — the doc names a reader that does not exist`);
+    // Positive control, per registry rather than over the union: a combined
+    // count would stay green while one registry's extraction silently matched
+    // nothing, which is the failure this guard is least able to notice.
+    assert.ok(pairs.length >= 3,
+      `expected ${registry} to name >=3 readers as \`symbol\` in \`file\`, got ${pairs.length}`);
+
+    for (const [, symbol, relPath] of pairs) {
+      const source = readFileSync(join(here, "..", relPath), "utf8");
+      assert.ok(source.includes(symbol),
+        `${registry} names \`${symbol}\` in ${relPath}, which does not define it`);
+    }
   }
 });
 
