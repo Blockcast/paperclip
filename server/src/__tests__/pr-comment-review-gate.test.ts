@@ -1171,12 +1171,22 @@ describe("mirrored findings retire under both identities (#1707)", () => {
     verb: "fixed",
   });
 
-  /** The #1707 sequence, with whatever ledger the final review carried. */
-  function history(dispositions: ReturnType<typeof fixed>[]) {
+  /**
+   * The #1707 sequence, with whatever ledger the final review carried.
+   *
+   * `counts` fixes how many Important findings each of the first two reviews
+   * reports, which is what decides whether the mirror's two ordinals coincide.
+   * The default is #1707 itself: RAISED reports one Important, MIRRORING
+   * mirrors it as its own Important 1 and adds a new Important 2.
+   */
+  function history(
+    dispositions: ReturnType<typeof fixed>[],
+    counts: { raised?: number; mirroring?: number } = {},
+  ) {
+    const { raised = 1, mirroring = 2 } = counts;
     return [
-      allyComment(verdictReview(RAISED, { important: 1 }, []), "2026-09-10T10:00:00Z"),
-      // Important 1 here is the mirror of RAISED's Important 1; Important 2 is new.
-      allyComment(verdictReview(MIRRORING, { important: 2 }, []), "2026-09-11T10:00:00Z"),
+      allyComment(verdictReview(RAISED, { important: raised }, []), "2026-09-10T10:00:00Z"),
+      allyComment(verdictReview(MIRRORING, { important: mirroring }, []), "2026-09-11T10:00:00Z"),
       allyComment(verdictReview(DISPOSITIONING, {}, dispositions), "2026-09-12T10:00:00Z"),
     ];
   }
@@ -1203,5 +1213,49 @@ describe("mirrored findings retire under both identities (#1707)", () => {
     });
 
     expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  /**
+   * #1707 is DEGENERATE for the rule's ordinal clause: the mirror is Important
+   * 1 at both heads, so `fixed(MIRRORING, 1)` above is what a correct producer
+   * emits AND what one that wrongly reuses the original's ordinal emits. The
+   * pair above therefore pins the mechanism (two entries, one per identity)
+   * but not the clause "recover the mirror's ordinal from the review that
+   * minted it rather than reusing the original's".
+   *
+   * Diverging the two ordinals makes that clause testable: RAISED reports two
+   * Importants and MIRRORING mirrors RAISED's SECOND as its own FIRST. The
+   * direction matters — mirroring first-as-second would leave both ordinals
+   * retired under either ledger, and would not discriminate.
+   */
+  describe("the mirror's index is its ordinal at its OWN head", () => {
+    const diverged = (dispositions: ReturnType<typeof fixed>[]) =>
+      history(dispositions, { raised: 2, mirroring: 1 });
+
+    it("clears when the mirror is retired at the ordinal its own head gave it", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: diverged([fixed(RAISED, 1), fixed(RAISED, 2), fixed(MIRRORING, 1)]),
+      });
+
+      expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    });
+
+    it("negative control: reusing the original's ordinal leaves the mirror carried", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        // `fixed(MIRRORING, 2)` names an index MIRRORING never reported, so the
+        // mirror it actually carries — MIRRORING important 1 — stays unretired.
+        comments: diverged([fixed(RAISED, 1), fixed(RAISED, 2), fixed(MIRRORING, 2)]),
+      });
+
+      expect(verdict).toMatchObject({
+        state: "failure",
+        outcome: "carried_finding",
+        carriedFromHeadSha: MIRRORING,
+      });
+    });
   });
 });
