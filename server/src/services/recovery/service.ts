@@ -2293,8 +2293,12 @@ export function recoveryService(
     finishedAt: heartbeatRuns.finishedAt,
   } as const;
 
-  async function getLatestIssueRun(companyId: string, issueId: string): Promise<LatestIssueRun> {
-    return db
+  async function getLatestIssueRun(
+    companyId: string,
+    issueId: string,
+    dbOrTx: Db | DbTransaction = db,
+  ): Promise<LatestIssueRun> {
+    return dbOrTx
       .select(LATEST_ISSUE_RUN_COLUMNS)
       .from(heartbeatRuns)
       .where(
@@ -7368,7 +7372,12 @@ export function recoveryService(
       // end: the action stays active, so the next sweep re-enters here, observes the
       // stamp, and escalates then — the cost of losing the race is one status-only wake
       // out of the attempt budget, not a permanent status-only trap.
-      const newestIssueRun = await getLatestIssueRun(input.issue.companyId, input.issue.id);
+      // On the caller tx: this runs while `lockIssueOwnership` is held, so a pooled
+      // read would take a second connection out of POSTGRES_POOL_MAX=10 while holding
+      // the lock (BLO-34207). Freshness is unchanged — these transactions run at
+      // READ COMMITTED, where each statement takes its own snapshot at statement
+      // start, so the tx read observes exactly the committed rows a pooled read would.
+      const newestIssueRun = await getLatestIssueRun(input.issue.companyId, input.issue.id, tx);
       const documentWriteRefusedRunId = newestIssueRun?.statusOnlyDocumentWriteRefusedAt
         ? newestIssueRun.id
         : null;
