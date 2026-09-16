@@ -191,25 +191,71 @@ function headsWithUndispositionedFinding(
   comments: CommentReviewGateComment[],
   reviewerBotLogin: string,
 ): CarriedFinding[] {
-  const newestPerHead = new Map<string, { attesting: AttestingComment; timeMs: number }>();
+  const newestPerHead = new Map<string, { attesting: AttestingComment; timeMs: number; attested: boolean }>();
   const ledger: { entry: AllyPriorFindingDisposition; timeMs: number; attestedHeadSha: string }[] = [];
 
   for (const comment of comments) {
     if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
     const attestedHeadSha = extractAllyReviewedHeadSha(comment.body);
-    if (!attestedHeadSha) continue;
+    // A review whose verdict block we cannot read still says which tree it
+    // examined, and it may still *raise* a finding here — it just may never
+    // retire one. Without this the whole comment was skipped at the `continue`
+    // below, so a finding its prose carried vanished the moment the author
+    // pushed past the reviewed head: master red that head, this branch greened
+    // it (peer review of #1721 at 97b4ddd1, TrafficOpsEngineer). The unreadable
+    // branch in evaluateCommentReviewGate catches it only at its own head.
+    //
+    // Scoped to `unreadable` deliberately. allyClaimedReviewHead is laxer than
+    // the attestation parser by design, and letting it stand in for every body
+    // that fails to attest would newly carry findings off ambiguous prose — a
+    // change to the block-less population this row never measured. Only the
+    // population the block created gets the new path.
+    const claimedHeadSha =
+      attestedHeadSha ??
+      (parseAllyVerdictBlock(comment.body).kind === "unreadable"
+        ? allyClaimedReviewHead(comment.body)
+        : null);
+    if (!claimedHeadSha) continue;
     const commentTime = toEpochMs(comment.createdAt);
     if (!Number.isFinite(commentTime)) continue;
 
-    for (const entry of extractAllyPriorFindingDispositions(comment.body)) {
-      ledger.push({ entry, timeMs: commentTime, attestedHeadSha });
+    // Ledger authority requires a real attestation, which is the asymmetry this
+    // whole path turns on: an unreadable verdict may carry a finding forward
+    // and may not dispose of one. Retiring is the direction that loses
+    // information, so it stays gated on a body we could actually parse.
+    //
+    // Belt and braces today rather than the mechanism: the extractor already
+    // returns `[]` for an unreadable block, so this guard changes nothing on
+    // its own. It is here because the loop now admits comments on a *claimed*
+    // head, and without it the code would read as though a claimed head
+    // conferred ledger authority — which it must not, and which would become
+    // true the moment that extractor grew a prose fallback of its own.
+    if (attestedHeadSha) {
+      for (const entry of extractAllyPriorFindingDispositions(comment.body)) {
+        ledger.push({ entry, timeMs: commentTime, attestedHeadSha });
+      }
     }
 
-    const existing = newestPerHead.get(attestedHeadSha);
+    const existing = newestPerHead.get(claimedHeadSha);
     // Ties prefer the later item, matching latestAttestingAllyComment: the
     // comment endpoint is chronological but its timestamps are second-resolution.
-    if (!existing || commentTime >= existing.timeMs) {
-      newestPerHead.set(attestedHeadSha, { attesting: { comment, attestedHeadSha }, timeMs: commentTime });
+    //
+    // But an unreadable review may not *displace* an attested one, however much
+    // newer it is, because displacing is retiring by another name: "newest per
+    // head" means the newest statement about that tree, and a verdict we could
+    // not read makes no statement. Letting it win drops the older review's
+    // finding on the strength of prose that merely happens not to mention one —
+    // the same fail-open this branch exists to close, arriving through the fix
+    // for it. Caught by the pre-existing case at "leaves a finding carried from
+    // the head it names". Among two unreadable reviews the newer still wins;
+    // neither one is evidence, so there is nothing to lose between them.
+    const mayDisplace = Boolean(attestedHeadSha) || !existing?.attested;
+    if (mayDisplace && (!existing || commentTime >= existing.timeMs)) {
+      newestPerHead.set(claimedHeadSha, {
+        attesting: { comment, attestedHeadSha: claimedHeadSha },
+        timeMs: commentTime,
+        attested: Boolean(attestedHeadSha),
+      });
     }
   }
 

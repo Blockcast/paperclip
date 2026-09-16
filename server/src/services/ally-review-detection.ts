@@ -184,10 +184,12 @@ export function extractAllyReviewedHeadSha(body: string | null | undefined): str
   // examined as a field, so no amount of prose around it can move the answer.
   const block = parseAllyVerdictBlock(body);
   if (block.kind === "ok") return block.verdict.head;
-  // An unreadable block attests nothing. Returning null here is safe *only*
-  // because evaluateCommentReviewGate detects the same unreadable block and
-  // reports it as its own failure outcome — without that, null would fall
-  // through to "nothing attests this head", which is a green.
+  // An unreadable block attests nothing, and unlike its two sibling readers
+  // this one does *not* fall through to prose. Attesting is how a review
+  // retires a prior head's finding, so reading prose here would let a body we
+  // failed to parse dispose of a live finding — the one direction that loses
+  // information. Carrying is the opposite trade and falls through; see
+  // hasActionablePrReviewFeedback.
   if (block.kind === "unreadable") return null;
   const text = emittedReviewText(body);
   if (text === null) return null;
@@ -229,7 +231,7 @@ export function extractAllyReviewedHeadSha(body: string | null | undefined): str
  *   1. this module
  *   2. `commentAttestsHead` in server/src/services/github-app-auth.ts
  *   3. `ATTESTED_HEAD_RE` in scripts/check-ally-review-consistency.mjs
- *   4. `HEAD_ATTESTATION_RE` in .github/scripts/sweep-stalled-ally-reviews.py
+ *   4. `REVIEWED_HEAD_PATTERN` in .github/scripts/sweep-stalled-ally-reviews.py
  *
  * A review carrying a block *and* the prose line reads identically to all
  * four, so adding the block breaks nothing. A review carrying only a block
@@ -351,12 +353,6 @@ function asSeverityCounts(raw: unknown): Map<string, number> | string {
     if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
       return "ally-verdict findings are not severity counts";
     }
-    // `Number.isInteger(1e100)` is true, and the ref loops in
-    // extractAllyReportedFindingRefs enumerate 1..count. Without a ceiling a
-    // single malformed block hangs the gate worker instead of failing it.
-    if (value > MAX_VERDICT_FINDING_COUNT) {
-      return `ally-verdict findings count \`${severity.trim().toLowerCase()}\` exceeds ${MAX_VERDICT_FINDING_COUNT}`;
-    }
     const key = severity.trim().toLowerCase();
     // An unrecognized key must make the whole block unreadable, not be dropped.
     // Dropping it is a fail-open: no blocking check ever consults a severity
@@ -364,8 +360,19 @@ function asSeverityCounts(raw: unknown): Map<string, number> | string {
     // verdict that is byte-indistinguishable from a clean one — a verdict
     // stating it found a Critical would clear the head. That is the BLO-29711
     // direction arriving through the structured path, so it fails closed here.
+    //
+    // Checked before the ceiling below, though both fail closed, because only
+    // one of the two reasons is actionable: `{"critcal": 5000}` is a typo, and
+    // the gate description is the only place Ally sees which key we rejected.
+    // Reporting `exceeds 1000` for it names the wrong defect.
     if (!VERDICT_SEVERITIES.has(key)) {
       return `ally-verdict findings name unsupported severity \`${key}\``;
+    }
+    // `Number.isInteger(1e100)` is true, and the ref loops in
+    // extractAllyReportedFindingRefs enumerate 1..count. Without a ceiling a
+    // single malformed block hangs the gate worker instead of failing it.
+    if (value > MAX_VERDICT_FINDING_COUNT) {
+      return `ally-verdict findings count \`${key}\` exceeds ${MAX_VERDICT_FINDING_COUNT}`;
     }
     counts.set(key, value);
   }
@@ -912,7 +919,12 @@ export function extractAllyReportedFindingRefs(
     }
     return refs;
   }
-  if (block.kind === "unreadable") return null;
+  // `unreadable` deliberately falls through to the prose enumeration below, for
+  // the reason spelled out in hasActionablePrReviewFeedback: a block we cannot
+  // read must not reduce what the gate blocks on. These two have to move
+  // together — the carried-finding path asks *both* whether a review blocks and
+  // which identities it raised, so a body that blocks here while enumerating
+  // `null` there would carry a head no ledger entry could ever retire.
   if (typeof body !== "string") return null;
 
   // Highest count seen per severity, across both readings. Findings are
@@ -939,9 +951,17 @@ export function extractAllyReportedFindingRefs(
 
 function carriesBlockingFeedback(text: string): boolean {
   let sawCountedBucket = false;
-  for (const bucket of text.matchAll(/\b(?:Critical|Important)\s+Issues\b[*_]*\s*\((\d+)\)/gi)) {
+  // The shared pattern, not a second copy of it. The inline literal that used
+  // to sit here differed from COUNTED_FINDINGS_BUCKET_PATTERN only by a
+  // non-capturing group, but the two feed different decisions — whether a body
+  // blocks, and which finding identities it raised — and this PR's own premise
+  // is that those two must not disagree about the vocabulary. A divergence
+  // between them recreates the unretirable carry of BLO-31446/BLO-31947: a head
+  // that blocks on a bucket the enumerator cannot see has no ledger entry that
+  // can retire it. Flagged in peer review of #1721 at 97b4ddd1.
+  for (const bucket of text.matchAll(COUNTED_FINDINGS_BUCKET_PATTERN)) {
     sawCountedBucket = true;
-    if (Number(bucket[1]) > 0) return true;
+    if (Number(bucket[2]) > 0) return true;
   }
   if (UNCOUNTED_FINDINGS_HEADING_REGEX.test(text)) return true;
   if (/^[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*$/im.test(text)) return true;
@@ -990,12 +1010,38 @@ export function hasActionablePrReviewFeedback(body: string | null | undefined, s
     }
     return false;
   }
-  // A block we cannot read is not evidence of a finding. Saying "carries an
-  // unresolved finding" here would attribute a finding to a body whose verdict
-  // we failed to parse — the specific misreport BLO-32695 exists to stop. The
-  // gate reports the parse failure under its own outcome instead.
-  if (block.kind === "unreadable") return false;
-
+  // An unreadable block falls through to prose rather than answering "no
+  // finding". Returning false here was a fail-open regression against master,
+  // found in peer review of #1721 at 97b4ddd1: `evaluateCommentReviewGate`
+  // catches an unreadable block under its own outcome, but that branch is
+  // head-scoped, so a review of an *earlier* head became invisible and the
+  // finding it carried was not carried. Same body, same prose, same finding,
+  // with only the block varying:
+  //
+  //     prose only (master)        -> failure/carried_finding
+  //     prose + well-formed block  -> failure/carried_finding
+  //     prose + malformed block    -> success/not_evaluated   <- the hole
+  //
+  // The trigger is the upgrade path this file documents, not contrived damage:
+  // a version bump makes every body unreadable until the rollout catches up,
+  // and then one push past the reviewed head turns the red green with the
+  // Critical still open — BLO-29711's direction, in the direction the author
+  // benefits from. So this is the module's own rule ("quoted text may never
+  // reduce what the gate blocks on") one layer out: an unreadable block may not
+  // reduce it either. Falling through costs at most a false red, which is
+  // visible and recoverable, and it is what master already does with the same
+  // prose.
+  //
+  // Asymmetric with extractAllyReviewedHeadSha, which still returns null here,
+  // and the asymmetry is the point: an unreadable verdict may still *carry* a
+  // finding, but it may never *retire* one. Attesting is how a review disposes
+  // of a prior head, so a body we could not parse must not be able to.
+  //
+  // AC-3 is intact. It forbids reaching `blocking_finding` from a failure to
+  // parse *prose* — a clean body the regex could not read. This path is the
+  // opposite: prose that positively states a count, on a body whose structured
+  // block is the part that failed. At the head under evaluation the
+  // unreadable_verdict branch still runs first and still wins.
   const text = body.trim();
   if (!text) return false;
 

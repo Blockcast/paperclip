@@ -566,10 +566,16 @@ describe("BLO-32695 — an unknown severity key fails closed, not open", () => {
     expect(title).not.toMatch(/unresolved finding/i);
   });
 
-  it("is now distinguishable from clean: null refs, not an empty list", () => {
-    // `[]` is "reviewed, found nothing"; `null` is "we could not read it".
-    // Collapsing the two is what let the typo pass as a clean review.
-    expect(extractAllyReportedFindingRefs(typod({ critcal: 1, important: 0 }))).toBeNull();
+  it("is now distinguishable from clean: the prose finding, not an empty list", () => {
+    // `[]` is "reviewed, found nothing", and returning it for an unreadable
+    // block is what let the typo pass as a clean review. `null` used to be the
+    // answer here; it is now the prose finding the body enumerates, which is
+    // the same distinction plus a retirable identity. `null` means "blocks, but
+    // no identity any ledger entry can name", i.e. a head carried forever —
+    // so enumerating is strictly better wherever the prose supports it.
+    expect(extractAllyReportedFindingRefs(typod({ critcal: 1, important: 0 }))).toEqual([
+      { severity: "critical", index: 1 },
+    ]);
     expect(extractAllyReportedFindingRefs(agreeing({ critical: 0, important: 0 }))).toEqual([]);
   });
 
@@ -1082,6 +1088,140 @@ describe("BLO-32695 — an unreadable block reds only the head it concerns", () 
 });
 
 /**
+ * Peer review of #1721 at 97b4ddd1 (TrafficOpsEngineer, review 5221179027),
+ * Important 1 — an unreadable block at an *earlier* head silently dropped the
+ * finding the prose carried.
+ *
+ * The unreadable branch in `evaluateCommentReviewGate` is head-scoped, so it
+ * cannot catch a review of a head that is no longer current. With the three
+ * readers all answering "nothing here" for an unreadable block, such a review
+ * became invisible and its finding was not carried: `master` red the head, this
+ * branch greened it. One push past the reviewed head converted the red into a
+ * green with the finding still open — BLO-29711's direction, reached through
+ * the new path, in the direction the author benefits from.
+ *
+ * The reachable trigger is the version bump this module documents, which makes
+ * every body unreadable until the rollout catches up — not contrived JSON
+ * damage.
+ */
+describe("BLO-32695 — an unreadable block may carry a finding, never retire one", () => {
+  const HEAD_A = PR1675_HEAD;
+  const HEAD_B = "b".repeat(40);
+  const PROSE = ["## Ally — Consolidated PR Review", `Reviewed head: ${HEAD_A}`, "### Critical Issues (1)", "1. Unfixed."];
+
+  /** Identical prose and finding in all three; only the block varies. */
+  const proseOnly = PROSE.join("\n");
+  const wellFormedBlock = [
+    `<!-- ally-verdict:1 {"head": "${HEAD_A}", "findings": {"critical": 1, "important": 0}} -->`,
+    ...PROSE,
+  ].join("\n");
+  const malformedBlock = [`<!-- ally-verdict:1 {"head": "${HEAD_A}", "findings": {"critical":`, ...PROSE].join("\n");
+
+  function gateAt(headSha: string, comments: ReturnType<typeof allyComment>[]) {
+    return evaluateCommentReviewGate({ headSha, reviewerBotLogin: ALLY_BOT_LOGIN, comments });
+  }
+
+  it("positive control: the three bodies differ only in how the block parses", () => {
+    expect(parseAllyVerdictBlock(proseOnly).kind).toBe("absent");
+    expect(parseAllyVerdictBlock(wellFormedBlock).kind).toBe("ok");
+    expect(parseAllyVerdictBlock(malformedBlock).kind).toBe("unreadable");
+  });
+
+  it.each([
+    ["prose only — master's behaviour", proseOnly],
+    ["prose + a well-formed block", wellFormedBlock],
+    ["prose + a malformed block", malformedBlock],
+  ])("carries the finding to a later head: %s", (_label, body) => {
+    // The third row was `success`/`not_evaluated` before the fix. The first two
+    // are the controls that make it a regression rather than a design choice.
+    expect(gateAt(HEAD_B, [allyComment(body, "2026-09-07T15:41:42Z")])).toMatchObject({
+      state: "failure",
+      outcome: "carried_finding",
+    });
+  });
+
+  it("carries it as identities a ledger entry can name, not as an unretirable head", () => {
+    // The two readers have to move together. Blocking while enumerating `null`
+    // would carry a head that no disposition could ever retire — the
+    // BLO-31446/BLO-31947 trap with the cause moved one layer out.
+    expect(hasActionablePrReviewFeedback(malformedBlock)).toBe(true);
+    expect(extractAllyReportedFindingRefs(malformedBlock)).toEqual([{ severity: "critical", index: 1 }]);
+  });
+
+  it("still refuses to attest, so it cannot retire the finding it carries", () => {
+    // The asymmetry this describe is named for. Falling through for attestation
+    // would let a body we could not parse dispose of a live finding.
+    expect(extractAllyReviewedHeadSha(malformedBlock)).toBeNull();
+  });
+
+  it("still reds its own head under the outcome that names the parse failure", () => {
+    expect(gateAt(HEAD_A, [allyComment(malformedBlock, "2026-09-07T15:41:42Z")])).toMatchObject({
+      state: "failure",
+      outcome: "unreadable_verdict",
+    });
+  });
+
+  it("cannot retire a finding it claims to have dispositioned", () => {
+    // The other half of the asymmetry, and the one that would be a fail-open:
+    // an unreadable review naming HEAD_A's Critical 1 as fixed must not clear
+    // it. Carrying is conservative; retiring destroys information.
+    const retiringButUnreadable = [
+      `<!-- ally-verdict:1 {"head": "${HEAD_B}", "findings": {"critical":`,
+      "## Ally — Consolidated PR Review",
+      `Reviewed head: ${HEAD_B}`,
+      `- **prior:${HEAD_A.slice(0, 9)} critical 1** — fixed —`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ].join("\n");
+    expect(parseAllyVerdictBlock(retiringButUnreadable).kind).toBe("unreadable");
+    const c = "c".repeat(40);
+    expect(
+      gateAt(c, [
+        allyComment(proseOnly, "2026-09-07T03:46:19Z"),
+        allyComment(retiringButUnreadable, "2026-09-07T15:41:42Z"),
+      ]),
+    ).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
+  it("control: the same ledger entry in a readable review does retire it", () => {
+    // Without this the test above passes for any reason at all — including the
+    // ledger never being consulted.
+    const retiringReadable = [
+      `<!-- ally-verdict:1 {"head": "${HEAD_B}", "findings": {"critical": 0, "important": 0},` +
+        ` "dispositions": [{"head": "${HEAD_A.slice(0, 9)}", "severity": "critical", "index": 1, "verb": "fixed"}]} -->`,
+      "## Ally — Consolidated PR Review",
+      `Reviewed head: ${HEAD_B}`,
+    ].join("\n");
+    expect(parseAllyVerdictBlock(retiringReadable).kind).toBe("ok");
+    const c = "c".repeat(40);
+    expect(
+      gateAt(c, [
+        allyComment(proseOnly, "2026-09-07T03:46:19Z"),
+        allyComment(retiringReadable, "2026-09-07T15:41:42Z"),
+      ]),
+    ).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  it("does not invent a finding from a malformed block over clean prose", () => {
+    // AC-3 still holds: falling through reads prose that positively states a
+    // count, it does not treat the parse failure itself as a finding.
+    const cleanProse = [
+      `<!-- ally-verdict:1 {"head": "${HEAD_A}", "findings": {"critical":`,
+      "## Ally — Consolidated PR Review",
+      `Reviewed head: ${HEAD_A}`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ].join("\n");
+    expect(parseAllyVerdictBlock(cleanProse).kind).toBe("unreadable");
+    expect(hasActionablePrReviewFeedback(cleanProse)).toBe(false);
+    expect(gateAt(HEAD_B, [allyComment(cleanProse, "2026-09-07T15:41:42Z")])).toMatchObject({
+      state: "success",
+      outcome: "not_evaluated",
+    });
+  });
+});
+
+/**
  * Peer review of #1721, Important 1 — head disagreement was fatal and count
  * disagreement was not.
  *
@@ -1124,11 +1264,26 @@ describe("BLO-32695 — the block and the prose must not name different counts",
     ).not.toBe("success");
   });
 
-  it("does not report it as a finding: the body's verdict was never read", () => {
-    // AC-3. `blocking_finding` must stay reachable only from a counted
-    // structured finding — an unreadable block is reported under its own
-    // outcome, not attributed to the author as a finding.
-    expect(hasActionablePrReviewFeedback(contradicting)).toBe(false);
+  it("does not report it as a finding under the outcome AC-3 names", () => {
+    // AC-3 constrains `blocking_finding`, and that outcome is structurally
+    // unreachable from an unreadable body: it is gated on
+    // latestAttestingAllyComment, and extractAllyReviewedHeadSha still refuses
+    // to attest here. So the property holds by construction rather than by
+    // branch ordering, which is why this asserts the outcome and no longer
+    // asserts `hasActionablePrReviewFeedback(contradicting) === false`.
+    //
+    // The predicate itself now reads the prose, because an unreadable block may
+    // not *reduce* what the gate blocks on — see the carry describe below.
+    // Dropping it silently was the fail-open TrafficOpsEngineer measured.
+    expect(extractAllyReviewedHeadSha(contradicting)).toBeNull();
+    expect(hasActionablePrReviewFeedback(contradicting)).toBe(true);
+    expect(
+      evaluateCommentReviewGate({
+        headSha: PR1675_HEAD,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: [allyComment(contradicting, "2026-09-07T15:41:42Z")],
+      }).outcome,
+    ).toBe("unreadable_verdict");
   });
 
   it("is asymmetric like the head rule: agreeing zeroes stay readable", () => {
