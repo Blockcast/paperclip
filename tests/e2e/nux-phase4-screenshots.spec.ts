@@ -215,11 +215,15 @@ test.describe("NUX Phase 4 visual QA", () => {
     // falls back to dev middleware. `consoleErrors` also receives "PAGEERROR: "
     // entries (see the pageerror listener above), which is how the thrown
     // minified error reaches this filter at all.
-    const hookErrors = consoleErrors.filter((e) =>
+    //
+    // #3xx is deliberately the whole range, not just the hooks codes: any
+    // React crash on these surfaces should red this test. Hence `reactErrors`
+    // -- do not narrow the regex back to hooks to match a narrower name.
+    const reactErrors = consoleErrors.filter((e) =>
       /Rendered more hooks|change in the order of Hooks|Minified React error #3\d\d|react\.dev\/errors\/3\d\d/i.test(
         e,
       ),
     );
-    expect(hookErrors, hookErrors.join("\n")).toHaveLength(0);
+    expect(reactErrors, reactErrors.join("\n")).toHaveLength(0);
   });
 });

@@ -35,7 +35,9 @@ const UI_DIST_EXISTS = fs.existsSync(UI_DIST_INDEX);
 // consumers of this config do build the UI first -- pr.yml via
 // `pnpm --filter @paperclipai/ui build`, e2e.yml via `pnpm -r build` -- so a
 // missing bundle under CI is a broken workflow, not a valid configuration.
-if (!UI_DIST_EXISTS && process.env.CI) {
+// `CI=false` is a real local convention, and a bare truthiness test on the
+// string "false" would throw at exactly the developer this fallback exists for.
+if (!UI_DIST_EXISTS && process.env.CI && process.env.CI !== "false") {
   throw new Error(
     `e2e: missing ${UI_DIST_INDEX}\n` +
       "CI must build the UI bundle before running e2e: pnpm --filter @paperclipai/ui build\n" +
