@@ -120,27 +120,44 @@ function budgetAssertionRefusal(type: string, payload: unknown) {
       // The `enforcement_assertions` fragment to merge into the payload — not a
       // whole card. The refusal has to be fixable in a single retry: these cards
       // are filed when a cap is about to stop an agent, so a guard that costs a
-      // round of guesswork is its own outage. `policyId` is the one field the
-      // server cannot supply, so it is spelled to be unusable rather than
-      // plausible: a copied placeholder passes here and is then refused by the
-      // reconciler as `missing_policy`, which is coverage in name only.
+      // round of guesswork is its own outage.
+      //
+      // Every field here is either forced to be replaced or safe to copy. A
+      // fragment built to be copied has to assume it *will* be, verbatim, minus
+      // only what the caller is obliged to touch:
+      //   - `policyId` — the one field the server cannot supply, so it is spelled
+      //     to be unusable rather than plausible: a copied placeholder passes here
+      //     and is then refused by the reconciler as `missing_policy`, which is
+      //     coverage in name only.
+      //   - `label` — same treatment, for the same reason one layer out. It is not
+      //     inert: extractEnforcementAssertions() reads it and describeDrift()
+      //     prepends it to the raised issue ("- CTO `<id>` — decided ..."), so a
+      //     real-looking name that survives the copy misattributes another agent's
+      //     drift to whoever the example happened to name.
+      //   - `expected_usd` — the figure the caller came to state, so it cannot
+      //     survive by accident.
+      //   - no `from_usd`: the remediation below says never to invent one, and an
+      //     example that ships a concrete starting figure invites exactly that.
       example_assertions: [
         {
           kind: BUDGET_POLICY_AMOUNT_ASSERTION,
           policyId: "<replace with the budget_policies.id uuid>",
           expected_usd: 32000,
-          from_usd: 19000,
-          label: "CTO",
+          label: "<replace with the agent or scope this policy caps>",
         },
       ],
       remediation:
         "Add one entry per policy this decision changes, under `payload.enforcement_assertions`. " +
         "`policyId` is a `budget_policies.id` uuid — NOT an agent id; read it from the budget " +
         "policy that enforces the cap. Give the target as `expected_usd` (dollars) or " +
-        "`expected_amount_cents` (integer cents). If you have the figure the change starts from, " +
-        "record it as `from_usd` / `from_amount_cents`: it is retained on the card so a later " +
-        "reader can tell 'never applied' from 'applied and then superseded'. Nothing reads it " +
-        "yet, so never invent one — only the target is required.",
+        "`expected_amount_cents` (integer cents). `label` is printed into the drift report this " +
+        "assertion raises, so set it to the agent or scope this policy actually caps — a label " +
+        "left over from the example misattributes the drift. If you have the figure the change " +
+        "starts from, record it as `from_usd` / `from_amount_cents`: it is retained on the card " +
+        "so a later reader can tell 'never applied' from 'applied and then superseded'. Nothing " +
+        "reads it yet, so never invent one — only the target is required. On resubmit, send the " +
+        "corrected assertions in the resubmit body: the check runs against the payload that will " +
+        "end up pending, and a card filed before this guard existed has none stored.",
     },
   };
 }

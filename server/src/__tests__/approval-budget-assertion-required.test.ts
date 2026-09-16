@@ -221,9 +221,7 @@ describe("budget_override_required requires an enforcement assertion (BLO-34008)
       policyId: expect.any(String),
       label: expect.any(String),
     });
-    // Both the target and the figure it starts from, per BLO-32796's classifier.
     expect(example.expected_usd).toEqual(expect.any(Number));
-    expect(example.from_usd).toEqual(expect.any(Number));
     expect(refused.body.details.remediation).toContain("budget_policies.id");
 
     // `policyId` is the one field the server cannot know, so the fragment must not
@@ -232,12 +230,31 @@ describe("budget_override_required requires an enforcement assertion (BLO-34008)
     // "covered but unverifiable" state the guard exists to prevent.
     expect(await extractAssertions({ enforcement_assertions: [example] })).toEqual([]);
 
+    // `label` needs the same treatment for a different reason: it is not inert.
+    // extractEnforcementAssertions() reads it and describeDrift() prints it at the
+    // head of the raised issue, so a real-looking name here survives the copy and
+    // attributes one agent's budget drift to whichever agent the example named.
+    // Pin it as a visibly-unfilled placeholder rather than merely "a string".
+    expect(example.label).toMatch(/^<.+>$/);
+
+    // No starting figure: the remediation tells the caller never to invent one, and
+    // an example carrying a concrete `from_usd` is an invitation to do exactly that
+    // in a path that writes money.
+    expect(example).not.toHaveProperty("from_usd");
+    expect(example).not.toHaveProperty("from_amount_cents");
+
     const accepted = await postApproval(app, {
       type: "budget_override_required",
       payload: {
         ...PROSE_ONLY_PAYLOAD,
         enforcement_assertions: [
-          { ...example, policyId: POLICY_ID, expected_usd: 32000, from_usd: 19000 },
+          {
+            ...example,
+            policyId: POLICY_ID,
+            expected_usd: 32000,
+            label: "PlayersEngineer",
+            from_usd: 19000,
+          },
         ],
       },
     });
