@@ -393,3 +393,31 @@ test("the skip path posts a comment, not a review", () => {
   assert.doesNotMatch(code, /gh pr review[^\n]*--comment/,
     "the review API files a review object and recreates the violation");
 });
+
+test("every reader the document names by symbol still exists", () => {
+  // The doc tells Ally to keep emitting the prose `Reviewed head:` line, and
+  // justifies it by naming the readers that parse it. That justification is the
+  // whole reason the line survives — so a symbol name that no longer exists does
+  // not read as a typo, it reads as "that reader was deleted", i.e. as
+  // permission to drop prose the remaining readers still need.
+  //
+  // Not hypothetical: master renamed `consolidatedReviewHead` ->
+  // `commentAttestsHead` in a74f9eae while this doc named the old symbol, and
+  // merging master carried the rename into the code while leaving the doc
+  // pointing at a dead name. Same family as the stale-identity guard above —
+  // one dead identifier, and the guard reading it matches nothing.
+  const pairs = [...agentsDoc.matchAll(
+    /`([A-Za-z_][A-Za-z0-9_]*)` in `([\w./-]+\.(?:ts|mjs|py))`/g)];
+
+  // Positive control: the extraction found the reader list, so the per-pair
+  // assertions below cannot pass vacuously on an empty match set.
+  assert.ok(pairs.length >= 3,
+    `expected the doc to name >=3 readers as \`symbol\` in \`file\`, got ${pairs.length}`);
+
+  for (const [, symbol, relPath] of pairs) {
+    const source = readFileSync(join(here, "..", relPath), "utf8");
+    assert.ok(source.includes(symbol),
+      `${relPath} no longer defines \`${symbol}\` — the doc names a reader that does not exist`);
+  }
+});
+
