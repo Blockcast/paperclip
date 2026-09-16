@@ -8461,6 +8461,124 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description ?? "").toContain("13h 0m executing");
   });
 
+  // BLO-27698 B3b (Ally review on 06b87852): the tail extension above must be
+  // bounded by the sibling's own live span, not applied as a duration-blind
+  // boolean. These two cases pin the two halves of that bound: a sibling whose
+  // live segment began *after* the holder parked cannot resurrect the park
+  // before it, and the sibling's own burn still counts in full.
+  //
+  // The reachable shape is a *promoted* sibling, not a freshly dispatched one,
+  // and the difference is load-bearing. `activeStartedAt` is `max(startedAt)`
+  // over the issue's runs, so a sibling that merely started 10m ago also drags
+  // the episode anchor to 10m ago and bounds `elapsedMs` on its own — the
+  // review's worked example is not reachable that way. A run promoted out of a
+  // park keeps its pre-park `startedAt` (promoteDueScheduledRetry writes only
+  // status/error/updatedAt; the claim preserves `startedAt ?? claimedAt`), so
+  // the anchor stays at 13h while the live segment is minutes old. That is the
+  // gap `runLiveInterval`/`liveSegmentStartedAt` already exclude for the holder,
+  // and what `siblingSegmentStart` extends issue-wide.
+  //
+  // Mutation control for both: drop `siblingSegmentStart` from `segmentStart`
+  // and both turn red — the first fires `long_active_duration` reporting 13h of
+  // "active elapsed time" for an episode that was 11h of park, and the second
+  // re-reports 7h of burn as 13h.
+  const seedParkedHolderWithPromotedSibling = async (now: Date, siblingParkEndedAt: Date) => {
+    const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+    // The holder's last signal — `attributableEndAt` if liveness were holder-only.
+    const holderLastSignal = new Date(now.getTime() - 11 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+    });
+    const siblingId = randomUUID();
+    const holderId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      {
+        // Promoted sibling: `startedAt` is the preserved pre-park dispatch, so it
+        // anchors the episode at 13h, while its live span starts at the park
+        // boundary. Signalling as of `now`, so it is genuinely live.
+        id: siblingId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "running",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt,
+        scheduledRetryAt: siblingParkEndedAt,
+        lastOutputAt: new Date(now.getTime() - 60 * 1000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: startedAt,
+        updatedAt: startedAt,
+      },
+      {
+        // Parked holder, with a `startedAt` so it is not `dispatch_backlog` and
+        // not `currentHolderNeverDispatched` — nothing else holds the trigger.
+        // `queued` returns `lastSignal` from `nonLiveExecutionHoldSince`.
+        id: holderId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "queued",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt,
+        lastOutputAt: holderLastSignal,
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: holderLastSignal,
+        updatedAt: holderLastSignal,
+      },
+    ]);
+    await db
+      .update(issues)
+      .set({ executionRunId: holderId, checkoutRunId: holderId, executionLockedAt: holderLastSignal })
+      .where(eq(issues.id, seeded.issueId));
+    return seeded;
+  };
+
+  it("does not resurrect a holder park when a sibling has only just gone live", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    // 10 minutes of live segment — far short of the 6h bar on its own, but enough
+    // to make `siblingStillExecuting` true and so, on a blind boolean, to
+    // re-attribute the holder's whole 11h park into `elapsedMs`.
+    const seeded = await seedParkedHolderWithPromotedSibling(now, new Date(now.getTime() - 10 * 60 * 1000));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.scanned).toBe(1);
+    expect(result.created).toBe(0);
+  });
+
+  it("counts a live sibling's own burn in full without the park before it", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    // 7h of live segment, beginning 4h after the holder parked: over the 6h bar
+    // either way, which is what makes this the load-bearing half — it
+    // distinguishes "bounded" from "suppressed".
+    const seeded = await seedParkedHolderWithPromotedSibling(now, new Date(now.getTime() - 7 * 60 * 60 * 1000));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(result.created).toBe(1);
+    expect(review?.description ?? "").toContain("Primary trigger: `runaway_execution`");
+    expect(review?.description ?? "").toContain("executing continuously for 7h 0m");
+    expect(review?.description ?? "").toContain("Current active elapsed time: 7h 0m");
+    // The excluded 6h is still disclosed rather than silently dropped — the
+    // second half of the defect, where `trailingHoldMs` went to 0 and the line
+    // stopped rendering, so the park was neither counted out nor visible as in.
+    expect(review?.description ?? "").toContain("Excluded as non-live execution hold: 6h 0m");
+  });
+
   it("does not suppress no-comment productivity reviews for future monitor waits", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
