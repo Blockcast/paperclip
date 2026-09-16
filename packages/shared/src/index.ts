@@ -1277,7 +1277,9 @@ export type {
   PluginWebhookDeliveryRecord,
   QuotaWindow,
   ProviderQuotaResult,
+  BilledTokenCounts,
 } from "./types/index.js";
+export { promptTokens, totalTokens } from "./types/cost.js";
 export {
   COMPANY_SEARCH_EXTRACT_KINDS,
   COMPANY_SEARCH_EXTRACT_SCOPES,
