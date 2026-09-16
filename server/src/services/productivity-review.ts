@@ -3153,37 +3153,83 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
    * Decision rubric asks for "an assignee run-linked comment in the last 6h",
    * and suppression must apply the criterion as written — see the gate in
    * `collectEvidence` for why the unlinked case is reported but not acted on.
+   *
+   * `runLinked` is a property of the **window**, not of the newest comment:
+   * the rubric asks whether *a* run-linked comment exists in the last 6h. Read
+   * off the newest row alone, any later unlinked comment carrying a next-action
+   * line — an out-of-band note, a human-triggered edit — would mask a run-linked
+   * one behind it and flip the gate off. The reported `line` stays the newest,
+   * since that is the one a reviewer wants to read; the two facts are decoupled.
+   *
+   * They are decoupled in their *window* too, and the asymmetry is deliberate:
+   * `line` is drawn from the full freshness window, while `runLinked` is
+   * additionally intersected with the episode. Reporting a next action is useful
+   * to a reviewer at a lower bar than suppressing the review outright — see the
+   * two cutoffs below.
    */
   async function findCommentNextAction(
     sourceIssue: IssueRow,
     sourceAgent: AgentRow,
+    episodeStartAt: Date | null,
     now: Date,
   ): Promise<{ line: string; runLinked: boolean } | null> {
-    const lookbackStart = new Date(now.getTime() - PRODUCTIVITY_REVIEW_NEXT_ACTION_COMMENT_FRESH_MS);
+    // The QUERY keeps the full freshness window, because the reporting fallback
+    // (BLO-19604) is a deliberately lower bar than suppression: recovering a
+    // `Next action:` line for a reviewer to read is useful even when the comment
+    // predates the current episode. Narrowing the query instead would regress it
+    // to "none recorded" — which reads as "the assignee left no next step" and is
+    // exactly what that fallback exists to prevent.
+    const freshCutoff = new Date(now.getTime() - PRODUCTIVITY_REVIEW_NEXT_ACTION_COMMENT_FRESH_MS);
+    // SUPPRESSION, by contrast, is intersected with the episode, exactly as A2's
+    // `findFreshLinkedProgressIssue` is. The freshness bar alone is NOT a subset
+    // of the episode: `longActiveMs` is freely overridable with no lower clamp
+    // (`buildThresholds`), so a lowered bar makes this fixed 6h window wider than
+    // the episode itself, and a `Next action:` from a *previous* episode on the
+    // same issue would suppress indefinitely many reviews of the current one.
+    // Before the lookback was decoupled from `longActiveMs` the subset property
+    // held by construction (`longActive` requires `elapsedMs >= longActiveMs`);
+    // decoupling it is right, but only its upper bound was argued — this restores
+    // the lower one. The failure direction is the unsafe one (review silently
+    // withheld), which is the indefinite-suppression hazard BLO-22331 AC2 forbids.
+    const suppressionStart = episodeStartAt && episodeStartAt.getTime() > freshCutoff.getTime()
+      ? episodeStartAt
+      : freshCutoff;
     const rows = await db
-      .select({ body: issueComments.body, createdByRunId: issueComments.createdByRunId })
+      .select({
+        body: issueComments.body,
+        createdByRunId: issueComments.createdByRunId,
+        createdAt: issueComments.createdAt,
+      })
       .from(issueComments)
       .where(
         and(
           eq(issueComments.companyId, sourceIssue.companyId),
           eq(issueComments.issueId, sourceIssue.id),
           eq(issueComments.authorAgentId, sourceAgent.id),
-          sql`${issueComments.createdAt} >= ${lookbackStart.toISOString()}::timestamptz`,
+          sql`${issueComments.createdAt} >= ${freshCutoff.toISOString()}::timestamptz`,
           sql`${issueComments.body} ~* ${NEXT_ACTION_COMMENT_CANDIDATE_PATTERN}`,
         ),
       )
       .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
       .limit(MAX_NEXT_ACTION_COMMENT_CANDIDATES);
 
+    let newestLine: string | null = null;
+    let runLinked = false;
     for (const comment of rows) {
       const line = extractNextActionFromText(comment.body);
       // The regex above is a cheap *candidate* filter; `extractNextActionFromText`
       // is what actually decides a comment states a next action. Only the latter
       // may be treated as the signal — otherwise a comment merely containing the
       // words would suppress a review.
-      if (line) return { line, runLinked: comment.createdByRunId !== null };
+      if (!line) continue;
+      // Rows are newest-first, so the first line seen is the one to report.
+      newestLine ??= line;
+      if (comment.createdByRunId !== null && comment.createdAt.getTime() >= suppressionStart.getTime()) {
+        runLinked = true;
+        break;
+      }
     }
-    return null;
+    return newestLine === null ? null : { line: newestLine, runLinked };
   }
 
   /**
@@ -3204,6 +3250,17 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
    * Both structural forms are load-bearing and neither subsumes the other:
    * decomposition writes `parentId`, while follow-up work the source blocks
    * writes a relation edge and no parent.
+   *
+   * The relation arm deliberately matches an edge of **any** `type`, in either
+   * direction, whoever created it. `blocks` is the only type the codebase writes
+   * today, so constraining to it would be a no-op that silently excludes any type
+   * added later — and it would not close the residual anyway: a third party can
+   * write a `blocks` edge as easily as any other, so the edge's *creator*, not its
+   * type, is what a tightening would have to key on, and `issue_relations` records
+   * no creator. The residual is therefore accepted and bounded rather than
+   * half-closed: a third party linking an unrelated assignee-filed issue to the
+   * source can manufacture one suppression, but the freshness bar below ages it
+   * out, so it cannot suppress indefinitely.
    *
    * Restricted to `originKind = 'manual'`, which is the single most important
    * line in this function. The productivity review row is ITSELF written as a
@@ -3234,7 +3291,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ? episodeStartAt
       : freshCutoff;
     const rows = await db
-      .select({ id: issues.id, identifier: issues.identifier, title: issues.title, createdAt: issues.createdAt })
+      .select({ id: issues.id })
       .from(issues)
       .where(
         and(
@@ -3812,7 +3869,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // for a fresh comment. Kept lazy for every other trigger, which is the access
     // pattern the fallback below was written for.
     const nextActionComment = trigger === "long_active_duration" || !structuredNextAction
-      ? await findCommentNextAction(sourceIssue, sourceAgent, now)
+      ? await findCommentNextAction(sourceIssue, sourceAgent, attributableStartAt, now)
       : null;
     // Run-linked only, exactly as the rubric words it. An assignee comment with no
     // `createdByRunId` is still *reported* (the fallback below prints it), but it
