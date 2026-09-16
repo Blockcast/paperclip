@@ -1230,6 +1230,17 @@ describe("mirrored findings retire under both identities (#1707)", () => {
    * Importants and MIRRORING mirrors RAISED's SECOND as its own FIRST. The
    * direction matters — mirroring first-as-second would leave both ordinals
    * retired under either ledger, and would not discriminate.
+   *
+   * SCOPE: these controls fail by naming an index the head never reported, so
+   * what they pin is "one distinct IN-RANGE index per resolved finding, per
+   * head" — the most the consumer can enforce. A within-range mis-assignment
+   * (mirror at important 2, ledger says important 1, a sibling at important 1)
+   * is undetectable by construction: refs are minted from counts alone and
+   * carry no content, so retirement is a set-cover over 1..N and any
+   * permutation of in-range indices produces the same verdict. The ordinal
+   * discipline above that is for ledger readability and for a consumer that
+   * later attaches content — don't read a swapped-index case going green as
+   * the consumer being broken.
    */
   describe("the mirror's index is its ordinal at its OWN head", () => {
     const diverged = (dispositions: ReturnType<typeof fixed>[]) =>
@@ -1301,6 +1312,22 @@ describe("mirrored findings retire under both identities (#1707)", () => {
           fixed(MIRRORING, 1, "critical"),
           fixed(MIRRORING, 2),
         ]),
+      });
+
+      expect(verdict).toMatchObject({
+        state: "failure",
+        outcome: "carried_finding",
+        carriedFromHeadSha: MIRRORING,
+      });
+    });
+
+    // Retirement is per-(head, severity, index), not per-head: clearing the
+    // Important mirror does not clear the head while its Critical dangles.
+    it("negative control: one severity retired at a head does not clear the other", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: acrossSeverities([fixed(RAISED, 1), fixed(MIRRORING, 1)]),
       });
 
       expect(verdict).toMatchObject({
