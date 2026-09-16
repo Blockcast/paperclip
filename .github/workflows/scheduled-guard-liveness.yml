@@ -139,7 +139,14 @@ on:
       stale_hours:
         description: "hours since last completion before a guard is called stopped"
         required: false
-        default: "4"
+        # Blank, NOT "4", deliberately. Downstream, the script treats ANY non-blank
+        # value as an operator-supplied "flatten every guard" debugging dial, so a
+        # non-blank default here is indistinguishable from a real override and makes
+        # that dial permanently on — silently collapsing the per-guard thresholds back
+        # to one global bar. Blank lets the script's own per-guard defaults stand on
+        # cron and on a bare dispatch, while an explicit dispatch value still flattens
+        # the set on purpose.
+        default: ""
 
 permissions:
   # Read-only. Enumerating workflows and their runs is all this needs, and
@@ -189,5 +196,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GUARD_LIVENESS_REPO: ${{ github.repository }}
-          GUARD_LIVENESS_STALE_HOURS: ${{ inputs.stale_hours || '4' }}
+          GUARD_LIVENESS_STALE_HOURS: ${{ inputs.stale_hours }}
         run: node scripts/check-scheduled-guard-liveness.mjs
