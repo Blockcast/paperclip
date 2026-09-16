@@ -1135,13 +1135,13 @@ function deliberatePendingMonitor(
  */
 function monitorGatingBreakdown(
   issue: IssueRow,
-  activeStartedAt: Date | null,
+  attributableStartAt: Date | null,
   elapsedMs: number | null,
   now: Date,
   latestRuns: HeartbeatRunRow[],
   thresholds: ProductivityReviewThresholds,
 ) {
-  if (elapsedMs === null || !activeStartedAt) return null;
+  if (elapsedMs === null || !attributableStartAt) return null;
   const armedUntil = coerceDate(issue.monitorNextCheckAt);
   const lastTriggeredAt = coerceDate(issue.monitorLastTriggeredAt);
 
@@ -1155,8 +1155,6 @@ function monitorGatingBreakdown(
   // unattended. That is the question the split exists to answer — "nobody was
   // watching; was anything still happening?" — and executing time inside the
   // gated prefix is unremarkable, because the monitor was accounting for it.
-  // Since `activeStartedAt` is the most recent dispatch, the current run's live
-  // span starts at the episode boundary, so this is the tail of that span.
   //
   // Leaving the gated prefix whole also keeps `unattendedMs + executingMs`
   // exactly equal to the pre-B1 `unattendedMs`, which is what lets the BLO-22331
@@ -1164,7 +1162,7 @@ function monitorGatingBreakdown(
   // only: B3 is the separate change that makes the trigger fire on the narrowed
   // bucket, and folding it in here is the compute-without-consult failure
   // BLO-27225 documents.
-  const episodeStartMs = activeStartedAt.getTime();
+  const episodeStartMs = attributableStartAt.getTime();
   const episodeEndMs = episodeStartMs + elapsedMs;
   const liveSpans = latestRuns
     .map((run) => runLiveInterval(run, now))
@@ -1180,7 +1178,7 @@ function monitorGatingBreakdown(
   };
 
   // Still armed for a future check. There is no arm-time column, so a monitor
-  // armed seconds ago is indistinguishable from one armed at `activeStartedAt`
+  // armed seconds ago is indistinguishable from one armed at `attributableStartAt`
   // and the whole episode is attributed to gating — flagged as an upper bound,
   // because reporting it flat would tell a manager that a 15h stall was fully
   // accounted for when only the last 90s provably was.
@@ -1216,8 +1214,8 @@ function monitorGatingBreakdown(
 
   // Coverage that ended before this episode began belongs to a prior episode:
   // none of this episode was gated, and calling it an in-episode lapse would
-  // print a timestamp from before `activeStartedAt`.
-  if (lapsedAt.getTime() <= activeStartedAt.getTime()) {
+  // print a timestamp from before `attributableStartAt`.
+  if (lapsedAt.getTime() <= attributableStartAt.getTime()) {
     return {
       ...splitExecuting(0),
       lapsedAt: null,
@@ -1244,7 +1242,7 @@ function monitorGatingBreakdown(
         .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())[0]?.id ?? null)
     : null;
 
-  const gatedMs = Math.min(elapsedMs, lapsedAt.getTime() - activeStartedAt.getTime());
+  const gatedMs = Math.min(elapsedMs, lapsedAt.getTime() - attributableStartAt.getTime());
   // BLO-27698 A4: a monitor whose scheduled check has only just passed has not
   // "lapsed" — it is waiting on the dispatcher, inside the same
   // `monitorLapseServiceGraceMs` window `deliberatePendingMonitor` already
@@ -4811,7 +4809,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       ...(evidence.nonLiveHoldMs > 0
         ? [
-            `- Excluded as non-live execution hold: ${msToHuman(evidence.nonLiveHoldMs)} (issue's executionRunId parked or pinned by a run that was not live; not counted toward the trigger — BLO-19848)`,
+            `- Excluded as non-live execution hold: ${msToHuman(evidence.nonLiveHoldMs)} (issue's executionRunId parked, pinned by a run that was not live, or outside the current live segment; not counted toward the trigger — BLO-19848)`,
           ]
         : []),
       ...(evidence.monitorGating
