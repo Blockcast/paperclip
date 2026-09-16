@@ -500,9 +500,10 @@ const CLAUDE_EVENT_SUBTYPE_RE = /"subtype"\s*:\s*"([^"\r\n]*)"/;
  * That trust is STRUCTURAL, not a sample. The surface this reads has exactly
  * one writer: the `tee` in the pipeline `job-manifest.ts` builds in
  * `claudeInvocation` —
- * `cat … | claude … | tee <podLogPath> | <failFastFilter> > /dev/null` — which
- * carries no `2>&1` on any stage. The file therefore receives Claude's stdout
- * and nothing else. Hook stderr, MCP-server stderr and the fail-fast
+ * `cat … | ${launcherCommand} … | tee <podLogPath> | <failFastFilter> >
+ * /dev/null` — which carries no `2>&1` on any stage. The file therefore
+ * receives that stage's stdout and nothing else. Hook stderr, MCP-server
+ * stderr and the fail-fast
  * `[wrapper]` line (written to `/dev/stderr` by `job-manifest.ts`'s
  * `failFastFilter`, and
  * downstream of the `tee` regardless) all bypass it by construction, as does
@@ -511,7 +512,9 @@ const CLAUDE_EVENT_SUBTYPE_RE = /"subtype"\s*:\s*"([^"\r\n]*)"/;
  * merely observed to be safe. The 6893-line production sample recorded in
  * PROVENANCE.md corroborates that; it is not what establishes it.
  *
- * Two edits would void this, and neither shows a diff at this call site:
+ * Three things void this, and none shows a diff at this call site. The first
+ * two break the single-writer premise; the third breaks the other one, that
+ * the binary writing stdout speaks only stream-json:
  *
  *   1. Adding `2>&1` before the `tee` in `job-manifest.ts`'s
  *      `claudeInvocation` — an entirely
@@ -520,12 +523,27 @@ const CLAUDE_EVENT_SUBTYPE_RE = /"subtype"\s*:\s*"([^"\r\n]*)"/;
  *      lines.
  *   2. Feeding a merged container-log read into the parse surface. Container
  *      logs interleave both streams, so `readPodContainerLogTail`
- *      (`execute.ts:894`, via `readNamespacedPodLog`) must stay confined to
+ *      (in `execute.ts`, via `readNamespacedPodLog`) must stay confined to
  *      diagnostics. Today `stdout` is assigned only from `podLogPath`
  *      (in `execute.ts`: the `tailResult.value` tail, and the `stdout =
  *      onDisk` re-read), so both paths read the same single-writer file.
+ *   3. Pointing `adapterConfig.agentCommand` at a launcher that writes any
+ *      line of its own to stdout. Stage 2 above is `launcherCommand`, not
+ *      `claude` — `job-manifest.ts` resolves it from `validateAgentCommand(
+ *      config.agentCommand, "claude")`, an operator-editable text field
+ *      ("Agent Launcher" in `config-schema.ts`). This one needs NO code edit
+ *      at all, which makes it the weakest of the three — and it is not
+ *      hypothetical: measured on this instance, 14 of 15 `claude_k8s` agents
+ *      already run an external launcher, so stage 2 is normally NOT `claude`.
+ *      The trust therefore assumes that launcher is a stream-json
+ *      PASSTHROUGH: `job-manifest.ts` encodes that expectation where it sets
+ *      `PENSTOCK_AGENT_COMMAND` ("the launcher owns provider credentials and
+ *      starts the native Claude protocol itself"), and a proxy that surfaced
+ *      an upstream error body on stdout would emit it here as a bare, trusted
+ *      line — the same shape as the nginx 503 page already seen in a
+ *      `hook_response`.
  *
- * Either one re-opens BLO-7991's hole with no diff on this guard — the failure
+ * Any one re-opens BLO-7991's hole with no diff on this guard — the failure
  * mode every prior iteration in this family took (BLO-7991 → #1525 → BLO-31794).
  */
 function claudeLineIsHarnessAuthored(line: string): boolean {
