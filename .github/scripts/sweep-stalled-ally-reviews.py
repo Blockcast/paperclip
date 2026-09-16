@@ -92,6 +92,9 @@ VERDICT_OPENER_PATTERN = re.compile(
 )
 SUPPORTED_VERDICT_VERSION = 1
 FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+# Ledger entries name the head they were raised at as Ally wrote it, which is
+# abbreviated. Mirrors the bound in `asDispositions` / `stillPresentIn`.
+ABBREV_SHA_PATTERN = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
 
 # Mirrors BLOCKING_SEVERITIES / VERDICT_SEVERITIES / MAX_VERDICT_FINDING_COUNT
 # in ally-review-detection.ts. A block whose counts that reader rejects must be
@@ -163,6 +166,54 @@ def severity_counts(raw):
     return counts
 
 
+def dispositions_ok(payload):
+    """Whether the ledger is readable, mirroring `asDispositions` field for field.
+
+    Takes the whole payload, not `payload["dispositions"]`, because absent and
+    explicitly-null are different answers and `.get()` collapses them. Both JS
+    readers key on `undefined`: an absent ledger is legitimate (a review that
+    retires nothing emits none) and reads as empty, while an explicit `null`
+    fails `Array.isArray` and reads as unreadable. Taking the dict is what lets
+    `"dispositions" in payload` tell those apart; passing the value could not.
+
+    This reader never uses the entries -- it only wants the head -- but it must
+    still agree with the other two about whether the block is readable at all.
+    Without this the validation covered one of the two fields the payload
+    carries: TS rejects a malformed ledger (`asDispositions` -> None ->
+    unreadable) and so does the mjs (`stillPresentIn`), while this dropped
+    through to ("ok", head).
+
+    That is the exact harm named in the comment justifying why `findings` is
+    validated here, and worse in this direction: the gate goes red on
+    `unreadable_verdict` while this sweep sees a review that already happened,
+    so it never re-requests the one that would clear it -- and the sweep is the
+    only automatic route back. Found in peer review of #1721 at 97b4ddd1 with
+    `{"head": "<40-hex>", "findings": {...}, "dispositions": "nope"}`:
+    ("ok", head) here, `failure` at the gate.
+    """
+    if "dispositions" not in payload:
+        return True
+    raw = payload["dispositions"]
+    if not isinstance(raw, list):
+        return False
+    for item in raw:
+        if not isinstance(item, dict):
+            return False
+        head = item.get("head")
+        if not isinstance(head, str) or not ABBREV_SHA_PATTERN.match(head.strip()):
+            return False
+        for field in ("severity", "verb"):
+            value = item.get(field)
+            if not isinstance(value, str) or not value.strip():
+                return False
+        index = item.get("index")
+        # bool is an int subclass in Python; `true` must not read as index 1,
+        # for the same reason severity_counts rejects it in a count.
+        if isinstance(index, bool) or not isinstance(index, int) or index < 1:
+            return False
+    return True
+
+
 def prose_count_contradicts(text, counts):
     """A positive emitted bucket against a stated zero -- mirrors
     proseCountContradicting in ally-review-detection.ts."""
@@ -186,8 +237,24 @@ def parse_verdict_block_head(body):
     present but cannot be trusted, and must NOT fall back -- falling back would
     put the retired prose regex back on the critical path for exactly the
     bodies the block exists to carry.
+
+    Counted over fence-stripped text, because the gate counts over fence-stripped
+    text: parseAllyVerdictBlock reads emittedReviewText(body). Reading the raw
+    body here made a fenced ```markdown example of the marker a *second* block --
+    gate blocks=1/openers=1 -> ok, this reader blocks=2/openers=2 -> unreadable,
+    on one body. The consequence is the one this file's own docstring at the
+    stalled-review check names: with ally_has_reviewed_head false the sweep
+    re-fires a request on a head Ally already reviewed, and each duplicate is a
+    COMMENTED review that cannot be dismissed -- "spam, and eventually a false
+    alarm, not reconciliation". It fires first on a review quoting the template,
+    which is the likeliest shape for a review *of this feature* (found in peer
+    review of #1721 at 97b4ddd1).
+
+    Scoped to the block and opener count. parse_reviewed_head still matches the
+    prose attestation against raw text; that fence divergence is the pre-existing
+    documented residual and is deliberately not widened here.
     """
-    text = body or ""
+    text = without_fenced_spans(body or "")
     blocks = VERDICT_BLOCK_PATTERN.findall(text)
     openers = VERDICT_OPENER_PATTERN.findall(text)
     # An opener with no terminator is a truncated payload, not an older review.
@@ -220,6 +287,9 @@ def parse_verdict_block_head(body):
     # already happened and never re-requests the one that would clear it.
     counts = severity_counts(parsed.get("findings"))
     if counts is None:
+        return ("unreadable", None)
+    # The other field the payload carries, held to the same rule.
+    if not dispositions_ok(parsed):
         return ("unreadable", None)
     if prose_count_contradicts(text, counts):
         return ("unreadable", None)

@@ -1169,6 +1169,83 @@ class TestVerdictCountsMirrorTheGate(unittest.TestCase):
             self.assertIsNone(sweep.parse_reviewed_head(self.body(findings)), findings)
 
 
+class TestVerdictBlockMirrorsTheGateOnFencesAndLedgers(unittest.TestCase):
+    """Peer review of #1721 at 97b4ddd1 -- the remaining two reader divergences.
+
+    Both are the same defect as TestVerdictCountsMirrorTheGate: a rule landed in
+    some readers and not this one, so the gate and this sweep disagree about one
+    body. Disagreeing in this direction is the expensive one -- with
+    ally_has_reviewed_head false the sweep re-fires a request on a head Ally
+    already reviewed, and each duplicate is a COMMENTED review that cannot be
+    dismissed.
+    """
+
+    HEAD = "d" * 40
+
+    def block(self, extra=""):
+        return '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0}%s}\n-->' % (
+            self.HEAD,
+            extra,
+        )
+
+    def body(self, *rest):
+        return "\n".join([self.block(), "", "## Ally — Consolidated PR Review"] + list(rest))
+
+    def test_a_fenced_example_of_the_marker_is_not_a_second_block(self):
+        # The gate counts blocks over fence-stripped text (parseAllyVerdictBlock
+        # reads emittedReviewText), so a quoted marker is invisible there:
+        # blocks=1, openers=1 -> ok. Read raw, this saw blocks=2, openers=2 ->
+        # unreadable. It fires first on a review quoting the template, which is
+        # the likeliest shape for a review *of this feature*.
+        body = self.body("Here is the emitted form:", "", "```markdown", self.block(), "```")
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_control_a_real_second_block_is_still_unreadable(self):
+        # Without this the test above passes for a reader that stopped counting
+        # blocks at all.
+        body = self.body("", self.block())
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_a_malformed_ledger_is_rejected_here_too(self):
+        # Validation had covered one of the two fields the payload carries. TS
+        # rejects these via asDispositions and the mjs via stillPresentIn, while
+        # this dropped through to ("ok", head) -- so the gate went red on
+        # `unreadable_verdict` with no mechanism left to clear it.
+        for dispositions in (
+            '"nope"',
+            "42",
+            "null",
+            '[{"head":"deadbee","severity":"critical","verb":"fixed"}]',
+            '[{"head":"deadbee","severity":"critical","index":0,"verb":"fixed"}]',
+            '[{"head":"deadbee","severity":"critical","index":true,"verb":"fixed"}]',
+            '[{"head":"xyz","severity":"critical","index":1,"verb":"fixed"}]',
+            '[{"head":"deadbee","severity":"","index":1,"verb":"fixed"}]',
+            '[{"head":"deadbee","severity":"critical","index":1,"verb":"  "}]',
+            '["not an object"]',
+        ):
+            body = self.body_with_dispositions(dispositions)
+            self.assertIsNone(sweep.parse_reviewed_head(body), dispositions)
+
+    def test_control_a_well_formed_or_absent_ledger_still_attests(self):
+        # `null` is deliberately absent from this list: both JS readers key on
+        # `undefined`, so an explicit null fails Array.isArray and is unreadable
+        # there. Collapsing the two is why this takes the payload rather than
+        # the field.
+        self.assertEqual(sweep.parse_reviewed_head(self.body()), self.HEAD)
+        for dispositions in (
+            "[]",
+            '[{"head":"deadbee","severity":"critical","index":1,"verb":"fixed"}]',
+            '[{"head":"deadbee","severity":"recommended-action","index":4,"verb":"withdrawn"}]',
+        ):
+            body = self.body_with_dispositions(dispositions)
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, dispositions)
+
+    def body_with_dispositions(self, dispositions):
+        return "\n".join(
+            [self.block(',"dispositions":%s' % dispositions), "", "## Ally — Consolidated PR Review"]
+        )
+
+
 class TestIsConsolidatedAllyCommentForHead(unittest.TestCase):
     HEAD = "c" * 40
 

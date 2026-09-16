@@ -249,8 +249,25 @@ function stillPresentIn(raw) {
  * `{ kind: "unreadable" }` when one is present but cannot be trusted (fail
  * closed — never fall back), or
  * `{ kind: "ok", head, blockingFindings, stillPresent }`.
+ *
+ * Counted over fence-stripped text, because the gate counts over fence-stripped
+ * text: `parseAllyVerdictBlock` reads `emittedReviewText(body)`. Reading the raw
+ * body here made a fenced ```` ```markdown ```` example of the marker a *second*
+ * block — gate `blocks=1, openers=1` → ok, this reader `blocks=2, openers=2` →
+ * unreadable, on one body. The divergence matters in the direction the sweep
+ * runs: `ally_has_reviewed_head` goes false, so it re-requests a review of a
+ * head Ally already reviewed, and each duplicate is a `COMMENTED` review that
+ * cannot be dismissed — the BLO-22892/BLO-28203 loop, reintroduced through the
+ * new path. It fires first on a review quoting the template, which is the
+ * likeliest shape for a review *of this feature* (found in peer review of
+ * #1721 at 97b4ddd1).
+ *
+ * Scoped to the block and opener count. The prose attestation below still
+ * matches raw text; that fence divergence is the pre-existing documented
+ * residual and is deliberately not widened here.
  */
-function structuredVerdict(text) {
+function structuredVerdict(rawText) {
+  const text = withoutFencedSpans(rawText);
   const blocks = Array.from(text.matchAll(VERDICT_BLOCK_RE));
   const openers = Array.from(text.matchAll(VERDICT_OPENER_RE));
   // A truncated payload is a broken block, not an older review, so it must not

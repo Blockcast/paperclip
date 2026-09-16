@@ -1290,3 +1290,34 @@ describe("the committed baseline", () => {
     assert.match(failing[0].violation, /PR #1601/);
   });
 });
+
+/**
+ * Peer review of #1721 at 97b4ddd1 — this reader counted verdict blocks over
+ * the raw body while the gate counts them over fence-stripped text.
+ *
+ * Same body, different verdict across two of the four readers the PR's central
+ * invariant names. It fires first on a review that quotes the template inside a
+ * fence, which is the likeliest shape for a review *of this feature* — the same
+ * self-referential trigger the block's own line anchoring exists for.
+ */
+describe("BLO-32695 — a fenced example of the marker is not a second block", () => {
+  const block = (head) =>
+    `<!-- ally-verdict:1\n{"head":"${head}","findings":{"critical":0,"important":0}}\n-->`;
+  const body = (...rest) =>
+    [block(HEAD), "", "## Ally — Consolidated PR Review", `Reviewed head: ${HEAD}`, ...rest].join("\n");
+
+  it("reads the head through a fenced quote of the marker", () => {
+    assert.equal(attestedHead(body("As emitted:", "", "```markdown", block(HEAD), "```")), HEAD);
+  });
+
+  it("control: a real second block is still unreadable", () => {
+    // Without this the test above passes for a reader that stopped counting.
+    assert.equal(attestedHead(body("", block(HEAD))), null);
+  });
+
+  it("control: a fenced opener alone does not mint a truncated-payload red", () => {
+    // openers > blocks is the fail-closed branch; stripping fences has to move
+    // both counts together or it trades one divergence for another.
+    assert.equal(attestedHead(body("```markdown", "<!-- ally-verdict:1 {", "```")), HEAD);
+  });
+});
