@@ -1318,26 +1318,19 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       }
     }
 
-    // Fixed here: the escalation body's own `getCompanyIssuePrefix` and
-    // `getAgent` reads now run on `tx`. Still pooled under the lock, tracked on
-    // BLO-34207: owner resolution (`resolveStrandedIssueRecoveryOwnerAgentId`
-    // -> `getAgent` / `isAgentInvokable` / `budgets.getInvocationBlock` /
-    // instance settings). This ratchet fails on any new pooled call site and on
-    // a regression of the two fixed ones.
+    // Fixed here: the escalation body's own `getCompanyIssuePrefix`, `getAgent`
+    // and `getLatestIssueRun` reads now run on `tx`. Still pooled under the
+    // lock, tracked on BLO-34207: owner resolution
+    // (`resolveStrandedIssueRecoveryOwnerAgentId` -> `getAgent` /
+    // `isAgentInvokable` / `budgets.getInvocationBlock` / instance settings).
+    // This ratchet fails on any new pooled call site and on a regression of the
+    // three fixed ones.
     const knownPooledUnderLock = [
       "resolveStrandedIssueRecoveryOwnerAgentId",
       "isAgentInvokable",
       "evaluateAgentInvokabilityFromDb",
       "getInvocationBlock",
       "getOrCreateRow",
-      // Deliberately pooled, NOT an unconverted call site. This read wants the
-      // freshest COMMITTED `heartbeat_runs` stamp: the stamp writer
-      // (`routes/issues.ts`, the statusOnly document-write refusal path) writes on
-      // the pooled connection and takes no advisory lock, so it does not serialize
-      // against `lockIssueOwnership`. Moving this onto the caller tx would bind it
-      // to the transaction snapshot and WIDEN the stale-read window the call site's
-      // own comment exists to narrow. See recovery/service.ts:7362-7371.
-      "getLatestIssueRun",
     ];
     const unexpected = pooledInsideTransaction.filter(
       (entry) => !knownPooledUnderLock.some((name) => entry.includes(name)),
@@ -1347,6 +1340,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(
       pooledInsideTransaction.filter((entry) => entry.includes("getAgent <- escalateStrandedAssignedIssue")),
     ).toEqual([]);
+    // Substring match, so this also covers `getLatestIssueRunForAgentStage` and
+    // `getLatestIssueRunSince` — none of the three may run pooled under the lock.
+    expect(pooledInsideTransaction.filter((entry) => entry.includes("getLatestIssueRun"))).toEqual([]);
     const actionRows = await db
       .select()
       .from(issueRecoveryActions)
