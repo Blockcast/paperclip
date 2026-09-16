@@ -731,7 +731,12 @@ describe("issue graph liveness classifier", () => {
       {
         name: "pending interaction",
         issue: baseReviewIssue,
-        pendingInteractions: [{ companyId, issueId: reviewIssueId, status: "pending" }],
+        pendingInteractions: [{
+          companyId,
+          issueId: reviewIssueId,
+          status: "pending",
+          createdAt: new Date(),
+        }],
       },
       {
         name: "pending approval",
@@ -759,6 +764,37 @@ describe("issue graph liveness classifier", () => {
 
       expect(findings, testCase.name).toEqual([]);
     }
+  });
+
+  it("flags an in_review issue whose only pending interaction is 24h old (BLO-22660)", () => {
+    const reviewIssueId = "review-stale-interaction-1";
+    const now = new Date("2026-06-02T00:00:00.000Z");
+    const classify = (createdAt: Date) => classifyIssueGraphLiveness({
+      issues: [issue({
+        id: reviewIssueId,
+        identifier: "PAP-2281",
+        title: "Stale confirmation",
+        status: "in_review",
+        assigneeAgentId: coderId,
+        executionState: null,
+      })],
+      relations: [],
+      agents: [agent(), manager],
+      pendingInteractions: [{ companyId, issueId: reviewIssueId, status: "pending", createdAt }],
+      now,
+    });
+
+    // One second under the threshold still owns the next action.
+    expect(classify(new Date("2026-06-01T00:00:01.000Z"))).toEqual([]);
+
+    const findings = classify(new Date("2026-06-01T00:00:00.000Z"));
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      state: "in_review_without_action_path",
+      recoveryIssueId: reviewIssueId,
+      reason: expect.stringContaining("older than 24h"),
+      recommendedAction: expect.stringContaining("Resolve or withdraw"),
+    });
   });
 
   it("still flags a stalled in_review issue when its blocker has an active run", () => {
