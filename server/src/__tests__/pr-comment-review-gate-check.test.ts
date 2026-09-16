@@ -17,12 +17,14 @@ vi.mock("../config.js", () => ({ loadConfig: () => h.cfg }));
 const mockListComments = vi.hoisted(() => vi.fn());
 const mockListReviews = vi.hoisted(() => vi.fn());
 const mockFetchHeadSha = vi.hoisted(() => vi.fn());
+const mockFetchPrAuthor = vi.hoisted(() => vi.fn());
 const mockPostStatus = vi.hoisted(() => vi.fn());
 const mockPostCheckRun = vi.hoisted(() => vi.fn());
 const mockStatusDeliveryLock = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/github-app-auth.js", () => ({
   githubFetchPrHeadSha: mockFetchHeadSha,
+  githubFetchPrAuthorLogin: mockFetchPrAuthor,
   githubListIssueCommentsWithTimestamps: mockListComments,
   githubListPrReviewsWithTimestamps: mockListReviews,
   githubPostCommitStatusDetailed: mockPostStatus,
@@ -71,6 +73,7 @@ beforeEach(() => {
   mockListComments.mockReset();
   mockListReviews.mockReset();
   mockFetchHeadSha.mockReset();
+  mockFetchPrAuthor.mockReset();
   mockPostStatus.mockReset();
   mockPostCheckRun.mockReset();
   mockStatusDeliveryLock.mockReset();
@@ -78,6 +81,9 @@ beforeEach(() => {
   // Default both surfaces to empty; each test overrides the one it exercises.
   mockListComments.mockResolvedValue([]);
   mockListReviews.mockResolvedValue([]);
+  // A PR author who is not the reviewer identity, so the existing fixtures keep
+  // their meaning; the self-attestation tests override it (BLO-34316).
+  mockFetchPrAuthor.mockResolvedValue("some-contributor");
   mockPostCheckRun.mockResolvedValue({ ok: true, statusCode: 201 });
 });
 
@@ -240,6 +246,47 @@ describe("runPrCommentReviewGateCheck", () => {
       verdict: { state: "success", outcome: "clean" },
     });
   });
+
+  it("publishes neutral, not success, when the PR author wrote the attestation", async () => {
+    // BLO-34316. The live shape: agent PRs and agent reviews carry the same App
+    // identity, so the author's own comment reached the gate's strongest green.
+    mockFetchPrAuthor.mockResolvedValue("allyblockcast[bot]");
+    mockListComments.mockResolvedValue([
+      {
+        login: "allyblockcast[bot]",
+        body: `## Ally — Consolidated PR Review\nReviewed head: ${TARGET.headSha}\n### Critical Issues (0)\n### Important Issues (0)`,
+        createdAt: "2026-08-04T22:09:19Z",
+      },
+    ]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "not_evaluated" },
+    });
+    expect(mockFetchPrAuthor).toHaveBeenCalledWith({
+      repoFullName: TARGET.repoFullName,
+      prNumber: TARGET.prNumber,
+    });
+    expect(mockPostCheckRun).toHaveBeenCalledWith(
+      expect.objectContaining({ conclusion: "neutral" }),
+    );
+    // Non-blocking on the status surface (BLO-29711): never pending/failure.
+    expect(mockPostStatus).toHaveBeenCalledWith(expect.objectContaining({ state: "success" }));
+  });
+
+  it("leaves the prior status untouched when the PR author cannot be read", async () => {
+    // Publishing on incomplete evidence would overwrite a correct earlier
+    // verdict with a weaker one on a transient failure. Same shape as an
+    // unreadable comment surface.
+    mockFetchPrAuthor.mockResolvedValue(null);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toEqual({
+      posted: false,
+      reason: "fetch_failed",
+    });
+    expect(mockPostStatus).not.toHaveBeenCalled();
+  }, 10_000);
 
   it("leaves the prior status untouched when the reviews surface cannot be read", async () => {
     // Half the history is not a verdict. Symmetric with the issue-comment path.

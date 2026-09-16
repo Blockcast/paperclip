@@ -24,6 +24,7 @@ import {
   type AllyPriorFindingDisposition,
 } from "./ally-review-detection.js";
 import {
+  githubFetchPrAuthorLogin,
   githubFetchPrHeadSha,
   githubListIssueCommentsWithTimestamps,
   githubListPrReviewsWithTimestamps,
@@ -72,7 +73,11 @@ export type CommentReviewGateOutcome =
   | "blocking_finding"
   /** No comment attests this head, but a finding from an earlier head stands undispositioned. */
   | "carried_finding"
-  /** Nothing established a comment-shaped review of this head. Not evidence of review. */
+  /**
+   * Nothing established an *independent* comment-shaped review of this head.
+   * Not evidence of review. Covers both "no comment attests it" and "the only
+   * one that does is the PR author's own" (BLO-34316).
+   */
   | "not_evaluated";
 
 export type CommentReviewGateVerdict =
@@ -306,6 +311,19 @@ export function evaluateCommentReviewGate(input: {
   comments: CommentReviewGateComment[];
   headSha: string;
   reviewerBotLogin?: string | null;
+  /**
+   * The login that opened the PR. Required to reach `clean` (BLO-34316).
+   *
+   * Every attesting comment has already been established to come from the
+   * reviewer identity, so "this attestation is the author's own" reduces to
+   * "the PR author IS that identity" — which is the case on every agent PR
+   * here, where both sides are `allyblockcast[bot]`. Omitted or unreadable is
+   * treated the same as self-attested: the positive claim is that someone
+   * other than the author examined this head, and an absent author cannot
+   * establish it. Passing it is what makes an omission at a call site loud
+   * rather than silently green.
+   */
+  prAuthorLogin?: string | null;
 }): CommentReviewGateVerdict {
   const reviewerBotLogin = input.reviewerBotLogin?.trim() || DEFAULT_PR_REVIEWER_BOT_LOGIN;
   const headSha = input.headSha?.trim();
@@ -329,6 +347,25 @@ export function evaluateCommentReviewGate(input: {
         reason:
           "Ally's most recent consolidated-review comment for this head carries an unresolved finding.",
         commentCreatedAt: new Date(toEpochMs(forHead.comment.createdAt)).toISOString(),
+      };
+    }
+    // Only the POSITIVE claim is withheld for a self-attestation. The blocking
+    // branch above stays author-blind on purpose: a finding is a finding
+    // whoever wrote it, and failing closed there is the direction this module
+    // must not get wrong.
+    const prAuthorLogin = input.prAuthorLogin?.trim();
+    if (!prAuthorLogin) {
+      return {
+        state: "success",
+        outcome: "not_evaluated",
+        reason: "The PR author is unknown, so this head's attestation cannot be shown to be independent.",
+      };
+    }
+    if (githubReviewerIdentityMatches(prAuthorLogin, reviewerBotLogin)) {
+      return {
+        state: "success",
+        outcome: "not_evaluated",
+        reason: "The only comment attesting this head is the PR author's own; nothing independent reviewed it.",
       };
     }
     return {
@@ -431,7 +468,12 @@ export function commentReviewGateCheckTitle(
     case "carried_finding":
       return "Unresolved finding carried from an earlier head";
     case "not_evaluated":
-      return "Not evaluated — no comment-shaped review attests this head";
+      // "independent" carries the self-attested case (BLO-34316), where a
+      // comment DOES attest this head — the author's own. Saying "no
+      // comment-shaped review attests this head" there would be false, which is
+      // the same laundering one level down from the green it replaces. The
+      // summary (`verdict.reason`) names which of the two it was.
+      return "Not evaluated — no independent comment-shaped review attests this head";
   }
 }
 
@@ -669,6 +711,17 @@ async function executeCommentReviewGateCheck(
     ));
   if (!headSha) return { posted: false, reason: "fetch_failed" };
 
+  // The gate cannot report `clean` without knowing who opened the PR, so an
+  // unreadable author is a fetch failure, not a downgrade to `neutral`:
+  // publishing on incomplete evidence would overwrite a correct verdict from an
+  // earlier delivery with a weaker one on a transient 5xx. Not publishing
+  // leaves that verdict standing, and the next webhook re-evaluates.
+  const prAuthorLogin = await withBoundedRetry(
+    () => githubFetchPrAuthorLogin({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
+    (login) => login == null,
+  );
+  if (!prAuthorLogin) return { posted: false, reason: "fetch_failed" };
+
   const publish = async (): Promise<PrCommentReviewGateCheckResult> => {
     // Both surfaces, because Ally uses whichever is available to it: a
     // `COMMENTED` pull_request_review on `/pulls/{n}/reviews`, or a plain issue
@@ -695,6 +748,7 @@ async function executeCommentReviewGateCheck(
       })),
       headSha,
       reviewerBotLogin,
+      prAuthorLogin,
     });
 
     warnOnceIfMisreadableContext(verdict, context);

@@ -419,6 +419,39 @@ async function fetchPrHeadSha(
   }
 }
 
+/**
+ * Fetch the login that opened a pull request.
+ *
+ * Needed by the comment-review gate to tell a review from a self-attestation:
+ * on this fleet agent PRs and agent reviews carry the same App identity, so
+ * without the author the gate treats the author's own comment as evidence that
+ * someone reviewed the head (BLO-34316). Null on any unreadable response — the
+ * caller must fail closed rather than assume a distinct author.
+ */
+export async function githubFetchPrAuthorLogin(input: {
+  repoFullName: string;
+  prNumber: number;
+  signal?: AbortSignal;
+}): Promise<string | null> {
+  const token = await getInstallationToken();
+  if (!token) return null;
+  try {
+    const res = await ghFetch(
+      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/pulls/${input.prNumber}`,
+      {
+        headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` },
+        signal: input.signal,
+      },
+    );
+    if (!res.ok) return null;
+    const body = (await res.json().catch(() => null)) as { user?: { login?: string } } | null;
+    const login = body?.user?.login;
+    return typeof login === "string" && login.trim() ? login.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Fetch the current SHA for a pull request when a webhook payload lacks it. */
 export async function githubFetchPrHeadSha(input: {
   repoFullName: string;
