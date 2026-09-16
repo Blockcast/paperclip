@@ -180,9 +180,15 @@ function canonicalReviewHead(body) {
   return attestations[0][1].toLowerCase();
 }
 
-// The two distinct GitHub principals required by the protected-merge policy.
-// Pin both the immutable REST ID and the canonical login: either mismatch is
-// not an eligible substitute for the required artifact.
+// The two GitHub principals the guard must recognise. Recognising both is not
+// endorsing both: only the App may carry a verdict, and every operative seat
+// review is a violation (I6, R4/BLO-24056). Do not read this pair as a shape
+// something requires.
+//
+// Only the IDs have production consumers — `allyReviewIdentityShape` pins the
+// immutable REST ID per lane, so an impostor matching a login regex is caught
+// by I5 rather than silently accepted. The login constants are retained as the
+// canonical spelling and for the test fixtures that exercise that mismatch.
 export const ALLY_APP_REVIEWER_ID = 290875700;
 export const ALLY_APP_REVIEWER_LOGIN = "allyblockcast[bot]";
 export const ALLY_USER_REVIEWER_ID = 296676656;
