@@ -499,17 +499,15 @@ const CLAUDE_EVENT_SUBTYPE_RE = /"subtype"\s*:\s*"([^"\r\n]*)"/;
  *
  * That trust is STRUCTURAL, not a sample. The surface this reads has exactly
  * one writer: the `tee` in the pipeline `job-manifest.ts` builds in
- * `claudeInvocation` —
- * `cat … | ${launcherCommand} … | tee <podLogPath> | <failFastFilter> >
- * /dev/null` — which carries no `2>&1` on any stage. The file therefore
- * receives that stage's stdout and nothing else. Hook stderr, MCP-server
- * stderr and the fail-fast
- * `[wrapper]` line (written to `/dev/stderr` by `job-manifest.ts`'s
- * `failFastFilter`, and
- * downstream of the `tee` regardless) all bypass it by construction, as does
- * the prompt. Operator- and MCP-authored text cannot reach this predicate as a
- * bare line at all — which is why trusting bare lines is safe, rather than
- * merely observed to be safe. The 6893-line production sample recorded in
+ * `claudeInvocation` — `cat … | ${launcherCommand} … | tee <podLogPath> |
+ * <failFastFilter> > /dev/null` — which carries no `2>&1` on any stage. The
+ * file therefore receives that stage's stdout and nothing else. Hook stderr,
+ * MCP-server stderr and the fail-fast `[wrapper]` line (written to
+ * `/dev/stderr` by `job-manifest.ts`'s `failFastFilter`, and downstream of the
+ * `tee` regardless) all bypass it by construction, as does the prompt.
+ * Operator- and MCP-authored text cannot reach this predicate as a bare line
+ * at all — which is why trusting bare lines is safe, rather than merely
+ * observed to be safe. The 6893-line production sample recorded in
  * PROVENANCE.md corroborates that; it is not what establishes it.
  *
  * Three things void this, and none shows a diff at this call site. The first
@@ -517,10 +515,9 @@ const CLAUDE_EVENT_SUBTYPE_RE = /"subtype"\s*:\s*"([^"\r\n]*)"/;
  * the binary writing stdout speaks only stream-json:
  *
  *   1. Adding `2>&1` before the `tee` in `job-manifest.ts`'s
- *      `claudeInvocation` — an entirely
- *      reasonable change, e.g. to capture CLI diagnostics in the pod log —
- *      which starts routing operator-authored stderr here as bare, TRUSTED
- *      lines.
+ *      `claudeInvocation` — an entirely reasonable change, e.g. to capture CLI
+ *      diagnostics in the pod log — which starts routing operator-authored
+ *      stderr here as bare, TRUSTED lines.
  *   2. Feeding a merged container-log read into the parse surface. Container
  *      logs interleave both streams, so `readPodContainerLogTail`
  *      (in `execute.ts`, via `readNamespacedPodLog`) must stay confined to
@@ -532,10 +529,16 @@ const CLAUDE_EVENT_SUBTYPE_RE = /"subtype"\s*:\s*"([^"\r\n]*)"/;
  *      `claude` — `job-manifest.ts` resolves it from `validateAgentCommand(
  *      config.agentCommand, "claude")`, an operator-editable text field
  *      ("Agent Launcher" in `config-schema.ts`). This one needs NO code edit
- *      at all, which makes it the weakest of the three — and it is not
- *      hypothetical: measured on this instance, 14 of 15 `claude_k8s` agents
- *      already run an external launcher, so stage 2 is normally NOT `claude`.
- *      The trust therefore assumes that launcher is a stream-json
+ *      at all, which makes it the weakest of the three — and it is the
+ *      deployed norm rather than a hypothetical, which THIS REPOSITORY shows
+ *      without reference to any instance: the agent image bakes a launcher in
+ *      (`Dockerfile.agent` copies `penstock-agent-runtime.mjs`, rolled out per
+ *      `docs/runbooks/penstock-claude-local-rollout.md`), so stage 2 is
+ *      normally NOT `claude`. Corroborated by a count that is re-runnable
+ *      rather than trusted — 14 of 15 `claude_k8s` agents on this instance had
+ *      a non-default `adapterConfig.agentCommand` on 2026-09-16; re-measure by
+ *      counting agents whose `adapterConfig.agentCommand` differs from
+ *      `"claude"`. The trust therefore assumes that launcher is a stream-json
  *      PASSTHROUGH: `job-manifest.ts` encodes that expectation where it sets
  *      `PENSTOCK_AGENT_COMMAND` ("the launcher owns provider credentials and
  *      starts the native Claude protocol itself"), and a proxy that surfaced
