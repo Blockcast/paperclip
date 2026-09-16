@@ -5,7 +5,10 @@ import { cn } from "../lib/utils";
 import { createIssueDetailPath } from "../lib/issueDetailBreadcrumb";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
-const TRIGGER_LABELS: Record<string, string> = {
+// Keyed on the trigger union, not `string` (Ally review on BLO-27698 2e95b50b):
+// adding a trigger must fail to compile here rather than fall through to the
+// generic "Productivity review" label at runtime.
+const TRIGGER_LABELS: Record<NonNullable<IssueProductivityReview["trigger"]>, string> = {
   no_comment_streak: "No-comment streak",
   long_active_duration: "Long active duration",
   high_churn: "High churn",
