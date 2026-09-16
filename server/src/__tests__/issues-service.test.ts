@@ -52,6 +52,10 @@ import {
   restoreCheckoutPromotedStatus,
 } from "../services/issue-checkout-status.ts";
 import {
+  ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES,
+  TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
+} from "../services/issue-execution-lock.ts";
+import {
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
 } from "../services/issue-execution-policy.ts";
@@ -6754,13 +6758,31 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
-  it("releases the workspace-finalize barrier once the run that owed the finalize is terminal (PEN-3255)", async () => {
+  // PEN-3304: "the owing run is over" has exactly one definition in this
+  // codebase -- `TERMINAL_HEARTBEAT_RUN_STATUSES`, the set that decides a run
+  // has released the issue execution lock -- and the release above must agree
+  // with it. The first cut of this fix reached for `agent-scorecards.ts`'s
+  // 4-element `TERMINAL_RUN_STATUSES` instead. That list answers a different
+  // question ("did the agent fail?", for a failure-rate denominator) and omits
+  // `interrupted`, `error` and `adapter_failed`, so the barrier stayed
+  // permanently shut on three of the seven ways a run can die -- precisely the
+  // run-death paths that record no finalize row. It shipped green because this
+  // suite only ever drove `running -> failed`.
+  //
+  // So the table is DERIVED from the constant, not transcribed from it: an
+  // eighth terminal status extends this test automatically rather than
+  // silently reopening the gap. `issue-execution-lock.ts` exists because this
+  // same notion had already been open-coded as three literal arrays that drifted
+  // apart; a fourth definition site is the defect, not the fix.
+  const seedFinalizeBarrierFixture = async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
     const projectId = randomUUID();
     const projectWorkspaceId = randomUUID();
     const executionWorkspaceId = randomUUID();
     const owingRunId = randomUUID();
+    const blockerId = randomUUID();
+    const dependentId = randomUUID();
 
     await db.insert(companies).values({
       id: companyId,
@@ -6805,9 +6827,6 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       status: "active",
       providerType: "local_fs",
     });
-
-    const blockerId = randomUUID();
-    const dependentId = randomUUID();
     await db.insert(issues).values([
       {
         id: blockerId,
@@ -6851,35 +6870,72 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       startedAt: new Date("2026-09-06T02:27:34.412Z"),
     });
 
-    // While that run is still alive the gate must stay closed -- it may yet
-    // record a succeeded finalize. This is the positive control for the
-    // release below: without it, a test that only asserts the release could
-    // pass against a gate that had been removed outright.
-    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
-      isDependencyReady: false,
-      pendingFinalizeBlockerIssueIds: [blockerId],
-      unresolvedBlockerIssueIds: [blockerId],
-    });
-    expect(await svc.listWakeableBlockedDependents(blockerId)).toEqual([]);
+    return { assigneeAgentId, blockerId, dependentId, owingRunId };
+  };
 
-    // Once the owing run reaches a terminal status no finalize can ever
-    // arrive. Before PEN-3255 the dependent stayed gated forever here, which
-    // refused both checkout and every `status=in_progress` write on three
-    // issues for nine days after their blocker closed.
-    await db
-      .update(heartbeatRuns)
-      .set({ status: "failed", finishedAt: new Date("2026-09-06T02:25:58.824Z") })
-      .where(eq(heartbeatRuns.id, owingRunId));
+  it.each(TERMINAL_HEARTBEAT_RUN_STATUS_VALUES)(
+    "releases the workspace-finalize barrier once the run that owed the finalize is `%s` (PEN-3255, PEN-3304)",
+    async (terminalStatus) => {
+      const { assigneeAgentId, blockerId, dependentId, owingRunId } = await seedFinalizeBarrierFixture();
 
-    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
-      isDependencyReady: true,
-      pendingFinalizeBlockerIssueIds: [],
-      unresolvedBlockerIssueIds: [],
-    });
-    await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
-      expect.objectContaining({ id: dependentId, blockerIssueIds: [blockerId] }),
-    ]);
-  });
+      // While that run is still alive the gate must stay closed -- it may yet
+      // record a succeeded finalize. This is the positive control for the
+      // release below: without it, a test that only asserts the release could
+      // pass against a gate that had been removed outright.
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: false,
+        pendingFinalizeBlockerIssueIds: [blockerId],
+        unresolvedBlockerIssueIds: [blockerId],
+      });
+      expect(await svc.listWakeableBlockedDependents(blockerId)).toEqual([]);
+
+      // Once the owing run reaches a terminal status no finalize can ever
+      // arrive. Before PEN-3255 the dependent stayed gated forever here, which
+      // refused both checkout and every `status=in_progress` write on three
+      // issues for nine days after their blocker closed.
+      //
+      // Note `error` and `adapter_failed` are absent from the `HeartbeatRunStatus`
+      // union but are observed in the column, which is text -- that gap is the
+      // whole reason the canonical set is a superset of it.
+      await db
+        .update(heartbeatRuns)
+        .set({ status: terminalStatus, finishedAt: new Date("2026-09-06T02:25:58.824Z") })
+        .where(eq(heartbeatRuns.id, owingRunId));
+
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: true,
+        pendingFinalizeBlockerIssueIds: [],
+        unresolvedBlockerIssueIds: [],
+      });
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+        expect.objectContaining({ id: dependentId, assigneeAgentId, blockerIssueIds: [blockerId] }),
+      ]);
+    },
+  );
+
+  // The complement, so the release cannot widen into "always release": a run
+  // that still holds the issue execution lock may yet deliver the finalize, and
+  // `scheduled_retry` is the one that reads most like a dead run while being
+  // resumable -- the retry ladder parks a run there with the issue's lock
+  // columns still pointed at it.
+  it.each(ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES)(
+    "keeps the workspace-finalize barrier closed while the owing run is `%s` (PEN-3304)",
+    async (holdingStatus) => {
+      const { blockerId, dependentId, owingRunId } = await seedFinalizeBarrierFixture();
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: holdingStatus })
+        .where(eq(heartbeatRuns.id, owingRunId));
+
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: false,
+        pendingFinalizeBlockerIssueIds: [blockerId],
+        unresolvedBlockerIssueIds: [blockerId],
+      });
+      expect(await svc.listWakeableBlockedDependents(blockerId)).toEqual([]);
+    },
+  );
 
   it("keeps the workspace-finalize barrier closed when the unfinalized operation names no run (PEN-3255)", async () => {
     const companyId = randomUUID();

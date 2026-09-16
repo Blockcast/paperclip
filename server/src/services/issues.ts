@@ -80,7 +80,6 @@ import {
   type ResolvedPluginFencingPrecondition,
 } from "./plugin-fencing.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
-import { TERMINAL_RUN_STATUSES } from "./agent-scorecards.js";
 import {
   checkoutRestoreStatusExpression,
   lockIssueOwnership,
@@ -1603,10 +1602,24 @@ async function listPendingFinalizeBlockerIssueIds(
     // Release only on positive evidence that the owing run is over. An op with
     // no `heartbeat_run_id`, or one naming a run we cannot read, leaves the
     // gate closed: absence of a run row is not evidence the work is finished,
-    // and a live/resumable run (`queued`, `running`, `scheduled_retry`,
-    // `interrupted`) may still deliver the finalize.
+    // and a live/resumable run (`queued`, `running`, `scheduled_retry`) may
+    // still deliver the finalize.
+    //
+    // "Over" is `TERMINAL_HEARTBEAT_RUN_STATUSES` — the set that decides a run
+    // has released the issue execution lock, and the one this file already
+    // uses for every other "has this run finished?" decision. It is
+    // deliberately a 7-element superset including `interrupted`, `error` and
+    // `adapter_failed`: those are dead runs that will never write another
+    // operation, and they are precisely the run-death paths that record no
+    // finalize row. Do not narrow this to a metrics list such as
+    // `agent-scorecards.ts`'s `TERMINAL_RUN_STATUSES` — that one answers "did
+    // the agent fail?" for a failure-rate denominator and excludes those three,
+    // which would leave this barrier permanently shut on exactly the cases it
+    // exists to release. `issue-execution-lock.ts` exists because this notion
+    // had already drifted across three open-coded arrays; a fourth definition
+    // site is the defect, not the fix. Fail toward releasing.
     const owingRunStatus = latest.heartbeatRunId ? owingRunStatusById.get(latest.heartbeatRunId) : undefined;
-    if (owingRunStatus && (TERMINAL_RUN_STATUSES as readonly string[]).includes(owingRunStatus)) continue;
+    if (owingRunStatus && TERMINAL_HEARTBEAT_RUN_STATUSES.has(owingRunStatus)) continue;
     pending.add(pair.blockerIssueId);
   }
 
