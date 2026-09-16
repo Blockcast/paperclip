@@ -129,9 +129,11 @@ export type GateProbeKind =
  *   *into* is an instruction to perform, so the row is now authorised and
  *   unperformed. See {@link ACTION_OWED_RESOLUTION_KINDS} for why that is kept
  *   in the escalation list rather than withheld from it.
- * - `approval-refused` is a row whose board gate closed with a `rejected` card
- *   and no grant. The ask was answered "no"; nothing further is owed by the
- *   gate and the row needs closing, not escalating.
+ * - `approval-refused` is a row whose board gate closed with a `rejected` card,
+ *   no grant, and no abandoned sibling — refusal is the row's whole approval
+ *   story. The ask was answered "no"; nothing further is owed by the gate and
+ *   the row needs closing, not escalating. A refusal alongside a withdrawn card
+ *   is `approval-abandoned` instead: answering ask A does not answer ask B.
  * - `interaction-answered` is a row where at least one question card got a real
  *   human decision (accepted / rejected / answered) and which is still open
  *   anyway. Deliberately *not* "every card": a row whose remaining cards were
@@ -441,13 +443,27 @@ export function probeBlockerPremise(input: GateEvidenceInput): ProbeResult | nul
  * - any card still undecided, **or carrying a status this module does not
  *   recognise** → `still-gated`;
  * - otherwise, any card `approved` → `approval-granted`;
- * - otherwise, any card `rejected` → `approval-refused`;
- * - otherwise every card was withdrawn or cancelled → the board was asked and
- *   never answered (`approval-abandoned`).
+ * - otherwise, any card `withdrawn`/`cancelled` → the board was asked and never
+ *   answered (`approval-abandoned`);
+ * - otherwise every card was `rejected` → `approval-refused`.
  *
- * Grant beats refusal on a mixed row for the same reason unknown beats
- * everything: a single live authorisation means work is owed, and the
- * escalation surface must not lose it behind a sibling refusal.
+ * Grant beats everything below it for the same reason unknown beats everything:
+ * a single live authorisation means work is owed, and the escalation surface
+ * must not lose it behind a sibling that resolved into no obligation.
+ *
+ * Abandonment beats refusal for the narrower version of that argument, and that
+ * ordering is load-bearing. A refusal answers *its own* ask and nothing else; it
+ * says nothing about a sibling card the requester retracted. Testing `rejected`
+ * first let a single refused card mask every withdrawn card on the row, classify
+ * it `approval-refused` — not action-owed — and withhold it: the exact
+ * suppression PEN-3089 exists to remove, re-entered through a multi-card row.
+ * Firing `approval-abandoned` only when *every* card was abandoned would make it
+ * the easiest kind to mask, and multi-card rows are normal on this seam (a
+ * resubmit after `revision_requested`, a moot card withdrawn beside a live one,
+ * a refused ask followed by a re-ask).
+ *
+ * This stays a narrowing rather than an "escalate everything": refusal still
+ * withholds the row when refusal is the row's whole approval story.
  *
  * The unknown-status branch is property 2 (fail toward `still-gated`) applied
  * to schema drift. `approvals.status` is a plain `text` column, and before
@@ -457,6 +473,9 @@ export function probeBlockerPremise(input: GateEvidenceInput): ProbeResult | nul
  */
 export function probeApprovalGate(input: GateEvidenceInput): ProbeResult | null {
   if (input.approvals.length === 0) return null;
+
+  const total = input.approvals.length;
+  const cards = total === 1 ? "" : "s";
 
   // Two reasons a gate reads as live, kept apart because they mean different
   // things to whoever reads the digest: a card nobody has decided yet, and a
@@ -477,8 +496,7 @@ export function probeApprovalGate(input: GateEvidenceInput): ProbeResult | null 
   );
 
   if (undecided.length > 0 || unrecognised.length > 0) {
-    const total = input.approvals.length;
-    const plural = total === 1 ? "" : "s";
+    const plural = cards;
     const clauses: string[] = [];
     if (undecided.length > 0) {
       clauses.push(
@@ -506,31 +524,43 @@ export function probeApprovalGate(input: GateEvidenceInput): ProbeResult | null 
       probe: "approval-gate",
       verdict: "resolved-but-open",
       resolutionKind: "approval-granted",
-      evidence: `${granted.map(describeApproval).join(", ")} — ${granted.length} of ${input.approvals.length} linked approval${input.approvals.length === 1 ? " was" : "s were"} granted and the row has not moved since, so it is authorised and unperformed: the gate opened and whoever the row is assigned to still owes the work`,
+      evidence: `${granted.map(describeApproval).join(", ")} — ${granted.length} of ${total} linked approval${cards} ${granted.length === 1 ? "was" : "were"} granted and the row has not moved since, so it is authorised and unperformed: the gate opened and whoever the row is assigned to still owes the work`,
     };
   }
 
-  const refused = input.approvals.filter((approval) =>
-    APPROVAL_REFUSED.has(approval.approvalStatus),
+  const abandoned = input.approvals.filter((approval) =>
+    APPROVAL_ABANDONED.has(approval.approvalStatus),
   );
 
-  if (refused.length > 0) {
+  // Ahead of the refusal branch, so a sibling `rejected` card cannot mask an ask
+  // that died unanswered — see the ordering argument in the docblock. Every card
+  // still in play here is refused or abandoned, so the non-abandoned remainder
+  // on a mixed row is exactly the refused set and can be named as such.
+  if (abandoned.length > 0) {
+    // The card refs lead, as they do in the cancelled-blocker and abandoned-
+    // interaction branches: the rendered evidence is length-bounded, and *which*
+    // ask died is the only part a reader can act on. On a mixed row that means
+    // the abandoned refs specifically, not every card.
+    const scope =
+      abandoned.length === total
+        ? `all ${total} linked approval${cards} ${total === 1 ? "was" : "were"} withdrawn or cancelled`
+        : `${abandoned.length} of ${total} linked approvals ${abandoned.length === 1 ? "was" : "were"} withdrawn or cancelled and the remaining ${total - abandoned.length} refused`;
     return {
       probe: "approval-gate",
       verdict: "resolved-but-open",
-      resolutionKind: "approval-refused",
-      evidence: `all ${input.approvals.length} linked approval${input.approvals.length === 1 ? " was" : "s were"} answered and none was granted: ${input.approvals.map(describeApproval).join(", ")} — the ask was refused, so this row needs closing rather than re-asking`,
+      resolutionKind: "approval-abandoned",
+      evidence: `${abandoned.map(describeApproval).join(", ")} — ${scope}, so the board was asked and never answered and no answer is coming; someone must re-ask or drop the row`,
     };
   }
 
-  // The card refs lead, as they do in the cancelled-blocker and abandoned-
-  // interaction branches: the rendered evidence is length-bounded, and *which*
-  // ask died is the only part a reader can act on.
+  // Terminal: the undecided/unrecognised guard, the granted branch and the
+  // abandoned branch have each returned, so every card is `rejected` — which is
+  // what lets this evidence say "all were answered" without qualification.
   return {
     probe: "approval-gate",
     verdict: "resolved-but-open",
-    resolutionKind: "approval-abandoned",
-    evidence: `${input.approvals.map(describeApproval).join(", ")} — all ${input.approvals.length} linked approval${input.approvals.length === 1 ? " was" : "s were"} withdrawn or cancelled, so the board was asked and never answered and no answer is coming; someone must re-ask or drop the row`,
+    resolutionKind: "approval-refused",
+    evidence: `all ${total} linked approval${cards} ${total === 1 ? "was" : "were"} answered and none was granted: ${input.approvals.map(describeApproval).join(", ")} — the ask was refused, so this row needs closing rather than re-asking`,
   };
 }
 
@@ -1107,7 +1137,7 @@ export function formatGateRevalidationSections(
     "",
     `#### Gate resolved but row still open — ${resolved.length}`,
     "",
-    "Each row below had its gate re-tested and the gate is no longer live. That is *not* the same as 'no longer waiting': where the resolution left an action owed, the row is marked ⛔ and still appears in the age-ranked list. Only the unmarked rows are withheld from it.",
+    "Each row below had its gate re-tested and the gate is no longer live. That is *not* the same as 'no longer waiting': where the resolution left an action owed, the row is marked ⛔ and is **not** withheld from the age-ranked list — it escalates there once it passes its human-silence threshold. Only the unmarked rows are withheld outright.",
   );
 
   // The rendered disposition is read from the *same* set that drives the
@@ -1122,12 +1152,29 @@ export function formatGateRevalidationSections(
   // its kind printed "withheld from the age-ranked list" over a row that was in
   // that list. Deriving from `withheld` makes the label unable to contradict
   // the filter by construction, which is the whole point of this module.
+  //
+  // What the label therefore claims is exactly what `withheld` decides —
+  // *not withheld*, rather than *listed*. Membership is two further filters
+  // downstream and neither is visible here: `selectAgedHumanGatedIssues` drops
+  // anything under its per-priority silence threshold (14d critical/high, 30d
+  // medium, 45d low/unset) and then caps the list at `DEFAULT_MAX_ESCALATED`.
+  // Since `loadHumanGatedIssues` applies no age predicate at all, most rows in
+  // this section are younger than their threshold, so "still appears in the
+  // age-ranked list" would be false on most ⛔ marks. Claiming membership
+  // honestly would mean plumbing the over-threshold ids back out of the ageing
+  // pass — a new seam, for a label; claiming non-withholding needs no seam and
+  // keeps the property that the label cannot contradict the filter.
   const withheld = withheldFromAgeRankingIssueIds(report);
   const isEscalated = (classification: GateClassification): boolean =>
     !withheld.has(classification.issueId);
 
   let listed = 0;
   for (const kind of resolutionKindRenderOrder()) {
+    // Checked before the heading, not just before each row: a heading pushed
+    // after the cap is spent would assert a disposition tally over rows the
+    // reader cannot see, ahead of the "... N further omitted" line that is
+    // supposed to account for them.
+    if (listed >= maxListed) break;
     const inKind = resolved.filter((classification) => classification.resolutionKind === kind);
     if (inKind.length === 0) continue;
 
@@ -1139,10 +1186,10 @@ export function formatGateRevalidationSections(
     const escalatedCount = inKind.filter(isEscalated).length;
     const disposition =
       escalatedCount === inKind.length
-        ? "⛔ still escalated — an action is owed"
+        ? "⛔ action owed — not withheld from the age-ranked list"
         : escalatedCount === 0
           ? "withheld from the age-ranked list"
-          : `⛔ ${escalatedCount} still escalated · ${inKind.length - escalatedCount} withheld from the age-ranked list`;
+          : `⛔ ${escalatedCount} action owed · ${inKind.length - escalatedCount} withheld from the age-ranked list`;
     body.push("", `**${RESOLUTION_KIND_HEADINGS[kind]} — ${inKind.length}** (${disposition})`);
     for (const classification of inKind) {
       if (listed >= maxListed) break;

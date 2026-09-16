@@ -382,7 +382,7 @@ describeEmbeddedPostgres("gate re-validation (wired into the digest producer)", 
     // Still rendered in the resolved section too, carrying its age — being
     // escalated must not cost the reader the diagnosis of *why* it is stalled.
     expect(markdown).toContain("GRG-1 (41.0d silent)");
-    expect(markdown).toContain("⛔ still escalated");
+    expect(markdown).toContain("⛔ action owed");
   });
 
   it("escalates a row whose only board card the requester withdrew (PEN-3089)", async () => {
