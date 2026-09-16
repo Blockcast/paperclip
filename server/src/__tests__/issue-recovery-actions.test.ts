@@ -1319,17 +1319,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     }
 
     // Fixed here: the escalation body's own `getCompanyIssuePrefix`, `getAgent`
-    // and `getLatestIssueRun` reads now run on `tx`. Still pooled under the
-    // lock, tracked on BLO-34207: owner resolution
-    // (`resolveStrandedIssueRecoveryOwnerAgentId` -> `getAgent` /
-    // `isAgentInvokable` / `budgets.getInvocationBlock` / instance settings).
-    // This ratchet fails on any new pooled call site and on a regression of the
-    // three fixed ones.
+    // and `getLatestIssueRun` reads now run on `tx`, and so does owner
+    // resolution (BLO-34207: `resolveStrandedIssueRecoveryOwnerAgentId` ->
+    // `getAgent` / `isAgentInvokable` / `budgets.getInvocationBlock` /
+    // instance settings). This ratchet fails on any new pooled call site and
+    // on a regression of any of them.
     const knownPooledUnderLock = [
-      "resolveStrandedIssueRecoveryOwnerAgentId",
-      "isAgentInvokable",
-      "evaluateAgentInvokabilityFromDb",
-      "getInvocationBlock",
       "getOrCreateRow",
     ];
     const unexpected = pooledInsideTransaction.filter(
@@ -1343,6 +1338,18 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // Substring match, so this also covers `getLatestIssueRunForAgentStage` and
     // `getLatestIssueRunSince` — none of the three may run pooled under the lock.
     expect(pooledInsideTransaction.filter((entry) => entry.includes("getLatestIssueRun"))).toEqual([]);
+    // BLO-34207. Named individually rather than relying on the `unexpected`
+    // filter above: an allowlist entry is a substring match, so a future entry
+    // that happens to contain one of these names would silently re-admit it.
+    for (const name of [
+      "resolveStrandedIssueRecoveryOwnerAgentId",
+      "resolveInvokableRecoveryAgentId",
+      "isAgentInvokable",
+      "evaluateAgentInvokabilityFromDb",
+      "getInvocationBlock",
+    ]) {
+      expect(pooledInsideTransaction.filter((entry) => entry.includes(name))).toEqual([]);
+    }
     const actionRows = await db
       .select()
       .from(issueRecoveryActions)

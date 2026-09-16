@@ -2296,8 +2296,20 @@ export function recoveryService(
     return dbOrTx.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
   }
 
-  async function isAgentInvokable(agent: typeof agents.$inferSelect | null | undefined) {
-    return (await evaluateAgentInvokabilityFromDb(db, agent)).invokable;
+  // Same rule as `getAgent` above: under `lockIssueParentMutationCompany` this
+  // must read on the caller's transaction.
+  async function isAgentInvokable(
+    agent: typeof agents.$inferSelect | null | undefined,
+    dbOrTx: Db | DbTransaction = db,
+  ) {
+    return (await evaluateAgentInvokabilityFromDb(dbOrTx, agent)).invokable;
+  }
+
+  // Budget reads are pure reads, so the tx-scoped service is only ever used to
+  // keep them off a second pool connection while a lock is held. Same idiom as
+  // `issueRecoveryActionService(dbOrTx)` below.
+  function budgetsOn(dbOrTx: Db | DbTransaction) {
+    return dbOrTx === db ? budgets : budgetService(dbOrTx as Db);
   }
 
   // Column set behind `LatestIssueRun`. Shared by every helper that produces
@@ -5277,20 +5289,21 @@ export function recoveryService(
   async function resolveStrandedIssueRecoveryOwnerAgentId(
     issue: typeof issues.$inferSelect,
     preferredOwnerAgentId?: string | null,
+    dbOrTx: Db | DbTransaction = db,
   ) {
     const candidateIds: string[] = [];
     if (preferredOwnerAgentId) candidateIds.push(preferredOwnerAgentId);
     if (issue.assigneeAgentId) {
-      const assignee = await getAgent(issue.assigneeAgentId);
+      const assignee = await getAgent(issue.assigneeAgentId, dbOrTx);
       if (assignee?.reportsTo) candidateIds.push(assignee.reportsTo);
     }
     if (issue.createdByAgentId) {
-      const creator = await getAgent(issue.createdByAgentId);
+      const creator = await getAgent(issue.createdByAgentId, dbOrTx);
       if (creator?.reportsTo) candidateIds.push(creator.reportsTo);
       candidateIds.push(issue.createdByAgentId);
     }
 
-    const roleCandidates = await db
+    const roleCandidates = await dbOrTx
       .select()
       .from(agents)
       .where(and(eq(agents.companyId, issue.companyId), inArray(agents.role, ["cto", "ceo"])))
@@ -5302,13 +5315,13 @@ export function recoveryService(
     for (const agentId of candidateIds) {
       if (seen.has(agentId)) continue;
       seen.add(agentId);
-      const candidate = await getAgent(agentId);
+      const candidate = await getAgent(agentId, dbOrTx);
       if (!candidate || candidate.companyId !== issue.companyId) continue;
-      const budgetBlock = await budgets.getInvocationBlock(issue.companyId, candidate.id, {
+      const budgetBlock = await budgetsOn(dbOrTx).getInvocationBlock(issue.companyId, candidate.id, {
         issueId: issue.id,
         projectId: issue.projectId,
       });
-      if ((await isAgentInvokable(candidate)) && !budgetBlock) return candidate.id;
+      if ((await isAgentInvokable(candidate, dbOrTx)) && !budgetBlock) return candidate.id;
     }
 
     return null;
@@ -5317,15 +5330,16 @@ export function recoveryService(
   async function resolveInvokableRecoveryAgentId(
     issue: typeof issues.$inferSelect,
     agentId: string | null | undefined,
+    dbOrTx: Db | DbTransaction = db,
   ) {
     if (!agentId) return null;
-    const candidate = await getAgent(agentId);
+    const candidate = await getAgent(agentId, dbOrTx);
     if (!candidate || candidate.companyId !== issue.companyId) return null;
-    const budgetBlock = await budgets.getInvocationBlock(issue.companyId, candidate.id, {
+    const budgetBlock = await budgetsOn(dbOrTx).getInvocationBlock(issue.companyId, candidate.id, {
       issueId: issue.id,
       projectId: issue.projectId,
     });
-    return (await isAgentInvokable(candidate)) && !budgetBlock ? candidate.id : null;
+    return (await isAgentInvokable(candidate, dbOrTx)) && !budgetBlock ? candidate.id : null;
   }
 
   async function resolveStrandedRecoveryRouting(input: {
@@ -5335,7 +5349,7 @@ export function recoveryService(
     preferredOwnerAgentId?: string | null;
     existingReturnOwnerAgentId?: string | null;
     existingOwnerAgentId?: string | null;
-  }) {
+  }, dbOrTx: Db | DbTransaction = db) {
     // `originalAgentId` intentionally keeps `latestRun.agentId` as the first candidate:
     // `provider_quota` retries need the agent who actually hit the quota, which can
     // diverge from `issue.assigneeAgentId` once THIS function has already escalated
@@ -5398,10 +5412,10 @@ export function recoveryService(
         (ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has(input.latestRun?.errorCode ?? "") ||
           isInfraClassStrandedFailure(input.latestRun)));
     if (input.recoveryCause === "provider_quota") {
-      const retryAgentId = await resolveInvokableRecoveryAgentId(input.issue, originalAgentId);
+      const retryAgentId = await resolveInvokableRecoveryAgentId(input.issue, originalAgentId, dbOrTx);
       if (!retryAgentId) {
         return {
-          ownerAgentId: await resolveStrandedIssueRecoveryOwnerAgentId(input.issue),
+          ownerAgentId: await resolveStrandedIssueRecoveryOwnerAgentId(input.issue, null, dbOrTx),
           returnOwnerAgentId: originalAgentId,
           routingFallbackReason: "The original assignee is not invokable; quota recovery fell through to the manager ladder.",
         };
@@ -5413,12 +5427,12 @@ export function recoveryService(
       };
     }
     if (routeToOriginal) {
-      const ownerAgentId = await resolveInvokableRecoveryAgentId(input.issue, returnOwnerAgentId);
+      const ownerAgentId = await resolveInvokableRecoveryAgentId(input.issue, returnOwnerAgentId, dbOrTx);
       if (ownerAgentId) {
         return { ownerAgentId, returnOwnerAgentId, routingFallbackReason: null };
       }
       return {
-        ownerAgentId: await resolveStrandedIssueRecoveryOwnerAgentId(input.issue),
+        ownerAgentId: await resolveStrandedIssueRecoveryOwnerAgentId(input.issue, null, dbOrTx),
         returnOwnerAgentId,
         routingFallbackReason: "The original assignee is not invokable; recovery fell through to the manager ladder.",
       };
@@ -5427,6 +5441,7 @@ export function recoveryService(
       ownerAgentId: await resolveStrandedIssueRecoveryOwnerAgentId(
         input.issue,
         input.preferredOwnerAgentId,
+        dbOrTx,
       ),
       returnOwnerAgentId,
       routingFallbackReason: null,
@@ -5815,7 +5830,7 @@ export function recoveryService(
       preferredOwnerAgentId: input.recoveryOwnerAgentId,
       existingReturnOwnerAgentId: existingAction?.returnOwnerAgentId,
       existingOwnerAgentId: existingAction?.ownerAgentId,
-    });
+    }, dbOrTx);
     const ownerAgentId = routing.ownerAgentId;
     // BLO-18996: the single predicate for "will any sweep wake an owner for this action".
     // The wake budget and the wake path have to agree, and previously they were written as
