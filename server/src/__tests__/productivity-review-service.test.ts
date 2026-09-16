@@ -1514,6 +1514,78 @@ describeEmbeddedPostgres("productivity review service", () => {
 
         expect(result.created).toBe(1);
       });
+
+      // The other half of the decoupling, and the direction the first version
+      // missed: LOWERING `longActiveMs` must not let a PRE-EPISODE comment
+      // suppress. `longActiveMs` has no lower clamp, so at a 1-minute bar the
+      // fixed 6h evidence window is 360x the trigger bar — without intersecting
+      // it with the episode, a `Next action:` from a *previous* episode on the
+      // same issue suppresses every review of the current one, indefinitely
+      // (BLO-22331 AC2). The comment here is run-linked and inside 6h, so the
+      // ONLY thing that can make this fire is the episode-start clamp.
+      it("does not let a pre-episode next-action comment suppress when `longActiveMs` is lowered", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const episodeStartAt = new Date(now.getTime() - 10 * 60 * 1000);
+        const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStartAt });
+        await seedNextActionComment({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          agentId: seeded.coderId,
+          // Before the episode began, but well inside the 6h evidence window.
+          createdAt: new Date(now.getTime() - 3 * 60 * 60 * 1000),
+          runLinked: true,
+          now,
+          episodeStartAt,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+          thresholds: { longActiveMs: 60_000 },
+        });
+
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      });
+
+      // `runLinked` is a property of the WINDOW, not of the newest comment. The
+      // rubric asks whether *a* run-linked comment exists in the last 6h, so a
+      // later unlinked comment — an out-of-band note, a human-triggered edit —
+      // must not mask an earlier run-linked one and flip the gate off. Read off
+      // the newest row alone this fixture generates a review against an assignee
+      // that posted exactly the artifact the rubric asks for.
+      it("suppresses on a run-linked comment masked by a newer unlinked one", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const episodeStartAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+        const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStartAt });
+        await seedNextActionComment({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          agentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          runLinked: true,
+          now,
+          episodeStartAt,
+        });
+        await seedNextActionComment({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          agentId: seeded.coderId,
+          // Newer, and NOT run-linked — the masking comment.
+          createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+          runLinked: false,
+          now,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(0);
+        expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+      });
     });
   });
 
