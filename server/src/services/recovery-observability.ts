@@ -127,11 +127,14 @@ export type RecoveryActionListItem = {
    * actions in the same pool carried a real routing class. This list shipped
    * projecting `status` only, which reproduces that same misread per-owner.
    *
-   * The two `final*` fields are the classifier's inputs, returned alongside its
-   * verdict so a consumer can audit the class without a second query.
+   * `resolutionSnapshot` is the classifier's input, returned alongside its verdict
+   * so a consumer can audit the class without a second query. It is the action's
+   * own evidence snapshot, NOT a live read of the source issue: reading the issue
+   * live made the class flip long after the action stopped changing (BLO-33600).
+   * `null` means the action resolved before that capture shipped, which is why
+   * such rows classify `unknown` rather than being re-derived from live state.
    */
-  finalAssigneeAgentId: string | null;
-  finalIssueStatus: string | null;
+  resolutionSnapshot: RecoveryResolutionSnapshot | null;
   handoffClass: HandoffClass;
 };
 
@@ -304,8 +307,13 @@ export function recoveryObservabilityService(db: Db) {
         outcome: issueRecoveryActions.outcome,
         createdAt: issueRecoveryActions.createdAt,
         updatedAt: issueRecoveryActions.updatedAt,
-        finalAssigneeAgentId: issues.assigneeAgentId,
-        finalIssueStatus: issues.status,
+        hasResolutionSnapshot: sql<boolean>`${issueRecoveryActions.evidence} ? ${RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY}`,
+        resolvedAssigneeAgentId: sql<
+          string | null
+        >`${issueRecoveryActions.evidence} ->> ${RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY}`,
+        resolvedIssueStatus: sql<
+          string | null
+        >`${issueRecoveryActions.evidence} ->> ${RESOLVED_ISSUE_STATUS_EVIDENCE_KEY}`,
       })
       .from(issueRecoveryActions)
       .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
@@ -325,7 +333,18 @@ export function recoveryObservabilityService(db: Db) {
 
     // Same pure classifier the company-wide report uses, over the same inputs, so
     // the per-owner list and the aggregate can never disagree about a given row.
-    return rows.map((row) => ({ ...row, handoffClass: classifyRecoveryHandoff(row) }));
+    return rows.map(
+      ({ hasResolutionSnapshot, resolvedAssigneeAgentId, resolvedIssueStatus, ...row }) => {
+        const resolutionSnapshot = hasResolutionSnapshot
+          ? { assigneeAgentId: resolvedAssigneeAgentId, issueStatus: resolvedIssueStatus }
+          : null;
+        return {
+          ...row,
+          resolutionSnapshot,
+          handoffClass: classifyRecoveryHandoff({ ...row, resolutionSnapshot }),
+        };
+      },
+    );
   }
 
   async function report(

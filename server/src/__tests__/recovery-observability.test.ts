@@ -634,12 +634,42 @@ describeEmbeddedPostgres("recovery observability report", () => {
 
     expect(actions.map((a) => a.status)).toEqual(["cancelled", "cancelled"]);
     expect(actions.map((a) => a.handoffClass)).toEqual(["self_recovery", "handed_back"]);
-    // The classifier's inputs come back with its verdict, so a caller can audit
+    // The classifier's input comes back with its verdict, so a caller can audit
     // the class without a second query.
-    expect(actions[1]).toMatchObject({
+    expect(actions[1]?.resolutionSnapshot).toEqual({
+      assigneeAgentId: coderId,
+      issueStatus: "in_progress",
+    });
+  });
+
+  // BLO-33600: the class must come from the action's own evidence snapshot, never
+  // from a live read of the source issue. This row has no snapshot, so the only
+  // way to classify it non-`unknown` is to read the issue live — which is what
+  // this pins shut. The issue row it seeds is a genuine `handed_back` shape.
+  it("classifies a pre-snapshot row unknown rather than reading the issue live", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+
+    await seedRecoveryAction({
+      companyId,
+      n: 1,
+      createdAt: latestWeek,
+      cause: "stranded_assigned_issue",
+      errorCode: "adapter_failed",
+      status: "cancelled",
+      outcome: "cancelled",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
       finalAssigneeAgentId: coderId,
       finalIssueStatus: "in_progress",
+      captureResolutionSnapshot: false,
     });
+
+    const [action] = await recoveryObservabilityService(db).listActions(companyId, {
+      kind: "stranded_assigned_issue",
+    });
+
+    expect(action?.resolutionSnapshot).toBeNull();
+    expect(action?.handoffClass).toBe("unknown");
   });
 
   it("agrees with the company-wide report on how a row is routed", async () => {
