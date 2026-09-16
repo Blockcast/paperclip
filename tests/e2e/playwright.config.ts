@@ -45,7 +45,12 @@ if (!UI_DIST_EXISTS && process.env.CI && process.env.CI !== "false") {
   );
 }
 
-const UI_DEV_MIDDLEWARE = UI_DIST_EXISTS ? "false" : "true";
+// An explicit export wins: with a stale `ui/dist` present, asking for live
+// modules is the natural move and `UI_DIST_EXISTS` would otherwise veto it
+// silently -- the same mask-your-own-intent shape this file exists to remove.
+// Unset under CI, so the throw above still owns the CI contract.
+const UI_DEV_MIDDLEWARE =
+  process.env.PAPERCLIP_UI_DEV_MIDDLEWARE ?? (UI_DIST_EXISTS ? "false" : "true");
 
 process.env.PAPERCLIP_HOME = PAPERCLIP_HOME;
 process.env.PAPERCLIP_CONFIG = PAPERCLIP_CONFIG;
