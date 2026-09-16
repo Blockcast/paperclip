@@ -376,6 +376,18 @@ jobs:
         run: node --test ./.github/scripts/tests/check-pr-test-coverage.test.mjs
         timeout-minutes: 1
 
+      # BLO-26636. This suite existed but was wired into no workflow, so it had
+      # never run — which is exactly why the two defects it now pins survived:
+      # a login allowlist that matched neither deployment's App (so the gate
+      # could never update its own comment), and a `pull_request_target` trigger
+      # list missing `edited` (so the fix the gate asks for re-ran nothing).
+      # Both are properties of the commitperclip gate that only fail on a live
+      # PR, days later, as a stalled review.
+      - name: Test commitperclip quality-gate orchestrator (BLO-26636)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/run-quality-gates.test.mjs
+        timeout-minutes: 1
+
       # Guards the one property of the BLO-28888 soak workflow that cannot be
       # re-checked after the fact: that it stays dispatch-only. Adding its
       # ~50-90 minutes to a per-PR trigger would be invisible until it was

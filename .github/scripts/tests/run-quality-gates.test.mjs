@@ -1,9 +1,21 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
+  buildComment,
   findExistingComment,
   isGraphifyReindexArtifactOnlyPr,
 } from '../run-quality-gates.mjs';
+
+const workflow = readFileSync(
+  path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    '../../workflows/commitperclip-review.yml',
+  ),
+  'utf8',
+);
 
 test('findExistingComment: paginates until it finds the commitperclip comment', async () => {
   const seenPaths = [];
@@ -12,14 +24,14 @@ test('findExistingComment: paginates until it finds the commitperclip comment', 
     if (path.endsWith('page=1')) {
       return Array.from({ length: 100 }, (_, index) => ({
         id: index + 1,
-        user: { login: 'someone-else' },
+        user: { login: 'someone-else', type: 'User' },
         body: 'unrelated',
       }));
     }
     if (path.endsWith('page=2')) {
       return [{
         id: 200,
-        user: { login: 'commitperclip[bot]' },
+        user: { login: 'commitperclip[bot]', type: 'Bot' },
         body: 'Looks good.\n\n— commitperclip',
       }];
     }
@@ -37,12 +49,76 @@ test('findExistingComment: returns null when no signed comment exists', async ()
   const comment = await findExistingComment(async () => ([
     {
       id: 1,
-      user: { login: 'commitperclip[bot]' },
+      user: { login: 'commitperclip[bot]', type: 'Bot' },
       body: 'Unsigned status update',
     },
   ]), 'token', 'paperclipai/paperclip', 6469);
 
   assert.equal(comment, null);
+});
+
+// BLO-26636. The old predicate allowlisted the literal login
+// `commitperclip[bot]`, but get-bot-token.mjs resolves whichever App
+// COMMITPERCLIP_APP_ID points at — `allyblockcast[bot]` on Blockcast. So
+// `existing` was permanently null there: every failing run POSTed a duplicate,
+// and a passing run skipped the write entirely, stranding the failure comment.
+// This fixture is the one the old code returns undefined for.
+test('findExistingComment: matches whichever App posted it, not a hard-coded login', async () => {
+  const comment = await findExistingComment(async () => ([
+    {
+      id: 5654012482,
+      user: { login: 'allyblockcast[bot]', type: 'Bot' },
+      body: 'Hey @someone! Before this PR can be reviewed…\n\n— commitperclip',
+    },
+  ]), 'token', 'Blockcast/paperclip', 1828);
+
+  assert.equal(comment.id, 5654012482);
+});
+
+// `type === 'Bot'` is the whole guard against the PATCH path overwriting a
+// human's comment — repo-write identities can edit others' comments via the
+// API, so a human quoting the signature must not be treated as ours.
+test('findExistingComment: ignores a human comment carrying the signature', async () => {
+  const comment = await findExistingComment(async () => ([
+    {
+      id: 9,
+      user: { login: 'kkroo', type: 'User' },
+      body: 'Quoting the bot here:\n\n— commitperclip',
+    },
+  ]), 'token', 'Blockcast/paperclip', 1828);
+
+  assert.equal(comment, null);
+});
+
+// BLO-26636. The failure the gate reports most often is a body/title
+// violation, and the old text sent the author to push a commit — advice that
+// re-runs nothing for a body edit and burns a CI matrix when followed.
+test('buildComment: names editing the description, not just pushing a commit', () => {
+  const body = buildComment('someone', ['Missing section: **## Risks**'], []);
+
+  assert.match(body, /editing the PR description or title/);
+  assert.doesNotMatch(body, /push a new commit and these checks will re-run/);
+});
+
+// The remedy above is only true because the workflow listens for `edited`.
+// These two assertions have to move together or the comment starts lying.
+test('commitperclip-review: pull_request_target listens for edited', () => {
+  assert.match(workflow, /types:\s*\[opened,\s*synchronize,\s*reopened,\s*edited\]/);
+});
+
+test('commitperclip-review: edited does not displace the original triggers', () => {
+  for (const type of ['opened', 'synchronize', 'reopened']) {
+    assert.match(workflow, new RegExp(`types:\\s*\\[[^\\]]*\\b${type}\\b`));
+  }
+  assert.match(workflow, /merge_group:\s*\n\s*types:\s*\[checks_requested\]/);
+});
+
+// pull_request_target hands secrets to a job triggered by an untrusted fork
+// PR, so the base-branch checkout is what makes adding a trigger type safe at
+// all. If this ever flips to the PR head, `edited` stops being a one-line
+// change and becomes an arbitrary-code-execution path.
+test('commitperclip-review: still checks out master, never PR code', () => {
+  assert.match(workflow, /uses:\s*actions\/checkout@[^\n]*\n\s*with:\s*\n\s*ref:\s*master/);
 });
 
 test('isGraphifyReindexArtifactOnlyPr: permits generated graphify reindex PRs', () => {

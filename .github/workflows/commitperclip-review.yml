@@ -2,7 +2,21 @@ name: commitperclip PR Review
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    # `edited` is load-bearing, not optional (BLO-26636). Three of the gates
+    # below read only the PR body and title (checkTemplate, checkLinkedIssue,
+    # checkDedupSearch), and the failure comment asks the author to fix exactly
+    # those. Without `edited` that fix fires no event, so the check stays red
+    # until somebody hand-re-runs the job; measured instances sat red 7h, 10h,
+    # ~21h and ~7h across #1328, #1359, #1696 and #1873.
+    #
+    # Deliberately NOT filtered down to `github.event.changes.body != null`.
+    # `edited` also fires on a base-branch retarget, and a job-level `if` that
+    # skips those publishes a check-run with conclusion `skipped` for the same
+    # head — which every downstream reader scores as non-failing, so a retarget
+    # would silently clear a genuinely red gate. The run is cheap enough that
+    # the filter is not worth that: 20 recent pull_request_target runs measured
+    # 25-133s (median ~60s) on arc-light.
+    types: [opened, synchronize, reopened, edited]
   merge_group:
     types: [checks_requested]
 
@@ -47,10 +61,12 @@ jobs:
     # without letting a genuinely hung job drain a runner.
     timeout-minutes: 10
     env:
-      # Blockcast does not provision the upstream commitperclip bot key. Skip
-      # the bot steps (token + quality/security gates) when it is absent so
-      # Dependency Review still gates every PR instead of the whole job
-      # failing at token generation.
+      # Skip the bot steps (token + quality/security gates) when no App key is
+      # provisioned, so Dependency Review still gates every PR instead of the
+      # whole job failing at token generation. Blockcast DOES provision one —
+      # it points COMMITPERCLIP_APP_ID at the `allyblockcast` App rather than
+      # upstream's `commitperclip` (see get-bot-token.mjs), so these steps run
+      # here and the gate comment is authored by `allyblockcast[bot]`.
       COMMITPERCLIP_ENABLED: ${{ secrets.COMMITPERCLIP_KEY != '' }}
     steps:
       - name: Checkout base branch (never PR or queue-candidate code)
@@ -90,13 +106,12 @@ jobs:
           base-ref: ${{ env.PR_BASE_SHA }}
           head-ref: ${{ env.PR_HEAD_SHA }}
 
-      # Only the commitperclip bot steps below use Node. On Blockcast the bot
-      # key is absent (COMMITPERCLIP_ENABLED=false), so setting up Node here
-      # would download the toolcache purely to leave it unused — the main cost
-      # that pushes this job past its cap. Gate it behind the same flag as its
-      # consumers: upstream (key present) still installs Node, Blockcast skips.
-      # Dependency Review runs as a JS action on the runner's own node20, so it
-      # does not depend on this step.
+      # Only the commitperclip bot steps below use Node. Where no App key is
+      # provisioned (COMMITPERCLIP_ENABLED=false) those steps are skipped, so
+      # setting up Node would download the toolcache purely to leave it unused
+      # — the main cost that pushes this job past its cap. Gate it behind the
+      # same flag as its consumers. Dependency Review runs as a JS action on
+      # the runner's own node20, so it does not depend on this step.
       - name: Set up Node
         if: env.COMMITPERCLIP_ENABLED == 'true'
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
