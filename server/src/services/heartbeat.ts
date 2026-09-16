@@ -303,6 +303,7 @@ import {
   githubFetchPrAuthorLogin,
   githubGetPullRequestGate,
   githubHasReviewerEvidenceForPr,
+  githubReviewerIdentityMatches,
 } from "./github-app-auth.js";
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
@@ -9997,7 +9998,7 @@ export async function resolvePrReviewEvidenceWithGithubAuthor<T extends { status
   contextSnapshot: Record<string, unknown> | null | undefined,
   output: { resultJson?: Record<string, unknown> | null; summary?: string | null },
   evidence: T,
-) {
+): Promise<T | { status: "self_review_skipped" }> {
   if (evidence.status !== "missing") return evidence;
   const prReview = derivePaperclipPrReview(contextSnapshot);
   if (!prReview || prReview.prAuthorLogin) return evidence;
@@ -10007,11 +10008,26 @@ export async function resolvePrReviewEvidenceWithGithubAuthor<T extends { status
     prNumber: prReview.prNumber,
   });
   if (!authorLogin) return evidence;
+  // A self-review skip is only legitimate when the PR was authored by the
+  // REVIEWER ITSELF. `prReviewOutputHasSelfReviewSkip` confirms the summary
+  // names the same handle the context carries, but never that the handle IS
+  // the reviewer -- so without this bind, a degraded run on a human-authored
+  // PR emitting "self-review is not allowed. PR author is `kkroo`" would be
+  // credited `self_review_skipped` with no review posted. Binding here keeps
+  // this path strictly tighter than the legacy webhook path rather than
+  // widening the shared gate.
+  if (!githubReviewerIdentityMatches(authorLogin, loadConfig().prReviewerBotLogin ?? "")) {
+    return evidence;
+  }
   const reevaluated = evaluatePrReviewCompletionEvidence(
     { ...(contextSnapshot ?? {}), githubPrAuthorLogin: authorLogin },
     output,
   );
-  return reevaluated.status === "self_review_skipped" ? (reevaluated as unknown as T) : evidence;
+  // Returning the literal rather than casting `reevaluated`: the declared
+  // return type is honest about the only status this function can introduce.
+  return reevaluated.status === "self_review_skipped"
+    ? { status: "self_review_skipped" as const }
+    : evidence;
 }
 
 function unavailablePrReviewVerification(reason: string) {
