@@ -307,6 +307,40 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     assert.ok(found.includes("codeowners-guard.yml"), "known member missing — the scan is broken");
   });
 
+  // Regression, review finding on 7bc9e6737. The per-guard thresholds are real
+  // in the script but were unreachable in production: this workflow set
+  // `GUARD_LIVENESS_STALE_HOURS: ${{ inputs.stale_hours || '4' }}` with a
+  // declared `default: "4"`, and main() treats ANY non-blank value as the
+  // flatten-every-guard override. So `production-environment-protection-guard`
+  // ran against 4h instead of its declared 16h on every invocation path, going
+  // red 16 of 24 hours a day while behaving perfectly.
+  //
+  // The defect is in the YAML wiring, so a script-level test cannot see it —
+  // this asserts against the workflow file itself.
+  it("does not hand the script a non-blank stale-hours default, which would flatten every per-guard threshold", () => {
+    const body = readFileSync(join(workflowDir, "scheduled-guard-liveness.yml"), "utf8");
+
+    // Positive control: a renamed file or changed key would otherwise make both
+    // assertions below vacuously pass.
+    assert.match(body, /GUARD_LIVENESS_STALE_HOURS:/, "env key missing — this test is no longer reading what it thinks");
+    assert.match(body, /stale_hours:/, "input key missing — this test is no longer reading what it thinks");
+
+    const envLine = body.split("\n").find((line) => line.includes("GUARD_LIVENESS_STALE_HOURS:"));
+    assert.equal(
+      /\|\||&&|'\d|"\d/.test(envLine),
+      false,
+      `stale-hours env must pass the input through unchanged, got: ${envLine.trim()}`,
+    );
+
+    const inputDefault = /stale_hours:[\s\S]*?^\s*default:\s*(.+)$/m.exec(body);
+    assert.ok(inputDefault, "stale_hours input has no default: line to check");
+    assert.match(
+      inputDefault[1].trim(),
+      /^(""|'')$/,
+      `stale_hours default must be blank so the script's per-guard thresholds stand, got: ${inputDefault[1].trim()}`,
+    );
+  });
+
   it("watches or explicitly exempts every scheduled workflow on the default lane", () => {
     const accounted = new Set([
       ...WATCHED_WORKFLOWS,
