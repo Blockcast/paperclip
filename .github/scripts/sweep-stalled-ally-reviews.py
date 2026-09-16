@@ -123,8 +123,9 @@ def without_fenced_spans(text):
     Deliberately simpler than withoutFencedCodeBlocks in the gate: a line-level
     toggle on ``` only, with no tilde fences, no fence-length matching and no
     info-string rule. Stated rather than implied -- a body using those forms is
-    read here as emitted structure and by the gate as a quote. Applied only to
-    the count cross-check, not to the block or attestation patterns, whose own
+    read here as emitted structure and by the gate as a quote. Applied to the
+    count cross-check and to the block and opener counts in
+    parse_verdict_block_head, not to the prose attestation pattern, whose own
     fence handling is unchanged by this.
     """
     if "```" not in text:
@@ -140,6 +141,32 @@ def without_fenced_spans(text):
     return "\n".join(lines)
 
 
+def is_js_integer(value):
+    """Whether `Number.isInteger` would accept this JSON value.
+
+    `isinstance(value, int)` is not that predicate, and the gap splits this
+    reader from both JS readers in the direction that hurts. `json.loads`
+    yields floats for `0.0`, `0e0` and `1e3`, every one of which is an integer
+    to `Number.isInteger`; `isinstance(0.0, int)` is False, so a
+    float-formatted count or ledger index read `unreadable` here while the gate
+    and the mjs read `ok`. Consequence is the loop the docstring on
+    parse_verdict_block_head names: no attestation here -> the sweep re-requests
+    a review of a head Ally already reviewed, and a `COMMENTED` duplicate cannot
+    be dismissed (Ally review of #1721 at bbe6d640; BLO-22892/BLO-28203).
+
+    bool stays rejected: it is an int subclass here and not a number in JS. An
+    int too large for float64 parses as Infinity in JS, where Number.isInteger
+    is False -- OverflowError from float() is that same answer, so it is caught
+    rather than special-cased.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return float(value).is_integer()
+    except OverflowError:
+        return False
+
+
 def severity_counts(raw):
     """Per-severity counts, or None when the payload cannot be trusted.
 
@@ -151,9 +178,7 @@ def severity_counts(raw):
         return None
     counts = {}
     for severity, value in raw.items():
-        # bool is an int subclass in Python; the JS readers reject a non-number
-        # outright, so `true` must not read as 1 here.
-        if isinstance(value, bool) or not isinstance(value, int):
+        if not is_js_integer(value):
             return None
         if value < 0 or value > MAX_VERDICT_FINDING_COUNT:
             return None
@@ -207,9 +232,9 @@ def dispositions_ok(payload):
             if not isinstance(value, str) or not value.strip():
                 return False
         index = item.get("index")
-        # bool is an int subclass in Python; `true` must not read as index 1,
-        # for the same reason severity_counts rejects it in a count.
-        if isinstance(index, bool) or not isinstance(index, int) or index < 1:
+        # Same JS-integer predicate as the counts above, for the same reason:
+        # `"index": 1.0` is an integer to the gate and to the mjs.
+        if not is_js_integer(index) or index < 1:
             return False
     return True
 

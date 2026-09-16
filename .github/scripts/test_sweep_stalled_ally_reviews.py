@@ -1246,6 +1246,53 @@ class TestVerdictBlockMirrorsTheGateOnFencesAndLedgers(unittest.TestCase):
         )
 
 
+class TestFloatFormattedIntegersMirrorNumberIsInteger(unittest.TestCase):
+    """Ally review of #1721 at bbe6d640 -- `isinstance(_, int)` is not that.
+
+    `json.loads` yields floats for `0.0`, `0e0` and `1e3`; every one is an
+    integer to `Number.isInteger`, so the gate and the mjs read these bodies
+    `ok` while this reader read them `unreadable`. Same harm direction as the
+    two divergences above: the sweep re-requests a review of a head Ally
+    already reviewed, and a COMMENTED duplicate cannot be dismissed.
+
+    The pre-existing `true` cases pin the other direction and cannot catch
+    this, which is why these are separate rather than added to that list.
+    """
+
+    HEAD = "e" * 40
+
+    def body(self, payload):
+        return "\n".join(
+            ['<!-- ally-verdict:1\n{"head":"%s",%s}\n-->' % (self.HEAD, payload), "",
+             "## Ally — Consolidated PR Review"]
+        )
+
+    def test_float_formatted_counts_still_attest(self):
+        for findings in ('{"critical":0.0,"important":0.0}',
+                         '{"critical":0e0,"important":0}',
+                         '{"critical":1e3,"important":0}'):
+            body = self.body('"findings":%s' % findings)
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, findings)
+
+    def test_a_float_formatted_ledger_index_still_attests(self):
+        body = self.body(
+            '"findings":{"critical":0,"important":0},'
+            '"dispositions":[{"head":"deadbee","severity":"critical","index":1.0,"verb":"fixed"}]'
+        )
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_control_non_integral_and_bool_are_still_rejected(self):
+        # Number.isInteger(0.5) is false and a bool is not a number in JS, so
+        # widening to floats must not have widened past integral ones.
+        for payload in ('"findings":{"critical":0.5,"important":0}',
+                        '"findings":{"critical":true,"important":0}',
+                        '"findings":{"critical":1e4,"important":0}',
+                        '"findings":{"critical":0,"important":0},'
+                        '"dispositions":[{"head":"deadbee","severity":"critical",'
+                        '"index":1.5,"verb":"fixed"}]'):
+            self.assertIsNone(sweep.parse_reviewed_head(self.body(payload)), payload)
+
+
 class TestIsConsolidatedAllyCommentForHead(unittest.TestCase):
     HEAD = "c" * 40
 
