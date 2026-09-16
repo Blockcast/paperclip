@@ -6,7 +6,7 @@ evidence. Chart value: `evidenceGate.unlabeledTruthBlock` in
 `deploy/helm/paperclip/values.blockcast.yaml`. Default `"0"`.
 
 ```
-  off ──(7 clean days, baseline recorded, BLO-24843 handled)──► on
+  off ──(7 clean days, baseline recorded)──────────────────► on
   on  ──(block rate > 5%/day, or a GitHub incident)──────────► off
 ```
 
@@ -17,7 +17,8 @@ plus a redeploy.
 
 | shape | satisfiable when entering `in_review`? | flag makes it blocking? |
 |---|---|---|
-| `review:ally-clean` | yes — a PR may be open, at head, 0 Critical / 0 Important | **yes** |
+| `review:ally-clean` | yes — a PR may be open, at head, 0 Critical / 0 Important | **yes**, unless suppressed (below) |
+| `review:ally-clean`, no linked PR | **never** — there is no head to review | **no, at any value** |
 | `deploy:landed` | **never** — it means merged | **no, at any value** |
 
 The gate runs on exactly one transition, INTO `in_review`
@@ -26,8 +27,27 @@ cannot be satisfied at the only moment it is evaluated — no flag value can
 change that, and the code does not let one
 (`BLOCKABLE_TRUTH_SHAPES` in `server/src/services/evidence-gate.ts`).
 `deploy:landed` stays a detected/missing shape that feeds the scorecards and
-the measurement below. A probe that failed (`probeFailed`) always stays `warn`:
-the flag escalates only evidence the probe actually established.
+the measurement below.
+
+Two populations are suppressed at every flag value, for two different reasons,
+and the verdict names which one applied:
+
+- `unlabeled-truth-block-suppressed:probe-failed` — we could not ask GitHub.
+  The flag escalates only evidence the probe actually established; otherwise a
+  GitHub outage becomes an estate-wide `in_review` freeze.
+- `unlabeled-truth-block-suppressed:no-linked-pull-request` — the probe worked
+  and the issue has no linked PR. `review:ally-clean` needs a head to review,
+  so the shape is unsatisfiable by the assignee **forever** — a stronger case
+  than `deploy:landed`, which at least becomes satisfiable on merge. This is
+  also why it is not the unlabeled path's job to enforce it: that path exists
+  to cover doc-only and refactor issues, which by design have no PR. CTO
+  ruling 2026-09-16. If we ever want "code work must have a PR", that is an
+  explicit requirement on a labeled path, decided on its own merits.
+
+This is what retired the old flip criterion about `harness_liveness_escalation`
+origins and BLO-24843: those issues have no PR by design and would have 422'd
+forever. The code now covers the general case, so the operator does not have to
+remember the instance.
 
 ## Before anything: two baselines, both on the day the truth shapes deploy
 
@@ -66,22 +86,53 @@ curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
     total: length,
     pass: map(select(.lastEvidenceVerdict.verdict=="pass")) | length,
     onlyTruthMissing: map(select((.lastEvidenceVerdict.missing|length)>0 and ((.lastEvidenceVerdict.missing - ["review:ally-clean","deploy:landed"])|length)==0)) | length,
-    onlyAllyCleanMissing: map(select(.lastEvidenceVerdict.missing == ["review:ally-clean"])) | length,
+    willBlock: map(select(
+        (.lastEvidenceVerdict.missing|length)>0
+        and ((.lastEvidenceVerdict.missing - ["review:ally-clean","deploy:landed"])|length)==0
+        and (.lastEvidenceVerdict.missing|index("review:ally-clean"))
+        and ((.lastEvidenceVerdict.diagnostics // []) | map(startswith("github-truth-probe-failed")) | any | not)
+        and ((.lastEvidenceVerdict.diagnostics // []) | index("no-linked-pull-request") | not))) | length,
+    noPr: map(select((.lastEvidenceVerdict.diagnostics // []) | index("no-linked-pull-request"))) | length,
     probeFailed: map(select(.lastEvidenceVerdict.diagnostics // [] | map(startswith("github-truth-probe-failed")) | any)) | length }'
 ```
 
-`onlyAllyCleanMissing` is the set the flip actually converts to `block`;
-`onlyTruthMissing` is the wider set and is the conservative number to read.
+`willBlock` is the number that matters: it mirrors the escalation predicate in
+`evidence-gate.ts` exactly — `truthOnlyGap && blockableGap`, minus the two
+suppressions. Read it, not `onlyTruthMissing`.
+
+Note what `blockableGap` is: `missing.some(s => BLOCKABLE_TRUTH_SHAPES.includes(s))`,
+**not** an exact match. So `missing == ["review:ally-clean","deploy:landed"]` —
+an open PR with neither shape yet, which is the *dominant* case, because
+`DEFAULT_UNLABELED_REQUIRED` co-requires `deploy:landed` and that shape is
+unsatisfiable entering `in_review` (see above) — blocks too. An earlier draft
+of this runbook measured `missing == ["review:ally-clean"]` exactly and called
+it "the set the flip actually converts to `block`". That was backwards: it
+counts only the narrow merged-PR-but-not-Ally-clean case, reads ≈0 for seven
+days, and would have invited an operator to discount `onlyTruthMissing` — the
+one number that was keeping them safe.
+
+The two suppressed populations are broken out because they are different
+problems:
+
+- `probeFailed` — we could not ask GitHub. A tooling/outage number.
+- `noPr` — the probe worked and the issue has no linked pull request at all.
+  These can **never** satisfy `review:ally-clean`; there is no head to review.
+  The gate suppresses them permanently at every flag value (CTO ruling
+  2026-09-16, `unlabeled-truth-block-suppressed:no-linked-pull-request`), so
+  they are not blast radius. Track the number anyway — a rising `noPr` on
+  code-bearing issues means PRs are not being linked, which is a real defect
+  with a different owner.
+
+`onlyTruthMissing` remains a safe upper bound on `willBlock`; its only excess
+is the `deploy:landed`-only set plus the two suppressed populations.
 
 ## Flip criterion
 
 Seven consecutive days with **all** of:
 
-- `onlyTruthMissing` below 10% of `total`;
+- `willBlock` below 10% of `total`;
 - `probeFailed` below 2% of `total`;
-- the landing routine merged every candidate it selected;
-- BLO-24843 resolved, **or** issues with origin `harness_liveness_escalation`
-  excluded from the block — they have no PR by design and would 422 forever.
+- the landing routine merged every candidate it selected.
 
 Then set `unlabeledTruthBlock: "1"` and open
 `feat(evidence): enforce truth shapes for unlabeled issues` with the seven daily

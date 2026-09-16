@@ -28,11 +28,20 @@ function render(extraArgs = []) {
   );
 }
 
-/** The `value:` line that follows each occurrence of the env name. */
+/**
+ * The `value:` line that follows each occurrence of the env name.
+ *
+ * Anchored, not `includes`: a future `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK_MODE`
+ * would otherwise be counted as this flag and break the exactly-two assertion
+ * for a reason that has nothing to do with the flag. And `?? ""` keeps a name
+ * on the last rendered line a clean assertion failure rather than a TypeError.
+ */
 function values(rendered) {
   const lines = rendered.split("\n");
   return lines.flatMap((line, i) =>
-    line.includes(`name: ${ENV}`) ? [lines[i + 1].trim()] : [],
+    line.trim() === `- name: ${ENV}` || line.trim() === `name: ${ENV}`
+      ? [(lines[i + 1] ?? "").trim()]
+      : [],
   );
 }
 
@@ -54,4 +63,14 @@ test("an absent evidenceGate block still renders the flag off", () => {
   // which the server would read as unset rather than as explicitly off.
   const rendered = render(["--set", "evidenceGate=null"]);
   assert.deepEqual(values(rendered), ['value: "0"', 'value: "0"']);
+});
+
+test("an unquoted YAML bool fails the render instead of silently reading as off", () => {
+  // `unlabeledTruthBlock: true` renders "true", and the server reads the var as
+  // `=== "1"` — so without this guard the flip appears to have happened and the
+  // gate stays off, which is indistinguishable from a quiet week of measurement.
+  assert.throws(
+    () => render(["--set", "evidenceGate.unlabeledTruthBlock=true"]),
+    /must be the string "0" or "1"/,
+  );
 });

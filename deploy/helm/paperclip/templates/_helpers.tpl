@@ -264,3 +264,21 @@ unscrubbed.
 {{- end -}}
 {{- $path -}}
 {{- end }}
+
+{{/*
+Render evidenceGate.unlabeledTruthBlock, failing loudly on anything but "0"/"1".
+
+The server reads this env var as `=== "1"` (server/src/config.ts), so a YAML bool
+— `unlabeledTruthBlock: true`, the most natural thing to write for a rollout
+flag — renders "true" and reads as OFF. It fails safe and it fails SILENTLY,
+which is the wrong shape for a flag whose entire purpose is a measured flip: the
+operator would read seven days of zero blocks as "the gate is quiet" rather than
+"the gate is off". Quote your values.
+*/}}
+{{- define "paperclip.evidenceGateUnlabeledTruthBlock" -}}
+{{- $v := (((.Values.evidenceGate).unlabeledTruthBlock) | default "0" | toString) -}}
+{{- if not (has $v (list "0" "1")) -}}
+{{- fail (printf "evidenceGate.unlabeledTruthBlock must be the string \"0\" or \"1\", got %q — an unquoted YAML bool renders \"true\" and the server reads it as off (docs/runbooks/evidence-gate-unlabeled-block.md)" $v) -}}
+{{- end -}}
+{{- $v | quote -}}
+{{- end }}
