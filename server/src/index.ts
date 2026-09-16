@@ -1086,6 +1086,17 @@ export async function startServer(): Promise<StartedServer> {
   // crashed run and handing that lock to the retry — exactly the interleaving
   // the in-tick `await` was added to remove.
   let crashReconcileSweepInFlight = false;
+  // BLO-34207: the same latch, for the reap → retry-promotion → queued-resume →
+  // stranded-reconcile → … chain below. That chain is sequential over every
+  // stranded candidate in the estate (147 distinct issues per pass, measured
+  // 2026-09-16) and each candidate takes the company-wide issue-graph advisory
+  // lock. One slow candidate makes the pass outlive the 30 s interval, the next
+  // tick starts a second pass, and the passes then contend with EACH OTHER on
+  // that lock: 8 waiters against `POSTGRES_POOL_MAX=10` starved the pool, so
+  // the holder could not get the second connection it needed to finish and only
+  // a waiter's 15 s `lock_timeout` broke the cycle. Every pass in the chain is
+  // idempotent, so a tick that finds one still running skips it.
+  let heartbeatRecoveryChainInFlight = false;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -1648,6 +1659,10 @@ export async function startServer(): Promise<StartedServer> {
 
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
+          //
+          // Single-flight across ticks — see `heartbeatRecoveryChainInFlight`.
+          if (heartbeatRecoveryChainInFlight) return;
+          heartbeatRecoveryChainInFlight = true;
           trackHeartbeatSchedulerWork(heartbeat
             .resumeRunningExternalRuntimeRuns()
             .then(() => heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 }))
@@ -1743,6 +1758,9 @@ export async function startServer(): Promise<StartedServer> {
             })
             .catch((err) => {
               logger.error({ err }, "periodic heartbeat recovery failed");
+            })
+            .finally(() => {
+              heartbeatRecoveryChainInFlight = false;
             }));
         }
       })();
