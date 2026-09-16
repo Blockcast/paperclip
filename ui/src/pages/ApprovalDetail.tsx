@@ -335,10 +335,11 @@ export function ApprovalDetail() {
           )}
           {isBudgetApproval && approval.status === "revision_requested" && !canDriveResubmit && (
             <p className="text-sm text-muted-foreground">
-              Sent back for revision. Only the agent that filed this card can resubmit it, with a
-              corrected <code className="font-mono text-xs">enforcement_assertions</code> entry —
-              resubmitting it unchanged from here is refused. Budget figures are set from the budget
-              controls on <Link to="/costs" className="underline underline-offset-2">/costs</Link>.
+              Sent back for revision. This page can only resubmit a card unchanged, and a budget card
+              a caller filed has to go back with its{" "}
+              <code className="font-mono text-xs">enforcement_assertions</code> reviewed — so resubmit
+              it through the API it was filed from. Budget figures are set from the budget controls
+              on <Link to="/costs" className="underline underline-offset-2">/costs</Link>.
             </p>
           )}
           {approval.status === "pending" && (
