@@ -66,12 +66,33 @@ function readTokenCount(
 
 // Extract input/output token counts from a heartbeat-run `usage_json` blob,
 // tolerating both camelCase and snake_case key spellings.
+//
+// BLO-29842: also reports the two cache classes. `usage_json` carries both the
+// normalized keys and `raw*` twins; when `normalizedUsage` is null but a cost
+// was recorded, only the `raw*` twins are written, hence the last-resort
+// spelling. Normalized is listed first so this keeps agreeing with the
+// input/output resolution above rather than quietly switching basis.
 export function runUsageTokenCounts(
   usage: Record<string, unknown> | null | undefined,
-): { inputTokens: number; outputTokens: number } {
+): {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+  cacheCreationInputTokens: number;
+} {
   return {
     inputTokens: readTokenCount(usage, ["inputTokens", "input_tokens"]),
     outputTokens: readTokenCount(usage, ["outputTokens", "output_tokens"]),
+    cachedInputTokens: readTokenCount(usage, [
+      "cachedInputTokens",
+      "cached_input_tokens",
+      "rawCachedInputTokens",
+    ]),
+    cacheCreationInputTokens: readTokenCount(usage, [
+      "cacheCreationInputTokens",
+      "cache_creation_input_tokens",
+      "rawCacheCreationInputTokens",
+    ]),
   };
 }
 
@@ -159,8 +180,34 @@ export function isInfraFailureRun(run: NeverExecutedRunInput): boolean {
   if (run.usageJson == null) {
     return (run.logBytes ?? 0) <= NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING;
   }
-  const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
-  return inputTokens === 0 && outputTokens === 0;
+  return runUsageHasNoModelTokens(run.usageJson);
+}
+
+// True when a run's usage blob shows it never reached the model at all.
+//
+// BLO-29842 is why this exists as one predicate instead of `inputTokens === 0 &&
+// outputTokens === 0` repeated at each call site. Cache writes used to be folded
+// into `inputTokens`; once they got their own column, a run that wrote a large
+// prompt to cache and died before emitting output reports input=0/output=0 with
+// creation>0 and would read as "never executed" — feeding poisoned-session
+// detection and pulling session rotation forward for a run that did reach the
+// model. Cache READS count for the same reason: serving a turn from cache is
+// still a model turn.
+//
+// Keep this the single definition. The heartbeat's `zeroTokenUsage` and
+// `isZeroTokenCompletedRun` test the same four classes; a call site that spells
+// the check out by hand is how the fifth predicate drifts out of agreement.
+export function runUsageHasNoModelTokens(
+  usage: Record<string, unknown> | null | undefined,
+): boolean {
+  const counts = runUsageTokenCounts(usage);
+  return (
+    counts.inputTokens === 0 &&
+    counts.outputTokens === 0 &&
+    counts.cachedInputTokens === 0 &&
+    counts.cacheCreationInputTokens === 0
+  );
+}
 }
 
 function readAdapterType(value: unknown): string | null {
@@ -210,8 +257,7 @@ export function isZeroTokenStartupFailureRun(
   if (!isLegacySessionUnavailable && (!errorCode || !ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has(errorCode))) {
     return false;
   }
-  const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
-  return inputTokens === 0 && outputTokens === 0;
+  return runUsageHasNoModelTokens(run.usageJson);
 }
 
 // BLO-10889 (BLO-10866 WS2): marker written into the wake `contextSnapshot`
