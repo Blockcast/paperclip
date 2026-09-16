@@ -439,7 +439,22 @@ test("every reader the document names by symbol still exists", () => {
 
     for (const [, symbol, relPath] of pairs) {
       const source = readFileSync(join(here, "..", relPath), "utf8");
-      assert.ok(source.includes(symbol),
+      // A definition form, not `includes`: the symbol appearing anywhere in the
+      // file satisfied the old assertion, including inside a comment, so a
+      // rename that left the old name in nearby prose still passed — which is
+      // exactly the rot this guard exists to catch.
+      //
+      // Two forms, because a Python module-level constant is a bare assignment
+      // with no keyword in front of it: REVIEWED_HEAD_PATTERN is defined that
+      // way and a keyword-only pattern rejected it. The second alternative is
+      // anchored at line start, which is what keeps it from matching the prose
+      // mention this is meant to exclude.
+      const defines = new RegExp(
+        String.raw`(?:^|\n)[ \t]*(?:(?:export[ \t]+)?(?:default[ \t]+)?(?:async[ \t]+)?` +
+          String.raw`(?:const|let|var|function|class|def|type|interface|enum)[ \t]+${symbol}\b` +
+          String.raw`|${symbol}[ \t]*[:=][^=])`,
+      );
+      assert.ok(defines.test(source),
         `${registry} names \`${symbol}\` in ${relPath}, which does not define it`);
     }
   }

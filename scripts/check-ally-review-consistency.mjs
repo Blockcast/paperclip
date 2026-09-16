@@ -91,15 +91,12 @@ const BLOCKING_SECTION_RE =
  * parsers disagreeing on this exact line, so the auditor and the merge gate
  * must not disagree about which indentation counts.
  *
- * The two constants are deliberately not byte-identical, so compare the
- * *composed* forms rather than these lines. The module's is the bare pair of
- * lookaheads and each of its three use sites appends its own ` {0,3}`; this
- * one folds that quantifier in, because both of its use sites want it. What
- * must match is the composition — `(?! *\t)(?! {4}) {0,3}` on either side. A
- * future edit that reads this as a literal-identity claim and "restores" it
- * by deleting the ` {0,3}` here would silently stop allowing the up-to-three
- * spaces CommonMark still treats as a paragraph, which is the divergence this
- * comment exists to prevent.
+ * Byte-identical to the module's, and each use site appends its own ` {0,3}`
+ * exactly as the module's do. It used to fold that quantifier in, which left
+ * the two block patterns below carrying two ` {0,3}` runs where the gate has
+ * one — harmless, because the leading `(?! {4})` caps the run at three either
+ * way, but a same-named mirror constant holding different content is the drift
+ * vector this file exists to close (Ally review of #1721 at bbe6d640).
  *
  * Residual, stated rather than implied: the gate additionally blanks fenced
  * spans before matching, and this script does not, so a *fenced* paste is
@@ -111,17 +108,17 @@ const BLOCKING_SECTION_RE =
  * the consequence is a false red against an otherwise-valid review rather than
  * a missed one, but it is a real remaining divergence, not parity.
  */
-const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4}) {0,3}`;
+const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4})`;
 
 /** A prior-finding disposition that says the blocker is still present. */
 const STILL_PRESENT_DISPOSITION_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*prior:[^\n]*\*\*[ \t]*(?:—|-)[ \t]*still-present[ \t]*(?:—|-)`,
+  String.raw`^${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*prior:[^\n]*\*\*[ \t]*(?:—|-)[ \t]*still-present[ \t]*(?:—|-)`,
   "im",
 );
 
 /** The single standalone attestation line Ally is required to emit. */
 const ATTESTED_HEAD_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}(?:[_*]+)?[ \t]*reviewed head:[ \t]*\`?([0-9a-f]{40})\`?[ \t]*(?:[_*]+)?[ \t]*$`,
+  String.raw`^${NOT_INDENTED_CODE} {0,3}(?:[_*]+)?[ \t]*reviewed head:[ \t]*\`?([0-9a-f]{40})\`?[ \t]*(?:[_*]+)?[ \t]*$`,
   "im",
 );
 const ATTESTED_HEAD_GLOBAL_RE = new RegExp(ATTESTED_HEAD_RE.source, "gim");
@@ -187,7 +184,7 @@ function severityCountsIn(raw) {
  * and over-matching fails a clean review closed.
  */
 const EMITTED_BUCKET_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>)(?:#{1,6}[ \t]*)?[*_]{0,3}` +
+  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}(?:#{1,6}[ \t]*)?[*_]{0,3}` +
     String.raw`(Critical|Important)[ \t]+Issues[ \t]*[*_]{0,3}[ \t]*\((\d+)\)[*_]{0,3}[ \t]*$`,
   "gim",
 );
@@ -199,9 +196,10 @@ const EMITTED_BUCKET_RE = new RegExp(
  * toggle on ``` only, with no tilde fences, no fence-length matching and no
  * info-string rule. The bound is stated rather than implied — a body using
  * those forms is read here as emitted structure and by the gate as a quote.
- * Applied only to this cross-check, not to the block or attestation patterns
- * above, whose own fence divergence is the documented residual on
- * NOT_INDENTED_CODE and is unchanged by this.
+ * Applied to this cross-check and to the block and opener counts in
+ * structuredVerdict, not to the prose attestation pattern above, whose own
+ * fence divergence is the documented residual on NOT_INDENTED_CODE and is
+ * unchanged by this.
  */
 function withoutFencedSpans(text) {
   if (!text.includes("```")) return text;
