@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { clampIssueRequestDepth } from "@paperclipai/shared";
+import { clampIssueRequestDepth, ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS } from "@paperclipai/shared";
+import type { IssueProductivityReviewTrigger } from "@paperclipai/shared";
 import {
   activityLog,
   agentWakeupRequests,
@@ -190,16 +191,13 @@ export const MONITOR_LAPSE_SERVICE_GRACE_MS = DEFAULT_PRODUCTIVITY_REVIEW_MONITO
 type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
-type ProductivityReviewTrigger =
-  | "no_comment_streak"
-  | "long_active_duration"
-  | "high_churn"
-  | "runtime_failure_streak"
-  // BLO-27698 B3b: one run that has been executing, uninterrupted and still
-  // live, for at least `longActiveMs`. Distinct from `long_active_duration`,
-  // which after B3 measures only time nobody was accounting for — a runaway run
-  // is the opposite shape (the turn was taken and never given back).
-  | "runaway_execution";
+// BLO-34216: derived from the single `ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS` tuple
+// in `@paperclipai/shared`. `runaway_execution` (BLO-27698 B3b) is one run that
+// has been executing, uninterrupted and still live, for at least `longActiveMs`
+// — distinct from `long_active_duration`, which after B3 measures only time
+// nobody was accounting for (a runaway run is the opposite shape: the turn was
+// taken and never given back).
+type ProductivityReviewTrigger = IssueProductivityReviewTrigger;
 
 type ProductivityReviewThresholds = {
   noCommentStreakRuns: number;
@@ -1471,12 +1469,19 @@ function isDependencyBlockedClosableRecord(trigger: unknown, firedTriggers: unkn
   return isDependencyBlockedClosableTriggerSet(firedTriggers);
 }
 
+// BLO-34216: exhaustive by construction. A trigger added to
+// `ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS` with no entry here is a typecheck
+// failure, not a silent fallback label.
+const TRIGGER_LABELS: Record<ProductivityReviewTrigger, string> = {
+  no_comment_streak: "No-comment streak",
+  long_active_duration: "Long active duration",
+  high_churn: "High churn",
+  runtime_failure_streak: "Runtime failure streak",
+  runaway_execution: "Runaway execution",
+};
+
 function formatTrigger(trigger: ProductivityReviewTrigger) {
-  if (trigger === "no_comment_streak") return "No-comment streak";
-  if (trigger === "high_churn") return "High churn";
-  if (trigger === "runtime_failure_streak") return "Runtime failure streak";
-  if (trigger === "runaway_execution") return "Runaway execution";
-  return "Long active duration";
+  return TRIGGER_LABELS[trigger];
 }
 
 // BLO-22097: `usageJson: null` means usage was never *recorded*, not that
@@ -1496,24 +1501,24 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
 // floor — see BLO-22097 for the full sample tables.
 const NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING = 200_000;
 
-const PRODUCTIVITY_REVIEW_TRIGGERS: readonly ProductivityReviewTrigger[] = [
-  "no_comment_streak",
-  "long_active_duration",
-  "high_churn",
-  "runtime_failure_streak",
-  "runaway_execution",
-];
-
 // BLO-22105: `buildReviewMarkdown` bakes the trigger that produced it into the
 // `- Primary trigger:` line. Reading it back out of the persisted description
 // (rather than, say, the last activity-log entry) means the comparison is
 // against exactly what a reader currently sees, so a refresh regenerates
 // precisely when the visible Manager Decision guidance is actually stale.
-function extractReviewTriggerFromDescription(description: string | null): ProductivityReviewTrigger | null {
+export function extractReviewTriggerFromDescription(description: string | null): ProductivityReviewTrigger | null {
   if (!description) return null;
   const match = description.match(/^- Primary trigger: `([a-z_]+)`/m);
   const candidate = match?.[1];
-  return PRODUCTIVITY_REVIEW_TRIGGERS.find((trigger) => trigger === candidate) ?? null;
+  return ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS.find((trigger) => trigger === candidate) ?? null;
+}
+
+// BLO-34216: the renderer half of that round-trip, kept adjacent to the parser
+// so the shared `- Primary trigger:` prefix is visible in one place. Drift here
+// fails the same way a drifted trigger name does — the review silently stops
+// refreshing — so the round-trip test drives this rather than a hand-built line.
+export function renderPrimaryTriggerLine(trigger: ProductivityReviewTrigger) {
+  return `- Primary trigger: \`${trigger}\` (${formatTrigger(trigger)})`;
 }
 
 // True when the dependency gate cancelled a queued run before dispatch (see
@@ -4056,7 +4061,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "",
       `- Source issue: ${issueUiLink(evidence.sourceIssue, prefix)}`,
       `- Assigned agent: ${evidence.sourceAgent.name} (${evidence.sourceAgent.role})`,
-      `- Primary trigger: \`${evidence.trigger}\` (${formatTrigger(evidence.trigger)})`,
+      renderPrimaryTriggerLine(evidence.trigger),
       `- Trigger reasons: ${evidence.triggerReasons.join("; ")}`,
       `- Generated at: ${evidence.generatedAt.toISOString()}`,
       "",

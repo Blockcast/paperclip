@@ -78,6 +78,7 @@ export type {
   DecisionTrainingSourceKind,
 } from "./types/decision-training.js";
 export { DECISION_TRAINING_RETENTION_POLICY } from "./types/decision-training.js";
+export { ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS } from "./types/issue.js";
 
 export type {
   PipelineAutomationRetryBlocker,
