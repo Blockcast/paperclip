@@ -7550,29 +7550,38 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(0);
   });
 
-  // BLO-27698 B3b (Ally review on 2e95b50b) — `liveExecutingMs` clamped its head
-  // to `attributableStartAt` but not its tail to `attributableEndAt`, and the two
-  // genuinely differ: `nonLiveExecutionHoldSince` keys *only* on the run pointed
-  // at by `issue.executionRunId`, so a parked holder truncates the episode into
-  // the past, while the reducer walks all of `latestRuns` and would count a live
-  // sibling right up to `now`.
+  // BLO-27698 B3b (Ally reviews on 2e95b50b and 160720b4) — episode attribution
+  // must ask "is anything live on this issue", not "is the *holder* live".
+  // `nonLiveExecutionHoldSince` keys only on `issue.executionRunId`, so a parked
+  // holder truncates the episode into the past even while another run of the same
+  // assignee is still executing on the same issue.
   //
   // The fixture is that exact shape and nothing else: a `queued` holder last
-  // signalling 11h ago (episode truncated to 2h) plus a live sibling that has
-  // been `running` for 13h and is still signalling. Unclamped, `liveExecutingMs`
-  // reads 13h — over the 6h bar — and fires; clamped it reads the episode's own
-  // 2h and declines. Note 2h is also under `longActiveMs`, so nothing else can
-  // fire here and the assertion isolates the clamp.
+  // signalling 11h ago plus a live sibling that has been `running` for 13h and is
+  // still signalling. Holder-only, the episode reads 2h, and *both* `elapsedMs`
+  // and `liveExecutingMs` are cut to it — so B2, B3 and B3b were blind to the
+  // sibling between them and a 13h runaway produced no review at all. That was
+  // the coverage gap B3b's AC forbids ("do not silently drop it").
   //
-  // This is not a tidiness fix. Unclamped, the trigger fires on precisely the
-  // wall-clock `nonLiveExecutionHoldSince` exists to exclude (BLO-18307), and
-  // the evidence pack self-contradicts: the trigger reason renders
-  // `liveExecutingMs` while the report renders `elapsedMs`, so the review would
-  // read "executing continuously for 13h" above "Current active elapsed time: 2h".
-  it("does not fire runaway_execution on live-sibling time outside the episode (tail clamp)", async () => {
+  // With `siblingStillExecuting` extending `attributableEndAt` to `now`, the two
+  // figures move together: 13h executing inside a 13h episode. That is what makes
+  // firing safe here — the self-contradictory evidence pack the tail clamp was
+  // added to prevent ("executing continuously for 13h" above "Current active
+  // elapsed time: 2h") is unrepresentable, so consistency is no longer bought by
+  // discarding the burn. Both halves are asserted below; asserting only the
+  // trigger would pass on exactly the contradiction this rejects.
+  //
+  // Mutation control: dropping the `siblingStillExecuting` term from
+  // `attributableEndAt` turns this red — the episode collapses to 2h, nothing
+  // clears the 6h bar, and `created` falls to 0.
+  //
+  // BLO-18307 is not weakened. Its shape is a parked holder with *nothing* live,
+  // which still truncates exactly as before — see the non-live execution hold
+  // tests above, which pin that path independently.
+  it("fires runaway_execution on a live sibling while the holder is parked, with a self-consistent episode", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
-    // The holder's last signal, and therefore `attributableEndAt`.
+    // The holder's last signal — `attributableEndAt` if liveness were holder-only.
     const holderLastSignal = new Date(now.getTime() - 11 * 60 * 60 * 1000);
     const seeded = await seedAssignedIssue({
       status: "in_progress",
@@ -7628,10 +7637,17 @@ describeEmbeddedPostgres("productivity review service", () => {
       companyId: seeded.companyId,
     });
 
-    // Removing `Math.min(span.end, attributableEndAt.getTime())` turns this red.
+    // Dropping `siblingStillExecuting` from `attributableEndAt` turns this red.
     const [review] = await listProductivityReviews(seeded.companyId);
-    expect(review?.description ?? "").not.toContain("Primary trigger: `runaway_execution`");
-    expect(result.created).toBe(0);
+    expect(result.scanned).toBe(1);
+    expect(result.created).toBe(1);
+    expect(review?.description ?? "").toContain("Primary trigger: `runaway_execution`");
+    // The episode and the burn agree. Holder-only these read 13h and 2h, which is
+    // the contradiction the tail clamp was added to suppress; fixing attribution
+    // removes it instead.
+    expect(review?.description ?? "").toContain("executing continuously for 13h 0m");
+    expect(review?.description ?? "").toContain("Current active elapsed time: 13h 0m");
+    expect(review?.description ?? "").toContain("13h 0m executing");
   });
 
   it("does not suppress no-comment productivity reviews for future monitor waits", async () => {

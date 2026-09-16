@@ -3801,9 +3801,36 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           ? null
           : issueEpisodeStartedAt;
     const nonLiveHoldSince = nonLiveExecutionHoldSince(sourceIssue, executionRun, now);
+    // BLO-27698 (Ally review on 160720b4): `nonLiveExecutionHoldSince` keys only
+    // on `issue.executionRunId`, so it answers "is the *holder* live", not "is
+    // anything live on this issue". Those diverge whenever the holder pointer is
+    // parked while another run keeps executing, and the holder-only reading is
+    // then applied on a false premise: the episode has not ended, work is
+    // happening on the sibling row. `runLiveInterval`'s docblock already states
+    // that principle for its own consumer — "a run sitting `queued` while a
+    // *different* run works the same issue is not a missing turn" — so reading
+    // liveness holder-only here contradicted it, and did so invisibly: because
+    // `elapsedMs` and `liveExecutingMs` are both cut at this boundary, a sibling
+    // burning 13h continuously was truncated to the holder's 2h for *every*
+    // B-group gate at once, leaving B2, B3 and B3b unable to see it between them.
+    //
+    // `latestRuns` is scoped to this issue and this assignee, so a live sibling
+    // here is that assignee demonstrably working this issue right now — not
+    // unrelated traffic. BLO-18307 is untouched: the hold still truncates exactly
+    // as before whenever nothing is live anywhere, which is the wedged-holder
+    // shape it exists to exclude.
+    const siblingStillExecuting = latestRuns.some(
+      (run) =>
+        run.id !== sourceIssue.executionRunId &&
+        run.status === "running" &&
+        // `runLiveInterval` caps a `running` row at `min(now, silentFrom)`, so
+        // `end >= now` is exactly "still signalling" — the same liveness test
+        // `liveExecutingMs` applies below.
+        (runLiveInterval(run, now)?.end ?? 0) >= now.getTime(),
+    );
     // Clamping below activeStartedAt collapses to 0 via Math.max — i.e. a holder
     // that went non-live before the episode began contributes no active time.
-    const attributableEndAt = nonLiveHoldSince ?? now;
+    const attributableEndAt = siblingStillExecuting ? now : (nonLiveHoldSince ?? now);
     // BLO-19848 (review follow-up): the tail clamp above is not enough on its
     // own, because it only truncates a hold that is *still* open. A holder that
     // parked and then resumed is live again, so nonLiveExecutionHoldSince
@@ -3876,16 +3903,30 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // outruns it cannot exceed the elapsed figure rendered beside it.
     //
     // The tail clamp is not symmetry for its own sake (Ally review on
-    // 2e95b50b). `nonLiveExecutionHoldSince` keys only on the run pointed at by
-    // `issue.executionRunId`, so when that holder is terminal/`queued`/silent
-    // it truncates `attributableEndAt` into the past — while this reducer walks
-    // *all* of `latestRuns` and would happily count a live sibling row right up
-    // to `now`. Unclamped, `liveExecutingMs > elapsedMs` is representable, and
-    // the evidence pack renders both: the trigger reason prints this figure and
-    // the report prints `elapsedMs`, so one review could claim 13h of continuous
-    // execution above "Current active elapsed time: 2h". Worse, the trigger
-    // would fire on exactly the wall-clock `nonLiveExecutionHoldSince` exists to
-    // exclude (BLO-18307), re-entering through a gate that never consulted it.
+    // 2e95b50b). It originally existed because `nonLiveExecutionHoldSince` keys
+    // only on the run pointed at by `issue.executionRunId`, so a parked holder
+    // truncated `attributableEndAt` into the past while this reducer walked
+    // *all* of `latestRuns` and counted a live sibling right up to `now` —
+    // making `liveExecutingMs > elapsedMs` representable, and the evidence pack
+    // self-contradictory: the trigger reason prints this figure and the report
+    // prints `elapsedMs`, so one review could claim 13h of continuous execution
+    // above "Current active elapsed time: 2h".
+    //
+    // That divergence is now fixed at its source — `attributableEndAt` extends
+    // to `now` while a sibling is still executing (see `siblingStillExecuting`),
+    // so both figures move together and the contradiction is unrepresentable
+    // rather than clamped away. Clamping the tail was the wrong half of that
+    // trade: it bought consistency by discarding the sibling's burn from
+    // `liveExecutingMs` too, which hid a genuinely runaway run from the one
+    // trigger B3b added to catch it.
+    //
+    // The clamp is therefore retained as a belt-and-braces invariant guard, not
+    // as a suppressor: with `attributableEndAt` sibling-aware it is provably a
+    // no-op, because every span this reducer counts is `running` and live, and
+    // any such run drives `attributableEndAt` to `now` (as the holder, via a
+    // null hold; or as a sibling, via `siblingStillExecuting`). Keeping it means
+    // `liveExecutingMs <= elapsedMs` stays true by construction if a future edit
+    // narrows either of those paths, instead of by the argument above.
     //
     // Order matters: the clamp is applied to the measured duration *after* the
     // `span.end < now` liveness test, never before. Testing a clamped end
