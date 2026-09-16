@@ -1396,6 +1396,7 @@ async function findGitWorktreeBranchContention(input: {
     worktreePath: input.worktreePath,
     liveBranchName: input.actualBranchName,
     excludingExecutionWorkspaceId: input.executionWorkspaceId,
+    excludingSourceIssueId: input.sourceIssue?.id ?? null,
   });
 }
 

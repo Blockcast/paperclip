@@ -1427,6 +1427,120 @@ describe("github-webhook pure helpers", () => {
     expect(selfEcho.suppressed).toHaveLength(0);
   });
 
+  it("reports a marker-prefixed agent request that never mentions the reviewer (BLO-33589)", () => {
+    // The THIRD invisible drop, and the last one in this file. `reviewerRequest`
+    // is a conjunction — the marker path AND the mention — but both existing
+    // suppression reports only ever fire on a body that HAS the mention
+    // (missing_marker requires the bare alias; marker_disqualified_by_heading
+    // requires the general mention). So a marker-prefixed agent request that
+    // simply forgot to name the reviewer fell out as silent `null`.
+    //
+    // Measured on Blockcast/libmmt 2026-09-11..12: 4 such comments across
+    // #436/#442/#444. On #444 the automatic `opened` wake had already been lost
+    // to an ambiguous reviewer run, so these two re-requests were the ONLY
+    // surviving path and the PR sat 10h06m with zero reviews while four sibling
+    // PRs in the same repo were reviewed in 5 to 10 minutes.
+    const resolve = (body: string, login = "allyblockcast[bot]") => {
+      const suppressed: { reason: string }[] = [];
+      const context = __test_resolveEventContext(
+        "issue_comment",
+        {
+          action: "created",
+          issue: {
+            number: 444,
+            title: "BLO-32722 layer ownership carries media",
+            pull_request: { url: "https://api.github.com/repos/Blockcast/libmmt/pulls/444" },
+          },
+          comment: {
+            id: 5190001,
+            body,
+            user: { login },
+            html_url: "https://github.com/Blockcast/libmmt/pull/444#issuecomment-5190001",
+          },
+          repository: { full_name: "Blockcast/libmmt" },
+        },
+        {
+          prReviewerBotLogin: "allyblockcast[bot]",
+          onSuppressedReviewRequest: (info) => suppressed.push(info as { reason: string }),
+        },
+      );
+      return { context, suppressed };
+    };
+
+    // The #444 shape: valid start-of-body marker, a real ask, no @ally.
+    const dropped = resolve(
+      "<!-- paperclip:review-request -->\nRe-requesting review at head `ae43eed59d9a2fb0c21fe1b1dad7b013a9d02668`.",
+    );
+    expect(dropped.context).toBeNull();
+    expect(dropped.suppressed).toHaveLength(1);
+    expect(dropped.suppressed[0]).toMatchObject({
+      repoFullName: "Blockcast/libmmt",
+      prNumber: 444,
+      commentId: 5190001,
+      commentAuthorLogin: "allyblockcast[bot]",
+      commentUrl: "https://github.com/Blockcast/libmmt/pull/444#issuecomment-5190001",
+      reason: "missing_mention",
+    });
+
+    // Behaviour is unchanged: still no wake. The report is the whole fix.
+    expect(dropped.context).toBeNull();
+
+    // Marker + mention is the honoured path, untouched.
+    const honoured = resolve(
+      "<!-- paperclip:review-request -->\n@ally please review at head ae43eed.",
+    );
+    expect(honoured.context).toMatchObject({ wakeReason: "github_pr_review_requested" });
+    expect(honoured.suppressed).toHaveLength(0);
+
+    // Marker + heading + no mention: the missing mention is what blocks it
+    // first and is the actionable half, so it classifies as missing_mention
+    // rather than marker_disqualified_by_heading (which requires the mention).
+    const headingNoMention = resolve(
+      "<!-- paperclip:review-request -->\nRe-requesting.\n\n## Ally — Consolidated PR Review\nwas your last pass.",
+    );
+    expect(headingNoMention.context).toBeNull();
+    expect(headingNoMention.suppressed).toHaveLength(1);
+    expect(headingNoMention.suppressed[0]).toMatchObject({ reason: "missing_mention" });
+
+    // NO RECLASSIFICATION of the two existing branches. `hasPrReviewerBareAliasMention`
+    // is a strict subset of `hasPrReviewerRequestMention`, so a markerless bare-alias
+    // body cannot reach the new branch.
+    const stillMissingMarker = resolve("@ally please review the layer ownership change");
+    expect(stillMissingMarker.suppressed).toHaveLength(1);
+    expect(stillMissingMarker.suppressed[0]).toMatchObject({ reason: "missing_marker" });
+
+    const stillDisqualified = resolve(
+      "<!-- paperclip:review-request -->\n@ally re-review.\n\n## Ally — Consolidated PR Review\nprior pass.",
+    );
+    expect(stillDisqualified.suppressed).toHaveLength(1);
+    expect(stillDisqualified.suppressed[0]).toMatchObject({
+      reason: "marker_disqualified_by_heading",
+    });
+
+    // The two documented intentionally-unlogged combinations stay quiet.
+    // No marker, no mention: an ordinary bot comment, not a dropped request.
+    const ordinary = resolve("Pushed a fixup for the headroom filter.");
+    expect(ordinary.context).toBeNull();
+    expect(ordinary.suppressed).toHaveLength(0);
+
+    // Marker-less greeting of the bot LOGIN: the commitperclip gate nudge that
+    // drove the #583 loop. Suppressing it is correct and must stay unreported.
+    const gateNudge = resolve("Hey @allyblockcast[bot]! Before this PR can be reviewed...");
+    expect(gateNudge.context).toBeNull();
+    expect(gateNudge.suppressed).toHaveLength(0);
+
+    // Ally's own marker-less output: still not a request, still unreported.
+    const selfEcho = resolve("## Ally — Consolidated PR Review\n\nNo blocking findings.");
+    expect(selfEcho.context).toBeNull();
+    expect(selfEcho.suppressed).toHaveLength(0);
+
+    // A HUMAN's marker-only, mention-less comment is not a reviewer-bot drop at
+    // all — the author guard never applied to it, so there is nothing to report.
+    const human = resolve("<!-- paperclip:review-request -->\nRe-requesting review.", "kkroo");
+    expect(human.context).toBeNull();
+    expect(human.suppressed).toHaveLength(0);
+  });
+
   it("keeps the #583 self-refire loop closed: a quoted or reviewer-output marker is not a request (BLO-18865)", () => {
     const botComment = (id: number, body: string) =>
       __test_resolveEventContext("issue_comment", {
@@ -2257,7 +2371,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     await tempDb?.cleanup();
   }, 60_000);
 
-  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "resolvePrReviewHeadSha" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions" | "listPullRequestCommits" | "notifyForeignCommits"> = {}) {
+  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "resolvePrReviewHeadSha" | "listPrReviewsForAttestation" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions" | "listPullRequestCommits" | "notifyForeignCommits"> = {}) {
     const app = express();
     app.use(express.json({
       verify: (req, _res, buf) => {
@@ -2536,6 +2650,121 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(1);
     expect(runs[0]?.status).toBe("queued");
+  });
+
+  // BLO-32198. The head-attestation gate suppresses a reviewer wake for a head
+  // an operative Ally App review already attests. These two tests exist because
+  // the suppression path is SILENT and destructive in one direction: a wake
+  // that is never enqueued leaves no artifact and nothing retries it, so a
+  // miswiring here (wrong bot login reaching the predicate, gate placed on the
+  // wrong side of a return, `unknown` treated as `attested`) would not show up
+  // as a failure anywhere. The predicate has its own unit suite; what is pinned
+  // here is only the wiring.
+  describe("reviewer wake head-attestation gate (BLO-32198)", () => {
+    const ATTESTED_HEAD = "4e4dd821d51cca842ee5bb65348b4d0b2c186a85";
+
+    function openedPayload(sha: string, number = 1687) {
+      return {
+        action: "opened",
+        pull_request: {
+          number,
+          title: "Add the head-attestation gate",
+          body: null,
+          head: { ref: "blo-32198-gate", sha },
+        },
+        repository: { full_name: "Blockcast/paperclip" },
+      };
+    }
+
+    async function postOpened(app: express.Express, sha: string, deliveryId: string) {
+      const { body, signature } = signedRequest(openedPayload(sha));
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", deliveryId)
+        .set("content-type", "application/json")
+        .send(body);
+    }
+
+    it("does not wake the reviewer when an App review already attests the head", async () => {
+      const { agentId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      let listed = 0;
+      const app = buildApp({
+        prReviewerAgentId: agentId,
+        prReviewerBotLogin: "allyblockcast[bot]",
+        listPrReviewsForAttestation: async () => {
+          listed += 1;
+          return [
+            {
+              login: "allyblockcast[bot]",
+              body: `## Ally — Consolidated PR Review\n\nReviewed head: ${ATTESTED_HEAD}\n`,
+              createdAt: "2026-09-06T09:30:00Z",
+            },
+          ];
+        },
+      });
+
+      const res = await postOpened(app, ATTESTED_HEAD, "delivery-32198-attested");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ reviewerWakeFired: false });
+      // Proves the gate ran rather than the wake being suppressed for some
+      // unrelated reason, which is what would make this test vacuous.
+      expect(listed).toBe(1);
+
+      const runs = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs).toHaveLength(0);
+    });
+
+    it("still wakes the reviewer when the attestation cannot be established", async () => {
+      // `null` is the unreachable-GitHub shape. It must fall through: an
+      // unreviewed PR is a worse failure than a redundant review.
+      const { agentId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({
+        prReviewerAgentId: agentId,
+        prReviewerBotLogin: "allyblockcast[bot]",
+        listPrReviewsForAttestation: async () => null,
+      });
+
+      const res = await postOpened(app, ATTESTED_HEAD, "delivery-32198-unknown");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ reviewerWakeFired: true });
+
+      const runs = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs).toHaveLength(1);
+    });
+
+    it("does not suppress on a review by the bare User seat", async () => {
+      // The User seat is a separate lane in the consistency guard. If its
+      // review could suppress, the App lane's required work would silently
+      // never happen. Pinned at the route because the login that reaches the
+      // predicate comes from config here, not from the caller.
+      const { agentId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      const app = buildApp({
+        prReviewerAgentId: agentId,
+        prReviewerBotLogin: "allyblockcast[bot]",
+        listPrReviewsForAttestation: async () => [
+          {
+            login: "allyblockcast",
+            body: `## Ally — Consolidated PR Review\n\nReviewed head: ${ATTESTED_HEAD}\n`,
+            createdAt: "2026-09-06T09:30:00Z",
+          },
+        ],
+      });
+
+      const res = await postOpened(app, ATTESTED_HEAD, "delivery-32198-seat");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ reviewerWakeFired: true });
+    });
   });
 
   // BLO-19566 AC4. Before this, nothing wrote a `pull_request` work product,
@@ -4223,6 +4452,183 @@ describeEmbeddedPostgres("github-webhook route", () => {
       expect(recovered).toMatchObject({ recovered: 1, exhausted: 0, superseded: 0 });
       expect(await runsForTask(taskKey)).toHaveLength(1);
       expect(await deliveryCount("dead_lettered")).toBe(0);
+    }, 30_000);
+
+    // BLO-32198. The route-level gate cannot cover this row: it ran when the
+    // row was written and correctly let the wake through, because no review
+    // existed yet. The replay happens HERE, not through the route, so nothing
+    // re-evaluates that — and an availability deferral is the single likeliest
+    // way to open a gap wide enough for another delivery's run to post a review
+    // at this same head in the meantime. Without the replay-time re-check this
+    // path reproduces exactly the duplicate the gate exists to prevent, in
+    // exactly the multi-hour shape that motivated it.
+    it("supersedes a deferred replay whose head was reviewed while it waited (BLO-32198)", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+      const prNumber = 22198;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+      const head = "beeff00d1234567890abcdef1234567890abcdef";
+
+      // No attesting review yet, so the live gate must let this through and the
+      // row must be persisted for replay. Asserted rather than assumed: if the
+      // gate suppressed here there would be no row, and the reconcile below
+      // would pass vacuously.
+      const app = buildApp({
+        prReviewerAgentIds: [reviewerId],
+        prReviewerBotLogin: "allyblockcast[bot]",
+        listPrReviewsForAttestation: async () => [],
+      });
+      const payload = {
+        action: "opened",
+        pull_request: {
+          number: prNumber,
+          title: "Deferred replay meets a review posted in the meantime",
+          body: null,
+          head: { ref: "blo-32198-deferred-replay", sha: head },
+        },
+        repository: { full_name: REPO },
+      };
+      const { body, signature } = signedRequest(payload);
+      const res = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-32198-deferred")
+        .set("content-type", "application/json")
+        .send(body);
+      expect(res.status).toBe(200);
+      expect(res.body.reviewerWakeFired).toBe(false);
+      expect(await runsForTask(taskKey)).toHaveLength(0);
+
+      const retryRows = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(retryRows).toHaveLength(1);
+
+      // The reviewer is back, so a replay would otherwise succeed — that is what
+      // makes this a real test of the re-check rather than of reviewer state.
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, reviewerId));
+
+      let listed = 0;
+      const reconciled = await reconcileContendedPrReviewerWakes(
+        db,
+        {
+          webhookSecret,
+          prReviewerAgentIds: [reviewerId],
+          prReviewerBotLogin: "allyblockcast[bot]",
+          // Live head unresolvable: the check must fall back to the head
+          // recorded on the row, not skip.
+          resolvePrReviewHeadSha: async () => null,
+          listPrReviewsForAttestation: async () => {
+            listed += 1;
+            return [
+              {
+                login: "allyblockcast[bot]",
+                body: `## Ally — Consolidated PR Review\n\nReviewed head: ${head}\n`,
+                createdAt: "2026-09-06T10:00:00Z",
+              },
+            ];
+          },
+          heartbeatOptions: {
+            penstockAvailabilityGate: allowPenstockGate,
+            skipQueuedRunDispatch: true,
+          },
+        },
+        new Date(Date.now() + 60_000),
+      );
+
+      expect(listed).toBe(1);
+      // superseded, not recovered: the work this row stands for has been done.
+      expect(reconciled).toMatchObject({ recovered: 0, superseded: 1, exhausted: 0 });
+      expect(await runsForTask(taskKey)).toHaveLength(0);
+      // Not counted as a retry attempt — it never attempted anything.
+      expect(await deliveryCount("retried")).toBe(0);
+      expect(await deliveryCount("dead_lettered")).toBe(0);
+    }, 30_000);
+
+    // BLO-32198. The row's head is frozen at webhook time, but the replay can
+    // run hours later and `taskKey` is PR-scoped, so the wake it replays reviews
+    // the CURRENT head. If the PR moved and was already reviewed at its new head,
+    // asking "is the old head attested?" answers no, the replay proceeds, and
+    // the reviewer posts a duplicate at the new head. The check has to ask
+    // about the live head.
+    it("checks a deferred replay against the live PR head, not the head frozen at webhook time (BLO-32198)", async () => {
+      __resetMetricsForTest();
+      const { agentId: reviewerId } = await seedCompanyAndAgent({ agentName: "Ally" });
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+      const prNumber = 22199;
+      const taskKey = `pr_review:${REPO}:${prNumber}`;
+      const frozenHead = "0ff1ce0000000000000000000000000000000001";
+      const liveHead = "0ff1ce0000000000000000000000000000000002";
+
+      const app = buildApp({
+        prReviewerAgentIds: [reviewerId],
+        prReviewerBotLogin: "allyblockcast[bot]",
+        listPrReviewsForAttestation: async () => [],
+      });
+      const { body, signature } = signedRequest({
+        action: "opened",
+        pull_request: {
+          number: prNumber,
+          title: "Deferred replay outlives its head",
+          body: null,
+          head: { ref: "blo-32198-moved-head", sha: frozenHead },
+        },
+        repository: { full_name: REPO },
+      });
+      const res = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-blo-32198-moved-head")
+        .set("content-type", "application/json")
+        .send(body);
+      expect(res.status).toBe(200);
+      expect(res.body.reviewerWakeFired).toBe(false);
+      const retryRows = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "pr_reviewer_dispatch_contended"));
+      expect(retryRows).toHaveLength(1);
+
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, reviewerId));
+
+      // While deferred: the branch was pushed (head is now `liveHead`) and Ally
+      // reviewed THAT head. Nothing attests `frozenHead`.
+      const resolved: Array<{ repoFullName: string; prNumber: number }> = [];
+      const reconciled = await reconcileContendedPrReviewerWakes(
+        db,
+        {
+          webhookSecret,
+          prReviewerAgentIds: [reviewerId],
+          prReviewerBotLogin: "allyblockcast[bot]",
+          resolvePrReviewHeadSha: async (input) => {
+            resolved.push(input);
+            return liveHead;
+          },
+          listPrReviewsForAttestation: async () => [
+            {
+              login: "allyblockcast[bot]",
+              body: `## Ally — Consolidated PR Review\n\nReviewed head: ${liveHead}\n`,
+              createdAt: "2026-09-06T10:00:00Z",
+            },
+          ],
+          heartbeatOptions: {
+            penstockAvailabilityGate: allowPenstockGate,
+            skipQueuedRunDispatch: true,
+          },
+        },
+        new Date(Date.now() + 60_000),
+      );
+
+      expect(resolved).toEqual([{ repoFullName: REPO, prNumber }]);
+      // Against the frozen head this would read `not_attested` and replay,
+      // producing the duplicate; against the live head it is superseded.
+      expect(reconciled).toMatchObject({ recovered: 0, superseded: 1, exhausted: 0 });
+      expect(await runsForTask(taskKey)).toHaveLength(0);
+      expect(await deliveryCount("retried")).toBe(0);
     }, 30_000);
 
     it("does not retry a paused reviewer whose reporting chain is invalid", async () => {

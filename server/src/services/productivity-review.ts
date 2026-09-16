@@ -230,6 +230,25 @@ type NoExecutableTurnGating = {
   currentBlockOpen: boolean;
 };
 
+// BLO-22887 AC2. Deliberately a STATE record, not a duration: the readiness
+// map carries blocker ids and counts, never the edge's own age, so there is no
+// honest "blocked for N hours" figure to compute from it — and inventing one
+// by scanning `issueRelations` or `latestRuns` was the defect that sank the
+// first attempt at this (PR #1361: an unbounded `latestRuns.find` against a
+// 100-run cap, so an older park silently read as absent). The line's job is to
+// tell a reviewer that the control plane independently classified this issue
+// as dependency-blocked while the elapsed split was calling the same wall-clock
+// "unattended". That disagreement is the whole finding; the arithmetic is not.
+type DependencyGating = {
+  unresolvedBlockerCount: number;
+  /** Subset that are `done` but whose execution workspace has not finalized. */
+  pendingFinalizeBlockerCount: number;
+  // The fired triggers an unresolved blocker does NOT excuse — i.e. the reason
+  // this review survived the suppression gate. Never empty on a rendered line:
+  // an all-closable set is suppressed before the body is built.
+  nonClosableTriggers: ProductivityReviewTrigger[];
+};
+
 type PullRequestEvidence = {
   title: string;
   url: string | null;
@@ -357,6 +376,12 @@ type ProductivityReviewEvidence = {
     // monitor so `formatMonitorGating` doesn't blame the wrong thing.
     firedAt: Date | null;
     successorRunId: string | null;
+    // BLO-27698 A4: set (to the same instant as `lapsedAt`) when the monitor's
+    // scheduled check has passed but is still inside `monitorLapseServiceGraceMs`
+    // — the same window `deliberatePendingMonitor` treats as pending. Reporting
+    // only; see `monitorGatingBreakdown` for why it is deliberately not folded
+    // into `gatedIsUpperBound`.
+    awaitingServiceSince: Date | null;
   } | null;
   // BLO-23248/BLO-23624: elapsed time attributable to a no-executable-turn
   // run — the union of capacity park, dispatch backlog, and zero-token
@@ -364,6 +389,21 @@ type ProductivityReviewEvidence = {
   // monitor-gated and unattended time. null when no run in the episode
   // classifies as one of those three mechanisms.
   noExecutableTurnGating: NoExecutableTurnGating | null;
+  // BLO-22887 AC2: the dependency-blocked bucket, reported alongside — never
+  // folded into — the monitor-gated/unattended split. Populated only on the
+  // generation path (`reconcileProductivityReviews`), from the readiness map
+  // that path already computes for BLO-22436's suppression gate;
+  // `collectEvidence` deliberately does not fetch it (see the note at the top
+  // of that function — its other caller must not see dependency state at all,
+  // and re-querying would put a second readiness round-trip on the
+  // continuation-hold path for a field that path never renders).
+  //
+  // Null whenever the source has no unresolved blocker, so the line's presence
+  // is itself a signal. Every blocked source that reaches the body builder is
+  // by construction one whose fired-trigger set is NOT dependency-closable —
+  // the closable case is suppressed outright at generation — i.e. exactly
+  // AC2's "still warranted on other grounds".
+  dependencyGating: DependencyGating | null;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -988,6 +1028,7 @@ function monitorGatingBreakdown(
   elapsedMs: number | null,
   now: Date,
   latestRuns: HeartbeatRunRow[],
+  thresholds: ProductivityReviewThresholds,
 ) {
   if (elapsedMs === null || !activeStartedAt) return null;
   const armedUntil = coerceDate(issue.monitorNextCheckAt);
@@ -1008,6 +1049,7 @@ function monitorGatingBreakdown(
       gatedIsUpperBound: true,
       firedAt: null,
       successorRunId: null,
+      awaitingServiceSince: null,
     };
   }
 
@@ -1024,6 +1066,7 @@ function monitorGatingBreakdown(
       gatedIsUpperBound: false,
       firedAt: null,
       successorRunId: null,
+      awaitingServiceSince: null,
     };
   }
   const lapsedAt = new Date(Math.max(...lapseCandidates.map((d) => d.getTime())));
@@ -1041,6 +1084,7 @@ function monitorGatingBreakdown(
       gatedIsUpperBound: false,
       firedAt: null,
       successorRunId: null,
+      awaitingServiceSince: null,
     };
   }
 
@@ -1059,6 +1103,25 @@ function monitorGatingBreakdown(
     : null;
 
   const gatedMs = Math.min(elapsedMs, lapsedAt.getTime() - activeStartedAt.getTime());
+  // BLO-27698 A4: a monitor whose scheduled check has only just passed has not
+  // "lapsed" — it is waiting on the dispatcher, inside the same
+  // `monitorLapseServiceGraceMs` window `deliberatePendingMonitor` already
+  // honours for suppression. Reporting that as "never re-armed" tells a manager
+  // nobody is watching when dispatch is merely still due, so suppression and
+  // reporting disagree about what lapsed means.
+  //
+  // Deliberately a separate display-only field rather than routing this case
+  // into the still-armed branch above, which is what a literal reading of the AC
+  // would do: that branch reports `gatedIsUpperBound: true`, and the BLO-22331
+  // AC2 guard below only subtracts the *measured* unattended component
+  // (`!gatedIsUpperBound`). Flipping this case into it would skip that guard
+  // entirely and fire the very `long_active_duration` review the current code
+  // correctly suppresses. Bucket math and `gatedIsUpperBound` are untouched here
+  // on purpose.
+  const awaitingServiceSince =
+    armedUntil !== null && now.getTime() - lapsedAt.getTime() <= thresholds.monitorLapseServiceGraceMs
+      ? lapsedAt
+      : null;
   return {
     gatedMs,
     unattendedMs: Math.max(0, elapsedMs - gatedMs),
@@ -1068,6 +1131,7 @@ function monitorGatingBreakdown(
     gatedIsUpperBound: false,
     firedAt: armedUntil === null ? lapsedAt : null,
     successorRunId,
+    awaitingServiceSince,
   };
 }
 
@@ -1087,11 +1151,46 @@ function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["mon
     const successor = gating.successorRunId ? ` (run \`${gating.successorRunId}\`)` : "";
     return `${split} (monitor fired on schedule at ${gating.firedAt.toISOString()} and enqueued a successor run${successor}; nothing has re-armed it since)`;
   }
+  if (gating.awaitingServiceSince) {
+    return `${split} (monitor came due at ${gating.awaitingServiceSince.toISOString()} and is still inside the dispatch service grace, so its wake has not been missed yet)`;
+  }
   if (gating.lapsedAt) return `${split} (monitor lapsed at ${gating.lapsedAt.toISOString()}, never re-armed)`;
   if (gating.priorLapseAt) {
     return `${split} (no monitor armed during this episode; previous monitor lapsed at ${gating.priorLapseAt.toISOString()}, before it began)`;
   }
   return `${split} (no monitor armed during this episode)`;
+}
+
+// BLO-22887 AC2: the dependency-blocked bucket, rendered next to the elapsed
+// split rather than subtracted from it. Reports blocker state and says so —
+// see `DependencyGating` for why there is no honest span to report here, and
+// why claiming one would be worse than the bug this replaces.
+function formatDependencyGating(
+  gating: NonNullable<ProductivityReviewEvidence["dependencyGating"]>,
+  // Whether the `Elapsed accounting` split is rendered above this line. It is
+  // conditional on `monitorGating`, which is null whenever `elapsedMs` is —
+  // i.e. for every `todo` candidate, the most ordinary dependency-blocked
+  // shape there is — so the caveat below must not point at a figure that is
+  // not on the page (Ally review, PR #1722).
+  elapsedSplitRendered: boolean,
+) {
+  const blockers = `${gating.unresolvedBlockerCount} unresolved \`blockedBy\` ${
+    gating.unresolvedBlockerCount === 1 ? "blocker" : "blockers"
+  } at this evidence pass`;
+  const finalize = gating.pendingFinalizeBlockerCount > 0
+    ? ` (${gating.pendingFinalizeBlockerCount} \`done\` but awaiting workspace finalize)`
+    : "";
+  // Explains the line's own presence. Without it the line reads as a
+  // contradiction of BLO-22436's suppression — "blocked, so why am I looking
+  // at this?" — which is the question that makes a reviewer close a real
+  // high-churn or runtime-failure review as a false positive.
+  const survived = gating.nonClosableTriggers.length > 0
+    ? `; reviewed anyway because ${gating.nonClosableTriggers.map((trigger) => `\`${trigger}\``).join(", ")} fired, which an unresolved blocker does not excuse`
+    : "";
+  const caveat = elapsedSplitRendered
+    ? "the elapsed figures above are wall-clock and are NOT reduced by this, so read their unattended portion as covering dependency-blocked time of unrecorded length"
+    : "no elapsed split was computed for this episode, so there is no wall-clock figure this reduces";
+  return `${blockers}${finalize}${survived} — blocker state at this pass, not a measured span: ${caveat}`;
 }
 
 function isFreshPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEvidence {
@@ -2708,8 +2807,58 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           notInArray(issues.status, ["done", "cancelled"]),
         ),
       )
-      .orderBy(asc(issues.updatedAt), asc(issues.id))
+      // BLO-33477: rotate on the same least-recently-scanned watermark the
+      // source candidate scan uses (BLO-30303), for the same reason. This loop
+      // writes only to a review it *retires*; a review that is scanned and
+      // correctly declined — its alarm still stands — has nothing written back,
+      // so its `updatedAt` never advances. Under `asc(updatedAt)` the same
+      // oldest-MAX_CANDIDATE_ISSUES declined rows therefore re-occupied the
+      // window on every pass forever, and once the open-review population
+      // passed the cap no review sorting behind them could ever be evaluated
+      // for retirement. Those are exactly the reviews whose sources have since
+      // gone `done` — dead alarms, each costing a manager run to triage by hand.
+      //
+      // Sharing `productivityScannedAt` with the source scan is safe: that scan
+      // filters `originKind <> PRODUCTIVITY_REVIEW_ORIGIN_KIND` and this one
+      // requires equality, so the two stamp strictly disjoint row sets and
+      // neither can perturb the other's ordering.
+      // `recoverStaleReservedProductivityReviews` reads a subset of these rows
+      // but orders on `updatedAt` and never reads this column, so it is
+      // unaffected either way (see the note on its own query).
+      //
+      // Coalesce to `createdAt` rather than sorting NULLS FIRST, for the reason
+      // given at the source scan: NULLS FIRST is an absolute priority class, so
+      // a sustained influx of new reviews would permanently preempt an
+      // already-scanned one — the same starvation with a different victim.
+      // Treating "created" as the implicit first touch makes the key a strict
+      // FIFO, so every open review is reached within
+      // ceil(N / MAX_CANDIDATE_ISSUES) passes at any population and arrival
+      // rate. `updatedAt`/`id` only break ties within one watermark value; a
+      // whole batch shares one `now`, so ties are common and must be stable.
+      .orderBy(
+        sql`coalesce(${issues.productivityScannedAt}, ${issues.createdAt}) asc`,
+        asc(issues.updatedAt),
+        asc(issues.id),
+      )
       .limit(MAX_CANDIDATE_ISSUES);
+
+    // Stamp before evaluating, not after: a review that throws mid-loop has
+    // already rotated out, so one poison row cannot wedge the window forever.
+    // A bare column write — it leaves `updatedAt` alone, so the
+    // `issues_sync_last_activity_at` BEFORE UPDATE trigger (which fires only
+    // when `updated_at` is distinct from OLD) stays quiet and the watermark
+    // cannot masquerade as activity on the review.
+    if (reviewRows.length > 0) {
+      await db
+        .update(issues)
+        .set({ productivityScannedAt: now })
+        .where(
+          inArray(
+            issues.id,
+            reviewRows.map((review) => review.id),
+          ),
+        );
+    }
 
     const sourceIssueIds = [
       ...new Set(reviewRows.map((review) => review.originId).filter((id): id is string => Boolean(id))),
@@ -2904,10 +3053,21 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       else if (suppressedBy === "dependency_blocked") closedDependencyBlocked += 1;
       else closedMonitorScheduled += 1;
     }
+    const retiredCount = closedMonitorScheduled + closedTerminalSource + closedDependencyBlocked;
     return {
       monitorScheduled: closedMonitorScheduled,
       terminalSource: closedTerminalSource,
       dependencyBlocked: closedDependencyBlocked,
+      // BLO-33477 AC4: funnel counters for the retirement pass. A sweep that
+      // scans a full window and retires nothing is exactly what starvation
+      // looks like, and without `scanned` it is indistinguishable from a
+      // healthy sweep with nothing to do — the same blind spot that let
+      // BLO-30303 read as normal for 23 days. `declined` is "scanned but not
+      // retired", which folds in the early `continue`s (no origin, missing or
+      // cross-company source, lost close race) as well as a standing alarm.
+      scanned: reviewRows.length,
+      retired: retiredCount,
+      declined: reviewRows.length - retiredCount,
     };
   }
 
@@ -3586,10 +3746,31 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       };
     }
 
+    // BLO-27698 A1: a fresh, progress-eligible linked PR is a concrete progress
+    // signal, so `long_active_duration` must not fire over it. A GitHub-side push
+    // is invisible to every Paperclip-side recency measure this detector reads
+    // (issue comments, run cadence), so an assignee actively pushing commits
+    // produced an evidence pack indistinguishable from an idle issue — BLO-27207
+    // fired with the PR 6h13m old and the last comment only 7m outside the
+    // window. `isProgressPullRequest` already gated the render-side "second
+    // signal is already present" line; this is the caller it never had in the
+    // generation path, so the suppression and the report now agree on what
+    // counts as progress.
+    //
+    // Bounded by construction, per BLO-22331 AC2: progress-eligibility requires
+    // `ageMs <= PRODUCTIVITY_REVIEW_PR_FRESH_MS` (24h), so a PR that stops moving
+    // ages out and the trigger fires again — this cannot suppress indefinitely.
+    // Returns null rather than a recorded suppression for the same reason the
+    // gated-elapsed check below does: `long_active_duration` is last in
+    // `choosePrimaryTrigger`'s ladder, so no other fired trigger is discarded.
+    if (trigger === "long_active_duration" && isProgressPullRequest(latestPullRequest)) {
+      return null;
+    }
+
     // BLO-25877: computed once here — after both suppression gates above have had
     // their chance to hold this review back — and reused as-is for the report-text
     // field further down, rather than recomputed there.
-    const monitorGating = monitorGatingBreakdown(sourceIssue, attributableStartAt, elapsedMs, now, latestRuns);
+    const monitorGating = monitorGatingBreakdown(sourceIssue, attributableStartAt, elapsedMs, now, latestRuns, thresholds);
     // Neither suppression gate above catches every "monitor accounted for most of
     // this episode" case: `currentPendingMonitorForReviewSuppression` only covers a
     // monitor that is still armed or within its lapse grace, not one that lapsed a
@@ -3668,6 +3849,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       nonLiveHoldMs,
       monitorGating,
       noExecutableTurnGating,
+      // BLO-22887 AC2: always null here. Dependency readiness is not fetched on
+      // this path (see the header note); `reconcileProductivityReviews` fills
+      // this in from the map it already holds, and the continuation-hold
+      // caller leaves it null because it renders no body.
+      dependencyGating: null,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -3831,6 +4017,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ...(evidence.noExecutableTurnGating
         ? [`- No-executable-turn accounting: ${formatNoExecutableTurnGating(evidence.noExecutableTurnGating)}`]
         : []),
+      ...(evidence.dependencyGating
+        ? [`- Dependency accounting: ${formatDependencyGating(evidence.dependencyGating, evidence.monitorGating !== null)}`]
+        : []),
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
@@ -3935,6 +4124,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         : []),
       ...(evidence.noExecutableTurnGating
         ? [`- No-executable-turn accounting: ${formatNoExecutableTurnGating(evidence.noExecutableTurnGating)}`]
+        : []),
+      ...(evidence.dependencyGating
+        ? [`- Dependency accounting: ${formatDependencyGating(evidence.dependencyGating, evidence.monitorGating !== null)}`]
         : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
       `- Linked pull request: ${formatPullRequestEvidence(evidence.latestPullRequest)}`,
@@ -4361,6 +4553,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     now: Date;
     companyId?: string;
   }) {
+    // BLO-33477 AC3: this scan orders by `asc(updatedAt)` rather than the
+    // `productivityScannedAt` watermark the source scan (BLO-30303) and the
+    // retirement scan above use — it cannot share that column, because
+    // `closeOpenSuppressedReviews` stamps a superset of these rows and would
+    // drive the ordering. It is starvation-free anyway: every path out of the
+    // loop below takes the row *out* of this window, including the failure
+    // path, which backs the row off for a full stale interval (see the catch).
+    //
+    //   - retired        -> status `done`, drops out of `notInArray(status, ...)`
+    //   - finalized      -> gains identifier/issueNumber, drops out of `isNull(...)`
+    //   - retire raced   -> `existing`; transient, the row changed under us
+    //   - finalize threw -> `failed`, and the catch sets `updatedAt = now`, so
+    //                       the row fails `updatedAt < staleCutoff` on the next
+    //                       pass and cannot hold a slot at all
     const staleCutoff = new Date(input.now.getTime() - PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS);
     const reservedReviews = await db
       .select()
@@ -4518,6 +4724,34 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       } catch (err) {
         result.failed += 1;
         result.failedIssueIds.push(sourceIssue.id);
+        // BLO-33477 AC3: back the row off for a full stale interval so a
+        // deterministically-failing finalize cannot re-select on the next pass
+        // and starve the reservations behind it. `input.now`, not `staleCutoff`
+        // — clamping to the cutoff also bounds starvation (the cohort's key
+        // tracks the eligibility frontier, so any fixed-key row overtakes it
+        // within two eligible passes) but keeps 250 poison rows re-filling the
+        // window forever; `now` drops them out of `updatedAt < staleCutoff`
+        // entirely until stale again, which is the property worth asserting.
+        // Costs a failed finalize one stale interval before retry, which this
+        // janitor path (rows are already >= 5min stale) can afford.
+        //
+        // Guarded to rows still reserved: if finalize threw *after* assigning
+        // identifier/issueNumber the row has already left this window. This
+        // advances `lastActivityAt` too, via the migration-0076 BEFORE UPDATE
+        // trigger — intended, the row was genuinely touched.
+        await db
+          .update(issues)
+          .set({ updatedAt: input.now })
+          .where(
+            and(
+              eq(issues.companyId, review.companyId),
+              eq(issues.id, review.id),
+              eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+              isNull(issues.issueNumber),
+              isNull(issues.identifier),
+              notInArray(issues.status, ["done", "cancelled"]),
+            ),
+          );
         logger.warn(
           {
             err,
@@ -4667,6 +4901,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       closedSuppressedMonitorReviews: 0,
       closedTerminalSourceReviews: 0,
       closedDependencyBlockedReviews: 0,
+      // BLO-33477 AC4: the retirement pass's own funnel. Kept separate from the
+      // `closed*` counters above because those are outcome tallies and one of
+      // them (`closedTerminalSourceReviews`) is also credited by the stale
+      // reservation recovery below — so neither it nor their sum isolates what
+      // this sweep actually did.
+      retirementScanned: 0,
+      retirementRetired: 0,
+      retirementDeclined: 0,
       creationCapped: 0,
       noActionSuppressed: 0,
       skipped: 0,
@@ -4680,6 +4922,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     result.closedSuppressedMonitorReviews = closedSuppressed.monitorScheduled;
     result.closedTerminalSourceReviews = closedSuppressed.terminalSource;
     result.closedDependencyBlockedReviews = closedSuppressed.dependencyBlocked;
+    result.retirementScanned = closedSuppressed.scanned;
+    result.retirementRetired = closedSuppressed.retired;
+    result.retirementDeclined = closedSuppressed.declined;
 
     const recoveredReservations = await recoverStaleReservedProductivityReviews({
       now,
@@ -4789,7 +5034,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // (below) rather than filtering the candidate up front, since the trigger
     // is what determines whether the blocker is dispositive and evidence is
     // already collected for every other candidate that reaches this point.
-    const dependencyBlockedSourceIssueIds = new Set<string>();
+    const dependencyBlockedSourceIssueIds = new Map<
+      string,
+      { unresolvedBlockerCount: number; pendingFinalizeBlockerCount: number }
+    >();
     const candidateIdsByCompany = new Map<string, string[]>();
     for (const candidate of candidates) {
       const forCompany = candidateIdsByCompany.get(candidate.companyId) ?? [];
@@ -4799,8 +5047,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     for (const [candidateCompanyId, candidateIds] of candidateIdsByCompany) {
       const readiness = await issuesSvc.listDependencyReadiness(candidateCompanyId, candidateIds, db);
       for (const candidateId of candidateIds) {
-        if ((readiness.get(candidateId)?.unresolvedBlockerCount ?? 0) > 0) {
-          dependencyBlockedSourceIssueIds.add(candidateId);
+        const candidateReadiness = readiness.get(candidateId);
+        const unresolvedBlockerCount = candidateReadiness?.unresolvedBlockerCount ?? 0;
+        if (unresolvedBlockerCount > 0) {
+          // BLO-22887 AC2: the membership test below is unchanged (`.has`), but
+          // the counts ride along so the reported bucket costs no second
+          // readiness round-trip. Deliberately NOT the blocker ids: rendering
+          // raw uuids in a review body is noise, and the source issue's own
+          // `blockedBy` is one click away for a reviewer who needs them.
+          dependencyBlockedSourceIssueIds.set(candidateId, {
+            unresolvedBlockerCount,
+            pendingFinalizeBlockerCount: candidateReadiness?.pendingFinalizeBlockerIssueIds.length ?? 0,
+          });
         }
       }
     }
@@ -4849,6 +5107,21 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         await recordMonitorScheduledSuppression(evidence);
         result.monitorScheduledSuppressed += 1;
         continue;
+      }
+      // BLO-22887 AC2: attach the dependency bucket for the survivors of the
+      // gate above. Placed here rather than beside that gate only because this
+      // is where the union has narrowed to `ProductivityReviewEvidence` — the
+      // two suppression branches carry no body to render. Reaching this line
+      // while blocked means the fired set was NOT all-closable, so
+      // `nonClosableTriggers` is non-empty by construction.
+      const dependencyBlockers = dependencyBlockedSourceIssueIds.get(candidate.id);
+      if (dependencyBlockers) {
+        evidence.dependencyGating = {
+          ...dependencyBlockers,
+          nonClosableTriggers: evidence.firedTriggers.filter(
+            (trigger) => !isDependencyBlockedClosableTrigger(trigger),
+          ),
+        };
       }
       if (await findRecentResolvedProductivityReview(candidate.companyId, candidate.id, thresholds, now)) {
         result.snoozed += 1;

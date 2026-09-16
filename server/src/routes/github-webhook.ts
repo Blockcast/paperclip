@@ -75,6 +75,10 @@ import {
   selectForeignCommits,
 } from "../services/foreign-commit-notice.js";
 import {
+  allyReviewAlreadyAttestsHead,
+  type ListPrReviewsForAttestation,
+} from "../services/pr-review-head-attestation.js";
+import {
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
 } from "../services/ally-review-detection.js";
@@ -173,6 +177,12 @@ export interface GithubWebhookConfig {
    * uses the GitHub App lookup; route tests can provide a deterministic seam.
    */
   resolvePrReviewHeadSha?: typeof githubFetchPrHeadSha;
+  /**
+   * Optional seam for the head-attestation idempotency check (BLO-32198).
+   * Production lists reviews through the GitHub App; route tests supply a
+   * deterministic list so the suppression path is verified without network.
+   */
+  listPrReviewsForAttestation?: ListPrReviewsForAttestation;
   /**
    * Optional seam for the comment-review status gate. Production uses the
    * service implementation; route tests supply a local recorder so webhook
@@ -976,14 +986,17 @@ function resolveEventContextRaw(
       commentId: number | null;
       commentAuthorLogin: string | null;
       commentUrl: string | null;
-      // BLO-21618: two distinct drops share this callback. "missing_marker" is
+      // BLO-21618: three distinct drops share this callback. "missing_marker" is
       // the original BLO-18273 case (bare alias, no marker at all).
       // "marker_disqualified_by_heading" is a marker-bearing agent request
       // whose body ALSO happens to contain a standalone Ally-consolidated-
       // review-heading line (see hasAllyConsolidatedReviewHeading) — the same
       // exclusion that correctly silences Ally's own review echoes also
       // silences this genuine request, and until now did so with zero trace.
-      reason: "missing_marker" | "marker_disqualified_by_heading";
+      // BLO-33589: "missing_mention" is a marker-bearing agent request that
+      // never names the reviewer, so `reviewerRequest` fails on the mention
+      // conjunct rather than on the marker one.
+      reason: "missing_marker" | "marker_disqualified_by_heading" | "missing_mention";
     }) => void;
     // BLO-23059: invoked when a pull_request_review.submitted delivery was
     // dropped as a Claude Code Review service notice. Separate from
@@ -1205,6 +1218,54 @@ function resolveEventContextRaw(
         hasPrReviewerAgentRequestMarker(commentBody) &&
         hasAllyConsolidatedReviewHeading(commentBody) &&
         hasPrReviewerRequestMention(commentBody);
+      // BLO-33589: the THIRD invisible drop, and the last one. `reviewerRequest`
+      // is a conjunction of the marker path AND the mention; the two reports
+      // above both only ever fire on a body that HAS the mention, so a
+      // marker-prefixed agent request that simply never names the reviewer fell
+      // out of here as silent `null`. Measured on Blockcast/libmmt 2026-09-11..12:
+      // 4 such comments across #436/#442/#444, and on #444 they were the only
+      // surviving wake path because the automatic `opened` wake had already been
+      // lost, so the PR sat 10h06m with zero reviews.
+      //
+      // Cannot reclassify either existing report: `hasPrReviewerBareAliasMention`
+      // is a strict subset of `hasPrReviewerRequestMention` (bare `@ally` matches
+      // both patterns), so `!hasPrReviewerRequestMention` excludes the
+      // missing_marker branch, and `markerRequestDisqualifiedByHeading` requires
+      // the mention outright. Not gated on the heading: Ally's own output is
+      // never marker-prefixed (the marker must be the literal first byte), so
+      // this cannot fire on a self-echo whether or not a heading is present —
+      // and a marker+heading body with no mention is blocked by the missing
+      // mention first, which is the actionable half.
+      const markerRequestMissingMention =
+        commentAuthorIsReviewerBot &&
+        hasPrReviewerAgentRequestMarker(commentBody) &&
+        !hasPrReviewerRequestMention(commentBody);
+      // Exhaustive over bot-authored bodies that do NOT wake the reviewer, by
+      // (marker, mention, heading):
+      //   marker=0, mention=1            -> missing_marker (BLO-18273)
+      //   marker=1, mention=1, heading=1 -> marker_disqualified_by_heading (BLO-21618)
+      //   marker=1, mention=0            -> missing_mention (BLO-33589)
+      //   marker=0, mention=0            -> INTENTIONALLY UNLOGGED. Addresses
+      //     nobody and carries no marker: an ordinary PR comment, not a dropped
+      //     request. Reporting it would log every bot comment in the repo.
+      //   marker=0, mention=1 via the LONG login only (`@allyblockcast[bot]`,
+      //     not bare `@ally`) -> INTENTIONALLY UNLOGGED. That is the
+      //     commitperclip template gate greeting the bot account; suppressing it
+      //     is the fix for the #583 loop, not a lost handoff. See
+      //     PR_REVIEWER_BARE_ALIAS_MENTION_PATTERN.
+      // (marker=1, mention=1, heading=0 is the waking path and reaches neither
+      // report, by construction.)
+      //
+      // Scope note, measured 2026-09-13: the BLO-33589 sweep reported 4
+      // marker-without-mention comments on Blockcast/libmmt in the window. Three
+      // are bot-authored (#442 once, #444 twice) and are what the new branch
+      // covers. The fourth, on #436 at 2026-09-11T03:21:04Z, was authored by the
+      // HUMAN `kkroo`. A human's marker-only body is dropped for the same reason
+      // (the mention is the missing conjunct) but was never in the author-guard
+      // suppression class this callback reports on — every reason here is
+      // prefixed `reviewer_bot_authored_`. Left uncovered deliberately rather
+      // than by oversight; widening the callback to non-bot authors is a
+      // separate decision with a different blast radius.
       if (!reviewerRequest && !reviewFeedback) {
         if (
           commentAuthorIsReviewerBot &&
@@ -1227,6 +1288,15 @@ function resolveEventContextRaw(
             commentAuthorLogin,
             commentUrl: readStringField(comment, "html_url"),
             reason: "marker_disqualified_by_heading",
+          });
+        } else if (markerRequestMissingMention) {
+          options.onSuppressedReviewRequest?.({
+            repoFullName,
+            prNumber: (issue.number as number | undefined) ?? null,
+            commentId: (comment?.id as number | undefined) ?? null,
+            commentAuthorLogin,
+            commentUrl: readStringField(comment, "html_url"),
+            reason: "missing_mention",
           });
         }
       }
@@ -3234,6 +3304,90 @@ export async function reconcileContendedPrReviewerWakes(
       result.superseded += 1;
       continue;
     }
+    // BLO-32198: re-check attestation before replaying. The route-level gate
+    // ran when this row was written and correctly let the wake through — no
+    // review existed yet. But this row is replayed here, NOT through the route,
+    // so nothing re-evaluates that. A wake deferred for reviewer-unavailability
+    // waits up to PR_REVIEWER_UNAVAILABLE_MAX_WAIT_MS, and in that window
+    // another delivery's run can post a review at this same head; replaying
+    // then produces exactly the duplicate the route gate exists to prevent, in
+    // exactly the multi-hour shape that motivated it. Deferral for
+    // unavailability is also the single likeliest way to open a gap that wide,
+    // so the deferred path needs the check more than the live one does.
+    //
+    // Retired as `superseded` rather than `recovered`: the work this row
+    // represents has been done, by whichever delivery won. That is the same
+    // meaning the `duplicate` outcome already carries below. Checked before the
+    // attempt counter and the `retried` metric, because this is not an attempt
+    // that happened — counting it would overstate retries and hide the
+    // supersession.
+    //
+    // Ask about the LIVE head, not the one frozen into the row. `context.headSha`
+    // was resolved when the webhook arrived, and this replay can run up to
+    // PR_REVIEWER_UNAVAILABLE_MAX_WAIT_MS later; `taskKey` is PR-scoped, so the
+    // wake it replays reviews whatever the head is now, regardless of which head
+    // it was queued for. Comparing against the frozen head would answer "is the
+    // OLD head attested?" — and when the PR moved and was already reviewed at
+    // its new head, that answer is `not_attested`, the replay proceeds, and the
+    // reviewer posts the very multi-hour duplicate this block exists to stop.
+    // One extra API call on a path that is already rare and already making one.
+    // If the head cannot be re-resolved, fall back to the frozen head so the
+    // check degrades to the old behaviour rather than being skipped.
+    if (replay.context.repoFullName) {
+      let liveHeadSha: string | null = null;
+      try {
+        liveHeadSha = await (config.resolvePrReviewHeadSha ?? githubFetchPrHeadSha)({
+          repoFullName: replay.context.repoFullName,
+          prNumber: replay.context.prNumber,
+        });
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            taskKey: replay.taskKey,
+            deliveryId: replay.deliveryId,
+            repoFullName: replay.context.repoFullName,
+            prNumber: replay.context.prNumber,
+            recordedHeadSha: replay.context.headSha ?? null,
+          },
+          "contended PR-reviewer replay could not re-resolve the live PR head; checking attestation against the head recorded at webhook time (BLO-32198)",
+        );
+      }
+      const attestHeadSha = liveHeadSha ?? replay.context.headSha ?? null;
+      const replayAttestation = attestHeadSha
+        ? await allyReviewAlreadyAttestsHead({
+          repoFullName: replay.context.repoFullName,
+          prNumber: replay.context.prNumber,
+          headSha: attestHeadSha,
+          botLogin: config.prReviewerBotLogin,
+          ...(config.listPrReviewsForAttestation
+            ? { listPrReviews: config.listPrReviewsForAttestation }
+            : {}),
+        })
+        : null;
+      if (replayAttestation?.outcome === "attested") {
+        await retireContendedRow(
+          db,
+          row.id,
+          PR_REVIEWER_CONTENDED_SUPERSEDED_STATUS,
+          "head already attested by an operative Ally review",
+        );
+        result.superseded += 1;
+        logger.info(
+          {
+            taskKey: replay.taskKey,
+            deliveryId: replay.deliveryId,
+            repoFullName: replay.context.repoFullName,
+            prNumber: replay.context.prNumber,
+            headSha: attestHeadSha,
+            recordedHeadSha: replay.context.headSha ?? null,
+            attestingReviewCount: replayAttestation.attestingReviewCount,
+          },
+          "contended PR-reviewer wake superseded: this head was reviewed while the retry was deferred (BLO-32198)",
+        );
+        continue;
+      }
+    }
     const attempts = replay.attempts + 1;
     // Counted up-front so a pass that throws somewhere unexpected still shows
     // as an attempt rather than looking like it never ran.
@@ -4068,21 +4222,45 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
 
     let context = resolveEventContext(eventName, payload, {
       prReviewerBotLogin: config.prReviewerBotLogin,
-      // BLO-18273/BLO-21618: surface both silent drops in this handler — an
-      // agent request missing the marker, and a marker-bearing agent request
-      // disqualified by an incidental heading match (see the two reasons on
-      // `onSuppressedReviewRequest`). Neither produces a wake or an error
-      // otherwise; this callback is the only trace either ever leaves.
+      // BLO-18273/BLO-21618/BLO-33589: surface all three silent drops in this
+      // handler — an agent request missing the marker, a marker-bearing request
+      // disqualified by an incidental heading match, and a marker-bearing
+      // request that never names the reviewer (see the three reasons on
+      // `onSuppressedReviewRequest`). None produces a wake or an error
+      // otherwise; this callback is the only trace any of them ever leaves.
       onSuppressedReviewRequest: (info) => {
-        const message =
-          info.reason === "marker_disqualified_by_heading"
-            ? "github webhook reviewer wake skipped: @ally request carries a valid start-of-body " +
+        // Keyed by reason rather than chained ternaries on purpose: a future
+        // fourth reason then fails to typecheck here instead of silently
+        // inheriting the missing_marker text and counter, which is exactly how
+        // BLO-33589's drop stayed invisible.
+        const report: Record<
+          typeof info.reason,
+          { suppressionReason: string; message: string }
+        > = {
+          marker_disqualified_by_heading: {
+            suppressionReason: "reviewer_bot_authored_request_disqualified_by_heading",
+            message:
+              "github webhook reviewer wake skipped: @ally request carries a valid start-of-body " +
               "<!-- paperclip:review-request --> marker, but its body also contains a standalone Ally " +
               "consolidated-review heading, so the self-echo guard (BLO-15799/BLO-18865) treated it as the " +
-              "reviewer's own output (BLO-21618); no review was requested"
-            : "github webhook reviewer wake skipped: @ally request authored by the reviewer bot login carries no " +
+              "reviewer's own output (BLO-21618); no review was requested",
+          },
+          missing_marker: {
+            suppressionReason: "reviewer_bot_authored_request_missing_marker",
+            message:
+              "github webhook reviewer wake skipped: @ally request authored by the reviewer bot login carries no " +
               "start-of-body <!-- paperclip:review-request --> marker, so it is indistinguishable from the " +
-              "reviewer's own output (BLO-18865/BLO-18273); no review was requested";
+              "reviewer's own output (BLO-18865/BLO-18273); no review was requested",
+          },
+          missing_mention: {
+            suppressionReason: "reviewer_bot_authored_request_missing_mention",
+            message:
+              "github webhook reviewer wake skipped: request carries a valid start-of-body " +
+              "<!-- paperclip:review-request --> marker but never mentions the reviewer, and the marker alone " +
+              "does not request a review (BLO-33589); no review was requested",
+          },
+        };
+        const { suppressionReason, message } = report[info.reason];
         logger.warn(
           {
             event: eventName,
@@ -4092,10 +4270,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             commentId: info.commentId,
             commentAuthorLogin: info.commentAuthorLogin,
             commentUrl: info.commentUrl,
-            suppressionReason:
-              info.reason === "marker_disqualified_by_heading"
-                ? "reviewer_bot_authored_request_disqualified_by_heading"
-                : "reviewer_bot_authored_request_missing_marker",
+            suppressionReason,
           },
           message,
         );
@@ -4419,6 +4594,85 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           "github webhook reviewer wake skipped: self-echo of the reviewer's own posted review",
         );
         return false;
+      }
+      // BLO-32198: don't wake the reviewer for a head it has already reviewed.
+      //
+      // Until this check existed the only thing enforcing "at most one
+      // operative Ally App review per (PR, head)" — invariant I1 of
+      // scripts/check-ally-review-consistency.mjs — was a prose instruction to
+      // the agent (.planning/ally-agent/AGENTS.md "Step 2"), which is not the
+      // agent's live instruction source and so was advisory. Four open PRs were
+      // measured carrying duplicate operative reviews at one head, with gaps
+      // from 53 s to 6h35m; a spread that wide is a step being skipped, not a
+      // delivery race, and the delivery/comment-scoped idempotency keys above
+      // cannot catch it because two DIFFERENT wake sources at one head
+      // legitimately produce two different keys.
+      //
+      // This suppresses unconditionally across wake reasons, matching what the
+      // agent instructions already state ("there is no wake reason that exempts
+      // it ... if a re-review is genuinely wanted, the PR needs a new commit").
+      // The asymmetry that justifies including the explicit-request reason: a
+      // duplicate COMMENTED review can never be retracted — GitHub's dismiss
+      // endpoint rejects COMMENTED (422) and there is no delete-review API — so
+      // the violation is permanent, whereas a re-review someone still wants is
+      // one commit away. On `github_pr_synchronized` the head is new by
+      // definition, so this costs one API call and always falls through.
+      //
+      // Fail-open by construction: only an `attested` outcome suppresses. An
+      // unreachable GitHub, an unparseable body, or a missing head all yield
+      // `unknown` and let the wake proceed, because an unreviewed PR is a worse
+      // failure than a redundant review and nothing else retries this.
+      //
+      // One asymmetry to know about. On `github_pr_review_submitted`,
+      // `context.headSha` is `review.commit_id ?? head.sha` (see
+      // resolveEventContext), i.e. the commit the INCOMING review was left
+      // against — which for a review on an outdated diff is not the live head.
+      // So this can answer "already attested" about a superseded head and skip
+      // the counter-review pass for the current one. The attesting side of the
+      // comparison deliberately never reads `commit_id`; this is the querying
+      // side, and the value arrives that way from GitHub's own payload.
+      // Deliberately not "fixed" by re-resolving the live head here: that
+      // would spend an extra API call on every wake to change behaviour only
+      // for reviews left on stale diffs, and the failure is a missed
+      // counter-review — recoverable by a push or a fresh request — not a
+      // permanent duplicate.
+      if (context.headSha && context.repoFullName) {
+        const attestation = await allyReviewAlreadyAttestsHead({
+          repoFullName: context.repoFullName,
+          prNumber: context.prNumber,
+          headSha: context.headSha,
+          botLogin: config.prReviewerBotLogin,
+          ...(config.listPrReviewsForAttestation
+            ? { listPrReviews: config.listPrReviewsForAttestation }
+            : {}),
+        });
+        if (attestation.outcome === "attested") {
+          logger.info(
+            {
+              deliveryId,
+              repoFullName: context.repoFullName,
+              prNumber: context.prNumber,
+              wakeReason: context.wakeReason,
+              headSha: context.headSha,
+              attestingReviewCount: attestation.attestingReviewCount,
+            },
+            "github webhook reviewer wake skipped: this head is already attested by an operative Ally review",
+          );
+          return false;
+        }
+        if (attestation.outcome === "unknown") {
+          logger.warn(
+            {
+              deliveryId,
+              repoFullName: context.repoFullName,
+              prNumber: context.prNumber,
+              wakeReason: context.wakeReason,
+              headSha: context.headSha,
+              reason: attestation.reason,
+            },
+            "github webhook could not establish whether this head was already reviewed; dispatching the reviewer wake anyway",
+          );
+        }
       }
       try {
         const outcome = await attemptPrReviewerWake({

@@ -9,6 +9,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  executionWorkspaces,
   heartbeatRuns,
   issueApprovals,
   issueComments,
@@ -17,6 +18,8 @@ import {
   issues,
   plugins,
   pluginState,
+  projects,
+  workspaceOperations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -194,6 +197,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     issuePrefix: string;
     blockedIssueId: string;
     blockerStatus?: "todo" | "done";
+    executionWorkspaceId?: string;
   }) {
     const blockerId = randomUUID();
     const createdAt = new Date("2026-04-28T09:00:00.000Z");
@@ -204,6 +208,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       status: input.blockerStatus ?? "todo",
       priority: "medium",
       originKind: "manual",
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
       issueNumber: 900,
       identifier: `${input.issuePrefix}-900`,
       createdAt,
@@ -469,8 +474,9 @@ describeEmbeddedPostgres("productivity review service", () => {
       metadata?: Record<string, unknown> | null;
       url?: string | null;
       createdByRunId?: string | null;
+      issue?: Parameters<typeof seedAssignedIssue>[0];
     }) {
-      const seeded = await seedAssignedIssue();
+      const seeded = await seedAssignedIssue(opts.issue);
       await db.insert(issueWorkProducts).values({
         companyId: seeded.companyId,
         issueId: seeded.issueId,
@@ -809,6 +815,82 @@ describeEmbeddedPostgres("productivity review service", () => {
 
       const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
       expect(description).toContain("Linked pull request: none recorded");
+    });
+
+    // BLO-27698 A1. Until now `isProgressPullRequest` had exactly one caller, in
+    // `buildReviewMarkdown` — the evidence pack could say "the second signal is
+    // already present" on a review that should never have been generated. These
+    // assert NON-generation, which is what makes them new coverage over the
+    // rendering tests above.
+    describe("long-active suppression by a fresh progress PR (BLO-27698 A1)", () => {
+      // The BLO-27207 fixture: episode long past `longActiveMs`, PR pushed 6h13m
+      // ago (well inside the 24h bar), and no Paperclip-side comment recency to
+      // save it. This fired a false positive on master.
+      it("does not generate a long-active review while a fresh progress PR exists", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - (6 * 60 + 13) * 60 * 1000),
+          issue: {
+            status: "in_progress",
+            startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+          },
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(0);
+        expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+      });
+
+      // BLO-22331 AC2 boundedness guard: the suppression must lapse on its own.
+      // A PR that stopped moving 30h ago is outside PRODUCTIVITY_REVIEW_PR_FRESH_MS,
+      // so the trigger fires again rather than being held off indefinitely.
+      it("still fires once the PR ages past the freshness window", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+          issue: {
+            status: "in_progress",
+            startedAt: new Date(now.getTime() - 31 * 60 * 60 * 1000),
+          },
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      });
+
+      // Keys on progress-eligibility, not mere freshness: a PR the assignee
+      // closed without merging is not progress, however recently it moved. Proves
+      // the gate reads `isProgressPullRequest`, not `isFreshPullRequest`.
+      it("still fires for a fresh but closed-unmerged PR", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          status: "closed",
+          issue: {
+            status: "in_progress",
+            startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+          },
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      });
     });
   });
 
@@ -1511,6 +1593,228 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.dependencyBlockedSuppressed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `high_churn`");
+  });
+
+  // BLO-22887 AC2: the two cells above are the "still warranted on other
+  // grounds" case — BLO-22436 suppresses a dependency-blocked source whose
+  // fired set is entirely closable, so *every* blocked source that reaches the
+  // body builder is one a blocker does not excuse. Until now the body said
+  // nothing about the blocker at all, so a manager read `Elapsed accounting`'s
+  // unattended figure with no indication that the control plane independently
+  // classified the issue as dependency-blocked — the exact subsystem
+  // disagreement this issue was filed for. The line reports blocker STATE and
+  // says so: the readiness map carries no edge timestamps, so subtracting an
+  // unmeasured span from the wall-clock buckets would swap a known-wrong
+  // attribution for an invented one.
+  // The full rendered line, not the count prefix: the "reviewed anyway" clause
+  // and the caveat are the part a reviewer cannot get from the source issue,
+  // and a prefix match passes with both deleted (Ally review, PR #1722).
+  const DEPENDENCY_LINE_ONE_BLOCKER =
+    "- Dependency accounting: 1 unresolved `blockedBy` blocker at this evidence pass; reviewed anyway because `high_churn` fired, which an unresolved blocker does not excuse — blocker state at this pass, not a measured span: the elapsed figures above are wall-clock and are NOT reduced by this, so read their unattended portion as covering dependency-blocked time of unrecorded length";
+  // Runs dispatched 30m ago: `activeStartedAt` anchors on the latest run
+  // `startedAt`, and `insertRuns`'s default (`startedAt = createdAt = now`)
+  // reports a 0m episode, which pins nothing.
+  const dispatchedThirtyMinutesAgo = (now: Date) => new Date(now.getTime() - 30 * 60 * 1000);
+  const ELAPSED_LINE_30M_UNATTENDED =
+    "- Elapsed accounting: 0m monitor-gated, 30m unattended (no monitor armed during this episode)";
+
+  it("reports a dependency-blocked bucket alongside the elapsed split when a review still fires on a non-closable trigger (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+      startedAt: dispatchedThirtyMinutesAgo(now),
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(DEPENDENCY_LINE_ONE_BLOCKER);
+    // Reported next to the elapsed split, never folded into it: the unattended
+    // figure is the same 30m the resolved-blocker cell below reports with no
+    // dependency line at all.
+    expect(review?.description).toContain(ELAPSED_LINE_30M_UNATTENDED);
+  });
+
+  // BLO-22887 AC2 over-reporting guard, and the counterpart to BLO-22436's
+  // cell-3 regression guard: an accounting line that renders unconditionally
+  // would pass the cell above while telling every reviewer in the fleet that
+  // an unblocked issue is dependency-blocked. Keyed on *unresolved*, so a
+  // `done` blocker is a stronger control than no edge at all — the edge still
+  // exists, and readiness is what decides.
+  it("omits the dependency accounting line when the source issue's only blocker is resolved (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+      startedAt: dispatchedThirtyMinutesAgo(now),
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+      blockerStatus: "done",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+    expect(review?.description).not.toContain("Dependency accounting");
+    // Same seeding as the cell above minus the unresolved blocker, same
+    // elapsed split: the bucket is never subtracted from the wall-clock figures.
+    expect(review?.description).toContain(ELAPSED_LINE_30M_UNATTENDED);
+  });
+
+  // BLO-22887 AC2: a `done` blocker whose execution workspace has not finalized
+  // is still unresolved (`listDependencyReadiness`'s workspace-finalize
+  // barrier), and the line says which kind it is — the remedy differs (wait
+  // for sync-back vs. chase the blocker's assignee).
+  it("names the done-but-awaiting-finalize subset in the dependency accounting line (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+    });
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId: seeded.companyId, name: "Finalize barrier" });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId: seeded.companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Finalize barrier workspace",
+    });
+    const blockerId = await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+      blockerStatus: "done",
+      executionWorkspaceId,
+    });
+    // The blocker's latest op on its workspace is not a succeeded
+    // `workspace_finalize`, so readiness keeps it unresolved.
+    await db.insert(workspaceOperations).values({
+      companyId: seeded.companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "worktree_prepare",
+      status: "succeeded",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      "- Dependency accounting: 1 unresolved `blockedBy` blocker at this evidence pass (1 `done` but awaiting workspace finalize); reviewed anyway because `high_churn` fired, which an unresolved blocker does not excuse — blocker state at this pass, not a measured span: the elapsed figures above",
+    );
+  });
+
+  // Ally review (PR #1722): `Elapsed accounting` renders only when
+  // `monitorGating` was computed, which needs an `in_progress` source — so
+  // every `todo` candidate carries the dependency line with no elapsed split
+  // above it (and the refresh comment, which prints no unconditional elapsed
+  // figure, with nothing at all). The caveat has to say so rather than point
+  // at figures that are not on the page.
+  it("does not point the dependency caveat at an elapsed split that was never rendered (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "todo" });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("- Current active elapsed time: unknown");
+    expect(review?.description).not.toContain("Elapsed accounting");
+    expect(review?.description).toContain(
+      "- Dependency accounting: 1 unresolved `blockedBy` blocker at this evidence pass; reviewed anyway because `high_churn` fired, which an unresolved blocker does not excuse — blocker state at this pass, not a measured span: no elapsed split was computed for this episode, so there is no wall-clock figure this reduces",
+    );
+    expect(review?.description).not.toContain("elapsed figures above");
+  });
+
+  // BLO-22887 AC2: the refresh comment is what lands in the manager's
+  // notifications, and it already mirrors `Elapsed accounting` /
+  // `No-executable-turn accounting` for exactly that reason. A dependency
+  // bucket that appeared only in the description would leave the summary
+  // telling a different story from the artifact it summarises.
+  it("carries the dependency accounting line into the refresh comment (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const service = productivityReviewService(db);
+    // `high_churn` is the non-closable trigger keeping this review alive, and
+    // it reads a rolling 1h window — so the refresh has to land while the
+    // seeded runs are still inside it. Shorten the refresh interval to the
+    // hard floor and step 6 minutes rather than the 1h default, which would
+    // age the runs out and stop generating the review entirely.
+    const thresholds = { refreshIntervalMs: PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS };
+    await service.reconcileProductivityReviews({ now, companyId: seeded.companyId, thresholds });
+    const [review] = await listProductivityReviews(seeded.companyId);
+    const refreshed = await service.reconcileProductivityReviews({
+      now: new Date(now.getTime() + 6 * 60 * 1000),
+      companyId: seeded.companyId,
+      thresholds,
+    });
+
+    expect(refreshed.updated).toBe(1);
+    const refreshComments = await listRefreshComments(review!.id);
+    expect(refreshComments.length).toBeGreaterThan(0);
+    expect(refreshComments.at(-1)?.body).toContain(DEPENDENCY_LINE_ONE_BLOCKER);
   });
 
   // BLO-22436: once the blocker resolves (or the edge is removed), the same
@@ -4608,6 +4912,68 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
+  // BLO-27698 A4 — suppression and reporting must agree on what "lapsed" means.
+  // `deliberatePendingMonitor` already treats a monitor inside
+  // `monitorLapseServiceGraceMs` as pending; `monitorGatingBreakdown` did not, so a
+  // monitor 20s past due reported "never re-armed" — reading to a manager as "nobody
+  // is watching" when dispatch is merely still due. Reachable whenever the
+  // suppression gates do not hold (here: a non-suppression-actor monitor), which is
+  // exactly when the report is rendered and read.
+  it("does not report a monitor inside the dispatch service grace as never re-armed", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 20_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorLastTriggeredAt: null,
+      monitorScheduledBy: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      // The 20s unattended residue is below the default long-active bar, so shrink
+      // the bar to render a report at all. Grace stays at its default 330s, which is
+      // the constant under test.
+      thresholds: { longActiveMs: 10_000 },
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).not.toContain("never re-armed");
+    expect(review?.description).toContain(
+      `20s unattended (monitor came due at ${monitorNextCheckAt.toISOString()} and is still inside the dispatch service grace`,
+    );
+  });
+
+  // BLO-27698 A4 boundedness — the converse, and the guard against A4 being applied
+  // as "recently due" rather than "inside grace". Same 20s-past-due monitor with the
+  // grace shrunk below 20s is genuinely unserviced, and must keep reporting the lapse.
+  it("still reports never re-armed once the monitor is past the dispatch service grace", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const monitorNextCheckAt = new Date(now.getTime() - 20_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt,
+      monitorLastTriggeredAt: null,
+      monitorScheduledBy: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { longActiveMs: 10_000, monitorLapseServiceGraceMs: 5_000 },
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      `20s unattended (monitor lapsed at ${monitorNextCheckAt.toISOString()}, never re-armed)`,
+    );
+  });
+
   it("does not renew backlog grace forever behind a non-draining predecessor", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const monitorNextCheckAt = new Date(now.getTime() - 10 * 60_000);
@@ -5376,8 +5742,13 @@ describeEmbeddedPostgres("productivity review service", () => {
       `);
     }
 
+    // BLO-33477: a failed finalize now backs the reservation off for a full
+    // stale interval so it cannot hold a slot in the window. The row is
+    // re-admitted once it is stale again, so this second reconcile advances the
+    // clock past PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS rather than replaying
+    // the same instant.
     const recovered = await productivityReviewService(db).reconcileProductivityReviews({
-      now,
+      now: new Date(now.getTime() + 5 * 60_000 + 1_000),
       companyId: seeded.companyId,
       thresholds: { monitorLapseServiceGraceMs: 60_000 },
     });
@@ -5454,6 +5825,210 @@ describeEmbeddedPostgres("productivity review service", () => {
     const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
     expect(review?.identifier).toBe(`${seeded.issuePrefix}-2`);
     expect(review?.issueNumber).toBe(2);
+  });
+
+  it("holds a stale reservation out of the window while its finalize keeps throwing", async () => {
+    // BLO-33477 AC3. The catch was the one path out of the recovery loop that
+    // left the row untouched, so a deterministically-failing finalize kept its
+    // `updatedAt` and re-selected at the head of `asc(updatedAt) LIMIT 250` on
+    // every pass — MAX_CANDIDATE_ISSUES of them would pin the window and starve
+    // every newer stale reservation behind it.
+    //
+    // The catch now sets `updatedAt = now`, which fails the query's own
+    // `updatedAt < staleCutoff` predicate: the row is not re-ordered within the
+    // window, it leaves the window, and cannot occupy a slot until it is stale
+    // again. Both halves — excluded during the back-off, retried after it — are
+    // asserted here.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const staleMs = 5 * 60_000;
+    const reservedAt = new Date(now.getTime() - 10 * 60_000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: reservedAt });
+
+    let attempts = 0;
+    const service = productivityReviewService(db, {
+      async beforeStaleReservationRecoveryFinalize(review) {
+        if (review.id !== reviewId) return;
+        attempts += 1;
+        throw new Error("finalize is deterministically broken for this reservation");
+      },
+    });
+    const reconcileAt = (at: Date) =>
+      service.reconcileProductivityReviews({
+        now: at,
+        companyId: seeded.companyId,
+        thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      });
+    const scanKey = async () =>
+      db
+        .select({ updatedAt: issues.updatedAt })
+        .from(issues)
+        .where(eq(issues.id, reviewId))
+        .then((rows) => rows[0]?.updatedAt);
+
+    const first = await reconcileAt(now);
+    expect(first.failed).toBe(1);
+    expect(attempts).toBe(1);
+    // Backed off to this pass's `now`, which is >= `staleCutoff` by definition.
+    expect(await scanKey()).toEqual(now);
+
+    // Held out of the window: not merely re-ordered within it, so it is not
+    // attempted at all and consumes no slot.
+    const second = await reconcileAt(new Date(now.getTime() + 1_000));
+    expect(second.failed).toBe(0);
+    expect(attempts).toBe(1);
+    expect(await scanKey()).toEqual(now);
+
+    // Stale again -> re-admitted and retried, so a transient failure is not
+    // punished beyond one stale interval.
+    const thirdAt = new Date(now.getTime() + staleMs + 1_000);
+    const third = await reconcileAt(thirdAt);
+    expect(third.failed).toBe(1);
+    expect(attempts).toBe(2);
+    expect(await scanKey()).toEqual(thirdAt);
+
+    // The reservation itself is untouched apart from the scan key.
+    const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
+    expect(review?.identifier).toBeNull();
+    expect(review?.issueNumber).toBeNull();
+    expect(review?.status).toBe("todo");
+  });
+
+  // BLO-33477 AC3, capped-window form. The test above proves a failing row
+  // leaves the window; this one proves what that buys — the tail is reached
+  // even when a whole window of deterministically-failing reservations is in
+  // front of it.
+  //
+  // The bound is TWO eligible passes, not one, and asserting one would be red
+  // against correct code: on the first pass the cohort is still eligible, sorts
+  // ahead of the target, and the LIMIT cuts it. The catch then backs all 250 of
+  // them off to that pass's `now`, which is >= the next pass's `staleCutoff`,
+  // so on pass two the cohort is not in the candidate set at all — whatever its
+  // size, and whether the target's key is older or newer than theirs.
+  //
+  // That is the refutation of "the failures stay ahead indefinitely": they are
+  // not ahead, they are gone. Pre-fix the cohort kept its original `reservedAt`
+  // — a fixed key, always <= any newer row's — and this test never goes green.
+  it("recovers a stale reservation behind a full window of failing ones (BLO-33477)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const staleMs = 5 * 60_000;
+    const staleCutoff = new Date(now.getTime() - staleMs); // c_1 = 11:55:00Z
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+
+    // Fill one whole window with reservations whose finalize throws every time.
+    // Each needs its own reviewable source: `issues_active_productivity_review_uq`
+    // allows at most one active review per (company, originId), and an
+    // unreviewable source would be *retired* rather than failed, which drops it
+    // out of the window and defeats the point.
+    const failingCount = 250;
+    const decoyReservedAt = new Date("2026-04-28T11:00:00.000Z"); // d
+    const decoySourceIds = Array.from({ length: failingCount }, () => randomUUID());
+    const decoyReviewIds = Array.from({ length: failingCount }, () => randomUUID());
+    await db.insert(issues).values(
+      decoySourceIds.map((id, i) => ({
+        id,
+        companyId: seeded.companyId,
+        title: `Failing source ${i}`,
+        status: "in_progress" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.coderId,
+        originKind: "manual",
+        issueNumber: 1000 + i,
+        identifier: `${seeded.issuePrefix}-${1000 + i}`,
+        startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+        monitorScheduledBy: "assignee" as const,
+        createdAt: decoyReservedAt,
+        updatedAt: decoyReservedAt,
+      })),
+    );
+    await db.insert(issues).values(
+      decoyReviewIds.map((id, i) => ({
+        id,
+        companyId: seeded.companyId,
+        title: `Failing reservation ${i}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        parentId: decoySourceIds[i],
+        assigneeAgentId: seeded.managerId,
+        createdByAgentId: seeded.coderId,
+        originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+        originId: decoySourceIds[i],
+        originFingerprint: `productivity-review:${decoySourceIds[i]}`,
+        requestDepth: 1,
+        // Reserved: no identifier/issueNumber yet, which is what keeps them in
+        // `recoverStaleReservedProductivityReviews`' predicate pass after pass.
+        issueNumber: null,
+        identifier: null,
+        createdAt: decoyReservedAt,
+        updatedAt: decoyReservedAt,
+        lastActivityAt: decoyReservedAt,
+      })),
+    );
+
+    // The target: `d < n < c_1`, so it is eligible on pass 1 yet sorts behind
+    // the whole failing cohort and is cut by the LIMIT.
+    const targetReservedAt = new Date("2026-04-28T11:50:00.000Z"); // n
+    expect(decoyReservedAt.getTime()).toBeLessThan(targetReservedAt.getTime());
+    expect(targetReservedAt.getTime()).toBeLessThan(staleCutoff.getTime());
+    const targetId = await insertProductivityReview({ seeded, createdAt: targetReservedAt });
+
+    const failing = new Set(decoyReviewIds);
+    let targetFinalizeAttempts = 0;
+    const service = productivityReviewService(db, {
+      async beforeStaleReservationRecoveryFinalize(review) {
+        if (failing.has(review.id)) {
+          throw new Error("finalize is deterministically broken for this reservation");
+        }
+        if (review.id === targetId) targetFinalizeAttempts += 1;
+      },
+    });
+    const reconcileAt = (at: Date) =>
+      service.reconcileProductivityReviews({
+        now: at,
+        companyId: seeded.companyId,
+        thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      });
+    const target = async () =>
+      db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, targetId))
+        .then((rows) => rows[0]);
+
+    // Pass 1: the window is saturated by the failing cohort, so the target is
+    // never even attempted. This is the starved shape, and it is correct here.
+    const first = await reconcileAt(now);
+    expect(first.failed).toBe(failingCount);
+    expect(targetFinalizeAttempts).toBe(0);
+    expect((await target())?.identifier).toBeNull();
+
+    // Pass 2: the cohort was backed off to pass 1's `now`, so it no longer
+    // satisfies `updatedAt < staleCutoff` and vacates the window entirely; the
+    // target is the only candidate left. Pre-fix the cohort is still at
+    // `decoyReservedAt` and this stays red forever, at any number of passes.
+    const second = await reconcileAt(new Date(now.getTime() + 1_000));
+    expect(targetFinalizeAttempts).toBe(1);
+    const recovered = await target();
+    // Finalized — identifier/issueNumber allocated is exactly what "recovered"
+    // means here, and is the inverse of the reserved state asserted above. The
+    // number itself is not pinned: the cohort's own sources consume the prefix
+    // sequence, so it tracks `failingCount` rather than the source's `-2`.
+    expect(recovered?.identifier).not.toBeNull();
+    expect(recovered?.issueNumber).not.toBeNull();
+    // Nothing of the cohort is even attempted on this pass — the back-off is a
+    // hard exclusion, not a re-ordering, so it cannot occupy a single slot.
+    expect(second.failed).toBe(0);
   });
 
   it("replays missing finalized review side effects without duplicating them", async () => {
@@ -6131,6 +6706,15 @@ describeEmbeddedPostgres("productivity review service", () => {
   // the deliberate-monitor suppression, so the qualifier itself is pinned —
   // an unqualified "15h monitor-gated, 0m unattended" would tell the manager a
   // real stall was fully accounted for.
+  //
+  // BLO-27698: this is also the B3a regression guard BLO-27225 calls "the most
+  // important single test in the set" — `created: 1` below is what fails if the
+  // `!gatedIsUpperBound` condition is ever dropped from the long-active predicate,
+  // which would make the trigger structurally unfireable for any issue with a
+  // monitor armed however briefly (the indefinite-suppression hazard BLO-22331 AC2
+  // forbids). Verified by removing that condition and watching this go red. Named
+  // here because the guard was twice reported missing: it asserts the behaviour
+  // without mentioning `gatedIsUpperBound`, so a grep for the symbol does not find it.
   it("marks monitor-gated time as an upper bound while the monitor is still armed", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const armedUntil = new Date(now.getTime() + 30 * 60 * 1000);
@@ -6431,6 +7015,139 @@ describeEmbeddedPostgres("productivity review service", () => {
       sourceIssueId: seeded.issueId,
     });
   });
+
+  // BLO-33477: retirement-scan starvation, the same defect BLO-30303 fixed on
+  // the source scan. `closeOpenSuppressedReviews` is the only path that can
+  // retire an open review, and it only writes to a review it *retires* — a
+  // review that is scanned and correctly declined (its alarm still stands) has
+  // nothing written back, so its `updatedAt` never advances. Under
+  // `asc(updatedAt)` the same oldest-MAX_CANDIDATE_ISSUES declined rows
+  // re-occupied the window on every pass forever, and no review sorting behind
+  // them could ever be evaluated.
+  //
+  // As in BLO-30303, the assertion that matters is rotation *across* passes,
+  // not reachability on any single one: on pass 1 every row's watermark is
+  // still null, so the target legitimately sorts outside the window. What the
+  // fix guarantees is that pass 2 reaches it. Pre-fix this is red at any number
+  // of passes, which is what distinguishes a rotation key from a cap increase.
+  it("retires a review that sorts outside one retirement-scan window (BLO-33477)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "done",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+
+    // Fill one whole window with open reviews whose alarm still stands. Their
+    // trigger is `no_comment_streak`, which completion never invalidates, so
+    // the retirement loop scans them and declines every one — writing nothing
+    // back, which is the whole mechanism. Their sources are `done` so the
+    // source-candidate scan cannot mint anything new for them and perturb the
+    // window. Each needs its own source: `issues_active_productivity_review_uq`
+    // allows at most one active review per (company, originId).
+    const decoyCount = 250;
+    const decoyAt = new Date("2026-04-01T00:00:00.000Z");
+    const decoySourceIds = Array.from({ length: decoyCount }, () => randomUUID());
+    const decoyReviewIds = Array.from({ length: decoyCount }, () => randomUUID());
+    await db.insert(issues).values(
+      decoySourceIds.map((id, i) => ({
+        id,
+        companyId: seeded.companyId,
+        title: `Decoy source ${i}`,
+        status: "done" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.coderId,
+        originKind: "manual",
+        issueNumber: 1000 + i,
+        identifier: `${seeded.issuePrefix}-${1000 + i}`,
+        createdAt: decoyAt,
+        updatedAt: decoyAt,
+      })),
+    );
+    await db.insert(issues).values(
+      decoyReviewIds.map((id, i) => ({
+        id,
+        companyId: seeded.companyId,
+        title: `Decoy review ${i}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.managerId,
+        parentId: decoySourceIds[i],
+        originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+        originId: decoySourceIds[i],
+        originFingerprint: `productivity-review:${decoySourceIds[i]}`,
+        issueNumber: 2000 + i,
+        identifier: `${seeded.issuePrefix}-${2000 + i}`,
+        // Older than the target on both keys, so the target sorts outside the
+        // window under the pre-fix `updatedAt` order *and* under the fixed
+        // `coalesce(productivityScannedAt, createdAt)` order on pass 1.
+        createdAt: decoyAt,
+        updatedAt: decoyAt,
+      })),
+    );
+    await db.insert(activityLog).values(
+      decoyReviewIds.map((id, i) => ({
+        companyId: seeded.companyId,
+        actorType: "system",
+        actorId: "system",
+        action: "issue.productivity_review_created",
+        entityType: "issue",
+        entityId: id,
+        details: { trigger: "no_comment_streak", sourceIssueId: decoySourceIds[i] },
+        createdAt: decoyAt,
+      })),
+    );
+
+    // The target: newest open review, source already `done`, so it is retirable
+    // the moment the scan actually reaches it. `createdAt` must be strictly
+    // before `now`: on pass 2 the decoys carry a watermark of exactly `now`, so
+    // an equal `createdAt` would tie and then lose the `asc(updatedAt)`
+    // tiebreak to them, leaving the target outside the window even post-fix.
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: new Date("2026-04-27T00:00:00.000Z"),
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: { trigger: "long_active_duration", sourceIssueId: seeded.issueId },
+    });
+
+    const service = productivityReviewService(db);
+
+    const first = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    // Pass 1 scans a full window and retires nothing — the funnel shape a
+    // starved sweep has, and the reason AC4 wants it counted rather than silent.
+    expect(first.retirementScanned).toBe(decoyCount);
+    expect(first.retirementRetired).toBe(0);
+    expect(first.retirementDeclined).toBe(decoyCount);
+
+    const second = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    // Pre-fix pass 2 re-scans the identical 250 decoys and this is 0 forever.
+    expect(second.retirementRetired).toBe(1);
+    expect(second.closedTerminalSourceReviews).toBe(1);
+    const [review] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review?.status).toBe("done");
+  }, 120_000);
 
   it("does not close a long-active productivity review when the source was cancelled", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");

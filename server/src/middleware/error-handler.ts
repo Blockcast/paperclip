@@ -2,6 +2,7 @@ import type { Request, Response, NextFunction } from "express";
 import type { Db } from "@paperclipai/db";
 import { ZodError } from "zod";
 import { HttpError } from "../errors.js";
+import { findPgError, TRANSIENT_DB_SQLSTATES } from "../lib/db-retry.js";
 import { trackErrorHandlerCrash } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
@@ -134,6 +135,38 @@ export function errorHandler(
 
   const tc = getTelemetryClient();
   if (tc) trackErrorHandlerCrash(tc, { errorCode: rootError.name });
+
+  // BLO-33733: a transient PostgreSQL conflict is not a broken server. Reported
+  // as a bare 500 it is indistinguishable from a permanent fault, so callers
+  // either retry a genuinely broken request forever or abandon a recoverable one.
+  //
+  // The live instance: PATCH /issues/:id with `blockedByIssueIds` takes a
+  // company-scoped advisory lock (`paperclip:issue-parent:<companyId>`) that a
+  // status-only patch never takes, so under graph contention that one field
+  // 500s while every other field on the same row succeeds.
+  //
+  // Scope of the claim, deliberately narrow: db-retry.ts's rollback guarantee is
+  // per-statement ("a single autocommit UPDATE"), and its contract requires
+  // rollback-guaranteed AND idempotent. This boundary is shared by every route
+  // and can prove neither for the request as a whole — a handler may have
+  // already committed earlier statements. `POST /issues/:id/comments` is the
+  // worked case: `svc.addComment` "does not open its own transaction", so the
+  // comment INSERT autocommits, and `syncComment` / `svc.update` / `logActivity`
+  // run after it. A transient failure in any of those rolls back only itself,
+  // and `idempotencyKey` is optional on that route — so a caller told the write
+  // "did not apply" would post a duplicate comment on replay. Report the
+  // classification, which is provable; leave replay safety to the caller.
+  const pgError = findPgError(err);
+  if (pgError && TRANSIENT_DB_SQLSTATES.has(pgError.code)) {
+    res.status(503).json({
+      error:
+        "Database contention: the failing statement was rolled back. " +
+        "Earlier statements in this request may have applied — replay only if it is idempotent.",
+      code: "transient_db_conflict",
+      details: { sqlstate: pgError.code },
+    });
+    return;
+  }
 
   res.status(500).json({
     error: "Internal server error",
