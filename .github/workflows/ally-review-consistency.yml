@@ -1,12 +1,18 @@
 name: Ally Review Consistency Guard
 
 # Asserts four things about every open PR: that it carries at most one
-# operative Ally App review at its current head; that no operative review is
-# submitted from the User seat at all, which R4 (BLO-24056) retired because the
-# seat shares a login with the authoring App and so cannot be an independent
-# verdict; that no standing APPROVED masks a Critical/Important finding or
-# omits its `Reviewed head:` attestation; and that a review's body-attested
-# head matches the commit GitHub recorded it against.
+# operative Ally review per lane at its current head; that no operative review
+# is submitted from the User seat at all, which R4 (BLO-24056) retired because
+# the seat shares a login with the authoring App and so cannot be an independent
+# verdict; that no standing APPROVED masks a Critical/Important finding, omits
+# its `Reviewed head:` attestation, or lets a seat approval stand over a
+# blocking App review; and that a review's body-attested head matches the commit
+# GitHub recorded it against.
+#
+# The seat-lane and cross-credential arms of the first check, and the
+# seat-approval-over-a-blocker arm of the third, can only fire where the seat
+# prohibition already fires. They are retained for the detail they add to a seat
+# violation, not as independent policy.
 #
 # The seat prohibition subsumes BLO-22916, whose two defects were one verdict
 # submitted under both credentials and five content-free seat approvals that
