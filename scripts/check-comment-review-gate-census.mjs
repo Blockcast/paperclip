@@ -34,7 +34,7 @@ const DEFAULT_PR_LIMIT = 60;
 
 /** Descriptions the gate emits when it established no review of the head. */
 const NOT_EVALUATED_DESCRIPTION_PATTERN =
-  /no Ally consolidated-review comment attests|no head SHA was supplied/i;
+  /no Ally consolidated-review comment attests|no head SHA was supplied|PR author/i;
 
 export function isReviewNamespacedContext(context) {
   return typeof context === "string" && context.trim().toLowerCase().startsWith("review/");
