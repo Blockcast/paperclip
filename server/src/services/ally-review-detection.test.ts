@@ -108,6 +108,32 @@ describe("hasActionablePrReviewFeedback", () => {
   it("is true for a changes_requested review state regardless of body", () => {
     expect(hasActionablePrReviewFeedback("looks fine", "CHANGES_REQUESTED")).toBe(true);
   });
+
+  // BLO-34160. The last clause of carriesBlockingFeedback() matches Recommended
+  // Action prose and has no negation guard, so an all-zero review that
+  // transcribes the directive boilerplate reds gate/ally-comment-findings with
+  // no finding for the author to dispose of. Measured on paperclip#1859
+  // @3326c2da (boilerplate -> failure) vs #1861 @fa7cfa93 (clean form ->
+  // success), identical 0/0 counts. The reviewer template is the half that was
+  // fixed; these pin the contract it must keep satisfying.
+  it("does not block an all-zero review whose Recommended Action is count-derived", () => {
+    const clean = body(`Reviewed head: ${SHA}`).replace(
+      "Land.",
+      "1. No blocking changes requested.\n2. Merge once the remaining required CI checks finish green.",
+    );
+    expect(hasActionablePrReviewFeedback(clean)).toBe(false);
+  });
+
+  it("still blocks an all-zero review that transcribes the directive boilerplate", () => {
+    // Guards against "fixing" BLO-34160 by deleting the prose clause: a body
+    // that narrates a blocking action while declaring (0) must keep failing
+    // closed, per the fail-safe documented on hasActionablePrReviewFeedback.
+    const boilerplate = body(`Reviewed head: ${SHA}`).replace(
+      "Land.",
+      "1. Fix Critical issues before merge.\n2. Address Important issues this cycle.",
+    );
+    expect(hasActionablePrReviewFeedback(boilerplate)).toBe(true);
+  });
 });
 
 describe("prior-finding dispositions", () => {
