@@ -1560,12 +1560,41 @@ async function listPendingFinalizeBlockerIssueIds(
   // The barrier waits for a finalize that only a *run* can deliver. Resolve the
   // status of the run that owes each unfinalized operation so a run that can no
   // longer deliver one does not gate its dependents forever (see below).
-  const owingRunIds = new Set<string>();
-  for (const pair of blockerWorkspacePairs) {
+  //
+  // Resolved ONCE, deliberately. The run-id lookup below and the decision loop
+  // after it must agree on which op is the relevant one for a pair: the first
+  // decides which run ids get fetched, the second decides using those fetches.
+  // Written as two loops they agree only by convention, and an edit to the
+  // resolution rule landing in just one of them produces a silent miss — the
+  // decision asks `owingRunStatusById` for an id the lookup never fetched,
+  // `get()` returns `undefined`, and the barrier fails closed on a run that is
+  // in fact dead. That is the PEN-3255 strand restored, with both loops still
+  // individually self-consistent and no test able to see it. Sharing the array
+  // makes the coupling structural instead.
+  //
+  // Note on the `??` fallback below: on a `shared_workspace` it is keyed by
+  // workspace alone, so a blocker with no attributed op inherits whichever run
+  // last wrote an *unattributed* op there. Before the run-status check that
+  // fallback could only ever hold the gate SHUT; it can now also RELEASE it,
+  // off the death of a run that may never have worked on this blocker. Its
+  // precision is therefore load-bearing in both directions where it used to be
+  // load-bearing in one. Left as-is deliberately: reaching it needs a blocker
+  // with zero attributed ops on a workspace that has unattributed ones, and the
+  // direction it errs in is the one this module's "fail toward releasing"
+  // doctrine prefers to a permanent strand. If those unattributed rows turn out
+  // to be legacy-only, narrow this to an `issueId`-scoped lookup.
+  const unfinalized = blockerWorkspacePairs.flatMap((pair) => {
     const latest = latestAttributedByBlockerWorkspace.get(`${pair.blockerIssueId}:${pair.executionWorkspaceId}`)
       ?? latestUnattributedByWorkspace.get(pair.executionWorkspaceId);
-    if (!latest) continue;
-    if (latest.phase === "workspace_finalize" && latest.status === "succeeded") continue;
+    // No ops recorded -> nothing to finalize for this blocker. An op that IS a
+    // succeeded finalize has already cleared the barrier.
+    if (!latest) return [];
+    if (latest.phase === "workspace_finalize" && latest.status === "succeeded") return [];
+    return [{ pair, latest }];
+  });
+
+  const owingRunIds = new Set<string>();
+  for (const { latest } of unfinalized) {
     if (latest.heartbeatRunId) owingRunIds.add(latest.heartbeatRunId);
   }
 
@@ -1583,11 +1612,7 @@ async function listPendingFinalizeBlockerIssueIds(
     for (const row of runRows) owingRunStatusById.set(row.id, row.status);
   }
 
-  for (const pair of blockerWorkspacePairs) {
-    const latest = latestAttributedByBlockerWorkspace.get(`${pair.blockerIssueId}:${pair.executionWorkspaceId}`)
-      ?? latestUnattributedByWorkspace.get(pair.executionWorkspaceId);
-    if (!latest) continue; // no ops recorded -> nothing to finalize for this blocker
-    if (latest.phase === "workspace_finalize" && latest.status === "succeeded") continue;
+  for (const { pair, latest } of unfinalized) {
     // PEN-3255: the barrier had no terminal condition. Only a run writes a
     // `workspace_finalize` op, so once the run that owed one has reached a
     // terminal status no finalize can ever arrive — the comment on the caller
