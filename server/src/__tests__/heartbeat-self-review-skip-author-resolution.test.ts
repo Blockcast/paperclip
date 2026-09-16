@@ -81,6 +81,46 @@ describe("resolvePrReviewEvidenceWithGithubAuthor (self-review skip on author-le
     expect(result.status).toBe("missing");
   });
 
+  // Ally's review of 36db30ae, Important issue: the resolved author must be
+  // bound to the REVIEWER's identity, not merely agreed with by the summary.
+  // Without that bind a degraded run on a human-authored PR that names that
+  // human is credited `self_review_skipped` with no review posted.
+  it("refuses a self-skip when the real author is a human the summary correctly names", async () => {
+    fetchAuthor.mockResolvedValue("kkroo");
+
+    const result = await resolvePrReviewEvidenceWithGithubAuthor(
+      AUTHORLESS_CONTEXT,
+      {
+        summary:
+          "PR author is `kkroo`, so self-review is not allowed. " +
+          "Exiting without posting a review on Blockcast/pim-multicast-gateway#3121.",
+        resultJson: null,
+      },
+      MISSING,
+    );
+
+    expect(result.status).toBe("missing");
+  });
+
+  // `githubReviewerAppSlug` treats the bare user seat as a distinct principal
+  // from the App. A summary naming the seat must not clear the bind either.
+  it("refuses the bare `allyblockcast` user seat, which is not the App identity", async () => {
+    fetchAuthor.mockResolvedValue("allyblockcast");
+
+    const result = await resolvePrReviewEvidenceWithGithubAuthor(
+      AUTHORLESS_CONTEXT,
+      {
+        summary:
+          "PR author is `allyblockcast`, so self-review is not allowed. " +
+          "Exiting without posting a review on Blockcast/pim-multicast-gateway#3121.",
+        resultJson: null,
+      },
+      MISSING,
+    );
+
+    expect(result.status).toBe("missing");
+  });
+
   it("never spends a GitHub call on a verdict that is not `missing`", async () => {
     const posted = { status: "posted_review" as const };
 
