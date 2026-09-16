@@ -1942,6 +1942,14 @@ export function extractReviewTriggerFromDescription(description: string | null):
   return ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS.find((trigger) => trigger === candidate) ?? null;
 }
 
+// BLO-34216: the renderer half of that round-trip, kept adjacent to the parser
+// so the shared `- Primary trigger:` prefix is visible in one place. Drift here
+// fails the same way a drifted trigger name does — the review silently stops
+// refreshing — so the round-trip test drives this rather than a hand-built line.
+export function renderPrimaryTriggerLine(trigger: ProductivityReviewTrigger) {
+  return `- Primary trigger: \`${trigger}\` (${formatTrigger(trigger)})`;
+}
+
 // BLO-22097: manager-facing evidence text must not claim a measured "0
 // input/output tokens" for a run whose usage was never recorded — that
 // overstates an inferred infrastructure classification as a fact. Only
@@ -5027,7 +5035,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "",
       `- Source issue: ${issueUiLink(evidence.sourceIssue, prefix)}`,
       `- Assigned agent: ${evidence.sourceAgent.name} (${evidence.sourceAgent.role})`,
-      `- Primary trigger: \`${evidence.trigger}\` (${formatTrigger(evidence.trigger)})`,
+      renderPrimaryTriggerLine(evidence.trigger),
       `- Trigger reasons: ${evidence.triggerReasons.join("; ")}`,
       `- Generated at: ${evidence.generatedAt.toISOString()}`,
       "",
