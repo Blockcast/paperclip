@@ -79,6 +79,8 @@ export interface IssueLivenessWaitingPathInput {
   companyId: string;
   issueId: string;
   status: string;
+  /** BLO-22660: pending interactions age out of the waiting path; absent means "treat as fresh". */
+  createdAt?: Date | string | null;
 }
 
 export interface IssueLivenessDependencyPathEntry {
@@ -217,6 +219,18 @@ function pathKeySet(...lists: { companyId: string; issueId: string | null }[][])
   }
   return keys;
 }
+
+/**
+ * BLO-22660: a pending interaction stops counting as a live waiting path after 24h.
+ *
+ * Measured instance: BLO-22464 sat `in_review` for 17 days with no monitor, run, retry or
+ * recovery action and was never classified as needing attention, because one
+ * `request_confirmation` card had been pending for 32 days. `continuationPolicy` fires when the
+ * card is *answered*, which has no relationship to whoever the card's prose names - so a card
+ * naming a decider routes to nobody while still reading as ownership. A missing `createdAt`
+ * counts as fresh: this only ever drops a path we can prove is stale.
+ */
+const PENDING_INTERACTION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 function readRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -485,9 +499,17 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   const pendingApprovals = input.pendingApprovals ?? [];
   const openRecoveryIssues = input.openRecoveryIssues ?? [];
   const openPullRequestAttendance = input.openPullRequestAttendance ?? [];
+  const livePendingInteractions: IssueLivenessWaitingPathInput[] = [];
+  const stalePendingInteractions: IssueLivenessWaitingPathInput[] = [];
+  for (const entry of pendingInteractions) {
+    const createdAtMs = readDateMs(entry.createdAt);
+    const stale = createdAtMs !== null && nowMs - createdAtMs >= PENDING_INTERACTION_MAX_AGE_MS;
+    (stale ? stalePendingInteractions : livePendingInteractions).push(entry);
+  }
   // Indexed once per pass rather than scanned per issue — see `pathKeySet` (BLO-33225).
   const executionPathKeys = pathKeySet(activeRuns, queuedWakeRequests);
-  const interactionPathKeys = pathKeySet(pendingInteractions);
+  const interactionPathKeys = pathKeySet(livePendingInteractions);
+  const staleInteractionPathKeys = pathKeySet(stalePendingInteractions);
   const approvalPathKeys = pathKeySet(pendingApprovals);
   const recoveryPathKeys = pathKeySet(openRecoveryIssues);
   const openPullRequestPathKeys = pathKeySet(openPullRequestAttendance);
@@ -742,10 +764,15 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     // ownerCandidates so unassigned issues don't sit silently forever.
     if (reviewIssue.assigneeUserId) return null;
 
-    const reason = reviewIssue.assigneeAgentId
+    const staleInteraction = staleInteractionPathKeys.has(pathKey(reviewIssue.companyId, reviewIssue.id));
+    const reason = staleInteraction
+      ? `${issueLabel(reviewIssue)} is in review behind a pending issue-thread interaction older than 24h, which is not a live action path.`
+      : reviewIssue.assigneeAgentId
       ? `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, recent open pull request, or recovery issue owning the next action.`
       : `${issueLabel(reviewIssue)} is in review with no assignee and no participant, interaction, approval, user owner, wake, active run, recent open pull request, or recovery issue owning the next action.`;
-    const recommendedAction = reviewIssue.assigneeAgentId
+    const recommendedAction = staleInteraction
+      ? `Resolve or withdraw ${issueLabel(reviewIssue)}'s stale interaction, then record the current owner and the next action.`
+      : reviewIssue.assigneeAgentId
       ? `Review ${issueLabel(reviewIssue)} and make the next action explicit: add a reviewer/interaction or request a review on its linked pull request, return it to active work with a change request, mark it done if accepted, or open a bounded recovery issue.`
       : `Assign ${issueLabel(reviewIssue)} to a clear owner from the project / chain-of-command, or move it back to an active status with a change request.`;
 
