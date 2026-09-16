@@ -358,7 +358,7 @@ test("the verdict block is additive, never a replacement for the prose line", ()
   const { template } = step4Template();
 
   // Four readers parse `Reviewed head:` and only one understands the block
-  // (this module; plus consolidatedReviewHead in github-app-auth.ts,
+  // (this module; plus commentAttestsHead in github-app-auth.ts,
   // ATTESTED_HEAD_RE in check-ally-review-consistency.mjs, and
   // HEAD_ATTESTATION_RE in sweep-stalled-ally-reviews.py). A block-only review
   // attests nothing to the other three, and reader 2 then raises

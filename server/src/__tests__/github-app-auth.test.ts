@@ -23,6 +23,7 @@ import {
   githubGetWorkflowRun,
   githubHasCommitEvidence,
   githubHasReviewerEvidenceForPr,
+  githubListReviewerSurfacesAtPr,
   githubGetLatestCommitStatusForContext,
   githubListIssueCommentsWithTimestamps,
   githubListPrReviewsWithTimestamps,
@@ -1231,5 +1232,240 @@ describe("githubListPrReviewsWithTimestamps", () => {
     await expect(githubListPrReviewsWithTimestamps({ repoFullName, prNumber })).resolves.toEqual([
       { login: "allyblockcast[bot]", body: reviewBody("blocking"), createdAt: "2026-08-02T15:38:57Z" },
     ]);
+  });
+});
+
+// Task B4 (BLO-32239). `githubHasReviewerEvidenceForPr` no longer carries a
+// private copy of the Ally grammar, and the paging loops both surfaces share are
+// now one helper that the truth probe also consumes.
+describe("githubListReviewerSurfacesAtPr", () => {
+  const repoFullName = "Blockcast/paperclip";
+  const prNumber = 1588;
+  const head = "c".repeat(40);
+
+  function stub(routes: {
+    reviews?: unknown[];
+    comments?: unknown[];
+    reviewsStatus?: number;
+    commentsStatus?: number;
+    throwOn?: "reviews" | "comments";
+  }) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const u = String(url);
+        if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        if (u.includes("/reviews")) {
+          if (routes.throwOn === "reviews") throw new Error("socket hang up");
+          if (routes.reviewsStatus) return jsonResponse([], false, routes.reviewsStatus);
+          return jsonResponse(routes.reviews ?? []);
+        }
+        if (u.includes("/issues/") && u.includes("/comments")) {
+          if (routes.throwOn === "comments") throw new Error("socket hang up");
+          if (routes.commentsStatus) return jsonResponse([], false, routes.commentsStatus);
+          return jsonResponse(routes.comments ?? []);
+        }
+        if (u.includes("/pulls/")) return jsonResponse({ head: { sha: head } });
+        throw new Error(`unexpected url ${u}`);
+      }),
+    );
+  }
+
+  const allyReview = `## Ally — Consolidated PR Review
+**Reviewed head:** \`${head}\`
+### Critical Issues (0)
+### Important Issues (0)`;
+
+  it("returns both surfaces, dropping PENDING drafts and non-App authors", async () => {
+    setCreds();
+    stub({
+      reviews: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: allyReview,
+          state: "COMMENTED",
+          commit_id: head,
+          submitted_at: "2026-09-06T00:00:00Z",
+        },
+        { user: { login: "allyblockcast[bot]" }, body: "draft", state: "PENDING", commit_id: head },
+        { user: { login: "kkroo" }, body: "lgtm", state: "APPROVED", commit_id: head },
+      ],
+      comments: [
+        { user: { login: "allyblockcast[bot]" }, body: allyReview, created_at: "2026-09-06T00:01:00Z" },
+        { user: { login: "kkroo" }, body: "thanks", created_at: "2026-09-06T00:02:00Z" },
+      ],
+    });
+
+    const result = await githubListReviewerSurfacesAtPr({ repoFullName, prNumber });
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    expect(result.reviews.map((r) => r.state)).toEqual(["COMMENTED"]);
+    expect(result.reviews[0]).toMatchObject({ commitId: head, submittedAt: "2026-09-06T00:00:00Z" });
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0]!.body).toBe(allyReview);
+  });
+
+  // Fails closed as a UNIT, unlike the predicate below: the probe reads these
+  // bodies to decide whether a review was clean, and an unread surface is not
+  // evidence that it carried no finding.
+  it("returns {error} when either surface fails, and never a partial read", async () => {
+    setCreds();
+    stub({ reviewsStatus: 500 });
+    expect(await githubListReviewerSurfacesAtPr({ repoFullName, prNumber })).toEqual({
+      error: expect.stringContaining("reviews"),
+    });
+
+    stub({ reviews: [], commentsStatus: 503 });
+    expect(await githubListReviewerSurfacesAtPr({ repoFullName, prNumber })).toEqual({
+      error: expect.stringContaining("comments"),
+    });
+
+    stub({ throwOn: "reviews" });
+    expect(await githubListReviewerSurfacesAtPr({ repoFullName, prNumber })).toEqual({
+      error: "reviews_fetch_failed",
+    });
+  });
+
+  it("errors without querying GitHub when no reviewer login is configured", async () => {
+    setCreds();
+    h.cfg.prReviewerBotLogin = "";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await githubListReviewerSurfacesAtPr({ repoFullName, prNumber })).toEqual({ error: "no_bot_login" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // A bare user-seat login matches no App row, so without this guard the helper
+  // returns empty surfaces and the caller cannot tell a misconfiguration from a
+  // review that carried no finding.
+  it("errors without querying GitHub when the configured login is the bare user seat", async () => {
+    setCreds();
+    h.cfg.prReviewerBotLogin = "allyblockcast";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await githubListReviewerSurfacesAtPr({ repoFullName, prNumber })).toEqual({
+      error: "bot_login_not_app_form",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("githubHasReviewerEvidenceForPr after delegating to the shared grammar", () => {
+  const repoFullName = "Blockcast/paperclip";
+  const prNumber = 1588;
+  const head = "c".repeat(40);
+
+  function stub(routes: { reviews?: unknown[]; comments?: unknown[]; commentsStatus?: number }) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const u = String(url);
+        if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        if (u.includes("/reviews")) return jsonResponse(routes.reviews ?? []);
+        if (u.includes("/issues/") && u.includes("/comments")) {
+          if (routes.commentsStatus) return jsonResponse([], false, routes.commentsStatus);
+          return jsonResponse(routes.comments ?? []);
+        }
+        if (u.includes("/pulls/")) return jsonResponse({ head: { sha: head } });
+        throw new Error(`unexpected url ${u}`);
+      }),
+    );
+  }
+
+  // REGRESSION GUARD. Composing this predicate out of the both-surfaces fetcher
+  // would turn this case into {error}, and its callers fail completion closed on
+  // {error} — a false `pr_review_output_missing` on a PR that WAS reviewed, i.e.
+  // BLO-28920 gated on an unrelated surface's availability. The short-circuit is
+  // load-bearing, not an optimisation.
+  it("returns a review match at head even when the comments surface is failing", async () => {
+    setCreds();
+    stub({
+      reviews: [{ user: { login: "allyblockcast[bot]" }, commit_id: head, state: "COMMENTED" }],
+      commentsStatus: 500,
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha: head })).resolves.toEqual({
+      found: true,
+      via: "review",
+    });
+  });
+
+  it("does not fetch the comments surface when a review already matched", async () => {
+    setCreds();
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      if (u.includes("/reviews")) {
+        return jsonResponse([{ user: { login: "allyblockcast[bot]" }, commit_id: head, state: "COMMENTED" }]);
+      }
+      throw new Error(`unexpected url ${u}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha: head })).resolves.toEqual({
+      found: true,
+      via: "review",
+    });
+    expect(fetchMock.mock.calls.every(([u]) => !String(u).includes("/issues/"))).toBe(true);
+  });
+
+  // The delegation WIDENS the comment surface: the deleted private copy required
+  // a literal `## Ally — Consolidated PR Review` heading and allowed only `_`
+  // around the label, so this real Ally shape attested nothing.
+  it("accepts a bold heading and a bold/backticked attestation", async () => {
+    setCreds();
+    stub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: `**Ally — Consolidated PR Review**\n**Reviewed head:** \`${head}\``,
+          created_at: "2026-09-06T00:00:00Z",
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha: head })).resolves.toEqual({
+      found: true,
+      via: "comment",
+    });
+  });
+
+  // The delegation also NARROWS one form, deliberately. The deleted copy used
+  // `\s*` around the label and the SHA, which crosses newlines, so an
+  // attestation split over two lines parsed. The shared grammar matches
+  // horizontal whitespace only. No live Ally attestation uses the split form,
+  // and a newline-crossing match would let a bare `Reviewed head:` line bind to
+  // an unrelated 40-hex on the next line. Pinned so the choice is visible if it
+  // ever needs revisiting.
+  it("no longer accepts an attestation split across two lines", async () => {
+    setCreds();
+    stub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: `## Ally — Consolidated PR Review\nReviewed head:\n${head}`,
+          created_at: "2026-09-06T00:00:00Z",
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha: head })).resolves.toEqual({
+      found: false,
+    });
+  });
+
+  it("still rejects a request comment quoting the heading and a SHA", async () => {
+    setCreds();
+    stub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: `> ## Ally — Consolidated PR Review\n> Reviewed head: ${head}`,
+          created_at: "2026-09-06T00:00:00Z",
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha: head })).resolves.toEqual({
+      found: false,
+    });
   });
 });

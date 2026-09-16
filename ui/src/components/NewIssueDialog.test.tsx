@@ -301,11 +301,17 @@ async function typeTextareaValue(textarea: HTMLTextAreaElement, value: string) {
 // Polls `assertion` until it stops throwing, flushing a tick between attempts.
 //
 // It only settles the gate its OWN assertion reads, and it flushes nothing at
-// all when the assertion already holds on the first attempt. That last part is
-// the trap behind BLO-31671: `expect(submitButton.hasAttribute("disabled"))
-// .toBe(false)` is driven by `titleHasText`, which the draft/defaults restore
-// sets synchronously during `root.render`, so waiting on it returns on attempt
-// 0 having advanced nothing. It reads like a settle and is not one.
+// all when the assertion already holds on the first attempt. A wait that holds
+// on attempt 0 is not a settle, however it reads.
+//
+// Beware of measuring that on the fast path. `expect(submitButton
+// .hasAttribute("disabled")).toBe(false)` was retired at eleven sites on the
+// evidence that it always returned on attempt 0 — but every sample was taken
+// with an `await flush()` sitting in front of it, which had already supplied
+// the one tick the defaults path needs. Remove the flush and the same wait
+// loops. Two of those eleven were real settles, and retiring them reopened the
+// flake in BLO-32761. Sample a wait with the preceding flush removed before
+// concluding it advances nothing.
 //
 // So never place a read of query-gated DOM after a wait on some unrelated
 // condition. Wait on the gated thing itself.
@@ -327,18 +333,30 @@ async function waitForAssertion(assertion: () => void, attempts = 20) {
 
 // Asserts the submit button exists and is clickable. Deliberately NOT a wait.
 //
-// `disabled` is `!titleHasText || createIssue.isPending`, and `titleHasText` is
-// set synchronously by every entry path into this dialog — typed input, dialog
-// defaults, draft restore — never by a query. Eleven call sites used to wait on
-// this (nine spelled `vi.waitFor`, two `waitForAssertion`), and every one of
-// them returned on attempt 0 having flushed nothing: it read as the settle
-// before the click and was not one, which is the trap described above. Keeping
-// it a bare `expect` makes that visible at every call site — no `await`, so
-// nothing can be mistaken for synchronisation.
+// `disabled` is `!titleHasText || createIssue.isPending`. `titleHasText` is
+// never set by a *query* — but it is NOT synchronous on every entry path, and
+// an earlier revision of this comment claimed it was. That claim caused
+// BLO-32761: the two `waitForAssertion` sites retired on its authority were
+// load-bearing, and dropping them reverted BLO-19290 and reddened the required
+// `workspaces-a` gate on unrelated PRs.
 //
-// If the click below depends on query-resolved state — the experimental flags,
-// the project list, the reusable-workspace summaries — settle on THAT state
-// with `waitForAssertion` first. This function will not do it for you.
+// Which paths are synchronous, measured rather than assumed:
+//   - typed input (`handleTitleChange`) — synchronous with the event.
+//   - dialog defaults and draft restore — NOT synchronous. Both land in the
+//     initialization effect (NewIssueDialog.tsx:754), which runs after the
+//     first commit. Probe right after `renderDialog`: the button is already
+//     rendered (its label comes from `isSubIssueMode`, which IS synchronous)
+//     and `disabled=true`. It clears one tick later.
+//
+// So on a defaults/draft path this function needs something to have settled
+// first. Prefer settling on a strictly LATER gate the click already requires —
+// e.g. the `listSummaries` call, which react-query only fires once the same
+// effect has set `projectId`. Where no such gate exists, wrap this in
+// `waitForAssertion` and do NOT leave an `await flush()` in front of it: the
+// flush hides the race by supplying exactly one tick of slack, and a wait that
+// is a no-op on attempt 0 is the decoy described above. With the flush gone the
+// wait genuinely loops every run, so deleting it fails locally instead of
+// flaking in CI.
 function expectSubmitEnabled(submitButton: HTMLButtonElement | undefined) {
   // Presence first, so a missing button fails as "expected undefined not to be
   // undefined". Asserting `hasAttribute` alone reports "expected undefined to
@@ -1186,11 +1204,27 @@ describe("NewIssueDialog", () => {
     };
 
     const { root } = renderDialog(container);
-    await flush();
 
-    const submitButton = Array.from(container.querySelectorAll("button"))
+    // The `Create Sub-Task` label is synchronous — `isSubIssueMode` reads
+    // `newIssueDefaults.parentId` during render — but the button's ENABLED
+    // state is not. `disabled` is `!titleHasText`, and on this entry path
+    // `titleHasText` is only set when the initialization effect
+    // (NewIssueDialog.tsx:754) runs `setIssueText(newIssueDefaults.title, ...)`,
+    // which is after the first commit. Measured directly: immediately after
+    // `renderDialog` the button is present with `disabled=true`, and it clears
+    // on the next tick.
+    //
+    // The `await flush()` that used to sit here supplied exactly that one tick
+    // and no more, so the test carried zero slack and reddened the required
+    // gate under CI load (BLO-32761, reverting BLO-19290's fix). It is
+    // deliberately NOT restored: without it this wait fails on attempt 0 on
+    // every run, which is what keeps it honest. Delete the wait and the test
+    // goes red locally and immediately instead of flaking in CI on someone
+    // else's PR.
+    const findSubmitButton = () => Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Sub-Task"));
-    expectSubmitEnabled(submitButton);
+    await waitForAssertion(() => expectSubmitEnabled(findSubmitButton()));
+    const submitButton = findSubmitButton();
 
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));

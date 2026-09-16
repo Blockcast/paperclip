@@ -169,6 +169,14 @@ export const PRECREATE_REQUIRED_INDEXES: readonly PrecreateRequiredIndex[] = [
       "CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_agent_queued_dispatch_idx " +
       "ON heartbeat_runs USING btree (agent_id, created_at, id) WHERE status = 'queued'",
   },
+  {
+    migration: "0243_heartbeat_runs_company_agent_created_at_index.sql",
+    name: "heartbeat_runs_company_agent_created_at_idx",
+    table: "heartbeat_runs",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_company_agent_created_at_idx " +
+      "ON heartbeat_runs USING btree (company_id, agent_id, created_at DESC, id DESC)",
+  },
 ];
 
 export type PreflightBlocker = {

@@ -270,7 +270,7 @@ describe("BLO-32695 — the structured verdict block as the primary source", () 
  * Cross-reader agreement about which tree was examined.
  *
  * Four readers parse `Reviewed head:` and only this module understands the
- * block — consolidatedReviewHead (github-app-auth.ts), ATTESTED_HEAD_RE
+ * block — commentAttestsHead (github-app-auth.ts), ATTESTED_HEAD_RE
  * (check-ally-review-consistency.mjs) and HEAD_ATTESTATION_RE
  * (sweep-stalled-ally-reviews.py) are the other three. So a body whose block
  * and prose name different heads would set the merge gate against one tree

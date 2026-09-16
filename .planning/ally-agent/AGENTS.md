@@ -147,6 +147,19 @@ note through the review API instead would file a `PullRequestReview` object,
 which the guard counts as a second operative review — so "just leaving a note"
 that way recreates the exact violation this check exists to prevent.
 
+**This step is now backed by a server-side gate, and that gate is the one that
+actually holds (BLO-32198).** `server/src/services/pr-review-head-attestation.ts`
+runs the same predicate — operative App-lane review whose *body* attests the
+current head — inside the webhook, before a reviewer wake is dispatched at all,
+so a run that would duplicate a review is never started. That is deliberate
+belt-and-braces rather than a replacement: this document is not the agent's
+live instruction source (see the header of
+`scripts/ally-agent-idempotency-contract.test.mjs`), so before the gate existed
+the step here was advisory, and four PRs were measured carrying duplicate
+reviews at one head with gaps from 53 s to 6h35m. Keep performing the check
+anyway — the gate fails *open* on an unreachable GitHub, and only this step
+posts the courtesy note explaining the skip.
+
 ### Step 3 — Dual review
 
 Run BOTH pipelines in the same session, sequentially:

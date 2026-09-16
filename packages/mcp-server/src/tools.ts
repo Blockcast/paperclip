@@ -859,11 +859,21 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipApiRequest",
-      "Escape hatch: make a raw JSON request to any /api endpoint not covered by a named tool above. Prefer the named tools when one exists — they validate inputs and shape errors consistently; this one does neither.",
+      "Escape hatch: make a raw JSON request to any Paperclip API endpoint not covered by a named tool above. Prefer the named tools when one exists — they validate inputs and shape errors consistently; this one does neither. path is relative to /api — pass '/agents/me', not '/api/agents/me'.",
       apiRequestSchema,
       async ({ method, path, jsonBody }) => {
         if (!path.startsWith("/") || path.includes("..")) {
           throw new Error("path must start with / and be relative to /api, and must not contain '..'");
+        }
+        // The client's base URL already ends in /api, so an /api-prefixed path would
+        // request /api/api/... and come back 404 "API route not found" — byte-identical
+        // to an absent route. Reject it, so a usage error can never read as a measurement.
+        if (/^\/api([/?#]|$)/i.test(path)) {
+          const relative = path.slice(4);
+          throw new Error(
+            `path is relative to /api — pass '${relative.startsWith("/") ? relative : "/agents/me"}', not '${path}'. ` +
+              "This is a usage error in the caller, not a missing route on the server.",
+          );
         }
         return client.requestJson(method, path, {
           body: parseOptionalJson(jsonBody),
