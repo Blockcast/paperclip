@@ -9240,6 +9240,20 @@ describe("hasActionablePrReviewFeedback — reviewer taxonomy", () => {
     expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);
   });
 
+  // The case above passes even against a consuming span, because the negated
+  // line carries its own `before merge` terminator. This is the real regression
+  // guard: the negated `fix` has NO inline terminator, so a consuming span
+  // reaches onto line 2, advances lastIndex past the genuine directive, and
+  // never tests it. Fails open on a consuming span; blocks on the lookahead.
+  it("stays actionable when a negated fix WITHOUT its own terminator precedes a real directive", () => {
+    const body = [
+      "### Recommended Action",
+      "1. No Critical issues to fix.",
+      "2. Fix the auth bypass before merge.",
+    ].join("\n");
+    expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
   it("does not mask a non-zero bucket that follows a zero-count bucket", () => {
     const body = "### Critical Issues (0)\n### Important Issues (2)\n- one\n- two";
     expect(__test_hasActionablePrReviewFeedback(body)).toBe(true);

@@ -383,7 +383,11 @@ function carriesBlockingFeedback(text: string): boolean {
   for (const heading of text.matchAll(/\bRecommended\s+Action\b/gi)) {
     // Same reach as the span this replaces: heading + two 400-character hops.
     const section = text.slice(heading.index, heading.index + RECOMMENDED_ACTION_REACH);
-    if (hasNonNegatedMatch(section, /\bfix\b[\s\S]{0,400}?\bbefore\s+merg(?:e|es|ed|ing)\b/i)) {
+    // The terminator sits in a LOOKAHEAD so the match extent is just `fix`. A
+    // consuming span would swallow a later line's `before merge`, advancing
+    // lastIndex past a genuine directive that then never gets tested — the one
+    // direction this module must not fail in.
+    if (hasNonNegatedMatch(section, /\bfix\b(?=[\s\S]{0,400}?\bbefore\s+merg(?:e|es|ed|ing)\b)/i)) {
       return true;
     }
   }
