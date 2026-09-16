@@ -233,7 +233,8 @@ describe("createOrAdoptRunSecret", () => {
     // permanently-contended name is capped at two passes rather than spinning.
     // Pinning the counts is what stops a later change raising the budget quietly.
     const err = apiException(409, "AlreadyExists");
-    const patch = vi.fn().mockRejectedValue(apiException(409, "Conflict"));
+    const writeErr = apiException(409, "Conflict");
+    const patch = vi.fn().mockRejectedValue(writeErr);
     const coreApi = makeCoreApi({
       createNamespacedSecret: vi.fn().mockRejectedValue(err),
       readNamespacedSecret: vi.fn().mockResolvedValue({
@@ -245,6 +246,10 @@ describe("createOrAdoptRunSecret", () => {
     await expect(createOrAdoptRunSecret(coreApi, INPUT)).rejects.toBe(err);
     expect(coreApi.createNamespacedSecret).toHaveBeenCalledTimes(2);
     expect(patch).toHaveBeenCalledTimes(2);
+    // The thrown identity is the create-time 409 (above), so without this the
+    // adoption failure would be discarded and the give-up would read as
+    // `AlreadyExists` with no trace of which mode was churning the name.
+    expect((err as { cause?: unknown }).cause).toBe(writeErr);
   });
 
   it("fails closed with its own error when the adoption write is neither 404 nor 409", async () => {
