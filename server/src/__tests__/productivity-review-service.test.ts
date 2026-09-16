@@ -7550,6 +7550,90 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(0);
   });
 
+  // BLO-27698 B3b (Ally review on 2e95b50b) — `liveExecutingMs` clamped its head
+  // to `attributableStartAt` but not its tail to `attributableEndAt`, and the two
+  // genuinely differ: `nonLiveExecutionHoldSince` keys *only* on the run pointed
+  // at by `issue.executionRunId`, so a parked holder truncates the episode into
+  // the past, while the reducer walks all of `latestRuns` and would count a live
+  // sibling right up to `now`.
+  //
+  // The fixture is that exact shape and nothing else: a `queued` holder last
+  // signalling 11h ago (episode truncated to 2h) plus a live sibling that has
+  // been `running` for 13h and is still signalling. Unclamped, `liveExecutingMs`
+  // reads 13h — over the 6h bar — and fires; clamped it reads the episode's own
+  // 2h and declines. Note 2h is also under `longActiveMs`, so nothing else can
+  // fire here and the assertion isolates the clamp.
+  //
+  // This is not a tidiness fix. Unclamped, the trigger fires on precisely the
+  // wall-clock `nonLiveExecutionHoldSince` exists to exclude (BLO-18307), and
+  // the evidence pack self-contradicts: the trigger reason renders
+  // `liveExecutingMs` while the report renders `elapsedMs`, so the review would
+  // read "executing continuously for 13h" above "Current active elapsed time: 2h".
+  it("does not fire runaway_execution on live-sibling time outside the episode (tail clamp)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+    // The holder's last signal, and therefore `attributableEndAt`.
+    const holderLastSignal = new Date(now.getTime() - 11 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+    });
+    const siblingId = randomUUID();
+    const holderId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      {
+        // Live sibling: signalling as of `now`, so its span IS live and only the
+        // tail clamp can bound it.
+        id: siblingId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "running",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt,
+        lastOutputAt: new Date(now.getTime() - 60 * 1000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: startedAt,
+        updatedAt: startedAt,
+      },
+      {
+        // Parked holder: `queued` returns `lastSignal` from
+        // `nonLiveExecutionHoldSince`, truncating the episode to 11h ago.
+        id: holderId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "queued",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: null,
+        lastOutputAt: holderLastSignal,
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: holderLastSignal,
+        updatedAt: holderLastSignal,
+      },
+    ]);
+    await db
+      .update(issues)
+      .set({ executionRunId: holderId, checkoutRunId: holderId, executionLockedAt: holderLastSignal })
+      .where(eq(issues.id, seeded.issueId));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    // Removing `Math.min(span.end, attributableEndAt.getTime())` turns this red.
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description ?? "").not.toContain("Primary trigger: `runaway_execution`");
+    expect(result.created).toBe(0);
+  });
+
   it("does not suppress no-comment productivity reviews for future monitor waits", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
@@ -7795,6 +7879,74 @@ describeEmbeddedPostgres("productivity review service", () => {
       .where(eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed"));
     expect(closeEntries).toHaveLength(1);
     expect(closeEntries[0]?.entityId).toBe(reviewId);
+    expect(closeEntries[0]?.details).toMatchObject({
+      suppressedBy: "terminal_source",
+      sourceStatus: "done",
+      sourceIssueId: seeded.issueId,
+    });
+  });
+
+  // BLO-27698 B3b (Ally review on 2e95b50b) — `runaway_execution` rides the same
+  // `done`-retires arm as `long_active_duration`, for the same reason: it is a
+  // runtime/cost alarm on a run executing *right now*, so once the source
+  // reaches `done` that run has finished and every option in its rubric ("let it
+  // finish", "bound it", "route to platform") is a question about a run that no
+  // longer exists. Without this the review sits unanswerable in a reviewer's
+  // queue forever.
+  //
+  // Deliberately paired with the sibling above rather than parameterised: the
+  // two arms are separate per-trigger decisions, and `cancelled` must still
+  // retire neither.
+  it("closes an open runaway-execution productivity review once its source issue is done", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "done",
+      startedAt: new Date(now.getTime() - 13 * 60 * 60 * 1000),
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        trigger: "runaway_execution",
+        sourceIssueId: seeded.issueId,
+      },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    // Dropping `runaway_execution` from the `done` arm turns this red.
+    expect(result.closedTerminalSourceReviews).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("done");
+
+    const closeEntries = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed"));
+    expect(closeEntries).toHaveLength(1);
     expect(closeEntries[0]?.details).toMatchObject({
       suppressedBy: "terminal_source",
       sourceStatus: "done",

@@ -1600,6 +1600,20 @@ function choosePrimaryTrigger(input: {
   return null;
 }
 
+// Which open reviews hold an agent back from *continuing* onto more work.
+// Scoped to the accumulation triggers — `no_comment_streak` and `high_churn`
+// both say "you have already spent turns badly, stop taking more".
+// Deliberately excluded:
+//   - `long_active_duration` / `runaway_execution` — both describe a single
+//     episode that is still in flight, not a pattern across turns. A
+//     continuation hold cannot act on either: the hold is evaluated between
+//     turns, while the run these describe is executing right now, so holding
+//     would neither stop that run nor answer the review. `runaway_execution`
+//     (BLO-27698 B3b) is excluded for exactly the reason it bypasses the
+//     monitor gate — it is a runtime/cost alarm for a human to adjudicate, not
+//     an automatic brake.
+//   - `runtime_failure_streak` — infra faults; withholding the agent's next
+//     turn punishes it for the platform's failure.
 function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
   return trigger === "no_comment_streak" || trigger === "high_churn";
 }
@@ -1616,6 +1630,11 @@ function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
 //   - `runtime_failure_streak` — genuine infra faults, disjoint from the gate by
 //     construction (`isInfraFailureRun` short-circuits on
 //     `isDependencyBlockedRun`), so a blocker does not explain it.
+//   - `runaway_execution` (BLO-27698 B3b) — an unresolved blocker cannot explain
+//     a run that is executing *right now*. The dependency gate cancels queued
+//     runs before dispatch, so it produces absence of execution, never an
+//     excess of it; a blocker added mid-run leaves the burn real and the alarm
+//     valid. Fail-closed here is the deliberate answer, not an oversight.
 //   - missing/unknown provenance — fails closed.
 function isDependencyBlockedClosableTrigger(trigger: unknown) {
   return trigger === "no_comment_streak" || trigger === "long_active_duration";
@@ -1652,12 +1671,21 @@ function isDependencyBlockedClosableRecord(trigger: unknown, firedTriggers: unkn
   return isDependencyBlockedClosableTriggerSet(firedTriggers);
 }
 
+// Exhaustive by type, not by if-ladder (Ally review on BLO-27698 2e95b50b): the
+// previous form fell through to "Long active duration" as its default, so a new
+// trigger would render under an existing trigger's name — a silently wrong
+// evidence pack rather than a compile error. `runaway_execution` in particular
+// would have been labelled as the very trigger it was split out from.
+const TRIGGER_LABELS: Record<ProductivityReviewTrigger, string> = {
+  no_comment_streak: "No-comment streak",
+  long_active_duration: "Long active duration",
+  high_churn: "High churn",
+  runtime_failure_streak: "Runtime failure streak",
+  runaway_execution: "Runaway execution",
+};
+
 function formatTrigger(trigger: ProductivityReviewTrigger) {
-  if (trigger === "no_comment_streak") return "No-comment streak";
-  if (trigger === "high_churn") return "High churn";
-  if (trigger === "runtime_failure_streak") return "Runtime failure streak";
-  if (trigger === "runaway_execution") return "Runaway execution";
-  return "Long active duration";
+  return TRIGGER_LABELS[trigger];
 }
 
 // BLO-22097: `usageJson: null` means usage was never *recorded*, not that
@@ -3139,18 +3167,33 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       let suppressionDetails: Record<string, unknown> = {};
       // A `done` source can retire an already-open long-active review: the work
       // episode finished under the terminal-status evidence gate, so the
-      // elapsed-time alarm no longer needs manager adjudication. This does not
-      // extend to `cancelled`; an assignee can abandon and later restore their
-      // own source issue, so cancellation must not retire its oversight
-      // artifact. It also does not extend to historical/accountability triggers
-      // (`no_comment_streak`, `high_churn`) or missing provenance: completion
-      // does not invalidate those signals, and unknown trigger semantics fail
-      // closed.
-      if (trigger === "long_active_duration" && sourceIssue.status === "done") {
+      // elapsed-time alarm no longer needs manager adjudication. `runaway_execution`
+      // rides the same arm for the same reason (BLO-27698 B3b, Ally review on
+      // 2e95b50b): it is a runtime/cost alarm on a run that is executing *right
+      // now*, so once the source reaches `done` that run has finished and every
+      // option in its rubric — "let it finish", "bound it", "route to platform"
+      // — is a question about a run that no longer exists. Leaving it open would
+      // park an unanswerable review in a reviewer's queue.
+      // This does not extend to `cancelled`; an assignee can abandon and later
+      // restore their own source issue, so cancellation must not retire its
+      // oversight artifact. It also does not extend to historical/accountability
+      // triggers (`no_comment_streak`, `high_churn`) or missing provenance:
+      // completion does not invalidate those signals, and unknown trigger
+      // semantics fail closed.
+      if (
+        (trigger === "long_active_duration" || trigger === "runaway_execution")
+        && sourceIssue.status === "done"
+      ) {
         suppressedBy = "terminal_source";
         suppressionDetails = { sourceStatus: sourceIssue.status };
       } else if (trigger === "long_active_duration" && !isTerminalIssueStatus(sourceIssue.status)) {
-        // Deliberately monitor-only. An approval gate suppresses *new* reviews but never closes one
+        // Deliberately monitor-only, and deliberately `long_active_duration`-only:
+        // `runaway_execution` is excluded here because `choosePrimaryTrigger`
+        // opts it out of the monitor gate by design (an armed monitor means
+        // "wake me later", not "this run may execute indefinitely"). Honouring a
+        // monitor here would re-suppress through the close path what the
+        // generation path deliberately let fire.
+        // An approval gate suppresses *new* reviews but never closes one
         // that already fired: the approval that would justify the close is creatable by the very
         // agent under review (`POST /companies/:companyId/approvals` resolves `requestedByAgentId`
         // from an agent actor and hard-codes `status: "pending"`), so honouring it here would let a
@@ -3828,8 +3871,27 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     //
     // For B3b the liveness requirement is what keeps `runaway_execution`
     // bounded: a run that executed hard and then went quiet stops counting, so
-    // the trigger cannot latch on a dead span. Clamped to the episode so a span
-    // that predates it cannot inflate the gate.
+    // the trigger cannot latch on a dead span. Clamped to the episode at *both*
+    // ends so a span that predates it cannot inflate the gate and a span that
+    // outruns it cannot exceed the elapsed figure rendered beside it.
+    //
+    // The tail clamp is not symmetry for its own sake (Ally review on
+    // 2e95b50b). `nonLiveExecutionHoldSince` keys only on the run pointed at by
+    // `issue.executionRunId`, so when that holder is terminal/`queued`/silent
+    // it truncates `attributableEndAt` into the past — while this reducer walks
+    // *all* of `latestRuns` and would happily count a live sibling row right up
+    // to `now`. Unclamped, `liveExecutingMs > elapsedMs` is representable, and
+    // the evidence pack renders both: the trigger reason prints this figure and
+    // the report prints `elapsedMs`, so one review could claim 13h of continuous
+    // execution above "Current active elapsed time: 2h". Worse, the trigger
+    // would fire on exactly the wall-clock `nonLiveExecutionHoldSince` exists to
+    // exclude (BLO-18307), re-entering through a gate that never consulted it.
+    //
+    // Order matters: the clamp is applied to the measured duration *after* the
+    // `span.end < now` liveness test, never before. Testing a clamped end
+    // against `now` would read a truncated `attributableEndAt` as "went silent"
+    // and zero out genuinely live runs — liveness asks about `now`, the counted
+    // duration stays inside the episode.
     const liveExecutingMs = Math.max(
       0,
       ...latestRuns.map((run) => {
@@ -3837,7 +3899,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         const span = runLiveInterval(run, now);
         if (!span || span.end < now.getTime()) return 0;
         const start = attributableStartAt ? Math.max(span.start, attributableStartAt.getTime()) : span.start;
-        return Math.max(0, span.end - start);
+        const end = Math.min(span.end, attributableEndAt.getTime());
+        return Math.max(0, end - start);
       }),
     );
     // Only suppress while the run currently heading the episode is still
