@@ -522,8 +522,8 @@ const CLAUDE_EVENT_SUBTYPE_RE = /"subtype"\s*:\s*"([^"\r\n]*)"/;
  *      logs interleave both streams, so `readPodContainerLogTail`
  *      (`execute.ts:894`, via `readNamespacedPodLog`) must stay confined to
  *      diagnostics. Today `stdout` is assigned only from `podLogPath`
- *      (`execute.ts:2248` tail, `:2261` on-disk), so both paths read the same
- *      single-writer file.
+ *      (in `execute.ts`: the `tailResult.value` tail, and the `stdout =
+ *      onDisk` re-read), so both paths read the same single-writer file.
  *
  * Either one re-opens BLO-7991's hole with no diff on this guard — the failure
  * mode every prior iteration in this family took (BLO-7991 → #1525 → BLO-31794).
