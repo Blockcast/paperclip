@@ -5128,13 +5128,15 @@ describeEmbeddedPostgres("productivity review service", () => {
   });
 
   // BLO-22887 verifying-signal cell 1. The three tests below deliberately reuse
-  // the fixture immediately above, because that fixture *is* the reported
-  // defect: BLO-22703 fired `long_active_duration` on BLO-21016 citing
-  // "18h 52m monitor-gated, 13h 8m unattended (monitor lapsed ..., never
-  // re-armed)" while the control plane independently held that issue
-  // dependency-blocked. Keeping the fixture byte-identical and adding only the
-  // blocker is what makes these a control/treatment pair rather than three
-  // unrelated scenarios.
+  // the fixture immediately above, because that fixture reproduces the *shape*
+  // of the reported defect — monitor lapses early, is never re-armed, long
+  // unattended remainder — on an issue the control plane independently holds
+  // dependency-blocked, which is how BLO-22703 fired `long_active_duration` on
+  // BLO-21016. Its shape, not its numbers: this fixture's own accounting is
+  // `5m monitor-gated, 19h 55m unattended` (asserted in cell 3), not
+  // BLO-22703's. Keeping the fixture byte-identical and adding only the blocker
+  // is what makes these a control/treatment pair rather than three unrelated
+  // scenarios.
   //
   // The BLO-22436 suppression tests all drive `no_comment_streak`, so until now
   // `long_active_duration` — the one trigger this ticket was filed about, and
@@ -5167,6 +5169,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     // rotting into a no-op — which is the failure mode that would make this
     // test pass for the wrong reason.
     expect(result.dependencyBlockedSuppressed).toBe(1);
+    // Pins gate *ordering*, not monitor state: the dependency gate `continue`s
+    // before the monitor gate, so this cannot fail while the assertion above
+    // holds. Kept here as the ordering pin; cell 2 omits it as redundant.
     expect(result.monitorScheduledSuppressed).toBe(0);
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
@@ -5185,7 +5190,10 @@ describeEmbeddedPostgres("productivity review service", () => {
   // pinning path, which would make this test green without the dependency gate
   // being consulted at all. Overdue removes that second explanation, so the
   // `dependencyBlockedSuppressed` assertion below can only be satisfied by the
-  // gate under test.
+  // gate under test. So this cell must land on the same counters as cell 1: the
+  // park row is inert with respect to the gate, and asserting invariance under
+  // the AC's named signal is the point — it is AC fidelity, not a second
+  // suppression path. The near-duplicate of cell 1 is deliberate.
   it("suppresses a long_active_duration review for an issue parked on an overdue dependency_blocked retry (BLO-22887)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const activeStartedAt = new Date(now.getTime() - 20 * 60 * 60 * 1000);
