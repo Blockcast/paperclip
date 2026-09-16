@@ -5185,15 +5185,20 @@ describeEmbeddedPostgres("productivity review service", () => {
   // deferral), so the retry reason is a downstream marker of the same graph
   // state, and BLO-21016 carried both at once exactly as this fixture does.
   //
-  // The park is placed OVERDUE on purpose. A future-due `scheduled_retry`
-  // suppresses `long_active_duration` on its own via the BLO-19848/BLO-23248
-  // pinning path, which would make this test green without the dependency gate
-  // being consulted at all. Overdue removes that second explanation, so the
-  // `dependencyBlockedSuppressed` assertion below can only be satisfied by the
-  // gate under test. So this cell must land on the same counters as cell 1: the
-  // park row is inert with respect to the gate, and asserting invariance under
-  // the AC's named signal is the point — it is AC fidelity, not a second
-  // suppression path. The near-duplicate of cell 1 is deliberate.
+  // The park is placed OVERDUE only because that is the state a real
+  // `issue_dependencies_blocked` park reaches once its due time passes — the
+  // position is not load-bearing. The BLO-19848/BLO-23248 pinning path cannot
+  // classify this row in either position: `classifyNoExecutableTurnRun`
+  // returns null for a `scheduled_retry` whose reason is not
+  // `ccrotate_capacity` and whose errorCode is not `rate_limit_exhausted`
+  // (productivity-review.ts, `isCapacityClass`), and this cell overrides both
+  // helper defaults. The only other `scheduledRetryAt` consumer,
+  // `liveSegmentStartedAt`, needs `status === "running"` plus an
+  // `issue.executionRunId` the helper deliberately leaves null. So the park row
+  // is inert with respect to the gate under test, and this cell must land on
+  // the same counters as cell 1: asserting invariance under the AC's named
+  // signal is the point — it is AC fidelity, not a second suppression path. The
+  // near-duplicate of cell 1 is deliberate.
   it("suppresses a long_active_duration review for an issue parked on an overdue dependency_blocked retry (BLO-22887)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const activeStartedAt = new Date(now.getTime() - 20 * 60 * 60 * 1000);
