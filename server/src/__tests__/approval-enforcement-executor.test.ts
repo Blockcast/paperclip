@@ -21,7 +21,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentConfigRevisions,
@@ -41,6 +41,25 @@ import { applyApprovalEnforcement } from "../services/approval-enforcement-execu
 import { reconcileApprovalEnforcement } from "../services/approval-enforcement-reconciler.ts";
 import { budgetService } from "../services/budgets.ts";
 import { HttpError } from "../errors.ts";
+
+/**
+ * Lets one test make the refusal-audit write fail. Off by default, so every
+ * other test in this file runs against the real `logActivity`.
+ */
+const activityLogControl = vi.hoisted(() => ({ failNext: false }));
+
+vi.mock("../services/activity-log.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/activity-log.ts")>();
+  return {
+    ...actual,
+    logActivity: async (...args: Parameters<typeof actual.logActivity>) => {
+      if (activityLogControl.failNext) {
+        throw new Error("simulated transient failure writing the activity log row");
+      }
+      return actual.logActivity(...args);
+    },
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -559,6 +578,31 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
     expect((refusals[0]!.details as { refusal?: { code?: string } }).refusal?.code).toBe(
       "assertion_superseded",
     );
+    expect(await enforcedAmount(policyId)).toBe(SUPERSEDING_CENTS);
+  });
+
+  it("surfaces the refusal even when recording it fails", async () => {
+    // The audit row is the secondary artifact; the typed code is the route's
+    // product. An unguarded await on the log write would let a transient DB
+    // error replace `assertion_superseded` (409, "a human moved this cap,
+    // stop") with a generic 500, which reads as retryable — losing both halves
+    // of the guardrail's observability at once.
+    const { requesterId, policyId, approvalId } = await seed({
+      enforcedCents: SUPERSEDING_CENTS,
+      policyAmountUpdatedAt: new Date(),
+    });
+    const { hooks } = collectingHooks();
+    activityLogControl.failNext = true;
+    try {
+      await expectRefusal(
+        applyApprovalEnforcement(db, approvalId, requester(requesterId), hooks),
+        "assertion_superseded",
+        409,
+      );
+    } finally {
+      activityLogControl.failNext = false;
+    }
+    // The guardrail still held: the later decision's cap is untouched.
     expect(await enforcedAmount(policyId)).toBe(SUPERSEDING_CENTS);
   });
 
