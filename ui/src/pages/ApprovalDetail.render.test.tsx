@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
 
-import type { ReactNode } from "react";
-import { flushSync } from "react-dom";
+import { act, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
@@ -55,8 +54,10 @@ vi.mock("../api/agents", () => ({ agentsApi: agentsApiMock }));
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 async function flush() {
-  await Promise.resolve();
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  await act(async () => {
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
 }
 
 async function waitForAssertion(assertion: () => void, attempts = 50) {
@@ -88,10 +89,10 @@ const budgetCard = (over: Partial<Approval> = {}): Approval =>
     ...over,
   }) as Approval;
 
-function renderDetail(container: HTMLDivElement) {
+async function renderDetail(container: HTMLDivElement) {
   const root = createRoot(container);
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  flushSync(() => {
+  await act(async () => {
     root.render(
       <QueryClientProvider client={queryClient}>
         <ApprovalDetail />
@@ -124,7 +125,7 @@ describe("ApprovalDetail resubmit affordance", () => {
   // button renders and this test fails — which is the point of the file.
   it("suppresses the button on a caller-filed budget card and explains why", async () => {
     approvalsApiMock.get.mockResolvedValue(budgetCard({ requestedByAgentId: "agent-1" }));
-    const root = renderDetail(container);
+    const root = await renderDetail(container);
 
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Sent back for revision");
@@ -138,18 +139,22 @@ describe("ApprovalDetail resubmit affordance", () => {
     expect(container.textContent).not.toContain("Only the agent");
     expect(container.textContent).toContain("enforcement_assertions");
 
-    flushSync(() => root.unmount());
+    await act(async () => {
+      root.unmount();
+    });
   });
 
   it("keeps the button on a watcher-filed budget card, which the server exempts", async () => {
     approvalsApiMock.get.mockResolvedValue(budgetCard());
-    const root = renderDetail(container);
+    const root = await renderDetail(container);
 
     await waitForAssertion(() => {
       expect(resubmitButton(container)).not.toBeNull();
     });
     expect(container.textContent).not.toContain("Sent back for revision");
 
-    flushSync(() => root.unmount());
+    await act(async () => {
+      root.unmount();
+    });
   });
 });
