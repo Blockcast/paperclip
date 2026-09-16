@@ -138,6 +138,7 @@ import {
   setBackstopDeferredCandidates,
 } from "../metrics.js";
 import {
+  isInfraFailureRun,
   isLegacySessionUnavailableAdapterMismatch,
   isZeroTokenStartupFailureRun,
   isZeroTokenSessionResetRetryRun,
@@ -837,6 +838,11 @@ type LatestIssueRun = Pick<
   | "livenessState"
   | "resultJson"
   | "usageJson"
+  // BLO-32679: read with `usageJson` by `isInfraFailureRun` to tell a run that
+  // never reached a model call from one that was interrupted mid-turn. Null
+  // usage alone is unknown, not zero, so omitting this column would silently
+  // widen the never-executed arm to every failed run with missing telemetry.
+  | "logBytes"
   | "sessionIdBefore"
   | "scheduledRetryAttempt"
   // BLO-32566: read by the stranded-lane wake sites to escalate off `status_only`
@@ -2314,6 +2320,7 @@ export function recoveryService(
     livenessState: heartbeatRuns.livenessState,
     resultJson: heartbeatRuns.resultJson,
     usageJson: heartbeatRuns.usageJson,
+    logBytes: heartbeatRuns.logBytes,
     sessionIdBefore: heartbeatRuns.sessionIdBefore,
     scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
     statusOnlyDocumentWriteRefusedAt: heartbeatRuns.statusOnlyDocumentWriteRefusedAt,
@@ -2854,24 +2861,37 @@ export function recoveryService(
    * unique index explicitly allows) says someone typed a URL, which predicts no wake at
    * all.
    *
-   * Deliberately consulted ONLY on the succeeded-run gate, where the sweep is reasoning
-   * from absence of evidence. The failed/nonretryable arms escalate on positive evidence
-   * that something broke, and an open PR does not refute that -- widening this to them
-   * would suppress recovery from real faults.
+   * Consulted on the succeeded-run gate, where the sweep is reasoning from absence of
+   * evidence, and -- since BLO-32679 -- on one narrow slice of the failed arm. The
+   * general rule still holds: the failed/nonretryable arms escalate on positive evidence
+   * that something broke, and an open PR does not refute that, so widening this to the
+   * whole failed arm would suppress recovery from real faults.
    *
-   * BLO-32679 measured the cost of that scoping and it is larger than "an edge case", so
-   * the numbers are recorded here rather than left to be re-derived. Company `aaced805`,
-   * 2026-09-08, 70 live `stranded_assigned_issue` actions on one assignee: `latestRun`
-   * had failed on **70 of 70**, so nothing in the live population could reach this
-   * predicate, and **38 of those 70** were on rows carrying a fresh webhook-written open
-   * PR -- i.e. rows this predicate would have exempted had it been asked. Error codes on
-   * the 38: `job_failed` 22, `adapter_failed` 12, `k8s_pod_schedule_failed` 4. None of
-   * the three is an assertion about attendance, and `job_failed`
+   * The slice that is exempt is runs that never reached a model call (`isInfraFailureRun`).
+   * The gate's real premise is not "a run failed" but "a turn was interrupted, so intent
+   * is unknown" -- and the danger case is that the interrupted work was precisely what
+   * would have moved the PR, leaving a wake that never arrives. A run that never started
+   * interrupted nothing: the last real state is whatever the previous run left, and if
+   * that was a fresh open PR it is still evidence. So the premise is false for that
+   * subset and true everywhere else.
+   *
+   * BLO-32679 measured the cost of the original scoping, and the numbers are recorded
+   * here rather than left to be re-derived. Company `aaced805`, 2026-09-08, 70 live
+   * `stranded_assigned_issue` actions on one assignee: `latestRun` had failed on **70 of
+   * 70**, so nothing in the live population could reach this predicate, and **38 of those
+   * 70** were on rows carrying a fresh webhook-written open PR -- i.e. rows this
+   * predicate would have exempted had it been asked. `job_failed`
    * (`BackoffLimitExceeded`) is frequently the sweep's OWN `issue_continuation_needed`
-   * retry giving up -- so the sweep can supply the disqualifier that voids the
-   * exemption. Two tests in the PEN-2791 block pin this behaviour on the failed arm;
-   * the ruling on whether to keep it is on BLO-32679, and if it lands the honoured way
-   * this paragraph and those two assertions move together.
+   * retry giving up, so the sweep can supply the disqualifier that voids the exemption.
+   *
+   * Re-measured 2026-09-16 on the predicate that actually gates the exemption rather than
+   * on error codes: of 71 live actions, **70 never executed** (21 with an explicit
+   * zero-token usage blob, 49 inferred from null usage with logs at most 4,738 bytes
+   * against a 200,000 ceiling) and exactly **1 had executed** -- 6,531 input + 3,983
+   * output tokens under an `adapter_failed` code. That one row is why this is keyed on
+   * `isInfraFailureRun` and not on the error code: every code in the population appears
+   * in `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES`, so a code test would have exempted a
+   * genuinely interrupted turn.
    *
    * Bounded on `updatedAt` because an open PR proves a wake arrives when the PR next
    * MOVES, not that one arrives on a schedule -- see `openPullRequestAttendanceGraceMs`
@@ -8694,6 +8714,34 @@ export function recoveryService(
           lapsedMonitorGraceMs,
           openPullRequestAttendanceGraceMs,
         )
+      ) {
+        result.skipped += 1;
+        return;
+      }
+      // BLO-32679: a run that never reached a model call interrupted no turn, so it is
+      // not evidence about attendance — only about the runtime. The gate above rests on
+      // a real asymmetry and is kept: a run that executed and then died leaves unknown
+      // intent, and if the interrupted work was precisely what would have moved the PR,
+      // the webhook wake never arrives and the exemption converts a recoverable fault
+      // into a silent stall. A run that never started has no such in-flight work — the
+      // agent's last real state is whatever the previous run left, and if that was
+      // "parked with a fresh open PR", it still holds.
+      //
+      // Only the PR disjunct is admitted here, NOT the whole of
+      // `hasPersistedDurableWaitPath`: a lapsed monitor or a blocker edge is a claim the
+      // sweep makes from absence, whereas a webhook-written open PR is positive external
+      // evidence bounded by its own freshness grace. Widening further would reintroduce
+      // the unbounded belief this scoping exists to prevent.
+      //
+      // Keyed on `isInfraFailureRun`, not on error code. Measured 2026-09-16 over the 71
+      // live `stranded_assigned_issue` actions on company `aaced805`: 70 never executed,
+      // and the single exception is exactly the row an error-code test would have gotten
+      // wrong — `adapter_failed` (in `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES`) that had
+      // burned 6,531 input + 3,983 output tokens before dying. That is an interrupted
+      // turn wearing an infra error code, and it stays seizable.
+      if (
+        latestRun && isInfraFailureRun(latestRun) &&
+        await hasOpenPullRequestWakePath(issue, openPullRequestAttendanceGraceMs)
       ) {
         result.skipped += 1;
         return;

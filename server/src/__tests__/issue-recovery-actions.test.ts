@@ -2549,6 +2549,18 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         invocationSource: "assignment",
         triggerDetail: "system",
         status: "failed",
+        // BLO-32679: `livenessState` and the usage/log pair are what
+        // `isInfraFailureRun` reads, so they are the difference between a run that never
+        // reached a model call and one interrupted mid-turn. Seeded to the measured
+        // production shape: of 71 live `stranded_assigned_issue` actions on company
+        // `aaced805` (2026-09-16), 71/71 carried `livenessState: "failed"`, and 49
+        // carried null usage with logs at most 4,738 bytes against a 200,000 ceiling.
+        // Leaving `livenessState` unset would make this row never-executed=false and
+        // quietly turn the exemption test below into a test of a row the predicate never
+        // looks at.
+        livenessState: "failed",
+        usageJson: null,
+        logBytes: null,
         error: "BackoffLimitExceeded: Job has reached the specified backoff limit",
         errorCode: "job_failed",
         startedAt: new Date(Date.now() - 45 * 60_000),
@@ -2697,8 +2709,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(updated?.status).toBe("blocked");
     });
 
-    // BLO-32679. These two pin the boundary of the exemption on the OTHER axis: not
-    // "which PRs count" but "which runs let the question be asked at all".
+    // BLO-32679. These three pin the boundary of the exemption on the OTHER axis: not
+    // "which PRs count" but "which runs let the question be asked at all". The control
+    // establishes the shape is seizable; the second shows a never-executed run does not
+    // void a fresh PR; the third shows an executed-then-died run still does.
     it("escalates the failed-continuation shape when no pull request is recorded (control)", async () => {
       const { sourceIssueId } = await seedSeizableFailedContinuationRow();
 
@@ -2711,7 +2725,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(updated?.status).toBe("blocked");
     });
 
-    it("still escalates a fresh webhook-written open pull request when the latest run failed", async () => {
+    it("skips a fresh webhook-written open pull request when the latest run never executed", async () => {
       const { companyId, sourceIssueId } = await seedSeizableFailedContinuationRow();
       const fields = await insertPullRequestWorkProduct({
         companyId,
@@ -2724,17 +2738,54 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
       const result = await sweep();
 
-      // CURRENT, DELIBERATE behaviour, not an aspiration: the work product satisfies
-      // every clause of `hasOpenPullRequestWakePath`, but the predicate is never
-      // consulted because the gate above it requires a succeeded run. Measured
-      // 2026-09-08 on company `aaced805`: 38 of 70 live `stranded_assigned_issue`
-      // actions were on rows matching this exact shape -- fresh webhook-written open
-      // PR, `latestRunStatus: failed` (22 `job_failed`, 12 `adapter_failed`, 4
-      // `k8s_pod_schedule_failed`), 70/70 of the population failed so 0 were eligible.
+      // BLO-32679, honoured. The seeded run failed before reaching a model call, so it
+      // interrupted no turn and says nothing about whether anyone will come back to the
+      // issue -- only that a runtime broke. The webhook-written open PR does answer that
+      // question, and is bounded by its own freshness grace (asserted above).
       //
-      // Flip these two assertions to `0` / `"in_progress"` if the BLO-32679 ruling
-      // honours the PR path independently of run status; that is the whole diff on the
-      // test side.
+      // Measured 2026-09-08 on company `aaced805`: 38 of 70 live
+      // `stranded_assigned_issue` actions were on rows matching this exact shape and
+      // were seized anyway, because the predicate was never consulted on the failed arm.
+      expect(result.escalated).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("in_progress");
+    });
+
+    it("still escalates a fresh webhook-written open pull request when the failed run had executed", async () => {
+      const { companyId, sourceIssueId, coderId } = await seedSeizableFailedContinuationRow();
+      // The boundary the BLO-32679 ruling draws, and the reason the exemption is keyed on
+      // `isInfraFailureRun` rather than on the error code. This run burned tokens before
+      // dying, so a turn WAS interrupted and its intent is unknown -- and if that
+      // interrupted work was what would have moved the PR, the webhook wake never comes.
+      //
+      // Not hypothetical: this is the one row out of 71 live actions (company
+      // `aaced805`, 2026-09-16) that had executed -- 6,531 input + 3,983 output tokens,
+      // 158,380 log bytes, under an `adapter_failed` code. Every error code in that
+      // population, including that one, is in `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES`, so
+      // a code-keyed exemption would have suppressed recovery on a genuinely interrupted
+      // turn.
+      //
+      // Only the usage/log pair is varied off the shared seed, NOT the error code:
+      // `adapter_failed` is in `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES`, so copying
+      // the live row's code verbatim would route this to the bounded-retry arm and the
+      // test would read `escalated: 0` for a reason that has nothing to do with the
+      // predicate under test. Holding the code at the control's `job_failed` keeps
+      // execution the single variable between this test and the one above.
+      await db.update(heartbeatRuns)
+        .set({
+          usageJson: { inputTokens: 6531, outputTokens: 3983 },
+          logBytes: 158380,
+        })
+        .where(eq(heartbeatRuns.agentId, coderId));
+      const fields = await insertPullRequestWorkProduct({
+        companyId,
+        issueId: sourceIssueId,
+        prNumber: 2434,
+      });
+      expect(fields.status).toBe("ready_for_review");
+
+      const result = await sweep();
+
       expect(result.escalated).toBe(1);
       const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
       expect(updated?.status).toBe("blocked");
