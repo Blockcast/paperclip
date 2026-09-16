@@ -14,13 +14,18 @@
 //
 // Requires `gh` authenticated for every repo named in the scanned comments.
 import { execFileSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const API = process.env.PAPERCLIP_API_URL;
 const KEY = process.env.PAPERCLIP_API_KEY;
 const CID = process.env.PAPERCLIP_COMPANY_ID;
 const APPLY = process.argv.includes("--apply");
 // Imported by the test for `namesIssue`; only the direct run touches the API.
-const RUN = process.argv[1]?.endsWith("backfill-pr-work-products.mjs");
+// The native idiom, not a filename suffix: a wrapper, symlink, or bundled entry
+// point would leave the suffix check false, and the else-branch below skips the
+// env check, the loop AND the summary — so "the backfill never ran" would exit 0
+// with no output, on a script whose result feeds the rollout baseline.
+const RUN = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (RUN && (!API || !KEY || !CID)) {
   console.error("set PAPERCLIP_API_URL, PAPERCLIP_API_KEY and PAPERCLIP_COMPANY_ID");
@@ -37,15 +42,46 @@ const j = async (path, init) => {
 const PR_RE = /https?:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)\b/g;
 const LIMIT = 500;
 
+// The body arm accepts ONLY a labeled owning-reference line, mirroring
+// OWNING_REFERENCE_LABEL_PATTERN / HOUSE_REFERENCE_LABEL_PATTERN in
+// server/src/services/paperclip-identifiers.ts. A bare prose mention is
+// deliberately NOT an owning reference (BLO-20886): `Related: BLO-1234` in
+// someone else's PR body must not link that PR to this issue.
+//
+// Deliberately a copy rather than an import: this is a plain .mjs ops script
+// and the real helpers are TypeScript source. The copy is narrower than the
+// original (no fenced-code or HTML-comment stripping, no trailing-label
+// splitting), which fails in the safe direction — it can miss a link, and a
+// missed link leaves the issue exactly as the script found it. The original
+// defect failed the other way.
+const OWNING_LABEL_LINE =
+  /^ {0,3}(?:[-*+]|\d{1,3}[.)])?[ \t]*(?:fix(?:e[sd])?|clos(?:e[sd]?)|resolv(?:e[sd]?)|refs?|paperclip[ \t]+qa[ \t]+task|paperclip[ \t]+task|paperclip[ \t]+issue|issue)[ \t]*:?[ \t]+(.+)$/i;
+
 /**
  * Does this PR claim this issue? Mirrors the webhook's link rule: the
- * identifier appears in the PR title, body or head branch. Case-insensitive,
- * bounded so BLO-123 does not match BLO-1234.
+ * identifier appears in the PR title, the head branch, or on a labeled owning
+ * reference line in the body. Case-insensitive, bounded so BLO-123 does not
+ * match BLO-1234.
+ *
+ * The body is NOT scanned as free text. The script's operating condition is
+ * issues that currently read `no-linked-pull-request`, so a row it creates is
+ * typically the issue's ONLY `pull_request` work product — and the probe
+ * aggregates with `every`. One spurious sibling link therefore either denies
+ * evidence the issue earned, or (if that wrong PR is merged and Ally-clean)
+ * grants both truth shapes vacuously over a single wrong element. Same-fleet
+ * siblings quoting each other's identifiers is the normal case here, not an
+ * edge.
  */
 export function namesIssue(pr, identifier) {
   if (!identifier) return false;
   const re = new RegExp(`\\b${identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
-  return re.test(`${pr.title ?? ""}\n${pr.body ?? ""}\n${pr.headRefName ?? ""}`);
+  if (re.test(`${pr.title ?? ""}\n${pr.headRefName ?? ""}`)) return true;
+  return (pr.body ?? "")
+    .split(/\r?\n/)
+    .some((line) => {
+      const rest = line.match(OWNING_LABEL_LINE)?.[1];
+      return rest ? re.test(rest) : false;
+    });
 }
 
 /** The list route has returned both shapes; neither is worth guessing at 3am. */
@@ -108,10 +144,12 @@ if (RUN) for (const status of ["in_review", "blocked", "in_progress"]) {
       }
 
       // Same rule the webhook uses to link a PR: the PR must NAME this issue in
-      // its title, body or branch. Without this the backfill invents evidence —
-      // a dry run over live data proposed `actions/actions-runner-controller#4516`
-      // and `safishamsi/graphify#1570`, upstream PRs merely cited in prose, and
-      // the truth probe would then read review:ally-clean off the wrong artifact.
+      // its title, its branch, or on a labeled owning-reference line in the body
+      // — a bare prose mention is not ownership. Without this the backfill
+      // invents evidence — a dry run over live data proposed
+      // `actions/actions-runner-controller#4516` and `safishamsi/graphify#1570`,
+      // upstream PRs merely cited in prose, and the truth probe would then read
+      // review:ally-clean off the wrong artifact.
       if (!namesIssue(pr, issue.identifier)) {
         console.warn(`UNRELATED ${issue.identifier} <- ${key}: PR does not name the issue`);
         unrelated += 1;
@@ -145,3 +183,4 @@ if (RUN) for (const status of ["in_review", "blocked", "in_progress"]) {
 }
 
 if (RUN) console.log(`done: created=${created} skipped=${skipped} unrelated=${unrelated} unreadable=${failed} apply=${APPLY}`);
+else console.error("not invoked as a script (argv[1] does not match this module); no backfill performed");

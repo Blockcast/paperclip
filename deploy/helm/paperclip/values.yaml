@@ -271,9 +271,21 @@ githubApp:
 
 # -- Evidence-gate rollout flags. See docs/runbooks/evidence-gate-unlabeled-block.md.
 evidenceGate:
-  # -- "1" escalates an issue whose ONLY missing evidence is `review:ally-clean`
-  # from `warn` to `block` at the `in_review` transition, and only when the
-  # GitHub truth probe ran clean (a failed probe always stays `warn`).
+  # -- Must be the string "0" or "1" — an unquoted YAML bool renders "true",
+  # which the server reads as OFF. The chart fails the render rather than let
+  # that pass silently.
+  #
+  # "1" escalates `warn` to `block` at the `in_review` transition when the gap
+  # is made ENTIRELY of truth shapes and CONTAINS `review:ally-clean`. Note the
+  # second half is `.some()`, not an exact match: a gap of
+  # `["review:ally-clean","deploy:landed"]` — the common case for an open PR —
+  # blocks too.
+  #
+  # Two populations are always suppressed, at every value: a failed GitHub probe
+  # (an outage must not freeze `in_review` estate-wide) and an issue with no
+  # linked pull request (no head to review means the shape is unsatisfiable by
+  # the assignee forever).
+  #
   # `deploy:landed` is never blocking at any value of this flag: the gate runs
   # only on the transition INTO `in_review` and `deploy:landed` means merged, so
   # it is unsatisfiable at the one moment it is evaluated. Keep "0" until the

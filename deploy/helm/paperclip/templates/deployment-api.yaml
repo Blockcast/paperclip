@@ -308,7 +308,7 @@ spec:
             {{- end }}
             {{- end }}
             - name: PAPERCLIP_EVIDENCE_UNLABELED_BLOCK
-              value: {{ ((.Values.evidenceGate).unlabeledTruthBlock) | default "0" | quote }}
+              value: {{ include "paperclip.evidenceGateUnlabeledTruthBlock" . }}
             {{- with .Values.env.extra }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
