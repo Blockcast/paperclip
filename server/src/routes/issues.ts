@@ -11932,6 +11932,43 @@ export function issueRoutes(
           },
           "issue update rejected with 422",
         );
+        // PEN-3255: every `commentBody` write in this handler happens *below*
+        // the `svc.update` call above, so a refused write discards the comment
+        // the same PATCH carried — no row, no log line, and nothing in the
+        // response saying so. An operator who bundles "move this to
+        // in_progress" with the note explaining why loses the note and keeps
+        // only a 422 about blockers. That was the third Done-when on PEN-3255,
+        // found while the unresolved-blocker guard was refusing every status
+        // write on PEN-2976.
+        //
+        // The comment is deliberately NOT persisted. It almost always narrates
+        // a transition that did not happen ("moving to in_progress because …"),
+        // so writing it anyway would record a false narrative against the row;
+        // and writing it *before* the guard would strand an orphan comment on
+        // every other refusal too. Making the drop explicit is the honest fix —
+        // the caller learns the note needs re-posting, and
+        // `POST /issues/:id/comments` is a separate path this guard does not
+        // touch.
+        //
+        // Scoped to any 422 from the write rather than to the blocker guard
+        // alone: the drop is a property of where the comment is written, not of
+        // which check refused, so narrowing it would leave the identical silent
+        // drop on every sibling refusal.
+        if (commentBody) {
+          const refusalDetails =
+            err.details !== null && typeof err.details === "object" && !Array.isArray(err.details)
+              ? (err.details as Record<string, unknown>)
+              : err.details === undefined
+                ? {}
+                : { detail: err.details };
+          throw new HttpError(err.status, err.message, {
+            ...refusalDetails,
+            commentPersisted: false,
+            commentHint:
+              "The `comment` carried by this PATCH was not saved, because the update it accompanied was refused. " +
+              "Re-post it with POST /api/issues/:id/comments, which is a separate path and is not subject to this guard.",
+          });
+        }
       }
       throw err;
     }
