@@ -1139,6 +1139,9 @@ describe("commit-status description budget", () => {
 describe("mirrored findings retire under both identities (#1707)", () => {
   const RAISED = "195e6e2".padEnd(40, "0");
   const MIRRORING = "ebae10fe77bd".padEnd(40, "0");
+  // A second mirroring head, spliced in only by the `mirroredAgain` knob, so a
+  // chain can be longer than the two heads #1707 itself had.
+  const MIRRORED_AGAIN = "c0ffee1".padEnd(40, "0");
   const DISPOSITIONING = "78107bf4".padEnd(40, "0");
   // Ally has not reviewed this one yet — the gap between reviews where a
   // carried finding is the only thing the gate has to go on.
@@ -1178,18 +1181,35 @@ describe("mirrored findings retire under both identities (#1707)", () => {
    * which is what decides whether the mirror's two ordinals coincide. The
    * default is #1707 itself: RAISED reports one Important, MIRRORING mirrors
    * it as its own Important 1 and adds a new Important 2.
+   *
+   * `mirroredAgain` splices a THIRD reporting head between MIRRORING and
+   * DISPOSITIONING, so the chain is longer than the two heads #1707 had.
+   * Default `0` omits it, leaving every pre-existing case a 2-head sequence.
    */
   function history(
     dispositions: ReturnType<typeof fixed>[],
-    counts: { raised?: number; mirroring?: number; mirroringCritical?: number } = {},
+    counts: {
+      raised?: number;
+      mirroring?: number;
+      mirroringCritical?: number;
+      mirroredAgain?: number;
+    } = {},
   ) {
-    const { raised = 1, mirroring = 2, mirroringCritical = 0 } = counts;
+    const { raised = 1, mirroring = 2, mirroringCritical = 0, mirroredAgain = 0 } = counts;
     return [
       allyComment(verdictReview(RAISED, { important: raised }, []), "2026-09-10T10:00:00Z"),
       allyComment(
         verdictReview(MIRRORING, { important: mirroring, critical: mirroringCritical }, []),
         "2026-09-11T10:00:00Z",
       ),
+      ...(mirroredAgain
+        ? [
+            allyComment(
+              verdictReview(MIRRORED_AGAIN, { important: mirroredAgain }, []),
+              "2026-09-11T22:00:00Z",
+            ),
+          ]
+        : []),
       allyComment(verdictReview(DISPOSITIONING, {}, dispositions), "2026-09-12T10:00:00Z"),
     ];
   }
@@ -1328,6 +1348,51 @@ describe("mirrored findings retire under both identities (#1707)", () => {
         headSha: UNATTESTED,
         reviewerBotLogin: ALLY_BOT_LOGIN,
         comments: acrossSeverities([fixed(RAISED, 1), fixed(MIRRORING, 1)]),
+      });
+
+      expect(verdict).toMatchObject({
+        state: "failure",
+        outcome: "carried_finding",
+        carriedFromHeadSha: MIRRORING,
+      });
+    });
+  });
+
+  /**
+   * A chain is the steady state: a finding survives every push until it is
+   * fixed, and each surviving review re-states it. #1707 is only the shortest
+   * such chain, so every case above is a 2-head sequence — and at two heads
+   * "the intermediate link" does not exist to be got wrong.
+   *
+   * These two extend it to H1 -> H2 -> H3 -> H4-disposes, which is what makes
+   * the rule's "three, not two" clause testable. `headsWithUndispositionedFinding`
+   * filters each attesting head through `isFullyDispositioned` independently,
+   * so H2 is carried by its own unretired ref regardless of H1 and H3 being
+   * clean — a consumer that treated a chain as endpoints-only, or let H3's
+   * retirement cascade backwards, goes green here.
+   */
+  describe("every link in a chain needs its own entry", () => {
+    const chained = (dispositions: ReturnType<typeof fixed>[]) =>
+      history(dispositions, { raised: 1, mirroring: 1, mirroredAgain: 1 });
+
+    it("clears when all three reporting heads are retired", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: chained([fixed(RAISED, 1), fixed(MIRRORING, 1), fixed(MIRRORED_AGAIN, 1)]),
+      });
+
+      expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    });
+
+    it("negative control: skipping the INTERMEDIATE head carries it alone", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        // Both ends of the chain retired, the middle link forgotten — the
+        // shape a producer reaches by dispositioning "the original and the
+        // mirror" when there were two mirrors.
+        comments: chained([fixed(RAISED, 1), fixed(MIRRORED_AGAIN, 1)]),
       });
 
       expect(verdict).toMatchObject({
