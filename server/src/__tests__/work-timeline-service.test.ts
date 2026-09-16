@@ -243,7 +243,7 @@ describeEmbeddedPostgres("work timeline aggregation", () => {
         issueId: childIssueId,
         end: null,
         status: "running",
-        usage: { inputTokens: 120, cachedInputTokens: 30, outputTokens: 50, totalTokens: 200 },
+        usage: { inputTokens: 120, cachedInputTokens: 30, cacheCreationInputTokens: 0, outputTokens: 50, totalTokens: 200 },
       }),
       expect.objectContaining({ runId: activityRunId, issueId: parentIssueId, status: "completed" }),
     ]));
