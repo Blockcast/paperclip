@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { ApiError } from "../api/client";
-import { errorWithRemediation } from "./ApprovalDetail";
+import { canResubmitFromBoard, errorWithRemediation } from "./ApprovalDetail";
 
 // The refusal this exists for: BLO-34008 stops a `budget_override_required` card
 // returning to `pending` without a machine-checkable assertion. The bare `error`
@@ -45,5 +45,41 @@ describe("errorWithRemediation", () => {
   it("survives a null body and a non-Error rejection", () => {
     expect(errorWithRemediation(new ApiError("boom", 500, null), "fell back")).toBe("boom");
     expect(errorWithRemediation("not an error", "fell back")).toBe("fell back");
+  });
+});
+
+// The dead end this closes: "Mark resubmitted" sends no payload, so on a
+// caller-filed budget card the server guard can only answer 422 with a
+// remediation telling the operator the fix must happen somewhere else. The
+// button is suppressed exactly where it cannot win, and — the half that matters
+// for not regressing today's population — left alone where it can.
+describe("canResubmitFromBoard", () => {
+  const card = (over: Partial<Parameters<typeof canResubmitFromBoard>[0]> = {}) => ({
+    type: "budget_override_required",
+    requestedByAgentId: null,
+    requestedByUserId: null,
+    ...over,
+  }) as Parameters<typeof canResubmitFromBoard>[0];
+
+  it("suppresses the button on an agent-filed budget card", () => {
+    expect(canResubmitFromBoard(card({ requestedByAgentId: "a1" }))).toBe(false);
+  });
+
+  it("suppresses it on a user-filed budget card too", () => {
+    expect(canResubmitFromBoard(card({ requestedByUserId: "u1" }))).toBe(false);
+  });
+
+  // Both requester columns null == filed by the budget watcher through
+  // insertApproval(), which the server exempts from the assertion guard. These
+  // are the entire `revision_requested` budget population today, so gating them
+  // would remove the only budget resubmit that currently works.
+  it("keeps it on a watcher-filed budget card, which the server exempts", () => {
+    expect(canResubmitFromBoard(card())).toBe(true);
+  });
+
+  it("never gates a non-budget card, whoever filed it", () => {
+    for (const type of ["hire_agent", "request_board_approval", "approve_ceo_strategy"] as const) {
+      expect(canResubmitFromBoard(card({ type, requestedByAgentId: "a1" }))).toBe(true);
+    }
   });
 });
