@@ -25,6 +25,12 @@ const OLD_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const CURRENT_HEAD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const INTERMEDIATE_HEAD = "cccccccccccccccccccccccccccccccccccccccc";
 const ALLY_BOT_LOGIN = "allyblockcast[bot]";
+// A PR author who is NOT the reviewer identity. Required to reach `clean`
+// (BLO-34316): the gate's positive claim is that someone other than the author
+// examined this head, so every fixture asserting `clean` has to name a distinct
+// author. Those fixtures double as the control showing the gate was narrowed
+// rather than switched off.
+const DISTINCT_PR_AUTHOR = "some-contributor";
 
 function reviewBody(headSha: string, lines: string[]): string {
   return ["## Ally — Consolidated PR Review", `Reviewed head: ${headSha}`, ...lines].join("\n");
@@ -103,6 +109,7 @@ describe("evaluateCommentReviewGate", () => {
   it("clears a carried finding once Ally attests the replacement head", () => {
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
         allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z"),
@@ -178,6 +185,7 @@ describe("evaluateCommentReviewGate", () => {
   it("lets a clean review of the current head disposition every earlier finding", () => {
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
         allyComment(blockingReview(INTERMEDIATE_HEAD), "2026-08-04T20:39:19Z"),
@@ -204,6 +212,7 @@ describe("evaluateCommentReviewGate", () => {
 
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
       comments: [allyComment(body, "2026-08-04T21:09:19Z")],
     });
 
@@ -588,6 +597,7 @@ describe("evaluateCommentReviewGate", () => {
   it("distinguishes a reviewed-and-clean head from a not-evaluated one", () => {
     const clean = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
       comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
     });
 
@@ -649,6 +659,102 @@ describe("evaluateCommentReviewGate", () => {
  * pasting the review it was replying to published a merge-visible verdict
  * about a head nothing had examined — in both directions.
  */
+/**
+ * Self-attestation (BLO-34316).
+ *
+ * The gate's only identity test is an inclusion test against the reviewer bot,
+ * and on this fleet the PR author IS that identity, so before this suite the
+ * author's own comment reached `clean` — the gate's strongest positive — for a
+ * head nothing independent had examined.
+ */
+describe("evaluateCommentReviewGate — self-attestation", () => {
+  it("refuses clean when the PR author is the attesting identity", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    expect(commentReviewGateCheckConclusion(verdict)).toBe("neutral");
+    // AC5: a reader who sees only the string must not be told the head was
+    // reviewed. `success`/`neutral` keep it non-blocking (BLO-29711).
+    expect(verdict.reason).toMatch(/PR author/i);
+    // GitHub truncates a commit-status description at 140 characters, and the
+    // PR-author clause is the whole point of this string.
+    expect(verdict.reason.length).toBeLessThanOrEqual(140);
+    expect(commentReviewGateCheckConclusion(verdict)).not.toBe("failure");
+  });
+
+  it("matches the App identity by form, not by literal string", () => {
+    // `app/<slug>` and `<slug>[bot]` are the same principal on different API
+    // surfaces. Comparing the raw logins would let the other spelling through.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: "app/allyblockcast",
+      comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
+    });
+
+    expect(verdict).toMatchObject({ outcome: "not_evaluated" });
+  });
+
+  it("refuses clean when the PR author is unknown", () => {
+    // Fail closed on absence: the caller silently not supplying the author is
+    // exactly how this defect shipped, so an omission must not read as green.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    expect(commentReviewGateCheckConclusion(verdict)).toBe("neutral");
+  });
+
+  it("still reports clean for an attestation from someone other than the author", () => {
+    // The gate is narrowed, not switched off.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
+    expect(commentReviewGateCheckConclusion(verdict)).toBe("success");
+  });
+
+  it("keeps blocking and carried findings author-blind", () => {
+    // A finding is a finding whoever wrote it. Only the POSITIVE claim is
+    // withdrawn for a self-attestation; the fail-closed direction is unchanged.
+    const atHead = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [allyComment(blockingReview(CURRENT_HEAD), "2026-08-04T20:09:19Z")],
+    });
+    const carried = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z")],
+    });
+
+    expect(atHead).toMatchObject({ state: "failure", outcome: "blocking_finding" });
+    expect(carried).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
+  it("is flagged by the census predicate under a review/ context", () => {
+    // A self-attested green is as misreadable under `review/` as a plain
+    // not-evaluated one, and the census must see the description as admitting
+    // nothing was established — otherwise the new reason strings escape it.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
+    });
+
+    expect(commentReviewGateVerdictIsMisreadable(verdict, "review/ally-comment")).toBe(true);
+    expect(admitsNothingEvaluated(verdict.reason)).toBe(true);
+  });
+});
+
 describe("evaluateCommentReviewGate — quoted review bodies", () => {
   const fenced = (body: string, info = ""): string =>
     ["Quoting the review I am replying to:", "", `\`\`\`${info}`, body, "```", "", "Nothing addressed yet."].join("\n");
@@ -998,6 +1104,7 @@ describe("commentReviewGateCheckConclusion", () => {
   const notEvaluated = evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments: [] });
   const clean = evaluateCommentReviewGate({
     headSha: CURRENT_HEAD,
+    prAuthorLogin: DISTINCT_PR_AUTHOR,
     comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
   });
   const blocking = evaluateCommentReviewGate({
