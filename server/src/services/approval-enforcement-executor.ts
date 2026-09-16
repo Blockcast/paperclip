@@ -60,6 +60,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvals, budgetPolicies } from "@paperclipai/db";
 import { conflict, forbidden, HttpError, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { agentService } from "./agents.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
@@ -120,10 +121,20 @@ function refuse(
  * inside the transaction rolls it back, so a log row written on `tx` would
  * vanish with the thing it is recording.
  *
- * Scoped to the classification pass, which is where the guardrail verdicts are
- * reached. The refusals that precede it — wrong status, wrong caller, a card
+ * The log is best-effort and the refusal is not. `logActivity` awaits three
+ * separate DB operations and is not defensive on its own behalf, so an
+ * unguarded await here would let a transient failure to *record* a refusal
+ * replace the refusal itself — the caller would receive a generic 500, which
+ * reads as retryable, in place of the 409 that means "a human moved this cap,
+ * stop". The audit row is the secondary artifact; the typed code is the
+ * route's product, so the rethrow below stays reachable on every path.
+ *
+ * Wraps the whole transaction, so it covers the write loop as well as the
+ * classification pass: the `written.policyId !== row.id` refusal — a
+ * silent-false-success guard tripping on a money path — is logged too. The
+ * refusals that precede the transaction — wrong status, wrong caller, a card
  * with no machine-readable figure — are properties of the request rather than
- * outcomes of comparing a card against enforcement.
+ * outcomes of comparing a card against enforcement, and are not logged here.
  */
 async function withRefusalLogged<T>(
   db: Db,
@@ -147,6 +158,11 @@ async function withRefusalLogged<T>(
         entityType: "approval",
         entityId: approval.id,
         details: { refusal: (error as HttpError).details, message: (error as Error).message },
+      }).catch((logError) => {
+        logger.warn(
+          { err: logError, approvalId: approval.id, refusalCode: code },
+          "failed to record approval enforcement refusal; surfacing the refusal anyway",
+        );
       });
     }
     throw error;
