@@ -1330,6 +1330,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       "evaluateAgentInvokabilityFromDb",
       "getInvocationBlock",
       "getOrCreateRow",
+      // Deliberately pooled, NOT an unconverted call site. This read wants the
+      // freshest COMMITTED `heartbeat_runs` stamp: the stamp writer
+      // (`routes/issues.ts`, the statusOnly document-write refusal path) writes on
+      // the pooled connection and takes no advisory lock, so it does not serialize
+      // against `lockIssueOwnership`. Moving this onto the caller tx would bind it
+      // to the transaction snapshot and WIDEN the stale-read window the call site's
+      // own comment exists to narrow. See recovery/service.ts:7362-7371.
+      "getLatestIssueRun",
     ];
     const unexpected = pooledInsideTransaction.filter(
       (entry) => !knownPooledUnderLock.some((name) => entry.includes(name)),
