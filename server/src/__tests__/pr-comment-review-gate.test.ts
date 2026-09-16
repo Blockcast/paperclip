@@ -1364,12 +1364,21 @@ describe("mirrored findings retire under both identities (#1707)", () => {
    * such chain, so every case above is a 2-head sequence — and at two heads
    * "the intermediate link" does not exist to be got wrong.
    *
-   * These two extend it to H1 -> H2 -> H3 -> H4-disposes, which is what makes
+   * These extend it to H1 -> H2 -> H3 -> H4-disposes, which is what makes
    * the rule's "three, not two" clause testable. `headsWithUndispositionedFinding`
    * filters each attesting head through `isFullyDispositioned` independently,
    * so H2 is carried by its own unretired ref regardless of H1 and H3 being
    * clean — a consumer that treated a chain as endpoints-only, or let H3's
    * retirement cascade backwards, goes green here.
+   *
+   * BOTH controls are needed, and for different regressions. Skipping the
+   * INTERMEDIATE head pins the consumer; skipping the NEWEST one pins the
+   * FIXTURE. Neither of the other two cases requires `MIRRORED_AGAIN` to
+   * exist at all — drop the `mirroredAgain` splice and the clearing case's
+   * third ledger entry dangles harmlessly while the intermediate control
+   * carries `MIRRORING` either way, so both stay green over a fixture that
+   * has silently collapsed back to the 2-head sequence covered above. Only a
+   * case asserting `MIRRORED_AGAIN` itself is carried reds on that.
    */
   describe("every link in a chain needs its own entry", () => {
     const chained = (dispositions: ReturnType<typeof fixed>[]) =>
@@ -1393,6 +1402,61 @@ describe("mirrored findings retire under both identities (#1707)", () => {
         // shape a producer reaches by dispositioning "the original and the
         // mirror" when there were two mirrors.
         comments: chained([fixed(RAISED, 1), fixed(MIRRORED_AGAIN, 1)]),
+      });
+
+      expect(verdict).toMatchObject({
+        state: "failure",
+        outcome: "carried_finding",
+        carriedFromHeadSha: MIRRORING,
+      });
+    });
+
+    // The one case that makes the third head load-bearing: it is the only
+    // assertion in the block that names MIRRORED_AGAIN as carried, so it is
+    // the only one that reds if the `mirroredAgain` splice regresses.
+    it("negative control: skipping the NEWEST mirror carries it", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: chained([fixed(RAISED, 1), fixed(MIRRORING, 1)]),
+      });
+
+      expect(verdict).toMatchObject({
+        state: "failure",
+        outcome: "carried_finding",
+        carriedFromHeadSha: MIRRORED_AGAIN,
+      });
+    });
+  });
+
+  /**
+   * A re-grade is the mirror MOVING buckets, not gaining a sibling: MIRRORING
+   * reports the finding as Critical and no Important at all. That is what the
+   * rule's "`severity` varies per entry too" clause is about, and it is a
+   * different shape from `acrossSeverities` above, where both severities
+   * coexist at the mirroring head.
+   */
+  describe("a re-graded mirror is dispositioned under its NEW severity", () => {
+    const regraded = (dispositions: ReturnType<typeof fixed>[]) =>
+      history(dispositions, { raised: 1, mirroring: 0, mirroringCritical: 1 });
+
+    it("clears when the mirror's entry carries the escalated severity", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: regraded([fixed(RAISED, 1), fixed(MIRRORING, 1, "critical")]),
+      });
+
+      expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    });
+
+    it("negative control: carrying the original's severity over names nothing", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        // `important 1` is the identity it had at RAISED; MIRRORING never
+        // reported an Important, so the entry dangles and the Critical stands.
+        comments: regraded([fixed(RAISED, 1), fixed(MIRRORING, 1)]),
       });
 
       expect(verdict).toMatchObject({
