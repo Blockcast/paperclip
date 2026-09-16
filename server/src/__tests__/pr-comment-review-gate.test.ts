@@ -1117,3 +1117,91 @@ describe("commit-status description budget", () => {
     }
   });
 });
+
+/**
+ * A finding's identity is `(head, severity, index)`, so a review that MIRRORS
+ * an earlier finding — re-stating it in its own counts — gives it a second,
+ * independent identity at the mirroring head. Nothing in the block links the
+ * two: extractAllyReportedFindingRefs mints refs from the counts alone. So a
+ * ledger that retires only the original leaves the mirroring head carrying a
+ * ref no verb ever names, and isFullyDispositioned carries the whole head.
+ *
+ * Reconstructed from Blockcast/trafficcontrol#1707 (BLO-34249): the ebae10f
+ * review mirrored `prior:195e6e2 important 1` as its own Important 1, the
+ * 78107bf4 review retired `195e6e2 important 1` and `ebae10f important 2`, and
+ * ebae10f stayed red on the mirror it had no way to name.
+ *
+ * The fix is producer-side and needs no schema change — the consumer already
+ * retires per (head, severity, index), so a second entry under the mirroring
+ * head retires the mirror exactly. These cases pin that, in the structured
+ * block, at `ally-verdict:1`.
+ */
+describe("mirrored findings retire under both identities (#1707)", () => {
+  const RAISED = "195e6e2".padEnd(40, "0");
+  const MIRRORING = "ebae10fe77bd".padEnd(40, "0");
+  const DISPOSITIONING = "78107bf4".padEnd(40, "0");
+  // Ally has not reviewed this one yet — the gap between reviews where a
+  // carried finding is the only thing the gate has to go on.
+  const UNATTESTED = "e".repeat(40);
+
+  function verdictReview(
+    headSha: string,
+    findings: { critical?: number; important?: number },
+    dispositions: { head: string; severity: string; index: number; verb: string }[],
+  ): string {
+    return [
+      "## Ally — Consolidated PR Review",
+      "",
+      "<!-- ally-verdict:1",
+      JSON.stringify({
+        head: headSha,
+        findings: { critical: 0, important: 0, suggestions: 0, ...findings },
+        dispositions,
+      }),
+      "-->",
+      "",
+      `Reviewed head: ${headSha}`,
+    ].join("\n");
+  }
+
+  const fixed = (headSha: string, index: number) => ({
+    head: headSha.slice(0, 7),
+    severity: "important",
+    index,
+    verb: "fixed",
+  });
+
+  /** The #1707 sequence, with whatever ledger the final review carried. */
+  function history(dispositions: ReturnType<typeof fixed>[]) {
+    return [
+      allyComment(verdictReview(RAISED, { important: 1 }, []), "2026-09-10T10:00:00Z"),
+      // Important 1 here is the mirror of RAISED's Important 1; Important 2 is new.
+      allyComment(verdictReview(MIRRORING, { important: 2 }, []), "2026-09-11T10:00:00Z"),
+      allyComment(verdictReview(DISPOSITIONING, {}, dispositions), "2026-09-12T10:00:00Z"),
+    ];
+  }
+
+  it("negative control: retiring only the original leaves the mirroring head carried", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: UNATTESTED,
+      reviewerBotLogin: ALLY_BOT_LOGIN,
+      comments: history([fixed(RAISED, 1), fixed(MIRRORING, 2)]),
+    });
+
+    expect(verdict).toMatchObject({
+      state: "failure",
+      outcome: "carried_finding",
+      carriedFromHeadSha: MIRRORING,
+    });
+  });
+
+  it("clears once the mirror is also dispositioned under the mirroring head", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: UNATTESTED,
+      reviewerBotLogin: ALLY_BOT_LOGIN,
+      comments: history([fixed(RAISED, 1), fixed(MIRRORING, 2), fixed(MIRRORING, 1)]),
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+});
