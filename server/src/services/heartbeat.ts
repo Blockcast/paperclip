@@ -488,7 +488,7 @@ import {
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
-  runUsageTokenCounts,
+  runUsageHasNoModelTokens,
   SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
   SESSION_UNAVAILABLE_RECOVERY_RETRY_REASON,
   ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
@@ -6540,8 +6540,7 @@ function isFailedOrZeroTokenResume(run: {
   ) {
     return true;
   }
-  const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
-  return inputTokens === 0 && outputTokens === 0;
+  return runUsageHasNoModelTokens(run.usageJson);
 }
 
 function heartbeatRunTokenUsage(usageJson: Record<string, unknown> | null): UsageTotals {

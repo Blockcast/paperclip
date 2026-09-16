@@ -150,9 +150,21 @@ function normalizeRunUsage(usageJson: unknown): RunUsage | null {
     "cacheReadInputTokens",
     "cache_read_input_tokens",
   );
+  // BLO-29842: cache writes are billed prompt tokens with their own column. Omit
+  // them and a run that only wrote cache totals 0, so `null` is returned and the
+  // timeline shows no usage at all rather than under-reported usage.
+  const cacheCreationInputTokens = readUsageToken(
+    source,
+    "cacheCreationInputTokens",
+    "cache_creation_input_tokens",
+    "rawCacheCreationInputTokens",
+    "raw_cache_creation_input_tokens",
+  );
   const outputTokens = readUsageToken(source, "outputTokens", "output_tokens", "rawOutputTokens", "raw_output_tokens");
-  const totalTokens = inputTokens + cachedInputTokens + outputTokens;
-  return totalTokens > 0 ? { inputTokens, cachedInputTokens, outputTokens, totalTokens } : null;
+  const totalTokens = inputTokens + cachedInputTokens + cacheCreationInputTokens + outputTokens;
+  return totalTokens > 0
+    ? { inputTokens, cachedInputTokens, cacheCreationInputTokens, outputTokens, totalTokens }
+    : null;
 }
 
 function maybeUuidList(ids: Iterable<string>) {

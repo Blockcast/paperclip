@@ -17,6 +17,7 @@ import {
   isZeroTokenStartupFailureRun,
   isZeroTokenSessionResetRetryRun,
   parseIssueGraphLivenessIncidentKey,
+  runUsageHasNoModelTokens,
 } from "../services/recovery/index.js";
 import {
   classifyContinuationFailure,
@@ -115,6 +116,55 @@ describe("recovery classifier boundary", () => {
     }
     // Restored, so the production invariant above still holds for other tests.
     expect(ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE)).toBe(false);
+  });
+
+  // BLO-29842: cache writes moved out of `inputTokens` into their own column.
+  // A run that wrote a large prompt to cache and died before emitting output
+  // reports input=0/output=0 with creation>0 — before this predicate counted
+  // cache creation, that read as "never reached the model" and fed
+  // poisoned-session detection, so a real model turn could pull session
+  // rotation forward. The negative assertion is the point: it fails if anyone
+  // narrows the predicate back to input+output.
+  it("does not call a cache-write-only run zero-token", () => {
+    expect(runUsageHasNoModelTokens({
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedInputTokens: 0,
+      cacheCreationInputTokens: 24_000,
+    })).toBe(false);
+    expect(isZeroTokenStartupFailureRun({
+      status: "failed",
+      errorCode: "context_overflow",
+      usageJson: { inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 24_000 },
+    })).toBe(false);
+  });
+
+  // Serving a turn from cache is still a model turn, so a read-only run is not
+  // "never executed" either. Keeps this predicate in agreement with the
+  // heartbeat's zeroTokenUsage/isZeroTokenCompletedRun, which test all four.
+  it("does not call a cache-read-only run zero-token", () => {
+    expect(runUsageHasNoModelTokens({ inputTokens: 0, outputTokens: 0, cachedInputTokens: 45_000 })).toBe(false);
+  });
+
+  it("reads cache creation under snake_case and raw spellings", () => {
+    expect(runUsageHasNoModelTokens({ input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 9 })).toBe(false);
+    // usage_json carries only the raw* twins when normalizedUsage was null.
+    expect(runUsageHasNoModelTokens({ rawCacheCreationInputTokens: 9 })).toBe(false);
+  });
+
+  it("still reports a genuinely tokenless run as zero-token", () => {
+    expect(runUsageHasNoModelTokens({
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedInputTokens: 0,
+      cacheCreationInputTokens: 0,
+    })).toBe(true);
+    expect(runUsageHasNoModelTokens(null)).toBe(true);
+    expect(isZeroTokenStartupFailureRun({
+      status: "failed",
+      errorCode: "context_overflow",
+      usageJson: { inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0 },
+    })).toBe(true);
   });
 
   it("routes a missing skill to blocked escalation instead of retry", () => {
