@@ -280,3 +280,4 @@ export function verifyLocalAgentJwt(token: string): LocalAgentJwtClaims | null {
     jti: typeof claims.jti === "string" ? claims.jti : undefined,
   };
 }
+// BLO-34222 path-filter control; PR closed immediately.
