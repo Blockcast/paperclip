@@ -693,15 +693,27 @@ export async function createOrAdoptRunSecret(
 
       try {
         // A merge PATCH, not `replaceNamespacedSecret`.  A replace is a PUT,
-        // i.e. the `update` verb, and this adapter's service account holds
-        // `create`/`patch`/`delete`/`get` on secrets but NOT `update` — so the
-        // replace this call used to make was refused 403 on *every* collision,
-        // deterministically, before it could ever reach the races guarded
-        // below (BLO-32424).  Merge semantics are also the closer fit for what
-        // adoption means here: assert this run's keys and labels.  Keys are
-        // re-derived byte-identically per (agentId, runId) and the Job reads
-        // env through per-key `secretKeyRef`, so a key left behind by an older
-        // adapter build is inert rather than something we must delete.
+        // i.e. the `update` verb, which `deploy/helm/paperclip/templates/
+        // role.yaml` did not grant — so the replace this call used to make was
+        // refused 403 on *every* collision, deterministically, before it could
+        // ever reach the races guarded below (BLO-32424).
+        //
+        // That 403 is no longer live: #1837 added `update` to that Role on
+        // 2026-09-16, and SSAR against `system:serviceaccount:paperclip:
+        // paperclip` in ns `paperclip` now reports it allowed.  This call stays
+        // a PATCH anyway because `patch` was already granted *before* #1837 —
+        // the adopt path needs no widened verb, so keeping it here is what lets
+        // the `update` grant be retired instead of becoming load-bearing.
+        //
+        // Merge semantics are also the closer fit for what adoption means here:
+        // assert this run's keys and labels.  Unlike a PUT, a merge leaves
+        // pre-existing `data` keys in place.  That is only reachable for the
+        // env Secret — `prompt.txt` and `mcp.json` each carry a single fixed
+        // key, so they have no variable key set to strand — and the env Secret
+        // is consumed per-key via `secretKeyRef`, never as a whole-Secret
+        // envFrom, so a key left behind by an older adapter build is inert to
+        // the container.  The residual is hygiene only: such a key survives at
+        // rest until the finally-block delete or ownerReference GC.
         // `resourceVersion` is still carried, so a concurrent writer is still
         // surfaced as a 409 instead of being silently clobbered.
         await coreApi.patchNamespacedSecret(
@@ -721,7 +733,13 @@ export async function createOrAdoptRunSecret(
         if (!isK8s404(writeErr) && !isK8s409(writeErr)) throw writeErr;
         if (attempt === 0) continue;
         // Twice in a row means something is actively churning this name.
-        // Surface the original 409, matching the read-404 branch above.
+        // Surface the original 409, matching the read-404 branch above — AC3
+        // pins that identity, and the caller classifies on it.  Carry the
+        // adoption failure as its `cause` so the diagnostic that says *which*
+        // mode was churning (404 reaper vs 409 concurrent writer) is not lost;
+        // same idiom as the read branch above, and it does not require
+        // threading a logger into this helper.
+        (err as { cause?: unknown }).cause ??= writeErr;
         throw err;
       }
       return "adopted";
