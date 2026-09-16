@@ -19010,21 +19010,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     //
     // Ordering the dispatch-side gate ahead of the penstock gate (see
     // `enqueueWakeup`) stops new generic ticks from parking, but it is not
-    // sufficient on its own and this block is not redundant with it. It cannot
-    // help a row that is ALREADY parked, and it cannot help a
-    // `dependency_blocked` / `transient_failure` park whose original wake was
-    // generic — those are written by paths that never consult the wake gate at
-    // all. Both halves are required; neither alone closes the bypass.
+    // sufficient on its own and this block is not redundant with it: it cannot
+    // help a row that is ALREADY parked, including every row parked before this
+    // change shipped. Both halves are required; neither alone closes the bypass.
     //
-    // Guard: only a wake that was generic-timer-shaped when it was ENQUEUED is
-    // eligible, reconstructed via `isGenericTimerWakeSnapshot` (read its doc for
-    // why a plain `deriveTaskKey` null-check would never fire here). A scoped
-    // retry must promote regardless of what else the lane has queued —
-    // suppressing one would drop the wake its scope was for. Evaluated before
-    // the capacity re-probe below so a tick with nothing to do is not re-parked
-    // for capacity it will never use.
+    // Two guards, and the second is the one that keeps this safe.
+    //
+    // 1. `isGenericTimerWakeSnapshot` — only a wake that was generic-timer-shaped
+    //    when it was ENQUEUED is eligible (read its doc for why a plain
+    //    `deriveTaskKey` null-check would never fire here). A scoped retry must
+    //    promote regardless of what else the lane has queued; suppressing one
+    //    would drop the wake its scope was for.
+    //
+    // 2. `retryOfRunId === null` — the park must be a wake that NEVER RAN. This
+    //    is a correctness guard, not a narrowing for tidiness. Cancelling is
+    //    terminal, so the block must not reach a park that represents work
+    //    already in flight. The three writers split cleanly on this column:
+    //    the ccrotate capacity park and the `dependency_blocked` park both
+    //    insert a deferred *fresh wake* and leave it null, while every
+    //    `scheduleBoundedRetryForRun` park sets `retryOfRunId: run.id` because
+    //    a run already executed and is being continued. Without this guard an
+    //    issueless `max_turns_continuation` park — an agent that ran out of
+    //    turns mid-task doing issueless work such as a sweep, report or PR
+    //    review — is cancelled outright whenever its lane's assigned queue
+    //    happens to be empty at promotion, which for issueless work is the
+    //    normal case. `session_unavailable`, `zero_token_session_reset`,
+    //    `job_failed`, `capacity_blocked` and `transient_failure` park through
+    //    the same function and would be lost the same way. Same asymmetry the
+    //    snapshot predicate is built around: promoting one redundant no-op is
+    //    cheap, dropping in-flight work is not.
+    //
+    // Evaluated before the capacity re-probe below so a tick with nothing to do
+    // is not re-parked for capacity it will never use.
     if (
       parseHeartbeatPolicy(agent).skipTimerWhenNoActionableWork &&
+      dueRun.retryOfRunId === null &&
       isGenericTimerWakeSnapshot(contextSnapshot) &&
       !(await hasActionableTimerWork(agent))
     ) {
@@ -34005,6 +34025,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
+    const genericTimerWake =
+      source === "timer" &&
+      !issueId &&
+      !wakeCommentId &&
+      !readNonEmptyString(enrichedContextSnapshot.taskId) &&
+      !taskKey;
+    // BLO-31344: this gate MUST be evaluated before the penstock capacity gate
+    // below, and the ordering is the fix, not a stylistic preference.
+    //
+    // The capacity gate does not decline a wake, it *postpones* it: it commits a
+    // `scheduled_retry` run and returns null. Promotion of that row never
+    // re-enters `wakeup()`, so anything ordered after the capacity gate is
+    // simply never evaluated for a wake that got parked. With this block second,
+    // `skipTimerWhenNoActionableWork` was therefore defeated precisely during a
+    // capacity crunch — when every tick parks and later promotes, and when
+    // burning a paid attempt on a guaranteed no-op costs the most. The knob
+    // worked on an idle fleet and stopped working under load.
+    //
+    // Evaluating suppression first collapses the common case with no run row, no
+    // park, no promotion and no adapter invocation. Declining a wake we would
+    // have thrown away regardless cannot lose work, whereas parking it demonstrably
+    // did: the park outlives the reason it was created.
+    if (policy.skipTimerWhenNoActionableWork && genericTimerWake && !(await hasActionableTimerWork(agent))) {
+      await writeSkippedHeartbeatRequest("heartbeat.timer.no_actionable_work", {
+        reason: "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
+      });
+      await markTimerHeartbeatChecked(agentId, source);
+      return null;
+    }
+
     // Heartbeat ccrotate-awareness: for adapters routed through ccrotate
     // (claude_local, codex_local), refuse to dispatch a *timer* heartbeat when
     // no underlying provider account is on a usable tier. The agent will be
@@ -34039,36 +34089,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Original check (`timer` only, plus the narrow
     // `provider_quota_exhausted_recovered` reason) only caught the
     // smallest slice.
-    const genericTimerWake =
-      source === "timer" &&
-      !issueId &&
-      !wakeCommentId &&
-      !readNonEmptyString(enrichedContextSnapshot.taskId) &&
-      !taskKey;
-    // BLO-31344: this gate MUST be evaluated before the penstock capacity gate
-    // below, and the ordering is the fix, not a stylistic preference.
-    //
-    // The capacity gate does not decline a wake, it *postpones* it: it commits a
-    // `scheduled_retry` run and returns null. Promotion of that row never
-    // re-enters `wakeup()`, so anything ordered after the capacity gate is
-    // simply never evaluated for a wake that got parked. With this block second,
-    // `skipTimerWhenNoActionableWork` was therefore defeated precisely during a
-    // capacity crunch — when every tick parks and later promotes, and when
-    // burning a paid attempt on a guaranteed no-op costs the most. The knob
-    // worked on an idle fleet and stopped working under load.
-    //
-    // Evaluating suppression first collapses the common case with no run row, no
-    // park, no promotion and no adapter invocation. Declining a wake we would
-    // have thrown away regardless cannot lose work, whereas parking it demonstrably
-    // did: the park outlives the reason it was created.
-    if (policy.skipTimerWhenNoActionableWork && genericTimerWake && !(await hasActionableTimerWork(agent))) {
-      await writeSkippedHeartbeatRequest("heartbeat.timer.no_actionable_work", {
-        reason: "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
-      });
-      await markTimerHeartbeatChecked(agentId, source);
-      return null;
-    }
-
     const gateAppliesToWake =
       source === "timer" ||
       source === "automation" ||

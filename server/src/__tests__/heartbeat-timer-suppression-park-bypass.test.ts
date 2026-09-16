@@ -220,29 +220,71 @@ describeEmbeddedPostgres("heartbeat timer suppression is not bypassed by park/pr
   }
 
   /**
-   * A capacity park as the wake gate writes one: no `agent_wakeup_requests`
-   * row (the capacity path writes none, hence the null `wakeupRequestId`) and a
-   * snapshot carrying the `__heartbeat__` sentinel.
+   * A park as one of the three `scheduled_retry` writers actually shapes it.
+   *
+   * Default (`retryOf` omitted) is a **deferred fresh wake** — the ccrotate
+   * capacity park and the `dependency_blocked` park both insert one: no
+   * `agent_wakeup_requests` row on the capacity path (hence the null
+   * `wakeupRequestId`), `retryOfRunId` left null because no run ever executed,
+   * and a snapshot carrying the `__heartbeat__` sentinel.
+   *
+   * Pass `retryOf` for a **bounded-retry** park as `scheduleBoundedRetryForRun`
+   * writes one: `invocationSource: "automation"`, a non-null `wakeupRequestId`
+   * bound to a queued wakeup request, and `retryOfRunId` set to the run being
+   * continued. The column split is load-bearing — it is the discriminator the
+   * promotion gate uses to tell "never ran" from "work already in flight" — so
+   * a test that means to exercise the bounded-retry path must use this arm or
+   * it is silently asserting against a capacity row with a different reason
+   * string.
    */
   async function seedPark(input: {
     companyId: string;
     agentId: string;
     contextSnapshot: Record<string, unknown>;
     scheduledRetryReason?: string;
+    retryOf?: { runId: string };
   }): Promise<string> {
     const runId = randomUUID();
+    let wakeupRequestId: string | null = null;
+    if (input.retryOf) {
+      wakeupRequestId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: wakeupRequestId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        source: "automation",
+        reason: "heartbeat.retry",
+        status: "queued",
+      });
+    }
     await db.insert(heartbeatRuns).values({
       id: runId,
       companyId: input.companyId,
       agentId: input.agentId,
-      invocationSource: "timer",
-      triggerDetail: "schedule",
+      invocationSource: input.retryOf ? "automation" : "timer",
+      triggerDetail: input.retryOf ? "system" : "schedule",
       status: "scheduled_retry",
       scheduledRetryAt: new Date(Date.now() - 60_000),
       scheduledRetryAttempt: 2,
       scheduledRetryReason: input.scheduledRetryReason ?? "ccrotate_capacity",
-      wakeupRequestId: null,
+      wakeupRequestId,
+      retryOfRunId: input.retryOf?.runId ?? null,
       contextSnapshot: input.contextSnapshot,
+    });
+    return runId;
+  }
+
+  /** A terminal run for a bounded-retry park to be a continuation *of*. */
+  async function seedSourceRun(companyId: string, agentId: string): Promise<string> {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "timer",
+      triggerDetail: "schedule",
+      status: "failed",
+      contextSnapshot: { wakeSource: "timer", taskKey: "__heartbeat__" },
     });
     return runId;
   }
@@ -387,16 +429,17 @@ describeEmbeddedPostgres("heartbeat timer suppression is not bypassed by park/pr
     expect(result.runIds).toContain(runId);
   });
 
-  it("suppresses a promoted park regardless of which path parked it", async () => {
-    // The bypass is not confined to capacity parks: `transient_failure` and
-    // `dependency_blocked` rows promote through the same function.
+  it("suppresses a promoted dependency_blocked park, not just a capacity one", async () => {
+    // The bypass is not confined to capacity parks. Both writers that defer a
+    // *fresh* wake leave `retryOfRunId` null, and both promote through the same
+    // function, so both are in scope.
     const { companyId, agentId } = await seedAgent();
     await seedBlockedAssignedIssue(companyId, agentId);
     const runId = await seedPark({
       companyId,
       agentId,
       contextSnapshot: { wakeSource: "timer", taskKey: "__heartbeat__" },
-      scheduledRetryReason: "transient_failure",
+      scheduledRetryReason: "dependency_blocked",
     });
     const heartbeat = heartbeatService(db, {
       penstockAvailabilityGate: allowingGate(),
@@ -412,6 +455,114 @@ describeEmbeddedPostgres("heartbeat timer suppression is not bypassed by park/pr
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     expect(parked).toMatchObject({ status: "cancelled", errorCode: "timer_no_actionable_work" });
+  });
+
+  it("never suppresses a max_turns_continuation park, even with an empty queue", async () => {
+    // The guard that keeps this fix from destroying in-flight work, and the one
+    // case where getting it wrong is unrecoverable: cancellation is terminal.
+    //
+    // An issueless continuation park exists *because* the agent ran out of
+    // turns mid-task. Agents doing issueless work — sweeps, reports, PR review
+    // — normally have an empty assigned queue, so without the `retryOfRunId`
+    // guard this is not an edge case but the common shape, and the work is
+    // dropped with no path back to it.
+    const { companyId, agentId } = await seedAgent();
+    await seedBlockedAssignedIssue(companyId, agentId);
+    const sourceRunId = await seedSourceRun(companyId, agentId);
+    const runId = await seedPark({
+      companyId,
+      agentId,
+      // Byte-identical to the suppressed capacity park above: generic-timer
+      // snapshot, no scope, empty queue. `retryOfRunId` is the only difference,
+      // which is exactly what this test is pinning.
+      contextSnapshot: { wakeSource: "timer", taskKey: "__heartbeat__" },
+      scheduledRetryReason: "max_turns_continuation",
+      retryOf: { runId: sourceRunId },
+    });
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: allowingGate(),
+      skipQueuedRunDispatch: true,
+    });
+
+    const result = await heartbeat.promoteDueScheduledRetries(new Date());
+
+    expect(result.runIds).toContain(runId);
+    const parked = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(parked?.status).not.toBe("cancelled");
+    expect(parked?.errorCode).not.toBe("timer_no_actionable_work");
+  });
+
+  it("never suppresses a transient_failure park, which is also a retry of a real run", async () => {
+    // Same protection, different reason: every `scheduleBoundedRetryForRun`
+    // reason is a retry *of* a run that already executed.
+    const { companyId, agentId } = await seedAgent();
+    await seedBlockedAssignedIssue(companyId, agentId);
+    const sourceRunId = await seedSourceRun(companyId, agentId);
+    const runId = await seedPark({
+      companyId,
+      agentId,
+      contextSnapshot: { wakeSource: "timer", taskKey: "__heartbeat__" },
+      scheduledRetryReason: "transient_failure",
+      retryOf: { runId: sourceRunId },
+    });
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: allowingGate(),
+      skipQueuedRunDispatch: true,
+    });
+
+    const result = await heartbeat.promoteDueScheduledRetries(new Date());
+
+    expect(result.runIds).toContain(runId);
+    const parked = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(parked?.status).not.toBe("cancelled");
+  });
+
+  it("pins the snapshot coupling the promotion gate rests on", async () => {
+    // The whole promotion-side fix assumes a REAL capacity park stores a
+    // snapshot that `isGenericTimerWakeSnapshot` matches. Nothing else asserts
+    // that, and it is precisely the coupling the helper's doc comment warns
+    // fails silently: if the persisted shape drifts, the gate compiles, deploys
+    // and never fires. So produce a genuine park through the wake path and read
+    // the row back, rather than trusting a hand-built snapshot.
+    const { companyId, agentId } = await seedAgent();
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Actionable",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: denyingGate(),
+      skipQueuedRunDispatch: true,
+    });
+
+    await heartbeat.wakeup(agentId, { source: "timer", triggerDetail: "schedule" });
+
+    const [parked] = await db
+      .select({
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        retryOfRunId: heartbeatRuns.retryOfRunId,
+        reason: heartbeatRuns.scheduledRetryReason,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(parked.reason).toBe("ccrotate_capacity");
+    expect(
+      isGenericTimerWakeSnapshot(parked.contextSnapshot as Record<string, unknown>),
+    ).toBe(true);
+    // The other half of the promotion gate's condition, on a real row: a
+    // capacity park is a deferred fresh wake, so it must carry no source run.
+    expect(parked.retryOfRunId).toBeNull();
   });
 
   it("keeps counting a todo row with unresolved blockers as actionable", async () => {
