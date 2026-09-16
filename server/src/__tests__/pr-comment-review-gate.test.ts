@@ -1117,3 +1117,353 @@ describe("commit-status description budget", () => {
     }
   });
 });
+
+/**
+ * A finding's identity is `(head, severity, index)`, so a review that MIRRORS
+ * an earlier finding — re-stating it in its own counts — gives it a second,
+ * independent identity at the mirroring head. Nothing in the block links the
+ * two: extractAllyReportedFindingRefs mints refs from the counts alone. So a
+ * ledger that retires only the original leaves the mirroring head carrying a
+ * ref no verb ever names, and isFullyDispositioned carries the whole head.
+ *
+ * Reconstructed from Blockcast/trafficcontrol#1707 (BLO-34249): the ebae10f
+ * review mirrored `prior:195e6e2 important 1` as its own Important 1, the
+ * 78107bf4 review retired `195e6e2 important 1` and `ebae10f important 2`, and
+ * ebae10f stayed red on the mirror it had no way to name.
+ *
+ * The fix is producer-side and needs no schema change — the consumer already
+ * retires per (head, severity, index), so a second entry under the mirroring
+ * head retires the mirror exactly. These cases pin that, in the structured
+ * block, at `ally-verdict:1`.
+ */
+describe("mirrored findings retire under both identities (#1707)", () => {
+  const RAISED = "195e6e2".padEnd(40, "0");
+  const MIRRORING = "ebae10fe77bd".padEnd(40, "0");
+  // A second mirroring head, spliced in only by the `mirroredAgain` knob, so a
+  // chain can be longer than the two heads #1707 itself had.
+  const MIRRORED_AGAIN = "c0ffee1".padEnd(40, "0");
+  const DISPOSITIONING = "78107bf4".padEnd(40, "0");
+  // Ally has not reviewed this one yet — the gap between reviews where a
+  // carried finding is the only thing the gate has to go on.
+  const UNATTESTED = "e".repeat(40);
+
+  function verdictReview(
+    headSha: string,
+    findings: { critical?: number; important?: number },
+    dispositions: { head: string; severity: string; index: number; verb: string }[],
+  ): string {
+    return [
+      "## Ally — Consolidated PR Review",
+      "",
+      "<!-- ally-verdict:1",
+      JSON.stringify({
+        head: headSha,
+        findings: { critical: 0, important: 0, suggestions: 0, ...findings },
+        dispositions,
+      }),
+      "-->",
+      "",
+      `Reviewed head: ${headSha}`,
+    ].join("\n");
+  }
+
+  const fixed = (headSha: string, index: number, severity = "important") => ({
+    head: headSha.slice(0, 7),
+    severity,
+    index,
+    verb: "fixed",
+  });
+
+  /**
+   * The #1707 sequence, with whatever ledger the final review carried.
+   *
+   * `counts` fixes how many findings each of the first two reviews reports,
+   * which is what decides whether the mirror's two ordinals coincide. The
+   * default is #1707 itself: RAISED reports one Important, MIRRORING mirrors
+   * it as its own Important 1 and adds a new Important 2.
+   *
+   * `mirroredAgain` splices a THIRD reporting head between MIRRORING and
+   * DISPOSITIONING, so the chain is longer than the two heads #1707 had.
+   * Default `0` omits it, leaving every pre-existing case a 2-head sequence.
+   */
+  function history(
+    dispositions: ReturnType<typeof fixed>[],
+    counts: {
+      raised?: number;
+      mirroring?: number;
+      mirroringCritical?: number;
+      mirroredAgain?: number;
+    } = {},
+  ) {
+    const { raised = 1, mirroring = 2, mirroringCritical = 0, mirroredAgain = 0 } = counts;
+    return [
+      allyComment(verdictReview(RAISED, { important: raised }, []), "2026-09-10T10:00:00Z"),
+      allyComment(
+        verdictReview(MIRRORING, { important: mirroring, critical: mirroringCritical }, []),
+        "2026-09-11T10:00:00Z",
+      ),
+      ...(mirroredAgain
+        ? [
+            allyComment(
+              verdictReview(MIRRORED_AGAIN, { important: mirroredAgain }, []),
+              "2026-09-11T22:00:00Z",
+            ),
+          ]
+        : []),
+      allyComment(verdictReview(DISPOSITIONING, {}, dispositions), "2026-09-12T10:00:00Z"),
+    ];
+  }
+
+  it("negative control: retiring only the original leaves the mirroring head carried", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: UNATTESTED,
+      reviewerBotLogin: ALLY_BOT_LOGIN,
+      comments: history([fixed(RAISED, 1), fixed(MIRRORING, 2)]),
+    });
+
+    expect(verdict).toMatchObject({
+      state: "failure",
+      outcome: "carried_finding",
+      carriedFromHeadSha: MIRRORING,
+    });
+  });
+
+  it("clears once the mirror is also dispositioned under the mirroring head", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: UNATTESTED,
+      reviewerBotLogin: ALLY_BOT_LOGIN,
+      comments: history([fixed(RAISED, 1), fixed(MIRRORING, 2), fixed(MIRRORING, 1)]),
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  /**
+   * #1707 is DEGENERATE for the rule's ordinal clause: the mirror is Important
+   * 1 at both heads, so `fixed(MIRRORING, 1)` above is what a correct producer
+   * emits AND what one that wrongly reuses the original's ordinal emits. The
+   * pair above therefore pins the mechanism (two entries, one per identity)
+   * but not the clause "recover the mirror's ordinal from the review that
+   * minted it rather than reusing the original's".
+   *
+   * Diverging the two ordinals makes that clause testable: RAISED reports two
+   * Importants and MIRRORING mirrors RAISED's SECOND as its own FIRST. The
+   * direction matters — mirroring first-as-second would leave both ordinals
+   * retired under either ledger, and would not discriminate.
+   *
+   * SCOPE: these controls fail by naming an index the head never reported, so
+   * what they pin is "one distinct IN-RANGE index per resolved finding, per
+   * head" — the most the consumer can enforce. A within-range mis-assignment
+   * (mirror at important 2, ledger says important 1, a sibling at important 1)
+   * is undetectable by construction: refs are minted from counts alone and
+   * carry no content, so retirement is a set-cover over 1..N and any
+   * permutation of in-range indices produces the same verdict. The ordinal
+   * discipline above that is for ledger readability and for a consumer that
+   * later attaches content — don't read a swapped-index case going green as
+   * the consumer being broken.
+   */
+  describe("the mirror's index is its ordinal at its OWN head", () => {
+    const diverged = (dispositions: ReturnType<typeof fixed>[]) =>
+      history(dispositions, { raised: 2, mirroring: 1 });
+
+    it("clears when the mirror is retired at the ordinal its own head gave it", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: diverged([fixed(RAISED, 1), fixed(RAISED, 2), fixed(MIRRORING, 1)]),
+      });
+
+      expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    });
+
+    it("negative control: reusing the original's ordinal leaves the mirror carried", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        // `fixed(MIRRORING, 2)` names an index MIRRORING never reported, so the
+        // mirror it actually carries — MIRRORING important 1 — stays unretired.
+        comments: diverged([fixed(RAISED, 1), fixed(RAISED, 2), fixed(MIRRORING, 2)]),
+      });
+
+      expect(verdict).toMatchObject({
+        state: "failure",
+        outcome: "carried_finding",
+        carriedFromHeadSha: MIRRORING,
+      });
+    });
+  });
+
+  /**
+   * Ordinals are namespaced PER SEVERITY: `extractAllyReportedFindingRefs`
+   * numbers `1..count` inside a per-severity loop, and `namesFinding` matches
+   * on severity AND index. So a Critical ahead of the mirror does not shift
+   * the mirror's Important ordinal — only another Important does.
+   *
+   * MIRRORING reports one new Critical plus the mirror as its own Important 1.
+   * A producer reading the rule's divergence clause as "any earlier finding
+   * shifts the ordinal" emits `important 2` and dangles.
+   */
+  describe("a higher-severity finding does not shift the mirror's ordinal", () => {
+    const acrossSeverities = (dispositions: ReturnType<typeof fixed>[]) =>
+      history(dispositions, { raised: 1, mirroring: 1, mirroringCritical: 1 });
+
+    it("clears when the mirror keeps important 1 despite a Critical ahead of it", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: acrossSeverities([
+          fixed(RAISED, 1),
+          fixed(MIRRORING, 1, "critical"),
+          fixed(MIRRORING, 1),
+        ]),
+      });
+
+      expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    });
+
+    it("negative control: counting the Critical against the Important ordinal dangles", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        // `fixed(MIRRORING, 2)` names an Important index MIRRORING never
+        // reported — its Critical does not occupy the Important bucket.
+        comments: acrossSeverities([
+          fixed(RAISED, 1),
+          fixed(MIRRORING, 1, "critical"),
+          fixed(MIRRORING, 2),
+        ]),
+      });
+
+      expect(verdict).toMatchObject({
+        state: "failure",
+        outcome: "carried_finding",
+        carriedFromHeadSha: MIRRORING,
+      });
+    });
+
+    // Retirement is per-(head, severity, index), not per-head: clearing the
+    // Important mirror does not clear the head while its Critical dangles.
+    it("negative control: one severity retired at a head does not clear the other", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: acrossSeverities([fixed(RAISED, 1), fixed(MIRRORING, 1)]),
+      });
+
+      expect(verdict).toMatchObject({
+        state: "failure",
+        outcome: "carried_finding",
+        carriedFromHeadSha: MIRRORING,
+      });
+    });
+  });
+
+  /**
+   * A chain is the steady state: a finding survives every push until it is
+   * fixed, and each surviving review re-states it. #1707 is only the shortest
+   * such chain, so every case above is a 2-head sequence — and at two heads
+   * "the intermediate link" does not exist to be got wrong.
+   *
+   * These extend it to H1 -> H2 -> H3 -> H4-disposes, which is what makes
+   * the rule's "three, not two" clause testable. `headsWithUndispositionedFinding`
+   * filters each attesting head through `isFullyDispositioned` independently,
+   * so H2 is carried by its own unretired ref regardless of H1 and H3 being
+   * clean — a consumer that treated a chain as endpoints-only, or let H3's
+   * retirement cascade backwards, goes green here.
+   *
+   * BOTH controls are needed, and for different regressions. Skipping the
+   * INTERMEDIATE head pins the consumer; skipping the NEWEST one pins the
+   * FIXTURE. Neither of the other two cases requires `MIRRORED_AGAIN` to
+   * exist at all — drop the `mirroredAgain` splice and the clearing case's
+   * third ledger entry dangles harmlessly while the intermediate control
+   * carries `MIRRORING` either way, so both stay green over a fixture that
+   * has silently collapsed back to the 2-head sequence covered above. Only a
+   * case asserting `MIRRORED_AGAIN` itself is carried reds on that.
+   */
+  describe("every link in a chain needs its own entry", () => {
+    const chained = (dispositions: ReturnType<typeof fixed>[]) =>
+      history(dispositions, { raised: 1, mirroring: 1, mirroredAgain: 1 });
+
+    it("clears when all three reporting heads are retired", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: chained([fixed(RAISED, 1), fixed(MIRRORING, 1), fixed(MIRRORED_AGAIN, 1)]),
+      });
+
+      expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    });
+
+    it("negative control: skipping the INTERMEDIATE head carries it alone", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        // Both ends of the chain retired, the middle link forgotten — the
+        // shape a producer reaches by dispositioning "the original and the
+        // mirror" when there were two mirrors.
+        comments: chained([fixed(RAISED, 1), fixed(MIRRORED_AGAIN, 1)]),
+      });
+
+      expect(verdict).toMatchObject({
+        state: "failure",
+        outcome: "carried_finding",
+        carriedFromHeadSha: MIRRORING,
+      });
+    });
+
+    // The one case that makes the third head load-bearing: it is the only
+    // assertion in the block that names MIRRORED_AGAIN as carried, so it is
+    // the only one that reds if the `mirroredAgain` splice regresses.
+    it("negative control: skipping the NEWEST mirror carries it", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: chained([fixed(RAISED, 1), fixed(MIRRORING, 1)]),
+      });
+
+      expect(verdict).toMatchObject({
+        state: "failure",
+        outcome: "carried_finding",
+        carriedFromHeadSha: MIRRORED_AGAIN,
+      });
+    });
+  });
+
+  /**
+   * A re-grade is the mirror MOVING buckets, not gaining a sibling: MIRRORING
+   * reports the finding as Critical and no Important at all. That is what the
+   * rule's "`severity` varies per entry too" clause is about, and it is a
+   * different shape from `acrossSeverities` above, where both severities
+   * coexist at the mirroring head.
+   */
+  describe("a re-graded mirror is dispositioned under its NEW severity", () => {
+    const regraded = (dispositions: ReturnType<typeof fixed>[]) =>
+      history(dispositions, { raised: 1, mirroring: 0, mirroringCritical: 1 });
+
+    it("clears when the mirror's entry carries the escalated severity", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: regraded([fixed(RAISED, 1), fixed(MIRRORING, 1, "critical")]),
+      });
+
+      expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    });
+
+    it("negative control: carrying the original's severity over names nothing", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        // `important 1` is the identity it had at RAISED; MIRRORING never
+        // reported an Important, so the entry dangles and the Critical stands.
+        comments: regraded([fixed(RAISED, 1), fixed(MIRRORING, 1)]),
+      });
+
+      expect(verdict).toMatchObject({
+        state: "failure",
+        outcome: "carried_finding",
+        carriedFromHeadSha: MIRRORING,
+      });
+    });
+  });
+});
