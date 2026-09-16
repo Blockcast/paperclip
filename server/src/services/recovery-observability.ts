@@ -198,6 +198,36 @@ const ACTIVE_STATUSES = new Set(["active", "escalated"]);
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "in_review"]);
 
 /**
+ * The classifier's input, projected once so every caller reads the snapshot the
+ * same way. The existence probe keys on the assignee key alone because capture
+ * writes both keys in a single jsonb merge with explicit `?? null`
+ * (`issue-recovery-actions.ts`), so the key is present-with-null — never absent
+ * — whenever capture ran. That distinguishes "resolved before capture shipped"
+ * (no snapshot, classified `unknown`) from "captured a null assignee".
+ */
+const resolutionSnapshotColumns = {
+  hasResolutionSnapshot: sql<boolean>`${issueRecoveryActions.evidence} ? ${RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY}`,
+  resolvedAssigneeAgentId: sql<
+    string | null
+  >`${issueRecoveryActions.evidence} ->> ${RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY}`,
+  resolvedIssueStatus: sql<
+    string | null
+  >`${issueRecoveryActions.evidence} ->> ${RESOLVED_ISSUE_STATUS_EVIDENCE_KEY}`,
+} as const;
+
+type ResolutionSnapshotRow = {
+  hasResolutionSnapshot: boolean;
+  resolvedAssigneeAgentId: string | null;
+  resolvedIssueStatus: string | null;
+};
+
+function toResolutionSnapshot(row: ResolutionSnapshotRow): RecoveryResolutionSnapshot | null {
+  return row.hasResolutionSnapshot
+    ? { assigneeAgentId: row.resolvedAssigneeAgentId, issueStatus: row.resolvedIssueStatus }
+    : null;
+}
+
+/**
  * Classify a recovery action by who ended up owning the deliverable work.
  *
  * The plan's `handed_back` vs `owner_completed` outcomes were never added to the
@@ -307,13 +337,7 @@ export function recoveryObservabilityService(db: Db) {
         outcome: issueRecoveryActions.outcome,
         createdAt: issueRecoveryActions.createdAt,
         updatedAt: issueRecoveryActions.updatedAt,
-        hasResolutionSnapshot: sql<boolean>`${issueRecoveryActions.evidence} ? ${RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY}`,
-        resolvedAssigneeAgentId: sql<
-          string | null
-        >`${issueRecoveryActions.evidence} ->> ${RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY}`,
-        resolvedIssueStatus: sql<
-          string | null
-        >`${issueRecoveryActions.evidence} ->> ${RESOLVED_ISSUE_STATUS_EVIDENCE_KEY}`,
+        ...resolutionSnapshotColumns,
       })
       .from(issueRecoveryActions)
       .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
@@ -331,13 +355,16 @@ export function recoveryObservabilityService(db: Db) {
       .limit(limit)
       .offset(offset);
 
-    // Same pure classifier the company-wide report uses, over the same inputs, so
-    // the per-owner list and the aggregate can never disagree about a given row.
+    // Same pure classifier the company-wide report uses, over inputs projected by
+    // the same `resolutionSnapshotColumns` / `toResolutionSnapshot` pair, so the
+    // per-owner list and the aggregate can never disagree about a given row.
     return rows.map(
       ({ hasResolutionSnapshot, resolvedAssigneeAgentId, resolvedIssueStatus, ...row }) => {
-        const resolutionSnapshot = hasResolutionSnapshot
-          ? { assigneeAgentId: resolvedAssigneeAgentId, issueStatus: resolvedIssueStatus }
-          : null;
+        const resolutionSnapshot = toResolutionSnapshot({
+          hasResolutionSnapshot,
+          resolvedAssigneeAgentId,
+          resolvedIssueStatus,
+        });
         return {
           ...row,
           resolutionSnapshot,
@@ -448,13 +475,7 @@ export function recoveryObservabilityService(db: Db) {
         outcome: issueRecoveryActions.outcome,
         ownerAgentId: issueRecoveryActions.ownerAgentId,
         returnOwnerAgentId: issueRecoveryActions.returnOwnerAgentId,
-        hasResolutionSnapshot: sql<boolean>`${issueRecoveryActions.evidence} ? ${RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY}`,
-        resolvedAssigneeAgentId: sql<
-          string | null
-        >`${issueRecoveryActions.evidence} ->> ${RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY}`,
-        resolvedIssueStatus: sql<
-          string | null
-        >`${issueRecoveryActions.evidence} ->> ${RESOLVED_ISSUE_STATUS_EVIDENCE_KEY}`,
+        ...resolutionSnapshotColumns,
       })
       .from(issueRecoveryActions)
       .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
@@ -471,9 +492,7 @@ export function recoveryObservabilityService(db: Db) {
       outcome: row.outcome,
       ownerAgentId: row.ownerAgentId,
       returnOwnerAgentId: row.returnOwnerAgentId,
-      resolutionSnapshot: row.hasResolutionSnapshot
-        ? { assigneeAgentId: row.resolvedAssigneeAgentId, issueStatus: row.resolvedIssueStatus }
-        : null,
+      resolutionSnapshot: toResolutionSnapshot(row),
     }));
 
     const handoff: RecoveryHandoffSummary = {
