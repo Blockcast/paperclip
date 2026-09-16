@@ -168,6 +168,49 @@ describe("probeApprovalGate", () => {
     expect(result?.evidence).toContain("a2=approved");
   });
 
+  it("does not let a sibling refusal mask an abandoned card (PEN-3089)", () => {
+    // The ticket's suppression, re-entered through a multi-card row. `rejected`
+    // used to be tested before `withdrawn`, so one refused card classified the
+    // whole row `approval-refused` — not action-owed, therefore withheld — and
+    // the withdrawn ask went dark without its own state changing. A refusal
+    // answers its own ask and says nothing about a card the requester retracted.
+    const result = probeApprovalGate(
+      evidence({
+        approvals: [
+          { approvalId: "a1", approvalStatus: "rejected" },
+          { approvalId: "a2", approvalStatus: "withdrawn" },
+        ],
+      }),
+    );
+    expect(result?.resolutionKind).toBe("approval-abandoned");
+    // The evidence leads with the card that died, and says so without claiming
+    // the refused sibling was also abandoned.
+    expect(result?.evidence).toContain("a2=withdrawn");
+    expect(result?.evidence).toContain("1 of 2 linked approvals was withdrawn or cancelled");
+    expect(result?.evidence).toContain("remaining 1 refused");
+    expect(result?.evidence).toContain("re-ask");
+  });
+
+  it("still withholds a row whose whole approval story is refusal (PEN-3089)", () => {
+    // The guard on the reorder above: making abandonment unmaskable must stay a
+    // narrowing. With no abandoned card the row is still `approval-refused`, and
+    // the evidence's "all N were answered" claim is true precisely because the
+    // abandoned branch has already returned by the time this one is reached.
+    const report = revalidateGates([
+      evidence({
+        issueId: "refused-only",
+        approvals: [
+          { approvalId: "a1", approvalStatus: "rejected" },
+          { approvalId: "a2", approvalStatus: "rejected" },
+        ],
+      }),
+    ]);
+    const [classification] = report.classifications;
+    expect(classification?.resolutionKind).toBe("approval-refused");
+    expect(classification?.evidence).toContain("all 2 linked approvals were answered");
+    expect(withheldFromAgeRankingIssueIds(report).has("refused-only")).toBe(true);
+  });
+
   it("reads an unrecognised status as still-gated, not as a resolution (PEN-3089)", () => {
     // `approvals.status` is a plain text column, so a new status is reachable.
     // Property 2: a false `still-gated` ages a row one more week, a false
@@ -694,7 +737,7 @@ describe("formatGateRevalidationSections", () => {
     ]);
     const markdown = formatGateRevalidationSections(report);
     expect(markdown).not.toContain("these are not still waiting");
-    expect(markdown).toContain("authorised, unperformed — 1** (⛔ still escalated");
+    expect(markdown).toContain("authorised, unperformed — 1** (⛔ action owed");
     expect(markdown).toContain("needs closing, not re-asking — 1** (withheld");
   });
 
@@ -722,7 +765,7 @@ describe("formatGateRevalidationSections", () => {
 
     // One heading, holding rows with opposite dispositions: it must report the
     // split rather than assert either disposition over both.
-    expect(markdown).toContain("never moved — 2** (⛔ 1 still escalated · 1 withheld");
+    expect(markdown).toContain("never moved — 2** (⛔ 1 action owed · 1 withheld");
     // The escalated row is marked; the withheld one is not.
     expect(markdown).toContain("- ⛔ PEN-3000");
     expect(markdown).toContain("- PEN-3001");
