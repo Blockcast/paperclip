@@ -54,6 +54,18 @@ export interface TruthProbeResult {
   diagnostics: string[];
   /** True when truth could not be established. NEVER means "not detected". */
   probeFailed: boolean;
+  /**
+   * True when the issue has no linked pull request at all. A THIRD state,
+   * distinct from `probeFailed`: the probe worked perfectly and the honest
+   * answer is "there is nothing to review".
+   *
+   * Kept off `probeFailed` deliberately. That field is how the rollout runbook
+   * separates a GitHub outage from a real evidence gap; folding PR-less issues
+   * into it makes the seven-day measurement unreadable in both directions, and
+   * writes `suppressed:probe-failed` into an operator-visible verdict on an
+   * issue where nothing failed.
+   */
+  noLinkedPullRequest: boolean;
 }
 
 export type TruthProbe = (input: TruthProbeInput) => Promise<TruthProbeResult>;
@@ -217,7 +229,13 @@ export function buildGithubTruthProbe(
     const all = prRefsFromWorkProducts(workProducts);
     // Not a failure: plenty of issues legitimately have no PR. The evaluator
     // records the shapes as missing and, unlabeled, only warns.
-    if (all.length === 0) return { detections: {}, diagnostics: ["no-linked-pull-request"], probeFailed: false };
+    if (all.length === 0)
+      return {
+        detections: {},
+        diagnostics: ["no-linked-pull-request"],
+        probeFailed: false,
+        noLinkedPullRequest: true,
+      };
 
     const diagnostics: string[] = [];
     let probeFailed = false;
@@ -255,7 +273,12 @@ export function buildGithubTruthProbe(
       abort.abort();
     });
     if (result === "deadline") {
-      return { detections: {}, diagnostics: [...diagnostics, "truth-probe-deadline"], probeFailed: true };
+      return {
+        detections: {},
+        diagnostics: [...diagnostics, "truth-probe-deadline"],
+        probeFailed: true,
+        noLinkedPullRequest: false,
+      };
     }
 
     for (const r of result) {
@@ -276,6 +299,6 @@ export function buildGithubTruthProbe(
       if (result.every((r) => r.merged)) detections["deploy:landed"] = true;
       if (result.every((r) => r.clean)) detections["review:ally-clean"] = true;
     }
-    return { detections, diagnostics, probeFailed };
+    return { detections, diagnostics, probeFailed, noLinkedPullRequest: false };
   };
 }

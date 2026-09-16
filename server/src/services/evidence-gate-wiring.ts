@@ -139,6 +139,7 @@ export async function runEvidenceGate(
   // slower and pointless.
   let externalDetections: Partial<Record<EvidenceShape, boolean>> | undefined;
   let probeFailed = false;
+  let noLinkedPullRequest = false;
   const truthDiagnostics: string[] = [];
   if (truth) {
     const probed = await truth({
@@ -150,6 +151,7 @@ export async function runEvidenceGate(
     });
     externalDetections = probed.detections;
     probeFailed = probed.probeFailed;
+    noLinkedPullRequest = probed.noLinkedPullRequest;
     truthDiagnostics.push(...probed.diagnostics);
   }
   const evaluation = evaluateEvidence({
@@ -167,6 +169,7 @@ export async function runEvidenceGate(
     doneWhenBulletsRemoved: data.doneWhenBulletsRemoved,
     externalDetections,
     probeFailed,
+    noLinkedPullRequest,
     unlabeledTruthBlock: options?.unlabeledTruthBlock,
   });
   return {

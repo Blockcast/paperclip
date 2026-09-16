@@ -239,7 +239,15 @@ describe("buildGithubTruthProbe", () => {
 
   it("no linked PR → no detections, a diagnostic, and NOT a probe failure", async () => {
     const r = await buildGithubTruthProbe(deps())({ workProducts: [] });
-    expect(r).toEqual({ detections: {}, diagnostics: ["no-linked-pull-request"], probeFailed: false });
+    // `noLinkedPullRequest` is the load-bearing half: it is what lets the gate
+    // suppress the escalation WITHOUT claiming the probe failed. Asserting the
+    // whole object keeps the two states from silently collapsing again.
+    expect(r).toEqual({
+      detections: {},
+      diagnostics: ["no-linked-pull-request"],
+      probeFailed: false,
+      noLinkedPullRequest: true,
+    });
   });
 
   it("more than 5 linked PRs → probes the 5 highest, names the rest, and withholds every detection", async () => {

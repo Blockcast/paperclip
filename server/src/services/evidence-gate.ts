@@ -62,6 +62,18 @@ export interface EvaluateEvidenceInput {
   /** True when the probe could not establish truth (GitHub error, deadline, cap). Suppresses escalation to block. */
   probeFailed?: boolean;
   /**
+   * True when the probe found NO linked pull request. A third state, not a
+   * flavour of `probeFailed` — the probe worked and the answer is "there is
+   * nothing to review".
+   *
+   * Passed as a boolean rather than derived here from `workProducts`, and
+   * rather than string-matched out of the probe's diagnostics. Deriving it
+   * would duplicate `prRefsFromWorkProducts`' free-text (D5) and sourceTrust
+   * rules in a second place; string-matching would rot the moment someone
+   * rewords a diagnostic.
+   */
+  noLinkedPullRequest?: boolean;
+  /**
    * Wired from loadConfig().evidenceGateUnlabeledTruthBlock. Default off.
    *
    * NAME IS NARROWER THAN THE BEHAVIOUR: the env var is
@@ -755,14 +767,33 @@ export function evaluateEvidence(
   // `missing` list, and blocking on the first would make every GitHub outage
   // an estate-wide in_review freeze.
   //
+  // So does a PR-less issue, for a stronger reason (CTO ruling 2026-09-16).
+  // `review:ally-clean` needs a head to review; with no linked PR there is no
+  // head, so the shape is unsatisfiable by the assignee FOREVER — not merely
+  // at this transition, as with `deploy:landed`. An AC an assignee cannot
+  // satisfy is a stall amplifier, not a gate. It is also exactly backwards to
+  // hard-block PR-less work on the UNLABELED path, which exists precisely to
+  // cover doc-only and refactor issues (see evidence-shapes.ts). If we ever
+  // want "code work must have a PR", that is an explicit requirement on a
+  // labeled path — not a side effect of an absent probe result.
+  //
   // The gap must also contain a shape the flag is ALLOWED to bind — see
   // BLOCKABLE_TRUTH_SHAPES. A gap of only `deploy:landed` stays a warn at every
   // flag setting: it is informational by construction, feeding the scorecards
   // and the rollout measurement without ever gating the transition.
   const blockableGap = missing.some((s) => BLOCKABLE_TRUTH_SHAPES.includes(s));
   if (verdict === "warn" && input.unlabeledTruthBlock === true && truthOnlyGap && blockableGap) {
-    if (input.probeFailed === true) {
-      diagnostics.push("unlabeled-truth-block-suppressed:probe-failed");
+    // Distinct reasons stay distinct in the verdict: the runbook's seven-day
+    // measurement reads these apart to separate a GitHub outage from work that
+    // can never satisfy the shape.
+    const suppress =
+      input.probeFailed === true
+        ? "probe-failed"
+        : input.noLinkedPullRequest === true
+          ? "no-linked-pull-request"
+          : null;
+    if (suppress !== null) {
+      diagnostics.push(`unlabeled-truth-block-suppressed:${suppress}`);
     } else {
       verdict = "block";
       diagnostics.push("unlabeled-truth-block");

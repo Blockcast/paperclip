@@ -14,6 +14,7 @@ const cleanProbe: TruthProbe = async () => ({
   detections: { "review:ally-clean": true, "deploy:landed": true },
   diagnostics: [],
   probeFailed: false,
+  noLinkedPullRequest: false,
 });
 
 const FRONTEND_DONE_WHEN = `## Done when\n- a\n- b\n- c\n`;
@@ -391,6 +392,7 @@ describe("runEvidenceGate — truth probe", () => {
       detections: { "review:ally-clean": true, "deploy:landed": true },
       diagnostics: ["probe-ran"],
       probeFailed: false,
+      noLinkedPullRequest: false,
     });
     const rec = await runEvidenceGate(async () => checklistIssue(), "i1", NOW, truth);
     expect(rec.verdict).toBe("pass");
@@ -402,6 +404,7 @@ describe("runEvidenceGate — truth probe", () => {
       detections: {},
       diagnostics: ["github-truth-probe-failed:head_sha:Blockcast/paperclip#1"],
       probeFailed: true,
+      noLinkedPullRequest: false,
     });
     const rec = await runEvidenceGate(async () => checklistIssue(), "i1", NOW, truth, {
       unlabeledTruthBlock: true,
@@ -411,13 +414,41 @@ describe("runEvidenceGate — truth probe", () => {
     expect(rec.diagnostics).toContain("github-truth-probe-failed:head_sha:Blockcast/paperclip#1");
   });
 
-  it("flag on + probe clean but nothing found → block", async () => {
-    const truth: TruthProbe = async () => ({ detections: {}, diagnostics: [], probeFailed: false });
+  it("flag on + a linked PR whose truth is clean but nothing found → block", async () => {
+    const truth: TruthProbe = async () => ({
+      detections: {},
+      diagnostics: [],
+      probeFailed: false,
+      noLinkedPullRequest: false,
+    });
     const rec = await runEvidenceGate(async () => checklistIssue(), "i1", NOW, truth, {
       unlabeledTruthBlock: true,
     });
     expect(rec.verdict).toBe("block");
     expect(rec.diagnostics).toContain("unlabeled-truth-block");
+  });
+
+  // The sibling of the case above, and the whole point of carrying a third
+  // state: its input was BYTE-IDENTICAL to a no-PR probe result before
+  // `noLinkedPullRequest` existed, so the assertion above used to pin the
+  // opposite of the CTO's 2026-09-16 ruling. `review:ally-clean` needs a head
+  // to review; with no linked PR the assignee can never satisfy it, at any
+  // flag value.
+  it("flag on + NO linked PR → warn, suppressed for its own distinct reason", async () => {
+    const truth: TruthProbe = async () => ({
+      detections: {},
+      diagnostics: ["no-linked-pull-request"],
+      probeFailed: false,
+      noLinkedPullRequest: true,
+    });
+    const rec = await runEvidenceGate(async () => checklistIssue(), "i1", NOW, truth, {
+      unlabeledTruthBlock: true,
+    });
+    expect(rec.verdict).toBe("warn");
+    expect(rec.diagnostics).toContain("unlabeled-truth-block-suppressed:no-linked-pull-request");
+    // Not folded into probe-failed: the runbook reads these apart.
+    expect(rec.diagnostics).not.toContain("unlabeled-truth-block-suppressed:probe-failed");
+    expect(rec.diagnostics).not.toContain("unlabeled-truth-block");
   });
 
   it("no probe supplied → truth shapes are simply missing, and it warns", async () => {
@@ -430,7 +461,7 @@ describe("runEvidenceGate — truth probe", () => {
     const seen: unknown[] = [];
     const truth: TruthProbe = async ({ workProducts }) => {
       seen.push(...workProducts);
-      return { detections: {}, diagnostics: [], probeFailed: false };
+      return { detections: {}, diagnostics: [], probeFailed: false, noLinkedPullRequest: false };
     };
     await runEvidenceGate(
       async () => ({
@@ -461,7 +492,7 @@ describe("runEvidenceGate — truth probe", () => {
     let calls = 0;
     const truth: TruthProbe = async () => {
       calls += 1;
-      return { detections: {}, diagnostics: [], probeFailed: false };
+      return { detections: {}, diagnostics: [], probeFailed: false, noLinkedPullRequest: false };
     };
     const rec = await runEvidenceGate(
       async () => ({
