@@ -1164,9 +1164,9 @@ describe("mirrored findings retire under both identities (#1707)", () => {
     ].join("\n");
   }
 
-  const fixed = (headSha: string, index: number) => ({
+  const fixed = (headSha: string, index: number, severity = "important") => ({
     head: headSha.slice(0, 7),
-    severity: "important",
+    severity,
     index,
     verb: "fixed",
   });
@@ -1174,19 +1174,22 @@ describe("mirrored findings retire under both identities (#1707)", () => {
   /**
    * The #1707 sequence, with whatever ledger the final review carried.
    *
-   * `counts` fixes how many Important findings each of the first two reviews
-   * reports, which is what decides whether the mirror's two ordinals coincide.
-   * The default is #1707 itself: RAISED reports one Important, MIRRORING
-   * mirrors it as its own Important 1 and adds a new Important 2.
+   * `counts` fixes how many findings each of the first two reviews reports,
+   * which is what decides whether the mirror's two ordinals coincide. The
+   * default is #1707 itself: RAISED reports one Important, MIRRORING mirrors
+   * it as its own Important 1 and adds a new Important 2.
    */
   function history(
     dispositions: ReturnType<typeof fixed>[],
-    counts: { raised?: number; mirroring?: number } = {},
+    counts: { raised?: number; mirroring?: number; mirroringCritical?: number } = {},
   ) {
-    const { raised = 1, mirroring = 2 } = counts;
+    const { raised = 1, mirroring = 2, mirroringCritical = 0 } = counts;
     return [
       allyComment(verdictReview(RAISED, { important: raised }, []), "2026-09-10T10:00:00Z"),
-      allyComment(verdictReview(MIRRORING, { important: mirroring }, []), "2026-09-11T10:00:00Z"),
+      allyComment(
+        verdictReview(MIRRORING, { important: mirroring, critical: mirroringCritical }, []),
+        "2026-09-11T10:00:00Z",
+      ),
       allyComment(verdictReview(DISPOSITIONING, {}, dispositions), "2026-09-12T10:00:00Z"),
     ];
   }
@@ -1249,6 +1252,55 @@ describe("mirrored findings retire under both identities (#1707)", () => {
         // `fixed(MIRRORING, 2)` names an index MIRRORING never reported, so the
         // mirror it actually carries — MIRRORING important 1 — stays unretired.
         comments: diverged([fixed(RAISED, 1), fixed(RAISED, 2), fixed(MIRRORING, 2)]),
+      });
+
+      expect(verdict).toMatchObject({
+        state: "failure",
+        outcome: "carried_finding",
+        carriedFromHeadSha: MIRRORING,
+      });
+    });
+  });
+
+  /**
+   * Ordinals are namespaced PER SEVERITY: `extractAllyReportedFindingRefs`
+   * numbers `1..count` inside a per-severity loop, and `namesFinding` matches
+   * on severity AND index. So a Critical ahead of the mirror does not shift
+   * the mirror's Important ordinal — only another Important does.
+   *
+   * MIRRORING reports one new Critical plus the mirror as its own Important 1.
+   * A producer reading the rule's divergence clause as "any earlier finding
+   * shifts the ordinal" emits `important 2` and dangles.
+   */
+  describe("a higher-severity finding does not shift the mirror's ordinal", () => {
+    const acrossSeverities = (dispositions: ReturnType<typeof fixed>[]) =>
+      history(dispositions, { raised: 1, mirroring: 1, mirroringCritical: 1 });
+
+    it("clears when the mirror keeps important 1 despite a Critical ahead of it", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        comments: acrossSeverities([
+          fixed(RAISED, 1),
+          fixed(MIRRORING, 1, "critical"),
+          fixed(MIRRORING, 1),
+        ]),
+      });
+
+      expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    });
+
+    it("negative control: counting the Critical against the Important ordinal dangles", () => {
+      const verdict = evaluateCommentReviewGate({
+        headSha: UNATTESTED,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        // `fixed(MIRRORING, 2)` names an Important index MIRRORING never
+        // reported — its Critical does not occupy the Important bucket.
+        comments: acrossSeverities([
+          fixed(RAISED, 1),
+          fixed(MIRRORING, 1, "critical"),
+          fixed(MIRRORING, 2),
+        ]),
       });
 
       expect(verdict).toMatchObject({
