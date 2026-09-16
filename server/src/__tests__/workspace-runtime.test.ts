@@ -6400,9 +6400,9 @@ describe("executeProcess (timeout classification)", () => {
     // 40_000, matching the sibling drain-grace case below. This body sleeps a
     // deliberate 7_500 to prove the descendant stays reaped, so its floor is
     // ~9.8s (measured 9857ms on a quiet 64-core host, load1 ~11) and the old
-    // 15_000 left only
-    // 1.5x -- too thin for a merge-queue shard (BLO-22985). The `< 5_000`
-    // assertion above still enforces reap promptness; this only bounds a hang.
+    // 15_000 left only 1.5x -- too thin for a merge-queue shard (BLO-22985).
+    // The `< 5_000` assertion above still enforces reap promptness; this only
+    // bounds a hang.
   }, 40_000);
 
   it("destroys captured stdio when drain grace expires after a clean exit", async () => {
@@ -6540,13 +6540,13 @@ describe("executeProcess (timeout classification)", () => {
       // post-kill liveness wait (750, PROCESS_TIMEOUT_GROUP_LIVENESS_GRACE_MS)
       // = 5_800, all timers -- the child is a stub, so there is no real work in
       // the span. Measured 5819/5822/5821ms on a quiet 64-core host (load1
-      // ~10-11), i.e. ~20ms
-      // of non-timer overhead. The old 6_500 left 679ms of slack (1.12x): three
-      // chained timers only have to fire ~230ms late each to trip it, and this
-      // file's original BLO-22985 ejection was a 33% overrun on a comparable
-      // timer-dominated span. 12_000 is 2.06x the measured floor and still well
-      // inside the 15_000 per-test cap, so a genuine regression fails here with
-      // this message rather than on the harness timeout.
+      // ~10-11), i.e. ~20ms of non-timer overhead. The old 6_500 left 679ms of
+      // slack (1.12x): three chained timers only have to fire ~230ms late each
+      // to trip it, and this file's original BLO-22985 ejection was a 33%
+      // overrun on a comparable timer-dominated span. 12_000 is 2.06x the
+      // measured floor and still well inside the 15_000 per-test cap, so a
+      // genuine regression fails here with this message rather than on the
+      // harness timeout.
       expect(elapsed).toBeLessThan(12_000);
       // Confirms the promise settled purely off the timeout timers: `exit`
       // and `close` handlers were armed but this stub never invoked them.
