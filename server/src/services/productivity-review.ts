@@ -1513,6 +1513,14 @@ export function extractReviewTriggerFromDescription(description: string | null):
   return ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS.find((trigger) => trigger === candidate) ?? null;
 }
 
+// BLO-34216: the renderer half of that round-trip, kept adjacent to the parser
+// so the shared `- Primary trigger:` prefix is visible in one place. Drift here
+// fails the same way a drifted trigger name does — the review silently stops
+// refreshing — so the round-trip test drives this rather than a hand-built line.
+export function renderPrimaryTriggerLine(trigger: ProductivityReviewTrigger) {
+  return `- Primary trigger: \`${trigger}\` (${formatTrigger(trigger)})`;
+}
+
 // True when the dependency gate cancelled a queued run before dispatch (see
 // `cancelQueuedRunForBlockedDependencies` in heartbeat.ts). The run never
 // reached the adapter, so it is disjoint from `isInfraFailureRun` below even
@@ -4053,7 +4061,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "",
       `- Source issue: ${issueUiLink(evidence.sourceIssue, prefix)}`,
       `- Assigned agent: ${evidence.sourceAgent.name} (${evidence.sourceAgent.role})`,
-      `- Primary trigger: \`${evidence.trigger}\` (${formatTrigger(evidence.trigger)})`,
+      renderPrimaryTriggerLine(evidence.trigger),
       `- Trigger reasons: ${evidence.triggerReasons.join("; ")}`,
       `- Generated at: ${evidence.generatedAt.toISOString()}`,
       "",

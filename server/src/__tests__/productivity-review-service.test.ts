@@ -33,6 +33,7 @@ import {
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
   extractReviewTriggerFromDescription,
   productivityReviewService,
+  renderPrimaryTriggerLine,
 } from "../services/productivity-review.js";
 import { logActivity } from "../services/activity-log.js";
 import { RECOVERY_ORIGIN_KINDS } from "../services/recovery/origins.js";
@@ -73,15 +74,16 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string) {
 // trigger the parser cannot read back fails quietly — it stops refreshing an
 // already-written review rather than failing a typecheck or a migration. This
 // asserts every member of the single source-of-truth tuple survives the
-// round-trip, so a trigger whose name the `[a-z_]+` pattern cannot match (a
-// digit, a dash) fails the build instead.
+// round-trip through the real renderer, so both halves fail the build: a
+// trigger whose name the `[a-z_]+` pattern cannot match (a digit, a dash), and
+// renderer/parser drift in the shared `- Primary trigger:` prefix.
 describe("productivity review trigger round-trip", () => {
   it("parses every trigger back out of the rendered primary-trigger line", () => {
     expect(ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS.length).toBeGreaterThan(0);
     for (const trigger of ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS) {
       const description = [
         "Some preamble.",
-        `- Primary trigger: \`${trigger}\` (Display label)`,
+        renderPrimaryTriggerLine(trigger),
         "- Something else: value",
       ].join("\n");
       expect(extractReviewTriggerFromDescription(description)).toBe(trigger);

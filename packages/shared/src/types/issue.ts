@@ -478,8 +478,10 @@ export interface IssueBlockedInboxAttention {
 // BLO-34216: the single source of truth for the productivity-review trigger
 // set. The union type below, both runtime parse-side allowlists (issues.ts,
 // productivity-review.ts) and both label maps derive from this tuple, so adding
-// a trigger is a one-line change here. The trigger round-trips through markdown
-// via `extractReviewTriggerFromDescription` rather than a DB enum, so a
+// a trigger is one line here plus a label in each map — the maps are
+// `Record<Trigger, string>`, so a missing label is a red build, not a silent
+// fallback. The trigger round-trips through markdown via
+// `extractReviewTriggerFromDescription` rather than a DB enum, so a
 // hand-maintained allowlist that drifted failed quietly — it silently stopped
 // parsing an already-written review rather than failing a typecheck.
 export const ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS = [
