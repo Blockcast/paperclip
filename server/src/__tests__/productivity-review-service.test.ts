@@ -5127,6 +5127,136 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("never re-armed");
   });
 
+  // BLO-22887 verifying-signal cell 1. The three tests below deliberately reuse
+  // the fixture immediately above, because that fixture *is* the reported
+  // defect: BLO-22703 fired `long_active_duration` on BLO-21016 citing
+  // "18h 52m monitor-gated, 13h 8m unattended (monitor lapsed ..., never
+  // re-armed)" while the control plane independently held that issue
+  // dependency-blocked. Keeping the fixture byte-identical and adding only the
+  // blocker is what makes these a control/treatment pair rather than three
+  // unrelated scenarios.
+  //
+  // The BLO-22436 suppression tests all drive `no_comment_streak`, so until now
+  // `long_active_duration` — the one trigger this ticket was filed about, and
+  // the one whose elapsed accounting crosses into the monitor-lapse subsystem —
+  // had no generation-gate coverage at all. The gate is trigger-set-generic, so
+  // this is a regression guard on an intersection, not a new behaviour.
+  it("suppresses a long_active_duration review for a dependency-blocked issue whose monitor deliberately lapsed (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const activeStartedAt = new Date(now.getTime() - 20 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: activeStartedAt,
+      monitorNextCheckAt: new Date(activeStartedAt.getTime() + 5 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    // Pins *which* mechanism suppressed it. `created: 0` alone is satisfied by
+    // the long-active predicate never firing — i.e. by the fixture silently
+    // rotting into a no-op — which is the failure mode that would make this
+    // test pass for the wrong reason.
+    expect(result.dependencyBlockedSuppressed).toBe(1);
+    expect(result.monitorScheduledSuppressed).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-22887 verifying-signal cell 2. The AC names the signal as
+  // `scheduledRetryReason: dependency_blocked`, which is real
+  // (`DEP_BLOCKED_RETRY_REASON`, heartbeat.ts) but is NOT what the detector
+  // gates on — the gate reads `listDependencyReadiness`, i.e. the `blockedBy`
+  // edge. Those are not independent: the park is only ever written with a
+  // non-empty `unresolvedBlockerIssueIds` (heartbeat.ts, dep-blocked wake
+  // deferral), so the retry reason is a downstream marker of the same graph
+  // state, and BLO-21016 carried both at once exactly as this fixture does.
+  //
+  // The park is placed OVERDUE on purpose. A future-due `scheduled_retry`
+  // suppresses `long_active_duration` on its own via the BLO-19848/BLO-23248
+  // pinning path, which would make this test green without the dependency gate
+  // being consulted at all. Overdue removes that second explanation, so the
+  // `dependencyBlockedSuppressed` assertion below can only be satisfied by the
+  // gate under test.
+  it("suppresses a long_active_duration review for an issue parked on an overdue dependency_blocked retry (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const activeStartedAt = new Date(now.getTime() - 20 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: activeStartedAt,
+      monitorNextCheckAt: new Date(activeStartedAt.getTime() + 5 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+    await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+      scheduledRetryAt: new Date(now.getTime() - 60 * 60 * 1000),
+      scheduledRetryReason: "dependency_blocked",
+      errorCode: "issue_dependencies_blocked",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.dependencyBlockedSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-22887 verifying-signal cell 3 (over-suppression guard). Named
+  // explicitly because cells 1 and 2 are both "no review emitted": a change
+  // that simply stopped emitting `long_active_duration` would satisfy them
+  // while disabling the detector. This is the same fixture with the blocker
+  // resolved rather than absent, so it also pins that the gate reads blocker
+  // *state* and not the mere existence of a relation row.
+  it("still emits the long_active_duration review once the blocker is resolved (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const activeStartedAt = new Date(now.getTime() - 20 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: activeStartedAt,
+      monitorNextCheckAt: new Date(activeStartedAt.getTime() + 5 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+      blockerStatus: "done",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.dependencyBlockedSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("5m monitor-gated, 19h 55m unattended");
+    // A resolved blocker leaves no unresolved edge, so the BLO-22887 bucket
+    // must not render — the line's presence is itself the signal.
+    expect(review?.description).not.toContain("Dependency accounting");
+  });
+
   // BLO-25877 defect 2 regression guard: the still-armed branch reports
   // `unattendedMs: 0` as a deliberate, documented upper bound (no arm-time column
   // exists), not a measured value. Wiring it into the predicate wholesale would make
