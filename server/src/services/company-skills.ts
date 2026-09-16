@@ -5992,7 +5992,10 @@ export function companySkillService(db: Db) {
       .select({
         issueId: costEvents.issueId,
         costCents: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::int`,
-        inputTokens: sql<number>`coalesce(sum(${costEvents.inputTokens}), 0)::int`,
+        // BLO-29842: cache writes used to live inside input_tokens. This is a
+        // volume figure, not a rate-card regressor, so sum both to keep it
+        // measuring what it measured before the column was split out.
+        inputTokens: sql<number>`coalesce(sum(${costEvents.inputTokens} + ${costEvents.cacheCreationInputTokens}), 0)::int`,
         cachedInputTokens: sql<number>`coalesce(sum(${costEvents.cachedInputTokens}), 0)::int`,
         outputTokens: sql<number>`coalesce(sum(${costEvents.outputTokens}), 0)::int`,
       })

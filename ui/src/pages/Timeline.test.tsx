@@ -71,6 +71,7 @@ const populatedTimeline: WorkTimelineResult = {
       usage: {
         inputTokens: 1_000,
         cachedInputTokens: 0,
+        cacheCreationInputTokens: 0,
         outputTokens: 500,
         totalTokens: 1_500,
       },
@@ -89,6 +90,7 @@ const populatedTimeline: WorkTimelineResult = {
       usage: {
         inputTokens: 900,
         cachedInputTokens: 100,
+        cacheCreationInputTokens: 0,
         outputTokens: 500,
         totalTokens: 1_500,
       },

@@ -28,14 +28,16 @@ function withStorybookTimelineDetails(data: WorkTimelineResult): WorkTimelineRes
     spans: data.spans.map((span, index) => {
       const inputTokens = 42_000 + index * 137;
       const cachedInputTokens = index % 3 === 0 ? 8_000 : 0;
+      const cacheCreationInputTokens = index % 2 === 0 ? 3_500 : 0;
       const outputTokens = 5_400 + index * 29;
       return {
         ...span,
         usage: span.usage ?? {
           inputTokens,
           cachedInputTokens,
+          cacheCreationInputTokens,
           outputTokens,
-          totalTokens: inputTokens + cachedInputTokens + outputTokens,
+          totalTokens: inputTokens + cachedInputTokens + cacheCreationInputTokens + outputTokens,
         },
       };
     }),
