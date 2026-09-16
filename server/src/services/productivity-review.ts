@@ -824,6 +824,22 @@ function runLiveInterval(run: HeartbeatRunRow, now: Date): { start: number; end:
   return end.getTime() > start.getTime() ? { start: start.getTime(), end: end.getTime() } : null;
 }
 
+/**
+ * The shared "still signalling" test: a live span that still reaches `now`.
+ *
+ * Written against the span rather than the run so its two consumers cannot
+ * drift — `siblingStillExecuting` (episode attribution) and `liveExecutingMs`
+ * (B3b). The tail clamp in `liveExecutingMs` is provably a no-op only while
+ * those two tests are identical; a comment was carrying that coupling (Ally
+ * review on 06b87852), so it is structural here instead.
+ */
+function stillSignalling(
+  span: { start: number; end: number } | null,
+  now: Date,
+): span is { start: number; end: number } {
+  return span !== null && span.end >= now.getTime();
+}
+
 /** Milliseconds of `[start, end)` not covered by any span in `liveSpans`. */
 function msOutsideLiveSpans(start: number, end: number, liveSpans: { start: number; end: number }[]) {
   if (end <= start) return 0;
@@ -3816,18 +3832,30 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     //
     // `latestRuns` is scoped to this issue and this assignee, so a live sibling
     // here is that assignee demonstrably working this issue right now — not
-    // unrelated traffic. BLO-18307 is untouched: the hold still truncates exactly
-    // as before whenever nothing is live anywhere, which is the wedged-holder
-    // shape it exists to exclude.
-    const siblingStillExecuting = latestRuns.some(
-      (run) =>
-        run.id !== sourceIssue.executionRunId &&
-        run.status === "running" &&
-        // `runLiveInterval` caps a `running` row at `min(now, silentFrom)`, so
-        // `end >= now` is exactly "still signalling" — the same liveness test
-        // `liveExecutingMs` applies below.
-        (runLiveInterval(run, now)?.end ?? 0) >= now.getTime(),
-    );
+    // unrelated traffic.
+    //
+    // BLO-18307 is not weakened, and the precise statement matters: the tail
+    // extension never resurrects a gap, because `attributableStartAt` moves to
+    // the sibling's own span start whenever the sibling began after the hold
+    // (see `siblingSegmentStart`). So the wedged-holder wall-clock this exists
+    // to exclude stays excluded either way — as a trailing hold when nothing is
+    // live anywhere, or as a leading park when a sibling picked the issue up
+    // later. An earlier draft of this comment claimed only the first half; that
+    // understated the change, because a *binary* extension removed the
+    // truncation entirely and retroactively the moment anything went live.
+    // The earliest point from which a still-signalling sibling has been live —
+    // i.e. when the sibling-carried live segment began, or null when no sibling
+    // is executing.
+    const siblingLiveFrom = latestRuns.reduce<number | null>((earliest, run) => {
+      if (run.id === sourceIssue.executionRunId || run.status !== "running") return earliest;
+      const span = runLiveInterval(run, now);
+      // `runLiveInterval` caps a `running` row at `min(now, silentFrom)`, so
+      // `end >= now` is exactly "still signalling" — the same liveness test
+      // `liveExecutingMs` applies below, shared via `stillSignalling`.
+      if (!stillSignalling(span, now)) return earliest;
+      return earliest === null || span.start < earliest ? span.start : earliest;
+    }, null);
+    const siblingStillExecuting = siblingLiveFrom !== null;
     // Clamping below activeStartedAt collapses to 0 via Math.max — i.e. a holder
     // that went non-live before the episode began contributes no active time.
     const attributableEndAt = siblingStillExecuting ? now : (nonLiveHoldSince ?? now);
@@ -3840,10 +3868,39 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // Exclude the park from the front of the episode too. See
     // liveSegmentStartedAt.
     const liveSegmentStart = liveSegmentStartedAt(executionRun, now);
+    // BLO-27698 (Ally review on 06b87852): extending the tail on a *duration-
+    // blind boolean* re-attributes the whole holder park whenever anything is
+    // live — a sibling up for one second resurrects an 11h gap retroactively and
+    // entirely, not proportionally, handing B2 an episode rendered as 13h of
+    // "active elapsed time" that was 11h of park. Worse, the disclosure vanishes
+    // with it: `trailingHoldMs` goes to 0, so the excluded-hold line is not
+    // rendered either, and the gap is neither counted out nor visible as in.
+    //
+    // Bound the extension to the sibling's own span. When the holder is non-live
+    // and the segment is carried by a sibling that started *after* the hold
+    // began, the current live segment starts there — so the sibling contributes
+    // its own burn without resurrecting the gap before it. A sibling live since
+    // before the hold leaves the start untouched, which is the 13h
+    // continuous-burn case the tail extension exists for.
+    //
+    // This is `liveSegmentStartedAt`'s own BLO-19848 discipline — a park breaks
+    // the segment, measure the current one — applied issue-wide rather than
+    // holder-only, so the excluded interval keeps surfacing through the existing
+    // `leadingParkMs` disclosure instead of disappearing from both sides of the
+    // ledger. It also keeps `elapsedMs` exactly `attributableEndAt -
+    // attributableStartAt`, which `monitorGatingBreakdown` relies on to place
+    // the episode window (`episodeEndMs = start + elapsedMs`); subtracting an
+    // interior hole from the duration instead would have shifted that window off
+    // the spans it measures and broken B1's bucket identity.
+    const siblingSegmentStart =
+      siblingLiveFrom !== null && nonLiveHoldSince && siblingLiveFrom > nonLiveHoldSince.getTime()
+        ? new Date(siblingLiveFrom)
+        : null;
+    const segmentStart = latestDate(liveSegmentStart, siblingSegmentStart);
     const attributableStartAt = activeStartedAt
-      && liveSegmentStart
-      && liveSegmentStart.getTime() > activeStartedAt.getTime()
-      ? liveSegmentStart
+      && segmentStart
+      && segmentStart.getTime() > activeStartedAt.getTime()
+      ? segmentStart
       : activeStartedAt;
     const elapsedMs = sourceIssue.status === "in_progress" && attributableStartAt
       ? Math.max(0, attributableEndAt.getTime() - attributableStartAt.getTime())
@@ -3913,8 +3970,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // above "Current active elapsed time: 2h".
     //
     // That divergence is now fixed at its source — `attributableEndAt` extends
-    // to `now` while a sibling is still executing (see `siblingStillExecuting`),
-    // so both figures move together and the contradiction is unrepresentable
+    // to `now` while a sibling is still executing (see `siblingLiveFrom`), with
+    // `attributableStartAt` moved to the sibling's own span start so the
+    // extension covers the sibling's burn and not the holder's park before it.
+    // Both figures move together and the contradiction is unrepresentable
     // rather than clamped away. Clamping the tail was the wrong half of that
     // trade: it bought consistency by discarding the sibling's burn from
     // `liveExecutingMs` too, which hid a genuinely runaway run from the one
@@ -3926,10 +3985,13 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // any such run drives `attributableEndAt` to `now` (as the holder, via a
     // null hold; or as a sibling, via `siblingStillExecuting`). Keeping it means
     // `liveExecutingMs <= elapsedMs` stays true by construction if a future edit
-    // narrows either of those paths, instead of by the argument above.
+    // narrows either of those paths, instead of by the argument above. The head
+    // clamp is no longer a no-op in the sibling case and is doing real work: it
+    // is what stops a sibling's pre-episode span leaking back in once
+    // `attributableStartAt` has been moved forward to exclude the park.
     //
     // Order matters: the clamp is applied to the measured duration *after* the
-    // `span.end < now` liveness test, never before. Testing a clamped end
+    // `stillSignalling` liveness test, never before. Testing a clamped end
     // against `now` would read a truncated `attributableEndAt` as "went silent"
     // and zero out genuinely live runs — liveness asks about `now`, the counted
     // duration stays inside the episode.
@@ -3938,7 +4000,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ...latestRuns.map((run) => {
         if (run.status !== "running") return 0;
         const span = runLiveInterval(run, now);
-        if (!span || span.end < now.getTime()) return 0;
+        if (!stillSignalling(span, now)) return 0;
         const start = attributableStartAt ? Math.max(span.start, attributableStartAt.getTime()) : span.start;
         const end = Math.min(span.end, attributableEndAt.getTime());
         return Math.max(0, end - start);
