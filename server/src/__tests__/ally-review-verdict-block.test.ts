@@ -1071,6 +1071,32 @@ describe("BLO-32695 — an unreadable block reds only the head it concerns", () 
     ).toMatchObject({ state: "failure", outcome: "carried_finding" });
   });
 
+  it("carries that finding whichever order the two comments arrive in", () => {
+    // Same two comments as above, reversed. The first cut of the fix asked
+    // "may this displace what is already here?", which reads state built by
+    // arrival order: with the unreadable review ahead of the attested one it
+    // took the slot and the attested one then lost the timestamp comparison,
+    // so this order returned `success`/`not_evaluated` with the finding still
+    // open — the same fail-open, through the fix for it (peer review of #1721
+    // at bbe6d640).
+    //
+    // Nothing enforces the order it rested on: executeCommentReviewGateCheck
+    // builds `[...issueComments, ...prReviews]` with no sort, so both
+    // orderings are inputs this function must answer the same way.
+    const olderBlocking = [
+      "## Ally — Consolidated PR Review",
+      `Reviewed head: ${HEAD_A}`,
+      "### Important Issues (1)",
+      "1. Something unresolved.",
+    ].join("\n");
+    expect(
+      gateAt(HEAD_B, [
+        allyComment(brokenNamingHeadA, "2026-09-07T15:41:42Z"),
+        allyComment(olderBlocking, "2026-09-07T03:46:19Z"),
+      ]),
+    ).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
   it("does not let an OLDER broken block shadow a newer clean review", () => {
     const newerClean = [
       "## Ally — Consolidated PR Review",

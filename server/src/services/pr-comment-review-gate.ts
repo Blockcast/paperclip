@@ -249,12 +249,28 @@ function headsWithUndispositionedFinding(
     // for it. Caught by the pre-existing case at "leaves a finding carried from
     // the head it names". Among two unreadable reviews the newer still wins;
     // neither one is evidence, so there is nothing to lose between them.
-    const mayDisplace = Boolean(attestedHeadSha) || !existing?.attested;
-    if (mayDisplace && (!existing || commentTime >= existing.timeMs)) {
+    //
+    // Written as a precedence over the pair rather than as a veto on the
+    // incumbent, so the winner does not depend on which comment the loop saw
+    // first. The first cut asked "may this displace what is already here?",
+    // which reads state built by arrival order: with the unattested review
+    // ahead of the attested one in the array it took the slot and the attested
+    // one then lost the `commentTime >=` comparison, so reversing two comments
+    // flipped the verdict green with the finding still open (peer review of
+    // #1721 at bbe6d640, TrafficOpsEngineer). Nothing establishes that order —
+    // executeCommentReviewGateCheck concatenates two independently-ordered
+    // lists — so the invariant it rested on was never enforced anywhere.
+    const attested = Boolean(attestedHeadSha);
+    const wins = !existing
+      ? true
+      : attested !== existing.attested
+        ? attested
+        : commentTime >= existing.timeMs;
+    if (wins) {
       newestPerHead.set(claimedHeadSha, {
         attesting: { comment, attestedHeadSha: claimedHeadSha },
         timeMs: commentTime,
-        attested: Boolean(attestedHeadSha),
+        attested,
       });
     }
   }
