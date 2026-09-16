@@ -85,7 +85,7 @@ describeEmbeddedPostgres("cli-auth refresh (sliding board key renewal)", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-cli-auth-refresh-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     await db.delete(activityLog);

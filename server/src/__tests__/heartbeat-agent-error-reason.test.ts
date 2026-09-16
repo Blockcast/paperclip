@@ -50,7 +50,7 @@ describeEmbeddedPostgres("agent error status always carries a reason", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-agent-error-reason-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);

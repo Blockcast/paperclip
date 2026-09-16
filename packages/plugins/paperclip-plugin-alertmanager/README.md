@@ -297,7 +297,7 @@ cached too (empty string) so a missing user doesn't cause repeated lookups.
 
 ### Issue creation floor and rule-level opt-out
 
-Two gates keep low-value alerts from becoming issues:
+Two gates keep low-value alerts from becoming issues at all:
 
 - **`severity: info` creates no issue.** The gate is *creation-only* and runs
   after the re-fire branch, so an `info` issue that already exists (filed
@@ -309,6 +309,40 @@ Two gates keep low-value alerts from becoming issues:
   refreshed, no state written, no suppression anchor banked) but deliberately
   lets the **resolved** path through. Emits
   `alertmanager.webhook.issue_opt_out`.
+
+A third gate suppresses *actionability* rather than creation:
+
+- **`severity: none` is filed terminal and unowned.** This is the heartbeat
+  band — Prometheus' `Watchdog` (`vector(1)`) is its only member and fires
+  forever by design. The row is kept because it is the only live evidence the
+  in-cluster delivery leg accepts POSTs, but an alert that can never resolve
+  must not carry an owner: an assigned row that can never legitimately close
+  recirculates through agent assignment and `stranded_assigned_issue` recovery
+  forever. So the issue is created — and on every re-fire kept — `done` with no
+  assignee, and owner-map / `issueRouteMap` resolution is skipped entirely. No
+  escalation-ladder exemption is needed: `none` maps to no
+  `escalationDeadlineMinutes`, so `nextEscalationAt` is already `null`.
+
+  `done` rather than unowned-`todo` on purpose. Heartbeat selection is by
+  assignee, so both are inert — but an ownerless `todo` row is
+  indistinguishable from a stranded issue on every triage surface, and this one
+  would be re-minted on every fire, forever. A terminal row is honestly
+  terminal.
+
+  Unlike the two gates above, this one is **not** creation-only: every re-fire
+  re-clears the assignee on the issue, the state record, *and* the emitted
+  firing event. A creation-only guard would leave rows filed before the policy
+  — and any row something later assigns — stuck in the loop, which is the same
+  one-shot patch as unassigning by hand. The re-fire also bypasses
+  `decideRefire`: that helper reads any `done` row as an *operator* close
+  (BLO-24234) and would mute the fingerprint for the suppression window, then
+  re-open it as `todo` when the window expired — re-manufacturing exactly the
+  actionable row this gate exists to prevent. A terminal close is the plugin's
+  own doing, so there is no operator intent to honour.
+
+  The terminal set is a constant (`TERMINAL_SEVERITIES`), deliberately not a
+  config key: a configurable list is what would make a plugin-closed `done` row
+  ambiguous with an operator close, and `none` has exactly one member here.
 
 Letting resolve through is what keeps the opt-out from wedging the issues it was
 added to silence. Gating it too would mean `handleResolved` never runs for an

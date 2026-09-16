@@ -133,12 +133,38 @@ export function hasAllyConsolidatedReviewHeading(body: string | null | undefined
 // reintroduces the brittleness this is widening away from.
 const MARKDOWN_EMPHASIS_RUN = "[*_`]{0,3}";
 
+// Emphasis and whitespace interleave freely around the SHA, so they are matched
+// as one bounded run rather than as an emphasis run that may be followed by
+// spaces. Allowing only the latter still dropped the form that closes the label
+// and wraps the SHA separately — `**Reviewed head:** \`<sha>\`` — because the
+// single permitted run was consumed by `**` and could not then cross the space
+// to reach the backtick. That is the same failure mode as BLO-31730 (a real
+// review made invisible by its own delimiters), one delimiter combination
+// further out, so the run is widened here instead of being enumerated.
+//
+// The run is length-bounded and the line is anchored at both ends, which is
+// what keeps this from reading a prose mention: widening the wrapper cannot
+// admit trailing text after the SHA, and the exactly-one rule below — not the
+// wrapper's tightness — is what stops a required check being set on a guess.
+const ATTESTATION_WRAPPER_RUN = "[*_`\\t ]{0,6}";
+
 // Indentation is bounded to agree with the heading pattern above — see
 // NOT_INDENTED_CODE.
+//
+// The unbounded `[ \t]*` on either side of the bounded wrapper run is
+// load-bearing, not redundant with it. Bounding the wrapper is what lets
+// emphasis and whitespace interleave; leaving the plain-whitespace runs
+// unbounded is what stops that bound from truncating a long run of ordinary
+// spaces. Without them, seven or more spaces after the colon — or nine after
+// the SHA — overflow `{0,6}` and the attestation stops parsing, which this
+// module's header explains is a fail-OPEN: an unattested review is never
+// recognised, so the gate reaches not_evaluated rather than blocking. That is
+// the BLO-31730 bug class the widening exists to close, so a widening must not
+// reintroduce it one delimiter out. Regression cases for all three forms are
+// pinned in ally-review-detection.test.ts.
 const REVIEWED_HEAD_ATTESTATION_PATTERN = new RegExp(
   `(?:^|\\n)${NOT_INDENTED_CODE} {0,3}${MARKDOWN_EMPHASIS_RUN}[ \\t]{0,3}reviewed head:[ \\t]*` +
-    `${MARKDOWN_EMPHASIS_RUN}([0-9a-f]{40})${MARKDOWN_EMPHASIS_RUN}[ \\t]*` +
-    `${MARKDOWN_EMPHASIS_RUN}[ \\t]*(?=\\n|$)`,
+    `${ATTESTATION_WRAPPER_RUN}([0-9a-f]{40})${ATTESTATION_WRAPPER_RUN}[ \\t]*(?=\\n|$)`,
   "gi",
 );
 

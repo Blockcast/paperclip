@@ -287,34 +287,75 @@ describe("createPenstockAvailabilityGate", () => {
     expect(log.warn).not.toHaveBeenCalled();
   });
 
-  it("defers for Penstock auth failures instead of launching doomed runs", async () => {
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 }));
-    const gate = gateWith(fetchMock as unknown as typeof fetch);
+  // PEN-2513: 401/403 are authorization faults, not availability signals. Every
+  // deny this gate returns is booked by heartbeat.ts as `ccrotate_capacity`, so
+  // denying on them parked a permanent entitlement fault on a capacity horizon
+  // that can never expire it. These four cases pin the narrowing: auth faults
+  // fail open at BOTH probe sites, and 429/503 keep their existing deny.
+  it.each([401, 403])(
+    "fails open on a %i from the capacity readback instead of minting a capacity park",
+    async (status) => {
+      const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: "nope" }), { status }));
+      const gate = gateWith(fetchMock as unknown as typeof fetch);
 
-    const result = await gate.checkAdapter({
-      adapterType: "claude_k8s",
-      agentId: "agent-1",
-      adapterConfig: {
-        model: "claude-sonnet-4-6[1m]",
-        env: { ANTHROPIC_BASE_URL: { value: "https://api.penstock.run/anthropic" } },
-      },
-      now: new Date("2026-06-30T08:00:00.000Z"),
-      env: { ANTHROPIC_API_KEY: "psk_test" },
-    });
+      const result = await gate.checkAdapter({
+        adapterType: "claude_k8s",
+        agentId: "agent-1",
+        adapterConfig: {
+          model: "claude-sonnet-4-6[1m]",
+          env: { ANTHROPIC_BASE_URL: { value: "https://api.penstock.run/anthropic" } },
+        },
+        now: new Date("2026-06-30T08:00:00.000Z"),
+        env: { ANTHROPIC_API_KEY: "psk_test" },
+      });
 
-    expect(result).toMatchObject({
-      allow: false,
-      provider: "anthropic",
-      reason: "penstock.model_temporarily_unavailable",
-      model: "claude-sonnet-4-6[1m]",
-      retryAfterSeconds: 300,
-    });
-    expect(result.allow === false ? result.resumeAt?.toISOString() : null).toBe("2026-06-30T08:05:00.000Z");
-    expect(log.info).toHaveBeenCalledWith(
-      expect.objectContaining({ status: 401, model: "claude-sonnet-4-6[1m]" }),
-      "heartbeat dispatch deferred: penstock model unavailable",
-    );
-  });
+      expect(result).toEqual({ allow: true });
+      // The capacity readback yields no verdict, so the messages probe still
+      // runs — and fails open on the same status rather than denying.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(log.warn).toHaveBeenCalledWith(
+        { status, model: "claude-sonnet-4-6[1m]", probe: "capacity readback" },
+        "penstock probe auth fault: not an availability signal, allowing dispatch",
+      );
+      expect(log.warn).toHaveBeenCalledWith(
+        { status, model: "claude-sonnet-4-6[1m]", probe: "availability probe" },
+        "penstock probe auth fault: not an availability signal, allowing dispatch",
+      );
+      expect(log.info).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([401, 403])(
+    "fails open on a %i from the messages probe when the capacity endpoint is absent",
+    async (status) => {
+      const fetchMock = vi
+        .fn()
+        // 404 = this deployment has no capacity endpoint, so the gate falls
+        // through to the messages probe. That probe carries the auth fault.
+        .mockResolvedValueOnce(new Response("not found", { status: 404 }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ error: "nope" }), { status }));
+      const gate = gateWith(fetchMock as unknown as typeof fetch);
+
+      const result = await gate.checkAdapter({
+        adapterType: "claude_k8s",
+        agentId: "agent-1",
+        adapterConfig: {
+          model: "claude-opus-4-8[1m]",
+          env: { ANTHROPIC_BASE_URL: { value: "https://api.penstock.run/anthropic" } },
+        },
+        now: new Date("2026-06-30T08:00:00.000Z"),
+        env: { ANTHROPIC_API_KEY: "psk_test" },
+      });
+
+      expect(result).toEqual({ allow: true });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(log.warn).toHaveBeenCalledWith(
+        { status, model: "claude-opus-4-8[1m]", probe: "availability probe" },
+        "penstock probe auth fault: not an availability signal, allowing dispatch",
+      );
+      expect(log.info).not.toHaveBeenCalled();
+    },
+  );
 
   it("defers when Penstock reports temporary unavailability", async () => {
     const fetchMock = vi.fn(async () => new Response("unavailable", { status: 503 }));

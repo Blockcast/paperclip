@@ -2523,6 +2523,240 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("tells the linked Paperclip issue when a reviewer run ends without a confirmed review (BLO-33589)", async () => {
+    // The commit status is the ONLY place this outcome was ever written. On
+    // Blockcast/libmmt#444 that status said "ended ambiguously and was not
+    // replayed" at 2026-09-12T20:02:59Z and nothing in Paperclip ever learned
+    // it: no wake, no comment, no retry. The requesting agent had already ended
+    // its run believing it handed off, so the PR read as ordinary reviewer
+    // latency for 10h06m while four sibling PRs were reviewed in 5-10 minutes.
+    //
+    // Asserted on the Paperclip side (issue comment + wake) rather than on the
+    // GitHub status fixture, which is what the existing test above covers.
+    const jobName = "agent-opencode-ambiguous-review-notifies-issue";
+    const headSha = "ae43eed59d9a2fb0c21fe1b1dad7b013a9d02668";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      // No issue on the reviewer run itself: a PR-review wake for an external
+      // repo is not bound to a Paperclip issue, which is exactly the `!issue`
+      // finalizer branch #444 took.
+      includeIssue: false,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/libmmt:444:${headSha}`,
+        githubRepoFullName: "Blockcast/libmmt",
+        githubPrNumber: 444,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { summary: `Posted the consolidated Ally review on #444 at ${headSha}.` } })
+      .where(eq(heartbeatRuns.id, runId));
+
+    // The requesting side: a separate issue owned by a separate agent, linked
+    // to the PR by its `pull_request` work product, parked `in_review` waiting
+    // for exactly this review.
+    const authorAgentId = randomUUID();
+    const authorIssueId = randomUUID();
+    await db.insert(agents).values({
+      id: authorAgentId,
+      companyId,
+      name: "PlayersEngineer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: authorIssueId,
+      companyId,
+      title: "BLO-32722 layer ownership carries media",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: authorAgentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 444,
+      identifier: "TAUTHOR-444",
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId,
+      issueId: authorIssueId,
+      type: "pull_request",
+      provider: "github",
+      externalId: "Blockcast/libmmt#444",
+      title: "BLO-32722 layer ownership carries media",
+      url: "https://github.com/Blockcast/libmmt/pull/444",
+      status: "ready_for_review",
+    });
+
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: false });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+    const previousGateContext = process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+    process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = "review/ally-complete";
+    try {
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    } finally {
+      if (previousGateContext === undefined) {
+        delete process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+      } else {
+        process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = previousGateContext;
+      }
+    }
+
+    const [comments, wakeups, gateDeliveries] = await Promise.all([
+      db.select().from(issueComments).where(eq(issueComments.issueId, authorIssueId)),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, authorAgentId)),
+      db
+        .select()
+        .from(githubCommitStatusDeliveries)
+        .where(eq(githubCommitStatusDeliveries.sourceRunId, runId)),
+    ]);
+
+    // The GitHub half still happens — this adds a reader, it does not move one.
+    expect(gateDeliveries).toHaveLength(1);
+    expect(gateDeliveries[0]).toMatchObject({ sha: headSha, state: "failure" });
+
+    const notice = comments.filter((comment) =>
+      comment.body.includes("Ally review did not land on")
+    );
+    expect(notice).toHaveLength(1);
+    expect(notice[0]?.authorType).toBe("system");
+    expect(notice[0]?.body).toContain("Blockcast/libmmt#444");
+    expect(notice[0]?.body).toContain(headSha);
+    // The terminal fact itself, in words, not just a link to a red check.
+    expect(notice[0]?.body).toContain("No review was posted, and none is coming for this head");
+
+    // The comment is the durable artifact; the wake is what actually reaches an
+    // agent. `in_review` is excluded from inbox-lite by design, so without this
+    // the issue would sit exactly as silently as it did on #444.
+    const gateWakes = wakeups.filter((wakeup) => wakeup.reason === "github_pr_review_gate_failed");
+    expect(gateWakes).toHaveLength(1);
+    expect(gateWakes[0]?.payload).toMatchObject({
+      issueId: authorIssueId,
+      repoFullName: "Blockcast/libmmt",
+      prNumber: 444,
+      headSha,
+      prReviewGateFailureReason: "non_retryable_external_lifecycle",
+      reviewerRunId: runId,
+    });
+  });
+
+  it("does not enqueue a second wake when another finalizer already claimed the notice (BLO-33589)", async () => {
+    // Concurrent finalization of ONE reviewer run. The wake used to be gated on
+    // a read of `agentWakeupRequests` by idempotency key — check-then-act, on a
+    // table with no unique index on that column, so both racers saw no row and
+    // both enqueued. The claim is now the system comment, whose partial unique
+    // index on (issue_id, idempotency_key) lets Postgres pick one winner.
+    //
+    // This drives the LOSER: the winner's comment is already committed under
+    // the shared key when the terminalizer runs, so `addComment` comes back
+    // `deduplicated` and the wake must not fire. Under the old code the wake
+    // row is absent at that point and it fires — the duplicate this closes.
+    const jobName = "agent-opencode-ambiguous-review-concurrent-claim";
+    const headSha = "bb1d4a7c0f2e46318a5c9d0e7b3f81624ad5e909";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      includeIssue: false,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/libmmt:446:${headSha}`,
+        githubRepoFullName: "Blockcast/libmmt",
+        githubPrNumber: 446,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+
+    const authorAgentId = randomUUID();
+    const authorIssueId = randomUUID();
+    await db.insert(agents).values({
+      id: authorAgentId,
+      companyId,
+      name: "PlayersEngineerConcurrent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: authorIssueId,
+      companyId,
+      title: "BLO-33589 concurrent finalization",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: authorAgentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 446,
+      identifier: "TAUTHOR-446",
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId,
+      issueId: authorIssueId,
+      type: "pull_request",
+      provider: "github",
+      externalId: "Blockcast/libmmt#446",
+      title: "BLO-33589 concurrent finalization",
+      url: "https://github.com/Blockcast/libmmt/pull/446",
+      status: "ready_for_review",
+    });
+    // The race winner, committed before this finalizer reaches the claim.
+    await db.insert(issueComments).values({
+      companyId,
+      issueId: authorIssueId,
+      authorType: "system",
+      idempotencyKey: `pr_review_gate_failed:${runId}:${authorIssueId}`,
+      body: "## Ally review did not land on `Blockcast/libmmt#446`",
+    });
+
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: false });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+    const previousGateContext = process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+    process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = "review/ally-complete";
+    try {
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    } finally {
+      if (previousGateContext === undefined) {
+        delete process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+      } else {
+        process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = previousGateContext;
+      }
+    }
+
+    const [comments, wakeups] = await Promise.all([
+      db.select().from(issueComments).where(eq(issueComments.issueId, authorIssueId)),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, authorAgentId)),
+    ]);
+    // One notice, from the winner — the loser neither posts nor wakes.
+    expect(
+      comments.filter((comment) => comment.body.includes("Ally review did not land on")),
+    ).toHaveLength(1);
+    expect(
+      wakeups.filter((wakeup) => wakeup.reason === "github_pr_review_gate_failed"),
+    ).toHaveLength(0);
+  });
+
   it.each(["pr_review_output_missing", "pr_review_verification_unavailable"])(
     "terminalizes the PR gate for non-retryable %s after adapter invocation",
     async (errorCode) => {
@@ -4365,6 +4599,52 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  // Twin of the test above, and it guards a line no other test reaches: `claude_k8s`'s
+  // membership in SHARED_DOC_MATERIALIZING_ADAPTER_TYPES. Every other shared-doc test drives
+  // `opencode_k8s`, so dropping `claude_k8s` back out of that set would leave the whole suite
+  // green while silently restoring the defect this change exists to fix — every Penstock agent
+  // is `claude_k8s`, so materialization would stop running for all of them.
+  it("materializes missing claude_k8s shared docs before adapter dispatch", async () => {
+    const instructionsRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-k8s-docs-"));
+    await fs.writeFile(
+      path.join(instructionsRoot, "AGENTS.md"),
+      "Read: docs/architecture-template.md\n",
+      "utf8",
+    );
+
+    try {
+      const { agentId, runId } = await seedQueuedIssueRunFixture();
+      await db
+        .update(agents)
+        .set({
+          adapterType: "claude_k8s",
+          adapterConfig: {
+            instructionsBundleMode: "external",
+            instructionsRootPath: instructionsRoot,
+            instructionsFilePath: path.join(instructionsRoot, "AGENTS.md"),
+            instructionsEntryFile: "AGENTS.md",
+          },
+        })
+        .where(eq(agents.id, agentId));
+
+      await heartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(heartbeat, runId);
+
+      const adapterCall = mockAdapterExecute.mock.calls.find(([ctx]) => ctx.runId === runId)?.[0] as
+        | { context?: { paperclipWorkspace?: { cwd?: unknown } } }
+        | undefined;
+      const workspaceCwd = adapterCall?.context?.paperclipWorkspace?.cwd;
+      expect(workspaceCwd).toBeTypeOf("string");
+      const materialized = await fs.readFile(
+        path.join(workspaceCwd as string, "docs", "architecture-template.md"),
+        "utf8",
+      );
+      expect(materialized).toContain("# Missing Shared Documentation: docs/architecture-template.md");
+    } finally {
+      await fs.rm(instructionsRoot, { recursive: true, force: true });
+    }
+  });
+
   it("does not materialize opencode_k8s shared docs when instructions do not reference them", async () => {
     const instructionsRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-k8s-docs-"));
     await fs.writeFile(path.join(instructionsRoot, "AGENTS.md"), "No shared docs referenced here.\n", "utf8");
@@ -4421,7 +4701,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const settledRun = await waitForRunToSettle(heartbeat, runId);
 
       expect(settledRun?.stderrExcerpt ?? "").toContain(
-        "Skipped opencode_k8s shared docs materialization: failed to read instructions entry",
+        "Skipped external k8s shared docs materialization: failed to read instructions entry",
       );
       expect(settledRun?.stderrExcerpt ?? "").toContain("EISDIR");
     } finally {

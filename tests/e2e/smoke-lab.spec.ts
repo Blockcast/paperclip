@@ -302,9 +302,18 @@ async function gatewayFetch(request: APIRequestContext, path: string, token: str
 
 test.describe.serial("Smoke Lab scenario catalog mirror", () => {
   // This CI-safe mirror records eight screenshot-backed lifecycle steps for
-  // each of P1-P7. On a cold dedicated e2e ARC runner the full 56-step pass can
-  // exceed fifteen minutes while still progressing normally; preserve half of
-  // the PR e2e job's 60-minute ceiling without truncating scenario coverage.
+  // each of P1-P7, all inside ONE test. Measured over 6 full CI runs
+  // (BLO-33282): 18.6m median / 22.9m p100, i.e. 44% of the whole 42.1m e2e
+  // suite and by far its largest single unit. The 30m budget below is ~2x the
+  // observed median, deliberately -- NOT "half the ceiling"; the enclosing
+  // `e2e` job cap is 90m, so this is a third of it.
+  //
+  // Because this is one test in a `describe.serial` block, it is indivisible
+  // for sharding: Playwright assigns a whole non-parallel group to one shard,
+  // so no `--shard=i/N` can split it and 18.6m is the floor for any N. If the
+  // e2e wall-time question is reopened, splitting these 7 scenarios into 7
+  // tests is the prerequisite -- see the `e2e` job comment in
+  // .github/workflows/pr.yml.
   test.setTimeout(1_800_000);
 
   test("records the P1-P7 CI-safe Smoke Lab lifecycle into the results API @smoke-lab", async ({ page, request }) => {
