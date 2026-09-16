@@ -7,6 +7,7 @@ vi.mock("../services/github-app-auth.js", async (importOriginal) => {
 
 import { githubFetchPrAuthorLogin } from "../services/github-app-auth.js";
 import { resolvePrReviewEvidenceWithGithubAuthor } from "../services/heartbeat.js";
+import { loadConfig } from "../config.js";
 
 const fetchAuthor = vi.mocked(githubFetchPrAuthorLogin);
 
@@ -36,7 +37,15 @@ const MISSING = {
 };
 
 describe("resolvePrReviewEvidenceWithGithubAuthor (self-review skip on author-less wakes)", () => {
-  beforeEach(() => fetchAuthor.mockReset());
+  beforeEach(() => {
+    fetchAuthor.mockReset();
+    // The identity cases below exercise the REAL `githubReviewerIdentityMatches`
+    // (the mock spreads importOriginal) against ambient config, which defaults to
+    // `allyblockcast[bot]` via PAPERCLIP_PR_REVIEWER_BOT_LOGIN. Pin it here so a
+    // user-form override fails with THIS assertion, naming the harness, instead of
+    // flipping a case below and reading as a regression in the code under test.
+    expect(loadConfig().prReviewerBotLogin).toBe("allyblockcast[bot]");
+  });
 
   it("upgrades `missing` to `self_review_skipped` once GitHub supplies the author", async () => {
     fetchAuthor.mockResolvedValue("allyblockcast[bot]");

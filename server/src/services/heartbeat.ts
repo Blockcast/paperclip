@@ -9959,7 +9959,7 @@ export async function resolvePrReviewEvidenceWithGithubAuthor<T extends { status
   // credited `self_review_skipped` with no review posted. Binding here keeps
   // this path strictly tighter than the legacy webhook path rather than
   // widening the shared gate.
-  if (!githubReviewerIdentityMatches(authorLogin, loadConfig().prReviewerBotLogin ?? "")) {
+  if (!githubReviewerIdentityMatches(authorLogin, loadConfig().prReviewerBotLogin)) {
     return evidence;
   }
   const reevaluated = evaluatePrReviewCompletionEvidence(
@@ -23171,7 +23171,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
       reviewEvidence = await resolvePrReviewEvidenceWithGithubAuthor(
         parseObject(input.run.contextSnapshot),
-        { resultJson: parseObject(input.run.resultJson) },
+        // `resultSummary` as well as `resultJson`: a self-skip whose text lives
+        // only in the summary column would otherwise spend the GitHub round-trip
+        // and still fail to classify. The adjacent pre-existing call above reads
+        // resultJson only, which works when the adapter duplicates the summary
+        // into it -- this path does not depend on that.
+        {
+          resultJson: parseObject(input.run.resultJson),
+          summary: input.run.resultSummary ?? null,
+        },
         reviewEvidence,
       );
       const claimedReview =
