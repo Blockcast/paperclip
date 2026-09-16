@@ -1666,6 +1666,12 @@ jobs:
     # 100% and 2/4 99%, policy 99%, server 1/4 98%, Typecheck 96%) and 46 cap
     # kills file-wide costing ~25.7 runner-hours/week. See BLO-32794 for the
     # full per-job table before sizing any other cap here by eye.
+    #
+    # Setup gained a UI build step (~1m05s) below, so the setup side of that
+    # table is now understated by about that much. Headroom still grew, not
+    # shrank: the job measured 11.9m end to end on run 35015220512 against a
+    # 59.2m baseline on 34802954363, because the build is what lets the suite
+    # skip dev middleware (BLO-33478). Re-measure before trimming this cap.
     timeout-minutes: 90
 
     steps:
