@@ -27,7 +27,23 @@ const PLAYWRIGHT_CHANNEL = process.env.PAPERCLIP_PLAYWRIGHT_CHANNEL;
 // when one exists; a checkout without `pnpm --filter @paperclipai/ui build`
 // keeps the dev-middleware behaviour.
 const UI_DIST_INDEX = path.resolve(import.meta.dirname, "../../ui/dist/index.html");
-const UI_DEV_MIDDLEWARE = fs.existsSync(UI_DIST_INDEX) ? "false" : "true";
+const UI_DIST_EXISTS = fs.existsSync(UI_DIST_INDEX);
+
+// The fallback above is silent in both directions, so in CI it would mask its
+// own removal: drop or reorder the build step and the suite reverts to dev
+// middleware, goes green but slow, and nothing in the log says why. Both CI
+// consumers of this config do build the UI first -- pr.yml via
+// `pnpm --filter @paperclipai/ui build`, e2e.yml via `pnpm -r build` -- so a
+// missing bundle under CI is a broken workflow, not a valid configuration.
+if (!UI_DIST_EXISTS && process.env.CI) {
+  throw new Error(
+    `e2e: missing ${UI_DIST_INDEX}\n` +
+      "CI must build the UI bundle before running e2e: pnpm --filter @paperclipai/ui build\n" +
+      "Without it the suite silently falls back to Vite dev middleware (BLO-33478).",
+  );
+}
+
+const UI_DEV_MIDDLEWARE = UI_DIST_EXISTS ? "false" : "true";
 
 process.env.PAPERCLIP_HOME = PAPERCLIP_HOME;
 process.env.PAPERCLIP_CONFIG = PAPERCLIP_CONFIG;

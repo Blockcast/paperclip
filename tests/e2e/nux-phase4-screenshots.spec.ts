@@ -205,8 +205,20 @@ test.describe("NUX Phase 4 visual QA", () => {
     }
 
     // No React Rules-of-Hooks / render crashes on any surface we visited.
-    const hookErrors = consoleErrors.filter(
-      (e) => /Rendered more hooks|change in the order of Hooks/i.test(e),
+    // Both spellings are required. Against the built bundle the suite now serves
+    // this is a *production* React build, which carries neither dev string:
+    // react-dom 19.2.7's production cjs has 0 occurrences of both "Rendered more
+    // hooks" and "change in the order of Hooks" (its development cjs has 1 of
+    // each) and throws `Minified React error #310` with a react.dev/errors link
+    // instead. Matching only the dev text made this assertion unfailable
+    // (BLO-33478). The dev branches still matter: a checkout with no ui/dist
+    // falls back to dev middleware. `consoleErrors` also receives "PAGEERROR: "
+    // entries (see the pageerror listener above), which is how the thrown
+    // minified error reaches this filter at all.
+    const hookErrors = consoleErrors.filter((e) =>
+      /Rendered more hooks|change in the order of Hooks|Minified React error #3\d\d|react\.dev\/errors\/3\d\d/i.test(
+        e,
+      ),
     );
     expect(hookErrors, hookErrors.join("\n")).toHaveLength(0);
   });
