@@ -210,6 +210,13 @@ const PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp(
 // that test would keep precedence applying on a two-of-three declaration.
 // Lowercase because the test compares lowercased captures; the pattern is
 // case-insensitive, so the alternation is unaffected.
+//
+// Deliberately NOT covered: UNCOUNTED_FINDINGS_HEADING_REGEX spells the same
+// alternation out literally. It is declared above this constant, so referencing
+// it there would read a temporal-dead-zone binding at module load. Adding a
+// severity here therefore widens the counted-bucket pattern and the clean
+// declaration test but leaves the uncounted-heading detector blind to it —
+// update that regex in the same change.
 const COUNTED_SEVERITIES = ["critical", "important"] as const;
 
 // The counted finding buckets a review reports, e.g. `### Important Issues (2)`.
