@@ -528,17 +528,20 @@ const CLAUDE_EVENT_SUBTYPE_RE = /"subtype"\s*:\s*"([^"\r\n]*)"/;
  *      line of its own to stdout. Stage 2 above is `launcherCommand`, not
  *      `claude` — `job-manifest.ts` resolves it from `validateAgentCommand(
  *      config.agentCommand, "claude")`, an operator-editable text field
- *      ("Agent Launcher" in `config-schema.ts`). This one needs NO code edit
- *      at all, which makes it the weakest of the three — and it is the
- *      deployed norm rather than a hypothetical, which THIS REPOSITORY shows
- *      without reference to any instance: the agent image bakes a launcher in
- *      (`Dockerfile.agent` copies `penstock-agent-runtime.mjs`, rolled out per
- *      `docs/runbooks/penstock-claude-local-rollout.md`), so stage 2 is
- *      normally NOT `claude`. Corroborated by a count that is re-runnable
- *      rather than trusted — 14 of 15 `claude_k8s` agents on this instance had
- *      a non-default `adapterConfig.agentCommand` on 2026-09-16; re-measure by
- *      counting agents whose `adapterConfig.agentCommand` differs from
- *      `"claude"`. The trust therefore assumes that launcher is a stream-json
+ *      ("Agent Launcher" in `config-schema.ts`). This one needs NO code edit,
+ *      no diff and no review, which is what makes it live regardless of how
+ *      often it is actually used — so nothing below is load-bearing. Note the
+ *      code default IS `claude`, and this repository records only that a
+ *      launcher is AVAILABLE to point at, never that any agent points at one:
+ *      selection lives entirely in per-agent `adapterConfig`, which is not in
+ *      this tree. A dated instance reading, corroboration only: 14 of 15
+ *      `claude_k8s` agents had a non-default `adapterConfig.agentCommand` on
+ *      2026-09-16 (all `/opt/penstock/bin/penstock-agent-runtime.mjs`).
+ *      Re-measure by counting agents whose `adapterConfig.agentCommand`
+ *      differs from `"claude"` — but first check the field is visible at all,
+ *      because `adapterConfig` comes back `{}` for a caller without config
+ *      visibility and that reads as 0 of 15 rather than as a failed read.
+ *      The trust therefore assumes that launcher is a stream-json
  *      PASSTHROUGH: `job-manifest.ts` encodes that expectation where it sets
  *      `PENSTOCK_AGENT_COMMAND` ("the launcher owns provider credentials and
  *      starts the native Claude protocol itself"), and a proxy that surfaced
