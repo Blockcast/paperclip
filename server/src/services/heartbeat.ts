@@ -485,9 +485,12 @@ import {
 import { clearAgentTaskSessions } from "./recovery/session-reset.js";
 import {
   recoveryAssigneeAdapterOverrides,
+  readRecoveryRunWriteClass,
   RECOVERY_GUARD_CONTEXT_KEYS,
+  RECOVERY_RUN_WRITE_CLASS_NOTICE,
   RECOVERY_WORK_CLASS_KEY,
   withRecoveryModelProfileHint,
+  type RecoveryRunWriteClass,
 } from "./recovery/model-profile-hint.js";
 import { recoveryService, STALE_PRE_CLAIM_ISSUE_LOCK_MS } from "./recovery/service.js";
 import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "./provider-capacity-horizon-bound.js";
@@ -11241,6 +11244,10 @@ export function buildPaperclipTaskMarkdown(input: {
     prAuthorLogin?: string | null;
   } | null;
   acceptedPlanContinuation?: boolean;
+  // PEN-3275: the run's write-containment class, derived by the caller from the run
+  // `contextSnapshot` via `readRecoveryRunWriteClass`. `null`/absent means unconstrained —
+  // including a wake that positively declared `normal_model`, which carries no guard tuple.
+  recoveryRunWriteClass?: RecoveryRunWriteClass | null;
 }) {
   const quoteTaskScalar = (value: string) => JSON.stringify(value);
   const fenceTaskText = (value: string) => {
@@ -11262,7 +11269,7 @@ export function buildPaperclipTaskMarkdown(input: {
       input.interaction.status === "accepted" &&
       issue?.workMode === "planning"
     ));
-  if (!issue && !wakeComment && !prReview) return null;
+  if (!issue && !wakeComment && !prReview && !input.recoveryRunWriteClass) return null;
 
   const lines = [
     "Paperclip task context:",
@@ -11456,6 +11463,18 @@ export function buildPaperclipTaskMarkdown(input: {
   }
   if (wakeComment?.body.trim()) {
     lines.push("", "Latest wake comment:", fenceTaskText(wakeComment.body.trim()));
+  }
+  // PEN-3275: last block before the closing directive, and deliberately not gated on `issue` —
+  // the containment binds the RUN, so it is stated on every wake that carries the guard tuple,
+  // including one with no issue context. Placed here rather than at the top because it is a
+  // constraint on how the work is done, not the work itself; placed before the closing line so it
+  // is the last thing read before the agent starts planning, which is the moment it has to land.
+  if (input.recoveryRunWriteClass) {
+    lines.push(
+      "",
+      "Run write-containment notice:",
+      RECOVERY_RUN_WRITE_CLASS_NOTICE[input.recoveryRunWriteClass],
+    );
   }
   lines.push("", "Use this task context as the current assignment.");
   return lines.join("\n");
@@ -28465,6 +28484,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       acceptedPlanContinuation:
         readNonEmptyString(context.workspaceRefreshReason) === "accepted_plan_confirmation"
         && Object.keys(parseObject(context.acceptedPlanWakeRouting)).length === 0,
+      // PEN-3275: read from this run's persisted `contextSnapshot` (the `context` this function
+      // parsed off the run row), not from the pre-merge wake payload. `mergeCoalescedContextSnapshot`
+      // runs at enqueue and writes its result to that row, so by execution time the guard tuple
+      // here is the one the route guards will test — a wake that coalesced onto a queued
+      // status-only one is therefore announced as what it will actually execute as.
+      recoveryRunWriteClass: readRecoveryRunWriteClass(context),
     });
     if (issueRef) {
       context.paperclipIssue = {

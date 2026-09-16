@@ -23,7 +23,11 @@ import { actorCanReadAgentConfig, assertBoard, assertCompanyAccess, getAccessibl
 import { redactApprovalPayloadForDisplay, withholdAgentConfigFromApprovalPayload } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
-import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
+import {
+  isPlanningOnlyRecoveryContextSnapshot,
+  isStatusOnlyRecoveryContextSnapshot,
+  STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+} from "../services/recovery/model-profile-hint.js";
 import {
   buildIssueGraphLivenessBoardEscalationKey,
   parseIssueGraphLivenessIncidentKey,
@@ -84,24 +88,13 @@ function statusOnlyEscalationSourceIssueId(contextSnapshot: unknown): string | n
   return typeof sourceIssueId === "string" && sourceIssueId.trim() ? sourceIssueId : null;
 }
 
-function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
-  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
-  const context = contextSnapshot as Record<string, unknown>;
-  return context.modelProfile === "cheap" &&
-    context.recoveryIntent === "status_only" &&
-    context.allowDeliverableWork === false &&
-    context.allowDocumentUpdates === false &&
-    context.resumeRequiresNormalModel === true;
-}
-
-function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
-  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
-  const context = contextSnapshot as Record<string, unknown>;
-  return context.recoveryIntent === "planning_only" &&
-    context.allowDeliverableWork === false &&
-    context.allowDocumentUpdates === true &&
-    context.resumeRequiresNormalModel === false;
-}
+// PEN-3275: both predicates are now derived from the canonical tuples in `model-profile-hint.ts`
+// rather than hand-repeated here. This file carried the last two hand-written copies — the exact
+// shape BLO-32774 removed from the status-only guard in `issues.ts`, and dangerous in the same
+// direction: a key added to either tuple would leave these guards testing the old shape and
+// failing OPEN on a write-containment control.
+const isStatusOnlyCheapRecoveryContext = isStatusOnlyRecoveryContextSnapshot;
+const isPlanningOnlyRecoveryContext = isPlanningOnlyRecoveryContextSnapshot;
 
 type ApprovalRunContextDecision =
   | { allowed: false }

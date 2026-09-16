@@ -234,6 +234,7 @@ import {
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
 import {
+  isPlanningOnlyRecoveryContextSnapshot,
   isStatusOnlyRecoveryContextSnapshot,
   STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
 } from "../services/recovery/model-profile-hint.js";
@@ -6777,16 +6778,11 @@ export function issueRoutes(
   // BLO-32774: the five keys used to be repeated here. They are now derived from
   // `STATUS_ONLY_RECOVERY_GUARD_CONTEXT`, so editing the tuple can no longer
   // leave this guard testing a stale shape and quietly failing open.
+  //
+  // PEN-3275: the planning-only predicate below was still hand-written, carrying
+  // the same hazard for `PLANNING_ONLY_RECOVERY_GUARD_CONTEXT`. Both are now derived.
   const isStatusOnlyCheapRecoveryContext = isStatusOnlyRecoveryContextSnapshot;
-
-  function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
-    if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
-    const context = contextSnapshot as Record<string, unknown>;
-    return context.recoveryIntent === "planning_only" &&
-      context.allowDeliverableWork === false &&
-      context.allowDocumentUpdates === true &&
-      context.resumeRequiresNormalModel === false;
-  }
+  const isPlanningOnlyRecoveryContext = isPlanningOnlyRecoveryContextSnapshot;
 
   function requestsCheapIssueAssigneeModelProfile(input: { assigneeAdapterOverrides?: unknown }) {
     const overrides = input.assigneeAdapterOverrides;

@@ -9,7 +9,11 @@ import {
   summarizeHeartbeatRunContextSnapshot,
   summarizeHeartbeatRunListResultJson,
 } from "../services/heartbeat.js";
-import { withRecoveryModelProfileHint } from "../services/recovery/model-profile-hint.js";
+import {
+  readRecoveryRunWriteClass,
+  STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+  withRecoveryModelProfileHint,
+} from "../services/recovery/model-profile-hint.js";
 
 describe("buildPaperclipTaskMarkdown", () => {
   it("adds planning directives for assignment and comment task context", () => {
@@ -2520,6 +2524,68 @@ describe("mergeCoalescedContextSnapshot", () => {
     expect(existing.recoveryIntent).toBe("status_only");
     expect(existing.modelProfile).toBe("cheap");
     expect(existing.resumeRequiresNormalModel).toBe(true);
+  });
+});
+
+// PEN-3275. The run's write-containment class reaches the agent through the task markdown —
+// the one surface it reads before planning. Previously it was stated only in a 403, i.e. after
+// the agent had committed to work the run cannot perform.
+describe("buildPaperclipTaskMarkdown run write-containment notice", () => {
+  const issue = {
+    id: "issue-1",
+    identifier: "PAP-1",
+    title: "Do the thing",
+    workMode: "standard",
+    description: null,
+  };
+
+  it("announces a status-only run and names its reachable exits", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue, recoveryRunWriteClass: "status_only" });
+
+    expect(markdown).toContain("Run write-containment notice:");
+    expect(markdown).toContain("cheap status-only recovery run");
+    expect(markdown).toContain("`request_board_approval`");
+    // The exits, carried verbatim from the 403's guidance.
+    expect(markdown).toContain(STATUS_ONLY_RECOVERY_RESUME_GUIDANCE.resumeGuidance);
+  });
+
+  it("announces a planning-only run as document-capable but approval-barred", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue, recoveryRunWriteClass: "planning_only" });
+
+    expect(markdown).toContain("planning-only recovery run");
+    expect(markdown).toContain("Issue document updates are permitted.");
+  });
+
+  // Silence must stay the default for an unconstrained run: a notice on every wake would be
+  // noise, and worse, would make the constrained case unremarkable.
+  it("says nothing on an unconstrained run", () => {
+    for (const markdown of [
+      buildPaperclipTaskMarkdown({ issue }),
+      buildPaperclipTaskMarkdown({ issue, recoveryRunWriteClass: null }),
+    ]) {
+      expect(markdown).not.toContain("Run write-containment notice:");
+    }
+  });
+
+  // End-to-end in the direction that matters: the snapshot a recovery wake actually persists
+  // must classify, so the announcement fires on the real payload rather than only on a literal.
+  it("fires on the snapshot a source_scoped_recovery_action wake persists", () => {
+    const context = withRecoveryModelProfileHint({
+      issueId: "issue-1",
+      taskId: "issue-1",
+      wakeReason: "source_scoped_recovery_action",
+      source: "issue_recovery_action",
+      recoveryActionId: "recovery-1",
+      sourceIssueId: "issue-1",
+      recoveryCause: "stranded_assigned_issue",
+    }, "status_only");
+
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      recoveryRunWriteClass: readRecoveryRunWriteClass(context),
+    });
+
+    expect(markdown).toContain("cheap status-only recovery run");
   });
 });
 
