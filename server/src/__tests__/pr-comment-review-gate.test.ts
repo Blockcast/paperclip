@@ -4,8 +4,6 @@ import { describe, expect, it } from "vitest";
 // the retirement description is checked against the real thing, not a copy.
 import { admitsNothingEvaluated } from "../../../scripts/check-comment-review-gate-census.mjs";
 
-import { hasActionablePrReviewFeedback } from "../services/ally-review-detection.js";
-
 import {
   extractAllyPriorFindingDispositions,
   extractAllyReportedFindingRefs,
