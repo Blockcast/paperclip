@@ -15,6 +15,22 @@ import { Textarea } from "@/components/ui/textarea";
 import { CheckCircle2, ChevronRight, Sparkles } from "lucide-react";
 import type { ApprovalComment } from "@paperclipai/shared";
 import { MarkdownBody } from "../components/MarkdownBody";
+import { ApiError } from "../api/client";
+
+/**
+ * Some refusals carry a `details.remediation` naming the shape that would satisfy
+ * them — `budget_approval_missing_enforcement_assertion` (BLO-34008) is the one
+ * reachable from this page. The bare `error` says the payload is unverifiable but
+ * not what would make it verifiable, and the operator reading it is the one person
+ * who has to decide what happens to the card next, so fold the remediation in.
+ */
+export function errorWithRemediation(err: unknown, fallback: string): string {
+  const base = err instanceof Error ? err.message : fallback;
+  if (!(err instanceof ApiError)) return base;
+  const details = (err.body as { details?: { remediation?: unknown } } | null)?.details;
+  const remediation = typeof details?.remediation === "string" ? details.remediation.trim() : "";
+  return remediation ? `${base} — ${remediation}` : base;
+}
 
 export function ApprovalDetail() {
   const { approvalId } = useParams<{ approvalId: string }>();
@@ -118,7 +134,7 @@ export function ApprovalDetail() {
       setError(null);
       refresh();
     },
-    onError: (err) => setError(err instanceof Error ? err.message : "Resubmit failed"),
+    onError: (err) => setError(errorWithRemediation(err, "Resubmit failed")),
   });
 
   const addCommentMutation = useMutation({
