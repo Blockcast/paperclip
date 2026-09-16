@@ -511,6 +511,57 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
     expect(await enforcedAmount(policyId)).toBe(PRE_APPROVAL_CENTS);
   });
 
+  it("refuses a decided figure of zero rather than deactivating the policy", async () => {
+    // A zero is extractable (the reconciler rejects only negatives) and would
+    // reach `upsertPolicy`, which derives `isActive = amount > 0` — so writing
+    // it flips the policy off, a lifecycle change no card asserts, and reports
+    // `applied` on a row the classifier then answers `inactive_policy` for.
+    const { requesterId, policyId, approvalId } = await seed({
+      enforcedCents: PRE_APPROVAL_CENTS,
+      decidedCents: 0,
+    });
+    const { hooks } = collectingHooks();
+    await expectRefusal(
+      applyApprovalEnforcement(db, approvalId, requester(requesterId), hooks),
+      "assertion_unverifiable",
+      422,
+    );
+    const row = await policyRow(policyId);
+    expect(row.amount).toBe(PRE_APPROVAL_CENTS);
+    expect(row.isActive).toBe(true);
+  });
+
+  it("records a refusal in the activity log, so the guardrail is auditable", async () => {
+    // The refusals are the events worth auditing on this route:
+    // `assertion_superseded` records an attempt to replay a card over a later
+    // decision, which is what BLO-24631's guardrail exists to catch. The log
+    // write has to survive the transaction the refusal rolls back.
+    const { companyId, requesterId, policyId, approvalId } = await seed({
+      enforcedCents: SUPERSEDING_CENTS,
+      policyAmountUpdatedAt: new Date(),
+    });
+    const { hooks } = collectingHooks();
+    await expectRefusal(
+      applyApprovalEnforcement(db, approvalId, requester(requesterId), hooks),
+      "assertion_superseded",
+      409,
+    );
+    const refusals = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, "approval.enforcement_apply_refused"),
+        ),
+      );
+    expect(refusals).toHaveLength(1);
+    expect((refusals[0]!.details as { refusal?: { code?: string } }).refusal?.code).toBe(
+      "assertion_superseded",
+    );
+    expect(await enforcedAmount(policyId)).toBe(SUPERSEDING_CENTS);
+  });
+
   it("lets a board actor apply a card it did not request", async () => {
     const { policyId, approvalId } = await seed({ enforcedCents: PRE_APPROVAL_CENTS });
     const { hooks } = collectingHooks();

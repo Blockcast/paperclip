@@ -59,7 +59,7 @@
 import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvals, budgetPolicies } from "@paperclipai/db";
-import { conflict, forbidden, unprocessable } from "../errors.js";
+import { conflict, forbidden, HttpError, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { agentService } from "./agents.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
@@ -105,6 +105,52 @@ function refuse(
   details: Record<string, unknown> = {},
 ): Error {
   return build(message, { code, ...details });
+}
+
+/**
+ * Record a refusal in the activity log, then rethrow it.
+ *
+ * On this route the refusals are the interesting events: `assertion_superseded`
+ * records that someone tried to replay a card over a later decision, which is
+ * precisely what BLO-24631's guardrail exists to catch. Enforcing it without
+ * logging it leaves the guardrail unauditable — you can see the caps that were
+ * written and never the attempts that were stopped.
+ *
+ * The write goes through the *outer* connection deliberately. Every refusal
+ * inside the transaction rolls it back, so a log row written on `tx` would
+ * vanish with the thing it is recording.
+ *
+ * Scoped to the classification pass, which is where the guardrail verdicts are
+ * reached. The refusals that precede it — wrong status, wrong caller, a card
+ * with no machine-readable figure — are properties of the request rather than
+ * outcomes of comparing a card against enforcement.
+ */
+async function withRefusalLogged<T>(
+  db: Db,
+  approval: { id: string; companyId: string },
+  actor: { actorType: "user" | "agent" | "system"; actorId: string; agentId: string | null },
+  run: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    const code = error instanceof HttpError
+      ? (error.details as { code?: ApplyApprovalRefusalCode } | undefined)?.code
+      : undefined;
+    if (code) {
+      await logActivity(db, {
+        companyId: approval.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "approval.enforcement_apply_refused",
+        entityType: "approval",
+        entityId: approval.id,
+        details: { refusal: (error as HttpError).details, message: (error as Error).message },
+      });
+    }
+    throw error;
+  }
 }
 
 /**
@@ -185,7 +231,7 @@ export async function applyApprovalEnforcement(
   const policyIds = assertions.map((assertion) => assertion.policyId);
 
   const deferredCancellations: BudgetEnforcementScope[] = [];
-  const result = await db.transaction(async (tx) => {
+  const result = await withRefusalLogged(db, approval, actor, () => db.transaction(async (tx) => {
     const txDb = tx as unknown as Db;
     const rows = await txDb
       .select({
@@ -294,6 +340,21 @@ export async function applyApprovalEnforcement(
               { policyId: assertion.policyId },
             );
           }
+          if (assertion.expectedAmountCents === 0) {
+            // `upsertPolicy` derives `isActive = amount > 0 && ...`
+            // (`budgets.ts`), so writing a zero would deactivate the policy —
+            // a lifecycle change no card asserts, on a route whose whole
+            // premise is that it writes only what the card recorded. It would
+            // also report `applied` on a row the classifier then answers
+            // `inactive_policy` for, i.e. a success this route cannot repair.
+            // No card in production carries a zero; keep it that way.
+            throw refuse(
+              "assertion_unverifiable",
+              `Policy \`${assertion.policyId}\`'s decided figure is 0, which would deactivate the policy rather than set a cap; this route writes amounts, not lifecycle`,
+              unprocessable,
+              { policyId: assertion.policyId },
+            );
+          }
           toWrite.push({ row: row!, toAmountCents: assertion.expectedAmountCents, label: assertion.label });
           continue;
         }
@@ -340,10 +401,13 @@ export async function applyApprovalEnforcement(
     });
 
     for (const { row, toAmountCents, label } of toWrite) {
-      // Both objects, in this order, per BLO-27626: the mirror alone binds
-      // nothing and the policy alone leaves the UI lying. `recordRevision`
-      // is what closes the attribution gap BLO-20121 named — without it the
-      // audit trail cannot say who applied the card.
+      // This call is here for `recordRevision`, not for the mirror:
+      // `upsertPolicy` already mirrors `agents.budget_monthly_cents` for
+      // exactly this scope pair (`budgets.ts`), so the mirror would be correct
+      // without it. What `upsertPolicy` does not do is record a config
+      // revision, which is the attribution gap BLO-20121 named — without it
+      // the audit trail cannot say who applied the card. The policy write
+      // still has to follow (BLO-27626: the mirror alone binds nothing).
       await txAgents.update(
         row.scopeId,
         { budgetMonthlyCents: toAmountCents },
@@ -394,7 +458,8 @@ export async function applyApprovalEnforcement(
     // Only when this call actually wrote something. An idempotent replay
     // changes nothing, and logging it anyway accumulates one
     // `approval.enforcement_applied` row carrying `applied: []` per retry —
-    // an audit trail that records non-events is a worse audit trail.
+    // an audit trail that records non-events is a worse audit trail. A refusal
+    // is not a non-event, and is logged by `withRefusalLogged` instead.
     if (applied.length > 0) {
       await logActivity(txDb, {
         companyId: approval.companyId,
@@ -416,7 +481,7 @@ export async function applyApprovalEnforcement(
     }
 
     return { approvalId: approval.id, applied, alreadyApplied };
-  });
+  }));
 
   for (const scope of deferredCancellations) {
     await hooks.cancelWorkForScope(scope);
