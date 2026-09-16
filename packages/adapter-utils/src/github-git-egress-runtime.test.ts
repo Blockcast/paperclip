@@ -316,6 +316,53 @@ describe("shell aliases", () => {
     ).toThrow(/refusing to run the shell alias `publish`/);
   });
 
+  it("refuses an alias chain deeper than the hop limit instead of handing it to git", () => {
+    // The chain reaches a push, but resolution runs out of budget before seeing
+    // it, so `isPush` is false. That must NOT reach the not-a-push early return:
+    // measured against git 2.47.3, handing this argv back unchanged meant no
+    // `core.hooksPath` was injected, git expanded the chain itself, and
+    // `refs/heads/deep5` landed on the remote with the hook never running.
+    const chain: Record<string, string> = {
+      a1: "a2",
+      a2: "a3",
+      a3: "a4",
+      a4: "a5",
+      a5: "push",
+    };
+    expect(() =>
+      buildGitArgv(["a1", "origin", "main"], {
+        ...PRESENT,
+        resolveAlias: (name) => chain[name] ?? null,
+      }),
+    ).toThrow(/alias chain deeper than 4 hops/);
+  });
+
+  it("refuses an unparseable alias expansion even though it classifies as not-a-push", () => {
+    // Same shape as the depth case and the reason this ordering is tested at the
+    // wrapper rather than only at `classifyGitInvocation`: the shim deliberately
+    // reports this bypass with `isPush` false, and an early return here would
+    // discard it. The shim's own unit test cannot catch that — it asserts the
+    // bypass is REPORTED, which it is either way.
+    expect(() =>
+      buildGitArgv(["q", "origin", "main"], {
+        ...PRESENT,
+        resolveAlias: (name) => (name === "q" ? 'push "--no-verify' : null),
+      }),
+    ).toThrow(/unterminated quote/);
+  });
+
+  it("still passes an ordinary non-push through untouched", () => {
+    // The guard against over-reading the two rules above: only a bypass the shim
+    // kept without a push refuses early. A plain non-push alias must not.
+    const argv = ["st", "--short"];
+    expect(
+      buildGitArgv(argv, {
+        ...PRESENT,
+        resolveAlias: (name) => (name === "st" ? "status --short" : null),
+      }),
+    ).toEqual(argv);
+  });
+
   it("refuses one whose expansion names no push at all, because it cannot be parsed", () => {
     // The point of failing closed: this publishes, and no textual test for
     // the subcommand that indirection can defeat is worth trusting.

@@ -6,6 +6,7 @@ import {
   commitsForRefUpdate,
   formatRefusal,
   type GitAliasBypass,
+  GitEgressInputError,
   GitEgressScanError,
   gitGlobalOptions,
   parsePrePushInput,
@@ -141,6 +142,49 @@ describe("classifyGitInvocation", () => {
   it("detects the hook-skipping flag", () => {
     expect(classifyGitInvocation(["push", "--no-verify"]).hasNoVerify).toBe(true);
     expect(classifyGitInvocation(["push"]).hasNoVerify).toBe(false);
+  });
+
+  it.each([["--no-veri"], ["--no-verif"]])(
+    "detects the hook-skipping flag spelled as the abbreviation %s",
+    (flag) => {
+      // Git's parse-options accepts any UNAMBIGUOUS long-option abbreviation, so
+      // these are `--no-verify` to git while matching no literal spelling.
+      // Measured against git 2.47.3: `git -c core.hooksPath=<h> push --no-veri
+      // origin HEAD:refs/heads/t` printed no hook output and landed the ref on
+      // the remote, while the same push without the flag ran the hook and was
+      // refused. `--no-veri` is the shortest that works — `--no-ver` and
+      // shorter are ambiguous with `--no-verbose` and git rejects them.
+      expect(classifyGitInvocation(["push", flag]).hasNoVerify).toBe(true);
+    },
+  );
+
+  it.each([["--no-ver"], ["--no-ve"], ["--no-v"], ["--no"], ["--n"]])(
+    "refuses %s too, though git rejects it as ambiguous",
+    (flag) => {
+      // Refusing a spelling git will not accept costs nothing — no command git
+      // would have run is turned away — and it keeps the test "could this be
+      // that flag?" rather than an enumeration that a future git could outgrow.
+      expect(classifyGitInvocation(["push", flag]).hasNoVerify).toBe(true);
+    },
+  );
+
+  it("does not mistake the end-of-options separator for the flag", () => {
+    // `--` is a prefix of nothing meaningful and must not trip the length floor.
+    expect(classifyGitInvocation(["push", "--"]).hasNoVerify).toBe(false);
+  });
+
+  it("does not mistake --verify for --no-verify", () => {
+    expect(classifyGitInvocation(["push", "--verify"]).hasNoVerify).toBe(false);
+  });
+
+  it("detects an abbreviated hook-skipping flag inside an alias expansion", () => {
+    // The alias leg had the same gap: `alias.q = push --no-veri` pushed
+    // unscanned against git 2.47.3.
+    const result = classifyGitInvocation(["q"], (name) =>
+      name === "q" ? "push --no-veri" : null,
+    );
+    expect(result.isPush).toBe(true);
+    expect(result.aliasBypass).toMatchObject({ alias: "q", reason: "no-verify" });
   });
 
   it("does not treat `push -n` as a hook bypass, because it is --dry-run", () => {
@@ -299,6 +343,47 @@ describe("classifyGitInvocation", () => {
     expect(result.aliasBypass).toBeNull();
   });
 
+  it("refuses an alias chain deeper than the hop limit rather than passing it", () => {
+    // Measured against git 2.47.3 with `alias.a1=a2 … alias.a5=push`: hops 0-3
+    // walk a1→a5 and resolution ends with `isPush` still false, so `buildGitArgv`
+    // returned argv untouched, no `core.hooksPath` was injected, and git then
+    // expanded the whole chain to a push that ran no hook —
+    // `git a1 origin HEAD:refs/heads/deep5` landed the ref on the remote. The
+    // same chain WITH the guard's `-c` did run the hook, which is what makes the
+    // missing injection the hole rather than the depth.
+    const chain: Record<string, string> = {
+      a1: "a2",
+      a2: "a3",
+      a3: "a4",
+      a4: "a5",
+      a5: "push",
+    };
+    const result = classifyGitInvocation(["a1", "origin", "HEAD:refs/heads/deep5"], (name) =>
+      chain[name] ?? null,
+    );
+    // The refusal does not depend on `isPush`: whether it reaches a push is
+    // exactly the question resolution ran out of budget to answer.
+    expect(result.aliasBypass).toMatchObject({ alias: "a1", reason: "alias-depth" });
+    expect(result.aliasBypass?.chain).toEqual(["a1", "a2", "a3", "a4", "a5"]);
+  });
+
+  it("resolves a chain that reaches a push within the hop limit without refusing", () => {
+    const chain: Record<string, string> = { a1: "a2", a2: "a3", a3: "a4", a4: "push" };
+    const result = classifyGitInvocation(["a1"], (name) => chain[name] ?? null);
+    expect(result.isPush).toBe(true);
+    expect(result.aliasBypass).toBeNull();
+  });
+
+  it("does not refuse a deep chain that ends in something git would not resolve", () => {
+    // Running out of hops is only a refusal when the chain is still LIVE. A tail
+    // git cannot resolve either is genuinely not a push, and refusing it would
+    // reject a command that publishes nothing.
+    const chain: Record<string, string> = { b1: "b2", b2: "b3", b3: "b4", b4: "status" };
+    const result = classifyGitInvocation(["b1"], (name) => chain[name] ?? null);
+    expect(result.isPush).toBe(false);
+    expect(result.aliasBypass).toBeNull();
+  });
+
   it("ignores a --config-env alias naming a variable that is not set", () => {
     // git would fail the invocation outright; there is no expansion to parse,
     // and inventing one would refuse a push over a definition that never
@@ -338,6 +423,17 @@ describe("parsePrePushInput", () => {
 
   it("returns nothing for empty input", () => {
     expect(parsePrePushInput("")).toEqual([]);
+  });
+
+  it("throws on a non-empty line it cannot parse rather than scanning it as nothing", () => {
+    // Not reachable against git today — the format is fixed and refs cannot
+    // contain whitespace. It is closed anyway because skipping was the one
+    // fail-open shape left in the module, and the worst kind: `runPrePushHook`
+    // treats an empty update list as a PASS, so a line that silently failed to
+    // parse would publish its ref unscanned rather than merely under-report.
+    expect(() => parsePrePushInput("refs/heads/main aaa refs/heads/main")).toThrow(
+      GitEgressInputError,
+    );
   });
 });
 
@@ -403,6 +499,44 @@ describe("addedLinesFromPatch", () => {
       "\n",
     );
     expect(addedLinesFromPatch(patch)).toBe("ADDED=1");
+  });
+
+  it("keeps an added content line whose own text begins with ++", () => {
+    // Skipping every `+++` line to drop the `+++ b/path` header also discarded
+    // added CONTENT beginning `++`, which git emits as `+++...`. Reproduced
+    // against git 2.47.3: committing a file whose first line is `++<token>`
+    // produced the patch line `+++<token>`, and it was dropped before the
+    // scrubber ever saw it. The vendor-key and JWT detectors are `\b`-anchored
+    // substring matches rather than line-anchored, so dropping the line drops
+    // the whole detection.
+    //
+    // Position, not spelling, separates the two: `+++` is a header only before
+    // the first `@@` of a file block.
+    const patch = [
+      "diff --git a/leak.txt b/leak.txt",
+      "--- /dev/null",
+      "+++ b/leak.txt",
+      "@@ -0,0 +1,2 @@",
+      "+++MARKER=1",
+      "+normal line",
+    ].join("\n");
+    expect(addedLinesFromPatch(patch)).toBe("++MARKER=1\nnormal line");
+  });
+
+  it("still drops the +++ file header when content in the same patch starts with ++", () => {
+    const patch = [
+      "diff --git a/a.txt b/a.txt",
+      "+++ b/a.txt",
+      "@@ -0,0 +1 @@",
+      "+plain",
+      "diff --git a/b.txt b/b.txt",
+      "+++ b/b.txt",
+      "@@ -0,0 +1 @@",
+      "+++ two-plus-space",
+    ].join("\n");
+    // Neither `+++ b/a.txt` nor `+++ b/b.txt` is content; the last line is, and
+    // it survives even though it is spelled exactly like a header.
+    expect(addedLinesFromPatch(patch)).toBe("plain\n++ two-plus-space");
   });
 
   it("keeps a line-anchored detector working through a diff", () => {

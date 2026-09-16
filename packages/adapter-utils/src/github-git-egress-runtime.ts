@@ -77,12 +77,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  ALIAS_HOP_LIMIT,
   classifyGitInvocation,
   formatRefusal,
   formatScanFailure,
   gitGlobalOptions,
   parsePrePushInput,
   scanPrePushUpdates,
+  type GitAliasBypass,
   type GitReader,
 } from "./github-git-egress-shim.js";
 
@@ -185,6 +187,37 @@ function prePushHookPresent(hooksDir: string): boolean {
  * a repository's own `core.hooksPath` config, and `GIT_CONFIG_KEY_*` in the
  * environment.
  */
+/**
+ * The refusal for an alias-carried bypass.
+ *
+ * Extracted because it is thrown from two places in {@link buildGitArgv} — once
+ * ahead of the not-a-push early return and once after it — and the two must not
+ * drift into saying different things about the same finding.
+ */
+function aliasBypassRefusal(bypass: GitAliasBypass): GitEgressRuntimeError {
+  const { alias, expansion, reason, chain } = bypass;
+
+  // Worded separately because this one asserts no bypass: the chain outran the
+  // resolver, so what it reaches is simply unknown. Telling the author it
+  // "expands to a push that ..." would be a claim the guard cannot make.
+  if (reason === "alias-depth") {
+    const shown = (chain ?? [alias]).join("` → `");
+    return new GitEgressRuntimeError(
+      `paperclip-github-egress: refusing to run \`${alias}\` — it is an alias chain deeper than ${ALIAS_HOP_LIMIT} hops (\`${shown}\` → \`${expansion}\`), so this guard stopped resolving before reaching the command git would actually run, and cannot tell whether it publishes. Resolution is bounded on purpose: the config defining the chain is writable from here, so an unbounded walk would be a denial of service. Invoke the underlying command directly, or flatten the alias so it resolves within ${ALIAS_HOP_LIMIT} hops.`,
+    );
+  }
+
+  const what =
+    reason === "no-verify"
+      ? "skips the pre-push hook with --no-verify"
+      : reason === "hooks-path"
+        ? "points core.hooksPath somewhere else"
+        : "cannot be parsed the way git parses an alias (unterminated quote), so it cannot be checked for a bypass";
+  return new GitEgressRuntimeError(
+    `paperclip-github-egress: refusing to publish — the alias \`${alias}\` expands to a push that ${what} (\`${expansion}\`), which would bypass the check for credential-shaped material. Invoke the push directly instead of through the alias, or redefine the alias without it.`,
+  );
+}
+
 export function buildGitArgv(
   argv: readonly string[],
   options: {
@@ -210,6 +243,32 @@ export function buildGitArgv(
     );
   }
 
+  // Checked ahead of the not-a-push early return, for the same reason the shell
+  // alias above is. `classifyGitInvocation` keeps a bypass with no push attached
+  // ONLY for the two reasons that exist because "is this a push?" is itself the
+  // question that went unanswered — `unquotable` and `alias-depth` — and it
+  // documents at length why neither may be gated on `isPush`. Letting the early
+  // return below discard them defeats that one layer up, silently: the shim
+  // reports the refusal and the wrapper drops it.
+  //
+  // Measured against git 2.47.3 with `alias.a1=a2 … alias.a5=push`: the early
+  // return handed argv straight to git, which expanded the whole chain and
+  // pushed `refs/heads/deep5` to the remote with no hook. The unit test on
+  // `classifyGitInvocation` passed throughout — it asserts the bypass is
+  // REPORTED, which it was. Only driving the wrapper end to end showed it being
+  // thrown away.
+  //
+  // The push-carried reasons are deliberately NOT handled here; they fall
+  // through to the block below so the argv-level `--no-verify` and
+  // `core.hooksPath` refusals keep winning the message on a real push.
+  if (
+    classification.aliasBypass &&
+    (classification.aliasBypass.reason === "unquotable" ||
+      classification.aliasBypass.reason === "alias-depth")
+  ) {
+    throw aliasBypassRefusal(classification.aliasBypass);
+  }
+
   if (!classification.isPush) return [...argv];
 
   if (classification.hasNoVerify) {
@@ -233,16 +292,7 @@ export function buildGitArgv(
   // expansion is the last thing git sees no matter where the guard is placed.
   // Refusal is the only enforcement available here.
   if (classification.aliasBypass) {
-    const { alias, expansion, reason } = classification.aliasBypass;
-    const what =
-      reason === "no-verify"
-        ? "skips the pre-push hook with --no-verify"
-        : reason === "hooks-path"
-          ? "points core.hooksPath somewhere else"
-          : "cannot be parsed the way git parses an alias (unterminated quote), so it cannot be checked for a bypass";
-    throw new GitEgressRuntimeError(
-      `paperclip-github-egress: refusing to publish — the alias \`${alias}\` expands to a push that ${what} (\`${expansion}\`), which would bypass the check for credential-shaped material. Invoke the push directly instead of through the alias, or redefine the alias without it.`,
-    );
+    throw aliasBypassRefusal(classification.aliasBypass);
   }
 
   // Last, so the specific caller-error refusals above win the message. Placed
@@ -313,11 +363,14 @@ export async function runPrePushHook(options: {
   stderr?: (message: string) => void;
 }): Promise<number> {
   const write = options.stderr ?? ((message: string) => process.stderr.write(`${message}\n`));
-  const updates = parsePrePushInput(options.input);
-  if (updates.length === 0) return 0;
 
   let findings;
   try {
+    // Inside the try: parsing the hook's stdin is part of deciding what this
+    // push publishes, so a throw from it must refuse like any other unknown
+    // verdict rather than escaping the guard's own error path.
+    const updates = parsePrePushInput(options.input);
+    if (updates.length === 0) return 0;
     findings = scanPrePushUpdates(updates, options.runGit);
   } catch (error) {
     // Deliberately catching everything, not just GitEgressScanError. An

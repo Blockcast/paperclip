@@ -43,22 +43,62 @@ const VALUE_TAKING_GLOBAL_OPTIONS: ReadonlySet<string> = new Set([
   "--attr-source",
 ]);
 
+/** The flag that skips the pre-push hook. */
+const NO_VERIFY_FLAG = "--no-verify";
+
 /**
- * Spellings of the flag that skips the pre-push hook.
+ * True for any token git would resolve to `--no-verify`.
  *
- * `-n` is deliberately NOT here. For `push` it means `--dry-run`, not
+ * Matching the fully-spelled flag alone was a measured bypass. Git's
+ * `parse-options` accepts any unambiguous long-option ABBREVIATION, so
+ * `--no-veri` and `--no-verif` are `--no-verify` to git while matching no
+ * literal spelling here. Measured against git 2.47.3:
+ *
+ *   git -c core.hooksPath=<h> push --no-veri origin HEAD:refs/heads/t
+ *
+ * printed no hook output and landed the ref on the remote, while the same push
+ * without the flag ran the hook and was refused. The alias leg had the same gap
+ * (`alias.q = push --no-veri`).
+ *
+ * So this tests "could this token be that flag?" rather than enumerating
+ * spellings — the enumeration is exactly the parser-disagrees-with-git failure
+ * this module sets out to avoid, and a new git release could shorten the
+ * accepted prefix without anything here changing. `--no-ver` and shorter are
+ * ambiguous with `--no-verbose` and git rejects them outright; refusing them
+ * too costs nothing, because no command git accepts is being turned away.
+ *
+ * The length floor keeps the bare `--` end-of-options separator out.
+ *
+ * `-n` is deliberately NOT matched. For `push` it means `--dry-run`, not
  * `--no-verify` (see the subcommand's own `-h` output), and it is harmless
  * twice over: the pre-push hook still runs under it, and a dry run publishes
  * nothing even if it did not. Refusing it would reject a safe command while
  * telling the author something untrue about why.
+ *
+ * The global-option scan needs no equivalent: git does NOT abbreviate those.
+ * Measured — `--config-e`, `--config-en` and `--exec-p` are each rejected with
+ * `unknown option`.
  */
-const NO_VERIFY_FLAGS: ReadonlySet<string> = new Set(["--no-verify"]);
+function isNoVerifyFlag(token: string): boolean {
+  return token.length > 2 && NO_VERIFY_FLAG.startsWith(token);
+}
 
 /** The config key whose value decides which directory git reads hooks from. */
 const HOOKS_PATH_KEY = "core.hookspath";
 
 /** The config section under which an assignment defines an alias. */
 const ALIAS_KEY_PREFIX = "alias.";
+
+/**
+ * How many alias hops resolution will walk before refusing.
+ *
+ * Bounded rather than recursive because the config defining the chain is
+ * agent-writable, so an unbounded walk is a denial of service on ourselves. The
+ * bound is safe only because exhausting it REFUSES; see the post-loop check in
+ * {@link classifyGitInvocation}, where falling through instead was a measured
+ * hook bypass.
+ */
+export const ALIAS_HOP_LIMIT = 4;
 
 /**
  * The environment `--config-env` reads through.
@@ -199,8 +239,20 @@ export interface GitAliasBypass {
    *
    * `unquotable` is the fail-closed case: the expansion could not be tokenised
    * the way git would tokenise it, so no claim about its contents is sound.
+   *
+   * `alias-depth` is the other one: resolution ran out of hops with the chain
+   * still unresolved, so whether it reaches a push went unanswered. Neither
+   * asserts a bypass is present — both say the question could not be settled,
+   * which is why both refuse without waiting for `isPush`.
    */
-  reason: "no-verify" | "hooks-path" | "unquotable";
+  reason: "no-verify" | "hooks-path" | "unquotable" | "alias-depth";
+  /**
+   * The alias names walked, in order, when the reason is `alias-depth`.
+   *
+   * Carried so the refusal can name the chain rather than just its head — the
+   * author has to find the definition to fix it.
+   */
+  chain?: readonly string[];
 }
 
 /**
@@ -214,7 +266,7 @@ export interface GitAliasBypass {
  *   git -c core.hooksPath=<h> -c 'alias.q=push "--no-verify"' q origin HEAD:t
  *
  * split on whitespace yields the token `"--no-verify"` WITH its quotes, which
- * matches no entry in {@link NO_VERIFY_FLAGS}, so the expansion read as an
+ * matches no spelling {@link isNoVerifyFlag} accepts, so the expansion read as an
  * ordinary push and the guard injected its hooks path as usual. Git dequoted it
  * to `--no-verify`, skipped the hook, exited 0, and the ref landed on the
  * remote. The scanner never ran.
@@ -393,7 +445,7 @@ export function classifyGitInvocation(
   const subcommandIndex = globals.subcommandIndex;
   const subcommand = argv[subcommandIndex]!;
   const rest = argv.slice(subcommandIndex + 1);
-  const hasNoVerify = rest.some((token) => NO_VERIFY_FLAGS.has(token));
+  const hasNoVerify = rest.some(isNoVerifyFlag);
 
   let isPush = subcommand === "push";
   // Accumulated across hops, then kept only if the chain reaches a push: a
@@ -401,6 +453,10 @@ export function classifyGitInvocation(
   // business, and refusing it would break unrelated tooling.
   let pendingBypass: GitAliasBypass | null = null;
   let shellAlias: GitShellAlias | null = null;
+  // Set when alias resolution runs out of hops with the chain still live. Like
+  // `unquotable`, it means "is this a push?" went unanswered, so the refusal
+  // must not be gated on `isPush` — that is the very thing not known.
+  let aliasDepthExhausted = false;
 
   if (!isPush) {
     const definitions = new Map(globals.aliasDefinitions);
@@ -409,9 +465,13 @@ export function classifyGitInvocation(
       definitions.get(name.toLowerCase()) ?? resolveAlias?.(name) ?? null;
 
     let name: string | null = subcommand;
-    for (let hop = 0; hop < 4 && name && !isPush; hop += 1) {
+    // Names walked, for the refusal message when the cap is exhausted.
+    const chain: string[] = [];
+    let hop = 0;
+    for (; hop < ALIAS_HOP_LIMIT && name && !isPush; hop += 1) {
       const expansion = lookup(name);
       if (!expansion) break;
+      chain.push(name);
       // A `!`-prefixed alias is an arbitrary shell command, and it is the one
       // expansion that escapes this guard completely — so it is recorded for
       // refusal rather than passed through.
@@ -458,7 +518,7 @@ export function classifyGitInvocation(
 
       const expanded: string | null = tokens[expansionGlobals.subcommandIndex] ?? null;
       const expandedRest = tokens.slice(expansionGlobals.subcommandIndex + 1);
-      if (!pendingBypass && expandedRest.some((token) => NO_VERIFY_FLAGS.has(token))) {
+      if (!pendingBypass && expandedRest.some(isNoVerifyFlag)) {
         pendingBypass = { alias: name, expansion, reason: "no-verify" };
       }
 
@@ -468,6 +528,45 @@ export function classifyGitInvocation(
       }
       name = expanded;
     }
+
+    // The cap is a denial-of-service bound, not a claim that chains stop here —
+    // git resolves deeper. Leaving the loop by falling through as NOT-a-push
+    // was therefore a measured hole, and in the permissive direction: with
+    // `alias.a1=a2 … alias.a5=push`, hops 0-3 walk a1→a5 and the loop ends with
+    // `isPush` still false, so `buildGitArgv` returns argv untouched, no
+    // `core.hooksPath` is injected, and git then expands the whole chain to a
+    // push that runs no hook. Measured against git 2.47.3: `git a1 origin
+    // HEAD:refs/heads/deep5` landed the ref on the remote with the hook never
+    // running, while the same chain WITH the guard's `-c` did run it — which is
+    // what identifies the missing injection, rather than the depth itself, as
+    // the hole.
+    //
+    // Refusing is chosen over classifying it as a push. Injecting the hooks
+    // path would let the hook decide, but only for a chain whose unscanned tail
+    // carries no `--no-verify` — and the tail is unscanned precisely because
+    // the budget ran out, so that variant is closed only by assumption.
+    // Refusal holds in every case, and a chain this deep is not a shape any
+    // config the agent image ships defines.
+    //
+    // `hop` reaching the limit is what separates budget exhaustion from every
+    // `break` above, each of which leaves it short. The final lookup then
+    // separates "ran out of road" from "arrived": a chain ending in a name git
+    // would not resolve either is genuinely not a push, and must not refuse.
+    if (!isPush && !shellAlias && hop >= ALIAS_HOP_LIMIT && name) {
+      const unresolved = lookup(name);
+      if (unresolved !== null) {
+        aliasDepthExhausted = true;
+        chain.push(name);
+        if (!pendingBypass) {
+          pendingBypass = {
+            alias: subcommand,
+            expansion: unresolved,
+            reason: "alias-depth",
+            chain: [...chain],
+          };
+        }
+      }
+    }
   }
 
   return {
@@ -476,17 +575,48 @@ export function classifyGitInvocation(
     hasNoVerify,
     subcommandIndex,
     hooksPathOverride: globals.hooksPathOverride,
-    // An alias bypass only matters on a push — EXCEPT when the expansion could
-    // not be tokenised, where "is it a push?" is precisely the question that
-    // went unanswered. Git happens to reject an unclosed quote itself (measured:
-    // `fatal: bad alias.q string: unclosed quote`), so nothing publishes either
-    // way, but gating the refusal on `isPush` would make this guard's safety
-    // depend on git's parser agreeing with ours. Where they disagree the guard
-    // must be the stricter one; a visible refusal is the safe direction, a
-    // silent pass is not.
-    aliasBypass: isPush || pendingBypass?.reason === "unquotable" ? pendingBypass : null,
+    // An alias bypass only matters on a push — EXCEPT for the two reasons that
+    // exist because "is it a push?" is itself the question that went
+    // unanswered, where gating on `isPush` would read the unanswered question
+    // as a "no":
+    //
+    //   unquotable   the expansion could not be tokenised the way git tokenises
+    //                one. Git happens to reject an unclosed quote itself
+    //                (measured: `fatal: bad alias.q string: unclosed quote`), so
+    //                nothing publishes either way — but gating here would make
+    //                this guard's safety depend on git's parser agreeing with
+    //                ours.
+    //   alias-depth  resolution ran out of hops with the chain still live, so
+    //                the tail that decides it was never read. Unlike the above,
+    //                git does NOT reject this one: the chain resolves fine and
+    //                pushes.
+    //
+    // Where the two parsers disagree the guard must be the stricter one; a
+    // visible refusal is the safe direction, a silent pass is not.
+    aliasBypass:
+      isPush || aliasDepthExhausted || pendingBypass?.reason === "unquotable"
+        ? pendingBypass
+        : null,
     shellAlias,
   };
+}
+
+/**
+ * Raised when the hook's own stdin carries a ref-update line that does not
+ * parse.
+ *
+ * Separate from {@link GitEgressScanError} because nothing failed to READ here
+ * — git handed over input in a shape this parser does not recognise, which is a
+ * different fault with a different remedy. Both reach the same place: the
+ * runtime catches everything around the scan and refuses.
+ */
+export class GitEgressInputError extends Error {
+  constructor(readonly line: string) {
+    super(
+      `the pre-push hook received a ref update it could not parse (\`${line}\`), so the refs this push would publish could not be determined`,
+    );
+    this.name = "GitEgressInputError";
+  }
 }
 
 export interface PrePushRefUpdate {
@@ -511,6 +641,15 @@ export function isNullSha(sha: string): boolean {
  * deliberate — refspec resolution, `push.default`, and tracking configuration
  * are git's to interpret, and a second implementation of them would disagree
  * with the push that is actually about to happen.
+ *
+ * A non-empty line that does not parse THROWS rather than being skipped. Git's
+ * format is fixed and refs cannot contain whitespace, so this is not reachable
+ * today — but skipping was the one fail-open shape left in a module that is
+ * otherwise uniformly fail-closed, and it is the worst kind: `runPrePushHook`
+ * treats an empty update list as a pass, so a line that silently failed to
+ * parse would publish its ref unscanned rather than merely under-reporting.
+ * Refusing costs nothing while the case stays unreachable, and holds if a
+ * future git widens the format.
  */
 export function parsePrePushInput(input: string): PrePushRefUpdate[] {
   const updates: PrePushRefUpdate[] = [];
@@ -518,7 +657,7 @@ export function parsePrePushInput(input: string): PrePushRefUpdate[] {
     const line = rawLine.trim();
     if (!line) continue;
     const parts = line.split(/\s+/);
-    if (parts.length < 4) continue;
+    if (parts.length < 4) throw new GitEgressInputError(line);
     updates.push({
       localRef: parts[0]!,
       localSha: parts[1]!,
@@ -624,13 +763,56 @@ export function commitsForRefUpdate(
  *
  * Only added lines are kept. Context and removed lines are, by definition,
  * already on the remote; reporting them would refuse a push for material the
- * author cannot remove by amending anything in this range. `+++` file headers
- * are dropped so a path is not mistaken for content.
+ * author cannot remove by amending anything in this range.
+ *
+ * The parse is a hunk-state machine rather than a prefix test, and that is the
+ * fix for a measured blind spot. Skipping every line starting with `+++` — the
+ * way to drop a `+++ b/path` file header — also discarded any ADDED CONTENT
+ * LINE whose own text begins with `++`, because git emits that as `+++...`.
+ * Measured: a file whose first line is `++<token>` produced the patch line
+ * `+++<token>`, and the token was gone before `scrubGitHubEgressText` ever saw
+ * it. That drops a real detection outright, because the vendor-key, JWT and
+ * long-assignment detectors are `\b`-anchored substring matches rather than
+ * line-anchored ones, so the line carried the whole finding.
+ *
+ * Tightening to `+++ ` with a trailing space does NOT fix it — content
+ * beginning `++ ` reproduces it exactly. What separates the two is position,
+ * not spelling: `---`/`+++` are headers only BEFORE the first `@@` of a file
+ * block. Inside a hunk every line carries a one-character origin marker, so a
+ * leading `+` is content no matter what follows it, and exactly one `+` comes
+ * off.
+ *
+ * Outside a hunk the `+++ <path>` header is dropped so a path is not mistaken
+ * for content, but any OTHER `+` line is still kept. Git emits no content
+ * outside a hunk, so that branch is unreachable on real `git show` output; it
+ * is there so malformed or synthetic input over-reports rather than
+ * under-reports. Every uncertainty in this function resolves toward scanning
+ * more, because the cost of a spurious line is a false refusal the author can
+ * read, and the cost of a dropped one is a credential on the remote.
  */
 export function addedLinesFromPatch(patch: string): string {
   const added: string[] = [];
+  let inHunk = false;
   for (const line of patch.split("\n")) {
-    if (line.startsWith("+++")) continue;
+    if (inHunk) {
+      if (line.startsWith("+")) {
+        added.push(line.slice(1));
+        continue;
+      }
+      // The rest of a hunk body: context, removals, the no-newline marker, and
+      // the bare empty line git emits for an empty context line.
+      if (line === "" || line.startsWith(" ") || line.startsWith("-") || line.startsWith("\\")) {
+        continue;
+      }
+      // Anything else has left the body — a `diff --git` for the next file, or
+      // the next `@@`. Fall through to the out-of-hunk tests below.
+      inHunk = false;
+    }
+    if (line.startsWith("@@")) {
+      inHunk = true;
+      continue;
+    }
+    if (line.startsWith("+++ ")) continue;
     if (line.startsWith("+")) added.push(line.slice(1));
   }
   return added.join("\n");
