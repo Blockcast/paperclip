@@ -16,6 +16,14 @@ on:
     # would silently clear a genuinely red gate. The run is cheap enough that
     # the filter is not worth that: 20 recent pull_request_target runs measured
     # 25-133s (median ~60s) on arc-light.
+    #
+    # Known residual: `edited` makes same-head re-runs routine, and GitHub adds
+    # a check-run rather than replacing the old one, so a fixed body leaves a
+    # stale `review: failure` row beside the new success at that SHA. Branch
+    # protection collapses to latest-per-name and is unaffected, but a reader
+    # that enumerates check-runs keyed on (name, run id) still scores the dead
+    # row as a stop. The fix belongs reader-side — collapse same-name re-runs
+    # to the latest run id — not here. Tracked on BLO-26636.
     types: [opened, synchronize, reopened, edited]
   merge_group:
     types: [checks_requested]

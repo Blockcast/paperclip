@@ -90,7 +90,36 @@ test('findExistingComment: ignores a human comment carrying the signature', asyn
   assert.equal(comment, null);
 });
 
-// BLO-26636. The failure the gate reports most often is a body/title
+// On Blockcast every agent posts as `allyblockcast[bot]`, so `type === 'Bot'`
+// cannot tell our gate comment from an agent comment that quotes the
+// signature — and `.find` takes the first match in id order, so a quoting
+// comment posted first would get PATCHed over. The signature is last in both
+// buildComment branches; anchor there.
+test('findExistingComment: ignores a bot comment that merely quotes the signature', async () => {
+  const comment = await findExistingComment(async () => ([
+    {
+      id: 11,
+      user: { login: 'allyblockcast[bot]', type: 'Bot' },
+      body: 'The old code matched `— commitperclip` by login.\n\nSee the diff above.',
+    },
+    {
+      id: 12,
+      user: { login: 'allyblockcast[bot]', type: 'Bot' },
+      body: 'Hey @someone! Before this PR can be reviewed…\n\n— commitperclip',
+    },
+  ]), 'token', 'Blockcast/paperclip', 1889);
+
+  assert.equal(comment.id, 12);
+});
+
+test('findExistingComment: tolerates a comment with no body', async () => {
+  const comment = await findExistingComment(async () => ([
+    { id: 13, user: { login: 'allyblockcast[bot]', type: 'Bot' }, body: null },
+  ]), 'token', 'Blockcast/paperclip', 1889);
+
+  assert.equal(comment, null);
+});
+
 // violation, and the old text sent the author to push a commit — advice that
 // re-runs nothing for a body edit and burns a CI matrix when followed.
 test('buildComment: names editing the description, not just pushing a commit', () => {
