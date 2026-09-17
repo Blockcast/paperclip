@@ -394,26 +394,35 @@ function headShaHex(headSha: string | null | undefined): string | null {
 }
 
 /**
- * Fetch the PR's current head SHA when the reviewer wake omitted one. The App
- * gate is tied to that exact commit; a missing/unreadable PR head therefore
- * fails closed rather than accepting review evidence for an arbitrary commit.
+ * Read the two fields the gates need off `GET /repos/{o}/{r}/pulls/{n}`: the
+ * head SHA a review must be pinned to, and the login that opened the PR. One
+ * parse for one endpoint, so the two cannot disagree about a PR that moved
+ * between separate reads. Null on any unreadable response — every caller here
+ * fails closed rather than accepting review evidence for an arbitrary commit,
+ * or assuming an author it could not read.
  */
-async function fetchPrHeadSha(
+async function fetchPr(
   apiBase: string,
   repoFullName: string,
   prNumber: number,
   headers: Record<string, string>,
   signal?: AbortSignal,
-): Promise<string | null> {
+): Promise<{ headSha: string | null; authorLogin: string | null } | null> {
   try {
     const res = await ghFetch(`${apiBase}/repos/${repoFullName}/pulls/${prNumber}`, {
       headers,
       signal,
     });
     if (!res.ok) return null;
-    const body = (await res.json().catch(() => null)) as { head?: { sha?: string } } | null;
+    const body = (await res.json().catch(() => null)) as
+      | { head?: { sha?: string }; user?: { login?: string } }
+      | null;
     const sha = body?.head?.sha;
-    return typeof sha === "string" ? headShaHex(sha) : null;
+    const login = body?.user?.login;
+    return {
+      headSha: typeof sha === "string" ? headShaHex(sha) : null,
+      authorLogin: typeof login === "string" && login.trim() ? login.trim() : null,
+    };
   } catch {
     return null;
   }
@@ -435,21 +444,14 @@ export async function githubFetchPrAuthorLogin(input: {
 }): Promise<string | null> {
   const token = await getInstallationToken();
   if (!token) return null;
-  try {
-    const res = await ghFetch(
-      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/pulls/${input.prNumber}`,
-      {
-        headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` },
-        signal: input.signal,
-      },
-    );
-    if (!res.ok) return null;
-    const body = (await res.json().catch(() => null)) as { user?: { login?: string } } | null;
-    const login = body?.user?.login;
-    return typeof login === "string" && login.trim() ? login.trim() : null;
-  } catch {
-    return null;
-  }
+  const pr = await fetchPr(
+    gitHubApiBase(GITHUB_HOST),
+    input.repoFullName,
+    input.prNumber,
+    { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` },
+    input.signal,
+  );
+  return pr?.authorLogin ?? null;
 }
 
 /** Fetch the current SHA for a pull request when a webhook payload lacks it. */
@@ -460,13 +462,14 @@ export async function githubFetchPrHeadSha(input: {
 }): Promise<string | null> {
   const token = await getInstallationToken();
   if (!token) return null;
-  return fetchPrHeadSha(
+  const pr = await fetchPr(
     gitHubApiBase(GITHUB_HOST),
     input.repoFullName,
     input.prNumber,
     { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` },
     input.signal,
   );
+  return pr?.headSha ?? null;
 }
 
 /**
@@ -881,7 +884,9 @@ export async function githubHasReviewerEvidenceForPr(input: {
   const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
   const apiBase = gitHubApiBase(GITHUB_HOST);
   const headSha =
-    headShaHex(input.headSha) ?? (await fetchPrHeadSha(apiBase, input.repoFullName, input.prNumber, headers));
+    headShaHex(input.headSha) ??
+    (await fetchPr(apiBase, input.repoFullName, input.prNumber, headers))?.headSha ??
+    null;
   if (!headSha) return { found: false };
 
   const args = { apiBase, repoFullName: input.repoFullName, prNumber: input.prNumber, headers, botLogin };
