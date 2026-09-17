@@ -74,3 +74,24 @@ test("an unquoted YAML bool fails the render instead of silently reading as off"
     /must be the string "0" or "1"/,
   );
 });
+
+test("the guard is an allow-list, not a bool-specific check", () => {
+  // `2` is neither a bool nor a recognised value. Pinning a non-bool string
+  // keeps the guard honest: a future edit that special-cases "true"/"false"
+  // instead of validating against the list would pass the test above and let
+  // this through as a quoted "2" the server reads as off.
+  assert.throws(
+    () => render(["--set", "evidenceGate.unlabeledTruthBlock=2"]),
+    /must be the string "0" or "1"/,
+  );
+});
+
+test("false is rejected as loudly as true", () => {
+  // Defaulting before validating made `false` collapse to "0" silently while
+  // `true` failed — one unquoted bool loud, the other silent. Both are now
+  // the same class of mistake and both say so.
+  assert.throws(
+    () => render(["--set", "evidenceGate.unlabeledTruthBlock=false"]),
+    /must be the string "0" or "1"/,
+  );
+});

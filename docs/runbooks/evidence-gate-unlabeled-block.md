@@ -63,6 +63,27 @@ curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
 Record it in BLO-3202. Run `scripts/ops/backfill-pr-work-products.mjs`,
 re-measure, expect near zero.
 
+> **Two different literals, both real — do not "reconcile" them.** The verdict
+> array is `[...evaluation.diagnostics, ...truthDiagnostics]`
+> (`evidence-gate-wiring.ts`), so it carries both of these at once and they
+> answer different questions:
+>
+> - `no-linked-pull-request` — bare, pushed by the **probe**
+>   (`evidence-truth.ts`) whenever it finds no linked PR. Emitted on every
+>   path and at every flag value, including labeled issues that never reach
+>   the unlabeled escalation. This is the one the jq above wants: the backfill
+>   population is "has no linked PR", not "was suppressed".
+> - `unlabeled-truth-block-suppressed:no-linked-pull-request` — pushed by the
+>   **evaluator** (`evidence-gate.ts`) only where escalation would otherwise
+>   have fired. A strict subset.
+>
+> The matching is asymmetric on purpose. `index(...)` is an exact *element*
+> match in jq, which is right for the bare fixed literal; `probe-failed` needs
+> `startswith` because it is always emitted with a variable suffix
+> (`github-truth-probe-failed:pull_request:<tag>:<error>`). Matching the
+> prefixed spelling here would read **0** and make the backfill look
+> unnecessary.
+
 **2. The agent-scorecard pass rate, BEFORE the measurement window opens.**
 `reviewPassRate = pass / (pass + warn + block)` counts `warn` as not-pass
 (`server/src/services/agent-scorecards.ts:116`). Every issue that reaches
