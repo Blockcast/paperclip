@@ -94,12 +94,20 @@ const NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING = 200_000;
 
 // The fields `isInfraFailureRun` reads. Structural rather than a `Pick` off the
 // schema row so this module stays dependency-free and unit-testable in isolation,
-// matching `ZeroTokenStartupFailureRunInput` above.
+// matching `ZeroTokenStartupFailureRunInput` above. Unlike that sibling, the fields
+// are REQUIRED: structural and required are orthogonal, and here optionality is
+// load-bearing rather than cosmetic. `isInfraFailureRun` reads `(logBytes ?? 0)`,
+// so an omitted column falls into the *permissive* arm and every failed run with
+// missing telemetry reads as never-executed -- widening the exemption silently
+// while every unit test still passes (the BLO-32566 projection-omission shape).
+// `ZeroTokenStartupFailureRunInput` can afford `?` because an absent field there
+// makes its predicate return false. Requiring these four makes a caller that
+// forgets a projection column a compile error instead of a behaviour change.
 export type NeverExecutedRunInput = {
-  livenessState?: string | null;
-  usageJson?: Record<string, unknown> | null;
-  logBytes?: number | null;
-  errorCode?: string | null;
+  livenessState: string | null;
+  usageJson: Record<string, unknown> | null;
+  logBytes: number | null;
+  errorCode: string | null;
 };
 
 // True when the dependency gate cancelled a queued run before dispatch (see
