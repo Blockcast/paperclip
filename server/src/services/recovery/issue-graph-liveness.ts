@@ -229,8 +229,14 @@ function pathKeySet(...lists: { companyId: string; issueId: string | null }[][])
  * card is *answered*, which has no relationship to whoever the card's prose names - so a card
  * naming a decider routes to nobody while still reading as ownership. A missing `createdAt`
  * counts as fresh: this only ever drops a path we can prove is stale.
+ *
+ * Exported because the belief "a pending card is a live wake path" lives in two places:
+ * here, and `hasPendingWakeInteraction` in `service.ts`, which gates the sweeps that would
+ * act on the findings minted here. Bounding only one half makes detection and remediation
+ * disagree about the same card -- the classifier ages it out and mints a finding, and the
+ * sweep declines to act because the card still reads as live. One constant, both halves.
  */
-const PENDING_INTERACTION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+export const PENDING_INTERACTION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 function readRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -700,7 +706,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     const isSelf = deadEnd.id === source.id;
     const stale = hasStaleInteraction(deadEnd);
     const pathClause = stale
-      ? "no unresolved blockers and no live action path — its only issue-thread interaction has been pending over 24h"
+      ? "no unresolved blockers and no live action path — its issue-thread interaction has been pending over 24h"
       : "no unresolved blockers and no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action";
 
     return finding({
@@ -783,16 +789,24 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     // ownerCandidates so unassigned issues don't sit silently forever.
     if (reviewIssue.assigneeUserId) return null;
 
+    // The assignee split stays the OUTER condition: an unassigned row needs the "no
+    // assignee" fact and the "assign an owner" instruction whether or not a stale card is
+    // what un-suppressed it. Leading on staleness told an unassigned row to "record the
+    // current owner" -- an owner that by construction does not exist.
     const staleInteraction = hasStaleInteraction(reviewIssue);
-    const reason = staleInteraction
-      ? `${issueLabel(reviewIssue)} is in review behind a pending issue-thread interaction older than 24h, which is not a live action path.`
-      : reviewIssue.assigneeAgentId
-      ? `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, recent open pull request, or recovery issue owning the next action.`
+    const reason = reviewIssue.assigneeAgentId
+      ? staleInteraction
+        ? `${issueLabel(reviewIssue)} is in review with an agent assignee but no live action path — its pending issue-thread interaction is older than 24h.`
+        : `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, recent open pull request, or recovery issue owning the next action.`
+      : staleInteraction
+      ? `${issueLabel(reviewIssue)} is in review with no assignee and no live action path — its pending issue-thread interaction is older than 24h.`
       : `${issueLabel(reviewIssue)} is in review with no assignee and no participant, interaction, approval, user owner, wake, active run, recent open pull request, or recovery issue owning the next action.`;
-    const recommendedAction = staleInteraction
-      ? `Resolve or withdraw ${issueLabel(reviewIssue)}'s stale interaction, then record the current owner and the next action.`
-      : reviewIssue.assigneeAgentId
-      ? `Review ${issueLabel(reviewIssue)} and make the next action explicit: add a reviewer/interaction or request a review on its linked pull request, return it to active work with a change request, mark it done if accepted, or open a bounded recovery issue.`
+    const recommendedAction = reviewIssue.assigneeAgentId
+      ? staleInteraction
+        ? `Resolve or withdraw ${issueLabel(reviewIssue)}'s stale interaction, then record the current owner and the next action.`
+        : `Review ${issueLabel(reviewIssue)} and make the next action explicit: add a reviewer/interaction or request a review on its linked pull request, return it to active work with a change request, mark it done if accepted, or open a bounded recovery issue.`
+      : staleInteraction
+      ? `Assign ${issueLabel(reviewIssue)} to a clear owner from the project / chain-of-command, then resolve or withdraw its stale interaction, or move it back to an active status with a change request.`
       : `Assign ${issueLabel(reviewIssue)} to a clear owner from the project / chain-of-command, or move it back to an active status with a change request.`;
 
     return finding({
@@ -852,7 +866,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
         issue: source,
         state: "blocked_by_assigned_backlog_issue",
         reason: stale
-          ? `${issueLabel(source)} is blocked by assigned backlog issue ${issueLabel(blocker)} with no live action path — its only issue-thread interaction has been pending over 24h.`
+          ? `${issueLabel(source)} is blocked by assigned backlog issue ${issueLabel(blocker)} with no live action path — its issue-thread interaction has been pending over 24h.`
           : `${issueLabel(source)} is blocked by assigned backlog issue ${issueLabel(blocker)} with no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action.`,
         dependencyPath,
         recoveryIssue: blocker,

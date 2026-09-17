@@ -857,6 +857,80 @@ describe("issue graph liveness classifier", () => {
     expect(findings[0].recommendedAction).not.toContain("assign a human owner or interaction");
   });
 
+  // The third hasExplicitWaitingPath caller a stale card can newly un-suppress. Its default
+  // prose tells the operator to "assign a human owner or interaction" -- the second half of
+  // which is the very thing that stranded the row.
+  it("names the stale card in the blocked_by_assigned_backlog_issue prose (BLO-22660)", () => {
+    const sourceId = "source-stale-backlog-1";
+    const blockerId = "backlog-stale-interaction-1";
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({ id: sourceId, identifier: "PAP-2283", title: "Blocked source", status: "blocked", assigneeAgentId: coderId }),
+        issue({
+          id: blockerId,
+          identifier: "PAP-2284",
+          title: "Backlog blocker behind a stale card",
+          status: "backlog",
+          assigneeAgentId: coderId,
+        }),
+      ],
+      relations: [{ companyId, blockerIssueId: blockerId, blockedIssueId: sourceId }],
+      agents: [agent(), manager],
+      pendingInteractions: [{
+        companyId,
+        issueId: blockerId,
+        status: "pending",
+        createdAt: new Date("2026-05-31T23:00:00.000Z"),
+      }],
+      now: new Date("2026-06-02T00:00:00.000Z"),
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      state: "blocked_by_assigned_backlog_issue",
+      recoveryIssueId: blockerId,
+      reason: expect.stringContaining("pending over 24h"),
+      recommendedAction: expect.stringContaining("resolve or withdraw its stale interaction"),
+    });
+    expect(findings[0].reason).not.toContain("interaction, approval, monitor");
+    expect(findings[0].recommendedAction).not.toContain("assign a human owner or interaction");
+  });
+
+  // An unassigned row behind a stale card still has no owner, so it must keep the "no
+  // assignee" fact and the assign instruction rather than being told to record an owner
+  // that does not exist.
+  it("keeps the assign-an-owner instruction for an unassigned in_review row (BLO-22660)", () => {
+    const reviewIssueId = "review-stale-unassigned-1";
+    const findings = classifyIssueGraphLiveness({
+      issues: [issue({
+        id: reviewIssueId,
+        identifier: "PAP-2285",
+        title: "Unassigned stale confirmation",
+        status: "in_review",
+        assigneeAgentId: null,
+        executionState: null,
+      })],
+      relations: [],
+      agents: [agent(), manager],
+      pendingInteractions: [{
+        companyId,
+        issueId: reviewIssueId,
+        status: "pending",
+        createdAt: new Date("2026-05-31T23:00:00.000Z"),
+      }],
+      now: new Date("2026-06-02T00:00:00.000Z"),
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      state: "in_review_without_action_path",
+      reason: expect.stringContaining("no assignee"),
+      recommendedAction: expect.stringContaining("clear owner from the project / chain-of-command"),
+    });
+    expect(findings[0].reason).toContain("older than 24h");
+    expect(findings[0].recommendedAction).not.toContain("record the current owner");
+  });
+
   it("still flags a stalled in_review issue when its blocker has an active run", () => {
     const reviewIssueId = "review-1";
     const activeBlockerId = "active-blocker-1";

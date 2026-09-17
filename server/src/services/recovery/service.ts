@@ -118,6 +118,7 @@ import {
 } from "./origins.js";
 import { postRoutineSchedulerFailureHeartbeat } from "./routine-scheduler-heartbeat.js";
 import {
+  PENDING_INTERACTION_MAX_AGE_MS,
   classifyIssueGraphLiveness,
   type IssueLivenessFinding,
 } from "./issue-graph-liveness.js";
@@ -2731,6 +2732,18 @@ export function recoveryService(
     return rows.length > 0;
   }
 
+  /**
+   * BLO-22660: bounded on the same 24h threshold the liveness classifier uses, because this
+   * is the remediation half of the belief that classifier encodes. These sweeps skip a row
+   * when a wake card is pending; the classifier mints a finding once that card ages out. If
+   * only one half aged, the overlap population (pending, wake policy, older than 24h) would
+   * get a finding that every sweep then declined to act on.
+   *
+   * The `continuationPolicy` filter is not a substitute for ageing: a `wake_assignee` card
+   * fires when it is *answered*, so a card nobody has answered in 32 days is precisely the
+   * shape that never fires. `createdAt` is `notNull().defaultNow()`, so unlike the
+   * classifier's in-memory input there is no missing-timestamp row for this to drop.
+   */
   async function hasPendingWakeInteraction(companyId: string, issueId: string) {
     return db
       .select({ id: issueThreadInteractions.id })
@@ -2741,6 +2754,7 @@ export function recoveryService(
           eq(issueThreadInteractions.issueId, issueId),
           eq(issueThreadInteractions.status, "pending"),
           inArray(issueThreadInteractions.continuationPolicy, ["wake_assignee", "wake_assignee_on_accept"]),
+          gt(issueThreadInteractions.createdAt, new Date(Date.now() - PENDING_INTERACTION_MAX_AGE_MS)),
         ),
       )
       .limit(1)
