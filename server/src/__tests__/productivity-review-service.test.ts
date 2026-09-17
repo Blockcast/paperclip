@@ -6271,7 +6271,17 @@ describeEmbeddedPostgres("productivity review service", () => {
     // Nothing of the cohort is even attempted on this pass — the back-off is a
     // hard exclusion, not a re-ordering, so it cannot occupy a single slot.
     expect(second.failed).toBe(0);
-  });
+    // BLO-22985: 120s, matching the two sibling full-window tests above and
+    // below. This one was authored without a cap and inherited the 60s global,
+    // which is not enough: it inserts 500 rows and then drives 250 failing
+    // finalizes, each with its own back-off UPDATE. Measured 32.5s unloaded
+    // (64-core host, load ~10) — only 1.8x under the global, so a merge-queue
+    // runner pod at 1.0-1.8 cores runs it straight past the deadline. It did,
+    // ejecting #1854 from the master queue on 2026-09-17 (run 35226379587).
+    // 120s is 3.7x the measured cost and still catches a genuine hang: the
+    // failure this test exists to detect is an unbounded recovery loop, which
+    // does not finish at any budget.
+  }, 120_000);
 
   it("replays missing finalized review side effects without duplicating them", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
