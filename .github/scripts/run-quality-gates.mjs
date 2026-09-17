@@ -79,8 +79,17 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
     // passing runs fell through the `|| existing` guard in main() and left the
     // stale failure comment standing forever (BLO-26636). `type === 'Bot'` is
     // what keeps a human comment quoting the signature out of the PATCH path.
+    //
+    // `endsWith`, not `includes`: on Blockcast every agent posts as
+    // `allyblockcast[bot]`, so `type === 'Bot'` discriminates nothing against
+    // an agent comment that merely *quotes* `— commitperclip` (they routinely
+    // do). Since `.find` returns the first match in ascending id order, such a
+    // comment posted before ours would take the PATCH — destroying content
+    // that is not ours and leaving our stale comment standing. buildComment
+    // puts the signature last in both branches, so anchoring on that is the
+    // property we actually own.
     const existing = comments.find(
-      c => c.user?.type === 'Bot' && c.body.includes(COMMENT_SIGNATURE)
+      c => c.user?.type === 'Bot' && (c.body ?? '').trimEnd().endsWith(COMMENT_SIGNATURE)
     );
     if (existing) return existing;
 
