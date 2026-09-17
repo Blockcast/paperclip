@@ -125,9 +125,28 @@ network call of its own — and owns none of the re-evaluation.
   re-armed on *different* gates produces a different key: the old resolution
   stops matching and oversight resumes. A re-arm on the *same* gates keeps
   matching, which is correct — the same gate is still resolved.
+  **The candidate scan recomputes this same digest in SQL** so the
+  already-announced anti-join tests the exact current signal set rather than
+  approximating it with a prefix match plus a timestamp. If you change
+  `terminalGateResolutionIdempotencyKey`, change `gateSignalDigestSql` with it —
+  the `scanned` assertions in `terminal-gate-reconciler.test.ts` fail if the two
+  drift. A drift is fail-open (the row is admitted and the authoritative JS key
+  filter drops it), so it costs a wasted scan slot, never a missed announcement.
 - **Cost per pass** is at most one GitHub read per distinct still-unresolved PR,
   capped at 100 reads per pass. Once a resolution is recorded the issue is
   filtered out *before* any API call.
+- **Saturation is logged, not inferred.** The read budget fails closed, so an
+  issue past the cap is left alone and looks exactly like "nothing to resolve".
+  When that happens the pass emits a `warn` —
+  `terminal-gate reconciler exhausted its per-pass pull-request read budget` —
+  carrying `readCapped`, `pullRequestReads`, `scanned` and `maxReads`. Sustained
+  across passes it means the window is saturated rather than idle: candidates
+  are ordered `updated_at ASC`, which is stable, so the same head-of-list issues
+  can consume the budget every pass while issues behind them never get read.
+  Raise `maxPullRequestReads`, or shorten the interval, before concluding the
+  reconciler has nothing to do. Note there is no negative caching for PRs that
+  read as still-open, so unmerged PRs are re-read every pass and count against
+  the budget each time.
 - **The comment is written directly to `issue_comments`**, not through
   `issuesSvc.addComment`, because that path can enqueue a wake. Not dispatching
   is the behaviour under test, not an implementation detail — see the
