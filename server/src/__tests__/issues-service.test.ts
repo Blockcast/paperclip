@@ -8896,6 +8896,38 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  // BLO-34207: issue mutations read instance settings on the caller's handle so
+  // they do not take a second pool connection while holding the company graph
+  // lock. That read must stay a pure read: bootstrapping the singleton row from
+  // inside the caller's tx takes an instance-wide row lock BEFORE
+  // `lockIssueParentMutationCompany` and holds it to commit, so two callers can
+  // take the two locks in opposite orders. Assert the write never happens.
+  it("does not write the instance settings singleton from an update running on a caller transaction", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Settings read must not write",
+      status: "todo",
+      priority: "medium",
+    });
+    await db.delete(instanceSettings);
+
+    await db.transaction(async (tx) => {
+      await svc.update(issueId, { title: "Renamed under a caller tx" }, tx);
+    });
+
+    expect(await db.select().from(instanceSettings)).toHaveLength(0);
+  });
+
   it("returns cycle validation instead of deadlocking intersecting multi-level reparent updates", async () => {
     const companyId = randomUUID();
     const issueAId = randomUUID();
