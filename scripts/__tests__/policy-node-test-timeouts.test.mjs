@@ -16,12 +16,36 @@ const workflowSource = readFileSync(new URL("../../.github/workflows/pr.yml", im
 // comments. pr.yml documents these invariants in prose inside itself -- the
 // `helm_chart` preamble names the suite's directory and says "do not re-add it
 // here" -- and counting a sentence about a rule as an instance of breaking it
-// makes documenting the rule in the obvious place turn this file red. Only
-// whole-line comments are stripped: `run:` bodies legitimately contain `#`
-// (`"${#failed[@]}"`), and mangling those would trade one false signal for
-// another. Comment bodies are blanked in place rather than deleted so every
-// byte offset still lines up with the real file.
-const workflow = workflowSource.replace(/^[ \t]*#.*$/gm, (line) => " ".repeat(line.length));
+// makes documenting the rule in the obvious place turn this file red. Comment
+// bodies are blanked in place rather than deleted so every byte offset still
+// lines up with the real file.
+//
+// BOTH whole-line and trailing comments. An earlier revision stripped only
+// whole-line ones, which left the exactly-once assertion red on
+// `run: echo hi  # see deploy/helm/paperclip/tests/ for the suite` -- a
+// trailing note about the rule is the same sentence the paragraph above exists
+// to protect, and the assertion then reported `found 2 ... outside comments`
+// while the second reference was inside one. A misleading message is the
+// failure this file has split assertions apart to avoid elsewhere.
+//
+// That revision justified whole-line-only as protecting `run:` bodies that
+// legitimately contain `#` (`"${#failed[@]}"`). The concern is real and the
+// form assumed is not: all five such forms in pr.yml put `{` immediately
+// before the `#`, never whitespace, so anchoring the trailing strip to
+// [ \t]# leaves every one intact. pr.yml today carries zero trailing comments
+// (`grep -cE '^[^#]*\S[ \t]#'` -> 0), so on the real file this is a no-op.
+//
+// The honest cost, since it is a hole and not a free fix: this also blanks a
+// `#` inside a quoted string, so a re-add sitting after one on the same line
+// (`run: echo "a # b" && node --test ./deploy/helm/paperclip/tests/x.test.mjs`)
+// is missed. That is the direction this gate tolerates -- a missed row is a
+// hole, a false red fails an unrelated PR and gets the assertion deleted.
+function stripComments(yaml) {
+  return yaml
+    .replace(/^[ \t]*#.*$/gm, (line) => " ".repeat(line.length))
+    .replace(/[ \t]#[^\n]*$/gm, (trailing) => " ".repeat(trailing.length));
+}
+const workflow = stripComments(workflowSource);
 
 function policySteps() {
   const start = workflow.indexOf("\n  policy:\n");
@@ -115,6 +139,13 @@ test("policy continues after a bounded test failure unless cancelled", () => {
 const CHART_DIR = "deploy/helm/paperclip";
 const CHART_SUITE = `${CHART_DIR}/tests/`;
 
+// CHART_DIR is interpolated into a RegExp below. Inert today -- the current
+// path carries no metacharacter -- but this constant is the one thing in this
+// file designed to be edited, and a `.` or `+` in a future chart path would
+// silently WIDEN the match instead of failing loudly. Escaping is the cheaper
+// half of that pair.
+const CHART_DIR_RE = CHART_DIR.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+
 // `[a-z_]+` missed every job key containing a digit -- 3 of the 12 defined
 // here (`opencode_k8s_seed_cold_start`, `vendor_claude_k8s`, `e2e`). Latent so
 // far: a suite placed in `e2e` attributes to the preceding *matching* key
@@ -148,6 +179,44 @@ function jobRegion(name) {
   const nextJob = after.search(/\n {2}[a-z0-9_-]+:\n/);
   return nextJob === -1 ? after : after.slice(0, nextJob + 1);
 }
+
+// The comment above is the whole argument for the `0-9` in both patterns, and a
+// comment is exactly what did not stop #965/#995 from crossing. Narrowing back
+// to `[a-z_]+` reads as tidying and leaves every assertion in this file green,
+// because attribution only drifts backwards into a job that still is not
+// `helm_chart`. Pin the keys by name so a revert says which one stopped
+// resolving rather than surfacing later as a mis-attributed re-add.
+test("jobOwning resolves job keys that carry digits (BLO-31516)", () => {
+  for (const name of ["helm_chart", "opencode_k8s_seed_cold_start", "vendor_claude_k8s", "e2e"]) {
+    const key = `\n  ${name}:\n`;
+    const at = workflow.indexOf(key);
+    assert.notEqual(at, -1, `pr.yml must define ${name}`);
+    assert.equal(jobOwning(at + key.length), name, `jobOwning must attribute ${name} to itself`);
+  }
+});
+
+// Every text assertion in this file reads `workflow`, so the stripper is the
+// one place a regression is invisible in BOTH directions at once: drop the
+// trailing pass and prose reddens the gate again, widen it past `[ \t]#` and
+// `"${#failed[@]}"` gets mangled into a false red of its own. Neither shows up
+// against the real pr.yml, which carries no trailing comment today -- so
+// nothing else here would go red. Gate the stripper on synthetic text instead.
+test("the comment stripper blanks both comment forms, in place (BLO-31516)", () => {
+  const lines = [
+    `    # never add ${CHART_SUITE}*.test.mjs here`,
+    `        run: echo hi  # see ${CHART_SUITE} for the suite`,
+    `        run: node --test ./${CHART_SUITE}probes.test.mjs`,
+    '        run: echo "${#failed[@]}"',
+  ];
+  const stripped = stripComments(lines.join("\n"));
+  assert.equal(stripped.length, lines.join("\n").length, "blanking must preserve byte offsets");
+  assert.deepEqual(
+    stripped.split("\n").map((line) => line.includes(CHART_SUITE)),
+    [false, false, true, false],
+    "only the real invocation may survive: prose and a trailing note must not",
+  );
+  assert.match(stripped, /\$\{#failed\[@\]\}/, '`${#...}` has no whitespace before its # and must survive');
+});
 
 test("the chart render suite runs in exactly one job, and that job is helm_chart", () => {
   const offsets = [];
@@ -255,7 +324,7 @@ test("only helm_chart runs the chart suite from inside the chart directory (BLO-
     const step = workflow.slice(at, next === -1 ? undefined : next);
     if (!step.includes("node --test")) continue;
     const chdirs = new RegExp(
-      `(?:[\\n;&|({!]|run:|\\b(?:if|elif|then|else|do|while|until)[ \\t]|["'])[ \\t]*(?:working-directory:|cd|pushd) +["']?\\.?/?${CHART_DIR}(?:/[^\\s&;|"')]*)?(?=[\\s&;|"')]|$)`,
+      `(?:[\\n;&|({!]|run:|\\b(?:if|elif|then|else|do|while|until)[ \\t]|["'])[ \\t]*(?:working-directory:|cd|pushd) +["']?\\.?/?${CHART_DIR_RE}(?:/[^\\s&;|"')]*)?(?=[\\s&;|"')]|$)`,
     ).test(step);
     if (chdirs && jobOwning(at) !== "helm_chart") {
       offenders.push(`${jobOwning(at)}: ${step.slice(marker.length).split("\n")[0]}`);
@@ -317,11 +386,13 @@ test("only helm_chart runs the chart suite from inside the chart directory (BLO-
 // `--experimental-test-coverage`, so wiring coverage into a `node --test` step
 // is the ordinary edit that hits it rather than an exotic one. Both are listed
 // for that reason; `--test-isolation` takes `process`/`none` and so only ever
-// costs a missed row, and is listed for consistency. Worth re-checking against
-// `node --help` whenever the pinned major moves -- and weighing any new
+// costs a missed row, and is listed for consistency -- under BOTH spellings,
+// since node 24 prints it as `--experimental-test-isolation, --test-isolation`
+// and listing only the short one leaves the alias unmatched. Worth re-checking
+// against `node --help` whenever the pinned major moves -- and weighing any new
 // value-taking flag by whether its value can hold a glob.
 const VALUE_FLAGS =
-  /^(?:--(?:test-(?:reporter|reporter-destination|name-pattern|skip-pattern|timeout|concurrency|shard|isolation|coverage-exclude|coverage-include)|import|require|loader|conditions)|-[rC])$/;
+  /^(?:--(?:experimental-test-isolation|test-(?:reporter|reporter-destination|name-pattern|skip-pattern|timeout|concurrency|shard|isolation|coverage-exclude|coverage-include)|import|require|loader|conditions)|-[rC])$/;
 test("every node --test names explicit paths, so the text match above is sound (BLO-31516)", () => {
   const marker = "\n      - name: ";
   const offenders = [];
