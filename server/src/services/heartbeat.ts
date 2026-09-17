@@ -267,7 +267,6 @@ import {
   resolveAgentEmptyWorkspaceSourceDir,
   resolveDefaultAgentWorkspaceDir,
   resolveManagedProjectWorkspaceDir,
-  resolvePaperclipInstanceRoot,
 } from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
@@ -301,6 +300,7 @@ import {
 import { githubGetPullRequestGate, githubHasReviewerEvidenceForPr } from "./github-app-auth.js";
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
+import { resolveSharedDocSearchBoundaryPath } from "./shared-doc-search-boundary.js";
 import { pullRequestExternalId } from "./pull-request-work-products.js";
 import {
   ensureReferencedSharedDocsMaterialized,
@@ -5539,7 +5539,7 @@ async function materializeExternalK8sSharedDocs(input: {
   }
   if (!instructionsContents) return;
 
-  const sharedDocSearchBoundaryPath = resolvePaperclipInstanceRoot();
+  const sharedDocSearchBoundaryPath = resolveSharedDocSearchBoundaryPath();
   if (!sharedDocSourceRoots(sourceRootPath, sharedDocSearchBoundaryPath).some((root) => root !== sourceRootPath)) {
     // Not fatal: shared docs may genuinely live in the bundle. Logged because an external
     // bundle configured outside the instance root silently loses the company-root lookup,
