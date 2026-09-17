@@ -127,6 +127,18 @@ function wrapClient<T extends object>(client: T): T {
           // Already aborted: refuse to start. Issuing the statement first and
           // cancelling it immediately would burn a pool slot the wedged agent's
           // recovery needs, and the rejection is identical either way.
+          //
+          // Throwing synchronously rather than returning a rejected thenable is
+          // deliberate. Not every drizzle entry point is async —
+          // `PostgresJsSession.query`/`queryObjects` return
+          // `client.unsafe(...).values()` straight out of a sync method, and
+          // `transaction` returns `client.begin(...)` the same way — so a
+          // rejected thenable would have to also carry `.values()`/`.raw()` to
+          // keep those chains intact, and would risk an unhandled rejection if
+          // any caller discarded it. A synchronous throw needs neither: every
+          // one of those paths is reached from inside the section's `async`
+          // closure, so the throw becomes a rejection of `fn`, which is exactly
+          // the outcome the lock is waiting for.
           if (signal.aborted) throw abortReason(signal);
 
           const query = (value as (...a: unknown[]) => CancellableQuery).apply(target, args);
