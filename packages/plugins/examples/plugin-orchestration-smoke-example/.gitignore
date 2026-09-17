@@ -2,7 +2,11 @@ dist
 node_modules
 .paperclip-sdk
 
-# BLO-34222: this package is excluded from pnpm-workspace.yaml, so the CI lane
-# installs it standalone. That generates a package-local lockfile which must not
-# be committed, or the exclusion (no root-lockfile churn) is defeated.
+# BLO-34222: this package is excluded from pnpm-workspace.yaml. CI does NOT
+# install it standalone -- its `workspace:*` deps make that impossible
+# (ERR_PNPM_WORKSPACE_PKG_NOT_FOUND), so the lane takes them from the root
+# install instead. This guards the contributor who tries
+# `pnpm install --ignore-workspace` here by hand: that run can leave a
+# package-local lockfile behind, which must not be committed or the exclusion
+# (no root-lockfile churn) is defeated.
 pnpm-lock.yaml
