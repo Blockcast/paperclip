@@ -12,6 +12,13 @@ function read(rows, dead = "__none__") {
   return out.split("\n").filter(Boolean);
 }
 
+/** Classify workflow runs at a head into the stale-run alternation. */
+function dead(runs) {
+  const stdin = runs.map((r) => r.join("\t")).join("\n") + "\n";
+  const out = execFileSync("bash", [READER, "--dead"], { input: stdin, encoding: "utf8" });
+  return out.trim();
+}
+
 const stops = (lines) => lines.filter((l) => l.startsWith("STOP\t"));
 
 describe("merge-gate reader", () => {
@@ -149,5 +156,88 @@ describe("merge-gate reader", () => {
   it("treats an in-flight check as a stop", () => {
     const lines = read([["General tests", "in_progress", "2026-09-16T13:00Z", "999"]]);
     assert.deepEqual(lines, ["STOP\tGeneral tests\tin_progress\trun=999"]);
+  });
+
+  // BLO-34367: `cancelled` at the RUN level conflates supersession with terminal
+  // cancellation, and only one of them is stale. GitHub marks a run `cancelled`
+  // when any job is cancelled, and a timeout-minutes expiry IS a cancellation —
+  // so keying the filter on the conclusion deletes a real STOP every time a job
+  // times out. Measured on Blockcast/paperclip @ 35e15bcc, run 35249848781: the
+  // sole run of its workflow at that head, `verify` failure + `policy` cancelled,
+  // both dropped. Supersession is the property the filter wants, so test for it.
+  describe("stale-run classification", () => {
+    it("keeps a cancelled run that nothing superseded", () => {
+      assert.equal(
+        dead([
+          ["276438379", "35249848781", "cancelled"], // sole run of its workflow
+          ["294511598", "35249846479", "success"],
+          ["315805904", "35249848741", "skipped"],
+        ]),
+        "",
+      );
+    });
+
+    it("drops a cancelled run that a newer run of the same workflow replaced", () => {
+      // penstock-llm-proxy-core#1948 @ 157589a6 — BLO-34114's own control.
+      assert.equal(
+        dead([
+          ["286504427", "34542908750", "cancelled"],
+          ["286504427", "34542929394", "success"], // 16s later, same workflow
+        ]),
+        "34542908750",
+      );
+    });
+
+    it("keeps the newest run of a workflow even when it is itself cancelled", () => {
+      // A chain of cancel-in-progress: only the last one still speaks for the head.
+      assert.equal(
+        dead([
+          ["10", "100", "cancelled"],
+          ["10", "200", "cancelled"],
+        ]),
+        "100",
+      );
+    });
+
+    // "Newest" is per workflow, not per head. Ordering matters: this fixture puts
+    // the cancelled run second so a global newest-check (rather than a grouped
+    // one) would classify it stale and fail.
+    it("scopes the newest-run check to one workflow", () => {
+      assert.equal(
+        dead([
+          ["10", "100", "success"],
+          ["20", "200", "cancelled"], // sole run of workflow 20 — not superseded
+        ]),
+        "",
+      );
+    });
+
+    it("is silent when no run was cancelled at all", () => {
+      assert.equal(dead([["10", "100", "success"]]), "");
+    });
+  });
+
+  // End to end on the measured shape. The BLO-34263 ABSENT guard cannot catch
+  // this one: unrelated workflows survive, so the survivor count is non-zero and
+  // the guard stays suppressed while a genuine red is deleted. That is what makes
+  // this a distinct defect rather than a repeat.
+  it("prints the STOPs of a terminally-cancelled run that nothing superseded", () => {
+    const runs = [
+      ["276438379", "35249848781", "cancelled"],
+      ["294511598", "35249846479", "success"],
+    ];
+    const rows = [
+      ["verify", "failure", "2026-09-17T17:13:29Z", "35249848781"],
+      ["policy", "cancelled", "2026-09-17T17:09:33Z", "35249848781"],
+      ["Build", "skipped", "2026-09-17T17:09:33Z", "35249848781"],
+      ["commitperclip", "success", "2026-09-17T17:00:00Z", "35249846479"],
+    ];
+    const lines = read(rows, dead(runs) || "__none__");
+    assert.deepEqual(lines.sort(), [
+      "STOP\tpolicy\tcancelled\trun=35249848781",
+      "STOP\tverify\tfailure\trun=35249848781",
+    ]);
+    // The ABSENT guard is NOT what saved us here — prove it stayed quiet.
+    assert.doesNotMatch(lines.join("\n"), /ABSENT/);
   });
 });
