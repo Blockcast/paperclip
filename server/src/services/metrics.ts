@@ -344,6 +344,27 @@ export const EXTERNAL_RUNTIME_RESERVATION_STRAND_METRICS_REFRESH_SUCCESS_METRIC 
  */
 export const AGENT_START_LOCK_HELD_SECONDS_METRIC = "paperclip_agent_start_lock_held_seconds";
 /**
+ * Dispatch sections cancelled for overrunning the start-lock budget (PEN-3328).
+ *
+ * The companion to {@link AGENT_START_LOCK_HELD_SECONDS_METRIC}, and it exists
+ * because that gauge cannot answer this question. A cancelled section releases
+ * its lock, so its series *disappears* — the gauge is how you see a wedge while
+ * it is happening, and this is how you see that it happened at all. Without it
+ * an abort at 03:00 leaves no durable trace anywhere Prometheus can reach.
+ *
+ * Deliberately unlabelled beyond the agent, and in particular it does NOT carry
+ * a "did the cancellation land" label. The two are different shapes: an abort
+ * is an event and belongs on a counter, while "still wedged afterwards" is a
+ * *condition* and is already exactly what the gauge reports — a series that
+ * stays high past the budget instead of vanishing. Splitting the counter would
+ * make every recovered abort also increment the alerting series.
+ *
+ * Any non-zero rate is a defect worth chasing: a healthy section is sub-second
+ * and the budget is five minutes, so this only increments when something inside
+ * dispatch stopped responding.
+ */
+export const AGENT_START_LOCK_ABORTED_METRIC = "paperclip_agent_start_lock_aborted_total";
+/**
  * Overdue-parked-retry age gauge (BLO-22094). {@link QUEUED_RUN_OLDEST_AGE_METRIC}
  * deliberately excludes `status='scheduled_retry'` rows -- that exclusion is
  * correct and stays (Ally review, onprem-k8s#2013: without it, a retry
@@ -2056,6 +2077,7 @@ let orphanedRuntimeResourceMetricsRefreshSuccess: Gauge | null = null;
 let externalRuntimeReservationStrandedOldestAge: Gauge<"agent_id"> | null = null;
 let externalRuntimeReservationStrandMetricsRefreshSuccess: Gauge | null = null;
 let agentStartLockHeldSeconds: Gauge<"agent_id"> | null = null;
+let agentStartLockAbortedTotal: Counter<"agent_id"> | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
@@ -2204,6 +2226,7 @@ function ensureRegistry(): {
   externalRuntimeReservationStrandedOldestAgeGauge: Gauge<"agent_id">;
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
   agentStartLockHeldSecondsGauge: Gauge<"agent_id">;
+  agentStartLockAbortedTotalCounter: Counter<"agent_id">;
   prReviewQueueWaitHistogram: Histogram;
   authRequestCounter: Counter<"operation" | "outcome">;
   gbrainRecallCounter: Counter<"status">;
@@ -2242,6 +2265,7 @@ function ensureRegistry(): {
     || !externalRuntimeReservationStrandedOldestAge
     || !externalRuntimeReservationStrandMetricsRefreshSuccess
     || !agentStartLockHeldSeconds
+    || !agentStartLockAbortedTotal
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !externalLifecycleRunSilenceGap
@@ -2454,6 +2478,20 @@ function ensureRegistry(): {
         + "status=idle, errorReason=null, orgChainHealth=healthy. Series exist only while a lock is "
         + "held, so absence means no hold, not a zero-length one. A healthy section is sub-second; "
         + "sustained tens of seconds is a wedge. Per-pod, because the lock is per-process.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    agentStartLockAbortedTotal = new Counter({
+      name: AGENT_START_LOCK_ABORTED_METRIC,
+      help:
+        "Queued-run dispatch sections cancelled for holding the per-agent start lock past its 5m "
+        + "budget (PEN-3328). Counterpart to " + AGENT_START_LOCK_HELD_SECONDS_METRIC + ", which "
+        + "cannot answer this: a cancelled section releases its lock, so its gauge series "
+        + "disappears and the event leaves no durable trace. A healthy section is sub-second, so "
+        + "any non-zero rate means something inside dispatch stopped responding. This counts the "
+        + "abort, not its outcome: if the cancellation did NOT land, the agent is still wedged and "
+        + "the gauge above keeps reporting it -- that condition is the gauge's job, not a label "
+        + "here. Per-pod, because the lock is per-process.",
       labelNames: ["agent_id"],
       registers: [registry],
     });
@@ -3144,6 +3182,7 @@ function ensureRegistry(): {
     externalRuntimeReservationStrandMetricsRefreshSuccessGauge:
       externalRuntimeReservationStrandMetricsRefreshSuccess,
     agentStartLockHeldSecondsGauge: agentStartLockHeldSeconds,
+    agentStartLockAbortedTotalCounter: agentStartLockAbortedTotal,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
@@ -3575,6 +3614,21 @@ export function setDbPoolStats(stats: DbPoolStats): void {
   dbPoolConnectionsGauge.set({ state: "active" }, stats.active);
   dbPoolConnectionsGauge.set({ state: "connecting" }, stats.connecting);
   dbPoolWaitingQueriesGauge.set(stats.waiting);
+}
+
+/**
+ * Count one dispatch section cancelled for overrunning the start-lock budget
+ * (PEN-3328).
+ *
+ * Incremented from the lock itself rather than from a scrape-path refresh: an
+ * abort is an *event*, and by the time the next scrape arrives the section has
+ * released its lock and left nothing behind to sample. Whether the cancellation
+ * then landed is not recorded here — see the metric's doc comment; a
+ * cancellation that did not land leaves the gauge high, which is the reading
+ * that already means "this agent is still not dispatching".
+ */
+export function recordAgentStartLockAborted(agentId: string): void {
+  ensureRegistry().agentStartLockAbortedTotalCounter.inc({ agent_id: agentId });
 }
 
 /**
@@ -4558,6 +4612,7 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationStrandedOldestAge = null;
   externalRuntimeReservationStrandMetricsRefreshSuccess = null;
   agentStartLockHeldSeconds = null;
+  agentStartLockAbortedTotal = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
