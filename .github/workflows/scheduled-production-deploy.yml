@@ -315,6 +315,14 @@ jobs:
       # runs hourly, so a failed close self-heals on the next slot. Non-fatal by
       # design — the dispatcher's `conclusion` is load-bearing (PEN-2848) and must
       # not start meaning "housekeeping failed".
+      #
+      # ONE EXCEPTION, and the script owns it rather than this `if:`. The supersede
+      # above has two failure paths that cancel the stale run and then fail to
+      # dispatch, which empties the gate with nothing shipped — and that reads as
+      # `checked-no-pending`, identical to a human clearing it. Those paths label
+      # the record, and --resolve refuses to close a labelled record on an outcome
+      # that did not refill the lane. The condition stays here so a labelled record
+      # still closes on `dispatched` / `up-to-date`.
       - name: Close the durable deploy-stall record once nothing is pending
         if: ${{ !cancelled() && steps.dispatch.outputs.outcome != '' && steps.dispatch.outputs.outcome != 'skipped-pending' }}
         env:

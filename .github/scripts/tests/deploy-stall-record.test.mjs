@@ -16,11 +16,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  REFILLING_OUTCOMES,
   STALL_ISSUE_TITLE,
   STALL_LABEL,
+  STALL_UNREFILLED_LABEL,
   createGitHubClient,
+  isUnrefilled,
   parseStallMarker,
   renderStallMarker,
+  renderSupersedeFailedComment,
   resolveStallStartedAt,
 } from '../deploy-stall-record.mjs';
 
@@ -198,4 +202,89 @@ test('createStallIssue: carries the dedupe label, or the next slot files a dupli
     assert.deepEqual(body.labels, [STALL_LABEL]);
     assert.equal(body.title, STALL_ISSUE_TITLE);
   });
+});
+
+// ---------------------------------------------------------------------------
+// "A human cleared it" vs "we emptied it and could not refill it".
+//
+// The supersede's two failure paths (cancel-poll timeout, dispatch-failed-
+// after-cancel) both cancel the stale run and then fail to dispatch. The gate
+// ends up EMPTY with production still at the stale commit — and the dispatcher
+// reports that as `checked-no-pending`, exactly as it would if a human had
+// cancelled the run themselves. Without this distinction the record opened to
+// make the stall auditable is closed as RESOLVED by the one new way "nothing
+// pending" can happen with no human having acted, while the escalation stops
+// firing and nothing ships until the daily dispatch slot, up to ~24h later.
+test('isUnrefilled: the label is what separates the two, in either label shape', () => {
+  assert.equal(isUnrefilled({ labels: [{ name: STALL_UNREFILLED_LABEL }] }), true);
+  assert.equal(isUnrefilled({ labels: [STALL_UNREFILLED_LABEL] }), true);
+  assert.equal(isUnrefilled({ labels: [{ name: STALL_LABEL }] }), false);
+  assert.equal(isUnrefilled({ labels: [] }), false);
+  assert.equal(isUnrefilled({}), false);
+  assert.equal(isUnrefilled(null), false);
+});
+
+test('an unrefilled record does NOT close on checked-no-pending — nothing shipped', () => {
+  // This is the whole finding: `checked-no-pending` is precisely the outcome a
+  // failed supersede produces, so it must not be the outcome that resolves it.
+  assert.equal(REFILLING_OUTCOMES.has('checked-no-pending'), false);
+});
+
+test('an unrefilled record DOES close once the lane is actually refilled', () => {
+  // `dispatched` means a replacement is on the gate; `up-to-date` means
+  // production already carries master. Either way nothing is owed, so the record
+  // must not be left open forever — the daily dispatch slot is the bounded exit.
+  assert.equal(REFILLING_OUTCOMES.has('dispatched'), true);
+  assert.equal(REFILLING_OUTCOMES.has('up-to-date'), true);
+});
+
+test('the supersede-failure comment states that production did NOT ship', () => {
+  // The record is read by a human after the fact, and the danger is that it
+  // reads as prompt recovery. Say the two things that are actually true.
+  const body = renderSupersedeFailedComment({
+    reason: 'dispatch-failed-after-cancel',
+    detail: 'Run 34889856627 was cancelled, but dispatching docker.yml failed: 500',
+    runUrl: 'https://github.com/Blockcast/paperclip/actions/runs/1',
+  });
+  assert.match(body, /still at the stale commit/i);
+  assert.match(body, /stays OPEN/);
+  assert.match(body, /24h/);
+  assert.match(body, /dispatch-failed-after-cancel/);
+});
+
+// The marker regex reads a JSON object out of an HTML comment. The lazy
+// quantifier is load-bearing in the direction that is easy to get backwards:
+// `[\s\S]*?` BACKTRACKS to satisfy the `-->` terminator, so it already handles a
+// nested object, while a greedy `[\s\S]*` would swallow everything between the
+// FIRST marker and the LAST `-->` in a body carrying two of them.
+test('parseStallMarker: a future nested-object shape still parses, and the first marker wins', () => {
+  const nested = `<!-- production-deploy-stall:${JSON.stringify({
+    version: 1,
+    stallStartedAt: '2026-09-14T19:58:34.000Z',
+    meta: { supersedes: 1 },
+  })} -->\nbody`;
+  assert.deepEqual(parseStallMarker(nested), { stallStartedAt: '2026-09-14T19:58:34.000Z' });
+
+  const two = [
+    renderStallMarker({ stallStartedAt: '2026-09-14T19:58:34.000Z' }),
+    'edited body',
+    renderStallMarker({ stallStartedAt: '2026-09-16T13:12:14.000Z' }),
+  ].join('\n');
+  assert.deepEqual(parseStallMarker(two), { stallStartedAt: '2026-09-14T19:58:34.000Z' });
+});
+
+test('addLabel: marks the record even when the label already exists', async () => {
+  const calls = [];
+  const client = stubClient((url, init) => {
+    calls.push({ url, body: init.body ? JSON.parse(init.body) : null });
+    if (url.endsWith('/labels') && !url.includes('/issues/')) {
+      return { ok: false, status: 422, text: async () => '{"message":"already_exists"}' };
+    }
+    return ok([{ name: STALL_UNREFILLED_LABEL }]);
+  });
+
+  await client.addLabel(77, STALL_UNREFILLED_LABEL);
+  const applied = calls.find((c) => c.url.includes('/issues/77/labels'));
+  assert.ok(applied, 'the label must still be applied after the 422');
+  assert.deepEqual(applied.body.labels, [STALL_UNREFILLED_LABEL]);
 });

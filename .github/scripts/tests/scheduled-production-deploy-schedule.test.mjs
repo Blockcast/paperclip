@@ -17,6 +17,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { selectStuckApproval } from '../post-pending-deploy-alert.mjs';
+import { REFILLING_OUTCOMES } from '../deploy-stall-record.mjs';
 
 const WORKFLOW = 'scheduled-production-deploy.yml';
 const DAILY_CRON = '23 7 * * *';
@@ -395,5 +396,63 @@ test('replay 2026-09-11: hourly sampling catches the gate the daily cron structu
   assert.ok(
     latencyHours < THRESHOLD_HOURS + 1,
     `detection must land within one sample period of the threshold, was ${latencyHours}h`,
+  );
+});
+
+// PEN-3315 follow-up. The supersede's failure paths empty the reviewer gate
+// without anything shipping, and the dispatcher reports that as
+// `checked-no-pending` — indistinguishable from a human having cancelled the
+// pending run. The record opened to make the stall auditable would then be
+// closed as RESOLVED while production sat at the stale commit, with the
+// escalation no longer firing (nothing is waiting) and nothing new going out
+// until the daily dispatch slot, up to ~24h later.
+//
+// The refusal lives in the script, not in the step `if:`, because a labelled
+// record must still close on `dispatched` / `up-to-date`. These assert the wiring
+// the script depends on is actually there.
+test('the supersede can reach the record it must label on its failure paths', () => {
+  const supersede = code.match(/- name: Supersede a stale pending deploy[\s\S]*?run: node/);
+  assert.ok(supersede, 'the workflow must run the supersede');
+  assert.match(
+    supersede[0],
+    /STALL_ISSUE_NUMBER:\s*\$\{\{\s*steps\.escalate\.outputs\.stall_issue_number\s*\}\}/,
+    'without the record number the supersede cannot mark a gate it emptied',
+  );
+});
+
+test('the record-closing step can tell WHICH non-pending outcome it is closing on', () => {
+  // `--resolve` distinguishes "a human cleared it" from "we emptied it" by
+  // outcome, so the outcome has to reach the script.
+  const close = code.match(/- name: Close the durable deploy-stall record[\s\S]*?--resolve/);
+  assert.ok(close, 'the workflow must close the stall record');
+  assert.match(
+    close[0],
+    /DISPATCH_OUTCOME:\s*\$\{\{\s*steps\.dispatch\.outputs\.outcome\s*\}\}/,
+    'the close must be told the outcome, or it cannot refuse a checked-no-pending close',
+  );
+});
+
+test('every outcome the close step fires on is classified by the resolver', () => {
+  // Guards the seam: a new outcome added to the dispatch step would otherwise
+  // fall through REFILLING_OUTCOMES and silently close an unrefilled record.
+  const emitted = [...code.matchAll(/echo "outcome=([a-z-]+)" >> "\$GITHUB_OUTPUT"/g)].map(
+    (m) => m[1],
+  );
+  assert.ok(emitted.length >= 4, `expected the four dispatch outcomes, saw ${emitted.join(', ')}`);
+  const nonPending = emitted.filter((outcome) => outcome !== 'skipped-pending');
+  for (const outcome of nonPending) {
+    assert.equal(
+      typeof REFILLING_OUTCOMES.has(outcome),
+      'boolean',
+      `outcome ${outcome} must be classified`,
+    );
+  }
+  // `checked-no-pending` is the one a failed supersede produces, so it is the one
+  // that must NOT resolve the record on its own.
+  assert.ok(nonPending.includes('checked-no-pending'));
+  assert.equal(REFILLING_OUTCOMES.has('checked-no-pending'), false);
+  assert.deepEqual(
+    nonPending.filter((outcome) => REFILLING_OUTCOMES.has(outcome)).sort(),
+    ['dispatched', 'up-to-date'],
   );
 });
