@@ -325,10 +325,10 @@ describeEmbeddedPostgres("PATCH /agents/:agentId/budgets records a config revisi
     } finally {
       release();
       await held;
+      await holder.$client.end();
+      await prober.$client.end();
     }
 
     expect((await patch).status).toBe(200);
-    await holder.$client.end();
-    await prober.$client.end();
   });
 });
