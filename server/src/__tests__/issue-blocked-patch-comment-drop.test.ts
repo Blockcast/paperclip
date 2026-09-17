@@ -9,6 +9,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  instanceSettings,
   issueComments,
   issueRelations,
   issues,
@@ -64,6 +65,16 @@ describeEmbeddedPostgres("PATCH refused by the blocker guard does not silently d
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
+    // The done-gate test below turns on an instance-wide experimental flag.
+    // Reset it unconditionally so this file cannot leak the flag into whatever
+    // runs next, and so the reset does not depend on that test passing.
+    await db
+      .insert(instanceSettings)
+      .values({ singletonKey: "default", general: {}, experimental: {} })
+      .onConflictDoUpdate({
+        target: [instanceSettings.singletonKey],
+        set: { experimental: {} },
+      });
   });
 
   afterAll(async () => {
@@ -228,5 +239,71 @@ describeEmbeddedPostgres("PATCH refused by the blocker guard does not silently d
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     const rows = await commentRows(issueId);
     expect(rows.map((row) => row.body)).toEqual(["Picking this up."]);
+  });
+
+  // Review follow-up (#1895): the three tests above all refuse on the *blocker*
+  // guard, so none of them distinguishes "the enrichment covers any refusal
+  // escaping `svc.update`" from "the enrichment is wired to the blocker guard".
+  // This one refuses on a different guard entirely — the done-gate — and
+  // carries a different `details` payload, so it pins the generalization and
+  // the survival of details it has never seen.
+  //
+  // The reviewer asked for a fourth test driving the **409** arm instead. That
+  // one is not writable: every non-422 refusal `svc.update` can raise on this
+  // route is a `conflict(...)` from a precondition that snapshots the very row
+  // the route already read (`expectedNoUnresolvedBlockers`,
+  // `expectedCurrentStatus`, `expectedCurrent*RunId`,
+  // `expectedCurrentExecution{State,Policy}`), so it fires only when a
+  // concurrent writer moves the row mid-request. The repro suggested in review
+  // — seed a blocker, PATCH `blockedByIssueIds: []` + `status` — does not reach
+  // it from either side: `isCreatorOrManagerChainRecoveryPatch` admits a body
+  // of *exactly* `{status, blockedByIssueIds}`, so adding `comment` makes it
+  // three keys and `delegateRecoveryPatchInFlight` false, and the other two
+  // `unresolvedBlockerWriteGuardInFlight` arms are each preceded by a
+  // route-level `res.status(409).json()` that returns before the write. Staging
+  // the real race needs two requests to interleave between a plain read and a
+  // locked write, which is a flaky test, not a deterministic one. The 409
+  // coverage in the route is therefore deliberate defensive breadth over a real
+  // production race rather than a path this suite exercises.
+  it("announces the drop on a refusal from a different guard, preserving its details", async () => {
+    const { companyId, agentId, runId, issueId } = await seedAssignedIssue({ withBlocker: false });
+    // Default is off, so without this the PATCH is simply accepted and nothing
+    // is exercised. Upsert, not insert: migrations seed the singleton row.
+    await db
+      .insert(instanceSettings)
+      .values({
+        singletonKey: "default",
+        general: {},
+        experimental: { enableDoneExecutionGate: true },
+      })
+      .onConflictDoUpdate({
+        target: [instanceSettings.singletonKey],
+        set: { experimental: { enableDoneExecutionGate: true } },
+      });
+    const app = createApp(agentActor(companyId, agentId, runId));
+
+    // No checkout run, no PR link, no durable artifact: the done-gate refuses
+    // an agent narrating `done` without execution evidence. Nothing to do with
+    // blockers — the row has none.
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done", comment: "Shipped it — writing up the details here." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    const details = res.body.details as Record<string, unknown>;
+
+    // A different guard, not the blocker one.
+    expect(details.reason).toBe("no_execution_run_and_no_pr_evidence");
+    expect(details).not.toHaveProperty("unresolvedBlockerIssueIds");
+
+    // Same announcement, and this guard's own details survive it.
+    expect(
+      details.commentPersisted,
+      `the refusal must say the carried comment was not saved; got ${JSON.stringify(details)}`,
+    ).toBe(false);
+    expect(String(details.commentHint)).toContain("POST /api/issues/:id/comments");
+    expect(details.issueId).toBe(issueId);
+
+    expect(await commentRows(issueId)).toEqual([]);
   });
 });
