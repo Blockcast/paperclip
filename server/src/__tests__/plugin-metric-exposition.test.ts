@@ -634,40 +634,89 @@ describe("BLO-32163 — fence-blocked labels survive the two-sided promotion gat
   const MANIFEST_METRIC_LABELS = [
     "aggregate_key",
     "alertname",
-    "phase",
     "severity",
     "version",
   ];
+  const FENCE_METRIC = "alertmanager.aggregate.fence_blocked";
+  const AGGREGATE_KEY = 'alert-aggregate:v1:["ArgoAppOutOfSyncTooLong",null]';
+  const RENDERED_AGGREGATE_KEY = `${PLUGIN_METRIC_TAG_LABEL_PREFIX}aggregate_key="alert-aggregate:v1:[\\"ArgoAppOutOfSyncTooLong\\",null]"`;
 
-  it("promotes aggregate_key and phase for the fence-blocked shape", async () => {
+  function writeFence(): void {
     recordPluginMetric({
       ...PLUGIN,
-      name: "alertmanager.aggregate.fence_blocked",
+      name: FENCE_METRIC,
       value: 930,
-      tags: {
-        alertname: "ArgoAppOutOfSyncTooLong",
-        aggregate_key: 'alert-aggregate:v1:["ArgoAppOutOfSyncTooLong",null]',
-        phase: "firing",
-      },
+      tags: { alertname: "ArgoAppOutOfSyncTooLong", aggregate_key: AGGREGATE_KEY },
       declaredLabels: MANIFEST_METRIC_LABELS,
     });
+  }
+
+  it("promotes aggregate_key for the fence-blocked shape", async () => {
+    writeFence();
 
     const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
     expect(series).toHaveLength(1);
-    expect(series[0]).toContain('metric="alertmanager.aggregate.fence_blocked"');
+    expect(series[0]).toContain(`metric="${FENCE_METRIC}"`);
     // The identifying label. Asserted on the rendered exposition, so a change
     // that promotes the key but mangles the value still fails here.
-    expect(series[0]).toContain(
-      `${PLUGIN_METRIC_TAG_LABEL_PREFIX}aggregate_key="alert-aggregate:v1:[\\"ArgoAppOutOfSyncTooLong\\",null]"`,
-    );
-    expect(series[0]).toContain(`${PLUGIN_METRIC_TAG_LABEL_PREFIX}phase="firing"`);
+    expect(series[0]).toContain(RENDERED_AGGREGATE_KEY);
   });
 
-  it("admits both keys to the platform allow-list", () => {
-    // Guards the silent-degradation path: dropping either key from the
-    // allow-list leaves a fence page that cannot name the wedged aggregate.
-    for (const key of ["aggregate_key", "phase"] as const) {
-      expect(PLUGIN_METRIC_PROMOTABLE_TAG_KEYS).toContain(key);
+  it("admits aggregate_key to the platform allow-list", () => {
+    // Guards the silent-degradation path: dropping the key from the allow-list
+    // leaves a fence page that cannot name the wedged aggregate.
+    expect(PLUGIN_METRIC_PROMOTABLE_TAG_KEYS).toContain("aggregate_key");
+  });
+
+  it("keeps phase off the allow-list", () => {
+    // Admitting it would 4x the fence metrics' combination count inside their
+    // own per-name budget — the starvation below, one level down.
+    expect(PLUGIN_METRIC_PROMOTABLE_TAG_KEYS).not.toContain("phase");
+  });
+
+  /**
+   * The defect that made the promotion above worthless in production.
+   *
+   * The ledger used to be keyed on `pluginId` alone, so one shared budget was
+   * consumed first-come-first-served across every metric name the plugin
+   * emits. Measured 2026-09-17: `paperclip-plugin-alertmanager` held 110
+   * distinct series against a shared budget of 100, and the fence metric — the
+   * rare one a page depends on — lost the lottery to `alertmanager.alert.error`
+   * and `alertmanager.firing.deduped`, dropping 91 writes/hr to `label_budget`.
+   * Adding `aggregate_key` to the allow-list could not fix that: a full ledger
+   * rejects every new combination regardless of which keys compose it.
+   *
+   * This is the test that fails if the ledger key is reverted to `pluginId`.
+   */
+  it("does not let a chatty metric starve the fence metric's labels", async () => {
+    // Exhaust a different metric name's entire allowance.
+    for (let i = 0; i < PLUGIN_METRIC_CARDINALITY_BUDGET + 5; i += 1) {
+      recordPluginMetric({
+        ...PLUGIN,
+        name: "alertmanager.alert.error",
+        value: 1,
+        tags: { alertname: `ChattyRule${i}` },
+        declaredLabels: MANIFEST_METRIC_LABELS,
+      });
     }
+
+    writeFence();
+
+    const fence = (await seriesFor(PLUGIN_METRIC_TOTAL_METRIC)).filter((line) =>
+      line.includes(`metric="${FENCE_METRIC}"`),
+    );
+    expect(fence).toHaveLength(1);
+    expect(fence[0]).toContain(RENDERED_AGGREGATE_KEY);
+
+    // And the chatty metric still gets told it overflowed, on its own name.
+    const dropped = await seriesFor(PLUGIN_METRIC_DROPPED_METRIC);
+    expect(
+      dropped.some(
+        (line) =>
+          line.includes('reason="label_budget"')
+          && line.includes('metric="alertmanager.alert.error"'),
+      ),
+    ).toBe(true);
+    expect(dropped.some((line) => line.includes(`metric="${FENCE_METRIC}"`))).toBe(false);
   });
 });

@@ -1154,25 +1154,30 @@ export const PLUGIN_METRIC_DROPPED_METRIC = "paperclip_plugin_metric_dropped_tot
  * Their metrics still publish; they just publish without those labels. Adding
  * a key here is an explicit cardinality decision, not a convenience.
  *
- * `aggregate_key` and `phase` were added for BLO-32163, and the bound is
- * argued rather than assumed:
- *   - `phase` is the alertmanager aggregate lifecycle fence's phase column,
- *     whose vocabulary is closed at four values (`active`, `firing`,
- *     `cancelling`, `finalizing`). Trivially bounded.
- *   - `aggregate_key` is `alert-aggregate:v1:["<alertname>",<dedupe-domain>]`
- *     (see the alertmanager plugin's `aggregateKeyForAlert`), so its
- *     cardinality is `alertname × dedupe-domain`. `alertname` is already
- *     accepted above as bounded by the alert-rule registry, and
- *     `dedupe-domain` is a rule-author opt-in label that is null on every
- *     rule that does not set it. So this sits in the same order as a key the
- *     list already admits, and is bounded by the rule registry — not by alert
- *     *instances*, which is the axis that would actually be unbounded.
+ * `aggregate_key` was added for BLO-32163, and the bound is argued rather than
+ * assumed: it is `alert-aggregate:v1:["<alertname>",<dedupe-domain>]` (see the
+ * alertmanager plugin's `aggregateKeyForAlert`), so its cardinality is
+ * `alertname × dedupe-domain`. `alertname` is already accepted above as bounded
+ * by the alert-rule registry, and `dedupe-domain` is a rule-author opt-in label
+ * that is null on every rule that does not set it. So this sits in the same
+ * order as a key the list already admits, and is bounded by the rule registry —
+ * not by alert *instances*, which is the axis that would actually be unbounded.
  *
  * It is load-bearing that `aggregate_key` be a label and not merely present in
  * the metric name: a wedged-fence page has to name the wedged aggregate to be
  * actionable, and `alertname` alone cannot do it — two aggregates of the same
  * rule differing only by dedupe-domain are distinct fences that wedge
  * independently.
+ *
+ * `phase` (the fence lifecycle column: `active`/`firing`/`cancelling`/
+ * `finalizing`) was in the first cut of this change and is deliberately NOT
+ * here. It is trivially bounded on its own, but it multiplies the fence
+ * metrics' combination count 4× inside their own
+ * {@link PLUGIN_METRIC_CARDINALITY_BUDGET} allowance — ~23 live aggregate keys
+ * × 4 phases exceeds the 50-slot per-name budget, so admitting it would
+ * reintroduce, within one metric, exactly the starvation the per-name ledger
+ * fixes. The responder-facing value it carried is supplied in prose by the
+ * alert annotation instead.
  */
 export const PLUGIN_METRIC_PROMOTABLE_TAG_KEYS = [
   "action",
@@ -1182,7 +1187,6 @@ export const PLUGIN_METRIC_PROMOTABLE_TAG_KEYS = [
   "error_code",
   "event_type",
   "exit_code",
-  "phase",
   "scope",
   "severity",
   "source",
@@ -1333,10 +1337,29 @@ export const PLUGIN_METRIC_NAME_BUDGET = 50;
  * restart; the alternative is persisting the ledger, which is not worth a DB
  * write per metric.
  *
- * Worst case per plugin is {@link PLUGIN_METRIC_NAME_BUDGET} name-level series
- * + this many full combinations + one `_overflow`, i.e. 151.
+ * This budget is per **(plugin, metric name)**, not per plugin, and that is
+ * load-bearing rather than a refinement (BLO-32163). A single shared pool is
+ * first-come-first-served over a *restart* lottery, so a chatty metric
+ * permanently starves a rare one — and the rare one is exactly the metric a
+ * page depends on. Measured in production 2026-09-17 on
+ * `paperclip-plugin-alertmanager`: 110 distinct series against a shared budget
+ * of 100, with `alertmanager.aggregate.fence_blocked` — the wedged-fence
+ * signal — dropping 91 writes/hr to `label_budget` while
+ * `alertmanager.alert.error` (185/hr) and `alertmanager.firing.deduped`
+ * (101/hr) held the slots. Adding a key to
+ * {@link PLUGIN_METRIC_PROMOTABLE_TAG_KEYS} cannot fix that: a full ledger
+ * rejects every new combination regardless of which keys compose it. Giving
+ * each name its own allowance is what makes a promotion actually reach the
+ * series, so the two changes ship together.
+ *
+ * Halved from 100 to keep the inflation proportionate: worst case per plugin
+ * is {@link PLUGIN_METRIC_NAME_BUDGET} name-level series + that many × this
+ * many combinations + one `_overflow`, i.e. 2551 rather than the previous 151.
+ * 50 is ~2× the largest per-name combination count any live metric has reached
+ * (24, on `alertmanager.alert.error`), and the chatty metrics already lose
+ * combinations under the shared pool, so no live breakdown regresses.
  */
-export const PLUGIN_METRIC_CARDINALITY_BUDGET = 100;
+export const PLUGIN_METRIC_CARDINALITY_BUDGET = 50;
 
 /** Label value that over-name-budget writes collapse into. */
 export const PLUGIN_METRIC_OVERFLOW_NAME = "_overflow";
@@ -2281,18 +2304,21 @@ let pluginMetricDropped: Counter<"plugin_id" | "plugin_key" | "reason" | "metric
  * `never emits a raw control character into the exposition` is what fails if
  * it is ever removed.
  *
- * Entries are keyed by `pluginId` and are never pruned in production — only
+ * Entries are keyed by `pluginId\0name` (BLO-32163 — see
+ * {@link PLUGIN_METRIC_CARDINALITY_BUDGET} for why the ledger is per-name
+ * rather than per-plugin) and are never pruned in production — only
  * {@link __resetMetricsForTest} clears them — so a plugin uninstalled or
  * disabled mid-process keeps its ledger for the worker's lifetime. That is
  * deliberate, not an oversight. The residue is bounded by the same two budgets
- * this ledger exists to enforce (at most 50 names and 100 combinations per
- * plugin, so ~150 short strings), and on the *default* uninstall path pruning
+ * this ledger exists to enforce (at most 50 names × 50 combinations per
+ * plugin), and on the *default* uninstall path pruning
  * would hand a reinstall a fresh budget — turning install/uninstall into a way
  * to mint unbounded series, which is exactly what the bound refuses.
  *
  * That default is a soft delete: the row survives as `uninstalled` and a
- * reinstall reuses it, so `pluginId` — and with it the ledger key — is stable
- * across the cycle. `uninstall(id, removeData = true)` instead hard-deletes the
+ * reinstall reuses it, so `pluginId` — and with it the ledger key prefix — is
+ * stable across the cycle. `uninstall(id, removeData = true)` instead
+ * hard-deletes the
  * row, so the reinstall inserts under a fresh `defaultRandom()` id and gets a
  * clean budget whether or not we prune; there the retained entry is an orphan
  * rather than a hole this closes. The rule is kept unconditional because the
@@ -3079,7 +3105,7 @@ function ensureRegistry(): {
         + "silently); unpromoted tags stay on the "
         + "plugin_logs row. company_id is deliberately not a label (unbounded "
         + "per tenant). Two cardinality tiers degrade on DIFFERENT axes: past "
-        + "the per-plugin tag-value budget a write keeps its 'metric' label and "
+        + "the per-(plugin, metric) tag-value budget a write keeps its 'metric' label and "
         + "drops its promoted labels, so a rule matching metric=\"<name>\" keeps "
         + "working and sum by (metric) stays exact; only a plugin exceeding the "
         + "much tighter metric-NAME budget collapses to metric=\""
@@ -3098,7 +3124,7 @@ function ensureRegistry(): {
         "Plugin metric writes not published as-submitted, by reason "
         + "(PEN-2799): 'bad_name' (name failed shape/length validation), "
         + "'bad_value' (non-finite or negative -- ctx.metrics.write is a "
-        + "counter increment), 'label_budget' (per-plugin tag-value budget "
+        + "counter increment), 'label_budget' (per-(plugin, metric) tag-value budget "
         + "exhausted, so the promoted labels were dropped but the increment "
         + "still landed on the metric's own series -- totals stay correct, only "
         + "the per-tag breakdown is lost), 'name_budget' (the plugin exceeded "
@@ -4517,10 +4543,15 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
     // PLUGIN_METRIC_NAME_REGEX. See pluginMetricCombinations for why a
     // collision would be a real leak rather than a miscount.
     const combo = comboParts.join("\0");
-    let seen = pluginMetricCombinations.get(pluginId);
+    // Keyed per (plugin, NAME), not per plugin — see
+    // PLUGIN_METRIC_CARDINALITY_BUDGET for why a shared pool starves the rare
+    // metric that a page depends on. `name` cleared tier 1 above, so it is one
+    // of at most PLUGIN_METRIC_NAME_BUDGET values and cannot contain a NUL.
+    const ledgerKey = `${pluginId}\0${name}`;
+    let seen = pluginMetricCombinations.get(ledgerKey);
     if (!seen) {
       seen = new Set<string>();
-      pluginMetricCombinations.set(pluginId, seen);
+      pluginMetricCombinations.set(ledgerKey, seen);
     }
     if (!seen.has(combo)) {
       if (seen.size >= PLUGIN_METRIC_CARDINALITY_BUDGET) {
