@@ -23,6 +23,7 @@ import type { IncomingHttpHeaders } from "node:http";
 import type { Request, RequestHandler, Router } from "express";
 import { logger } from "../middleware/logger.js";
 import { assertBoardOrgAccess } from "./authz.js";
+import { recordWorkerTierProxyFailure } from "../services/metrics.js";
 
 /**
  * Plugin routes whose handlers reach pluginWorkerManager.{startWorker,
@@ -326,8 +327,10 @@ function createWorkerProxyHandler(
     } catch (err) {
       // Client left before we finished — expected, nothing to report.
       if (clientDisconnected) return;
+      const failureReason = timedOut ? "timeout" : "unreachable";
+      recordWorkerTierProxyFailure(failureReason);
       logger.error(
-        { err, targetUrl, method: req.method, reason: timedOut ? "timeout" : "unreachable", requestTimeoutMs },
+        { err, targetUrl, method: req.method, reason: failureReason, requestTimeoutMs },
         timedOut
           ? "worker-tier proxy: worker tier did not respond before the proxy timeout"
           : "worker-tier proxy: failed to relay request to worker tier",

@@ -14,6 +14,30 @@ import {
   type WorkerTierProxyOptions,
   WORKER_DEPENDENT_PLUGIN_ROUTES,
 } from "../routes/worker-tier-proxy.js";
+import {
+  WORKER_TIER_PROXY_FAILURES_METRIC,
+  __resetMetricsForTest,
+  renderMetrics,
+} from "../services/metrics.js";
+
+/**
+ * Read the failure counter out of the *rendered* exposition rather than the
+ * registry object.
+ *
+ * BLO-31945's remaining acceptance criterion is a PromQL query, so a counter
+ * that exists in the process but never reaches `/metrics` would pass an
+ * in-memory assertion and fail the actual requirement.
+ */
+async function proxyFailureSeries(): Promise<Record<string, number>> {
+  const { body } = await renderMetrics();
+  const out: Record<string, number> = {};
+  for (const line of body.split("\n")) {
+    if (!line.startsWith(`${WORKER_TIER_PROXY_FAILURES_METRIC}{`)) continue;
+    const [, reason, rawValue] = /reason="([^"]*)"\}\s+(\S+)$/.exec(line) ?? [];
+    if (reason) out[reason] = Number(rawValue);
+  }
+  return out;
+}
 
 interface CapturedRequest {
   method: string;
@@ -337,12 +361,14 @@ describe("registerWorkerTierProxyRoutes", () => {
 
   it("returns 502 when the worker tier is unreachable", async () => {
     // Port 1 is privileged and never listening — fetch fails fast.
+    __resetMetricsForTest();
     const app = buildApp("http://127.0.0.1:1");
 
     const res = await request(app).post("/api/plugins/ccrotate/disable").send({});
 
     expect(res.status).toBe(502);
     expect(res.body.error).toMatch(/worker tier unreachable/i);
+    expect(await proxyFailureSeries()).toEqual({ timeout: 0, unreachable: 1 });
   });
 
   it("returns 504 — not 502 — when the worker tier is reachable but too slow", async () => {
@@ -350,6 +376,7 @@ describe("registerWorkerTierProxyRoutes", () => {
     // answer "Worker tier unreachable", which sent responders hunting for a
     // missing Service endpoint that was never missing. The two causes must
     // stay distinguishable from the status code alone.
+    __resetMetricsForTest();
     worker = await startWorkerStub(async () => {
       await new Promise((resolve) => setTimeout(resolve, 200));
       return { status: 200, body: JSON.stringify({ ok: true }) };
@@ -361,6 +388,10 @@ describe("registerWorkerTierProxyRoutes", () => {
     expect(res.status).toBe(504);
     expect(res.body.error).toMatch(/did not respond within 50ms/i);
     expect(res.body.error).not.toMatch(/unreachable/i);
+    // The whole point of the label: a slow worker must not be counted as a
+    // missing endpoint. Asserting both series also proves the zero-init holds,
+    // so `rate()` over the quiet reason returns 0 rather than nothing.
+    expect(await proxyFailureSeries()).toEqual({ timeout: 1, unreachable: 0 });
   });
 
   it("lets plugin scoped API actions run longer than the generic proxy timeout", async () => {
