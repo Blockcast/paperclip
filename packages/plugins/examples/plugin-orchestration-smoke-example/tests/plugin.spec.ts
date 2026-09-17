@@ -160,12 +160,3 @@ describe("orchestration smoke plugin", () => {
     });
   });
 });
-
-// TEMPORARY — BLO-34222 negative control for the sibling-tree coverage.
-// Reverted in the next commit on this branch. Proves the lane can go red on
-// the workspace:* install path, not merely exist and pass.
-describe("BLO-34222 negative control", () => {
-  it("fails on purpose", () => {
-    expect(1).toBe(2);
-  });
-});
