@@ -147,15 +147,22 @@ export type RecoveryHorizonDeliveryState = (typeof RECOVERY_HORIZON_DELIVERY_STA
  * was therefore unevaluable in either direction against that surface. The
  * counter has normal retention, so the same question is a range query.
  *
- * Cardinality is two series by construction —
+ * Cardinality is three series by construction —
  * {@link KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS} is a closed set, not caller
  * input. `timeout` means the connection succeeded and the worker was still
- * silent when the proxy's own deadline fired; `unreachable` means the request
- * never got that far. They are separated because they route differently:
- * `timeout` is worker latency, `unreachable` is a missing Service endpoint.
+ * silent when the proxy's own deadline fired; `mid_stream` means the worker
+ * answered and the response then broke after headers were already flushed;
+ * `unreachable` means the request never got that far. They are separated
+ * because they route differently: `timeout` is worker latency, `mid_stream` is
+ * a worker that died or was restarted mid-response, and only `unreachable`
+ * points at a missing Service endpoint.
  */
 export const WORKER_TIER_PROXY_FAILURES_METRIC = "paperclip_worker_tier_proxy_failures_total";
-export const KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS = ["timeout", "unreachable"] as const;
+export const KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS = [
+  "timeout",
+  "mid_stream",
+  "unreachable",
+] as const;
 export type WorkerTierProxyFailureReason =
   (typeof KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS)[number];
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
@@ -3111,14 +3118,15 @@ function ensureRegistry(): {
       name: WORKER_TIER_PROXY_FAILURES_METRIC,
       help:
         "Count of worker-tier proxy relay failures, labeled by reason: 'timeout' "
-        + "(connection succeeded, the worker was still silent at the proxy deadline) "
-        + "or 'unreachable' (the request never reached a worker). Replaces a log "
-        + "grep that could not answer a 24h question, because the api pod's log "
-        + "does not survive its own recreation (BLO-31945).",
+        + "(connection succeeded, the worker was still silent at the proxy deadline), "
+        + "'mid_stream' (the worker answered and the response broke after headers "
+        + "were flushed) or 'unreachable' (the request never reached a worker). "
+        + "Replaces a log grep that could not answer a 24h question, because the api "
+        + "pod's log does not survive its own recreation (BLO-31945).",
       labelNames: ["reason"],
       registers: [registry],
     });
-    // Zero-init both series. An un-incremented counter is absent from the
+    // Zero-init every series. An un-incremented counter is absent from the
     // scrape, and an absent series is indistinguishable from a healthy one on
     // every dashboard — rate() over it returns nothing rather than 0.
     for (const reason of KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS) {
