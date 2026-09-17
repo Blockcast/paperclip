@@ -951,18 +951,22 @@ export const PLUGIN_METRIC_CONTROL_CHAR_REGEX = /[\u0000-\u001F\u007F]/g;
  * from the inbound Alertmanager webhook, so its length is chosen by whoever
  * authored the firing rule, not by us.
  *
- * The *count* of retained values is already bounded by
- * {@link PLUGIN_METRIC_CARDINALITY_BUDGET}, so an unbounded length is bloat
- * rather than a breach: prom-client never retires a label combination, so each
- * one is re-serialised on every scrape for the process lifetime. Truncating is
- * strictly better than dropping — a truncated `alertname` still identifies the
- * alert to a human reading the series, where a dropped label loses the
- * breakdown entirely.
+ * The *count* of retained values is bounded by
+ * {@link PLUGIN_METRIC_NAME_BUDGET} × {@link PLUGIN_METRIC_CARDINALITY_BUDGET}
+ * — each name carries its own combination pool (BLO-32163), so the two budgets
+ * multiply rather than the second bounding the whole plugin. That product is
+ * still finite, so an unbounded length is bloat rather than a breach:
+ * prom-client never retires a label combination, so each one is re-serialised
+ * on every scrape for the process lifetime. Truncating is strictly better than
+ * dropping — a truncated `alertname` still identifies the alert to a human
+ * reading the series, where a dropped label loses the breakdown entirely.
  *
  * 128 is comfortably above the longest alertname firing fleet-wide when this
  * was written (59 chars, `PhysicalInfra...NearConfiguredMax`) while keeping the
  * worst case bounded at roughly
- * `CARDINALITY_BUDGET x promotable-keys x 128` bytes per plugin.
+ * `NAME_BUDGET x CARDINALITY_BUDGET x promotable-keys x 128` bytes per plugin,
+ * i.e. ~3.8 MB at 50 x 50 x 12 x 128. That is 50x the pre-BLO-32163 figure,
+ * which assumed one combination pool shared across all of a plugin's names.
  */
 export const PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH = 128;
 
@@ -982,9 +986,10 @@ export const PLUGIN_METRIC_NAME_BUDGET = 50;
 
 /**
  * Ceiling on distinct `(metric, promoted-label-values)` combinations a single
- * plugin may occupy, per process lifetime. Past it, a write **keeps its
- * `metric` label and drops its promoted labels**, so it still lands on the
- * plugin's real per-name series.
+ * **(plugin, metric name)** pair may occupy, per process lifetime — not a
+ * per-plugin pool; see the BLO-32163 paragraph below for why that distinction
+ * is load-bearing. Past it, a write **keeps its `metric` label and drops its
+ * promoted labels**, so it still lands on the plugin's real per-name series.
  *
  * The two tiers degrade on different axes, and that asymmetry is the whole
  * point (PEN-2799 review of its own first cut):
@@ -3755,7 +3760,11 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
       (input.declaredLabels ?? []).map((key) => String(key)),
     );
     const labels: Record<string, string> = { ...identity, metric: name };
-    const comboParts: string[] = [name];
+    // Seeded empty: the ledger key below carries `name`, so repeating it in
+    // every combination string adds no discriminating power — only an extra
+    // copy of it per combination, up to NAME_BUDGET x CARDINALITY_BUDGET of
+    // them per plugin.
+    const comboParts: string[] = [];
     let truncatedValue = false;
     let sanitizedValue = false;
     for (const key of PLUGIN_METRIC_PROMOTABLE_TAG_KEYS) {
@@ -3805,15 +3814,20 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
 
     // Tier 2 — the tag-value axis, over combinations ever observed. NUL-joined,
     // which is injective ONLY because no part can contain a NUL — and that is
-    // now enforced here rather than assumed: every promoted value is stripped
-    // of control characters a few lines above, and `name` cleared
-    // PLUGIN_METRIC_NAME_REGEX. See pluginMetricCombinations for why a
-    // collision would be a real leak rather than a miscount.
+    // now enforced here rather than assumed: every part is a promoted value,
+    // and each was stripped of control characters a few lines above. See
+    // pluginMetricCombinations for why a collision would be a real leak rather
+    // than a miscount.
     const combo = comboParts.join("\0");
     // Keyed per (plugin, NAME), not per plugin — see
     // PLUGIN_METRIC_CARDINALITY_BUDGET for why a shared pool starves the rare
-    // metric that a page depends on. `name` cleared tier 1 above, so it is one
-    // of at most PLUGIN_METRIC_NAME_BUDGET values and cannot contain a NUL.
+    // metric that a page depends on. The join is injective on both components,
+    // which now needs stating for both rather than one: `name` cleared tier 1
+    // above, so it is one of at most PLUGIN_METRIC_NAME_BUDGET values and
+    // cleared PLUGIN_METRIC_NAME_REGEX, which admits no NUL; `pluginId` is a
+    // `defaultRandom()` UUID (see pluginMetricCombinations), so it cannot
+    // contain one either. It moved from opaque map key to joined key component
+    // in BLO-32163, which is what put it inside this argument.
     const ledgerKey = `${pluginId}\0${name}`;
     let seen = pluginMetricCombinations.get(ledgerKey);
     if (!seen) {
