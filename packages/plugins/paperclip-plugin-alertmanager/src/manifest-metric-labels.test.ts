@@ -23,9 +23,15 @@ describe("alertmanager manifest — promoted metric labels", () => {
     // cannot: two aggregates of the same rule differing only by
     // dedupe-domain are distinct fences that wedge independently.
     expect(manifest.metricLabels).toContain("aggregate_key");
-    // `phase` names which half of the lifecycle is holding — `firing` vs
-    // `cancelling` — which is the first thing a responder needs.
-    expect(manifest.metricLabels).toContain("phase");
+  });
+
+  it("does not declare phase, which would 4x the fence combination count", () => {
+    // Not an oversight and not free to re-add: ~23 live aggregate keys × 4
+    // lifecycle phases exceeds the 50-slot per-name label budget, so promoting
+    // `phase` would starve `aggregate_key` inside the fence metric's own
+    // allowance — the same failure the per-name ledger exists to fix, one
+    // level down. See PLUGIN_METRIC_PROMOTABLE_TAG_KEYS.
+    expect(manifest.metricLabels).not.toContain("phase");
   });
 
   it("keeps the pre-existing PEN-2799 labels", () => {
