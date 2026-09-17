@@ -7,7 +7,7 @@ const READER = fileURLToPath(new URL("./merge-gate-read.sh", import.meta.url));
 
 /** Run the canonical reader's verdict pipeline over fixture rows. */
 function read(rows, dead = "__none__") {
-  const stdin = rows.map((r) => r.join("\t")).join("\n") + "\n";
+  const stdin = rows.length ? rows.map((r) => r.join("\t")).join("\n") + "\n" : "";
   const out = execFileSync("bash", [READER, "--rows", dead], { input: stdin, encoding: "utf8" });
   return out.split("\n").filter(Boolean);
 }
@@ -17,6 +17,15 @@ function dead(runs) {
   const stdin = runs.map((r) => r.join("\t")).join("\n") + "\n";
   const out = execFileSync("bash", [READER, "--dead"], { input: stdin, encoding: "utf8" });
   return out.trim();
+}
+
+/** Turn a check-runs API body into reader rows. */
+function extract(checkRuns) {
+  const out = execFileSync("bash", [READER, "--extract"], {
+    input: JSON.stringify({ check_runs: checkRuns }),
+    encoding: "utf8",
+  });
+  return out.split("\n").filter(Boolean);
 }
 
 const stops = (lines) => lines.filter((l) => l.startsWith("STOP\t"));
@@ -239,5 +248,73 @@ describe("merge-gate reader", () => {
     ]);
     // The ABSENT guard is NOT what saved us here — prove it stayed quiet.
     assert.doesNotMatch(lines.join("\n"), /ABSENT/);
+  });
+
+  // Reviewer finding on the BLO-34263 guard: it was gated on `dead != __none__`,
+  // so a head that produced NO rows at all printed nothing — the same
+  // "empty output reads as all-green" shape the clause exists to close, reached
+  // by a different path. Live whenever both surfaces come back empty: no workflow
+  // triggered (path filters, fork PR awaiting approval, unparseable workflow
+  // file), or a transient gh failure.
+  describe("ABSENT fires on any absence of surviving verdicts", () => {
+    it("fires on no rows at all, with nothing cancelled", () => {
+      assert.deepEqual(read([]), [
+        "STOP\t<no check-run verdict at this head>\tABSENT\trun=-",
+      ]);
+    });
+
+    it("does not count a blank line as a surviving verdict", () => {
+      assert.match(read([[]]).join("\n"), /ABSENT/);
+    });
+
+    it("keeps the two causes distinguishable", () => {
+      assert.match(
+        read([["verify", "failure", "t", "111"]], "111").join("\n"),
+        /dropped as superseded-run/,
+      );
+      assert.match(read([]).join("\n"), /no check-run verdict/);
+    });
+  });
+
+  // Reviewer finding: capture() RAISES on a null details_url rather than failing
+  // to match, so `// "app"` never sees it. jq aborts mid-stream on the raise and
+  // every check-run after the null is silently dropped — including reds.
+  // details_url is nullable in the REST schema and is set by whichever App
+  // published the run, not by this repo.
+  describe("row extraction", () => {
+    const run = (o) => ({ completed_at: "t", conclusion: "success", ...o });
+
+    it("does not truncate the stream on a null details_url", () => {
+      assert.deepEqual(
+        extract([
+          run({ name: "a", details_url: "https://x/runs/123/job/9" }),
+          run({ name: "b", conclusion: "failure", details_url: null }),
+          run({ name: "c", conclusion: "failure", details_url: "https://x/runs/456/job/1" }),
+        ]),
+        ["a\tsuccess\tt\t123", "b\tfailure\tt\tapp", "c\tfailure\tt\t456"],
+      );
+    });
+
+    it("falls back to `app` for a details_url with no run id", () => {
+      assert.deepEqual(extract([run({ name: "gate", details_url: "https://x/apps/ally" })]), [
+        "gate\tsuccess\tt\tapp",
+      ]);
+    });
+
+    it("uses status when conclusion is null, so an in-flight run still reports", () => {
+      assert.deepEqual(
+        extract([
+          {
+            name: "e2e",
+            conclusion: null,
+            status: "in_progress",
+            completed_at: null,
+            started_at: "t0",
+            details_url: "https://x/runs/9/job/1",
+          },
+        ]),
+        ["e2e\tin_progress\tt0\t9"],
+      );
+    });
   });
 });
