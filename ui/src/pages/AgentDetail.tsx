@@ -304,7 +304,19 @@ function setsEqual<T>(left: Set<T>, right: Set<T>) {
 function runMetrics(run: HeartbeatRun) {
   const usage = (run.usageJson ?? null) as Record<string, unknown> | null;
   const result = (run.resultJson ?? null) as Record<string, unknown> | null;
-  const input = usageNumber(usage, "inputTokens", "input_tokens");
+  // BLO-29842: `usage_json` is untyped here, so the BilledTokenCounts split cannot
+  // reach this site as a compile error. Read cache WRITES back into `input` so this
+  // keeps the `promptTokens` meaning `inputTokens` carried before the split —
+  // otherwise the Input tile and `totalTokens` both shrink by the whole cache-write
+  // volume, which on this fleet is most of the prompt. Cache READS stay separate.
+  const input =
+    usageNumber(usage, "inputTokens", "input_tokens")
+    + usageNumber(
+      usage,
+      "cacheCreationInputTokens",
+      "cache_creation_input_tokens",
+      "rawCacheCreationInputTokens",
+    );
   const output = usageNumber(usage, "outputTokens", "output_tokens");
   const cached = usageNumber(
     usage,

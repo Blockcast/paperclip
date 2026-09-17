@@ -31,6 +31,11 @@ function initials(name: string | null | undefined) {
   return value.slice(0, 2).toUpperCase();
 }
 
+// BLO-29842: deliberately NOT the shared `totalTokens()` from @paperclipai/shared,
+// despite the name. This route already folds cache writes into `inputTokens`
+// server-side (user-profiles.ts, via sumPromptTokens), so these stats carry the
+// pre-split meaning and have no cacheCreationInputTokens field. Swapping in the
+// shared helper would not compile, and folding one in by hand double-counts.
 function totalTokens(stats: Pick<UserProfileWindowStats, "inputTokens" | "cachedInputTokens" | "outputTokens">) {
   return stats.inputTokens + stats.cachedInputTokens + stats.outputTokens;
 }

@@ -28,7 +28,8 @@ export const costEvents = pgTable(
     // 1.25x/2x input vs 0.1x for cachedInputTokens (cache read). Previously folded
     // into inputTokens, which made the 3-price rate card unidentifiable from 2
     // columns. Rows written before migration 0246 carry 0 and cannot be backfilled —
-    // the information was never captured.
+    // the information was never captured. Any rate-card fit must start AFTER that
+    // migration deployed, or it reads the zero-default as real cache-write volume.
     // ponytail: one column, not one per TTL. Claude's `modelUsage` ledger reports
     // cacheCreationInputTokens as a single aggregate and does not split
     // ephemeral_5m/_1h, so a second column would have nothing to read. Cost of the
