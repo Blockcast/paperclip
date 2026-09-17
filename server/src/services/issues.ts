@@ -5673,6 +5673,18 @@ function alertmanagerAggregateCreationFingerprint(
 
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
+  // BLO-34207: `update` and `addComment` are called from inside a transaction
+  // that already holds `lockIssueParentMutationCompany` (recovery's
+  // `escalateStrandedAssignedIssue`). Reading instance settings off the pooled
+  // handle there takes a SECOND pool connection while the lock is held, and
+  // with `POSTGRES_POOL_MAX=10` against 8-9 waiters on that same key the read
+  // only gets a connection when a waiter hits its `lock_timeout` — the convoy.
+  // So bind the settings reads to the caller's handle when there is one.
+  //
+  // Safe to run `getOrCreateRow`'s singleton bootstrap INSERT on the caller's
+  // tx: if that tx rolls back the row is simply recreated by the next reader.
+  const instanceSettingsOn = (dbOrTx: unknown) =>
+    dbOrTx === db ? instanceSettings : instanceSettingsService(dbOrTx as Db);
   const treeControlSvc = issueTreeControlService(db);
 
   async function lockIssueBlockerRelations(
@@ -10677,7 +10689,7 @@ export function issueService(db: Db) {
           issueId: id,
         });
       }
-      const experimental = await instanceSettings.getExperimental();
+      const experimental = await instanceSettingsOn(dbOrTx).getExperimental();
       const isolatedWorkspacesEnabled = experimental.enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -12836,7 +12848,7 @@ export function issueService(db: Db) {
       if (!comment) return null;
 
       const currentUserRedactionOptions = {
-        enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+        enabled: (await instanceSettingsOn(dbOrTx).getGeneral()).censorUsernameInLogs,
       };
       return redactIssueComment(comment, currentUserRedactionOptions.enabled);
     },
@@ -12896,7 +12908,7 @@ export function issueService(db: Db) {
       if (!issue) throw notFound("Issue not found");
 
       const currentUserRedactionOptions = {
-        enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+        enabled: (await instanceSettingsOn(dbOrTx).getGeneral()).censorUsernameInLogs,
       };
       const redactedBody = redactCurrentUserText(body, currentUserRedactionOptions);
       const authorType = issueCommentAuthorTypeSchema.parse(

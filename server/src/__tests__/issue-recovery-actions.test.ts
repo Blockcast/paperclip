@@ -1342,6 +1342,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // filter above: an allowlist entry is a substring match, so a future entry
     // that happens to contain one of these names would silently re-admit it.
     for (const name of [
+      // BLO-34207: `issuesSvc.update` / `addComment` read instance settings on
+      // the caller handle now (`instanceSettingsOn`), so the singleton read no
+      // longer takes a second pool connection under the graph lock.
+      "getOrCreateRow",
       "resolveStrandedIssueRecoveryOwnerAgentId",
       "resolveInvokableRecoveryAgentId",
       "isAgentInvokable",
