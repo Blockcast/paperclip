@@ -738,6 +738,23 @@ describe("issue graph liveness classifier", () => {
           createdAt: new Date(),
         }],
       },
+      // BLO-22660 fail-open: only a provably-stale card is dropped, so an unreadable
+      // createdAt must keep counting as a live path.
+      {
+        name: "pending interaction with null createdAt",
+        issue: baseReviewIssue,
+        pendingInteractions: [{ companyId, issueId: reviewIssueId, status: "pending", createdAt: null }],
+      },
+      {
+        name: "pending interaction with absent createdAt",
+        issue: baseReviewIssue,
+        pendingInteractions: [{ companyId, issueId: reviewIssueId, status: "pending" }],
+      },
+      {
+        name: "pending interaction with unparseable createdAt",
+        issue: baseReviewIssue,
+        pendingInteractions: [{ companyId, issueId: reviewIssueId, status: "pending", createdAt: "not-a-date" }],
+      },
       {
         name: "pending approval",
         issue: baseReviewIssue,
@@ -769,7 +786,7 @@ describe("issue graph liveness classifier", () => {
   it("flags an in_review issue whose only pending interaction is 24h old (BLO-22660)", () => {
     const reviewIssueId = "review-stale-interaction-1";
     const now = new Date("2026-06-02T00:00:00.000Z");
-    const classify = (createdAt: Date) => classifyIssueGraphLiveness({
+    const classify = (...createdAts: Date[]) => classifyIssueGraphLiveness({
       issues: [issue({
         id: reviewIssueId,
         identifier: "PAP-2281",
@@ -780,12 +797,21 @@ describe("issue graph liveness classifier", () => {
       })],
       relations: [],
       agents: [agent(), manager],
-      pendingInteractions: [{ companyId, issueId: reviewIssueId, status: "pending", createdAt }],
+      pendingInteractions: createdAts.map((createdAt) => ({
+        companyId,
+        issueId: reviewIssueId,
+        status: "pending",
+        createdAt,
+      })),
       now,
     });
 
     // One second under the threshold still owns the next action.
     expect(classify(new Date("2026-06-01T00:00:01.000Z"))).toEqual([]);
+
+    // A single live card carries the row even when a stale one sits beside it. Pinned
+    // because today this holds by partition, not by evaluation order.
+    expect(classify(new Date("2026-06-01T00:00:01.000Z"), new Date("2026-05-31T23:00:00.000Z"))).toEqual([]);
 
     const findings = classify(new Date("2026-06-01T00:00:00.000Z"));
     expect(findings).toHaveLength(1);
@@ -795,6 +821,40 @@ describe("issue graph liveness classifier", () => {
       reason: expect.stringContaining("older than 24h"),
       recommendedAction: expect.stringContaining("Resolve or withdraw"),
     });
+  });
+
+  // Aging a card out reaches every hasExplicitWaitingPath caller, not just reviewFinding.
+  // The default dead-end prose asserts no interaction exists and tells the operator to add
+  // one — both wrong on a row a stale card just un-suppressed.
+  it("names the stale card in the blocked_without_blockers prose (BLO-22660)", () => {
+    const deadEndId = "dead-end-stale-interaction-1";
+    const findings = classifyIssueGraphLiveness({
+      issues: [issue({
+        id: deadEndId,
+        identifier: "PAP-2282",
+        title: "Dead end behind a stale card",
+        status: "blocked",
+        assigneeAgentId: coderId,
+      })],
+      relations: [],
+      agents: [agent(), manager],
+      pendingInteractions: [{
+        companyId,
+        issueId: deadEndId,
+        status: "pending",
+        createdAt: new Date("2026-05-31T23:00:00.000Z"),
+      }],
+      now: new Date("2026-06-02T00:00:00.000Z"),
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      state: "blocked_without_blockers",
+      reason: expect.stringContaining("pending over 24h"),
+      recommendedAction: expect.stringContaining("resolve or withdraw its stale interaction"),
+    });
+    expect(findings[0].reason).not.toContain("interaction, approval, monitor");
+    expect(findings[0].recommendedAction).not.toContain("assign a human owner or interaction");
   });
 
   it("still flags a stalled in_review issue when its blocker has an active run", () => {

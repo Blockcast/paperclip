@@ -618,6 +618,18 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   }
 
   /**
+   * BLO-22660: did this issue lose its waiting path only because an interaction aged out?
+   *
+   * Every `hasExplicitWaitingPath` caller can now newly fire on such a row, so every finding
+   * reachable from one has to say so. The default prose asserts no interaction exists and
+   * recommends adding one — both false here, and the second recommends a second card of
+   * exactly the kind that caused the finding.
+   */
+  function hasStaleInteraction(issue: IssueLivenessIssueInput) {
+    return staleInteractionPathKeys.has(pathKey(issue.companyId, issue.id));
+  }
+
+  /**
    * Does this issue still have a blocker edge that could plausibly resolve?
    *
    * `done` is the only status that retires an edge here. A `cancelled` blocker
@@ -686,20 +698,27 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       includeStalledAssignee: true,
     });
     const isSelf = deadEnd.id === source.id;
+    const stale = hasStaleInteraction(deadEnd);
+    const pathClause = stale
+      ? "no unresolved blockers and no live action path — its only issue-thread interaction has been pending over 24h"
+      : "no unresolved blockers and no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action";
 
     return finding({
       issue: source,
       state: "blocked_without_blockers",
       reason: isSelf
-        ? `${issueLabel(deadEnd)} is blocked with no unresolved blockers and no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action, so nothing can ever unblock it.`
-        : `${issueLabel(source)} is blocked by ${issueLabel(deadEnd)}, which is itself blocked with no unresolved blockers and no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action.`,
+        ? `${issueLabel(deadEnd)} is blocked with ${pathClause}, so nothing can ever unblock it.`
+        : `${issueLabel(source)} is blocked by ${issueLabel(deadEnd)}, which is itself blocked with ${pathClause}.`,
       dependencyPath,
       recoveryIssue: deadEnd,
       recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
       recommendedOwnerCandidates: ownerCandidates,
       recommendedAction:
         `Review ${issueLabel(deadEnd)} and give it a next action: move it back to todo/in_progress so its assignee wakes, ` +
-        `add the blocker it is actually waiting on, assign a human owner or interaction if it is intentionally parked, ` +
+        `add the blocker it is actually waiting on, ` +
+        (stale
+          ? `resolve or withdraw its stale interaction and record the current owner, `
+          : `assign a human owner or interaction if it is intentionally parked, `) +
         `or close it if it is no longer required.`,
       blockerIssueId: deadEnd.id,
     });
@@ -764,7 +783,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     // ownerCandidates so unassigned issues don't sit silently forever.
     if (reviewIssue.assigneeUserId) return null;
 
-    const staleInteraction = staleInteractionPathKeys.has(pathKey(reviewIssue.companyId, reviewIssue.id));
+    const staleInteraction = hasStaleInteraction(reviewIssue);
     const reason = staleInteraction
       ? `${issueLabel(reviewIssue)} is in review behind a pending issue-thread interaction older than 24h, which is not a live action path.`
       : reviewIssue.assigneeAgentId
@@ -828,16 +847,23 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     }
 
     if (blocker.status === "backlog" && blocker.assigneeAgentId) {
+      const stale = hasStaleInteraction(blocker);
       return finding({
         issue: source,
         state: "blocked_by_assigned_backlog_issue",
-        reason: `${issueLabel(source)} is blocked by assigned backlog issue ${issueLabel(blocker)} with no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action.`,
+        reason: stale
+          ? `${issueLabel(source)} is blocked by assigned backlog issue ${issueLabel(blocker)} with no live action path — its only issue-thread interaction has been pending over 24h.`
+          : `${issueLabel(source)} is blocked by assigned backlog issue ${issueLabel(blocker)} with no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action.`,
         dependencyPath,
         recoveryIssue: blocker,
         recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
         recommendedOwnerCandidates: ownerCandidates,
         recommendedAction:
-          `Review ${issueLabel(blocker)} and either move it to todo so the assignee wakes, assign a human owner or interaction if it is intentionally parked, or remove it from ${issueLabel(source)}'s blockers if it is no longer required.`,
+          `Review ${issueLabel(blocker)} and either move it to todo so the assignee wakes, ` +
+          (stale
+            ? `resolve or withdraw its stale interaction and record the current owner, `
+            : `assign a human owner or interaction if it is intentionally parked, `) +
+          `or remove it from ${issueLabel(source)}'s blockers if it is no longer required.`,
         blockerIssueId: blocker.id,
       });
     }
