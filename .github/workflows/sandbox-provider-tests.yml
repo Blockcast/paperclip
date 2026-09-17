@@ -113,15 +113,30 @@ jobs:
           # tree. `packages/services/**` is the third exclusion and is
           # deliberately NOT here: it ships via per-service Docker workflows
           # that already run its tests, and it is Python + npm, not pnpm.
+          roots=(
+            packages/plugins/sandbox-providers
+            packages/plugins/examples/plugin-orchestration-smoke-example
+          )
+
+          # Check each root SEPARATELY, before find runs. `mapfile < <(find A B)`
+          # cannot do this job: process substitution is not a pipeline, so
+          # pipefail never reaches find and errexit does not fire on it either.
+          # With two roots a missing A only makes find print to stderr and exit
+          # 1 -- it still returns B's manifests, so `manifests` is non-empty and
+          # an emptiness check passes while covering none of the providers.
+          for root in "${roots[@]}"; do
+            [ -d "$root" ] && continue
+            echo "::error::${root} is missing; this workflow's paths filter is now pointing at nothing."
+            echo "Path moved or renamed. Update the paths: filter and this list together."
+            exit 1
+          done
+
           mapfile -t manifests < <(
-            find packages/plugins/sandbox-providers \
-                 packages/plugins/examples/plugin-orchestration-smoke-example \
-              -name package.json -not -path '*/node_modules/*' | sort
+            find "${roots[@]}" -name package.json -not -path '*/node_modules/*' | sort
           )
 
           if [ "${#manifests[@]}" -eq 0 ]; then
-            echo "::error::No package.json found under packages/plugins/sandbox-providers."
-            echo "Path moved or renamed; this workflow's paths filter is now pointing at nothing."
+            echo "::error::No package.json found under: ${roots[*]}"
             exit 1
           fi
 
