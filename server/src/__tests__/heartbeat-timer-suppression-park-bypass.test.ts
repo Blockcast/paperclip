@@ -478,6 +478,10 @@ describeEmbeddedPostgres("heartbeat timer suppression is not bypassed by park/pr
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
+    // Asserted before the predicate call because `isGenericTimerWakeSnapshot`
+    // returns false for `undefined`: a missing row would otherwise satisfy the
+    // very guard that is carrying this test.
+    expect(seeded).not.toBeNull();
     expect(isGenericTimerWakeSnapshot(seeded?.snapshot as Record<string, unknown>)).toBe(false);
     expect(seeded?.wakeupRequestId).not.toBeNull();
 
@@ -489,7 +493,12 @@ describeEmbeddedPostgres("heartbeat timer suppression is not bypassed by park/pr
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     expect(parked?.errorCode).not.toBe("timer_no_actionable_work");
-    expect(parked?.status).not.toBe("cancelled");
+    // Positive, not just `not.toBe("cancelled")`. The blocker is still
+    // unresolved, so the dep-blocked re-defer must leave the row parked; a
+    // wrongly *promoted* park — the opposite failure to the one the negative
+    // assertions catch — moves it out of `scheduled_retry` and would otherwise
+    // pass both of them.
+    expect(parked?.status).toBe("scheduled_retry");
   });
 
   it("never suppresses a max_turns_continuation park, even with an empty queue", async () => {
