@@ -100,6 +100,41 @@ export type BackstopSkipReason = (typeof BACKSTOP_SKIP_REASONS)[number];
  * Abuse costs a counter increment on an existing series, never storage.
  */
 export const PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC = "paperclip_plugin_webhook_delivery_rejected_total";
+/**
+ * PEN-3000: recovery actions retired by `escalateExpiredWakeHorizons`, split by whether a wake
+ * was delivered to the action's CURRENT owner.
+ *
+ * These are two different events that render identically today. `attemptCount` is the count
+ * of wakes that actually REACHED THE QUEUE, not the count of sweeps: `upsertSourceScoped`
+ * reserves `+1` per sweep and `releaseWakeAttempt` refunds it whenever `enqueueWakeup`
+ * returned null (BLO-18996 review follow-up), so reserve-then-refund nets to zero and the
+ * counter freezes at the number of delivered wakes.
+ *
+ * The claim is scoped to the CURRENT OWNER SEQUENCE, not the row's whole life: owner churn
+ * restarts the counter (`attemptCount: isNewOwnerSequence ? 1 : existing.attemptCount + 1`
+ * in `upsertSourceScopedUnlocked`), so a row that woke owner A three times, was handed to
+ * owner B, and then had B's only reservation refunded reads `attemptCount: 0` too. A row
+ * therefore reaches its horizon at 0 only after EVERY sweep since the current owner took
+ * over failed to deliver — a wake-channel failure (provider-capacity deferral, tree pause
+ * hold, wake disabled, cooldown) for that owner, not an owner who was woken and failed to
+ * converge. Nothing on the row records the lifetime delivered count, and
+ * `previousOwnerAgentId` cannot stand in for "never churned": the stranded sweep writes it
+ * from the issue's current assignee on the very first insert (`recovery/service.ts`,
+ * `previousOwnerAgentId: input.issue.assigneeAgentId`), so it is non-null on exactly the
+ * population PEN-3000 measured and gating on it would silence the series.
+ *
+ * Splitting them is what makes the first alertable. `never_delivered` is a scheduler-side
+ * fault and should page (`PaperclipRecoveryHorizonNoWakeToCurrentOwner{Elevated,Sustained}` in
+ * `deploy/helm/paperclip/templates/prometheusrule.yaml`); `delivered` is a genuine
+ * unresolvable stranding and is expected to occur at a low background rate. Measured
+ * motivation (PEN-3000, fleet sweep of 2026-09-07): 19 of 25 live expired actions were at
+ * `attemptCount: 0`, and BLO-19124 could see the symptom but not separate the populations.
+ * The action id, cause and owner stay on the paired structured log line rather than becoming
+ * labels, matching the cardinality rule used above.
+ */
+export const RECOVERY_HORIZON_EXPIRED_METRIC = "paperclip_recovery_horizon_expired_total";
+export const RECOVERY_HORIZON_DELIVERY_STATES = ["never_delivered", "delivered"] as const;
+export type RecoveryHorizonDeliveryState = (typeof RECOVERY_HORIZON_DELIVERY_STATES)[number];
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
 /**
@@ -2038,6 +2073,7 @@ let backstopCandidatesSkipped: Counter<"source" | "reason"> | null = null;
 let pluginWebhookDeliveryRejected:
   | Counter<"plugin_key" | "response_class" | "plugin_status">
   | null = null;
+let recoveryHorizonExpired: Counter<"delivery"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -2096,6 +2132,7 @@ function ensureRegistry(): {
   backstopSweepCompletedCounter: Counter<"source">;
   backstopCandidatesSkippedCounter: Counter<"source" | "reason">;
   pluginWebhookDeliveryRejectedCounter: Counter<"plugin_key" | "response_class" | "plugin_status">;
+  recoveryHorizonExpiredCounter: Counter<"delivery">;
 } {
   if (
     !registry
@@ -2152,6 +2189,7 @@ function ensureRegistry(): {
     || !backstopSweepCompleted
     || !backstopCandidatesSkipped
     || !pluginWebhookDeliveryRejected
+    || !recoveryHorizonExpired
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -2179,10 +2217,11 @@ function ensureRegistry(): {
       help:
         "Count of heartbeat runs that reached terminal status 'failed', labeled by agent, source issue, "
         + "adapter, error_code, invocation_source (wake reason), and bounded isolation_mode. Used to "
-        + "compute webhook-driven PR-review failure rate and detect repeated run-isolated execution-pod "
-        + "failures for one issue (BLO-7457 / BLO-9147 / BLO-17953). Agent and issue identifiers are "
-        + "retained only for run-isolated k8s_pod_schedule_failed; other failures collapse them to "
-        + "bounded fallbacks.",
+        + "compute webhook-driven PR-review failure rate and detect repeated execution-pod "
+        + "failures (BLO-7457 / BLO-9147 / BLO-17953). Agent and issue identifiers are "
+        + "retained for k8s_pod_schedule_failed in every isolation mode (run, workspace and shared are "
+        + "all execution pods); other error codes collapse them to bounded fallbacks. Note issue_id is "
+        + "legitimately 'none' for stateless PR-review runs, which are issue-less by construction.",
       labelNames: ["agent_id", "issue_id", "adapter", "error_code", "invocation_source", "isolation_mode"],
       registers: [registry],
     });
@@ -2916,6 +2955,29 @@ function ensureRegistry(): {
       labelNames: ["plugin_key", "response_class", "plugin_status"],
       registers: [registry],
     });
+    recoveryHorizonExpired = new Counter({
+      name: RECOVERY_HORIZON_EXPIRED_METRIC,
+      help:
+        "Recovery actions retired at their auto-recovery wake horizon, labeled by whether a "
+        + "wake was delivered to the action's CURRENT owner. delivery=\"never_delivered\" "
+        + "means attemptCount reached the horizon at 0 — every sweep since the current owner "
+        + "took over reserved an attempt and refunded it because enqueueWakeup delivered "
+        + "nothing, so no wake reached the queue for that owner. Owner churn restarts the "
+        + "counter, so an earlier owner may have been woken; the label does not claim the row's "
+        + "whole life. That is a wake-channel fault (capacity deferral, tree pause hold, wake "
+        + "disabled, cooldown) and is the alertable one. delivery=\"delivered\" means the current "
+        + "owner was woken at least once and the recovery still did not converge, which is a "
+        + "genuine unresolvable stranding. Action id, cause and owner are on the paired "
+        + "structured log line, not these labels.",
+      labelNames: ["delivery"],
+      registers: [registry],
+    });
+    // Zero-init both series so a scrape can distinguish "no expiry yet" from "not
+    // instrumented" — same reason the backstop gauges and the workspace-fallback counter
+    // are seeded above. Without this an alert on never_delivered cannot fire off absent().
+    for (const delivery of RECOVERY_HORIZON_DELIVERY_STATES) {
+      recoveryHorizonExpired.inc({ delivery }, 0);
+    }
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -2976,6 +3038,7 @@ function ensureRegistry(): {
     backstopSweepCompletedCounter: backstopSweepCompleted,
     backstopCandidatesSkippedCounter: backstopCandidatesSkipped,
     pluginWebhookDeliveryRejectedCounter: pluginWebhookDeliveryRejected,
+    recoveryHorizonExpiredCounter: recoveryHorizonExpired,
   };
 }
 
@@ -3065,8 +3128,19 @@ export function recordHeartbeatRunFailed(
   // Per-issue labels are intentionally limited to the retry-loop failure this
   // monitor needs. Keeping them on every terminal failure would retain one
   // Prometheus counter series per historical issue for the process lifetime.
+  // The `error_code` gate alone supplies that bound: it is what confines the
+  // per-issue series to one failure mode.
+  //
+  // BLO-17953: this deliberately does NOT also gate on `isolationMode === "run"`.
+  // `resolveK8sRunIsolationIdentity` returns run | workspace | shared for every
+  // k8s adapter and all three are execution pods, so gating on "run" erased
+  // `agent_id` AND `issue_id` together — one boolean feeds both labels below —
+  // for the majority of the population the alert exists to catch (measured
+  // 2026-09-12: 54.1 of 96.2 pod-schedule failures over 24h sat in
+  // workspace/shared and were therefore unattributable). Narrowing by isolation
+  // mode never added a cardinality bound; the error code already was the bound.
   const isolationMode = normalizeIsolationMode(input.isolationMode);
-  const retainSourceIds = input.errorCode === "k8s_pod_schedule_failed" && isolationMode === "run";
+  const retainSourceIds = input.errorCode === "k8s_pod_schedule_failed";
   const labels = {
     agent_id: retainSourceIds && typeof input.agentId === "string" && input.agentId.length > 0
       ? input.agentId
@@ -4211,6 +4285,17 @@ export function recordPluginWebhookDeliveryRejected(input: {
   logPluginWebhookDeliveryRejection({ ...input, pluginKey });
 }
 
+/**
+ * PEN-3000: count a recovery action retired at its wake horizon, split on delivery.
+ *
+ * `attemptCount` counts DELIVERED wakes, not sweeps (see
+ * {@link RECOVERY_HORIZON_EXPIRED_METRIC}), so 0 is the positive signal that the wake
+ * channel refused for the entire window rather than that nothing was ever scheduled.
+ */
+export function recordRecoveryHorizonExpired(delivery: RecoveryHorizonDeliveryState): void {
+  ensureRegistry().recoveryHorizonExpiredCounter.inc({ delivery });
+}
+
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
@@ -4296,6 +4381,7 @@ export function __resetMetricsForTest(): void {
   backstopDeferredCandidates = null;
   backstopSweepCompleted = null;
   backstopCandidatesSkipped = null;
+  recoveryHorizonExpired = null;
   gbrainRecallTotal = null;
   pluginWebhookDeliveryRejected = null;
   trackedWebhookRejectionPluginKeys.clear();

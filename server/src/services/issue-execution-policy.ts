@@ -973,6 +973,31 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     return { patch };
   }
 
+  // BLO-33728: cancelling while the stage sits in `changes_requested` (the work
+  // is back with the return assignee, so there is no active stage) reaches none
+  // of the branches below — `shouldStartWorkflow` covers only done/in_review —
+  // and so used to return an empty patch, leaving a live `currentStageId` on a
+  // terminal issue. Drop only the live pointers: `lastDecisionOutcome` and
+  // `completedStageIds` are real history, and a genuine `changes_requested`
+  // must still read back as `changes_requested`. Reopening still nulls the
+  // whole state via the terminal -> active branch above, so the review path is
+  // rebuilt from scratch rather than resumed against a discharged stage.
+  if (
+    requestedStatus === "cancelled" &&
+    existingState?.status === CHANGES_REQUESTED_STATUS &&
+    existingState.currentStageId
+  ) {
+    patch.executionState = {
+      ...existingState,
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      reviewRequest: null,
+    };
+    return { patch };
+  }
+
   if (existingState?.currentStageId && !currentStage) {
     clearExecutionStatePatch({
       patch,

@@ -1073,7 +1073,9 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
     const previousPath = process.env.PATH;
     const previousTimeout = process.env.PAPERCLIP_STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_MS;
     try {
-      await fs.writeFile(path.join(fakeBin, "git"), "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
+      // The stall must stay far enough above the budget below that a probe
+      // which ignores its timeout cannot squeak in under it on a fast runner.
+      await fs.writeFile(path.join(fakeBin, "git"), "#!/bin/sh\nsleep 20\n", { mode: 0o755 });
       process.env.PATH = `${fakeBin}${path.delimiter}${previousPath ?? ""}`;
       process.env.PAPERCLIP_STRICT_GIT_CHECKOUT_PROBE_TIMEOUT_MS = "200";
       await fs.mkdir(fallbackCwd, { recursive: true });
@@ -1084,7 +1086,12 @@ describe("assertGitSensitiveAdapterWorkspaceValid rejects unsafe claude_k8s boot
         "k8s_agent_home_git_bootstrap_unsupported",
         "Refusing to dispatch claude_k8s run isolation from the fallback cwd",
       );
-      expect(Date.now() - startedAt).toBeLessThan(1_500);
+      // Boundedness, not latency: the probe's own deadline is 200ms, so a
+      // healthy run lands at ~200-400ms including spawn overhead. 5s gives
+      // that >10x headroom for merge-queue CPU contention (BLO-22985) while
+      // staying 4x under the 20s stall above, so a probe that ignores its
+      // timeout still fails here rather than passing on a widened budget.
+      expect(Date.now() - startedAt).toBeLessThan(5_000);
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;

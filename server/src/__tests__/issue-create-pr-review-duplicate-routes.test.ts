@@ -186,7 +186,7 @@ describeEmbeddedPostgres("issue create PR-review duplicate guard routes", () => 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-create-pr-review-guard-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     // Issue creation enqueues the assignee wake fire-and-forget, so an

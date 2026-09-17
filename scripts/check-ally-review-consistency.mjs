@@ -18,7 +18,10 @@
  *   I1  At most one operative App review and one operative User-seat approval
  *       per (PR, head SHA). One review in each separate lane is valid; an
  *       exact App/User pair is therefore not a duplicate, but retries within
- *       either lane remain fatal.
+ *       either lane remain fatal. A same-lane duplicate also reports whether
+ *       the bodies are identical or differ (`sameLaneBodyRelation`), because
+ *       that — not the gap between submissions — is what says whether the
+ *       missing control is submit idempotency or reviewer exclusion.
  *   I2  No operative APPROVED review whose own body reports a Critical or
  *       Important finding, no User-seat APPROVED review coexisting with a
  *       blocking App review, and no clean App approval without a `Reviewed
@@ -297,6 +300,59 @@ export function duplicateBodyAcrossIdentities(operative) {
 }
 
 /**
+ * Classifies a same-lane duplicate by comparing the bodies against each other.
+ *
+ * I1 says two reviews in one lane is a violation; it does not say which defect
+ * produced them, and the two need different fixes. The bodies discriminate:
+ *
+ *   "resubmit"  Every body is identical. One computed verdict reached GitHub
+ *               more than once, so the submit step is at-least-once. Ally holds
+ *               the composed body in context, so a retried submit re-sends the
+ *               same bytes; two independent runs cannot emit identical prose.
+ *   "recompute" The bodies differ. Two full reviews were computed for one head
+ *               and both were submitted, so the missing control is exclusion
+ *               (one reviewer per head), not submit idempotency.
+ *   "mixed"     Both shapes at once: >2 reviews, some identical, some distinct.
+ *   null        Not a duplicate, or a body is empty — an empty body is an
+ *               attestation defect (I3), and guessing a mode from it would
+ *               assert a mechanism the evidence does not carry.
+ *
+ * Timing is NOT a substitute for this. PEN-2865 first split these modes by the
+ * gap between submissions on the theory that seconds meant a retry and hours
+ * meant a re-review. Measured on paperclip#1220, two reviews 10 s apart carried
+ * different bodies (8513 vs 6564 bytes) — a genuine double-compute inside the
+ * window the timing rule reserved for retries. Reporting the gap alone had
+ * already produced one wrong recommendation, which is why the classification
+ * lives here rather than in the reader's head.
+ *
+ * Keep the label free of any 6-digit-or-longer number. `violationFingerprint`
+ * harvests every such token out of the message text, so a count or an account
+ * id embedded here would change the fingerprint of an I1 finding and silently
+ * void the matching baseline suppression.
+ */
+export function sameLaneBodyRelation(operative) {
+  const reviews = operative ?? [];
+  if (reviews.length < 2) return null;
+  const bodies = reviews.map(normalizedBody);
+  if (bodies.some((body) => body === "")) return null;
+  const identical = bodies.every((body) => body === bodies[0]);
+  if (identical) return "resubmit";
+  const anyPairIdentical = bodies.some((body, i) =>
+    bodies.some((other, j) => j > i && body === other),
+  );
+  return anyPairIdentical ? "mixed" : "recompute";
+}
+
+const SAME_LANE_RELATION_NOTES = {
+  resubmit:
+    "the bodies are identical — one verdict submitted more than once, so the submit step is at-least-once",
+  recompute:
+    "the bodies differ — two reviews were computed for this one head and both submitted, so the missing control is exclusion, not submit idempotency",
+  mixed:
+    "some bodies are identical and some differ — both a repeated submit and an independent recomputation are present",
+};
+
+/**
  * The only permitted two-review shape: one current-head clean review from the
  * required App identity and one from the required User seat. Independently
  * authored PRs require formal approval in both lanes. For an App-authored PR,
@@ -366,8 +422,10 @@ export function findPrViolations(pr) {
     const label = laneLabel(lane);
 
     if (reviews.length > 1) {
+      const relation = SAME_LANE_RELATION_NOTES[sameLaneBodyRelation(reviews)];
       violations.push(
-        `I1 PR #${pr.number} @${short}: ${reviews.length} operative ${label} reviews (${reviewDetails(reviews)}) — expected at most 1 in the ${lane} lane`,
+        `I1 PR #${pr.number} @${short}: ${reviews.length} operative ${label} reviews (${reviewDetails(reviews)}) — expected at most 1 in the ${lane} lane` +
+          (relation ? `; ${relation}` : ""),
       );
     }
 
