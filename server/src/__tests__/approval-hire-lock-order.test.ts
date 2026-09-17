@@ -177,11 +177,11 @@ describeEmbeddedPostgres("hire_agent approval takes the budget_policies lock fir
     } finally {
       release();
       await held;
+      await holder.$client.end();
+      await prober.$client.end();
     }
 
     await expect(decision).resolves.toMatchObject({ applied: true });
     await expect(agentService(db).getById(pending.id)).resolves.toMatchObject({ status: "idle" });
-    await holder.$client.end();
-    await prober.$client.end();
   });
 });
