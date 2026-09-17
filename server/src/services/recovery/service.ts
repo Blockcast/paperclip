@@ -134,6 +134,7 @@ import {
 import {
   recordBackstopCandidateSkipped,
   recordBackstopSweepCompleted,
+  recordRecoveryHorizonExpired,
   setBackstopDeferredCandidates,
 } from "../metrics.js";
 import {
@@ -2255,8 +2256,10 @@ export function recoveryService(
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
 
-  async function getAgent(agentId: string) {
-    return db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
+  // Same rule as `getCompanyIssuePrefix`: under `lockIssueParentMutationCompany`
+  // this must read on the caller's transaction, not a second pool connection.
+  async function getAgent(agentId: string, dbOrTx: Db | DbTransaction = db) {
+    return dbOrTx.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
   }
 
   async function isAgentInvokable(agent: typeof agents.$inferSelect | null | undefined) {
@@ -2290,8 +2293,12 @@ export function recoveryService(
     finishedAt: heartbeatRuns.finishedAt,
   } as const;
 
-  async function getLatestIssueRun(companyId: string, issueId: string): Promise<LatestIssueRun> {
-    return db
+  async function getLatestIssueRun(
+    companyId: string,
+    issueId: string,
+    dbOrTx: Db | DbTransaction = db,
+  ): Promise<LatestIssueRun> {
+    return dbOrTx
       .select(LATEST_ISSUE_RUN_COLUMNS)
       .from(heartbeatRuns)
       .where(
@@ -3437,8 +3444,13 @@ export function recoveryService(
     return { assigned, skipped, issueIds };
   }
 
-  async function getCompanyIssuePrefix(companyId: string) {
-    return db
+  // Runs on the caller's transaction when one is open. Two callers hold
+  // `lockIssueParentMutationCompany` (the company-wide issue-graph lock) when
+  // they get here; taking a second pool connection under that lock starved the
+  // 10-connection pool once the lock had enough waiters, and the holder then
+  // idled until a waiter hit lock_timeout (BLO-34207).
+  async function getCompanyIssuePrefix(companyId: string, dbOrTx: Db | DbTransaction = db) {
+    return dbOrTx
       .select({ issuePrefix: companies.issuePrefix })
       .from(companies)
       .where(eq(companies.id, companyId))
@@ -5770,7 +5782,7 @@ export function recoveryService(
       recoveryCause !== "workspace_validation_failed" &&
       recoveryCause !== "configuration_incomplete";
     const sourceAssignee = input.issue.assigneeAgentId
-      ? await getAgent(input.issue.assigneeAgentId)
+      ? await getAgent(input.issue.assigneeAgentId, dbOrTx)
       : null;
     const now = new Date();
     const boundsAtCreation = wakesOwner ? recoveryActionBoundsAtCreation(now) : null;
@@ -6498,7 +6510,7 @@ export function recoveryService(
       );
       if (!updated) return null;
 
-      const prefix = await getCompanyIssuePrefix(fresh.companyId);
+      const prefix = await getCompanyIssuePrefix(fresh.companyId, tx);
       await issuesSvc.addComment(
         fresh.id,
         buildRecoveryIssueInPlaceEscalationComment({
@@ -7360,7 +7372,12 @@ export function recoveryService(
       // end: the action stays active, so the next sweep re-enters here, observes the
       // stamp, and escalates then — the cost of losing the race is one status-only wake
       // out of the attempt budget, not a permanent status-only trap.
-      const newestIssueRun = await getLatestIssueRun(input.issue.companyId, input.issue.id);
+      // On the caller tx: this runs while `lockIssueOwnership` is held, so a pooled
+      // read would take a second connection out of POSTGRES_POOL_MAX=10 while holding
+      // the lock (BLO-34207). Freshness is unchanged — these transactions run at
+      // READ COMMITTED, where each statement takes its own snapshot at statement
+      // start, so the tx read observes exactly the committed rows a pooled read would.
+      const newestIssueRun = await getLatestIssueRun(input.issue.companyId, input.issue.id, tx);
       const documentWriteRefusedRunId = newestIssueRun?.statusOnlyDocumentWriteRefusedAt
         ? newestIssueRun.id
         : null;
@@ -7578,10 +7595,10 @@ export function recoveryService(
         };
       }
 
-      const prefix = await getCompanyIssuePrefix(fresh.companyId);
+      const prefix = await getCompanyIssuePrefix(fresh.companyId, tx);
       const workspacePreflightHandoffCause = describeWorkspacePreflightRecoveryCause(input.latestRun);
-      const recoveryOwner = action.ownerAgentId ? await getAgent(action.ownerAgentId) : null;
-      const sourceAssignee = fresh.assigneeAgentId ? await getAgent(fresh.assigneeAgentId) : null;
+      const recoveryOwner = action.ownerAgentId ? await getAgent(action.ownerAgentId, tx) : null;
+      const sourceAssignee = fresh.assigneeAgentId ? await getAgent(fresh.assigneeAgentId, tx) : null;
       let notice: SuccessfulRunHandoffNotice | null = null;
       if (recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON && input.successfulRunHandoffEvidence) {
         notice = buildSuccessfulRunHandoffExhaustedNotice({
@@ -12249,7 +12266,14 @@ export function recoveryService(
     now?: Date;
     limit?: number;
   }) {
-    const result = { checked: 0, escalated: 0, announced: 0, actionIds: [] as string[], issueIds: [] as string[] };
+    const result = {
+      checked: 0,
+      escalated: 0,
+      neverDelivered: 0,
+      announced: 0,
+      actionIds: [] as string[],
+      issueIds: [] as string[],
+    };
     const now = opts?.now ?? new Date();
 
     const expired = await recoveryActionsSvc.escalateExpiredWakeHorizons({
@@ -12265,6 +12289,20 @@ export function recoveryService(
       result.actionIds.push(action.id);
       result.issueIds.push(action.sourceIssueId);
 
+      // PEN-3000: `attemptCount` counts wakes that REACHED THE QUEUE, not sweeps — every
+      // sweep reserves +1 and refunds it when `enqueueWakeup` returned null, so the counter
+      // freezes at the delivered count. It also restarts on owner change (`isNewOwnerSequence`
+      // in `upsertSourceScopedUnlocked`), so 0 means no wake was delivered to the CURRENT
+      // owner since it took over — not necessarily across the row's whole life. Within that
+      // scope it is a wake-channel fault rather than an owner who was woken and did not
+      // converge; those are different incidents with different responders and they render
+      // identically without this split. Not gated on `previousOwnerAgentId`: the stranded
+      // sweep writes it from the issue's assignee on the first insert (see `upsertSourceScoped`
+      // call above), so it is non-null on the un-churned rows this label exists to catch.
+      const neverDelivered = action.attemptCount === 0;
+      if (neverDelivered) result.neverDelivered += 1;
+      recordRecoveryHorizonExpired(neverDelivered ? "never_delivered" : "delivered");
+
       logger.warn(
         {
           actionId: action.id,
@@ -12274,6 +12312,7 @@ export function recoveryService(
           ownerAgentId: action.ownerAgentId,
           attemptCount: action.attemptCount,
           maxAttempts: action.maxAttempts,
+          neverDelivered,
           timeoutAt: action.timeoutAt,
           runId: opts?.runId ?? null,
         },
@@ -12313,8 +12352,15 @@ export function recoveryService(
             `- Auto-recovery horizon: ${horizonAt}`,
             `- Cause: \`${action.cause}\``,
             action.attemptCount === 0
-              ? "- Note: this action never made a single wake attempt before its window closed, so the stranding it " +
-                "was opened to repair was never actually worked."
+              ? "- Note: no wake reached the queue for this action's current owner. `Attempts` counts wakes " +
+                "that were DELIVERED, not sweeps attempted — each sweep reserves an attempt and refunds it " +
+                "when the wake is not delivered, and the count restarts when ownership changes — so 0 means " +
+                "every sweep since the current owner took over was refused by the wake channel " +
+                "(provider-capacity deferral, an active tree pause hold, wake disabled, or cooldown). An " +
+                "earlier owner may have been woken; check the action's owner history before concluding the " +
+                "whole window was refused. Within the current owner's tenure the stranding this action was " +
+                "opened to repair was never worked, and that is a scheduler-side fault rather than an owner " +
+                "who was woken and could not resolve it."
               : "- Note: reassigning will NOT restore the wake budget — the horizon above is fixed for the life of " +
                 "the action, so a new owner does not get fresh attempts.",
             "- Next action: discharge or cancel this recovery action, or record an intentional manual resolution.",
@@ -13453,6 +13499,7 @@ export function recoveryService(
       strandedRecoveryWakeEnqueueFailed: 0,
       strandedRecoveryWakeIssueIds: [] as string[],
       expiredRecoveryHorizonsEscalated: 0,
+      expiredRecoveryHorizonsNeverDelivered: 0,
       expiredRecoveryHorizonsAnnounced: 0,
       expiredRecoveryHorizonIssueIds: [] as string[],
       issueIds: [] as string[],
@@ -13500,6 +13547,7 @@ export function recoveryService(
       now,
     });
     result.expiredRecoveryHorizonsEscalated = expiredHorizons.escalated;
+    result.expiredRecoveryHorizonsNeverDelivered = expiredHorizons.neverDelivered;
     result.expiredRecoveryHorizonsAnnounced = expiredHorizons.announced;
     result.expiredRecoveryHorizonIssueIds = expiredHorizons.issueIds;
 

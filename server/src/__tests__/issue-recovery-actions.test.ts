@@ -1246,6 +1246,114 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("does not take a second pool connection while holding the issue-graph lock", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => ({ id: randomUUID() })) });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "agent is not invokable",
+      errorCode: "agent_not_invokable",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    // BLO-34207: the escalation holds `lockIssueParentMutationCompany` inside
+    // its `db.transaction` callback. A pooled statement issued from inside that
+    // callback needs a second connection; with POSTGRES_POOL_MAX = 10 and the
+    // lock's waiters holding the rest of the pool, the holder idled until a
+    // waiter hit lock_timeout and dispatch stalled fleet-wide. Record every
+    // pooled statement issued while a transaction callback is open.
+    type AnyFn = (...args: unknown[]) => unknown;
+    const dbRecord = db as unknown as Record<string, AnyFn>;
+    const pooledMethods = ["select", "insert", "update", "delete", "execute"] as const;
+    const originals = new Map<string, { fn: AnyFn; own: boolean }>();
+    for (const method of ["transaction", ...pooledMethods]) {
+      originals.set(method, {
+        fn: dbRecord[method]!.bind(db),
+        own: Object.prototype.hasOwnProperty.call(db, method),
+      });
+    }
+    let openTransactions = 0;
+    const pooledInsideTransaction: string[] = [];
+    dbRecord.transaction = async (...args: unknown[]) => {
+      openTransactions += 1;
+      try {
+        return await originals.get("transaction")!.fn(...args);
+      } finally {
+        openTransactions -= 1;
+      }
+    };
+    for (const method of pooledMethods) {
+      dbRecord[method] = (...args: unknown[]) => {
+        if (openTransactions > 0) {
+          // Name the offending call site so a regression reads as a location,
+          // not as a bare method name.
+          const frames = (new Error().stack ?? "")
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => line.includes("/services/") && !line.includes("node_modules"))
+            .slice(0, 2)
+            .map((line) => line.replace(/^at /, "").replace(/ \(.*$/, ""));
+          pooledInsideTransaction.push(`${method} @ ${frames.join(" <- ") || "unknown"}`);
+        }
+        return originals.get(method)!.fn(...args);
+      };
+    }
+    try {
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      });
+    } finally {
+      for (const [method, original] of originals) {
+        if (original.own) dbRecord[method] = original.fn;
+        else delete dbRecord[method];
+      }
+    }
+
+    // Fixed here: the escalation body's own `getCompanyIssuePrefix` and
+    // `getAgent` reads now run on `tx`. Still pooled under the lock, tracked on
+    // BLO-34207: owner resolution (`resolveStrandedIssueRecoveryOwnerAgentId`
+    // -> `getAgent` / `isAgentInvokable` / `budgets.getInvocationBlock` /
+    // instance settings). This ratchet fails on any new pooled call site and on
+    // a regression of the two fixed ones.
+    const knownPooledUnderLock = [
+      "resolveStrandedIssueRecoveryOwnerAgentId",
+      "isAgentInvokable",
+      "evaluateAgentInvokabilityFromDb",
+      "getInvocationBlock",
+      "getOrCreateRow",
+      // Deliberately pooled, NOT an unconverted call site. This read wants the
+      // freshest COMMITTED `heartbeat_runs` stamp: the stamp writer
+      // (`routes/issues.ts`, the statusOnly document-write refusal path) writes on
+      // the pooled connection and takes no advisory lock, so it does not serialize
+      // against `lockIssueOwnership`. Moving this onto the caller tx would bind it
+      // to the transaction snapshot and WIDEN the stale-read window the call site's
+      // own comment exists to narrow. See recovery/service.ts:7362-7371.
+      "getLatestIssueRun",
+    ];
+    const unexpected = pooledInsideTransaction.filter(
+      (entry) => !knownPooledUnderLock.some((name) => entry.includes(name)),
+    );
+    expect(unexpected).toEqual([]);
+    expect(pooledInsideTransaction.filter((entry) => entry.includes("getCompanyIssuePrefix"))).toEqual([]);
+    expect(
+      pooledInsideTransaction.filter((entry) => entry.includes("getAgent <- escalateStrandedAssignedIssue")),
+    ).toEqual([]);
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actionRows).toHaveLength(1);
+  });
+
   it("does not mutate an ownerless action on repeated sweep passes", async () => {
     const { coderId, managerId, sourceIssue } = await seedCompany();
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
