@@ -701,8 +701,12 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
   it("refuses clean when the PR author is unknown", () => {
     // Fail closed on absence: the caller silently not supplying the author is
     // exactly how this defect shipped, so an omission must not read as green.
+    // `null`, not an omitted key — that is what the production caller sends,
+    // and only `tsconfig`'s `exclude` of `src/__tests__` lets a call site here
+    // omit a required field at all.
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
+      prAuthorLogin: null,
       comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
     });
 
@@ -738,6 +742,10 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
 
     expect(atHead).toMatchObject({ state: "failure", outcome: "blocking_finding" });
     expect(carried).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    // Nothing attests the current head here, so the original tail is the
+    // accurate one. Pinned alongside the two withheld-positive variants so the
+    // three cannot be collapsed back into a single unconditional string.
+    expect(carried.reason).toMatch(/no comment attests the current head/i);
   });
 
   it("does not let a self-attestation cancel a finding carried from an earlier head", () => {
@@ -760,12 +768,30 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
     // must not be able to hide the red either. The caller only fetches the
     // author on `authorUnknown`, so returning the red here means it publishes
     // without the author at all.
-    const authorUnknown = evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments });
+    const authorUnknown = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: null,
+      comments,
+    });
 
     expect(selfAttested).toMatchObject({ state: "failure", outcome: "carried_finding" });
     expect(commentReviewGateCheckConclusion(selfAttested)).toBe("failure");
     expect(authorUnknown).toMatchObject({ state: "failure", outcome: "carried_finding" });
     expect(authorUnknown.authorUnknown).toBeUndefined();
+
+    // The red must not tell the author "no comment attests the current head":
+    // on both these routes one does, and the action that sentence invites is
+    // the one they just took and the one that cannot clear a carried finding.
+    // Assert the replacement text too — `not.toMatch` alone passes on any
+    // rewording, including one that drops the explanation entirely.
+    expect(selfAttested.reason).not.toMatch(/no comment attests the current head/i);
+    expect(selfAttested.reason).toMatch(/the only comment attesting it is the PR author's own/i);
+    expect(authorUnknown.reason).not.toMatch(/no comment attests the current head/i);
+    expect(authorUnknown.reason).toMatch(/its only attestation is not known to be independent/i);
+    // GitHub truncates a commit-status description at 140 characters, and
+    // `verdict.reason` is written to it verbatim.
+    expect(selfAttested.reason.length).toBeLessThanOrEqual(140);
+    expect(authorUnknown.reason.length).toBeLessThanOrEqual(140);
 
     // Control: an INDEPENDENT attestation of the current head still dispositions
     // the earlier head's finding. That is pre-existing BLO-29711 behaviour and
@@ -780,6 +806,7 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
     // to the carried check must not drop it on the way past.
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
+      prAuthorLogin: null,
       comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
     });
 
