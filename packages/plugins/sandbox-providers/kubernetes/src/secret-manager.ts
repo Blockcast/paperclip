@@ -1,4 +1,3 @@
-import { PatchStrategy, setHeaderOptions } from "@kubernetes/client-node";
 import type { KubeClients } from "./kube-client.js";
 
 export interface CreatePerRunSecretInput {
@@ -106,42 +105,17 @@ export async function createPerRunSecret(clients: KubeClients, input: CreatePerR
       throw new Error(`Secret ${input.namespace}/${input.secretName} already exists with unexpected Paperclip identity`);
     }
 
-    // A merge PATCH, not `replaceNamespacedSecret`. A replace is a PUT, i.e.
-    // the `update` verb; `patch` is the narrower verb for the same effect and
-    // there is no reason for an adoption write to ask for the wider one.
-    //
-    // Do NOT read the sibling's RBAC argument onto this call. The vendored
-    // claude_k8s adapter writes into the release namespace, which
-    // `deploy/helm/paperclip/templates/role.yaml` governs; this plugin writes
-    // into per-tenant namespaces (`deriveTenantNamespace`, plugin.ts), and
-    // nothing in-tree grants the server's service account secrets there at
-    // all. Measured 2026-09-16 by SSAR as
-    // `system:serviceaccount:paperclip:paperclip`: in ns `paperclip`
-    // create/get/patch/update/delete are all allowed, while in a tenant
-    // namespace every one of them is denied — including `create`. So this
-    // verb change cannot introduce a 403 that did not already exist: the
-    // `createNamespacedSecret` above fails first and this line is
-    // unreachable. The tenant-namespace RBAC gap is real and is a separate
-    // defect (the Role `ensureTenantNamespace` provisions grants only
-    // `pods/log: get`, and to the tenant SA, not to ours); it is not created
-    // or worsened here.
-    //
-    // `resourceVersion` is still carried, so a concurrent writer still
-    // surfaces as a 409 rather than being silently clobbered.
-    await clients.core.patchNamespacedSecret(
-      {
-        namespace: input.namespace,
-        name: input.secretName,
-        body: {
-          ...body,
-          metadata: {
-            ...body.metadata,
-            resourceVersion: existing.metadata?.resourceVersion,
-          },
+    await clients.core.replaceNamespacedSecret({
+      namespace: input.namespace,
+      name: input.secretName,
+      body: {
+        ...body,
+        metadata: {
+          ...body.metadata,
+          resourceVersion: existing.metadata?.resourceVersion,
         },
       },
-      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
-    );
+    });
   }
 }
 

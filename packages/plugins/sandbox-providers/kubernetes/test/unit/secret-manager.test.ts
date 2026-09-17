@@ -60,33 +60,19 @@ describe("createPerRunSecret", () => {
         },
       },
     });
-    const patch = vi.fn().mockResolvedValue({});
-    const clients = { core: { createNamespacedSecret: create, readNamespacedSecret: read, patchNamespacedSecret: patch } };
+    const replace = vi.fn().mockResolvedValue({});
+    const clients = { core: { createNamespacedSecret: create, readNamespacedSecret: read, replaceNamespacedSecret: replace } };
 
     await createPerRunSecret(clients as never, baseInput);
 
     expect(read).toHaveBeenCalledWith({ namespace: "paperclip-acme", name: "r-abcd-env" });
-    expect(patch).toHaveBeenCalledWith(
-      expect.objectContaining({
-        namespace: "paperclip-acme",
-        name: "r-abcd-env",
-        body: expect.objectContaining({ metadata: expect.objectContaining({ resourceVersion: "7" }) }),
-      }),
-      expect.anything(),
-    );
-    const replacement = patch.mock.calls[0][0].body;
+    expect(replace).toHaveBeenCalledWith(expect.objectContaining({
+      namespace: "paperclip-acme",
+      name: "r-abcd-env",
+      body: expect.objectContaining({ metadata: expect.objectContaining({ resourceVersion: "7" }) }),
+    }));
+    const replacement = replace.mock.calls[0][0].body;
     expect(replacement.metadata.ownerReferences[0].uid).toBe(baseInput.ownerUid);
-
-    // BLO-32424: this must be a merge PATCH, not a PUT. The in-cluster service
-    // account holds `patch` on secrets but not `update`, so a replace here is
-    // refused 403 on every collision. The client's default Content-Type for
-    // patch is json-patch+json, which would reject this object body, so the
-    // explicit header is load-bearing rather than decorative.
-    const headers: Record<string, string> = {};
-    for (const mw of patch.mock.calls[0][1].middleware) {
-      mw.pre({ setHeaderParam: (k: string, v: string) => void (headers[k] = v) });
-    }
-    expect(headers["Content-Type"]).toBe("application/merge-patch+json");
   });
 
   it("rejects a 409 Secret belonging to another run", async () => {
@@ -101,12 +87,12 @@ describe("createPerRunSecret", () => {
             },
           },
         }),
-        patchNamespacedSecret: vi.fn(),
+        replaceNamespacedSecret: vi.fn(),
       },
     };
 
     await expect(createPerRunSecret(clients as never, baseInput)).rejects.toThrow(/unexpected Paperclip identity/);
-    expect(clients.core.patchNamespacedSecret).not.toHaveBeenCalled();
+    expect(clients.core.replaceNamespacedSecret).not.toHaveBeenCalled();
   });
 
   it("throws if adapterEnv contains BOOTSTRAP_TOKEN", async () => {
