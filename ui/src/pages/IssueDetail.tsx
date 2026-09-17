@@ -206,6 +206,8 @@ import {
   type IssueTreeControlMode,
   type WorkspaceFileRef,
   workspaceFileRefSchema,
+  promptTokens,
+  totalTokens as sumTotalTokens,
 } from "@paperclipai/shared";
 
 type StopAndFinalizeRunError = Error & {
@@ -1335,7 +1337,18 @@ function IssueDetailActivityTab({
     for (const run of linkedRuns ?? []) {
       const usage = asRecord(run.usageJson);
       const result = asRecord(run.resultJson);
-      const runInput = usageNumber(usage, "inputTokens", "input_tokens");
+      // BLO-29842: untyped `usage_json`, so the BilledTokenCounts split cannot reach
+      // this site as a compile error. Fold cache WRITES back in to keep the
+      // `promptTokens` meaning `inputTokens` carried before the split; without it a
+      // cache-write-only run reads as no tokens at all. Cache READS stay separate.
+      const runInput =
+        usageNumber(usage, "inputTokens", "input_tokens")
+        + usageNumber(
+          usage,
+          "cacheCreationInputTokens",
+          "cache_creation_input_tokens",
+          "rawCacheCreationInputTokens",
+        );
       const runOutput = usageNumber(usage, "outputTokens", "output_tokens");
       const runCached = usageNumber(
         usage,
@@ -1366,7 +1379,8 @@ function IssueDetailActivityTab({
       output,
       cached,
       cost,
-      totalTokens: input + output,
+      // matches the issue-tree figure below, which uses shared `totalTokens()`
+      totalTokens: input + cached + output,
       hasCost,
       hasTokens,
       runtimeMs,
@@ -1374,8 +1388,7 @@ function IssueDetailActivityTab({
       hasRuntime: runtimeMs > 0,
     };
   }, [linkedRuns]);
-  const issueTreeCostTokens =
-    (issueTreeCostSummary?.inputTokens ?? 0) + (issueTreeCostSummary?.outputTokens ?? 0);
+  const issueTreeCostTokens = issueTreeCostSummary ? sumTotalTokens(issueTreeCostSummary) : 0;
   const hasIssueTreeCost =
     !!issueTreeCostSummary
     && (issueTreeCostSummary.costCents > 0
@@ -1437,8 +1450,8 @@ function IssueDetailActivityTab({
                   <span>
                     Tokens {formatTokens(issueTreeCostTokens)}
                     {issueTreeCostSummary.cachedInputTokens > 0
-                      ? ` (in ${formatTokens(issueTreeCostSummary.inputTokens)}, out ${formatTokens(issueTreeCostSummary.outputTokens)}, cached ${formatTokens(issueTreeCostSummary.cachedInputTokens)})`
-                      : ` (in ${formatTokens(issueTreeCostSummary.inputTokens)}, out ${formatTokens(issueTreeCostSummary.outputTokens)})`}
+                      ? ` (in ${formatTokens(promptTokens(issueTreeCostSummary))}, out ${formatTokens(issueTreeCostSummary.outputTokens)}, cached ${formatTokens(issueTreeCostSummary.cachedInputTokens)})`
+                      : ` (in ${formatTokens(promptTokens(issueTreeCostSummary))}, out ${formatTokens(issueTreeCostSummary.outputTokens)})`}
                   </span>
                   {issueTreeCostSummary.runCount > 0 ? (
                     <span>
