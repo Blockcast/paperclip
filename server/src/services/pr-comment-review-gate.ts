@@ -31,6 +31,7 @@ import {
   githubPostCheckRun,
   githubPostCommitStatusDetailed,
   githubReviewerIdentityMatches,
+  githubSharesReviewerIdentity,
   type GitHubCheckRunConclusion,
   type GitHubCommitStatusPostResult,
 } from "./github-app-auth.js";
@@ -341,6 +342,18 @@ export function evaluateCommentReviewGate(input: {
   const normalizedHead = headSha.toLowerCase();
   const forHead = latestAttestingAllyComment(comments, reviewerBotLogin, normalizedHead);
 
+  // Set when an attestation for this head exists but its positive claim is
+  // withheld. HELD rather than returned: withholding a positive is not an
+  // all-clear, so the carried-finding check below still has to run. Returning
+  // here made the author strictly better off posting a self-attestation than
+  // posting nothing — either withheld positive silently converted a red
+  // carried from an earlier head into `neutral`, because
+  // `headsWithUndispositionedFinding` is only reached when NOTHING attests the
+  // current head. The `clean` return below is deliberately not held: an
+  // independent attestation of the current head does disposition an earlier
+  // head's finding, which is the pre-existing BLO-29711 behaviour.
+  let withheldPositive: CommentReviewGateVerdict | null = null;
+
   if (forHead) {
     if (hasActionablePrReviewFeedback(forHead.comment.body)) {
       return {
@@ -357,36 +370,43 @@ export function evaluateCommentReviewGate(input: {
     // must not get wrong.
     const prAuthorLogin = input.prAuthorLogin?.trim();
     if (!prAuthorLogin) {
-      return {
+      withheldPositive = {
         state: "success",
         outcome: "not_evaluated",
         authorUnknown: true,
         reason: "The PR author is unknown, so this head's attestation cannot be shown to be independent.",
       };
-    }
-    if (githubReviewerIdentityMatches(prAuthorLogin, reviewerBotLogin)) {
-      return {
+      // `githubSharesReviewerIdentity`, not `githubReviewerIdentityMatches`: the
+      // strict predicate exists to keep the bare `<slug>` user seat from being
+      // CREDITED as the reviewer, and that fail direction is inverted here. The
+      // seat and the App are one agent wearing two hats, so a PR opened by the
+      // seat and attested by the App is still a self-attestation.
+    } else if (githubSharesReviewerIdentity(prAuthorLogin, reviewerBotLogin)) {
+      withheldPositive = {
         state: "success",
         outcome: "not_evaluated",
         reason: "The only comment attesting this head is the PR author's own; nothing independent reviewed it.",
       };
+    } else {
+      return {
+        state: "success",
+        outcome: "clean",
+        reason:
+          "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
+      };
     }
-    return {
-      state: "success",
-      outcome: "clean",
-      reason:
-        "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
-    };
   }
 
-  // Nothing attests this head. A finding raised against an earlier head is not
-  // dispositioned by replacing that head, so it carries forward rather than
-  // going green (BLO-29711). It is disposed by a later clean review of that
-  // same earlier head, or by a later review that names it as resolved in its
-  // prior-findings ledger — see headsWithUndispositionedFinding. It also clears
-  // the moment Ally attests the current head. Note that none of those routes
-  // exists while the reviewer itself is failing to run, which is the state that
-  // strands a PR here.
+  // Nothing attests this head, or what does cannot make the positive claim. A
+  // finding raised against an earlier head is not dispositioned by replacing
+  // that head, so it carries forward rather than going green (BLO-29711). It is
+  // disposed by a later clean review of that same earlier head, or by a later
+  // review that names it as resolved in its prior-findings ledger — see
+  // headsWithUndispositionedFinding. It also clears the moment an INDEPENDENT
+  // review attests the current head; the author's own attestation does not,
+  // which is why `withheldPositive` falls through to here rather than returning.
+  // Note that none of those routes exists while the reviewer itself is failing
+  // to run, which is the state that strands a PR here.
   const [carried] = headsWithUndispositionedFinding(comments, reviewerBotLogin);
   if (carried) {
     const shortHead = carried.attestedHeadSha.slice(0, 7);
@@ -414,11 +434,17 @@ export function evaluateCommentReviewGate(input: {
     };
   }
 
-  return {
-    state: "success",
-    outcome: "not_evaluated",
-    reason: "No Ally consolidated-review comment attests to reviewing this head.",
-  };
+  // The withheld positive is the accurate verdict only once no red carries: a
+  // comment DOES attest this head, so the generic "no comment attests" reason
+  // below would be false, and `authorUnknown` has to survive for the caller to
+  // know this is the one outcome worth a PR-author fetch.
+  return (
+    withheldPositive ?? {
+      state: "success",
+      outcome: "not_evaluated",
+      reason: "No Ally consolidated-review comment attests to reviewing this head.",
+    }
+  );
 }
 
 /**

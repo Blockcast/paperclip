@@ -740,6 +740,69 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
     expect(carried).toMatchObject({ state: "failure", outcome: "carried_finding" });
   });
 
+  it("does not let a self-attestation cancel a finding carried from an earlier head", () => {
+    // Each half of this pair was already covered; the combination was not, and
+    // only the combination reaches the branch. Withholding the positive is not
+    // an all-clear, so the carried check must still run — otherwise the author
+    // is strictly BETTER OFF posting a self-attestation than posting nothing,
+    // which turns the whole gate into an opt-out.
+    const comments = [
+      allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+      allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z"),
+    ];
+
+    const selfAttested = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments,
+    });
+    // The other route to the same suppression: an unreadable `GET /pulls/{n}`
+    // must not be able to hide the red either. The caller only fetches the
+    // author on `authorUnknown`, so returning the red here means it publishes
+    // without the author at all.
+    const authorUnknown = evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments });
+
+    expect(selfAttested).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(commentReviewGateCheckConclusion(selfAttested)).toBe("failure");
+    expect(authorUnknown).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(authorUnknown.authorUnknown).toBeUndefined();
+
+    // Control: an INDEPENDENT attestation of the current head still dispositions
+    // the earlier head's finding. That is pre-existing BLO-29711 behaviour and
+    // this change must not tighten it.
+    expect(
+      evaluateCommentReviewGate({ headSha: CURRENT_HEAD, prAuthorLogin: DISTINCT_PR_AUTHOR, comments }),
+    ).toMatchObject({ state: "success", outcome: "clean" });
+  });
+
+  it("keeps authorUnknown on the withheld positive when nothing carries", () => {
+    // The caller keys its one PR-author fetch on this flag, so falling through
+    // to the carried check must not drop it on the way past.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
+    });
+
+    expect(verdict).toMatchObject({ outcome: "not_evaluated", authorUnknown: true });
+    // And the reason must not claim nothing attests this head — one does.
+    expect(verdict.reason).not.toMatch(/No Ally consolidated-review comment attests/i);
+  });
+
+  it("treats the bare user seat as the same agent when it authored the PR", () => {
+    // Inverted fail direction: the strict predicate excludes the `<slug>` user
+    // seat so it can never be CREDITED as the reviewer. Detecting a
+    // self-attestation wants the opposite — seat and App are one agent in two
+    // hats, so a seat-authored PR attested by the App is not independent.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: "allyblockcast",
+      comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
+    });
+
+    expect(verdict).toMatchObject({ outcome: "not_evaluated" });
+    expect(commentReviewGateCheckConclusion(verdict)).toBe("neutral");
+  });
+
   it("is flagged by the census predicate under a review/ context", () => {
     // A self-attested green is as misreadable under `review/` as a plain
     // not-evaluated one, and the census must see the description as admitting

@@ -88,6 +88,24 @@ export function githubReviewerIdentityMatches(login: string, configuredLogin: st
 }
 
 /**
+ * Match ANY spelling of the reviewer identity, the bare `<slug>` user seat
+ * included.
+ *
+ * The fail direction is the inverse of `githubReviewerIdentityMatches`, so the
+ * two are not interchangeable. CREDITING a review must exclude the user seat:
+ * it is a distinct principal, and counting it would let a human-shaped account
+ * speak as the reviewer. DETECTING a self-attestation must include it: the seat
+ * and the App are one agent wearing two hats, so a PR opened by the seat and
+ * attested by the App is still nothing independent examining that head.
+ */
+export function githubSharesReviewerIdentity(login: string, configuredLogin: string): boolean {
+  const candidate = exactGithubLogin(login);
+  const appSlug = githubReviewerAppSlug(configuredLogin);
+  if (!candidate || !appSlug) return false;
+  return candidate === appSlug || githubReviewerIdentityMatches(login, configuredLogin);
+}
+
+/**
  * Mint an RS256 GitHub App JWT (valid ~9 min). Returns null when the App id or
  * private key is unconfigured.
  */
