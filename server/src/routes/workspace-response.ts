@@ -253,13 +253,18 @@ export function publicWorkspaceOperations(
  * with an unresolved owner would NOT fail closed. Human operators keep the read,
  * matching the board carve-out the decider makes itself and the operator UI that
  * renders these excerpts.
+ *
+ * The return type carries `withheldFields` optionally rather than dropping it:
+ * an entitled row keeps the key absent, a withheld row carries the list, and
+ * that is the documented difference between "not entitled" and "captured no
+ * output" (`doc/DEVELOPING.md`). Declaring the plain row type erased it.
  */
 export async function withholdUnentitledWorkspaceOperationOutput(
   operations: WorkspaceOperation[],
   owners: Map<string, string>,
   gate: (agentId: string) => Promise<boolean>,
   actorIsHumanOperator: boolean,
-): Promise<WorkspaceOperation[]> {
+): Promise<Array<WorkspaceOperation & { withheldFields?: string[] }>> {
   return Promise.all(operations.map(async (operation) => {
     const ownerAgentId = operation.heartbeatRunId ? owners.get(operation.heartbeatRunId) : undefined;
     if (!ownerAgentId) {

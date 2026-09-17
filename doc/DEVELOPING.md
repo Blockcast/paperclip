@@ -787,6 +787,51 @@ subset. Adapters supply their own `eventType` string, and the in-repo
 `lifecycle` emitters already carry agent-written prose and adapter failure text,
 so a type allowlist would rest on a convention nothing enforces.
 
+### The live-event push channel
+
+The two routes above are **pull** paths. The same transcript content is also
+**pushed**, over the company live-event WebSocket
+(`GET /api/companies/:companyId/events/ws`), and it is scoped by the same
+decision — closing one and not the other would leave the highest-fidelity copy
+of the material on an ungated socket.
+
+Three of the eleven `LIVE_EVENT_TYPES` carry transcript content:
+
+| live event type | transcript-bearing keys |
+|---|---|
+| `heartbeat.run.log` | `chunk` |
+| `heartbeat.run.event` | `message`, `payload`, `lastAssistantSnippet` |
+| `heartbeat.run.progress` | `message`, `lastAssistantSnippet` |
+
+A subscriber receives **every** event; only those keys are nulled, and the
+payload then carries `withheldFields` — same contract as `/events`. A peer can
+still see that a run is producing output (`runId`, `seq`, `stream`, `phase`,
+`currentToolName`), which is state. `currentToolName` in particular stays
+readable, matching the REST projection that recomputes `currentStatusMessage`
+*from* it rather than nulling it.
+
+The filter matches on **key name, not event type**
+(`withholdLiveEventTranscriptContent`, `redaction.ts`). `LiveEventType` is a
+closed server-owned union, so a type allowlist would be sound today — but it
+would reopen silently the first time a twelfth type carried prose. Matching keys
+means a new type carrying `chunk` / `message` / `payload` /
+`lastAssistantSnippet` is withheld the day it is added, and widening is a
+deliberate act. State-only types (`heartbeat.run.status` and its `error`,
+`heartbeat.run.queued`, `agent.status`, `activity.logged`,
+`external_object.updated`) carry none of those keys and pass through untouched.
+
+The decision is memoized per socket, keyed on the run's owning agent. The
+staleness that buys is bounded and one-directional: a grant revoked mid-stream
+is not picked up until the socket reconnects, which is why the memo is scoped to
+a live connection rather than cached globally.
+
+**Not audited, deliberately.** The two pull routes emit an `activity_log` row per
+read. The push channel does not: it would emit one row per log chunk per
+subscriber, which is a different order of volume, and the audit already records
+the pull reads that a `denied` finding would be investigated through. Auditing
+the subscription rather than the event is the shape to reach for if this is ever
+needed.
+
 ### Access auditing
 
 Both transcript routes emit a company-scoped `activity_log` entry for allowed
@@ -814,9 +859,13 @@ log store type for `/log`. It deliberately does not record transcript content,
 log chunks, log references/paths, environment values, or credential material.
 
 Incident response can inspect these events through the company activity API or
-activity UI filtered by action/entity/run. Use one of the two actions above,
-`entity_type = heartbeat_run`, and `entity_id = <runId>` to isolate a run's
-access history. The event `details.result` value is `allowed` when content was
+activity UI filtered by action/entity/run. To isolate a run's access history,
+query all three actions above — the two run-transcript routes are keyed
+`entity_type = heartbeat_run` with `entity_id = <runId>`, while the
+workspace-operation route is keyed `entity_type = workspace_operation` with the
+owning run in `runId`. Querying only the `heartbeat_run` rows silently omits the
+workspace-operation path, which is the same partial-coverage blindness this
+section warns about immediately above. The event `details.result` value is `allowed` when content was
 eligible to be read and `denied` when an access check rejected the request —
 which now includes a same-company caller that lacks transcript entitlement, not
 only a cross-company one. Retention follows the deployment's normal

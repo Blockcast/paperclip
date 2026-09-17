@@ -835,6 +835,79 @@ export function withholdRunEventTranscriptContent(
 }
 
 /**
+ * The live-event PUSH channel carries the same transcript content the two REST
+ * routes above withdraw, to the same peers (PEN-3142, Ally review at
+ * `7d859154`). `subscribeCompanyLiveEvents` fans every company event out to
+ * every subscriber, so narrowing only the pull paths would have left the
+ * highest-fidelity copy of the material on an ungated socket — the PEN-2777
+ * split-sibling failure this change exists to close, one sibling further out.
+ *
+ * Three published types carry it: `heartbeat.run.log` (`chunk`, a verbatim
+ * slice of the run log body), `heartbeat.run.event` (`message` / `payload`, the
+ * same two keys {@link withholdRunEventTranscriptContent} nulls), and
+ * `heartbeat.run.progress` (`lastAssistantSnippet`, a
+ * `WITHHELD_RUN_STATE_CONTENT_KEYS` member).
+ *
+ * KEY-SHAPED RATHER THAN TYPE-SHAPED, and deliberately so. `LiveEventType` is a
+ * closed server-owned union (`LIVE_EVENT_TYPES`), so a type allowlist would be
+ * *sound* today — unlike the adapter-chosen `eventType` space that forced the
+ * all-events posture on `withholdRunEventTranscriptContent`. It is still the
+ * wrong shape: a type allowlist silently reopens the moment someone adds a
+ * twelfth live event type carrying prose, and nothing would fail. Matching on
+ * the key names instead means a new type carrying `chunk` / `message` /
+ * `payload` / `lastAssistantSnippet` is withheld the day it is added, and
+ * widening is the deliberate act rather than the accident.
+ *
+ * Verified against every current emitter: no state-only type carries any of
+ * these four keys. `heartbeat.run.status` carries `error`, `heartbeat.run.queued`
+ * carries `triggerDetail`, `agent.status` carries `outcome`, and
+ * `activity.logged` carries `details` — all four stay untouched here, because
+ * the PEN-3140 decision keeps error text and activity state company-readable.
+ *
+ * `currentToolName` is NOT withheld, matching the REST side exactly: the
+ * projection there recomputes `currentStatusMessage` *from* it rather than
+ * nulling it, which makes it state. Withholding it here would contradict the
+ * decision this function exists to enforce.
+ *
+ * Withholds the fields rather than dropping the event, for the reason the
+ * envelope on `/events` is preserved: a peer must still be able to see that a
+ * run is producing output, which is run STATE, while not being able to read it.
+ */
+const WITHHELD_LIVE_EVENT_CONTENT_KEYS = [
+  "chunk",
+  "message",
+  "payload",
+  "lastAssistantSnippet",
+] as const;
+
+export function withholdLiveEventTranscriptContent(
+  payload: Record<string, unknown>,
+): Record<string, unknown> & { withheldFields: string[] } {
+  const out: Record<string, unknown> = { ...payload };
+  const withheldFields: string[] = [];
+  for (const key of WITHHELD_LIVE_EVENT_CONTENT_KEYS) {
+    if (!(key in out)) continue;
+    if (out[key] !== null && out[key] !== undefined) withheldFields.push(key);
+    out[key] = null;
+  }
+  return { ...out, withheldFields };
+}
+
+/**
+ * True when a live-event payload carries any transcript-bearing key, so the
+ * caller can skip the decision entirely for the state-only majority
+ * (`heartbeat.run.queued`, `agent.status`, `external_object.updated`, …).
+ *
+ * This is an optimisation, not the control: {@link withholdLiveEventTranscriptContent}
+ * is what enforces the boundary, and it is safe to call on any payload.
+ */
+export function liveEventCarriesTranscriptContent(payload: Record<string, unknown>): boolean {
+  return WITHHELD_LIVE_EVENT_CONTENT_KEYS.some(
+    (key) => payload[key] !== null && payload[key] !== undefined,
+  );
+}
+
+/**
  * The run-STATE routes carry transcript content too (PEN-3149 decision, folded
  * into PEN-3142). `GET /heartbeat-runs/:runId` returns every column of
  * `heartbeat_runs`, which includes captured output and the adapter's own result
