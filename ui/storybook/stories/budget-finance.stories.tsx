@@ -153,12 +153,15 @@ const providerRowsByProvider: Record<string, CostByProviderModel[]> = {
       costCents: 0,
       inputTokens: 1_420_000,
       cachedInputTokens: 210_000,
-      cacheCreationInputTokens: 0,
+      // BLO-29842: non-zero on purpose — this is the one frame that exercises the
+      // cache-write add-back through promptTokens()/totalTokens(). A regression that
+      // drops the class shows up here as a shrunken total.
+      cacheCreationInputTokens: 96_000,
       outputTokens: 385_000,
       apiRunCount: 0,
       subscriptionRunCount: 38,
       subscriptionCachedInputTokens: 210_000,
-      subscriptionCacheCreationInputTokens: 0,
+      subscriptionCacheCreationInputTokens: 96_000,
       subscriptionInputTokens: 1_420_000,
       subscriptionOutputTokens: 385_000,
     },
