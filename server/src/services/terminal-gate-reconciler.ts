@@ -235,6 +235,52 @@ export function buildTerminalGateResolvedComment(input: {
   ].join("\n");
 }
 
+/**
+ * `terminalGateResolutionIdempotencyKey`'s digest, computed in SQL so the
+ * already-announced anti-join can test the *exact* current signal set rather
+ * than approximating it.
+ *
+ * Why an exact key and not a timestamp: the previous form correlated a
+ * `terminal-gate-resolved:%` prefix match against `created_at >=
+ * issues.updated_at`. Migration `0076`'s AFTER INSERT trigger on
+ * `issue_comments` bumps `last_activity_at` only — never `updated_at` — so the
+ * announcement suppressed the row until any *later* write (a restore sweep
+ * flipping `blocked`->`todo`, a priority or assignee change) advanced
+ * `updated_at` past the comment. That inverted the comparison permanently: the
+ * row became a candidate on every pass, could never be re-announced (the exact
+ * key filter drops it, and the idempotency index would reject the insert), and
+ * so camped on a SCAN_LIMIT slot forever. `updatedAt ASC` ages those rows to
+ * the front, so they starve real candidates. The timestamp could not simply be
+ * dropped either — a monitor re-armed on *new* signals yields a new key and
+ * must stay re-announceable, which a bare prefix match would forbid.
+ *
+ * Mirrors the TS: sha256 over the distinct signals sorted and joined by "\n",
+ * lowercase hex, first 32 chars. The separator is `chr(10)` rather than an
+ * `E'\n'` literal on purpose — this is a JS template literal, so a backslash-n
+ * written here would be collapsed to a real newline before PostgreSQL ever
+ * parsed it. `chr(10)` means the same thing at both layers.
+ * `normalizeIssueMonitorGateSignals` already
+ * lowercases, trims and sorts on write (issue-execution-policy.ts), so the
+ * stored array is in that form and no normalization is restated here. If a
+ * legacy row's stored form ever disagrees, the digests differ, the row is
+ * *admitted* and the authoritative JS key filter drops it — degrading to a
+ * wasted window slot, never to a missed announcement. The `scanned` assertions
+ * in the reconciler tests fail if this drifts from the TS.
+ *
+ * The CASE is the same guard as the candidate predicate above, for the same
+ * reason: PostgreSQL does not promise to evaluate this conjunct only after its
+ * neighbour, so `jsonb_array_elements_text` must not see a malformed
+ * object/scalar `gateSignals` — that raises and aborts the whole pass.
+ */
+const gateSignalDigestSql = sql`substr(encode(sha256(convert_to((
+  select coalesce(string_agg(distinct signal, chr(10) order by signal), '')
+  from jsonb_array_elements_text(
+    case when jsonb_typeof(${issues.executionState} -> 'monitor' -> 'gateSignals') = 'array'
+      then ${issues.executionState} -> 'monitor' -> 'gateSignals'
+      else '[]'::jsonb end
+  ) as t(signal)
+), 'UTF8')), 'hex'), 1, 32)`;
+
 type CandidateRow = {
   id: string;
   companyId: string;
@@ -276,11 +322,10 @@ async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promi
       sql`not exists (
         select 1 from issue_comments resolved_comment
         where resolved_comment.issue_id = ${issues.id}
-          and resolved_comment.idempotency_key like ${`${TERMINAL_GATE_RESOLVED_IDEMPOTENCY_PREFIX}%`}
+          and resolved_comment.idempotency_key = ${TERMINAL_GATE_RESOLVED_IDEMPOTENCY_PREFIX}::text || ${gateSignalDigestSql}
           and resolved_comment.author_agent_id is null
           and resolved_comment.author_user_id is null
           and resolved_comment.deleted_at is null
-          and resolved_comment.created_at >= ${issues.updatedAt}
       )`,
     ))
     .orderBy(issues.updatedAt, issues.id)
@@ -444,6 +489,7 @@ export async function reconcileTerminalGates(
 
   const gateCache = new Map<string, PullRequestGateResult>();
   let resolved = 0;
+  let readCapped = 0;
   for (const entry of pending) {
     if (!dependencyReady.has(entry.candidate.id)) continue;
 
@@ -453,7 +499,10 @@ export async function reconcileTerminalGates(
       gateCache,
       maxPullRequestReads: maxReads,
     });
-    if (verdict.kind !== "satisfied") continue;
+    if (verdict.kind !== "satisfied") {
+      if (verdict.reason === "pull_request_read_cap") readCapped += 1;
+      continue;
+    }
 
     const inserted = await db
       .insert(issueComments)
@@ -481,6 +530,18 @@ export async function reconcileTerminalGates(
         gateSignals: verdict.signals,
       },
       "terminal-gate reconciler recorded a satisfied monitor gate without dispatching a run (BLO-27515)",
+    );
+  }
+
+  // The read budget fails closed, so a capped issue is simply left alone and is
+  // otherwise indistinguishable from "nothing to resolve". Say so out loud:
+  // `updatedAt ASC` is a stable order, so without this the same head-of-list
+  // issues would consume the budget every pass and anything behind them would
+  // stay unannounced silently rather than diagnosably.
+  if (readCapped > 0) {
+    log.warn(
+      { readCapped, pullRequestReads: gateCache.size, scanned: candidates.length, maxReads },
+      "terminal-gate reconciler exhausted its per-pass pull-request read budget; issues past the cap were left unresolved this pass (BLO-27515)",
     );
   }
 

@@ -442,8 +442,128 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     const second = await reconcileTerminalGates(db, { now: NOW, readPullRequestGate: countingReader });
 
     expect(reads).toBe(1);
-    expect(second).toMatchObject({ resolved: 0, pullRequestReads: 0 });
+    // `scanned: 0` is the load-bearing half: it pins that the *SQL* anti-join
+    // excluded the row, not merely that the JS key filter dropped it. Asserting
+    // only `resolved`/`pullRequestReads` holds either way and would not notice
+    // an announced row silently re-entering the scan window.
+    expect(second).toMatchObject({ scanned: 0, resolved: 0, pullRequestReads: 0 });
     expect(await commentsFor(issueId)).toHaveLength(1);
+  });
+
+  it("keeps an announced issue out of the scan window after a later unrelated write", async () => {
+    // The announcing INSERT bumps `issues.last_activity_at` (migration 0076's
+    // AFTER INSERT trigger on issue_comments) but never `updated_at`. So any
+    // later write that does bump `updated_at` — a restore sweep flipping
+    // blocked->todo, a priority or assignee change — moves it past the
+    // comment's `created_at`. An anti-join correlated on that comparison
+    // inverts permanently: the row is a candidate on every subsequent pass,
+    // can never be re-announced (the exact-key filter drops it, and the
+    // idempotency index would reject the insert anyway), and so camps on a
+    // SCAN_LIMIT slot forever. `updatedAt ASC` then ages these rows toward the
+    // front of the window, starving real candidates behind them.
+    const { companyId, agentId } = await createCompany("TG2B");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TG2B-1",
+      gateSignals: ["pr:blockcast/paperclip#1281:merged"],
+    });
+
+    const reader = mergedReader(new Set(["blockcast/paperclip#1281"]));
+    expect(await reconcileTerminalGates(db, { now: NOW, readPullRequestGate: reader })).toMatchObject({
+      scanned: 1,
+      resolved: 1,
+    });
+
+    // Bump `updated_at` past the announcement's real `created_at` (a DB
+    // `now()` default, not the injected `now`), which is what an ordinary later
+    // write does. Deriving it from the stored row rather than from `NOW` is
+    // load-bearing: the fixture timestamps are historical, so a `NOW`-relative
+    // bump lands *before* the comment and fails to reproduce anything.
+    const [announced] = await db
+      .select({ createdAt: issueComments.createdAt })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const announcedAt = announced!.createdAt;
+
+    await db
+      .update(issues)
+      .set({ priority: "high", updatedAt: new Date(announcedAt.getTime() + 1_000) })
+      .where(eq(issues.id, issueId));
+
+    const after = await reconcileTerminalGates(db, { now: NOW, readPullRequestGate: reader });
+    expect(after).toMatchObject({ scanned: 0, resolved: 0, pullRequestReads: 0 });
+    expect(await commentsFor(issueId)).toHaveLength(1);
+  });
+
+  it("keeps an announced MULTI-signal issue out of the scan window", async () => {
+    // Pins the separator, ordering and dedup of the SQL digest against the TS.
+    // A single-signal fixture cannot: `string_agg` emits no separator for one
+    // element, so the digest is identical under any separator and a drift
+    // between `gateSignalDigestSql` and `terminalGateResolutionIdempotencyKey`
+    // stays invisible. Two signals is the smallest case that discriminates.
+    const { companyId, agentId } = await createCompany("TG2D");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TG2D-1",
+      // Deliberately not in sorted order, so the digest's ORDER BY is exercised.
+      gateSignals: ["pr:blockcast/paperclip#1400:merged", "pr:blockcast/paperclip#1281:merged"],
+    });
+
+    const reader = mergedReader(
+      new Set(["blockcast/paperclip#1281", "blockcast/paperclip#1400"]),
+    );
+    expect(await reconcileTerminalGates(db, { now: NOW, readPullRequestGate: reader })).toMatchObject({
+      scanned: 1,
+      resolved: 1,
+    });
+
+    const second = await reconcileTerminalGates(db, { now: NOW, readPullRequestGate: reader });
+    expect(second).toMatchObject({ scanned: 0, resolved: 0, pullRequestReads: 0 });
+    expect(await commentsFor(issueId)).toHaveLength(1);
+  });
+
+  it("re-announces after the monitor is re-armed on a different gate set", async () => {
+    // The property the removed `created_at >= updated_at` correlation was
+    // protecting: suppression must key on the *current* signal set, so a
+    // re-arm on new gates is announceable again. A bare prefix anti-join would
+    // silence this issue permanently.
+    const { companyId, agentId } = await createCompany("TG2C");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TG2C-1",
+      gateSignals: ["pr:blockcast/paperclip#1281:merged"],
+    });
+
+    const reader = mergedReader(
+      new Set(["blockcast/paperclip#1281", "blockcast/paperclip#1400"]),
+    );
+    expect(await reconcileTerminalGates(db, { now: NOW, readPullRequestGate: reader })).toMatchObject({
+      resolved: 1,
+    });
+
+    const [row] = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const state = row!.executionState as { monitor: Record<string, unknown> };
+    await db
+      .update(issues)
+      .set({
+        executionState: {
+          ...state,
+          monitor: { ...state.monitor, gateSignals: ["pr:blockcast/paperclip#1400:merged"] },
+        },
+      })
+      .where(eq(issues.id, issueId));
+
+    expect(await reconcileTerminalGates(db, { now: NOW, readPullRequestGate: reader })).toMatchObject({
+      scanned: 1,
+      resolved: 1,
+    });
+    expect(await commentsFor(issueId)).toHaveLength(2);
   });
 
   it("covers the outage-strand shape: a `blocked` issue is still reconciled", async () => {
