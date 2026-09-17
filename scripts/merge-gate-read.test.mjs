@@ -208,14 +208,16 @@ describe("merge-gate reader", () => {
       );
     });
 
-    // "Newest" is per workflow, not per head. Ordering matters: this fixture puts
-    // the cancelled run second so a global newest-check (rather than a grouped
-    // one) would classify it stale and fail.
+    // "Newest" is per workflow, not per head. The cancelled run must carry the
+    // LOWER run id: "newest" is max id, so a global (ungrouped) newest-check
+    // spares whichever run id is highest at the head and would mark this one
+    // stale. With the ids the other way round both implementations agree and the
+    // fixture passes on broken code — it did, until a mutation run caught it.
     it("scopes the newest-run check to one workflow", () => {
       assert.equal(
         dead([
-          ["10", "100", "success"],
-          ["20", "200", "cancelled"], // sole run of workflow 20 — not superseded
+          ["20", "200", "success"], // unrelated workflow, higher id
+          ["10", "100", "cancelled"], // sole run of workflow 10 — not superseded
         ]),
         "",
       );
