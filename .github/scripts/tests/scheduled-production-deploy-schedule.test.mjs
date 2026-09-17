@@ -117,18 +117,233 @@ test('a sampling slot can reach the escalation but never reaches the dispatch', 
 });
 
 test('the escalation is armed by the pending outcome, not by the cron', () => {
-  // Both the Node setup and the escalation gate on `skipped-pending` — the one
-  // condition every slot can reach. Gating either on the event or the cron would
-  // silently re-couple sampling to the dispatch cadence.
+  // The escalation gates on `skipped-pending` — the one condition every slot can
+  // reach. Gating it on the event or the cron would silently re-couple sampling
+  // to the dispatch cadence. (The supersede added by PEN-3315 gates on the same
+  // outcome behind a `!cancelled() &&`, asserted separately below.)
   const gates = [...code.matchAll(/if:\s*steps\.dispatch\.outputs\.outcome\s*==\s*'([^']+)'/g)].map(
     (m) => m[1],
   );
-  assert.deepEqual(gates, ['skipped-pending', 'skipped-pending']);
+  assert.deepEqual(gates, ['skipped-pending']);
 
   assert.ok(
     /if:\s*steps\.escalate\.outputs\.escalated\s*==\s*'true'/.test(code),
     'the red-run backstop must stay gated on the escalation actually firing',
   );
+});
+
+test('node is set up unconditionally, so the record-closing path is not silently skipped', () => {
+  // PEN-3315 made this unconditional. `node` is not on the arc-deploy image's
+  // PATH for `run:` steps, and the close step runs on the three NON-pending
+  // outcomes — the exact outcomes the old `skipped-pending` gate excluded. Left
+  // conditional, the close would fail `command not found` on every slot that was
+  // supposed to run it, and one open record would carry its clock into the next,
+  // unrelated stall.
+  const setup = code.match(/- name: Set up Node\n(?:.*\n)*?\s+uses: actions\/setup-node/);
+  assert.ok(setup, 'the workflow must still pin setup-node rather than trust a bare `node`');
+  assert.ok(
+    !/- name: Set up Node\n\s+if:[^\n]*steps\.dispatch\.outputs\.outcome/.test(code),
+    'setup-node must not be gated on a dispatch outcome',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// PEN-3315: guard (1)'s bounded exit, and the durable record.
+//
+// Guard (1) is correct and stays. What it never had was a way to END a wait —
+// the only exit was a human. These pin the three things that make the supersede
+// safe to leave running unattended: it is armed by the same condition as the
+// escalation, it approves nothing, and it cannot be starved by an Alertmanager
+// outage.
+// ---------------------------------------------------------------------------
+
+const stepIndex = (needle) => {
+  const i = code.indexOf(needle);
+  assert.notEqual(i, -1, `expected to find ${JSON.stringify(needle)} in ${WORKFLOW}`);
+  return i;
+};
+
+test('the supersede runs AFTER the escalation, so the alert reports the pre-supersede run', () => {
+  // Order matters twice. The durable record must exist before the supersede can
+  // annotate it, and the Alertmanager alert must describe the run a reviewer was
+  // actually looking at rather than the replacement dispatched seconds earlier.
+  assert.ok(
+    stepIndex('id: escalate') < stepIndex('id: supersede'),
+    'the escalation must run before the supersede',
+  );
+  assert.ok(
+    stepIndex('id: supersede') < stepIndex('supersede-stale-deploy.mjs'),
+    'the supersede step id must belong to the supersede script step',
+  );
+});
+
+test('the supersede survives a failed escalation — Alertmanager must not freeze the deploy lane', () => {
+  // post-pending-deploy-alert is fatal on a failed push, by design. If the
+  // supersede were `success()`-gated, an Alertmanager outage would ALSO stop the
+  // lane being unblocked — coupling the repair to the notification, which is the
+  // shape of defect this row is about.
+  const step = code.slice(stepIndex('id: supersede'), stepIndex('supersede-stale-deploy.mjs'));
+  assert.match(
+    step,
+    /if:\s*\$\{\{\s*!cancelled\(\)\s*&&\s*steps\.dispatch\.outputs\.outcome == 'skipped-pending'\s*\}\}/,
+    'the supersede must be gated on !cancelled() && skipped-pending',
+  );
+});
+
+test('the supersede reuses PENDING_DEPLOY_ALERT_HOURS — no second tunable', () => {
+  // A separate threshold would let the two drift apart, so a slot could escalate
+  // without superseding (or supersede a run nobody was told about). One signal,
+  // one number.
+  const step = code.slice(stepIndex('id: supersede'), stepIndex('supersede-stale-deploy.mjs'));
+  assert.match(step, /ALERT_AFTER_HOURS:\s*\$\{\{\s*vars\.PENDING_DEPLOY_ALERT_HOURS/);
+  assert.match(
+    step,
+    /MASTER_SHA:\s*\$\{\{\s*steps\.dispatch\.outputs\.master_sha\s*\}\}/,
+    'the supersede must judge staleness against the master head guard (1) read',
+  );
+});
+
+test('master_sha is published BEFORE guard (1) can exit, or the supersede has no master to compare', () => {
+  // Guard (1)'s `skipped-pending` branch exits early, and that branch is the only
+  // one the supersede ever runs on. A master_sha written after it would always be
+  // empty exactly when it is needed, and the supersede would refuse forever while
+  // looking correctly configured.
+  assert.ok(
+    stepIndex('master_sha=$MASTER_SHA') < stepIndex('outcome=skipped-pending'),
+    'master_sha must be written before the skipped-pending early exit',
+  );
+});
+
+test('the supersede APPROVES NOTHING — the red backstop stays gated on the escalation', () => {
+  // The 2026-08-28 rejection of auto-approval is untouched: "three green guards
+  // prove the code builds, not that a human intends to ship it". Refreshing the
+  // head is not a human acting, so the run must stay red for as long as the
+  // approval is outstanding. Gating the backstop on the SUPERSEDE instead would
+  // turn a superseded stall green and hide it.
+  assert.ok(
+    /if:\s*steps\.escalate\.outputs\.escalated\s*==\s*'true'/.test(code),
+    'the red-run backstop must stay gated on the escalation, not the supersede',
+  );
+  assert.ok(
+    !/if:[^\n]*steps\.supersede\.outputs\.superseded/.test(code),
+    'no step may be gated on the supersede having fired',
+  );
+  // And nothing in this workflow may touch the environment approval endpoint —
+  // that is the line between "refresh the head" and "press the button".
+  assert.ok(
+    !/pending_deployments/.test(code),
+    'the dispatcher must never reach for the environment approval API',
+  );
+});
+
+test('the durable record is closed on every outcome that means nothing is pending', () => {
+  // `dispatched`, `up-to-date` and `checked-no-pending` all mean the reviewer
+  // gate is clear, which ends the stall by definition. Without a close, one open
+  // record would carry its stall clock into the next, unrelated stall and report
+  // it as days old from the first slot.
+  const close = code.match(/- name: Close the durable deploy-stall record[\s\S]*?--resolve/);
+  assert.ok(close, 'the workflow must close the stall record');
+  assert.match(
+    close[0],
+    /steps\.dispatch\.outputs\.outcome != '' && steps\.dispatch\.outputs\.outcome != 'skipped-pending'/,
+    'the close must run on the non-pending outcomes, and not on an empty outcome',
+  );
+});
+
+test('the workflow grants exactly the permissions the new paths need, and no more', () => {
+  // `issues: write` is the entire credential cost of the durable record — the
+  // reason a GitHub issue was chosen over any external store. `actions: write`
+  // was already there for the dispatch and now also covers the cancel. Anything
+  // beyond these two on a workflow that holds a deploy dispatch is worth a stop.
+  const block = code.split(/^permissions:\n/m)[1] ?? '';
+  const granted = [];
+  for (const line of block.split('\n')) {
+    if (!/^ {2}\S/.test(line)) break; // first non-entry line ends the block
+    const entry = line.replace(/#.*$/, '').trim();
+    if (entry) granted.push(entry);
+  }
+  assert.deepEqual(granted, ['contents: read', 'actions: write', 'issues: write']);
+});
+
+// PEN-3315. The supersede resets the pending run's age by construction — it
+// cancels one run and creates another — so the escalation's clock has to come
+// from somewhere that outlives a run. Without this, a 41h stall reports as a
+// train of 6.0h ones and the critical alert flaps firing/resolved on the
+// threshold instead of firing continuously with a climbing age. That would be a
+// regression in the one control that demonstrably worked during the incident.
+test('a supersede cannot reset the escalation clock', () => {
+  const STALL_START = '2026-09-14T19:55:57.000Z';
+  const NOW = new Date('2026-09-16T13:00:00.000Z'); // ~41h into the real stall
+  // The replacement run, dispatched 20 minutes ago by the supersede.
+  const FRESH = {
+    databaseId: 35100812969,
+    status: 'waiting',
+    createdAt: '2026-09-16T12:40:00.000Z',
+    url: 'https://github.com/Blockcast/paperclip/actions/runs/35100812969',
+  };
+
+  // Without the recorded stall start, the escalation sees a 20-minute-old run
+  // and reports a healthy gate in the middle of a 41-hour outage.
+  const runOnly = selectStuckApproval({
+    pendingRuns: [FRESH],
+    alertAfterHours: 6,
+    now: NOW,
+  });
+  assert.equal(runOnly.stuck, false, 'this is the regression the record exists to prevent');
+
+  const withRecord = selectStuckApproval({
+    pendingRuns: [FRESH],
+    alertAfterHours: 6,
+    now: NOW,
+    stallStartedAt: STALL_START,
+  });
+  assert.equal(withRecord.stuck, true);
+  assert.ok(withRecord.ageHours > 41 && withRecord.ageHours < 42);
+  assert.equal(withRecord.stallStartedAt, STALL_START);
+});
+
+test('the recorded stall start can only move the clock EARLIER, never later', () => {
+  // A record left open by a failed close must not be able to SHORTEN a real
+  // stall. The basis is the minimum of the two, so a record that is somehow
+  // younger than the run on the gate is simply ignored.
+  const verdict = selectStuckApproval({
+    pendingRuns: [
+      {
+        databaseId: 1,
+        status: 'waiting',
+        createdAt: '2026-09-01T02:00:00.000Z',
+        url: 'https://github.com/Blockcast/paperclip/actions/runs/1',
+      },
+    ],
+    alertAfterHours: 6,
+    now: new Date('2026-09-01T12:00:00.000Z'),
+    stallStartedAt: '2026-09-01T11:00:00.000Z',
+  });
+
+  assert.equal(verdict.ageHours, 10);
+  assert.equal(verdict.stallStartedAt, '2026-09-01T02:00:00.000Z');
+});
+
+test('an unreadable recorded stall start degrades to the run, it does not disable the escalation', () => {
+  // The value comes from a marker in an issue body that a human can edit. Going
+  // fatal there would take the escalation down over a cosmetic change; ignoring
+  // it costs precision only, and only until the next slot rewrites the marker.
+  const verdict = selectStuckApproval({
+    pendingRuns: [
+      {
+        databaseId: 1,
+        status: 'waiting',
+        createdAt: '2026-09-01T02:00:00.000Z',
+        url: 'https://github.com/Blockcast/paperclip/actions/runs/1',
+      },
+    ],
+    alertAfterHours: 6,
+    now: new Date('2026-09-01T12:00:00.000Z'),
+    stallStartedAt: 'not-a-date',
+  });
+
+  assert.equal(verdict.stuck, true);
+  assert.equal(verdict.ageHours, 10);
 });
 
 // Replay of the incident, against both cadences. This is the assertion that
