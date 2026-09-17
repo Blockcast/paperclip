@@ -82,7 +82,18 @@ export type CommentReviewGateOutcome =
 
 export type CommentReviewGateVerdict =
   | { state: "success"; outcome: "clean"; reason: string }
-  | { state: "success"; outcome: "not_evaluated"; reason: string }
+  | {
+      state: "success";
+      outcome: "not_evaluated";
+      reason: string;
+      /**
+       * Set only on the branch that would have been `clean` had the author been
+       * known. It is what lets the caller fetch the author on the one path that
+       * reads it, instead of making that fetch a precondition for publishing
+       * anything — see executeCommentReviewGateCheck.
+       */
+      authorUnknown?: true;
+    }
   | { state: "failure"; outcome: "blocking_finding"; reason: string; commentCreatedAt: string }
   | {
       state: "failure";
@@ -308,13 +319,13 @@ export function evaluateCommentReviewGate(input: {
    * Every attesting comment has already been established to come from the
    * reviewer identity, so "this attestation is the author's own" reduces to
    * "the PR author IS that identity" — which is the case on every agent PR
-   * here, where both sides are `allyblockcast[bot]`. Omitted or unreadable is
-   * treated the same as self-attested: the positive claim is that someone
-   * other than the author examined this head, and an absent author cannot
-   * establish it. Passing it is what makes an omission at a call site loud
-   * rather than silently green.
+   * here, where both sides are `allyblockcast[bot]`. Null is treated the same
+   * as self-attested: the positive claim is that someone other than the author
+   * examined this head, and an absent author cannot establish it. Required and
+   * explicitly nullable rather than optional, so a new call site has to state
+   * which it means instead of silently downgrading every `clean` to `neutral`.
    */
-  prAuthorLogin?: string | null;
+  prAuthorLogin: string | null;
 }): CommentReviewGateVerdict {
   const reviewerBotLogin = input.reviewerBotLogin?.trim() || DEFAULT_PR_REVIEWER_BOT_LOGIN;
   const headSha = input.headSha?.trim();
@@ -349,6 +360,7 @@ export function evaluateCommentReviewGate(input: {
       return {
         state: "success",
         outcome: "not_evaluated",
+        authorUnknown: true,
         reason: "The PR author is unknown, so this head's attestation cannot be shown to be independent.",
       };
     }
@@ -686,17 +698,6 @@ async function executeCommentReviewGateCheck(
     ));
   if (!headSha) return { posted: false, reason: "fetch_failed" };
 
-  // The gate cannot report `clean` without knowing who opened the PR, so an
-  // unreadable author is a fetch failure, not a downgrade to `neutral`:
-  // publishing on incomplete evidence would overwrite a correct verdict from an
-  // earlier delivery with a weaker one on a transient 5xx. Not publishing
-  // leaves that verdict standing, and the next webhook re-evaluates.
-  const prAuthorLogin = await withBoundedRetry(
-    () => githubFetchPrAuthorLogin({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
-    (login) => login == null,
-  );
-  if (!prAuthorLogin) return { posted: false, reason: "fetch_failed" };
-
   const publish = async (): Promise<PrCommentReviewGateCheckResult> => {
     // Both surfaces, because Ally uses whichever is available to it: a
     // `COMMENTED` pull_request_review on `/pulls/{n}/reviews`, or a plain issue
@@ -715,16 +716,33 @@ async function executeCommentReviewGateCheck(
     ]);
     if (issueComments == null || prReviews == null) return { posted: false, reason: "fetch_failed" };
 
-    const verdict = evaluateCommentReviewGate({
-      comments: [...issueComments, ...prReviews].map((comment) => ({
-        authorLogin: comment.login,
-        body: comment.body,
-        createdAt: comment.createdAt,
-      })),
-      headSha,
-      reviewerBotLogin,
-      prAuthorLogin,
-    });
+    const comments = [...issueComments, ...prReviews].map((comment) => ({
+      authorLogin: comment.login,
+      body: comment.body,
+      createdAt: comment.createdAt,
+    }));
+
+    // Evaluate author-blind FIRST. Only `clean` reads the author, and both red
+    // outcomes stand on the comment surfaces alone — so fetching the author up
+    // front made an unreadable `GET /pulls/{n}` suppress a `blocking_finding`
+    // or `carried_finding` that was already fully justified, leaving the merge
+    // surface showing that finding as absent rather than red. A red going
+    // silent is the direction this module must not get wrong.
+    let verdict = evaluateCommentReviewGate({ comments, headSha, reviewerBotLogin, prAuthorLogin: null });
+
+    // `authorUnknown` marks the one outcome that would have been `clean`. Only
+    // there is the author worth a request, and only there is an unreadable one
+    // a `fetch_failed`: publishing `neutral` on incomplete evidence would
+    // overwrite a correct earlier verdict with a weaker one on a transient 5xx.
+    // Not publishing leaves it standing, and the next webhook re-evaluates.
+    if (verdict.outcome === "not_evaluated" && verdict.authorUnknown) {
+      const prAuthorLogin = await withBoundedRetry(
+        () => githubFetchPrAuthorLogin({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
+        (login) => login == null,
+      );
+      if (!prAuthorLogin) return { posted: false, reason: "fetch_failed" };
+      verdict = evaluateCommentReviewGate({ comments, headSha, reviewerBotLogin, prAuthorLogin });
+    }
 
     warnOnceIfMisreadableContext(verdict, context);
     const posted = await withBoundedRetry<GitHubCommitStatusPostResult>(

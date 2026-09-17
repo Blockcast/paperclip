@@ -278,8 +278,17 @@ describe("runPrCommentReviewGateCheck", () => {
   it("leaves the prior status untouched when the PR author cannot be read", async () => {
     // Publishing on incomplete evidence would overwrite a correct earlier
     // verdict with a weaker one on a transient failure. Same shape as an
-    // unreadable comment surface.
+    // unreadable comment surface. The comment must be a CLEAN attestation:
+    // that is the only outcome whose verdict depends on the author, so it is
+    // the only one where an unreadable author may withhold a publish.
     mockFetchPrAuthor.mockResolvedValue(null);
+    mockListComments.mockResolvedValue([
+      {
+        login: "allyblockcast[bot]",
+        body: `## Ally — Consolidated PR Review\nReviewed head: ${TARGET.headSha}\n### Critical Issues (0)\n### Important Issues (0)`,
+        createdAt: "2026-08-04T22:09:19Z",
+      },
+    ]);
 
     await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toEqual({
       posted: false,
@@ -287,6 +296,53 @@ describe("runPrCommentReviewGateCheck", () => {
     });
     expect(mockPostStatus).not.toHaveBeenCalled();
   }, 10_000);
+
+  it("still publishes a red when the PR author cannot be read", async () => {
+    // Regression: the author fetch was an unconditional precondition for
+    // publishing ANY verdict, so a transient failure on `GET /pulls/{n}` —
+    // while the comment surfaces stayed healthy — dropped a `failure` the
+    // previous code published. No status had ever existed for the head, so the
+    // merge surface showed the finding as absent rather than red.
+    mockFetchPrAuthor.mockResolvedValue(null);
+    mockListComments.mockResolvedValue([blockingCommentFor(TARGET.headSha)]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "blocking_finding" },
+    });
+    expect(mockPostStatus).toHaveBeenCalledWith(expect.objectContaining({ state: "failure" }));
+    // Both reds are author-blind, so the fetch is never even attempted.
+    expect(mockFetchPrAuthor).not.toHaveBeenCalled();
+  });
+
+  it("still publishes a carried finding when the PR author cannot be read", async () => {
+    // The other author-blind red. A finding raised against an earlier head
+    // carries forward (BLO-29711); it must not go silent on an author fetch.
+    mockFetchPrAuthor.mockResolvedValue(null);
+    mockListComments.mockResolvedValue([blockingCommentFor("0".repeat(40))]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "carried_finding" },
+    });
+    expect(mockFetchPrAuthor).not.toHaveBeenCalled();
+  });
+
+  it("does not fetch the PR author when nothing attests the head", async () => {
+    // `not_evaluated` for "no comment attests this head" is reached from the
+    // comment surfaces alone, so it costs no request inside the serialized lock.
+    mockListComments.mockResolvedValue([]);
+    mockListReviews.mockResolvedValue([]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "not_evaluated" },
+    });
+    expect(mockFetchPrAuthor).not.toHaveBeenCalled();
+  });
 
   it("leaves the prior status untouched when the reviews surface cannot be read", async () => {
     // Half the history is not a verdict. Symmetric with the issue-comment path.
