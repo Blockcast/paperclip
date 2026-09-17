@@ -337,7 +337,21 @@ async function main() {
         : 'No deploy is waiting on a human reviewer (pending runs are queued/building) — ' +
             'not escalating.',
     );
-    if (recordReadFailed) process.exit(1);
+    // Only fail on a failed record read if the record COULD have changed this
+    // verdict. With no waiting run at all, selectStuckApproval returns
+    // `stuck: false` before `stallStartedAt` is consulted, so the recorded stall
+    // clock is provably irrelevant — and exiting 1 there would make a transient
+    // GitHub API blip, during a slot where only queued/in_progress dispatches
+    // exist, produce the exact red that PEN-2848 made mean "a production
+    // approval is stuck". That is the same conflation the sibling close step is
+    // careful to avoid: the dispatcher's `conclusion` must not start meaning
+    // "housekeeping failed". The `::error::` annotation already makes the failed
+    // read non-silent.
+    //
+    // With a waiting run under threshold the record IS record-sensitive — an
+    // earlier recorded start would push the age over — so a failed read there is
+    // still an unjudgeable age and still fatal.
+    if (recordReadFailed && verdict.oldest) process.exit(1);
     return;
   }
 

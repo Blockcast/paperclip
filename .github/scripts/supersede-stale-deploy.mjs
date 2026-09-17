@@ -70,6 +70,26 @@
  * `waiting` aborts. The pending-runs file this step is handed was written
  * earlier in the job, and on a slow runner that is minutes of staleness.
  *
+ * That window has a SECOND half, after the cancel. `POST .../cancel` is
+ * asynchronous, so the run leaves `waiting` on its own schedule — and it can
+ * leave `waiting` by being approved rather than cancelled. Only a terminal state
+ * clears the lane, so the post-cancel poll requires `completed` and treats
+ * `queued`/`in_progress` as the approval having won: it declines instead of
+ * dispatching a replacement alongside a live production deploy. See
+ * waitForCancel.
+ *
+ * WHEN THE GATE IS EMPTIED BUT NOT REFILLED
+ * -----------------------------------------
+ * Both failure paths here — the cancel not settling, and the dispatch failing
+ * after a cancel that did — leave the reviewer gate EMPTY with production still
+ * at the stale commit. The dispatcher reports an empty gate as
+ * `checked-no-pending`, which is exactly what a human cancelling the run
+ * produces, and which closes the durable stall record as resolved. So those
+ * paths label the record (STALL_UNREFILLED_LABEL) and --resolve refuses to close
+ * a labelled record until an outcome actually refills the lane. Recovery is the
+ * daily dispatch slot, up to ~24h — the hourly sampling slots exit at guard (1b)
+ * without dispatching — so the record must not read as prompt recovery.
+ *
  * CONSERVATIVE BY CONSTRUCTION
  * ----------------------------
  * More than one `waiting` dispatch, or any `queued`/`in_progress` dispatch
@@ -80,8 +100,10 @@
  */
 import { readFileSync } from 'node:fs';
 import {
+  STALL_UNREFILLED_LABEL,
   createGitHubClient,
   renderSupersedeComment,
+  renderSupersedeFailedComment,
   setOutput,
   tryComment,
 } from './deploy-stall-record.mjs';
@@ -187,26 +209,107 @@ function declined(reason, detail) {
   console.log(`Not superseding the pending dispatch (${reason})${detail ? `: ${detail}` : ''}.`);
 }
 
+/**
+ * Mark the stall record as "WE emptied this gate and could not refill it".
+ *
+ * Both failure paths below leave the reviewer gate EMPTY with production still
+ * at the stale commit. On the next sampling slot the dispatcher then reports
+ * `checked-no-pending`, which is otherwise indistinguishable from a human having
+ * cleared the stall — and would close the durable record as *resolved* while
+ * nothing has shipped. That is the one record whose entire purpose is to make
+ * this incident auditable after the fact.
+ *
+ * The signal is a LABEL, not a comment: `--resolve` already reads the issue
+ * object (labels included) to find the record, so this costs it no extra call
+ * and no comment-pagination guesswork about which marker is the most recent. The
+ * comment alongside is for the human reading the record, not for the machine.
+ *
+ * Best-effort throughout — annotating the audit trail must never be what turns a
+ * cancel that already happened into an unreported one.
+ */
+async function noteSupersedeFailed(client, { reason, detail, runUrl }) {
+  setOutput('superseded', 'false');
+  setOutput('supersede_failed', 'true');
+  setOutput('supersede_reason', reason);
+
+  const issueNumber = Number(process.env.STALL_ISSUE_NUMBER || '') || null;
+  if (!issueNumber) {
+    console.log(
+      '::warning::No stall record to mark as unrefilled (STALL_ISSUE_NUMBER is unset), so the ' +
+        'next `checked-no-pending` slot cannot tell this apart from a human clearing the gate.',
+    );
+    return;
+  }
+
+  await tryComment(
+    client,
+    issueNumber,
+    renderSupersedeFailedComment({ reason, detail, runUrl }),
+    'supersede-failure',
+  );
+  try {
+    await client.addLabel(issueNumber, STALL_UNREFILLED_LABEL);
+  } catch (err) {
+    console.log(
+      `::warning::Could not label record #${issueNumber} as unrefilled: ${err.message}. ` +
+        'The next no-pending slot may close it as resolved even though nothing shipped.',
+    );
+  }
+}
+
 /** ~24s total, which is far inside a cancel's observed settle time. */
 export const CANCEL_POLL_ATTEMPTS = 8;
 export const CANCEL_POLL_DELAY_MS = 3_000;
 
+const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
- * True once the run has left `waiting`. A read failure while polling counts as
- * "not yet": we would rather not dispatch than dispatch into a guard that will
- * refuse the replacement and leave the lane looking healthy with nothing in it.
+ * Wait for the cancel to land, and report WHICH WAY the run left `waiting` —
+ * because those are two different questions and only one of them clears the lane.
+ *
+ * `POST .../cancel` returns 202 Accepted, not "cancelled", so the run leaves
+ * `waiting` asynchronously. But it can also leave `waiting` by being APPROVED:
+ * that is exactly the race this file's header documents, and an approved run
+ * goes `waiting` -> `queued` -> `in_progress`, never straight to `completed`.
+ *
+ * Treating merely-not-`waiting` as "the cancel landed" would dispatch a
+ * replacement alongside a live, approved production deploy — the stacking that
+ * guard (1) exists to prevent. Nothing downstream would catch it either:
+ * `guard-pending-deploy` and `guard-pending-deploy-final` both query
+ * `workflows/docker.yml/runs?status=waiting`, so an `in_progress` sibling reads
+ * as `blocked=false`. It is the `non-waiting-dispatch-present` refusal that
+ * selectSupersedeCandidate already makes on the PRE-cancel side, missing on the
+ * post-cancel side.
+ *
+ * So only a TERMINAL state clears the lane:
+ *
+ *   completed            - the cancel landed. Lane is empty; dispatch.
+ *   queued / in_progress - the approval won the race. A human's deploy is live:
+ *                          decline, and leave it alone.
+ *   waiting              - the cancel has not settled yet; keep polling.
+ *
+ * A read failure counts as "not yet" for the same reason it always did: we would
+ * rather not dispatch than dispatch into a guard that will refuse the
+ * replacement and leave the lane looking healthy with nothing in it.
  */
-async function waitForCancel(client, runId) {
+export async function waitForCancel(client, runId, { sleep = defaultSleep } = {}) {
+  let lastStatus = null;
   for (let attempt = 0; attempt < CANCEL_POLL_ATTEMPTS; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, CANCEL_POLL_DELAY_MS));
+    await sleep(CANCEL_POLL_DELAY_MS);
     try {
       const run = await client.request('GET', `/actions/runs/${runId}`);
-      if (run?.status !== 'waiting') return true;
+      lastStatus = run?.status ?? null;
+      if (lastStatus === 'completed') {
+        return { cleared: true, reason: 'cancel-landed', status: lastStatus };
+      }
+      if (lastStatus !== null && lastStatus !== 'waiting') {
+        return { cleared: false, reason: 'approval-won-cancel-race', status: lastStatus };
+      }
     } catch (err) {
       console.log(`::warning::Re-reading run ${runId} after cancel failed: ${err.message}`);
     }
   }
-  return false;
+  return { cleared: false, reason: 'cancel-did-not-settle', status: lastStatus };
 }
 
 async function main() {
@@ -297,13 +400,40 @@ async function main() {
   // `workflows/docker.yml/runs?status=waiting` from inside the replacement, so
   // dispatching into that window would make the replacement block itself on the
   // run we just cancelled — a self-inflicted repeat of the stall.
-  if (!(await waitForCancel(client, runId))) {
+  const cancelOutcome = await waitForCancel(client, runId);
+
+  if (!cancelOutcome.cleared && cancelOutcome.reason === 'approval-won-cancel-race') {
+    // A reviewer approved inside the cancel window, so the run left `waiting` by
+    // being APPROVED rather than cancelled. Not an error, and not a failure path
+    // that needs the record kept open: a human acted and production is
+    // deploying, which is the outcome this whole step exists to reach. Declining
+    // is the entire fix — dispatching here would stack a second deploy on a live
+    // one, which is what guard (1) is for.
+    declined(
+      'approval-won-cancel-race',
+      `run ${runId} left \`waiting\` as \`${cancelOutcome.status}\`, i.e. it was approved in the ` +
+        'cancel window. NOT dispatching a replacement: that deploy is live',
+    );
+    return;
+  }
+
+  if (!cancelOutcome.cleared) {
     console.error(
-      `::error::Cancelled run ${runId} but it was still \`waiting\` after ` +
-        `${CANCEL_POLL_ATTEMPTS * CANCEL_POLL_DELAY_MS}ms. NOT dispatching a replacement: ` +
+      `::error::Cancelled run ${runId} but it had not reached a terminal state after ` +
+        `${CANCEL_POLL_ATTEMPTS * CANCEL_POLL_DELAY_MS}ms (last status ` +
+        `\`${cancelOutcome.status ?? 'unreadable'}\`). NOT dispatching a replacement: ` +
         "docker.yml's own pending-deploy guard would refuse it. The next scheduled slot " +
         're-evaluates from scratch.',
     );
+    await noteSupersedeFailed(client, {
+      reason: cancelOutcome.reason,
+      detail:
+        `The cancel of run ${runId} did not reach a terminal state within ` +
+        `${CANCEL_POLL_ATTEMPTS * CANCEL_POLL_DELAY_MS}ms (last status ` +
+        `\`${cancelOutcome.status ?? 'unreadable'}\`), so no replacement was dispatched. ` +
+        'The cancel usually lands moments later, which leaves the gate EMPTY.',
+      runUrl,
+    });
     process.exit(1);
   }
 
@@ -314,13 +444,22 @@ async function main() {
     });
   } catch (err) {
     // The stale run is already cancelled, so the lane is now EMPTY and the next
-    // scheduled slot will dispatch on its own. Say so explicitly: a bare failure
-    // here reads like the lane was left broken.
+    // scheduled DISPATCH slot will dispatch on its own. Say so explicitly: a bare
+    // failure here reads like the lane was left broken. Note "next dispatch slot"
+    // is the daily `23 7 * * *` one — the hourly sampling slots exit at guard
+    // (1b) without dispatching — so recovery is up to ~24h, not up to an hour.
     console.error(
       `::error::Cancelled stale run ${runId} but could not dispatch a replacement at ` +
         `${masterSha}: ${err.message}. The reviewer gate is now clear, so the next ` +
-        'scheduled dispatch slot will re-dispatch.',
+        'scheduled DISPATCH slot (daily) will re-dispatch — up to ~24h away.',
     );
+    await noteSupersedeFailed(client, {
+      reason: 'dispatch-failed-after-cancel',
+      detail:
+        `Run ${runId} was cancelled, but dispatching \`${DEPLOY_WORKFLOW_FILE}\` at ` +
+        `\`${masterSha}\` failed: ${err.message}`,
+      runUrl,
+    });
     process.exit(1);
   }
 

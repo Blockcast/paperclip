@@ -12,10 +12,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  CANCEL_POLL_ATTEMPTS,
+  CANCEL_POLL_DELAY_MS,
   DEPLOY_REF,
   DEPLOY_WORKFLOW_FILE,
   confirmSupersede,
   selectSupersedeCandidate,
+  waitForCancel,
 } from '../supersede-stale-deploy.mjs';
 
 const NOW = new Date('2026-09-01T12:00:00.000Z');
@@ -211,4 +214,63 @@ test('replay 2026-09-14: the incident that held the lane 41.2h would have been s
   // 41.2h into a partial.
   const missedHours = (HUMAN_CANCELLED_AT - firstSlotPastThreshold) / 3_600_000;
   assert.ok(missedHours > 34, `the stall ran ${missedHours}h past the first supersede point`);
+});
+
+// ---------------------------------------------------------------------------
+// waitForCancel — the POST-cancel half of the approval race.
+//
+// selectSupersedeCandidate already refuses to act when a queued/in_progress
+// dispatch sits alongside (`non-waiting-dispatch-present`). The same hazard
+// exists on the other side of the cancel: `POST .../cancel` is asynchronous, so
+// the run leaves `waiting` on its own schedule — and it can also leave `waiting`
+// by being APPROVED. Reading merely-not-`waiting` as "the cancel landed" would
+// dispatch a replacement alongside a live, approved production deploy, and
+// nothing downstream would notice: guard-pending-deploy{,-final} both query
+// `status=waiting` only, so an in_progress sibling reads as blocked=false.
+const cancelClient = (statuses) => {
+  const seen = [...statuses];
+  return {
+    request: async () => {
+      const status = seen.length > 1 ? seen.shift() : seen[0];
+      if (status instanceof Error) throw status;
+      return { status };
+    },
+  };
+};
+const noSleep = { sleep: async () => {} };
+
+test('waitForCancel: only a TERMINAL state proves the cancel landed', async () => {
+  const outcome = await waitForCancel(cancelClient(['waiting', 'completed']), 1, noSleep);
+  assert.deepEqual(outcome, { cleared: true, reason: 'cancel-landed', status: 'completed' });
+});
+
+test('waitForCancel: an APPROVED run is not a cleared lane — in_progress must not dispatch', async () => {
+  // The exact race the file header documents: a reviewer clicks between the live
+  // re-read and the cancel taking effect. An approved run goes
+  // waiting -> queued -> in_progress, never straight to completed.
+  for (const status of ['queued', 'in_progress']) {
+    const outcome = await waitForCancel(cancelClient([status]), 1, noSleep);
+    assert.equal(outcome.cleared, false, `${status} must not read as a cleared lane`);
+    assert.equal(outcome.reason, 'approval-won-cancel-race');
+    assert.equal(outcome.status, status);
+  }
+});
+
+test('waitForCancel: a cancel that never settles times out rather than dispatching', async () => {
+  const outcome = await waitForCancel(cancelClient(['waiting']), 1, noSleep);
+  assert.deepEqual(outcome, { cleared: false, reason: 'cancel-did-not-settle', status: 'waiting' });
+});
+
+test('waitForCancel: a read failure counts as "not yet", never as cleared', async () => {
+  // Same posture as before: we would rather not dispatch than dispatch into a
+  // guard that refuses the replacement and leaves the lane looking healthy with
+  // nothing in it.
+  const outcome = await waitForCancel(cancelClient([new Error('502 Bad Gateway')]), 1, noSleep);
+  assert.equal(outcome.cleared, false);
+  assert.equal(outcome.reason, 'cancel-did-not-settle');
+});
+
+test('waitForCancel: polling is bounded and the bound is far inside a cancel settle', () => {
+  assert.ok(CANCEL_POLL_ATTEMPTS * CANCEL_POLL_DELAY_MS >= 20_000);
+  assert.ok(CANCEL_POLL_ATTEMPTS * CANCEL_POLL_DELAY_MS <= 60_000);
 });

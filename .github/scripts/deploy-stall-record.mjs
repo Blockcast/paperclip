@@ -53,6 +53,18 @@ export const STALL_ISSUE_TITLE =
   'Production deploy approval stuck on the paperclip-production reviewer gate';
 
 /**
+ * Applied when a supersede EMPTIED the reviewer gate but could not refill it.
+ *
+ * Without it, the next sampling slot reports `checked-no-pending` — "nothing is
+ * on the gate" — and closes this record as resolved, while production is still
+ * at the stale commit and nothing has shipped. "A human cleared it" and "we
+ * emptied it and could not refill it" produce the identical dispatcher outcome,
+ * and only this label separates them.
+ */
+export const STALL_UNREFILLED_LABEL = 'production-deploy-lane-emptied';
+export const STALL_UNREFILLED_LABEL_COLOR = 'd93f0b';
+
+/**
  * Machine-readable state, kept in an HTML comment so it renders as nothing. The
  * version field exists so a future shape change can be detected rather than
  * silently mis-parsed into a wrong — and therefore understated — age.
@@ -218,6 +230,31 @@ export function renderResolvedComment({ outcome, runUrl }) {
 }
 
 /**
+ * Written by the supersede's two failure paths, both of which cancel the stale
+ * run and then fail to dispatch a replacement. The lane ends up EMPTY with
+ * production unchanged, which the dispatcher reports as `checked-no-pending` —
+ * the same outcome a human cancelling the run produces.
+ */
+export function renderSupersedeFailedComment({ reason, detail, runUrl }) {
+  return [
+    '**The supersede emptied the reviewer gate but could not refill it.**',
+    '',
+    `- Reason: \`${reason}\``,
+    ...(detail ? [`- Detail: ${detail}`] : []),
+    `- Dispatcher run: ${runUrl || '(unknown)'}`,
+    '',
+    '**Production is still at the stale commit.** Nothing is on the reviewer gate now, so the',
+    'escalation stops firing and there is nothing left to approve — but nothing has shipped',
+    'either. This record therefore stays OPEN until a dispatch actually lands, so that "a human',
+    'cleared it" is never recorded as having happened when it did not.',
+    '',
+    'The hourly sampling slots exit without dispatching, so the next automatic recovery is the',
+    'daily `23 7 * * *` dispatch slot — up to ~24h away. To recover now, re-run',
+    '`scheduled-production-deploy.yml` or dispatch `docker.yml` at `master` by hand.',
+  ].join('\n');
+}
+
+/**
  * Minimal GitHub REST client. `fetchImpl` is injectable so the dedup and
  * create-vs-comment branches are testable without a network.
  */
@@ -257,16 +294,34 @@ export function createGitHubClient({
     request,
 
     /** Idempotent: a 422 here means the label already exists, which is the goal. */
-    async ensureLabel() {
+    async ensureLabel(
+      name = STALL_LABEL,
+      color = STALL_LABEL_COLOR,
+      description = 'Opened by scheduled-production-deploy when an approval is stuck',
+    ) {
       try {
-        await request('POST', '/labels', {
-          name: STALL_LABEL,
-          color: STALL_LABEL_COLOR,
-          description: 'Opened by scheduled-production-deploy when an approval is stuck',
-        });
+        await request('POST', '/labels', { name, color, description });
       } catch (err) {
         if (err.status !== 422) throw err;
       }
+    },
+
+    /**
+     * Mark an existing record. `POST /issues/{n}/labels` creates a missing label
+     * on the fly with an arbitrary colour, so ensureLabel runs first purely to
+     * pin the colour; a failure there is not worth losing the mark over.
+     */
+    async addLabel(issueNumber, name) {
+      try {
+        await this.ensureLabel(
+          name,
+          STALL_UNREFILLED_LABEL_COLOR,
+          'The dispatcher emptied the reviewer gate and could not refill it',
+        );
+      } catch {
+        // Non-fatal: the label add below creates it anyway.
+      }
+      return request('POST', `/issues/${issueNumber}/labels`, { labels: [name] });
     },
 
     /**
@@ -335,13 +390,39 @@ export async function tryComment(client, issueNumber, body, label) {
  *
  * Runs on every dispatcher slot whose outcome is NOT `skipped-pending` — i.e.
  * `dispatched`, `up-to-date` and `checked-no-pending`, all three of which mean
- * no deploy is sitting on the reviewer gate. That is the definition of the stall
- * being over, so the record closes and the next stall starts a fresh clock.
+ * no deploy is sitting on the reviewer gate. That is USUALLY the definition of
+ * the stall being over, so the record closes and the next stall starts a fresh
+ * clock.
+ *
+ * The exception is the one the supersede introduced: its two failure paths
+ * cancel the stale run and then fail to dispatch, which empties the gate without
+ * anything shipping. That reads as `checked-no-pending` too. Those paths label
+ * the record STALL_UNREFILLED_LABEL, and an unrefilled record only closes on an
+ * outcome that actually refilled the lane (REFILLING_OUTCOMES) — otherwise this
+ * would record "a human cleared it" about a stall that is still running.
  *
  * Deliberately non-fatal: this is the audit trail's housekeeping, and failing a
  * green dispatch run over it would make the dispatcher's `conclusion` — which
  * PEN-2848 made load-bearing — mean something else again.
  */
+/**
+ * True when this record is only "no longer pending" because a supersede emptied
+ * the gate and could not refill it. See STALL_UNREFILLED_LABEL.
+ */
+export function isUnrefilled(issue) {
+  return (issue?.labels ?? []).some(
+    (label) => (typeof label === 'string' ? label : label?.name) === STALL_UNREFILLED_LABEL,
+  );
+}
+
+/**
+ * The outcomes on which an unrefilled record may still close. `dispatched` means
+ * the lane was refilled, `up-to-date` means production is already at master —
+ * either way nothing is owed. `checked-no-pending` is the one that means
+ * "empty, and we are the reason", so it must not close the record.
+ */
+export const REFILLING_OUTCOMES = new Set(['dispatched', 'up-to-date']);
+
 async function resolveMain() {
   const outcome = process.env.DISPATCH_OUTCOME || '(unknown)';
   const runUrl = process.env.RUN_URL ?? '';
@@ -356,6 +437,22 @@ async function resolveMain() {
   }
   if (!open) {
     console.log('No open production-deploy-stall record to close.');
+    return;
+  }
+
+  if (isUnrefilled(open) && !REFILLING_OUTCOMES.has(outcome)) {
+    // Closing here would write "Resolved: the dispatcher found no deploy on the
+    // reviewer gate" onto a stall that is not over — production is still at the
+    // stale commit, and the gate is empty because WE emptied it. Stay open and
+    // stay quiet: the supersede-failure comment already explains why, and this
+    // path runs hourly, so commenting each time would bury it.
+    console.log(
+      `::warning::Not closing the production-deploy-stall record #${open.number}: it is ` +
+        `labelled \`${STALL_UNREFILLED_LABEL}\`, so outcome \`${outcome}\` means "nothing ` +
+        'pending because a supersede emptied the gate and could not refill it", not "a human ' +
+        'cleared it". Production has not shipped. The record closes on the first `dispatched` ' +
+        'or `up-to-date` slot.',
+    );
     return;
   }
 

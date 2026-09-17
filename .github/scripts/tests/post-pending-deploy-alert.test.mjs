@@ -231,3 +231,62 @@ test('buildAlert: endsAt brackets the hourly schedule — outlives a missed slot
   // 10:00 paged until 11:00 the next day.
   assert.ok(ALERT_TTL_MS <= 6 * HOUR, 'TTL must not outlive the gate it reports');
 });
+
+// ---------------------------------------------------------------------------
+// When the stall record is UNREADABLE, the run only goes red if the record
+// could have changed the verdict.
+//
+// PEN-2848 made this dispatcher's `conclusion` mean one specific thing: "a
+// production approval is stuck". Exiting 1 on any failed record read would make
+// a transient GitHub API blip, during a slot where nothing is on the reviewer
+// gate at all, emit that same signal — and it would contradict the rule the
+// sibling close step states, that the conclusion must not start meaning
+// "housekeeping failed".
+//
+// The discriminator is `verdict.oldest`. These two tests pin the property the
+// gate is derived from, so the gate cannot be "simplified" back.
+test('with no waiting run the verdict is settled BEFORE the record is consulted', () => {
+  // Every recorded stall start, including an absurd one, must produce the
+  // identical verdict — which is what makes a failed read provably irrelevant.
+  const base = { pendingRuns: [], alertAfterHours: 6, now: new Date('2026-09-16T12:00:00Z') };
+  const noRecord = selectStuckApproval({ ...base, stallStartedAt: null });
+  const ancientRecord = selectStuckApproval({ ...base, stallStartedAt: '2020-01-01T00:00:00Z' });
+
+  assert.deepEqual(noRecord, ancientRecord);
+  assert.equal(noRecord.stuck, false);
+  assert.equal(noRecord.oldest, null);
+});
+
+test('queued and in_progress dispatches are not waiting runs, so they too settle without the record', () => {
+  // This is the slot the finding is about: guard (1) reported something pending,
+  // so the escalation step runs, but nothing is actually on the reviewer gate.
+  const base = {
+    pendingRuns: [
+      { databaseId: 1, status: 'queued', createdAt: '2026-09-16T11:00:00Z' },
+      { databaseId: 2, status: 'in_progress', createdAt: '2026-09-16T11:30:00Z' },
+    ],
+    alertAfterHours: 6,
+    now: new Date('2026-09-16T12:00:00Z'),
+  };
+  assert.deepEqual(
+    selectStuckApproval({ ...base, stallStartedAt: null }),
+    selectStuckApproval({ ...base, stallStartedAt: '2020-01-01T00:00:00Z' }),
+  );
+  assert.equal(selectStuckApproval({ ...base, stallStartedAt: null }).oldest, null);
+});
+
+test('WITH a waiting run under threshold the record IS decisive, so a failed read stays fatal', () => {
+  // The other arm: here an earlier recorded start pushes the age over the
+  // threshold, so an unreadable record genuinely means an unjudgeable age.
+  const base = {
+    pendingRuns: [{ databaseId: 1, status: 'waiting', createdAt: '2026-09-16T11:00:00Z' }],
+    alertAfterHours: 6,
+    now: new Date('2026-09-16T12:00:00Z'),
+  };
+  assert.equal(selectStuckApproval({ ...base, stallStartedAt: null }).stuck, false);
+  assert.equal(
+    selectStuckApproval({ ...base, stallStartedAt: '2026-09-16T00:00:00Z' }).stuck,
+    true,
+    'the record can flip the verdict here, which is why a failed read must still fail',
+  );
+});
