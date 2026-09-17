@@ -787,6 +787,36 @@ describe("formatGateRevalidationSections", () => {
     expect(markdown.indexOf("cancelled")).toBeLessThan(markdown.indexOf("never moved"));
   });
 
+  it("does not head a mixed refused/withdrawn row as if every card was withdrawn", () => {
+    // The sibling of the `interaction-answered` case below, and a direct
+    // consequence of the PEN-3089 reorder: moving the abandoned branch ahead of
+    // the refusal branch is what stops a `rejected` card masking a retracted
+    // ask, and it is also what makes this kind non-terminal. It now fires on
+    // *at least one* abandoned card, so this row — one refused, one withdrawn —
+    // lands under the heading with a refused card still on it. The heading must
+    // not claim every card was withdrawn; the evidence line directly beneath it
+    // says "the remaining 1 refused", and the two cannot disagree about the
+    // same row.
+    const report = revalidateGates([
+      evidence({
+        issueId: "mixed",
+        identifier: "PEN-2224",
+        approvals: [
+          { approvalId: "a1", approvalStatus: "rejected" },
+          { approvalId: "a2", approvalStatus: "withdrawn" },
+        ],
+      }),
+    ]);
+    const markdown = formatGateRevalidationSections(report);
+    expect(markdown).toContain("At least one board card was withdrawn or cancelled");
+    expect(markdown).not.toContain("Every board card was withdrawn");
+    // Heading and evidence must agree: the refused sibling is still reported,
+    // and the row is still action-owed because the retracted ask needs re-asking.
+    expect(markdown).toContain("the remaining 1 refused");
+    expect(markdown).toContain("a2=withdrawn");
+    expect(withheldFromAgeRankingIssueIds(report).has("mixed")).toBe(false);
+  });
+
   it("does not head a mixed answered/expired row as if every card was answered", () => {
     // The `interaction-answered` kind is assigned whenever *at least one* card
     // got a decision, so this row — one answered, one expired — lands under

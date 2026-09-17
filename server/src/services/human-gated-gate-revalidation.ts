@@ -116,12 +116,18 @@ export type GateProbeKind =
  *   human" while the thing it was waiting on no longer exists. Like a stuck
  *   edge it cannot self-clear — someone has to re-ask or drop the row.
  * - `approval-abandoned` (PEN-3089) is the approval-side twin of
- *   `interaction-abandoned`: every linked card was `withdrawn` by its own
- *   requester or `cancelled`, so the board never answered and no answer is
- *   coming. Before PEN-3089 these rows were reported as `approval-decided` —
- *   identically to an `approved` card — which is how PEN-2224, the root blocker
- *   of a critical credential-exposure chain, spent 26 days inside a section
- *   headed "these are not still waiting".
+ *   `interaction-abandoned`: at least one linked card was `withdrawn` by its
+ *   own requester or `cancelled`, so that ask never got a board answer and no
+ *   answer is coming. Deliberately *not* "every card", and this is where the
+ *   twin stops being symmetric — `interaction-abandoned` is its probe's
+ *   fall-through and so is terminal, whereas this kind is assigned *ahead* of
+ *   `approval-refused` so a sibling refusal cannot mask a retracted ask (see
+ *   {@link probeApprovalGate} for that ordering argument). A mixed row
+ *   therefore lands here with refused cards on it; the heading and evidence
+ *   line both say so. Before PEN-3089 these rows were reported as
+ *   `approval-decided` — identically to an `approved` card — which is how
+ *   PEN-2224, the root blocker of a critical credential-exposure chain, spent
+ *   26 days inside a section headed "these are not still waiting".
  * - `blocker-done-row-not-moved` is a row whose blockers all completed; the
  *   platform already considers it dependency-ready and it is merely still open.
  * - `approval-granted` is a row whose board gate opened: at least one linked
@@ -940,8 +946,19 @@ const RESOLUTION_KIND_HEADINGS: Record<GateResolutionKind, string> = {
     "Blocker edge is cancelled — permanently un-checkoutable until an operator clears it",
   "interaction-abandoned":
     "Every question card was withdrawn or expired — the human was asked and never answered",
+  // Not "every card": unlike `interaction-abandoned` — which is its probe's
+  // fall-through and so is terminal — this kind is assigned ahead of the
+  // refusal branch, precisely so a sibling `rejected` card cannot mask an ask
+  // the requester retracted. That reorder is what makes the kind correct and
+  // is also what costs it the "every" claim: the branch fires on *at least
+  // one* abandoned card, so a mixed row reaches this heading with refused
+  // cards on it. The remainder is exactly the refused set — `granted`,
+  // undecided and unrecognised have each already returned — which is why the
+  // second clause can name it rather than hedge. Claiming "every" here would
+  // contradict the evidence line printed directly beneath it ("…and the
+  // remaining N refused") on the very rows the reorder exists to surface.
   "approval-abandoned":
-    "Every board card was withdrawn or cancelled — the board was asked and never answered",
+    "At least one board card was withdrawn or cancelled — that ask died unanswered; any remaining cards were refused",
   "blocker-done-row-not-moved": "Every blocker is done — the row simply never moved",
   "approval-granted":
     "The board granted the ask and the row has not moved since — authorised, unperformed",
