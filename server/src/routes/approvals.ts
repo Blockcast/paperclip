@@ -120,6 +120,12 @@ export function approvalRoutes(
   const access = accessService(db);
   const issueApprovalsSvc = issueApprovalService(db);
   const secretsSvc = secretService(db);
+  // Built once, like `costRoutes` does for the sibling budget-writing route
+  // (`costs.ts`), rather than rebuilding the whole heartbeat closure graph on
+  // every apply just to reach one method.
+  const heartbeat = heartbeatService(db, {
+    pluginWorkerManager: options.pluginWorkerManager,
+  });
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
 
   async function requireApprovalAccess(req: Request, id: string) {
@@ -725,9 +731,7 @@ export function approvalRoutes(
         agentId: actor.agentId ?? null,
         isBoard: req.actor.type === "board",
       },
-      { cancelWorkForScope: heartbeatService(db, {
-        pluginWorkerManager: options.pluginWorkerManager,
-      }).cancelBudgetScopeWork },
+      { cancelWorkForScope: heartbeat.cancelBudgetScopeWork },
     );
 
     res.json(result);

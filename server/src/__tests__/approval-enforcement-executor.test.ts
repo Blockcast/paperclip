@@ -166,6 +166,8 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
       windowKind: "calendar_month_utc",
       amount: options.enforcedCents,
       isActive: options.isActive ?? true,
+      // Whoever last set this cap by hand. An agent-driven apply must not blank it.
+      updatedByUserId: "board-user",
       amountUpdatedAt: options.policyAmountUpdatedAt ?? new Date(Date.now() - 48 * 60 * 60 * 1000),
     });
 
@@ -279,6 +281,16 @@ describeEmbeddedPostgres("applyApprovalEnforcement", () => {
         ),
       );
     expect(activity).toHaveLength(1);
+
+    // 3e. ...and applying does not blank the prior human attribution on the
+    // policy row. The requester here is an agent, so there is no user id to
+    // write; overwriting would discard the board user who last set the cap and
+    // record nothing in its place.
+    const [attributed] = await db
+      .select({ updatedByUserId: budgetPolicies.updatedByUserId })
+      .from(budgetPolicies)
+      .where(eq(budgetPolicies.id, policyId));
+    expect(attributed?.updatedByUserId).toBe("board-user");
 
     // 4. The detector and the executor agree on what "applied" means.
     await db.delete(issues);
