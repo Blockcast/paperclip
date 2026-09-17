@@ -2804,6 +2804,7 @@ export function recoveryService(
     issue: typeof issues.$inferSelect,
     graceMs: number,
     openPullRequestGraceMs: number,
+    pendingBoardApprovalGraceMs: number,
   ) {
     // BLO-24782: this used to be `if (issue.monitorNextCheckAt) return true`, which
     // accepted a check instant already in the past. That was not simply a looser
@@ -2816,6 +2817,8 @@ export function recoveryService(
     if (hasActiveMonitorPath(issue, graceMs)) return true;
 
     if (await hasOpenPullRequestWakePath(issue, openPullRequestGraceMs)) return true;
+
+    if (await hasPendingBoardApprovalWakePath(issue, pendingBoardApprovalGraceMs)) return true;
 
     return db
       .select({ id: issueRelations.issueId })
@@ -2951,6 +2954,85 @@ export function recoveryService(
           eq(issueWorkProducts.companyId, issue.companyId),
           eq(issueWorkProducts.issueId, issue.id),
           ...openPullRequestWakePathConditions(freshSinceIso),
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
+  /**
+   * Whether a PENDING board approval linked to this issue still constitutes an automatic
+   * path back to life FOR THIS ISSUE'S ASSIGNEE.
+   *
+   * PEN-3352, filed against PEN-2791's omission. A board card awaiting a human is the
+   * same class of object as an open PR awaiting a merge press — the normal resting state
+   * of correct work, on a queue measured in days — and it was the one such class with no
+   * durable path here. The consequence is the one written on `hasOpenPullRequestWakePath`
+   * above: the convergence guard's whole job, against a gate it cannot move, is to stop
+   * re-arming and clear `monitorNextCheckAt`, so on a row whose only gate is a board card
+   * the guard behaving correctly is precisely what made the row seizable.
+   *
+   * Live instance PEN-2727: seized 2026-09-17T12:56:20Z as `stranded_assigned_issue` with
+   * `latestRunStatus: succeeded` and `latestRunErrorCode: null` — fired on the absence of
+   * a counted path, not on a fault — while linked to pending approval `71e27d35`.
+   *
+   * ⚠️ The clause that makes this NOT a copy of the PR predicate, and the reason it must
+   * not be written as one. The two wakes have different targets:
+   *
+   *   - `github-webhook.ts` wakes `effectiveAssigneeAgentId` — the ISSUE'S ASSIGNEE. So
+   *     `hasOpenPullRequestWakePath` can be assignee-agnostic: whoever holds the row is
+   *     by construction the actor the webhook will wake.
+   *   - `approval-resolution.ts` wakes `approval.requestedByAgentId` — the REQUESTER, who
+   *     need not hold the row and frequently does not.
+   *
+   * Measured 2026-09-17 across all 17 pending approvals in the reference company: of 20
+   * linked (approval, issue) pairs, **8 had requester != assignee**. Without the equality
+   * clause this disjunct would suppress seizure on rows whose decision wake lands on a
+   * different agent entirely — protecting them from recovery while leaving them genuinely
+   * dark, which is a strictly worse failure than the one being fixed. PEN-2727 itself is
+   * such a pair today (requester Cfo, assignee Ceo, following the seizure that moved it),
+   * so the motivating row is deliberately NOT exempted by this predicate until its
+   * assignee and its requester are the same agent again. The repair for that shape is to
+   * put the row back with the agent who filed the card, not to widen this.
+   *
+   * `requestedByAgentId IS NOT NULL` is load-bearing for the same reason the PR path
+   * insists on webhook provenance: `queueRequesterWake` returns immediately without a
+   * requester agent, so a board-filed or system-filed card (every
+   * `budget_override_required` row) predicts no wake at all. A human-filed card says a
+   * human is waiting, which is not the same claim as an agent being woken.
+   *
+   * Scoped to `pending` ONLY, deliberately excluding `revision_requested` even though the
+   * issue-graph liveness classifier counts both. There the question is "does anything own
+   * the next action", and a revision request is owned — by the requester. Here the
+   * question is "will an external event wake this agent", and the board has already
+   * answered: the next move is the requester resubmitting, which is the assignee acting,
+   * not an event arriving. Counting it would credit a wake that has already been spent.
+   *
+   * Bounded on `createdAt` — see `pendingBoardApprovalAttendanceGraceMs` for the measured
+   * decision-latency distribution behind the 14d default, and for why the bound reads
+   * `createdAt` rather than the PR path's `updatedAt`.
+   */
+  async function hasPendingBoardApprovalWakePath(
+    issue: typeof issues.$inferSelect,
+    graceMs: number,
+  ) {
+    // An unassigned row has no assignee for the decision wake to reach, and is not the
+    // stranded-ASSIGNED population in any case. Returning early keeps the SQL's equality
+    // clause from having to express "null equals null is not a match".
+    if (!issue.assigneeAgentId) return false;
+    const filedSinceIso = new Date(Date.now() - graceMs).toISOString();
+    return db
+      .select({ approvalId: issueApprovals.approvalId })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+      .where(
+        and(
+          eq(issueApprovals.companyId, issue.companyId),
+          eq(issueApprovals.issueId, issue.id),
+          eq(approvals.companyId, issue.companyId),
+          eq(approvals.status, "pending"),
+          eq(approvals.requestedByAgentId, issue.assigneeAgentId),
+          sql`${approvals.createdAt} > ${filedSinceIso}::timestamptz`,
         ),
       )
       .limit(1)
@@ -8506,13 +8588,15 @@ export function recoveryService(
     // restart -- the next tick sees the new value -- while making the cost O(1) in the
     // candidate count.
     //
-    // PEN-2791 added a second grace to this pass. Both come off ONE `loadConfig()` --
-    // adding a `loadConfig().openPullRequestAttendanceGraceMs` beside the existing line
-    // would have doubled exactly the per-tick subprocess cost the single read exists to
-    // remove.
+    // PEN-2791 added a second grace to this pass, PEN-3352 a third. All come off ONE
+    // `loadConfig()` -- adding a `loadConfig().openPullRequestAttendanceGraceMs` beside
+    // the existing line would have doubled exactly the per-tick subprocess cost the
+    // single read exists to remove.
     const recoverySweepConfig = loadConfig();
     const lapsedMonitorGraceMs = recoverySweepConfig.lapsedMonitorGraceMs;
     const openPullRequestAttendanceGraceMs = recoverySweepConfig.openPullRequestAttendanceGraceMs;
+    const pendingBoardApprovalAttendanceGraceMs =
+      recoverySweepConfig.pendingBoardApprovalAttendanceGraceMs;
     const reconcileStrandedCandidate = async (issue: (typeof candidates)[number]) => {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
@@ -8727,6 +8811,7 @@ export function recoveryService(
           issue,
           lapsedMonitorGraceMs,
           openPullRequestAttendanceGraceMs,
+          pendingBoardApprovalAttendanceGraceMs,
         )
       ) {
         result.skipped += 1;
