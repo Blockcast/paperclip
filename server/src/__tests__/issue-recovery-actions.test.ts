@@ -2532,12 +2532,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     }
 
     // The same row, except its continuation retry died on infrastructure instead of
-    // exiting 0. This is the population the exemption does NOT currently reach, because
-    // it is consulted only under `latestRun?.status === "succeeded"` -- see the
-    // "Deliberately consulted ONLY on the succeeded-run gate" note on
-    // `hasOpenPullRequestWakePath`. Seeded here so that scoping is pinned by a test
-    // rather than resting on the comment alone; BLO-32679 carries the pending ruling on
-    // whether it should stay.
+    // exiting 0. Under the BLO-32679 ruling this population IS reached: the exemption is
+    // consulted whenever the latest run never executed a model turn
+    // (`isInfraFailureRun`), not only on the succeeded arm. The run below is seeded to
+    // that never-executed shape, so the tests using this helper measure the exemption
+    // itself rather than a row the predicate declines to look at. The one test that
+    // varies it -- by giving the run real token usage -- is asserting the boundary, where
+    // an interrupted turn stays seizable.
     //
     // `job_failed` specifically, because that is the sweep's own retry giving up:
     // `reconcileStrandedAssignedIssues` issues the `issue_continuation_needed`
@@ -2546,8 +2547,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // NOT in `isInfraClassStrandedFailure`, so `infraClassCause` reads false on it.
     async function seedSeizableFailedContinuationRow() {
       const seeded = await seedCompany();
+      // Returned so callers that mutate this run address it by id. Scoping the update
+      // by `agentId` instead would be correct only while this helper inserts exactly
+      // one run for that agent -- an invariant of a shared helper two call sites away.
+      const failedRunId = randomUUID();
       await db.insert(heartbeatRuns).values({
-        id: randomUUID(),
+        id: failedRunId,
         companyId: seeded.companyId,
         agentId: seeded.coderId,
         invocationSource: "assignment",
@@ -2575,7 +2580,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           source: "issue.productive_terminal_continuation_recovery",
         },
       });
-      return seeded;
+      return { ...seeded, failedRunId };
     }
 
     // Built through the real producer, not hand-written literals: the predicate filters
@@ -2756,7 +2761,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     it("still escalates a fresh webhook-written open pull request when the failed run had executed", async () => {
-      const { companyId, sourceIssueId, coderId } = await seedSeizableFailedContinuationRow();
+      const { companyId, sourceIssueId, failedRunId } = await seedSeizableFailedContinuationRow();
       // The boundary the BLO-32679 ruling draws, and the reason the exemption is keyed on
       // `isInfraFailureRun` rather than on the error code. This run burned tokens before
       // dying, so a turn WAS interrupted and its intent is unknown -- and if that
@@ -2780,7 +2785,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           usageJson: { inputTokens: 6531, outputTokens: 3983 },
           logBytes: 158380,
         })
-        .where(eq(heartbeatRuns.agentId, coderId));
+        .where(eq(heartbeatRuns.id, failedRunId));
       const fields = await insertPullRequestWorkProduct({
         companyId,
         issueId: sourceIssueId,
