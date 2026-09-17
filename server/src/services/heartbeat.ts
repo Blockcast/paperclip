@@ -19029,8 +19029,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     //    the ccrotate capacity park and the `dependency_blocked` park both
     //    insert a deferred *fresh wake* and leave it null, while every
     //    `scheduleBoundedRetryForRun` park sets `retryOfRunId: run.id` because
-    //    a run already executed and is being continued. Without this guard an
-    //    issueless `max_turns_continuation` park — an agent that ran out of
+    //    a run already executed and is being continued.
+    //
+    //    That column split is NOT a claim that both fresh-wake parks are
+    //    candidates here: in practice the ccrotate capacity park is the only
+    //    one that reaches this gate at all. A `dependency_blocked` park is
+    //    already excluded by guard 1, because its writer runs only inside the
+    //    `if (issueId)` branch of `wakeup()` and persists a snapshot spread
+    //    from an `enrichedContextSnapshot` that carries that `issueId` — so
+    //    `isGenericTimerWakeSnapshot` is false for every row it writes. Guard 2
+    //    earns its place against the `scheduleBoundedRetryForRun` family, not
+    //    against dep-blocked. Without it an issueless
+    //    `max_turns_continuation` park — an agent that ran out of
     //    turns mid-task doing issueless work such as a sweep, report or PR
     //    review — is cancelled outright whenever its lane's assigned queue
     //    happens to be empty at promotion, which for issueless work is the
