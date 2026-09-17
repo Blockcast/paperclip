@@ -8101,6 +8101,101 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("- Elapsed accounting: 0m monitor-gated, 7h 0m executing, 7h 0m unattended");
   });
 
+  // BLO-27698 B2 boundedness, the case the test above cannot reach (Ally review
+  // on fe4e9dcb). Both fixtures above let the episode clock run — they set no
+  // `executionRunId`, so `nonLiveExecutionHoldSince` returns null,
+  // `attributableEndAt` is `now`, and `elapsedMs` grows every reconcile. That is
+  // what makes the share test self-clearing there, and it is exactly the
+  // assumption that fails here.
+  //
+  // A silent `running` HOLDER pins `attributableEndAt` at the fixed
+  // `lastSignal + NON_LIVE_EXECUTION_SILENCE_MS`. `elapsedMs`, `executingMs` and
+  // `unattendedMs` then freeze, so the ratio is constant across every subsequent
+  // reconcile and can never cross back under the bar — indefinite suppression,
+  // the BLO-22331 AC2 hazard. Advancing `now` cannot rescue it the way the
+  // boundedness test does, because advancing `now` no longer moves the episode.
+  //
+  // The holder carries NO `startedAt`, which is the documented shape for one
+  // (see the `activeStartedAt` comment at productivity-review.ts:3784 — a holder
+  // pinned via `executionRunId` tracks liveness through `lastOutputAt` instead).
+  // That detail is what makes the case reachable, and the review's own worked
+  // example is not: a holder that *does* carry `startedAt` necessarily spans the
+  // whole episode, because the anchor is `max(startedAt)` — which is at or after
+  // the holder's own start — while the episode END is that same holder's silence
+  // point. Unattended collapses to 0 and the first arm suppresses before B2 is
+  // ever consulted. Here the executing time comes from a terminal sibling that
+  // ran the first 9h, so the two ends are decoupled and the 7h residue is real.
+  //
+  // 16h episode, 9h executing (9/16 > 0.5, so the dominance arm engages), 7h
+  // unattended (above the 6h bar, so the first arm does not). `runaway_execution`
+  // declines because the sibling is terminal and no longer signalling.
+  it("fires long_active_duration when a dominant executing share is frozen by a non-live holder", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const hours = (n: number) => new Date(now.getTime() - n * 60 * 60 * 1000);
+    const holderId = randomUUID();
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: hours(18),
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        // The holder: `running`, no `startedAt`, last signal 4h stale. Pins
+        // `attributableEndAt` at 2h ago and contributes no live span of its own
+        // (`runLiveInterval` returns null without a `startedAt`).
+        id: holderId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "running",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: null,
+        lastOutputAt: hours(4),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: hours(19),
+        updatedAt: hours(4),
+      },
+      {
+        // Terminal sibling carrying the executing time. Starts before the issue's
+        // own `startedAt` so it cannot pull the anchor forward.
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: hours(19),
+        finishedAt: hours(9),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: hours(19),
+        updatedAt: hours(9),
+      },
+    ]);
+    await db
+      .update(issues)
+      .set({ executionRunId: holderId, checkoutRunId: holderId, executionLockedAt: hours(4) })
+      .where(eq(issues.id, seeded.issueId));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    // Anchors the positive: without the `trailingHoldMs === 0` conjunct the
+    // dominance arm suppresses this outright and `created` is 0.
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    // The frozen figures themselves, so a future change that "fixes" this by
+    // moving the episode window rather than bounding the arm also fails here.
+    expect(review?.description).toContain("- Elapsed accounting: 0m monitor-gated, 9h 0m executing, 7h 0m unattended");
+  });
+
   // BLO-27698 B3 — the narrowing itself, isolated from B2's dominance arm. 9h
   // episode, no monitor, a run that executed the first 4h and then finished:
   // 0m gated + 4h executing + 5h unattended.
