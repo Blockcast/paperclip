@@ -124,14 +124,24 @@ describe("hasActionablePrReviewFeedback", () => {
     expect(hasActionablePrReviewFeedback(clean)).toBe(false);
   });
 
-  it("still blocks an all-zero review that transcribes the directive boilerplate", () => {
+  it("still blocks a bucketless review that transcribes the directive boilerplate", () => {
     // Guards against "fixing" BLO-34160 by deleting the prose clause: a body
-    // that narrates a blocking action while declaring (0) must keep failing
-    // closed, per the fail-safe documented on hasActionablePrReviewFeedback.
-    const boilerplate = body(`Reviewed head: ${SHA}`).replace(
-      "Land.",
-      "1. Fix Critical issues before merge.\n2. Address Important issues this cycle.",
-    );
+    // that narrates a blocking action must keep failing closed, per the
+    // fail-safe documented on hasActionablePrReviewFeedback.
+    //
+    // Deliberately carries NO counted buckets. An all-zero body would make this
+    // assertion order-dependent: BLO-31446's fix (#1657) lets an explicit
+    // Critical(0) + Important(0) outrank this prose clause, so the same input
+    // is `true` on master and `false` once #1657 lands, and whichever PR merges
+    // second reds CI. Measured both ways before narrowing the fixture. A body
+    // with no buckets never reaches that precedence rule, so the clause stays
+    // reachable -- and reachable is exactly what this test exists to pin.
+    const boilerplate = `## Ally — Consolidated PR Review
+Reviewed head: ${SHA}
+
+### Recommended Action
+1. Fix Critical issues before merge.
+2. Address Important issues this cycle.`;
     expect(hasActionablePrReviewFeedback(boilerplate)).toBe(true);
   });
 });
