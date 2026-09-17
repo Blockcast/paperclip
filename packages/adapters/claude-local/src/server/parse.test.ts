@@ -185,7 +185,8 @@ describe("isClaudeTransientUpstreamError — transcript independence (PEN-3223)"
     ).toBe(true);
   });
 
-  it("does not invent a transient label when a NON-result parsed has a clean transcript", () => {    const nonResult = { type: "error", error: { message: "workspace path not found" } };
+  it("does not invent a transient label when a NON-result parsed has a clean transcript", () => {
+    const nonResult = { type: "error", error: { message: "workspace path not found" } };
     expect(
       isClaudeTransientUpstreamError({
         parsed: nonResult,

@@ -392,38 +392,6 @@ function buildClaudeTransientHaystack(input: {
 }
 
 /**
- * The bounded error surfaces of a *finished* run: the terminal `result` event and
- * the failure message derived from it. Deliberately does NOT read `stdout`.
- *
- * Twin of the guard in `vendor/paperclip-adapter-claude-k8s/src/server/parse.ts`,
- * which carries the full measurement (PEN-3223). In short: `stdout` is the entire
- * pod log, so a haystack containing it decides the label from *transcript content*
- * rather than from the fault. Measured on 964 retained run logs, 20 of the 41 runs
- * whose terminal event carries `api_error_status: 403` were labelled
- * `claude_transient_upstream` off tokens present only in the transcript — buying
- * paid retries for an authorization that cannot succeed. Narrowing costs no
- * detection on that population: every 429 (9/9) and 503 (6/6) in that corpus
- * keeps its signal on these surfaces.
- *
- * This builder is for the terminal-result case ONLY, and its caller selects it on
- * `parsed` being present. In THIS adapter (unlike the k8s twin) the classifier is
- * also reachable with `parsed: null`, from the `!parsed` fallback in
- * `execute.ts`; applying this builder there would leave only `errorMessage` and
- * `stderr` and would lose a stdout-only transient signal. That path keeps the wide
- * builder deliberately.
- *
- * `result` is deliberately NOT gated on a non-`success` subtype the way
- * `isClaudeSkillNotFoundError` gates it: a genuine upstream refusal arrives as
- * `subtype: "success"` with `is_error: true` and `api_error_status: 429`, so that
- * gate would discard the true positives this rule exists for.
- *
- * The transcript-reading callers below (`isClaudeImmutableThinkingBlockError`,
- * `isClaudeProviderQuotaError`, `extractClaudeRetryNotBefore`) keep the wide
- * builder on purpose: the first two can only ever SUPPRESS a transient label, and
- * the third extracts a timestamp once a family is already decided. None of them
- * grants a retry family off transcript text.
- */
-/**
  * Is `parsed` the CLI's terminal `result` event, as opposed to some other JSON
  * object that merely reached the same variable?
  *
@@ -440,6 +408,42 @@ function isClaudeTerminalResultEvent(parsed: Record<string, unknown> | null): bo
   return parsed !== null && asString(parsed.type, "") === "result";
 }
 
+/**
+ * The bounded error surfaces of a *finished* run: the terminal `result` event and
+ * the failure message derived from it. Deliberately does NOT read `stdout`.
+ *
+ * Twin of the guard in `vendor/paperclip-adapter-claude-k8s/src/server/parse.ts`,
+ * which carries the full measurement (PEN-3223). In short: `stdout` is the entire
+ * pod log, so a haystack containing it decides the label from *transcript content*
+ * rather than from the fault. Measured on 964 retained run logs, 20 of the 41 runs
+ * whose terminal event carries `api_error_status: 403` were labelled
+ * `claude_transient_upstream` off tokens present only in the transcript — buying
+ * paid retries for an authorization that cannot succeed. Narrowing costs no
+ * detection on that population: every 429 (9/9) and 503 (6/6) in that corpus
+ * keeps its signal on these surfaces.
+ *
+ * This builder is for the terminal-result case ONLY, and its caller selects it on
+ * the terminal `result` event (`isClaudeTerminalResultEvent` above), NOT on
+ * `parsed` being non-null — selecting on presence is precisely the defect that
+ * shape gate exists to prevent. Everything else keeps the wide builder
+ * deliberately, and in THIS adapter (unlike the k8s twin) that is two distinct
+ * arrivals, not one: `parsed: null`, from the `!parsed` fallback in `execute.ts`,
+ * and a truthy NON-result object, because that file derives `parsed` as
+ * `parsedStream.resultJson ?? parseJson(stdout)`. Applying this builder to either
+ * would leave only `errorMessage` and `stderr` and would lose a stdout-only
+ * transient signal.
+ *
+ * `result` is deliberately NOT gated on a non-`success` subtype the way
+ * `isClaudeSkillNotFoundError` gates it: a genuine upstream refusal arrives as
+ * `subtype: "success"` with `is_error: true` and `api_error_status: 429`, so that
+ * gate would discard the true positives this rule exists for.
+ *
+ * The transcript-reading callers below (`isClaudeImmutableThinkingBlockError`,
+ * `isClaudeProviderQuotaError`, `extractClaudeRetryNotBefore`) keep the wide
+ * builder on purpose: the first two can only ever SUPPRESS a transient label, and
+ * the third extracts a timestamp once a family is already decided. None of them
+ * grants a retry family off transcript text.
+ */
 function buildClaudeTerminalResultHaystack(input: {
   parsed?: Record<string, unknown> | null;
   stderr?: string | null;
