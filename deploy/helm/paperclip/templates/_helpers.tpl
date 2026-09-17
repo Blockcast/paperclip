@@ -276,7 +276,15 @@ operator would read seven days of zero blocks as "the gate is quiet" rather than
 "the gate is off". Quote your values.
 */}}
 {{- define "paperclip.evidenceGateUnlabeledTruthBlock" -}}
-{{- $v := (((.Values.evidenceGate).unlabeledTruthBlock) | default "0" | toString) -}}
+{{- $raw := ((.Values.evidenceGate).unlabeledTruthBlock) -}}
+{{- /* Only a genuinely absent key defaults; everything else is validated.
+       `kindIs "invalid"` is the nil test, and it is deliberately NOT `empty`
+       or `default`: Go templates count boolean `false` as empty, so both of
+       those collapse `unlabeledTruthBlock: false` to "0" silently while
+       `true` fails loudly — the same unquoted-bool trap this helper exists to
+       catch, one level down. Both bools are now the same class of mistake and
+       both say so. */ -}}
+{{- $v := (kindIs "invalid" $raw | ternary "0" ($raw | toString)) -}}
 {{- if not (has $v (list "0" "1")) -}}
 {{- fail (printf "evidenceGate.unlabeledTruthBlock must be the string \"0\" or \"1\", got %q — an unquoted YAML bool renders \"true\" and the server reads it as off (docs/runbooks/evidence-gate-unlabeled-block.md)" $v) -}}
 {{- end -}}

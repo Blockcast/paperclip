@@ -16,6 +16,17 @@
 import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
+// The real thing, not a copy. Node strips the types on import (>=22.18, and
+// CI pins 24), and this module has no imports of its own, so a plain .mjs ops
+// script can hold the webhook's own link rule without a build step or a
+// dependency. An earlier revision inlined a merged copy of the two patterns
+// below and silently dropped three of upstream's defenses; see the block over
+// `namesIssue`.
+import {
+  extractHouseReferenceLabeledIdentifiers,
+  extractOwningLabeledIdentifiers,
+} from "../../server/src/services/paperclip-identifiers.ts";
+
 const API = process.env.PAPERCLIP_API_URL;
 const KEY = process.env.PAPERCLIP_API_KEY;
 const CID = process.env.PAPERCLIP_COMPANY_ID;
@@ -42,26 +53,23 @@ const j = async (path, init) => {
 const PR_RE = /https?:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)\b/g;
 const LIMIT = 500;
 
-// The body arm accepts ONLY a labeled owning-reference line, mirroring
-// OWNING_REFERENCE_LABEL_PATTERN / HOUSE_REFERENCE_LABEL_PATTERN in
-// server/src/services/paperclip-identifiers.ts. A bare prose mention is
-// deliberately NOT an owning reference (BLO-20886): `Related: BLO-1234` in
-// someone else's PR body must not link that PR to this issue.
-//
-// Deliberately a copy rather than an import: this is a plain .mjs ops script
-// and the real helpers are TypeScript source. The copy is narrower than the
-// original (no fenced-code or HTML-comment stripping, no trailing-label
-// splitting), which fails in the safe direction — it can miss a link, and a
-// missed link leaves the issue exactly as the script found it. The original
-// defect failed the other way.
-const OWNING_LABEL_LINE =
-  /^ {0,3}(?:[-*+]|\d{1,3}[.)])?[ \t]*(?:fix(?:e[sd])?|clos(?:e[sd]?)|resolv(?:e[sd]?)|refs?|paperclip[ \t]+qa[ \t]+task|paperclip[ \t]+task|paperclip[ \t]+issue|issue)[ \t]*:?[ \t]+(.+)$/i;
-
 /**
  * Does this PR claim this issue? Mirrors the webhook's link rule: the
  * identifier appears in the PR title, the head branch, or on a labeled owning
- * reference line in the body. Case-insensitive, bounded so BLO-123 does not
- * match BLO-1234.
+ * reference line in the body.
+ *
+ * The body arm DELEGATES to the two upstream extractors rather than copying
+ * their patterns, and that is load-bearing. They are two grammars, not one:
+ * the closing verbs (`Fixes`/`Closes`/`Resolves`/`Refs`) take an OPTIONAL
+ * colon because "Closes BLO-1" is unambiguous, while the house labels
+ * (`Issue`/`Paperclip task`/…) REQUIRE one because `Issue` is an ordinary
+ * noun that also starts ordinary sentences — "Issue filed a related bug, see
+ * BLO-1" claims nothing. Merging them under one optional-colon alternation,
+ * as an earlier revision did, links off prose. Delegating also inherits
+ * `visibleMarkdownLines` (fenced code and HTML comments declare nothing a
+ * reader can see) and the trailing-label split (`Refs: BLO-1; Related:
+ * BLO-2` owns only BLO-1) — three defenses the copy silently lacked. Each
+ * one made the matcher see MORE, so each ADDED wrong links.
  *
  * The body is NOT scanned as free text. The script's operating condition is
  * issues that currently read `no-linked-pull-request`, so a row it creates is
@@ -71,17 +79,20 @@ const OWNING_LABEL_LINE =
  * grants both truth shapes vacuously over a single wrong element. Same-fleet
  * siblings quoting each other's identifiers is the normal case here, not an
  * edge.
+ *
+ * Title and branch stay a bounded case-insensitive match so BLO-123 does not
+ * match BLO-1234; they carry no prose to confuse.
  */
 export function namesIssue(pr, identifier) {
   if (!identifier) return false;
   const re = new RegExp(`\\b${identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
   if (re.test(`${pr.title ?? ""}\n${pr.headRefName ?? ""}`)) return true;
-  return (pr.body ?? "")
-    .split(/\r?\n/)
-    .some((line) => {
-      const rest = line.match(OWNING_LABEL_LINE)?.[1];
-      return rest ? re.test(rest) : false;
-    });
+  const body = pr.body ?? "";
+  const want = identifier.toUpperCase();
+  return [
+    ...extractOwningLabeledIdentifiers(body),
+    ...extractHouseReferenceLabeledIdentifiers(body),
+  ].some((found) => found.toUpperCase() === want);
 }
 
 /** The list route has returned both shapes; neither is worth guessing at 3am. */

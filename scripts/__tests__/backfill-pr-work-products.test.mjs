@@ -41,6 +41,33 @@ test("the body arm accepts only a labeled owning reference, never bare prose", (
   assert.equal(namesIssue({ title: `wip ${id}`, body: "Related: BLO-1" }, id), true);
 });
 
+test("the body arm inherits the three defenses a merged-pattern copy dropped", () => {
+  const id = "BLO-32239";
+
+  // 1. The house labels require a colon; the closing verbs do not. An earlier
+  // revision folded both alternations under one optional-colon pattern, which
+  // linked off ordinary English — `Issue` is a noun as well as a label.
+  assert.equal(namesIssue({ body: `Issue filed a related bug, see ${id}` }, id), false);
+  assert.equal(namesIssue({ body: `Issue description for ${id} is attached.` }, id), false);
+
+  // 2. Fenced code declares nothing a reader can see. Both forms matter: a
+  // root-level fence and one nested in a list item — this repo's own issue
+  // bodies quote example PR bodies in exactly the second shape.
+  assert.equal(namesIssue({ body: "```\nRefs: " + id + "\n```" }, id), false);
+  assert.equal(namesIssue({ body: "- Example body:\n  ```md\n  Refs: " + id + "\n  ```" }, id), false);
+
+  // 3. A trailing non-owning label on the same line owns nothing: the owning
+  // reference is BLO-1, and this issue is explicitly marked `Related`.
+  assert.equal(namesIssue({ body: `Refs: BLO-1; Related: ${id}` }, id), false);
+  assert.equal(namesIssue({ body: `Closes BLO-1, see also: ${id}` }, id), false);
+
+  // Controls: the narrowing above must not cost recall on the real forms.
+  assert.equal(namesIssue({ body: `Fixes: ${id}` }, id), true);
+  assert.equal(namesIssue({ body: `Closes ${id}` }, id), true);
+  assert.equal(namesIssue({ body: `Issue: ${id}` }, id), true);
+  assert.equal(namesIssue({ body: `- Refs: ${id}` }, id), true);
+});
+
 test("PR state maps onto the work-product status enum", () => {
   assert.equal(prStatus({ state: "MERGED" }), "merged");
   assert.equal(prStatus({ state: "CLOSED" }), "closed");
