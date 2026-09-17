@@ -259,10 +259,16 @@ describeEmbeddedPostgres("PR→issue back-link is posted at most once per PR (PE
     const readSettings = async (handle: {
       execute: (q: ReturnType<typeof sql>) => Promise<unknown>;
     }): Promise<{ lock: string; idle: string }> => {
+      // postgres-js returns the rows as an array; node-postgres wraps them in
+      // `.rows`. Narrow across both rather than asserting an intersection of
+      // the two, which would describe a value neither driver can return. Same
+      // shape as `toRows` in `services/approval-gate-reconciler.ts`.
+      type Settings = { lock: string; idle: string };
       const result = (await handle.execute(
         sql`select current_setting('lock_timeout') as lock, current_setting('idle_in_transaction_session_timeout') as idle`,
-      )) as { rows?: Array<{ lock: string; idle: string }> } & Array<{ lock: string; idle: string }>;
-      const row = (result.rows ?? result)[0];
+      )) as Array<Settings> | { rows?: Array<Settings> };
+      const rows = Array.isArray(result) ? result : (result.rows ?? []);
+      const row = rows[0];
       return { lock: row.lock, idle: row.idle };
     };
 
