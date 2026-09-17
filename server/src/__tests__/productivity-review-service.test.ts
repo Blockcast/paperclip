@@ -3413,6 +3413,53 @@ describeEmbeddedPostgres("productivity review service", () => {
       // the wrong instruction for an agent that never got a turn.
       expect(review!.description!.indexOf("Route to platform/SRE as a capacity/dispatch constraint"))
         .toBeLessThan(review!.description!.indexOf("- Request decomposition"));
+      // Ally finding 2 on #1856: `assigneeConcurrency` is ONE sample taken at
+      // `now`, so it cannot carry an episode-wide claim. The cell must say what
+      // it measured and ask the reviewer to confirm, not instruct them not to
+      // record under-performance across hours it never observed.
+      expect(review?.description).toContain("occupied as of this evidence snapshot");
+      expect(review?.description).toContain("not established across the whole episode");
+      expect(review?.description).not.toContain("do not record this as assignee under-performance");
+    });
+
+    it("does not emit the categorical exoneration on a small, non-dominant no-executable-turn span (C2)", async () => {
+      // Ally finding 1 on #1856: the `noExecutableTurn` arm fired on `> 0`, so
+      // ~30s of queue time inside a 7h episode emitted the full "the assignee
+      // was not given an executable turn … do not record this as assignee
+      // under-performance". The five original C2 tests all seeded `slots` only,
+      // leaving `noExecutableTurnMs` incidentally 0 — this arm was never driven
+      // by any of them, which is why the defect survived them.
+      //
+      // Free slots deliberately: this isolates the turn-time arm. 4m of a 7h
+      // episode is ~1%, far below NO_EXECUTABLE_TURN_DOMINANT_SHARE.
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+      const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+      await insertNeverDispatchedRun({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        createdAt: new Date(now.getTime() - 34 * 60 * 1000),
+        finishedAt: new Date(now.getTime() - 30 * 60 * 1000),
+      });
+
+      await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+      const [review] = await listProductivityReviews(seeded.companyId);
+
+      expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      // Still OFFERED — a real capacity block the reviewer should see. Only the
+      // wording is graded; withholding the cell would be the other failure.
+      expect(review?.description).toContain("Route to platform/SRE as a capacity/dispatch constraint");
+      expect(review?.description).toContain("PARTIAL capacity block");
+      expect(review?.description).toContain("Confirm it held for the period in question before routing");
+      // The categorical half must NOT appear: 4m does not exonerate 7h.
+      expect(review?.description).not.toContain("was not given an executable turn");
+      expect(review?.description).not.toContain("do not record this as assignee under-performance");
+      // And the four assignee-directed verdicts stay on the table.
+      expect(review?.description).toContain("- Request decomposition");
     });
 
     it("withholds the capacity verdict when the assignee had free slots (C2 negative control)", async () => {
@@ -4255,6 +4302,16 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("fleet-capacity signal, not assignee inactivity");
     expect(review?.description).toContain(`run \`${runId}\``);
     expect(review?.description).toContain(`No-executable-turn accounting:`);
+    // BLO-27698 C2 positive control for the wording split (Ally finding 1 on
+    // #1856). The retry spans essentially the whole 7h episode, so the
+    // no-executable-turn share clears NO_EXECUTABLE_TURN_DOMINANT_SHARE and
+    // this — unlike a 4m span or a single concurrency sample — genuinely IS
+    // episode-scoped evidence. Pinned here because grading the cell down to
+    // "partial" everywhere would be the opposite over-correction, and nothing
+    // else in the suite would catch it.
+    expect(review?.description).toContain("the assignee was not given an executable turn");
+    expect(review?.description).toContain("do not record this as assignee under-performance");
+    expect(review?.description).not.toContain("PARTIAL capacity block");
   });
 
   it("surfaces the no-executable-turn bucket in evidence and does not let long_active_duration ride along when a different trigger fires (BLO-23248 AC, generalized by BLO-23624)", async () => {

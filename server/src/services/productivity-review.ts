@@ -1416,6 +1416,9 @@ function formatNoExecutableTurnGating(gating: NonNullable<ProductivityReviewEvid
 // gates *suppression* — withholding the review entirely — and must stay strict.
 // This gates whether a human reviewer is *shown the option*, where a
 // non-dominant but real capacity block is still the thing they need to know.
+// What the cell then SAYS is graded by `hasEpisodeScopedCapacityBlock` — being
+// shown the option and being told not to record under-performance are two
+// different claims, and only the second needs episode-scoped evidence.
 function isCapacityConstrainedEvidence(evidence: ProductivityReviewEvidence) {
   return (
     (evidence.assigneeConcurrency !== null
@@ -1426,6 +1429,33 @@ function isCapacityConstrainedEvidence(evidence: ProductivityReviewEvidence) {
   );
 }
 
+// BLO-27698 C2 (Ally review on #1856): whether the evidence can carry the
+// CATEGORICAL claim — "had no turn, none of the four verdicts applies" — across
+// the whole episode. Only one of the two signals can:
+//
+//   - `noExecutableTurnGating` is episode-scoped by construction (clamped to
+//     `[attributableStartAt, attributableEndAt)`), so a DOMINANT share of it
+//     does describe the episode. Same predicate and same constant the
+//     suppression gate uses, deliberately — one bar, two consumers.
+//   - `assigneeConcurrency` is a single sample at `now` (see its field note).
+//     Saturation at evidence time says nothing about the preceding hours.
+//   - a NON-dominant no-executable-turn share is real but does not exonerate
+//     the episode: ~30s of queue inside a 7h stall would otherwise emit a
+//     blanket "do not record this as assignee under-performance".
+//
+// Neither weak case is dropped — `isCapacityConstrainedEvidence` still offers
+// the cell — but they render as an unconfirmed partial block the reviewer must
+// check, not as an exoneration.
+function hasEpisodeScopedCapacityBlock(evidence: ProductivityReviewEvidence) {
+  const { noExecutableTurnGating: gating, elapsedMs } = evidence;
+  return Boolean(
+    gating
+      && elapsedMs !== null
+      && elapsedMs > 0
+      && gating.noExecutableTurnMs / elapsedMs > NO_EXECUTABLE_TURN_DOMINANT_SHARE,
+  );
+}
+
 function describeCapacityConstraint(evidence: ProductivityReviewEvidence) {
   const parts: string[] = [];
   if (
@@ -1433,8 +1463,12 @@ function describeCapacityConstraint(evidence: ProductivityReviewEvidence) {
     && evidence.assigneeConcurrency.runningRunCount
       >= evidence.assigneeConcurrency.effectiveMaxConcurrentRuns
   ) {
+    // "as of this evidence snapshot" is load-bearing, not hedging: this count
+    // is read once at `now`, so stating it unqualified inside an episode-wide
+    // verdict is an instant-to-episode leap. The C1 line scopes itself the
+    // same way ("live", "while this held").
     parts.push(
-      `all ${evidence.assigneeConcurrency.effectiveMaxConcurrentRuns} of the assignee's run slots occupied`,
+      `all ${evidence.assigneeConcurrency.effectiveMaxConcurrentRuns} of the assignee's run slots occupied as of this evidence snapshot`,
     );
   }
   if (evidence.noExecutableTurnGating && evidence.noExecutableTurnGating.noExecutableTurnMs > 0) {
@@ -4348,7 +4382,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           // verdict for every slow episode, which is the opposite failure.
           ...(isCapacityConstrainedEvidence(evidence)
             ? [
-              `- Route to platform/SRE as a capacity/dispatch constraint — the evidence above shows the assignee was not given an executable turn (${describeCapacityConstraint(evidence)}). None of the four verdicts below applies to an agent that had no turn; do not record this as assignee under-performance.`,
+              hasEpisodeScopedCapacityBlock(evidence)
+                ? `- Route to platform/SRE as a capacity/dispatch constraint — the evidence above shows the assignee was not given an executable turn (${describeCapacityConstraint(evidence)}). None of the four verdicts below applies to an agent that had no turn; do not record this as assignee under-performance.`
+                : `- Route to platform/SRE as a capacity/dispatch constraint — the evidence above shows a PARTIAL capacity block (${describeCapacityConstraint(evidence)}), not established across the whole episode. Confirm it held for the period in question before routing; if it did not, one of the four verdicts below still applies.`,
             ]
             : []),
           "- Request decomposition (the work is too large for a single heartbeat issue and needs to be split)",
