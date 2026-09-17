@@ -239,6 +239,51 @@ describeEmbeddedPostgres("PR→issue back-link is posted at most once per PR (PE
     }
   }, 60_000);
 
+  it("hands the callback the lock-holding transaction, not a second pool connection", async () => {
+    // The bounds asserted above only protect the pool while everything inside
+    // the critical section runs on the transaction that holds the lock. A
+    // caller that needs a DB read and reaches for the outer `db` instead takes
+    // a *second* connection while this one is still held, which is the
+    // exhaustion those bounds exist to make recoverable — and the shape that
+    // caused a measured production incident on the recovery path (#1879,
+    // #1887, #1897). So `post` is handed `tx`, and this asserts the handle is
+    // genuinely that transaction rather than merely being typed as one.
+    //
+    // The discriminator is that `set_config(..., true)` is transaction-local:
+    // the helper's own timeouts are readable through the real transaction and
+    // through nothing else. Non-round values are used so neither can pass by
+    // matching a server default, and so Postgres prints them in `ms` rather
+    // than normalising to a coarser unit.
+    const ref = { repoFullName: "Blockcast/paperclip", prNumber: 1742 };
+
+    const readSettings = async (handle: {
+      execute: (q: ReturnType<typeof sql>) => Promise<unknown>;
+    }): Promise<{ lock: string; idle: string }> => {
+      const result = (await handle.execute(
+        sql`select current_setting('lock_timeout') as lock, current_setting('idle_in_transaction_session_timeout') as idle`,
+      )) as { rows?: Array<{ lock: string; idle: string }> } & Array<{ lock: string; idle: string }>;
+      const row = (result.rows ?? result)[0];
+      return { lock: row.lock, idle: row.idle };
+    };
+
+    const insideOnTx = await withPrIssueBackLinkLock(
+      db,
+      ref,
+      async (tx) => readSettings(tx),
+      { waitMs: 7_777, holdMs: 23_456 },
+    );
+
+    expect(insideOnTx).toEqual({ lock: "7777ms", idle: "23456ms" });
+
+    // Negative control: the same read on the pooled handle is a different
+    // session and cannot see those transaction-local values. Without this, the
+    // assertion above would also pass if `current_setting` simply returned
+    // whatever was configured process-wide.
+    const outsideOnPool = await readSettings(db);
+    expect(outsideOnPool.lock).not.toBe("7777ms");
+    expect(outsideOnPool.idle).not.toBe("23456ms");
+  }, 30_000);
+
   it("keys the lock on the normalized repo and the PR number", () => {
     expect(__test_prIssueBackLinkLockKey({ repoFullName: "  Blockcast/Paperclip ", prNumber: 1738 })).toBe(
       "github:pr-issue-backlink:blockcast/paperclip:1738",
