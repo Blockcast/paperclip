@@ -781,7 +781,13 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             hardStopEnabled: input.hardStopEnabled ?? existing.hardStopEnabled,
             notifyEnabled: input.notifyEnabled ?? existing.notifyEnabled,
             isActive: nextIsActive,
-            updatedByUserId: actorUserId,
+            // Only when the actor is a user. An agent-driven write — the apply
+            // route in `approval-enforcement-executor.ts` is the first — passes
+            // null here, and overwriting would discard whichever board user
+            // last set the cap without recording anything in its place. That
+            // write's own attribution lives in the config revision and the
+            // `approval.enforcement_applied` activity row (BLO-32796).
+            ...(actorUserId === null ? {} : { updatedByUserId: actorUserId }),
             updatedAt: now,
             // Only when the enforced figure actually moved. This is the single
             // edit path for warn percent, hard stop, notify and active state as
