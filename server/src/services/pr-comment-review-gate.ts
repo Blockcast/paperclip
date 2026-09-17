@@ -354,13 +354,23 @@ export function evaluateCommentReviewGate(input: {
   // Set when an attestation for this head exists but its positive claim is
   // withheld. HELD rather than returned: withholding a positive is not an
   // all-clear, so the carried-finding check below still has to run. Returning
-  // here made the author strictly better off posting a self-attestation than
-  // posting nothing — either withheld positive silently converted a red
-  // carried from an earlier head into `neutral`, because
+  // here made the author better off posting a self-attestation that carries NO
+  // disposition ledger than posting nothing — either withheld positive silently
+  // converted a red carried from an earlier head into `neutral`, because
   // `headsWithUndispositionedFinding` is only reached when NOTHING attests the
   // current head. The `clean` return below is deliberately not held: an
   // independent attestation of the current head does disposition an earlier
   // head's finding, which is the pre-existing BLO-29711 behaviour.
+  //
+  // The LEDGER route is deliberately still author-blind and is not closed here:
+  // `headsWithUndispositionedFinding` credits a `prior:<A> critical 1 — fixed`
+  // entry from any comment passing `isAllyConsolidatedReviewComment`, so on an
+  // agent PR — where the reviewer identity IS the author — a self-authored
+  // ledger still retires a carried finding. Requiring independence there would
+  // make an agent PR permanently red once any finding is raised, because only
+  // the reviewer ever writes ledgers: the BLO-29711 deadlock this module exists
+  // to avoid. What this branch closes is the malformed-ledger shape, where the
+  // section parses as absent and the bare attestation was the whole claim.
   let withheldPositive: CommentReviewGateVerdict | null = null;
 
   if (forHead) {
@@ -445,11 +455,23 @@ export function evaluateCommentReviewGate(input: {
       .map((verb) => `"${verb}"`)
       .join(", ")
       .slice(0, UNRECOGNIZED_VERB_BUDGET);
+    // The tail is conditional because `withheldPositive` is exactly the state
+    // in which a comment DOES attest the current head. Saying "no comment
+    // attests the current head" there invites the author to post one — which
+    // they just did, and which cannot clear a carried finding. Naming why the
+    // attestation did not count is the difference between a red that routes
+    // the author to the reviewer and a red that routes them into a loop.
+    // Longest rendering is 131 characters, inside the 140 cap.
+    const carriedTail = !withheldPositive
+      ? "; no comment attests the current head."
+      : withheldPositive.authorUnknown
+        ? "; its only attestation is not known to be independent."
+        : "; the only comment attesting it is the PR author's own.";
     const reason = carried.unrecognizedVerbs.length
       ? `A finding from Ally's review of ${shortHead} is undispositioned: unrecognized ledger ` +
         `${carried.unrecognizedVerbs.length === 1 ? "verb" : "verbs"} ${verbList}.`
-      : `An unresolved finding from Ally's review of ${shortHead} ` +
-        "is still undispositioned; no comment attests the current head.";
+      : `An unresolved finding from Ally's review of ${shortHead} is still undispositioned` +
+        carriedTail;
     return {
       state: "failure",
       outcome: "carried_finding",
