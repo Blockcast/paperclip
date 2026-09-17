@@ -120,6 +120,7 @@ test('findExistingComment: tolerates a comment with no body', async () => {
   assert.equal(comment, null);
 });
 
+// BLO-26636. The failure the gate reports most often is a body/title
 // violation, and the old text sent the author to push a commit — advice that
 // re-runs nothing for a body edit and burns a CI matrix when followed.
 test('buildComment: names editing the description, not just pushing a commit', () => {
@@ -141,12 +142,15 @@ test('commitperclip-review: listens for edited without displacing the original t
 // pull_request_target hands secrets to a job triggered by an untrusted fork
 // PR, so the base-branch checkout is what makes adding a trigger type safe at
 // all. If this ever flips to the PR head, `edited` stops being a one-line
-// change and becomes an arbitrary-code-execution path. The negative form is
-// the load-bearing one: the positive match only pins the first checkout, so
-// adding a *second* step that checks out PR code would slip past it.
+// change and becomes an arbitrary-code-execution path. The negative forms are
+// the load-bearing ones: the positive match only pins the first checkout, so
+// adding a *second* step that checks out PR code would slip past it. No `\b`
+// after `head` — `head_ref` continues with a word character, so anchoring the
+// far end would miss `${{ github.head_ref }}`, the canonical footgun.
 test('commitperclip-review: still checks out master, never PR code', () => {
   assert.match(workflow, /uses:\s*actions\/checkout@[^\n]*\n\s*with:\s*\n\s*ref:\s*master/);
-  assert.doesNotMatch(workflow, /ref:\s*\$\{\{[^}]*\bhead\b/);
+  assert.doesNotMatch(workflow, /ref:\s*\$\{\{[^}]*\bhead/);
+  assert.doesNotMatch(workflow, /ref:\s*[^\n]*refs\/pull\//);
 });
 
 test('isGraphifyReindexArtifactOnlyPr: permits generated graphify reindex PRs', () => {
