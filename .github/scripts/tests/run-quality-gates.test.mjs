@@ -142,15 +142,14 @@ test('commitperclip-review: listens for edited without displacing the original t
 // pull_request_target hands secrets to a job triggered by an untrusted fork
 // PR, so the base-branch checkout is what makes adding a trigger type safe at
 // all. If this ever flips to the PR head, `edited` stops being a one-line
-// change and becomes an arbitrary-code-execution path. The negative forms are
-// the load-bearing ones: the positive match only pins the first checkout, so
-// adding a *second* step that checks out PR code would slip past it. No `\b`
-// after `head` — `head_ref` continues with a word character, so anchoring the
-// far end would miss `${{ github.head_ref }}`, the canonical footgun.
+// change and becomes an arbitrary-code-execution path. The count is what makes
+// this airtight: blacklisting `ref:` spellings can only ever chase an unbounded
+// set (`github.head_ref`, `refs/pull/`, `env.PR_HEAD_SHA`, `merge_commit_sha`,
+// …). Asserting there is exactly one checkout, and that it is `master`, rejects
+// every second-checkout spelling regardless of how its `ref:` is written.
 test('commitperclip-review: still checks out master, never PR code', () => {
   assert.match(workflow, /uses:\s*actions\/checkout@[^\n]*\n\s*with:\s*\n\s*ref:\s*master/);
-  assert.doesNotMatch(workflow, /ref:\s*\$\{\{[^}]*\bhead/);
-  assert.doesNotMatch(workflow, /ref:\s*[^\n]*refs\/pull\//);
+  assert.equal((workflow.match(/uses:\s*actions\/checkout@/g) ?? []).length, 1);
 });
 
 test('isGraphifyReindexArtifactOnlyPr: permits generated graphify reindex PRs', () => {
