@@ -53,6 +53,18 @@ const SETTINGS = {
   heartbeatSchedulerIntervalMs: "HEARTBEAT_SCHEDULER_INTERVAL_MS",
   recoveryActionMaxAttempts: "RECOVERY_ACTION_MAX_ATTEMPTS",
   recoveryActionTimeoutMs: "RECOVERY_ACTION_TIMEOUT_MS",
+  // PEN-3352. Registered so the hostile-input table actually drives this env var
+  // rather than merely declaring that it exists.
+  //
+  // ⚠️ Note while you are here: `lapsedMonitorGraceMs` and
+  // `openPullRequestAttendanceGraceMs` are in `NUMERIC_SETTING_BOUNDS` and are NOT in
+  // this map, so they get no hostile-input coverage. The `satisfies Record<keyof typeof
+  // NUMERIC_SETTING_BOUNDS, string>` below looks like it would catch that and does not:
+  // `server/tsconfig.json` excludes `src/__tests__`, so nothing typechecks this file,
+  // and vitest transpiles without checking. Left as-is deliberately — closing it is a
+  // change to two settings this PR does not otherwise touch, and doing it here would
+  // hide that the enforcement mechanism itself is the thing that needs fixing.
+  pendingBoardApprovalAttendanceGraceMs: "PENDING_BOARD_APPROVAL_ATTENDANCE_GRACE_MS",
 } as const satisfies Record<keyof typeof NUMERIC_SETTING_BOUNDS, string>;
 
 type SettingKey = keyof typeof SETTINGS;

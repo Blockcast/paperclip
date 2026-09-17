@@ -177,6 +177,11 @@ export interface Config {
   // reuse of it: one bounds belief in an anomaly, this one bounds belief in a normal
   // multi-day wait, so a shared value would be wrong for whichever it was not tuned for.
   openPullRequestAttendanceGraceMs: number;
+  // PEN-3352. How long a pending board approval linked to an issue is believed to be a
+  // live external decision-wake path for that issue. Separate knob from the PR grace for
+  // the same reason that one is separate from `lapsedMonitorGraceMs`, and with a
+  // different measured distribution behind it — see the bounds entry.
+  pendingBoardApprovalAttendanceGraceMs: number;
   // Process role for HA topology. When set to "api", the process serves
   // HTTP traffic only — no in-process plugin workers, no heartbeat
   // scheduler. When set to "worker", the process owns the heartbeat
@@ -502,6 +507,43 @@ export const NUMERIC_SETTING_BOUNDS = {
   // description of the PR but of a problem nobody is holding.
   openPullRequestAttendanceGraceMs: {
     fallback: 7 * 24 * 60 * 60_000,
+    min: 60 * 60_000,
+    max: 30 * 24 * 60 * 60_000,
+  },
+  // PEN-3352. How long a PENDING board approval linked to an issue is believed to be a
+  // live external decision-wake path.
+  //
+  // Sibling of `openPullRequestAttendanceGraceMs` and justified the same way — a board
+  // card awaiting a human is the normal resting state of correct work, not an anomaly,
+  // so `lapsedMonitorGraceMs` (6h, tuned for a fault) would re-seize exactly the rows
+  // this protects. What it must NOT do is inherit the PR value, because the two queues
+  // were measured and they are not the same queue.
+  //
+  // Measured 2026-09-17 over all 398 decided approvals in the reference company
+  // (`decidedAt - createdAt`): p50 0.41d, p75 1.94d, p90 5.91d, p95 9.93d, p99 20.40d,
+  // max 27.39d. Cumulative: 63.1% within 1d, 80.4% within 3d, 91.2% within 7d, 98.2%
+  // within 14d, 100% within 30d.
+  //
+  // So the PR grace of 7d would stop believing ~8.8% of decisions that DO arrive — the
+  // precise population this disjunct exists to protect, re-seized on the eighth day. 14d
+  // is chosen as the p98 of the real distribution. The trade is stated rather than
+  // buried: against a card that will never be decided, 14d holds its issue unattended
+  // for a week longer than 7d would. That is the right side to err on here, because the
+  // sweep's own evidence block names no fault when it fires on this population
+  // (`latestRunStatus: succeeded`), whereas a genuinely abandoned card is also visible
+  // in the board queue by its age.
+  //
+  // Recency is read from `approvals.createdAt`, deliberately NOT `updatedAt`. An
+  // approval has no intermediate movement to observe: unlike a PR it is filed once and
+  // then decided, so `updatedAt` would measure comment noise rather than progress, and
+  // could refresh belief in a card nobody is any closer to answering.
+  //
+  // Ceiling is 30d, matching the PR entry and the observed maximum: past a month
+  // "waiting on the board" is not a description of the card but of a problem nobody is
+  // holding. Floor is 1h for symmetry; below that a card filed minutes ago reads as
+  // abandoned.
+  pendingBoardApprovalAttendanceGraceMs: {
+    fallback: 14 * 24 * 60 * 60_000,
     min: 60 * 60_000,
     max: 30 * 24 * 60 * 60_000,
   },
@@ -1138,6 +1180,11 @@ export function loadConfig(): Config {
       [process.env.OPEN_PULL_REQUEST_ATTENDANCE_GRACE_MS],
       NUMERIC_SETTING_BOUNDS.openPullRequestAttendanceGraceMs,
       "openPullRequestAttendanceGraceMs",
+    ),
+    pendingBoardApprovalAttendanceGraceMs: resolveNumericSetting(
+      [process.env.PENDING_BOARD_APPROVAL_ATTENDANCE_GRACE_MS],
+      NUMERIC_SETTING_BOUNDS.pendingBoardApprovalAttendanceGraceMs,
+      "pendingBoardApprovalAttendanceGraceMs",
     ),
     paperclipNodeRole,
     paperclipWorkersInternalUrl:
