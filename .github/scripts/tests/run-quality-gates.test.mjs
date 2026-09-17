@@ -130,13 +130,9 @@ test('buildComment: names editing the description, not just pushing a commit', (
 });
 
 // The remedy above is only true because the workflow listens for `edited`.
-// These two assertions have to move together or the comment starts lying.
-test('commitperclip-review: pull_request_target listens for edited', () => {
-  assert.match(workflow, /types:\s*\[opened,\s*synchronize,\s*reopened,\s*edited\]/);
-});
-
-test('commitperclip-review: edited does not displace the original triggers', () => {
-  for (const type of ['opened', 'synchronize', 'reopened']) {
+// These assertions have to move together or the comment starts lying.
+test('commitperclip-review: listens for edited without displacing the original triggers', () => {
+  for (const type of ['opened', 'synchronize', 'reopened', 'edited']) {
     assert.match(workflow, new RegExp(`types:\\s*\\[[^\\]]*\\b${type}\\b`));
   }
   assert.match(workflow, /merge_group:\s*\n\s*types:\s*\[checks_requested\]/);
@@ -145,9 +141,12 @@ test('commitperclip-review: edited does not displace the original triggers', () 
 // pull_request_target hands secrets to a job triggered by an untrusted fork
 // PR, so the base-branch checkout is what makes adding a trigger type safe at
 // all. If this ever flips to the PR head, `edited` stops being a one-line
-// change and becomes an arbitrary-code-execution path.
+// change and becomes an arbitrary-code-execution path. The negative form is
+// the load-bearing one: the positive match only pins the first checkout, so
+// adding a *second* step that checks out PR code would slip past it.
 test('commitperclip-review: still checks out master, never PR code', () => {
   assert.match(workflow, /uses:\s*actions\/checkout@[^\n]*\n\s*with:\s*\n\s*ref:\s*master/);
+  assert.doesNotMatch(workflow, /ref:\s*\$\{\{[^}]*\bhead\b/);
 });
 
 test('isGraphifyReindexArtifactOnlyPr: permits generated graphify reindex PRs', () => {
