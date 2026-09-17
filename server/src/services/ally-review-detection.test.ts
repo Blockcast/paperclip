@@ -110,39 +110,78 @@ describe("hasActionablePrReviewFeedback", () => {
   });
 
   // BLO-34160. The last clause of carriesBlockingFeedback() matches Recommended
-  // Action prose and has no negation guard, so an all-zero review that
-  // transcribes the directive boilerplate reds gate/ally-comment-findings with
-  // no finding for the author to dispose of. Measured on paperclip#1859
-  // @3326c2da (boilerplate -> failure) vs #1861 @fa7cfa93 (clean form ->
-  // success), identical 0/0 counts. The reviewer template is the half that was
-  // fixed; these pin the contract it must keep satisfying.
-  it("does not block an all-zero review whose Recommended Action is count-derived", () => {
-    const clean = body(`Reviewed head: ${SHA}`).replace(
-      "Land.",
-      "1. No blocking changes requested.\n2. Merge once the remaining required CI checks finish green.",
-    );
-    expect(hasActionablePrReviewFeedback(clean)).toBe(false);
-  });
-
-  it("still blocks a bucketless review that transcribes the directive boilerplate", () => {
-    // Guards against "fixing" BLO-34160 by deleting the prose clause: a body
-    // that narrates a blocking action must keep failing closed, per the
-    // fail-safe documented on hasActionablePrReviewFeedback.
-    //
-    // Deliberately carries NO counted buckets. An all-zero body would make this
-    // assertion order-dependent: BLO-31446's fix (#1657) lets an explicit
-    // Critical(0) + Important(0) outrank this prose clause, so the same input
-    // is `true` on master and `false` once #1657 lands, and whichever PR merges
-    // second reds CI. Measured both ways before narrowing the fixture. A body
-    // with no buckets never reaches that precedence rule, so the clause stays
-    // reachable -- and reachable is exactly what this test exists to pin.
-    const boilerplate = `## Ally — Consolidated PR Review
+  // Action prose and has no negation guard, so a review that transcribes the
+  // directive boilerplate reds gate/ally-comment-findings with no finding for
+  // the author to dispose of. Measured on paperclip#1859 @3326c2da (boilerplate
+  // -> failure) vs #1861 @fa7cfa93 (clean form -> success), identical 0/0
+  // counts. The reviewer template is the half that was fixed; the three cases
+  // below pin the contract it must keep satisfying.
+  //
+  // Every fixture here is deliberately BUCKETLESS. Counted buckets make these
+  // assertions merge-order-dependent: BLO-31446's fix (#1657) lets an explicit
+  // Critical(0) + Important(0) short-circuit before the prose clause is ever
+  // reached, so an all-zero body returns `false` there whatever its Recommended
+  // Action says. Measured against both modules: with buckets, every input below
+  // flips (or goes vacuous) across #1657; without buckets, every one is
+  // identical on both. So a bucketless body is the only fixture that keeps the
+  // prose clause reachable -- and reachable is what these tests exist to pin.
+  // The 0/0 precedence itself belongs in #1657, and its sibling assertion
+  // `keeps the prose fallback live when no bucket is declared`
+  // (server/src/__tests__/pr-comment-review-gate.test.ts) covers it from the
+  // gate side; keep both, they are in different files on purpose.
+  const proseOnly = (recommendedAction: string) =>
+    `## Ally — Consolidated PR Review
 Reviewed head: ${SHA}
 
 ### Recommended Action
-1. Fix Critical issues before merge.
-2. Address Important issues this cycle.`;
-    expect(hasActionablePrReviewFeedback(boilerplate)).toBe(true);
+${recommendedAction}`;
+
+  it("does not block a review whose Recommended Action is count-derived", () => {
+    expect(
+      hasActionablePrReviewFeedback(
+        proseOnly(
+          "1. No blocking changes requested.\n2. Merge once the remaining required CI checks finish green.",
+        ),
+      ),
+    ).toBe(false);
+  });
+
+  it("still blocks a review that transcribes the directive boilerplate", () => {
+    // Guards against "fixing" BLO-34160 by deleting the prose clause: a body
+    // that narrates a blocking action must keep failing closed, per the
+    // fail-safe documented on hasActionablePrReviewFeedback.
+    expect(
+      hasActionablePrReviewFeedback(
+        proseOnly("1. Fix Critical issues before merge.\n2. Address Important issues this cycle."),
+      ),
+    ).toBe(true);
+  });
+
+  // CHARACTERIZATION, not desired behaviour. The clause is a bare
+  // `Recommended Action ... \bfix\b ... before merg` window with no negation
+  // guard, so a review that says it found nothing still blocks -- the same
+  // false RED as BLO-34160, reached through prose instead of through the
+  // template. `No fixes required` escapes only because `\bfix\b` does not match
+  // "fixes"; that is the entire width of the boundary, and it is written down
+  // nowhere else.
+  //
+  // Two measured notes for whoever closes it, because the obvious fix is a
+  // no-op. Wrapping the clause in hasNonNegatedMatch() changes NOTHING here:
+  // the match begins at "Recommended Action", and the lookback only inspects
+  // the words BEFORE the match start, so the negation -- which sits inside the
+  // matched window -- is never seen. Re-anchoring the match at `\bfix\b`
+  // instead does flip three of these four to false, but not "Nothing to fix
+  // before merge.", because NEGATION_CUE_REGEX has no "nothing" cue. Both
+  // measured by mutating carriesBlockingFeedback() against these cases.
+  const nearMisses: [action: string, blocks: boolean][] = [
+    ["Nothing to fix before merge.", true],
+    ["No Critical issues to fix before merging.", true],
+    ["No blocking changes to fix before merge.", true],
+    ["No Critical or Important issues — nothing to fix before merge.", true],
+    ["No fixes required before merge.", false],
+  ];
+  it.each(nearMisses)("negated near-miss %j blocks: %s", (action, blocks) => {
+    expect(hasActionablePrReviewFeedback(proseOnly(action))).toBe(blocks);
   });
 });
 
