@@ -117,7 +117,7 @@ import {
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   runOwnsIssueExecutionLock,
 } from "./issue-execution-lock.js";
-import { instanceSettingsService } from "./instance-settings.js";
+import { instanceSettingsService, readInstanceSettingsOn } from "./instance-settings.js";
 import {
   assertNotDuplicatePrReviewIssue,
   lockPrReviewIssueScopes,
@@ -5681,10 +5681,11 @@ export function issueService(db: Db) {
   // only gets a connection when a waiter hits its `lock_timeout` — the convoy.
   // So bind the settings reads to the caller's handle when there is one.
   //
-  // Safe to run `getOrCreateRow`'s singleton bootstrap INSERT on the caller's
-  // tx: if that tx rolls back the row is simply recreated by the next reader.
-  const instanceSettingsOn = (dbOrTx: unknown) =>
-    dbOrTx === db ? instanceSettings : instanceSettingsService(dbOrTx as Db);
+  // `readInstanceSettingsOn` and not `instanceSettingsService(tx)`: the latter
+  // bootstraps the singleton row, which on a caller's tx is a row lock taken
+  // BEFORE the company graph lock and held to commit — a deadlock edge. These
+  // are pure reads, so they take the read-only view on either handle.
+  const instanceSettingsOn = (dbOrTx: unknown) => readInstanceSettingsOn(dbOrTx as Db);
   const treeControlSvc = issueTreeControlService(db);
 
   async function lockIssueBlockerRelations(
@@ -10689,7 +10690,7 @@ export function issueService(db: Db) {
           issueId: id,
         });
       }
-      const experimental = await instanceSettingsOn(dbOrTx).getExperimental();
+      const experimental = (await instanceSettingsOn(dbOrTx)).experimental;
       const isolatedWorkspacesEnabled = experimental.enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -12848,7 +12849,7 @@ export function issueService(db: Db) {
       if (!comment) return null;
 
       const currentUserRedactionOptions = {
-        enabled: (await instanceSettingsOn(dbOrTx).getGeneral()).censorUsernameInLogs,
+        enabled: (await instanceSettingsOn(dbOrTx)).general.censorUsernameInLogs,
       };
       return redactIssueComment(comment, currentUserRedactionOptions.enabled);
     },
@@ -12908,7 +12909,7 @@ export function issueService(db: Db) {
       if (!issue) throw notFound("Issue not found");
 
       const currentUserRedactionOptions = {
-        enabled: (await instanceSettingsOn(dbOrTx).getGeneral()).censorUsernameInLogs,
+        enabled: (await instanceSettingsOn(dbOrTx)).general.censorUsernameInLogs,
       };
       const redactedBody = redactCurrentUserText(body, currentUserRedactionOptions);
       const authorType = issueCommentAuthorTypeSchema.parse(
