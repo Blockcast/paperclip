@@ -463,8 +463,19 @@ export function agentService(db: Db) {
         // Synchronous in-process read, like `orgChainHealth` beside it: this is
         // on the request path of every agent read, and the condition it reports
         // is a section stuck on the database, so it must not need the database.
-        // Per-pod by construction — the lock is per-process, so only the pod
-        // that owns dispatch can answer, and on the api tier it is always null.
+        //
+        // ⚠️ Worker-tier-only, and therefore diagnostic rather than
+        // authoritative. The lock is per-process and dispatch is fenced off on
+        // the api tier, so a pod that never dispatches can never report here —
+        // and in the deployed topology `/api/agents*` is served by exactly that
+        // tier, so through the API this field is always `null`. `null` is
+        // consequently ambiguous between "healthy", "nothing to report" and
+        // "you asked the wrong pod", and must NOT be read as evidence that an
+        // agent is dispatching. The cross-pod surface is the worker's
+        // `/metrics` (`paperclip_agent_start_lock_held_seconds`,
+        // `paperclip_agent_start_lock_aborted_total`) and the alerts on them;
+        // this field explains a wedge to someone already looking at the right
+        // pod, it does not detect one. See `AgentStartLockDispatchHealth`.
         dispatchHealth: describeAgentStartLockDispatchHealth(row.id),
       };
     });

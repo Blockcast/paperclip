@@ -685,6 +685,10 @@ prometheusRule:
   agentStartLockHeldFor: 5m
   # -- Runbook for the wedged-start-lock alert, linked from its annotation.
   agentStartLockWedgedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md#agent-start-lock-wedged-pen-3305"
+  # -- Lookback for PaperclipAgentStartLockAborted (PEN-3328). Counts cancelled dispatch sections, which are self-healed wedges: the lock released and dispatch resumed, so this is a post-mortem rather than a live outage. An hour is long enough that a single abort stays visible well past the 5m the held gauge existed for, and short enough that "is this still happening" is answerable from the alert rather than from a dashboard. Note this is deliberately a counter window and not a rate: one abort is already the signal, because a section that sat on the database for 300s is ~300x a healthy sub-second pass.
+  agentStartLockAbortedWindow: 1h
+  # -- Hold time for PaperclipAgentStartLockAborted. Zero-length on purpose: `increase() > 0` over a 1h window is already heavily damped, and stacking a `for:` on top would only delay a warning that describes something which has ALREADY finished happening. Kept as a value rather than inlined so it can be raised if abort volume ever makes this noisy.
+  agentStartLockAbortedFor: 0m
   # -- Rolling window and hold time for PR-review queue-wait saturation.
   prReviewQueueWaitWindow: 6h
   prReviewQueueWaitFor: 10m

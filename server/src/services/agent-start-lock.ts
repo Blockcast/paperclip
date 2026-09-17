@@ -224,6 +224,25 @@ type DispatchAbortRecord = {
 /** The most recent abort per agent, retained for `DISPATCH_ABORT_RETENTION_MS`. */
 const lastAbortByAgent = new Map<string, DispatchAbortRecord>();
 
+/**
+ * Re-issue cancellation for statements still in flight on an aborted section.
+ *
+ * Registered by `agent-start-lock-db.ts` rather than imported from it, because
+ * that module already imports {@link currentAgentStartLockSignal} from here and
+ * importing back would make the cycle mutual. A hook keeps the dependency
+ * one-directional and keeps this module's concern intact: it decides *when* a
+ * section has stopped, and knows nothing about how database work is cancelled.
+ *
+ * Unset is a safe state — retries simply do not happen, and the first abort
+ * (which is delivered by the signal itself, not through here) is unaffected.
+ */
+let cancelRetryHook: ((signal: AbortSignal) => number) | null = null;
+
+/** @see cancelRetryHook */
+export function registerAgentStartLockCancelRetry(fn: (signal: AbortSignal) => number): void {
+  cancelRetryHook = fn;
+}
+
 export type AgentStartLockOptions<T> = {
   /**
    * Result to return when this call is folded into another pass instead of
@@ -291,6 +310,7 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
     if (stopped && loggedStopped && nowMs - lastLoggedAtMs < LOCK_HELD_ERROR_MS) return;
     lastLoggedAtMs = nowMs;
     const fields = { agentId, heldMs, warnAfterMs: LOCK_HELD_WARN_MS };
+    let retried = 0;
     if (stopped) {
       // Abort on the FIRST error tick only, and never stop awaiting `execution`
       // because of it (PEN-3328). The abort is a request into the section, not
@@ -301,10 +321,20 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
         lastAbortByAgent.set(agentId, { abortedAtMs: nowMs, heldMs, released: false });
         recordAgentStartLockAborted(agentId);
         abort.abort(new AgentStartLockAbortedError(agentId, heldMs));
+      } else {
+        // Later ticks: the abort was already raised and its listeners have
+        // detached, so the signal cannot deliver anything again. Reaching here
+        // means the section is STILL held, i.e. the cancel did not take — most
+        // likely because `Query#cancel()` on an executing statement dials a
+        // fresh connection and that dial failed. Retry it, so recovery is
+        // best-effort *and repeated* rather than a single shot spent at the
+        // five-minute mark. Cheap (one weak-map lookup) and a no-op once
+        // nothing is in flight.
+        retried = cancelRetryHook?.(abort.signal) ?? 0;
       }
       loggedStopped = true;
       logger.error(
-        { ...fields, errorAfterMs: LOCK_HELD_ERROR_MS, aborted: true },
+        { ...fields, errorAfterMs: LOCK_HELD_ERROR_MS, aborted: true, cancelRetried: retried },
         "agent start lock held far past its budget; queued-run dispatch for this agent has stopped",
       );
     } else {
@@ -472,14 +502,28 @@ export function runDetachedFromAgentStartLock<T>(fn: () => T): T {
 }
 
 /**
- * Drop abort records older than {@link DISPATCH_ABORT_RETENTION_MS}.
+ * Drop *settled* abort records older than {@link DISPATCH_ABORT_RETENTION_MS}.
  *
  * Called from the write path and from the read path rather than on a timer:
  * the map is only interesting while something is reading or writing it, and a
  * timer would be one more thing to leak in tests.
+ *
+ * Retention applies only once `released` is set, and that asymmetry is the
+ * whole point. A released record is a post-mortem — the section settled,
+ * dispatch resumed, and an hour later nobody needs to be told again. An
+ * *unreleased* record is not history, it is a live condition with no natural
+ * end: the section aborted and the abort did not land, so the agent is not
+ * dispatching and will not until the process is replaced. Expiring that on age
+ * would make `describeAgentStartLockDispatchHealth` return `null` an hour into
+ * the wedge and put the agent straight back to reading `status: idle` /
+ * `errorReason: null` — the exact darkness PEN-3305/PEN-3328 exist to end, and
+ * the measured outages ran 6–19 h, so it would be dark for most of every one of
+ * them. An unreleased record needs no timer to bound it: `runExclusively`'s
+ * `finally` sets `released`, which is what starts this clock.
  */
 function forgetExpiredAborts(nowMs: number): void {
   for (const [agentId, record] of lastAbortByAgent) {
+    if (!record.released) continue;
     if (nowMs - record.abortedAtMs > DISPATCH_ABORT_RETENTION_MS) lastAbortByAgent.delete(agentId);
   }
 }
@@ -491,6 +535,24 @@ function forgetExpiredAborts(nowMs: number): void {
  * `null` is the overwhelmingly common answer and means only that this module
  * has nothing to report — NOT that the agent is healthy. Dispatch can be
  * stopped for reasons the lock never sees.
+ *
+ * ⚠️ **Worker-tier-only, and diagnostic rather than authoritative.** The lock
+ * lives in process memory, and dispatch is fenced off entirely when
+ * `paperclipNodeRole === "api"` (`heartbeat.ts`), so only a pod that actually
+ * runs dispatch can ever hold one. In the deployed Blockcast topology
+ * `/api/agents*` is served by the **api** tier, which by construction never
+ * holds a start lock — so on that read path this is *always* `null`, whatever
+ * the worker is doing.
+ *
+ * That makes `null` ambiguous between three different things: "healthy",
+ * "nothing to report", and "you asked a pod that could not know". Do not read
+ * it as evidence that an agent is dispatching. The surface that spans pods is
+ * the worker tier's `/metrics` — `paperclip_agent_start_lock_held_seconds` for
+ * a live wedge and `paperclip_agent_start_lock_aborted_total` for one that
+ * self-healed — and the alerts built on them are the operator-facing detector.
+ * This field is the human-readable explanation once you are already looking at
+ * an agent row on a pod that owns dispatch, not the thing that tells you to
+ * look.
  */
 export type AgentStartLockDispatchHealth = {
   /**

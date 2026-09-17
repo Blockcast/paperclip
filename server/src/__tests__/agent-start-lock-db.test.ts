@@ -130,6 +130,55 @@ describe("agent start lock database cancellation seam (PEN-3328)", () => {
     await expect(held).rejects.toMatchObject({ code: "57014" });
   });
 
+  it("re-issues the cancel on later ticks when the first attempt fails to take", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    vi.spyOn(logger, "error").mockImplementation(() => logger);
+    const client = makeFakeClient("never");
+    const db = withAgentStartLockAbortableDb(makeFakeDb(client));
+    const wrapped = (db as Db & { $client: typeof client }).$client;
+
+    const held = withAgentStartLock(
+      randomUUID(),
+      async () => wrapped.unsafe("select 1"),
+      coalesced,
+    );
+    void held.catch(() => {});
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Stand in for the real failure mode this retry exists for: `cancel()` on
+    // an EXECUTING statement dials a fresh connection, and that dial can fail.
+    // The query then stays pending with the abort already spent — before the
+    // retry, that was a permanent wedge, because the signal fires its listeners
+    // once and they detach.
+    const query = client.issued[0]!;
+    let attempts = 0;
+    const realCancel = query.cancel;
+    query.cancel = () => {
+      attempts += 1;
+      // Fail the first two attempts, then let one through.
+      if (attempts < 3) throw new Error("could not connect to cancel the query");
+      realCancel();
+    };
+
+    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS + 1_000);
+    // First attempt happened and threw; the section is still wedged, and
+    // crucially the lock is still HELD — a failed cancel must never be mistaken
+    // for a release.
+    expect(attempts).toBe(1);
+    expect(query.cancelled).toBe(false);
+
+    // Each subsequent error tick tries again rather than giving up.
+    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS);
+    expect(attempts).toBe(2);
+    expect(query.cancelled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS);
+    expect(attempts).toBe(3);
+    expect(query.cancelled).toBe(true);
+    await expect(held).rejects.toMatchObject({ code: "57014" });
+  });
+
   it("refuses to issue a new statement once the section is aborted", async () => {
     vi.useFakeTimers();
     vi.spyOn(logger, "warn").mockImplementation(() => logger);

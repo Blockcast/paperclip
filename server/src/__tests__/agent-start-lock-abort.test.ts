@@ -143,6 +143,17 @@ describe("agent start lock cancellation (PEN-3328)", () => {
 
       // And the agent still reports the fault rather than presenting as idle.
       expect(describeAgentStartLockDispatchHealth(agentId)).toMatchObject({ status: "stalled" });
+
+      // Still reporting well past the abort-record retention window (1 h).
+      // Retention is for *released* records, which are post-mortems; this
+      // section never released, so the wedge is live and must stay visible.
+      // The measured PEN-3305 outages ran 6–19 h, so expiring on age alone
+      // would leave the agent reading `status: idle` for most of every outage
+      // this surface exists to describe. Two hours is past the window and
+      // still inside the range of a real one.
+      await vi.advanceTimersByTimeAsync(2 * 60 * 60_000);
+      expect(describeHeldAgentStartLocks()).toHaveLength(1);
+      expect(describeAgentStartLockDispatchHealth(agentId)).toMatchObject({ status: "stalled" });
     },
   );
 
@@ -224,6 +235,14 @@ describe("agent start lock cancellation (PEN-3328)", () => {
     expect(health?.reason).toMatch(/queued runs were not lost/i);
     expect(Date.parse(health!.abortedAt)).toBeGreaterThan(0);
     expect(health?.heldMs).toBeGreaterThanOrEqual(LOCK_HELD_ERROR_MS);
+
+    // The other half of the retention rule. This record *did* release, so it is
+    // genuinely history and stops being reported once the window passes —
+    // otherwise a one-off abort would follow the agent around forever. Paired
+    // with the negative control's unreleased record, which must NOT expire,
+    // this is what pins retention to `released` rather than to age.
+    await vi.advanceTimersByTimeAsync(2 * 60 * 60_000);
+    expect(describeAgentStartLockDispatchHealth(agentId)).toBeNull();
   });
 
   it("counts the abort on a metric, because the gauge series vanishes with the lock", async () => {
