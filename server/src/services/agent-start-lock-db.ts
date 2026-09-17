@@ -1,6 +1,9 @@
 import { createDbFromPostgresClient, type Db } from "@paperclipai/db";
 
-import { currentAgentStartLockSignal } from "./agent-start-lock.js";
+import {
+  currentAgentStartLockSignal,
+  registerAgentStartLockCancelRetry,
+} from "./agent-start-lock.js";
 
 /**
  * Make the queued-run dispatch critical section's database work cancellable
@@ -51,6 +54,24 @@ import { currentAgentStartLockSignal } from "./agent-start-lock.js";
  * `runExclusively`. The next section starts only after that, because
  * `runExclusively` never stops awaiting `execution`.
  *
+ * ## Where this is applied, and why not in `heartbeatService`
+ *
+ * At the composition root, in `index.ts`, on the handle returned by `createDb`.
+ *
+ * It was originally applied inside `heartbeatService`, which was wrong.
+ * Installing the wrapper means rebuilding a `Db` from `$client`, and a rebuilt
+ * `Db` carries none of the decoration a caller may have layered on the handle
+ * it passed — a caller whose `Db` wraps `transaction` got a service that
+ * silently ignored the wrapping and talked to the raw client instead. That is a
+ * correctness hazard wherever it happens and it is invisible at the call site;
+ * two rollback-behaviour tests caught it.
+ *
+ * Applying it at the root removes the hazard by construction: the wrap happens
+ * before any `Db` exists, so there is no decoration to drop, and it happens
+ * exactly once rather than once per service handle. Every `heartbeatService` in
+ * the process is constructed from that root handle, so the dispatch section is
+ * covered exactly as before.
+ *
  * ## What it does not cover
  *
  * Awaits that are not database work. The Kubernetes call in the section
@@ -60,6 +81,15 @@ import { currentAgentStartLockSignal } from "./agent-start-lock.js";
  * `paperclip_agent_start_lock_held_seconds` from PEN-3305 remain the detector,
  * and `describeAgentStartLockDispatchHealth` reports `stalled` rather than
  * `aborted` when a requested abort does not land.
+ *
+ * Also uncovered, deliberately: the **tagged-template call form**
+ * (``client`select 1` ``). drizzle does not use it — it reaches the database
+ * through the three methods named above — so a query issued that way carries no
+ * cancellation listener and would be uncancellable inside a section. Nothing in
+ * `server/src` issues one against `$client` today, so this is latent rather
+ * than live, but a future raw tagged query would be silently exempt from the
+ * abort. Route it through `unsafe` (or extend the `apply` trap) if that
+ * changes.
  */
 
 /** The postgres.js surface drizzle's postgres-js driver actually calls. */
@@ -71,6 +101,54 @@ type PostgresClient = {
 };
 
 const WRAPPED = Symbol.for("paperclip.agentStartLockAbortableClient");
+
+/**
+ * Statements still in flight for a given section signal.
+ *
+ * Keyed weakly by signal so an abandoned section's entry dies with it, and the
+ * set is emptied as statements settle — in the healthy case it is created,
+ * emptied and collected without anyone reading it.
+ *
+ * It exists for one narrow case: `Query#cancel()` on an *executing* statement
+ * dials a fresh connection, and that dial can fail. The abort listener is
+ * `once: true`, so a cancel that did not take is never retried and the section
+ * stays wedged with its abort already spent. Retaining the query lets
+ * {@link retryAgentStartLockCancels} have another go on a later tick.
+ */
+const inFlightBySignal = new WeakMap<AbortSignal, Set<CancellableQuery>>();
+
+/**
+ * Re-issue `cancel()` for every statement still in flight on an already-aborted
+ * section. Returns how many it attempted.
+ *
+ * Best-effort and idempotent: cancelling an already-cancelled or
+ * already-finished postgres.js query is harmless, and every throw is swallowed
+ * for the same reason the first attempt's is — the caller is being torn down
+ * and has nothing useful to do with the failure.
+ *
+ * Deliberately a no-op unless the signal has aborted, so this can never cancel
+ * a healthy section's work.
+ */
+export function retryAgentStartLockCancels(signal: AbortSignal): number {
+  if (!signal.aborted) return 0;
+  const inFlight = inFlightBySignal.get(signal);
+  if (!inFlight?.size) return 0;
+  let attempted = 0;
+  for (const query of inFlight) {
+    attempted += 1;
+    try {
+      query.cancel?.();
+    } catch {
+      /* best-effort, same as the first attempt */
+    }
+  }
+  return attempted;
+}
+
+// The lock module raises the abort; this module is what can act on it a second
+// time. Registering here (rather than having the lock import this file) keeps
+// the dependency one-directional — see `registerAgentStartLockCancelRetry`.
+registerAgentStartLockCancelRetry(retryAgentStartLockCancels);
 
 function isPostgresClient(value: unknown): value is PostgresClient {
   return typeof value === "function"
@@ -157,6 +235,16 @@ function wrapClient<T extends object>(client: T): T {
             }
           };
           signal.addEventListener("abort", onAbort, { once: true });
+          // Also retain the query so the cancel can be RE-issued on a later
+          // tick. The listener above is `once: true` and detaches after firing,
+          // so without this a failed `cancel()` — the fresh connection it dials
+          // can itself fail — would never be retried, and the section would
+          // stay wedged for the rest of the process's life with the abort
+          // already spent. Subsequent statements are refused synchronously by
+          // the `signal.aborted` check above, so the one case this covers is a
+          // single statement in flight whose cancel did not take.
+          inFlightBySignal.get(signal)?.add(query)
+            ?? inFlightBySignal.set(signal, new Set([query]));
           // Drop the listener when the statement settles, so a long section
           // issuing many statements does not accumulate them on one signal.
           //
@@ -167,7 +255,10 @@ function wrapClient<T extends object>(client: T): T {
           // return. So `values()`/`raw()` still land before the statement is
           // built. (`Query[Symbol.species]` is `Promise`, so this branch is a
           // plain promise and cannot be mistaken for the query itself.)
-          const detach = () => signal.removeEventListener("abort", onAbort);
+          const detach = () => {
+            signal.removeEventListener("abort", onAbort);
+            inFlightBySignal.get(signal)?.delete(query);
+          };
           void Promise.resolve(query).then(detach, detach);
           return query;
         };
@@ -192,16 +283,11 @@ function wrapClient<T extends object>(client: T): T {
 }
 
 /**
- * Memoized per input handle.
- *
- * `heartbeatService` is constructed once per route/service factory, and there
- * are seven of those — all from the same `Db`. Without this, each would build
- * its own drizzle instance, and `drizzle()` runs
- * `extractTablesRelationalConfig` over the entire schema every time. Reusing
- * one wrapper per handle keeps that cost at one and keeps `db` reference-stable
- * across services built from the same handle, which matters because
- * `heartbeat.ts` compares an executor against `db` by identity
- * (`appendRunEvent`'s publish guard).
+ * Memoized per input handle, so calling this twice on one handle yields the
+ * same `Db` rather than a second drizzle instance. `drizzle()` runs
+ * `extractTablesRelationalConfig` over the whole schema on every construction,
+ * and reference stability matters because `heartbeat.ts` compares an executor
+ * against `db` by identity (`appendRunEvent`'s publish guard).
  */
 const wrappedDbByHandle = new WeakMap<object, Db>();
 

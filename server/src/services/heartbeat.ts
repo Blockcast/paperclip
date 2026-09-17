@@ -506,7 +506,6 @@ import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
 import { runDetachedFromAgentStartLock, withAgentStartLock } from "./agent-start-lock.js";
-import { withAgentStartLockAbortableDb } from "./agent-start-lock-db.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -12244,17 +12243,20 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
-export function heartbeatService(dbHandle: Db, options: HeartbeatServiceOptions = {}) {
-  // PEN-3328. Every database await reachable from the queued-run dispatch
-  // critical section resolves this one binding — the seven `db.select(...)`
-  // calls in the section itself, the twenty helpers below that close over it,
-  // and the sub-services constructed from it. Wrapping it here, once, is what
-  // makes the section's start-lock abort signal able to cancel that work, so a
-  // wedged section rejects and releases its lock instead of taking the agent's
-  // dispatch down for the life of the process. Inert outside a dispatch section
-  // (no signal on the async path) and a pass-through when the handle is a test
-  // double; see `agent-start-lock-db.ts`.
-  const db = withAgentStartLockAbortableDb(dbHandle);
+export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
+  // PEN-3328. The queued-run dispatch critical section's database work is made
+  // cancellable by wrapping the postgres.js client, but that wrap is applied at
+  // the composition root (`index.ts`, right after `createDb`) rather than here,
+  // so this function takes the handle as given.
+  //
+  // It used to be applied here, and that was wrong. Installing it meant
+  // rebuilding a `Db` from the handle's `$client`, which silently discards any
+  // decoration the caller had layered on the handle itself — a caller passing a
+  // `Db` whose `transaction` is wrapped got a service that quietly ignored the
+  // wrapping and talked to the raw client instead. Two rollback-behaviour tests
+  // caught exactly that. Wrapping the client once, before any `Db` exists, has
+  // the same effect on the section and cannot drop a decoration because there
+  // is nothing decorated yet.
   const envNodeRole = process.env.PAPERCLIP_NODE_ROLE;
   const paperclipNodeRole =
     options.paperclipNodeRole ??

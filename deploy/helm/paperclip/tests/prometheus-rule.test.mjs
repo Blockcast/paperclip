@@ -1262,6 +1262,50 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
   );
 });
 
+test("PaperclipAgentStartLockAborted reports the self-healed wedge the held gauge cannot (PEN-3328)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipAgentStartLockAborted/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipAgentStartLockAborted[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "aborted-start-lock alert must render an expr");
+
+  // A counter over a window, NOT the held gauge. This is the whole reason the
+  // rule exists: PEN-3328 cancels a wedged section at the same 300s boundary
+  // PaperclipAgentStartLockWedged waits 5m (`for:`) to fire on, and the held
+  // gauge is emitted only for locks held at scrape time -- so a successful
+  // cancellation deletes the series before the wedge alert ever fires. Without
+  // a durable counter the incident is invisible exactly because it was handled.
+  // If a later reader "simplifies" this onto the gauge, that blind spot returns.
+  assert.match(
+    expr,
+    /increase\(paperclip_agent_start_lock_aborted_total\[1h\]\) > 0/,
+    "aborted alert must read the durable counter over a window, not the transient held gauge",
+  );
+
+  // Warning, not critical, and this is the deliberate split from the wedge
+  // alert beside it. By the time this fires the lock has been released and the
+  // agent is dispatching again, so waking someone is wrong -- but the thing
+  // that blocked the section for five minutes has NOT been fixed, so staying
+  // silent is also wrong.
+  assert.match(
+    rendered,
+    /alert: PaperclipAgentStartLockAborted[\s\S]*?\n\s+severity: warning\n/,
+    "a self-healed dispatch wedge must warn rather than page",
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipAgentStartLockAborted[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#agent-start-lock-wedged-pen-3305"/,
+    "aborted-start-lock alert must link the runbook section from its annotation",
+  );
+});
+
 test("PaperclipRecoveryHorizonNoWakeToCurrentOwner{Elevated,Sustained} key on the never_delivered series only and take their thresholds from values (PEN-3000)", () => {
   const rendered = renderChart([
     "--show-only",
