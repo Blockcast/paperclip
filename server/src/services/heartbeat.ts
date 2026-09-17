@@ -506,6 +506,7 @@ import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
 import { runDetachedFromAgentStartLock, withAgentStartLock } from "./agent-start-lock.js";
+import { withAgentStartLockAbortableDb } from "./agent-start-lock-db.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -12243,7 +12244,17 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
-export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
+export function heartbeatService(dbHandle: Db, options: HeartbeatServiceOptions = {}) {
+  // PEN-3328. Every database await reachable from the queued-run dispatch
+  // critical section resolves this one binding — the seven `db.select(...)`
+  // calls in the section itself, the twenty helpers below that close over it,
+  // and the sub-services constructed from it. Wrapping it here, once, is what
+  // makes the section's start-lock abort signal able to cancel that work, so a
+  // wedged section rejects and releases its lock instead of taking the agent's
+  // dispatch down for the life of the process. Inert outside a dispatch section
+  // (no signal on the async path) and a pass-through when the handle is a test
+  // double; see `agent-start-lock-db.ts`.
+  const db = withAgentStartLockAbortableDb(dbHandle);
   const envNodeRole = process.env.PAPERCLIP_NODE_ROLE;
   const paperclipNodeRole =
     options.paperclipNodeRole ??

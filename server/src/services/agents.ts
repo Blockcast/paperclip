@@ -40,6 +40,7 @@ import {
   EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS,
 } from "@paperclipai/shared/validators/agent";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { describeAgentStartLockDispatchHealth } from "./agent-start-lock.js";
 import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
@@ -452,6 +453,19 @@ export function agentService(db: Db) {
           agent: toEligibilityAgent(row),
           agents: eligibilityAgents,
         }).orgChainHealth,
+        // PEN-3328. A dispatch section that overran its budget and was cancelled
+        // must say so here. Without it the agent reads `status: idle` /
+        // `errorReason: null` / `orgChainHealth: healthy` while its queued runs
+        // pile up untouched — the exact reading five agents presented for 6-19 h
+        // each in PEN-3305, which is why nobody could name the fault. `null`
+        // whenever the start lock has nothing to report, which is almost always.
+        //
+        // Synchronous in-process read, like `orgChainHealth` beside it: this is
+        // on the request path of every agent read, and the condition it reports
+        // is a section stuck on the database, so it must not need the database.
+        // Per-pod by construction — the lock is per-process, so only the pod
+        // that owns dispatch can answer, and on the api tier it is always null.
+        dispatchHealth: describeAgentStartLockDispatchHealth(row.id),
       };
     });
   }
