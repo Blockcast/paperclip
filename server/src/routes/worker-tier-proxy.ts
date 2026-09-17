@@ -22,6 +22,7 @@ import { Readable } from "node:stream";
 import type { IncomingHttpHeaders } from "node:http";
 import type { Request, RequestHandler, Router } from "express";
 import { logger } from "../middleware/logger.js";
+import { urlForLog } from "../middleware/http-log-policy.js";
 import { assertBoardOrgAccess } from "./authz.js";
 
 /**
@@ -182,7 +183,14 @@ async function fetchWithStartupRetry(
   init: RequestInit,
   retry: boolean,
   retryBudgetMs?: number,
+  // Logged in place of `targetUrl`, which carries the caller-supplied query
+  // string. Optional only so the signature stays back-compatible; it
+  // deliberately does NOT default to `targetUrl`, because that would make the
+  // leak silently reappear for any caller that forgot to pass it. An absent
+  // value logs a placeholder instead — a missing diagnostic, not a secret.
+  targetUrlForLog?: string,
 ): Promise<Response> {
+  const loggedTargetUrl = targetUrlForLog ?? "[OMITTED: unscrubbed target url]";
   let attempt = 0;
   let backoffMs = PROXY_GET_RETRY_INITIAL_MS;
   const startedAtMs = Date.now();
@@ -199,7 +207,7 @@ async function fetchWithStartupRetry(
       if (remainingBudgetMs <= 0) throw err;
       const nextRetryMs = Math.min(backoffMs, remainingBudgetMs);
       logger.warn(
-        { err, targetUrl, method: init.method, attempt, nextRetryMs },
+        { err, targetUrl: loggedTargetUrl, method: init.method, attempt, nextRetryMs },
         "worker-tier proxy: worker tier fetch failed; retrying idempotent request",
       );
       await sleep(nextRetryMs, signal ?? new AbortController().signal);
@@ -219,6 +227,13 @@ function createWorkerProxyHandler(
 ): RequestHandler {
   return async (req, res) => {
     const targetUrl = `${workersInternalUrl}${req.originalUrl}`;
+    // The same URL with the query string dropped on untrusted webhook routes.
+    // `req.originalUrl` is sender-authored on those routes, so interpolating
+    // the raw one into a log payload re-opens the query half of the
+    // BLO-29716 guard (PEN-2996). Scrub the relative part, THEN prepend the
+    // origin — the route patterns are anchored at the path root and match
+    // nothing against an absolute URL.
+    const targetUrlForLog = `${workersInternalUrl}${urlForLog(req.originalUrl) ?? ""}`;
     const controller = new AbortController();
 
     // Set when the downstream client goes away before we finished
@@ -284,13 +299,13 @@ function createWorkerProxyHandler(
         body: body as BodyInit | undefined,
         redirect: "manual",
         signal: controller.signal,
-      }, retryStartupRace, retryBudgetMs);
+      }, retryStartupRace, retryBudgetMs, targetUrlForLog);
 
       if (upstream.status >= 500) {
         // The worker tier reached us but failed the operation. Forward it
         // verbatim, but log so the failure is visible from API-tier logs.
         logger.warn(
-          { targetUrl, method: req.method, status: upstream.status },
+          { targetUrl: targetUrlForLog, method: req.method, status: upstream.status },
           "worker-tier proxy: worker tier returned a server error",
         );
       }
@@ -318,7 +333,7 @@ function createWorkerProxyHandler(
       // Client left before we finished — expected, nothing to report.
       if (clientDisconnected) return;
       logger.error(
-        { err, targetUrl, method: req.method },
+        { err, targetUrl: targetUrlForLog, method: req.method },
         "worker-tier proxy: failed to relay request to worker tier",
       );
       if (!res.headersSent) {
