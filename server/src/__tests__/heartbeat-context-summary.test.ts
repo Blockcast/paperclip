@@ -2587,6 +2587,19 @@ describe("buildPaperclipTaskMarkdown run write-containment notice", () => {
     expect(markdown).toContain("no `request_board_approval` exception on this lane");
   });
 
+  // The notice must not assert WHY the run is contained. `successful-run-handoff.ts` selects
+  // `planning_only` as `workMode === "planning" || Boolean(run.statusOnlyDocumentWriteRefusedAt)`;
+  // the `workMode` arm involves no refusal and stamps nothing, so an "escalated after a refusal"
+  // opener is false for a reachable run — an agent reading a prior-run event that never happened,
+  // on the one lane whose notice tells it to confirm before claiming. Pinned because the earlier
+  // draft carried exactly that clause and nothing failed when it did.
+  it("does not claim a refusal caused the planning-only escalation", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue, recoveryRunWriteClass: "planning_only" });
+
+    expect(markdown).not.toContain("escalated after");
+    expect(markdown).not.toContain("was refused a document write");
+  });
+
   // The notice is a system-generated containment constraint rendered inside a block whose preamble
   // declares its contents user-authored and overridable by higher-priority instructions. Without
   // this line an agent may discount the one statement that is not negotiable.

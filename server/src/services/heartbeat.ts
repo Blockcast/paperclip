@@ -11566,6 +11566,10 @@ export function buildPaperclipTaskMarkdown(input: {
   // including one with no issue context. Placed here rather than at the top because it is a
   // constraint on how the work is done, not the work itself; placed before the closing line so it
   // is the last thing read before the agent starts planning, which is the moment it has to land.
+  // "Last" is true of what this function builds, not of what ships: the unmaterialized-skill notice
+  // appends to `context.paperclipTaskMarkdown` after this returns, so on a wake carrying both, one
+  // block follows. That is the only appender today; keep it that way rather than treating the
+  // position as a stronger invariant than it is.
   //
   // The provenance line is load-bearing, not decoration: this block's preamble declares the
   // surrounding content user-authored and explicitly not permission to override higher-priority

@@ -143,6 +143,21 @@ describe("recovery run write class", () => {
     })).toBe("planning_only");
   });
 
+  // The other direction of that same asymmetry, asserted rather than only documented. The
+  // status-only predicate requires `modelProfile: "cheap"`; its planning-only sibling deliberately
+  // omits the check, because the `planning_only` arm of `withRecoveryModelProfileHint` SCRUBS the
+  // key rather than setting it — so requiring a value would make the predicate unsatisfiable on
+  // the producer's own output. Together with the case above this pins both arms of a divergence
+  // that reads like an oversight and would otherwise be "tidied" into symmetry.
+  it("classifies a planning-only snapshot carrying no model profile at all", () => {
+    const planningOnly = withRecoveryModelProfileHint({ issueId: "i" }, "planning_only");
+
+    expect(planningOnly).not.toHaveProperty("modelProfile");
+    expect(readRecoveryRunWriteClass(planningOnly)).toBe("planning_only");
+    // The sibling requires the key, so the same tuple minus a profile is NOT status-only.
+    expect(isStatusOnlyRecoveryContextSnapshot(planningOnly)).toBe(false);
+  });
+
   it("reuses the shared resume guidance verbatim so the wake and the 403 cannot drift", () => {
     expect(RECOVERY_RUN_WRITE_CLASS_NOTICE.status_only)
       .toContain(STATUS_ONLY_RECOVERY_RESUME_GUIDANCE.resumeGuidance);

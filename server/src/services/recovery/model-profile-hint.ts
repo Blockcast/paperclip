@@ -157,6 +157,19 @@ export function readRecoveryRunWriteClass(contextSnapshot: unknown): RecoveryRun
  * exhaustive, and an incomplete exhaustive list licenses the reader to plan around what it omits.
  * Cited by name rather than `file:line` deliberately — these call sites move under unrelated
  * churn, and a stale line number in a security-control comment reads as authority.
+ *
+ * Neither notice states WHY the run is contained, and `planning_only`'s omission is the deliberate
+ * one. An earlier draft opened "escalated after a status-only run was refused a document write",
+ * which is true of only one of that class's two producers: `successful-run-handoff.ts` selects it
+ * as `issue.workMode === "planning" || Boolean(run.statusOnlyDocumentWriteRefusedAt)`, and the
+ * `workMode` arm — the older path, which that file's own comment notes "only ever fired for
+ * `planning` issues" — involves no refusal and stamps nothing. So a planning-workMode issue read a
+ * notice asserting a prior-run event that never happened: the PEN-3248 failure class one step
+ * removed, an agent narrating an act that did not occur, on the very lane whose notice tells it to
+ * confirm before claiming. Provenance is not what a reader needs from a containment notice — it
+ * needs to know what will be refused — and a sentence enumerating origins rots the moment a third
+ * appears. Where the origin matters it is already on the handoff record's `details`
+ * (`escalatedAfterDocumentWriteRefusal`). Do not reintroduce a causal clause here.
  */
 export const RECOVERY_RUN_WRITE_CLASS_NOTICE: Readonly<Record<RecoveryRunWriteClass, string>> = {
   status_only:
@@ -164,8 +177,8 @@ export const RECOVERY_RUN_WRITE_CLASS_NOTICE: Readonly<Record<RecoveryRunWriteCl
     "there is no other signal that writes are contained. Refused with 403: creating, modifying, " +
     "commenting on, resubmitting, withdrawing, linking or unlinking approvals — including the " +
     "`request_board_approval` this run may itself file; assigning downstream issue work to the " +
-    "cheap model profile; arming issue monitors; writing issue documents other than the " +
-    "status-adjudication document; and all deliverable and annotation writes. The only approval " +
+    "cheap model profile; arming issue monitors; writing issue documents other than upserting " +
+    "the status-adjudication document; and all deliverable and annotation writes. The only approval " +
     "write this run can perform is creating a `request_board_approval` linked to this run's " +
     "source issue, and that is a single call you cannot follow up from here — not even to comment " +
     "on what you just filed. Permitted: reads, issue comments, and recording a status " +
@@ -174,11 +187,11 @@ export const RECOVERY_RUN_WRITE_CLASS_NOTICE: Readonly<Record<RecoveryRunWriteCl
     " Confirm any of the refused writes returned before you describe it as done: composing the " +
     "claim before the call lands is how a refused write becomes a false record.",
   planning_only:
-    "This wake is a planning-only recovery run, escalated after a status-only run was refused a " +
-    "document write. Issue document updates are permitted. Refused with 403: creating, modifying, " +
-    "commenting on, resubmitting, withdrawing, linking or unlinking approvals — every approval " +
-    "write, with no `request_board_approval` exception on this lane — and all deliverable and " +
-    "annotation writes. Confirm any of those returned before you describe it as done.",
+    "This wake is a planning-only recovery run. Issue document updates are permitted. Refused " +
+    "with 403: creating, modifying, commenting on, resubmitting, withdrawing, linking or " +
+    "unlinking approvals — every approval write, with no `request_board_approval` exception on " +
+    "this lane — and all deliverable and annotation writes. Confirm any of those returned before " +
+    "you describe it as done.",
 };
 
 const RECOVERY_MODEL_PROFILE_HINT_KEYS = [
