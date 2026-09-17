@@ -222,11 +222,19 @@ describeEmbeddedPostgres("heartbeat timer suppression is not bypassed by park/pr
   /**
    * A park as one of the three `scheduled_retry` writers actually shapes it.
    *
-   * Default (`retryOf` omitted) is a **deferred fresh wake** — the ccrotate
-   * capacity park and the `dependency_blocked` park both insert one: no
-   * `agent_wakeup_requests` row on the capacity path (hence the null
-   * `wakeupRequestId`), `retryOfRunId` left null because no run ever executed,
-   * and a snapshot carrying the `__heartbeat__` sentinel.
+   * Default (`retryOf` omitted, reason defaulted) is the **ccrotate capacity**
+   * park: `retryOfRunId` left null because no run ever executed, a snapshot
+   * carrying the `__heartbeat__` sentinel, and — uniquely among the three — a
+   * null `wakeupRequestId`, because that writer inserts no
+   * `agent_wakeup_requests` row at all.
+   *
+   * Pass `scheduledRetryReason: "dependency_blocked"` for the **dep-blocked**
+   * park. It is also a deferred *fresh* wake (`retryOfRunId` null), but it does
+   * insert a wakeup request and bind it, so `wakeupRequestId` is NOT null here.
+   * Its snapshot additionally always carries an `issueId`, because the writer
+   * only runs inside the `if (issueId)` branch of `wakeup()` and spreads an
+   * `enrichedContextSnapshot` that has already been stamped with it — pass one
+   * explicitly, or the row is not the shape production stores.
    *
    * Pass `retryOf` for a **bounded-retry** park as `scheduleBoundedRetryForRun`
    * writes one: `invocationSource: "automation"`, a non-null `wakeupRequestId`
@@ -245,16 +253,17 @@ describeEmbeddedPostgres("heartbeat timer suppression is not bypassed by park/pr
     retryOf?: { runId: string };
   }): Promise<string> {
     const runId = randomUUID();
+    const depBlocked = input.scheduledRetryReason === "dependency_blocked";
     let wakeupRequestId: string | null = null;
-    if (input.retryOf) {
+    if (input.retryOf || depBlocked) {
       wakeupRequestId = randomUUID();
       await db.insert(agentWakeupRequests).values({
         id: wakeupRequestId,
         companyId: input.companyId,
         agentId: input.agentId,
-        source: "automation",
-        reason: "heartbeat.retry",
-        status: "queued",
+        source: input.retryOf ? "automation" : "timer",
+        reason: input.retryOf ? "heartbeat.retry" : "issue_dependencies_blocked",
+        status: input.retryOf ? "queued" : "scheduled",
       });
     }
     await db.insert(heartbeatRuns).values({
@@ -429,16 +438,32 @@ describeEmbeddedPostgres("heartbeat timer suppression is not bypassed by park/pr
     expect(result.runIds).toContain(runId);
   });
 
-  it("suppresses a promoted dependency_blocked park, not just a capacity one", async () => {
-    // The bypass is not confined to capacity parks. Both writers that defer a
-    // *fresh* wake leave `retryOfRunId` null, and both promote through the same
-    // function, so both are in scope.
+  it("never suppresses a dependency_blocked park, whose snapshot always carries an issueId", async () => {
+    // Negative control, and the reason this suite does NOT claim the promotion
+    // gate is park-agnostic. A real `dependency_blocked` park cannot reach the
+    // suppression block at all:
+    //
+    //   - the writer runs only inside the `if (issueId)` branch of `wakeup()`;
+    //   - its snapshot spreads `enrichedContextSnapshot`, and
+    //     `enrichWakeContextSnapshot` stamps `issueId` onto that snapshot
+    //     whenever it lacks one and the payload has one — so a non-empty
+    //     `issueId` at the writer implies a non-empty `issueId` in the row;
+    //   - `isGenericTimerWakeSnapshot` returns false on any snapshot carrying
+    //     `issueId`, so the suppression conjunct can never be satisfied by this
+    //     writer, however empty the lane is.
+    //
+    // Seeded the way that writer actually shapes the row — `issueId` in the
+    // snapshot, a bound `wakeupRequestId` — the park is left alone: still
+    // blocked, so promotion re-defers it rather than cancelling it. Asserting
+    // the *absence* of the suppression cancel is what keeps a later widening of
+    // the predicate (dropping the `issueId` check) from silently starting to
+    // cancel real dependency-blocked work with this suite still green.
     const { companyId, agentId } = await seedAgent();
-    await seedBlockedAssignedIssue(companyId, agentId);
+    const { blockedId } = await seedBlockedAssignedIssue(companyId, agentId);
     const runId = await seedPark({
       companyId,
       agentId,
-      contextSnapshot: { wakeSource: "timer", taskKey: "__heartbeat__" },
+      contextSnapshot: { wakeSource: "timer", taskKey: "__heartbeat__", issueId: blockedId },
       scheduledRetryReason: "dependency_blocked",
     });
     const heartbeat = heartbeatService(db, {
@@ -446,15 +471,25 @@ describeEmbeddedPostgres("heartbeat timer suppression is not bypassed by park/pr
       skipQueuedRunDispatch: true,
     });
 
-    const result = await heartbeat.promoteDueScheduledRetries(new Date());
+    // Precondition: the fixture is the shape the gate is blind to. If this ever
+    // fails, the rest of the test is asserting nothing.
+    const seeded = await db
+      .select({ snapshot: heartbeatRuns.contextSnapshot, wakeupRequestId: heartbeatRuns.wakeupRequestId })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(isGenericTimerWakeSnapshot(seeded?.snapshot as Record<string, unknown>)).toBe(false);
+    expect(seeded?.wakeupRequestId).not.toBeNull();
 
-    expect(result.promoted).toBe(0);
+    await heartbeat.promoteDueScheduledRetries(new Date());
+
     const parked = await db
       .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
-    expect(parked).toMatchObject({ status: "cancelled", errorCode: "timer_no_actionable_work" });
+    expect(parked?.errorCode).not.toBe("timer_no_actionable_work");
+    expect(parked?.status).not.toBe("cancelled");
   });
 
   it("never suppresses a max_turns_continuation park, even with an empty queue", async () => {
