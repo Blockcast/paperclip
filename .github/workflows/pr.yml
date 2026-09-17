@@ -411,12 +411,21 @@ jobs:
       # rarely to observe a 6h condition, which no assertion about the script
       # itself can catch. Those tests pin the sampling cadence and the step
       # ORDER the cadence depends on.
-      - name: Test stuck production-approval escalation (PEN-2848, BLO-33400)
+      #
+      # PEN-3315 adds two more. The supersede suite pins that guard (1)'s new
+      # bounded exit approves nothing and refuses a run whose target is still
+      # current; the record suite pins that superseding a run cannot reset the
+      # escalation's stall clock. Both properties are unobservable in production
+      # until a deploy is already stuck for hours, which is the wrong moment to
+      # discover either of them regressed.
+      - name: Test stuck production-approval escalation (PEN-2848, BLO-33400, PEN-3315)
         if: ${{ !cancelled() }}
         run: |
           node --test \
             ./.github/scripts/tests/post-pending-deploy-alert.test.mjs \
-            ./.github/scripts/tests/scheduled-production-deploy-schedule.test.mjs
+            ./.github/scripts/tests/scheduled-production-deploy-schedule.test.mjs \
+            ./.github/scripts/tests/supersede-stale-deploy.test.mjs \
+            ./.github/scripts/tests/deploy-stall-record.test.mjs
         timeout-minutes: 1
 
       # BLO-28203. The stalled-Ally-review sweep's decision suite otherwise runs
