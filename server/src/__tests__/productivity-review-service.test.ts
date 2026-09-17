@@ -1852,7 +1852,7 @@ describeEmbeddedPostgres("productivity review service", () => {
   // and the caveat are the part a reviewer cannot get from the source issue,
   // and a prefix match passes with both deleted (Ally review, PR #1722).
   const DEPENDENCY_LINE_ONE_BLOCKER =
-    "- Dependency accounting: 1 unresolved `blockedBy` blocker at this evidence pass; reviewed anyway because `high_churn` fired, which an unresolved blocker does not excuse — blocker state at this pass, not a measured span: the elapsed figures above are wall-clock and are NOT reduced by this, so read their unattended portion as covering dependency-blocked time of unrecorded length";
+    "- Dependency accounting: 1 unresolved `blockedBy` blocker at this evidence pass; reviewed anyway because `high_churn` fired, which an unresolved blocker does not excuse — blocker state at this pass, not a measured span: the elapsed figures above are wall-clock and are NOT reduced by this, so dependency-blocked time of unrecorded length is already inside them";
   // Runs dispatched 30m ago: `activeStartedAt` anchors on the latest run
   // `startedAt`, and `insertRuns`'s default (`startedAt = createdAt = now`)
   // reports a 0m episode, which pins nothing.

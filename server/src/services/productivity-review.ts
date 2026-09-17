@@ -1210,8 +1210,18 @@ function formatDependencyGating(
   const survived = gating.nonClosableTriggers.length > 0
     ? `; reviewed anyway because ${gating.nonClosableTriggers.map((trigger) => `\`${trigger}\``).join(", ")} fired, which an unresolved blocker does not excuse`
     : "";
+  // Names NO individual bucket of the elapsed split, deliberately. This read
+  // "read their unattended portion as covering dependency-blocked time", which
+  // was written when the split had exactly two buckets and dependency-blocked
+  // time could only land in `unattended`. B1 (BLO-27698) adds an `executing`
+  // bucket that absorbs some of it, so on a 30m episode with a blocker
+  // unresolved throughout, the split can render `0m unattended` and a manager
+  // applying the old wording literally concludes there was no
+  // dependency-blocked time — the opposite of the truth, reached by following
+  // the caveat correctly. Point at the figures collectively so a bucket added
+  // later cannot empty the one this names. Do not re-add a bucket name.
   const caveat = elapsedSplitRendered
-    ? "the elapsed figures above are wall-clock and are NOT reduced by this, so read their unattended portion as covering dependency-blocked time of unrecorded length"
+    ? "the elapsed figures above are wall-clock and are NOT reduced by this, so dependency-blocked time of unrecorded length is already inside them"
     : "no elapsed split was computed for this episode, so there is no wall-clock figure this reduces";
   return `${blockers}${finalize}${survived} — blocker state at this pass, not a measured span: ${caveat}`;
 }
