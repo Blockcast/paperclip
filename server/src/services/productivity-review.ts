@@ -4582,17 +4582,36 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         // `isDominantEpisodeShare`, because both answer one question: is this
         // episode better explained by something other than assignee inactivity?
         //
-        // Deliberately NOT also gated on a run being live right now, which is
-        // where `noExecutableTurnDominantAndOpen` gets its bound. That guard
-        // would make this clause unreachable rather than conservative: a run
-        // that is live now started at or before the episode anchor
-        // (`mostRecentDispatchAt`), so its span covers the whole episode,
-        // `unattendedMs` is then ~0, and the first arm above has already
-        // suppressed. The bound here is the share test itself — as unattended
-        // time grows the ratio falls, and suppression lapses for good once the
-        // episode reaches twice the executing time. Bounded and self-clearing,
-        // which is what BLO-22331 AC2 requires; see the paired boundedness test.
-        isDominantEpisodeShare(monitorGating.executingMs, elapsedMs))
+        // Deliberately NOT gated on a *run* being live right now, which is where
+        // `noExecutableTurnDominantAndOpen` gets its bound. That guard would make
+        // this clause unreachable rather than conservative: a run that is live now
+        // started at or before the episode anchor (`mostRecentDispatchAt`), so its
+        // span covers the whole episode, `unattendedMs` is then ~0, and the first
+        // arm above has already suppressed. Both fixtures below prove the point
+        // from the other side — their executing span is a *terminal* run, so no
+        // run is live and the clause still has to work.
+        //
+        // It IS gated on the *episode clock* being live, which is a different
+        // thing and the actual bound (Ally review on fe4e9dcb). The share test
+        // alone is not self-clearing: it only falls as `elapsedMs` grows, and
+        // `elapsedMs` stops growing whenever `attributableEndAt` stops tracking
+        // `now` — i.e. exactly when `trailingHoldMs > 0`. For a silent `running`
+        // holder, `nonLiveExecutionHoldSince` (:698) pins the episode end at the
+        // fixed `lastSignal + NON_LIVE_EXECUTION_SILENCE_MS`, so `elapsedMs`,
+        // `executingMs` and `unattendedMs` all freeze and the ratio can never
+        // cross back under the bar. Reachable shape: anchor 15h ago, holder live
+        // for 8h, then silent — executing 8h / unattended 7h / elapsed 15h, the
+        // unattended residue is above the bar so the first arm does not apply,
+        // and `runaway_execution` declines because the span no longer reaches
+        // `now`. B2 alone would then suppress permanently, which is the BLO-22331
+        // AC2 hazard this clause claimed to avoid.
+        //
+        // `trailingHoldMs === 0` is the whole guard: while the clock runs, the
+        // ratio genuinely falls and suppression lapses once the episode reaches
+        // twice the executing time (the paired boundedness test pins that); once
+        // it freezes, the episode falls through to the trigger rather than being
+        // suppressed on a number that can no longer move.
+        (trailingHoldMs === 0 && isDominantEpisodeShare(monitorGating.executingMs, elapsedMs)))
     ) {
       return null;
     }
