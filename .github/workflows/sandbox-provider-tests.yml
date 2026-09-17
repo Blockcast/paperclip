@@ -4,7 +4,9 @@ name: Sandbox provider tests
 # pnpm-workspace.yaml so the providers stay installable standalone without
 # churning the root pnpm-lock.yaml. That exclusion is deliberate and this
 # workflow does not touch it -- the workspace file and the root lockfile are
-# unchanged by this lane.
+# unchanged by this lane. The same applies to
+# `packages/plugins/examples/plugin-orchestration-smoke-example`, the other
+# `!` plugin exclusion, which this lane also covers.
 #
 # The unintended consequence is what this closes. Measured at master
 # 2026-09-15: 0 of 33 workflows referenced the tree. Because the packages are
@@ -49,6 +51,7 @@ on:
   pull_request:
     paths:
       - "packages/plugins/sandbox-providers/**"
+      - "packages/plugins/examples/plugin-orchestration-smoke-example/**"
       - ".github/workflows/sandbox-provider-tests.yml"
 
 permissions:
@@ -101,9 +104,19 @@ jobs:
           # Discovered, not enumerated: a provider added later is covered with
           # no edit here, which is the failure mode that produced BLO-34222 in
           # the first place. Picks up the nested cloudflare/bridge-template too.
+          #
+          # BOTH pnpm-workspace.yaml `!` plugin exclusions are covered, not just
+          # the one BLO-34222 names. plugin-orchestration-smoke-example is
+          # excluded for the same stated reason (no lockfile churn for a local
+          # example) and had the same invisible-not-skipped property. Covering
+          # one and not the other would leave the defect alive in the sibling
+          # tree. `packages/services/**` is the third exclusion and is
+          # deliberately NOT here: it ships via per-service Docker workflows
+          # that already run its tests, and it is Python + npm, not pnpm.
           mapfile -t manifests < <(
-            find packages/plugins/sandbox-providers -name package.json \
-              -not -path '*/node_modules/*' | sort
+            find packages/plugins/sandbox-providers \
+                 packages/plugins/examples/plugin-orchestration-smoke-example \
+              -name package.json -not -path '*/node_modules/*' | sort
           )
 
           if [ "${#manifests[@]}" -eq 0 ]; then
@@ -119,10 +132,27 @@ jobs:
             jq -e '.scripts.test' "$manifest" >/dev/null 2>&1 || continue
             ran=$((ran + 1))
             echo "::group::${dir}"
-            # --ignore-workspace because these are not workspace members. No
-            # --frozen-lockfile: they intentionally ship no lockfile, which is
-            # the whole point of the pnpm-workspace.yaml exclusion.
-            if pnpm -C "$dir" install --ignore-workspace && pnpm -C "$dir" test; then
+            # Two install shapes, and they are not interchangeable.
+            #
+            # The sandbox providers carry only third-party deps, so they
+            # install standalone -- that is the shape the workspace exclusion
+            # exists to preserve. No --frozen-lockfile: they intentionally ship
+            # no lockfile, which is the whole point of the exclusion.
+            #
+            # plugin-orchestration-smoke-example instead depends on
+            # @paperclipai/* through `workspace:*`, which --ignore-workspace
+            # cannot resolve at all -- it fails outright with
+            # ERR_PNPM_WORKSPACE_PKG_NOT_FOUND. Its deps come from the root
+            # install above: vitest hoists from the root node_modules, and the
+            # SDK arrives via the root postinstall hook
+            # scripts/link-plugin-dev-sdk.mjs, whose own excludedPluginDirs()
+            # lists exactly these two trees. So it needs no install of its own.
+            if grep -q '"workspace:' "$manifest"; then
+              install=(true)
+            else
+              install=(pnpm -C "$dir" install --ignore-workspace)
+            fi
+            if "${install[@]}" && pnpm -C "$dir" test; then
               echo "PASS ${dir}"
             else
               echo "::error::${dir} tests failed"
