@@ -138,24 +138,48 @@ export function readRecoveryRunWriteClass(contextSnapshot: unknown): RecoveryRun
  *    a second phrasing cannot go stale on its own.
  *  - It must not promise a normal-model run is coming. That was the BLO-25878 failure: three runs
  *    read `resumeRequiresNormalModel: true` as a retry that would arrive, and none did.
+ *
+ * The refusal lists name OPERATIONS, not objects, because the guards key on the operation and the
+ * object-shaped phrasing predicted the wrong thing. `assertApprovalMutationAllowedByRunContext`
+ * admits only the CREATE route: `approvals.ts` passes `requestedType` at the create call site and
+ * nowhere else, so the comment, resubmit and withdraw routes all compare
+ * `undefined !== BOARD_ESCALATION_APPROVAL_TYPE` and refuse — on the run's own escalation included.
+ * An earlier draft read "creating or modifying approvals (except a single `request_board_approval`
+ * …)", which invites exactly the PEN-3248 write: comment on the card you just filed.
+ *
+ * Enumerated against the five guards that consume these predicates, not from memory:
+ * `assertApprovalMutationAllowedByRunContext` (`approvals.ts`), and in `issues.ts`
+ * `assertApprovalMutationAllowedByRunContext` (link/unlink),
+ * `assertDeliverableMutationAllowedByRunContext` (documents, deliverables, annotations),
+ * `assertMonitorArmingAllowedByRunContext` and `assertCheapRecoveryIssueAssigneeProfileAllowed`.
+ * The last two do not consult the planning-only predicate, which is why `planning_only` names
+ * neither. If you add a guard that consumes them, add it here: this list presents itself as
+ * exhaustive, and an incomplete exhaustive list licenses the reader to plan around what it omits.
+ * Cited by name rather than `file:line` deliberately — these call sites move under unrelated
+ * churn, and a stale line number in a security-control comment reads as authority.
  */
 export const RECOVERY_RUN_WRITE_CLASS_NOTICE: Readonly<Record<RecoveryRunWriteClass, string>> = {
   status_only:
     "This wake is a cheap status-only recovery run. Reads and issue comments behave normally, so " +
-    "there is no other signal that writes are contained. Refused with 403: creating or modifying " +
-    "approvals (except a single `request_board_approval` linked to this run's source issue), " +
-    "linking or unlinking approvals, arming issue monitors, writing issue documents other than the " +
-    "status-adjudication document, and all deliverable and annotation writes. Permitted: reads, " +
-    "issue comments, and recording a status disposition. " +
+    "there is no other signal that writes are contained. Refused with 403: creating, modifying, " +
+    "commenting on, resubmitting, withdrawing, linking or unlinking approvals — including the " +
+    "`request_board_approval` this run may itself file; assigning downstream issue work to the " +
+    "cheap model profile; arming issue monitors; writing issue documents other than the " +
+    "status-adjudication document; and all deliverable and annotation writes. The only approval " +
+    "write this run can perform is creating a `request_board_approval` linked to this run's " +
+    "source issue, and that is a single call you cannot follow up from here — not even to comment " +
+    "on what you just filed. Permitted: reads, issue comments, and recording a status " +
+    "disposition. " +
     STATUS_ONLY_RECOVERY_RESUME_GUIDANCE.resumeGuidance +
     " Confirm any of the refused writes returned before you describe it as done: composing the " +
     "claim before the call lands is how a refused write becomes a false record.",
   planning_only:
     "This wake is a planning-only recovery run, escalated after a status-only run was refused a " +
     "document write. Issue document updates are permitted. Refused with 403: creating, modifying, " +
-    "linking or unlinking approvals, and all deliverable and annotation writes. Confirm any of " +
-    "those returned before you describe it as done.",
-} as const;
+    "commenting on, resubmitting, withdrawing, linking or unlinking approvals — every approval " +
+    "write, with no `request_board_approval` exception on this lane — and all deliverable and " +
+    "annotation writes. Confirm any of those returned before you describe it as done.",
+};
 
 const RECOVERY_MODEL_PROFILE_HINT_KEYS = [
   "modelProfile",

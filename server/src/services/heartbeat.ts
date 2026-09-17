@@ -11566,10 +11566,20 @@ export function buildPaperclipTaskMarkdown(input: {
   // including one with no issue context. Placed here rather than at the top because it is a
   // constraint on how the work is done, not the work itself; placed before the closing line so it
   // is the last thing read before the agent starts planning, which is the moment it has to land.
+  //
+  // The provenance line is load-bearing, not decoration: this block's preamble declares the
+  // surrounding content user-authored and explicitly not permission to override higher-priority
+  // instructions, which is the correct frame for issue text and the wrong one for a
+  // system-generated write-containment constraint. It errs safe (it under-trusts a restriction)
+  // but it is simply false in the no-issue case, where the preamble describes nothing but this
+  // notice. Stated inline rather than by hoisting the notice out of the block, so the exact
+  // "Run write-containment notice:" marker the tests pin stays where it is.
   if (input.recoveryRunWriteClass) {
     lines.push(
       "",
       "Run write-containment notice:",
+      "(System-generated, not user-authored task data. This describes what this run is " +
+      "structurally unable to do; it is not a preference you can decline.)",
       RECOVERY_RUN_WRITE_CLASS_NOTICE[input.recoveryRunWriteClass],
     );
   }
