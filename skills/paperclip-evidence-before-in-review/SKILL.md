@@ -85,14 +85,16 @@ To actually be reviewed, request it explicitly: post a PR comment whose **first 
 
 #### `review:ally-clean`
 
-**You cannot produce this shape by writing anything.** The server finds the pull requests Paperclip linked to this issue — the webhook links a PR whose branch or title carries the issue identifier, e.g. `BLO-1234`, or whose body carries it on a labeled reference line (`Fixes:`, `Closes:`, `Refs:`); a bare prose mention is deliberately not ownership — fetches Ally's reviews and comments, and asks the same judge the merge gate uses (`evaluateCommentReviewGate`) whether Ally's review at the PR's **current head** has zero open Critical or Important findings. Pasting a PR URL does nothing. A PR that does not name this issue is not this issue's PR — and, per the fourth bullet below, the converse bites harder.
+**You cannot produce this shape by writing anything.** The server finds the pull requests Paperclip linked to this issue — every PR that references the issue identifier **anywhere**: branch, title, or body, including a bare prose mention — fetches Ally's reviews and comments, and asks the same judge the merge gate uses (`evaluateCommentReviewGate`) whether Ally's review at the PR's **current head** has zero open Critical or Important findings. Pasting a PR URL does nothing. A PR that does not name this issue at all is not this issue's PR — and, per the fourth bullet below, the converse bites harder.
+
+> **Ownership and linkage are different rules; do not substitute one for the other.** *Ownership* (branch, title, or a labeled `Fixes:`/`Closes:`/`Refs:` line) decides wakes and attribution. The truth shapes read the **wider** set, with no ownership filter — so a PR that merely mentions you counts. Reasoning from the ownership rule here rules out exactly the case most likely to hold your shape missing.
 
 Fails after you think you are done when:
 
 - **You pushed after Ally reviewed.** The attested head is now stale and the shape reverts to missing. Request review again with a comment whose first byte is `<!-- paperclip:review-request -->`.
 - **Ally left a Critical or Important finding.** Fix it, push, request again. A `COMMENTED` review with findings is not clean.
 - **Nobody has reviewed at all.** A green `gate/ally-comment-findings` status does not mean reviewed — read its description; `success` there can also mean *nothing attests to this head*. The shape reads the review surface, not the status.
-- **Another PR mentions this issue.** *Every* linked PR must be clean; the server aggregates with `every`. A PR you did not write becomes one of this issue's linked PRs if its branch or title carries the identifier, or its body carries it on a labeled reference line — and while that PR is unreviewed or carries findings, your shape stays missing with no signal on your own PR explaining why. Check the issue's `pull_request` work products, not just your own branch.
+- **Another PR mentions this issue.** *Every* linked PR must be clean; the server aggregates with `every`. A PR you did not write becomes one of this issue's linked PRs if it names the identifier **anywhere** — branch, title, or body, and a bare prose mention such as an informational `Related: BLO-1234` is enough — and while that PR is unreviewed or carries findings, your shape stays missing with no signal on your own PR explaining why. Check the issue's `pull_request` work products, not just your own branch.
 - **More than five PRs are linked.** Both truth shapes are withheld entirely rather than answered from a subset, with a `too-many-linked-prs:` diagnostic. Same symptom as "not reviewed", different cause.
 
 #### `deploy:landed`
