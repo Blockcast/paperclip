@@ -13,6 +13,8 @@
 //     node scripts/ops/backfill-pr-work-products.mjs [--apply]
 //
 // Requires `gh` authenticated for every repo named in the scanned comments.
+// Requires Node >= 22.18: this script imports a .ts module and relies on
+// built-in type stripping. On Node 20 it throws ERR_UNKNOWN_FILE_EXTENSION.
 import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
@@ -56,7 +58,13 @@ const LIMIT = 500;
 /**
  * Does this PR claim this issue? Mirrors the webhook's link rule: the
  * identifier appears in the PR title, the head branch, or on a labeled owning
- * reference line in the body.
+ * reference line in the body. Same grammar as the webhook, **unioned rather
+ * than ranked** — `resolveOwningPaperclipIdentifiers` is first-tier-wins, so a
+ * PR titled BLO-A with `Refs: BLO-B` in the body owns A only, while this
+ * answers true for both. Deliberate: a work product asks "is this PR an
+ * artifact of this issue", not "which single issue owns this wake", and every
+ * tier here is a labeled ownership claim rather than the bare-prose class that
+ * was the actual hazard.
  *
  * The body arm DELEGATES to the two upstream extractors rather than copying
  * their patterns, and that is load-bearing. They are two grammars, not one:

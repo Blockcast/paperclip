@@ -26,8 +26,13 @@ The gate runs on exactly one transition, INTO `in_review`
 cannot be satisfied at the only moment it is evaluated — no flag value can
 change that, and the code does not let one
 (`BLOCKABLE_TRUTH_SHAPES` in `server/src/services/evidence-gate.ts`).
-`deploy:landed` stays a detected/missing shape that feeds the scorecards and
-the measurement below.
+`deploy:landed` is therefore **required nowhere** — not by any labeled array and
+not by `DEFAULT_UNLABELED_REQUIRED` (CTO ruling 2026-09-17). It stays a
+registered, detected shape, reported via `allDetected` rather than
+`required`/`missing`, and it feeds the scorecards and the measurement below.
+Keeping it required would have made `pass` unreachable for every labeled
+code-completion issue and for the unlabeled majority, leaving merge-before-review
+as the only route to `pass` — an inverted incentive, not a degraded metric.
 
 Two populations are suppressed at every flag value, for two different reasons,
 and the verdict names which one applied:
@@ -60,8 +65,10 @@ curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
 | jq '[.[] | select(.lastEvidenceVerdict.diagnostics // [] | index("no-linked-pull-request"))] | length'
 ```
 
-Record it in BLO-3202. Run `scripts/ops/backfill-pr-work-products.mjs`,
-re-measure, expect near zero.
+Record it in BLO-3202. Run `scripts/ops/backfill-pr-work-products.mjs`
+(needs **Node >= 22.18** — it imports a `.ts` module and relies on built-in
+type stripping; Node 20 throws `ERR_UNKNOWN_FILE_EXTENSION`), re-measure,
+expect near zero.
 
 > **Two different literals, both real — do not "reconcile" them.** The verdict
 > array is `[...evaluation.diagnostics, ...truthDiagnostics]`
@@ -122,15 +129,22 @@ curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
 suppressions. Read it, not `onlyTruthMissing`.
 
 Note what `blockableGap` is: `missing.some(s => BLOCKABLE_TRUTH_SHAPES.includes(s))`,
-**not** an exact match. So `missing == ["review:ally-clean","deploy:landed"]` —
-an open PR with neither shape yet, which is the *dominant* case, because
-`DEFAULT_UNLABELED_REQUIRED` co-requires `deploy:landed` and that shape is
-unsatisfiable entering `in_review` (see above) — blocks too. An earlier draft
-of this runbook measured `missing == ["review:ally-clean"]` exactly and called
-it "the set the flip actually converts to `block`". That was backwards: it
-counts only the narrow merged-PR-but-not-Ally-clean case, reads ≈0 for seven
-days, and would have invited an operator to discount `onlyTruthMissing` — the
-one number that was keeping them safe.
+**not** an exact match. Since the 2026-09-17 registry change that distinction is
+currently moot: `deploy:landed` is required nowhere, so it can never enter
+`missing`, and a truth-only gap is therefore always exactly
+`["review:ally-clean"]`. `willBlock` and `onlyTruthMissing` now differ **only**
+by the two suppressed populations. The jq keeps subtracting both shapes anyway —
+a no-op today, and the thing that stops this measurement going wrong if a future
+registry re-requires `deploy:landed`.
+
+Read the history here rather than re-deriving it, because the correct set has
+changed once. An earlier draft measured `missing == ["review:ally-clean"]`
+exactly, and that was backwards **under the registry as it then stood**: with
+`deploy:landed` co-required, the exact set counted only the narrow
+merged-PR-but-not-Ally-clean case and read ≈0 for seven days. Dropping
+`deploy:landed` from `required` removed that trap, so the exact set is
+well-defined again — but measure `willBlock` as written, not the exact set,
+because only `willBlock` also subtracts the suppressions.
 
 The two suppressed populations are broken out because they are different
 problems:
@@ -144,16 +158,29 @@ problems:
   code-bearing issues means PRs are not being linked, which is a real defect
   with a different owner.
 
-`onlyTruthMissing` remains a safe upper bound on `willBlock`; its only excess
-is the `deploy:landed`-only set plus the two suppressed populations.
+`onlyTruthMissing` remains a safe upper bound on `willBlock`; since the registry
+change its only excess is the two suppressed populations.
 
 ## Flip criterion
 
 Seven consecutive days with **all** of:
 
-- `willBlock` below 10% of `total`;
+- `willBlock` below 2% of `total`;
 - `probeFailed` below 2% of `total`;
 - the landing routine merged every candidate it selected.
+
+**Why 2% against a 5% abort trigger, and not 10%.** `willBlock` *is* the
+predicted post-flip `block` count — that is the whole point of the number — so
+any flip threshold at or above the abort trigger authorises a flip that trips
+the abort on day one, and the abort says not to wait for a root cause. The
+operator would follow this runbook correctly and land back where they started,
+having spent a deploy and a rollback. The two numbers are also measured against
+**different bases**: `willBlock / total` is a *stock* (the standing `in_review`
+population carrying a verdict), while the abort's `block / in_review
+transitions` is a *daily flow*, which is noisier and can exceed the stock rate
+on a slow day. Equal thresholds would leave no margin for that. 2% is the
+tolerance this runbook already uses for `probeFailed`, so there is one number to
+remember rather than three.
 
 Then set `unlabeledTruthBlock: "1"` and open
 `feat(evidence): enforce truth shapes for unlabeled issues` with the seven daily
@@ -163,4 +190,6 @@ rows in the body.
 
 If `block` verdicts exceed 5% of `in_review` transitions on any day, or GitHub
 reports an incident, set `"0"` and redeploy. Do not wait for a root cause: the
-flag is the rollback.
+flag is the rollback. This is a daily *flow* against a different base than the
+flip gate's stock (see above) — expect it to be noisier day to day, which is
+why the flip gate carries margin rather than sitting at the same number.
