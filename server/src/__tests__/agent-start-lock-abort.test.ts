@@ -226,6 +226,26 @@ describe("agent start lock cancellation (PEN-3328)", () => {
     expect(health?.heldMs).toBeGreaterThanOrEqual(LOCK_HELD_ERROR_MS);
   });
 
+  it("counts the abort on a metric, because the gauge series vanishes with the lock", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    vi.spyOn(logger, "error").mockImplementation(() => logger);
+    const agentId = randomUUID();
+    const { renderMetrics } = await import("../services/metrics.js");
+
+    const held = withAgentStartLock(agentId, abortableAwait, coalesced);
+    void held.catch(() => {});
+    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS + 1_000);
+    await expect(held).rejects.toBeInstanceOf(AgentStartLockAbortedError);
+
+    // `paperclip_agent_start_lock_held_seconds` is gone by now — the lock was
+    // released, which is the fix working. Without this counter the event would
+    // leave no durable trace anywhere Prometheus can reach.
+    expect(describeHeldAgentStartLocks()).toEqual([]);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`paperclip_agent_start_lock_aborted_total{agent_id="${agentId}"} 1`);
+  });
+
   it("leaves a healthy section untouched and reports nothing for it", async () => {
     vi.useFakeTimers();
     const agentId = randomUUID();

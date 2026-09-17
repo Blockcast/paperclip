@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
 import { logger } from "../middleware/logger.js";
+import { recordAgentStartLockAborted } from "./metrics.js";
 
 /**
  * Per-agent serialization for queued-run dispatch (BLO-20396).
@@ -298,6 +299,7 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
       if (!loggedStopped) {
         forgetExpiredAborts(nowMs);
         lastAbortByAgent.set(agentId, { abortedAtMs: nowMs, heldMs, released: false });
+        recordAgentStartLockAborted(agentId);
         abort.abort(new AgentStartLockAbortedError(agentId, heldMs));
       }
       loggedStopped = true;
