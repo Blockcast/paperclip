@@ -22,23 +22,18 @@ const mockPostStatus = vi.hoisted(() => vi.fn());
 const mockPostCheckRun = vi.hoisted(() => vi.fn());
 const mockStatusDeliveryLock = vi.hoisted(() => vi.fn());
 
-vi.mock("../services/github-app-auth.js", () => ({
+// Only the network calls are mocked. The identity predicates are imported for
+// real via `importOriginal`: they are pure, and the hand-rolled copy this mock
+// used to carry could drift from the shipped one — which is precisely the class
+// of bug this suite exists to catch.
+vi.mock("../services/github-app-auth.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/github-app-auth.js")>()),
   githubFetchPrHeadSha: mockFetchHeadSha,
   githubFetchPrAuthorLogin: mockFetchPrAuthor,
   githubListIssueCommentsWithTimestamps: mockListComments,
   githubListPrReviewsWithTimestamps: mockListReviews,
   githubPostCommitStatusDetailed: mockPostStatus,
   githubPostCheckRun: mockPostCheckRun,
-  githubReviewerIdentityMatches: (login: string, configuredLogin: string) => {
-    const candidate = login.trim().toLowerCase().replace(/^@/, "");
-    const configured = configuredLogin.trim().toLowerCase().replace(/^@/, "");
-    const appSlug = configured.endsWith("[bot]")
-      ? configured.slice(0, -"[bot]".length)
-      : configured.startsWith("app/")
-        ? configured.slice("app/".length)
-        : "";
-    return candidate === `${appSlug}[bot]` || candidate === `app/${appSlug}`;
-  },
 }));
 
 vi.mock("../services/github-status-delivery-outbox.js", () => ({
