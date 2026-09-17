@@ -401,7 +401,7 @@ describeEmbeddedPostgres("gate re-validation (wired into the digest producer)", 
 
     const markdown = (await collect(companyId))!.markdown;
     expect(markdown).toContain(
-      "Every board card was withdrawn or cancelled — the board was asked and never answered",
+      "At least one board card was withdrawn or cancelled — that ask died unanswered",
     );
     expect(markdown).toContain("someone must re-ask or drop the row");
     expect(markdown).toContain("Human-gated work past its human-silence threshold (1)");
