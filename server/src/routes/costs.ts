@@ -374,17 +374,14 @@ export function costRoutes(
     const deferredCancellations: BudgetEnforcementScope[] = [];
     const updated = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
-      // Lock the policy rows before anything touches `agents`. Every other
-      // writer of the (budget_policies, agents) pair takes them in that order —
-      // `applyApprovalEnforcement` (`approval-enforcement-executor.ts`) locks
-      // the policies it classifies and only then writes the mirror, and
-      // `budgets.resolveIncident` updates the policy before the agent row. This
-      // route used to be the lone inversion: `txAgents.update` first, then the
-      // policy lock inside `upsertPolicy`'s UPDATE. Against a concurrent apply
-      // on the same agent that is a textbook ABBA deadlock — Postgres aborts
-      // one side with 40P01, which is not an `HttpError`, so the caller gets an
-      // unhandled 500 with no retry and a board cap change is the losing side
-      // as often as the apply is (BLO-32796).
+      // Lock the policy rows before anything touches `agents` — the one lock
+      // order for this pair, stated in full on `upsertPolicy` in `budgets.ts`.
+      // This route used to be the lone inversion: `txAgents.update` first, then
+      // the policy lock inside `upsertPolicy`'s UPDATE. Against a concurrent
+      // apply on the same agent that is a textbook ABBA deadlock — Postgres
+      // aborts one side with 40P01, which is not an `HttpError`, so the caller
+      // gets an unhandled 500 with no retry and a board cap change is the losing
+      // side as often as the apply is (BLO-32796).
       await txDb
         .select({ id: budgetPolicies.id })
         .from(budgetPolicies)

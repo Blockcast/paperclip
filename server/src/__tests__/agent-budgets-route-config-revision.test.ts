@@ -85,6 +85,7 @@ describeEmbeddedPostgres("PATCH /agents/:agentId/budgets records a config revisi
   });
 
   afterAll(async () => {
+    await db?.$client.end();
     await tempDb?.cleanup();
   });
 
@@ -299,6 +300,12 @@ describeEmbeddedPostgres("PATCH /agents/:agentId/budgets records a config revisi
       .patch(`/api/agents/${agent.id}/budgets`)
       .send({ budgetMonthlyCents: 1_100_000 })
       .then((response) => response);
+    // The probe window is time-based, so it fails toward green: if express were
+    // slower to enter the transaction than the window is long, the pre-fix route
+    // would never hold `agents` during the probes and all five would succeed for
+    // the wrong reason. Tracking settlement turns that into a failure.
+    let settled = false;
+    void patch.then(() => { settled = true; }, () => { settled = true; });
 
     try {
       // Pre-fix the route grabs `agents` immediately and holds it for the whole
@@ -314,11 +321,14 @@ describeEmbeddedPostgres("PATCH /agents/:agentId/budgets records a config revisi
             .for("update", { noWait: true });
         });
       }
+      expect(settled).toBe(false);
     } finally {
       release();
       await held;
     }
 
     expect((await patch).status).toBe(200);
+    await holder.$client.end();
+    await prober.$client.end();
   });
 });
