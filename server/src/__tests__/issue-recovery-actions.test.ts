@@ -1246,6 +1246,114 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("does not take a second pool connection while holding the issue-graph lock", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => ({ id: randomUUID() })) });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "agent is not invokable",
+      errorCode: "agent_not_invokable",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    // BLO-34207: the escalation holds `lockIssueParentMutationCompany` inside
+    // its `db.transaction` callback. A pooled statement issued from inside that
+    // callback needs a second connection; with POSTGRES_POOL_MAX = 10 and the
+    // lock's waiters holding the rest of the pool, the holder idled until a
+    // waiter hit lock_timeout and dispatch stalled fleet-wide. Record every
+    // pooled statement issued while a transaction callback is open.
+    type AnyFn = (...args: unknown[]) => unknown;
+    const dbRecord = db as unknown as Record<string, AnyFn>;
+    const pooledMethods = ["select", "insert", "update", "delete", "execute"] as const;
+    const originals = new Map<string, { fn: AnyFn; own: boolean }>();
+    for (const method of ["transaction", ...pooledMethods]) {
+      originals.set(method, {
+        fn: dbRecord[method]!.bind(db),
+        own: Object.prototype.hasOwnProperty.call(db, method),
+      });
+    }
+    let openTransactions = 0;
+    const pooledInsideTransaction: string[] = [];
+    dbRecord.transaction = async (...args: unknown[]) => {
+      openTransactions += 1;
+      try {
+        return await originals.get("transaction")!.fn(...args);
+      } finally {
+        openTransactions -= 1;
+      }
+    };
+    for (const method of pooledMethods) {
+      dbRecord[method] = (...args: unknown[]) => {
+        if (openTransactions > 0) {
+          // Name the offending call site so a regression reads as a location,
+          // not as a bare method name.
+          const frames = (new Error().stack ?? "")
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => line.includes("/services/") && !line.includes("node_modules"))
+            .slice(0, 2)
+            .map((line) => line.replace(/^at /, "").replace(/ \(.*$/, ""));
+          pooledInsideTransaction.push(`${method} @ ${frames.join(" <- ") || "unknown"}`);
+        }
+        return originals.get(method)!.fn(...args);
+      };
+    }
+    try {
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      });
+    } finally {
+      for (const [method, original] of originals) {
+        if (original.own) dbRecord[method] = original.fn;
+        else delete dbRecord[method];
+      }
+    }
+
+    // Fixed here: the escalation body's own `getCompanyIssuePrefix` and
+    // `getAgent` reads now run on `tx`. Still pooled under the lock, tracked on
+    // BLO-34207: owner resolution (`resolveStrandedIssueRecoveryOwnerAgentId`
+    // -> `getAgent` / `isAgentInvokable` / `budgets.getInvocationBlock` /
+    // instance settings). This ratchet fails on any new pooled call site and on
+    // a regression of the two fixed ones.
+    const knownPooledUnderLock = [
+      "resolveStrandedIssueRecoveryOwnerAgentId",
+      "isAgentInvokable",
+      "evaluateAgentInvokabilityFromDb",
+      "getInvocationBlock",
+      "getOrCreateRow",
+      // Deliberately pooled, NOT an unconverted call site. This read wants the
+      // freshest COMMITTED `heartbeat_runs` stamp: the stamp writer
+      // (`routes/issues.ts`, the statusOnly document-write refusal path) writes on
+      // the pooled connection and takes no advisory lock, so it does not serialize
+      // against `lockIssueOwnership`. Moving this onto the caller tx would bind it
+      // to the transaction snapshot and WIDEN the stale-read window the call site's
+      // own comment exists to narrow. See recovery/service.ts:7362-7371.
+      "getLatestIssueRun",
+    ];
+    const unexpected = pooledInsideTransaction.filter(
+      (entry) => !knownPooledUnderLock.some((name) => entry.includes(name)),
+    );
+    expect(unexpected).toEqual([]);
+    expect(pooledInsideTransaction.filter((entry) => entry.includes("getCompanyIssuePrefix"))).toEqual([]);
+    expect(
+      pooledInsideTransaction.filter((entry) => entry.includes("getAgent <- escalateStrandedAssignedIssue")),
+    ).toEqual([]);
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actionRows).toHaveLength(1);
+  });
+
   it("does not mutate an ownerless action on repeated sweep passes", async () => {
     const { coderId, managerId, sourceIssue } = await seedCompany();
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
@@ -2423,6 +2531,41 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       return seeded;
     }
 
+    // The same row, except its continuation retry died on infrastructure instead of
+    // exiting 0. This is the population the exemption does NOT currently reach, because
+    // it is consulted only under `latestRun?.status === "succeeded"` -- see the
+    // "Deliberately consulted ONLY on the succeeded-run gate" note on
+    // `hasOpenPullRequestWakePath`. Seeded here so that scoping is pinned by a test
+    // rather than resting on the comment alone; BLO-32679 carries the pending ruling on
+    // whether it should stay.
+    //
+    // `job_failed` specifically, because that is the sweep's own retry giving up:
+    // `reconcileStrandedAssignedIssues` issues the `issue_continuation_needed`
+    // continuation, the lifecycle Job exhausts its backoff, and the resulting
+    // `latestRun.status = "failed"` is what disqualifies the row. Note the error code is
+    // NOT in `isInfraClassStrandedFailure`, so `infraClassCause` reads false on it.
+    async function seedSeizableFailedContinuationRow() {
+      const seeded = await seedCompany();
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "failed",
+        error: "BackoffLimitExceeded: Job has reached the specified backoff limit",
+        errorCode: "job_failed",
+        startedAt: new Date(Date.now() - 45 * 60_000),
+        finishedAt: new Date(Date.now() - 40 * 60_000),
+        contextSnapshot: {
+          issueId: seeded.sourceIssueId,
+          retryReason: "issue_continuation_needed",
+          source: "issue.productive_terminal_continuation_recovery",
+        },
+      });
+      return seeded;
+    }
+
     // Built through the real producer, not hand-written literals: the predicate filters
     // on the webhook's metadata source and system source-trust, so if either constant
     // moves, this seeding moves with it and a stale filter fails loudly instead of
@@ -2553,6 +2696,49 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       // other side.
       const result = await sweep();
 
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    // BLO-32679. These two pin the boundary of the exemption on the OTHER axis: not
+    // "which PRs count" but "which runs let the question be asked at all".
+    it("escalates the failed-continuation shape when no pull request is recorded (control)", async () => {
+      const { sourceIssueId } = await seedSeizableFailedContinuationRow();
+
+      const result = await sweep();
+
+      // Establishes the row is genuinely at risk, so the next test measures the
+      // exemption's reach rather than a row that was never seizable.
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("still escalates a fresh webhook-written open pull request when the latest run failed", async () => {
+      const { companyId, sourceIssueId } = await seedSeizableFailedContinuationRow();
+      const fields = await insertPullRequestWorkProduct({
+        companyId,
+        issueId: sourceIssueId,
+        prNumber: 2434,
+      });
+      // Guard the guard, as above: an open status is what makes this a test of the
+      // exemption and not of a terminal PR.
+      expect(fields.status).toBe("ready_for_review");
+
+      const result = await sweep();
+
+      // CURRENT, DELIBERATE behaviour, not an aspiration: the work product satisfies
+      // every clause of `hasOpenPullRequestWakePath`, but the predicate is never
+      // consulted because the gate above it requires a succeeded run. Measured
+      // 2026-09-08 on company `aaced805`: 38 of 70 live `stranded_assigned_issue`
+      // actions were on rows matching this exact shape -- fresh webhook-written open
+      // PR, `latestRunStatus: failed` (22 `job_failed`, 12 `adapter_failed`, 4
+      // `k8s_pod_schedule_failed`), 70/70 of the population failed so 0 were eligible.
+      //
+      // Flip these two assertions to `0` / `"in_progress"` if the BLO-32679 ruling
+      // honours the PR path independently of run status; that is the whole diff on the
+      // test side.
       expect(result.escalated).toBe(1);
       const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
       expect(updated?.status).toBe("blocked");

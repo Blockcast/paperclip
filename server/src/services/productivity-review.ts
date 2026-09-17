@@ -40,6 +40,7 @@ import {
   PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
   PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
 } from "./pull-request-work-products.js";
+import { resolveOwningPaperclipIdentifiers } from "./paperclip-identifiers.js";
 import { runUsageTokenCounts } from "./recovery/zero-token-startup-failure.js";
 import { extractNextActionFromText } from "./run-liveness.js";
 
@@ -258,6 +259,20 @@ type PullRequestEvidence = {
   updatedAt: Date;
   /** Age of the newest PR event at evidence-collection time. */
   ageMs: number;
+  /**
+   * Whether this PR names the source issue as an OWNER, rather than merely
+   * mentioning it (PEN-3219).
+   *
+   * A `pull_request` work product is written for every issue a PR references
+   * anywhere, so holding one is not evidence that the PR is work on the issue
+   * holding it. A long-lived registry/invariant row accumulates every PR that
+   * name-drops it: PEN-2370 carried 44 such rows, none of them its own work.
+   * Without this flag the most recently *touched* member of that pile became
+   * the row's progress signal, and the review then told its reviewer that
+   * "the second signal is already present" — licensing a "close as productive"
+   * verdict on a `critical` row that had been dark for seven days.
+   */
+  ownsSourceIssue: boolean;
 };
 
 const PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUS_VALUES = ["ready_for_review", "draft", "merged"] as const;
@@ -286,6 +301,14 @@ type PullRequestEvidenceRow = {
   externalId: string | null;
   updatedAt: Date;
   sourceEventTimestampMs: string | number | null;
+  /** PR head branch, from metadata — an ownership tier for legacy rows. */
+  branch: string | null;
+  /**
+   * Owning identifiers recorded by the webhook at write time, or null on rows
+   * written before that field existed. Null means "not recorded", NOT "owns
+   * nothing" — see `pullRequestOwnsIssue`.
+   */
+  owningIdentifiers: unknown;
 };
 
 type ProductivityReviewEvidence = {
@@ -1197,11 +1220,58 @@ function isFreshPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEv
   return pr !== null && pr.ageMs <= PRODUCTIVITY_REVIEW_PR_FRESH_MS;
 }
 
-function isProgressPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEvidence {
-  return isFreshPullRequest(pr) && PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES.has(pr.status);
+// Deliberately NOT a type predicate: a false result means "not progress", not
+// "null", so narrowing `pr` to null on the false branch (as `pr is
+// PullRequestEvidence` would) makes the unattributed fall-through in
+// `pullRequestProgressNote` read as `never` and fails the build.
+function isProgressPullRequest(pr: PullRequestEvidence | null): boolean {
+  return (
+    isFreshPullRequest(pr) &&
+    PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES.has(pr.status) &&
+    // PEN-3219: attribution, not just movement. The webhook proves the PR
+    // moved; it says nothing about whether THIS row moved. Every consumer of
+    // this predicate treats a true result as concrete progress on the source
+    // issue — the "second signal is already present" note in the Manager
+    // Decision block, and any suppression gate that declines to file a review
+    // at all — so an unattributed PR here is a counterfeit progress signal
+    // that defeats the exact failure mode a productivity review exists to
+    // catch. Checked in the predicate rather than at each call site so a
+    // consumer added later inherits it.
+    pr.ownsSourceIssue
+  );
 }
 
-function toPullRequestEvidence(row: PullRequestEvidenceRow | null, now: Date): PullRequestEvidence | null {
+/**
+ * Does this PR work product belong to the issue holding it?
+ *
+ * Prefers the owning set the webhook recorded at write time. Rows written
+ * before that field existed fall back to re-deriving ownership from the two
+ * tiers the row still carries — the PR title and its head branch. The PR body
+ * is never persisted on the row, so a legacy PR that claims its issue ONLY in
+ * a labeled body line (`Fixes: PEN-1234`) cannot be recognised here and loses
+ * the progress signal until its next `pull_request` event rewrites the row.
+ * That direction is the safe one: it withholds a progress signal rather than
+ * manufacturing one.
+ */
+function pullRequestOwnsIssue(row: PullRequestEvidenceRow, sourceIdentifier: string | null): boolean {
+  if (!sourceIdentifier) return false;
+  const recorded = row.owningIdentifiers;
+  // An empty recorded array IS authoritative — the PR named no owner anywhere,
+  // so it is attributable to nothing. Only null/absent means "not recorded".
+  if (Array.isArray(recorded)) {
+    return recorded.some((value) => typeof value === "string" && value === sourceIdentifier);
+  }
+  return resolveOwningPaperclipIdentifiers({
+    title: row.title,
+    branch: row.branch,
+  }).owning.includes(sourceIdentifier);
+}
+
+function toPullRequestEvidence(
+  row: PullRequestEvidenceRow | null,
+  now: Date,
+  sourceIdentifier: string | null,
+): PullRequestEvidence | null {
   if (!row) return null;
   // Prefer the GitHub event time; `updatedAt` is only a fallback for rows
   // written before the source timestamp was recorded.
@@ -1216,6 +1286,7 @@ function toPullRequestEvidence(row: PullRequestEvidenceRow | null, now: Date): P
     externalId: row.externalId ?? null,
     updatedAt: eventAt,
     ageMs: Math.max(0, now.getTime() - eventAt.getTime()),
+    ownsSourceIssue: pullRequestOwnsIssue(row, sourceIdentifier),
   };
 }
 
@@ -1223,6 +1294,11 @@ function toPullRequestEvidence(row: PullRequestEvidenceRow | null, now: Date): P
  * Render the linked PR for the evidence pack (BLO-19566 AC4). Reads "none
  * recorded" only when the issue genuinely has no PR work product -- which is
  * now a real signal rather than, as before, the only possible output.
+ *
+ * PEN-3219: reports attribution alongside freshness and status. The PR is
+ * still shown when it belongs to another issue — suppressing it would hide
+ * real information from the reviewer — but it is labelled, so the line cannot
+ * be read as progress on this row.
  */
 function formatPullRequestEvidence(pr: PullRequestEvidence | null) {
   if (!pr) return "none recorded";
@@ -1231,7 +1307,46 @@ function formatPullRequestEvidence(pr: PullRequestEvidence | null) {
   const progress = PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES.has(pr.status)
     ? "progress-eligible"
     : "not progress-eligible";
-  return `${ref} \`${pr.status}\`, last activity ${pr.updatedAt.toISOString()} (${msToHuman(pr.ageMs)} ago, ${freshness}, ${progress})`;
+  const attribution = pr.ownsSourceIssue
+    ? "attributed to this issue"
+    : "NOT attributed to this issue";
+  return `${ref} \`${pr.status}\`, last activity ${pr.updatedAt.toISOString()} (${msToHuman(pr.ageMs)} ago, ${freshness}, ${progress}, ${attribution})`;
+}
+
+/**
+ * The Manager Decision note about the linked PR.
+ *
+ * Three outcomes, not two (PEN-3219). The affirmation is unchanged for a PR
+ * that owns this row. A PR that moved recently but belongs to another issue
+ * now gets an explicit warning rather than silence: staying quiet would leave
+ * the reviewer reading a `Linked pull request:` line that looks like progress
+ * with nothing telling them it is not theirs, which is how PEN-3216 reached a
+ * reviewer recommending "close as productive" on a `critical` row that had
+ * been dark for seven days.
+ */
+function pullRequestProgressNote(pr: PullRequestEvidence | null): string[] {
+  if (isProgressPullRequest(pr)) {
+    return [
+      "",
+      `> The second signal is already present: ${formatPullRequestEvidence(pr)}.`,
+      "> PR activity is recorded from the GitHub webhook, so this is deliverable progress even",
+      "> when the run/comment counters above read zero.",
+    ];
+  }
+  const movedButUnattributed =
+    pr !== null &&
+    isFreshPullRequest(pr) &&
+    PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES.has(pr.status) &&
+    !pr.ownsSourceIssue;
+  if (!movedButUnattributed) return [];
+  return [
+    "",
+    `> A linked PR moved recently, but it is NOT attributed to this issue: ${formatPullRequestEvidence(pr)}.`,
+    "> A PR work product is recorded against every issue the PR mentions anywhere, so this row",
+    "> holding it is not evidence that anyone worked on THIS issue. The webhook proves the PR",
+    "> moved; it says nothing about whether this row moved.",
+    "> This does NOT satisfy the second signal. Do not treat it as grounds for \"Close as productive\".",
+  ];
 }
 
 const NO_EXECUTABLE_TURN_MECHANISM_LABELS: Record<NoExecutableTurnMechanism, string> = {
@@ -3398,6 +3513,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           then (${issueWorkProducts.metadata}->>'sourceEventTimestampMs')::bigint
         else null
       end`,
+      branch: sql<string | null>`${issueWorkProducts.metadata}->>'branch'`,
+      owningIdentifiers: sql<unknown>`${issueWorkProducts.metadata}->'owningIdentifiers'`,
     };
     const trustedPullRequestEvidenceWhere = and(
       eq(issueWorkProducts.companyId, sourceIssue.companyId),
@@ -3484,6 +3601,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // The verdict criterion is satisfied by any fresh progress-eligible PR,
       // not necessarily the newest PR overall. A newer closed-unmerged PR must
       // not hide an older open/draft/merged PR that is still fresh.
+      //
+      // PEN-3219: and it must be a PR that OWNS this row. Attribution cannot be
+      // decided in SQL — `resolveOwningPaperclipIdentifiers` is a ranked
+      // tier-walk over title/body/branch, and legacy rows carry no recorded
+      // owning set — so every candidate is read newest-first and the first
+      // attributed one is picked in TS below. There is deliberately NO row cap:
+      // a cap applied before the ownership filter would let N newer
+      // unattributed PRs (a registry issue name-dropped by many PRs at once)
+      // push this row's own PR off the page and withhold a real progress
+      // signal. The WHERE already bounds the read to this issue's trusted PR
+      // rows that moved inside the 24h freshness window AND sit in a
+      // progress-eligible state, which is small in practice (PEN-2370 held 44
+      // rows in TOTAL, not 44 moving inside one day).
       db
         .select(pullRequestEvidenceSelect)
         .from(issueWorkProducts)
@@ -3495,8 +3625,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           ),
         )
         .orderBy(desc(pullRequestEffectiveEventAtSql))
-        .limit(1)
-        .then((rows) => rows[0] ?? null),
+        .then((rows) => rows.find((row) => pullRequestOwnsIssue(row, sourceIssue.identifier)) ?? null),
     ]);
 
     const activeRunCount = latestRuns.filter((run) =>
@@ -3582,7 +3711,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ? trailingHoldMs
       : Math.min(episodeMs, leadingParkMs + trailingHoldMs);
 
-    const latestPullRequest = toPullRequestEvidence(progressPullRequestRow ?? latestPullRequestRow, now);
+    const latestPullRequest = toPullRequestEvidence(
+      progressPullRequestRow ?? latestPullRequestRow,
+      now,
+      sourceIssue.identifier,
+    );
     // BLO-23248/BLO-23624: the portion of elapsedMs attributable to a
     // no-executable-turn run anywhere in the episode (not just the current
     // one), reported as its own evidence bucket distinct from
@@ -4064,16 +4197,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         : [
           "A \"Close as productive\" verdict requires at least ONE of the following concrete progress signals:",
           "- An assignee run-linked comment in the last 6h that contains a `Next action:` line",
-          "- A non-stale PR/MR link in the source issue's evidence (created or updated in the last 24h)",
+          "- A non-stale PR/MR link in the source issue's evidence, attributed to THIS issue (created or updated in the last 24h)",
           "- A recent test result, artifact commit, or workspace deliverable in the last 6h",
-          ...(isProgressPullRequest(evidence.latestPullRequest)
-            ? [
-              "",
-              `> The second signal is already present: ${formatPullRequestEvidence(evidence.latestPullRequest)}.`,
-              "> PR activity is recorded from the GitHub webhook, so this is deliverable progress even",
-              "> when the run/comment counters above read zero.",
-            ]
-            : []),
+          ...pullRequestProgressNote(evidence.latestPullRequest),
           "",
           "If none of these signals is present, the correct verdict is one of:",
           "- Request decomposition (the work is too large for a single heartbeat issue and needs to be split)",

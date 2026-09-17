@@ -436,9 +436,10 @@ import {
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
-import { mapAdapterToCcrotateTarget } from "./ccrotate-target.js";
+import { mapAdapterToCcrotateTarget, mapPenstockProviderToCcrotateTarget } from "./ccrotate-target.js";
 import {
   createPenstockAvailabilityGate,
+  mapAdapterToPenstockProvider,
   type PenstockAvailabilityGate,
   type PenstockAvailabilityGateDenyResult,
 } from "./penstock-availability-gate.js";
@@ -12769,7 +12770,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     heartbeatRunId?: string | null;
   }) {
     let adapterConfig = parseObject(input.agent.adapterConfig);
-    if (input.agent.adapterType === "claude_k8s") {
+    // Resolve secret bindings for every Penstock-gated adapter, not only
+    // claude_k8s: an opencode_k8s agent binds its Penstock credential the same
+    // way, and an unresolved binding makes the gate fail open (BLO-34116).
+    if (mapAdapterToPenstockProvider(input.agent.adapterType, adapterConfig) !== null) {
       try {
         const resolved = await secretsSvc.resolveAdapterConfigForRuntime(
           input.agent.companyId,
@@ -19002,7 +19006,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       if (!penstockCapacity.allow) {
         capacity = {
-          target: "claude",
+          target: mapPenstockProviderToCcrotateTarget(penstockCapacity.provider),
           reason: penstockCapacity.reason,
           resumeAt: penstockCapacity.resumeAt,
           penstockProvider: penstockCapacity.provider,
@@ -30165,6 +30169,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             statusReadError = error;
           }
           if (terminalStatus || statusReadError) {
+            // The counter and the log are this path's only two reporting
+            // channels, and both can throw exactly where the AC's "not lost
+            // silently" clause needs them not to: `ensureRegistry()` constructs
+            // its counters on first call, and a logger transport can fail. They
+            // are guarded independently rather than inside one `try`, so a
+            // metrics failure is still reported — through the log, as
+            // `metricErr` — instead of suppressing the log along with itself.
+            //
+            // Incremented BEFORE the sanitization block below, which awaits
+            // `getCurrentUserRedactionOptions()`. That await is guarded against
+            // *throws* but not against a *hang*: an instance-settings read that
+            // never settles would otherwise lose both channels at once. The
+            // counter is the cheaper and more reliable of the two, so it runs
+            // first and is never downstream of a DB await.
+            let metricError: unknown = null;
+            try {
+              recordHeartbeatPostTerminalRunEventDropped(terminalStatus);
+            } catch (error) {
+              metricError = error;
+            }
             // This log is the substitute for the row that is deliberately not
             // written, so it must not be a *less* redacted substitute than the
             // storage path. Mirror `appendRunEvent`'s four sanitizations in the
@@ -30190,19 +30214,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sanitizationError = error;
               sanitizedMessage = null;
               sanitizedPayload = null;
-            }
-            // The counter and the log are this path's only two reporting
-            // channels, and both can throw exactly where the AC's "not lost
-            // silently" clause needs them not to: `ensureRegistry()` constructs
-            // its counters on first call, and a logger transport can fail. They
-            // are guarded independently rather than inside one `try`, so a
-            // metrics failure is still reported — through the log, as
-            // `metricErr` — instead of suppressing the log along with itself.
-            let metricError: unknown = null;
-            try {
-              recordHeartbeatPostTerminalRunEventDropped(terminalStatus);
-            } catch (error) {
-              metricError = error;
             }
             try {
               logger.warn(
@@ -33757,6 +33768,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         wakeTriggerDetail: triggerDetail,
         penstockProvider: gateResult.provider,
         penstockModel: gateResult.model,
+        // Pin the escalation key to the pool that denied. Without it the
+        // promotion path falls back to the adapter default, which is `codex`
+        // for an opencode_k8s agent that deferred on the anthropic pool.
+        ccrotateTarget: mapPenstockProviderToCcrotateTarget(gateResult.provider),
         ...(githubReviewWakeReason !== null ? { githubReviewWakeReason } : {}),
         ...(resumeAtIso ? { penstockResumeAt: resumeAtIso } : {}),
         ...(advertisedResumeAtIso ? { penstockAdvertisedResumeAt: advertisedResumeAtIso } : {}),
