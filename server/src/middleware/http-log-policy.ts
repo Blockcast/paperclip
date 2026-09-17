@@ -207,7 +207,20 @@ export function buildHttpLogProps(req: LoggedRequest, res: LoggedResponse): Reco
 
 // The URL as it may appear in a log line: query string dropped on routes
 // whose sender input is unloggable, untouched everywhere else.
-function urlForLog(url: string | undefined): string | undefined {
+//
+// Exported because this middleware is NOT the only place a request URL
+// reaches a log line, and the rule above is only a control if every such
+// place applies it. `shouldOmitRequestBodyFromLog` governs the body, the
+// query and the URL together; a caller that logs a raw `req.originalUrl`
+// re-opens the query half of that guard on exactly the untrusted routes it
+// exists for. Call this instead of interpolating a URL into a log payload.
+//
+// Note the argument must be the request-relative URL (`/api/plugins/…`),
+// not an absolute one: the route patterns are anchored at the path root, so
+// an absolute `http://host/api/plugins/…` matches nothing and would silently
+// scrub nothing. Callers building an upstream URL should scrub the relative
+// part and concatenate the origin afterwards.
+export function urlForLog(url: string | undefined): string | undefined {
   return url !== undefined && shouldOmitRequestBodyFromLog(url) ? normalizePath(url) : url;
 }
 
