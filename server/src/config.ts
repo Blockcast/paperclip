@@ -225,11 +225,12 @@ export interface Config {
   // "allyblockcast[bot]") used to filter reviews/comments during verification.
   prReviewerBotLogin: string;
   // Escalate the UNLABELED evidence-gate warn to a block when the only thing
-  // missing is the two GitHub truth shapes (`review:ally-clean`,
-  // `deploy:landed`) AND the truth probe actually established that. Ships off;
-  // see docs/runbooks for the measurement the flip depends on. A failed probe
-  // never blocks, so turning this on cannot make a GitHub outage an
-  // estate-wide in_review freeze.
+  // missing is `review:ally-clean` AND the truth probe actually established
+  // that. Ships off; see docs/runbooks for the measurement the flip depends
+  // on. A failed probe never blocks, so turning this on cannot make a GitHub
+  // outage an estate-wide in_review freeze. `deploy:landed` is registered and
+  // detected but required nowhere (CTO ruling 2026-09-17), so no value of this
+  // flag can bind it — see `BLOCKABLE_TRUTH_SHAPES` in evidence-gate.ts.
   evidenceGateUnlabeledTruthBlock: boolean;
   // Capture is deployed one rollout before authority processing so every API
   // replica durably records deliveries before any replica can activate the gate.

@@ -192,7 +192,20 @@ async function probeOne(
     const commentBlocking = commentVerdict.state === "failure";
 
     // Surface 2: a formal review object.
+    //
+    // DISMISSED is dropped in BOTH directions, matching the ruling this repo
+    // already made for the other verdict-supplying read
+    // (`githubListPrReviewsWithTimestamps`, github-app-auth.ts). Dismissal is
+    // an authorized actor withdrawing a verdict from operation — by hand or
+    // via `dismiss_stale_reviews` — and GitHub keeps the body while ceasing to
+    // count it. Reading it here re-animates a retraction: a dismissed CLEAN
+    // review would set `review:ally-clean` off an approval nobody stands
+    // behind. `githubListReviewerSurfacesAtPr` keeps them because
+    // `githubHasReviewerEvidenceForPr` asks the different question "did a
+    // review happen" — a dismissed review still happened. This probe supplies
+    // a verdict, so it asks the other question and filters here.
     const atHead = surfaces.reviews
+      .filter((r) => (r.state ?? "").trim().toUpperCase() !== "DISMISSED")
       .filter((r) => (r.commitId ?? "").trim().toLowerCase() === normalizedHead)
       .sort((a, b) => (b.submittedAt ?? "").localeCompare(a.submittedAt ?? ""));
     const newest = atHead[0];

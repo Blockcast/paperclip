@@ -80,19 +80,31 @@ export type EvidenceRegistry = Record<string, EvidenceRegistryEntry>;
  *     `cms-data-op` are excluded for the same reason `landing-artifact` skips
  *     them: they deliver live state with no PR, and their existing shapes
  *     already demand a real probe.
+ *
+ *     Only `review:ally-clean` is REQUIRED (CTO ruling 2026-09-17).
+ *     `deploy:landed` stays a registered, detected shape — reported through
+ *     `allDetected`, which is explicitly "all shapes detected, including
+ *     shapes not required" — so the probe still measures it for the rollout
+ *     runbook and the scorecards. It is not required because a required shape
+ *     must be satisfiable by correct behaviour AT THE MOMENT IT IS EVALUATED,
+ *     and the gate fires on exactly one transition: INTO `in_review`, where
+ *     merged-ness is unsatisfiable by construction. Requiring it made `pass`
+ *     unreachable for every labeled code issue, so the only route to `pass`
+ *     was to merge BEFORE requesting review — a metric paying out for exactly
+ *     the behaviour BLO-26572 forbids. Inverted, not merely degraded.
  */
 export const DEFAULT_EVIDENCE_REGISTRY: EvidenceRegistry = {
   frontend: {
-    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when", "landing-artifact", "review:ally-clean", "deploy:landed"],
+    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when", "landing-artifact", "review:ally-clean"],
   },
   ui: {
-    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when", "landing-artifact", "review:ally-clean", "deploy:landed"],
+    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when", "landing-artifact", "review:ally-clean"],
   },
   "cms-published": {
-    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when", "landing-artifact", "review:ally-clean", "deploy:landed"],
+    required: ["screenshot:1440x900", "screenshot:390x844", "checklist:done-when", "landing-artifact", "review:ally-clean"],
   },
   backend: {
-    required: ["test-output", "checklist:done-when", "landing-artifact", "review:ally-clean", "deploy:landed"],
+    required: ["test-output", "checklist:done-when", "landing-artifact", "review:ally-clean"],
   },
   infra: {
     required: ["kubectl-state", "probe-output"],
@@ -104,10 +116,10 @@ export const DEFAULT_EVIDENCE_REGISTRY: EvidenceRegistry = {
     required: ["pr-link"],
   },
   "db-migration": {
-    required: ["migration-output", "landing-artifact", "review:ally-clean", "deploy:landed"],
+    required: ["migration-output", "landing-artifact", "review:ally-clean"],
   },
   migration: {
-    required: ["migration-output", "landing-artifact", "review:ally-clean", "deploy:landed"],
+    required: ["migration-output", "landing-artifact", "review:ally-clean"],
   },
 };
 
@@ -117,18 +129,20 @@ export const DEFAULT_EVIDENCE_REGISTRY: EvidenceRegistry = {
  * `block`) — historically not every issue gets labeled, and we don't want the
  * gate to become a chore for refactor / doc-only issues.
  *
- * The two truth shapes are required here as well (D13). They do not by
- * themselves change the verdict: an unlabeled issue missing them still only
- * warns, unless `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK` is on AND the probe
- * actually established truth — see `unlabeledTruthBlock` in `evidence-gate.ts`.
+ * `review:ally-clean` is required here as well (D13). It does not by itself
+ * change the verdict: an unlabeled issue missing it still only warns, unless
+ * `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK` is on AND the probe actually
+ * established truth — see `unlabeledTruthBlock` in `evidence-gate.ts`.
  *
- * And even then the flag reaches only `review:ally-clean`. A gap of solely
- * `deploy:landed` warns at every flag setting, because the gate runs on the
- * transition INTO `in_review`, where a merged PR is unsatisfiable by
- * construction — see `BLOCKABLE_TRUTH_SHAPES` in `evidence-gate.ts`.
+ * `deploy:landed` is deliberately NOT required, here or on any labeled path
+ * (CTO ruling 2026-09-17) — see the registry comment above. Unlabeled is the
+ * majority shape in this estate, so requiring an unsatisfiable-at-evaluation
+ * shape here would turn nearly every issue's verdict into a permanent `warn`
+ * and flatten `reviewPassRate` (`agent-scorecards.ts`) for reasons no agent
+ * behaviour could ever change. The probe still detects it; `allDetected`
+ * still reports it.
  */
 export const DEFAULT_UNLABELED_REQUIRED: EvidenceShape[] = [
   "checklist:done-when",
   "review:ally-clean",
-  "deploy:landed",
 ];

@@ -242,7 +242,7 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
       // make the in_review transition unreachable before merge.
       expect(response.body.lastEvidenceVerdict).toMatchObject({
         verdict: "warn",
-        missing: ["review:ally-clean", "deploy:landed"],
+        missing: ["review:ally-clean"],
       });
       // The frozen 11:48:19Z evaluation must have been superseded.
       expect(
@@ -409,7 +409,7 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
       expect(inReview.body.lastEvidenceVerdict).toMatchObject({
         verdict: "warn",
         unlabeledFallback: true,
-        missing: ["review:ally-clean", "deploy:landed"],
+        missing: ["review:ally-clean"],
       });
 
       const labeled = await request(createApp())
