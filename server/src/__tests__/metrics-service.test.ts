@@ -5,6 +5,8 @@ import {
   BACKSTOP_CANDIDATES_SKIPPED_METRIC,
   BACKSTOP_DEFERRED_CANDIDATES_METRIC,
   BACKSTOP_SWEEP_COMPLETED_METRIC,
+  HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC,
+  HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC,
   CONCURRENT_RUN_BLOCKED_METRIC,
   DEP_BLOCKED_WAKEUP_METRIC,
   ROUTINE_DISPATCH_METRIC,
@@ -30,6 +32,8 @@ import {
   recordAuthRequest,
   recordBackstopCandidateSkipped,
   recordBackstopSweepCompleted,
+  recordHeartbeatRecoveryChainDuration,
+  recordHeartbeatRecoveryChainSkipped,
   recordGbrainRecallOutcome,
   GBRAIN_RECALL_METRIC,
   UNKNOWN_GBRAIN_RECALL_STATUS,
@@ -1315,6 +1319,42 @@ describe("setQueuedRunOldestAgeMetrics (BLO-21116)", () => {
     const { body } = await renderMetrics();
     expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 9000`);
     expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${UNKNOWN_AGENT_ID}"} 4500`);
+  });
+});
+
+describe("heartbeat recovery chain gate metrics (PEN-3314)", () => {
+  it("publishes the skip counter at zero before any overlap", async () => {
+    const { body } = await renderMetrics();
+    // Zero-initialized on purpose: an absent series and a healthy worker must
+    // not look alike to an alert.
+    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC} 0`);
+  });
+
+  it("counts skipped ticks and reports the last chain duration in seconds", async () => {
+    recordHeartbeatRecoveryChainSkipped();
+    recordHeartbeatRecoveryChainSkipped();
+    // Milliseconds in, seconds out — the gauge is compared against
+    // heartbeatSchedulerIntervalMs, so the unit has to be explicit.
+    recordHeartbeatRecoveryChainDuration(45_500);
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC} 2`);
+    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC} 45.5`);
+  });
+
+  it("keeps both series unlabeled so they stay roster-independent", async () => {
+    recordHeartbeatRecoveryChainSkipped();
+    recordHeartbeatRecoveryChainDuration(1_000);
+    const { body } = await renderMetrics();
+
+    const labeled = body
+      .split("\n")
+      .filter((line) =>
+        [HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC, HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC].some(
+          (metric) => line.startsWith(`${metric}{`),
+        ),
+      );
+    expect(labeled).toEqual([]);
   });
 });
 

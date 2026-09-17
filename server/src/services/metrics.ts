@@ -58,6 +58,38 @@ export const BACKSTOP_SOURCES = [
   "issue_graph_liveness.backstop",
   "stranded_recovery_wake_backstop",
 ] as const;
+/**
+ * Ticks on which the worker's periodic recovery chain was skipped because the
+ * previous pass was still running (PEN-3314).
+ *
+ * The chain is launched fire-and-forget from a fixed 30 s `setInterval`, so
+ * before the gate existed a pass that ran long simply overlapped its
+ * predecessor — invisibly. That invisibility is the reason this cost a
+ * multi-day fleet outage: each overlapping pass pins its own copy of the whole
+ * visible issue graph, so the only externally observable symptom was the worker
+ * heap climbing to the 6.2 GB V8 ceiling and aborting every few hours, with
+ * nothing anywhere naming overlap as the cause.
+ *
+ * Read it with {@link HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC}: a non-zero
+ * rate here means the chain is exceeding the scheduler interval, and the
+ * duration gauge says by how much. Sustained skipping is not itself data loss
+ * — these passes are reconcilers, so a skipped tick is later work, not lost
+ * work — but it does mean recovery latency now tracks chain duration rather
+ * than the interval, which is worth an operator's attention well before the
+ * heap is.
+ */
+export const HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC = "paperclip_heartbeat_recovery_chain_skipped_total";
+/**
+ * Wall-clock duration of the last completed periodic recovery chain, in seconds
+ * (PEN-3314).
+ *
+ * This is the leading indicator the incident lacked. Overlap begins precisely
+ * when this crosses `heartbeatSchedulerIntervalMs` (default 30 s), which is
+ * observable here hours before the heap ceiling is reached. A gauge rather than
+ * a histogram because the question is "is the current chain outrunning the
+ * interval", not "what is the distribution of chain durations".
+ */
+export const HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC = "paperclip_heartbeat_recovery_chain_duration_seconds";
 export type BackstopSource = (typeof BACKSTOP_SOURCES)[number];
 export const BACKSTOP_SKIP_REASONS = [
   "not_ready", "existing_wake", "live_path", "pause_hold", "interaction",
@@ -2128,6 +2160,8 @@ let projectPrimaryWorkspaceFallback: Counter | null = null;
 let backstopDeferredCandidates: Gauge<"source"> | null = null;
 let backstopSweepCompleted: Counter<"source"> | null = null;
 let backstopCandidatesSkipped: Counter<"source" | "reason"> | null = null;
+let heartbeatRecoveryChainSkipped: Counter | null = null;
+let heartbeatRecoveryChainDuration: Gauge | null = null;
 let pluginWebhookDeliveryRejected:
   | Counter<"plugin_key" | "response_class" | "plugin_status">
   | null = null;
@@ -2194,6 +2228,8 @@ function ensureRegistry(): {
   backstopDeferredCandidatesGauge: Gauge<"source">;
   backstopSweepCompletedCounter: Counter<"source">;
   backstopCandidatesSkippedCounter: Counter<"source" | "reason">;
+  heartbeatRecoveryChainSkippedCounter: Counter;
+  heartbeatRecoveryChainDurationGauge: Gauge;
   pluginWebhookDeliveryRejectedCounter: Counter<"plugin_key" | "response_class" | "plugin_status">;
   recoveryHorizonExpiredCounter: Counter<"delivery">;
 } {
@@ -2256,6 +2292,8 @@ function ensureRegistry(): {
     || !backstopDeferredCandidates
     || !backstopSweepCompleted
     || !backstopCandidatesSkipped
+    || !heartbeatRecoveryChainSkipped
+    || !heartbeatRecoveryChainDuration
     || !pluginWebhookDeliveryRejected
     || !recoveryHorizonExpired
   ) {
@@ -3041,6 +3079,25 @@ function ensureRegistry(): {
       labelNames: ["source", "reason"],
       registers: [registry],
     });
+    heartbeatRecoveryChainSkipped = new Counter({
+      name: HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC,
+      help:
+        "Scheduler ticks on which the periodic recovery chain was skipped because the "
+        + "previous pass was still running (PEN-3314). Zero in steady state. A sustained "
+        + "non-zero rate means the chain is outrunning heartbeatSchedulerIntervalMs; read "
+        + HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC + " to see by how much.",
+      registers: [registry],
+    });
+    // Zero-initialize so a healthy worker exports an explicit 0 rather than an
+    // absent series -- "no overlap" and "gate never reached" must not look alike.
+    heartbeatRecoveryChainSkipped.inc(0);
+    heartbeatRecoveryChainDuration = new Gauge({
+      name: HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC,
+      help:
+        "Wall-clock duration of the last completed periodic recovery chain, in seconds "
+        + "(PEN-3314). Overlap begins when this crosses heartbeatSchedulerIntervalMs.",
+      registers: [registry],
+    });
     for (const source of BACKSTOP_SOURCES) {
       backstopDeferredCandidates.set({ source }, 0);
     }
@@ -3145,6 +3202,8 @@ function ensureRegistry(): {
     backstopDeferredCandidatesGauge: backstopDeferredCandidates,
     backstopSweepCompletedCounter: backstopSweepCompleted,
     backstopCandidatesSkippedCounter: backstopCandidatesSkipped,
+    heartbeatRecoveryChainSkippedCounter: heartbeatRecoveryChainSkipped,
+    heartbeatRecoveryChainDurationGauge: heartbeatRecoveryChainDuration,
     pluginWebhookDeliveryRejectedCounter: pluginWebhookDeliveryRejected,
     recoveryHorizonExpiredCounter: recoveryHorizonExpired,
   };
@@ -4381,6 +4440,16 @@ export function setBackstopDeferredCandidates(source: BackstopSource, value: num
 
 export function recordBackstopSweepCompleted(source: BackstopSource): void {
   ensureRegistry().backstopSweepCompletedCounter.inc({ source });
+}
+
+/** PEN-3314: one tick's recovery chain was skipped because the previous one was still running. */
+export function recordHeartbeatRecoveryChainSkipped(): void {
+  ensureRegistry().heartbeatRecoveryChainSkippedCounter.inc();
+}
+
+/** PEN-3314: a recovery chain settled (success or failure) after `durationMs`. */
+export function recordHeartbeatRecoveryChainDuration(durationMs: number): void {
+  ensureRegistry().heartbeatRecoveryChainDurationGauge.set(durationMs / 1000);
 }
 
 export function recordBackstopCandidateSkipped(source: BackstopSource, reason: BackstopSkipReason): void {

@@ -67,6 +67,11 @@ import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-sh
 import { summarizeStrandedRecoveryHandBackPass } from "./services/recovery/service.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import { createSingleFlightGate } from "./services/single-flight-gate.js";
+import {
+  recordHeartbeatRecoveryChainDuration,
+  recordHeartbeatRecoveryChainSkipped,
+} from "./services/metrics.js";
 import { createApiTierPluginWorkerManagerStub } from "./services/plugin-worker-manager-stub.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
@@ -1086,6 +1091,23 @@ export async function startServer(): Promise<StartedServer> {
   // crashed run and handing that lock to the retry — exactly the interleaving
   // the in-tick `await` was added to remove.
   let crashReconcileSweepInFlight = false;
+  // PEN-3314: the same latch `crashReconcileSweepInFlight` provides for the
+  // crash-reconcile pair, generalized for the long serial recovery chain below.
+  // That chain is the heaviest pass on the worker and the only one that pins a
+  // whole materialized issue graph while it awaits, so overlapping it does not
+  // just duplicate work — it duplicates hundreds of megabytes of retained heap.
+  const heartbeatRecoveryChainGate = createSingleFlightGate({
+    onSkip: () => {
+      recordHeartbeatRecoveryChainSkipped();
+      logger.warn(
+        {},
+        "periodic heartbeat recovery chain still running at tick; skipping this tick (PEN-3314)",
+      );
+    },
+    onSettled: (durationMs) => {
+      recordHeartbeatRecoveryChainDuration(durationMs);
+    },
+  });
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -1648,7 +1670,24 @@ export async function startServer(): Promise<StartedServer> {
 
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
-          trackHeartbeatSchedulerWork(heartbeat
+          //
+          // PEN-3314: gated so a chain that outruns `heartbeatSchedulerIntervalMs`
+          // cannot stack on itself. `reconcileIssueGraphLiveness` below
+          // materializes every visible issue plus its relations, agents, runs,
+          // wake requests, interactions and approvals (profiled at 40k issues in
+          // BLO-33225) and then awaits per-finding database work while holding
+          // all of it. Overlapping passes therefore each pin their own copy, and
+          // because they contend for one 10-connection pool whose wait queue is
+          // unbounded, every extra concurrent pass slows every other one — the
+          // overlap feeds itself. Measured on the production worker before this
+          // gate: old-space heap tracked pool wait-queue depth at ~10 MB per
+          // queued query across seven consecutive container generations, reaching
+          // the 6.2 GB V8 heap ceiling in 5-7 h and aborting, which killed every
+          // in-flight agent run (PEN-3294).
+          //
+          // Skipping is safe and is the point: every pass in this chain is a
+          // reconciler, so a skipped tick is later work, not lost work.
+          const recoveryChain = heartbeatRecoveryChainGate.run(() => heartbeat
             .resumeRunningExternalRuntimeRuns()
             .then(() => heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 }))
             .then(() => heartbeat.promoteDueScheduledRetries())
@@ -1744,6 +1783,9 @@ export async function startServer(): Promise<StartedServer> {
             .catch((err) => {
               logger.error({ err }, "periodic heartbeat recovery failed");
             }));
+          // `null` means the gate skipped this tick, so there is nothing for the
+          // shutdown drain to wait on.
+          if (recoveryChain) trackHeartbeatSchedulerWork(recoveryChain);
         }
       })();
     }, config.heartbeatSchedulerIntervalMs);
