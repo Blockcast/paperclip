@@ -170,6 +170,38 @@ describe("buildGithubTruthProbe", () => {
     expect((await probe({ workProducts: [wp()] })).detections["review:ally-clean"]).toBeUndefined();
   });
 
+  // Dismissal is an authorized actor withdrawing a verdict from operation, so
+  // it is dropped in BOTH directions — the same ruling
+  // `githubListPrReviewsWithTimestamps` already makes for the merge gate.
+  it("a DISMISSED clean review at head is not evidence — a retraction is not an approval", async () => {
+    const probe = buildGithubTruthProbe(
+      deps({
+        listReviewerSurfaces: async () => ({
+          reviews: [{ login: ALLY, body: clean, state: "DISMISSED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" }],
+          comments: [],
+        }),
+      }),
+    );
+    expect((await probe({ workProducts: [wp()] })).detections["review:ally-clean"]).toBeUndefined();
+  });
+
+  it("a DISMISSED review does not veto a live clean one, and does not win by being newest", async () => {
+    const probe = buildGithubTruthProbe(
+      deps({
+        listReviewerSurfaces: async () => ({
+          reviews: [
+            { login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" },
+            // Newer AND blocking: without the filter this would both win the
+            // sort and wedge the shape off a verdict nobody stands behind.
+            { login: ALLY, body: dirty, state: "DISMISSED", commitId: HEAD, submittedAt: "2026-09-06T01:00:00Z" },
+          ],
+          comments: [],
+        }),
+      }),
+    );
+    expect((await probe({ workProducts: [wp()] })).detections["review:ally-clean"]).toBe(true);
+  });
+
   it("a comment attested at a stale head reaches not_evaluated — not detected, and not a failure", async () => {
     const r = await buildGithubTruthProbe(deps({ fetchHeadSha: async () => "d".repeat(40) }))({
       workProducts: [wp()],

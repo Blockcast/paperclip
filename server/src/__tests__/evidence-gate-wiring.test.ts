@@ -454,7 +454,7 @@ describe("runEvidenceGate — truth probe", () => {
   it("no probe supplied → truth shapes are simply missing, and it warns", async () => {
     const rec = await runEvidenceGate(async () => checklistIssue(), "i1", NOW);
     expect(rec.verdict).toBe("warn");
-    expect(rec.missing).toEqual(expect.arrayContaining(["review:ally-clean", "deploy:landed"]));
+    expect(rec.missing).toEqual(expect.arrayContaining(["review:ally-clean"]));
   });
 
   it("hands the probe each work product's provenance, not just its metadata", async () => {

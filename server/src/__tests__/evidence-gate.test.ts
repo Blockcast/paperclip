@@ -73,7 +73,7 @@ describe("resolveRequiredShapes", () => {
       DEFAULT_EVIDENCE_REGISTRY,
     );
     expect(unlabeledFallback).toBe(true);
-    expect(required).toEqual(["checklist:done-when", "review:ally-clean", "deploy:landed"]);
+    expect(required).toEqual(["checklist:done-when", "review:ally-clean"]);
   });
 
   it("falls back to weak default when no labels at all", () => {
@@ -82,7 +82,7 @@ describe("resolveRequiredShapes", () => {
       DEFAULT_EVIDENCE_REGISTRY,
     );
     expect(unlabeledFallback).toBe(true);
-    expect(required).toEqual(["checklist:done-when", "review:ally-clean", "deploy:landed"]);
+    expect(required).toEqual(["checklist:done-when", "review:ally-clean"]);
   });
 });
 
@@ -947,7 +947,7 @@ describe("evaluateEvidence — db-migration label", () => {
       DEFAULT_EVIDENCE_REGISTRY,
     );
     expect(unlabeledFallback).toBe(false);
-    expect(required).toEqual(["migration-output", "landing-artifact", "review:ally-clean", "deploy:landed"]);
+    expect(required).toEqual(["migration-output", "landing-artifact", "review:ally-clean"]);
   });
 });
 
@@ -1425,18 +1425,31 @@ describe("countDoneWhenBullets — Ally review regressions (BLO-19047)", () => {
 // --- BLO-32239 Track B: the two truth shapes -------------------------------
 
 describe("registry policy (D13)", () => {
-  it("requires the truth shapes on unlabeled and code-completion labels only", () => {
-    const truth = ["review:ally-clean", "deploy:landed"];
+  it("requires `review:ally-clean` on unlabeled and code-completion labels only", () => {
     for (const label of ["frontend", "ui", "cms-published", "backend", "db-migration", "migration"]) {
-      expect(DEFAULT_EVIDENCE_REGISTRY[label]!.required).toEqual(expect.arrayContaining(truth));
+      expect(DEFAULT_EVIDENCE_REGISTRY[label]!.required).toContain("review:ally-clean");
     }
     // `pr` delivers an OPEN pull request for a human decision, so requiring
     // "merged" would make the label unsatisfiable. `infra` and `cms-data-op`
     // deliver live state with no PR at all.
     for (const label of ["pr", "infra", "cms-data-op"]) {
-      expect(DEFAULT_EVIDENCE_REGISTRY[label]!.required.some((s) => truth.includes(s))).toBe(false);
+      expect(DEFAULT_EVIDENCE_REGISTRY[label]!.required).not.toContain("review:ally-clean");
     }
-    expect(DEFAULT_UNLABELED_REQUIRED).toEqual(expect.arrayContaining(truth));
+    expect(DEFAULT_UNLABELED_REQUIRED).toContain("review:ally-clean");
+  });
+
+  it("requires `deploy:landed` NOWHERE — it is registered and detected, never required", () => {
+    // CTO ruling 2026-09-17. A required shape must be satisfiable by correct
+    // behaviour at the moment it is evaluated; the gate fires only on the
+    // transition INTO `in_review`, where merged-ness is not. Requiring it made
+    // `pass` unreachable for labeled code work, so the only route to `pass`
+    // was to merge before requesting review — an inverted incentive, not a
+    // merely degraded metric. It stays detectable and reaches the scorecards
+    // through `allDetected` (see the truth-shapes suite below).
+    for (const entry of Object.values(DEFAULT_EVIDENCE_REGISTRY)) {
+      expect(entry.required).not.toContain("deploy:landed");
+    }
+    expect(DEFAULT_UNLABELED_REQUIRED).not.toContain("deploy:landed");
   });
 });
 
@@ -1450,10 +1463,12 @@ describe("evaluateEvidence — truth shapes", () => {
     registry: DEFAULT_EVIDENCE_REGISTRY,
   });
 
-  it("no probe ran: unlabeled with only a checklist warns, both truth shapes missing", () => {
+  it("no probe ran: unlabeled with only a checklist warns, `review:ally-clean` missing", () => {
     const result = evaluateEvidence(base());
     expect(result.verdict).toBe("warn");
-    expect(result.missing).toEqual(expect.arrayContaining(["review:ally-clean", "deploy:landed"]));
+    expect(result.missing).toEqual(expect.arrayContaining(["review:ally-clean"]));
+    // Registered but never required, so it is never a gap. See "registry policy (D13)".
+    expect(result.missing).not.toContain("deploy:landed");
   });
 
   it("external true detections satisfy the shapes and pass", () => {
@@ -1534,9 +1549,10 @@ describe("evaluateEvidence — a truth-only gap never hard-blocks (BLO-32239)", 
       ].join("\n"),
     );
 
-  it("a labeled issue with every text shape but an unmerged PR warns, it does not block", () => {
-    // `deploy:landed` means merged, and in_review is the state where work
-    // waits FOR review. Blocking here would make the transition unreachable.
+  it("a labeled issue with every text shape but no Ally review warns, it does not block", () => {
+    // `review:ally-clean` is satisfiable while a PR is open, but it is not
+    // something the agent can type — so a gap of only truth shapes warns
+    // rather than blocking, unless the operator flag is on.
     const result = evaluateEvidence({
       issue: { description: DONE_WHEN, labels: [{ name: "frontend" }] },
       comments: [complete()],
@@ -1544,7 +1560,7 @@ describe("evaluateEvidence — a truth-only gap never hard-blocks (BLO-32239)", 
       registry: DEFAULT_EVIDENCE_REGISTRY,
     });
     expect(result.verdict).toBe("warn");
-    expect(result.missing).toEqual(["review:ally-clean", "deploy:landed"]);
+    expect(result.missing).toEqual(["review:ally-clean"]);
     expect(result.diagnostics).toContain("truth-gap-warn-only");
   });
 
@@ -1574,16 +1590,35 @@ describe("evaluateEvidence — a truth-only gap never hard-blocks (BLO-32239)", 
     expect(failed.diagnostics).toContain("unlabeled-truth-block-suppressed:probe-failed");
   });
 
-  // The gap the test above leaves open: there BOTH truth shapes are missing, so
-  // blocking is right — `review:ally-clean` is genuinely absent and genuinely
-  // satisfiable. These two pin the case where the ONLY thing missing is the one
-  // shape no flag can make satisfiable at this transition.
-  it("the flag never makes `deploy:landed` binding alone — labeled, Ally-clean at head, PR open", () => {
+  // The gap the test above leaves open: there `review:ally-clean` is missing,
+  // so blocking is right — it is genuinely absent and genuinely satisfiable
+  // while a PR is open. These two pin the case where the only thing missing is
+  // the one shape no flag can make satisfiable at this transition.
+  //
+  // Since the CTO ruling of 2026-09-17 there are TWO independent defenses, and
+  // each is pinned separately on purpose:
+  //   1. the registry never requires `deploy:landed` — "registry policy (D13)";
+  //   2. the evaluator would refuse to escalate it even if a registry did —
+  //      `BLOCKABLE_TRUTH_SHAPES`, pinned here against a local registry that
+  //      deliberately requires it. Revert that constant and this test fails,
+  //      which is the only reason it is worth keeping after defense 1 landed.
+  it("the flag never makes `deploy:landed` binding alone — even from a registry that requires it", () => {
     const result = evaluateEvidence({
       issue: { description: DONE_WHEN, labels: [{ name: "frontend" }] },
       comments: [complete()],
       workProducts: [],
-      registry: DEFAULT_EVIDENCE_REGISTRY,
+      registry: {
+        frontend: {
+          required: [
+            "screenshot:1440x900",
+            "screenshot:390x844",
+            "checklist:done-when",
+            "landing-artifact",
+            "review:ally-clean",
+            "deploy:landed",
+          ],
+        },
+      },
       unlabeledTruthBlock: true,
       probeFailed: false,
       externalDetections: { "review:ally-clean": true },
@@ -1594,7 +1629,12 @@ describe("evaluateEvidence — a truth-only gap never hard-blocks (BLO-32239)", 
     expect(result.diagnostics).not.toContain("unlabeled-truth-block");
   });
 
-  it("the flag never makes `deploy:landed` binding alone — unlabeled fallback", () => {
+  it("the flag never makes `deploy:landed` binding alone — unlabeled, unmerged PR, still passes", () => {
+    // The shipped registry's half of the same guarantee: an unlabeled issue
+    // whose PR is reviewed-clean but NOT merged has no gap at all, at any flag
+    // value. The unmerged shape is still reported through `allDetected` once
+    // the probe sees it — which is how it reaches the scorecards and the
+    // rollout measurement without ever gating the transition.
     const result = evaluateEvidence({
       issue: { description: DONE_WHEN, labels: [] },
       comments: [complete()],
@@ -1604,8 +1644,17 @@ describe("evaluateEvidence — a truth-only gap never hard-blocks (BLO-32239)", 
       probeFailed: false,
       externalDetections: { "review:ally-clean": true },
     });
-    expect(result.verdict).toBe("warn");
-    expect(result.missing).toEqual(["deploy:landed"]);
+    expect(result.verdict).toBe("pass");
+    expect(result.missing).toEqual([]);
     expect(result.diagnostics).not.toContain("unlabeled-truth-block");
+
+    const merged = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [] },
+      comments: [complete()],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { "review:ally-clean": true, "deploy:landed": true },
+    });
+    expect(merged.allDetected).toContain("deploy:landed");
   });
 });
