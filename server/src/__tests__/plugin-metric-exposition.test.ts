@@ -435,11 +435,16 @@ describe("recordPluginMetric — cardinality budget", () => {
         declaredLabels: ["alertname"],
       });
     }
-    // A second plugin must not inherit the first's exhausted budget.
+    // A second plugin must not inherit the first's exhausted budget. The name
+    // is deliberately the SAME as the first plugin's: under a name-only ledger
+    // key the pool is already full here and this write degrades, failing the
+    // assertions below. A differing name would satisfy them on its own and
+    // leave the `pluginId` half of the composite key unguarded — which is what
+    // this test looked like before BLO-32163 made the key composite.
     recordPluginMetric({
       pluginId: "plugin-uuid-2",
       pluginKey: "other.plugin",
-      name: "b.metric",
+      name: "a.metric",
       value: 1,
       tags: { alertname: "B-0" },
       declaredLabels: ["alertname"],
@@ -463,27 +468,39 @@ describe("recordPluginMetric — cardinality budget", () => {
     // Fill the budget to its last slot, then spend that slot on A. B must then
     // find the budget exhausted. If B collides with A in the ledger it will be
     // treated as seen and publish normally, and this assertion fails.
+    //
+    // The two writes only render to ONE key under a printable separator if
+    // their differing values sit in ADJACENT promotable slots: an unpromoted
+    // slot between them contributes its own separator and keeps the joins
+    // distinct either way, which makes the mutation pass and the guard
+    // vacuous. Derived from the head of the list rather than named, because
+    // naming them is exactly what broke this once — BLO-32163 inserted
+    // `aggregate_key` between the hardcoded `action` and `alertname`, and a
+    // space-separator mutation went green on all 35 tests.
+    const [K1, K2] = PLUGIN_METRIC_PROMOTABLE_TAG_KEYS;
+    const DECLARED = [K1, K2];
+
     for (let i = 0; i < PLUGIN_METRIC_CARDINALITY_BUDGET - 1; i += 1) {
       recordPluginMetric({
         ...PLUGIN,
         name: "m",
         value: 1,
-        tags: { action: `fill-${i}` },
-        declaredLabels: ["action", "alertname"],
+        tags: { [K1]: `fill-${i}` },
+        declaredLabels: DECLARED,
       });
     }
 
-    // A: action="x y", alertname="z"   → space-joined "m x y z …"
+    // A: K1="x y", K2="z"   → space-joined "… x y z …"
     recordPluginMetric({
       ...PLUGIN, name: "m", value: 1,
-      tags: { action: "x y", alertname: "z" },
-      declaredLabels: ["action", "alertname"],
+      tags: { [K1]: "x y", [K2]: "z" },
+      declaredLabels: DECLARED,
     });
-    // B: action="x", alertname="y z"   → space-joined "m x y z …"  (identical)
+    // B: K1="x", K2="y z"   → space-joined "… x y z …"  (identical)
     recordPluginMetric({
       ...PLUGIN, name: "m", value: 1,
-      tags: { action: "x", alertname: "y z" },
-      declaredLabels: ["action", "alertname"],
+      tags: { [K1]: "x", [K2]: "y z" },
+      declaredLabels: DECLARED,
     });
 
     const dropped = await seriesFor(PLUGIN_METRIC_DROPPED_METRIC);
@@ -497,7 +514,7 @@ describe("recordPluginMetric — cardinality budget", () => {
     expect(series.filter((l) => l.includes(`metric="${PLUGIN_METRIC_OVERFLOW_NAME}"`)))
       .toHaveLength(0);
     expect(
-      series.filter((l) => l.includes('metric="m"') && !l.includes("action=")),
+      series.filter((l) => l.includes('metric="m"') && !l.includes(`${K1}=`)),
     ).toHaveLength(1);
   });
 
@@ -509,10 +526,13 @@ describe("recordPluginMetric — cardinality budget", () => {
     // `alertname`/`severity` are verbatim Alertmanager webhook labels, and
     // JSON.parse of a body containing \u0000 yields that code point intact.
     //
-    // `alertname` and `severity` sit at promotable indices 1 and 7, so the
-    // join places a fixed run of 6 NULs between them (the five empty
-    // unpromoted slots between). Six NULs inside one value therefore straddle
-    // that boundary and make the two writes below render to one key.
+    // `alertname` and `severity` are separated by FIVE unpromoted slots in
+    // PLUGIN_METRIC_PROMOTABLE_TAG_KEYS, so the join places a fixed run of six
+    // NULs between them. Six NULs inside one value therefore straddle that
+    // boundary and make the two writes below render to one key. Stated as the
+    // gap rather than as absolute indices because inserting a key before the
+    // pair shifts both (BLO-32163 moved them from 1 and 7 to 2 and 8) while
+    // leaving the gap — and so this constant — unchanged.
     const NUL6 = "\u0000".repeat(6);
 
     for (let i = 0; i < PLUGIN_METRIC_CARDINALITY_BUDGET - 1; i += 1) {
