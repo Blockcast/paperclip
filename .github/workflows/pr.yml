@@ -485,6 +485,17 @@ jobs:
         run: node --test ./scripts/check-comment-review-gate-census.test.mjs
         timeout-minutes: 1
 
+      - name: Test merge-gate reader
+        if: ${{ !cancelled() }}
+        # The fleet-mandated reader has shipped three false-GREENs, each because a
+        # filter was added without checking what it prints when it matches EVERY
+        # row: BLO-34035 (neutral dropped), BLO-34114 (dedup key not unique),
+        # BLO-34263 (dead-run filter eats the whole surface, empty output reads as
+        # a pass). All three are pinned here. Mutation-checked: removing any one of
+        # the three guards fails this suite.
+        run: node --test ./scripts/merge-gate-read.test.mjs
+        timeout-minutes: 1
+
       - name: Test comment-review-gate merge-queue mirror
         if: ${{ !cancelled() }}
         # Guards the no-`pending` invariant in particular: a pending required
