@@ -180,6 +180,20 @@ function wrapClient<T extends object>(client: T): T {
 }
 
 /**
+ * Memoized per input handle.
+ *
+ * `heartbeatService` is constructed once per route/service factory, and there
+ * are seven of those — all from the same `Db`. Without this, each would build
+ * its own drizzle instance, and `drizzle()` runs
+ * `extractTablesRelationalConfig` over the entire schema every time. Reusing
+ * one wrapper per handle keeps that cost at one and keeps `db` reference-stable
+ * across services built from the same handle, which matters because
+ * `heartbeat.ts` compares an executor against `db` by identity
+ * (`appendRunEvent`'s publish guard).
+ */
+const wrappedDbByHandle = new WeakMap<object, Db>();
+
+/**
  * Return a `Db` whose statements are cancellable by the current dispatch
  * section's abort signal, or the input unchanged when that is not possible.
  *
@@ -195,7 +209,13 @@ function wrapClient<T extends object>(client: T): T {
 export function withAgentStartLockAbortableDb(db: Db): Db {
   const client = (db as Db & { $client?: unknown }).$client;
   if (!isPostgresClient(client)) return db;
+  const cached = wrappedDbByHandle.get(db as object);
+  if (cached) return cached;
   const wrapped = wrapClient(client as object);
   if (wrapped === client) return db;
-  return createDbFromPostgresClient(wrapped as Parameters<typeof createDbFromPostgresClient>[0]);
+  const wrappedDb = createDbFromPostgresClient(
+    wrapped as Parameters<typeof createDbFromPostgresClient>[0],
+  );
+  wrappedDbByHandle.set(db as object, wrappedDb);
+  return wrappedDb;
 }

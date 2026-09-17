@@ -525,13 +525,16 @@ export function describeAgentStartLockDispatchHealth(
   forgetExpiredAborts(nowMs);
   const record = lastAbortByAgent.get(agentId);
   if (!record) return null;
+  // `released` is written by `runExclusively`'s `finally`, so it is a direct
+  // observation that the aborted section actually settled — not an inference
+  // from the lock being free, which a newly-started follow-up would muddy.
+  const stillWedged = !record.released;
   const heldSince = heldSinceByAgent.get(agentId);
-  // Still held *and* held since before the abort ⇒ the abort has not landed and
-  // this is the same wedged section, not a fresh one that happens to be running.
-  const stillWedged = heldSince !== undefined && heldSince <= record.abortedAtMs;
   return {
     status: stillWedged ? "stalled" : "aborted",
-    heldMs: stillWedged ? Math.max(0, nowMs - heldSince) : record.heldMs,
+    heldMs: stillWedged && heldSince !== undefined
+      ? Math.max(0, nowMs - heldSince)
+      : record.heldMs,
     abortedAt: new Date(record.abortedAtMs).toISOString(),
     reason: stillWedged
       ? "Queued-run dispatch has been holding this agent's start lock past its budget and did not "
