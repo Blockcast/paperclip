@@ -154,6 +154,67 @@ describe("isClaudeTransientUpstreamError — transcript independence (PEN-3223)"
       }),
     ).toBe(false);
   });
+
+  // `execute.ts` derives `parsed` as `parsedStream.resultJson ?? parseJson(stdout)`,
+  // so a run that emitted NO result event but whose stdout is a single parseable
+  // JSON object arrives here with `parsed` truthy. Gating the narrowing on
+  // truthiness rather than on the result-event shape dropped the transcript for
+  // that population: `result`, `errors[]` and `api_error_status` are all absent,
+  // `describeClaudeFailure` returns null, and the haystack collapses to
+  // `Claude exited with code N`. These pin the shape gate.
+  it("classifies a transcript-only 429 when parsed is a truthy NON-result object", () => {
+    const nonResult = { type: "error", error: { message: "API Error: 429 rate_limit_error" } };
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: nonResult,
+        stdout: JSON.stringify(nonResult),
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(true);
+  });
+
+  it("classifies a transcript-only 503 when parsed is a truthy NON-result object", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: { type: "system", subtype: "init", session_id: "s1" },
+        stdout: "API Error: 503 upstream temporarily unavailable",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not invent a transient label when a NON-result parsed has a clean transcript", () => {    const nonResult = { type: "error", error: { message: "workspace path not found" } };
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: nonResult,
+        stdout: JSON.stringify(nonResult),
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(false);
+  });
+
+  it("still narrows a genuine result event, so the 403 fix is not widened back open", () => {
+    // Same poisoned transcript as above, but `parsed` IS a result event: the
+    // transcript must stay out of the haystack.
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: 403,
+          result:
+            "API Error: 403 The connected subscription for org 'org_penstock' provider " +
+            "'anthropic' is not entitled to serve this request; re-entitle the seat and retry",
+        },
+        stdout: "upstream returned 429 rate_limit_error; throttled and temporarily unavailable",
+        stderr: "",
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("isClaudeTransientUpstreamError", () => {

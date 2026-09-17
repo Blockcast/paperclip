@@ -1160,6 +1160,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
+    // NOTE: `parsed` is NOT necessarily the terminal `result` event. The second
+    // arm is a bare `JSON.parse`, so any single parseable object on stdout makes
+    // this truthy with no result event in the run. Classifiers that narrow their
+    // evidence to result-event surfaces must test the event's shape, not this
+    // variable's truthiness (see `isClaudeTerminalResultEvent`, PEN-3223). The
+    // vendored k8s twin has no such fallback, so that invariant holds there and
+    // not here.
     const parsed = parsedStream.resultJson ?? parseJson(proc.stdout);
     return { proc, parsedStream, parsed };
   };

@@ -306,6 +306,25 @@ function buildClaudeTransientHaystack(input: {
  *
  * `api_error_status` is included so the verdict does not rest solely on CLI prose.
  */
+/**
+ * Is `parsed` the CLI's terminal `result` event, as opposed to some other JSON
+ * object that merely reached the same variable?
+ *
+ * In THIS copy the distinction is provably inert: `execute.ts` derives `parsed`
+ * from `parseClaudeStreamJson().resultJson` (assigned only on `type === "result"`)
+ * with recovery via `scanForResultEvent`, which hard-checks `.type === "result"`
+ * too — so `parsed` is always null or a genuine result event. It is written on
+ * the shape anyway to match the `claude-local` twin, where it is NOT inert: that
+ * copy derives `parsed` as `parsedStream.resultJson ?? parseJson(stdout)`, and
+ * the second arm is a bare `JSON.parse` that admits any single parseable object.
+ * Testing the shape here means the narrowing stays correct if this copy ever
+ * gains a similar fallback, and keeps the two mechanisms from drifting apart —
+ * which is how this rule's own defect arose.
+ */
+function isClaudeTerminalResultEvent(parsed: Record<string, unknown> | null): boolean {
+  return parsed !== null && asString(parsed.type, "") === "result";
+}
+
 function buildClaudeTerminalResultHaystack(input: {
   parsed?: Record<string, unknown> | null;
   stderr?: string | null;
@@ -415,12 +434,13 @@ export function isClaudeTransientUpstreamError(input: {
 
   // Narrow to the terminal-result surfaces only when a `result` event actually
   // exists. In THIS copy that is the only reachable case — leg 1 above — so the
-  // `parsed: null` branch is defensive rather than live. It is kept because the
-  // `claude-local` twin IS reachable that way from its `!parsed` fallback, and a
-  // silent divergence between the two copies is what this rule's own defect grew
-  // out of. With `parsed` null there are no bounded surfaces to read, so the
+  // no-result branch is defensive rather than live. It is kept because the
+  // `claude-local` twin IS reachable that way, from both its `!parsed` fallback
+  // and its `parseJson(stdout)` arm (which yields a truthy NON-result object), and
+  // a silent divergence between the two copies is what this rule's own defect grew
+  // out of. With no result event there are no bounded surfaces to read, so the
   // transcript is the only evidence available.
-  const haystack = parsed
+  const haystack = isClaudeTerminalResultEvent(parsed)
     ? buildClaudeTerminalResultHaystack(input)
     : buildClaudeTransientHaystack(input);
   if (!haystack) return false;

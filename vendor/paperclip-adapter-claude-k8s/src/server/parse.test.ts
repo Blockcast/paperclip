@@ -440,6 +440,53 @@ describe("isClaudeTransientUpstreamError — transcript independence (PEN-3223)"
       }),
     ).toBe(false);
   });
+
+  // Inert in THIS copy — `parsed` here is always null or a real result event
+  // (`resultJson`, plus `scanForResultEvent`, which hard-checks `type === "result"`).
+  // Mirrored from the `claude-local` twin, where the `parseJson(stdout)` fallback
+  // makes it live, so the shared contract is pinned in both copies and the two
+  // cannot drift apart again.
+  it("classifies a transcript-only 429 when parsed is a truthy NON-result object", () => {
+    const nonResult = { type: "error", error: { message: "API Error: 429 rate_limit_error" } };
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: nonResult,
+        stdout: JSON.stringify(nonResult),
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not invent a transient label when a NON-result parsed has a clean transcript", () => {
+    const nonResult = { type: "error", error: { message: "workspace path not found" } };
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: nonResult,
+        stdout: JSON.stringify(nonResult),
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(false);
+  });
+
+  it("still narrows a genuine result event, so the 403 fix is not widened back open", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: 403,
+          result:
+            "API Error: 403 The connected subscription for org 'org_penstock' provider " +
+            "'anthropic' is not entitled to serve this request; re-entitle the seat and retry",
+        },
+        stdout: "upstream returned 429 rate_limit_error; throttled and temporarily unavailable",
+        stderr: "",
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("matchClaudeUpstreamCapacityCode", () => {

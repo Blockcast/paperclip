@@ -423,6 +423,23 @@ function buildClaudeTransientHaystack(input: {
  * the third extracts a timestamp once a family is already decided. None of them
  * grants a retry family off transcript text.
  */
+/**
+ * Is `parsed` the CLI's terminal `result` event, as opposed to some other JSON
+ * object that merely reached the same variable?
+ *
+ * `parseClaudeStreamJson` only ever assigns `resultJson` on `type === "result"`,
+ * so for a stream-json parse this is exactly "a result event exists". The check
+ * is written on the SHAPE rather than taken as a boolean from the caller because
+ * `execute.ts` derives `parsed` as `parsedStream.resultJson ?? parseJson(stdout)`
+ * — a raw `JSON.parse` with no shape validation, so any single parseable object
+ * on stdout lands here looking like a result event. Callers cannot be relied on
+ * to distinguish the two: forgetting to is precisely how the narrowing below
+ * first went wrong, and there are three call sites plus the vendored twin.
+ */
+function isClaudeTerminalResultEvent(parsed: Record<string, unknown> | null): boolean {
+  return parsed !== null && asString(parsed.type, "") === "result";
+}
+
 function buildClaudeTerminalResultHaystack(input: {
   parsed?: Record<string, unknown> | null;
   stderr?: string | null;
@@ -670,14 +687,25 @@ export function isClaudeTransientUpstreamError(input: {
   if (loginMeta.requiresLogin) return false;
 
   // Only a run that produced a terminal `result` event has bounded surfaces worth
-  // narrowing to. `execute.ts`'s `!parsed` fallback calls this with `parsed: null`
-  // when the CLI died without emitting one; there `result`, `errors[]` and
-  // `api_error_status` are all empty, so the narrowed haystack would be reduced to
-  // `errorMessage` + `stderr` and would silently drop a transient signal that only
-  // ever reached stdout. Keep the wide transcript haystack on that path: the
-  // transcript is the only evidence it has, and the defect this rule fixes cannot
-  // occur there (it is defined by an `api_error_status` that requires `parsed`).
-  const haystack = parsed
+  // narrowing to, so gate on the event itself — NOT on `parsed` being non-null.
+  // Two distinct populations reach this with no result event, and both need the
+  // wide transcript haystack:
+  //
+  //   1. `parsed: null` — `execute.ts`'s `!parsed` fallback (:1227), when the CLI
+  //      died without emitting one.
+  //   2. `parsed` truthy but not a result event — `execute.ts`'s `parsed` is
+  //      `parsedStream.resultJson ?? parseJson(proc.stdout)` (:1163), and that
+  //      second arm is a bare `JSON.parse`, so any single parseable object on
+  //      stdout arrives here truthy.
+  //
+  // In both, `result`, `errors[]` and `api_error_status` are empty and
+  // `describeClaudeFailure` returns null, so the narrowed haystack collapses to
+  // `Claude exited with code N` + `stderr` and silently drops a transient signal
+  // that only ever reached stdout — losing its retry family. The transcript is
+  // the only evidence those runs have, and the defect this rule fixes cannot
+  // occur there: it is defined by an `api_error_status`, which only a real result
+  // event carries.
+  const haystack = isClaudeTerminalResultEvent(parsed)
     ? buildClaudeTerminalResultHaystack(input)
     : buildClaudeTransientHaystack(input);
   if (!haystack) return false;
