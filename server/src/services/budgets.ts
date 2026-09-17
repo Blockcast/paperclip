@@ -767,14 +767,21 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
      * `hire_agent` decision path (`approvals.ts`, whose
      * `activatePendingApproval` opens with `agents … for update`).
      *
-     * Two callers are outside the rule and are safe for reasons that do not
-     * generalise — do not copy them:
-     *  - `budgets.resolveIncident` and the two company-scope route callers run
-     *    outside any transaction, so each statement autocommits and no lock is
-     *    held across the pair in either order;
-     *  - the agent-creation callers (`routes/agents.ts`, and the non-pending
-     *    branch of `approvals.approve`) write `agents` first, but insert a brand
-     *    new row whose id no concurrent request can name yet.
+     * The remaining callers are outside the rule and are safe for reasons that
+     * do not generalise — do not copy them:
+     *  - `budgets.resolveIncident`, `POST /companies/:companyId/budgets/policies`
+     *    and `PATCH /companies/:companyId/budgets` (`routes/costs.ts`),
+     *    `POST /companies` (`routes/companies.ts`), and
+     *    `POST /companies/:companyId/agents` (`routes/agents.ts`) run outside any
+     *    transaction, so each statement autocommits and no lock is held across
+     *    the pair in either order. The agent-creation route is safe for that
+     *    reason and not because its row is new — the insert has committed by the
+     *    time it calls this, so a concurrent `PATCH /agents/:agentId/budgets` can
+     *    already name it. `budgets/policies` takes its scope from the request
+     *    body, so it writes agent-scope rows too;
+     *  - the non-pending branch of `approvals.approve` writes `agents` first
+     *    inside the live transaction, but inserts a brand new row whose id no
+     *    concurrent request can name yet — the only caller that reason covers.
      *
      * BLO-32796 introduced the order; BLO-34422 brought the last writer into it.
      */
