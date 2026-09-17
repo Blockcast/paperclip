@@ -702,8 +702,11 @@ export async function createOrAdoptRunSecret(
         // 2026-09-16, and SSAR against `system:serviceaccount:paperclip:
         // paperclip` in ns `paperclip` now reports it allowed.  This call stays
         // a PATCH anyway because `patch` was already granted *before* #1837 —
-        // the adopt path needs no widened verb, so keeping it here is what lets
-        // the `update` grant be retired instead of becoming load-bearing.
+        // *this adapter* needs no widened verb.  That does not make the grant
+        // retirable: the sandbox-provider plugin still PUTs at
+        // `packages/plugins/sandbox-providers/kubernetes/src/secret-manager.ts
+        // :108` under the same service account when `inCluster` is set, so
+        // `update` stays load-bearing until that call site is converted too.
         //
         // Merge semantics are also the closer fit for what adoption means here:
         // assert this run's keys and labels.  Unlike a PUT, a merge leaves
@@ -729,7 +732,10 @@ export async function createOrAdoptRunSecret(
         // the name is takeable again — go re-create.  409: `resourceVersion`
         // went stale under a concurrent writer — go re-read.  Both route back
         // through the loop's existing bound rather than adding a third code
-        // path, so the retry budget is unchanged.
+        // path, so the retry budget is unchanged.  Note `continue` re-enters at
+        // the create (`:654`), not at the read: on the 409 path that create
+        // 409s again and *that* is what reaches the re-read.  One doomed create
+        // per stale-version retry is the price of not adding a third path.
         if (!isK8s404(writeErr) && !isK8s409(writeErr)) throw writeErr;
         if (attempt === 0) continue;
         // Twice in a row means something is actively churning this name.

@@ -152,20 +152,28 @@ describe("createOrAdoptRunSecret", () => {
     expect(call.body.stringData).toEqual({ FOO: "bar" });
   });
 
-  it("writes the adoption as a merge PATCH, because the SA has no `update` verb", async () => {
+  it("writes the adoption as a merge PATCH, on the verb this path already held", async () => {
     // BLO-32424. This is the load-bearing assertion of that fix, and it is
     // about the HTTP verb, not about a race. `replaceNamespacedSecret` is a
-    // PUT == the `update` verb, and the adapter's service account was measured
-    // holding create/patch/delete/get on secrets but NOT update:
+    // PUT == the `update` verb, and when this was written the adapter's service
+    // account was measured holding create/patch/delete/get on secrets but NOT
+    // update:
     //
     //   secrets create -> true   secrets update -> false
     //   secrets patch  -> true   (control: zzzfakeres update -> false)
     //
     // so the old replace returned 403 on EVERY collision, deterministically,
     // never reaching the races the rest of this file guards. Two live agents
-    // were failing to launch on exactly that. If someone reverts to a PUT, or
-    // drops the explicit Content-Type (the client's default for patch is
-    // json-patch+json, which would reject this object body), this fails.
+    // were failing to launch on exactly that.
+    //
+    // That measurement is now stale — #1837 granted `update` on 2026-09-16 —
+    // so do NOT read this test as pinning the absence of a verb. The durable
+    // reason is the one `execute.ts` gives at the call site: `patch` was
+    // already granted before #1837, so this path needs no widened verb and
+    // cannot be broken by `update` being retired later. If someone reverts to
+    // a PUT, or drops the explicit Content-Type (the client's default for
+    // patch is json-patch+json, which would reject this object body), this
+    // fails.
     const coreApi = makeCoreApi({
       createNamespacedSecret: vi.fn().mockRejectedValue(apiException(409, "AlreadyExists")),
       readNamespacedSecret: vi.fn().mockResolvedValue({
