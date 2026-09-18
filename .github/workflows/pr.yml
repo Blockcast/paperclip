@@ -1662,28 +1662,36 @@ jobs:
     # occupancy. Only worst-case single-job occupancy rises (+15m). How much 90
     # costs is NOT yet known -- nothing observes how long a killed job would
     # have taken, which is exactly what this change makes measurable.
-    # Deliberately left below the ~107m that Playwright's own limits can produce
-    # (43 tests x 60s timeout x `retries: 1`, plus the 300s webServer boot and
-    # measured setup), so a genuinely wedged suite is still killed rather than
-    # sitting on a runner.
+    # Deliberately left below the ceiling Playwright's own limits can produce
+    # (42 tests x 60s + 7 smoke-lab tests x 8m, all x `retries: 1`, plus the
+    # 300s webServer boot and measured setup ~= 215m), so a genuinely wedged
+    # suite is still killed rather than sitting on a runner. That figure read
+    # ~107m before BLO-33282 split smoke-lab, and it was understated even then
+    # -- it charged the old 30m `setTimeout` override as 60s.
     #
     # 90 is the DURABLE value, not a stop-gap. BLO-33282 evaluated cross-job
     # sharding as the alternative and ruled against it on measurement; do not
     # re-open it as "the fix nobody got round to".
     #
     # Why sharding does not help here. Per-file wall-times over 6 full runs:
-    # `smoke-lab.spec.ts` is ONE test (`test.setTimeout(1_800_000)`, 7 CI-safe
-    # P1-P7 scenarios in one `describe.serial` body) taking 18.6m median /
-    # 22.9m p100 -- 44% of a 42.1m suite. Playwright balances shards by TEST
-    # COUNT, not duration (testGroups.ts `filterForShard`: "Shards are still
-    # balanced by the number of tests, not files"), and shards non-parallel
-    # files as whole groups. So `--shard=i/N` puts that one 18.6m test in a
-    # shard with ~half the other 42 tests: simulated against the real algorithm
-    # the wall-time miss vs `suite/N` is +34% (N=2), +91% (N=3), +100% (N=4) --
-    # all failing BLO-33282's own <=20% balance criterion. A `--grep
-    # @smoke-lab` / `--grep-invert` split DOES balance (+12%, wall 23.6m), but
-    # 18.6m is an irreducible floor at ANY N because a single test cannot be
-    # split, so N>2 buys nothing.
+    # `smoke-lab.spec.ts` took 18.6m median / 28.1m p100 -- 44% of a 42.1m
+    # suite. Playwright balances shards by TEST COUNT, not duration
+    # (testGroups.ts `filterForShard`: "Shards are still balanced by the number
+    # of tests, not files"), and shards non-parallel files as whole groups. So
+    # when that file was ONE test, `--shard=i/N` put it in a shard with ~half
+    # the other 42 tests: simulated against the real algorithm the wall-time
+    # miss vs `suite/N` was +34% (N=2), +91% (N=3), +100% (N=4) -- all failing
+    # BLO-33282's own <=20% balance criterion. A `--grep @smoke-lab` /
+    # `--grep-invert` split DID balance (+12%, wall 23.6m).
+    #
+    # BLO-33282 then took the OTHER branch of its own AC2 and split that one
+    # test into 7 (one per P1-P7 scenario, plain `describe`, 8m each). That was
+    # for retry blast radius, not for sharding -- a single hung scenario used to
+    # cost 2 x 30m and kill the job by itself. But it also removes the 18.6m
+    # irreducible floor the pre-split arithmetic above rests on, so the shard
+    # simulation is STALE and must be re-run against the new 49-test shape
+    # before anyone quotes those percentages again. It is not evidence that
+    # sharding now works; nobody has measured it.
     #
     # The blocker is pool capacity, not suite structure: `arc-e2e` is
     # maxRunners 8 and was observed at 8/8 with 2 pending. Over this window 42%

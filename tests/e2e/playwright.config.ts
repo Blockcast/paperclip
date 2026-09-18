@@ -76,9 +76,11 @@ export default defineConfig({
   // `--shard=i/N`: each sharded job boots its own throwaway PAPERCLIP_HOME via
   // `mkdtempSync` + `reuseExistingServer: false`, so cross-shard flag flips
   // cannot interact. BLO-33282 measured sharding anyway and ruled against it
-  // for now -- `smoke-lab.spec.ts` is a single 18.6m test worth 44% of the
-  // suite, and Playwright balances shards by test count, so no N balances.
-  // See the `e2e` job comment in .github/workflows/pr.yml before revisiting.
+  // -- Playwright balances shards by test count, and `smoke-lab.spec.ts` was
+  // then a single 18.6m test worth 44% of the suite, so no N balanced. That
+  // file has since been split into 7 tests, which invalidates the simulation
+  // without re-running it. See the `e2e` job comment in
+  // .github/workflows/pr.yml before revisiting.
   workers: 1,
   use: {
     baseURL: BASE_URL,
