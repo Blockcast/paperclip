@@ -30,31 +30,30 @@
  * of those paths require the pass to *finish*. A pass that simply never settles
  * — a chain awaiting a database query that never returns — holds the flag with
  * no cleanup path to reach, and every subsequent tick is skipped for the life of
- * the process. That failure is quieter than the one this gate replaces and
- * therefore worse: pre-gate, a stuck chain grew the heap to the V8 ceiling and
- * the worker aborted, which was destructive but self-clearing, whereas a wedged
- * gate leaves a process that looks perfectly healthy — flat heap, no restart —
- * while orphan reaping, scheduled-retry promotion, stranded-issue reconciliation,
- * watchdogs and every other pass in the chain are stopped indefinitely.
+ * the process. That state is quieter than the failure this gate replaces and so
+ * worse in character: pre-gate, a stuck chain grew the heap to the V8 ceiling
+ * and the worker aborted, which was destructive but self-clearing, whereas a
+ * wedged gate leaves a process that looks perfectly healthy — flat heap, no
+ * restart — while orphan reaping, scheduled-retry promotion, stranded-issue
+ * reconciliation, watchdogs and every other pass in the chain are stopped
+ * indefinitely.
  *
- * {@link SingleFlightGateOptions.stallCeilingMs} bounds that. Once a pass has
- * been outstanding for longer than the ceiling, the next tick abandons the
- * GATE — not the work, which is unawaitable by construction and may still be
- * holding a connection — reports it through
- * {@link SingleFlightGateOptions.onStalled}, and is admitted. Two properties
- * make that safe to do:
+ * {@link SingleFlightGateOptions.stallAfterMs} makes that state **loud**. Once a
+ * pass has been outstanding longer than the threshold, the next skipped tick
+ * reports it — once per pass — through
+ * {@link SingleFlightGateOptions.onStalled}. The tick is still skipped.
  *
- *   - It cannot recreate the incident. The ceiling is a large multiple of the
- *     tick interval, so overlap accrues at one extra pass per ceiling rather
- *     than one per tick. A merely slow chain — the actual production failure,
- *     which was pool contention rather than a hang — is never abandoned.
- *   - An abandoned pass that settles late cannot corrupt the replacement. Each
- *     pass carries its own identity and `settle` is a no-op for any pass that no
- *     longer owns the gate, so a stalled chain returning an hour later does not
- *     clear a flag set by a live successor.
+ * **The gate deliberately does NOT clear itself and admit the next tick.** That
+ * was considered and declined (PEN-3365): force-clearing re-admits exactly the
+ * overlapping passes this gate exists to remove, under precisely the conditions
+ * that would have triggered the watchdog — a saturated pool — so the self-heal
+ * would reintroduce the heap leak at the moment the system is least able to
+ * absorb it. A stall you can page on is the goal; a stall that quietly reopens
+ * the leak is not. **Alert, do not self-heal.**
  *
- * The ceiling is opt-in (`0`/unset disables it) so a caller that genuinely wants
- * unbounded single-flight semantics still gets them.
+ * The durable fix for the underlying hang is a bounded statement/connection
+ * timeout on the pool, which removes the mechanism at source rather than
+ * reacting to it. `stallAfterMs` is the detector, not the cure.
  */
 export type SingleFlightGate = {
   /** True while a pass launched through {@link SingleFlightGate.run} is outstanding. */
@@ -86,41 +85,37 @@ export type SingleFlightGateOptions = {
   /** Called once per completed pass, on success and on failure alike. */
   readonly onSettled?: (durationMs: number) => void;
   /**
-   * Called when a tick abandons the gate because the outstanding pass exceeded
-   * {@link SingleFlightGateOptions.stallCeilingMs}, with that pass's elapsed
-   * time. The abandoned work is NOT cancelled — it is unawaitable by
-   * construction — so this reports a pass that is still running somewhere, not
-   * one that ended.
+   * Called at most ONCE per pass, the first time a skipped tick observes that
+   * pass outstanding for longer than {@link SingleFlightGateOptions.stallAfterMs}.
+   *
+   * Once per pass rather than once per tick so the signal counts distinct
+   * wedges rather than re-counting one wedge every interval forever. The pass is
+   * still running and the gate is still held when this fires — nothing here
+   * cancels or clears anything.
    */
   readonly onStalled?: (elapsedMs: number) => void;
   /**
-   * Abandon the gate once a pass has been outstanding this long, admitting the
-   * next tick. `0` or unset disables the ceiling entirely.
+   * Report a pass still outstanding after this long. `0` or unset disables the
+   * report. Detection only — the gate stays held either way.
    *
-   * Size it as a large multiple of the caller's tick interval. Too low
-   * reintroduces the self-overlap the gate exists to prevent, for a chain that
-   * is slow but making progress; the ceiling is for a chain that is not coming
-   * back.
+   * Size it as a large multiple of the caller's tick interval: a chain that is
+   * slow but progressing is an ordinary skip, and calling that a stall would
+   * page on the healthy-but-degraded case this gate is designed to absorb.
    */
-  readonly stallCeilingMs?: number;
+  readonly stallAfterMs?: number;
   /** Injectable clock; defaults to `Date.now`. */
   readonly now?: () => number;
 };
 
-/** One outstanding pass. Identity is the point — see `settle`. */
-type Pass = { readonly startedAtMs: number };
+/** One outstanding pass. `stallReported` latches the once-per-pass `onStalled`. */
+type Pass = { readonly startedAtMs: number; stallReported: boolean };
 
 export function createSingleFlightGate(options: SingleFlightGateOptions = {}): SingleFlightGate {
   const now = options.now ?? (() => Date.now());
-  const stallCeilingMs = options.stallCeilingMs ?? 0;
+  const stallAfterMs = options.stallAfterMs ?? 0;
   let current: Pass | null = null;
 
   const settle = (pass: Pass) => {
-    // A pass abandoned at the stall ceiling can still settle, arbitrarily late.
-    // It no longer owns the gate, so clearing here would release a flag that a
-    // live replacement set — reopening the overlap this gate prevents. Compare
-    // identity rather than a boolean.
-    if (current !== pass) return;
     current = null;
     // A backwards clock must not produce a negative duration on a metric that
     // only ever means "how long did this take".
@@ -135,21 +130,17 @@ export function createSingleFlightGate(options: SingleFlightGateOptions = {}): S
       const outstanding = current;
       if (outstanding) {
         const elapsedMs = Math.max(0, now() - outstanding.startedAtMs);
-        if (stallCeilingMs <= 0 || elapsedMs < stallCeilingMs) {
-          options.onSkip?.(elapsedMs);
-          return null;
+        if (stallAfterMs > 0 && !outstanding.stallReported && elapsedMs >= stallAfterMs) {
+          // Latch before the callback: a throwing hook must not re-arm the
+          // report and turn a once-per-pass signal into a once-per-tick one.
+          outstanding.stallReported = true;
+          options.onStalled?.(elapsedMs);
         }
-        // Past the ceiling. Abandon the gate so recovery resumes; the work
-        // itself keeps running (nothing here can cancel it) and its late settle
-        // is ignored by the identity check in `settle`. Resetting `current` here
-        // also resets the clock, so the next abandonment cannot happen sooner
-        // than a further `stallCeilingMs` — that is what bounds the overlap rate
-        // to one extra pass per ceiling rather than one per tick.
-        current = null;
-        options.onStalled?.(elapsedMs);
+        options.onSkip?.(elapsedMs);
+        return null;
       }
 
-      const pass: Pass = { startedAtMs: now() };
+      const pass: Pass = { startedAtMs: now(), stallReported: false };
       current = pass;
 
       let work: Promise<unknown>;

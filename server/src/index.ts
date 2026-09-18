@@ -1099,26 +1099,32 @@ export async function startServer(): Promise<StartedServer> {
   // whole materialized issue graph while it awaits, so overlapping it does not
   // just duplicate work — it duplicates hundreds of megabytes of retained heap.
   //
-  // The gate skips a tick whose predecessor is still running, and abandons the
-  // gate outright once a pass has been outstanding past `stallCeilingMs`. That
-  // ceiling is the bound on the one failure this design would otherwise be blind
-  // to: every cleanup path in the gate requires the pass to *finish*, so a chain
-  // that never settles at all would hold the flag for the life of the process
-  // and silently stop orphan reaping, retry promotion, stranded-issue
-  // reconciliation and every other recovery pass — a quieter failure than the
-  // heap abort it replaces, and therefore a worse one.
+  // The gate skips a tick whose predecessor is still running, and REPORTS a pass
+  // that has been outstanding past `stallAfterMs`. That report is the bound on
+  // the one failure this design would otherwise be blind to: every cleanup path
+  // in the gate requires the pass to *finish*, so a chain that never settles at
+  // all holds the flag for the life of the process and silently stops orphan
+  // reaping, retry promotion, stranded-issue reconciliation and every other
+  // recovery pass — a quieter failure than the heap abort it replaces.
   //
-  // 20 intervals (10 min at the 30 s default) is deliberately far above any
-  // plausible honest pass. The production incident was a chain slowed by pool
-  // contention, not a hung one, and a ceiling low enough to abandon a slow pass
-  // would recreate exactly the overlap this gate exists to prevent. The floor
-  // keeps that true for a short configured interval.
-  const heartbeatRecoveryChainStallCeilingMs = Math.max(
+  // It reports and does NOT self-clear, per PEN-3365. Force-clearing the flag
+  // would re-admit the overlapping passes this gate exists to remove, under
+  // exactly the conditions that raised the alarm (a saturated pool) — so the
+  // "self-heal" would reopen the heap leak at the worst possible moment. The
+  // durable fix is a bounded statement/connection timeout on the pool; this is
+  // the detector for the gap until that exists.
+  //
+  // 20 intervals (10 min at the 30 s default) is a deliberately conservative
+  // starting threshold: a chain that is slow but progressing is an ordinary skip,
+  // and paging on that would defeat the degradation this gate is meant to absorb.
+  // PEN-3365 calls for recalibrating it against real duration data once this is
+  // deployed; the floor keeps it sane for a short configured interval.
+  const heartbeatRecoveryChainStallAfterMs = Math.max(
     10 * 60_000,
     20 * config.heartbeatSchedulerIntervalMs,
   );
   const heartbeatRecoveryChainGate = createSingleFlightGate({
-    stallCeilingMs: heartbeatRecoveryChainStallCeilingMs,
+    stallAfterMs: heartbeatRecoveryChainStallAfterMs,
     onSkip: (elapsedMs) => {
       recordHeartbeatRecoveryChainSkipped();
       recordHeartbeatRecoveryChainInflight(elapsedMs);
@@ -1126,7 +1132,7 @@ export async function startServer(): Promise<StartedServer> {
       // separates "the chain is taking 35 s" from "the chain has been wedged for
       // six hours", and only the second is worth a page.
       logger.warn(
-        { elapsedMs, stallCeilingMs: heartbeatRecoveryChainStallCeilingMs },
+        { elapsedMs, stallAfterMs: heartbeatRecoveryChainStallAfterMs },
         "periodic heartbeat recovery chain still running at tick; skipping this tick (PEN-3314)",
       );
     },
@@ -1138,13 +1144,12 @@ export async function startServer(): Promise<StartedServer> {
     },
     onStalled: (elapsedMs) => {
       recordHeartbeatRecoveryChainStalled();
-      // A fresh pass is starting this same tick, so the in-flight clock restarts.
-      recordHeartbeatRecoveryChainInflight(0);
       logger.error(
-        { elapsedMs, stallCeilingMs: heartbeatRecoveryChainStallCeilingMs },
-        "periodic heartbeat recovery chain exceeded the stall ceiling without settling; "
-          + "admitting the next tick (PEN-3314). The abandoned pass is still running and may "
-          + "still hold a database connection.",
+        { elapsedMs, stallAfterMs: heartbeatRecoveryChainStallAfterMs },
+        "periodic heartbeat recovery chain has not settled past the stall threshold (PEN-3314/PEN-3365). "
+          + "Every recovery pass on this worker is halted and will stay halted until the chain returns "
+          + "or the process is restarted; the gate does not self-clear, because re-admitting ticks here "
+          + "would reopen the heap leak. Investigate for a hung database query.",
       );
     },
   });

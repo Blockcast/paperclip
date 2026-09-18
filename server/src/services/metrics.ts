@@ -113,15 +113,18 @@ export const HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC = "paperclip_heartbeat_rec
  */
 export const HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC = "paperclip_heartbeat_recovery_chain_inflight_seconds";
 /**
- * Times the recovery-chain gate was abandoned because its outstanding pass
- * exceeded the stall ceiling and the next tick was admitted anyway (PEN-3314).
+ * Recovery-chain passes that were still outstanding past the stall threshold
+ * (PEN-3314 / PEN-3365). Counted once per stalled pass, not once per tick.
  *
  * Non-zero means a pass stopped settling entirely — not merely ran slow, which
- * shows up as skips instead. The gate deliberately prefers bounded overlap here
- * to the alternative of holding the flag forever, which would silently stop
- * every recovery pass on the worker while leaving the process looking healthy.
- * Page on this: it is rare by design, and the abandoned pass is still out there
- * holding whatever it was holding.
+ * shows up as skips instead — and therefore that **every recovery pass on this
+ * worker is halted**: orphan reaping, retry promotion, stranded-issue
+ * reconciliation, watchdogs, the lot. The gate deliberately does not self-clear
+ * (force-clearing would re-admit the overlapping passes that cause the heap
+ * leak, under exactly the saturated-pool conditions that raised the alarm), so
+ * this state persists until the chain returns or the process restarts.
+ *
+ * **Page on this.** It is rare by design and it does not resolve itself.
  */
 export const HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC = "paperclip_heartbeat_recovery_chain_stalled_total";
 export type BackstopSource = (typeof BACKSTOP_SOURCES)[number];
@@ -3157,10 +3160,10 @@ function ensureRegistry(): {
     heartbeatRecoveryChainStalled = new Counter({
       name: HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC,
       help:
-        "Times the recovery-chain gate was abandoned because its outstanding pass exceeded "
-        + "the stall ceiling, admitting the next tick anyway (PEN-3314). Non-zero means a "
-        + "pass stopped settling entirely rather than merely running slow. Rare by design; "
-        + "the abandoned pass is still running somewhere. Page on this.",
+        "Recovery-chain passes still outstanding past the stall threshold, counted once per "
+        + "stalled pass (PEN-3314/PEN-3365). Non-zero means a pass stopped settling entirely "
+        + "rather than merely running slow, so EVERY recovery pass on this worker is halted. "
+        + "The gate does not self-clear, so this does not resolve itself. Page on this.",
       registers: [registry],
     });
     heartbeatRecoveryChainStalled.inc(0);
@@ -4532,7 +4535,7 @@ export function recordHeartbeatRecoveryChainInflight(elapsedMs: number): void {
   ensureRegistry().heartbeatRecoveryChainInflightGauge.set(Math.max(0, elapsedMs) / 1000);
 }
 
-/** PEN-3314: the gate abandoned a pass that exceeded the stall ceiling and admitted the next tick. */
+/** PEN-3314: a recovery-chain pass passed the stall threshold without settling. */
 export function recordHeartbeatRecoveryChainStalled(): void {
   ensureRegistry().heartbeatRecoveryChainStalledCounter.inc();
 }
