@@ -203,26 +203,39 @@ const EMITTED_BUCKET_RE = new RegExp(
 /**
  * Fenced spans blanked, so a quoted bucket cannot fail a block closed.
  *
- * Deliberately simpler than withoutFencedCodeBlocks in the gate: a line-level
- * toggle on ``` only, with no tilde fences, no fence-length matching and no
- * info-string rule. The bound is stated rather than implied — a body using
- * those forms is read here as emitted structure and by the gate as a quote.
- * Applied to this cross-check and to the block and opener counts in
+ * Mirrors withoutFencedCodeBlocks in the gate exactly — tilde fences, fence
+ * length matching and the backtick info-string rule. A simpler toggle here is
+ * not a scoping choice but a divergence: the two readers then disagree about
+ * how many blocks a body contains, which is the BLO-31730 cross-reader failure
+ * one layer down, and it fires first on a review that quotes the marker
+ * template. Applied to this cross-check and to the block and opener counts in
  * structuredVerdict, not to the prose attestation pattern above, whose own
  * fence divergence is the documented residual on NOT_INDENTED_CODE and is
  * unchanged by this.
  */
+const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+
 function withoutFencedSpans(text) {
-  if (!text.includes("```")) return text;
-  let fenced = false;
+  if (!text.includes("```") && !text.includes("~~~")) return text;
+  let open = null;
   return text
     .split("\n")
     .map((line) => {
-      if (/^ {0,3}```/.test(line)) {
-        fenced = !fenced;
+      if (open) {
+        const close = FENCE_CLOSE_RE.exec(line);
+        if (close && close[1][0] === open.char && close[1].length >= open.length) open = null;
         return "";
       }
-      return fenced ? "" : line;
+      const fence = FENCE_OPEN_RE.exec(line);
+      // Per CommonMark a backtick fence's info string may not itself contain a
+      // backtick, so an inline span cannot open a phantom fence that would
+      // blank the rest of a genuine review.
+      if (fence && !(fence[1][0] === "`" && fence[2].includes("`"))) {
+        open = { char: fence[1][0], length: fence[1].length };
+        return "";
+      }
+      return line;
     })
     .join("\n");
 }
