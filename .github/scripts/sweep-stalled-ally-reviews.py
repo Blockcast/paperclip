@@ -157,10 +157,43 @@ ALLY_REVIEWER_LOGINS = parse_list(os.environ.get("ALLY_REVIEWER_LOGINS"), DEFAUL
 ALLY_REQUEST_REVIEWER_LOGIN = os.environ.get("ALLY_REQUEST_REVIEWER_LOGIN") or "allyblockcast"
 
 # How long a head must have been awaiting review before we consider it
-# stranded rather than "just waiting its turn". Ally's own documented
-# response times in BLO-22892 were 6m35s and 30m when the wake landed; 90m
-# gives generous headroom above that before treating silence as loss.
-STALL_THRESHOLD_SECONDS = int(os.environ.get("STALL_THRESHOLD_SECONDS") or 90 * 60)
+# stranded rather than "just waiting its turn".
+#
+# THIS NUMBER IS CALIBRATION AND IT ROTS. Re-derive it, do not inherit it.
+# The threshold measures request -> review, which is QUEUE WAIT + SERVICE.
+# It was originally set to 90m from BLO-22892's figures of 6m35s and 30m --
+# but those are SERVICE time (`startedAt` -> review), measured when the wake
+# landed promptly. Queue wait was negligible then and dominates now by an
+# order of magnitude, so the old number had become a constant-true predicate:
+# "stranded" meant "dispatched normally", and every re-fire woke a PR author
+# for nothing.
+#
+# Measured 2026-09-18 (BLO-34521), window 2026-09-16T22:37Z -> 2026-09-18T05:50Z,
+# n=706 started Ally `pr_review:` runs, wait = `startedAt - createdAt`:
+#
+#     p50 268m (4h28m) | p90 338m | max 405m | min 45m
+#     > 90m: 697/706 = 99%     (plus 107 still queued, median age 201m)
+#
+# Reproduce with:
+#
+#     GET /companies/{companyId}/heartbeat-runs?agentId=<ally>&limit=1000
+#     keep runs whose `contextSnapshot.taskKey` starts with "pr_review:"
+#     wait = startedAt - createdAt   (queued runs: now - createdAt)
+#
+# 8h sits above the observed max wait (405m) with service headroom. Re-run
+# that query before trusting it; if p90 has moved, move this with it.
+#
+# KNOWN CEILING -- elapsed time is structurally the wrong instrument. It
+# cannot distinguish a LOST wake from a merely QUEUED one, which is the only
+# distinction that matters here: no elapsed-time value separates them, so any
+# value is a trade between false author-wakes and slow loss detection. The
+# sound discriminator is "does a `heartbeat_run` row exist for this request's
+# `pr_review:<repo>:<n>` taskKey?" -- a queued row means healthy, no row means
+# genuinely lost. review-gate-sweep.yml carries only `GITHUB_TOKEN` and no
+# Paperclip credential, so that check is unreachable from CI today; granting
+# the sweep API access is a strictly larger blast radius and belongs in its
+# own row.
+STALL_THRESHOLD_SECONDS = int(os.environ.get("STALL_THRESHOLD_SECONDS") or 8 * 60 * 60)
 
 # Don't re-fire more than once per cooldown window even if still stalled --
 # the sweep itself must not become the burst that re-triggers whatever
@@ -201,11 +234,17 @@ MAX_REFIRES_PER_RUN = int(os.environ.get("MAX_REFIRES_PER_RUN") or 5)
 # +1h, because this repo's sweep runs HOURLY rather than every 30 minutes
 # (see review-gate-sweep.yml for the rate-limit arithmetic behind that). The
 # extra hour is the polling granularity: worst case a head goes stale just
-# after a run, so its first re-fire lands at 90m+60m=150m and its cooldown
-# expires at 270m, making the next re-fire opportunity 300m. Alarming at
-# 270m would fire in the same window as that second re-fire; 330m (5.5h)
-# keeps "at least one full re-fire and its cooldown have come and gone"
-# true at the coarser cadence.
+# after a run, so with STALL at 8h its first re-fire lands at 480m+60m=540m
+# and its cooldown expires at 660m, making the next re-fire opportunity 720m.
+# The formula gives 720m (12h) -- i.e. the alarm now lands exactly ON that
+# second re-fire opportunity rather than 30m past it, as it did at the old
+# 90m STALL. That is cosmetic: the property the margin buys is "at least one
+# full re-fire AND its cooldown have come and gone", and at 720m both (540m,
+# 660m) are in the past. Kept as a formula so it tracks STALL automatically;
+# the 12h it yields is ~1.8x the measured max dispatch wait (405m) recorded
+# above STALL_THRESHOLD_SECONDS, so a normally-queued PR no longer alarms.
+# Before BLO-34521 it was 330m, INSIDE the normal distribution -- ~14% of
+# healthy dispatches went red.
 ALARM_THRESHOLD_SECONDS = int(
     os.environ.get("ALARM_THRESHOLD_SECONDS") or (STALL_THRESHOLD_SECONDS + REFIRE_COOLDOWN_SECONDS + 2 * 60 * 60)
 )
