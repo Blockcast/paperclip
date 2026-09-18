@@ -631,6 +631,26 @@ function issueRunScopeSql(issueId: string) {
   );
 }
 
+/**
+ * Batched `issueRunScopeSql` — same three columns, one query for many issues.
+ * Used by the retirement sweep, which resolves run liveness for every open
+ * `runaway_execution` review at once rather than per review.
+ */
+function issueRunScopeInSql(issueIds: string[]) {
+  return or(
+    inArray(heartbeatRuns.contextIssueId, issueIds),
+    inArray(heartbeatRuns.contextTaskId, issueIds),
+    inArray(heartbeatRuns.contextTaskKey, issueIds),
+  );
+}
+
+/** The source issue a run row is scoped to, for grouping a batched scope read. */
+function runScopeIssueIds(run: HeartbeatRunRow) {
+  return [run.contextIssueId, run.contextTaskId, run.contextTaskKey].filter(
+    (id): id is string => Boolean(id),
+  );
+}
+
 function msToHuman(ms: number | null) {
   if (ms === null) return "unknown";
   const minutes = Math.floor(ms / 60_000);
@@ -3237,6 +3257,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     let closedMonitorScheduled = 0;
     let closedTerminalSource = 0;
     let closedDependencyBlocked = 0;
+    let closedExecutionEnded = 0;
 
     // BLO-22436: resolve blocker state for the sources whose open review a
     // blocker could retire, batched per company. Without this, a review minted
@@ -3267,6 +3288,65 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }
     }
 
+    // BLO-27698 B3b (Ally review on 7f4fbc43b): resolve, for every open
+    // `runaway_execution` review, whether the run it describes is still running.
+    //
+    // That trigger is the only one in the set whose subject is a single
+    // in-flight run, and its rubric is entirely forward-looking — "let it
+    // finish", "bound it", "route to platform/SRE" are all actions on a live
+    // process. Its retirement predicate is therefore *the run ended*, and
+    // source-`done` (the arm below) is a strictly narrower proxy for it: a run
+    // that exits while its issue stays `in_progress`/`todo`/`blocked` would
+    // strand an unanswerable review open indefinitely, because generation
+    // cannot retire it either (`createOrUpdateReview` returns null the moment
+    // no trigger fires, so an open review whose trigger stopped firing is never
+    // revisited). Close on the predicate itself.
+    //
+    // Liveness is `runLiveInterval` + `stillSignalling`, the identical pair
+    // `liveExecutingMs` applies in the generation path, so suppression and
+    // retirement cannot drift on what "still executing" means — the same
+    // discipline A4 applies to the monitor grace. When no run is still
+    // signalling, `liveExecutingMs` is 0 by construction and so cannot clear
+    // any positive bar; that is why this needs no threshold of its own.
+    const runawayExecutionEndedSourceIds = new Set<string>();
+    const runawaySourceIdsByCompany = new Map<string, Set<string>>();
+    for (const review of reviewRows) {
+      if (!review.originId) continue;
+      if (reviewTriggerById.get(review.id) !== "runaway_execution") continue;
+      const sourceIssue = sourceIssueById.get(review.originId);
+      if (!sourceIssue || sourceIssue.companyId !== review.companyId) continue;
+      const forCompany = runawaySourceIdsByCompany.get(review.companyId) ?? new Set<string>();
+      forCompany.add(sourceIssue.id);
+      runawaySourceIdsByCompany.set(review.companyId, forCompany);
+    }
+    for (const [runawayCompanyId, sourceIds] of runawaySourceIdsByCompany) {
+      const scopedIds = [...sourceIds];
+      // Only `running` rows can be live: `runLiveInterval` ends a terminal row
+      // at `finishedAt` and a re-parked one at its last signal, so neither can
+      // satisfy `stillSignalling`. Filtering in SQL keeps this read bounded by
+      // the number of *live* runs rather than by run history.
+      const liveRuns = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, runawayCompanyId),
+            eq(heartbeatRuns.status, "running"),
+            issueRunScopeInSql(scopedIds),
+          ),
+        );
+      const stillExecutingSourceIds = new Set<string>();
+      for (const run of liveRuns) {
+        if (!stillSignalling(runLiveInterval(run, now), now)) continue;
+        for (const scopeId of runScopeIssueIds(run)) {
+          if (sourceIds.has(scopeId)) stillExecutingSourceIds.add(scopeId);
+        }
+      }
+      for (const sourceId of sourceIds) {
+        if (!stillExecutingSourceIds.has(sourceId)) runawayExecutionEndedSourceIds.add(sourceId);
+      }
+    }
+
     for (const review of reviewRows) {
       if (!review.originId) continue;
       const sourceIssue = sourceIssueById.get(review.originId) ?? null;
@@ -3274,7 +3354,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       if (sourceIssue.companyId !== review.companyId) continue;
       const trigger = reviewTriggerById.get(review.id);
 
-      let suppressedBy: "terminal_source" | "monitor_scheduled" | "dependency_blocked" | null = null;
+      let suppressedBy:
+        | "terminal_source"
+        | "monitor_scheduled"
+        | "dependency_blocked"
+        | "execution_ended"
+        | null = null;
       let suppressionDetails: Record<string, unknown> = {};
       // A `done` source can retire an already-open long-active review: the work
       // episode finished under the terminal-status evidence gate, so the
@@ -3285,6 +3370,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // option in its rubric — "let it finish", "bound it", "route to platform"
       // — is a question about a run that no longer exists. Leaving it open would
       // park an unanswerable review in a reviewer's queue.
+      // For `runaway_execution` this arm is a *convenience*, not its predicate:
+      // source-`done` implies the run ended, but the run can also end with the
+      // source still open, and that case is retired by the `execution_ended`
+      // arm below on the real predicate (Ally review on 7f4fbc43b). The two
+      // overlap deliberately — this one costs no extra read when it applies.
       // This does not extend to `cancelled`; an assignee can abandon and later
       // restore their own source issue, so cancellation must not retire its
       // oversight artifact. It also does not extend to historical/accountability
@@ -3296,6 +3386,24 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         && sourceIssue.status === "done"
       ) {
         suppressedBy = "terminal_source";
+        suppressionDetails = { sourceStatus: sourceIssue.status };
+      } else if (
+        trigger === "runaway_execution"
+        && runawayExecutionEndedSourceIds.has(sourceIssue.id)
+      ) {
+        // The run this alarm describes has stopped executing. Unlike
+        // `long_active_duration` — whose rubric ("what progress did the
+        // assignee show") stays answerable after the episode ends, and which
+        // keeps the `monitor_scheduled` arm — every option offered for a
+        // runaway run is an instruction to a live process. Retire it rather
+        // than asking a manager to bound a run that already exited.
+        //
+        // Deliberately NOT gated on `isTerminalIssueStatus`: the whole point is
+        // that the source is usually still open here. A run that restarts and
+        // clears the bar again simply re-fires a fresh review through
+        // generation, so this cannot suppress a genuinely runaway run — it can
+        // only retire the record of one that ended.
+        suppressedBy = "execution_ended";
         suppressionDetails = { sourceStatus: sourceIssue.status };
       } else if (trigger === "long_active_duration" && !isTerminalIssueStatus(sourceIssue.status)) {
         // Deliberately monitor-only, and deliberately `long_active_duration`-only:
@@ -3399,15 +3507,22 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           ...suppressionDetails,
         },
       });
+      // Explicit on every arm rather than falling through to
+      // `closedMonitorScheduled`: that default silently mis-attributed any new
+      // suppression reason to the monitor counter, which is the funnel
+      // BLO-33477 AC4 added these counters to make legible.
       if (suppressedBy === "terminal_source") closedTerminalSource += 1;
       else if (suppressedBy === "dependency_blocked") closedDependencyBlocked += 1;
+      else if (suppressedBy === "execution_ended") closedExecutionEnded += 1;
       else closedMonitorScheduled += 1;
     }
-    const retiredCount = closedMonitorScheduled + closedTerminalSource + closedDependencyBlocked;
+    const retiredCount =
+      closedMonitorScheduled + closedTerminalSource + closedDependencyBlocked + closedExecutionEnded;
     return {
       monitorScheduled: closedMonitorScheduled,
       terminalSource: closedTerminalSource,
       dependencyBlocked: closedDependencyBlocked,
+      executionEnded: closedExecutionEnded,
       // BLO-33477 AC4: funnel counters for the retirement pass. A sweep that
       // scans a full window and retires nothing is exactly what starvation
       // looks like, and without `scanned` it is indistinguishable from a
@@ -5747,6 +5862,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       closedSuppressedMonitorReviews: 0,
       closedTerminalSourceReviews: 0,
       closedDependencyBlockedReviews: 0,
+      closedExecutionEndedReviews: 0,
       // BLO-33477 AC4: the retirement pass's own funnel. Kept separate from the
       // `closed*` counters above because those are outcome tallies and one of
       // them (`closedTerminalSourceReviews`) is also credited by the stale
@@ -5768,6 +5884,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     result.closedSuppressedMonitorReviews = closedSuppressed.monitorScheduled;
     result.closedTerminalSourceReviews = closedSuppressed.terminalSource;
     result.closedDependencyBlockedReviews = closedSuppressed.dependencyBlocked;
+    result.closedExecutionEndedReviews = closedSuppressed.executionEnded;
     result.retirementScanned = closedSuppressed.scanned;
     result.retirementRetired = closedSuppressed.retired;
     result.retirementDeclined = closedSuppressed.declined;
