@@ -253,6 +253,123 @@ test("Step 4 emits the attestation Step 2 consumes", () => {
     + " short SHA is not a substitute for the 40-hex attestation");
 });
 
+// The producer half of BLO-32695. The gate reads `ally-verdict:1` as its
+// primary source, so the same consumer-with-no-producer failure applies: a
+// reader that understands blocks against an emitter that never posts one falls
+// back to the prose patterns on every review, which is the state that produced
+// the paperclip#1675 false red in the first place.
+function step4Template() {
+  const start = agentsDoc.indexOf("### Step 4");
+  assert.notEqual(start, -1, "Step 4 must exist");
+  const step4 = agentsDoc.slice(start, agentsDoc.indexOf("### Step 5", start));
+  const fence = /```markdown\n([\s\S]*?)```/.exec(step4);
+  assert.ok(fence, "Step 4 must retain its markdown review template");
+  return { step4, template: fence[1] };
+}
+
+test("Step 4 emits the structured verdict block the gate reads first", () => {
+  const { template } = step4Template();
+
+  // Matched against the parser's own opener, not against loose prose: the
+  // regex in ally-review-detection.ts is `<!--[ \t]*ally-verdict:(\d+)`, so a
+  // template that documented the marker in prose while emitting some other
+  // spelling would satisfy a laxer assertion and parse as `absent`.
+  assert.match(template, /<!--[ \t]*ally-verdict:1/,
+    "the template must emit an `<!-- ally-verdict:1` block — without a producer"
+    + " every review takes the prose fallback that BLO-32695 exists to retire");
+
+  // The three fields the gate actually consumes. `head` decides attestation,
+  // `findings` is the only route to blocking_finding, `dispositions` is the
+  // only route that retires a prior finding.
+  for (const field of ["head", "findings", "dispositions"]) {
+    assert.match(template, new RegExp(`"${field}"`),
+      `the block must carry a "${field}" field`);
+  }
+
+  // The parser's opener is line-anchored (`^` plus the NOT_INDENTED_CODE
+  // lookahead), so that a quoted mention cannot mint a phantom second block.
+  // That puts a requirement on the producer that a prose reading of the
+  // template would not reveal: indent the marker four spaces and every review
+  // parses as `absent`, silently falling back to the prose path this row
+  // retires. Asserted here because the failure is invisible on both sides.
+  assert.match(template, /(?:^|\n) {0,3}<!--[ \t]*ally-verdict:1/,
+    "the block must start at the beginning of a line, indented at most three"
+    + " spaces — the parser's opener is line-anchored and will not see it otherwise");
+});
+
+test("the template leads with the heading, not the verdict block", () => {
+  const { template } = step4Template();
+
+  const heading = template.indexOf("## Ally — Consolidated PR Review");
+  const block = template.indexOf("<!-- ally-verdict:1");
+  assert.notEqual(heading, -1, "positive control: the canonical heading is present");
+  assert.notEqual(block, -1, "positive control: the block is present");
+
+  // Every reader in THIS repo is line-anchored (`gim`), so either order parses
+  // here — which is exactly why the order has to be pinned by a test rather
+  // than discovered. Ally's live one-review-per-head guard is a managed bundle
+  // outside this repo and matches the heading at the FIRST BYTE, so a
+  // block-first body reads as "not yet reviewed" and the next wake re-reviews
+  // the same head. A COMMENTED review cannot be dismissed, so each duplicate
+  // is permanent until the head moves.
+  //
+  // Measured on paperclip#1721 (2026-09-15): of 17 reviews, the 4 whose body
+  // led with the block produced same-head duplicates at 2 heads (a8096107,
+  // d40c450b); the 13 that led with the heading produced 0.
+  assert.ok(heading < block,
+    "the `## Ally — Consolidated PR Review` heading must come BEFORE the"
+    + " ally-verdict block — a first-byte heading reader outside this repo"
+    + " misses a block-first body and re-reviews the head, and the duplicate"
+    + " COMMENTED review it files can never be dismissed");
+});
+
+test("the template's severity counts are all severities the gate can act on", () => {
+  const { template } = step4Template();
+
+  // BLOCKING_SEVERITIES in ally-review-detection.ts. A count outside this set
+  // is reported but never blocks, and — the sharper half — never mints a
+  // finding ref, because the disposition vocabulary cannot name one and the
+  // head could never be fully dispositioned.
+  const BLOCKING = new Set(["critical", "important"]);
+
+  const findings = /"findings"\s*:\s*\{([^}]*)\}/.exec(template);
+  assert.ok(findings, "Step 4's template must spell out the findings counts");
+  const keys = [...findings[1].matchAll(/"([a-z-]+)"\s*:/g)].map((m) => m[1]);
+
+  assert.ok(keys.length > 0, "the findings object must name its severities");
+  for (const key of BLOCKING) {
+    assert.ok(keys.includes(key), `the template must emit a "${key}" count`);
+  }
+
+  // Deliberately not an equality check: `suggestions` is emitted on purpose and
+  // must stay non-blocking. What this pins is that adding a *new* key is a
+  // decision, not an accident — the reviewer has to come here and say whether
+  // it blocks. Getting that wrong in the permissive direction reds a clean
+  // review; getting it wrong in the other direction drops a real finding.
+  const known = new Set([...BLOCKING, "suggestions"]);
+  const unknown = keys.filter((key) => !known.has(key));
+  assert.deepEqual(unknown, [],
+    `unrecognized severity count(s) ${unknown.join(", ")} — decide whether each`
+    + " blocks by adding it to BLOCKING_SEVERITIES, or record it here as"
+    + " non-blocking; leaving it unlisted means the gate silently ignores it");
+});
+
+test("the verdict block is additive, never a replacement for the prose line", () => {
+  const { template } = step4Template();
+
+  // Four readers parse `Reviewed head:` and only one understands the block
+  // (this module; plus commentAttestsHead in github-app-auth.ts,
+  // ATTESTED_HEAD_RE in check-ally-review-consistency.mjs, and
+  // HEAD_ATTESTATION_RE in sweep-stalled-ally-reviews.py). A block-only review
+  // attests nothing to the other three, and reader 2 then raises
+  // pr_review_output_missing — a false "reviewer never finished" on a review
+  // that was in fact completed.
+  assert.match(template, /<!--[ \t]*ally-verdict:1/, "positive control: the block is present");
+  assert.match(template, /(^|\n)Reviewed head: /,
+    "the prose attestation must survive alongside the block; dropping it breaks"
+    + " the three readers that do not parse the block");
+});
+
 test("the skip path posts a comment, not a review", () => {
   const block = idempotencyBlock();
 
@@ -276,3 +393,95 @@ test("the skip path posts a comment, not a review", () => {
   assert.doesNotMatch(code, /gh pr review[^\n]*--comment/,
     "the review API files a review object and recreates the violation");
 });
+
+/**
+ * Whether a source file defines `symbol`, as opposed to merely mentioning it.
+ *
+ * A definition form, not `includes`: the symbol appearing anywhere in the file
+ * satisfied the old assertion, including inside a comment, so a rename that
+ * left the old name in nearby prose still passed — which is exactly the rot
+ * the registry guard exists to catch.
+ *
+ * Two forms, because a Python module-level constant is a bare assignment with
+ * no keyword in front of it: REVIEWED_HEAD_PATTERN is defined that way and a
+ * keyword-only pattern rejected it. That alternative is anchored at column 0 —
+ * not merely at line start — because a module-level constant is never
+ * indented, while `symbol: value` one level in is an object key or an
+ * interface member, which defines nothing this registry means (Ally +
+ * TrafficOpsEngineer, #1721).
+ */
+function definesSymbol(symbol) {
+  return new RegExp(
+    String.raw`(?:^|\n)(?:[ \t]*(?:export[ \t]+)?(?:default[ \t]+)?(?:async[ \t]+)?` +
+      String.raw`(?:const|let|var|function|class|def|type|interface|enum)[ \t]+${symbol}\b` +
+      String.raw`|${symbol}[ \t]*[:=][^=])`,
+  );
+}
+
+test("the registry guard reads a definition, not a mention or a key", () => {
+  const defines = definesSymbol("REVIEWED_HEAD_PATTERN");
+
+  // Accepted: the two real forms, indented or not for the keyword branch.
+  assert.ok(defines.test("REVIEWED_HEAD_PATTERN = re.compile(r'...')\n"));
+  assert.ok(defines.test("export const REVIEWED_HEAD_PATTERN = /x/;\n"));
+  assert.ok(defines.test("  const REVIEWED_HEAD_PATTERN = /x/;\n"));
+
+  // Rejected: prose, and the indented key forms the column-0 anchor exists to
+  // exclude. Without that anchor the last two pass and the guard reports a
+  // file that defines nothing as a live reader.
+  assert.ok(!defines.test("// see REVIEWED_HEAD_PATTERN for the grammar\n"));
+  assert.ok(!defines.test("const readers = {\n  REVIEWED_HEAD_PATTERN: legacy,\n};\n"));
+  assert.ok(!defines.test("interface Readers {\n  REVIEWED_HEAD_PATTERN: RegExp;\n}\n"));
+});
+
+test("every reader the document names by symbol still exists", () => {
+  // The doc tells Ally to keep emitting the prose `Reviewed head:` line, and
+  // justifies it by naming the readers that parse it. That justification is the
+  // whole reason the line survives — so a symbol name that no longer exists does
+  // not read as a typo, it reads as "that reader was deleted", i.e. as
+  // permission to drop prose the remaining readers still need.
+  //
+  // Not hypothetical: master renamed `consolidatedReviewHead` ->
+  // `commentAttestsHead` in a74f9eae while this doc named the old symbol, and
+  // merging master carried the rename into the code while leaving the doc
+  // pointing at a dead name. Same family as the stale-identity guard above —
+  // one dead identifier, and the guard reading it matches nothing.
+  //
+  // Two registries, because the list is duplicated and fixing one copy does not
+  // fix the other. The first pass of this guard covered only the doc; the twin
+  // in the source module kept a name (`HEAD_ATTESTATION_RE`) that had never
+  // existed, and Ally found it by hand in review of #1721 at 97b4ddd1. The
+  // source comment is the more authoritative of the two, since it is the one an
+  // editor of the grammar reads before touching it.
+  const registries = [
+    [".planning/ally-agent/AGENTS.md", agentsDoc],
+    [
+      "server/src/services/ally-review-detection.ts",
+      readFileSync(join(here, "../server/src/services/ally-review-detection.ts"), "utf8"),
+    ],
+  ];
+
+  for (const [registry, text] of registries) {
+    // The path is backticked in Markdown prose and bare in the source comment,
+    // and must contain a directory: both files also mention a symbol "in
+    // github-app-auth.ts" as ordinary prose, which resolves against the repo
+    // root to a file that does not exist. Requiring a repo-relative path is
+    // what separates a registry entry from a passing reference, and costs no
+    // coverage — the same symbol is registered with its full path.
+    const pairs = [...text.matchAll(
+      /`([A-Za-z_][A-Za-z0-9_]*)` in `?([\w.-]+(?:\/[\w.-]+)+\.(?:ts|mjs|py))`?/g)];
+
+    // Positive control, per registry rather than over the union: a combined
+    // count would stay green while one registry's extraction silently matched
+    // nothing, which is the failure this guard is least able to notice.
+    assert.ok(pairs.length >= 3,
+      `expected ${registry} to name >=3 readers as \`symbol\` in \`file\`, got ${pairs.length}`);
+
+    for (const [, symbol, relPath] of pairs) {
+      const source = readFileSync(join(here, "..", relPath), "utf8");
+      assert.ok(definesSymbol(symbol).test(source),
+        `${registry} names \`${symbol}\` in ${relPath}, which does not define it`);
+    }
+  }
+});
+
