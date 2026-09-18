@@ -4,6 +4,7 @@ import {
   filterZombieCoalesceTarget,
   isCoalesceTargetPastHeartbeatInterval,
   filterIntervalOverrunCoalesceTarget,
+  describeIntervalOverrunCoalesceBypass,
   resolveStalledCoalesceBudgetMs,
   STALLED_COALESCE_INTERVAL_MULTIPLE,
   STALLED_COALESCE_MIN_BUDGET_MS,
@@ -321,5 +322,111 @@ describe("filterIntervalOverrunCoalesceTarget", () => {
     expect(
       filterIntervalOverrunCoalesceTarget({ target: null, source: "timer", intervalSec: 3600, now }),
     ).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PEN-1990: the record the filter leaves behind.
+//
+// The rule above decides silently, so a production activation was only ever
+// inferable by reconstructing overlapping same-scope run pairs out of the run
+// corpus — which cannot separate a filter activation from any other reason two
+// runs overlapped. These pin that the marker is emitted exactly when the
+// filter removed a target, and never otherwise.
+// ---------------------------------------------------------------------------
+describe("describeIntervalOverrunCoalesceBypass", () => {
+  const overrunTarget = { id: "stalled-1", startedAt: agoMs(4 * HOUR_MS) };
+
+  it("describes the removed target when the filter returned null", () => {
+    expect(
+      describeIntervalOverrunCoalesceBypass({
+        target: overrunTarget,
+        filteredTarget: null,
+        intervalSec: 3600,
+        now,
+      }),
+    ).toEqual({
+      targetRunId: "stalled-1",
+      targetStartedAt: agoMs(4 * HOUR_MS).toISOString(),
+      targetAgeMs: 4 * HOUR_MS,
+      budgetMs: STALLED_COALESCE_MIN_BUDGET_MS,
+      intervalSec: 3600,
+    });
+  });
+
+  it("reports the agent's own budget, not the floor, for a slow-cadence agent", () => {
+    const bypass = describeIntervalOverrunCoalesceBypass({
+      target: overrunTarget,
+      filteredTarget: null,
+      intervalSec: 86_400,
+      now,
+    });
+    expect(bypass?.budgetMs).toBe(86_400 * 1000 * STALLED_COALESCE_INTERVAL_MULTIPLE);
+    expect(bypass?.intervalSec).toBe(86_400);
+  });
+
+  // The two negatives. Without these the marker could be stamped on runs the
+  // filter had nothing to do with, and the measurement it exists for would
+  // over-report activations rather than being unavailable.
+  it("returns null when the target passed through the filter", () => {
+    expect(
+      describeIntervalOverrunCoalesceBypass({
+        target: overrunTarget,
+        filteredTarget: overrunTarget,
+        intervalSec: 3600,
+        now,
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null when there was no target to remove", () => {
+    expect(
+      describeIntervalOverrunCoalesceBypass({
+        target: null,
+        filteredTarget: null,
+        intervalSec: 3600,
+        now,
+      }),
+    ).toBeNull();
+  });
+
+  // Derived from the before/after pair rather than re-running the predicate,
+  // so the record can never contradict the decision that was acted on. A
+  // re-derivation would call this pair "no activation" — the filter says
+  // otherwise, and the filter is what happened.
+  it("records the activation even for an input the predicate would not have filtered", () => {
+    const freshTarget = { id: "fresh-1", startedAt: agoMs(60 * 1000) };
+    expect(
+      describeIntervalOverrunCoalesceBypass({
+        target: freshTarget,
+        filteredTarget: null,
+        intervalSec: 3600,
+        now,
+      }),
+    ).toMatchObject({ targetRunId: "fresh-1", targetAgeMs: 60 * 1000 });
+  });
+
+  it("reports unknown rather than NaN when startedAt is missing or unparseable", () => {
+    for (const startedAt of [null, "not-a-date"]) {
+      expect(
+        describeIntervalOverrunCoalesceBypass({
+          target: { id: "odd-1", startedAt },
+          filteredTarget: null,
+          intervalSec: 3600,
+          now,
+        }),
+      ).toMatchObject({ targetStartedAt: "unknown", targetAgeMs: -1 });
+    }
+  });
+
+  it("accepts an ISO string startedAt, as read back from the DB driver", () => {
+    expect(
+      describeIntervalOverrunCoalesceBypass({
+        target: { id: "iso-1", startedAt: agoMs(4 * HOUR_MS).toISOString() },
+        filteredTarget: null,
+        intervalSec: 3600,
+        now,
+      }),
+    ).toMatchObject({ targetAgeMs: 4 * HOUR_MS });
   });
 });
