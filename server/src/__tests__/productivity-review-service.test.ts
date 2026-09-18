@@ -8409,6 +8409,133 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).not.toContain("Suppressed by a scheduled monitor");
   });
 
+  // BLO-27698 B3b (Ally review on 7f4fbc43b) — `runaway_execution` is the only
+  // trigger in the set whose subject is a single in-flight run, and every option
+  // in its rubric ("let it finish", "bound it", "route to platform/SRE") is an
+  // instruction to a live process. Its real retirement predicate is therefore
+  // *the run ended*; source-`done` is a strictly narrower proxy. Before the
+  // `execution_ended` arm, the ordinary shape — run executes past the bar, review
+  // fires, run exits, issue stays `in_progress` — stranded an unanswerable review
+  // in a manager's queue indefinitely, because generation cannot retire one
+  // either (`createOrUpdateReview` returns null the moment no trigger fires, so
+  // an open review whose trigger stopped firing is never revisited).
+  //
+  // The source is deliberately NOT `done` here: that is the pre-existing
+  // `terminal_source` arm, and asserting `closedTerminalSourceReviews` is 0 is
+  // what stops this passing through it.
+  it("retires an open runaway_execution review once its run has stopped executing", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+    const finishedAt = new Date(now.getTime() - 30 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      // Terminal: `runLiveInterval` ends a terminal row at `finishedAt`, which is
+      // in the past, so `stillSignalling` is false and `liveExecutingMs` is 0.
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      finishedAt,
+      lastOutputAt: finishedAt,
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: startedAt });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: { trigger: "runaway_execution", sourceIssueId: seeded.issueId },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedExecutionEndedReviews).toBe(1);
+    expect(result.closedTerminalSourceReviews).toBe(0);
+    expect(result.closedDependencyBlockedReviews).toBe(0);
+    expect(result.closedSuppressedMonitorReviews).toBe(0);
+    const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
+    expect(review?.status).toBe("done");
+    const [closed] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, reviewId),
+          eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed"),
+        ),
+      );
+    // The source status is carried so a reader can see this retired on the run,
+    // not on the issue — the distinction the whole arm exists to draw.
+    expect(closed?.details).toMatchObject({
+      suppressedBy: "execution_ended",
+      sourceStatus: "in_progress",
+    });
+  });
+
+  // The converse, and the more important of the pair: a genuinely runaway run
+  // must stay flagged. Identical fixture except the run is still `running` and
+  // signalling, which is the only difference the `execution_ended` predicate is
+  // allowed to key on. Without this, the arm above could degrade into a blanket
+  // retirement of every `runaway_execution` review and the suite would stay green
+  // — B3b's own acceptance criterion is that a runaway run stays detectable.
+  it("keeps an open runaway_execution review while its run is still executing", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      // Signalled a minute ago, so `runLiveInterval` caps the span at `now` and
+      // `stillSignalling` holds.
+      lastOutputAt: new Date(now.getTime() - 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: startedAt });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: { trigger: "runaway_execution", sourceIssueId: seeded.issueId },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedExecutionEndedReviews).toBe(0);
+    const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
+    expect(review?.status).not.toBe("done");
+    expect(
+      await countReviewActivity(reviewId, "issue.productivity_review_suppressed_open_review_closed"),
+    ).toBe(0);
+  });
+
   // BLO-27698 B3b (Ally review follow-up) — `reconcileProductivityReviews`
   // selects candidates in `["todo", "in_progress"]`, but `elapsedMs` is null for
   // anything not `in_progress`. Without the `elapsedMs !== null` guard,
