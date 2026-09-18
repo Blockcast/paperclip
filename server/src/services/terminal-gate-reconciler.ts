@@ -259,6 +259,19 @@ export function buildTerminalGateResolvedComment(input: {
  * `E'\n'` literal on purpose — this is a JS template literal, so a backslash-n
  * written here would be collapsed to a real newline before PostgreSQL ever
  * parsed it. `chr(10)` means the same thing at both layers.
+ *
+ * `collate "C"` is load-bearing for the same reason: the TS sorts with JS
+ * `.sort()`, i.e. code-unit order, while a bare `order by` sorts under the
+ * database collation. Those agree under `C`/`C.UTF-8` and for most token pairs
+ * under glibc, but a non-`C` collation weights punctuation below alphanumerics,
+ * so a pair differing in punctuation position can sort oppositely
+ * (`deploy:paperclip-zzz` vs `deploy:paperclipapi`). The consequence is not a
+ * missed announcement — the digests differ, the row is admitted and the JS key
+ * filter drops it — but a permanently-consumed SCAN_LIMIT slot, which is the
+ * starvation vector this anti-join exists to remove, reached through a narrower
+ * door. No fixture can discriminate this on a `C`-collation test database,
+ * which is exactly why it has to be pinned here rather than asserted.
+ *
  * `normalizeIssueMonitorGateSignals` already
  * lowercases, trims and sorts on write (issue-execution-policy.ts), so the
  * stored array is in that form and no normalization is restated here. If a
@@ -273,7 +286,7 @@ export function buildTerminalGateResolvedComment(input: {
  * object/scalar `gateSignals` — that raises and aborts the whole pass.
  */
 const gateSignalDigestSql = sql`substr(encode(sha256(convert_to((
-  select coalesce(string_agg(distinct signal, chr(10) order by signal), '')
+  select coalesce(string_agg(distinct signal collate "C", chr(10) order by signal collate "C"), '')
   from jsonb_array_elements_text(
     case when jsonb_typeof(${issues.executionState} -> 'monitor' -> 'gateSignals') = 'array'
       then ${issues.executionState} -> 'monitor' -> 'gateSignals'
