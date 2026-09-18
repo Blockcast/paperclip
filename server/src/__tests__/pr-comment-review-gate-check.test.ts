@@ -61,6 +61,14 @@ function blockingCommentFor(headSha: string) {
   };
 }
 
+function cleanCommentFor(headSha: string, createdAt = "2026-08-04T22:09:19Z") {
+  return {
+    login: "allyblockcast[bot]",
+    body: `## Ally — Consolidated PR Review\nReviewed head: ${headSha}\n### Critical Issues (0)\n### Important Issues (0)`,
+    createdAt,
+  };
+}
+
 beforeEach(() => {
   h.cfg.prCommentReviewGateStatusContext = "review/ally-comment-gate";
   h.cfg.prCommentReviewGateRetiredStatusContexts = [];
@@ -324,6 +332,71 @@ describe("runPrCommentReviewGateCheck", () => {
     });
     expect(mockFetchPrAuthor).not.toHaveBeenCalled();
   });
+
+  it("clears a carried finding when a DISTINCT author's comment attests the head", async () => {
+    // BLO-34316 regression. The carried-finding branch consumes the withheld
+    // positive, so gating the author fetch on `outcome === "not_evaluated"`
+    // never fetched here — and `clean` is unreachable on the author-blind pass
+    // by construction. Result was a green->red flip on a merge-blocking status
+    // for a head an independent reviewer did attest.
+    mockFetchPrAuthor.mockResolvedValue("some-contributor");
+    mockListComments.mockResolvedValue([
+      blockingCommentFor("0".repeat(40)),
+      cleanCommentFor(TARGET.headSha),
+    ]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "clean" },
+    });
+    expect(mockFetchPrAuthor).toHaveBeenCalledWith({
+      repoFullName: TARGET.repoFullName,
+      prNumber: TARGET.prNumber,
+    });
+  });
+
+  it("tells a self-attesting author why their attestation did not clear the carry", async () => {
+    // Same input, author == reviewer identity. The red is correct here, but it
+    // must name the real reason: before the fetch reached this route the tail
+    // always rendered "not known to be independent", asserting the author was
+    // unreadable when it had simply never been requested.
+    mockFetchPrAuthor.mockResolvedValue("allyblockcast[bot]");
+    mockListComments.mockResolvedValue([
+      blockingCommentFor("0".repeat(40)),
+      cleanCommentFor(TARGET.headSha),
+    ]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "carried_finding" },
+    });
+    expect(mockPostStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        state: "failure",
+        description: expect.stringContaining("the only comment attesting it is the PR author's own"),
+      }),
+    );
+  });
+
+  it("publishes a carried finding whose author fetch failed rather than going silent", async () => {
+    // The fetch is now reached on a `failure` too, so its failure handling has
+    // to branch on `verdict.state`: withholding a red on an unreadable author
+    // would drop a finding the comment surfaces already justify.
+    mockFetchPrAuthor.mockResolvedValue(null);
+    mockListComments.mockResolvedValue([
+      blockingCommentFor("0".repeat(40)),
+      cleanCommentFor(TARGET.headSha),
+    ]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "carried_finding" },
+    });
+    expect(mockFetchPrAuthor).toHaveBeenCalled();
+  }, 10_000);
 
   it("does not fetch the PR author when nothing attests the head", async () => {
     // `not_evaluated` for "no comment attests this head" is reached from the
