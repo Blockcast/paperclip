@@ -434,7 +434,13 @@ describe("runEvidenceGate — truth probe", () => {
   // opposite of the CTO's 2026-09-16 ruling. `review:ally-clean` needs a head
   // to review; with no linked PR the assignee can never satisfy it, at any
   // flag value.
-  it("flag on + NO linked PR → warn, suppressed for its own distinct reason", async () => {
+  //
+  // Asserts the VERDICT, not just the absence of `unlabeled-truth-block`: the
+  // diagnostic alone passes under both readings of the ruling, and the earlier
+  // one (suppress the escalation, keep the shape in `missing`) left a permanent
+  // `warn` that `reviewPassRate` scores as not-pass forever. `pass` is the
+  // assertion that catches a regression to it.
+  it("flag on + NO linked PR on the unlabeled path → PASS, shape not required at all", async () => {
     const truth: TruthProbe = async () => ({
       detections: {},
       diagnostics: ["no-linked-pull-request"],
@@ -444,11 +450,15 @@ describe("runEvidenceGate — truth probe", () => {
     const rec = await runEvidenceGate(async () => checklistIssue(), "i1", NOW, truth, {
       unlabeledTruthBlock: true,
     });
-    expect(rec.verdict).toBe("warn");
-    expect(rec.diagnostics).toContain("unlabeled-truth-block-suppressed:no-linked-pull-request");
-    // Not folded into probe-failed: the runbook reads these apart.
-    expect(rec.diagnostics).not.toContain("unlabeled-truth-block-suppressed:probe-failed");
+    expect(rec.verdict).toBe("pass");
+    expect(rec.diagnostics).toContain("truth-shapes-not-required:no-linked-pull-request");
+    expect(rec.missing).not.toContain("review:ally-clean");
     expect(rec.diagnostics).not.toContain("unlabeled-truth-block");
+    // The escalation is not merely suppressed here — it is never reached, so
+    // neither suppression reason is emitted. The labeled case below is what
+    // keeps that arm live.
+    expect(rec.diagnostics).not.toContain("unlabeled-truth-block-suppressed:no-linked-pull-request");
+    expect(rec.diagnostics).not.toContain("unlabeled-truth-block-suppressed:probe-failed");
   });
 
   it("no probe supplied → truth shapes are simply missing, and it warns", async () => {

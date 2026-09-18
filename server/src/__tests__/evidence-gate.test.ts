@@ -1533,6 +1533,117 @@ describe("evaluateEvidence — truth shapes", () => {
   });
 });
 
+describe("evaluateEvidence — no linked PR: unsatisfiable, so not required (BLO-32239)", () => {
+  const DONE_WHEN = "## Done when\n- a\n- b\n- c\n";
+  const CHECKLIST = "| Criterion | Status |\n|---|---|\n| a | ✅ |\n| b | ✅ |\n| c | ✅ |";
+  const labeledComplete = () =>
+    agentComment(
+      [
+        "![desktop](./shot_1440x900.png)",
+        "![mobile](./shot_390x844.png)",
+        LANDING_ARTIFACT,
+        CHECKLIST,
+      ].join("\n"),
+    );
+
+  // The split is SATISFIABILITY, not blast radius. Suppressing the escalation
+  // (`unlabeled-truth-block-suppressed:no-linked-pull-request`) fixed the block
+  // hazard and left the metric one: the shape stayed in `missing`, so the
+  // verdict was a permanent `warn`, and `reviewPassRate` in agent-scorecards.ts
+  // counts warn and block identically as not-pass. Nothing an assignee of a
+  // doc-only issue could ever do would clear it.
+  it("unlabeled + no linked PR → PASS, the shape is not required at all", () => {
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [] },
+      comments: [agentComment(CHECKLIST)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      noLinkedPullRequest: true,
+    });
+    expect(result.verdict).toBe("pass");
+    expect(result.missing).toEqual([]);
+    expect(result.diagnostics).toContain("truth-shapes-not-required:no-linked-pull-request");
+  });
+
+  it("...at every flag value — the drop is upstream of the escalation, not a suppression", () => {
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [] },
+      comments: [agentComment(CHECKLIST)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      noLinkedPullRequest: true,
+      unlabeledTruthBlock: true,
+      probeFailed: false,
+    });
+    expect(result.verdict).toBe("pass");
+    expect(result.diagnostics).not.toContain("unlabeled-truth-block");
+    expect(result.diagnostics).not.toContain(
+      "unlabeled-truth-block-suppressed:no-linked-pull-request",
+    );
+  });
+
+  // The other side of the line, and the reason the drop is scoped to the
+  // unlabeled fallback: a LABELED assignee CAN satisfy the shape by opening a
+  // PR, so the gap is real and stays visible. Dropping it here too would let
+  // `landing-artifact`-via-commit-link reach `pass` with no review at all —
+  // exactly the fabrication hole the truth shapes were added to close.
+  it("LABELED + no linked PR → still required, still a warn, escalation suppressed", () => {
+    const input = {
+      issue: { description: DONE_WHEN, labels: [{ name: "frontend" }] },
+      comments: [labeledComplete()],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      noLinkedPullRequest: true,
+    };
+    const off = evaluateEvidence(input);
+    expect(off.verdict).toBe("warn");
+    expect(off.missing).toEqual(["review:ally-clean"]);
+    expect(off.diagnostics).not.toContain("truth-shapes-not-required:no-linked-pull-request");
+
+    // This is the case that keeps the escalation's `noLinkedPullRequest` arm
+    // reachable rather than dead code: flag on, and it suppresses rather than
+    // blocks.
+    const on = evaluateEvidence({ ...input, unlabeledTruthBlock: true, probeFailed: false });
+    expect(on.verdict).toBe("warn");
+    expect(on.diagnostics).toContain("unlabeled-truth-block-suppressed:no-linked-pull-request");
+    expect(on.diagnostics).not.toContain("unlabeled-truth-block");
+  });
+
+  // `probeFailed` must NOT get the drop. A probe that could not reach GitHub has
+  // not established that there is no PR, so laundering an outage into a `pass`
+  // would let a real gap through — the one direction the suppression logic is
+  // careful never to allow.
+  it("a FAILED probe keeps the shape required (no drop) and only suppresses", () => {
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [] },
+      comments: [agentComment(CHECKLIST)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      probeFailed: true,
+      unlabeledTruthBlock: true,
+    });
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(["review:ally-clean"]);
+    expect(result.diagnostics).toContain("unlabeled-truth-block-suppressed:probe-failed");
+    expect(result.diagnostics).not.toContain("truth-shapes-not-required:no-linked-pull-request");
+  });
+
+  // A mixed gap is untouched — the drop shrinks `required`, so it can only ever
+  // move a verdict warn -> pass, never reach down and clear a shape the agent
+  // does own.
+  it("a MIXED gap on a PR-less unlabeled issue still warns on the shape the agent owns", () => {
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [] },
+      comments: [agentComment("Done, no checklist.")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      noLinkedPullRequest: true,
+    });
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(["checklist:done-when"]);
+  });
+});
+
 describe("evaluateEvidence — a truth-only gap never hard-blocks (BLO-32239)", () => {
   const DONE_WHEN = "## Done when\n- a\n- b\n- c\n";
   const complete = () =>
