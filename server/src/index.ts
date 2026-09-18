@@ -70,7 +70,9 @@ import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createSingleFlightGate } from "./services/single-flight-gate.js";
 import {
   recordHeartbeatRecoveryChainDuration,
+  recordHeartbeatRecoveryChainInflight,
   recordHeartbeatRecoveryChainSkipped,
+  recordHeartbeatRecoveryChainStalled,
 } from "./services/metrics.js";
 import { createApiTierPluginWorkerManagerStub } from "./services/plugin-worker-manager-stub.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
@@ -1096,16 +1098,54 @@ export async function startServer(): Promise<StartedServer> {
   // That chain is the heaviest pass on the worker and the only one that pins a
   // whole materialized issue graph while it awaits, so overlapping it does not
   // just duplicate work — it duplicates hundreds of megabytes of retained heap.
+  //
+  // The gate skips a tick whose predecessor is still running, and abandons the
+  // gate outright once a pass has been outstanding past `stallCeilingMs`. That
+  // ceiling is the bound on the one failure this design would otherwise be blind
+  // to: every cleanup path in the gate requires the pass to *finish*, so a chain
+  // that never settles at all would hold the flag for the life of the process
+  // and silently stop orphan reaping, retry promotion, stranded-issue
+  // reconciliation and every other recovery pass — a quieter failure than the
+  // heap abort it replaces, and therefore a worse one.
+  //
+  // 20 intervals (10 min at the 30 s default) is deliberately far above any
+  // plausible honest pass. The production incident was a chain slowed by pool
+  // contention, not a hung one, and a ceiling low enough to abandon a slow pass
+  // would recreate exactly the overlap this gate exists to prevent. The floor
+  // keeps that true for a short configured interval.
+  const heartbeatRecoveryChainStallCeilingMs = Math.max(
+    10 * 60_000,
+    20 * config.heartbeatSchedulerIntervalMs,
+  );
   const heartbeatRecoveryChainGate = createSingleFlightGate({
-    onSkip: () => {
+    stallCeilingMs: heartbeatRecoveryChainStallCeilingMs,
+    onSkip: (elapsedMs) => {
       recordHeartbeatRecoveryChainSkipped();
+      recordHeartbeatRecoveryChainInflight(elapsedMs);
+      // `elapsedMs` is the payload that makes this line actionable: it is what
+      // separates "the chain is taking 35 s" from "the chain has been wedged for
+      // six hours", and only the second is worth a page.
       logger.warn(
-        {},
+        { elapsedMs, stallCeilingMs: heartbeatRecoveryChainStallCeilingMs },
         "periodic heartbeat recovery chain still running at tick; skipping this tick (PEN-3314)",
       );
     },
     onSettled: (durationMs) => {
       recordHeartbeatRecoveryChainDuration(durationMs);
+      // No pass is outstanding now. Leaving the previous value behind would keep
+      // the overlap alert firing against a worker that has already recovered.
+      recordHeartbeatRecoveryChainInflight(0);
+    },
+    onStalled: (elapsedMs) => {
+      recordHeartbeatRecoveryChainStalled();
+      // A fresh pass is starting this same tick, so the in-flight clock restarts.
+      recordHeartbeatRecoveryChainInflight(0);
+      logger.error(
+        { elapsedMs, stallCeilingMs: heartbeatRecoveryChainStallCeilingMs },
+        "periodic heartbeat recovery chain exceeded the stall ceiling without settling; "
+          + "admitting the next tick (PEN-3314). The abandoned pass is still running and may "
+          + "still hold a database connection.",
+      );
     },
   });
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
