@@ -102,7 +102,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
-          "expr": "min(paperclip_overdue_scheduled_retry_age_metrics_refresh_success)",
+          "expr": "min(paperclip_overdue_scheduled_retry_age_metrics_refresh_success) or vector(0)",
           "legendFormat": "refresh ok",
           "instant": true
         }

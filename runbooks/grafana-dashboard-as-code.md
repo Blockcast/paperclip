@@ -55,15 +55,25 @@ Verified against the live cluster on 2026-09-02:
 ## Adding a whole new dashboard
 
 Same, plus copy `templates/grafana-dashboard-runtime.yaml` to a new file and
-change two things: the ConfigMap name suffix and the `.Files.Get` path. The
-templates are deliberately one-file-per-dashboard rather than a glob — see the
-comment at the top of that file for why.
+change three things: the ConfigMap name suffix, the `.Files.Get` path, and the
+new dashboard's top-level `"uid"` in the JSON. **Changing the first two and not
+the third is the trap** — see below. The templates are deliberately
+one-file-per-dashboard rather than a glob — see the comment at the top of that
+file for why.
 
 ## Traps that produce a silently-empty dashboard
 
 These all deploy cleanly and render a dashboard that is simply wrong or blank.
 None of them fail loudly.
 
+- **Duplicate dashboard `uid`.** Grafana keys dashboards by the JSON's
+  top-level `uid`, not by filename or ConfigMap name. Copying an existing
+  dashboard as a starting point and forgetting to change its `uid` ships two
+  dashboards claiming the same one; both ConfigMaps apply, both show up in
+  `kubectl get cm`, and in Grafana one silently replaces or fails to provision
+  the other. Pinned by the duplicate-`uid` test in
+  `deploy/helm/paperclip/tests/grafana-dashboard-runtime.test.mjs`, which
+  renders every `dashboards/*.json` through the chart and fails on a repeat.
 - **Wrong datasource.** Only the `cluster` datasource
   (`http://prometheus.monitoring.svc:9090`) scrapes the Paperclip control
   plane. `thanos` is the Grafana default and `prometheus-monitoring` is the
