@@ -172,27 +172,50 @@ ALLY_REQUEST_REVIEWER_LOGIN = os.environ.get("ALLY_REQUEST_REVIEWER_LOGIN") or "
 # n=706 started Ally `pr_review:` runs, wait = `startedAt - createdAt`:
 #
 #     p50 268m (4h28m) | p90 338m | max 405m | min 45m
-#     > 90m: 697/706 = 99%     (plus 107 still queued, median age 201m)
+#     > 90m: 697/706 = 99%
+#
+# plus 107 `pr_review` runs still QUEUED at observation: median age 201m,
+# max age 408m. Report that tail, because it is what censors the sample.
+# A queued run's eventual wait is unknown but strictly GREATER than its
+# current age, and long waits are disproportionately the ones still queued
+# when you look -- so `max 405m` over the started cohort is a biased-LOW
+# estimate of the population max, over a sample ~13% censored (107/813).
 #
 # Reproduce with:
 #
 #     GET /companies/{companyId}/heartbeat-runs?agentId=<ally>&limit=1000
 #     keep runs whose `contextSnapshot.taskKey` starts with "pr_review:"
-#     wait = startedAt - createdAt   (queued runs: now - createdAt)
+#     wait = startedAt - createdAt   (queued runs: now - createdAt; report
+#     those separately -- they are a lower bound, not an observation)
 #
-# 8h sits above the observed max wait (405m) with service headroom. Re-run
-# that query before trusting it; if p90 has moved, move this with it.
+# 8h is therefore picked off p90, not off the max: 480m is 1.42x p90 (338m),
+# and 72m above the largest wait-so-far seen anywhere in the sample (408m,
+# a queued run). It does NOT also claim a separate service-time buffer on
+# top; BLO-22892's 6m35s/30m service figures fit inside that 72m only while
+# the censored tail stays where it is. The failure direction is benign --
+# understating the ceiling costs a false re-fire, never a missed loss -- so
+# the multiplier, not the max, is the thing to re-derive. Re-run the query
+# before trusting it; if p90 has moved, move this with it.
 #
 # KNOWN CEILING -- elapsed time is structurally the wrong instrument. It
 # cannot distinguish a LOST wake from a merely QUEUED one, which is the only
 # distinction that matters here: no elapsed-time value separates them, so any
 # value is a trade between false author-wakes and slow loss detection. The
-# sound discriminator is "does a `heartbeat_run` row exist for this request's
-# `pr_review:<repo>:<n>` taskKey?" -- a queued row means healthy, no row means
-# genuinely lost. review-gate-sweep.yml carries only `GITHUB_TOKEN` and no
-# Paperclip credential, so that check is unreachable from CI today; granting
-# the sweep API access is a strictly larger blast radius and belongs in its
-# own row.
+# sound discriminator is the `heartbeat_run` row for this request's
+# `pr_review:<repo>:<n>` taskKey, and it is a THREE-state read, not two:
+#
+#     no row at all          -> the wake never landed: genuinely lost
+#     queued or running row  -> dispatch is healthy SO FAR
+#     terminal row, no review -> lost, and the alarm must still fire
+#
+# The third state is not hypothetical: `process_lost` and
+# `external_lifecycle_stale_killed` are live wake reasons on this fleet, so a
+# run can be created, start, and die mid-flight without posting a review.
+# Reading row-exists as health would call that healthy forever -- a false
+# negative in the same direction as the bug this script backstops.
+# review-gate-sweep.yml carries only `GITHUB_TOKEN` and no Paperclip
+# credential, so that check is unreachable from CI today; granting the sweep
+# API access is a strictly larger blast radius and belongs in its own row.
 STALL_THRESHOLD_SECONDS = int(os.environ.get("STALL_THRESHOLD_SECONDS") or 8 * 60 * 60)
 
 # Don't re-fire more than once per cooldown window even if still stalled --
@@ -234,17 +257,18 @@ MAX_REFIRES_PER_RUN = int(os.environ.get("MAX_REFIRES_PER_RUN") or 5)
 # +1h, because this repo's sweep runs HOURLY rather than every 30 minutes
 # (see review-gate-sweep.yml for the rate-limit arithmetic behind that). The
 # extra hour is the polling granularity: worst case a head goes stale just
-# after a run, so with STALL at 8h its first re-fire lands at 480m+60m=540m
-# and its cooldown expires at 660m, making the next re-fire opportunity 720m.
-# The formula gives 720m (12h) -- i.e. the alarm now lands exactly ON that
-# second re-fire opportunity rather than 30m past it, as it did at the old
-# 90m STALL. That is cosmetic: the property the margin buys is "at least one
+# after a run, so with STALL at 8h its first re-fire lands at 480m+60m=540m.
+# Its cooldown then expires at 660m, and the boundary is INCLUSIVE --
+# `should_refire` blocks only on `since_last < REFIRE_COOLDOWN_SECONDS`, so
+# the hourly run at exactly 660m is already eligible. The formula gives 720m
+# (12h), clearing that second re-fire opportunity by a full hour rather than
+# landing on it. Either way the property the margin buys holds: "at least one
 # full re-fire AND its cooldown have come and gone", and at 720m both (540m,
-# 660m) are in the past. Kept as a formula so it tracks STALL automatically;
-# the 12h it yields is ~1.8x the measured max dispatch wait (405m) recorded
-# above STALL_THRESHOLD_SECONDS, so a normally-queued PR no longer alarms.
-# Before BLO-34521 it was 330m, INSIDE the normal distribution -- ~14% of
-# healthy dispatches went red.
+# 660m) are strictly in the past. Kept as a formula so it tracks STALL
+# automatically; the 12h it yields is ~1.8x the largest dispatch wait seen in
+# the sample recorded above STALL_THRESHOLD_SECONDS (408m), so a normally-
+# queued PR no longer alarms. Before BLO-34521 it was 330m, INSIDE the normal
+# distribution -- ~14% of healthy dispatches went red.
 ALARM_THRESHOLD_SECONDS = int(
     os.environ.get("ALARM_THRESHOLD_SECONDS") or (STALL_THRESHOLD_SECONDS + REFIRE_COOLDOWN_SECONDS + 2 * 60 * 60)
 )
@@ -732,11 +756,15 @@ def too_young_to_be_stranded(pr_payload, now):
 
     Call volume is the binding constraint on this job, not correctness: in
     `status-free` mode every non-draft PR costs at least three requests (head
-    commit + comments page + reviews page). Measured on this repo, 108
-    non-draft open PRs is ~346 requests per run, and at `9,39 * * * *` that is
-    ~700 requests/hour from this job alone against `github.token`'s documented
-    budget of 1,000/hour/repository -- shared with every other workflow here.
-    Exhaustion would not be an edge case, it would be the steady state.
+    commit + comments page + reviews page). Re-measured 2026-09-18T22:55Z on
+    this repo (BLO-34521): 110 non-draft unlocked open PRs of 116 open is
+    ~330 requests per run. The half-hourly `9,39 * * * *` cadence this
+    paragraph was written against would have made that ~660 requests/hour
+    from this job alone, against `github.token`'s documented budget of
+    1,000/hour/repository -- shared with every other workflow here, so
+    exhaustion would have been the steady state rather than an edge case.
+    That is why review-gate-sweep.yml now runs hourly; see the rate-limit
+    arithmetic there, which also records what this cut is currently worth.
 
     The cheap proof: `unreviewed_since` returns `max(created_at,
     committer_date)` (each clamped to `now`), so `pending_since >=

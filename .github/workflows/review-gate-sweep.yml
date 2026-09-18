@@ -46,16 +46,29 @@ on:
     # case. Hourly halves it to ~359/hour and leaves real headroom.
     #
     # The cheap predicate-level cut (skipping PRs younger than the stall
-    # threshold, which cannot be stranded) was measured too and saves only
-    # 3 of those 359 calls on this repo -- almost every open PR here is
-    # older than 90 minutes. It is kept because it is free and correct, but
-    # cadence is the lever that actually moves the number.
+    # threshold, which cannot be stranded) scales with that threshold, so
+    # BLO-34521's 90m -> 8h move changed it. Re-measured 2026-09-18T22:55Z
+    # over all 116 open PRs, using the script's own `pending_since` =
+    # max(created_at, committer_date): 110 non-draft and unlocked -> ~330
+    # requests per run uncut, of which 19 are younger than 8h, so the cut now
+    # saves ~57 (~17%). At the old 90m threshold only 2 qualified -- ~6 calls,
+    # ~2% -- which is why this paragraph used to dismiss the cut as noise.
+    # Cadence is still the bigger lever (hourly vs `9,39` is worth ~330/hour
+    # against a 1,000/hour budget), but the cut is no longer rounding error.
     #
-    # ALARM_THRESHOLD_SECONDS is raised to 5.5h in the script to absorb the
-    # coarser polling granularity -- see the comment on that constant. Off
-    # the hour to avoid clustering with every other cron in the org, and
-    # offset from trafficcontrol (7,37) and pim-multicast-gateway (8,38) so
-    # the repos' sweeps do not fire their re-requests at Ally at once.
+    # Measure it with the committer date, not `created_at` alone: an old PR
+    # pushed an hour ago is young by this predicate, and ignoring that
+    # undercounts the cut severalfold (4 vs 19 on the same day). Re-derive
+    # rather than inherit -- these track the open-PR backlog, which is why the
+    # 2026-08-21 pair above no longer reproduces.
+    #
+    # ALARM_THRESHOLD_SECONDS derives as STALL + COOLDOWN + 2h in the script
+    # -- 12h at the current constants -- to absorb the coarser polling
+    # granularity. See the comment on that constant rather than trusting the
+    # number here. Off the hour to avoid clustering with every other cron in
+    # the org, and offset from trafficcontrol (7,37) and
+    # pim-multicast-gateway (8,38) so the repos' sweeps do not fire their
+    # re-requests at Ally at once.
     - cron: '9 * * * *'
   workflow_dispatch: {}
 
