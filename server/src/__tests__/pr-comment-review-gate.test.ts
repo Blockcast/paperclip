@@ -765,9 +765,12 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
       comments,
     });
     // The other route to the same suppression: an unreadable `GET /pulls/{n}`
-    // must not be able to hide the red either. The caller only fetches the
-    // author on `authorUnknown`, so returning the red here means it publishes
-    // without the author at all.
+    // must not be able to hide the red either. This one carries `authorUnknown`
+    // because the author can still change the verdict here — a DISTINCT author's
+    // at-head attestation dispositions the carry (the control below) — so the
+    // caller must fetch rather than pin this red on the author-blind pass. The
+    // safety property moves to the caller: on a failed fetch it publishes the
+    // red in hand instead of withholding, asserted in the check-level suite.
     const authorUnknown = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
       prAuthorLogin: null,
@@ -777,7 +780,9 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
     expect(selfAttested).toMatchObject({ state: "failure", outcome: "carried_finding" });
     expect(commentReviewGateCheckConclusion(selfAttested)).toBe("failure");
     expect(authorUnknown).toMatchObject({ state: "failure", outcome: "carried_finding" });
-    expect(authorUnknown.authorUnknown).toBeUndefined();
+    expect(authorUnknown.authorUnknown).toBe(true);
+    // The settled verdict must NOT re-request the author: it would loop.
+    expect(selfAttested.authorUnknown).toBeUndefined();
 
     // The red must not tell the author "no comment attests the current head":
     // on both these routes one does, and the action that sentence invites is

@@ -102,6 +102,15 @@ export type CommentReviewGateVerdict =
       reason: string;
       commentCreatedAt: string;
       carriedFromHeadSha: string;
+      /**
+       * Same meaning as on `not_evaluated`, and it has to exist here too: a
+       * carried finding CONSUMES the withheld positive rather than returning
+       * it, so without this flag the author-blind first pass pins the verdict
+       * and the caller never fetches the author — making `clean` unreachable
+       * for a distinct author whose at-head attestation should have cleared
+       * the carry, and leaving the self-attested tail below unrenderable.
+       */
+      authorUnknown?: true;
     };
 
 function toEpochMs(value: string | Date): number {
@@ -362,7 +371,7 @@ export function evaluateCommentReviewGate(input: {
   // the reviewer ever writes ledgers: the BLO-29711 deadlock this module exists
   // to avoid. What this branch closes is the malformed-ledger shape, where the
   // section parses as absent and the bare attestation was the whole claim.
-  let withheldPositive: CommentReviewGateVerdict | null = null;
+  let withheldPositive: Extract<CommentReviewGateVerdict, { outcome: "not_evaluated" }> | null = null;
 
   if (forHead) {
     if (hasActionablePrReviewFeedback(forHead.comment.body)) {
@@ -453,6 +462,11 @@ export function evaluateCommentReviewGate(input: {
       reason,
       commentCreatedAt: new Date(toEpochMs(carried.comment.createdAt)).toISOString(),
       carriedFromHeadSha: carried.attestedHeadSha,
+      // Carried forward so the caller still fetches the author on this route.
+      // A distinct author's at-head attestation clears the carry outright (the
+      // `clean` return above), so pinning this red on the author-blind pass
+      // would publish a red the evidence does not support.
+      ...(withheldPositive?.authorUnknown ? { authorUnknown: true as const } : {}),
     };
   }
 
@@ -778,18 +792,26 @@ async function executeCommentReviewGateCheck(
     // silent is the direction this module must not get wrong.
     let verdict = evaluateCommentReviewGate({ comments, headSha, reviewerBotLogin, prAuthorLogin: null });
 
-    // `authorUnknown` marks the one outcome that would have been `clean`. Only
-    // there is the author worth a request, and only there is an unreadable one
-    // a `fetch_failed`: publishing `neutral` on incomplete evidence would
-    // overwrite a correct earlier verdict with a weaker one on a transient 5xx.
-    // Not publishing leaves it standing, and the next webhook re-evaluates.
-    if (verdict.outcome === "not_evaluated" && verdict.authorUnknown) {
+    // `authorUnknown` marks every outcome the author could still change, which
+    // is both the withheld positive and the carried finding that consumed it —
+    // gating on the OUTCOME instead would never fetch on the carried route, and
+    // `clean` is unreachable on the author-blind pass by construction.
+    if ("authorUnknown" in verdict && verdict.authorUnknown) {
       const prAuthorLogin = await withBoundedRetry(
         () => githubFetchPrAuthorLogin({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
         (login) => login == null,
       );
-      if (!prAuthorLogin) return { posted: false, reason: "fetch_failed" };
-      verdict = evaluateCommentReviewGate({ comments, headSha, reviewerBotLogin, prAuthorLogin });
+      if (prAuthorLogin) {
+        verdict = evaluateCommentReviewGate({ comments, headSha, reviewerBotLogin, prAuthorLogin });
+      } else if (verdict.state === "success") {
+        // Publishing `neutral` on incomplete evidence would overwrite a correct
+        // earlier verdict with a weaker one on a transient 5xx. Not publishing
+        // leaves it standing, and the next webhook re-evaluates.
+        return { posted: false, reason: "fetch_failed" };
+      }
+      // A `failure` stands on the comment surfaces alone — the author can only
+      // ever soften it — so it publishes even with the author unread. Going
+      // silent there is the direction this module must not get wrong.
     }
 
     warnOnceIfMisreadableContext(verdict, context);
