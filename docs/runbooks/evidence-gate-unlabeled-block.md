@@ -15,6 +15,22 @@ plus a redeploy.
 
 ## What the flag does and does not govern
 
+> **The name is narrower than the behaviour.** The env var says `UNLABELED`,
+> but the escalation binds **any** truth-only gap — labeled or unlabeled. A
+> labeled issue missing only `review:ally-clean` is escalated to `block` on the
+> same path as an unlabeled one; the guard has no label test
+> (`unlabeledTruthBlock && truthOnlyGap && blockableGap` in
+> `server/src/services/evidence-gate.ts`, which says the same thing at
+> `unlabeledTruthBlock`'s docstring). The name is kept because it is
+> load-bearing in the Helm chart, this runbook and the measurement baseline.
+>
+> So the blast radius is **not** the unlabeled doc/refactor population alone.
+> Six labeled arrays require `review:ally-clean` (`frontend`, `ui`,
+> `cms-published`, `backend`, `db-migration`, `migration` in
+> `evidence-shapes.ts`) — the code-completion labels, i.e. plausibly the
+> dominant share. A `willBlock` count above the flip gate is not by itself
+> evidence of an unlabeled-side problem; scope the investigation to both.
+
 | shape | satisfiable when entering `in_review`? | flag makes it blocking? |
 |---|---|---|
 | `review:ally-clean` | yes — a PR may be open, at head, 0 Critical / 0 Important | **yes**, unless suppressed (below) |
@@ -77,9 +93,9 @@ expect near zero.
 >
 > - `no-linked-pull-request` — bare, pushed by the **probe**
 >   (`evidence-truth.ts`) whenever it finds no linked PR. Emitted on every
->   path and at every flag value, including labeled issues that never reach
->   the unlabeled escalation. This is the one the jq above wants: the backfill
->   population is "has no linked PR", not "was suppressed".
+>   path and at every flag value, labeled or unlabeled. This is the one the jq
+>   above wants: the backfill population is "has no linked PR", not "was
+>   suppressed".
 > - `unlabeled-truth-block-suppressed:no-linked-pull-request` — pushed by the
 >   **evaluator** (`evidence-gate.ts`) only where escalation would otherwise
 >   have fired. A strict subset.
@@ -93,7 +109,8 @@ expect near zero.
 
 **2. The agent-scorecard pass rate, BEFORE the measurement window opens.**
 `reviewPassRate = pass / (pass + warn + block)` counts `warn` as not-pass
-(`server/src/services/agent-scorecards.ts:116`). Every issue that reaches
+(see `reviewPassRate` in `server/src/services/agent-scorecards.ts`). Every issue
+that reaches
 `in_review` without a merged, Ally-clean PR now records `warn` where it used to
 record `pass`, so **every agent's `reviewPassRate` steps down on deploy day for
 reasons unrelated to agent behaviour**. Capture the pre-deploy numbers or the
@@ -165,7 +182,10 @@ change its only excess is the two suppressed populations.
 
 Seven consecutive days with **all** of:
 
-- `willBlock` below 2% of `total`;
+- `willBlock` below 2% of `total`, **or** `willBlock` of 0 on a `total` under
+  50 — below that the percentage is arithmetically "must be 0" (2% of 50 is one
+  issue), so state the floor rather than letting a single slow-to-review PR read
+  as a broken gate;
 - `probeFailed` below 2% of `total`;
 - the landing routine merged every candidate it selected.
 
@@ -183,8 +203,9 @@ tolerance this runbook already uses for `probeFailed`, so there is one number to
 remember rather than three.
 
 Then set `unlabeledTruthBlock: "1"` and open
-`feat(evidence): enforce truth shapes for unlabeled issues` with the seven daily
-rows in the body.
+`feat(evidence): enforce review:ally-clean on truth-only gaps (labeled and
+unlabeled)` with the seven daily rows in the body. Do not describe the flip as
+unlabeled-only in the permanent record — see the scope note at the top.
 
 ## Abort criterion — check daily after the flip
 
