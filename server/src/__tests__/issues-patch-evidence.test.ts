@@ -403,14 +403,21 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
         .patch(`/api/issues/${issueId}`)
         .send({ status: "in_review" });
       expect(inReview.status, JSON.stringify(inReview.body)).toBe(200);
-      // BLO-32239: warn, not pass — no linked PR, so the two truth shapes are
-      // missing. The point of the case is the unlabeled fallback and the
-      // re-evaluation below, both unchanged.
+      // BLO-32239: `pass`. This issue has no linked PR, so on the UNLABELED
+      // path `review:ally-clean` is unsatisfiable and is therefore not
+      // required at all — see `prLessUnlabeledTruthDrop` in evidence-gate.ts.
+      // It warned while the shape was still counted in `missing`; that was the
+      // permanent-`warn` metric hazard the drop removes. The subject of this
+      // case is the unlabeled fallback and the re-evaluation below, both
+      // unchanged — the `block` after labeling is what it actually pins.
       expect(inReview.body.lastEvidenceVerdict).toMatchObject({
-        verdict: "warn",
+        verdict: "pass",
         unlabeledFallback: true,
-        missing: ["review:ally-clean"],
+        missing: [],
       });
+      expect(inReview.body.lastEvidenceVerdict.diagnostics).toEqual(
+        expect.arrayContaining(["truth-shapes-not-required:no-linked-pull-request"]),
+      );
 
       const labeled = await request(createApp())
         .patch(`/api/issues/${issueId}`)

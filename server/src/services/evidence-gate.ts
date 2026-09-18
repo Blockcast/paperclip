@@ -686,7 +686,47 @@ export function evaluateEvidence(
   const text = buildAgentEvidenceText(input.comments, limit);
   const resolved = resolveRequiredShapes(input.issue, input.registry);
   const { unlabeledFallback } = resolved;
-  const required = resolved.required;
+
+  // A truth shape is computed against a PR head. On the UNLABELED fallback with
+  // no linked PR, there is no head and never will be, so no truth shape is
+  // REQUIRED — the same demotion `deploy:landed` got for being unsatisfiable at
+  // the moment it is evaluated (evidence-shapes.ts).
+  //
+  // Suppressing only the escalation (below) fixed the BLOCK hazard and left the
+  // METRIC one: `missing` still carried the shape, so the verdict stayed a
+  // permanent `warn`, and `reviewPassRate` (`agent-scorecards.ts`, where warn
+  // and block are both not-pass) was depressed for work no agent behaviour
+  // could change. Inverted, not degraded — same diagnosis as `deploy:landed`.
+  //
+  // Scoped to the unlabeled fallback ON PURPOSE, and the line is satisfiability,
+  // not blast radius:
+  //   - Unlabeled is the doc-only / refactor population (see
+  //     DEFAULT_UNLABELED_REQUIRED). There is no code to open a PR for, so the
+  //     shape is unsatisfiable FOREVER and must not be binding.
+  //   - A LABELED code issue with no linked PR keeps the shape required. Its
+  //     assignee CAN satisfy it — open a PR and let the webhook link it — so it
+  //     is a real gap, and it stays a `warn` via `truth-gap-warn-only` with the
+  //     escalation suppressed by `noLinkedPullRequest` below. Dropping it there
+  //     would let `landing-artifact`-via-commit-link reach `pass` with no review
+  //     at all, which is the hole the truth shapes exist to close.
+  //
+  // `probeFailed` deliberately gets NO drop: a probe that could not reach GitHub
+  // has not established that there is no PR. The shape stays required and only
+  // the escalation is suppressed, so an outage can never launder a gap into a
+  // `pass`.
+  //
+  // Can only move a verdict warn -> pass; it shrinks `required` and never grows
+  // it. A mixed gap is untouched.
+  const prLessUnlabeledTruthDrop =
+    unlabeledFallback &&
+    input.noLinkedPullRequest === true &&
+    resolved.required.some((s) => TRUTH_SHAPES.includes(s));
+  const required = prLessUnlabeledTruthDrop
+    ? resolved.required.filter((s) => !TRUTH_SHAPES.includes(s))
+    : resolved.required;
+  if (prLessUnlabeledTruthDrop) {
+    diagnostics.push("truth-shapes-not-required:no-linked-pull-request");
+  }
 
   const doneWhenApplicable =
     !!input.issue.description && countDoneWhenBullets(input.issue.description) > 0;
@@ -771,16 +811,29 @@ export function evaluateEvidence(
   // `review:ally-clean` needs a head to review; with no linked PR there is no
   // head, so the shape is unsatisfiable by the assignee FOREVER — not merely
   // at this transition, as with `deploy:landed`. An AC an assignee cannot
-  // satisfy is a stall amplifier, not a gate. It is also exactly backwards to
-  // hard-block PR-less work on the UNLABELED path, which exists precisely to
-  // cover doc-only and refactor issues (see evidence-shapes.ts). If we ever
-  // want "code work must have a PR", that is an explicit requirement on a
-  // labeled path — not a side effect of an absent probe result.
+  // satisfy is a stall amplifier, not a gate. If we ever want "code work must
+  // have a PR", that is an explicit requirement on a labeled path — not a side
+  // effect of an absent probe result.
+  //
+  // The population reaching this arm is now LABELED-only: on the unlabeled
+  // fallback the shape is dropped from `required` outright (see
+  // `prLessUnlabeledTruthDrop` above), so its gap is empty and `truthOnlyGap` is
+  // false before we get here. Both defenses are live and neither is dead code —
+  // they cover disjoint populations, and the split is satisfiability: the
+  // labeled assignee can open a PR, the doc-only one cannot.
   //
   // The gap must also contain a shape the flag is ALLOWED to bind — see
   // BLOCKABLE_TRUTH_SHAPES. A gap of only `deploy:landed` stays a warn at every
   // flag setting: it is informational by construction, feeding the scorecards
   // and the rollout measurement without ever gating the transition.
+  //
+  // Since `deploy:landed` is required NOWHERE in DEFAULT_EVIDENCE_REGISTRY or
+  // DEFAULT_UNLABELED_REQUIRED, it can never enter `missing` on a shipped path,
+  // so `blockableGap` is vacuously true there — belt-and-braces, not dead. It is
+  // still reachable through a custom `registry` that requires the shape, and one
+  // test drives exactly that: it is what pins the flag's scope to
+  // BLOCKABLE_TRUTH_SHAPES independently of the registry decision, so the two
+  // can never silently collapse into one.
   const blockableGap = missing.some((s) => BLOCKABLE_TRUTH_SHAPES.includes(s));
   if (verdict === "warn" && input.unlabeledTruthBlock === true && truthOnlyGap && blockableGap) {
     // Distinct reasons stay distinct in the verdict: the runbook's seven-day

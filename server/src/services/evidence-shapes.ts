@@ -134,6 +134,23 @@ export const DEFAULT_EVIDENCE_REGISTRY: EvidenceRegistry = {
  * `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK` is on AND the probe actually
  * established truth — see `unlabeledTruthBlock` in `evidence-gate.ts`.
  *
+ * ...and it is dropped from `required` entirely when the probe establishes
+ * there is no linked PR, so it never shows up in `missing` for work that can
+ * never acquire a head to review. The same unsatisfiable-at-evaluation test
+ * that demoted `deploy:landed` below, applied to the one population this
+ * fallback exists for. Without that, every doc-only issue's verdict was a
+ * permanent `warn` and `reviewPassRate` carried a not-pass no agent behaviour
+ * could clear. The shape stays registered and detected; `allDetected` still
+ * reports it.
+ *
+ * The two shapes are still treated differently, and the line is WHO can satisfy
+ * them, not how much they bite:
+ *   - `deploy:landed` is unsatisfiable for EVERY issue at the only transition
+ *     the gate runs on, so it is required nowhere.
+ *   - `review:ally-clean` is satisfiable by anyone with an open PR, so it stays
+ *     required — including on a LABELED issue with no linked PR, whose assignee
+ *     can open one. Only the PR-less UNLABELED case is exempt.
+ *
  * `deploy:landed` is deliberately NOT required, here or on any labeled path
  * (CTO ruling 2026-09-17) — see the registry comment above. Unlabeled is the
  * majority shape in this estate, so requiring an unsatisfiable-at-evaluation
