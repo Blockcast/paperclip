@@ -1135,10 +1135,10 @@ export async function githubGetLatestCommitStatusForContext(input: {
  * The same gap has now been found twice — PEN-2527 covered the `gh` binary and
  * missed the MCP server; PEN-3152 covered both wrappers and missed `server/`
  * entirely. Both times the cause was the same: a scrub applied per-caller, so
- * closing it required every future caller to remember. These two functions are
+ * closing it required every future caller to remember. These write helpers are
  * how `paperclip-api` puts authored text on GitHub, so scrubbing here makes the
  * control a property of the boundary rather than of the caller's diligence. A
- * new caller of either helper is covered the day it is written.
+ * new caller of any helper is covered the day it is written.
  *
  * Exported for the one writer that cannot use those helpers:
  * `github-review-gate-authority.ts` builds its own request because it carries a
@@ -1264,17 +1264,27 @@ export async function githubPostCheckRun(input: {
     "content-type": "application/json",
   };
   const apiBase = gitHubApiBase(GITHUB_HOST);
+  // `summary` is the same verdict prose a commit-status description carries,
+  // and a check-run has no 140-char cap — so it publishes MORE of it. Scrubbed
+  // here like every other free-text field this file writes, so the helper's
+  // callers inherit the control rather than each remembering it (PEN-3157).
+  const name = scrubOutboundGitHubText(input.name, "check-run name");
+  const title = scrubOutboundGitHubText(input.title, "check-run title");
+  const summary = scrubOutboundGitHubText(input.summary, "check-run summary");
+  const detailsUrl = input.detailsUrl
+    ? scrubOutboundGitHubText(input.detailsUrl, "check-run details_url")
+    : input.detailsUrl;
   try {
     const res = await ghFetch(`${apiBase}/repos/${input.repoFullName}/check-runs`, {
       method: "POST",
       headers,
       body: JSON.stringify({
-        name: input.name,
+        name,
         head_sha: input.sha,
         status: "completed",
         conclusion: input.conclusion,
-        output: { title: input.title, summary: input.summary },
-        ...(input.detailsUrl ? { details_url: input.detailsUrl } : {}),
+        output: { title, summary },
+        ...(detailsUrl ? { details_url: detailsUrl } : {}),
       }),
     });
     if (res.ok) return { ok: true, statusCode: res.status };
