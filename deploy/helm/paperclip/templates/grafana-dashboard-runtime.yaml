@@ -22,9 +22,15 @@
 
   ADDING ANOTHER DASHBOARD
   ------------------------
-  Drop the JSON in dashboards/ and copy this file, changing the ConfigMap name
-  suffix and the .Files.Get path. No Grafana UI access is required at any
-  point; see runbooks/grafana-dashboard-as-code.md.
+  Drop the JSON in dashboards/ and copy this file, changing THREE things:
+  the ConfigMap name suffix, the .Files.Get path, and -- in the JSON itself --
+  the top-level "uid". Grafana keys dashboards by uid, not by filename or
+  ConfigMap name, so if you start from a copy of an existing dashboard and
+  leave its uid, the two collide: both ConfigMaps apply cleanly, both appear
+  in `kubectl get cm`, and one dashboard silently replaces the other in
+  Grafana. The duplicate-uid test in tests/grafana-dashboard-runtime.test.mjs
+  fails the build before that can ship. No Grafana UI access is required at
+  any point; see runbooks/grafana-dashboard-as-code.md.
 
   HOW IT REACHES GRAFANA (summary -- details in grafana-dashboard.yaml)
   --------------------------------------------------------------------
