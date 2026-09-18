@@ -7747,6 +7747,64 @@ export function filterIntervalOverrunCoalesceTarget<
     : target;
 }
 
+/**
+ * Context-snapshot key stamped on the run a timer wake mints because
+ * {@link filterIntervalOverrunCoalesceTarget} removed its coalesce target.
+ *
+ * PEN-1990: the rule above decides silently. It emits no log, no event and no
+ * column, so the only way to tell whether it has ever fired in production is
+ * to reconstruct overlapping same-scope run pairs out of the run corpus and
+ * infer it — which cannot distinguish a filter activation from any other
+ * reason two runs overlapped. Measured 2026-09-18, 55.8 h and 892 started runs
+ * after the rule reached production: fleet-wide longest run 4727 s against a
+ * 5400 s budget, so zero activations and nothing to attribute either way.
+ *
+ * The marker lands on the RUN rather than on `agent_wakeup_requests`, which is
+ * the row the rule is really about, because there is no HTTP route that reads
+ * wakeup requests and `GET /companies/:id/heartbeat-runs` already returns
+ * `contextSnapshot`. A capture that cannot be fetched is no capture.
+ */
+export const STALLED_COALESCE_BYPASS_SNAPSHOT_KEY = "__intervalOverrunCoalesceBypass";
+
+export type IntervalOverrunCoalesceBypass = {
+  targetRunId: string;
+  targetStartedAt: string;
+  targetAgeMs: number;
+  budgetMs: number;
+  intervalSec: number;
+};
+
+/**
+ * Describe the coalesce target {@link filterIntervalOverrunCoalesceTarget} just
+ * removed, or null when it removed nothing.
+ *
+ * Takes the before/after pair rather than re-running the predicate so the
+ * record can never disagree with the decision that was actually acted on: if
+ * the two ever diverged, a re-derivation here would describe a filter
+ * activation that did not happen (or miss one that did).
+ */
+export function describeIntervalOverrunCoalesceBypass(input: {
+  target: { id: string; startedAt: Date | string | null } | null;
+  filteredTarget: { id: string } | null;
+  intervalSec: number;
+  now: Date;
+}): IntervalOverrunCoalesceBypass | null {
+  const { target, filteredTarget, intervalSec, now } = input;
+  if (!target || filteredTarget) return null;
+  const startedAt = target.startedAt ? new Date(target.startedAt) : null;
+  // Unreachable through the filter — it only removes a target with a parseable
+  // `startedAt` — but the marker is evidence, so it reports what it can rather
+  // than emitting `NaN`/`Invalid Date` if that ever stops holding.
+  const startedAtMs = startedAt ? startedAt.getTime() : Number.NaN;
+  return {
+    targetRunId: target.id,
+    targetStartedAt: Number.isFinite(startedAtMs) ? startedAt!.toISOString() : "unknown",
+    targetAgeMs: Number.isFinite(startedAtMs) ? now.getTime() - startedAtMs : -1,
+    budgetMs: resolveStalledCoalesceBudgetMs(intervalSec),
+    intervalSec,
+  };
+}
+
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
@@ -36413,25 +36471,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       rawCoalescedTarget.scheduledRetryReason === CCROTATE_CAPACITY_RETRY_REASON
         ? rawCoalescedTarget
         : null;
+    const overrunFilterInput = filterZombieCoalesceTarget(
+      manualCapacityRetryTarget ? null : rawCoalescedTarget,
+      liveRunExecutions,
+    );
+    // The agent's own configured interval, so a slow-cadence agent gets a
+    // proportionally larger budget. `intervalSec` is always positive (clamped
+    // to [30, 86400]) and is returned even when heartbeats are disabled, so
+    // the floor in resolveStalledCoalesceBudgetMs — not this value — is what
+    // keeps fast-cadence agents safe.
+    const overrunFilterIntervalSec = resolveHeartbeatPolicyForRuntimeConfig(
+      agent.runtimeConfig,
+    ).intervalSec;
+    // One clock for the decision and for the record it produces, so the age
+    // the marker reports is the age the filter judged.
+    const overrunFilterNow = new Date();
     const coalescedTargetRun = filterIntervalOverrunCoalesceTarget({
-      target: filterZombieCoalesceTarget(
-        manualCapacityRetryTarget ? null : rawCoalescedTarget,
-        liveRunExecutions,
-      ),
+      target: overrunFilterInput,
       // PEN-1995: timer wakes only. A demand wake has no cadence to miss, so
       // its age proves nothing was lost — filtering on it would discard a live
       // target and mint a concurrent run for a manual or recovery wake. The
       // helper enforces this; it is passed rather than branched here so the
       // whole rule stays in one unit-testable place.
       source,
-      // The agent's own configured interval, so a slow-cadence agent gets a
-      // proportionally larger budget. `intervalSec` is always positive (clamped
-      // to [30, 86400]) and is returned even when heartbeats are disabled, so
-      // the floor in resolveStalledCoalesceBudgetMs — not this value — is what
-      // keeps fast-cadence agents safe.
-      intervalSec: resolveHeartbeatPolicyForRuntimeConfig(agent.runtimeConfig).intervalSec,
-      now: new Date(),
+      intervalSec: overrunFilterIntervalSec,
+      now: overrunFilterNow,
     });
+    // PEN-1990: record the activation. Consumed below, on the mint path only.
+    const intervalOverrunBypass = describeIntervalOverrunCoalesceBypass({
+      target: overrunFilterInput,
+      filteredTarget: coalescedTargetRun,
+      intervalSec: overrunFilterIntervalSec,
+      now: overrunFilterNow,
+    });
+    if (intervalOverrunBypass) {
+      logger.info(
+        { agentId, taskKey: effectiveTaskKey, ...intervalOverrunBypass },
+        "timer wake declined to coalesce into a run that has overrun its heartbeat interval; "
+          + "minting its own run (PEN-1995)",
+      );
+    }
 
     if (coalescedTargetRun) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
@@ -36695,7 +36774,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // connection to avoid pool starvation under concurrent wakes.
           responsibleUserId: await resolveQueuedResponsibleUserId(tx),
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: enrichedContextSnapshot,
+          // PEN-1990: stamped only on the row we actually insert, for the same
+          // reason as the redelivery token above — `enrichedContextSnapshot` is
+          // also handed to the coalesce helpers, and a marker merged into an
+          // existing run would claim that run was minted by this filter.
+          contextSnapshot: intervalOverrunBypass
+            ? {
+                ...(enrichedContextSnapshot ?? {}),
+                [STALLED_COALESCE_BYPASS_SNAPSHOT_KEY]: intervalOverrunBypass,
+              }
+            : enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
           continuationAttempt,
           retryOfRunId: opts.retryOfRunId,
