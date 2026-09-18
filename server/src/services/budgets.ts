@@ -761,7 +761,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
      * so `withRefusalLogged` neither logs nor maps it and the loser gets an
      * unhandled 500 with no retry.
      *
-     * The three in-transaction writers of the pair all take policies first:
+     * The three in-transaction writers that take policies first:
      * `PATCH /agents/:agentId/budgets` (`routes/costs.ts`),
      * `applyApprovalEnforcement` (`approval-enforcement-executor.ts`), and the
      * `hire_agent` decision path (`approvals.ts`, whose
@@ -769,10 +769,11 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
      *
      * The remaining callers are outside the rule and are safe for reasons that
      * do not generalise — do not copy them:
-     *  - `budgets.resolveIncident`, `POST /companies/:companyId/budgets/policies`
-     *    and `PATCH /companies/:companyId/budgets` (`routes/costs.ts`),
-     *    `POST /companies` (`routes/companies.ts`), and
-     *    `POST /companies/:companyId/agents` (`routes/agents.ts`) run outside any
+     *  - `POST /companies/:companyId/budgets/policies` and
+     *    `PATCH /companies/:companyId/budgets` (`routes/costs.ts`),
+     *    `POST /companies` (`routes/companies.ts`),
+     *    `POST /companies/:companyId/agents` (`routes/agents.ts`), and
+     *    `resolveIncident` (this file, below) run outside any
      *    transaction, so each statement autocommits and no lock is held across
      *    the pair in either order. The agent-creation route is safe for that
      *    reason and not because its row is new — the insert has committed by the
