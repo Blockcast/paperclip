@@ -2833,10 +2833,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   describe("PEN-3352 pending board approval as an attendance path", () => {
     async function insertBoardApproval(input: {
       companyId: string;
-      issueId: string;
+      issueId: string | null;
       requestedByAgentId: string | null;
       status?: string;
       createdAt?: Date;
+      updatedAt?: Date;
     }) {
       const approvalId = randomUUID();
       await db.insert(approvals).values({
@@ -2847,12 +2848,27 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         status: input.status ?? "pending",
         payload: { title: "Authorize the seat purchase" },
         ...(input.createdAt ? { createdAt: input.createdAt } : {}),
+        // `updated_at` follows `created_at` unless a caller moves it deliberately. Both
+        // columns are `defaultNow()`, so the real insert path leaves them EQUAL at filing
+        // and only `resubmit` separates them — back-dating `created_at` alone would seed a
+        // row production cannot produce (filed two weeks ago, touched a moment ago) and
+        // would make every aged-out test silently assert nothing once the predicate reads
+        // `GREATEST(created_at, updated_at)`. Caught exactly that way: the pre-existing
+        // grace test went green-to-red on the predicate change, because the fixture, not
+        // the code, was wrong.
+        ...(input.updatedAt ?? input.createdAt
+          ? { updatedAt: input.updatedAt ?? input.createdAt }
+          : {}),
       });
-      await db.insert(issueApprovals).values({
-        companyId: input.companyId,
-        issueId: input.issueId,
-        approvalId,
-      });
+      // `issueId: null` seeds a card that exists but is linked to nothing, so the
+      // issue-scoping clause can be measured without the link row confounding it.
+      if (input.issueId) {
+        await db.insert(issueApprovals).values({
+          companyId: input.companyId,
+          issueId: input.issueId,
+          approvalId,
+        });
+      }
       return approvalId;
     }
 
@@ -2991,7 +3007,50 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(updated?.status).toBe("blocked");
     });
 
-    it("still escalates a fresh pending approval when the latest run failed", async () => {
+    it("keeps believing a stale-filed approval that was resubmitted inside the grace", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      const graceMs = loadConfig().pendingBoardApprovalAttendanceGraceMs;
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        // Filed well outside the grace, revision-requested, then resubmitted an hour ago.
+        // `resubmit` is the one writer that returns a row to `pending` while moving
+        // `updated_at` and leaving `created_at` at the original filing instant, so this is
+        // the exact shape that `created_at`-only bounding got wrong: a fresh board
+        // decision is owed, and the row would have read as a two-week-old dead card.
+        createdAt: new Date(Date.now() - (graceMs + 7 * 24 * 60 * 60_000)),
+        updatedAt: new Date(Date.now() - 60 * 60_000),
+      });
+
+      const result = await sweep();
+
+      expect(result.escalated).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("in_progress");
+    });
+
+    it("does not exempt a row whose fresh approval is linked to a different issue", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      // Same company, same requester, same `pending` status, inside the grace — differing
+      // only in that no `issue_approvals` row ties it to this issue. Without the
+      // `issueApprovals.issueId` clause this would be an AGENT-level exemption: one open
+      // card would shield every issue that agent holds. This test is what keeps the
+      // exemption issue-level.
+      await insertBoardApproval({
+        companyId,
+        issueId: null,
+        requestedByAgentId: coderId,
+      });
+
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("does not escalate a fresh pending approval when the latest run never executed", async () => {
       const { companyId, coderId, sourceIssueId } = await seedSeizableFailedContinuationRow();
       await insertBoardApproval({
         companyId,
@@ -3001,10 +3060,34 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
       const result = await sweep();
 
-      // Inherits the PR path's succeeded-run scoping rather than reopening it: the
-      // failed/nonretryable arms escalate on positive evidence that something broke, and
-      // a pending card does not refute that. Flip with the BLO-32679 ruling if that
-      // ruling moves the PR path, so the two stay one policy.
+      // Follows the PR path onto the BLO-32679 gate rather than staying on the
+      // succeeded-only one. That ruling landed while this branch was open and the earlier
+      // revision of this test pre-committed to flipping with it, precisely so the two
+      // gates stay one policy (PEN-3198). The argument transfers unchanged: a run that
+      // never reached a model call cannot have decided a board card, so a card that was
+      // pending before it started is still pending after — the run is evidence about the
+      // runtime, not about attendance.
+      expect(result.escalated).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("in_progress");
+    });
+
+    it("still escalates an aged-out approval when the latest run never executed", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableFailedContinuationRow();
+      const graceMs = loadConfig().pendingBoardApprovalAttendanceGraceMs;
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        createdAt: new Date(Date.now() - (graceMs + 60 * 60_000)),
+      });
+
+      // The grace is what makes admitting this disjunct onto the infra-failure gate
+      // bounded rather than an unbounded belief. Pinned separately from the succeeded-arm
+      // grace test because the two gates are different call sites and only a test proves
+      // the bound travelled with the disjunct.
+      const result = await sweep();
+
       expect(result.escalated).toBe(1);
       const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
       expect(updated?.status).toBe("blocked");

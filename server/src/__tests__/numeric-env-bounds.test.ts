@@ -57,14 +57,23 @@ const SETTINGS = {
   // PEN-3352. Registered so the hostile-input table actually drives this env var
   // rather than merely declaring that it exists.
   //
-  // ⚠️ Note while you are here: `lapsedMonitorGraceMs` and
-  // `openPullRequestAttendanceGraceMs` are in `NUMERIC_SETTING_BOUNDS` and are NOT in
-  // this map, so they get no hostile-input coverage. The `satisfies Record<keyof typeof
-  // NUMERIC_SETTING_BOUNDS, string>` below looks like it would catch that and does not:
-  // `server/tsconfig.json` excludes `src/__tests__`, so nothing typechecks this file,
-  // and vitest transpiles without checking. Left as-is deliberately — closing it is a
-  // change to two settings this PR does not otherwise touch, and doing it here would
-  // hide that the enforcement mechanism itself is the thing that needs fixing.
+  // ⚠️ Note while you are here: this map is a STRICT SUBSET of
+  // `NUMERIC_SETTING_BOUNDS`, and the gap is much wider than it looks. Measured at this
+  // commit: 15 keys here against 22 there, so SEVEN settings get no hostile-input
+  // coverage at all —
+  //   isolationWorkspaceReaperIntervalMinutes, isolationWorkspaceReaperMaxAgeDays,
+  //   isolationWorkspaceReaperMaxDeletesPerTick, prReviewStateReconcilerIntervalMinutes,
+  //   prReviewStateMaxPullRequestsPerRepo, lapsedMonitorGraceMs,
+  //   openPullRequestAttendanceGraceMs.
+  // Do not trust that list to be current; recompute the set difference
+  // (`keyof NUMERIC_SETTING_BOUNDS` minus `keyof SETTINGS`) before acting on it.
+  //
+  // The `satisfies Record<keyof typeof NUMERIC_SETTING_BOUNDS, string>` clause below
+  // looks like it would make that impossible and does not: `server/tsconfig.json`
+  // excludes `src/__tests__`, so nothing typechecks this file, and vitest transpiles
+  // without checking. Left as-is deliberately — closing it means registering seven
+  // settings this PR does not otherwise touch, and doing it here would hide that the
+  // enforcement mechanism itself is the thing that needs fixing.
   pendingBoardApprovalAttendanceGraceMs: "PENDING_BOARD_APPROVAL_ATTENDANCE_GRACE_MS",
 } as const satisfies Record<keyof typeof NUMERIC_SETTING_BOUNDS, string>;
 

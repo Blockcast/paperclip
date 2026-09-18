@@ -551,10 +551,22 @@ export const NUMERIC_SETTING_BOUNDS = {
   // (`latestRunStatus: succeeded`), whereas a genuinely abandoned card is also visible
   // in the board queue by its age.
   //
-  // Recency is read from `approvals.createdAt`, deliberately NOT `updatedAt`. An
-  // approval has no intermediate movement to observe: unlike a PR it is filed once and
-  // then decided, so `updatedAt` would measure comment noise rather than progress, and
-  // could refresh belief in a card nobody is any closer to answering.
+  // Recency is read from `GREATEST(created_at, updated_at)`, not `created_at` alone. An
+  // approval is normally filed once and then decided, so on most rows the two are equal
+  // and this reads as a filing-age bound. The exception is the one that matters: a
+  // revision-requested card that the requester RESUBMITS returns to `pending` with
+  // `updated_at` moved and `created_at` untouched, and that is a fresh board decision
+  // owed, not stale belief in an old one. Bounding on `created_at` alone would date that
+  // live wait from the original filing and re-seize a row whose decision is genuinely
+  // still coming.
+  //
+  // Reading `updated_at` is safe here ONLY because the predicate is scoped to `pending`.
+  // The column has no `$onUpdate` and no trigger, so it moves solely where a write sets
+  // it; of the eleven writers to `approvals`, exactly one leaves the row `pending`
+  // afterwards (`resubmit`), and comments are inserted into `approval_comments` without
+  // touching the parent. So on a `pending` row `updated_at` cannot carry comment noise —
+  // it carries a resubmission instant or nothing. Do not lift this bound to a predicate
+  // that also admits decided or withdrawn rows without redoing that survey.
   //
   // Ceiling is 30d, matching the PR entry and the observed maximum: past a month
   // "waiting on the board" is not a description of the card but of a problem nobody is

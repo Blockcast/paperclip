@@ -2800,11 +2800,20 @@ export function recoveryService(
       .then((rows) => Boolean(rows[0]));
   }
 
+  // PEN-3352: named rather than three adjacent bare `number` positionals. The three
+  // graces differ by more than an order of magnitude (6h / 7d / 14d) and a transposition
+  // between them is type-silent — it would surface only as a subtly wrong seizure window,
+  // which is the hardest kind of defect to attribute in this sweep. The fourth addition
+  // to this signature is the moment to make that unrepresentable.
+  type DurableWaitGraces = {
+    monitor: number;
+    openPullRequest: number;
+    pendingBoardApproval: number;
+  };
+
   async function hasPersistedDurableWaitPath(
     issue: typeof issues.$inferSelect,
-    graceMs: number,
-    openPullRequestGraceMs: number,
-    pendingBoardApprovalGraceMs: number,
+    graces: DurableWaitGraces,
   ) {
     // BLO-24782: this used to be `if (issue.monitorNextCheckAt) return true`, which
     // accepted a check instant already in the past. That was not simply a looser
@@ -2814,11 +2823,11 @@ export function recoveryService(
     // two genuinely disagreed in both directions about the same monitor. Delegating
     // makes that divergence unrepresentable rather than merely tested for: there is now
     // one definition of "the monitor is still a live wake path", and it is bounded.
-    if (hasActiveMonitorPath(issue, graceMs)) return true;
+    if (hasActiveMonitorPath(issue, graces.monitor)) return true;
 
-    if (await hasOpenPullRequestWakePath(issue, openPullRequestGraceMs)) return true;
+    if (await hasOpenPullRequestWakePath(issue, graces.openPullRequest)) return true;
 
-    if (await hasPendingBoardApprovalWakePath(issue, pendingBoardApprovalGraceMs)) return true;
+    if (await hasPendingBoardApprovalWakePath(issue, graces.pendingBoardApproval)) return true;
 
     return db
       .select({ id: issueRelations.issueId })
@@ -3008,9 +3017,19 @@ export function recoveryService(
    * answered: the next move is the requester resubmitting, which is the assignee acting,
    * not an event arriving. Counting it would credit a wake that has already been spent.
    *
-   * Bounded on `createdAt` — see `pendingBoardApprovalAttendanceGraceMs` for the measured
-   * decision-latency distribution behind the 14d default, and for why the bound reads
-   * `createdAt` rather than the PR path's `updatedAt`.
+   * The other half of that story is the resubmission, and it is why the grace reads
+   * `GREATEST(createdAt, updatedAt)` rather than `createdAt`: when the requester does
+   * resubmit, the row returns to `pending` and a fresh board decision is owed again.
+   * Bounding on `createdAt` alone would date that live wait from the original filing, so
+   * a card filed on day 0 and resubmitted on day 20 reports no path and is seizable while
+   * a genuine decision is still coming. `updatedAt` is safe to read here precisely because
+   * this predicate is scoped to `pending`: of the eleven writers to `approvals`, the only
+   * one that leaves a row `pending` while touching `updatedAt` is `resubmit`
+   * (`services/approvals.ts`) — `addComment` writes `approval_comments` only, the column
+   * has no `$onUpdate` and no trigger, and every other write moves the row out of
+   * `pending`. So on a `pending` row `updatedAt` carries exactly one signal, and it is the
+   * one this predicate wants. See `pendingBoardApprovalAttendanceGraceMs` for the measured
+   * decision-latency distribution behind the 14d default.
    */
   async function hasPendingBoardApprovalWakePath(
     issue: typeof issues.$inferSelect,
@@ -3032,7 +3051,7 @@ export function recoveryService(
           eq(approvals.companyId, issue.companyId),
           eq(approvals.status, "pending"),
           eq(approvals.requestedByAgentId, issue.assigneeAgentId),
-          sql`${approvals.createdAt} > ${filedSinceIso}::timestamptz`,
+          sql`GREATEST(${approvals.createdAt}, ${approvals.updatedAt}) > ${filedSinceIso}::timestamptz`,
         ),
       )
       .limit(1)
@@ -8807,12 +8826,11 @@ export function recoveryService(
       // population without creating a class of row that can never be recovered.
       if (
         (latestRun?.status === "succeeded" || isExternalWaitYieldRun(latestRun)) &&
-        await hasPersistedDurableWaitPath(
-          issue,
-          lapsedMonitorGraceMs,
-          openPullRequestAttendanceGraceMs,
-          pendingBoardApprovalAttendanceGraceMs,
-        )
+        await hasPersistedDurableWaitPath(issue, {
+          monitor: lapsedMonitorGraceMs,
+          openPullRequest: openPullRequestAttendanceGraceMs,
+          pendingBoardApproval: pendingBoardApprovalAttendanceGraceMs,
+        })
       ) {
         result.skipped += 1;
         return;
@@ -8826,11 +8844,22 @@ export function recoveryService(
       // agent's last real state is whatever the previous run left, and if that was
       // "parked with a fresh open PR", it still holds.
       //
-      // Only the PR disjunct is admitted here, NOT the whole of
+      // Only the two POSITIVE-EVIDENCE disjuncts are admitted here, NOT the whole of
       // `hasPersistedDurableWaitPath`: a lapsed monitor or a blocker edge is a claim the
-      // sweep makes from absence, whereas a webhook-written open PR is positive external
-      // evidence bounded by its own freshness grace. Widening further would reintroduce
-      // the unbounded belief this scoping exists to prevent.
+      // sweep makes from absence, whereas a webhook-written open PR and a pending board
+      // approval are both rows some external actor wrote, each bounded by its own
+      // freshness grace. Widening further would reintroduce the unbounded belief this
+      // scoping exists to prevent.
+      //
+      // PEN-3352 joined the approval disjunct to the PR one here rather than leaving it
+      // on the succeeded-only gate above. The two gates answer one question and PEN-3198
+      // forbids them answering it differently; on the criterion this comment already
+      // states, a pending card qualifies for the same reason a PR does. The argument
+      // transfers verbatim: a run that never started cannot have decided a board card, so
+      // if the agent's last real state was "parked on a fresh pending approval", that
+      // still holds. Leaving it out would have made an infra-failed run seize exactly the
+      // rows the succeeded arm protects — a divergence created by which gate the row
+      // happened to enter, not by anything true about it.
       //
       // Keyed on `isInfraFailureRun`, not on error code. Measured 2026-09-16 over the 71
       // live `stranded_assigned_issue` actions on company `aaced805`: 70 never executed,
@@ -8840,7 +8869,8 @@ export function recoveryService(
       // turn wearing an infra error code, and it stays seizable.
       if (
         latestRun && isInfraFailureRun(latestRun) &&
-        await hasOpenPullRequestWakePath(issue, openPullRequestAttendanceGraceMs)
+        (await hasOpenPullRequestWakePath(issue, openPullRequestAttendanceGraceMs) ||
+          await hasPendingBoardApprovalWakePath(issue, pendingBoardApprovalAttendanceGraceMs))
       ) {
         result.skipped += 1;
         return;
