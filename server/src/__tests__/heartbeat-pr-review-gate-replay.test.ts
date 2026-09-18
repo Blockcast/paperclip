@@ -353,9 +353,10 @@ describeEmbeddedPostgres(
       expect(wake).toMatchObject({
         status: "queued",
         reason: "github_pr_synchronized",
-        // Delivery-scoped so a redelivery of one push cannot be absorbed into
-        // an unrelated PR's in-flight review (BLO-18953).
-        idempotencyKey: `${TASK_KEY}:github_pr_synchronized:delivery:${FRESH_HEAD_DELIVERY_ID}`,
+        // Head-scoped (PEN-2865) so a redelivery of one push — or a duplicate
+        // delivery of the same head — cannot become a second review, while a
+        // genuinely new head still earns its own key (BLO-18953).
+        idempotencyKey: `${TASK_KEY}:github_pr_synchronized:head:${NEW_HEAD}`,
         payload: expect.objectContaining({
           taskKey: TASK_KEY,
           source: "github",
