@@ -34,7 +34,7 @@ plus a redeploy.
 | shape | satisfiable when entering `in_review`? | flag makes it blocking? |
 |---|---|---|
 | `review:ally-clean` | yes — a PR may be open, at head, 0 Critical / 0 Important | **yes**, unless suppressed (below) |
-| `review:ally-clean`, no linked PR | **never** — there is no head to review | **no, at any value** |
+| `review:ally-clean`, no linked PR | **never** — there is no head to review | **no, at any value**; unlabeled is not even required to have it |
 | `deploy:landed` | **never** — it means merged | **no, at any value** |
 
 The gate runs on exactly one transition, INTO `in_review`
@@ -59,11 +59,25 @@ and the verdict names which one applied:
 - `unlabeled-truth-block-suppressed:no-linked-pull-request` — the probe worked
   and the issue has no linked PR. `review:ally-clean` needs a head to review,
   so the shape is unsatisfiable by the assignee **forever** — a stronger case
-  than `deploy:landed`, which at least becomes satisfiable on merge. This is
-  also why it is not the unlabeled path's job to enforce it: that path exists
-  to cover doc-only and refactor issues, which by design have no PR. CTO
+  than `deploy:landed`, which at least becomes satisfiable on merge. CTO
   ruling 2026-09-16. If we ever want "code work must have a PR", that is an
   explicit requirement on a labeled path, decided on its own merits.
+
+  **This diagnostic is now LABELED-only, and that is not a narrowing of the
+  ruling but a strengthening of it.** On the **unlabeled** path a PR-less issue
+  no longer reaches the escalation at all: the truth shapes are dropped from
+  `required` outright, `missing` is empty, and the verdict is **`pass`** with
+  `truth-shapes-not-required:no-linked-pull-request` instead
+  (`prLessUnlabeledTruthDrop` in `evidence-gate.ts`, BLO-32239). Suppressing
+  the escalation alone fixed the block hazard and left a metric one — the shape
+  stayed in `missing`, so the verdict was a permanent `warn`, which
+  `reviewPassRate` scores identically to `block` (see baseline 2 below).
+
+  A **labeled** PR-less issue keeps the shape required and still lands here,
+  because its assignee *can* satisfy it by opening a PR. The split is
+  satisfiability, not blast radius. So both mechanisms are live over disjoint
+  populations, and a labeled `noPr` issue is the one worth chasing: it means a
+  code-bearing issue has no PR linked.
 
 This is what retired the old flip criterion about `harness_liveness_escalation`
 origins and BLO-24843: those issues have no PR by design and would have 422'd
@@ -73,7 +87,11 @@ remember the instance.
 ## Before anything: two baselines, both on the day the truth shapes deploy
 
 **1. Issues whose linked PR the webhook never saw.** These read
-`no-linked-pull-request` and can never pass until the Task B10 backfill runs.
+`no-linked-pull-request`. A **labeled** one cannot reach `pass` until its PR is
+linked — that is what the Task B10 backfill is for. An **unlabeled** one now
+passes on its own (the shapes are not required without a head to review), so
+this count is a backfill work-list, not a stuck-issue count; split it by
+`labelIds` before reading it as either.
 
 ```bash
 curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
@@ -115,6 +133,13 @@ that reaches
 record `pass`, so **every agent's `reviewPassRate` steps down on deploy day for
 reasons unrelated to agent behaviour**. Capture the pre-deploy numbers or the
 step reads as a fleet-wide regression a week later:
+
+Two exemptions bound how far it steps down, and both exist because a shape no
+correct behaviour can satisfy must not be scored: `deploy:landed` is required
+nowhere (2026-09-17), and on the unlabeled path the truth shapes are not
+required at all when there is no linked PR (BLO-32239). So a PR-less doc-only
+issue still records `pass`. What steps down is work that *has* a PR and no clean
+Ally review at head — which is the thing the shapes were added to measure.
 
 ```bash
 curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
@@ -169,11 +194,15 @@ problems:
 - `probeFailed` — we could not ask GitHub. A tooling/outage number.
 - `noPr` — the probe worked and the issue has no linked pull request at all.
   These can **never** satisfy `review:ally-clean`; there is no head to review.
-  The gate suppresses them permanently at every flag value (CTO ruling
-  2026-09-16, `unlabeled-truth-block-suppressed:no-linked-pull-request`), so
-  they are not blast radius. Track the number anyway — a rising `noPr` on
-  code-bearing issues means PRs are not being linked, which is a real defect
-  with a different owner.
+  Never blast radius, at any flag value, but by two different mechanisms since
+  BLO-32239: an **unlabeled** one is not required to have the shape and records
+  `pass`; a **labeled** one keeps it required and is suppressed at the
+  escalation (CTO ruling 2026-09-16,
+  `unlabeled-truth-block-suppressed:no-linked-pull-request`). Track the number
+  anyway, and **split it by label** — a rising labeled `noPr` means PRs are not
+  being linked on code-bearing issues, which is a real defect with a different
+  owner, while the unlabeled share is mostly the doc-only population this path
+  exists for.
 
 `onlyTruthMissing` remains a safe upper bound on `willBlock`; since the registry
 change its only excess is the two suppressed populations.
