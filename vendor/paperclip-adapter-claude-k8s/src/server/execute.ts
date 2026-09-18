@@ -702,11 +702,14 @@ export async function createOrAdoptRunSecret(
         // 2026-09-16, and SSAR against `system:serviceaccount:paperclip:
         // paperclip` in ns `paperclip` now reports it allowed.  This call stays
         // a PATCH anyway because `patch` was already granted *before* #1837 —
-        // *this adapter* needs no widened verb.  That does not make the grant
-        // retirable: the sandbox-provider plugin still PUTs at
-        // `packages/plugins/sandbox-providers/kubernetes/src/secret-manager.ts
-        // :108` under the same service account when `inCluster` is set, so
-        // `update` stays load-bearing until that call site is converted too.
+        // *this adapter* needs no widened verb.  Whether the grant is now
+        // retirable outright is a separate question and NOT settled here: the
+        // sandbox-provider plugin's PUT at `packages/plugins/sandbox-providers/
+        // kubernetes/src/secret-manager.ts:108` runs under the same service
+        // account but in a *tenant* namespace, which that release-namespace
+        // Role never covered, so it neither justifies nor blocks retirement.
+        // Tracked as BLO-34510; see the justification block in
+        // `deploy/helm/paperclip/templates/role.yaml` for what was measured.
         //
         // Merge semantics are also the closer fit for what adoption means here:
         // assert this run's keys and labels.  Unlike a PUT, a merge leaves
