@@ -1802,14 +1802,37 @@ export function agentRoutes(
     );
   }
 
+  /**
+   * An agent must not be able to change its own instructions path or bundle
+   * configuration — that is a rewrite of its own operating instructions.
+   *
+   * This compares each instructions key the write would persist against the
+   * value already stored and refuses only a difference. A presence test is
+   * wrong here for the same reason it was wrong for secret bindings: on
+   * `PATCH /agents/:id` this guard also runs against the *effective* config,
+   * which `resolveRawEffectiveAdapterConfigForPatch` shallow-merges onto the
+   * stored config precisely to preserve these keys. Every bundle-managed agent
+   * therefore carried all four keys into the guard, so any agent-authored
+   * `adapterConfig` write — one naming no instructions key at all, or a
+   * verbatim no-op round-trip — was refused with a message listing keys the
+   * caller never sent (BLO-32332). There was no request shape that could pass.
+   *
+   * `existingAdapterConfig` is omitted on create and hire, where there is no
+   * prior state and every key present is therefore a change. Removal is not
+   * checked here: a merge cannot drop a key, and the `replaceAdapterConfig`
+   * path that can routes through `assertCanManageInstructionsPath` instead.
+   */
   function assertNoAgentInstructionsConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown> | null | undefined,
     path = "adapterConfig",
+    existingAdapterConfig?: Record<string, unknown> | null,
   ) {
     if (req.actor.type !== "agent" || !adapterConfig) return;
+    const existing = existingAdapterConfig ?? {};
     const changedSensitiveKeys = KNOWN_INSTRUCTIONS_BUNDLE_KEYS
-      .filter((key) => adapterConfig[key] !== undefined)
+      .filter((key) => adapterConfig[key] !== undefined
+        && JSON.stringify(adapterConfig[key]) !== JSON.stringify(existing[key]))
       .map((key) => `${path}.${key}`);
     if (changedSensitiveKeys.length === 0) return;
     throw forbidden(
@@ -1924,7 +1947,12 @@ export function agentRoutes(
       effectiveAdapterConfig?: Record<string, unknown> | null;
     },
   ) {
-    assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
+    assertNoAgentInstructionsConfigMutation(
+      req,
+      adapterConfig,
+      path,
+      options?.existingAdapterConfig ?? null,
+    );
     assertNoAgentSecretBindingMutation(
       req,
       options?.effectiveAdapterConfig ?? adapterConfig,
