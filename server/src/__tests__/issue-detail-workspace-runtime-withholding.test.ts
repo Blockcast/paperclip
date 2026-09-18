@@ -312,6 +312,16 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
    * these are MASKED — so this asserts sentinel-absence AND an explicit `REDACTED_EVENT_VALUE`
    * equality. `toBeNull()` would encode the wrong contract and would pass on a field that had
    * simply been dropped, which is the opposite of withheld-is-not-absent.
+   *
+   * ⚠ On the mask alone these equality assertions would NOT be self-sufficient:
+   * `maskWorkspaceRuntimeTextForRead` tests `=== null` (`redaction.ts`), so an `undefined` field
+   * would map to `REDACTED_EVENT_VALUE` and pass here even if the fixture stopped seeding it —
+   * the very blind spot this case exists to close. What rules that out is upstream, not the mask:
+   * `readNullableString` (`services/execution-workspaces.ts`) normalises `undefined` to `null`
+   * when the config view is derived, so the mask never receives `undefined` on this route and an
+   * unseeded scalar arrives as `null`. Measured 2026-09-18 by deleting `provisionCommand` from the
+   * fixture: this case fails `expected null to be '***REDACTED***'` and the entitled case below
+   * fails alongside it. Both halves guard the seeding; neither depends on the other.
    */
   it("withholds the command scalars beside workspaceRuntime on both compacted exits", async () => {
     const { companyId, agentId, issueId } = await seedScenario();
@@ -365,6 +375,10 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
     // satisfied by `cleanupCommand` on its own, so a regression masking `provisionCommand`
     // unconditionally for an entitled reader would still pass. Mirrors the withheld case above and
     // `workspace-runtime-response-withholding.test.ts`'s entitled case.
+    //
+    // These also pin the FIXTURE: an unseeded scalar fails here as `expected null to be '…'`
+    // (measured), so the withheld case above cannot quietly go vacuous. It does not depend on this
+    // — see its own note — but the two failing together names the cause immediately.
     const config = res.body.currentExecutionWorkspace.config;
     expect(config.provisionCommand).toBe(`${CONFIG_COMMAND_SENTINEL}-provision`);
     expect(config.teardownCommand).toBe(`${CONFIG_COMMAND_SENTINEL}-teardown`);
