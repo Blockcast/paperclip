@@ -82,6 +82,33 @@ import {
  * and `describeAgentStartLockDispatchHealth` reports `stalled` rather than
  * `aborted` when a requested abort does not land.
  *
+ * Also uncovered, and unlike the tagged template below this one is **live**:
+ * a `begin`/`savepoint` call that hangs *before* it invokes its callback.
+ * The wrapper pre-checks `signal.aborted` and then hands off to the real
+ * client, but it registers nothing — the promise `begin` returns gets no abort
+ * listener and no `inFlightBySignal` entry, and `wrapCallbackArgs` only reaches
+ * statements issued through the scoped client *after* the callback runs.
+ * Connection acquisition is the instance that matters: `begin` takes a pool
+ * slot before it can issue `BEGIN`, and with `max: 10` and no acquire timeout
+ * that wait is unbounded — the same pool-exhaustion shape listed as *covered*
+ * for `unsafe` above, and one of the two causes PEN-3305's evidence pointed at.
+ * The dispatch section reaches this for real (`claimQueuedRun` wraps
+ * `lockIssueOwnership` in `db.transaction`), so read the `unsafe` coverage above
+ * as being about statements, not about every way this module touches the pool.
+ *
+ * It is left uncovered because the alternatives are worse, not because it is
+ * unreachable. postgres.js returns a plain promise from `begin` with no
+ * `cancel()`, so there is no handle to call; racing it against the signal would
+ * reject the caller while the underlying reservation still resolves later,
+ * leaking a connection and letting the *next* section's work overlap an
+ * abandoned transaction — the abandon-rather-than-cancel shortcut this module
+ * refuses everywhere else, and the BLO-20396 regression PEN-3328 exists not to
+ * reintroduce. So this residue is reported rather than rescued, exactly like the
+ * non-database awaits above: the abort is raised and does not land, the section
+ * stays held, and `describeAgentStartLockDispatchHealth` reports `stalled`.
+ * `agent-start-lock-db.test.ts` pins that behaviour with a `begin` that never
+ * settles and never calls its callback.
+ *
  * Also uncovered, deliberately: the **tagged-template call form**
  * (``client`select 1` ``). drizzle does not use it — it reaches the database
  * through the three methods named above — so a query issued that way carries no
@@ -268,6 +295,14 @@ function wrapClient<T extends object>(client: T): T {
         return function scoped(this: unknown, ...args: unknown[]) {
           const signal = currentAgentStartLockSignal();
           if (signal?.aborted) throw abortReason(signal);
+          // NOTE: this is a pre-check, not cancellation. Once the real call is
+          // under way nothing here can interrupt it — `begin` returns a plain
+          // promise with no `cancel()`, and `wrapCallbackArgs` only takes effect
+          // when the callback is invoked, i.e. after a pool slot is already held.
+          // A hang in that acquisition is therefore uncancellable, and that is a
+          // live gap rather than a theoretical one. See "What it does not cover"
+          // in the module header for why racing it would be worse than leaving
+          // it, and `agent-start-lock-db.test.ts` for the test that pins it.
           return (value as (...a: unknown[]) => unknown).apply(target, wrapCallbackArgs(args));
         };
       }
