@@ -24,6 +24,7 @@ import {
   type AllyPriorFindingDisposition,
 } from "./ally-review-detection.js";
 import {
+  githubFetchPrAuthorLogin,
   githubFetchPrHeadSha,
   githubListIssueCommentsWithTimestamps,
   githubListPrReviewsWithTimestamps,
@@ -101,6 +102,33 @@ function isAllyConsolidatedReviewComment(
       githubReviewerIdentityMatches(authorLogin, reviewerBotLogin) &&
       hasAllyConsolidatedReviewHeading(comment.body),
   );
+}
+
+/**
+ * Whether a comment was written by the pull request's own author (BLO-34316).
+ *
+ * `isAllyConsolidatedReviewComment` is an *inclusion* test against the reviewer
+ * identity and nothing stood behind it. On this fleet the PR author IS
+ * `allyblockcast[bot]` — the same GitHub identity as the reviewer — so an
+ * author-written comment satisfied that test by construction and reached
+ * `clean`, the gate's strongest positive, on a head nobody else had read.
+ *
+ * Exact login equality is what this normally turns on: the PR author and both
+ * comment surfaces all come from REST `user.login`, so they agree in form. The
+ * App-identity match is the safety net for the `app/<slug>` rendering GitHub
+ * uses on some surfaces. A bare `<slug>` user seat is a distinct principal and
+ * is deliberately not matched by it — but it is still caught by the exact
+ * comparison when it is genuinely the author.
+ */
+function isPrAuthorComment(
+  comment: CommentReviewGateComment,
+  prAuthorLogin: string | null | undefined,
+): boolean {
+  const normalize = (login: string) => login.trim().toLowerCase().replace(/^@/, "");
+  const author = prAuthorLogin?.trim();
+  const commenter = comment.authorLogin?.trim();
+  if (!author || !commenter) return false;
+  return normalize(commenter) === normalize(author) || githubReviewerIdentityMatches(commenter, author);
 }
 
 interface AttestingComment {
@@ -306,6 +334,13 @@ export function evaluateCommentReviewGate(input: {
   comments: CommentReviewGateComment[];
   headSha: string;
   reviewerBotLogin?: string | null;
+  /**
+   * Login of the PR's own author, when known. Supplied, a comment from this
+   * login can no longer produce `clean` (BLO-34316). Omitted, the author test
+   * is skipped — callers that cannot establish the author must fail closed
+   * themselves rather than pass a guess in here.
+   */
+  prAuthorLogin?: string | null;
 }): CommentReviewGateVerdict {
   const reviewerBotLogin = input.reviewerBotLogin?.trim() || DEFAULT_PR_REVIEWER_BOT_LOGIN;
   const headSha = input.headSha?.trim();
@@ -329,6 +364,23 @@ export function evaluateCommentReviewGate(input: {
         reason:
           "Ally's most recent consolidated-review comment for this head carries an unresolved finding.",
         commentCreatedAt: new Date(toEpochMs(forHead.comment.createdAt)).toISOString(),
+      };
+    }
+    // Only the *positive* claim is withdrawn for a self-written attestation.
+    // The blocking branch above stays author-blind on purpose: a finding is a
+    // finding whoever wrote it, so the fail-closed direction is unchanged.
+    //
+    // Returning here rather than falling through to the carried-finding check
+    // is also deliberate. Reaching that check would make a self-attested head
+    // inherit an earlier head's finding, turning a `success` into a `failure`
+    // on essentially every agent-authored PR — the deadlock BLO-29711 pinned
+    // this gate against. Withdrawing evidence must not manufacture a red.
+    if (isPrAuthorComment(forHead.comment, input.prAuthorLogin)) {
+      return {
+        state: "success",
+        outcome: "not_evaluated",
+        reason:
+          "The consolidated-review comment attesting this head was written by the PR author, so it is not evidence of review.",
       };
     }
     return {
@@ -415,7 +467,12 @@ export function commentReviewGateCheckTitle(
     case "carried_finding":
       return "Unresolved finding carried from an earlier head";
     case "not_evaluated":
-      return "Not evaluated — no comment-shaped review attests this head";
+      // Covers both "nothing attests this head" and "only the PR author does"
+      // (BLO-34316). "no independent review" is true of both; the earlier "no
+      // comment-shaped review attests this head" was flatly false for the
+      // second, which is the same kind of misleading string this gate exists to
+      // stop publishing. The `summary` carries which case it was.
+      return "Not evaluated — no independent review attests this head";
   }
 }
 
@@ -653,6 +710,19 @@ async function executeCommentReviewGateCheck(
     ));
   if (!headSha) return { posted: false, reason: "fetch_failed" };
 
+  // Resolved from GitHub rather than taken from a webhook payload, for the same
+  // reason `headSha` is on two of the three trigger paths: the payload is a
+  // snapshot, and this is the fact the `clean` verdict now depends on
+  // (BLO-34316). Failing closed on an unresolvable author matches the `headSha`
+  // branch above and is the recoverable direction — nothing is published, and
+  // the next webhook for this head re-evaluates. Publishing `clean` without
+  // knowing the author is the defect itself.
+  const prAuthorLogin = await withBoundedRetry(
+    () => githubFetchPrAuthorLogin({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
+    (login) => login == null,
+  );
+  if (!prAuthorLogin) return { posted: false, reason: "fetch_failed" };
+
   const publish = async (): Promise<PrCommentReviewGateCheckResult> => {
     // Both surfaces, because Ally uses whichever is available to it: a
     // `COMMENTED` pull_request_review on `/pulls/{n}/reviews`, or a plain issue
@@ -679,6 +749,7 @@ async function executeCommentReviewGateCheck(
       })),
       headSha,
       reviewerBotLogin,
+      prAuthorLogin,
     });
 
     warnOnceIfMisreadableContext(verdict, context);

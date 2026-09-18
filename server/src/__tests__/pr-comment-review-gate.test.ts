@@ -1067,6 +1067,109 @@ describe("commentReviewGateCheckConclusion", () => {
 });
 
 /**
+ * BLO-34316 — a self-attestation must not reach `clean`.
+ *
+ * `isAllyConsolidatedReviewComment` is an inclusion test against the reviewer
+ * login and nothing stood behind it. On this fleet the PR author IS
+ * `allyblockcast[bot]`, so the author satisfied that test by construction and
+ * an author-written `## Ally` comment produced the gate's strongest positive on
+ * a head nobody else had read (Blockcast/onprem-k8s#3381 @ 8cef0a08).
+ *
+ * The narrowing withdraws only the positive claim. The blocking and carried
+ * paths stay author-blind: a finding is a finding whoever wrote it.
+ */
+describe("evaluateCommentReviewGate self-attestation", () => {
+  it("refuses clean for an attestation written by the PR author", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-09-16T21:07:06Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    expect(commentReviewGateCheckConclusion(verdict)).toBe("neutral");
+    // AC#5: a reader who only sees the string must not be told the head was
+    // reviewed. The `state` stays green, so the string is the whole signal.
+    expect(verdict.reason).toMatch(/written by the PR author/i);
+    expect(verdict.reason.length).toBeLessThanOrEqual(140);
+  });
+
+  it("still reports clean when the attesting login is not the PR author", () => {
+    // The negative control: the gate is narrowed, not switched off. Reverting
+    // the author exclusion leaves this passing and the case above failing;
+    // deleting the exclusion's `prAuthorLogin` guard fails this one instead.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: "some-contributor",
+      comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-09-16T21:07:06Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
+    expect(commentReviewGateCheckConclusion(verdict)).toBe("success");
+  });
+
+  it("matches the author across GitHub's app/<slug> rendering of one identity", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: "app/allyblockcast",
+      comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-09-16T21:07:06Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  it("keeps blocking_finding author-blind", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [allyComment(blockingReview(CURRENT_HEAD), "2026-09-16T21:07:06Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "blocking_finding" });
+  });
+
+  it("keeps carried_finding author-blind", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [allyComment(blockingReview(OLD_HEAD), "2026-09-16T20:07:06Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
+  it("does not let a withdrawn attestation inherit an earlier head's finding", () => {
+    // Withdrawing evidence must not manufacture a red. A self-attested clean
+    // head returns `not_evaluated` directly rather than falling through to the
+    // carried check — falling through would turn a green into a failure on
+    // essentially every agent-authored PR, the deadlock BLO-29711 pinned this
+    // gate against.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-09-16T20:07:06Z"),
+        allyComment(cleanReview(CURRENT_HEAD), "2026-09-16T21:07:06Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  it("leaves every verdict unchanged when the author is unknown", () => {
+    // The evaluator cannot invent the author, and guessing is worse than not
+    // testing. `runPrCommentReviewGateCheck` is what fails closed on an
+    // unresolvable author; the pure function stays honest about not knowing.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-09-16T21:07:06Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
+  });
+});
+
+/**
  * BLO-31446 — Ally's clean-review boilerplate must not read as a blocking
  * finding.
  *

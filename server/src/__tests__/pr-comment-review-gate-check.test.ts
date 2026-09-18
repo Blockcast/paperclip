@@ -17,12 +17,14 @@ vi.mock("../config.js", () => ({ loadConfig: () => h.cfg }));
 const mockListComments = vi.hoisted(() => vi.fn());
 const mockListReviews = vi.hoisted(() => vi.fn());
 const mockFetchHeadSha = vi.hoisted(() => vi.fn());
+const mockFetchPrAuthor = vi.hoisted(() => vi.fn());
 const mockPostStatus = vi.hoisted(() => vi.fn());
 const mockPostCheckRun = vi.hoisted(() => vi.fn());
 const mockStatusDeliveryLock = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/github-app-auth.js", () => ({
   githubFetchPrHeadSha: mockFetchHeadSha,
+  githubFetchPrAuthorLogin: mockFetchPrAuthor,
   githubListIssueCommentsWithTimestamps: mockListComments,
   githubListPrReviewsWithTimestamps: mockListReviews,
   githubPostCommitStatusDetailed: mockPostStatus,
@@ -71,10 +73,16 @@ beforeEach(() => {
   mockListComments.mockReset();
   mockListReviews.mockReset();
   mockFetchHeadSha.mockReset();
+  mockFetchPrAuthor.mockReset();
   mockPostStatus.mockReset();
   mockPostCheckRun.mockReset();
   mockStatusDeliveryLock.mockReset();
   mockStatusDeliveryLock.mockImplementation(async (_db, _key, operation) => operation());
+  // A PR author who is NOT the reviewer identity, so every pre-existing case
+  // keeps exercising the ordinary path. The self-attestation cases (BLO-34316)
+  // override it; leaving this at `allyblockcast[bot]` would instead make the
+  // whole file a self-attestation test and hide the distinct-author control.
+  mockFetchPrAuthor.mockResolvedValue("some-contributor");
   // Default both surfaces to empty; each test overrides the one it exercises.
   mockListComments.mockResolvedValue([]);
   mockListReviews.mockResolvedValue([]);
@@ -400,4 +408,69 @@ describe("check-run mirror (BLO-33657)", () => {
     await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
     expect(mockPostStatus).toHaveBeenCalled();
   });
+});
+
+/**
+ * BLO-34316 — the PR author reaching the gate's strongest green.
+ *
+ * The only identity test in the evaluator was an *inclusion* test against the
+ * reviewer login, and on this fleet the PR author IS that identity. So an
+ * author-written `## Ally` comment attesting the current head produced
+ * `clean` → check-run `success`, on a head nobody else had read. Measured live
+ * on Blockcast/onprem-k8s#3381 @ 8cef0a08.
+ */
+describe("self-attestation (BLO-34316)", () => {
+  const attestation = {
+    login: "allyblockcast[bot]",
+    body:
+      `## Ally — Consolidated PR Review\nReviewed head: ${TARGET.headSha}\n` +
+      "### Critical Issues (0)\n### Important Issues (0)",
+    createdAt: "2026-09-16T21:07:06Z",
+  };
+
+  it("withdraws the clean verdict when the attesting comment is the PR's own author", async () => {
+    mockFetchPrAuthor.mockResolvedValue("allyblockcast[bot]");
+    mockListComments.mockResolvedValue([attestation]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "not_evaluated" },
+    });
+
+    // Non-blocking, per BLO-29711: the status stays green and the check-run
+    // carries the distinction. Withdrawing evidence must not manufacture a red.
+    expect(mockPostStatus.mock.calls[0][0]).toMatchObject({ state: "success" });
+    expect(mockPostStatus.mock.calls[0][0].description).toMatch(/written by the PR author/i);
+    expect(mockPostCheckRun.mock.calls[0][0]).toMatchObject({ conclusion: "neutral" });
+  });
+
+  it("still reports clean for the same comment from someone other than the author", async () => {
+    // The negative control. The gate is narrowed, not switched off.
+    mockFetchPrAuthor.mockResolvedValue("some-contributor");
+    mockListComments.mockResolvedValue([attestation]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "clean" },
+    });
+    expect(mockPostCheckRun.mock.calls[0][0]).toMatchObject({ conclusion: "success" });
+  });
+
+  it("publishes nothing when the PR author cannot be resolved", async () => {
+    // `clean` now depends on knowing the author, so an unresolvable author is
+    // the same class of failure as an unresolvable head: leave the previous
+    // status standing and let the next webhook re-evaluate. Publishing green
+    // without the author is the defect this suite pins.
+    mockFetchPrAuthor.mockResolvedValue(null);
+    mockListComments.mockResolvedValue([attestation]);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toEqual({
+      posted: false,
+      reason: "fetch_failed",
+    });
+    expect(mockPostStatus).not.toHaveBeenCalled();
+    expect(mockPostCheckRun).not.toHaveBeenCalled();
+  }, 10_000);
 });
