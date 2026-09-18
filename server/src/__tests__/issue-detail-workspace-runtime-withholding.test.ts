@@ -19,6 +19,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import { issueRoutes } from "../routes/issues.js";
 
 /**
@@ -54,6 +55,17 @@ const EXECUTION_WS_SENTINEL = "sentinel-execution-workspace-runtime-must-not-egr
  * the boundary at all because the issue routes answer with spreads. Distinct sentinels from the
  * three above, so a failure names which carrier regressed.
  */
+/**
+ * BLO-33568. The command SCALARS beside `workspaceRuntime`, which this file's fixture did not
+ * populate. `compactIssueExecutionWorkspace` / `compactIssueProjectWorkspace` mask them
+ * (`routes/issues.ts`), but an absent fixture field cannot show that a present one crosses — the
+ * same blind spot PEN-3073 recorded for the empty `plannedActions` array, one field over. Measured
+ * 2026-09-18: reverting the `config.cleanupCommand` mask left all 74 tests across all four
+ * withholding suites green.
+ */
+const CONFIG_COMMAND_SENTINEL = "TOKEN_FIXTURE=sentinel-issue-config-command-not-a-real-credential ./run.sh";
+const PROJECT_WS_COMMAND_SENTINEL = "TOKEN_FIXTURE=sentinel-issue-project-ws-command-not-a-real-credential ./drop.sh";
+
 const ISSUE_SETTINGS_RUNTIME_SENTINEL = "sentinel-issue-settings-runtime-must-not-egress";
 const ISSUE_SETTINGS_COMMAND_SENTINEL = "sentinel-issue-settings-command-must-not-egress";
 const ISSUE_SETTINGS_UNKNOWN_SENTINEL = "sentinel-issue-settings-unknown-key-must-not-egress";
@@ -178,6 +190,8 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
         projectId,
         name: "attached-primary",
         isPrimary: true,
+        setupCommand: `${PROJECT_WS_COMMAND_SENTINEL}-setup`,
+        cleanupCommand: PROJECT_WS_COMMAND_SENTINEL,
         metadata: workspaceMetadata(PROJECT_WS_SENTINEL),
       },
       {
@@ -201,6 +215,9 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
       status: "active",
       metadata: {
         config: {
+          provisionCommand: `${CONFIG_COMMAND_SENTINEL}-provision`,
+          teardownCommand: `${CONFIG_COMMAND_SENTINEL}-teardown`,
+          cleanupCommand: CONFIG_COMMAND_SENTINEL,
           workspaceRuntime: {
             services: [{ name: "api", command: EXECUTION_WS_SENTINEL }],
           },
@@ -285,6 +302,31 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
     expect(JSON.stringify(res.body)).not.toContain(EXECUTION_WS_SENTINEL);
   });
 
+  /**
+   * BLO-33568. The command SCALARS beside `workspaceRuntime`, on both compacted exits. Distinct
+   * from the assertions above in contract as well as in field: `workspaceRuntime` goes to `null`,
+   * these are MASKED — so this asserts sentinel-absence AND an explicit `REDACTED_EVENT_VALUE`
+   * equality. `toBeNull()` would encode the wrong contract and would pass on a field that had
+   * simply been dropped, which is the opposite of withheld-is-not-absent.
+   */
+  it("withholds the command scalars beside workspaceRuntime on both compacted exits", async () => {
+    const { companyId, agentId, issueId } = await seedScenario();
+
+    const res = await request(createApp(agentActor(companyId, agentId))).get(`/api/issues/${issueId}`);
+
+    expect(res.status).toBe(200);
+    const body = JSON.stringify(res.body);
+    expect(body).not.toContain(CONFIG_COMMAND_SENTINEL);
+    expect(body).not.toContain(PROJECT_WS_COMMAND_SENTINEL);
+
+    const config = res.body.currentExecutionWorkspace.config;
+    expect(config.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+    expect(config.teardownCommand).toBe(REDACTED_EVENT_VALUE);
+    expect(config.cleanupCommand).toBe(REDACTED_EVENT_VALUE);
+    expect(res.body.project.workspaces[0].setupCommand).toBe(REDACTED_EVENT_VALUE);
+    expect(res.body.project.workspaces[0].cleanupCommand).toBe(REDACTED_EVENT_VALUE);
+  });
+
   it("withholds mentionedProjects[].workspaces — the uncompacted exit that also carries metadata", async () => {
     const { companyId, agentId, issueId } = await seedScenario();
 
@@ -313,6 +355,10 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
     expect(body).toContain(PROJECT_WS_SENTINEL);
     expect(body).toContain(EXECUTION_WS_SENTINEL);
     expect(body).toContain(MENTIONED_WS_SENTINEL);
+    // BLO-33568 AC 4. The command scalars are an entitled reader's working data — the workspace
+    // editors round-trip them — so masking them unconditionally would be a regression, not a fix.
+    expect(body).toContain(CONFIG_COMMAND_SENTINEL);
+    expect(body).toContain(PROJECT_WS_COMMAND_SENTINEL);
   });
 
   it("reports hasWorkspaceRuntimeConfig to the withheld agent, so existence never needs contents", async () => {
