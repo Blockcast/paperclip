@@ -142,11 +142,16 @@ test('commitperclip-review: listens for edited without displacing the original t
 // pull_request_target hands secrets to a job triggered by an untrusted fork
 // PR, so the base-branch checkout is what makes adding a trigger type safe at
 // all. If this ever flips to the PR head, `edited` stops being a one-line
-// change and becomes an arbitrary-code-execution path. The count is what makes
-// this airtight: blacklisting `ref:` spellings can only ever chase an unbounded
-// set (`github.head_ref`, `refs/pull/`, `env.PR_HEAD_SHA`, `merge_commit_sha`,
-// …). Asserting there is exactly one checkout, and that it is `master`, rejects
-// every second-checkout spelling regardless of how its `ref:` is written.
+// change and becomes an arbitrary-code-execution path. The count is what bounds
+// the blacklist problem: enumerating `ref:` spellings can only ever chase an
+// unbounded set (`github.head_ref`, `refs/pull/`, `env.PR_HEAD_SHA`,
+// `merge_commit_sha`, …). Asserting there is exactly one checkout, and that it
+// is `master`, rejects every second *checkout step* regardless of how its
+// `ref:` is written. Ceiling: a `run:` step fetching PR code itself (`git fetch
+// origin pull/N/head`), or a third-party action taking its own `ref:` input, is
+// outside any guard that reads this workflow as text. Neither exists today —
+// the only `uses:` steps are checkout, dependency-review-action and setup-node
+// — so if you add one, this test will not stop you.
 test('commitperclip-review: still checks out master, never PR code', () => {
   assert.match(workflow, /uses:\s*actions\/checkout@[^\n]*\n\s*with:\s*\n\s*ref:\s*master/);
   assert.equal((workflow.match(/uses:\s*actions\/checkout@/g) ?? []).length, 1);
