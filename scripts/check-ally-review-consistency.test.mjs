@@ -1311,4 +1311,41 @@ describe("BLO-32695 — a fenced example of the marker is not a second block", (
     // both counts together or it trades one divergence for another.
     assert.equal(attestedHead(body("```markdown", "<!-- ally-verdict:1 {", "```")), HEAD);
   });
+
+  it("reads the head through a tilde fence and through a longer backtick run", () => {
+    // The case above pinned ``` only, so every other CommonMark fence the gate
+    // handles stayed a divergence: this reader saw blocks=2 where the gate saw
+    // one quoted example.
+    for (const [open, close] of [
+      ["~~~", "~~~"],
+      ["````markdown", "````"],
+    ]) {
+      assert.equal(attestedHead(body("As emitted:", "", open, block(HEAD), close)), HEAD, open);
+    }
+  });
+
+  it("only a same-char run at least as long closes a fence", () => {
+    // Fence-length and fence-char matching are the halves a delimiter widening
+    // leaves behind: if ``` closed a ```` fence, or ~~~ closed a ``` one, the
+    // quoted block after it would re-appear as a second block.
+    for (const [open, inner, close] of [
+      ["````markdown", "```", "````"],
+      ["```markdown", "~~~", "```"],
+    ]) {
+      assert.equal(
+        attestedHead(body("As emitted:", "", open, block(HEAD), inner, block(HEAD), close)),
+        HEAD,
+        open,
+      );
+    }
+  });
+
+  it("an inline backtick span does not open a phantom fence", () => {
+    // CommonMark bars a backtick from a backtick fence's info string. Without
+    // that rule this line opens a fence that never closes, blanking the rest of
+    // the body — so the second block goes unseen and an unreadable body reads
+    // `ok`. Same assertion as the real-second-block control because the harm is
+    // masking exactly that.
+    assert.equal(attestedHead(body("``` `example` is prose, not a fence opener", block(HEAD))), null);
+  });
 });

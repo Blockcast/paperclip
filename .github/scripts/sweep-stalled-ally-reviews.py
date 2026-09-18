@@ -114,30 +114,44 @@ EMITTED_BUCKET_PATTERN = re.compile(
     r"(Critical|Important)[ \t]+Issues[ \t]*[*_]{0,3}[ \t]*\((\d+)\)[*_]{0,3}[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
-FENCE_PATTERN = re.compile(r"^ {0,3}```")
+FENCE_OPEN_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+FENCE_CLOSE_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 
 
 def without_fenced_spans(text):
     """Blank fenced spans so a quoted bucket cannot fail a block closed.
 
-    Deliberately simpler than withoutFencedCodeBlocks in the gate: a line-level
-    toggle on ``` only, with no tilde fences, no fence-length matching and no
-    info-string rule. Stated rather than implied -- a body using those forms is
-    read here as emitted structure and by the gate as a quote. Applied to the
-    count cross-check and to the block and opener counts in
+    Mirrors withoutFencedCodeBlocks in the gate exactly -- tilde fences, fence
+    length matching and the backtick info-string rule. A simpler toggle here is
+    not a scoping choice but a divergence: the two readers then disagree about
+    how many blocks a body contains, which is the BLO-31730 cross-reader
+    failure one layer down, and it fires first on a review that quotes the
+    marker template -- the likeliest shape for a review of this feature.
+    Applied to the count cross-check and to the block and opener counts in
     parse_verdict_block_head, not to the prose attestation pattern, whose own
-    fence handling is unchanged by this.
+    fence handling is the residual documented on parse_reviewed_head.
     """
-    if "```" not in text:
+    if "```" not in text and "~~~" not in text:
         return text
     lines = []
-    fenced = False
+    open_fence = None
     for line in text.split("\n"):
-        if FENCE_PATTERN.match(line):
-            fenced = not fenced
+        if open_fence:
+            close = FENCE_CLOSE_PATTERN.match(line)
+            lines.append("")
+            if close and close.group(1)[0] == open_fence[0] and len(close.group(1)) >= open_fence[1]:
+                open_fence = None
+            continue
+        fence = FENCE_OPEN_PATTERN.match(line)
+        # Per CommonMark a backtick fence's info string may not itself contain
+        # a backtick. Honoring that keeps an inline span from opening a phantom
+        # fence that would blank the rest of a genuine review.
+        if fence and not (fence.group(1)[0] == "`" and "`" in fence.group(2)):
+            open_fence = (fence.group(1)[0], len(fence.group(1)))
             lines.append("")
         else:
-            lines.append("" if fenced else line)
+            lines.append(line)
+    # An unclosed fence blanks to end of body, matching how GitHub renders it.
     return "\n".join(lines)
 
 

@@ -1206,6 +1206,36 @@ class TestVerdictBlockMirrorsTheGateOnFencesAndLedgers(unittest.TestCase):
         body = self.body("", self.block())
         self.assertIsNone(sweep.parse_reviewed_head(body))
 
+    def test_a_tilde_or_longer_fenced_example_is_not_a_second_block_either(self):
+        # The test above pinned the ``` form only, so the same harm reopened
+        # under every other CommonMark fence the gate handles: a ~~~ opener, and
+        # a longer backtick run wrapping a ``` fence. Both read `ok` at the
+        # gate and `unreadable` here until this reader matched it.
+        for opener, closer in (("~~~", "~~~"), ("````markdown", "````")):
+            body = self.body("Here is the emitted form:", "", opener, self.block(), closer)
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, opener)
+
+    def test_only_a_same_char_run_at_least_as_long_closes_a_fence(self):
+        # Fence-length and fence-char matching are the halves a delimiter
+        # widening leaves behind. If ``` closed a ```` fence, or ~~~ closed a
+        # ``` one, the quoted block after it would re-appear as a second block
+        # and the body would read `unreadable` again.
+        for opener, inner, closer in (
+            ("````markdown", "```", "````"),
+            ("```markdown", "~~~", "```"),
+        ):
+            body = self.body("As emitted:", "", opener, self.block(), inner, self.block(), closer)
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, opener)
+
+    def test_an_inline_backtick_span_does_not_open_a_phantom_fence(self):
+        # CommonMark bars a backtick from a backtick fence's info string. Without
+        # that rule this line opens a fence that never closes, blanking the rest
+        # of the body -- so the second block below goes unseen and a genuinely
+        # unreadable body reads `ok`. The assertion is the same as the
+        # real-second-block control precisely because the harm is masking it.
+        body = self.body("``` `example` is prose, not a fence opener", self.block())
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
     def test_a_malformed_ledger_is_rejected_here_too(self):
         # Validation had covered one of the two fields the payload carries. TS
         # rejects these via asDispositions and the mjs via stillPresentIn, while
