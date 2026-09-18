@@ -1324,9 +1324,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // `getAgent` / `isAgentInvokable` / `budgets.getInvocationBlock` /
     // instance settings). This ratchet fails on any new pooled call site and
     // on a regression of any of them.
-    const knownPooledUnderLock = [
-      "getOrCreateRow",
-    ];
+    // Empty on purpose: nothing may run pooled under the lock any more. Master
+    // dropped `getLatestIssueRun` (29cdd6ab3) and this PR moved the last one,
+    // `getOrCreateRow`, onto the caller tx (`readInstanceSettingsOn`); it is
+    // asserted forbidden by name below, so it must not be allowlisted here.
+    const knownPooledUnderLock: string[] = [];
     const unexpected = pooledInsideTransaction.filter(
       (entry) => !knownPooledUnderLock.some((name) => entry.includes(name)),
     );
