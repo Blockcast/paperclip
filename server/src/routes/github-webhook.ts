@@ -2479,14 +2479,19 @@ function shouldFirePrReviewerWake(context: ResolvedEventContext | null): context
 // A wake idempotency key is either REQUEST-scoped or STABLE, and the two want
 // opposite treatment of terminal statuses (see idempotentWakeStatuses):
 //
-//   request — the suffix carries a per-event identity (GitHub comment id or
-//     delivery id). The key can only recur if GitHub redelivers THAT event, so
-//     a terminal success/cancellation must dedup: replaying it would redo work
+//   request — the suffix carries a per-event identity (GitHub comment id,
+//     delivery id, or head sha). The key can only recur if GitHub redelivers
+//     THAT event, or re-reports the same head, so a terminal
+//     success/cancellation must dedup: replaying it would redo work
 //     that already happened.
 //   stable  — the suffix is just repo+pr+reason, so a genuinely NEW event
 //     reuses the key. A terminal status must NOT dedup, or the first completed
 //     wake would block every later event of that reason on that PR forever.
 type WakeIdempotencyScope = "request" | "stable";
+
+// Declared above wakeIdempotencySuffix so its default parameter never reads a
+// const through the temporal dead zone. The PR-author path head-scopes nothing.
+const NO_HEAD_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set();
 
 // Computes the key suffix and its scope together so the two can never drift —
 // getting `scope` wrong while the suffix stays right is exactly the bug that
@@ -2502,6 +2507,7 @@ function wakeIdempotencySuffix(
   context: ResolvedEventContext,
   deliveryId: string | null,
   deliveryScopedReasons: ReadonlySet<string>,
+  headScopedReasons: ReadonlySet<string> = NO_HEAD_SCOPED_WAKE_REASONS,
 ): { suffix: string; scope: WakeIdempotencyScope } {
   const scopeFor = (identity: string | number | null): WakeIdempotencyScope =>
     identity === null || identity === "" ? "stable" : "request";
@@ -2533,6 +2539,35 @@ function wakeIdempotencySuffix(
       scope: scopeFor(identity),
     };
   }
+  // PEN-2865: scope the push-driven reviewer wakes to the HEAD, not to the
+  // delivery. Two deliveries of one PR event on an UNCHANGED head used to earn
+  // two different keys, clear the idempotency precheck, and become two wakes.
+  // Nothing downstream collapses them: both reasons sit in
+  // EXPLICIT_PR_REVIEW_REQUEST_WAKE_REASONS, which forces `includeRunning:
+  // false` in enqueueWakeup, so a RUNNING same-PR review is never a coalesce
+  // target and the second wake becomes a second queued run. Ally then posted a
+  // byte-identical second review on one head -- observed on
+  // Blockcast/paperclip#1594 (866 bytes twice, 26s apart) and #1304 (53s).
+  //
+  // Head is the right identity for precisely the reason delivery-scoping was
+  // introduced in BLO-18953: each push is "a fresh request for the current
+  // head", and a genuine push always carries a NEW head sha, so it still earns
+  // a fresh key and a fresh wake. What it no longer earns is a SECOND key for
+  // the same head. A GitHub redelivery dedups here too, as it did before.
+  //
+  // This is the BLO-32381 escalation precedent applied to the review itself.
+  //
+  // Falling back to the delivery-scoped branch below (rather than emitting
+  // `head:unknown`) is load-bearing: an `unknown` identity scores `stable`,
+  // where `coalesced` is idempotent in the BASE status set, which is exactly
+  // the self-poisoning BLO-18953 fixed (Blockcast/paperclip#822). The fallback
+  // keeps that path byte-for-byte identical to today.
+  if (context.wakeReason && headScopedReasons.has(context.wakeReason) && context.headSha) {
+    return {
+      suffix: `${context.wakeReason}:head:${context.headSha}`,
+      scope: scopeFor(context.headSha),
+    };
+  }
   if (context.wakeReason && deliveryScopedReasons.has(context.wakeReason)) {
     return {
       suffix: `${context.wakeReason}:delivery:${deliveryId ?? "unknown"}`,
@@ -2547,6 +2582,14 @@ const REVIEWER_DELIVERY_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set([
   "github_pr_synchronized",
 ]);
 
+// PEN-2865. Same two reasons as the delivery-scoped set above, and deliberately
+// NOT a replacement for it: head-scoping is attempted first, and the delivery
+// set remains the fallback for an event that somehow carries no head sha.
+const REVIEWER_HEAD_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set([
+  "github_pr_ready_for_review",
+  "github_pr_synchronized",
+]);
+
 // The PR-author wake keeps repo+pr+reason keys for everything except the
 // comment-scoped @ally request; widening it is a separate behavior change.
 const AUTHOR_DELIVERY_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set();
@@ -2555,7 +2598,12 @@ function prReviewerWakeIdempotencyScope(
   context: ResolvedEventContext,
   deliveryId: string | null,
 ): WakeIdempotencyScope {
-  return wakeIdempotencySuffix(context, deliveryId, REVIEWER_DELIVERY_SCOPED_WAKE_REASONS).scope;
+  return wakeIdempotencySuffix(
+    context,
+    deliveryId,
+    REVIEWER_DELIVERY_SCOPED_WAKE_REASONS,
+    REVIEWER_HEAD_SCOPED_WAKE_REASONS,
+  ).scope;
 }
 
 function buildPrReviewerWakeIdempotencyKey(
@@ -2582,16 +2630,25 @@ function buildPrReviewerWakeIdempotencyKey(
   // explicit re-review comment can wake Ally again.
   //
   // github_pr_ready_for_review and github_pr_synchronized are scoped to the
-  // delivery id for the same reason (BLO-18953). Each draft->ready toggle and
-  // each push is a fresh request for the current head. Keying either on
-  // repo+pr+reason alone made it self-poisoning: `coalesced` is an
+  // HEAD SHA (PEN-2865), falling back to the delivery id when a head is somehow
+  // absent. Each draft->ready toggle and each push is a fresh request for the
+  // current head, and a genuine one always carries a NEW head -- so head keeps
+  // the "fresh request" property that BLO-18953 needed, while collapsing the
+  // duplicate deliveries of ONE head that were producing two reviewer wakes and
+  // two byte-identical Ally reviews on an unchanged head.
+  //
+  // Keying either on repo+pr+reason alone made it self-poisoning: `coalesced`
+  // is an
   // IDEMPOTENT_REVIEWER_WAKE_STATUS and is terminal (the row is inserted with
   // finishedAt already set and never transitions), so once ONE event was
   // coalesced, every future event of that reason on that PR was dropped at this
   // precheck forever. Observed on Blockcast/paperclip#822 and on synchronize
-  // pushes that arrived during an older-head running review. GitHub reuses the
-  // delivery id when it retries a delivery, so genuine redeliveries still
-  // dedup.
+  // pushes that arrived during an older-head running review. Head-scoping does
+  // not reintroduce that: a new push carries a new head and therefore a new key,
+  // and the `unknown` suffix that would land in `stable` is unreachable because
+  // the head branch is skipped entirely when no head sha is present.
+  // GitHub reuses the delivery id when it retries a delivery, and a redelivery
+  // reports the same head, so genuine redeliveries still dedup under either.
   //
   // Every other reason keys on repo+prNumber+reason alone. This deliberately
   // omits head sha and delivery id so the idempotency precheck can skip
@@ -2606,6 +2663,7 @@ function buildPrReviewerWakeIdempotencyKey(
     context,
     deliveryId,
     REVIEWER_DELIVERY_SCOPED_WAKE_REASONS,
+    REVIEWER_HEAD_SCOPED_WAKE_REASONS,
   );
   return `pr_review:${repo}:${context.prNumber}:${suffix}`;
 }

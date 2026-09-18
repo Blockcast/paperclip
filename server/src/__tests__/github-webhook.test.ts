@@ -795,7 +795,7 @@ describe("github-webhook pure helpers", () => {
     ).toBeNull();
   });
 
-  it("resolves pull_request synchronize with PR-scoped task keys and delivery-scoped idempotency", () => {
+  it("resolves pull_request synchronize with PR-scoped task keys and head-scoped idempotency", () => {
     const ctx1 = __test_resolveEventContext("pull_request", {
       action: "synchronize",
       pull_request: {
@@ -836,15 +836,30 @@ describe("github-webhook pure helpers", () => {
       throw new Error("expected synchronize pull_request contexts with PR numbers");
     }
     // taskKey controls reviewer affinity and queued-run coalescing. The
-    // idempotency key is delivery-scoped so a coalesced push cannot poison
-    // every future synchronize event for the PR.
+    // idempotency key is head-scoped (PEN-2865) so a coalesced push cannot
+    // poison every future synchronize event for the PR — these two pushes
+    // carry different heads and so keep distinct keys — while two deliveries
+    // of ONE head collapse onto a single wake.
     expect(__test_buildPrReviewerTaskKey(ctx1)).toBe("pr_review:Blockcast/paperclip:318");
     expect(__test_buildPrReviewerTaskKey(ctx2)).toBe(__test_buildPrReviewerTaskKey(ctx1));
     expect(__test_buildPrReviewerWakeIdempotencyKey(ctx1, "delivery-push-2")).toBe(
-      "pr_review:Blockcast/paperclip:318:github_pr_synchronized:delivery:delivery-push-2",
+      "pr_review:Blockcast/paperclip:318:github_pr_synchronized:head:push2sha",
     );
     expect(__test_buildPrReviewerWakeIdempotencyKey(ctx2, "delivery-push-3")).toBe(
-      "pr_review:Blockcast/paperclip:318:github_pr_synchronized:delivery:delivery-push-3",
+      "pr_review:Blockcast/paperclip:318:github_pr_synchronized:head:push3sha",
+    );
+
+    // PEN-2865: the duplicate-delivery property. Two DISTINCT delivery ids on
+    // the SAME unchanged head must produce ONE key, so the second delivery is
+    // dropped at the idempotency precheck instead of becoming a second queued
+    // run and a second byte-identical Ally review (Blockcast/paperclip#1594).
+    expect(__test_buildPrReviewerWakeIdempotencyKey(ctx1, "delivery-duplicate-a")).toBe(
+      __test_buildPrReviewerWakeIdempotencyKey(ctx1, "delivery-duplicate-b"),
+    );
+    // ...and the key must still change when the head does, or a real push
+    // would be swallowed (BLO-18953 / Blockcast/paperclip#822).
+    expect(__test_buildPrReviewerWakeIdempotencyKey(ctx2, "delivery-duplicate-a")).not.toBe(
+      __test_buildPrReviewerWakeIdempotencyKey(ctx1, "delivery-duplicate-a"),
     );
   });
 
@@ -866,8 +881,9 @@ describe("github-webhook pure helpers", () => {
       return ctx as NonNullable<typeof ctx>;
     };
 
-    // Delivery-scoped: the key can only recur as a redelivery, so a terminal
-    // completed/cancelled row must dedup it.
+    // Head-scoped (PEN-2865): the key can only recur as a redelivery or as a
+    // duplicate delivery of the same head, so a terminal completed/cancelled
+    // row must dedup it.
     for (const [action, reason] of [
       ["ready_for_review", "github_pr_ready_for_review"],
       ["synchronize", "github_pr_synchronized"],
@@ -881,10 +897,33 @@ describe("github-webhook pure helpers", () => {
     const opened = requestScoped("opened", "github_pr_opened");
     expect(__test_prReviewerWakeIdempotencyScope(opened, "delivery-1")).toBe("stable");
 
-    // A suffix with no per-event identity at all cannot distinguish two
-    // distinct events, so it must NOT get the terminal-dedup rule.
-    const noIdentity = requestScoped("ready_for_review", "github_pr_ready_for_review");
-    expect(__test_prReviewerWakeIdempotencyScope(noIdentity, null)).toBe("stable");
+    // PEN-2865: with no delivery id the suffix is still request-scoped, because
+    // the HEAD now supplies the per-event identity. This case used to fall back
+    // to `delivery:unknown` and score `stable`.
+    const noDeliveryId = requestScoped("ready_for_review", "github_pr_ready_for_review");
+    expect(noDeliveryId.headSha).toBe("readysha");
+    expect(__test_prReviewerWakeIdempotencyScope(noDeliveryId, null)).toBe("request");
+
+    // A suffix with no per-event identity AT ALL — neither head nor delivery —
+    // cannot distinguish two distinct events, so it must NOT get the
+    // terminal-dedup rule. This is the invariant the case above used to carry.
+    const headless = __test_resolveEventContext("pull_request", {
+      action: "ready_for_review",
+      pull_request: {
+        number: 992,
+        title: "Fix BLO-3182 webflow blog",
+        body: null,
+        draft: false,
+        html_url: "https://github.com/Blockcast/magma/pull/992",
+        head: { ref: "fix/BLO-3182-webflow-blog" },
+      },
+      repository: { full_name: "Blockcast/magma" },
+    });
+    expect(headless?.wakeReason).toBe("github_pr_ready_for_review");
+    expect(headless?.headSha).toBeFalsy();
+    expect(
+      __test_prReviewerWakeIdempotencyScope(headless as NonNullable<typeof headless>, null),
+    ).toBe("stable");
 
     expect(__test_idempotentWakeStatuses("stable")).not.toContain("completed");
     expect(__test_idempotentWakeStatuses("stable")).not.toContain("cancelled");
@@ -988,7 +1027,7 @@ describe("github-webhook pure helpers", () => {
     expect(__test_shouldFirePrReviewerWake(converted)).toBe(false);
   });
 
-  it("scopes the ready_for_review idempotency key to the delivery so every toggle is a fresh request (BLO-18953)", () => {
+  it("scopes the ready_for_review idempotency key to the head so every toggle on a new head is a fresh request (BLO-18953, PEN-2865)", () => {
     const readyAt = (sha: string) =>
       __test_resolveEventContext("pull_request", {
         action: "ready_for_review",
@@ -1013,18 +1052,21 @@ describe("github-webhook pure helpers", () => {
 
     // Keyed on repo+pr+reason alone, the first toggle's wake row — which lands
     // on the terminal `coalesced` status, an IDEMPOTENT_REVIEWER_WAKE_STATUS —
-    // blocked every later toggle on the PR forever. Delivery scoping keeps each
-    // deliberate draft->ready transition its own request.
+    // blocked every later toggle on the PR forever. Head scoping (PEN-2865)
+    // keeps each deliberate draft->ready transition on a NEW head its own
+    // request, because the two toggles carry different heads.
     expect(__test_buildPrReviewerWakeIdempotencyKey(firstToggle, "delivery-ready-1")).toBe(
-      "pr_review:Blockcast/paperclip:822:github_pr_ready_for_review:delivery:delivery-ready-1",
+      "pr_review:Blockcast/paperclip:822:github_pr_ready_for_review:head:ea8697d1",
     );
     expect(__test_buildPrReviewerWakeIdempotencyKey(secondToggle, "delivery-ready-2")).not.toBe(
       __test_buildPrReviewerWakeIdempotencyKey(firstToggle, "delivery-ready-1"),
     );
 
-    // A GitHub redelivery reuses the delivery id, so genuine retries still dedup.
+    // A GitHub redelivery reuses the delivery id, so genuine retries still
+    // dedup — and under head scoping so does a DISTINCT delivery that reports
+    // the same unchanged head, which is the PEN-2865 duplicate.
     expect(__test_buildPrReviewerWakeIdempotencyKey(secondToggle, "delivery-ready-2")).toBe(
-      __test_buildPrReviewerWakeIdempotencyKey(secondToggle, "delivery-ready-2"),
+      __test_buildPrReviewerWakeIdempotencyKey(secondToggle, "delivery-ready-2-redelivered"),
     );
 
     // The task key stays PR-scoped: it also scopes reviewer affinity, the task
@@ -5803,7 +5845,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(wakes).toContainEqual(expect.objectContaining({
       status: "coalesced",
       idempotencyKey:
-        "pr_review:Blockcast/magma:976:github_pr_synchronized:delivery:delivery-review-pool-affinity-synchronized",
+        "pr_review:Blockcast/magma:976:github_pr_synchronized:head:second-head",
     }));
   });
 
@@ -5886,7 +5928,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(
         eq(
           agentWakeupRequests.idempotencyKey,
-          "pr_review:Blockcast/magma:977:github_pr_synchronized:delivery:delivery-review-pool-retry-affinity",
+          "pr_review:Blockcast/magma:977:github_pr_synchronized:head:second-head",
         ),
       );
     expect(wake).toEqual({ agentId: firstReviewerId, status: "coalesced" });
@@ -6029,7 +6071,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(firstRes.status).toBe(200);
 
     const idempotencyKey =
-      "pr_review:Blockcast/magma:991:github_pr_ready_for_review:delivery:delivery-ready-replay";
+      "pr_review:Blockcast/magma:991:github_pr_ready_for_review:head:readysha";
 
     const reviewerWakes = async () =>
       db
@@ -6067,6 +6109,86 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, reviewerAgentId));
     expect(reviewerRuns).toHaveLength(1);
+  });
+
+  it("drives ONE reviewer wake when two distinct deliveries report the same unchanged head (PEN-2865)", async () => {
+    const { companyId } = await seedIssueWithIdentifier("BLO-3182");
+    const reviewerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+    // Same head on both deliveries, and no push between them. This is the
+    // Blockcast/paperclip#1594 shape: two reviewer wakes fanned into two queued
+    // runs and Ally posted two byte-identical 866-byte reviews on one head, 26s
+    // apart. Delivery-scoped keys could not collapse them because the delivery
+    // ids differ; head-scoped keys can.
+    const synchronizePayload = () => ({
+      action: "synchronize",
+      pull_request: {
+        number: 982,
+        title: "Fix BLO-3182 webflow blog",
+        body: null,
+        html_url: "https://github.com/Blockcast/magma/pull/982",
+        head: { ref: "fix/BLO-3182-webflow-blog", sha: "samehead" },
+      },
+      repository: { full_name: "Blockcast/magma" },
+    });
+
+    const deliver = async (deliveryId: string) => {
+      const signed = signedRequest(synchronizePayload());
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signed.signature)
+        .set("x-github-delivery", deliveryId)
+        .set("content-type", "application/json")
+        .send(signed.body);
+    };
+
+    const firstRes = await deliver("delivery-same-head-1");
+    const secondRes = await deliver("delivery-same-head-2");
+
+    expect(firstRes.status).toBe(200);
+    expect(secondRes.status).toBe(200);
+
+    const reviewerWakes = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, reviewerAgentId));
+
+    // Exactly one wake row, and therefore exactly one review. Before PEN-2865
+    // this was two rows, both `queued`, under two delivery-scoped keys.
+    expect(reviewerWakes).toHaveLength(1);
+    expect(reviewerWakes[0]).toMatchObject({
+      status: "queued",
+      reason: "github_pr_synchronized",
+      idempotencyKey: "pr_review:Blockcast/magma:982:github_pr_synchronized:head:samehead",
+    });
+
+    // The invariant that actually matters: one reviewer run for one head.
+    const reviewerRuns = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, reviewerAgentId));
+    expect(reviewerRuns).toHaveLength(1);
+    expect(reviewerRuns[0]?.contextSnapshot).toMatchObject({
+      taskKey: "pr_review:Blockcast/magma:982",
+      githubHeadSha: "samehead",
+    });
   });
 
   it("dedupes rapid pull_request.synchronize pushes and suppresses only synchronize author wakes", async () => {
@@ -6133,7 +6255,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(reviewerWakes).toContainEqual(expect.objectContaining({
       status: "queued",
       reason: "github_pr_synchronized",
-      idempotencyKey: "pr_review:Blockcast/magma:981:github_pr_synchronized:delivery:delivery-sync-1",
+      idempotencyKey: "pr_review:Blockcast/magma:981:github_pr_synchronized:head:push1sha",
       payload: expect.objectContaining({
         taskKey: "pr_review:Blockcast/magma:981",
         source: "github",
@@ -6149,7 +6271,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(reviewerWakes).toContainEqual(expect.objectContaining({
       status: "coalesced",
       reason: "github_pr_synchronized",
-      idempotencyKey: "pr_review:Blockcast/magma:981:github_pr_synchronized:delivery:delivery-sync-2",
+      idempotencyKey: "pr_review:Blockcast/magma:981:github_pr_synchronized:head:push2sha",
     }));
 
     const reviewerRuns = await db
@@ -6405,7 +6527,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     // A normalized row can already exist from a canary or interrupted rollout.
     // Phase-one producers retain the legacy spelling for old-reader safety, so
     // the compatibility read must also work in this direction.
-    const normalizedIdempotencyKey = `pr_review:blockcast/paperclip:631:github_pr_synchronized:delivery:${deliveryId}`;
+    const normalizedIdempotencyKey = `pr_review:blockcast/paperclip:631:github_pr_synchronized:head:5ec17d77`;
     await db.insert(agentWakeupRequests).values({
       companyId,
       agentId: reviewerAgentId,
@@ -6487,7 +6609,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     const staleIdempotencyKey = "pr_review:blockcast/paperclip:630:github_pr_synchronized";
     // Canonical mixed-case: the phase-one producer preserves GitHub's spelling.
     const freshIdempotencyKey =
-      "pr_review:Blockcast/paperclip:630:github_pr_synchronized:delivery:delivery-post-exhaustion";
+      "pr_review:Blockcast/paperclip:630:github_pr_synchronized:head:freshsha";
     await db.insert(agentWakeupRequests).values({
       companyId,
       agentId: reviewerAgentId,
@@ -6557,7 +6679,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     const staleIdempotencyKey = "pr_review:blockcast/paperclip:813:github_pr_synchronized";
     // Canonical mixed-case: the phase-one producer preserves GitHub's spelling.
     const freshIdempotencyKey =
-      "pr_review:Blockcast/paperclip:813:github_pr_synchronized:delivery:delivery-fixup-after-completed-review";
+      "pr_review:Blockcast/paperclip:813:github_pr_synchronized:head:newhead";
     await db.insert(agentWakeupRequests).values({
       companyId,
       agentId: reviewerAgentId,
