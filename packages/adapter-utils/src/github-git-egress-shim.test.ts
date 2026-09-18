@@ -13,6 +13,7 @@ import {
   scanAnnotatedTags,
   scanCommit,
   scanPrePushUpdates,
+  TAG_PEEL_LIMIT,
   type GitReader,
 } from "./github-git-egress-shim.js";
 
@@ -29,6 +30,11 @@ function environmentDump(): string {
   return ["ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHOES"]
     .map((name, index) => `${name}=value-${index}`)
     .join("\n");
+}
+
+/** A vendor-key-shaped token, assembled for the same reason as the dump above. */
+function vendorKey(): string {
+  return `${["gh", "p"].join("")}_${"Ab3".repeat(9)}`;
 }
 
 /** A git reader backed by a fixed map, so no repository is needed. */
@@ -580,6 +586,30 @@ describe("scanCommit", () => {
     expect(findings[0]!.subject).toBe("wip");
   });
 
+  it("redacts the subject it reports, so the refusal cannot republish the material", () => {
+    // The subject of a one-line commit IS the text that fired the detector, so
+    // reporting it verbatim carries the credential out of the control through
+    // stderr and the run log — the disclosure shape this whole path exists to
+    // stop. The finding must never hold the raw value.
+    const token = vendorKey();
+    const subject = `fix: drop ${token} from config`;
+    const findings = scanCommit(
+      sha,
+      fakeGit({
+        [`log -1 --format=%s ${sha}`]: subject,
+        [`log -1 --format=%B ${sha}`]: `${subject}\n`,
+        [`show --format= --no-color -m --unified=0 --text --no-textconv ${sha}`]: "",
+      }),
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.where).toBe("message");
+    expect(findings[0]!.subject).not.toContain(token);
+    expect(findings[0]!.subject).toContain("redacted: vendor-key");
+    // The surrounding prose survives — the point is a recognisable subject, not
+    // an opaque one.
+    expect(findings[0]!.subject).toContain("fix: drop");
+  });
+
   it("passes a clean commit", () => {
     const findings = scanCommit(
       sha,
@@ -743,6 +773,87 @@ describe("scanAnnotatedTags", () => {
       ),
     ).toEqual([]);
   });
+  it("refuses when the peel budget runs out with a tag still unscanned", () => {
+    // Exhaustion must fail closed, exactly as the alias hop limit does. A push
+    // of the tag ref publishes every object in the chain, so returning the
+    // findings gathered so far would report an unscanned tail clean.
+    const chain = Array.from({ length: TAG_PEEL_LIMIT + 1 }, (_, index) =>
+      // +1 so the first object is not the all-zero null sha, which reads as a
+      // deletion and would return before the walk starts.
+      (index + 1).toString(16).padStart(2, "0").repeat(20),
+    );
+    const responses: Record<string, string> = { [`cat-file -t ${commitSha}`]: "commit\n" };
+    chain.forEach((objectSha, index) => {
+      const next = chain[index + 1] ?? commitSha;
+      responses[`cat-file -t ${objectSha}`] = "tag\n";
+      responses[`cat-file tag ${objectSha}`] = [
+        `object ${next}`,
+        next === commitSha ? "type commit" : "type tag",
+        `tag v${index}`,
+        "tagger T <t@example.invalid> 1700000000 +0000",
+        "",
+        "nothing interesting",
+      ].join("\n");
+    });
+
+    expect(() =>
+      scanAnnotatedTags(
+        { localRef: "refs/tags/v0", localSha: chain[0]!, remoteRef: "refs/tags/v0", remoteSha: zero },
+        fakeGit(responses),
+      ),
+    ).toThrow(GitEgressScanError);
+  });
+
+  it("scans a chain that exactly fills the budget rather than refusing it", () => {
+    // The budget is checked after the type read, so a chain of exactly
+    // TAG_PEEL_LIMIT tags terminating in a commit is scanned to the end. The
+    // material sits on the DEEPEST tag, so a loop that stopped one short would
+    // return no findings and this would pass for the wrong reason.
+    const chain = Array.from({ length: TAG_PEEL_LIMIT }, (_, index) =>
+      // +1 so the first object is not the all-zero null sha, which reads as a
+      // deletion and would return before the walk starts.
+      (index + 1).toString(16).padStart(2, "0").repeat(20),
+    );
+    const responses: Record<string, string> = { [`cat-file -t ${commitSha}`]: "commit\n" };
+    chain.forEach((objectSha, index) => {
+      const deepest = index === chain.length - 1;
+      const next = chain[index + 1] ?? commitSha;
+      responses[`cat-file -t ${objectSha}`] = "tag\n";
+      responses[`cat-file tag ${objectSha}`] = [
+        `object ${next}`,
+        deepest ? "type commit" : "type tag",
+        `tag v${index}`,
+        "tagger T <t@example.invalid> 1700000000 +0000",
+        "",
+        deepest ? `Release\n\n${environmentDump()}\n` : "nothing interesting",
+      ].join("\n");
+    });
+
+    const findings = scanAnnotatedTags(
+      { localRef: "refs/tags/v0", localSha: chain[0]!, remoteRef: "refs/tags/v0", remoteSha: zero },
+      fakeGit(responses),
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.commit).toBe(chain[chain.length - 1]);
+  });
+
+  it("redacts a tag name before it reaches the finding", () => {
+    // The name is author-chosen free text and is interpolated into the
+    // `git tag -f -a <name>` remedy, so it is the same disclosure path as a
+    // commit subject.
+    const token = vendorKey();
+    const findings = scanAnnotatedTags(
+      { localRef: "refs/tags/v1", localSha: tagSha, remoteRef: "refs/tags/v1", remoteSha: zero },
+      fakeGit({
+        [`cat-file -t ${tagSha}`]: "tag\n",
+        [`cat-file tag ${tagSha}`]: tagObject(`Release\n\n${environmentDump()}\n`, `rel-${token}`),
+        [`cat-file -t ${commitSha}`]: "commit\n",
+      }),
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.subject).not.toContain(token);
+    expect(findings[0]!.subject).toContain("redacted: vendor-key");
+  });
 });
 
 describe("formatRefusal", () => {
@@ -785,5 +896,40 @@ describe("formatRefusal", () => {
     // rev-list is newest-first, so the last finding is the oldest commit and is
     // the one an interactive rebase has to reach.
     expect(message).toContain("rebase -i bbbbbbbbbbbb~1");
+  });
+
+  it("does not reprint credential-shaped material carried in a subject", () => {
+    // Second barrier. The findings this renderer receives from `scanCommit`
+    // arrive scrubbed, so this constructs an UNSCRUBBED one on purpose: the
+    // renderer is the only thing here that writes to a human-visible sink, and
+    // it must not depend on every construction site having remembered.
+    const token = vendorKey();
+    const message = formatRefusal([
+      {
+        commit: "f".repeat(40),
+        shortCommit: "ffffffffffff",
+        subject: `fix: drop ${token} from config`,
+        where: "message",
+        classes: ["vendor-key"],
+      },
+    ]);
+    expect(message).not.toContain(token);
+    expect(message).toContain("redacted: vendor-key");
+    expect(message).toContain("ffffffffffff");
+  });
+
+  it("does not reprint a credential-shaped tag name in the retag remedy", () => {
+    const token = vendorKey();
+    const message = formatRefusal([
+      {
+        commit: "a".repeat(40),
+        shortCommit: "aaaaaaaaaaaa",
+        subject: `tag rel-${token}`,
+        where: "tag-message",
+        classes: ["vendor-key"],
+      },
+    ]);
+    expect(message).toContain("git tag -f -a");
+    expect(message).not.toContain(token);
   });
 });

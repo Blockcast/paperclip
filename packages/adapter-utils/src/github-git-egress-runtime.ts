@@ -330,7 +330,7 @@ export function makeGitReader(gitPath: string, cwd?: string): GitReader {
 }
 
 function readStdin(): Promise<string> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let buffer = "";
     if (process.stdin.isTTY) {
       resolve("");
@@ -341,7 +341,15 @@ function readStdin(): Promise<string> {
       buffer += chunk;
     });
     process.stdin.on("end", () => resolve(buffer));
-    process.stdin.on("error", () => resolve(buffer));
+    // Reject rather than resolving the partial buffer. A truncation that lands
+    // mid-line throws in `parsePrePushInput` and refuses, but one landing
+    // exactly on a newline yields a SHORTER, well-formed update list — and
+    // `runPrePushHook` reads a short list as "that is all this push contains"
+    // and returns 0 for the ref updates that were dropped. The rejection
+    // reaches `reportRuntimeError`, which sets a non-zero exit code, so the
+    // push aborts: an unread ref update is an unscanned ref update, exactly as
+    // an unreadable commit is an unscanned commit.
+    process.stdin.on("error", reject);
   });
 }
 

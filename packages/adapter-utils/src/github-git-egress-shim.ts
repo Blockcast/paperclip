@@ -101,6 +101,17 @@ const ALIAS_KEY_PREFIX = "alias.";
 export const ALIAS_HOP_LIMIT = 4;
 
 /**
+ * How many objects an annotated-tag chain is peeled through before refusing.
+ *
+ * Bounded for the same reason as {@link ALIAS_HOP_LIMIT} — the chain is
+ * agent-writable and a cycle must not spin a push forever — and safe for the
+ * same reason: exhausting it refuses. Set well above any legitimate shape; a
+ * tag pointing at a tag is already unusual and a chain of sixteen has no honest
+ * use.
+ */
+export const TAG_PEEL_LIMIT = 16;
+
+/**
  * The environment `--config-env` reads through.
  *
  * Narrower than `NodeJS.ProcessEnv` on purpose: this module is pure, and taking
@@ -673,7 +684,17 @@ export interface GitPushFinding {
   commit: string;
   /** Abbreviated sha, for the message. */
   shortCommit: string;
-  /** Commit subject, so the author can recognise it without looking it up. */
+  /**
+   * Commit subject, so the author can recognise it without looking it up.
+   *
+   * ALREADY SCRUBBED at construction, and that is a security invariant rather
+   * than a formatting choice. For a `message` finding the subject IS the head of
+   * the text that fired the detector, so a one-line commit would otherwise carry
+   * the material back out through the refusal — into agent stderr, into run
+   * logs, and from there into whatever the agent pastes when it reports the
+   * refusal. That is PEN-2526's shape, reached from inside the control built to
+   * prevent it. Anything reading this field is reading redacted text.
+   */
   subject: string;
   /**
    * Where in the pushed object the material sits.
@@ -706,13 +727,36 @@ export class GitEgressScanError extends Error {
   constructor(
     readonly command: readonly string[],
     readonly commit?: string,
+    /**
+     * Overrides the failed-read wording for a refusal that is NOT a failed
+     * read. Everything on this path refuses, but the author is told why, and
+     * "git failed" would send them to look for a broken repository when the
+     * scan in fact ran out of budget. See {@link tagPeelExhausted}.
+     */
+    reason?: string,
   ) {
     super(
-      `\`git ${command.join(" ")}\` failed, so ${
-        commit ? `commit ${commit.slice(0, 12)}` : "the set of commits this push would publish"
-      } could not be read`,
+      reason ??
+        `\`git ${command.join(" ")}\` failed, so ${
+          commit ? `commit ${commit.slice(0, 12)}` : "the set of commits this push would publish"
+        } could not be read`,
     );
     this.name = "GitEgressScanError";
+  }
+
+  /**
+   * The annotated-tag peel budget ran out with another tag object still in
+   * front of the scanner, so the rest of the chain would be published
+   * unscanned.
+   */
+  static tagPeelExhausted(sha: string, limit: number): GitEgressScanError {
+    return new GitEgressScanError(
+      ["cat-file", "-t", sha],
+      sha,
+      `an annotated tag chain deeper than ${limit} objects reached ${sha.slice(0, 12)} with objects still unscanned; ` +
+        "a push of the tag ref publishes every object in the chain, so the unscanned tail cannot be reported clean. " +
+        "Recreate the tag so it points at its target directly rather than through a chain of tags.",
+    );
   }
 }
 
@@ -730,6 +774,17 @@ function readGit(runGit: GitReader, args: string[], commit?: string): string {
  * remote does not have, `--not --remotes` excludes everything already published
  * under any remote-tracking ref, which is what keeps a new branch off a shared
  * base from re-reporting the entire history of the repository.
+ *
+ * A known trade-off, recorded rather than fixed: `--remotes` is EVERY remote,
+ * not the push target's. A commit present only on a second remote — a fork, an
+ * upstream — is genuinely reaching this one for the first time and is skipped.
+ * The exclusion set is therefore agent-writable via `git remote add`, which sits
+ * oddly beside the hook's refusal to scope itself by remote URL. It stays as it
+ * is because the alternative is worse in the common case: scoping to the target
+ * remote re-reports every commit a branch shares with an already-published
+ * upstream, on every push, with nothing the author can amend. The residual is
+ * narrow — material already published to another remote, i.e. already disclosed
+ * once — where the alternative's cost falls on ordinary clean pushes.
  *
  * Throws {@link GitEgressScanError} if `rev-list` fails: without its output the
  * scanner does not know what the push contains, and an empty list would read as
@@ -841,7 +896,14 @@ export function addedLinesFromPatch(patch: string): string {
 export function scanCommit(commit: string, runGit: GitReader): GitPushFinding[] {
   const findings: GitPushFinding[] = [];
   const shortCommit = commit.slice(0, 12);
-  const subject = readGit(runGit, ["log", "-1", "--format=%s", commit], commit).trim();
+  // Scrubbed HERE rather than at the point it is printed, so the invariant
+  // belongs to the finding and not to one renderer. The subject of a one-line
+  // commit is the material that fired the detector; carrying it raw in the
+  // object would leak through any sink that later reads a finding, not just
+  // through `formatRefusal`.
+  const subject = scrubGitHubEgressText(
+    readGit(runGit, ["log", "-1", "--format=%s", commit], commit).trim(),
+  ).text;
 
   const message = readGit(runGit, ["log", "-1", "--format=%B", commit], commit);
   if (message) {
@@ -912,8 +974,18 @@ export function scanCommit(commit: string, runGit: GitReader): GitPushFinding[] 
  *
  * The peel loop handles a tag pointing at a tag, which git permits. It is
  * bounded rather than `while (true)`: a malformed or cyclic chain must not spin
- * a push forever, and stopping early only ever means scanning less than the
- * whole chain, which the depth cap makes explicit rather than silent.
+ * a push forever. Exhausting that bound REFUSES rather than returning what it
+ * has, for the same reason the alias hop limit does. `git push refs/tags/<tag>`
+ * sends every object in the chain, not just the first, so a chain longer than
+ * the budget would publish objects — messages included — that nothing read.
+ * Returning the findings so far would be a clean verdict on an unscanned tail,
+ * which is the permissive direction and contradicts this module's rule that
+ * every uncertainty resolves toward scanning more.
+ *
+ * The budget is checked AFTER the type read, so a chain that is exactly
+ * {@link TAG_PEEL_LIMIT} tags deep and then reaches a commit terminates
+ * normally. Only a further tag object — one this loop would have had to scan
+ * and cannot — refuses.
  *
  * Reads throw {@link GitEgressScanError} rather than being skipped, for the same
  * reason as every other read on this path — an unreadable tag object is an
@@ -929,8 +1001,12 @@ export function scanAnnotatedTags(
   const findings: GitPushFinding[] = [];
   let sha = update.localSha;
 
-  for (let depth = 0; depth < 16; depth += 1) {
+  for (let depth = 0; ; depth += 1) {
     if (readGit(runGit, ["cat-file", "-t", sha], sha).trim() !== "tag") break;
+
+    // A tag object is in front of us and the budget is gone: this one and
+    // everything behind it would be published unscanned. Refuse.
+    if (depth >= TAG_PEEL_LIMIT) throw GitEgressScanError.tagPeelExhausted(sha, TAG_PEEL_LIMIT);
 
     const raw = readGit(runGit, ["cat-file", "tag", sha], sha);
     const shortCommit = sha.slice(0, 12);
@@ -942,7 +1018,10 @@ export function scanAnnotatedTags(
         findings.push({
           commit: sha,
           shortCommit,
-          subject: name ? `tag ${name}` : "annotated tag",
+          // Scrubbed for the same reason a commit subject is: a tag name is
+          // author-chosen free text that ends up in the refusal, and in the
+          // `git tag -f -a <name>` remedy line.
+          subject: name ? `tag ${scrubGitHubEgressText(name).text}` : "annotated tag",
           where: "tag-message",
           classes: scrubbed.classes,
         });
@@ -1030,9 +1109,19 @@ export function formatRefusal(findings: readonly GitPushFinding[]): string {
     "tag-message": "annotated tag message",
   } as const;
 
+  // `subject` arrives scrubbed (see {@link GitPushFinding.subject}); re-applying
+  // it here is a second barrier, not a duplicate. This function is the one thing
+  // on this path that writes to a human-visible sink, so it must not depend on
+  // every present and future construction site having remembered. The scrubber
+  // carries an existing marker through untouched, so a twice-scrubbed subject
+  // renders identically to a once-scrubbed one.
+  const displaySubject = (finding: GitPushFinding): string =>
+    scrubGitHubEgressText(finding.subject).text;
+
   for (const finding of findings) {
+    const subject = displaySubject(finding);
     lines.push(
-      `  ${finding.shortCommit}  ${WHERE_LABEL[finding.where]}: ${finding.classes.join(", ")}${finding.subject ? `  (${finding.subject})` : ""}`,
+      `  ${finding.shortCommit}  ${WHERE_LABEL[finding.where]}: ${finding.classes.join(", ")}${subject ? `  (${subject})` : ""}`,
     );
   }
 
@@ -1050,7 +1139,7 @@ export function formatRefusal(findings: readonly GitPushFinding[]): string {
   }
   if (tagFindings.length > 0) {
     const names = tagFindings
-      .map((finding) => finding.subject.replace(/^tag /, ""))
+      .map((finding) => displaySubject(finding).replace(/^tag /, ""))
       .filter((name) => name && name !== "annotated tag");
     lines.push(
       `To fix the annotated tag${tagFindings.length === 1 ? "" : "s"}: the message lives in the tag object, not in any commit, so \`--amend\` and \`rebase\` cannot reach it. Recreate with \`git tag -f -a ${names[0] ?? "<tag>"} -m '<clean message>'\`${names.length > 0 ? "" : " for each tag above"}.`,
