@@ -58,6 +58,75 @@ export const BACKSTOP_SOURCES = [
   "issue_graph_liveness.backstop",
   "stranded_recovery_wake_backstop",
 ] as const;
+/**
+ * Ticks on which the worker's periodic recovery chain was skipped because the
+ * previous pass was still running (PEN-3314).
+ *
+ * The chain is launched fire-and-forget from a fixed 30 s `setInterval`, so
+ * before the gate existed a pass that ran long simply overlapped its
+ * predecessor — invisibly. That invisibility is the reason this cost a
+ * multi-day fleet outage: each overlapping pass pins its own copy of the whole
+ * visible issue graph, so the only externally observable symptom was the worker
+ * heap climbing to the 6.2 GB V8 ceiling and aborting every few hours, with
+ * nothing anywhere naming overlap as the cause.
+ *
+ * Read it with {@link HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC}: a non-zero
+ * rate here means the chain is exceeding the scheduler interval, and the
+ * in-flight gauge says by how much. (Not the *duration* gauge, which describes
+ * the last pass to finish and so cannot see the one that is overrunning now.)
+ * Sustained skipping is not itself data loss — these passes are reconcilers, so
+ * a skipped tick is later work, not lost work — but it does mean recovery
+ * latency now tracks chain duration rather than the interval, which is worth an
+ * operator's attention well before the heap is.
+ */
+export const HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC = "paperclip_heartbeat_recovery_chain_skipped_total";
+/**
+ * Wall-clock duration of the last COMPLETED periodic recovery chain, in seconds
+ * (PEN-3314).
+ *
+ * Read this for how long the chain takes when it works. Do NOT build the overlap
+ * alert on it: it is written only when a pass settles, so while a pass is
+ * overrunning it holds the previous pass's value — which is by construction a
+ * value *below* the interval, since that pass finished in time. A chain that is
+ * currently running long, or wedged outright, reports a healthy-looking number
+ * here. {@link HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC} is the one that sees
+ * the pass you actually care about.
+ *
+ * A gauge rather than a histogram because the question is "is the chain
+ * outrunning the interval", not "what is the distribution of chain durations".
+ */
+export const HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC = "paperclip_heartbeat_recovery_chain_duration_seconds";
+/**
+ * How long the currently outstanding periodic recovery chain has been running,
+ * in seconds; `0` when no pass is outstanding (PEN-3314).
+ *
+ * This is the leading indicator the incident lacked, and the one to alert on:
+ * overlap begins precisely when this crosses `heartbeatSchedulerIntervalMs`
+ * (default 30 s), which is observable hours before the heap ceiling is reached.
+ * Unlike the duration gauge it describes the *live* pass, so it is also the only
+ * signal that distinguishes a chain taking 35 s from a chain that has been
+ * wedged for six hours — see {@link HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC}.
+ *
+ * It is refreshed on every skipped tick, so it updates once per scheduler
+ * interval for exactly as long as the chain is overrunning. A pass that finishes
+ * within the interval never produces a skip and correctly leaves this at `0`.
+ */
+export const HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC = "paperclip_heartbeat_recovery_chain_inflight_seconds";
+/**
+ * Recovery-chain passes that were still outstanding past the stall threshold
+ * (PEN-3314 / PEN-3365). Counted once per stalled pass, not once per tick.
+ *
+ * Non-zero means a pass stopped settling entirely — not merely ran slow, which
+ * shows up as skips instead — and therefore that **every recovery pass on this
+ * worker is halted**: orphan reaping, retry promotion, stranded-issue
+ * reconciliation, watchdogs, the lot. The gate deliberately does not self-clear
+ * (force-clearing would re-admit the overlapping passes that cause the heap
+ * leak, under exactly the saturated-pool conditions that raised the alarm), so
+ * this state persists until the chain returns or the process restarts.
+ *
+ * **Page on this.** It is rare by design and it does not resolve itself.
+ */
+export const HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC = "paperclip_heartbeat_recovery_chain_stalled_total";
 export type BackstopSource = (typeof BACKSTOP_SOURCES)[number];
 export const BACKSTOP_SKIP_REASONS = [
   "not_ready", "existing_wake", "live_path", "pause_hold", "interaction",
@@ -2128,6 +2197,10 @@ let projectPrimaryWorkspaceFallback: Counter | null = null;
 let backstopDeferredCandidates: Gauge<"source"> | null = null;
 let backstopSweepCompleted: Counter<"source"> | null = null;
 let backstopCandidatesSkipped: Counter<"source" | "reason"> | null = null;
+let heartbeatRecoveryChainSkipped: Counter | null = null;
+let heartbeatRecoveryChainDuration: Gauge | null = null;
+let heartbeatRecoveryChainInflight: Gauge | null = null;
+let heartbeatRecoveryChainStalled: Counter | null = null;
 let pluginWebhookDeliveryRejected:
   | Counter<"plugin_key" | "response_class" | "plugin_status">
   | null = null;
@@ -2194,6 +2267,10 @@ function ensureRegistry(): {
   backstopDeferredCandidatesGauge: Gauge<"source">;
   backstopSweepCompletedCounter: Counter<"source">;
   backstopCandidatesSkippedCounter: Counter<"source" | "reason">;
+  heartbeatRecoveryChainSkippedCounter: Counter;
+  heartbeatRecoveryChainDurationGauge: Gauge;
+  heartbeatRecoveryChainInflightGauge: Gauge;
+  heartbeatRecoveryChainStalledCounter: Counter;
   pluginWebhookDeliveryRejectedCounter: Counter<"plugin_key" | "response_class" | "plugin_status">;
   recoveryHorizonExpiredCounter: Counter<"delivery">;
 } {
@@ -2256,6 +2333,10 @@ function ensureRegistry(): {
     || !backstopDeferredCandidates
     || !backstopSweepCompleted
     || !backstopCandidatesSkipped
+    || !heartbeatRecoveryChainSkipped
+    || !heartbeatRecoveryChainDuration
+    || !heartbeatRecoveryChainInflight
+    || !heartbeatRecoveryChainStalled
     || !pluginWebhookDeliveryRejected
     || !recoveryHorizonExpired
   ) {
@@ -3041,6 +3122,51 @@ function ensureRegistry(): {
       labelNames: ["source", "reason"],
       registers: [registry],
     });
+    heartbeatRecoveryChainSkipped = new Counter({
+      name: HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC,
+      help:
+        "Scheduler ticks on which the periodic recovery chain was skipped because the "
+        + "previous pass was still running (PEN-3314). Zero in steady state. A sustained "
+        + "non-zero rate means the chain is outrunning heartbeatSchedulerIntervalMs; read "
+        + HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC + " to see by how much.",
+      registers: [registry],
+    });
+    // Zero-initialize so a healthy worker exports an explicit 0 rather than an
+    // absent series -- "no overlap" and "gate never reached" must not look alike.
+    heartbeatRecoveryChainSkipped.inc(0);
+    heartbeatRecoveryChainDuration = new Gauge({
+      name: HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC,
+      help:
+        "Wall-clock duration of the last COMPLETED periodic recovery chain, in seconds "
+        + "(PEN-3314). Describes the last pass to finish, so it cannot see a pass that is "
+        + "overrunning now; alert on " + HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC + " instead.",
+      registers: [registry],
+    });
+    // Same reasoning as the skip counter above, and it matters more here: without
+    // this, a worker whose very first chain runs long or wedges exports no series
+    // at all, so an alert of the form "> heartbeatSchedulerIntervalMs" never
+    // evaluates -- silent during precisely the incident it was written for.
+    heartbeatRecoveryChainDuration.set(0);
+    heartbeatRecoveryChainInflight = new Gauge({
+      name: HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC,
+      help:
+        "How long the currently outstanding periodic recovery chain has been running, in "
+        + "seconds; 0 when none is outstanding (PEN-3314). Refreshed on every skipped tick. "
+        + "This is the overlap alert: it crosses heartbeatSchedulerIntervalMs while the "
+        + "offending pass is still running, hours before the heap ceiling is reached.",
+      registers: [registry],
+    });
+    heartbeatRecoveryChainInflight.set(0);
+    heartbeatRecoveryChainStalled = new Counter({
+      name: HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC,
+      help:
+        "Recovery-chain passes still outstanding past the stall threshold, counted once per "
+        + "stalled pass (PEN-3314/PEN-3365). Non-zero means a pass stopped settling entirely "
+        + "rather than merely running slow, so EVERY recovery pass on this worker is halted. "
+        + "The gate does not self-clear, so this does not resolve itself. Page on this.",
+      registers: [registry],
+    });
+    heartbeatRecoveryChainStalled.inc(0);
     for (const source of BACKSTOP_SOURCES) {
       backstopDeferredCandidates.set({ source }, 0);
     }
@@ -3145,6 +3271,10 @@ function ensureRegistry(): {
     backstopDeferredCandidatesGauge: backstopDeferredCandidates,
     backstopSweepCompletedCounter: backstopSweepCompleted,
     backstopCandidatesSkippedCounter: backstopCandidatesSkipped,
+    heartbeatRecoveryChainSkippedCounter: heartbeatRecoveryChainSkipped,
+    heartbeatRecoveryChainDurationGauge: heartbeatRecoveryChainDuration,
+    heartbeatRecoveryChainInflightGauge: heartbeatRecoveryChainInflight,
+    heartbeatRecoveryChainStalledCounter: heartbeatRecoveryChainStalled,
     pluginWebhookDeliveryRejectedCounter: pluginWebhookDeliveryRejected,
     recoveryHorizonExpiredCounter: recoveryHorizonExpired,
   };
@@ -4383,6 +4513,33 @@ export function recordBackstopSweepCompleted(source: BackstopSource): void {
   ensureRegistry().backstopSweepCompletedCounter.inc({ source });
 }
 
+/** PEN-3314: one tick's recovery chain was skipped because the previous one was still running. */
+export function recordHeartbeatRecoveryChainSkipped(): void {
+  ensureRegistry().heartbeatRecoveryChainSkippedCounter.inc();
+}
+
+/** PEN-3314: a recovery chain settled (success or failure) after `durationMs`. */
+export function recordHeartbeatRecoveryChainDuration(durationMs: number): void {
+  ensureRegistry().heartbeatRecoveryChainDurationGauge.set(durationMs / 1000);
+}
+
+/**
+ * PEN-3314: how long the outstanding recovery chain has been running, or `0`
+ * once none is.
+ *
+ * Call this on settle and on stall as well as on skip. The gauge means "the pass
+ * running right now", so leaving a stale non-zero value behind after the pass
+ * ends would fire the overlap alert against a worker that has recovered.
+ */
+export function recordHeartbeatRecoveryChainInflight(elapsedMs: number): void {
+  ensureRegistry().heartbeatRecoveryChainInflightGauge.set(Math.max(0, elapsedMs) / 1000);
+}
+
+/** PEN-3314: a recovery-chain pass passed the stall threshold without settling. */
+export function recordHeartbeatRecoveryChainStalled(): void {
+  ensureRegistry().heartbeatRecoveryChainStalledCounter.inc();
+}
+
 export function recordBackstopCandidateSkipped(source: BackstopSource, reason: BackstopSkipReason): void {
   ensureRegistry().backstopCandidatesSkippedCounter.inc({ source, reason });
 }
@@ -4528,6 +4685,10 @@ export function __resetMetricsForTest(): void {
   backstopDeferredCandidates = null;
   backstopSweepCompleted = null;
   backstopCandidatesSkipped = null;
+  heartbeatRecoveryChainSkipped = null;
+  heartbeatRecoveryChainDuration = null;
+  heartbeatRecoveryChainInflight = null;
+  heartbeatRecoveryChainStalled = null;
   recoveryHorizonExpired = null;
   gbrainRecallTotal = null;
   pluginWebhookDeliveryRejected = null;

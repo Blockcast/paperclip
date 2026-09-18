@@ -8,6 +8,10 @@ import {
   CONCURRENT_RUN_BLOCKED_METRIC,
   DEP_BLOCKED_WAKEUP_METRIC,
   ROUTINE_DISPATCH_METRIC,
+  HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC,
+  HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC,
+  HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC,
+  HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC,
   HEARTBEAT_RUN_FAILED_METRIC,
   ISOLATED_RUN_STARTED_METRIC,
   KNOWN_BLOCKED_REASONS,
@@ -34,6 +38,10 @@ import {
   GBRAIN_RECALL_METRIC,
   UNKNOWN_GBRAIN_RECALL_STATUS,
   normalizeGbrainRecallStatus,
+  recordHeartbeatRecoveryChainDuration,
+  recordHeartbeatRecoveryChainInflight,
+  recordHeartbeatRecoveryChainSkipped,
+  recordHeartbeatRecoveryChainStalled,
   recordHeartbeatRunFailed,
   recordIsolatedRunStarted,
   renderMetrics,
@@ -1315,6 +1323,95 @@ describe("setQueuedRunOldestAgeMetrics (BLO-21116)", () => {
     const { body } = await renderMetrics();
     expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 9000`);
     expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${UNKNOWN_AGENT_ID}"} 4500`);
+  });
+});
+
+describe("heartbeat recovery chain gate metrics (PEN-3314)", () => {
+  it("publishes every series at zero before any overlap", async () => {
+    const { body } = await renderMetrics();
+    // Zero-initialized on purpose: an absent series and a healthy worker must
+    // not look alike to an alert. This matters most for the in-flight gauge —
+    // if a worker's very first chain wedges, an alert of the documented form
+    // ("> heartbeatSchedulerIntervalMs") would otherwise never evaluate at all,
+    // because the series it reads does not exist yet.
+    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC} 0`);
+    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC} 0`);
+    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC} 0`);
+    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC} 0`);
+  });
+
+  it("counts skipped ticks and reports the last chain duration in seconds", async () => {
+    recordHeartbeatRecoveryChainSkipped();
+    recordHeartbeatRecoveryChainSkipped();
+    // Milliseconds in, seconds out — the gauge is compared against
+    // heartbeatSchedulerIntervalMs, so the unit has to be explicit.
+    recordHeartbeatRecoveryChainDuration(45_500);
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC} 2`);
+    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC} 45.5`);
+  });
+
+  it("reports the OUTSTANDING pass separately from the last completed one", async () => {
+    // The distinction the duration gauge alone cannot express: a pass that has
+    // been running 40 min while the last completed pass took 12 s. Alerting on
+    // the duration gauge here reads 12 and stays silent through the incident.
+    recordHeartbeatRecoveryChainDuration(12_000);
+    recordHeartbeatRecoveryChainInflight(2_400_000);
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC} 12`);
+    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC} 2400`);
+  });
+
+  it("clears the in-flight gauge when the pass ends, so the alert stops firing", async () => {
+    recordHeartbeatRecoveryChainInflight(2_400_000);
+    recordHeartbeatRecoveryChainInflight(0);
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC} 0`);
+  });
+
+  it("never publishes a negative in-flight duration", async () => {
+    // Same reasoning as the gate's own backwards-clock guard: this gauge only
+    // ever means "how long has this been running".
+    recordHeartbeatRecoveryChainInflight(-5_000);
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC} 0`);
+  });
+
+  it("counts a stalled pass separately from a skipped tick", async () => {
+    // A stall means a pass stopped settling entirely and every recovery pass on
+    // the worker is halted until it returns. It is a page; a skip is not.
+    // Folding it into the skip counter would bury it under the skips that
+    // necessarily precede it.
+    recordHeartbeatRecoveryChainSkipped();
+    recordHeartbeatRecoveryChainStalled();
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC} 1`);
+    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC} 1`);
+  });
+
+  it("keeps every series unlabeled so they stay roster-independent", async () => {
+    recordHeartbeatRecoveryChainSkipped();
+    recordHeartbeatRecoveryChainDuration(1_000);
+    recordHeartbeatRecoveryChainInflight(1_000);
+    recordHeartbeatRecoveryChainStalled();
+    const { body } = await renderMetrics();
+
+    const labeled = body
+      .split("\n")
+      .filter((line) =>
+        [
+          HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC,
+          HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC,
+          HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC,
+          HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC,
+        ].some((metric) => line.startsWith(`${metric}{`)),
+      );
+    expect(labeled).toEqual([]);
   });
 });
 
