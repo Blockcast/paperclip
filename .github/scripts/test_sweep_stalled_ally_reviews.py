@@ -1009,5 +1009,319 @@ class TestCommentBodyIsModeAware(unittest.TestCase):
         self.assertIn("awaiting review", body)
 
 
+class TestParseReviewedHead(unittest.TestCase):
+    """The structured verdict block is the primary source.
+
+    Before this, a body carrying a block plus a #1675-shaped prose line (an
+    attested SHA trailed by a parenthetical) read as "no attestation" here while
+    the merge gate read it as attesting the head -- the reader disagreement that
+    is the BLO-32695 finding.
+    """
+
+    HEAD = "c" * 40
+
+    def block(self, head):
+        return (
+            '<!-- ally-verdict:1\n'
+            '{"head":"%s","findings":{"critical":0,"important":0,"suggestions":0}}\n'
+            "-->" % head
+        )
+
+    def test_block_wins_when_prose_is_unparseable(self):
+        body = "%s\n\n## Ally — Consolidated PR Review\nReviewed head: %s (unchanged since my last pass)\n" % (
+            self.block(self.HEAD),
+            self.HEAD,
+        )
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_block_alone_attests(self):
+        self.assertEqual(sweep.parse_reviewed_head(self.block(self.HEAD)), self.HEAD)
+
+    def test_prose_alone_still_attests(self):
+        self.assertEqual(
+            sweep.parse_reviewed_head("Reviewed head: %s" % self.HEAD), self.HEAD
+        )
+
+    def test_disagreement_fails_closed(self):
+        body = "%s\nReviewed head: %s" % (self.block(self.HEAD), "d" * 40)
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_two_blocks_fail_closed_without_falling_back_to_prose(self):
+        body = "%s\n%s\nReviewed head: %s" % (
+            self.block(self.HEAD),
+            self.block(self.HEAD),
+            self.HEAD,
+        )
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_unterminated_block_fails_closed_without_falling_back_to_prose(self):
+        body = '<!-- ally-verdict:1\n{"head":"%s"}\nReviewed head: %s' % (
+            self.HEAD,
+            self.HEAD,
+        )
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_unsupported_version_fails_closed(self):
+        self.assertIsNone(
+            sweep.parse_reviewed_head('<!-- ally-verdict:2\n{"head":"%s"}\n-->' % self.HEAD)
+        )
+
+    def test_partial_sha_in_block_fails_closed(self):
+        self.assertIsNone(
+            sweep.parse_reviewed_head(
+                '<!-- ally-verdict:1\n{"head":"%s"}\n-->' % self.HEAD[:7]
+            )
+        )
+
+    def test_a_zero_padded_version_reads_the_same_here_as_in_the_two_js_readers(self):
+        """Peer review of #1721, Suggestion 1 -- the version compare diverged.
+
+        This compared `raw_version != str(1)` while ally-review-detection.ts and
+        check-ally-review-consistency.mjs both use `Number(raw) !== 1`, so
+        `ally-verdict:01` was readable to the merge gate and unreadable here.
+        The sweep then treats the review as no signal for that head and
+        re-requests a review that already happened. Two parsers disagreeing
+        about one body is the BLO-31730 failure, not a formatting nicety.
+        """
+        body = '<!-- ally-verdict:01\n{"head":"%s","findings":{"critical":0,"important":0}}\n-->' % self.HEAD
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_a_space_after_the_colon_is_the_block_it_plainly_is(self):
+        """Peer review of #1721, Important 2.
+
+        The emitter is a model transcribing a template out of a fenced example,
+        so pretty-printing a space here is the likeliest single drift. It used
+        to match neither the block nor the opener pattern, so it read `absent`
+        and fell through to the prose path this row retires.
+        """
+        body = '<!-- ally-verdict: 1\n{"head":"%s","findings":{"critical":0,"important":0}}\n-->' % self.HEAD
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_a_garbled_version_fails_closed_rather_than_vanishing(self):
+        """The opener is version-agnostic so the strict pattern can be the only
+        reader of the version. `:v1` and a missing version previously missed
+        both patterns and degraded silently to prose."""
+        for opener in ('<!-- ally-verdict:v1', '<!-- ally-verdict '):
+            body = '%s\n{"head":"%s"}\n-->\nReviewed head: %s' % (
+                opener,
+                self.HEAD,
+                self.HEAD,
+            )
+            self.assertIsNone(sweep.parse_reviewed_head(body), opener)
+
+    def test_quoted_block_is_a_body_discussing_one_not_emitting_one(self):
+        body = "> <!-- ally-verdict:1\n> {\"head\":\"%s\"}\n> -->\nReviewed head: %s" % (
+            "d" * 40,
+            self.HEAD,
+        )
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+
+class TestVerdictCountsMirrorTheGate(unittest.TestCase):
+    """Peer review of #1721, Important 2 -- the count rule landed in one reader
+    of three.
+
+    A block whose counts the merge gate rejects is red there with
+    `unreadable_verdict`, whose only escape is one more review. This sweep is
+    what asks for that review, and it used to read the same body as a perfectly
+    good attestation -- so the red had no escape route at all.
+    """
+
+    HEAD = "c" * 40
+
+    def body(self, findings, *prose):
+        return "\n".join(
+            [
+                '<!-- ally-verdict:1\n{"head":"%s","findings":%s}\n-->' % (self.HEAD, findings),
+                "",
+                "## Ally — Consolidated PR Review",
+            ]
+            + list(prose)
+        )
+
+    def test_a_positive_bucket_against_a_stated_zero_is_unreadable(self):
+        body = self.body('{"critical":0,"important":0}', "### Critical Issues (2)")
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_control_agreeing_counts_still_attest(self):
+        body = self.body('{"critical":0,"important":0}', "### Critical Issues (0)")
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_a_sentence_referencing_a_prior_pass_does_not_fail_it_closed(self):
+        body = self.body(
+            '{"critical":0,"important":0}',
+            "### Critical Issues (0)",
+            "",
+            "Both Critical Issues (2) from the previous pass are fixed.",
+        )
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_a_quoted_bucket_does_not_fail_it_closed(self):
+        for quoted in ("> ### Critical Issues (2)", "```\n### Critical Issues (2)\n```"):
+            body = self.body('{"critical":0,"important":0}', quoted)
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, quoted)
+
+    def test_findings_the_gate_rejects_are_rejected_here_too(self):
+        # Absent counts are not zero counts; an unknown severity is not a key to
+        # drop; and `true` is not 1, however Python spells its bools.
+        for findings in ('{}', '{"critical":0}', '{"critical":0,"important":0,"typo":0}',
+                         '{"critical":true,"important":0}', '{"critical":-1,"important":0}'):
+            self.assertIsNone(sweep.parse_reviewed_head(self.body(findings)), findings)
+
+
+class TestVerdictBlockMirrorsTheGateOnFencesAndLedgers(unittest.TestCase):
+    """Peer review of #1721 at 97b4ddd1 -- the remaining two reader divergences.
+
+    Both are the same defect as TestVerdictCountsMirrorTheGate: a rule landed in
+    some readers and not this one, so the gate and this sweep disagree about one
+    body. Disagreeing in this direction is the expensive one -- with
+    ally_has_reviewed_head false the sweep re-fires a request on a head Ally
+    already reviewed, and each duplicate is a COMMENTED review that cannot be
+    dismissed.
+    """
+
+    HEAD = "d" * 40
+
+    def block(self, extra=""):
+        return '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0}%s}\n-->' % (
+            self.HEAD,
+            extra,
+        )
+
+    def body(self, *rest):
+        return "\n".join([self.block(), "", "## Ally — Consolidated PR Review"] + list(rest))
+
+    def test_a_fenced_example_of_the_marker_is_not_a_second_block(self):
+        # The gate counts blocks over fence-stripped text (parseAllyVerdictBlock
+        # reads emittedReviewText), so a quoted marker is invisible there:
+        # blocks=1, openers=1 -> ok. Read raw, this saw blocks=2, openers=2 ->
+        # unreadable. It fires first on a review quoting the template, which is
+        # the likeliest shape for a review *of this feature*.
+        body = self.body("Here is the emitted form:", "", "```markdown", self.block(), "```")
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_control_a_real_second_block_is_still_unreadable(self):
+        # Without this the test above passes for a reader that stopped counting
+        # blocks at all.
+        body = self.body("", self.block())
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_a_malformed_ledger_is_rejected_here_too(self):
+        # Validation had covered one of the two fields the payload carries. TS
+        # rejects these via asDispositions and the mjs via stillPresentIn, while
+        # this dropped through to ("ok", head) -- so the gate went red on
+        # `unreadable_verdict` with no mechanism left to clear it.
+        for dispositions in (
+            '"nope"',
+            "42",
+            "null",
+            '[{"head":"deadbee","severity":"critical","verb":"fixed"}]',
+            '[{"head":"deadbee","severity":"critical","index":0,"verb":"fixed"}]',
+            '[{"head":"deadbee","severity":"critical","index":true,"verb":"fixed"}]',
+            '[{"head":"xyz","severity":"critical","index":1,"verb":"fixed"}]',
+            '[{"head":"deadbee","severity":"","index":1,"verb":"fixed"}]',
+            '[{"head":"deadbee","severity":"critical","index":1,"verb":"  "}]',
+            '["not an object"]',
+        ):
+            body = self.body_with_dispositions(dispositions)
+            self.assertIsNone(sweep.parse_reviewed_head(body), dispositions)
+
+    def test_control_a_well_formed_or_absent_ledger_still_attests(self):
+        # `null` is deliberately absent from this list: both JS readers key on
+        # `undefined`, so an explicit null fails Array.isArray and is unreadable
+        # there. Collapsing the two is why this takes the payload rather than
+        # the field.
+        self.assertEqual(sweep.parse_reviewed_head(self.body()), self.HEAD)
+        for dispositions in (
+            "[]",
+            '[{"head":"deadbee","severity":"critical","index":1,"verb":"fixed"}]',
+            '[{"head":"deadbee","severity":"recommended-action","index":4,"verb":"withdrawn"}]',
+        ):
+            body = self.body_with_dispositions(dispositions)
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, dispositions)
+
+    def body_with_dispositions(self, dispositions):
+        return "\n".join(
+            [self.block(',"dispositions":%s' % dispositions), "", "## Ally — Consolidated PR Review"]
+        )
+
+
+class TestFloatFormattedIntegersMirrorNumberIsInteger(unittest.TestCase):
+    """Ally review of #1721 at bbe6d640 -- `isinstance(_, int)` is not that.
+
+    `json.loads` yields floats for `0.0`, `0e0` and `1e3`; every one is an
+    integer to `Number.isInteger`, so the gate and the mjs read these bodies
+    `ok` while this reader read them `unreadable`. Same harm direction as the
+    two divergences above: the sweep re-requests a review of a head Ally
+    already reviewed, and a COMMENTED duplicate cannot be dismissed.
+
+    The pre-existing `true` cases pin the other direction and cannot catch
+    this, which is why these are separate rather than added to that list.
+    """
+
+    HEAD = "e" * 40
+
+    def body(self, payload):
+        return "\n".join(
+            ['<!-- ally-verdict:1\n{"head":"%s",%s}\n-->' % (self.HEAD, payload), "",
+             "## Ally — Consolidated PR Review"]
+        )
+
+    def test_float_formatted_counts_still_attest(self):
+        for findings in ('{"critical":0.0,"important":0.0}',
+                         '{"critical":0e0,"important":0}',
+                         '{"critical":1e3,"important":0}'):
+            body = self.body('"findings":%s' % findings)
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, findings)
+
+    def test_a_float_formatted_ledger_index_still_attests(self):
+        body = self.body(
+            '"findings":{"critical":0,"important":0},'
+            '"dispositions":[{"head":"deadbee","severity":"critical","index":1.0,"verb":"fixed"}]'
+        )
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_control_non_integral_and_bool_are_still_rejected(self):
+        # Number.isInteger(0.5) is false and a bool is not a number in JS, so
+        # widening to floats must not have widened past integral ones.
+        for payload in ('"findings":{"critical":0.5,"important":0}',
+                        '"findings":{"critical":true,"important":0}',
+                        '"findings":{"critical":1e4,"important":0}',
+                        '"findings":{"critical":0,"important":0},'
+                        '"dispositions":[{"head":"deadbee","severity":"critical",'
+                        '"index":1.5,"verb":"fixed"}]'):
+            self.assertIsNone(sweep.parse_reviewed_head(self.body(payload)), payload)
+
+
+class TestIsConsolidatedAllyCommentForHead(unittest.TestCase):
+    HEAD = "c" * 40
+
+    def test_block_before_heading_still_matches(self):
+        """Ally emits the verdict block first, so the heading is not byte 0.
+
+        `body.startswith("## Ally")` rejected Ally's own emitted bodies.
+        """
+        body = '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0}}\n-->\n\n## Ally — Consolidated PR Review\nReviewed head: %s\n' % (
+            self.HEAD,
+            self.HEAD,
+        )
+        self.assertTrue(sweep.is_consolidated_ally_comment_for_head(body, self.HEAD))
+
+    def test_heading_first_still_matches(self):
+        body = "## Ally — Consolidated PR Review\nReviewed head: %s\n" % self.HEAD
+        self.assertTrue(sweep.is_consolidated_ally_comment_for_head(body, self.HEAD))
+
+    def test_no_heading_does_not_match(self):
+        body = "Reviewed head: %s\n" % self.HEAD
+        self.assertFalse(sweep.is_consolidated_ally_comment_for_head(body, self.HEAD))
+
+    def test_heading_without_attestation_does_not_match(self):
+        self.assertFalse(
+            sweep.is_consolidated_ally_comment_for_head(
+                "## Ally — Consolidated PR Review\n", self.HEAD
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
