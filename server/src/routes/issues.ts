@@ -11984,13 +11984,24 @@ export function issueRoutes(
               : err.details === undefined || err.details === null
                 ? {}
                 : { detail: err.details };
-          throw new HttpError(err.status, err.message, {
+          const wrapped = new HttpError(err.status, err.message, {
             ...refusalDetails,
             commentPersisted: false,
             commentHint:
               "The `comment` carried by this PATCH was not saved, because the update it accompanied did not land. " +
               "Re-post it with POST /api/issues/:id/comments, which is a separate path and is not subject to this guard.",
           });
+          // Re-wrapping resets the stack to this `catch`. That is harmless for
+          // the 4xx refusals this branch was written for, but the widening
+          // above from 422 to any `HttpError` also catches the done-gate's
+          // `HttpError(503, "Done-gate commit evidence verification
+          // unavailable", …)`, and `middleware/error-handler.ts` forwards
+          // `stack` into `attachErrorContext` and `trackErrorHandlerCrash` for
+          // `status >= 500` — so without this a 5xx from a PATCH carrying a
+          // comment would report this route's catch as its origin instead of
+          // the throw site.
+          wrapped.stack = err.stack;
+          throw wrapped;
         }
       }
       throw err;
