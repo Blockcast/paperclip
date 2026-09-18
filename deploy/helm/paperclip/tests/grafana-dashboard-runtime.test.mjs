@@ -168,6 +168,14 @@ test("age gauges are aggregated with max by (agent_id), never summed across repl
   // service=paperclip-workers (1), 46 agent series each. sum() therefore
   // reports triple the real age and still looks like a plausible number, which
   // is exactly the kind of wrong that survives review.
+  //
+  // Note the asymmetry: on the two TIMESERIES panels this assertion is doing
+  // real work. On the bare-max() stat panel it is not -- `max(max by (agent_id)
+  // (x))` is exactly `max(x)`, because the outer max already collapses every
+  // label. That panel is correct for a different reason than this test
+  // asserts. The grouping is kept for uniformity so the next panel author
+  // copies the safe shape, but do not read a pass here as proof the stat panel
+  // needed it.
   const { dashboard } = renderDashboard();
 
   const ageTargets = allTargets(dashboard).filter(
@@ -207,6 +215,15 @@ test("the refresher-health panel is present so a frozen gauge cannot read as hea
     /^min\(/,
     "refresh health must be min() across replicas; one failing replica is already a stale gauge",
   );
+  // Total absence of the series -- refresh loop removed, metric renamed, all
+  // replicas down -- is strictly worse than the 0 this panel was built to
+  // catch, but bare min() returns empty and renders "No data" instead of
+  // STALE. `or vector(0)` makes the worst case read as the worst case.
+  assert.match(
+    target.target.expr,
+    /or vector\(0\)/,
+    "refresh health must fall back to 0 when the series is absent entirely, not render No data",
+  );
 });
 
 test("grafanaDashboard.enabled=false renders no runtime ConfigMap", () => {
@@ -229,4 +246,63 @@ test("the runtime dashboard datasource uid is overridable", () => {
     allTargets(dashboard).map(({ target }) => target.datasource?.uid),
   );
   assert.deepEqual([...uids], ["some-other-prom"]);
+});
+
+test("no two rendered dashboards claim the same uid", () => {
+  // Grafana keys dashboards by the JSON's top-level uid -- NOT by filename or
+  // ConfigMap name. The "add another dashboard" recipe says to copy an
+  // existing template, so starting from a copy of an existing DASHBOARD is the
+  // natural next move; leave its uid and the two collide. Both ConfigMaps
+  // apply cleanly, both pass every `kubectl get cm` check in the runbook, and
+  // one dashboard silently replaces the other in Grafana. Deploys clean,
+  // renders wrong, fails nowhere -- so it has to fail here instead.
+  //
+  // Scans the WHOLE chart rather than a fixed template list so a third
+  // dashboard added in a new template file is covered without touching this
+  // test. Self-selecting: a block only counts as a dashboard if it parses as
+  // JSON carrying both `uid` and `panels`.
+  const rendered = renderChart();
+
+  const byUid = new Map();
+  const marker = /^(\s+)([\w.-]+\.json): \|/gm;
+
+  for (const m of rendered.matchAll(marker)) {
+    const key = m[2];
+    const body = rendered
+      .slice(rendered.indexOf("\n", m.index) + 1)
+      .split("\n")
+      .reduce(
+        (acc, line) => {
+          if (!acc.open) return acc;
+          if (line.trim() === "") return acc;
+          if (!line.startsWith("    ")) return { ...acc, open: false };
+          return { ...acc, lines: [...acc.lines, line.slice(4)] };
+        },
+        { open: true, lines: [] },
+      )
+      .lines.join("\n");
+
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed.uid !== "string" || !parsed.panels) continue;
+
+    const seen = byUid.get(parsed.uid);
+    assert.equal(
+      seen,
+      undefined,
+      `dashboards '${seen}' and '${key}' both use uid '${parsed.uid}'; Grafana keys on uid, so one silently replaces the other`,
+    );
+    byUid.set(parsed.uid, key);
+  }
+
+  // Guard the guard: if the scan matched nothing the assertion above is
+  // vacuous and would pass on any collision at all.
+  assert.ok(
+    byUid.size >= 2,
+    `expected to find at least the two shipped dashboards, found ${byUid.size}`,
+  );
 });
