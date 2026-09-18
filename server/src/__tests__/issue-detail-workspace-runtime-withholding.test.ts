@@ -55,6 +55,11 @@ const EXECUTION_WS_SENTINEL = "sentinel-execution-workspace-runtime-must-not-egr
  * the boundary at all because the issue routes answer with spreads. Distinct sentinels from the
  * three above, so a failure names which carrier regressed.
  */
+const ISSUE_SETTINGS_RUNTIME_SENTINEL = "sentinel-issue-settings-runtime-must-not-egress";
+const ISSUE_SETTINGS_COMMAND_SENTINEL = "sentinel-issue-settings-command-must-not-egress";
+const ISSUE_SETTINGS_UNKNOWN_SENTINEL = "sentinel-issue-settings-unknown-key-must-not-egress";
+const ISSUE_SETTINGS_ENVIRONMENT_ID = "6f9619ff-8b86-d011-b42d-00c04fc964ff";
+
 /**
  * BLO-33568. The command SCALARS beside `workspaceRuntime`, which this file's fixture did not
  * populate. `compactIssueExecutionWorkspace` / `compactIssueProjectWorkspace` mask them
@@ -62,14 +67,13 @@ const EXECUTION_WS_SENTINEL = "sentinel-execution-workspace-runtime-must-not-egr
  * same blind spot PEN-3073 recorded for the empty `plannedActions` array, one field over. Measured
  * 2026-09-18: reverting the `config.cleanupCommand` mask left all 74 tests across all four
  * withholding suites green.
+ *
+ * Each is the `cleanupCommand` value verbatim and the STEM of its siblings (`-provision`,
+ * `-teardown`, `-setup`). So a bare `toContain(SENTINEL)` is satisfied by any one of the three —
+ * assert the siblings per-field, never by substring. See the entitled case below.
  */
 const CONFIG_COMMAND_SENTINEL = "TOKEN_FIXTURE=sentinel-issue-config-command-not-a-real-credential ./run.sh";
 const PROJECT_WS_COMMAND_SENTINEL = "TOKEN_FIXTURE=sentinel-issue-project-ws-command-not-a-real-credential ./drop.sh";
-
-const ISSUE_SETTINGS_RUNTIME_SENTINEL = "sentinel-issue-settings-runtime-must-not-egress";
-const ISSUE_SETTINGS_COMMAND_SENTINEL = "sentinel-issue-settings-command-must-not-egress";
-const ISSUE_SETTINGS_UNKNOWN_SENTINEL = "sentinel-issue-settings-unknown-key-must-not-egress";
-const ISSUE_SETTINGS_ENVIRONMENT_ID = "6f9619ff-8b86-d011-b42d-00c04fc964ff";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -357,8 +361,16 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
     expect(body).toContain(MENTIONED_WS_SENTINEL);
     // BLO-33568 AC 4. The command scalars are an entitled reader's working data — the workspace
     // editors round-trip them — so masking them unconditionally would be a regression, not a fix.
-    expect(body).toContain(CONFIG_COMMAND_SENTINEL);
-    expect(body).toContain(PROJECT_WS_COMMAND_SENTINEL);
+    // Per-field, because each sentinel is the STEM of its siblings: `toContain(SENTINEL)` alone is
+    // satisfied by `cleanupCommand` on its own, so a regression masking `provisionCommand`
+    // unconditionally for an entitled reader would still pass. Mirrors the withheld case above and
+    // `workspace-runtime-response-withholding.test.ts`'s entitled case.
+    const config = res.body.currentExecutionWorkspace.config;
+    expect(config.provisionCommand).toBe(`${CONFIG_COMMAND_SENTINEL}-provision`);
+    expect(config.teardownCommand).toBe(`${CONFIG_COMMAND_SENTINEL}-teardown`);
+    expect(config.cleanupCommand).toBe(CONFIG_COMMAND_SENTINEL);
+    expect(res.body.project.workspaces[0].setupCommand).toBe(`${PROJECT_WS_COMMAND_SENTINEL}-setup`);
+    expect(res.body.project.workspaces[0].cleanupCommand).toBe(PROJECT_WS_COMMAND_SENTINEL);
   });
 
   it("reports hasWorkspaceRuntimeConfig to the withheld agent, so existence never needs contents", async () => {
@@ -409,6 +421,10 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
     expect(res.body.currentExecutionWorkspace.name).toBe("issue-execution");
     expect(res.body.currentExecutionWorkspace.config.workspaceRuntime).toBeNull();
     expect(JSON.stringify(res.body)).not.toContain(EXECUTION_WS_SENTINEL);
+    // BLO-33568. `compactIssueExecutionWorkspace` is shared with `/issues/:id`, so this is low
+    // production risk today — but it is the same "asserted on both exits that serialize it"
+    // convention the flag case above states, and it is this principal's every-wake read.
+    expect(JSON.stringify(res.body)).not.toContain(CONFIG_COMMAND_SENTINEL);
   });
 
   it("still discloses heartbeat-context runtime config to an entitled owner member", async () => {
