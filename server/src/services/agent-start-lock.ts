@@ -298,10 +298,20 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
   // past LOCK_HELD_ERROR_MS separates "slow" from "stopped".
   let lastLoggedAtMs = startedAtMs;
   let loggedStopped = false;
+  let cancelRetriesSinceLog = 0;
   const warnTimer = setInterval(() => {
     const nowMs = Date.now();
     const heldMs = nowMs - startedAtMs;
     const stopped = heldMs >= LOCK_HELD_ERROR_MS;
+    // Retry the cancel on EVERY tick once the abort has been raised, deliberately
+    // ABOVE the log backoff below (PEN-3328 review). The two were coupled only by
+    // position: the backoff exists to stop a multi-hour wedge emitting thousands of
+    // identical log lines, and a retry is not a log line. It is a weak-map lookup
+    // over at most one in-flight query and a no-op unless the signal has aborted,
+    // so it is far cheaper than the line the backoff suppresses. Leaving it below
+    // the early return bought nothing and cost a 10x slower recovery cadence --
+    // one attempt per LOCK_HELD_ERROR_MS instead of one per tick.
+    if (stopped && loggedStopped) cancelRetriesSinceLog += cancelRetryHook?.(abort.signal) ?? 0;
     // Past the error threshold the section is not coming back on its own, so
     // back the cadence off from 30s to LOCK_HELD_ERROR_MS: a multi-hour wedge
     // should be loud enough to alert on, not thousands of identical lines.
@@ -310,7 +320,6 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
     if (stopped && loggedStopped && nowMs - lastLoggedAtMs < LOCK_HELD_ERROR_MS) return;
     lastLoggedAtMs = nowMs;
     const fields = { agentId, heldMs, warnAfterMs: LOCK_HELD_WARN_MS };
-    let retried = 0;
     if (stopped) {
       // Abort on the FIRST error tick only, and never stop awaiting `execution`
       // because of it (PEN-3328). The abort is a request into the section, not
@@ -321,18 +330,15 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
         lastAbortByAgent.set(agentId, { abortedAtMs: nowMs, heldMs, released: false });
         recordAgentStartLockAborted(agentId);
         abort.abort(new AgentStartLockAbortedError(agentId, heldMs));
-      } else {
-        // Later ticks: the abort was already raised and its listeners have
-        // detached, so the signal cannot deliver anything again. Reaching here
-        // means the section is STILL held, i.e. the cancel did not take — most
-        // likely because `Query#cancel()` on an executing statement dials a
-        // fresh connection and that dial failed. Retry it, so recovery is
-        // best-effort *and repeated* rather than a single shot spent at the
-        // five-minute mark. Cheap (one weak-map lookup) and a no-op once
-        // nothing is in flight.
-        retried = cancelRetryHook?.(abort.signal) ?? 0;
       }
       loggedStopped = true;
+      // Reaching a LATER tick at all means the section is STILL held, i.e. the
+      // cancel did not take — most likely because `Query#cancel()` on an
+      // executing statement dials a fresh connection and that dial failed. The
+      // count is every retry since the previous line, not just this tick's, so
+      // the backoff above cannot hide the attempts made while it suppressed.
+      const retried = cancelRetriesSinceLog;
+      cancelRetriesSinceLog = 0;
       logger.error(
         { ...fields, errorAfterMs: LOCK_HELD_ERROR_MS, aborted: true, cancelRetried: retried },
         "agent start lock held far past its budget; queued-run dispatch for this agent has stopped",

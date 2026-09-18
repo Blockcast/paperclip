@@ -5,6 +5,7 @@ import type { Db } from "@paperclipai/db";
 import {
   _resetAgentStartLocksForTesting,
   AgentStartLockAbortedError,
+  describeAgentStartLockDispatchHealth,
   withAgentStartLock,
 } from "../services/agent-start-lock.js";
 import { withAgentStartLockAbortableDb } from "../services/agent-start-lock-db.js";
@@ -25,6 +26,7 @@ import { logger } from "../middleware/logger.js";
 
 const coalesced = { onCoalesced: () => "coalesced" as const };
 const LOCK_HELD_ERROR_MS = 5 * 60_000;
+const LOCK_HELD_WARN_MS = 30_000;
 
 type FakeQuery = Promise<unknown> & {
   cancel: () => void;
@@ -168,12 +170,16 @@ describe("agent start lock database cancellation seam (PEN-3328)", () => {
     expect(attempts).toBe(1);
     expect(query.cancelled).toBe(false);
 
-    // Each subsequent error tick tries again rather than giving up.
-    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS);
+    // Each subsequent WARN tick tries again rather than giving up. The retry is
+    // hoisted above the log backoff (PEN-3328 review), so recovery runs at the
+    // 30s tick cadence while the error LOG stays backed off to
+    // LOCK_HELD_ERROR_MS. Pinning 30s here is what discriminates the hoist: on
+    // the old coupling these two attempts took 10 minutes rather than one.
+    await vi.advanceTimersByTimeAsync(LOCK_HELD_WARN_MS);
     expect(attempts).toBe(2);
     expect(query.cancelled).toBe(false);
 
-    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS);
+    await vi.advanceTimersByTimeAsync(LOCK_HELD_WARN_MS);
     expect(attempts).toBe(3);
     expect(query.cancelled).toBe(true);
     await expect(held).rejects.toMatchObject({ code: "57014" });
@@ -246,6 +252,69 @@ describe("agent start lock database cancellation seam (PEN-3328)", () => {
 
     expect(inner.issued[0]!.cancelled).toBe(true);
     await expect(held).rejects.toMatchObject({ code: "57014" });
+  });
+
+  it("does NOT rescue a `begin` that hangs before its callback, and stays mutually exclusive while stalled", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    vi.spyOn(logger, "error").mockImplementation(() => logger);
+    const agentId = randomUUID();
+    const client = makeFakeClient("never");
+
+    // The gap this pins: `begin` takes a pool slot BEFORE it can issue `BEGIN`
+    // or invoke its callback, and with `max: 10` and no acquire timeout that
+    // wait is unbounded. The wrapper pre-checks `signal.aborted` and then hands
+    // off, registering no listener and no in-flight entry, so nothing observes
+    // the abort. Modelled by a `begin` that never settles and never calls back —
+    // the existing transactional test cannot reach this, because its `begin`
+    // invokes the callback synchronously.
+    let callbackRan = false;
+    client.begin = () => {
+      return new Promise<unknown>(() => {}); // acquisition that never completes
+    };
+    const db = withAgentStartLockAbortableDb(makeFakeDb(client));
+    const wrapped = (db as Db & { $client: typeof client }).$client;
+
+    const held = withAgentStartLock(
+      agentId,
+      async () =>
+        wrapped.begin(async () => {
+          callbackRan = true;
+          return undefined;
+        }),
+      coalesced,
+    );
+    let settled = false;
+    void held.then(() => { settled = true; }, () => { settled = true; });
+
+    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS + 1_000);
+
+    // The honest assertion. The abort was raised and did not land: no statement
+    // was ever issued to cancel, so the section is still sitting on the
+    // acquisition. If a future change makes this path genuinely cancellable,
+    // this expectation is the one that must be rewritten.
+    expect(callbackRan).toBe(false);
+    expect(client.issued).toHaveLength(0);
+    expect(settled).toBe(false);
+
+    // Reported rather than rescued — the residue is visible, which is what
+    // separates this from the silent wedge PEN-3305 measured.
+    expect(describeAgentStartLockDispatchHealth(agentId)).toMatchObject({ status: "stalled" });
+
+    // And the property that must survive the gap: an unrescued section still
+    // holds its lock, so a follow-up folds into it rather than running
+    // alongside. Deliberately NOT awaited — a lock-free caller returns the
+    // coalesced follow-up, which is chained onto a section that never settles,
+    // so awaiting it would hang the test rather than assert anything. That the
+    // follow-up's `fn` never runs is the BLO-20396 regression check.
+    let followUpRan = false;
+    const follow = withAgentStartLock(agentId, async () => {
+      followUpRan = true;
+      return "ran-concurrently";
+    }, coalesced);
+    void follow.catch(() => {});
+    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS);
+    expect(followUpRan).toBe(false);
   });
 
   it("is a pass-through outside a dispatch section", async () => {
