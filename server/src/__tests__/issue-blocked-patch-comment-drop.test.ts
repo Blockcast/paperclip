@@ -11,8 +11,10 @@ import {
   heartbeatRuns,
   instanceSettings,
   issueComments,
+  issueLabels,
   issueRelations,
   issues,
+  labels,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -56,12 +58,14 @@ describeEmbeddedPostgres("PATCH refused by the blocker guard does not silently d
 
   afterEach(async () => {
     await db.delete(issueComments);
+    await db.delete(issueLabels);
     await db.delete(issueRelations);
     // Before `heartbeat_runs`: an accepted PATCH writes an activity_log row
     // that FK-references the run, so tearing the run down first fails on
     // `activity_log_run_id_heartbeat_runs_id_fk`.
     await db.delete(activityLog);
     await db.delete(issues);
+    await db.delete(labels);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
@@ -163,6 +167,45 @@ describeEmbeddedPostgres("PATCH refused by the blocker guard does not silently d
 
   function agentActor(companyId: string, agentId: string, runId: string): Express.Request["actor"] {
     return { type: "agent", agentId, companyId, runId, source: "agent_jwt" };
+  }
+
+  /**
+   * An issue the evidence gate will refuse on a move to `in_review`: labelled
+   * `frontend`, so the registry requires screenshots, and carrying Done-when
+   * bullets with nothing satisfying them. Seeded `in_progress` so the PATCH is
+   * a real transition into `in_review` — `isInReviewTransition` is what arms
+   * the gate.
+   *
+   * The scheduled monitor is load-bearing, not decoration.
+   * `assertAgentInReviewReviewPath` refuses an agent-authored move to
+   * `in_review` that leaves nobody owning the next action, and it runs *before*
+   * the evidence gate — so without a review path the request never reaches the
+   * refusal under test. A future `monitorNextCheckAt` on the row is the one
+   * review path that keeps the PATCH body at exactly `{status, comment}`; the
+   * others (`assigneeUserId`, `executionState.currentParticipant`,
+   * `executionPolicy`) would add a third key and change which guard fires.
+   * It is also the realistic shape: an agent moving to review behind a
+   * scheduled check is the documented loop.
+   */
+  async function seedEvidenceGatedIssue() {
+    const seeded = await seedAssignedIssue({ withBlocker: false });
+    const labelId = randomUUID();
+    await db.insert(labels).values({
+      id: labelId,
+      companyId: seeded.companyId,
+      name: "frontend",
+      color: "#000000",
+    });
+    await db.insert(issueLabels).values({ issueId: seeded.issueId, labelId, companyId: seeded.companyId });
+    await db
+      .update(issues)
+      .set({
+        status: "in_progress",
+        description: "## Done when\n- desktop works\n- mobile works",
+        monitorNextCheckAt: new Date(Date.now() + 60 * 60 * 1000),
+      })
+      .where(eq(issues.id, seeded.issueId));
+    return seeded;
   }
 
   async function commentRows(issueId: string) {
@@ -305,5 +348,64 @@ describeEmbeddedPostgres("PATCH refused by the blocker guard does not silently d
     expect(details.issueId).toBe(issueId);
 
     expect(await commentRows(issueId)).toEqual([]);
+  });
+
+  // Review follow-up (#1895, second round): the four tests above all read
+  // `res.body.details`, and every refusal they stage emits it. The
+  // `missing-evidence` refusal does not. `middleware/error-handler.ts`
+  // short-circuits `422 missing-evidence` into a narrow `{error, missing}`
+  // body and never emits `details` at all, so the route built the
+  // announcement and the handler dropped it on the floor — the PEN-3255
+  // defect verbatim, surviving on the refusal an agent is most likely to hit,
+  // since the documented loop is "attach evidence, then move to `in_review`"
+  // and bundling the note into that same PATCH is the normal shape.
+  //
+  // So this one asserts on `res.body` directly rather than on
+  // `res.body.details`. A fix applied only to the route would leave it red.
+  it("announces the drop through the missing-evidence short-circuit, which emits no `details`", async () => {
+    const { companyId, agentId, runId, issueId } = await seedEvidenceGatedIssue();
+    const app = createApp(agentActor(companyId, agentId, runId));
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review", comment: "Screenshots are in the PR description rather than here." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toBe("missing-evidence");
+
+    // The narrow contract this branch exists to serve is intact: `missing` is
+    // still top-level, and `details` is still absent. The announcement is
+    // carried through it, not by abandoning it.
+    expect(res.body.missing).toEqual(expect.arrayContaining(["screenshot:1440x900"]));
+    expect(res.body).not.toHaveProperty("details");
+
+    expect(
+      res.body.commentPersisted,
+      `the refusal must say the carried comment was not saved; got ${JSON.stringify(res.body)}`,
+    ).toBe(false);
+    expect(String(res.body.commentHint)).toContain("POST /api/issues/:id/comments");
+
+    expect(await commentRows(issueId)).toEqual([]);
+  });
+
+  // Complement, mirroring the blocker-guard pair above: the carry-through must
+  // be tied to a comment having been carried. Without this, a handler change
+  // that stamped the keys onto every `missing-evidence` refusal would pass the
+  // test above while telling every agent in the evidence loop that a comment
+  // it never sent was dropped. This is also the regression guard for the
+  // existing `{error, missing}` exact-shape assertion in
+  // `issues-patch-evidence.test.ts`.
+  it("leaves the missing-evidence body untouched when the refused PATCH carried no comment", async () => {
+    const { companyId, agentId, runId, issueId } = await seedEvidenceGatedIssue();
+    const app = createApp(agentActor(companyId, agentId, runId));
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toBe("missing-evidence");
+    expect(res.body).not.toHaveProperty("commentPersisted");
+    expect(res.body).not.toHaveProperty("commentHint");
   });
 });
