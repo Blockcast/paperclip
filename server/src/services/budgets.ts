@@ -767,8 +767,8 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
      * `hire_agent` decision path (`approvals.ts`, whose
      * `activatePendingApproval` opens with `agents … for update`).
      *
-     * The remaining callers are outside the rule and are safe for reasons that
-     * do not generalise — do not copy them:
+     * The remaining callers and writers are outside the rule and are safe for
+     * reasons that do not generalise — do not copy them:
      *  - `POST /companies/:companyId/budgets/policies` and
      *    `PATCH /companies/:companyId/budgets` (`routes/costs.ts`),
      *    `POST /companies` (`routes/companies.ts`),

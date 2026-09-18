@@ -149,7 +149,14 @@ describeEmbeddedPostgres("hire_agent approval takes the budget_policies lock fir
       acquired();
       await released;
     });
-    await holding;
+    // `holding` only ever resolves on the success path, so awaiting it alone
+    // turns a holder that rejects before `acquired()` into a hang to vitest's
+    // timeout. Racing `held` surfaces the real error instead, and attaches a
+    // rejection handler to it for the window before the `finally` awaits it.
+    await Promise.race([
+      holding,
+      held.then(() => { throw new Error("holder ended before acquiring the policy lock"); }),
+    ]);
 
     const decision = approvalService(db).approve(approval.id, "board-user", "Approved");
     // The probe window is time-based, so it fails toward green: if the decision
