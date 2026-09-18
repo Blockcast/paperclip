@@ -18,10 +18,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * `grep -rn 'scrubGitHubEgressText' server` returned nothing at all.
  *
  * The same shape produced the gap twice: a scrub applied per-caller closes only
- * the callers someone remembered. So these assertions are aimed at the two
- * write helpers in `github-app-auth.ts` rather than at their callers. Those two
- * functions are the only way this service puts authored text on GitHub, so
- * covering them covers every present and future caller.
+ * the callers someone remembered. So these assertions are aimed at the write
+ * helpers in `github-app-auth.ts` rather than at their callers. Those helpers
+ * are the only way this service puts authored text on GitHub, so covering them
+ * covers every present and future caller. `githubPostCheckRun` (BLO-33657)
+ * landed after the first two were scrubbed and is held to the same rule: a
+ * check-run `summary` is the same verdict prose a status description carries,
+ * with no 140-char cap.
  *
  * ## What a passing run here does and does not establish
  *
@@ -51,6 +54,7 @@ const h = vi.hoisted(() => ({
 vi.mock("../config.js", () => ({ loadConfig: () => h.cfg }));
 
 import {
+  githubPostCheckRun,
   githubPostCommitStatusDetailed,
   githubPostIssueComment,
   _resetInstallationTokenCache,
@@ -84,7 +88,9 @@ function stubGitHub() {
     if (u.includes("/access_tokens")) {
       return jsonResponse({ token: ["gh", "s_test"].join(""), expires_at: FUTURE_ISO });
     }
-    if (u.includes("/statuses/") || u.includes("/comments")) return jsonResponse({ id: 1 }, true, 201);
+    if (u.includes("/statuses/") || u.includes("/comments") || u.includes("/check-runs")) {
+      return jsonResponse({ id: 1 }, true, 201);
+    }
     throw new Error(`unexpected url ${u}`);
   });
   vi.stubGlobal("fetch", fetchMock);
@@ -101,7 +107,7 @@ function setCreds() {
 function writtenBody(fetchMock: ReturnType<typeof stubGitHub>): Record<string, unknown> {
   const call = fetchMock.mock.calls.find(([url]) => {
     const u = String(url);
-    return u.includes("/statuses/") || u.includes("/comments");
+    return u.includes("/statuses/") || u.includes("/comments") || u.includes("/check-runs");
   });
   expect(call, "no write reached fetch").toBeDefined();
   return JSON.parse(((call as unknown[])[1] as { body?: string }).body ?? "{}");
@@ -275,6 +281,53 @@ describe("githubPostCommitStatusDetailed egress scrub", () => {
   });
 });
 
+describe("githubPostCheckRun egress scrub", () => {
+  it("redacts a credential-shaped summary, which has no 140-char cap to hide behind", async () => {
+    // The check-run summary is `verdict.reason` — the very text the commit
+    // status description carries — but GitHub does not truncate it, so an
+    // unscrubbed check-run publishes MORE of a leaked value than the status.
+    setCreds();
+    const fetchMock = stubGitHub();
+    await githubPostCheckRun({
+      repoFullName: REPO,
+      sha: SHA,
+      name: "review/ally-complete",
+      conclusion: "failure",
+      title: "Unresolved finding at this head",
+      summary: `${"x".repeat(200)} unrecognized ledger verb "${FAKE_AWS_KEY_ID}"`,
+    });
+    const output = writtenBody(fetchMock).output as { title: string; summary: string };
+    expect(output.summary).not.toContain(FAKE_AWS_KEY_ID);
+    expect(output.summary).toContain("[paperclip-egress-scrub redacted: vendor-key]");
+    expect(output.summary.length).toBeGreaterThan(140);
+    expect(output.title).toBe("Unresolved finding at this head");
+  });
+
+  it("leaves an ordinary check-run untouched", async () => {
+    setCreds();
+    const fetchMock = stubGitHub();
+    const summary =
+      "Ally's most recent consolidated-review comment for this head reports no unresolved findings.";
+    await githubPostCheckRun({
+      repoFullName: REPO,
+      sha: SHA,
+      name: "review/ally-complete",
+      conclusion: "success",
+      title: "Reviewed at this head — no unresolved findings",
+      summary,
+      detailsUrl: "https://github.com/Blockcast/paperclip/pull/1754",
+    });
+    expect(writtenBody(fetchMock)).toEqual({
+      name: "review/ally-complete",
+      head_sha: SHA,
+      status: "completed",
+      conclusion: "success",
+      output: { title: "Reviewed at this head — no unresolved findings", summary },
+      details_url: "https://github.com/Blockcast/paperclip/pull/1754",
+    });
+  });
+});
+
 describe("the scrub is reachable from server/ at all", () => {
   it("is exported from the adapter-utils barrel", () => {
     // The mechanical fact PEN-3157 turned on: `server/` imports the package by
@@ -298,6 +351,9 @@ describe("the scrub is reachable from server/ at all", () => {
       source.indexOf("export async function githubPostCommitStatusDetailed"),
     );
     expect(statusHelper).toContain("scrubOutboundGitHubText(input.description");
+    const checkRunHelper = source.slice(source.indexOf("export async function githubPostCheckRun"));
+    expect(checkRunHelper).toContain("scrubOutboundGitHubText(input.summary");
+    expect(checkRunHelper).toContain("scrubOutboundGitHubText(input.title");
   });
 
   it("leaves no server-side GitHub writer outside the scrub", () => {
