@@ -19266,8 +19266,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // and `retryNotBefore: 08:00Z` against a `scheduledRetryAt` four days
         // out, which is two decisions wearing one row and reads like a
         // scheduler bug rather than a second, later denial.
-        // PEN-3153: `capacity.reason` is upstream-provider text and this write
-        // is a direct UPDATE, so the status writers never see it.
+        // PEN-3153/PEN-3323: `capacity.reason` is NOT upstream-provider text —
+        // it is a closed two-member enum produced by our own gate
+        // (`PenstockAvailabilityGateDenyResult.reason`), either
+        // `penstock.model_capacity_unavailable` or
+        // `penstock.model_temporarily_unavailable`. The local declares it as
+        // `string`, but its only assignment is from that gate result. Carries
+        // no provider text, so it is safe to surface; this write is a direct
+        // UPDATE, so the status writers never see it.
         const nextResultJson = sanitizeRunResultJsonForStorage(
           applyCcrotateCapacityDecision(parseObject(dueRun.resultJson), {
             retryAtIso: nextDueAt.toISOString(),
@@ -34332,8 +34338,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             errorCode: "rate_limit_exhausted",
             // Shared with the promotion-time re-defer (BLO-24011) so the two
             // writers cannot drift in which fields describe the current park.
-            // PEN-3153: `reason` here is upstream-provider text off the
-            // penstock availability gate, and this is an INSERT, so neither the
+            // PEN-3153/PEN-3323: `reason` here is NOT upstream-provider text —
+            // it is a closed two-member enum our own availability gate assigns
+            // (`PenstockAvailabilityGateDenyResult.reason`), either
+            // `penstock.model_capacity_unavailable` or
+            // `penstock.model_temporarily_unavailable`. Do not confuse it with
+            // the gate's body-derived `capacityReason`, which IS upstream text
+            // and is logged only, never persisted here. Carries no provider
+            // text, so it is safe to surface; this is an INSERT, so neither the
             // adapter boundary nor the status writers see it.
             resultJson: sanitizeRunResultJsonForStorage(
               applyCcrotateCapacityDecision(
