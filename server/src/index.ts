@@ -27,6 +27,8 @@ import {
   createEmbeddedPostgresLogBuffer,
   prepareEmbeddedPostgresNativeRuntime,
   reconcilePendingMigrationHistory,
+  readInheritedTimeoutSettings,
+  formatInheritedTimeoutSettings,
   formatDatabaseBackupResult,
   runDatabaseBackup,
   authUsers,
@@ -707,6 +709,29 @@ export async function startServer(): Promise<StartedServer> {
     activeDatabaseConnectionString = embeddedConnectionString;
     resolvedEmbeddedPostgresPort = port;
     startupDbInfo = { mode: "embedded-postgres", dataDir, port };
+  }
+
+  // Report the timeout environment the application pool inherits from the
+  // server. `createDb` bounds idle-in-transaction itself, but leaves
+  // `statement_timeout` to whatever the server imposes — and nothing in this
+  // repo or in `Blockcast/onprem-k8s` provably sets it, despite two places
+  // asserting a role-level 30s bound. A `statement_timeout` of `disabled` here
+  // means one blocked query can hang a recovery pass indefinitely (PEN-3365);
+  // that is the reading the explicit-timeout decision is gated on. Probing is
+  // strictly diagnostic, so it must never prevent the server from starting.
+  try {
+    const inheritedTimeouts = await readInheritedTimeoutSettings(activeDatabaseConnectionString);
+    const unbounded = inheritedTimeouts.statementTimeout.valueMs === null;
+    logger[unbounded ? "warn" : "info"](
+      `Database timeout environment: ${formatInheritedTimeoutSettings(inheritedTimeouts)}` +
+        (unbounded
+          ? " — statement_timeout is disabled, so a blocked query is bounded by nothing server-side (PEN-3365)"
+          : ""),
+    );
+  } catch (error) {
+    logger.warn(
+      `Could not read the database timeout environment: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
   
   if (config.deploymentMode === "local_trusted" && !isLoopbackHost(config.host)) {
