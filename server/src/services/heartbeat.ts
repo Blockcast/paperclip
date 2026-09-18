@@ -1725,11 +1725,11 @@ export function selectAgedPrReviewRunForFairDispatch(
 export function resolveAutomaticRunRetryOpts(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "contextSnapshot">,
 ) {
-  // NOTE: `errorCode === "timeout"` is the GENERIC code the finalizer sets for
-  // every adapter's `timed_out` outcome, and this branch sits ahead of the more
-  // specific ones below -- so any future adapter that times out inherits the
-  // 1-attempt cap without opting into it. That is latent today (only
-  // claude-local tags a timeout, via `resultJson.errorFamily`).
+  // TODO(PEN-3097): `errorCode === "timeout"` is the GENERIC code the finalizer
+  // sets for every adapter's `timed_out` outcome, and this branch sits ahead of
+  // the more specific ones below -- so any future adapter that times out
+  // inherits the 1-attempt cap without opting into it. That is latent today
+  // (only claude-local tags a timeout, via `resultJson.errorFamily`).
   //
   // Deliberately NOT narrowed to claude-local's `resultJson.timedOutBeforeOutput`
   // evidence (PEN-3093, carried-over suggestion 2). It is feasible -- `resultJson`
