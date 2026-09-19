@@ -260,6 +260,67 @@ test('the closest cancel in the window is chosen, and no run is consumed twice',
   assert.equal(chain.links.length, 1);
 });
 
+test('a rejected CLOSEST cancel falls through to the real supersede behind it', async () => {
+  // The failure this pins is the module's worst direction of error: under-report.
+  // `scheduled-production-deploy.yml` records a live double-dispatch ("two
+  // dispatches 28min apart", 2026-08-30), so two cancels CAN land in one window.
+  // When the nearer one is a duplicate at the same master sha, `createAncestryProbe`
+  // resolves `identical -> false`. Rejecting the whole walk on that would report
+  // this 46h stall as the waiting run's own 0.1h age, on a GREEN dispatcher.
+  const duplicateSha = 'd'.repeat(40);
+  const supersedeSha = 'a'.repeat(40);
+
+  const chain = await deriveStallStartFromSupersedeChain({
+    oldestWaitingRun: waitingRun({ id: 35391811913, createdAt: '2026-09-18T20:30:21Z' }),
+    cancelledRuns: [
+      // The REAL supersede: further away, and the one carrying the stall.
+      cancelledRun({
+        id: 35172796731,
+        createdAt: '2026-09-17T02:01:24Z',
+        cancelledAt: '2026-09-18T20:30:05Z',
+        headSha: supersedeSha,
+      }),
+      // A duplicate dispatch at the same sha, cancelled 3s nearer to us.
+      cancelledRun({
+        id: 35172799999,
+        createdAt: '2026-09-18T20:02:00Z',
+        cancelledAt: '2026-09-18T20:30:18Z',
+        headSha: duplicateSha,
+      }),
+    ],
+    isAncestor: async (baseSha) => baseSha !== duplicateSha,
+  });
+
+  assert.equal(chain.stallStartedAt, '2026-09-17T02:01:24.000Z');
+  assert.equal(chain.links.length, 1);
+  assert.equal(chain.links[0].cancelledRunId, 35172796731);
+  assert.equal(chain.links[0].ancestryVerified, true);
+
+  // The rejected candidate is consumed, not silently re-offered on a later hop.
+  assert.ok(
+    chain.links.every((link) => link.cancelledRunId !== 35172799999),
+    'the duplicate must never enter the chain',
+  );
+});
+
+test('a window where EVERY candidate fails ancestry still reports not-a-forward-replace', async () => {
+  // Falling through candidates must not blur the two exhausted-window causes:
+  // "nothing was in range" and "everything in range was tested and refused" stay
+  // distinguishable in the log.
+  const chain = await deriveStallStartFromSupersedeChain({
+    oldestWaitingRun: waitingRun({ createdAt: '2026-09-18T20:30:21Z' }),
+    cancelledRuns: [
+      cancelledRun({ id: 71, createdAt: '2026-09-18T19:00:00Z', cancelledAt: '2026-09-18T20:30:05Z' }),
+      cancelledRun({ id: 72, createdAt: '2026-09-18T19:30:00Z', cancelledAt: '2026-09-18T20:30:18Z' }),
+    ],
+    isAncestor: neverAncestor,
+  });
+
+  assert.equal(chain.stallStartedAt, null);
+  assert.equal(chain.links.length, 0);
+  assert.equal(chain.stoppedBecause, 'not-a-forward-replace');
+});
+
 test('CHAIN_WINDOW_MINUTES stays tight enough to exclude an hourly slot', () => {
   // The next scheduled dispatcher slot is up to 60 minutes away. If the window
   // ever reaches that, a deliberate human cancel starts reading as a supersede.
