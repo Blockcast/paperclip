@@ -273,7 +273,7 @@ export function executeDetailWrite(rowIds, { reserveTripsBeforeShard = null, sta
   }
 
   const headWroteCleanly = written.some((shard) => shard.key === "agent-health-detail");
-  const degraded = outcome !== "complete" && outcome !== "not_required";
+  const degraded = outcome !== "complete";
   return {
     state,
     detailShardPlan: plan.map(({ key, rowCount, range }) => ({ key, rowCount, range })),
@@ -290,9 +290,32 @@ export function executeDetailWrite(rowIds, { reserveTripsBeforeShard = null, sta
       ? `**Rendering degraded — ${failureCode}: ${materialised.length} of ${rowIds.length} P3/informational rows materialised, ${unmaterialised.length} unreachable.**`
       : null,
     receiptEmitted: true,
-    conserved: materialised.length + unmaterialised.length === rowIds.length
-      && materialised.every((id) => !unmaterialised.includes(id)),
+    conserved: conservedAgainstPlan(rowIds, written),
   };
+}
+
+/**
+ * Conservation, checked against three facts the writer cannot re-derive from its
+ * own output: the planner's declared `rowCount`, the caller's `rowIds` order, and
+ * a duplicate check.
+ *
+ * The previous form compared `materialised` against `unmaterialised`, which is
+ * *defined* as its complement — so the identity held under ANY row loss, and the
+ * fixture named for conservation could not fail. Dropping 5 rows per shard left
+ * `conserved: true` with 15 rows silently gone (Ally review, PR #1571). That is
+ * exactly the `assigned + (n - assigned) === n` shape this file's header bans.
+ *
+ * Each conjunct fails on a different mutation: `declared` catches a short write,
+ * the `Set` catches a row written twice, and the prefix comparison catches a gap
+ * or a reorder — shards are contiguous head-first slices of `rowIds`, so anything
+ * materialised must be a prefix of the input in input order.
+ */
+export function conservedAgainstPlan(rowIds, writtenShards) {
+  const materialised = writtenShards.flatMap((shard) => shard.rows);
+  const declared = writtenShards.reduce((sum, shard) => sum + shard.rowCount, 0);
+  return materialised.length === declared
+    && new Set(materialised).size === materialised.length
+    && materialised.every((id, index) => id === rowIds[index]);
 }
 
 export function boundBlockers(blockers, max = DETAIL_MAX_BLOCKERS_PER_ROW) {
@@ -300,11 +323,21 @@ export function boundBlockers(blockers, max = DETAIL_MAX_BLOCKERS_PER_ROW) {
   return `${blockers.slice(0, max).join(", ")} +${blockers.length - max} more`;
 }
 
+const ELIDED_SUFFIX = " … (elided)";
+
+/**
+ * The returned text is <= `max`, including the suffix. Searching for the field
+ * boundary within `max` rather than within `max - suffix.length` returned 251
+ * chars against a 240 cap whenever no ` · ` fell before the cut (Ally review,
+ * PR #1571) — the only elide-path coverage used a string whose boundary landed
+ * at 200, so the overflow was never observed.
+ */
 export function truncateRow(text, max = DETAIL_MAX_ROW_CHARS) {
   if (text.length <= max) return { text, elided: false };
-  const cut = text.lastIndexOf(" · ", max);
-  const boundary = cut > 0 ? cut : max;
-  return { text: `${text.slice(0, boundary)} … (elided)`, elided: true };
+  const limit = max - ELIDED_SUFFIX.length;
+  const cut = text.lastIndexOf(" · ", limit);
+  const boundary = cut > 0 ? cut : limit;
+  return { text: `${text.slice(0, boundary)}${ELIDED_SUFFIX}`, elided: true };
 }
 
 export function runDetailWriteFixture() {
@@ -352,7 +385,6 @@ export function runDetailWriteFixture() {
     c.detailMaterialisedRowCount === 0 && c.detailUnmaterialisedRowCount === 312);
   check("C: null key/revision but discriminating failure code",
     c.detailDocumentKey === null && c.detailRevisionId === null
-    && c.detailFailureCode !== "detail_not_required"
     && c.detailFailureCode !== "detail_write_fallback_inline");
   check("C: receipt emitted", c.receiptEmitted === true);
 
@@ -367,8 +399,10 @@ export function runDetailWriteFixture() {
     boundBlockers(Array.from({ length: 11 }, (_, i) => `B-${i + 1}`)).endsWith("+5 more"));
   check("row bound: over-long row elided at a field boundary",
     truncateRow(`${"A".repeat(200)} · ${"B".repeat(100)}`).elided === true);
-
-  check("large state never records not_required", a.detailWriteOutcome !== "not_required");
+  check("row bound: elided text never exceeds the cap, boundary or not",
+    truncateRow("A".repeat(500)).text.length <= DETAIL_MAX_ROW_CHARS
+    && truncateRow(`${"A".repeat(200)} · ${"B".repeat(100)}`).text.length <= DETAIL_MAX_ROW_CHARS,
+    `noBoundary=${truncateRow("A".repeat(500)).text.length} cap=${DETAIL_MAX_ROW_CHARS}`);
 
   return { status: checks.every((entry) => entry.ok) ? "pass" : "fail", checks };
 }
@@ -403,16 +437,37 @@ export function runMandatoryFixtures() {
 
   // 2. Population conservation at large state: every canonical row appears in
   //    exactly one of comment / document / disclosed-unmaterialised.
-  const conservation = executeDetailWrite(
-    Array.from({ length: 312 }, (_, index) => `SYN-${1001 + index}`),
-    { reserveTripsBeforeShard: 3 },
-  );
+  //
+  //    The positive case is asserted against NEGATIVE CONTROLS, because the
+  //    previous form compared the materialised set against its own complement
+  //    and so could not fail: a writer dropping 5 rows per shard still reported
+  //    `conserved: true` (Ally review, PR #1571). Each control below mutates the
+  //    written shards in one way and must flip `conservedAgainstPlan` to false.
+  const rows312 = Array.from({ length: 312 }, (_, index) => `SYN-${1001 + index}`);
+  const conservation = executeDetailWrite(rows312, { reserveTripsBeforeShard: 3 });
+  const { plan: fullPlan } = planDetailShards(rows312);
+  const writtenTwoShards = fullPlan.slice(0, 2);
+  const dropFive = writtenTwoShards.map((shard) => ({ ...shard, rows: shard.rows.slice(0, -5) }));
+  const duplicated = writtenTwoShards.map((shard, index) => (index === 1
+    ? { ...shard, rows: [...shard.rows.slice(0, -1), writtenTwoShards[0].rows[0]] }
+    : shard));
+  const reordered = writtenTwoShards.map((shard, index) => (index === 0
+    ? { ...shard, rows: [...shard.rows].reverse() }
+    : shard));
   fixtures.push(fixture(
     V4_FIXTURE_MANIFEST[1],
     conservation.conserved
-      && conservation.detailMaterialisedRowCount + conservation.detailUnmaterialisedRowCount === 312
-      && conservation.receiptEmitted,
-    `materialised=${conservation.detailMaterialisedRowCount} unmaterialised=${conservation.detailUnmaterialisedRowCount}`,
+      && conservation.detailMaterialisedRowCount === 240
+      && conservation.detailUnmaterialisedRowCount === 72
+      && conservation.receiptEmitted
+      && conservedAgainstPlan(rows312, dropFive) === false
+      && conservedAgainstPlan(rows312, duplicated) === false
+      && conservedAgainstPlan(rows312, reordered) === false,
+    `materialised=${conservation.detailMaterialisedRowCount}`
+      + ` unmaterialised=${conservation.detailUnmaterialisedRowCount}`
+      + ` controls: dropped=${conservedAgainstPlan(rows312, dropFive)}`
+      + ` duplicated=${conservedAgainstPlan(rows312, duplicated)}`
+      + ` reordered=${conservedAgainstPlan(rows312, reordered)}`,
   ));
 
   // 3. Superseded approvals contribute nothing to the canonical fingerprint.
@@ -464,17 +519,23 @@ export function runMandatoryFixtures() {
   ));
 
   // 4. Human-review gate parks only on a LIVE pending card.
-  const gate = (approvalStatus) => (approvalStatus === "pending"
-    ? { classification: "parked", reason: "human_review_gate:appr-1" }
-    : { classification: "stalled_issue", reason: "agent_actionable" });
-  const parked = gate("pending");
-  const rejected = gate("rejected");
+  const parked = classifyHumanReviewGate({ approvals: [{ id: "appr-1", status: "pending" }] });
+  const rejected = classifyHumanReviewGate({ approvals: [{ id: "appr-1", status: "rejected" }] });
+  const noCard = classifyHumanReviewGate({ approvals: [] });
+  const staleThenLive = classifyHumanReviewGate({
+    approvals: [{ id: "appr-0", status: "approved" }, { id: "appr-2", status: "pending" }],
+  });
   fixtures.push(fixture(
     V4_FIXTURE_MANIFEST[3],
     parked.classification === "parked"
       && parked.reason === "human_review_gate:appr-1"
-      && rejected.classification === "stalled_issue",
-    "pending parks with card id; rejected is a counted stalled_issue",
+      && rejected.classification === "stalled_issue"
+      && rejected.reason === "agent_actionable"
+      && noCard.classification === "stalled_issue"
+      && staleThenLive.classification === "parked"
+      && staleThenLive.reason === "human_review_gate:appr-2",
+    `pending parks with card id; rejected=${rejected.classification} noCard=${noCard.classification}`
+      + ` decidedCardIgnored=${staleThenLive.reason}`,
   ));
 
   // 5. Terminal-blocker precedence: cancelled > reaffirmed > stale edge.
@@ -555,6 +616,50 @@ export function runMandatoryFixtures() {
 const FAILING_RUN_STATUSES = new Set(["failed", "error", "adapter_failed"]);
 
 /**
+ * §8 human-review gate: an issue parks only behind a card that is STILL pending.
+ *
+ * A decided card — approved, rejected, withdrawn — is not a gate, and an issue
+ * sitting behind one is agent-actionable and must stay counted as a
+ * `stalled_issue` rather than being excused as "waiting on a human". The card id
+ * travels in the reason so the reader can go look at the thing being waited on.
+ *
+ * This exists as an exported predicate because fixture 4 previously asserted a
+ * ternary defined five lines above it, calling nothing in this module: its
+ * `pass` was a compile-time constant that survived every mutation, while still
+ * counting toward the 7-fixture manifest that gates `runPreflight` (Ally review,
+ * PR #1571).
+ */
+export function classifyHumanReviewGate({ approvals = [] } = {}) {
+  const live = approvals.find((card) => card?.status === "pending");
+  return live == null
+    ? { classification: "stalled_issue", reason: "agent_actionable" }
+    : { classification: "parked", reason: `human_review_gate:${live.id}` };
+}
+
+/**
+ * Longest unbroken run of failing statuses ANYWHERE in the list, not just at the
+ * head.
+ *
+ * `runs.slice(0, 3).every(...)` asks "are the newest three all failing", which is
+ * a different question and a live detection gap: one interleaved row at the head
+ * suppressed `agent_in_error` over a streak of any length, so
+ * `["scheduled_retry","failed","failed","failed","failed","failed"]` — five
+ * consecutive failures on a running agent — raised nothing at all (Ally review,
+ * PR #1571). The docblock on classifyAgentHealth has always stated that an
+ * interleaved row "must not displace the newest genuinely failing run"; the code
+ * did the opposite.
+ */
+function longestFailureStreak(runs) {
+  let longest = 0;
+  let current = 0;
+  for (const status of runs) {
+    current = FAILING_RUN_STATUSES.has(status) ? current + 1 : 0;
+    if (current > longest) longest = current;
+  }
+  return longest;
+}
+
+/**
  * Agent-health row selection. Agent state is authoritative and evaluated
  * independently of run history: an interleaved `cancelled` / `scheduled_retry`
  * row must not displace the newest genuinely failing run, and must not make
@@ -567,8 +672,7 @@ export function classifyAgentHealth(agent) {
     rows.push("agent_paused_non_manual");
   }
   const runs = agent.runs ?? [];
-  const threeConsecutiveFailures = runs.length >= 3
-    && runs.slice(0, 3).every((status) => FAILING_RUN_STATUSES.has(status));
+  const threeConsecutiveFailures = longestFailureStreak(runs) >= 3;
   if (threeConsecutiveFailures && !rows.includes("agent_in_error")) rows.push("agent_in_error");
 
   const openIssues = agent.openIssues ?? [];
@@ -700,7 +804,7 @@ export function currentWindowEnd(now = Date.now()) {
 export const MAX_SILENT_WINDOWS = 2;
 
 function hasClassificationReceipt(row) {
-  return row?.classification != null && row?.commentId != null;
+  return row?.classification != null && hasAnyReceipt(row);
 }
 
 /**
@@ -718,13 +822,22 @@ function hasClassificationReceipt(row) {
  * emission, so this keys on `commentId` alone.
  *
  * "Absent" is null, undefined, OR blank, and this is the SINGLE definition —
- * `classifyWindowRows` calls this rather than restating it. The two used to
- * disagree: this tested `!= null` while the `completed-without-comment` branch
- * tested `!row.commentId`, so a `commentId: ""` row was receiptless for display
- * and a receipt for the `silent` term. A 28/28 census of terminal runs carrying
- * `commentId: ""` therefore reported `counts.silent === 0`, `complete: true`,
- * `pass: true` — the identical total emission-contract outage the same input
- * with `null` correctly fails, reported green (Ally review, PR #1571).
+ * `classifyWindowRows` and `hasClassificationReceipt` both call this rather than
+ * restating it. All three used to disagree: this tested `!= null` while the
+ * `completed-without-comment` branch tested `!row.commentId`, so a
+ * `commentId: ""` row was receiptless for display and a receipt for the `silent`
+ * term. A 28/28 census of terminal runs carrying `commentId: ""` therefore
+ * reported `counts.silent === 0`, `complete: true`, `pass: true` — the identical
+ * total emission-contract outage the same input with `null` correctly fails,
+ * reported green (Ally review, PR #1571).
+ *
+ * `hasClassificationReceipt` was the last holdout and was fixed one round later:
+ * it still tested `commentId != null`, so with `commentId: "   "` a window read
+ * `classification-producing` where `commentId: null` read `receipt-only`. That
+ * one inflated the published coverage figure without opening a false green —
+ * `census.complete` reads only `counts.silent` and `malformedRows` — but two
+ * predicates named for the same concept must not disagree about it (Ally review,
+ * PR #1571).
  *
  * Blank, not just empty: these rows are parsed from a caller-supplied JSON file
  * whose null-vs-empty convention this script explicitly cannot assume (see the
@@ -831,12 +944,22 @@ const BOUNDARY_KEY_SHAPE = /^\d{4}-\d{2}-\d{2}T\d{2}:00:00(\.000)?Z$/;
  * The accepted shape is exactly what `windowKey()` emits, plus the `.000Z`
  * variant pinned by test. Anything else is a producer bug, and stating the
  * contract this narrowly is what lets `malformed` mean what its name says.
+ *
+ * The regex alone did not state it narrowly enough: `\d{2}` admits hour `24`, a
+ * key `windowKey()` can never emit, and `Date.parse` rolls it to the FOLLOWING
+ * midnight — on-grid, so it passed every later check and was silently credited
+ * to the next day's window, leaving its true window `silent` while over-filling
+ * a neighbour (Ally review, PR #1571). That is worse than misnaming a defect: it
+ * can mask a genuinely silent window. The round-trip below is the general form
+ * of "the exact shape `windowKey()` emits" — it rejects any key the emitter
+ * could not have produced, rather than enumerating the hours it can.
  */
 function placeWindowKey(rawKey) {
   if (typeof rawKey !== "string") return { kind: "malformed" };
   if (!BOUNDARY_KEY_SHAPE.test(rawKey)) return { kind: "malformed" };
   const ms = Date.parse(rawKey);
   if (!Number.isFinite(ms)) return { kind: "malformed" };
+  if (windowKey(ms) !== rawKey.replace(/\.000Z$/, "Z")) return { kind: "malformed" };
   if (ms % SIX_HOURS_MS !== 0) return { kind: "malformed" };
   return { kind: "boundary", key: windowKey(ms) };
 }

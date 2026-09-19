@@ -8,8 +8,10 @@ import {
   boundBlockers,
   canonicalRows,
   classifyAgentHealth,
+  classifyHumanReviewGate,
   classifyRoutineRuns,
   compareIdentifier,
+  conservedAgainstPlan,
   currentWindowEnd,
   deriveRendererOutput,
   executeDetailWrite,
@@ -178,6 +180,19 @@ describe("agent-health v4 preflight", () => {
     assert.deepEqual(census.malformedRows, [{ runId: "bare-year", windowKey: "2026" }]);
     assert.deepEqual(census.outOfWindowKeys, []);
     assert.equal(census.complete, false);
+  });
+
+  it("rejects an hour a boundary key can never carry instead of rolling it into the next day", () => {
+    // `\d{2}` admitted hour 24. `Date.parse` rolls it to the FOLLOWING midnight,
+    // which is on-grid and so passed every later check — the row was credited to
+    // a neighbouring window, leaving its true window `silent`. That can mask a
+    // genuinely silent slot, not merely misname a defect.
+    const census = classifyRoutineRuns([
+      { windowKey: "2026-08-25T24:00:00Z", runId: "hour-24", status: "completed", commentId: "c", classification: "x" },
+    ]);
+    assert.deepEqual(census.malformedRows, [{ runId: "hour-24", windowKey: "2026-08-25T24:00:00Z" }]);
+    assert.equal(census.slots.some((slot) => slot.windowKey === "2026-08-26T00:00:00Z"
+      && slot.state === "classification-producing"), false);
   });
 
   it("reports malformed rows instead of dropping them", () => {
@@ -504,9 +519,26 @@ describe("census completeness is derived from observed coverage, not from the ke
     assert.equal(census.complete, true);
     assert.equal(census.counts["classification-producing"], 28);
   });
+  it("treats a blank commentId as absent in BOTH receipt predicates", () => {
+    // Ally's reproduction: inputs identical but for one field. A slot whose only
+    // classifying row emitted nothing, and whose only emitting row did not
+    // classify, was credited `classification-producing` when the blank id was
+    // whitespace and `receipt-only` when it was null. Two predicates named for
+    // the same concept must not disagree about it.
+    const [slot] = sevenDayWindowKeys();
+    // Non-terminal, so the higher-precedence `completed-without-comment` branch
+    // does not fire and the classification predicate is what decides the slot.
+    const census = (commentId) => classifyRoutineRuns([
+      { windowKey: slot, runId: "r-classified", status: "running", commentId, classification: "x", fingerprint: "fp-a" },
+      { windowKey: slot, runId: "r-emitted", status: "succeeded", commentId: "c-real", fingerprint: "fp-b" },
+    ]);
+    assert.equal(census("   ").slots[0].state, "receipt-only");
+    assert.equal(census(null).slots[0].state, "receipt-only");
+    assert.equal(census("").slots[0].state, "receipt-only");
+    // The control: a real id on the classifying row does produce a classification.
+    assert.equal(census("c-classified").slots[0].state, "classification-producing");
+  });
 });
-
-// --- Regression: Ally Important findings #1 and #2 on PR #1571, head 3707eaca --
 // Neither `superseded_fingerprint` nor `cap_raise_july_backtest` was referenced
 // from this file at all, which is how both kept inert assertions: the fixture
 // suite reported them `pass` while their headline claims were asserted against
@@ -680,14 +712,13 @@ describe("§8d bounded shard contract", () => {
     assert.equal(result.receiptEmitted, true);
   });
 
-  it("branch C writes nothing but stays discriminable from not_required", () => {
+  it("branch C writes nothing but still names a discriminating failure code", () => {
     const result = executeDetailWrite(rows312, { reserveTripsBeforeShard: 1 });
     assert.equal(result.detailWriteOutcome, "skipped");
     assert.equal(result.detailFailureCode, "detail_write_skipped_no_budget");
     assert.deepEqual(result.detailShardKeys, []);
     assert.equal(result.detailDocumentKey, null);
     assert.equal(result.detailRevisionId, null);
-    assert.notEqual(result.detailFailureCode, "detail_not_required");
     assert.notEqual(result.detailFailureCode, "detail_write_fallback_inline");
     assert.equal(result.detailUnmaterialisedRowCount, 312);
     // The 2026-08-19T18:00Z defect: the receipt must survive.
@@ -705,10 +736,30 @@ describe("§8d bounded shard contract", () => {
     assert.equal(result.detailUnmaterialisedRowIds.at(-1), "SYN-2700");
   });
 
-  it("never records not_required at large state", () => {
-    for (const options of [{}, { reserveTripsBeforeShard: 3 }, { reserveTripsBeforeShard: 1 }]) {
-      assert.notEqual(executeDetailWrite(rows312, options).detailWriteOutcome, "not_required");
-    }
+  it("conservation is falsifiable: loss, duplication and reordering each flip it", () => {
+    const { plan } = planDetailShards(rows312);
+    const written = plan.slice(0, 2);
+    assert.equal(conservedAgainstPlan(rows312, written), true);
+    // Ally's mutant: the writer drops rows from each shard body. The old
+    // complement-based identity held here, losing 10 rows with no signal.
+    assert.equal(
+      conservedAgainstPlan(rows312, written.map((s) => ({ ...s, rows: s.rows.slice(0, -5) }))),
+      false,
+    );
+    // A row written twice, keeping the count right.
+    assert.equal(
+      conservedAgainstPlan(rows312, written.map((s, i) => (i === 1
+        ? { ...s, rows: [...s.rows.slice(0, -1), written[0].rows[0]] }
+        : s))),
+      false,
+    );
+    // Right rows, wrong order — shards are contiguous head-first slices.
+    assert.equal(
+      conservedAgainstPlan(rows312, written.map((s, i) => (i === 0
+        ? { ...s, rows: [...s.rows].reverse() }
+        : s))),
+      false,
+    );
   });
 
   it("bounds blockers per row and elides an over-long row at a field boundary", () => {
@@ -719,6 +770,16 @@ describe("§8d bounded shard contract", () => {
     assert.equal(long.elided, true);
     assert.ok(long.text.endsWith("… (elided)"));
     assert.ok(truncateRow("short row").elided === false);
+  });
+
+  it("never exceeds the row cap, with or without a field boundary before the cut", () => {
+    // The no-boundary path used to slice to exactly `max` and then append the
+    // 11-char suffix, returning 251 against a 240 cap.
+    for (const text of ["A".repeat(500), `${"A".repeat(200)} · ${"B".repeat(100)}`, "A".repeat(241)]) {
+      const { text: out, elided } = truncateRow(text);
+      assert.equal(elided, true);
+      assert.ok(out.length <= 240, `${out.length} > 240 for input of ${text.length}`);
+    }
   });
 
   it("runs all four documented branches green", () => {
@@ -759,6 +820,54 @@ describe("agent-health classification seam", () => {
     });
     assert.equal(result.threeConsecutiveFailures, true);
     assert.ok(result.rows.includes("agent_in_error"));
+  });
+
+  it("finds a failure streak that does not sit at the head of the run list", () => {
+    // The discriminator Ally named: the old head-anchored form
+    // (`runs.slice(0, 3).every(...)`) raised nothing for either of these, so a
+    // five-failure streak on a running agent went completely unalerted.
+    for (const runs of [
+      ["cancelled", "failed", "failed", "failed"],
+      ["scheduled_retry", "failed", "failed", "failed", "failed", "failed"],
+    ]) {
+      const result = classifyAgentHealth({ ...base, status: "running", runs });
+      assert.equal(result.threeConsecutiveFailures, true, runs.join(","));
+      assert.ok(result.rows.includes("agent_in_error"), runs.join(","));
+    }
+  });
+
+  it("does not manufacture a streak from non-adjacent failures", () => {
+    const result = classifyAgentHealth({
+      ...base,
+      status: "running",
+      runs: ["failed", "cancelled", "failed", "cancelled", "failed"],
+    });
+    assert.equal(result.threeConsecutiveFailures, false);
+    assert.ok(!result.rows.includes("agent_in_error"));
+  });
+
+  it("parks only behind a live pending card", () => {
+    assert.deepEqual(
+      classifyHumanReviewGate({ approvals: [{ id: "appr-1", status: "pending" }] }),
+      { classification: "parked", reason: "human_review_gate:appr-1" },
+    );
+    // A decided card is not a gate — the issue stays a counted stalled_issue.
+    for (const status of ["rejected", "approved", "withdrawn", "revision_requested"]) {
+      assert.equal(
+        classifyHumanReviewGate({ approvals: [{ id: "appr-1", status }] }).classification,
+        "stalled_issue",
+        status,
+      );
+    }
+    assert.equal(classifyHumanReviewGate({ approvals: [] }).classification, "stalled_issue");
+    assert.equal(classifyHumanReviewGate().classification, "stalled_issue");
+    // A decided card must not shadow a live one behind it.
+    assert.equal(
+      classifyHumanReviewGate({
+        approvals: [{ id: "appr-0", status: "approved" }, { id: "appr-2", status: "pending" }],
+      }).reason,
+      "human_review_gate:appr-2",
+    );
   });
 
   it("treats missing heartbeat config as different from explicit false", () => {
