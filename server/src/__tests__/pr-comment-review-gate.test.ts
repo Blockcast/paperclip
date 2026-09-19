@@ -1552,6 +1552,12 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
     // to retire it.
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
+      // Master added this case (BLO-31446) while this branch was narrowing
+      // `clean` to require a known, distinct author. It is about ledger
+      // parsing, not identity, so it gets a distinct author rather than a
+      // relaxed assertion — with the author omitted it would now correctly
+      // return `not_evaluated` and stop exercising the boilerplate path.
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
       comments: [
         allyComment(
           reviewBody(CURRENT_HEAD, [
