@@ -324,6 +324,26 @@ export const EXTERNAL_RUNTIME_RESERVATION_STRANDED_OLDEST_AGE_METRIC =
 export const EXTERNAL_RUNTIME_RESERVATION_STRAND_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_external_runtime_reservation_strand_metrics_refresh_success";
 /**
+ * How long each currently-held per-agent start lock has been held (PEN-3305).
+ *
+ * `withAgentStartLock` serializes queued-run dispatch per agent and has no
+ * timeout, no TTL and no owner-liveness check — deliberately, because the
+ * defect it replaced was a timeout that let a waiter run *alongside* the
+ * holder. The cost of that choice is that a section which never settles holds
+ * its agent's lock forever, and the agent then stops dispatching while
+ * presenting as `status: idle` / `errorReason: null` / `orgChainHealth:
+ * healthy`. Nothing exported that condition, so it was unobservable by
+ * construction — the same gap, and the same argument, as
+ * {@link DB_POOL_CONNECTIONS_METRIC}.
+ *
+ * Emitted only for agents whose lock is held right now, matching the
+ * convention of the per-agent backlog gauges: an absent series means no lock
+ * is held, not a zero-length hold. A healthy section is sub-second, so this is
+ * near-empty in normal operation and anything above a few seconds is real —
+ * `max by (agent_id) (...)` over it is the whole detector.
+ */
+export const AGENT_START_LOCK_HELD_SECONDS_METRIC = "paperclip_agent_start_lock_held_seconds";
+/**
  * Overdue-parked-retry age gauge (BLO-22094). {@link QUEUED_RUN_OLDEST_AGE_METRIC}
  * deliberately excludes `status='scheduled_retry'` rows -- that exclusion is
  * correct and stays (Ally review, onprem-k8s#2013: without it, a retry
@@ -2035,6 +2055,7 @@ let environmentLeasesOrphanedOldestAge: Gauge | null = null;
 let orphanedRuntimeResourceMetricsRefreshSuccess: Gauge | null = null;
 let externalRuntimeReservationStrandedOldestAge: Gauge<"agent_id"> | null = null;
 let externalRuntimeReservationStrandMetricsRefreshSuccess: Gauge | null = null;
+let agentStartLockHeldSeconds: Gauge<"agent_id"> | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
@@ -2182,6 +2203,7 @@ function ensureRegistry(): {
   pluginStatusCollectorLastSuccessGauge: Gauge<"role">;
   externalRuntimeReservationStrandedOldestAgeGauge: Gauge<"agent_id">;
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
+  agentStartLockHeldSecondsGauge: Gauge<"agent_id">;
   prReviewQueueWaitHistogram: Histogram;
   authRequestCounter: Counter<"operation" | "outcome">;
   gbrainRecallCounter: Counter<"status">;
@@ -2219,6 +2241,7 @@ function ensureRegistry(): {
     || !orphanedRuntimeResourceMetricsRefreshSuccess
     || !externalRuntimeReservationStrandedOldestAge
     || !externalRuntimeReservationStrandMetricsRefreshSuccess
+    || !agentStartLockHeldSeconds
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !externalLifecycleRunSilenceGap
@@ -2420,6 +2443,18 @@ function ensureRegistry(): {
         "Statements queued with no pool connection yet (BLO-33243). postgres.js only enqueues "
         + "here once every connection is busy, so a sustained non-zero value IS pool exhaustion "
         + "and a zero value rules it out.",
+      registers: [registry],
+    });
+    agentStartLockHeldSeconds = new Gauge({
+      name: AGENT_START_LOCK_HELD_SECONDS_METRIC,
+      help:
+        "Seconds the per-agent queued-run dispatch start lock has currently been held (PEN-3305). "
+        + "withAgentStartLock has no timeout by design, so a section that never settles holds its "
+        + "agent's lock forever and that agent silently stops dispatching -- while still reading "
+        + "status=idle, errorReason=null, orgChainHealth=healthy. Series exist only while a lock is "
+        + "held, so absence means no hold, not a zero-length one. A healthy section is sub-second; "
+        + "sustained tens of seconds is a wedge. Per-pod, because the lock is per-process.",
+      labelNames: ["agent_id"],
       registers: [registry],
     });
     externalRuntimeReservationsReleasePending = new Gauge({
@@ -3108,6 +3143,7 @@ function ensureRegistry(): {
     externalRuntimeReservationStrandedOldestAgeGauge: externalRuntimeReservationStrandedOldestAge,
     externalRuntimeReservationStrandMetricsRefreshSuccessGauge:
       externalRuntimeReservationStrandMetricsRefreshSuccess,
+    agentStartLockHeldSecondsGauge: agentStartLockHeldSeconds,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
@@ -3539,6 +3575,33 @@ export function setDbPoolStats(stats: DbPoolStats): void {
   dbPoolConnectionsGauge.set({ state: "active" }, stats.active);
   dbPoolConnectionsGauge.set({ state: "connecting" }, stats.connecting);
   dbPoolWaitingQueriesGauge.set(stats.waiting);
+}
+
+/**
+ * Publish the currently-held agent start locks and their hold ages (PEN-3305).
+ *
+ * Reset-then-set, but unlike the per-agent reservation gauges this does NOT
+ * zero-fill known agents: a held lock is the exception, not a per-agent
+ * property, and zero-filling every agent would turn a near-empty series into
+ * one row per agent per pod forever. An absent series therefore means "no lock
+ * held", and `reset()` is what releases a series when its section finishes —
+ * without it a completed hold would keep reporting its final age and hold an
+ * alert open permanently.
+ *
+ * Called from the `/metrics` request path (see `refreshAgentStartLockMetrics`)
+ * because the reading is a synchronous in-memory map walk, and because the
+ * scenario worth sampling is a section wedged on the database — exactly when a
+ * DB-backed background collector would be stuck and publish nothing.
+ */
+export function setAgentStartLockHeldMetrics(
+  held: ReadonlyArray<{ agentId: string; heldMs: number }>,
+): void {
+  const gauge = ensureRegistry().agentStartLockHeldSecondsGauge;
+  gauge.reset();
+  for (const entry of held) {
+    const heldMs = Number.isFinite(entry.heldMs) ? Math.max(0, entry.heldMs) : 0;
+    gauge.set({ agent_id: entry.agentId }, heldMs / 1000);
+  }
 }
 
 /**
@@ -4494,6 +4557,7 @@ export function __resetMetricsForTest(): void {
   orphanedRuntimeResourceMetricsRefreshSuccess = null;
   externalRuntimeReservationStrandedOldestAge = null;
   externalRuntimeReservationStrandMetricsRefreshSuccess = null;
+  agentStartLockHeldSeconds = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
