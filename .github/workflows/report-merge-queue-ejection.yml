@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   report:
-    if: ${{ github.event.workflow_run.event == 'merge_group' && github.event.workflow_run.conclusion == 'failure' }}
+    if: ${{ github.event.workflow_run.event == 'merge_group' && (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') }}
     runs-on: arc-light
     timeout-minutes: 5
     steps:
