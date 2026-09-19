@@ -454,6 +454,37 @@ describe("merge-gate reader", () => {
       });
     }
 
+    // The two degenerate branches this PR originally claimed were safe, and
+    // which the reviewer falsified against the un-ordered rule: BOTH fail once
+    // an OLDER sibling success exists, because the un-ordered test cannot see
+    // that the success predates the cancellation. They hold again under the
+    // time-ordered rule, so they are pinned rather than left as prose.
+    it("keeps a cancelled run followed only by a failure, despite an older pass", () => {
+      assert.equal(
+        dead([
+          ["900", "pull_request", "111", "success", "2026-09-19T10:00:00Z"],
+          ["900", "pull_request", "222", "cancelled", "2026-09-19T11:00:00Z"],
+          ["900", "pull_request", "333", "failure", "2026-09-19T12:00:00Z"],
+        ]),
+        "",
+      );
+    });
+
+    it("keeps a cancelled run whose actual superseder is still in flight", () => {
+      // trafficcontrol @ be0a7003, lane 323092531/issue_comment, live ids and
+      // times. The run that really superseded 35439779269 started 1s later and
+      // had produced NO verdict; the un-ordered rule retired the cancellation on
+      // the strength of a success 50 minutes older.
+      assert.equal(
+        dead([
+          ["323092531", "issue_comment", "35437563292", "success", "2026-09-19T10:29:56Z"],
+          ["323092531", "issue_comment", "35439779269", "cancelled", "2026-09-19T11:19:06Z"],
+          ["323092531", "issue_comment", "35439779707", "", "2026-09-19T11:19:07Z"], // in flight
+        ]),
+        "",
+      );
+    });
+
     // A missing run_started_at on either side must fail CLOSED — the run is
     // kept, i.e. STOP. An absent field is never evidence that a verdict exists;
     // reading it as one is the direction that ships a merge-authorizing green.
