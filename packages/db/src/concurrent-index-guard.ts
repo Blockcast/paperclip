@@ -358,15 +358,29 @@ export async function ensurePendingConcurrentIndexes(
       });
     }
   } finally {
-    if (lockAcquired) {
+    // BLO-34039: every cleanup step is best-effort. A throw from any of them
+    // used to propagate out of this `finally` and REPLACE the index-build
+    // error the operator needs, and a throw from the unlock skipped
+    // `sql.end()` entirely, leaking the pool into the bootstrap process.
+    // Both only bite once the session is already broken — exactly when the
+    // original error matters most. Cleanup failures go to `options.log ??
+    // console.warn` rather than `log`, whose default is a no-op: the two
+    // production callers (server/src/index.ts, migrate.ts) pass no `log`, so
+    // routing these through it would make "swallow and log" just "swallow".
+    const warn = options.log ?? ((message: string) => console.warn(message));
+    const bestEffort = async (what: string, step: () => Promise<unknown>) => {
       try {
-        await sql.unsafe("SET statement_timeout = 0");
-        await sql.unsafe("SET lock_timeout = 0");
-      } finally {
-        await releaseSerializingLock(sql);
+        await step();
+      } catch (error) {
+        warn(`concurrent-index cleanup: ${what} failed: ${error instanceof Error ? error.message : String(error)}`);
       }
+    };
+    if (lockAcquired) {
+      await bestEffort("resetting statement_timeout", () => sql.unsafe("SET statement_timeout = 0"));
+      await bestEffort("resetting lock_timeout", () => sql.unsafe("SET lock_timeout = 0"));
+      await bestEffort(`releasing advisory lock "${SERIALIZING_LOCK_KEY}"`, () => releaseSerializingLock(sql));
     }
-    await sql.end();
+    await bestEffort("closing the connection pool", () => sql.end());
   }
 
   return results;

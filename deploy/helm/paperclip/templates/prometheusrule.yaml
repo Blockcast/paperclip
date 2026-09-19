@@ -445,7 +445,11 @@ spec:
           # value — normally the healthy 0 — while the process stays up, so
           # neither up-based arm compensates and the count arms read clean
           # during exactly the kube-API outage this alert tells the operator to
-          # check for. `max()` rather than a bare `== 0` on purpose: every
+          # check for. BLO-34039: the same arm also covers a FRESH sweep that
+          # hit per-row reconciliation failures (heartbeat.ts clears the gauge
+          # on failedRowCount > 0) — same 0, opposite diagnosis, so the
+          # description names both and the worker log distinguishes them.
+          # `max()` rather than a bare `== 0` on purpose: every
           # control-plane pod exports its own copy of the gauge but only the
           # worker runs the sweep, so a bare comparison would fire forever on
           # the api pods' untouched initial 0 (the same duplicate-series defect
@@ -465,7 +469,7 @@ spec:
             severity: warning
           annotations:
             summary: "Paperclip cancellation cleanup is not keeping up"
-            description: "A confirmed-releasable external-runtime reservation (paperclip_external_runtime_reservations_release_pending) or ephemeral environment lease (paperclip_environment_leases_orphaned_active) has not been released for 10+ minutes, OR the reconciliation sweep that publishes those gauges has been failing for 10+ minutes (paperclip_orphaned_runtime_resource_metrics_refresh_success == 0, meaning the backlog numbers are stale and a 0 must NOT be read as healthy), OR that telemetry / the paperclip-control-plane scrape target has gone missing for 10+ minutes (BLO-21460). A missing-telemetry firing usually means the scheduler itself is down (e.g. crash-looping on a migration) — check up{job=\"paperclip-control-plane\"} and control-plane pod status first. Otherwise check whether the kube API is reachable so a reservation's Job status can be confirmed. See the runbook for manual recovery steps if the automated reconciler itself is down."
+            description: "A confirmed-releasable external-runtime reservation (paperclip_external_runtime_reservations_release_pending) or ephemeral environment lease (paperclip_environment_leases_orphaned_active) has not been released for 10+ minutes, OR the reconciliation sweep that publishes those gauges has not reported a clean pass for 10+ minutes (paperclip_orphaned_runtime_resource_metrics_refresh_success == 0 — BLO-34039: a 0 must NOT be read as healthy; check which worker log line fired before hunting for staleness that may not be there. (a) \"backlog refresh failed\": the gauge refresh threw, so the backlog numbers are stale — do not read the count gauges. (b) \"reconciliation sweep failed\": the sweep threw but the refresh still ran in its finally block, so the numbers are current and reconciliation is incomplete — same operator action as (c). (c) \"completed with per-row failures\": the sweep ran fresh but one or more per-row reconciliations failed, so the numbers are current and the backlog simply has not drained. If \"backlog refresh failed\" appears alongside either other line it wins: treat the numbers as stale), OR that telemetry / the paperclip-control-plane scrape target has gone missing for 10+ minutes (BLO-21460). A missing-telemetry firing usually means the scheduler itself is down (e.g. crash-looping on a migration) — check up{job=\"paperclip-control-plane\"} and control-plane pod status first. Otherwise check whether the kube API is reachable so a reservation's Job status can be confirmed. See the runbook for manual recovery steps if the automated reconciler itself is down."
     - name: paperclip-queued-run-stranded
       rules:
         - alert: PaperclipQueuedRunStranded

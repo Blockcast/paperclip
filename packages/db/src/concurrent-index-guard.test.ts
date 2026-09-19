@@ -212,4 +212,41 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
       action: "created",
     }]);
   }, 60_000);
+
+  it("surfaces the build failure rather than a cleanup failure, and still closes the pool (BLO-34039)", async () => {
+    const { database } = await seedPopulatedDatabaseWithoutIndex();
+    // Leaving the session in an aborted transaction as the build fails is the
+    // cheapest real reproduction of a broken-session cleanup: every later
+    // statement on that connection -- the two timeout resets and the advisory
+    // unlock in the `finally` -- then errors with "current transaction is
+    // aborted", which used to replace the build error and skip `sql.end()`.
+    const abortingSpec: ConcurrentIndexSpec = {
+      ...CRASH_RECOVERY_SPEC,
+      createStatement: "BEGIN; SELECT 1 / 0;",
+    };
+    const logged: string[] = [];
+
+    await expect(
+      ensurePendingConcurrentIndexes(database.connectionString, {
+        specs: [abortingSpec],
+        log: (message) => logged.push(message),
+      }),
+    ).rejects.toThrow(/division by zero/);
+
+    expect(logged.filter((message) => message.startsWith("concurrent-index cleanup:"))).toHaveLength(3);
+
+    // The advisory lock is session-scoped, so Postgres only releases it when
+    // the backend exits -- it is therefore gone if and only if `sql.end()`
+    // ran despite the unlock throwing.
+    const probe = postgres(database.connectionString, { max: 1 });
+    cleanups.push(async () => probe.end());
+    let locked = false;
+    for (let attempt = 0; attempt < 20 && !locked; attempt += 1) {
+      [{ locked }] = await probe.unsafe(
+        `select pg_try_advisory_lock(hashtextextended('${SERIALIZING_LOCK_KEY}', 0)) as locked`,
+      );
+      if (!locked) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(locked).toBe(true);
+  }, 60_000);
 });
