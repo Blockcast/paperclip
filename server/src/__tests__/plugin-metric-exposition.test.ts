@@ -12,6 +12,7 @@ import {
   recordPluginMetric,
   renderMetrics,
 } from "../services/metrics.js";
+import alertmanagerManifest from "../../../packages/plugins/paperclip-plugin-alertmanager/src/manifest.js";
 
 /**
  * PEN-2799 — plugin-contributed metrics must reach Prometheus.
@@ -643,20 +644,22 @@ describe("recordPluginMetric — never throws", () => {
  * simply stops saying which aggregate is stuck. There is no error and no gap
  * in the graph, so both sides are pinned.
  *
- * This file pins the PLATFORM half only. The alertmanager plugin is
- * deliberately not a server dependency, so the manifest half is pinned inside
- * that package instead (`manifest-metric-labels.test.ts`) rather than pulled
- * across the package boundary for one assertion.
+ * BOTH halves are pinned HERE, from the real manifest, because this is a lane
+ * CI actually runs. `packages/plugins/paperclip-plugin-alertmanager` owns test
+ * files but no CI lane executes it — it is listed in `UNEXECUTED_WITH_TESTS`
+ * in `scripts/__tests__/vitest-project-coverage.test.mjs` (PEN-2506). So the
+ * in-package `manifest-metric-labels.test.ts` is a guard that will start
+ * running when PEN-2506 wires the package in, not one that runs today; relying
+ * on it would leave the manifest half unpinned while claiming it was pinned.
+ *
+ * Importing the manifest by relative path does not make the plugin a server
+ * dependency — it is a test-only import, the same shape as
+ * `linear-webhook-fixture-replay.test.ts` uses for the Linear manifest.
  */
 describe("BLO-32163 — fence-blocked labels survive the two-sided promotion gate", () => {
-  // Mirrors the alertmanager manifest's `metricLabels`. Held as a literal
-  // because importing it would make a plugin a dependency of the server.
-  const MANIFEST_METRIC_LABELS = [
-    "aggregate_key",
-    "alertname",
-    "severity",
-    "version",
-  ];
+  // The REAL manifest, not a mirror of it. A literal copy here would pass
+  // while `manifest.ts` drifted, which is the whole silent-degradation path.
+  const MANIFEST_METRIC_LABELS = alertmanagerManifest.metricLabels ?? [];
   const FENCE_METRIC = "alertmanager.aggregate.fence_blocked";
   const AGGREGATE_KEY = 'alert-aggregate:v1:["ArgoAppOutOfSyncTooLong",null]';
   const RENDERED_AGGREGATE_KEY = `${PLUGIN_METRIC_TAG_LABEL_PREFIX}aggregate_key="alert-aggregate:v1:[\\"ArgoAppOutOfSyncTooLong\\",null]"`;
@@ -692,6 +695,23 @@ describe("BLO-32163 — fence-blocked labels survive the two-sided promotion gat
     // Admitting it would 4x the fence metrics' combination count inside their
     // own per-name budget — the starvation below, one level down.
     expect(PLUGIN_METRIC_PROMOTABLE_TAG_KEYS).not.toContain("phase");
+  });
+
+  it("declares aggregate_key in the alertmanager manifest", () => {
+    // The MANIFEST half of the gate. `promotes aggregate_key for the
+    // fence-blocked shape` above also fails if this key is dropped, because it
+    // now feeds `declaredLabels` from the real manifest — but it fails as "the
+    // rendered series lost a label", which does not say where to look. This
+    // names it. Mutation-checked: deleting "aggregate_key" from manifest.ts
+    // fails this test and that one, and nothing else.
+    expect(MANIFEST_METRIC_LABELS).toContain("aggregate_key");
+  });
+
+  it("keeps phase out of the alertmanager manifest", () => {
+    // Either side of the gate can readmit `phase` independently, so the
+    // exclusion is pinned on both. ~23 live aggregate keys x 4 lifecycle
+    // phases overruns the 50-slot per-name budget and starves aggregate_key.
+    expect(MANIFEST_METRIC_LABELS).not.toContain("phase");
   });
 
   /**
