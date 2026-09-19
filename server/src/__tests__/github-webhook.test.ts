@@ -881,8 +881,9 @@ describe("github-webhook pure helpers", () => {
       return ctx as NonNullable<typeof ctx>;
     };
 
-    // Head-scoped (PEN-2865): the key can only recur as a redelivery or as a
-    // duplicate delivery of the same head, so a terminal completed/cancelled
+    // Request-scoped: the key can only recur as a redelivery (ready_for_review,
+    // delivery-scoped) or as a duplicate delivery of the same head
+    // (synchronize, head-scoped, PEN-2865), so a terminal completed/cancelled
     // row must dedup it.
     for (const [action, reason] of [
       ["ready_for_review", "github_pr_ready_for_review"],
@@ -897,29 +898,32 @@ describe("github-webhook pure helpers", () => {
     const opened = requestScoped("opened", "github_pr_opened");
     expect(__test_prReviewerWakeIdempotencyScope(opened, "delivery-1")).toBe("stable");
 
-    // PEN-2865: with no delivery id the suffix is still request-scoped, because
-    // the HEAD now supplies the per-event identity. This case used to fall back
-    // to `delivery:unknown` and score `stable`.
-    const noDeliveryId = requestScoped("ready_for_review", "github_pr_ready_for_review");
-    expect(noDeliveryId.headSha).toBe("readysha");
-    expect(__test_prReviewerWakeIdempotencyScope(noDeliveryId, null)).toBe("request");
+    // PEN-2865: for the head-scoped reason the HEAD supplies the per-event
+    // identity, so the suffix is request-scoped even with no delivery id.
+    const synchronizeNoDeliveryId = requestScoped("synchronize", "github_pr_synchronized");
+    expect(synchronizeNoDeliveryId.headSha).toBe("readysha");
+    expect(__test_prReviewerWakeIdempotencyScope(synchronizeNoDeliveryId, null)).toBe("request");
 
-    // A suffix with no per-event identity AT ALL — neither head nor delivery —
-    // cannot distinguish two distinct events, so it must NOT get the
-    // terminal-dedup rule. This is the invariant the case above used to carry.
+    // A suffix with no per-event identity at all cannot distinguish two
+    // distinct events, so it must NOT get the terminal-dedup rule.
+    // ready_for_review is delivery-scoped, so a null delivery id is enough to
+    // strip its identity even though it carries a head.
+    const noIdentity = requestScoped("ready_for_review", "github_pr_ready_for_review");
+    expect(__test_prReviewerWakeIdempotencyScope(noIdentity, null)).toBe("stable");
+
+    // ...and so is a head-scoped reason that carries neither head nor delivery.
     const headless = __test_resolveEventContext("pull_request", {
-      action: "ready_for_review",
+      action: "synchronize",
       pull_request: {
         number: 992,
         title: "Fix BLO-3182 webflow blog",
         body: null,
-        draft: false,
         html_url: "https://github.com/Blockcast/magma/pull/992",
         head: { ref: "fix/BLO-3182-webflow-blog" },
       },
       repository: { full_name: "Blockcast/magma" },
     });
-    expect(headless?.wakeReason).toBe("github_pr_ready_for_review");
+    expect(headless?.wakeReason).toBe("github_pr_synchronized");
     expect(headless?.headSha).toBeFalsy();
     expect(
       __test_prReviewerWakeIdempotencyScope(headless as NonNullable<typeof headless>, null),
@@ -1027,7 +1031,7 @@ describe("github-webhook pure helpers", () => {
     expect(__test_shouldFirePrReviewerWake(converted)).toBe(false);
   });
 
-  it("scopes the ready_for_review idempotency key to the head so every toggle on a new head is a fresh request (BLO-18953, PEN-2865)", () => {
+  it("scopes the ready_for_review idempotency key to the delivery so every toggle is a fresh request (BLO-18953, PEN-2865)", () => {
     const readyAt = (sha: string) =>
       __test_resolveEventContext("pull_request", {
         action: "ready_for_review",
@@ -1052,21 +1056,28 @@ describe("github-webhook pure helpers", () => {
 
     // Keyed on repo+pr+reason alone, the first toggle's wake row — which lands
     // on the terminal `coalesced` status, an IDEMPOTENT_REVIEWER_WAKE_STATUS —
-    // blocked every later toggle on the PR forever. Head scoping (PEN-2865)
-    // keeps each deliberate draft->ready transition on a NEW head its own
-    // request, because the two toggles carry different heads.
+    // blocked every later toggle on the PR forever. Delivery scoping keeps each
+    // deliberate draft->ready transition its own request.
     expect(__test_buildPrReviewerWakeIdempotencyKey(firstToggle, "delivery-ready-1")).toBe(
-      "pr_review:Blockcast/paperclip:822:github_pr_ready_for_review:head:ea8697d1",
+      "pr_review:Blockcast/paperclip:822:github_pr_ready_for_review:delivery:delivery-ready-1",
     );
     expect(__test_buildPrReviewerWakeIdempotencyKey(secondToggle, "delivery-ready-2")).not.toBe(
       __test_buildPrReviewerWakeIdempotencyKey(firstToggle, "delivery-ready-1"),
     );
 
-    // A GitHub redelivery reuses the delivery id, so genuine retries still
-    // dedup — and under head scoping so does a DISTINCT delivery that reports
-    // the same unchanged head, which is the PEN-2865 duplicate.
+    // A GitHub redelivery reuses the delivery id, so genuine retries still dedup.
     expect(__test_buildPrReviewerWakeIdempotencyKey(secondToggle, "delivery-ready-2")).toBe(
-      __test_buildPrReviewerWakeIdempotencyKey(secondToggle, "delivery-ready-2-redelivered"),
+      __test_buildPrReviewerWakeIdempotencyKey(secondToggle, "delivery-ready-2"),
+    );
+
+    // PEN-2865: ready_for_review must NOT be head-scoped. Two toggles on ONE
+    // unchanged head (ready -> draft -> ready, no push) are two distinct user
+    // actions, and head is the only identity head-scoping has to tell them
+    // apart — so collapsing them would drop the second and leave the PR
+    // unreviewed at that head. Distinct deliveries on one head keep distinct
+    // keys, which is the opposite of the synchronize property asserted above.
+    expect(__test_buildPrReviewerWakeIdempotencyKey(firstToggle, "delivery-ready-toggle-2")).not.toBe(
+      __test_buildPrReviewerWakeIdempotencyKey(firstToggle, "delivery-ready-1"),
     );
 
     // The task key stays PR-scoped: it also scopes reviewer affinity, the task
@@ -6071,7 +6082,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(firstRes.status).toBe(200);
 
     const idempotencyKey =
-      "pr_review:Blockcast/magma:991:github_pr_ready_for_review:head:readysha";
+      "pr_review:Blockcast/magma:991:github_pr_ready_for_review:delivery:delivery-ready-replay";
 
     const reviewerWakes = async () =>
       db
@@ -6109,6 +6120,97 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, reviewerAgentId));
     expect(reviewerRuns).toHaveLength(1);
+  });
+
+  it("wakes the reviewer when a PR is marked ready AGAIN on an unchanged head after a draft toggle (PEN-2865)", async () => {
+    // The discriminator the redelivery test above cannot supply. That test
+    // reuses ONE delivery id across all three deliveries, so if
+    // `github_pr_ready_for_review` were head-scoped every delivery would rebuild
+    // the same key and its assertions would hold whether the drop was correct
+    // redelivery dedup or the silent loss of a DISTINCT event.
+    //
+    // This is that distinct event, and it is an ordinary user flow: mark ready
+    // -> realise it is not ready -> convert back to draft -> mark ready again,
+    // no push. Step 3 retires the wake row via cancelPendingRunsForTask, which
+    // sets it `cancelled`; step 4 carries a NEW delivery id but the SAME head.
+    //
+    // It must enqueue. `cancelled` records that an EARLIER request was retired,
+    // not that this head was reviewed — nothing has reviewed it, so dropping
+    // step 4 leaves `review/ally-complete` pending until someone pushes a commit
+    // or posts `@ally`. That is the BLO-18953 / Blockcast/paperclip#822
+    // self-poisoning class narrowed to the unchanged-head toggle, and it is why
+    // `github_pr_ready_for_review` stays delivery-scoped while
+    // `github_pr_synchronized` (whose second occurrence at one head can only be
+    // a duplicate delivery) is head-scoped.
+    const { companyId } = await seedIssueWithIdentifier("BLO-3182");
+    const reviewerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Ally",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const app = buildApp({ prReviewerAgentId: reviewerAgentId });
+    const prBody = (draft: boolean) => ({
+      number: 993,
+      title: "Fix BLO-3182 webflow blog",
+      body: null,
+      draft,
+      html_url: "https://github.com/Blockcast/magma/pull/993",
+      head: { ref: "fix/BLO-3182-webflow-blog", sha: "toggledhead" },
+    });
+    const deliver = async (action: string, deliveryId: string) => {
+      const signed = signedRequest({
+        action,
+        pull_request: prBody(action === "converted_to_draft"),
+        repository: { full_name: "Blockcast/magma" },
+      });
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signed.signature)
+        .set("x-github-delivery", deliveryId)
+        .set("content-type", "application/json")
+        .send(signed.body);
+    };
+
+    const reviewerWakes = async () =>
+      db
+        .select({ status: agentWakeupRequests.status, idempotencyKey: agentWakeupRequests.idempotencyKey })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, reviewerAgentId));
+
+    // Deliberately NOT pinning the key shape here. The exact literal is pinned
+    // by the pure-helper test above; asserting it again would make this test
+    // fail on the key rather than on the behaviour it exists to carry, which is
+    // the count.
+    expect((await deliver("ready_for_review", "delivery-toggle-ready-1")).status).toBe(200);
+    expect(await reviewerWakes()).toEqual([expect.objectContaining({ status: "queued" })]);
+
+    // The real retirement path, not a hand-written status flip: this is what
+    // sets the first wake row `cancelled` AND cancels the run it created.
+    expect((await deliver("converted_to_draft", "delivery-toggle-draft")).status).toBe(200);
+    expect(await reviewerWakes()).toEqual([expect.objectContaining({ status: "cancelled" })]);
+
+    // Marked ready again: same head, no push, new delivery. This must enqueue a
+    // SECOND wake. Head-scoping `github_pr_ready_for_review` rebuilds the
+    // cancelled row's key here and the precheck drops it, leaving exactly one
+    // row — so this length assertion is the discriminator.
+    expect((await deliver("ready_for_review", "delivery-toggle-ready-2")).status).toBe(200);
+
+    const after = await reviewerWakes();
+    expect(after).toHaveLength(2);
+    expect(after).toContainEqual({
+      status: "queued",
+      idempotencyKey:
+        "pr_review:Blockcast/magma:993:github_pr_ready_for_review:delivery:delivery-toggle-ready-2",
+    });
   });
 
   it("drives ONE reviewer wake when two distinct deliveries report the same unchanged head (PEN-2865)", async () => {
