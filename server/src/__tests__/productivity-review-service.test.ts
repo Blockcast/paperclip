@@ -233,6 +233,11 @@ describeEmbeddedPostgres("productivity review service", () => {
     contextSource?: string;
     status?: string;
     startedAt?: Date | null;
+    // Derived from `createdAt` (i.e. `now`) by default, which is wrong for any
+    // fixture that back-dates `startedAt`: the run then spans the whole episode
+    // and B1 reads it as 100% executing time. Set explicitly to model a run that
+    // both started AND ended in the past.
+    finishedAt?: Date | null;
     nextAction?: string | null;
     livenessState?: string | null;
     usageJson?: Record<string, unknown> | null;
@@ -269,7 +274,12 @@ describeEmbeddedPostgres("productivity review service", () => {
         invocationSource: "assignment",
         triggerDetail: "system",
         startedAt: input.startedAt === undefined ? createdAt : input.startedAt,
-        finishedAt: (input.status ?? "succeeded") === "succeeded" ? new Date(createdAt.getTime() + 30_000) : null,
+        finishedAt:
+          input.finishedAt !== undefined
+            ? input.finishedAt
+            : (input.status ?? "succeeded") === "succeeded"
+              ? new Date(createdAt.getTime() + 30_000)
+              : null,
         contextSnapshot: {
           issueId: input.issueId,
           taskId: input.issueId,
@@ -1363,7 +1373,14 @@ describeEmbeddedPostgres("productivity review service", () => {
             // the suppression cases vacuously, the "still fires" cases not at
             // all. A3 is the one AC whose signal REQUIRES a run, so it is the
             // one place this bites.
+            //
+            // BLO-27698 B1/B3: `finishedAt` must be pinned too. Left to default
+            // it lands at `now + 30s`, so the run spans the whole episode, the
+            // executing bucket swallows `elapsedMs`, `unattendedMs` collapses to
+            // ~0, and `long_active_duration` cannot fire for a reason that has
+            // nothing to do with A3. Anchor the episode with a SHORT run.
             startedAt: opts.episodeStartAt ?? opts.now,
+            finishedAt: new Date((opts.episodeStartAt ?? opts.now).getTime() + 30_000),
           })
           : [null];
         await db.insert(issueComments).values({
@@ -1394,6 +1411,8 @@ describeEmbeddedPostgres("productivity review service", () => {
           now,
           nextAction: null,
           startedAt: episodeStartAt,
+          // BLO-27698 B1/B3: short run at the anchor — see `seedNextActionComment`.
+          finishedAt: new Date(episodeStartAt.getTime() + 30_000),
           withRunComments: true,
         });
 
