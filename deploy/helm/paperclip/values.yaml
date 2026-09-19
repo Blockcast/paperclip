@@ -277,9 +277,16 @@ evidenceGate:
   #
   # "1" escalates `warn` to `block` at the `in_review` transition when the gap
   # is made ENTIRELY of truth shapes and CONTAINS `review:ally-clean`. Note the
-  # second half is `.some()`, not an exact match: a gap of
-  # `["review:ally-clean","deploy:landed"]` — the common case for an open PR —
-  # blocks too.
+  # second half is `.some()`, not an exact match, so the predicate survives a
+  # future registry that re-requires a second truth shape. Today that is a
+  # no-op: `deploy:landed` is required nowhere (CTO ruling 2026-09-17), so it
+  # can never enter `missing` and a truth-only gap is always exactly
+  # `["review:ally-clean"]`.
+  #
+  # Reads "0" until PR #1857 is deployed — that is what registers the truth
+  # shapes and teaches loadConfig this variable. Setting "1" before then
+  # changes nothing, and every number in the runbook's measurement reads a
+  # structural zero.
   #
   # Two populations are always suppressed, at every value: a failed GitHub probe
   # (an outage must not freeze `in_review` estate-wide) and an issue with no

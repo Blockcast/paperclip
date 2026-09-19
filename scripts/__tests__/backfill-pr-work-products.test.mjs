@@ -73,6 +73,9 @@ test("PR state maps onto the work-product status enum", () => {
   assert.equal(prStatus({ state: "CLOSED" }), "closed");
   assert.equal(prStatus({ state: "OPEN", isDraft: true }), "draft");
   assert.equal(prStatus({ state: "OPEN", isDraft: false }), "ready_for_review");
-  // Draft wins over CLOSED: a closed draft is not a decision anyone made.
-  assert.equal(prStatus({ state: "CLOSED", isDraft: true }), "draft");
+  // CLOSED wins over draft: a closed draft is abandoned work, and reporting it
+  // as `draft` puts a permanently-stale live-looking row in front of a human.
+  assert.equal(prStatus({ state: "CLOSED", isDraft: true }), "closed");
+  // MERGED still wins over both — GitHub reports isDraft on merged PRs too.
+  assert.equal(prStatus({ state: "MERGED", isDraft: true }), "merged");
 });
