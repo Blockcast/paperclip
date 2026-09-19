@@ -60,14 +60,14 @@
     {
       "type": "stat",
       "title": "Worst queued-run age",
-      "description": "Oldest run sitting in `queued` across all agents. Excludes time parked in `scheduled_retry` by design (BLO-21116) — that window is the panel to the right.",
+      "description": "Oldest run sitting in `queued` across all agents. Excludes time parked in `scheduled_retry` by design (BLO-21116) — that window is the panel to the right. Absence of the series is rendered as NO DATA on red via the -1 sentinel, NOT as a green zero: a dead emit path and an empty queue are both \"no series\" to Grafana, and only one of them is healthy.",
       "gridPos": { "h": 4, "w": 8, "x": 8, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
       "targets": [
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
-          "expr": "max(max by (agent_id) (paperclip_queued_run_oldest_age_seconds))",
+          "expr": "max(max by (agent_id) (paperclip_queued_run_oldest_age_seconds)) or vector(-1)",
           "legendFormat": "worst queued age",
           "instant": true
         }
@@ -75,10 +75,19 @@
       "fieldConfig": {
         "defaults": {
           "unit": "s",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "-1": { "text": "NO DATA", "color": "red", "index": 0 }
+              }
+            }
+          ],
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0 },
               { "color": "orange", "value": 1800 },
               { "color": "red", "value": 3600 }
             ]
