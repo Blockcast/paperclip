@@ -12854,6 +12854,63 @@ export function issueService(db: Db) {
       return redactIssueComment(comment, currentUserRedactionOptions.enabled);
     },
 
+    /**
+     * BLO-31634: rewrite the body of a comment located by its idempotency key.
+     *
+     * The key is the authorization, not just the lookup. Only a caller able to
+     * reproduce the exact `(issue, author, key)` tuple it wrote can reach the
+     * row — and the plugin host namespaces plugin keys with the install row's
+     * id — so a plugin can edit the comments it authored and nothing else.
+     * There is deliberately no update-by-comment-id sibling: that would let
+     * anything holding the permission rewrite a human's comment, and no caller
+     * needs it.
+     *
+     * Returns null when no live row matches — a keyless (pre-0206) row, a
+     * soft-deleted one, or another author's. Callers must treat null as "not
+     * mine to edit" rather than retrying without the key.
+     *
+     * Concurrent callers converge: this is a single UPDATE, so two deliveries
+     * carrying the same edit both write the same body and neither inserts.
+     */
+    updateCommentByIdempotencyKey: async (
+      issueId: string,
+      idempotencyKey: string,
+      body: string,
+      actor: { agentId?: string | null; userId?: string | null },
+      dbOrTx: any = db,
+    ) => {
+      const currentUserRedactionOptions = {
+        enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+      };
+      const now = new Date();
+      const [comment] = await dbOrTx
+        .update(issueComments)
+        .set({
+          body: redactCurrentUserText(body, currentUserRedactionOptions),
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.idempotencyKey, idempotencyKey),
+          issueCommentIdempotencyAuthorScope(actor),
+          isNull(issueComments.deletedAt),
+        ))
+        .returning();
+
+      if (!comment) return null;
+
+      // The `issue_comments` activity trigger (0076) is AFTER INSERT only, so an
+      // edit would otherwise leave the thread's recency untouched. Bump the
+      // issue the same way `addComment` does and let the BEFORE UPDATE trigger
+      // on `issues` mirror it into `last_activity_at`.
+      await dbOrTx
+        .update(issues)
+        .set({ updatedAt: now })
+        .where(eq(issues.id, issueId));
+
+      return redactIssueComment(comment, currentUserRedactionOptions.enabled);
+    },
+
     markCommentIdempotencyProcessed: async (commentId: string, dbOrTx: any = db) => {
       await dbOrTx
         .update(issueComments)

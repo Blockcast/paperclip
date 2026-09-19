@@ -1701,6 +1701,7 @@ export interface PluginIssueSummariesClient {
  * - `issues.orchestration.read` for orchestration summaries
  * - `issue.comments.read` for `listComments`
  * - `issue.comments.create` for `createComment`
+ * - `issue.comments.update` for `updateComment`
  * - `issue.interactions.create` for `createInteraction`, `suggestTasks`, `askUserQuestions`, `requestConfirmation`, and `requestCheckboxConfirmation`
  * - `issue.documents.read` for `documents.list` and `documents.get`
  * - `issue.documents.write` for `documents.upsert` and `documents.delete`
@@ -1919,6 +1920,30 @@ export interface PluginIssuesClient {
       idempotencyKey?: string | null;
     },
   ): Promise<IssueComment & { deduplicated?: boolean }>;
+  /**
+   * Rewrite the body of a comment this installation created with
+   * `createComment` and an `idempotencyKey`.
+   *
+   * Pass the same unnamespaced key; the host re-applies its
+   * `plugin:<pluginId>:` prefix, which is why this can only ever reach your own
+   * comments — there is no update-by-comment-id form, so a human's comment or
+   * another plugin's is unreachable by construction.
+   *
+   * Resolves to `null` when nothing matches: the comment was created without a
+   * key, was created by a different `authorAgentId` (the scope is
+   * `(issue, author, key)`), or has since been deleted. Treat that as "nothing
+   * of mine to edit" — the usual fallback is `createComment` with the same key.
+   *
+   * The body is replaced wholesale; concurrent callers writing the same edit
+   * converge on it rather than inserting.
+   */
+  updateComment(
+    issueId: string,
+    idempotencyKey: string,
+    body: string,
+    companyId: string,
+    options?: { authorAgentId?: string },
+  ): Promise<IssueComment | null>;
   createInteraction(
     issueId: string,
     interaction: CreateIssueThreadInteraction,

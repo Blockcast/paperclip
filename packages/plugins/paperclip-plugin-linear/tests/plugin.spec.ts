@@ -3633,6 +3633,211 @@ describe("paperclip-plugin-linear", () => {
       expect(bridged[0]!.body).toContain("Edited before we ever saw it");
     });
 
+    // ---------------------------------------------------------------------
+    // BLO-31634: Linear comment edits propagate onto the existing mirror
+    // ---------------------------------------------------------------------
+
+    // Before this landed, an `update` for an already-bridged comment matched
+    // the mirror written by its own `create` and returned — so an edit in
+    // Linear left the Paperclip thread showing the original text forever, with
+    // no way to tell it was stale. Fails on the pre-BLO-31634 handler: the
+    // bridged body still reads "Original text".
+    it("propagates a Linear comment edit onto the existing bridged comment", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      const delivery = (action: "create" | "update", body: string, requestId: string) => ({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action,
+          data: {
+            id: "lin-comment-uuid-edit",
+            body,
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId,
+      });
+
+      await plugin.definition.onWebhook!(delivery("create", "Original text", "edit-create"));
+      await plugin.definition.onWebhook!(delivery("update", "Edited text", "edit-update"));
+
+      const comments = await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1");
+      const bridged = comments.filter((c) => c.body.includes("(from Linear)"));
+      // The edit rewrites in place — one comment, not two versions in the
+      // thread with nothing marking which is current.
+      expect(bridged).toHaveLength(1);
+      expect(bridged[0]!.body).toContain("Edited text");
+      expect(bridged[0]!.body).not.toContain("Original text");
+      // The sentinel survives the rewrite: it is the only mapping a reader
+      // outside the handler has, since the stored idempotency key is namespaced
+      // with the install row's PK.
+      expect(bridged[0]!.body).toContain("<!-- linear-comment-id: lin-comment-uuid-edit -->");
+
+      // AC control — `create` is unchanged by this work. A `create` redelivery
+      // carrying the *stale* body must still skip rather than write, so it can
+      // neither duplicate the comment nor roll the edit back.
+      await plugin.definition.onWebhook!(delivery("create", "Original text", "edit-create-redelivery"));
+      const afterRedelivery = (await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1"))
+        .filter((c) => c.body.includes("(from Linear)"));
+      expect(afterRedelivery).toHaveLength(1);
+      expect(afterRedelivery[0]!.body).toContain("Edited text");
+    });
+
+    // Mirrors the concurrent-`create` test above. Two edits of one comment in
+    // flight at once must converge on a single row: `updateComment` is one
+    // `UPDATE ... WHERE key = ...` and inserts nothing, so this holds for the
+    // same reason the create case does — it is the database, not a
+    // process-local claim that a second replica would not share.
+    it("keeps exactly one comment when concurrent update deliveries carry the same edit", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      const updatePayload = {
+        type: "Comment",
+        action: "update" as const,
+        data: {
+          id: "lin-comment-uuid-concurrent-edit",
+          body: "Edited text",
+          issue: { id: "lin-iss-1" },
+          user: { name: "Linear Author" },
+        },
+      };
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          ...updatePayload,
+          action: "create" as const,
+          data: { ...updatePayload.data, body: "Original text" },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "concurrent-edit-create",
+      });
+
+      await Promise.all([
+        plugin.definition.onWebhook!({
+          endpointKey: "linear-events",
+          parsedBody: updatePayload,
+          headers: {},
+          rawBody: "",
+          requestId: "concurrent-edit-a",
+        }),
+        plugin.definition.onWebhook!({
+          endpointKey: "linear-events",
+          parsedBody: updatePayload,
+          headers: {},
+          rawBody: "",
+          requestId: "concurrent-edit-b",
+        }),
+      ]);
+
+      const comments = await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1");
+      const bridged = comments.filter((c) => c.body.includes("(from Linear)"));
+      expect(bridged).toHaveLength(1);
+      expect(bridged[0]!.body).toContain("Edited text");
+    });
+
+    // Direct plumbing assertion, the companion to the create-side key check
+    // above. The outcome tests observe one comment carrying the edit, which the
+    // harness could in principle deliver for the wrong reason; this pins *how*.
+    //
+    // `listComments` not being called is half the point: correlating on the key
+    // rather than the sentinel is what makes the edit reach only a comment this
+    // installation wrote, and it drops the scan round-trip for every keyed
+    // mirror. Route the update back through the sentinel scan and this fails.
+    it("correlates an edit on the Linear comment UUID, without re-scanning the thread", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action: "create" as const,
+          data: {
+            id: "lin-comment-uuid-edit-key",
+            body: "Original text",
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "edit-key-create",
+      });
+
+      const updateSpy = vi.spyOn(harness.ctx.issues, "updateComment");
+      const listSpy = vi.spyOn(harness.ctx.issues, "listComments");
+      const createSpy = vi.spyOn(harness.ctx.issues, "createComment");
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action: "update" as const,
+          data: {
+            id: "lin-comment-uuid-edit-key",
+            body: "Edited text",
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "edit-key-update",
+      });
+
+      expect(updateSpy).toHaveBeenCalledTimes(1);
+      // Same key the create wrote — a Linear edit keeps the comment UUID, which
+      // is the whole reason the correlation works.
+      expect(updateSpy.mock.calls[0]![1]).toBe("linear-comment:lin-comment-uuid-edit-key");
+      expect(updateSpy.mock.calls[0]![2]).toContain("Edited text");
+      expect(listSpy).not.toHaveBeenCalled();
+      // A propagated edit returns before the create path; reaching it would
+      // mean relying on the key's dedup to avoid a duplicate instead.
+      expect(createSpy).not.toHaveBeenCalled();
+
+      updateSpy.mockRestore();
+      listSpy.mockRestore();
+      createSpy.mockRestore();
+    });
+
     // A deduplicated create returns the first delivery's comment instead of
     // throwing, so the handler must not go on to log activity — that would
     // report a sync that did not happen, once per duplicate delivery, which is
