@@ -425,7 +425,8 @@ jobs:
             ./.github/scripts/tests/post-pending-deploy-alert.test.mjs \
             ./.github/scripts/tests/scheduled-production-deploy-schedule.test.mjs \
             ./.github/scripts/tests/supersede-stale-deploy.test.mjs \
-            ./.github/scripts/tests/deploy-stall-record.test.mjs
+            ./.github/scripts/tests/deploy-stall-record.test.mjs \
+            ./.github/scripts/tests/deploy-stall-chain.test.mjs
         timeout-minutes: 1
 
       # BLO-28203. The stalled-Ally-review sweep's decision suite otherwise runs
