@@ -40,6 +40,7 @@ import {
   EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS,
 } from "@paperclipai/shared/validators/agent";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { describeAgentStartLockDispatchHealth } from "./agent-start-lock.js";
 import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
@@ -452,6 +453,30 @@ export function agentService(db: Db) {
           agent: toEligibilityAgent(row),
           agents: eligibilityAgents,
         }).orgChainHealth,
+        // PEN-3328. A dispatch section that overran its budget and was cancelled
+        // must say so here. Without it the agent reads `status: idle` /
+        // `errorReason: null` / `orgChainHealth: healthy` while its queued runs
+        // pile up untouched — the exact reading five agents presented for 6-19 h
+        // each in PEN-3305, which is why nobody could name the fault. `null`
+        // whenever the start lock has nothing to report, which is almost always.
+        //
+        // Synchronous in-process read, like `orgChainHealth` beside it: this is
+        // on the request path of every agent read, and the condition it reports
+        // is a section stuck on the database, so it must not need the database.
+        //
+        // ⚠️ Worker-tier-only, and therefore diagnostic rather than
+        // authoritative. The lock is per-process and dispatch is fenced off on
+        // the api tier, so a pod that never dispatches can never report here —
+        // and in the deployed topology `/api/agents*` is served by exactly that
+        // tier, so through the API this field is always `null`. `null` is
+        // consequently ambiguous between "healthy", "nothing to report" and
+        // "you asked the wrong pod", and must NOT be read as evidence that an
+        // agent is dispatching. The cross-pod surface is the worker's
+        // `/metrics` (`paperclip_agent_start_lock_held_seconds`,
+        // `paperclip_agent_start_lock_aborted_total`) and the alerts on them;
+        // this field explains a wedge to someone already looking at the right
+        // pod, it does not detect one. See `AgentStartLockDispatchHealth`.
+        dispatchHealth: describeAgentStartLockDispatchHealth(row.id),
       };
     });
   }

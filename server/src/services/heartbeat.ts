@@ -12282,6 +12282,19 @@ export function resolveHeartbeatSchedulingSuppression(
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
+  // PEN-3328. The queued-run dispatch critical section's database work is made
+  // cancellable by wrapping the postgres.js client, but that wrap is applied at
+  // the composition root (`index.ts`, right after `createDb`) rather than here,
+  // so this function takes the handle as given.
+  //
+  // It used to be applied here, and that was wrong. Installing it meant
+  // rebuilding a `Db` from the handle's `$client`, which silently discards any
+  // decoration the caller had layered on the handle itself — a caller passing a
+  // `Db` whose `transaction` is wrapped got a service that quietly ignored the
+  // wrapping and talked to the raw client instead. Two rollback-behaviour tests
+  // caught exactly that. Wrapping the client once, before any `Db` exists, has
+  // the same effect on the section and cannot drop a decoration because there
+  // is nothing decorated yet.
   const envNodeRole = process.env.PAPERCLIP_NODE_ROLE;
   const paperclipNodeRole =
     options.paperclipNodeRole ??

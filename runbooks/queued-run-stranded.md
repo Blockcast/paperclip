@@ -405,10 +405,231 @@ deploy on Blockcast (`prometheusRule.enabled: false`) — verify this rule
 against `/api/v1/rules` in the environment that actually pages before relying
 on it, and confirm the `Blockcast/onprem-k8s` copy is in place if it isn't.
 
+## Agent start lock wedged (PEN-3305)
+
+Source: `server/src/services/agent-start-lock.ts` (`withAgentStartLock`,
+`describeHeldAgentStartLocks`), `server/src/services/metrics.ts`
+(`AGENT_START_LOCK_HELD_SECONDS_METRIC`, `setAgentStartLockHeldMetrics`),
+`server/src/services/scrape-metrics-collector.ts`
+(`refreshAgentStartLockMetrics`)
+Trigger: alert `PaperclipAgentStartLockWedged` —
+`max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 300` for 5m
+(the `300` is quoted for readability only; `deploy/helm/paperclip/values.yaml`
+`prometheusRule.agentStartLockHeldSeconds` is the source of record, pinned by
+the chart test to `LOCK_HELD_ERROR_MS` in `agent-start-lock.ts` — read it there
+before acting on the number)
+Owner: Platform / SRE (PEN-3305)
+
+### The invariant, and why it is a cause alert rather than a consequence one
+
+`withAgentStartLock` serializes queued-run dispatch per agent. It has **no
+timeout, no TTL and no owner-liveness check**, deliberately: the defect
+BLO-20396 removed was a timeout that let a waiter run *alongside* the holder.
+The lock is released if and only if `fn` settles, so a critical section that
+never settles holds its agent's lock for the life of the process.
+
+That agent then dispatches nothing, while every status surface reads healthy —
+`status: idle`, `errorReason: null`, `orgChainHealth: healthy`, work piling up
+in `queued`. Measured 2026-09-15/16: five agents across two companies dark for
+6–19 h, ~70 runs stuck, ended only by a pod replacement on an identical image
+digest and StatefulSet revision.
+
+`PaperclipQueuedRunStranded` above fires on the *consequence* of this and will
+usually fire too, a while later. It cannot tell you the cause: a queued run
+strands identically under slot starvation, a scheduler-tick gap or a dropped
+dispatch. This alert names the mechanism directly, and fires sooner.
+
+### What to do when paged
+
+#### Step 1 — confirm the hold, and read its age from two independent places
+
+```
+max by (agent_id) (paperclip_agent_start_lock_held_seconds)
+```
+
+An **absent** series means no lock is held — the gauge is emitted only for
+locks held at scrape time (reset-then-set, no zero-fill), so unlike the two
+age gauges above a healthy agent renders *nothing*, not `0`. "No data" here is
+the healthy reading.
+
+Cross-check against the log, which carries the same `agentId` and `heldMs`:
+
+```
+kubectl logs -n paperclip paperclip-0 | grep "agent start lock held"
+```
+
+`agent start lock held longer than expected` (warn, every 30s) is a section
+that is slow. `agent start lock held far past its budget; queued-run dispatch
+for this agent has stopped` (error, first at 5m then every 5m) is the one this
+alert fires on. The 5-minute alert threshold is
+`prometheusRule.agentStartLockHeldSeconds`, pinned to `LOCK_HELD_ERROR_MS` in
+`agent-start-lock.ts` so the log line and the page cannot disagree about when
+an agent counts as wedged.
+
+#### Step 2 — do NOT clear the agent as healthy
+
+`paperclipGetAgent` will report `status: idle`, `errorReason: null`,
+`orgChainHealth: healthy` and a normal budget. `paperclipListParkedAgents`
+will not list it. None of those refute the wedge — they are what the wedge
+looks like from outside, and they are why the original incident ran 19 h. The
+discriminator is a **dispatch**: `startedAt` moving on a run for that agent.
+Queue depth falling is not one either; runs can be cancelled.
+
+#### Step 3 — decide whether it is the lock or the pool, and mind the trap
+
+The known-plausible wedge is a second pool connection taken while holding
+`lockIssueOwnership`, against `POSTGRES_POOL_MAX = 10` with no acquire timeout
+(`issue-recovery-actions.test.ts` still allowlists five such call sites under
+BLO-34207). Check the pool gauges for the **worker** pod, which is the only
+tier that dispatches:
+
+```
+paperclip_db_pool_connections{pod="paperclip-0"}
+```
+
+⚠️ **Two inferences that look sound and are not.**
+
+- *"Saturation explains it."* In the 2026-09-15/16 incident the pod was
+  already `idle=0 / active=10 / waiting=385` **4.5 h before the first onset**,
+  and the pod serving the fleet healthily afterwards was saturated harder.
+  Saturation is not the discriminator. For the last five hours of that outage
+  the pod read `idle=6–8 / active=2–4 / waiting=0` and still dispatched
+  nothing: the database was not the constraint and the process was not asking.
+- *"A pod restart cleared it, so it is not Postgres."* `lockIssueOwnership` is
+  `pg_advisory_xact_lock` — transaction-scoped, so it dies with the connection
+  and hence with the process, exactly as an in-memory lock does.
+  Restart-clears-it does not discriminate between the two.
+
+The signature that *did* discriminate was a permanently `active` connection
+count with nothing queued — a stuck transaction — alongside zero dispatches.
+
+#### Step 4 — recovery
+
+**Since PEN-3328 the usual case self-heals, and you should confirm that before
+reaching for a restart.** The dispatch critical section is cancellable: at the
+same 300s boundary that escalates the log to `error`, the section's abort
+signal fires, its in-flight database work is cancelled for real, `fn` rejects,
+and the lock is released through the `finally` that was already there. The
+agent resumes dispatching and its queued runs are not lost. When that happens
+you will see `PaperclipAgentStartLockAborted` rather than this alert — see the
+section below, and prefer chasing *why* a section blocked for five minutes over
+treating the recovery as the end of it.
+
+`PaperclipAgentStartLockWedged` firing therefore now means something narrower
+and more serious than it did before PEN-3328: the abort was requested and did
+**not** land. Cancellation can only reach awaits that observe the signal —
+today, database work — so a section wedged on anything else (an unbounded
+socket, an in-process promise that never settles) still holds its lock. The
+agent row's `dispatchHealth` distinguishes the two directly, reading `stalled`
+for a requested-but-unlanded abort versus `aborted` for one that landed; read
+it **on the worker pod**, since the api tier never holds a lock and so always
+reports `null` there.
+
+For that residue there is still no in-process remedy: the lock has no timeout,
+so the section must settle or the process must be replaced. Deleting the worker
+pod clears it (`kubectl delete pod -n paperclip paperclip-0`) and the queued
+runs then dispatch normally. Capture the pool gauges and the `agent start lock
+held` lines **before** restarting; the restart destroys the only evidence of
+which section was stuck.
+
+Abandoning a still-pending `fn` on a timer is **not** an acceptable extension of
+this: it reintroduces the BLO-20396 defect of two sections running at once.
+Cancellation makes `fn` finish; it must never make the lock stop waiting for it.
+
+### Verifying the signal is live
+
+```
+paperclip_agent_start_lock_held_seconds
+```
+
+Unlike the two age gauges above there is **no** companion
+`..._refresh_success` series and no freshness gate on the alert expression.
+That is deliberate, not an omission: this gauge is a synchronous in-memory map
+walk performed on the `/metrics` request path itself (see
+`refreshAgentStartLockMetrics`), so a value being present already means the
+scrape succeeded — there is no separate refresh that can fail and leave a
+stale value behind. Publishing on the scrape path is itself load-bearing: the
+section being reported is typically wedged on a database await, which is
+exactly when a DB-backed background collector would be stuck behind the thing
+it is meant to report. Do not "restore" an `and on(instance) (... == 1)` join
+here; it would reference a series that does not exist and make the alert
+permanently unevaluable.
+
+To prove the signal end-to-end, hold a lock deliberately in a scratch process:
+`withAgentStartLock(agentId, () => new Promise(() => {}), opts)` — the series
+appears on the next scrape and its value climbs.
+
+Same onprem-k8s lockstep caveat as the two sections above: the chart copy at
+`deploy/helm/paperclip/templates/prometheusrule.yaml` does not deploy on
+Blockcast (`prometheusRule.enabled: false`), so merging this repository alone
+does **not** make the page live. The rule must also land in the two lockstep
+`Blockcast/onprem-k8s` alert files and the `monitoring-rules` Argo application
+must be synced (BLO-19095). Verify at `/api/v1/rules` before relying on it.
+
+## Agent start lock aborted (PEN-3328)
+
+`PaperclipAgentStartLockAborted` — `warning`, not a page.
+
+### What it means
+
+A queued-run dispatch section held its agent's start lock past 300s, was
+cancelled, and the lock was released. **Dispatch has already resumed and no
+queued runs were lost.** Nobody needs waking; this is a post-mortem.
+
+### Why it is a separate alert, and not redundant with the wedge alert
+
+The two fire on opposite outcomes of the same fault, and the wedge alert
+structurally cannot cover this one. `paperclip_agent_start_lock_held_seconds`
+is emitted **only for locks held at scrape time** (`reset()` then set), and
+`PaperclipAgentStartLockWedged` waits 5m (`for:`) on top of its 300s threshold.
+The abort lands *at* 300s and deletes the series. So a successful cancellation
+is invisible to the wedge alert — the incident disappears precisely because it
+was handled. `paperclip_agent_start_lock_aborted_total` is a counter, so it
+survives the release and keeps the event answerable afterwards.
+
+### What to do
+
+**Do not close this on the strength of the recovery.** The cancellation bounded
+the damage; it did not fix whatever blocked the section. A healthy pass is
+sub-second, so a section that sat for 300s is ~300× that and something real was
+holding it.
+
+1. Read `dispatchHealth` on the agent row **on the worker pod** — `aborted`
+   carries the post-mortem (`heldMs`, `abortedAt`). Via the API it will read
+   `null`: the api tier never holds a lock, so it cannot answer.
+2. Correlate with the `agent start lock held far past its budget` error log for
+   the same `agentId`.
+3. Apply Step 3 of the wedged section above — the pool-versus-lock split and
+   its trap — since the candidate causes are identical.
+
+**A repeat for one `agent_id` is the thing to escalate.** Recurring aborts mean
+cancellation is masking a persistent condition rather than clearing a transient
+one; the likely candidates are pool exhaustion (`max: 10`, no acquire timeout)
+and a circular advisory-lock wait in `lockIssueOwnership`.
+
+### Verifying the signal is live
+
+```
+paperclip_agent_start_lock_aborted_total
+```
+
+Counter, labelled by `agent_id`, so it is absent until the first abort — an
+empty result is the expected healthy reading and does **not** indicate a broken
+scrape. To prove it end-to-end, hold a lock on an *abortable* await in a
+scratch process and advance past 300s; the wedge gauge climbs, then vanishes as
+the counter increments by one.
+
+Same onprem-k8s lockstep caveat as every section above: the chart copy does not
+deploy on Blockcast (`prometheusRule.enabled: false`), so merging this
+repository alone does **not** make this alert live. It must also land in the two
+lockstep `Blockcast/onprem-k8s` alert files — tracked as **PEN-3338** alongside
+`PaperclipAgentStartLockWedged`. Verify at `/api/v1/rules` before relying on it.
+
 ## References
 
 - `runbooks/README.md` — index
 - BLO-21116 — JSON-parse recovery classification and queued-run observability
 - BLO-22094 — the `PaperclipOverdueScheduledRetry` alert above
+- PEN-3305 — the `PaperclipAgentStartLockWedged` alert above
 - `runbooks/agent-wakeup-terminal-failed.md` — the sibling alert
 - BLO-19095 — the manual Argo sync gate between merge and deployment

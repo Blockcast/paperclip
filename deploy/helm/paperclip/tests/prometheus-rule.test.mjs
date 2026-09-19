@@ -1172,6 +1172,140 @@ test("PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed exposes a st
   );
 });
 
+test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own error boundary (PEN-3305)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipAgentStartLockWedged/);
+
+  // Slice the one alert block out before asserting anything about its fields.
+  // An unbounded `alert: Name[\s\S]*?severity:` matches the FIRST severity
+  // anywhere later in the document, so with the alert's own fields absent it
+  // would silently borrow a neighbour's -- today it passes only because the
+  // next rendered alert happens to be `severity: warning` with a different
+  // runbook. Adding any `severity: critical` alert after this group would let
+  // a silent downgrade of THIS one to `warning` keep passing.
+  const [, block] = rendered.match(
+    /\n\s+- alert: PaperclipAgentStartLockWedged\n([\s\S]*?)(?=\n\s+- alert: |\n\s+- name: |$)/,
+  ) ?? [];
+  assert.ok(block, "wedged-start-lock alert must render its own block");
+
+  const [, expr] = block.match(/\n\s+expr: (.+)\n/) ?? [];
+  assert.ok(expr, "wedged-start-lock alert must render an expr");
+
+  // Per-agent max, not a sum: the gauge is published by every replica that
+  // serves /metrics, and a sum would add one pod's hold age to another's for
+  // the same agent. It must also NOT carry a freshness join -- unlike the
+  // queued-run and stranded-reservation gauges there is no separate
+  // `..._refresh_success` series, because this one is a synchronous map walk
+  // performed on the scrape itself. Asserting the exact shape is what stops a
+  // later reader "restoring" a join against a series that does not exist,
+  // which would make the alert permanently unevaluable rather than noisy.
+  assert.match(
+    expr,
+    /^max by \(agent_id\) \(paperclip_agent_start_lock_held_seconds\) > (\d+)$/,
+    "wedged-start-lock alert must threshold the per-agent max of the hold gauge, with no refresh-freshness join",
+  );
+
+  const [, heldThreshold] = expr.match(/> (\d+)$/) ?? [];
+  // The gauge is emitted only for locks held at scrape time (reset-then-set,
+  // no zero-fill), so any positive threshold is silent in steady state. It is
+  // pinned to 300 on purpose: that is LOCK_HELD_ERROR_MS in
+  // server/src/services/agent-start-lock.ts, the point at which the code
+  // itself escalates to logger.error and says dispatch "has stopped". If the
+  // constant moves and this does not, the page and the log line disagree
+  // about when an agent is considered wedged.
+  assert.equal(
+    heldThreshold,
+    "300",
+    "hold threshold must track LOCK_HELD_ERROR_MS (300s) in agent-start-lock.ts",
+  );
+
+  const [, forWindow] = block.match(/\n\s+for: (.+)\n/) ?? [];
+  assert.ok(forWindow, "wedged-start-lock alert must render a for window");
+  const forMinutes = /^(\d+)m$/.test(forWindow.trim())
+    ? Number(forWindow.trim().slice(0, -1))
+    : /^(\d+)h$/.test(forWindow.trim())
+      ? Number(forWindow.trim().slice(0, -1)) * 60
+      : null;
+  // Scrape-flap tolerance only; the ageing lives in the threshold. Same
+  // stacking trap as PaperclipQueuedRunStranded -- threshold and `for:` are
+  // not independent, so check the sum, not each half.
+  assert.ok(
+    forMinutes !== null && forMinutes > 0 && forMinutes <= 10,
+    `for window ${forWindow} must be a short scrape-flap tolerance (<= 10m)`,
+  );
+  assert.ok(
+    Number(heldThreshold) + forMinutes * 60 <= 900,
+    `hold threshold ${heldThreshold}s plus for-window ${forWindow} stacks to `
+      + `${Number(heldThreshold) + forMinutes * 60}s; a wedge must page inside 15m, `
+      + "not on the 6-19h timescale the incident actually ran",
+  );
+
+  // Severity, not decoration: the hold never self-heals (the lock has no
+  // timeout, by design), so this is a per-agent dispatch outage that lasts
+  // until the process is replaced. A warning would reproduce the original
+  // failure, which was nobody being paged.
+  assert.match(
+    block,
+    /\n\s+severity: critical\n/,
+    "a non-self-healing per-agent dispatch outage must page, not warn",
+  );
+  assert.match(
+    block,
+    /runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#agent-start-lock-wedged-pen-3305"/,
+    "wedged-start-lock alert must link the runbook section from its annotation",
+  );
+});
+
+test("PaperclipAgentStartLockAborted reports the self-healed wedge the held gauge cannot (PEN-3328)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipAgentStartLockAborted/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipAgentStartLockAborted[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "aborted-start-lock alert must render an expr");
+
+  // A counter over a window, NOT the held gauge. This is the whole reason the
+  // rule exists: PEN-3328 cancels a wedged section at the same 300s boundary
+  // PaperclipAgentStartLockWedged waits 5m (`for:`) to fire on, and the held
+  // gauge is emitted only for locks held at scrape time -- so a successful
+  // cancellation deletes the series before the wedge alert ever fires. Without
+  // a durable counter the incident is invisible exactly because it was handled.
+  // If a later reader "simplifies" this onto the gauge, that blind spot returns.
+  assert.match(
+    expr,
+    /increase\(paperclip_agent_start_lock_aborted_total\[1h\]\) > 0/,
+    "aborted alert must read the durable counter over a window, not the transient held gauge",
+  );
+
+  // Warning, not critical, and this is the deliberate split from the wedge
+  // alert beside it. By the time this fires the lock has been released and the
+  // agent is dispatching again, so waking someone is wrong -- but the thing
+  // that blocked the section for five minutes has NOT been fixed, so staying
+  // silent is also wrong.
+  assert.match(
+    rendered,
+    /alert: PaperclipAgentStartLockAborted[\s\S]*?\n\s+severity: warning\n/,
+    "a self-healed dispatch wedge must warn rather than page",
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipAgentStartLockAborted[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#agent-start-lock-wedged-pen-3305"/,
+    "aborted-start-lock alert must link the runbook section from its annotation",
+  );
+});
+
 test("PaperclipRecoveryHorizonNoWakeToCurrentOwner{Elevated,Sustained} key on the never_delivered series only and take their thresholds from values (PEN-3000)", () => {
   const rendered = renderChart([
     "--show-only",

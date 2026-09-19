@@ -36,6 +36,7 @@ import {
 } from "@paperclipai/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
+import { withAgentStartLockAbortableDb } from "./services/agent-start-lock-db.js";
 import { loadConfig } from "./config.js";
 import { startEventLoopStallLogging } from "./event-loop-stall-log.js";
 import { logger } from "./middleware/logger.js";
@@ -538,7 +539,7 @@ export async function startServer(): Promise<StartedServer> {
     const migrationUrl = config.databaseMigrationUrl ?? config.databaseUrl;
     migrationSummary = await ensureMigrations(migrationUrl, "PostgreSQL");
   
-    db = createDb(config.databaseUrl);
+    db = withAgentStartLockAbortableDb(createDb(config.databaseUrl));
     pluginMigrationDb = config.databaseMigrationUrl ? createDb(config.databaseMigrationUrl) : db;
     logger.info("Using external PostgreSQL via DATABASE_URL/config");
     activeDatabaseConnectionString = config.databaseUrl;
@@ -701,7 +702,7 @@ export async function startServer(): Promise<StartedServer> {
       autoApply: shouldAutoApplyFirstRunMigrations,
     });
   
-    db = createDb(embeddedConnectionString);
+    db = withAgentStartLockAbortableDb(createDb(embeddedConnectionString));
     pluginMigrationDb = db;
     logger.info("Embedded PostgreSQL ready");
     activeDatabaseConnectionString = embeddedConnectionString;

@@ -772,6 +772,92 @@ spec:
             summary: "Paperclip stranded-reservation metric refresh is failing"
             description: "The most recent /metrics stranded-reservation database refresh failed (BLO-28865), so strand ages may be stale and PaperclipExternalRuntimeReservationStranded is intentionally gated off. Check Paperclip logs and database connectivity; do not interpret a stale zero as a healthy launch path."
             runbook_url: {{ .Values.prometheusRule.externalRuntimeReservationStrandedRunbookUrl | quote }}
+    - name: paperclip-agent-start-lock
+      rules:
+        - alert: PaperclipAgentStartLockWedged
+          # PEN-3305. `withAgentStartLock` serializes queued-run dispatch per
+          # agent and has no timeout, no TTL and no owner-liveness check --
+          # deliberately, because the defect BLO-20396 removed was a timeout
+          # that let a waiter run ALONGSIDE the holder. The cost of that
+          # choice is that a section which never settles holds its agent's
+          # lock for the life of the process, and the agent then dispatches
+          # nothing while presenting as `status: idle` / `errorReason: null` /
+          # `orgChainHealth: healthy`. Measured 2026-09-15/16: five agents
+          # across two companies dark for 6-19 h, ~70 runs stuck in `queued`,
+          # ended only by a pod replacement on an identical image.
+          #
+          # This is the reported half of that. The gauge alone only closed the
+          # "nobody could have looked" gap; the incident's actual failure was
+          # "nobody was paged", which needs this rule.
+          #
+          # NO freshness gate, unlike PaperclipQueuedRunStranded and
+          # PaperclipExternalRuntimeReservationStranded above. Those publish
+          # from a DB-backed refresh that can fail and leave a stale value in
+          # memory, so they must join against their own
+          # `..._refresh_success == 1`. This gauge is a synchronous in-memory
+          # map walk performed on the `/metrics` request path itself, so a
+          # value being present at all already means the scrape succeeded --
+          # there is no refresh that can fail separately from the scrape.
+          # That absence is deliberate; do not "fix" it by adding an
+          # `and on(instance) (...)` join to a series that does not exist.
+          #
+          # Silent in steady state without a zero-fill: the gauge is emitted
+          # only for locks held RIGHT NOW (`reset()` then set), so an agent
+          # with no held lock has no series rather than a 0, and a healthy
+          # section is sub-second.
+          #
+          # Threshold is LOCK_HELD_ERROR_MS (300s) from agent-start-lock.ts --
+          # the same boundary at which the code itself stops calling the hold
+          # "slow" and logs "queued-run dispatch for this agent has stopped".
+          # Keeping one number of record means the log line an operator finds
+          # and the alert that woke them agree. `for:` stacks on top as
+          # scrape-flap tolerance only, so the first real-clock fire is at
+          # 300 + 300 = 600s of continuous hold -- three orders of magnitude
+          # inside the 19h this alert exists to have caught.
+          expr: max by (agent_id) (paperclip_agent_start_lock_held_seconds) > {{ .Values.prometheusRule.agentStartLockHeldSeconds }}
+          for: {{ .Values.prometheusRule.agentStartLockHeldFor }}
+          labels:
+            severity: critical
+          annotations:
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has held its start lock for longer than {{ .Values.prometheusRule.agentStartLockHeldSeconds }}s and has stopped dispatching"
+            description: "Agent {{`{{ $labels.agent_id }}`}} has held its per-agent start lock for {{`{{ $value | printf \"%.0f\" }}`}}s (PEN-3305). Queued-run dispatch for THIS agent is stopped for as long as the hold lasts, and it does not self-heal: the lock has no timeout by design, so the section must settle or the process must be replaced. The agent will still read `status: idle` / `errorReason: null` / `orgChainHealth: healthy` and its runs will sit in `queued` -- do NOT clear that as healthy. Correlate with the `agent start lock held far past its budget` error log (same agentId, re-logged every 5m) and with PaperclipQueuedRunStranded for the same agent_id, which fires on the consequence rather than the cause. See the runbook for the pool-exhaustion-versus-lock split; note that a pod restart clearing it does NOT discriminate between the two, because lockIssueOwnership is pg_advisory_xact_lock and dies with the connection."
+            runbook_url: {{ .Values.prometheusRule.agentStartLockWedgedRunbookUrl | quote }}
+        - alert: PaperclipAgentStartLockAborted
+          # PEN-3328. The companion to PaperclipAgentStartLockWedged above, and
+          # the two are deliberately not redundant -- they fire on opposite
+          # outcomes of the same fault.
+          #
+          # PEN-3328 made the dispatch critical section cancellable, so a
+          # wedged section now rejects at the budget and releases its lock
+          # instead of holding it for the life of the process. That is a
+          # self-heal, which is exactly why it needs its own rule: the wedge
+          # alert above reads a gauge that is emitted ONLY for locks held right
+          # now, so the moment cancellation works the series disappears and
+          # PaperclipAgentStartLockWedged never fires (its `for:` window is
+          # 5m, and the abort lands at 5m). The incident becomes invisible
+          # precisely because it was handled.
+          #
+          # A counter is the right shape for that: it survives the release, so
+          # the event stays answerable after the fact. `increase(...[1h]) > 0`
+          # rather than a rate threshold because ONE abort is already the
+          # signal -- it means a section sat on the database for five minutes,
+          # which is ~300x a healthy sub-second pass. The cancellation bounded
+          # the damage; it did not fix whatever hung, and that cause is still
+          # there.
+          #
+          # `warning`, not `critical`, and the split is the point: by the time
+          # this fires the agent is dispatching again and queued runs were not
+          # lost, so nobody needs waking. Sustained or repeating aborts are the
+          # thing to chase, and `increase` over an hour surfaces that without a
+          # second rule.
+          expr: increase(paperclip_agent_start_lock_aborted_total[{{ .Values.prometheusRule.agentStartLockAbortedWindow }}]) > 0
+          for: {{ .Values.prometheusRule.agentStartLockAbortedFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} had a queued-run dispatch section cancelled after overrunning its budget"
+            description: "Agent {{`{{ $labels.agent_id }}`}} held its per-agent start lock past {{ .Values.prometheusRule.agentStartLockHeldSeconds }}s and the section was cancelled (PEN-3328), so the lock released and dispatch has RESUMED -- queued runs were not lost and this is not an outage. Treat it as evidence of the underlying hang, not of the recovery: something in the dispatch section blocked on the database for five minutes, which a healthy sub-second pass never does. Correlate with the `agent start lock held far past its budget` error log for the same agentId, and check `dispatchHealth` on the agent row (worker tier only) for the post-mortem. If this repeats for one agent_id, the cancellation is masking a persistent condition -- most likely pool exhaustion or a circular advisory-lock wait in lockIssueOwnership -- and that is what to fix. See the runbook."
+            runbook_url: {{ .Values.prometheusRule.agentStartLockWedgedRunbookUrl | quote }}
     - name: paperclip-pr-review-queue
       rules:
         - alert: PaperclipPrReviewQueueWaitSaturated
