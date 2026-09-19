@@ -5685,7 +5685,7 @@ export function issueService(db: Db) {
   // bootstraps the singleton row, which on a caller's tx is a row lock taken
   // BEFORE the company graph lock and held to commit — a deadlock edge. These
   // are pure reads, so they take the read-only view on either handle.
-  const instanceSettingsOn = (dbOrTx: unknown) => readInstanceSettingsOn(dbOrTx as Db);
+  const instanceSettingsOn = readInstanceSettingsOn;
   const treeControlSvc = issueTreeControlService(db);
 
   async function lockIssueBlockerRelations(
