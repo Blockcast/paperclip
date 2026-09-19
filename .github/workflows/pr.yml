@@ -487,12 +487,15 @@ jobs:
 
       - name: Test merge-gate reader
         if: ${{ !cancelled() }}
-        # The fleet-mandated reader has shipped three false-GREENs, each because a
+        # The fleet-mandated reader has shipped four false-GREENs, each because a
         # filter was added without checking what it prints when it matches EVERY
         # row: BLO-34035 (neutral dropped), BLO-34114 (dedup key not unique),
         # BLO-34263 (dead-run filter eats the whole surface, empty output reads as
-        # a pass). All three are pinned here. Mutation-checked: removing any one of
-        # the three guards fails this suite.
+        # a pass), BLO-34619 (supersession proxied through id ordering, then
+        # through an un-ordered sibling test). All four are pinned here, and every
+        # guard in the reader is mutation-checked: reverting any ONE of them alone
+        # fails this suite. A guard with no failing mutation is a comment — add
+        # the mutation before you trust the fixture.
         run: node --test ./scripts/merge-gate-read.test.mjs
         timeout-minutes: 1
 
