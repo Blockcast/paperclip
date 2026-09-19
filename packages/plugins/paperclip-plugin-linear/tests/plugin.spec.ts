@@ -3838,6 +3838,91 @@ describe("paperclip-plugin-linear", () => {
       createSpy.mockRestore();
     });
 
+    // The throw path, which is *not* the `null` path even though one `catch`
+    // used to serve both. `null` means "no keyed mirror, go look for a legacy
+    // one"; a throw means "could not tell", and the legacy scan cannot answer
+    // that question because a keyed mirror carries the sentinel as well. Route
+    // the throw back into the scan and it matches this comment's own sentinel,
+    // then reports it as a pre-BLO-31657 keyless row — so the handler returns
+    // normally, the delivery is ACKed, the edit is lost, and the single log line
+    // an operator reads while debugging this names the wrong cause.
+    //
+    // Pinning the two negative assertions is the point: both flip on the
+    // pre-fix code.
+    it("leaves the mirror stale without consulting the legacy scan when the rewrite throws", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action: "create" as const,
+          data: {
+            id: "lin-comment-uuid-edit-throws",
+            body: "Original text",
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "edit-throws-create",
+      });
+
+      // A transient DB/RPC blip on the rewrite of a mirror that does have a key.
+      const updateSpy = vi.spyOn(harness.ctx.issues, "updateComment")
+        .mockRejectedValue(new Error("connection terminated"));
+      const listSpy = vi.spyOn(harness.ctx.issues, "listComments");
+      const createSpy = vi.spyOn(harness.ctx.issues, "createComment");
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action: "update" as const,
+          data: {
+            id: "lin-comment-uuid-edit-throws",
+            body: "Edited text",
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "edit-throws-update",
+      });
+
+      expect(updateSpy).toHaveBeenCalledTimes(1);
+      // The two that regress. The scan would match the keyed mirror's own
+      // sentinel and misreport it as keyless; reaching the create path would
+      // spend a round-trip to dedup against the row we just failed to rewrite.
+      expect(listSpy).not.toHaveBeenCalled();
+      expect(createSpy).not.toHaveBeenCalled();
+
+      updateSpy.mockRestore();
+      listSpy.mockRestore();
+      createSpy.mockRestore();
+
+      // A failed edit must not damage the thread: still exactly one mirror, and
+      // it keeps the pre-edit body rather than being half-written or dropped.
+      const bridged = (await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1"))
+        .filter((c) => c.body.includes("(from Linear)"));
+      expect(bridged).toHaveLength(1);
+      expect(bridged[0]!.body).toContain("Original text");
+      expect(bridged[0]!.body).not.toContain("Edited text");
+    });
+
     // A deduplicated create returns the first delivery's comment instead of
     // throwing, so the handler must not go on to log activity — that would
     // report a sync that did not happen, once per duplicate delivery, which is
