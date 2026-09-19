@@ -850,6 +850,70 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
   });
 });
 
+/**
+ * Hazard fixtures for the disposition ledger's missing author exclusion
+ * (BLO-34389). The defect is real and still open: an author-written `## Ally`
+ * comment can retire its own carried finding, turning this gate's `failure`
+ * into a pass. What these pin is the two ways of *fixing* it that must not
+ * ship — both of which compile and read as correct at the call site.
+ *
+ * Every fixture here uses a SINGLE shared login, because that is the only
+ * shape that occurs in production: on an agent PR the author and the reviewer
+ * are both `allyblockcast[bot]`. A fixture that varies the login instead tests
+ * a case this fleet never produces, and passes while the shipped gate is
+ * broken — which is exactly how a login-equality exclusion gets mistaken for a
+ * working fix. The lane, not the login, is the discriminator this needs, and
+ * no such discriminator exists yet.
+ */
+describe("evaluateCommentReviewGate — ledger author exclusion hazards", () => {
+  // Placement (2): excluding the author at `ledger.push`. On an agent PR every
+  // ledger entry is the author's by login, so the ledger empties, nothing ever
+  // retires, and the head is permanently red — unclearable by any review,
+  // contradicting BLO-29711's anti-deadlock constraint.
+  it("still retires a carried finding when author and reviewer share one login", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "fixed"), "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict.outcome).not.toBe("carried_finding");
+  });
+
+  // Placement (1): excluding the author inside `isAllyConsolidatedReviewComment`
+  // — the smallest diff, and the worse one. That filter feeds the carried-head
+  // map as well as the ledger, so on an agent PR no head is ever carried and
+  // the red path disappears entirely.
+  it("still carries an unretired finding when author and reviewer share one login", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
+  // The defect itself, recorded as known-failing so it retires itself: this
+  // flips to a suite failure the moment a real lane discriminator lands, which
+  // is the prompt to assert the fixed behavior here instead.
+  it.fails("accepts an author-lane retirement today — the open BLO-34389 defect", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "fixed"), "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+});
+
 describe("evaluateCommentReviewGate — quoted review bodies", () => {
   const fenced = (body: string, info = ""): string =>
     ["Quoting the review I am replying to:", "", `\`\`\`${info}`, body, "```", "", "Nothing addressed yet."].join("\n");
