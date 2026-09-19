@@ -159,7 +159,7 @@ import {
   type RoutineSchedulerHeartbeatIssue,
   type SchedulerHeartbeatAddComment,
 } from "./recovery/routine-scheduler-heartbeat.js";
-import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
+import { classifyIssueGraphLiveness, PENDING_INTERACTION_MAX_AGE_MS, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
 import {
   ACTIVE_RECOVERY_ACTION_STATUSES,
   BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES,
@@ -4902,6 +4902,7 @@ async function listIssueBlockedInboxAttentionMap(
     companyId,
     issueId: row.issueId,
     status: "pending",
+    createdAt: row.createdAt,
   }));
   const pendingApprovals = (approvalRows as BlockedInboxApprovalRow[]).map((row) => ({
     companyId,
@@ -4976,8 +4977,21 @@ async function listIssueBlockedInboxAttentionMap(
     if (!findingByIssueId.has(finding.issueId)) findingByIssueId.set(finding.issueId, finding);
   }
 
+  // BLO-22660: live cards only. This map short-circuits the reason ladder below *ahead of*
+  // the classifier finding, so feeding `createdAt` to the classifier is necessary but not
+  // sufficient on this surface -- a stale card would still be reported as
+  // `awaiting_decision` / `pending_board_decision` / medium / owner "Board", i.e. the row
+  // reads as owned by someone who has not answered in weeks. That is the exact claim this
+  // issue exists to stop making, so a provably-stale card falls through to the finding
+  // branch and the operator gets `in_review_without_action_path` naming the stale card.
+  // Pending approvals are deliberately NOT aged the same way: the classifier does not age
+  // them either, and bounding them is separate work with its own evidence.
+  const interactionCutoffMs = Date.now() - PENDING_INTERACTION_MAX_AGE_MS;
   const interactionByIssueId = new Map<string, BlockedInboxInteractionRow>();
   for (const row of interactionRows as BlockedInboxInteractionRow[]) {
+    // Fail open exactly as the classifier does: only a card we can prove is stale is dropped.
+    const createdAtMs = row.createdAt instanceof Date ? row.createdAt.getTime() : NaN;
+    if (Number.isFinite(createdAtMs) && createdAtMs <= interactionCutoffMs) continue;
     if (!interactionByIssueId.has(row.issueId)) interactionByIssueId.set(row.issueId, row);
   }
   const approvalByIssueId = new Map<string, BlockedInboxApprovalRow>();

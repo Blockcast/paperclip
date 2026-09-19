@@ -79,8 +79,22 @@ export interface IssueLivenessWaitingPathInput {
   companyId: string;
   issueId: string;
   status: string;
-  /** BLO-22660: pending interactions age out of the waiting path; absent means "treat as fresh". */
-  createdAt?: Date | string | null;
+}
+
+/**
+ * BLO-22660: the one waiting path that ages out, so the only one carrying a timestamp.
+ *
+ * `createdAt` is a REQUIRED key whose value may be null/undefined, not an optional key. The
+ * fail-open is unchanged -- null, undefined and unparseable all still read as fresh -- but
+ * *omitting* the field is now a compile error. It was optional, and
+ * `listIssueBlockedInboxAttentionMap` duly selected the column, typed it, and then dropped it
+ * building this input, so every card read as fresh forever on the operator-facing surface
+ * while the recovery sweep aged it out. That pair of producers had already drifted once on
+ * `parkedUntil` (BLO-27912) and the comment asking the next author to keep them in step did
+ * not prevent this one; a required key does.
+ */
+export interface IssueLivenessPendingInteractionInput extends IssueLivenessWaitingPathInput {
+  createdAt: Date | string | null | undefined;
 }
 
 export interface IssueLivenessDependencyPathEntry {
@@ -125,7 +139,7 @@ export interface IssueGraphLivenessInput {
   agents: IssueLivenessAgentInput[];
   activeRuns?: IssueLivenessExecutionPathInput[];
   queuedWakeRequests?: IssueLivenessExecutionPathInput[];
-  pendingInteractions?: IssueLivenessWaitingPathInput[];
+  pendingInteractions?: IssueLivenessPendingInteractionInput[];
   pendingApprovals?: IssueLivenessWaitingPathInput[];
   openRecoveryIssues?: IssueLivenessWaitingPathInput[];
   /**
@@ -230,11 +244,20 @@ function pathKeySet(...lists: { companyId: string; issueId: string | null }[][])
  * naming a decider routes to nobody while still reading as ownership. A missing `createdAt`
  * counts as fresh: this only ever drops a path we can prove is stale.
  *
- * Exported because the belief "a pending card is a live wake path" lives in two places:
- * here, and `hasPendingWakeInteraction` in `service.ts`, which gates the sweeps that would
- * act on the findings minted here. Bounding only one half makes detection and remediation
- * disagree about the same card -- the classifier ages it out and mints a finding, and the
- * sweep declines to act because the card still reads as live. One constant, both halves.
+ * Exported so that detection and remediation cannot disagree about the same card: the other
+ * consumer is `hasPendingWakeInteraction` in `service.ts`, which gates the sweeps that act on
+ * the findings minted here. Bounding only one half means the classifier ages a card out and
+ * mints a finding while the sweep declines to act because the card still reads as live.
+ *
+ * NOT an exhaustive list of places that believe "a pending card is a live wake path". At
+ * least two others are deliberately left unbounded, because they gate WAKES rather than
+ * findings and so fail in the opposite direction:
+ * `listBlockedIssueAutoResumeSuppressions` (`issues.ts`, `pending_interaction` suppression)
+ * and `explicitlyWaitingIssueIds` in the resolved-blocker sweep. Ageing a card out here costs
+ * a finding on a row that may be genuinely waiting; ageing one out there spends agent runs
+ * re-waking an assignee who cannot move the row, every tick, for as long as the human queue
+ * is deep -- and it is measured in weeks. If you bound those, bound them on their own
+ * evidence, not on this constant's say-so.
  */
 export const PENDING_INTERACTION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
@@ -505,8 +528,8 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   const pendingApprovals = input.pendingApprovals ?? [];
   const openRecoveryIssues = input.openRecoveryIssues ?? [];
   const openPullRequestAttendance = input.openPullRequestAttendance ?? [];
-  const livePendingInteractions: IssueLivenessWaitingPathInput[] = [];
-  const stalePendingInteractions: IssueLivenessWaitingPathInput[] = [];
+  const livePendingInteractions: IssueLivenessPendingInteractionInput[] = [];
+  const stalePendingInteractions: IssueLivenessPendingInteractionInput[] = [];
   for (const entry of pendingInteractions) {
     const createdAtMs = readDateMs(entry.createdAt);
     const stale = createdAtMs !== null && nowMs - createdAtMs >= PENDING_INTERACTION_MAX_AGE_MS;
