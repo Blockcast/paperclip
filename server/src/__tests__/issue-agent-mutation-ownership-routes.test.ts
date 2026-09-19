@@ -3637,6 +3637,11 @@ describe("agent issue mutation checkout ownership", () => {
   it("refuses a status-only recovery run arming a monitor on its own issue", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", executionPolicy: null }));
     mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    // BLO-34683: the containment this guard exists to hold. Without an active
+    // action there is nothing to escape from, and the suite default is `null` —
+    // so this line is load-bearing, not scene-setting. Reverting the
+    // recovery-action arm of the predicate is what this case must catch.
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction({ status: "active" }));
     const app = await createApp(ownerActor(), createRunContextDb(statusOnlyRecoveryContext));
 
     const res = await armMonitorPatch(app, "self-armed by a guarded run");
@@ -3664,6 +3669,71 @@ describe("agent issue mutation checkout ownership", () => {
       }),
       expect.anything(),
     );
+  });
+
+  // BLO-34683. The paired half of the containment case directly above: same
+  // actor, same request body, same status-only run class — the ONLY difference
+  // is that no recovery action is active. It must be allowed, because the
+  // monitor-CLEAR path stamps its own repair wake status-only, so refusing here
+  // means the one run dispatched to restore a cleared monitor is the one run
+  // barred from restoring it. Observed live on BLO-19124, which has never held
+  // a recovery action.
+  //
+  // The two cases must DISAGREE for the suite to pass, so reverting the guard
+  // change alone turns this red while the case above stays green.
+  it("lets a status-only recovery run arm a monitor when no recovery action is active", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", executionPolicy: null }));
+    mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
+    const app = await createApp(ownerActor(), createRunContextDb({
+      ...statusOnlyRecoveryContext,
+      // The real shape of the wake this bug was found on (`heartbeat.ts`,
+      // `issue_monitor_recovery`), so the case exercises the stamped context
+      // rather than a hand-made one.
+      issueId,
+      source: "issue.monitor.recovery",
+      wakeReason: "issue_monitor_recovery",
+      clearReason: "max_attempts_exhausted",
+    }));
+
+    const res = await armMonitorPatch(app, "re-armed by the monitor-recovery wake");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueRecoveryActionService.getActiveForIssue).toHaveBeenCalledWith(companyId, issueId);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        executionPolicy: expect.objectContaining({
+          monitor: expect.objectContaining({ notes: "re-armed by the monitor-recovery wake" }),
+        }),
+      }),
+    );
+    // AC3: nothing may hand this run an exit that names an object the issue
+    // does not have. The strongest form of that is raising no 403 at all.
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        details: expect.objectContaining({ reason: "deny_status_only_recovery_monitor_arm" }),
+      }),
+      expect.anything(),
+    );
+  });
+
+  // BLO-34683. `escalated` is inside ACTIVE_RECOVERY_ACTION_STATUSES, so it
+  // still holds containment. Keyed on the status value rather than on the
+  // field's presence: an escalated action is exactly the one a contained agent
+  // has the most reason to want out of.
+  it("still refuses a status-only recovery run while the recovery action is escalated", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", executionPolicy: null }));
+    mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(makeRecoveryAction({ status: "escalated" }));
+    const app = await createApp(ownerActor(), createRunContextDb(statusOnlyRecoveryContext));
+
+    const res = await armMonitorPatch(app, "self-armed while escalated");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Cheap status-only recovery runs cannot arm issue monitors");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   // The paired half, and the half that makes this a fix rather than a blanket
