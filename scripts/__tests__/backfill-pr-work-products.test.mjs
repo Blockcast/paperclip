@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createServer } from "node:http";
+import { execFile as execFileCb } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const execFile = promisify(execFileCb);
 
 import { namesIssue, prStatus } from "../ops/backfill-pr-work-products.mjs";
 
@@ -78,4 +84,48 @@ test("PR state maps onto the work-product status enum", () => {
   assert.equal(prStatus({ state: "CLOSED", isDraft: true }), "closed");
   // MERGED still wins over both — GitHub reports isDraft on merged PRs too.
   assert.equal(prStatus({ state: "MERGED", isDraft: true }), "merged");
+});
+
+// The module tail has now been the subject of two review findings — first a
+// silent-green module guard, then an unbraced `if` that re-parented that
+// guard's `else` and printed "no backfill performed" under every clean run,
+// directly beneath the counts the runbook tells the operator to read. Both
+// shipped under a green CI because nothing executed the script end to end.
+// A stub API with no issues is enough: it reaches the tail on the RUN=true
+// path, which is the only path either finding was ever on.
+test("a real invocation prints the summary and NOT the module-guard message", async () => {
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("[]");
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const script = fileURLToPath(new URL("../ops/backfill-pr-work-products.mjs", import.meta.url));
+    const { stdout, stderr } = await execFile(process.execPath, [script], {
+      env: {
+        ...process.env,
+        PAPERCLIP_API_URL: `http://127.0.0.1:${server.address().port}`,
+        PAPERCLIP_API_KEY: "test",
+        PAPERCLIP_COMPANY_ID: "test",
+      },
+    });
+    assert.match(stdout, /^done: created=0 would-create=0 /m);
+    assert.doesNotMatch(stderr, /no backfill performed/);
+  } finally {
+    server.close();
+  }
+});
+
+// The control for the case above: imported rather than invoked, the guard
+// message is the correct output. Without this, deleting the `else` entirely
+// would pass the assertion above.
+test("imported rather than invoked, the module guard reports it did nothing", async () => {
+  const entry = fileURLToPath(new URL("../ops/backfill-pr-work-products.mjs", import.meta.url));
+  const { stdout, stderr } = await execFile(process.execPath, [
+    "--input-type=module",
+    "-e",
+    `await import(${JSON.stringify(pathToFileURL(entry).href)});`,
+  ]);
+  assert.match(stderr, /no backfill performed/);
+  assert.doesNotMatch(stdout, /^done:/m);
 });
