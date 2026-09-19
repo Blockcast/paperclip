@@ -6,6 +6,7 @@ export {
   isSensitiveEnv,
   isSensitiveEnvKey,
 } from "./sensitive-env.js";
+export { REDACTED_SENTINEL } from "./secret-sentinel.js";
 export {
   getAgentOrgChainHealth,
   getAgentWorkEligibility,
