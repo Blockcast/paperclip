@@ -112,6 +112,31 @@ test('findExistingComment: ignores a bot comment that merely quotes the signatur
   assert.equal(comment.id, 12);
 });
 
+// Pins `.find` over `findLast` (BLO-26636). Both pass every other fixture, so
+// nothing else in this suite would notice the swap. Our comment is posted by
+// the first failing run, i.e. near PR open, and a bot comment quoting it can
+// only exist after it does — so oldest-match is the genuine one and
+// newest-match is the paste. Adopting the paste PATCHes over another agent's
+// comment, which recurs; picking the older of two genuine gate comments only
+// mattered for pre-fix duplicates, which this fix stops and which were deleted
+// from all 20 affected open PRs when it landed.
+test('findExistingComment: adopts the oldest gate comment, not the newest', async () => {
+  const comment = await findExistingComment(async () => ([
+    {
+      id: 20,
+      user: { login: 'allyblockcast[bot]', type: 'Bot' },
+      body: 'Hey @someone! Before this PR can be reviewed…\n\n— commitperclip',
+    },
+    {
+      id: 21,
+      user: { login: 'allyblockcast[bot]', type: 'Bot' },
+      body: 'Quoting the gate verbatim:\n\n> Hey @someone!\n\n— commitperclip',
+    },
+  ]), 'token', 'Blockcast/paperclip', 1889);
+
+  assert.equal(comment.id, 20);
+});
+
 test('findExistingComment: tolerates a comment with no body', async () => {
   const comment = await findExistingComment(async () => ([
     { id: 13, user: { login: 'allyblockcast[bot]', type: 'Bot' }, body: null },
