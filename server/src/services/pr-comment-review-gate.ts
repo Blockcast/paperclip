@@ -18,8 +18,10 @@ import {
   extractAllyPriorFindingDispositions,
   extractAllyReportedFindingRefs,
   extractAllyReviewedHeadSha,
+  allyClaimedReviewHead,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
+  parseAllyVerdictBlock,
   type AllyFindingRef,
   type AllyPriorFindingDisposition,
 } from "./ally-review-detection.js";
@@ -72,6 +74,13 @@ export type CommentReviewGateOutcome =
   | "blocking_finding"
   /** No comment attests this head, but a finding from an earlier head stands undispositioned. */
   | "carried_finding"
+  /**
+   * The newest Ally review carries a structured verdict block this parser
+   * cannot read. Distinct from every other outcome on purpose: it is neither
+   * evidence of review nor evidence of a finding, and conflating it with
+   * either is the misreport BLO-32695 exists to end.
+   */
+  | "unreadable_verdict"
   /** Nothing established a comment-shaped review of this head. Not evidence of review. */
   | "not_evaluated";
 
@@ -79,6 +88,7 @@ export type CommentReviewGateVerdict =
   | { state: "success"; outcome: "clean"; reason: string }
   | { state: "success"; outcome: "not_evaluated"; reason: string }
   | { state: "failure"; outcome: "blocking_finding"; reason: string; commentCreatedAt: string }
+  | { state: "failure"; outcome: "unreadable_verdict"; reason: string; commentCreatedAt: string }
   | {
       state: "failure";
       outcome: "carried_finding";
@@ -89,6 +99,78 @@ export type CommentReviewGateVerdict =
 
 function toEpochMs(value: string | Date): number {
   return value instanceof Date ? value.getTime() : Date.parse(value);
+}
+
+/**
+ * Every candidate tied at the top of a newest-wins scan, by a lexicographic
+ * numeric precedence key.
+ *
+ * Shared by all three scans below, which is the point of it (CTO ruling on
+ * BLO-32695). Each of them used to end in `time >= best`, and each therefore
+ * let array order decide the verdict whenever two comments shared a second:
+ * latestAttestingAllyComment flipped clean/blocking_finding,
+ * headsWithUndispositionedFinding flipped not_evaluated/carried_finding,
+ * newestAllyConsolidatedReviewComments flipped clean/unreadable_verdict — all
+ * three reproduced in both orders, all three fail *open*. Nothing establishes
+ * that order: executeCommentReviewGateCheck concatenates two independently
+ * ordered GitHub surfaces, and GitHub's created_at is second-resolution, so a
+ * tie is not a corner case of the data, it is the expected collision.
+ *
+ * A precedence tuple is order-independent only while its final axis is a strict
+ * total order, and a second-resolution timestamp is not one. So the comparison
+ * is strict (`>`) and the tie is not resolved here at all: this returns the
+ * whole tied set and each caller then picks the more conservative candidate —
+ * `unreadable` > `finding` > `clean`, which is order-independent by
+ * construction and is what AC-5 already requires. Resolving it here instead
+ * would need a per-site notion of "conservative" threaded through as a
+ * parameter, which is the three-comparators-that-drift shape this replaces.
+ *
+ * A stable sort is not an alternative: executeCommentReviewGateCheck's `.map()`
+ * keeps only authorLogin/body/createdAt, so no comment id reaches these scans.
+ */
+function topTiedBy<T>(items: T[], key: (item: T) => number[]): T[] {
+  let best: number[] | null = null;
+  let tied: T[] = [];
+  for (const item of items) {
+    const candidate = key(item);
+    const cmp = best === null ? 1 : compareKeys(candidate, best);
+    if (cmp > 0) {
+      best = candidate;
+      tied = [item];
+    } else if (cmp === 0) {
+      tied.push(item);
+    }
+  }
+  return tied;
+}
+
+function compareKeys(a: number[], b: number[]): number {
+  // Equal length is the invariant, not an assumption: this loop runs to
+  // `a.length`, so a shorter key with an equal prefix reports a *tie* against a
+  // longer one that outranks it, while the reverse order compares `undefined`
+  // and reports `-1`. Both are silent — in a helper whose whole purpose is
+  // making a tie decidable.
+  //
+  // Exactly one shape reaches this throw: a `key` whose output length is
+  // *data-dependent*, e.g. `(c) => c.attested ? [1, c.timeMs] : [c.timeMs]`.
+  // That is one edit away from the live key at :412, which keeps its ternary
+  // *inside* the tuple precisely so the length cannot vary with the item.
+  //
+  // Lengthening one call site's key does NOT reach it, and believing otherwise
+  // misreads the helper: compareKeys has a single caller (:136), where both
+  // arguments are outputs of the same `key` within the same topTiedBy
+  // invocation. Keys from different call sites are never compared, so a longer
+  // tuple changes that site's own comparisons uniformly and meets no other.
+  // topTiedBy does not relate its call sites to one another (Ally, #1721 at
+  // 31532b48). Unreachable today: all three keys return unconditional array
+  // literals.
+  if (a.length !== b.length) {
+    throw new Error(`compareKeys requires equal-length keys, got ${a.length} and ${b.length}`);
+  }
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i]! !== b[i]!) return a[i]! > b[i]! ? 1 : -1;
+  }
+  return 0;
 }
 
 function isAllyConsolidatedReviewComment(
@@ -128,8 +210,7 @@ function latestAttestingAllyComment(
   reviewerBotLogin: string,
   matchHeadSha: string,
 ): AttestingComment | null {
-  let latest: AttestingComment | null = null;
-  let latestTime = -Infinity;
+  const candidates: { attesting: AttestingComment; timeMs: number }[] = [];
 
   for (const comment of comments) {
     if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
@@ -139,14 +220,18 @@ function latestAttestingAllyComment(
 
     const commentTime = toEpochMs(comment.createdAt);
     if (!Number.isFinite(commentTime)) continue;
-    // GitHub's issue-comment endpoint is chronological. Prefer the later item
-    // when two comments share its second-resolution created_at timestamp.
-    if (commentTime >= latestTime) {
-      latest = { comment, attestedHeadSha };
-      latestTime = commentTime;
-    }
+    candidates.push({ attesting: { comment, attestedHeadSha }, timeMs: commentTime });
   }
-  return latest;
+
+  // Strictly newest wins; on an exact tie the finding wins over the clean
+  // review. Two comments at the same second, one carrying a finding and one
+  // clean, used to go green with the finding open whenever the finding
+  // happened to come first in the array.
+  const tied = topTiedBy(candidates, (candidate) => [candidate.timeMs]);
+  const chosen =
+    tied.find((candidate) => hasActionablePrReviewFeedback(candidate.attesting.comment.body)) ??
+    tied[0];
+  return chosen?.attesting ?? null;
 }
 
 /**
@@ -181,26 +266,59 @@ function headsWithUndispositionedFinding(
   comments: CommentReviewGateComment[],
   reviewerBotLogin: string,
 ): CarriedFinding[] {
-  const newestPerHead = new Map<string, { attesting: AttestingComment; timeMs: number }>();
+  const byHead = new Map<string, { attesting: AttestingComment; timeMs: number; attested: boolean }[]>();
   const ledger: { entry: AllyPriorFindingDisposition; timeMs: number; attestedHeadSha: string }[] = [];
 
   for (const comment of comments) {
     if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
     const attestedHeadSha = extractAllyReviewedHeadSha(comment.body);
-    if (!attestedHeadSha) continue;
+    // A review whose verdict block we cannot read still says which tree it
+    // examined, and it may still *raise* a finding here — it just may never
+    // retire one. Without this the whole comment was skipped at the `continue`
+    // below, so a finding its prose carried vanished the moment the author
+    // pushed past the reviewed head: master red that head, this branch greened
+    // it (peer review of #1721 at 97b4ddd1, TrafficOpsEngineer). The unreadable
+    // branch in evaluateCommentReviewGate catches it only at its own head.
+    //
+    // Scoped to `unreadable` deliberately. allyClaimedReviewHead is laxer than
+    // the attestation parser by design, and letting it stand in for every body
+    // that fails to attest would newly carry findings off ambiguous prose — a
+    // change to the block-less population this row never measured. Only the
+    // population the block created gets the new path.
+    const claimedHeadSha =
+      attestedHeadSha ??
+      (parseAllyVerdictBlock(comment.body).kind === "unreadable"
+        ? allyClaimedReviewHead(comment.body)
+        : null);
+    if (!claimedHeadSha) continue;
     const commentTime = toEpochMs(comment.createdAt);
     if (!Number.isFinite(commentTime)) continue;
 
-    for (const entry of extractAllyPriorFindingDispositions(comment.body)) {
-      ledger.push({ entry, timeMs: commentTime, attestedHeadSha });
+    // Ledger authority requires a real attestation, which is the asymmetry this
+    // whole path turns on: an unreadable verdict may carry a finding forward
+    // and may not dispose of one. Retiring is the direction that loses
+    // information, so it stays gated on a body we could actually parse.
+    //
+    // Belt and braces today rather than the mechanism: the extractor already
+    // returns `[]` for an unreadable block, so this guard changes nothing on
+    // its own. It is here because the loop now admits comments on a *claimed*
+    // head, and without it the code would read as though a claimed head
+    // conferred ledger authority — which it must not, and which would become
+    // true the moment that extractor grew a prose fallback of its own.
+    if (attestedHeadSha) {
+      for (const entry of extractAllyPriorFindingDispositions(comment.body)) {
+        ledger.push({ entry, timeMs: commentTime, attestedHeadSha });
+      }
     }
 
-    const existing = newestPerHead.get(attestedHeadSha);
-    // Ties prefer the later item, matching latestAttestingAllyComment: the
-    // comment endpoint is chronological but its timestamps are second-resolution.
-    if (!existing || commentTime >= existing.timeMs) {
-      newestPerHead.set(attestedHeadSha, { attesting: { comment, attestedHeadSha }, timeMs: commentTime });
-    }
+    const perHead = byHead.get(claimedHeadSha);
+    const candidate = {
+      attesting: { comment, attestedHeadSha: claimedHeadSha },
+      timeMs: commentTime,
+      attested: Boolean(attestedHeadSha),
+    };
+    if (perHead) perHead.push(candidate);
+    else byHead.set(claimedHeadSha, [candidate]);
   }
 
   // A ledger entry speaks only to findings that already existed when it was
@@ -281,21 +399,96 @@ function headsWithUndispositionedFinding(
     return [...verbs];
   };
 
+  // Newest statement per head wins, with one precedence above recency: an
+  // unreadable review may not *displace* an attested one, however much newer it
+  // is, because displacing is retiring by another name. "Newest per head" means
+  // the newest statement about that tree, and a verdict we could not read makes
+  // no statement. Letting it win drops the older review's finding on the
+  // strength of prose that merely happens not to mention one — the same
+  // fail-open this branch exists to close, arriving through the fix for it
+  // (peer review of #1721 at bbe6d640, TrafficOpsEngineer). Caught by the
+  // pre-existing case at "leaves a finding carried from the head it names".
+  // Among two unreadable reviews neither is evidence, so there is nothing to
+  // lose between them.
+  //
+  // The remaining tie — same head, same attestation class, same second — is
+  // resolved here on the *final* verdict rather than on a mid-loop proxy, which
+  // is what keeps it from trading one fail-open for a quieter one. Preferring
+  // the blocking body up in the loop would have handed the slot to a body that
+  // isFullyDispositioned then filters straight back out, losing the tied
+  // candidate that would have carried. Asking "does any tied candidate still
+  // carry a finding?" is order-independent and cannot lose one.
+  //
   // `countInheritedLedgerAssertion: false` keeps this enumeration answering
   // "which findings did *this head* raise?". A `still-present` entry names an
   // earlier head's finding, and that head is enumerated in its own right, so
   // counting it here would name a review whose own buckets are empty — and
   // permanently, since a 0/0 body reports no identities for any later ledger
-  // entry to retire. The current-head branch below deliberately does count it.
-  return [...newestPerHead.values()]
-    .filter(
+  // entry to retire. The current-head branch deliberately does count it. That
+  // asymmetry is BLO-31446's, and it survives the tied-set rewrite unchanged:
+  // the option narrows what each candidate *asserts*, the tie-break decides
+  // *which* candidates are eligible to assert it, and neither reads the other.
+  const carried: { attesting: AttestingComment; timeMs: number }[] = [];
+  for (const candidates of byHead.values()) {
+    const tied = topTiedBy(candidates, (candidate) => [candidate.attested ? 1 : 0, candidate.timeMs]);
+    const blocking = tied.find(
       (entry) =>
         hasActionablePrReviewFeedback(entry.attesting.comment.body, undefined, {
           countInheritedLedgerAssertion: false,
         }) && !isFullyDispositioned(entry),
+    );
+    if (blocking) carried.push(blocking);
+  }
+
+  // Cross-head, and the last `timeMs`-only comparison left. The verdict does
+  // not turn on it — every entry here already carries a finding — but
+  // evaluateCommentReviewGate takes `[carried]` and puts that head's short SHA
+  // in the commit-status text, so two heads carrying at the same second named
+  // a different one on each run. The head is the final axis because it is a
+  // strict total order and a second-resolution timestamp is not.
+  return carried
+    .sort(
+      (a, b) =>
+        b.timeMs - a.timeMs ||
+        a.attesting.attestedHeadSha.localeCompare(b.attesting.attestedHeadSha),
     )
-    .sort((a, b) => b.timeMs - a.timeMs)
     .map((entry) => ({ ...entry.attesting, unrecognizedVerbs: unrecognizedVerbsBlocking(entry) }));
+}
+
+/**
+ * The newest Ally consolidated-review comments, whatever they attest — the
+ * whole set tied at that second, not a winner among them.
+ *
+ * Deliberately not filtered by attestation: the point is to reach a review
+ * whose head could not be established, which is precisely the case
+ * latestAttestingAllyComment skips.
+ *
+ * The tie is returned rather than resolved because the only caller's predicate
+ * is strictly wider than the one this function could apply: it wants an
+ * unreadable review that is *also* in scope for the head being evaluated, and
+ * scope is not known here. Picking on the narrower predicate alone let `find`
+ * hand the slot to an unreadable review naming some other tree, which the
+ * caller then scopes out — so the in-scope unreadable review was never
+ * examined and the gate went green off a candidate nobody consulted (Ally,
+ * peer review of #1721 at 9fd4b499; the same shape as the mid-loop proxy at
+ * headsWithUndispositionedFinding, and it fails open the same way). A
+ * tie-break is order-independent only when its predicate is the caller's whole
+ * predicate.
+ */
+function newestAllyConsolidatedReviewComments(
+  comments: CommentReviewGateComment[],
+  reviewerBotLogin: string,
+): CommentReviewGateComment[] {
+  const candidates: { comment: CommentReviewGateComment; timeMs: number }[] = [];
+  for (const comment of comments) {
+    if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
+    const commentTime = toEpochMs(comment.createdAt);
+    if (!Number.isFinite(commentTime)) continue;
+    candidates.push({ comment, timeMs: commentTime });
+  }
+  return topTiedBy(candidates, (candidate) => [candidate.timeMs]).map(
+    (candidate) => candidate.comment,
+  );
 }
 
 /**
@@ -319,6 +512,79 @@ export function evaluateCommentReviewGate(input: {
 
   const comments = input.comments ?? [];
   const normalizedHead = headSha.toLowerCase();
+
+  // Checked before anything else, scoped to the newest review, and scoped to
+  // this head.
+  //
+  // Scoped to the newest review, because an unreadable block anywhere in
+  // history would wedge the PR permanently with no route out — the same
+  // unretirable trap BLO-31446 and BLO-31947 document.
+  //
+  // Checked first, because the alternative is silence: an unreadable block
+  // attests no head, so without this branch the newest review is invisible and
+  // an *older* review of the same head stays authoritative. That is not
+  // hypothetical — it is exactly how paperclip#1675 reported a finding Ally
+  // had withdrawn. The 15:41:42Z clean review failed to attest, so the
+  // 03:46:19Z review of the same head kept its `Important Issues (1)`, and the
+  // gate published `blocking_finding` against a superseded verdict.
+  //
+  // Scoped to this head, because "newest" is not "at this head" and the
+  // difference is a real red on a tree nobody reviewed.
+  // newestAllyConsolidatedReviewComments has no head filter, so unscoped this
+  // branch lets a malformed block from three pushes ago decide the current
+  // head — where the same PR with no comments at all is `not_evaluated`, i.e.
+  // green. A stale broken block must not be worse for an author than no review
+  // (found in peer review of #1721 at 11a52e9a). It matters most on the
+  // designed upgrade path: SUPPORTED_ALLY_VERDICT_VERSION is bumped by a
+  // server rollout, but the producer is a prompt that takes effect the moment
+  // it merges, so between those two moments an unscoped branch reds every open
+  // PR at once — including PRs whose current head was never reviewed.
+  //
+  // The scoping test is asymmetric and fails closed, which is what keeps AC-5:
+  // the branch is skipped only when the review *positively* names some other
+  // tree. allyClaimedReviewHead returning null means "cannot tell which head
+  // this examined", and that is an ambiguity, not an exemption — a review of
+  // this head whose verdict we could not read is precisely the case that must
+  // not resolve to success. Only a head we can read, and that is not this one,
+  // makes the unreadable verdict somebody else's problem.
+  // Applied as one predicate over the whole tied set, because scope and
+  // readability are both parts of the question and splitting them across the
+  // helper and here is what let a tie go green (see
+  // newestAllyConsolidatedReviewComments). Among reviews we cannot order,
+  // "does any of them make this claim?" is order-independent.
+  //
+  // The verdict is settled by that existential, but the *cause* is not: every
+  // tied candidate yields the same {state, outcome} while `block.reason`
+  // differs between them, and that string becomes the commit-status
+  // description and the check-run summary. Returning on the first match let
+  // array order name a different cause on each run. So the scan is exhaustive
+  // and the reason is the final axis — lexicographically smallest, mirroring
+  // the cross-head tie-break at :429, which is a strict total order where a
+  // second-resolution timestamp is not. commentCreatedAt travels with the
+  // chosen candidate so the two can never describe different comments
+  // (Ally, #1721 at 31532b48).
+  let unreadable: { reason: string; commentCreatedAt: string } | null = null;
+  for (const review of newestAllyConsolidatedReviewComments(comments, reviewerBotLogin)) {
+    const claimedHead = allyClaimedReviewHead(review.body);
+    if (claimedHead !== null && claimedHead !== normalizedHead) continue;
+    const block = parseAllyVerdictBlock(review.body);
+    if (block.kind !== "unreadable") continue;
+    if (unreadable === null || block.reason.localeCompare(unreadable.reason) < 0) {
+      unreadable = {
+        reason: block.reason,
+        commentCreatedAt: new Date(toEpochMs(review.createdAt)).toISOString(),
+      };
+    }
+  }
+  if (unreadable) {
+    return {
+      state: "failure",
+      outcome: "unreadable_verdict",
+      reason: `Ally's newest review carries an unreadable verdict block: ${unreadable.reason}.`,
+      commentCreatedAt: unreadable.commentCreatedAt,
+    };
+  }
+
   const forHead = latestAttestingAllyComment(comments, reviewerBotLogin, normalizedHead);
 
   if (forHead) {
@@ -331,11 +597,25 @@ export function evaluateCommentReviewGate(input: {
         commentCreatedAt: new Date(toEpochMs(forHead.comment.createdAt)).toISOString(),
       };
     }
+    // Name the source that decided this, because "clean" from a counted
+    // structured block and "clean" from the prose fallback are different
+    // claims with different failure modes, and the whole point of BLO-32695
+    // is being able to tell which one you are looking at. Without this the
+    // gate description is identical either way, so a silent regression back
+    // onto the prose path — the exact thing this change retires — would be
+    // invisible on the PR.
+    // Both phrasings are kept inside MAX_COMMIT_STATUS_DESCRIPTION. The writer
+    // in github-app-auth.ts slices at 140 before the POST, so an overlong
+    // description is never rejected — it is silently cut, and what it cuts is
+    // the tail, which is where the source attribution lives. Pinned by test.
+    const source =
+      parseAllyVerdictBlock(forHead.comment.body).kind === "ok"
+        ? "its structured ally-verdict block"
+        : "prose fallback (no ally-verdict block)";
     return {
       state: "success",
       outcome: "clean",
-      reason:
-        "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
+      reason: `Ally's most recent consolidated-review comment for this head reports no unresolved findings, per ${source}.`,
     };
   }
 
@@ -414,6 +694,13 @@ export function commentReviewGateCheckTitle(
       return "Unresolved finding at this head";
     case "carried_finding":
       return "Unresolved finding carried from an earlier head";
+    // Deliberately does not say "finding": this outcome is neither evidence of
+    // review nor evidence of a finding, and the title is the surface a reader
+    // sees before opening the check. Calling it a finding here would re-commit
+    // the misreport BLO-32695 exists to end, on the one line most likely to be
+    // read in isolation.
+    case "unreadable_verdict":
+      return "Verdict block unreadable — no finding asserted";
     case "not_evaluated":
       return "Not evaluated — no comment-shaped review attests this head";
   }

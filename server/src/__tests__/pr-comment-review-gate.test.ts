@@ -1365,3 +1365,240 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
     expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
   });
 });
+
+describe("commit-status description budget", () => {
+  // GitHub caps a commit-status description at 140 characters and
+  // `githubPostCommitStatusDetailed` slices to that before the POST, so an
+  // overlong reason is never rejected — it is silently cut. What gets cut is
+  // the tail, and the tail of the clean reason is the source attribution, the
+  // one field that says whether the structured block or the prose fallback
+  // produced the green (BLO-32695). Losing it is exactly the silent regression
+  // the attribution exists to make visible.
+  const MAX = 140;
+
+  // Both branches of the `source` ternary, driven through the real evaluator
+  // rather than re-rendered here: a copy of the sentence would keep passing
+  // after the real one grew.
+  const structured = evaluateCommentReviewGate({
+    headSha: CURRENT_HEAD,
+    comments: [
+      allyComment(
+        [
+          "## Ally — Consolidated PR Review",
+          "",
+          "<!-- ally-verdict:1",
+          JSON.stringify({
+            head: CURRENT_HEAD,
+            findings: { critical: 0, important: 0, suggestions: 0 },
+            dispositions: [],
+          }),
+          "-->",
+          "",
+          `Reviewed head: ${CURRENT_HEAD}`,
+        ].join("\n"),
+        "2026-08-04T21:09:19Z",
+      ),
+    ],
+  });
+  const prose = evaluateCommentReviewGate({
+    headSha: CURRENT_HEAD,
+    comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
+  });
+
+  it("keeps both clean descriptions inside GitHub's cap", () => {
+    // Positive control: assert we actually exercised both branches, so a
+    // regression that collapses them to one phrasing cannot pass vacuously.
+    expect(structured).toMatchObject({ state: "success", outcome: "clean" });
+    expect(prose).toMatchObject({ state: "success", outcome: "clean" });
+    expect(structured.reason).not.toBe(prose.reason);
+
+    for (const verdict of [structured, prose]) {
+      expect(verdict.reason.length).toBeLessThanOrEqual(MAX);
+    }
+  });
+});
+
+/**
+ * Equal-timestamp ties at each of the three newest-wins scans.
+ *
+ * GitHub's created_at is second-resolution and
+ * executeCommentReviewGateCheck concatenates two independently-ordered
+ * surfaces, so nothing makes the array order meaningful. Each scan used to end
+ * in `time >= best`, so a tie handed the verdict to whichever comment the array
+ * happened to list last — and all three flipped *open*. Every case asserts both
+ * orders, because a case aimed at one site cannot reach the others: the
+ * pre-existing multi-comment cases all use distinct timestamps, and the one at
+ * "an unattested newer review does not displace" pins the attested/unattested
+ * axis with a 12-hour gap.
+ */
+describe("equal-timestamp ties resolve to the conservative verdict", () => {
+  const TIE = "2026-08-04T20:09:19Z";
+  const LATER = "2026-08-04T20:09:20Z";
+
+  const bothOrders = (a: ReturnType<typeof allyComment>, b: ReturnType<typeof allyComment>) =>
+    [
+      [a, b],
+      [b, a],
+    ].map((comments) => evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments }));
+
+  it("latestAttestingAllyComment: a finding at this head beats a clean review of the same second", () => {
+    for (const verdict of bothOrders(
+      allyComment(blockingReview(CURRENT_HEAD), TIE),
+      allyComment(cleanReview(CURRENT_HEAD), TIE),
+    )) {
+      expect(verdict).toMatchObject({ state: "failure", outcome: "blocking_finding" });
+    }
+  });
+
+  it("latestAttestingAllyComment: a strictly later clean review still clears it", () => {
+    // Control. The tie rule must not turn "newest wins" into "a finding always
+    // wins", which would wedge every PR whose finding was later cleared.
+    for (const verdict of bothOrders(
+      allyComment(blockingReview(CURRENT_HEAD), TIE),
+      allyComment(cleanReview(CURRENT_HEAD), LATER),
+    )) {
+      expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
+    }
+  });
+
+  it("headsWithUndispositionedFinding: a carried finding beats a clean review of the same second", () => {
+    for (const verdict of bothOrders(
+      allyComment(blockingReview(OLD_HEAD), TIE),
+      allyComment(cleanReview(OLD_HEAD), TIE),
+    )) {
+      expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    }
+  });
+
+  it("headsWithUndispositionedFinding: a strictly later clean review of that head still clears it", () => {
+    for (const verdict of bothOrders(
+      allyComment(blockingReview(OLD_HEAD), TIE),
+      allyComment(cleanReview(OLD_HEAD), LATER),
+    )) {
+      expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    }
+  });
+
+  it("headsWithUndispositionedFinding: a tied finding the ledger retires loses nothing", () => {
+    // The reason the tie is resolved on the final verdict rather than by
+    // preferring the blocking body inside the loop: preferring it there hands
+    // the slot to a body isFullyDispositioned filters back out, and the head
+    // goes green off a candidate that was never consulted. Here the tied
+    // blocking body is retired by name, so the head clears on its own terms
+    // rather than because the clean body happened to take the slot.
+    const comments = [
+      allyComment(blockingReview(OLD_HEAD), TIE),
+      allyComment(cleanReview(OLD_HEAD), TIE),
+      allyComment(dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "fixed"), LATER),
+    ];
+
+    for (const order of [comments, [...comments].reverse()]) {
+      expect(evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments: order })).toMatchObject({
+        state: "success",
+        outcome: "not_evaluated",
+      });
+    }
+  });
+
+  /** An unreadable verdict block, claiming `headSha` in prose, or no head. */
+  const unreadableReview = (headSha: string | null) =>
+    [
+      "## Ally — Consolidated PR Review",
+      "<!-- ally-verdict:1",
+      "{ this is not json",
+      "-->",
+      ...(headSha ? [`Reviewed head: ${headSha}`] : []),
+    ].join("\n");
+
+  it("newestAllyConsolidatedReviewComments: an unreadable block beats a clean review of the same second", () => {
+    for (const verdict of bothOrders(
+      allyComment(unreadableReview(CURRENT_HEAD), TIE),
+      allyComment(cleanReview(CURRENT_HEAD), TIE),
+    )) {
+      expect(verdict).toMatchObject({ state: "failure", outcome: "unreadable_verdict" });
+    }
+  });
+
+  /**
+   * The tie-break must be the caller's *whole* predicate, not a subset of it.
+   *
+   * newestAllyConsolidatedReviewComments picked one unreadable review out of the
+   * tied set, but evaluateCommentReviewGate then requires that review to also
+   * be in scope for this head. Where two unreadable reviews tie, the subset
+   * predicate could hand the slot to the out-of-scope one, whose claim the
+   * caller discards — and the in-scope unreadable review is never examined.
+   * Both flips fail open, which is the BLO-29711 direction (Ally, #1721 at
+   * 9fd4b499). A null claim is in scope: "cannot tell which head this
+   * examined" is an ambiguity, not an exemption.
+   */
+  it("newestAllyConsolidatedReviewComments: an out-of-scope unreadable review cannot take the slot", () => {
+    for (const inScope of [unreadableReview(CURRENT_HEAD), unreadableReview(null)]) {
+      for (const verdict of bothOrders(
+        allyComment(unreadableReview(OLD_HEAD), TIE),
+        allyComment(inScope, TIE),
+      )) {
+        expect(verdict).toMatchObject({ state: "failure", outcome: "unreadable_verdict" });
+      }
+    }
+  });
+
+  it("newestAllyConsolidatedReviewComments: two unreadable reviews of other heads stay out of scope", () => {
+    for (const verdict of bothOrders(
+      allyComment(unreadableReview(OLD_HEAD), TIE),
+      allyComment(unreadableReview(INTERMEDIATE_HEAD), TIE),
+    )) {
+      expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    }
+  });
+
+  /** An unreadable block of an unsupported version — a *different* reason. */
+  const unsupportedVersionReview = (headSha: string) =>
+    [
+      "## Ally — Consolidated PR Review",
+      "<!-- ally-verdict:2",
+      '{ "head": "x" }',
+      "-->",
+      `Reviewed head: ${headSha}`,
+    ].join("\n");
+
+  /**
+   * The last place array order was visible in output. Two in-scope unreadable
+   * reviews tied at one second agree on {state, outcome} but not on
+   * `block.reason`, and that string is the commit-status description and the
+   * check-run summary — so the same input named a different cause on each run
+   * (Ally, #1721 at 31532b48). Asserts the *property* (order-independence)
+   * rather than a chosen string, so reversing the comparator's sense cannot
+   * silently keep this green.
+   */
+  it("the unreadable cause is named deterministically", () => {
+    const reasons = bothOrders(
+      allyComment(unreadableReview(CURRENT_HEAD), TIE),
+      allyComment(unsupportedVersionReview(CURRENT_HEAD), TIE),
+    ).map((verdict) => {
+      expect(verdict).toMatchObject({ state: "failure", outcome: "unreadable_verdict" });
+      return verdict.reason;
+    });
+
+    expect(reasons[0]).toBe(reasons[1]);
+    // Both causes are genuinely reachable from this input, so the assertion
+    // above is not vacuously satisfied by one of them never being produced.
+    expect(reasons[0]).toMatch(/not valid JSON|unsupported ally-verdict version/);
+  });
+
+  /**
+   * The cross-head sort is not a verdict, but it is output. Both entries carry
+   * a finding, so `failure/carried_finding` is stable either way — the head
+   * named in the commit-status text was not (Ally, #1721 at 9fd4b499).
+   */
+  it("headsWithUndispositionedFinding: the carried head is named deterministically", () => {
+    const named = bothOrders(
+      allyComment(blockingReview(OLD_HEAD), TIE),
+      allyComment(blockingReview(INTERMEDIATE_HEAD), TIE),
+    ).map((verdict) => {
+      expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+      return verdict.outcome === "carried_finding" ? verdict.carriedFromHeadSha : null;
+    });
+
+    expect(named[0]).toBe(named[1]);
+  });
+});
