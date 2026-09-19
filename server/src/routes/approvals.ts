@@ -32,7 +32,8 @@ import { heartbeatService } from "../services/heartbeat.js";
 import {
   isPlanningOnlyRecoveryContextSnapshot,
   isStatusOnlyRecoveryContextSnapshot,
-  STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+  statusOnlyEscalationSourceIssueId,
+  statusOnlyRecoveryResumeGuidance,
 } from "../services/recovery/model-profile-hint.js";
 import {
   buildIssueGraphLivenessBoardEscalationKey,
@@ -168,12 +169,6 @@ function budgetAssertionRefusal(type: string, payload: unknown) {
   };
 }
 
-function statusOnlyEscalationSourceIssueId(contextSnapshot: unknown): string | null {
-  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
-  const sourceIssueId = (contextSnapshot as Record<string, unknown>).sourceIssueId;
-  return typeof sourceIssueId === "string" && sourceIssueId.trim() ? sourceIssueId : null;
-}
-
 // PEN-3275: both predicates are now derived from the canonical tuples in `model-profile-hint.ts`
 // rather than hand-repeated here. This file carried the last two hand-written copies — the exact
 // shape BLO-32774 removed from the status-only guard in `issues.ts`, and dangerous in the same
@@ -268,7 +263,7 @@ export function approvalRoutes(
           ...(statusOnly ? {
             modelProfile: "cheap",
             allowedApprovalType: BOARD_ESCALATION_APPROVAL_TYPE,
-            ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+            ...statusOnlyRecoveryResumeGuidance(run.contextSnapshot),
           } : {}),
           recoveryIntent: planningOnly ? "planning_only" : "status_only",
           resumeRequiresNormalModel: statusOnly,

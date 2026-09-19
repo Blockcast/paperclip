@@ -244,7 +244,8 @@ import { externalObjectService } from "../services/external-objects.js";
 import {
   isPlanningOnlyRecoveryContextSnapshot,
   isStatusOnlyRecoveryContextSnapshot,
-  STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+  statusOnlyEscalationSourceIssueId,
+  statusOnlyRecoveryResumeGuidance,
 } from "../services/recovery/model-profile-hint.js";
 import {
   enqueueCommentEffects,
@@ -6908,7 +6909,7 @@ export function issueRoutes(
         modelProfile: "cheap",
         recoveryIntent: "status_only",
         resumeRequiresNormalModel: true,
-        ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+        ...statusOnlyRecoveryResumeGuidance(run.contextSnapshot),
       },
     });
     if (issue.id) {
@@ -6973,7 +6974,7 @@ export function issueRoutes(
         modelProfile: "cheap",
         recoveryIntent: "status_only",
         resumeRequiresNormalModel: true,
-        ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+        ...statusOnlyRecoveryResumeGuidance(run.contextSnapshot),
       },
     );
   }
@@ -7175,7 +7176,7 @@ export function issueRoutes(
           ? {
             modelProfile: "cheap",
             allowedDocumentKey: ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
-            ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+            ...statusOnlyRecoveryResumeGuidance(run.contextSnapshot),
           }
           : {}),
         recoveryIntent: planningOnly ? "planning_only" : "status_only",
@@ -7200,8 +7201,16 @@ export function issueRoutes(
       error:
         planningOnly
           ? "Planning-only recovery runs cannot link or unlink approvals"
-          : "Cheap status-only recovery runs cannot link or unlink approvals; to escalate from this run, " +
-            "create a `request_board_approval` with the run context's source issue in `issueIds` instead",
+          // PEN-3275: the redirect is only offered when the guard would actually admit it.
+          // `approvals.ts` refuses the create when the run context carries no source issue, so on
+          // an issueless status-only run the old unconditional phrasing sent a refused caller
+          // straight into a second refusal.
+          : statusOnlyEscalationSourceIssueId(run.contextSnapshot)
+            ? "Cheap status-only recovery runs cannot link or unlink approvals; to escalate from this run, " +
+              "create a `request_board_approval` with the run context's source issue in `issueIds` instead"
+            : "Cheap status-only recovery runs cannot link or unlink approvals, and this run context " +
+              "carries no source issue, so it cannot file a `request_board_approval` either; record a " +
+              "status disposition instead",
       details: {
         issueId: issue.id,
         runId: run.id,
@@ -7209,7 +7218,7 @@ export function issueRoutes(
           ? {
             modelProfile: "cheap",
             allowedApprovalType: "request_board_approval",
-            ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+            ...statusOnlyRecoveryResumeGuidance(run.contextSnapshot),
           }
           : {}),
         recoveryIntent: planningOnly ? "planning_only" : "status_only",

@@ -3,14 +3,39 @@ import {
   isStatusOnlyRecoveryContextSnapshot,
   readRecoveryRunWriteClass,
   RECOVERY_GUARD_CONTEXT_KEYS,
-  RECOVERY_RUN_WRITE_CLASS_NOTICE,
+  recoveryRunWriteClassNotice,
   RECOVERY_WORK_CLASS_KEY,
   recoveryAssigneeAdapterOverrides,
   scrubRecoveryModelProfileHints,
   STATUS_ONLY_RECOVERY_GUARD_CONTEXT,
-  STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+  statusOnlyEscalationSourceIssueId,
+  statusOnlyRecoveryResumeGuidance,
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
+
+// The two status-only snapshots that differ ONLY in escalation availability. Both are what the
+// `stale_active_run_evaluation` producers in `recovery/service.ts` actually emit — they stamp
+// `sourceIssueId: sourceIssue?.id ?? null`, and `resolveStaleRunSourceIssue` returns null for a
+// silent run whose own snapshot carries no issue id.
+const STATUS_ONLY_WITH_SOURCE = withRecoveryModelProfileHint(
+  { issueId: "eval-1", sourceIssueId: "src-1" },
+  "status_only",
+);
+const STATUS_ONLY_WITHOUT_SOURCE = withRecoveryModelProfileHint(
+  { issueId: "eval-1", sourceIssueId: null },
+  "status_only",
+);
+
+// Every notice a reachable snapshot can produce. The invariant loops below run over THIS rather
+// than over two class keys: since PEN-3275 the status-only lane has two texts, and a loop that
+// saw only one of them would leave the other's invariants unasserted.
+function eachNotice(): string[] {
+  return [
+    STATUS_ONLY_WITH_SOURCE,
+    STATUS_ONLY_WITHOUT_SOURCE,
+    withRecoveryModelProfileHint({ issueId: "i" }, "planning_only"),
+  ].map((snapshot) => recoveryRunWriteClassNotice(snapshot) ?? "");
+}
 
 describe("recovery model profile policy", () => {
   it("allows cheap only for status-only recovery and adds guard context", () => {
@@ -159,25 +184,69 @@ describe("recovery run write class", () => {
   });
 
   it("reuses the shared resume guidance verbatim so the wake and the 403 cannot drift", () => {
-    expect(RECOVERY_RUN_WRITE_CLASS_NOTICE.status_only)
-      .toContain(STATUS_ONLY_RECOVERY_RESUME_GUIDANCE.resumeGuidance);
+    expect(recoveryRunWriteClassNotice(STATUS_ONLY_WITH_SOURCE))
+      .toContain(statusOnlyRecoveryResumeGuidance(STATUS_ONLY_WITH_SOURCE).resumeGuidance);
+    expect(recoveryRunWriteClassNotice(STATUS_ONLY_WITHOUT_SOURCE))
+      .toContain(statusOnlyRecoveryResumeGuidance(STATUS_ONLY_WITHOUT_SOURCE).resumeGuidance);
+  });
+
+  // PEN-3275 round 3. A status-only run whose context carries no source issue is refused the
+  // `request_board_approval` create outright (`approvals.ts`: "its run context has no source
+  // issue"), yet it is fully status-only by the guard tuple — which deliberately does not include
+  // `sourceIssueId` — so it is classified, announced, and contained exactly like any other.
+  // Announcing the escalation unconditionally therefore promised a FILING that run cannot make:
+  // the BLO-25878 shape in the more dangerous direction, since a promised capability is planned
+  // around, where a promised retry is only waited for.
+  //
+  // Asserted on both snapshots against the SAME predicate the guard reads, so the announcement
+  // names the escalation exactly when `approvals.ts` would admit it.
+  it("names the escalation exit only when the guard would admit it", () => {
+    expect(statusOnlyEscalationSourceIssueId(STATUS_ONLY_WITH_SOURCE)).toBe("src-1");
+    expect(statusOnlyEscalationSourceIssueId(STATUS_ONLY_WITHOUT_SOURCE)).toBeNull();
+
+    // Containment is unchanged by escalation availability — both are status-only, both refused.
+    expect(readRecoveryRunWriteClass(STATUS_ONLY_WITHOUT_SOURCE)).toBe("status_only");
+    expect(isStatusOnlyRecoveryContextSnapshot(STATUS_ONLY_WITHOUT_SOURCE)).toBe(true);
+
+    const withSource = recoveryRunWriteClassNotice(STATUS_ONLY_WITH_SOURCE) ?? "";
+    const withoutSource = recoveryRunWriteClassNotice(STATUS_ONLY_WITHOUT_SOURCE) ?? "";
+
+    expect(withSource).toContain("The only approval write this run can perform is creating a");
+    expect(withSource).toContain("not even to comment on what you just filed");
+
+    expect(withoutSource).toContain("no approval write available at all");
+    expect(withoutSource).toContain("The only reachable exit from this run is recording a valid");
+    // The load-bearing negative: no sentence may offer the filing to a run that cannot make it.
+    expect(withoutSource).not.toMatch(/only approval write this run can perform|or file a `request_board_approval`/);
   });
 
   // BLO-25878 / BLO-32774. The notice must not read as a promise that a normal-model run is
   // coming, nor as an instruction to go arm oneself an unguarded one — `issues.ts` refuses
   // exactly that monitor arm, so suggesting it would send the reader into another 403.
   it("neither promises a normal-model run nor steers the reader into arming one", () => {
-    for (const notice of Object.values(RECOVERY_RUN_WRITE_CLASS_NOTICE)) {
+    for (const notice of eachNotice()) {
       expect(notice).not.toMatch(/arm a monitor|monitor to resume|wait for a normal-model run/i);
     }
-    expect(RECOVERY_RUN_WRITE_CLASS_NOTICE.status_only).toContain("never ends");
+    expect(recoveryRunWriteClassNotice(STATUS_ONLY_WITH_SOURCE)).toContain("never ends");
+    expect(recoveryRunWriteClassNotice(STATUS_ONLY_WITHOUT_SOURCE)).toContain("never ends");
   });
 
   // The false-record failure is the one that produced a durable wrong claim on PEN-3248, so the
   // instruction that prevents it is asserted rather than left to prose review.
   it("tells the reader to confirm a contained write returned before claiming it", () => {
-    for (const notice of Object.values(RECOVERY_RUN_WRITE_CLASS_NOTICE)) {
+    for (const notice of eachNotice()) {
       expect(notice).toContain("before you describe it as done");
     }
+  });
+
+  // Asserts the SHAPE the doc comment forbids, not the previous draft's literals. The earlier pin
+  // named the strings "escalated after" / "was refused a document write", so any reworded causal
+  // opener ("following a refused document write") passed while reintroducing exactly what the
+  // comment forbids. The opener is the whole surface a causal clause can occupy.
+  it("keeps the planning-only notice free of any causal opener", () => {
+    const planningOnly = recoveryRunWriteClassNotice(
+      withRecoveryModelProfileHint({ issueId: "i" }, "planning_only"),
+    ) ?? "";
+    expect(planningOnly.split(".")[0]).toBe("This wake is a planning-only recovery run");
   });
 });
