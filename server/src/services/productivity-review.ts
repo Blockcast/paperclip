@@ -3336,6 +3336,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           ),
         );
       const stillExecutingSourceIds = new Set<string>();
+      // Issue-scoped, not run-scoped, and chosen that way: the review does not
+      // persist the run id it fired on, so keying per-run would mean adding that
+      // to `details` first. The cost is a residue — a review that fired on run A
+      // stays open while an unrelated later run B is live on the same source.
+      // That is the fail-closed direction and it is self-clearing (the first
+      // sweep with nothing live retires it), so it is bounded by an unrelated
+      // run's lifetime rather than by the issue's, which is the bound the
+      // predicate was tightened to buy.
       for (const run of liveRuns) {
         if (!stillSignalling(runLiveInterval(run, now), now)) continue;
         for (const scopeId of runScopeIssueIds(run)) {
@@ -4688,9 +4696,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // still-armed branch reports `unattendedMs: 0` as a deliberate upper
       // bound, and treating that as measured would exempt any issue with a
       // monitor armed however briefly (BLO-22331 AC2). B3b's
-      // `runaway_execution` is what keeps the case this narrowing drops
-      // detectable; it outranks this trigger, so an episode that qualifies
-      // never reaches this gate at all.
+      // `runaway_execution` recovers the case this narrowing drops for ONE
+      // shape only — a single continuous run, still live, past the bar — and it
+      // outranks this trigger, so an episode of that shape never reaches this
+      // gate at all. It is deliberately NOT the general inverse of B3: an
+      // episode whose executing time is split across several finished runs,
+      // none individually past the bar, stays suppressed here and is not
+      // recovered. That is intended, on the same ground the B2 clause below
+      // takes — an executing-dominant episode is explained — but do not read
+      // B3b as full coverage and widen this narrowing on that basis.
       (monitorGating.unattendedMs < thresholds.longActiveMs ||
         // BLO-27698 B2: the episode is more than half executing time. Same
         // dominance shape as `noExecutableTurnDominant`, through the shared
