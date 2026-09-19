@@ -47,22 +47,33 @@ on:
     #
     # The cheap predicate-level cut (skipping PRs younger than
     # STALL_THRESHOLD_SECONDS, which cannot be stranded) scales with that
-    # threshold, so BLO-34521's 90m -> 18h move changed it by an order of
-    # magnitude. Re-measured 2026-09-19T11:44Z over all 119 open PRs, using
-    # the script's own `pending_since` = max(created_at, committer_date): 113
-    # non-draft and unlocked -> ~339 requests per run uncut, of which 47 are
-    # younger than the 18h threshold, so the cut saves ~141 (~42%). At 8h the
-    # same day it was 28 PRs / ~84 calls (~25%), and at the old 90m only ~2%
-    # -- which is why this paragraph used to dismiss the cut as noise.
-    # Cadence is still a comparable lever (hourly vs `9,39` is worth ~339/hour
-    # against a 1,000/hour budget), but the cut is no longer rounding error.
+    # threshold, so BLO-34521's 90m -> 18h move changed it sixfold.
     #
-    # Measure it with the committer date, not `created_at` alone: an old PR
-    # pushed an hour ago is young by this predicate, and ignoring that
-    # undercounts the cut severalfold (4 vs 19 on the same day). Re-derive
-    # rather than inherit -- these track STALL_THRESHOLD_SECONDS and the
-    # open-PR backlog, which is why the 2026-08-21 pair above no longer
-    # reproduces.
+    # EVERY FIGURE BELOW IS ONE SNAPSHOT, 2026-09-19T22:26Z: 111 open PRs,
+    # 105 non-draft and unlocked -> ~315 requests per run uncut. Cut by the
+    # script's own `pending_since` = max(created_at, committer_date):
+    #
+    #     threshold | younger | cut saves | vs `created_at` alone
+    #         90m   |    5    | ~15 (~5%) |  1
+    #          8h   |    9    | ~27 (~9%) |  4
+    #         18h   |   33    | ~99 (~31%)|  9
+    #
+    # Deliberately one snapshot rather than the best figure for each line:
+    # every prior revision of this paragraph quoted numbers from two
+    # different measurement moments, and every one of them ended up with a
+    # figure a sibling figure contradicted -- three revisions running. Numbers
+    # from one population cannot disagree with each other. Re-measure the
+    # whole table or none of it.
+    #
+    # The last column is why you measure with the committer date and not
+    # `created_at` alone: an old PR pushed an hour ago is young by this
+    # predicate, and ignoring that undercounts the cut nearly fourfold at the
+    # threshold in force (9 against 33). Re-derive rather than inherit --
+    # these track STALL_THRESHOLD_SECONDS and the open-PR backlog, which is
+    # why the 2026-08-21 pair above no longer reproduces.
+    #
+    # Cadence is still a comparable lever (hourly vs `9,39` is worth ~315/hour
+    # against a 1,000/hour budget), but the cut is no longer rounding error.
     #
     # ALARM_THRESHOLD_SECONDS derives as STALL + COOLDOWN + 2h in the script,
     # to absorb the coarser polling granularity. Deliberately no figure here:

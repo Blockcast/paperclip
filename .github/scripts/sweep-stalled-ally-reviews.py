@@ -220,7 +220,13 @@ ALLY_REQUEST_REVIEWER_LOGIN = os.environ.get("ALLY_REQUEST_REVIEWER_LOGIN") or "
 #
 #     p50 4.09h | p90 12.70h | p95 17.20h | max 30.81h | min 0.05h
 #     > 90m: 178/232 = 77%   |   > 8h: 45/232 = 19.4%
-#     > 18h:  11/232 = 4.7%  |   > 22h (ALARM): ~3%
+#     > 18h:  11/232 = 4.7%  |   > 22h (ALARM): ~3% ESTIMATED
+#
+# The ALARM cell is the one soft number here -- estimated, not counted, which
+# is why it is the only cell without an exact numerator. Do not reason from it
+# against the counted cells; ~3% of 232 is ~7, which is not reconcilable with
+# any count in this table. Give it its numerator on the next full re-run of
+# the reproduction below, and delete this note when you do.
 #
 # So 8h breached on 19.4% of HEALTHY reviews -- against an acceptance
 # criterion of under ~10%. Measured against dispatch wait the same value
@@ -246,8 +252,11 @@ ALLY_REQUEST_REVIEWER_LOGIN = os.environ.get("ALLY_REQUEST_REVIEWER_LOGIN") or "
 # the precision either sample supports. Quote it to 3dp, not 2: rounding this
 # UP to "1.42x" states a margin 18h does not actually clear, and the guard
 # below asserts the stated figure. Chasing the max instead would mean 32h --
-# a day and a half to detect a lost review, bought against
-# a tail of 3 PRs. The failure direction is benign (understating the ceiling
+# a day and a half to detect a lost review, bought against the 11/232 (4.7%)
+# that sit above 18h, which is the band that move actually covers. ("A tail of
+# 3 PRs" stood here through two revisions and reconciles with no cell in the
+# table above; read the band off the table, do not carry a figure forward.)
+# The failure direction is benign (understating the ceiling
 # costs a false re-fire, never a missed loss), so the MULTIPLIER is the thing
 # to re-derive, not the max. The floor this must clear is asserted in
 # TestStallThresholdCalibration; update that table in the same commit that
