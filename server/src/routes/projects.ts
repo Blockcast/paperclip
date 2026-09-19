@@ -40,6 +40,7 @@ import {
   publicWorkspaceOperation,
   resolveWorkspaceRuntimeViewer,
 } from "./workspace-response.js";
+import { maskProjectEnv, restoreMaskedEnvBindings } from "./project-env-response.js";
 import { parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { appendWithCap } from "../adapters/utils.js";
@@ -250,10 +251,15 @@ export function projectRoutes(db: Db) {
       body.archivedAt = new Date(body.archivedAt);
     }
     if (body.env !== undefined) {
-      body.env = await secretsSvc.normalizeEnvBindingsForPersistence(existing.companyId, body.env, {
-        strictMode: strictSecretsMode,
-        fieldPath: "env",
-      });
+      // PEN-3033: the read side masks plain values, and the editor re-emits every row on save, so
+      // an incoming masked value means "keep the stored binding" rather than a literal to persist.
+      // Merged BEFORE normalization so `normalizeEnvBindingsForPersistence` still sees — and still
+      // refuses — any placeholder that has no stored binding behind it.
+      body.env = await secretsSvc.normalizeEnvBindingsForPersistence(
+        existing.companyId,
+        restoreMaskedEnvBindings(body.env, existing.env),
+        { strictMode: strictSecretsMode, fieldPath: "env" },
+      );
     }
     const project = await svc.update(id, body);
     if (!project) {
@@ -695,6 +701,11 @@ export function projectRoutes(db: Db) {
     // carries both the open `workspaceRuntime` record and the strategy's command strings. Named
     // `deletedProjectRow` rather than `project` so the narrowing is legible at the response site
     // instead of being an unexplained exemption in the CI guard.
+    //
+    // PEN-3033: `env` is a SECOND column on that same row, on a different axis. It is masked
+    // unconditionally here rather than through `publicProject` — this exit skips that projection
+    // because the row has no `workspaces[]` to satisfy its constraint — so both columns are
+    // narrowed at the one exit. Two withholdings, one response, neither deriving from the other.
     const deletedProjectRow = await svc.remove(id);
     if (!deletedProjectRow) {
       res.status(404).json({ error: "Project not found" });
@@ -713,7 +724,7 @@ export function projectRoutes(db: Db) {
     });
 
     res.json({
-      ...deletedProjectRow,
+      ...maskProjectEnv(deletedProjectRow),
       executionWorkspacePolicy: publicProjectExecutionWorkspacePolicy(
         parseProjectExecutionWorkspacePolicy(deletedProjectRow.executionWorkspacePolicy),
         await resolveWorkspaceRuntimeViewer(access, req, deletedProjectRow.companyId),
