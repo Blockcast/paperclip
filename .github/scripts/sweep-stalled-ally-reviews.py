@@ -84,7 +84,13 @@ REVIEWED_HEAD_PATTERN = re.compile(
 # cannot disagree about which tree was reviewed. The prose line above is the
 # fallback for a body that carries no block.
 VERDICT_BLOCK_PATTERN = re.compile(
-    r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)<!--[ \t]*ally-verdict:[ \t]*(\d+)(.*?)-->",
+    # `[0-9]`, never `\d`: Python's `\d` is Unicode-aware and JavaScript's is
+    # ASCII-only, so `ally-verdict:١` (U+0661) parses as version 1 here and
+    # matches nothing in either JS reader. The gate then counts an opener with
+    # no block and goes `unreadable_verdict` while this sweep records the head
+    # as reviewed -- verbatim the divergence `parse_verdict_block_head` below
+    # exists to prevent. Same rule at EMITTED_BUCKET_PATTERN, where it inverts.
+    r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)<!--[ \t]*ally-verdict:[ \t]*([0-9]+)(.*?)-->",
     re.MULTILINE | re.DOTALL,
 )
 VERDICT_OPENER_PATTERN = re.compile(
@@ -111,7 +117,12 @@ MAX_VERDICT_FINDING_COUNT = 1000
 # counts, and over-matching fails a clean review closed.
 EMITTED_BUCKET_PATTERN = re.compile(
     r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)(?:#{1,6}[ \t]*)?[*_]{0,3}"
-    r"(Critical|Important)[ \t]+Issues[ \t]*[*_]{0,3}[ \t]*\((\d+)\)[*_]{0,3}[ \t]*$",
+    # `[0-9]` for the reason given at VERDICT_BLOCK_PATTERN, and here the harm
+    # runs the other way: `### Critical Issues (١)` over a block stating 0 is
+    # no bucket at all to the JS readers -- no contradiction, gate green --
+    # while Unicode `\d` would make it a contradiction here, sending the sweep
+    # to re-request review on a head Ally already reviewed.
+    r"(Critical|Important)[ \t]+Issues[ \t]*[*_]{0,3}[ \t]*\(([0-9]+)\)[*_]{0,3}[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 FENCE_OPEN_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
@@ -155,6 +166,42 @@ def without_fenced_spans(text):
     return "\n".join(lines)
 
 
+# The exact character set ECMAScript's String.prototype.trim removes:
+# WhiteSpace (TAB, VT, FF, ZWNBSP, and the Space_Separator category) plus
+# LineTerminator (LF, CR, LS, PS). Python's str.strip() is a different set in
+# *both* directions -- it removes U+001C..U+001F and U+0085, which JS keeps,
+# and it keeps U+FEFF, which JS removes -- so a bare .strip() on any field this
+# reader shares with the JS readers is the same class of divergence as `\d`.
+JS_WHITESPACE = (
+    # WhiteSpace: TAB, VT, FF, ZWNBSP ...
+    "\u0009\u000b\u000c\ufeff"
+    # ... and the Space_Separator (Zs) category.
+    "\u0020\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+    "\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000"
+    # LineTerminator: LF, CR, LS, PS.
+    "\u000a\u000d\u2028\u2029"
+)
+
+
+def js_trim(value):
+    """`String.prototype.trim`, not `str.strip`. See JS_WHITESPACE."""
+    return value.strip(JS_WHITESPACE)
+
+
+def reject_js_nonfinite(literal):
+    """Make json.loads refuse what JSON.parse refuses.
+
+    Python accepts the bare `NaN`/`Infinity`/`-Infinity` literals as a JSON
+    extension; `JSON.parse` raises on all three. The counts and ledger indices
+    are already held to `is_js_integer`, so the gap is only reachable through a
+    key no reader validates -- but the block's own comment anticipates a future
+    free-text field, and one extra key carrying `NaN` would read `ok` here and
+    `unreadable` at the gate. Closing it at the parser costs one argument and
+    cannot rot as fields are added.
+    """
+    raise ValueError("JSON.parse rejects the %s literal" % literal)
+
+
 def is_js_integer(value):
     """Whether `Number.isInteger` would accept this JSON value.
 
@@ -196,7 +243,7 @@ def severity_counts(raw):
             return None
         if value < 0 or value > MAX_VERDICT_FINDING_COUNT:
             return None
-        key = severity.strip().lower() if isinstance(severity, str) else None
+        key = js_trim(severity).lower() if isinstance(severity, str) else None
         if key not in VERDICT_SEVERITIES:
             return None
         counts[key] = value
@@ -239,11 +286,11 @@ def dispositions_ok(payload):
         if not isinstance(item, dict):
             return False
         head = item.get("head")
-        if not isinstance(head, str) or not ABBREV_SHA_PATTERN.match(head.strip()):
+        if not isinstance(head, str) or not ABBREV_SHA_PATTERN.match(js_trim(head)):
             return False
         for field in ("severity", "verb"):
             value = item.get(field)
-            if not isinstance(value, str) or not value.strip():
+            if not isinstance(value, str) or not js_trim(value):
                 return False
         index = item.get("index")
         # Same JS-integer predicate as the counts above, for the same reason:
@@ -311,13 +358,13 @@ def parse_verdict_block_head(body):
     if int(raw_version) != SUPPORTED_VERDICT_VERSION:
         return ("unreadable", None)
     try:
-        parsed = json.loads(raw_payload.strip())
+        parsed = json.loads(js_trim(raw_payload), parse_constant=reject_js_nonfinite)
     except ValueError:
         return ("unreadable", None)
     if not isinstance(parsed, dict):
         return ("unreadable", None)
     head = parsed.get("head")
-    if not isinstance(head, str) or not FULL_SHA_PATTERN.match(head.strip()):
+    if not isinstance(head, str) or not FULL_SHA_PATTERN.match(js_trim(head)):
         return ("unreadable", None)
     # The counts the gate reads, read here too. A block whose findings that
     # reader rejects -- or whose own emitted buckets contradict it -- is a
@@ -332,7 +379,7 @@ def parse_verdict_block_head(body):
         return ("unreadable", None)
     if prose_count_contradicts(text, counts):
         return ("unreadable", None)
-    return ("ok", head.strip().lower())
+    return ("ok", js_trim(head).lower())
 
 
 def parse_reviewed_head(body):

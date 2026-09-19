@@ -1353,5 +1353,117 @@ class TestIsConsolidatedAllyCommentForHead(unittest.TestCase):
         )
 
 
+class TestVerdictBlockMirrorsJsCharacterSemantics(unittest.TestCase):
+    """Peer review of #1721 at d3412cce -- the same reader split one layer down.
+
+    The fence and ledger rules above made this reader agree with the gate about
+    *which constructs* it recognises. These pin the *character sets* underneath
+    them: Python's `\\d`, `str.strip` and `json.loads` are each a superset of
+    the JavaScript primitive they mirror, so a body could still be read by one
+    reader and refused by the other with every construct-level rule in place.
+
+    Both harms named on the divergent rows are the ones this module's own
+    docstrings already describe, and they run in opposite directions -- which
+    is why neither masks the other and each needs its own case.
+    """
+
+    HEAD = "e" * 40
+
+    def block(self, version="1", head=None, extra=""):
+        return '<!-- ally-verdict:%s\n{"head":"%s","findings":{"critical":0,"important":0}%s}\n-->' % (
+            version,
+            self.HEAD if head is None else head,
+            extra,
+        )
+
+    def body(self, *rest, **kw):
+        return "\n".join(
+            [self.block(**kw), "", "## Ally - Consolidated PR Review"] + list(rest)
+        )
+
+    def test_a_unicode_digit_version_is_unreadable_not_version_one(self):
+        # int("\u0661") == 1 in Python, so a Unicode-aware `\d` would accept
+        # this as a supported version and record the head as reviewed -- while
+        # both JS readers match no block at all, count the opener, and go
+        # `unreadable_verdict`. Gate red, sweep silent, and the sweep is the
+        # only automatic route back.
+        for digit in ("\u0661", "\uff11"):
+            self.assertIsNone(sweep.parse_reviewed_head(self.body(version=digit)), digit)
+
+    def test_control_an_ascii_digit_version_is_still_read(self):
+        # Without this the test above passes for a reader that stopped parsing
+        # versions entirely. `01` is pinned for the same reason it is elsewhere:
+        # the JS readers use Number(), so a string compare would split them.
+        for digit in ("1", "01"):
+            self.assertEqual(
+                sweep.parse_reviewed_head(self.body(version=digit)), self.HEAD, digit
+            )
+
+    def test_a_unicode_digit_bucket_count_is_not_a_bucket(self):
+        # The mirror image, and the reason a single `\d` rule is not enough:
+        # here Unicode-awareness makes this reader see a contradiction the JS
+        # readers cannot see. The gate stays green while the sweep re-requests
+        # review on a head Ally already reviewed -- spam, and each duplicate is
+        # a COMMENTED review that cannot be dismissed.
+        body = self.body("### Critical Issues (\u0661)")
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_control_an_ascii_bucket_count_still_contradicts(self):
+        body = self.body("### Critical Issues (1)")
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_head_padding_is_trimmed_exactly_as_javascript_trims_it(self):
+        # str.strip() differs from String.prototype.trim in *both* directions,
+        # so a bare strip splits the readers either way round, and each
+        # direction needs its own case.
+        #
+        # U+0085 is Python-only whitespace: strip() removes it, trim() keeps
+        # it, so the JS SHA test fails and the gate reads `unreadable` while
+        # this read a clean attestation. U+FEFF is the exact reverse -- trim()
+        # removes it, strip() keeps it -- so before js_trim this reader alone
+        # refused a head both JS readers accept.
+        #
+        # U+001C..U+001F are the other Python-only whitespace and are
+        # deliberately NOT here: they are JSON control characters, so both
+        # json.loads and JSON.parse refuse the payload before any trim runs.
+        # Asserting on them would pass with or without js_trim.
+        self.assertIsNone(
+            sweep.parse_reviewed_head(
+                self.body(head="\u0085" + self.HEAD + "\u0085")
+            )
+        )
+        self.assertEqual(
+            sweep.parse_reviewed_head(
+                self.body(head="\ufeff" + self.HEAD + "\ufeff")
+            ),
+            self.HEAD,
+        )
+        # Agreement controls -- whitespace both runtimes trim. These fail if
+        # js_trim is narrowed to just the two characters above.
+        for pad in ("\u0020", "\u00a0", "\u2028", "\u3000"):
+            self.assertEqual(
+                sweep.parse_reviewed_head(self.body(head=pad + self.HEAD + pad)),
+                self.HEAD,
+                repr(pad),
+            )
+
+    def test_a_json_literal_javascript_rejects_is_unreadable(self):
+        # json.loads accepts the bare NaN/Infinity literals as an extension;
+        # JSON.parse raises on all three. Reachable only through a key no
+        # reader validates today, but the block's own comment anticipates a
+        # future free-text field, and closing it at the parser cannot rot as
+        # fields are added.
+        for literal in ("NaN", "Infinity", "-Infinity"):
+            body = self.body(extra=',"note":%s' % literal)
+            self.assertIsNone(sweep.parse_reviewed_head(body), literal)
+
+    def test_control_an_unvalidated_extra_key_is_otherwise_ignored(self):
+        # The gate destructures head/findings/dispositions and ignores the
+        # rest, so rejecting every extra key would be its own divergence.
+        self.assertEqual(
+            sweep.parse_reviewed_head(self.body(extra=',"note":"anything"')), self.HEAD
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
