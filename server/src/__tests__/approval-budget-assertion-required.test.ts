@@ -57,13 +57,21 @@ function registerModuleMocks() {
  * Two readers reach `select()` on these routes: the run-context lookup, and
  * `loadEnforcedBudgetPolicies` (BLO-34008). They are told apart by the projection,
  * because that is the only thing this stub sees — distinguishing on the table
- * would mean reimplementing enough of drizzle to read `.from()`.
+ * would mean reimplementing enough of drizzle to read `.from()`. `policyId` is
+ * the discriminator rather than `amount`: `amount` is a plausible column for any
+ * future select on these routes to project, and a misroute would surface as a
+ * confusing run-context failure instead of a clear one.
+ *
+ * The `where` clause is ignored, so the company/policy filter inside
+ * `loadEnforcedBudgetPolicies` is not exercised here — these cases are about the
+ * routes' stamping behaviour, and that filter is covered where the function is
+ * tested directly.
  */
 function createRouteDb(policyRows: Array<Record<string, unknown>> = []) {
   const runContextRow = { id: "run-1", companyId: "company-1", agentId: "agent-1", contextSnapshot: {} };
   return {
     select: vi.fn((projection?: Record<string, unknown>) => {
-      const rows = projection && "amount" in projection ? policyRows : [runContextRow];
+      const rows = projection && "policyId" in projection ? policyRows : [runContextRow];
       return {
         from: vi.fn(() => ({
           where: vi.fn(() => ({
@@ -399,8 +407,60 @@ describe("budget_override_required requires an enforcement assertion (BLO-34008)
     expect(mockApprovalService.resubmit).toHaveBeenCalledTimes(1);
   });
 
-  it("leaves resubmit of every other approval type alone", async () => {
-    mockApprovalService.getById.mockResolvedValue({
+  // The cohort the creation stamp cannot reach: a card filed before it existed
+  // carries an assertion with no prior. It passes the refusal above — that asks
+  // for *an* assertion, not a prior — so stamping only the supplied payload let
+  // it return to `pending` classifying as `unverifiable_mismatch` forever, which
+  // is the state BLO-34008 exists to eliminate. Ally's review of `b8d4f5e`.
+  const RESUBMIT_POLICY_AT_19K = {
+    policyId: POLICY_ID,
+    amount: 1900000,
+    isActive: true,
+    amountUpdatedAt: new Date("2026-08-01T00:00:00.000Z"),
+  };
+
+  it("stamps the stored payload on an empty resubmit when the card predates the creation stamp", async () => {
+    const priorless = { kind: "budget_policy_amount", policyId: POLICY_ID, expected_usd: 32000, label: "CTO" };
+    mockApprovalService.getById.mockResolvedValue(
+      revisionRequestedBudgetCard({ title: "Raise the CTO cap", enforcement_assertions: [priorless] }),
+    );
+    mockApprovalService.resubmit.mockImplementation(async (id: string, payload?: Record<string, unknown>) => ({
+      ...revisionRequestedBudgetCard(payload ?? {}),
+      id,
+      status: "pending",
+    }));
+
+    const res = await resubmit(await createAgentApp([RESUBMIT_POLICY_AT_19K]), {});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [, written] = mockApprovalService.resubmit.mock.calls.at(-1) ?? [];
+    expect((written as any)?.enforcement_assertions?.[0]).toMatchObject({
+      from_amount_cents: 1900000,
+      from_source: "server_policy_read",
+    });
+  });
+
+  it("still keeps the stored payload on an empty resubmit when there is no prior to add", async () => {
+    // The other half of the same branch: stamping must not turn every empty
+    // resubmit into an explicit payload write. `stampAssertionPriors` returns its
+    // argument by reference when it changes nothing, and that is what the route
+    // tests to decide whether to send one at all.
+    mockApprovalService.getById.mockResolvedValue(
+      revisionRequestedBudgetCard({ title: "Raise the CTO cap", enforcement_assertions: [VALID_ASSERTION] }),
+    );
+    mockApprovalService.resubmit.mockImplementation(async (id: string, payload?: Record<string, unknown>) => ({
+      ...revisionRequestedBudgetCard(payload ?? {}),
+      id,
+      status: "pending",
+    }));
+
+    const res = await resubmit(await createAgentApp([RESUBMIT_POLICY_AT_19K]), {});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockApprovalService.resubmit).toHaveBeenCalledWith("approval-budget-1", undefined);
+  });
+
+  it("leaves resubmit of every other approval type alone", async () => {    mockApprovalService.getById.mockResolvedValue({
       ...revisionRequestedBudgetCard({ title: "Approve hosting spend" }),
       type: "request_board_approval",
     });
@@ -652,5 +712,22 @@ describe("the starting figure is stamped from the enforcing policy (BLO-34008)",
 
     const movedLater = { ...POLICY_AT_19K, amount: 2500000, amountUpdatedAt: new Date("2026-08-20T00:00:00.000Z") };
     expect(classifyEnforcementAssertion(assertion!, movedLater, new Date("2026-08-04T10:04:45.877Z"))).toBe("superseded");
+  });
+
+  it("writes the stamp back to the key it read, not the key that merely exists", async () => {
+    // `??` falls through a present-but-null `enforcement_assertions` to the
+    // camelCase array. Choosing the write key with `in` would then stamp the
+    // snake_case key and leave the camelCase array this actually read in place
+    // unstamped — two divergent assertion arrays on one money payload.
+    const { stampAssertionPriors } = await import("../services/approval-enforcement-reconciler.js");
+    const payload = {
+      enforcement_assertions: null,
+      enforcementAssertions: [{ kind: "budget_policy_amount", policyId: POLICY_ID, expected_usd: 32000 }],
+    };
+
+    const out = stampAssertionPriors(payload, new Map([[POLICY_ID, POLICY_AT_19K]])) as any;
+
+    expect(out.enforcementAssertions[0]).toMatchObject({ from_amount_cents: 1900000 });
+    expect(out.enforcement_assertions).toBeNull();
   });
 });

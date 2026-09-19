@@ -352,7 +352,14 @@ export function stampAssertionPriors(
 ): unknown {
   const root = asRecord(payload);
   if (!root) return payload;
-  const entries = root.enforcement_assertions ?? root.enforcementAssertions;
+  // Read and write the same key. Deriving the write key with `in` diverges from
+  // this read: `??` falls through a present-but-`null` `enforcement_assertions`
+  // to the camelCase array, but `in` would then pick the snake_case key — so the
+  // stamped array lands under snake_case while the camelCase one this actually
+  // read stays in place unstamped. Two arrays, one payload, on a money path.
+  const snake = root.enforcement_assertions;
+  const usesSnake = snake !== undefined && snake !== null;
+  const entries = usesSnake ? snake : root.enforcementAssertions;
   if (!Array.isArray(entries)) return payload;
 
   let changed = false;
@@ -370,7 +377,7 @@ export function stampAssertionPriors(
   });
 
   if (!changed) return payload;
-  const key = "enforcement_assertions" in root ? "enforcement_assertions" : "enforcementAssertions";
+  const key = usesSnake ? "enforcement_assertions" : "enforcementAssertions";
   return { ...root, [key]: stamped };
 }
 

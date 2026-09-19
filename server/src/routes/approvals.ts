@@ -806,15 +806,27 @@ export function approvalRoutes(
       return;
     }
 
-    // Only a supplied payload is stamped. An empty resubmit keeps the stored one,
-    // which was already stamped when it was created — and a card old enough to
-    // predate that is refused above for having no assertion at all.
+    // Stamp whichever payload will actually end up `pending`, for the same reason
+    // the refusal checks that one. Stamping only a *supplied* payload left the
+    // motivating cohort uncovered: a card filed before the creation stamp existed
+    // carries an assertion with no prior, which passes the refusal above (that
+    // only requires *an* assertion, not a prior) and walks back to `pending`
+    // classifying as `unverifiable_mismatch` — the exact state this exists to
+    // eliminate. Found by Ally reviewing `b8d4f5e`.
+    //
+    // `stampAssertionPriors` returns its argument by reference when it changes
+    // nothing, so keep-vs-overwrite semantics are untouched: an empty resubmit
+    // still sends `undefined` and lets `svc.resubmit()` keep the stored payload
+    // unless there was genuinely a prior to add.
+    const stamped = await stampPriors(
+      existing.companyId,
+      existing.type,
+      normalizedPayload ?? existing.payload,
+    );
     const resubmitPayload =
-      normalizedPayload === undefined
+      normalizedPayload === undefined && stamped === existing.payload
         ? undefined
-        : ((await stampPriors(existing.companyId, existing.type, normalizedPayload)) as
-            | Record<string, unknown>
-            | undefined);
+        : (stamped as Record<string, unknown> | undefined);
 
     const approval = await svc.resubmit(id, resubmitPayload);
     const actor = getActorInfo(req);
