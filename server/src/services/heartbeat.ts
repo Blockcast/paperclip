@@ -10107,8 +10107,37 @@ function unavailablePrReviewVerification(reason: string) {
  *  - an operator opted in by configuring a context name (this server does not
  *    own the branch-protection rule, so it must not invent one);
  *  - the run is a PR-review run (`derivePaperclipPrReview`);
+ *  - the run is the REVIEWER's, not the author's (`reviewKind` / `prRole`);
  *  - the wake carried a repo AND an exact head SHA — statuses are per-commit,
  *    so a guessed SHA would fail an unrelated commit.
+ *
+ * BLO-34699: `derivePaperclipPrReview` answers "is this wake ABOUT a PR", which
+ * is true of both sides of one review. The author's own agent is woken by its
+ * own `<!-- paperclip:review-request -->` marker (BLO-19522, deliberate and not
+ * being removed), so an author run carries the same repo/head/PR identity as
+ * the reviewer run and used to resolve a target here. Measured on
+ * Blockcast/pim-multicast-gateway#3237: run 974efdbd on the PR AUTHOR's agent
+ * (`prRole: "author"`, `reviewKind: null`) died `k8s_pod_schedule_failed` at pod
+ * start with zero turns, and its crash was written as `review/ally-complete =
+ * failure` — while Ally's real review for that head was still QUEUED (oldest
+ * queued reviewer run 4.67h, matching the request age). `review-gate` is a
+ * scheduled peer of `ci-gate`, so that manufactured red made the PR unmergeable
+ * and could not self-heal: the gate re-runs on `pull_request_review: submitted`
+ * and Ally's common shape is a comment-shaped review, which never re-triggers it.
+ *
+ * Gating on the context's own `reviewKind`/`prRole` rather than on the agent
+ * id: both are stamped by the code that CHOSE whom to wake — the two reviewer
+ * wake constructors (`buildPrReviewerWakeupOptions` and
+ * `queueIssueAssignmentWakeup`'s PR-review branch) each set
+ * `reviewKind: "pr_review"` AND `prRole: "reviewer"`, while the author-directed
+ * path sets `prRole: "author"` and no `reviewKind`. That is the server's own
+ * recorded answer, rather than an identity re-derived at finalize time from a
+ * reviewer-agent-id config this module does not carry.
+ *
+ * The predicate is the one already used by `evaluatePrReviewCompletionEvidence`
+ * for the same question, deliberately: require a positive `pr_review` tag, and
+ * reject a `prRole` that is present and not the reviewer's. The measured case
+ * fails both clauses.
  */
 export function resolvePrReviewGateStatusTarget(
   contextSnapshot: Record<string, unknown> | null | undefined,
@@ -10118,6 +10147,8 @@ export function resolvePrReviewGateStatusTarget(
   if (!context) return null;
   const prReview = derivePaperclipPrReview(contextSnapshot);
   if (!prReview) return null;
+  if (prReview.reviewKind !== "pr_review") return null;
+  if (prReview.prRole && prReview.prRole !== "reviewer") return null;
   const { repoFullName, headSha, prNumber, prUrl } = prReview;
   if (!repoFullName || !headSha) return null;
   return { repoFullName, sha: headSha, context, prNumber, prUrl: prUrl ?? null };
@@ -12770,14 +12801,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const body = [
       `## Ally review did not land on \`${target.repoFullName}#${target.prNumber}\``,
       "",
-      `The Paperclip reviewer run for head \`${shortSha}\` ${cause}. **No review was posted, and none is coming for this head** — this is a terminal outcome, not reviewer latency.`,
+      // BLO-34699: this used to assert "none is coming for this head — a
+      // terminal outcome, not reviewer latency". That claim is about the QUEUE,
+      // and this function has not read the queue. It was measured false on
+      // Blockcast/pim-multicast-gateway#3237 at the moment it was written: a
+      // reviewer run for that exact head was queued and 4.67h old behind a
+      // firing PaperclipPrReviewConsumerStarved. Report only what this run did;
+      // a second request for the same head can still be in flight, and the old
+      // prescribed remedy (re-request / push a new head) is actively harmful
+      // against a starved queue — a re-request lengthens it and a push voids
+      // the head.
+      `The Paperclip reviewer run for head \`${shortSha}\` ${cause}. **No review was posted by that run**, and the gate below is red on its behalf.`,
       "",
       `- Head: \`${target.sha}\``,
       `- Gate status: \`${target.context}\` set to \`failure\` on that commit`,
       ...(target.prUrl ? [`- PR: ${target.prUrl}`] : []),
       `- Reviewer run: \`${run.id}\``,
       "",
-      "Re-request the review on the PR (a start-of-body `<!-- paperclip:review-request -->` marker **and** a bare `@ally` mention — the marker alone is silently dropped), or push a new head.",
+      "Check whether another review for this exact head is still queued before acting — this notice does not know. If one is, wait for it. If none is, re-request the review on the PR (a start-of-body `<!-- paperclip:review-request -->` marker **and** a bare `@ally` mention — the marker alone is silently dropped); pushing a new head voids any at-head attestation and is the last resort.",
     ].join("\n");
 
     for (const issue of linked) {
