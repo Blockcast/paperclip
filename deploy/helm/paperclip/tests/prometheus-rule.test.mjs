@@ -1325,3 +1325,74 @@ test("PaperclipRecoveryHorizonNoWakeToCurrentOwner{Elevated,Sustained} key on th
     "alert names must be current-owner-scoped, not bare NeverDelivered",
   );
 });
+
+test("PaperclipCrashRecoveryCandidateIndex{Missing,Unobservable} distinguish a missing index from an unreadable catalog (BLO-21526)", () => {
+  // Migration 0226 records COMPLETE on a populated database without building
+  // its deferred CREATE INDEX CONCURRENTLY, and its RAISE NOTICE is swallowed
+  // by the production client. paperclip_crash_recovery_candidate_index_present
+  // is the only channel that states presence out loud; these two rules are
+  // what make it actionable. They are a PAIR and neither covers the other's
+  // case, so assert both.
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  const [, missingExpr] = rendered.match(
+    /alert: PaperclipCrashRecoveryCandidateIndexMissing[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(missingExpr, "index-missing alert must render an expr");
+
+  // `== 0` is the real-absence arm. It can only fire while the series exists,
+  // which is precisely why the companion below is required rather than
+  // optional.
+  assert.match(
+    missingExpr,
+    /paperclip_crash_recovery_candidate_index_present\)? == 0/,
+    "the missing-index arm must key on the gauge reading 0, not on its absence",
+  );
+
+  const [, absentExpr] = rendered.match(
+    /alert: PaperclipCrashRecoveryCandidateIndexUnobservable[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(absentExpr, "index-unobservable alert must render an expr");
+
+  // The load-bearing assertion, and the same invariant
+  // PaperclipPluginStatusCollectorAbsent carries. The gauge is CLEARED, not
+  // zeroed, when the catalog probe throws — so on an unreadable catalog the
+  // `== 0` rule above has no series to compare and is structurally silent,
+  // which on a dashboard is indistinguishable from a present, healthy index.
+  // absent_over_time() is the required primitive because it is TRUE on an
+  // empty range; instant `absent()` under a `for:` window is entangled with
+  // Prometheus's lookback delta, and no threshold form can represent absence
+  // at all.
+  assert.match(
+    absentExpr,
+    /absent_over_time\(\s*paperclip_crash_recovery_candidate_index_present\s*\[\d+[smh]\]\s*\)/,
+    'absence must be absent_over_time(<gauge>[window]) so it is TRUE on an empty range',
+  );
+
+  // The window debounces rolling restarts, so a `for:` on top would silently
+  // double the detection delay and re-introduce the lookback entanglement the
+  // range form exists to avoid.
+  //
+  // Scope the search to THIS alert's own block before asserting absence. A
+  // lazy `[\s\S]*?` against the whole document just expands until it finds a
+  // `for:` in some later alert, so the naive form fails on a correct chart —
+  // and would equally have passed on a broken one for the wrong reason.
+  const [, unobservableBlock] = rendered.match(
+    /(alert: PaperclipCrashRecoveryCandidateIndexUnobservable[\s\S]*?)(?=\n\s+- alert:|\n\s+- name:|$)/,
+  ) ?? [];
+  assert.ok(unobservableBlock, "index-unobservable alert must render a block");
+  assert.doesNotMatch(
+    unobservableBlock,
+    /\n\s+for:/,
+    "absent_over_time already debounces via its range; an additional for: is redundant and misleading",
+  );
+
+  // A responder who reads "cannot observe" as "probably fine" reproduces the
+  // exact silent-on-healthy defect this issue closed, so the text must refuse
+  // that reading rather than merely imply it.
+  assert.match(
+    rendered,
+    /alert: PaperclipCrashRecoveryCandidateIndexUnobservable[\s\S]*?description: "[^"]*NOT evidence the index is healthy[^"]*"/,
+    "the unobservable alert must state that absence is not health",
+  );
+});

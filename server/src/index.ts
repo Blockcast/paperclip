@@ -356,11 +356,19 @@ export async function startServer(): Promise<StartedServer> {
     // index (BLO-21526 — migration 0226), so an unchanged migration state is
     // not evidence the index exists. Failure here fails startup, so a deploy
     // that skips the online build fails visibly instead of silently.
+    // Logged unconditionally, including "already-valid" (BLO-21526): logging
+    // only when the guard *changed* something reproduces the very defect this
+    // guard replaced — a healthy verified index and a step that never ran both
+    // emit nothing, so the deployed index state is unreadable. One line per
+    // startup per listed index makes `kubectl logs` a standing index-presence
+    // receipt, which is the only runtime check available to an identity with no
+    // database query channel.
     const indexResults = await ensurePendingConcurrentIndexes(connectionString);
     for (const result of indexResults) {
-      if (result.action !== "already-valid") {
-        logger.info({ index: result.name, table: result.table, action: result.action }, `${label}: built deferred index`);
-      }
+      logger.info(
+        { index: result.name, table: result.table, action: result.action },
+        `${label}: deferred index ${result.name} is ${result.action}`,
+      );
     }
 
     return summary;
