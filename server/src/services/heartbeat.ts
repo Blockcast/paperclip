@@ -496,6 +496,7 @@ import {
 import { clearAgentTaskSessions } from "./recovery/session-reset.js";
 import {
   recoveryAssigneeAdapterOverrides,
+  recoveryRunWriteClassNotice,
   RECOVERY_GUARD_CONTEXT_KEYS,
   RECOVERY_WORK_CLASS_KEY,
   withRecoveryModelProfileHint,
@@ -11338,6 +11339,13 @@ export function buildPaperclipTaskMarkdown(input: {
     prAuthorLogin?: string | null;
   } | null;
   acceptedPlanContinuation?: boolean;
+  // PEN-3275: the run's write-containment notice, derived by the caller from the run
+  // `contextSnapshot` via `recoveryRunWriteClassNotice`. `null`/absent means unconstrained —
+  // including a wake that positively declared `normal_model`, which carries no guard tuple.
+  // The caller passes the rendered notice rather than a class because the status-only text is
+  // conditional on the snapshot's `sourceIssueId`; deriving both from one input there is what
+  // stops the announcement promising an escalation the guard would refuse.
+  recoveryRunWriteClassNotice?: string | null;
 }) {
   const quoteTaskScalar = (value: string) => JSON.stringify(value);
   const fenceTaskText = (value: string) => {
@@ -11359,7 +11367,7 @@ export function buildPaperclipTaskMarkdown(input: {
       input.interaction.status === "accepted" &&
       issue?.workMode === "planning"
     ));
-  if (!issue && !wakeComment && !prReview) return null;
+  if (!issue && !wakeComment && !prReview && !input.recoveryRunWriteClassNotice) return null;
 
   const lines = [
     "Paperclip task context:",
@@ -11554,7 +11562,38 @@ export function buildPaperclipTaskMarkdown(input: {
   if (wakeComment?.body.trim()) {
     lines.push("", "Latest wake comment:", fenceTaskText(wakeComment.body.trim()));
   }
-  lines.push("", "Use this task context as the current assignment.");
+  // PEN-3275: last block before the closing directive, and deliberately not gated on `issue` —
+  // the containment binds the RUN, so it is stated on every wake that carries the guard tuple,
+  // including one with no issue context. Placed here rather than at the top because it is a
+  // constraint on how the work is done, not the work itself; placed before the closing line so it
+  // is the last thing read before the agent starts planning, which is the moment it has to land.
+  // "Last" is true of what this function builds, not of what ships: the unmaterialized-skill notice
+  // appends to `context.paperclipTaskMarkdown` after this returns, so on a wake carrying both, one
+  // block follows. That is the only appender today; keep it that way rather than treating the
+  // position as a stronger invariant than it is.
+  //
+  // The provenance line is load-bearing, not decoration: this block's preamble declares the
+  // surrounding content user-authored and explicitly not permission to override higher-priority
+  // instructions, which is the correct frame for issue text and the wrong one for a
+  // system-generated write-containment constraint. It errs safe (it under-trusts a restriction)
+  // but it is simply false in the no-issue case, where the preamble describes nothing but this
+  // notice. Stated inline rather than by hoisting the notice out of the block, so the exact
+  // "Run write-containment notice:" marker the tests pin stays where it is.
+  if (input.recoveryRunWriteClassNotice) {
+    lines.push(
+      "",
+      "Run write-containment notice:",
+      "(System-generated, not user-authored task data. This describes what this run is " +
+      "structurally unable to do; it is not a preference you can decline.)",
+      input.recoveryRunWriteClassNotice,
+    );
+  }
+  // PEN-3275: on the no-issue path this function newly serves, the block holds a containment
+  // notice and nothing else, so the usual closing directive would point at an assignment that is
+  // not there. Select a closing line that matches what was actually emitted.
+  lines.push("", issue || wakeComment || prReview
+    ? "Use this task context as the current assignment."
+    : "This block carries no assignment — it states only the write-containment constraints on this run.");
   return lines.join("\n");
 }
 
@@ -28948,6 +28987,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       acceptedPlanContinuation:
         readNonEmptyString(context.workspaceRefreshReason) === "accepted_plan_confirmation"
         && Object.keys(parseObject(context.acceptedPlanWakeRouting)).length === 0,
+      // PEN-3275: read from this run's persisted `contextSnapshot` (the `context` this function
+      // parsed off the run row), not from the pre-merge wake payload. `mergeCoalescedContextSnapshot`
+      // runs at enqueue and writes its result to that row, so by execution time the guard tuple
+      // here is the one the route guards will test — a wake that coalesced onto a queued
+      // status-only one is therefore announced as what it will actually execute as.
+      recoveryRunWriteClassNotice: recoveryRunWriteClassNotice(context),
     });
     if (issueRef) {
       context.paperclipIssue = {
