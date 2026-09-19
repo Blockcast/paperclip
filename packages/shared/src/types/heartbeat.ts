@@ -124,10 +124,14 @@ export interface HeartbeatRun {
   processPid: number | null;
   processGroupId?: number | null;
   processStartedAt: Date | null;
-  // First byte this run emitted, vs `lastOutputAt` which advances on every
-  // flush. NULL means it never emitted anything -- which is the interesting
-  // case: it distinguishes a run that went quiet from one that never spoke.
-  // See migration 0245 for why the reaper's silence floor needs this.
+  // First progress-counting output this run emitted, vs `lastOutputAt` which
+  // advances on every flush. NULL means it never emitted progress-counting
+  // output -- NOT that it emitted nothing. Synthetic keepalive/reattach chunks
+  // are excluded here but still land in the log store, so `logBytes > 0` with
+  // this NULL means keepalive-only (a Job reporting itself alive), not silent.
+  // The distinction is the interesting one: it separates a run that went quiet
+  // from one that never spoke. See migration 0245 for why the reaper's silence
+  // floor needs this, and why conflating the two would be unsafe.
   firstOutputAt: Date | null;
   lastOutputAt: Date | null;
   lastOutputSeq: number;

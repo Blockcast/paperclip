@@ -133,12 +133,35 @@ describeEmbeddedPostgres("heartbeat run first_output_at", () => {
     // `firstOutputAt: heartbeatRuns.firstOutputAt` is the SELECT-projection
     // form and is excluded deliberately — it reads the column, it does not
     // write it. Every OTHER assignment is a write and must be write-once.
-    const heartbeatSource = await fs.readFile(
-      path.join(path.dirname(fileURLToPath(import.meta.url)), "../services/heartbeat.ts"),
-      "utf8",
+    //
+    // Scans ALL of server/src, not just heartbeat.ts: a second write site
+    // added in any other file is exactly the regression this guards against,
+    // and pinning one path let it through silently. Test files are skipped
+    // because this asserts about production code — and because this file's own
+    // regex literals would otherwise match themselves.
+    const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const sources: string[] = [];
+    const walk = async (dir: string): Promise<void> => {
+      for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === "__tests__" || entry.name === "node_modules") continue;
+          await walk(full);
+        } else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts")) {
+          sources.push(await fs.readFile(full, "utf8"));
+        }
+      }
+    };
+    await walk(root);
+
+    // `[^\n]+`, not `[^,\n]+`: stopping at the first comma truncated the match
+    // to `firstOutputAt: sql\`COALESCE(${heartbeatRuns.firstOutputAt}`, which
+    // contained "COALESCE" only because COALESCE happens to precede that
+    // comma. A write whose COALESCE came later would have passed.
+    const all = sources.flatMap((src: string) => src.match(/firstOutputAt:\s*[^\n]+/g) ?? []);
+    const projections = all.filter((a: string) =>
+      /^firstOutputAt:\s*heartbeatRuns\.firstOutputAt,?$/.test(a.trim()),
     );
-    const all = heartbeatSource.match(/firstOutputAt:\s*[^,\n]+/g) ?? [];
-    const projections = all.filter((a: string) => /^firstOutputAt:\s*heartbeatRuns\.firstOutputAt$/.test(a.trim()));
     const writes = all.filter((a: string) => !projections.includes(a));
 
     expect(all.length).toBeGreaterThan(0);
