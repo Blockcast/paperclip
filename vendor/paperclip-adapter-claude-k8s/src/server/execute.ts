@@ -33,6 +33,7 @@ import {
   type JobIsolation,
 } from "./job-manifest.js";
 import type * as k8s from "@kubernetes/client-node";
+import { PatchStrategy, setHeaderOptions } from "@kubernetes/client-node";
 
 const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
@@ -690,11 +691,67 @@ export async function createOrAdoptRunSecret(
         );
       }
 
-      await coreApi.replaceNamespacedSecret({
-        namespace: input.namespace,
-        name: input.name,
-        body: { ...body, metadata: { ...body.metadata, resourceVersion: existing.metadata?.resourceVersion } },
-      });
+      try {
+        // A merge PATCH, not `replaceNamespacedSecret`.  A replace is a PUT,
+        // i.e. the `update` verb, which `deploy/helm/paperclip/templates/
+        // role.yaml` did not grant — so the replace this call used to make was
+        // refused 403 on *every* collision, deterministically, before it could
+        // ever reach the races guarded below (BLO-32424).
+        //
+        // That 403 is no longer live: #1837 added `update` to that Role on
+        // 2026-09-16, and SSAR against `system:serviceaccount:paperclip:
+        // paperclip` in ns `paperclip` now reports it allowed.  This call stays
+        // a PATCH anyway because `patch` was already granted *before* #1837 —
+        // *this adapter* needs no widened verb.  Whether the grant is now
+        // retirable outright is a separate question and NOT settled here: the
+        // sandbox-provider plugin's PUT at `packages/plugins/sandbox-providers/
+        // kubernetes/src/secret-manager.ts:108` runs under the same service
+        // account but in a *tenant* namespace, which that release-namespace
+        // Role never covered, so it neither justifies nor blocks retirement.
+        // Tracked as BLO-34510; see the justification block in
+        // `deploy/helm/paperclip/templates/role.yaml` for what was measured.
+        //
+        // Merge semantics are also the closer fit for what adoption means here:
+        // assert this run's keys and labels.  Unlike a PUT, a merge leaves
+        // pre-existing `data` keys in place.  That is only reachable for the
+        // env Secret — `prompt.txt` and `mcp.json` each carry a single fixed
+        // key, so they have no variable key set to strand — and the env Secret
+        // is consumed per-key via `secretKeyRef`, never as a whole-Secret
+        // envFrom, so a key left behind by an older adapter build is inert to
+        // the container.  The residual is hygiene only: such a key survives at
+        // rest until the finally-block delete or ownerReference GC.
+        // `resourceVersion` is still carried, so a concurrent writer is still
+        // surfaced as a 409 instead of being silently clobbered.
+        await coreApi.patchNamespacedSecret(
+          {
+            namespace: input.namespace,
+            name: input.name,
+            body: { ...body, metadata: { ...body.metadata, resourceVersion: existing.metadata?.resourceVersion } },
+          },
+          setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+        );
+      } catch (writeErr) {
+        // 404: the reaper freed the name between our read and this write, so
+        // the name is takeable again — go re-create.  409: `resourceVersion`
+        // went stale under a concurrent writer — go re-read.  Both route back
+        // through the loop's existing bound rather than adding a third code
+        // path, so the retry budget is unchanged.  Note `continue` re-enters at
+        // this loop's `createNamespacedSecret`, not at the read: on the 409
+        // path that create 409s again and *that* is what reaches the re-read.
+        // One doomed create per stale-version retry is the price of not adding
+        // a third path.
+        if (!isK8s404(writeErr) && !isK8s409(writeErr)) throw writeErr;
+        if (attempt === 0) continue;
+        // Twice in a row means something is actively churning this name.
+        // Surface the original 409, matching the read-404 branch above — AC3
+        // pins that identity, and the caller classifies on it.  Carry the
+        // adoption failure as its `cause` so the diagnostic that says *which*
+        // mode was churning (404 reaper vs 409 concurrent writer) is not lost;
+        // same idiom as the read branch above, and it does not require
+        // threading a logger into this helper.
+        (err as { cause?: unknown }).cause ??= writeErr;
+        throw err;
+      }
       return "adopted";
     }
   }
@@ -1997,6 +2054,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     // Attach ownerReference so K8s GC cleans up the Secret(s) if the process
     // crashes before the finally block runs.
+    //
+    // These three bodies are JSON Patch arrays, and their Content-Type is
+    // stated explicitly rather than inherited.  The generated client picks the
+    // first entry of its accepted-media-type list via
+    // `ObjectSerializer.getPreferredMediaType`, which happens to be
+    // `application/json-patch+json` — so the default is load-bearing here, and
+    // a client-version change that reorders that list would break all three
+    // silently.  The adoption write at `createOrAdoptRunSecret` sets its own
+    // MergePatch header, so leaving these implicit would also make them the
+    // only unstated patch content-type in this file.
     if (promptSecret && createdJobUid) {
       try {
         await coreApi.patchNamespacedSecret({
@@ -2017,7 +2084,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               ],
             },
           ],
-        });
+        }, setHeaderOptions("Content-Type", PatchStrategy.JsonPatch));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on prompt Secret: ${msg}\n`);
@@ -2043,7 +2110,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               ],
             },
           ],
-        });
+        }, setHeaderOptions("Content-Type", PatchStrategy.JsonPatch));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on env Secret: ${msg}\n`);
@@ -2069,7 +2136,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               ],
             },
           ],
-        });
+        }, setHeaderOptions("Content-Type", PatchStrategy.JsonPatch));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on mcp-config Secret: ${msg}\n`);

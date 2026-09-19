@@ -68,23 +68,53 @@ rules:
   # mid-run (claude-k8s execute.js:884, opencode-k8s execute.js:1052) —
   # `patch` is NOT in either adapter's SSAR self-test.
   #
-  # `update` (BLO-31665 / PEN-3041) — required by createOrAdoptRunSecret in
-  # vendor/paperclip-adapter-claude-k8s/src/server/execute.ts. On a create 409
-  # it reads the colliding Secret, checks its run-id/managed-by labels, then
-  # calls replaceNamespacedSecret — a PUT, which the RBAC authorizer maps to
-  # `update`, not to the `patch` granted above. Without this verb the adopt
-  # path 403s and the run dies anyway, so the #1678 fix for the intermittent
-  # (~1 in 40 runs) Secret collision is present but inert: it converts an
-  # AlreadyExists failure into a Forbidden one. Measured in prod 2026-09-13 —
-  # 7 runs across 4 agents in one 7h window, all on
-  # `cannot update resource "secrets"`.
+  # `update` (BLO-31665 / PEN-3041) — the RBAC authorizer maps a PUT
+  # (`replaceNamespacedSecret`) to `update`, not to the `patch` granted above,
+  # so any Secret-adoption path that re-derives the whole object needs it.
+  # Originally added for createOrAdoptRunSecret in the claude-k8s adapter, which
+  # was 403ing on every collision: the #1678 fix for the intermittent (~1 in 40
+  # runs) Secret collision was present but inert, converting an AlreadyExists
+  # failure into a Forbidden one. Measured in prod 2026-09-13 — 7 runs across 4
+  # agents in one 7h window, all on `cannot update resource "secrets"`.
   #
-  # `replace` is deliberate upstream, not an oversight to paper over with
-  # `patch`: it re-derives the full Secret body and carries the existing
-  # resourceVersion as an optimistic-concurrency precondition. A strategic-merge
-  # patch would leave stale keys from the prior attempt and drop that guard.
-  # Granting `update` beside the `create`+`delete` already held is not a
-  # privilege increase — the same end state is reachable by delete-then-create.
+  # As of BLO-32424 that adapter call site is a merge PATCH, and `patch` was
+  # already granted — so no in-release-namespace consumer of `update` is known
+  # to remain. Also checked: the claude-k8s SSAR self-test probes only secrets
+  # create/delete/get (src/server/test.ts:85-94), and the opencode-k8s adapter
+  # at the pinned ref (OPENCODE_K8S_REF, Dockerfile:396) has no
+  # replaceNamespacedSecret and no PUT anywhere in its source.
+  #
+  # The one in-tree `replaceNamespacedSecret` left does NOT justify this grant,
+  # because it never runs in this namespace:
+  # packages/plugins/sandbox-providers/kubernetes/src/secret-manager.ts:108 is
+  # reached only from createPerRunSecret at plugin.ts:318, and plugin.ts:208
+  # binds that namespace to deriveTenantNamespace() unconditionally on the
+  # acquire-lease path — so the PUT targets the tenant namespace
+  # `{namespacePrefix}{companySlug}` (default prefix `paperclip-`, types.ts:12).
+  # This Role is namespace-scoped to the release namespace and authorizes
+  # nothing there. Measured, not inferred: SSAR for this service account reads
+  # allowed on every secrets verb in ns `paperclip` and denied on all of them in
+  # every `paperclip-*` namespace (BLO-34298).
+  #
+  # `update` is therefore a candidate for retirement, deliberately NOT retired
+  # here — dropping a standing grant is a stated decision with its own
+  # verification, and the opencode-k8s half of the evidence above holds only at
+  # the current pin. Tracked as BLO-34510, which carries the pin-bump guard that
+  # has to land with the removal. Do not retire it as a cleanup step.
+  #
+  # `replace` in that plugin is deliberate, not an oversight to paper over with
+  # `patch`: it re-derives the full Secret body, so a shrinking key set is
+  # actually removed. A merge patch leaves stale keys from the prior attempt —
+  # which matters for that plugin because it consumes the Secret whole. (That is
+  # in-tree Blockcast code under packages/, not vendored upstream, so it is a
+  # design choice open to revisiting, not an external constraint.) It does NOT
+  # cost the optimistic-concurrency guard: a merge patch carries
+  # `resourceVersion` in the body just as a PUT does (the adapter's does — see
+  # the patchNamespacedSecret body in createOrAdoptRunSecret, execute.ts; cited
+  # by symbol because a line number here drifts every time that file is edited).
+  # Granting `update` beside the `create`+`delete` already held
+  # is not a privilege increase — the same end state is reachable by
+  # delete-then-create.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create", "delete", "get", "patch", "update"]
