@@ -41,6 +41,11 @@ const mockCorePatchSecret = vi.fn();
 function adoptPatchCalls(): { name: string; body: { metadata?: { resourceVersion?: string } } }[] {
   return mockCorePatchSecret.mock.calls.map((c) => c[0]).filter((arg) => !Array.isArray(arg?.body));
 }
+
+/** The complement of `adoptPatchCalls()` — the JSON Patch *array* writes. */
+function ownerRefPatchCalls(): [{ name: string; body: unknown[] }, { middleware: { pre: (c: unknown) => void }[] }][] {
+  return mockCorePatchSecret.mock.calls.filter((c) => Array.isArray(c[0]?.body)) as never;
+}
 const mockCoreDeleteSecret = vi.fn();
 // vi.hoisted ensures a single vi.fn() instance shared between the mock factory
 // (which runs at hoist time) and the test body (which calls mockResolvedValue).
@@ -1217,6 +1222,56 @@ describe("execute: job creation", () => {
     expect(result.errorCode).not.toBe("k8s_prompt_secret_create_failed");
     expect(adoptPatchCalls()).toHaveLength(1);
     expect(mockBatchCreateJob).toHaveBeenCalled();
+  });
+
+  it("states the JSON Patch Content-Type explicitly on every ownerReference attach", async () => {
+    // Ally review suggestion on #1873. Adoption sets its Content-Type
+    // explicitly; these three attaches used to inherit the client's default.
+    // That default is load-bearing and invisible: the generated client picks
+    // the FIRST entry of its accepted-media-type list via
+    // `ObjectSerializer.getPreferredMediaType`, which is currently
+    // `application/json-patch+json` — so a client-version bump that reorders
+    // that list would send these array bodies as a merge patch, and the API
+    // would reject them, with no diff anywhere in this repo.
+    //
+    // `adoptPatchCalls()` discriminates on body shape, so it cannot see this
+    // regression; only reading the header can. Drop the explicit argument and
+    // `options` is undefined here, so this fails.
+    // The launch outcome is deliberately not asserted: the attaches happen
+    // immediately after the Job create, and this fixture goes on to fail pod
+    // scheduling. What matters is the header on the writes that did happen.
+    await execute(largePromptCtx());
+
+    const calls = ownerRefPatchCalls();
+    expect(calls.length).toBeGreaterThan(0);
+
+    for (const [, options] of calls) {
+      const headers: Record<string, string> = {};
+      for (const mw of options.middleware) {
+        mw.pre({ setHeaderParam: (k: string, v: string) => void (headers[k] = v) } as never);
+      }
+      expect(headers["Content-Type"]).toBe("application/json-patch+json");
+    }
+  });
+
+  it("carries an explicit JSON Patch Content-Type on ALL THREE ownerReference attaches", async () => {
+    // The runtime test above reaches only two of the three. `mcpConfigSecret`
+    // is unreachable in this suite by construction: line 14 pins
+    // PAPERCLIP_SHARED_MCP_BASELINE_PATH to "" so buildJobManifest() never
+    // stages an mcp Secret here. Mutation-testing confirmed it — reverting the
+    // prompt or env attach reddens the test above, reverting the mcp attach
+    // does not. So that one needs a static pin, in the style BLO-33894 used
+    // for the 2>&1-free tee pipeline.
+    //
+    // Counts rather than positions, so the pin survives the call sites moving.
+    // `patchNamespacedSecret({` is the single-argument-object call shape the
+    // three attaches share; the adoption write opens its argument list on the
+    // next line and so is deliberately not counted.
+    const src = await readFile(new URL("./execute.ts", import.meta.url), "utf8");
+    const attaches = src.match(/patchNamespacedSecret\(\{/g) ?? [];
+    const explicit = src.match(/PatchStrategy\.JsonPatch/g) ?? [];
+    expect(attaches).toHaveLength(3);
+    expect(explicit).toHaveLength(attaches.length);
   });
 
   it("re-creates when the leftover Secret is deleted between create and read", async () => {
