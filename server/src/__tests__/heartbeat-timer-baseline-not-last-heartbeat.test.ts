@@ -161,7 +161,11 @@ describeEmbeddedPostgres("timer baseline is the last timer tick, not the last ru
       requestedAt: new Date("2026-09-19T09:00:00.000Z"),
     });
 
-    const result = await heartbeatService(db).tickTimers(now);
+    // This is the only case here that actually enqueues, so it is the only one
+    // whose dispatch would keep writing heartbeat_run_events after the body
+    // returns and race afterEach. The assertion below never depended on the
+    // run being dispatched -- only on the scheduling decision.
+    const result = await heartbeatService(db, { skipQueuedRunDispatch: true }).tickTimers(now);
 
     // Pre-fix this read `{ checked: 1, enqueued: 0 }` -- the fresh
     // `lastHeartbeatAt` swallowed the tick. Deleting the baseline change must
@@ -189,7 +193,7 @@ describeEmbeddedPostgres("timer baseline is the last timer tick, not the last ru
       requestedAt: new Date("2026-09-19T10:59:00.000Z"),
     });
 
-    const result = await heartbeatService(db).tickTimers(now);
+    const result = await heartbeatService(db, { skipQueuedRunDispatch: true }).tickTimers(now);
 
     expect(result).toMatchObject({ enqueued: 0 });
     expect(await countTimerWakeups(agentId)).toBe(1);
@@ -210,7 +214,7 @@ describeEmbeddedPostgres("timer baseline is the last timer tick, not the last ru
     // has been pruned. Old behaviour must be preserved rather than firing
     // immediately on an empty history.
 
-    const result = await heartbeatService(db).tickTimers(now);
+    const result = await heartbeatService(db, { skipQueuedRunDispatch: true }).tickTimers(now);
 
     expect(result).toMatchObject({ enqueued: 0 });
     expect(await countTimerWakeups(agentId)).toBe(0);
