@@ -6147,13 +6147,13 @@ export function resolveLedgerCostStatus(input: {
   costUsd: number | null | undefined;
   inputTokens: number;
   cachedInputTokens: number;
-  cacheCreationInputTokens?: number;
+  cacheCreationInputTokens: number;
   outputTokens: number;
 }): CostStatus {
   const hasTokenUsage =
     input.inputTokens > 0 ||
     input.cachedInputTokens > 0 ||
-    (input.cacheCreationInputTokens ?? 0) > 0 ||
+    input.cacheCreationInputTokens > 0 ||
     input.outputTokens > 0;
   return input.costUsd == null && hasTokenUsage ? "unpriced" : "reported";
 }
