@@ -119,8 +119,11 @@ import { maskProjectEnv } from "./project-env-response.js";
  *    caller already holds, while `cleanup_command` is the operator's own string.
  *  - `ExecutionWorkspaceStrategy.type` / `.runScope` — closed enums. `.baseRef` / `.branchTemplate`
  *    are git refs and templates the branch-naming UI renders and the agent needs to name its branch.
- *  - `stdoutExcerpt` / `stderrExcerpt` / `logRef` on operations — command *output*, not a copy of a
- *    declared-withheld value (CTO Ruling F §4, BLO-33407). Unchanged by this ticket.
+ *  - `logRef` / `logStore` on operations — opaque handles, and the route they point at
+ *    (`/workspace-operations/:id/log`) withholds its content on the same entitlement as of
+ *    BLO-34631. `stdoutExcerpt` / `stderrExcerpt` used to sit on this list on the "command output,
+ *    not a copy of a declared-withheld value" reading (CTO Ruling F §4, BLO-33407); BLO-34631
+ *    surveyed the consumers, found no agent or viewer flow that needs them, and withholds them.
  *
  * ### PEN-3252 — the bypass this module recorded as open, now closed
  *
@@ -444,9 +447,25 @@ export function publicRuntimeServices(
  * unentitled operator must still be able to see that an operation ran and how it ended — withholding
  * the operator's text is the point, hiding the fact of execution is not.
  *
- * `stdoutExcerpt` / `stderrExcerpt` / `logRef` are deliberately NOT withheld here. They are command
- * *output*, not a copy of a declared-withheld value, so they sit on the far side of BLO-33568's rule
- * and are a product decision rather than a projection bug (CTO Ruling F §4, BLO-33407).
+ * `stdoutExcerpt` / `stderrExcerpt` are withheld too, as of BLO-34631, and that is a measurement
+ * rather than a symmetry argument. They are command *output*, so they are not a copy of a
+ * declared-withheld value — but the output of a withheld command discloses the command: shells
+ * echo, `npm` prints the script it runs, `set -x` prints everything, and the only control standing
+ * over the bytes is the write-time `redactSensitiveText` heuristic, which matches env-dump
+ * assignments, JSON secret fields and URI credentials and nothing else. Host paths, repo layout
+ * and an operator's `cleanupCommand` cross it intact.
+ *
+ * The consumer survey that decides it (BLO-34631 AC 3): every reader of these two fields and of
+ * `/workspace-operations/:id/log` is a human UI or CLI surface — `ui/src/pages/AgentDetail.tsx`,
+ * `ui/src/pages/ExecutionWorkspaceDetail.tsx`, and `paperclip run workspace-log`. There is no agent
+ * consumer, no MCP tool and no server-internal read. `workspace_runtime:read` is granted by
+ * `allow_simple_company_member` to every non-viewer board member, so all three surfaces keep the
+ * raw value for the humans that use them; what loses it is the actor class PEN-2852 built the
+ * entitlement to exclude — same-company agents, viewers, low-trust principals and bridge keys.
+ *
+ * `logRef` / `logStore` stay: they are opaque handles, and the route they point at now withholds
+ * the content on this same entitlement. Masking a pointer while its route still served the bytes
+ * would have been theatre.
  */
 export function publicWorkspaceOperation(
   operation: WorkspaceOperation,
@@ -457,6 +476,8 @@ export function publicWorkspaceOperation(
     ...operation,
     command: maskWorkspaceRuntimeTextForRead(operation.command),
     cwd: maskWorkspaceRuntimeTextForRead(operation.cwd),
+    stdoutExcerpt: maskWorkspaceRuntimeTextForRead(operation.stdoutExcerpt),
+    stderrExcerpt: maskWorkspaceRuntimeTextForRead(operation.stderrExcerpt),
     metadata: maskWorkspaceRuntimeForRead(operation.metadata) as Record<string, unknown> | null,
   };
 }

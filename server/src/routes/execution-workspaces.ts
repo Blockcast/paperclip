@@ -162,10 +162,11 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     const operations = await workspaceOperationsSvc.listForExecutionWorkspace(id);
     const viewer = await resolveWorkspaceRuntimeViewer(access, req, workspace.companyId);
     // PEN-3205: same username censoring as the sibling list route on `routes/agents.ts`. Both
-    // answer with the same historical `WorkspaceOperation` rows including `stdoutExcerpt` /
-    // `stderrExcerpt`, which `publicWorkspaceOperation` deliberately does NOT withhold, so
-    // censoring on one route and not the other left the same bytes legible one URL over.
-    // New rows are censored at write time as well; this still covers rows stored before that.
+    // answer with the same historical `WorkspaceOperation` rows, so censoring on one route and not
+    // the other left the same bytes legible one URL over. New rows are censored at write time as
+    // well; this still covers rows stored before that. (BLO-34631 additionally withholds
+    // `stdoutExcerpt` / `stderrExcerpt` from an unentitled reader inside
+    // `publicWorkspaceOperation`; the censor below is what stands over them for an entitled one.)
     res.json(redactCurrentUserValue(
       publicWorkspaceOperations(operations, viewer),
       await getCurrentUserRedactionOptions(),

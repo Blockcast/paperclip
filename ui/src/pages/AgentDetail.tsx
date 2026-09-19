@@ -553,7 +553,14 @@ function WorkspaceOperationLogViewer({
             </div>
           )}
           {!isLoading && !error && chunks.length === 0 && (
-            <div className="text-xs text-muted-foreground">No persisted log lines.</div>
+            <div className="text-xs text-muted-foreground">
+              {/* BLO-34631: the API masks withheld log content rather than emptying it, so the
+                  viewer has to tell the two apart — `parseStoredLogContent` yields no chunks for
+                  either. */}
+              {logData?.content === REDACTED_ENV_VALUE
+                ? "Log content withheld — requires workspace runtime access."
+                : "No persisted log lines."}
+            </div>
           )}
           {chunks.length > 0 && (
             <div className="max-h-64 overflow-y-auto rounded bg-neutral-100 p-2 font-mono text-xs dark:bg-neutral-950">

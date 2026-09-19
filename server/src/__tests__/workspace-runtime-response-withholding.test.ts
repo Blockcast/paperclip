@@ -57,6 +57,14 @@ const OPERATION_CWD_SENTINEL = "/fixture/sentinel-operation-cwd";
 const OPERATION_METADATA_SENTINEL = "/fixture/sentinel-operation-worktree-path";
 
 /**
+ * BLO-34631. Command *output*, and distinct from the `command` sentinel on purpose: the whole
+ * question this ticket settled is whether withholding the command while disclosing its output is a
+ * boundary or a gap, so an assertion has to name which of the two it closed. Both invented.
+ */
+const OPERATION_STDOUT_SENTINEL = "sentinel-operation-stdout-must-not-egress";
+const OPERATION_STDERR_SENTINEL = "sentinel-operation-stderr-must-not-egress";
+
+/**
  * PEN-3073. The lifecycle command scalars that sit BESIDE `workspaceRuntime` on the same config
  * object, and their siblings on the three nouns that carry the same strings elsewhere. Each gets its
  * own sentinel for the reason stated above: a passing assertion has to name the exit it closed.
@@ -840,10 +848,38 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
     });
 
     /**
-     * PEN-3205, read side. `publicWorkspaceOperation` masks `command`/`cwd`/`metadata` and spreads
-     * the rest, so `stdoutExcerpt` crosses this route UNMASKED by design — the username censor is
-     * the only control standing over it here, and `routes/agents.ts` was already applying it on
-     * the sibling list route while this one answered with a bare `res.json`.
+     * BLO-34631. `stdoutExcerpt` / `stderrExcerpt` used to ride the spread in
+     * `publicWorkspaceOperation` on the "command output is not a copy of a declared-withheld value"
+     * reading. The output of a withheld command discloses the command — shells echo, `set -x`
+     * prints everything — and the write-time scrub is a heuristic secret matcher, not a boundary.
+     * The consumer survey found no agent or viewer flow that needs the raw value, so they are
+     * withheld on the same entitlement as `command`/`cwd`.
+     */
+    it("withholds the operation excerpts from a reader without workspace_runtime:read", async () => {
+      mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
+        workspaceOperationFixture({
+          stdoutExcerpt: OPERATION_STDOUT_SENTINEL,
+          stderrExcerpt: OPERATION_STDERR_SENTINEL,
+        }),
+      ]);
+
+      const res = await request(createApp("execution-workspaces")).get(
+        "/api/execution-workspaces/workspace-1/workspace-operations",
+      );
+
+      expect(res.status).toBe(200);
+      expect(JSON.stringify(res.body)).not.toContain(OPERATION_STDOUT_SENTINEL);
+      expect(JSON.stringify(res.body)).not.toContain(OPERATION_STDERR_SENTINEL);
+      // Masked, not dropped — withheld-is-not-absent, same contract as `publicRuntimeServices`.
+      expect(res.body[0].stdoutExcerpt).toBe(REDACTED_EVENT_VALUE);
+      expect(res.body[0].stderrExcerpt).toBe(REDACTED_EVENT_VALUE);
+      // `logRef` / `logStore` stay: opaque handles, and their route withholds the content itself.
+      expect(res.body[0].logBytes).toBe(4096);
+    });
+
+    /**
+     * PEN-3205, read side, now scoped to the entitled reader (BLO-34631 masks the excerpt for an
+     * unentitled one, so this case would pass for the wrong reason without the grant).
      *
      * The home directory comes from `os.homedir()` rather than a literal because that is the same
      * value `defaultHomeDirs` derives its (module-cached) candidate list from, so this is
@@ -852,6 +888,7 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
      * dropped from the route, and neither passes if it is replaced by blanket blanking.
      */
     it("censors the current user's home directory in the excerpt when the setting is on", async () => {
+      decideAsRuntimeManager();
       mockInstanceGeneralSettings.censorUsernameInLogs = true;
       const homeDir = os.homedir();
       mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
@@ -870,6 +907,7 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
     });
 
     it("leaves the excerpt alone when the setting is off", async () => {
+      decideAsRuntimeManager();
       mockInstanceGeneralSettings.censorUsernameInLogs = false;
       const homeDir = os.homedir();
       mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
