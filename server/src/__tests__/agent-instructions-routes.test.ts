@@ -37,6 +37,11 @@ const mockEnvironmentService = vi.hoisted(() => ({
   getById: vi.fn(),
 }));
 
+const mockCompanySkillService = vi.hoisted(() => ({
+  listRuntimeSkillEntries: vi.fn(),
+  resolveRequestedSkillEntries: vi.fn(async () => ({ entries: [], unresolved: [] })),
+}));
+
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockSyncInstructionsBundleConfigFromFilePath = vi.hoisted(() => vi.fn());
 const mockFindServerAdapter = vi.hoisted(() => vi.fn());
@@ -47,7 +52,7 @@ vi.mock("../services/index.js", () => ({
   accessService: () => mockAccessService,
   approvalService: () => ({}),
   builtInAgentService: () => mockBuiltInAgentService,
-  companySkillService: () => ({ listRuntimeSkillEntries: vi.fn() }),
+  companySkillService: () => mockCompanySkillService,
   budgetService: () => ({}),
   environmentService: () => mockEnvironmentService,
   heartbeatService: () => ({}),
@@ -79,7 +84,7 @@ function registerModuleMocks() {
     accessService: () => mockAccessService,
     approvalService: () => ({}),
     builtInAgentService: () => mockBuiltInAgentService,
-    companySkillService: () => ({ listRuntimeSkillEntries: vi.fn() }),
+    companySkillService: () => mockCompanySkillService,
     budgetService: () => ({}),
     heartbeatService: () => ({}),
     issueApprovalService: () => ({}),
@@ -205,6 +210,7 @@ describe("agent instructions bundle routes", () => {
     registerModuleMocks();
     vi.clearAllMocks();
     mockBuiltInAgentService.ensureCompanyDefaultAgentGrants.mockResolvedValue(0);
+    mockCompanySkillService.resolveRequestedSkillEntries.mockResolvedValue({ entries: [], unresolved: [] });
     mockSyncInstructionsBundleConfigFromFilePath.mockImplementation((_agent, config) => config);
     mockFindServerAdapter.mockImplementation((_type: string) => ({ type: _type }));
     mockAccessService.decide.mockResolvedValue({
@@ -570,5 +576,141 @@ describe("agent instructions bundle routes", () => {
     expect(res.body.adapterConfig.instructionsRootPath).toBeUndefined();
     expect(res.body.adapterConfig.instructionsEntryFile).toBeUndefined();
     expect(res.body.adapterConfig.instructionsFilePath).toBeUndefined();
+  });
+
+  // BLO-32332. The agent-actor instructions guard tested presence, not a diff,
+  // and `PATCH /agents/:id` runs it against the config it will persist — which
+  // shallow-merges onto the stored one to preserve exactly these keys. So every
+  // bundle-managed agent re-introduced all four keys into the guard and no
+  // agent-authored adapterConfig write of any shape could pass. Both directions
+  // are pinned here: a 200-only test would also pass on a deleted guard.
+  describe("agent-authenticated adapterConfig writes", () => {
+    const bundleManagedConfig = {
+      // `external`, and root/entry exactly dirname/basename of the file path,
+      // so the real sync below is a no-op on this fixture. A `managed` mode on
+      // a /tmp path would be internally inconsistent and the sync would rewrite
+      // it, which is a fixture artifact rather than anything under test.
+      instructionsBundleMode: "external",
+      instructionsRootPath: "/tmp/agent-1",
+      instructionsEntryFile: "AGENTS.md",
+      instructionsFilePath: "/tmp/agent-1/AGENTS.md",
+      model: "gpt-5.4",
+    };
+
+    function agentActor() {
+      return {
+        type: "agent",
+        agentId: "11111111-1111-4111-8111-111111111111",
+        companyId: "company-1",
+        runId: "run-1",
+      };
+    }
+
+    beforeEach(async () => {
+      // The rest of this file stubs the sync to identity, which would make the
+      // preservation assertions below a claim about the mock: in production the
+      // persisted value is the sync's *output*, and the sync is the step that
+      // re-derives these keys from `instructionsFilePath` + `cwd`. Run the real
+      // one here so the claim is load-bearing (it is pure, `(agent, config)`).
+      const { syncInstructionsBundleConfigFromFilePath } = await import("../services/agent-instructions.js");
+      mockSyncInstructionsBundleConfigFromFilePath.mockImplementation(syncInstructionsBundleConfigFromFilePath);
+      mockAgentService.getById.mockResolvedValue({
+        ...makeAgent(),
+        adapterType: "codex_local",
+        adapterConfig: bundleManagedConfig,
+      });
+    });
+
+    it("allows a write naming no instructions key and preserves the stored ones", async () => {
+      const res = await requestApp(await createApp(agentActor()), (baseUrl) => request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+        .send({
+          adapterConfig: {
+            paperclipSkillSync: { desiredSkills: ["paperclipai/paperclip/evidence-before-in-review"] },
+          },
+        }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const persisted = mockAgentService.update.mock.calls.at(-1)?.[1].adapterConfig as Record<string, unknown>;
+      expect(persisted.instructionsBundleMode).toBe("external");
+      expect(persisted.instructionsRootPath).toBe("/tmp/agent-1");
+      expect(persisted.instructionsEntryFile).toBe("AGENTS.md");
+      expect(persisted.instructionsFilePath).toBe("/tmp/agent-1/AGENTS.md");
+      expect(persisted.paperclipSkillSync).toEqual({
+        desiredSkills: ["paperclipai/paperclip/evidence-before-in-review"],
+      });
+    });
+
+    it("allows an unchanged instructions key echoed back by a read-modify-write", async () => {
+      const res = await requestApp(await createApp(agentActor()), (baseUrl) => request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+        .send({
+          adapterConfig: {
+            instructionsRootPath: "/tmp/agent-1",
+            command: "codex --profile engineer",
+          },
+        }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    });
+
+    it("still refuses an instructions key whose value differs from stored", async () => {
+      const res = await requestApp(await createApp(agentActor()), (baseUrl) => request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+        .send({
+          adapterConfig: {
+            instructionsRootPath: "/tmp/somewhere-else",
+          },
+        }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toContain("adapterConfig.instructionsRootPath");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    // `cwd` is not an instructions key and has no agent-actor guard of its own,
+    // but the sync resolves a legacy relative `instructionsFilePath` against
+    // it — so naming only `cwd` relocates the whole bundle while every
+    // instructions value is still byte-identical to stored at the pre-sync
+    // check. Only a check on the post-sync result catches this.
+    describe("with a legacy relative instructionsFilePath", () => {
+      const relativeConfig = {
+        instructionsBundleMode: "external",
+        instructionsRootPath: "/tmp/agent-1",
+        instructionsEntryFile: "AGENTS.md",
+        instructionsFilePath: "AGENTS.md",
+        cwd: "/tmp/agent-1",
+        model: "gpt-5.4",
+      };
+
+      beforeEach(() => {
+        mockAgentService.getById.mockResolvedValue({
+          ...makeAgent(),
+          adapterType: "codex_local",
+          adapterConfig: relativeConfig,
+        });
+      });
+
+      it("refuses a cwd-only write that would relocate the bundle", async () => {
+        const res = await requestApp(await createApp(agentActor()), (baseUrl) => request(baseUrl)
+          .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+          .send({ adapterConfig: { cwd: "/tmp/attacker" } }));
+
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(res.body.error).toContain("adapterConfig.instructionsRootPath");
+        expect(mockAgentService.update).not.toHaveBeenCalled();
+      });
+
+      it("still allows an unrelated write that leaves cwd alone", async () => {
+        const res = await requestApp(await createApp(agentActor()), (baseUrl) => request(baseUrl)
+          .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+          .send({ adapterConfig: { model: "gpt-5.5" } }));
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        const persisted = mockAgentService.update.mock.calls.at(-1)?.[1].adapterConfig as Record<string, unknown>;
+        expect(persisted.instructionsRootPath).toBe("/tmp/agent-1");
+        expect(persisted.instructionsEntryFile).toBe("AGENTS.md");
+      });
+    });
   });
 });
