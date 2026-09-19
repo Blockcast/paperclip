@@ -114,6 +114,12 @@ export function parseStallMarker(body) {
  *                       true start. Bounded understatement, never a zero.
  *   oldest waiting    - the run currently on the gate. Correct when no supersede
  *                       has happened, and the only source on a first escalation.
+ *   supersede chain   - derived from Actions run history by walking cancelled
+ *                       predecessors (deploy-stall-chain.mjs). This is the only
+ *                       source that works in THIS repository, where the record
+ *                       channel is unavailable by configuration: `has_issues` is
+ *                       false, so `POST /issues` is a hard 410 and both
+ *                       record-derived sources above are permanently null.
  *
  * Taking the minimum means a supersede cannot move the clock forward, and a
  * hand-edited or deleted marker degrades rather than resets.
@@ -122,6 +128,7 @@ export function resolveStallStartedAt({
   marker,
   issueCreatedAt,
   oldestWaitingCreatedAt,
+  chainStallStartedAt,
   alertAfterHours,
 }) {
   const candidates = [];
@@ -130,6 +137,7 @@ export function resolveStallStartedAt({
   };
 
   push(Date.parse(oldestWaitingCreatedAt), 'oldest-waiting-run');
+  push(Date.parse(chainStallStartedAt), 'supersede-chain');
   if (marker) {
     push(Date.parse(marker.stallStartedAt), 'record-marker');
   } else if (issueCreatedAt) {
