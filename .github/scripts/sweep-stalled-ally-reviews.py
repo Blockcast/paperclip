@@ -160,7 +160,8 @@ ALLY_REQUEST_REVIEWER_LOGIN = os.environ.get("ALLY_REQUEST_REVIEWER_LOGIN") or "
 # stranded rather than "just waiting its turn".
 #
 # THIS NUMBER IS CALIBRATION AND IT ROTS. Re-derive it, do not inherit it.
-# The threshold measures request -> review, which is QUEUE WAIT + SERVICE.
+# The threshold measures `unreviewed_since()` -> review: WEBHOOK LAG + QUEUE
+# WAIT + SERVICE + REVIEW-WRITING. Measure that, not any one term of it.
 # It was originally set to 90m from BLO-22892's figures of 6m35s and 30m --
 # but those are SERVICE time (`startedAt` -> review), measured when the wake
 # landed promptly. Queue wait was negligible then and dominates now by an
@@ -200,17 +201,55 @@ ALLY_REQUEST_REVIEWER_LOGIN = os.environ.get("ALLY_REQUEST_REVIEWER_LOGIN") or "
 # is the direction that matters. Two independent windows now agree that 8h
 # sits outside the distribution: 0% breach on both.
 #
-# 8h is picked off p90, not off the max: 480m is 1.35x-1.42x p90 across the
-# two windows (355m, 338m), and above the largest wait observed in either
-# (462m). It does NOT also claim a separate service-time buffer on top;
-# BLO-22892's 6m35s/30m service figures fit in the remaining margin only
-# while the tail stays where it is, and between these two windows p90 moved
-# +5% and max moved +14%, eating most of it. The failure direction is benign
-# -- understating the ceiling costs a false re-fire, never a missed loss --
-# so the multiplier, not the max, is the thing to re-derive. Re-run the query
-# before trusting it; if p90 has moved, move this with it. The floor this
-# must clear is asserted in TestStallThresholdCalibration; update that table
-# in the same commit that changes this constant.
+# *** BOTH WINDOWS ABOVE MEASURE THE WRONG QUANTITY. They are kept because
+# they are a valid LOWER BOUND, and because the gap between them and the
+# right quantity is the whole lesson here. ***
+#
+# Dispatch wait is `startedAt - createdAt`. This threshold is compared
+# against `unreviewed_since()` -- max(PR opened, head commit landed) -- so
+# the interval it actually clocks is head-landed -> review posted, which is
+# webhook lag + queue wait + service + the time Ally spends writing the
+# review. Dispatch wait is one term of four. An 8h value derived from it was
+# never calibrated against the predicate it gates; the paragraph this
+# replaced conceded the gap ("does NOT also claim a separate service-time
+# buffer on top") and then treated it as a rounding margin. It is not one.
+#
+# MEASURED DIRECTLY 2026-09-19 (BLO-34521), `Blockcast/paperclip`, the last
+# 100 PRs, n=232 first-Ally-review-per-head pairs, window 2026-09-13T17:37Z
+# -> 2026-09-19T05:25Z, wait = review_submitted - unreviewed_since:
+#
+#     p50 4.09h | p90 12.70h | p95 17.20h | max 30.81h | min 0.05h
+#     > 90m: 178/232 = 77%   |   > 8h: 45/232 = 19.4%
+#     > 18h:  11/232 = 4.7%  |   > 22h (ALARM): ~3%
+#
+# So 8h breached on 19.4% of HEALTHY reviews -- against an acceptance
+# criterion of under ~10%. Measured against dispatch wait the same value
+# breached 0%. The instrument, not the number, was the defect.
+#
+# Reproduce with (no Paperclip credential needed, unlike the query above --
+# this one reads only GitHub, which is what makes it the reproducible one):
+#
+#     for each recent PR: reviews + `^## Ally` comments authored by the Ally
+#     App identity, keep those carrying a head SHA (`commit_id`, or the
+#     `Reviewed head: <40-hex>` line); take the EARLIEST review per
+#     (pr, head) -- the predicate is satisfied by the first one;
+#     wait = review_time - max(pr.created_at, commit.committer.date)
+#
+# Corroborated independently on `Blockcast/Network-Operator-Portal` the same
+# day (BLO-34617, TrafficOpsEngineer): marker -> review over n=50 served
+# pairs gave p50 4.26h against p50 4.09h here -- a near-exact match on two
+# repos by two different methods, which is what promotes this from one
+# sample to a property of the fleet rather than of this repo.
+#
+# 18h is picked off p90, not off the max: 1080m is 1.42x the 762m p90, the
+# same multiplier the dispatch-wait derivation used. Chasing the max instead
+# would mean 32h -- a day and a half to detect a lost review, bought against
+# a tail of 3 PRs. The failure direction is benign (understating the ceiling
+# costs a false re-fire, never a missed loss), so the MULTIPLIER is the thing
+# to re-derive, not the max. The floor this must clear is asserted in
+# TestStallThresholdCalibration; update that table in the same commit that
+# changes this constant, and add the quantity you measured -- a row labelled
+# `dispatch-wait` alone is what let 8h pass its own guard.
 #
 # The upward drift is not noise: its root cause is BLO-19881 (fleet-wide
 # heartbeat queue starvation concentrated on Ally). If that lands, this
@@ -236,7 +275,7 @@ ALLY_REQUEST_REVIEWER_LOGIN = os.environ.get("ALLY_REQUEST_REVIEWER_LOGIN") or "
 # review-gate-sweep.yml carries only `GITHUB_TOKEN` and no Paperclip
 # credential, so that check is unreachable from CI today; granting the sweep
 # API access is a strictly larger blast radius and belongs in its own row.
-STALL_THRESHOLD_SECONDS = int(os.environ.get("STALL_THRESHOLD_SECONDS") or 8 * 60 * 60)
+STALL_THRESHOLD_SECONDS = int(os.environ.get("STALL_THRESHOLD_SECONDS") or 18 * 60 * 60)
 
 # Don't re-fire more than once per cooldown window even if still stalled --
 # the sweep itself must not become the burst that re-triggers whatever
@@ -277,18 +316,19 @@ MAX_REFIRES_PER_RUN = int(os.environ.get("MAX_REFIRES_PER_RUN") or 5)
 # +1h, because this repo's sweep runs HOURLY rather than every 30 minutes
 # (see review-gate-sweep.yml for the rate-limit arithmetic behind that). The
 # extra hour is the polling granularity: worst case a head goes stale just
-# after a run, so with STALL at 8h its first re-fire lands at 480m+60m=540m.
-# Its cooldown then expires at 660m, and the boundary is INCLUSIVE --
+# after a run, so with STALL at 18h its first re-fire lands at 1080m+60m=1140m.
+# Its cooldown then expires at 1260m, and the boundary is INCLUSIVE --
 # `should_refire` blocks only on `since_last < REFIRE_COOLDOWN_SECONDS`, so
-# the hourly run at exactly 660m is already eligible. The formula gives 720m
-# (12h), clearing that second re-fire opportunity by a full hour rather than
+# the hourly run at exactly 1260m is already eligible. The formula gives 1320m
+# (22h), clearing that second re-fire opportunity by a full hour rather than
 # landing on it. Either way the property the margin buys holds: "at least one
-# full re-fire AND its cooldown have come and gone", and at 720m both (540m,
-# 660m) are strictly in the past. Kept as a formula so it tracks STALL
-# automatically; the 12h it yields is ~1.8x the largest dispatch wait seen in
-# the sample recorded above STALL_THRESHOLD_SECONDS (408m), so a normally-
-# queued PR no longer alarms. Before BLO-34521 it was 330m, INSIDE the normal
-# distribution -- ~14% of healthy dispatches went red.
+# full re-fire AND its cooldown have come and gone", and at 1320m both (1140m,
+# 1260m) are strictly in the past. Kept as a formula so it tracks STALL
+# automatically; the 22h it yields breaches ~3% of the healthy head-landed ->
+# review distribution recorded above STALL_THRESHOLD_SECONDS (p90 12.70h, max
+# 30.81h), so a normally-queued PR no longer alarms. Before BLO-34521 it was
+# 330m, INSIDE the normal distribution -- and the 12h an earlier revision of
+# this same fix yielded was still inside it, at ~11%.
 ALARM_THRESHOLD_SECONDS = int(
     os.environ.get("ALARM_THRESHOLD_SECONDS") or (STALL_THRESHOLD_SECONDS + REFIRE_COOLDOWN_SECONDS + 2 * 60 * 60)
 )
