@@ -106,6 +106,7 @@ import {
   type WorkspaceOperation,
   isResponsibleUserDenialCode,
   isSensitiveEnv,
+  REDACTED_VALUE_SENTINEL,
   responsibleUserLabel,
 } from "@paperclipai/shared";
 import { ResponsibleUserDenialNotice } from "../components/ResponsibleUserDenialNotice";
@@ -133,7 +134,9 @@ const runStatusIcons: Record<string, { icon: typeof CheckCircle2; color: string 
 
 const RUN_LOG_PAGE_BYTES = 256_000;
 
-const REDACTED_ENV_VALUE = "***REDACTED***";
+// Shared with the server's `REDACTED_EVENT_VALUE` so the withheld/absent distinction below cannot
+// drift apart from what the API actually writes (BLO-34631).
+const REDACTED_ENV_VALUE = REDACTED_VALUE_SENTINEL;
 const COMMAND_ENV_KEY_RE = /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
 

@@ -628,6 +628,13 @@ describe("agent live run routes", () => {
     expect(res.body.content).toBe("***REDACTED***");
     // The opaque handles stay — the route they point at is the one that now withholds.
     expect(res.body.logRef).toBe("logs/operation-1.ndjson");
+    // AC 2 + review: the access check passed, so this is `result: "allowed"` — but nothing was
+    // disclosed. Without `withheld` the record is indistinguishable from a real disclosure, and
+    // "who read this log" over-reports.
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "workspace_operation.log_accessed",
+      details: expect.objectContaining({ result: "allowed", withheld: true }),
+    }));
   });
 
   it("discloses workspace-operation log content to a reader holding workspace_runtime:read", async () => {
@@ -657,6 +664,9 @@ describe("agent live run routes", () => {
         offset: 7,
         limitBytes: 64,
         logStore: "local_file",
+        // Paired with the withheld case above: the flag is what separates a real disclosure from
+        // a masked read, so it has to be asserted on both sides or it proves nothing.
+        withheld: false,
       }),
     }));
     expect(mockLogActivity.mock.calls[0]?.[1]?.details).not.toHaveProperty("content");

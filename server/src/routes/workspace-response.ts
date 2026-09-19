@@ -119,11 +119,11 @@ import { maskProjectEnv } from "./project-env-response.js";
  *    caller already holds, while `cleanup_command` is the operator's own string.
  *  - `ExecutionWorkspaceStrategy.type` / `.runScope` — closed enums. `.baseRef` / `.branchTemplate`
  *    are git refs and templates the branch-naming UI renders and the agent needs to name its branch.
- *  - `logRef` / `logStore` on operations — opaque handles, and the route they point at
- *    (`/workspace-operations/:id/log`) withholds its content on the same entitlement as of
- *    BLO-34631. `stdoutExcerpt` / `stderrExcerpt` used to sit on this list on the "command output,
- *    not a copy of a declared-withheld value" reading (CTO Ruling F §4, BLO-33407); BLO-34631
- *    surveyed the consumers, found no agent or viewer flow that needs them, and withholds them.
+ *  - `stdoutExcerpt` / `stderrExcerpt` / `logRef` / `logStore` on operations — command *output* and
+ *    opaque handles. BLO-34631 surveyed the consumers and kept the excerpts disclosed: the agent's
+ *    own MCP control path reads them back for the command it just triggered (see
+ *    `publicWorkspaceOperation`). The route `logRef` points at does withhold its content, because
+ *    that one has no agent consumer.
  *
  * ### PEN-3252 — the bypass this module recorded as open, now closed
  *
@@ -447,25 +447,42 @@ export function publicRuntimeServices(
  * unentitled operator must still be able to see that an operation ran and how it ended — withholding
  * the operator's text is the point, hiding the fact of execution is not.
  *
- * `stdoutExcerpt` / `stderrExcerpt` are withheld too, as of BLO-34631, and that is a measurement
- * rather than a symmetry argument. They are command *output*, so they are not a copy of a
- * declared-withheld value — but the output of a withheld command discloses the command: shells
- * echo, `npm` prints the script it runs, `set -x` prints everything, and the only control standing
- * over the bytes is the write-time `redactSensitiveText` heuristic, which matches env-dump
- * assignments, JSON secret fields and URI credentials and nothing else. Host paths, repo layout
- * and an operator's `cleanupCommand` cross it intact.
+ * `stdoutExcerpt` / `stderrExcerpt` are NOT withheld, and as of BLO-34631 that is a measured
+ * decision rather than the inherited "command output is not a copy of a declared-withheld value"
+ * reading (CTO Ruling F §4, BLO-33407).
  *
- * The consumer survey that decides it (BLO-34631 AC 3): every reader of these two fields and of
- * `/workspace-operations/:id/log` is a human UI or CLI surface — `ui/src/pages/AgentDetail.tsx`,
- * `ui/src/pages/ExecutionWorkspaceDetail.tsx`, and `paperclip run workspace-log`. There is no agent
- * consumer, no MCP tool and no server-internal read. `workspace_runtime:read` is granted by
- * `allow_simple_company_member` to every non-viewer board member, so all three surfaces keep the
- * raw value for the humans that use them; what loses it is the actor class PEN-2852 built the
- * entitlement to exclude — same-company agents, viewers, low-trust principals and bridge keys.
+ * The symmetry argument for withholding them is real and was the CTO's stated lean: the output of a
+ * withheld command can disclose the command — shells echo, `npm` prints the script it runs, `set -x`
+ * prints everything — and the only control standing over the bytes is the write-time
+ * `redactSensitiveText` heuristic, which matches env-dump assignments, JSON secret fields and URI
+ * credentials and nothing else. Host paths, repo layout and an operator's `cleanupCommand` cross it
+ * intact. BLO-34631 AC 3 made that lean explicitly falsifiable by a consumer survey, and the survey
+ * falsifies it:
  *
- * `logRef` / `logStore` stay: they are opaque handles, and the route they point at now withholds
- * the content on this same entitlement. Masking a pointer while its route still served the bytes
- * would have been theatre.
+ *  - `POST /execution-workspaces/:id/runtime-services/:action` (`routes/execution-workspaces.ts`) and
+ *    `POST /projects/:id/workspaces/:workspaceId/runtime-services/:action` (`routes/projects.ts`)
+ *    answer with `operation: publicWorkspaceOperation(operation, viewer)`, where the operation is the
+ *    one the caller just triggered and `stdout`/`stderr` are captured synchronously from it.
+ *  - The first of those is the backing call for the MCP tool `paperclipControlIssueWorkspaceServices`
+ *    (`packages/mcp-server/src/tools.ts`), which returns the response JSON verbatim to the calling
+ *    agent, and both it and `GET /heartbeat-runs/:runId/workspace-operations` are on the sandbox
+ *    callback bridge allowlist (`packages/adapter-utils/src/sandbox-callback-bridge.ts`).
+ *  - Same-company agents deliberately lack `workspace_runtime:read` (PEN-2852), so masking here
+ *    hands an agent `***REDACTED***` for the output of the command it just ran. `status`/`exitCode`
+ *    survive, so it would still learn pass/fail — but not why, which is exactly the "debugging a
+ *    failed provision" flow BLO-34631 named as the finding that settles this.
+ *
+ * So the disclosure is deliberate and recorded, not an unexamined pass-through. The residual it
+ * accepts: an operator's service command echoed into its own output still reaches an unentitled
+ * reader, and the write-time scrub is not a boundary. Narrowing it is a product decision that has to
+ * keep the agent's own command-result path readable — masking the read/list routes alone would split
+ * the same field across routes, which is the failure mode this series exists to close.
+ *
+ * `logRef` / `logStore` stay for a different reason: they are opaque handles, and the route they
+ * point at (`/workspace-operations/:id/log`) DOES withhold its content on this entitlement as of
+ * BLO-34631 — that route has no agent consumer (no MCP tool, not bridge-allowlisted; only
+ * `ui/src/pages/AgentDetail.tsx` and `paperclip run workspace-log` read it). Masking a pointer whose
+ * route still served the bytes would have been theatre.
  */
 export function publicWorkspaceOperation(
   operation: WorkspaceOperation,
@@ -476,8 +493,6 @@ export function publicWorkspaceOperation(
     ...operation,
     command: maskWorkspaceRuntimeTextForRead(operation.command),
     cwd: maskWorkspaceRuntimeTextForRead(operation.cwd),
-    stdoutExcerpt: maskWorkspaceRuntimeTextForRead(operation.stdoutExcerpt),
-    stderrExcerpt: maskWorkspaceRuntimeTextForRead(operation.stderrExcerpt),
     metadata: maskWorkspaceRuntimeForRead(operation.metadata) as Record<string, unknown> | null,
   };
 }

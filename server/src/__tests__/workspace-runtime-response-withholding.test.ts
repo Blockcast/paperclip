@@ -59,10 +59,12 @@ const OPERATION_METADATA_SENTINEL = "/fixture/sentinel-operation-worktree-path";
 /**
  * BLO-34631. Command *output*, and distinct from the `command` sentinel on purpose: the whole
  * question this ticket settled is whether withholding the command while disclosing its output is a
- * boundary or a gap, so an assertion has to name which of the two it closed. Both invented.
+ * boundary or a gap. It resolved to "disclosed, deliberately" on a consumer survey, so these two
+ * are the values an unentitled reader is expected to RECEIVE — named for the decision they pin
+ * rather than for egress. Both invented.
  */
-const OPERATION_STDOUT_SENTINEL = "sentinel-operation-stdout-must-not-egress";
-const OPERATION_STDERR_SENTINEL = "sentinel-operation-stderr-must-not-egress";
+const OPERATION_STDOUT_SENTINEL = "sentinel-operation-stdout-disclosed-by-design";
+const OPERATION_STDERR_SENTINEL = "sentinel-operation-stderr-disclosed-by-design";
 
 /**
  * PEN-3073. The lifecycle command scalars that sit BESIDE `workspaceRuntime` on the same config
@@ -848,14 +850,23 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
     });
 
     /**
-     * BLO-34631. `stdoutExcerpt` / `stderrExcerpt` used to ride the spread in
-     * `publicWorkspaceOperation` on the "command output is not a copy of a declared-withheld value"
-     * reading. The output of a withheld command discloses the command — shells echo, `set -x`
-     * prints everything — and the write-time scrub is a heuristic secret matcher, not a boundary.
-     * The consumer survey found no agent or viewer flow that needs the raw value, so they are
-     * withheld on the same entitlement as `command`/`cwd`.
+     * BLO-34631 AC 3, resolved as DISCLOSED — pinned by a test because it is a decision, not an
+     * omission, and the next reader of `publicWorkspaceOperation` will otherwise see `command` and
+     * `cwd` masked beside two unmasked siblings and "fix" the asymmetry.
+     *
+     * The CTO lean was to withhold, on the symmetry argument that the output of a withheld command
+     * discloses the command. AC 3 made that falsifiable by a consumer survey and the survey
+     * falsifies it: `POST /execution-workspaces/:id/runtime-services/:action` answers with this
+     * same projection, it is the backing call for the MCP tool
+     * `paperclipControlIssueWorkspaceServices`, and same-company agents deliberately lack
+     * `workspace_runtime:read` — so masking here hands an agent `***REDACTED***` for the output of
+     * the command it just triggered.
+     *
+     * The contrast in the last two assertions is the whole point: this reader is unentitled, and
+     * the SAME row still withholds `command`/`cwd`. So this case cannot pass by the projection
+     * being skipped, only by the excerpts being deliberately exempt from it.
      */
-    it("withholds the operation excerpts from a reader without workspace_runtime:read", async () => {
+    it("discloses the operation excerpts to a reader without workspace_runtime:read", async () => {
       mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
         workspaceOperationFixture({
           stdoutExcerpt: OPERATION_STDOUT_SENTINEL,
@@ -868,18 +879,18 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       );
 
       expect(res.status).toBe(200);
-      expect(JSON.stringify(res.body)).not.toContain(OPERATION_STDOUT_SENTINEL);
-      expect(JSON.stringify(res.body)).not.toContain(OPERATION_STDERR_SENTINEL);
-      // Masked, not dropped — withheld-is-not-absent, same contract as `publicRuntimeServices`.
-      expect(res.body[0].stdoutExcerpt).toBe(REDACTED_EVENT_VALUE);
-      expect(res.body[0].stderrExcerpt).toBe(REDACTED_EVENT_VALUE);
-      // `logRef` / `logStore` stay: opaque handles, and their route withholds the content itself.
-      expect(res.body[0].logBytes).toBe(4096);
+      expect(res.body[0].stdoutExcerpt).toBe(OPERATION_STDOUT_SENTINEL);
+      expect(res.body[0].stderrExcerpt).toBe(OPERATION_STDERR_SENTINEL);
+      expect(res.body[0].command).toBe(REDACTED_EVENT_VALUE);
+      expect(res.body[0].cwd).toBe(REDACTED_EVENT_VALUE);
     });
 
     /**
-     * PEN-3205, read side, now scoped to the entitled reader (BLO-34631 masks the excerpt for an
-     * unentitled one, so this case would pass for the wrong reason without the grant).
+     * PEN-3205, read side. `publicWorkspaceOperation` masks `command`/`cwd`/`metadata` and spreads
+     * the rest, so `stdoutExcerpt` crosses this route UNMASKED by design (BLO-34631 surveyed that
+     * and kept it) — the username censor is the only control standing over it here, and
+     * `routes/agents.ts` was already applying it on the sibling list route while this one answered
+     * with a bare `res.json`.
      *
      * The home directory comes from `os.homedir()` rather than a literal because that is the same
      * value `defaultHomeDirs` derives its (module-cached) candidate list from, so this is
@@ -888,7 +899,6 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
      * dropped from the route, and neither passes if it is replaced by blanket blanking.
      */
     it("censors the current user's home directory in the excerpt when the setting is on", async () => {
-      decideAsRuntimeManager();
       mockInstanceGeneralSettings.censorUsernameInLogs = true;
       const homeDir = os.homedir();
       mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
@@ -907,7 +917,6 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
     });
 
     it("leaves the excerpt alone when the setting is off", async () => {
-      decideAsRuntimeManager();
       mockInstanceGeneralSettings.censorUsernameInLogs = false;
       const homeDir = os.homedir();
       mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([

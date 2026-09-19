@@ -382,7 +382,7 @@ export function agentRoutes(
       logStore: string | null;
     },
     result: "allowed" | "denied",
-    opts: { offset: number; limitBytes: number },
+    opts: { offset: number; limitBytes: number; withheld?: boolean },
   ) {
     const actor = getRunLogAuditActor(req);
     await logActivity(db, {
@@ -403,6 +403,11 @@ export function agentRoutes(
         offset: opts.offset,
         limitBytes: opts.limitBytes,
         logStore: entity.logStore,
+        // BLO-34631 review: a withheld read and a real disclosure are both `result: "allowed"` —
+        // the access check decides reachability, the entitlement decides the bytes. Record which
+        // one happened so "who read this log" is answerable without re-deriving the reader's
+        // grants after the fact. Absent on surfaces that apply no read-time projection.
+        ...(opts.withheld === undefined ? {} : { withheld: opts.withheld }),
       },
     });
   }
@@ -5103,13 +5108,13 @@ export function agentRoutes(
       return;
     }
 
-    const audit = (result: "allowed" | "denied") => logLogAccessAudit(req, {
+    const audit = (result: "allowed" | "denied", withheld?: boolean) => logLogAccessAudit(req, {
       companyId: operation.companyId,
       entityType: "workspace_operation",
       entityId: operation.id,
       runId: operation.heartbeatRunId,
       logStore: operation.logStore,
-    }, result, { offset: normalizedOffset, limitBytes });
+    }, result, { offset: normalizedOffset, limitBytes, withheld });
 
     // Same shape as `/heartbeat-runs/:runId/log` rather than `getAccessibleResource`: keep the
     // cross-tenant 404 so this route is not an existence oracle, without silently dropping the
@@ -5128,8 +5133,11 @@ export function agentRoutes(
       throw error;
     }
 
-    await audit("allowed");
+    // Viewer first: the audit record has to say whether this read actually disclosed anything, and
+    // only the entitlement knows that. Resolved after the two denial paths, so a caller who never
+    // clears company access costs no entitlement lookup.
     const viewer = await resolveWorkspaceRuntimeViewer(access, req, operation.companyId);
+    await audit("allowed", !viewer.revealRuntimeConfig);
     const result = await workspaceOperations.readLog(operationId, {
       offset: normalizedOffset,
       limitBytes,
