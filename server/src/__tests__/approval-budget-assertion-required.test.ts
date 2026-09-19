@@ -53,20 +53,29 @@ function registerModuleMocks() {
   }));
 }
 
-function createRouteDb() {
+/**
+ * Two readers reach `select()` on these routes: the run-context lookup, and
+ * `loadEnforcedBudgetPolicies` (BLO-34008). They are told apart by the projection,
+ * because that is the only thing this stub sees — distinguishing on the table
+ * would mean reimplementing enough of drizzle to read `.from()`.
+ */
+function createRouteDb(policyRows: Array<Record<string, unknown>> = []) {
+  const runContextRow = { id: "run-1", companyId: "company-1", agentId: "agent-1", contextSnapshot: {} };
   return {
-    select: vi.fn(() => ({
-      from: vi.fn(() => ({
-        where: vi.fn(() => ({
-          then: async (resolve: (rows: unknown[]) => unknown) =>
-            resolve([{ id: "run-1", companyId: "company-1", agentId: "agent-1", contextSnapshot: {} }]),
+    select: vi.fn((projection?: Record<string, unknown>) => {
+      const rows = projection && "amount" in projection ? policyRows : [runContextRow];
+      return {
+        from: vi.fn(() => ({
+          where: vi.fn(() => ({
+            then: async (resolve: (rows: unknown[]) => unknown) => resolve(rows),
+          })),
         })),
-      })),
-    })),
+      };
+    }),
   } as any;
 }
 
-async function createAgentApp() {
+async function createAgentApp(policyRows: Array<Record<string, unknown>> = []) {
   const [{ errorHandler }, { approvalRoutes }] = await Promise.all([
     import("../middleware/index.js"),
     import("../routes/approvals.js"),
@@ -84,7 +93,7 @@ async function createAgentApp() {
     };
     next();
   });
-  app.use("/api", approvalRoutes(createRouteDb()));
+  app.use("/api", approvalRoutes(createRouteDb(policyRows)));
   app.use(errorHandler);
   return app;
 }
@@ -516,5 +525,132 @@ describe("the budget watcher's own threshold cards are exempt by construction (B
     };
 
     expect(extractEnforcementAssertions(watcherPayload)).toEqual([]);
+  });
+});
+
+/**
+ * BLO-34008 — the server records the figure the change starts from.
+ *
+ * `classifyEnforcementAssertion` needs three numbers (prior, decided, enforced)
+ * to tell a decision that never landed from one a later decision superseded.
+ * With only two it answers `unverifiable_mismatch` for every disagreement:
+ * still reported as drift, but not auto-appliable, and it cannot distinguish the
+ * real gap from the false-positive class that filed BLO-33160, BLO-33397,
+ * BLO-33416 and BLO-33772.
+ *
+ * Requiring the caller to supply it is not available: the refusal's own
+ * remediation says never to invent a starting figure, and its example payload
+ * deliberately omits one. So the server reads it from the policy the assertion
+ * already names. That is a database read, not a guess — the distinction the
+ * whole refusal exists to protect.
+ */
+describe("the starting figure is stamped from the enforcing policy (BLO-34008)", () => {
+  const POLICY_AT_19K = { policyId: POLICY_ID, amount: 1900000, isActive: true, amountUpdatedAt: new Date("2026-08-01T00:00:00.000Z") };
+
+  beforeEach(() => {
+    vi.resetModules();
+    vi.doUnmock("../services/index.js");
+    registerModuleMocks();
+    vi.clearAllMocks();
+
+    mockApprovalService.createWithIdempotency.mockImplementation(
+      async (companyId: string, data: Record<string, unknown>) => ({
+        approval: { id: "approval-1", companyId, status: "pending", ...data },
+        deduplicated: false,
+      }),
+    );
+    mockLogActivity.mockResolvedValue(mockDeferredActivityPublish);
+    mockAccessService.decide.mockResolvedValue({
+      allowed: true,
+      action: "company_scope:read",
+      reason: "allow_test",
+      explanation: "Allowed by test mock.",
+    });
+    mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([]);
+  });
+
+  /** The `enforcement_assertions` array as it was actually persisted. */
+  function persistedAssertions() {
+    const [, data] = mockApprovalService.createWithIdempotency.mock.calls.at(-1) ?? [];
+    return (data as any)?.payload?.enforcement_assertions ?? [];
+  }
+
+  function fileCard(app: express.Express, assertion: Record<string, unknown>) {
+    return postApproval(app, {
+      type: "budget_override_required",
+      payload: { title: "Raise the CTO cap", enforcement_assertions: [assertion] },
+    });
+  }
+
+  it("fills the prior from the policy when the caller states none", async () => {
+    const app = await createAgentApp([POLICY_AT_19K]);
+
+    const res = await fileCard(app, { kind: "budget_policy_amount", policyId: POLICY_ID, expected_usd: 32000, label: "CTO" });
+
+    expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
+    expect(persistedAssertions()[0]).toMatchObject({
+      from_amount_cents: 1900000,
+      from_source: "server_policy_read",
+    });
+  });
+
+  it("does not overwrite a prior the caller stated", async () => {
+    // The caller may know a pre-decision figure the current row no longer shows
+    // (a card filed after a manual edit). Silently replacing it would also hide
+    // a wrong one, which `policyAmountChangedAfterDecision` is there to catch.
+    const app = await createAgentApp([{ ...POLICY_AT_19K, amount: 2500000 }]);
+
+    await fileCard(app, { kind: "budget_policy_amount", policyId: POLICY_ID, expected_usd: 32000, from_usd: 19000 });
+
+    expect(persistedAssertions()[0]).toMatchObject({ from_usd: 19000 });
+    expect(persistedAssertions()[0]).not.toHaveProperty("from_source");
+  });
+
+  it("leaves an unresolvable policy unstamped so it still reports as missing_policy", async () => {
+    // Stamping nothing is the point: a card naming a policy that does not exist
+    // in this company must keep reading as broken, not acquire a figure that
+    // makes it look serviceable.
+    const app = await createAgentApp([]);
+
+    await fileCard(app, { kind: "budget_policy_amount", policyId: POLICY_ID, expected_usd: 32000 });
+
+    expect(persistedAssertions()[0]).not.toHaveProperty("from_amount_cents");
+    expect(persistedAssertions()[0]).not.toHaveProperty("from_source");
+  });
+
+  it("turns the 0-of-8 shape from unverifiable_mismatch into never_applied", async () => {
+    // The whole reason the stamp exists, asserted end to end rather than on the
+    // field: file the card, take the payload that was actually persisted, and
+    // classify it against a policy still sitting at the pre-approval amount.
+    // That is card 304ea443's shape — approved, never applied.
+    const app = await createAgentApp([POLICY_AT_19K]);
+    await fileCard(app, { kind: "budget_policy_amount", policyId: POLICY_ID, expected_usd: 32000, label: "CTO" });
+
+    const { extractEnforcementAssertions, classifyEnforcementAssertion } = await import(
+      "../services/approval-enforcement-reconciler.js"
+    );
+    const [, data] = mockApprovalService.createWithIdempotency.mock.calls.at(-1) ?? [];
+    const [assertion] = extractEnforcementAssertions((data as any).payload);
+    const decidedAt = new Date("2026-08-04T10:04:45.877Z");
+
+    expect(assertion?.priorAmountCents).toBe(1900000);
+    expect(classifyEnforcementAssertion(assertion!, POLICY_AT_19K, decidedAt)).toBe("never_applied");
+  });
+
+  it("still classifies a genuine supersession as superseded, not drift", async () => {
+    // The other half: the stamp must not convert the legitimate case into a
+    // false positive. Enforced figure is neither prior nor decided, and the
+    // amount moved after the decision.
+    const app = await createAgentApp([POLICY_AT_19K]);
+    await fileCard(app, { kind: "budget_policy_amount", policyId: POLICY_ID, expected_usd: 32000 });
+
+    const { extractEnforcementAssertions, classifyEnforcementAssertion } = await import(
+      "../services/approval-enforcement-reconciler.js"
+    );
+    const [, data] = mockApprovalService.createWithIdempotency.mock.calls.at(-1) ?? [];
+    const [assertion] = extractEnforcementAssertions((data as any).payload);
+
+    const movedLater = { ...POLICY_AT_19K, amount: 2500000, amountUpdatedAt: new Date("2026-08-20T00:00:00.000Z") };
+    expect(classifyEnforcementAssertion(assertion!, movedLater, new Date("2026-08-04T10:04:45.877Z"))).toBe("superseded");
   });
 });
