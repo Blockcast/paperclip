@@ -1305,13 +1305,31 @@ export function parseMemoryQuantityToKiB(raw: string, field: string): number {
 /**
  * Resolve the RLIMIT_DATA cap (KiB) applied to tool-spawned children. Unset
  * derives half of the container memory limit; an explicit non-negative integer
- * (number or digit string) wins; `0` disables the cap. Anything else throws —
- * the value is interpolated into a shell command, so only digits may pass.
+ * (number or digit string) wins; `0` disables the cap. A malformed explicit
+ * value throws — it is interpolated into a shell command, so only digits may
+ * pass. A container limit this derivation cannot read (a legal but fractional
+ * Kubernetes quantity such as `1.5Gi`, or a unit outside the parser) is NOT a
+ * reason to refuse the Job: that limit was already valid before this cap
+ * existed and the cluster still enforces it. It degrades to no cap (`0`) with
+ * a warning so the operator can pin `toolMemoryKb` explicitly.
  */
-export function resolveToolMemoryLimitKb(config: Record<string, unknown>, containerMemoryLimit: string): number {
+export function resolveToolMemoryLimitKb(
+  config: Record<string, unknown>,
+  containerMemoryLimit: string,
+  warn: (message: string) => void = (message) => console.warn(message),
+): number {
   const raw = config[TOOL_MEMORY_LIMIT_CONFIG_KEY];
   if (raw === undefined || raw === null || (typeof raw === "string" && raw.trim() === "")) {
-    return Math.floor(parseMemoryQuantityToKiB(containerMemoryLimit, "resources.limits.memory") / 2);
+    try {
+      return Math.floor(parseMemoryQuantityToKiB(containerMemoryLimit, "resources.limits.memory") / 2);
+    } catch (error) {
+      warn(
+        `resources.limits.memory=${JSON.stringify(containerMemoryLimit)} cannot be halved into a tool RLIMIT_DATA cap ` +
+          `(${error instanceof Error ? error.message : String(error)}); running tool children with no RLIMIT_DATA cap. ` +
+          `Set ${TOOL_MEMORY_LIMIT_CONFIG_KEY} (KiB) explicitly to cap them.`,
+      );
+      return 0;
+    }
   }
   const value =
     typeof raw === "number"

@@ -2952,8 +2952,21 @@ describe("tool-child memory cap (BLO-34477)", () => {
       }
     });
 
-    it("surfaces an unparseable container memory limit instead of guessing a cap", () => {
-      expect(() => resolveToolMemoryLimitKb({}, "1.5Gi")).toThrow(/resources.limits.memory must be an integer Kubernetes memory quantity/);
+    it("degrades an unparseable container memory limit to no cap with a warning instead of aborting the Job", () => {
+      const warnings: string[] = [];
+      expect(resolveToolMemoryLimitKb({}, "1.5Gi", (message) => warnings.push(message))).toBe(0);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatch(/resources\.limits\.memory="1\.5Gi" cannot be halved/);
+      expect(warnings[0]).toMatch(/no RLIMIT_DATA cap/);
+      expect(warnings[0]).toMatch(/toolMemoryKb/);
+    });
+
+    it("still refuses a malformed explicit toolMemoryKb (it is interpolated into a shell command)", () => {
+      const warnings: string[] = [];
+      expect(() => resolveToolMemoryLimitKb({ "resources.limits.toolMemoryKb": "1.5Gi" }, "8Gi", (message) => warnings.push(message))).toThrow(
+        /toolMemoryKb must be a non-negative integer number of KiB/,
+      );
+      expect(warnings).toEqual([]);
     });
   });
 
