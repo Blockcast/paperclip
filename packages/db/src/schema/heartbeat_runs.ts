@@ -36,6 +36,28 @@ export const heartbeatRuns = pgTable(
     processPid: integer("process_pid"),
     processGroupId: integer("process_group_id"),
     processStartedAt: timestamp("process_started_at", { withTimezone: true }),
+    // First byte, not last. `lastOutputAt` advances on every flush, so it
+    // cannot answer "how long did this run take to say anything" -- by the
+    // time a run ends the two are the same field read at different moments.
+    //
+    // That question gates the reaper's silence floor. `RUN_STALE_SILENCE_MS`
+    // (15m) is applied uniformly to started external-lifecycle runs because a
+    // quiet run might be a live agent mid-Bash-call; the 2026-05-23 RCA
+    // (~6.5/hr fleet-wide false `process_lost` on agents that were still
+    // streaming) is why it must stay that long for runs that HAVE streamed.
+    // A run that has never emitted a byte is a different case, but telling
+    // the two apart safely needs the distribution of time-to-first-output on
+    // HEALTHY runs, and nothing records it. Measured 2026-09-18: 41
+    // `process_lost` runs held 638 slot-minutes -- within 1% of the 644
+    // minutes all successful runs consumed in the same window -- every one
+    // with `log_bytes` 0, killed at a 15.1m median. Those minutes cost zero
+    // provider capacity, since the adapter never produced anything.
+    //
+    // Write-once via COALESCE at the single output-progress flush site, so
+    // concurrent flushes cannot move it and no read-modify-write is needed.
+    // NULL means "this run never emitted output", which is itself the signal
+    // the reaper work needs. No backfill: history cannot be reconstructed.
+    firstOutputAt: timestamp("first_output_at", { withTimezone: true }),
     lastOutputAt: timestamp("last_output_at", { withTimezone: true }),
     lastOutputSeq: integer("last_output_seq").notNull().default(0),
     lastOutputStream: text("last_output_stream"),

@@ -124,6 +124,11 @@ export interface HeartbeatRun {
   processPid: number | null;
   processGroupId?: number | null;
   processStartedAt: Date | null;
+  // First byte this run emitted, vs `lastOutputAt` which advances on every
+  // flush. NULL means it never emitted anything -- which is the interesting
+  // case: it distinguishes a run that went quiet from one that never spoke.
+  // See migration 0245 for why the reaper's silence floor needs this.
+  firstOutputAt: Date | null;
   lastOutputAt: Date | null;
   lastOutputSeq: number;
   lastOutputStream: "stdout" | "stderr" | null;
