@@ -41,9 +41,19 @@ const DEFAULT_PR_LIMIT = 60;
  * a short generic substring couples the census to any wording another repo's
  * review script happens to use. The shorter the alternative, the more of the
  * org it silently claims.
+ *
+ * `independent` is optional inside the first alternative — one alternative,
+ * not two — because exactly two sites render that sentence and they disagree
+ * on the qualifier: the unqualified fallback reason in `verdict` ("No Ally
+ * consolidated-review comment attests to reviewing this head.") and the
+ * qualified retirement wording in `commentReviewGateRetirementDescription`
+ * ("Retired. No independent Ally consolidated-review comment attests this
+ * head; …"). It is NOT what catches a self-attested head: that renders "The
+ * only comment attesting this head is the PR author's own", which this
+ * alternative never matches and the PR-author alternative does.
  */
 const NOT_EVALUATED_DESCRIPTION_PATTERN =
-  /no Ally consolidated-review comment attests|no head SHA was supplied|attesting this head is the PR author's own|The PR author is unknown/i;
+  /no (?:independent )?Ally consolidated-review comment attests|no head SHA was supplied|attesting this head is the PR author's own|The PR author is unknown/i;
 
 export function isReviewNamespacedContext(context) {
   return typeof context === "string" && context.trim().toLowerCase().startsWith("review/");
@@ -102,6 +112,17 @@ export function findViolations(prs) {
   return (prs ?? []).flatMap((pr) => findPrViolations(pr));
 }
 
+/**
+ * Distinct PRs behind a violation list. The per-row `VIOLATION:` lines are the
+ * detail; the headline is reported as "N of M merged PRs", so it has to count
+ * PRs. One PR can contribute several rows — every retired context takes its own
+ * retirement write, and a `review/`-namespaced live context adds a row beside
+ * its mirror — so a row count can exceed M and read as more PRs than exist.
+ */
+export function violatingPrCount(violations) {
+  return new Set((violations ?? []).map((violation) => violation.number)).size;
+}
+
 function gh(args) {
   const stdout = execFileSync("gh", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
   return JSON.parse(stdout);
@@ -143,8 +164,8 @@ function main() {
 
   if (violations.length > 0) {
     console.error(
-      `\n${violations.length} of ${prs.length} merged PRs in ${repo} carried a green review/* ` +
-        "status that admitted nothing evaluated the head.",
+      `\n${violatingPrCount(violations)} of ${prs.length} merged PRs in ${repo} carried a green ` +
+        "review/* status that admitted nothing evaluated the head.",
     );
     process.exit(1);
   }
