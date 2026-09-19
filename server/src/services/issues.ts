@@ -5685,7 +5685,12 @@ export function issueService(db: Db) {
   // bootstraps the singleton row, which on a caller's tx is a row lock taken
   // BEFORE the company graph lock and held to commit — a deadlock edge. These
   // are pure reads, so they take the read-only view on either handle.
-  const instanceSettingsOn = readInstanceSettingsOn;
+  // Wrapper, not a bare alias: an alias dereferences the module binding when
+  // `issueService(db)` is constructed, so any test that partially mocks
+  // `instance-settings.js` fails just by building the service. Reading it
+  // inside the arrow keeps the dereference at call time.
+  const instanceSettingsOn = (dbOrTx: Parameters<typeof readInstanceSettingsOn>[0]) =>
+    readInstanceSettingsOn(dbOrTx);
   const treeControlSvc = issueTreeControlService(db);
 
   async function lockIssueBlockerRelations(

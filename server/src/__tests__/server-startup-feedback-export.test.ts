@@ -1055,6 +1055,11 @@ describe("startServer feedback export wiring", () => {
     // and the chain's trailing pass is a real (unmocked) import, so there is no
     // mock to await for "the `.finally` has run". Tick until it does; a latch
     // that never releases simply never satisfies this and times out.
+    // Ticking inside the predicate means the tick count is however many times
+    // `waitFor` happened to retry, so every call count downstream of the first
+    // `tickUntilTailRuns` is nondeterministic: assert on the tail's own count
+    // (which this waits for) and never add a `toHaveBeenCalledTimes` on the
+    // unlatched passes after it.
     const tickUntilTailRuns = async (times: number) =>
       vi.waitFor(() => {
         intervalCallback?.();
