@@ -1561,20 +1561,21 @@ export async function handleFiring(
     // rule itself remains BLO-32163. Two things that rule's author needs which
     // are not visible from the `metrics.write` calls below:
     //
-    //   - `aggregate_key` and `phase` do NOT reach Prometheus. The host
-    //     promotes a tag to a label only if it is BOTH manifest-declared and
-    //     in PLUGIN_METRIC_PROMOTABLE_TAG_KEYS (`metrics.ts`); this plugin
-    //     declares `["alertname", "severity", "version"]` (`manifest.ts`) and
-    //     neither key is promotable in any case. So the scraped series is
-    //     dimensioned by `tag_alertname` only — promoted tags publish under the
+    //   - `aggregate_key` DOES reach Prometheus, as `tag_aggregate_key`
+    //     (BLO-32163). The host promotes a tag to a label only if it is BOTH
+    //     manifest-declared and in PLUGIN_METRIC_PROMOTABLE_TAG_KEYS
+    //     (`metrics.ts`); it is now on both lists, which is what lets a
+    //     wedged-fence page name the aggregate that is actually stuck.
+    //     `phase` is deliberately NOT promoted — it would 4x this metric's
+    //     combination count inside its own per-name label budget and starve
+    //     `aggregate_key` — so it stays a `plugin_logs`-only tag, which is
+    //     still where a responder can read it. Promoted tags publish under the
     //     host's `tag_` prefix (`pluginMetricTagLabel` =
-    //     PLUGIN_METRIC_TAG_LABEL_PREFIX + key, `metrics.ts`), and the counter's
-    //     label set is built through exactly that mapper, so a rule matching a
-    //     bare `alertname` hits the same empty-vector trap as the bare
-    //     `rate(age) / rate(count)` described below. AC3's "naming the
-    //     aggregate_key" has to come from the `plugin_logs` metric row or the
-    //     error thrown below — both carry the full tag set — not from the
-    //     rule's labels.
+    //     PLUGIN_METRIC_TAG_LABEL_PREFIX + key, `metrics.ts`), and the
+    //     counter's label set is built through exactly that mapper, so a rule
+    //     matching a bare `alertname` or `aggregate_key` hits the same
+    //     empty-vector trap as the bare `rate(age) / rate(count)` described
+    //     below.
     //   - Both series land on the SAME prom-client counter
     //     (`paperclip_plugin_metric_total`), distinguished only by the `metric`
     //     label. Prometheus matches binary operands on all labels by default,
