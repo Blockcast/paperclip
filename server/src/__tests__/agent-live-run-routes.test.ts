@@ -29,7 +29,60 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
+/**
+ * BLO-34631. `/workspace-operations/:operationId/log` was the only one of the four run/operation
+ * log surfaces with neither a read-time projection nor an access audit — it answered with the
+ * stored chunk verbatim and wrote nothing. These cover both, plus the entitled control.
+ *
+ * Every value below is invented; no real credential, command or path is quoted, per the parent
+ * series' standing prohibition.
+ */
+const mockWorkspaceOperationService = vi.hoisted(() => ({
+  getById: vi.fn(),
+  readLog: vi.fn(),
+}));
+
+/**
+ * Flippable so the entitled and unentitled readers are separate cases. The default allows
+ * everything, which models the board actor the rest of this file drives with; denying only
+ * `workspace_runtime:read` models a standard same-company agent, which holds `company_scope:read`
+ * and `runtime:manage` but deliberately NOT this one (PEN-2852, `allow_company_agent`).
+ */
+const mockAccessDecide = vi.hoisted(() => vi.fn());
+
 const routeAgentId = "11111111-1111-4111-8111-111111111111";
+
+const WORKSPACE_OPERATION_LOG_SENTINEL =
+  "TOKEN_FIXTURE=sentinel-operation-log-not-a-real-credential ./deploy.sh";
+
+function workspaceOperationLogFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "operation-1",
+    companyId: "company-1",
+    heartbeatRunId: "run-1",
+    logStore: "local_file",
+    logRef: "logs/operation-1.ndjson",
+    ...overrides,
+  };
+}
+
+function allowEveryAction() {
+  mockAccessDecide.mockImplementation(async (input: { action?: string }) => ({
+    allowed: true,
+    action: input.action,
+    reason: "allow_explicit_grant",
+    explanation: "Allowed by test grant.",
+  }));
+}
+
+function denyWorkspaceRuntimeRead() {
+  mockAccessDecide.mockImplementation(async (input: { action?: string }) => ({
+    allowed: input.action !== "workspace_runtime:read",
+    action: input.action,
+    reason: "test",
+    explanation: "Allowed by test mock.",
+  }));
+}
 
 function registerModuleMocks() {
   vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
@@ -65,12 +118,7 @@ function registerModuleMocks() {
     agentInstructionsService: () => ({}),
     accessService: () => ({
       canUser: vi.fn(async () => true),
-      decide: vi.fn(async (input: { action?: string }) => ({
-        allowed: true,
-        action: input.action,
-        reason: "allow_explicit_grant",
-        explanation: "Allowed by test grant.",
-      })),
+      decide: mockAccessDecide,
       hasPermission: vi.fn(async () => true),
     }),
     approvalService: () => ({}),
@@ -83,7 +131,7 @@ function registerModuleMocks() {
     logActivity: mockLogActivity,
     secretService: () => ({}),
     syncInstructionsBundleConfigFromFilePath: vi.fn((_agent, config) => config),
-    workspaceOperationService: () => ({}),
+    workspaceOperationService: () => mockWorkspaceOperationService,
   }));
 
   vi.doMock("../adapters/index.js", () => ({
@@ -290,6 +338,15 @@ describe("agent live run routes", () => {
     registerModuleMocks();
     vi.clearAllMocks();
     mockLogActivity.mockResolvedValue(undefined);
+    allowEveryAction();
+    mockWorkspaceOperationService.getById.mockResolvedValue(workspaceOperationLogFixture());
+    mockWorkspaceOperationService.readLog.mockResolvedValue({
+      operationId: "operation-1",
+      store: "local_file",
+      logRef: "logs/operation-1.ndjson",
+      content: WORKSPACE_OPERATION_LOG_SENTINEL,
+      nextOffset: 9,
+    });
     mockIssueService.getByIdentifier.mockResolvedValue({
       id: "issue-1",
       companyId: "company-1",
@@ -542,6 +599,157 @@ describe("agent live run routes", () => {
     }));
     expect(mockLogActivity.mock.calls[0]?.[1]?.details).not.toHaveProperty("content");
     expect(mockLogActivity.mock.calls[0]?.[1]?.details).not.toHaveProperty("logRef");
+  });
+
+  /**
+   * BLO-34631 AC 1/2/3/4. Four cases, one per control, so a pass names which one it proved.
+   *
+   * The sentinel is the log CONTENT rather than a row field: the route answered with
+   * `readLog`'s result unprojected, so a fixture whose content is inert could not show it.
+   */
+  it("withholds workspace-operation log content from a reader without workspace_runtime:read", async () => {
+    denyWorkspaceRuntimeRead();
+
+    const res = await requestApp(
+      await createApp({}, {
+        type: "agent",
+        agentId: routeAgentId,
+        companyId: "company-1",
+        companyIds: ["company-1"],
+        source: "agent_key",
+        runId: "actor-run-1",
+      }),
+      (baseUrl) => request(baseUrl).get("/api/workspace-operations/operation-1/log?offset=0&limitBytes=64"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(JSON.stringify(res.body)).not.toContain(WORKSPACE_OPERATION_LOG_SENTINEL);
+    // Masked, not emptied: a withheld reader must still tell "logged nothing" from "withheld".
+    expect(res.body.content).toBe("***REDACTED***");
+    // The opaque handles stay — the route they point at is the one that now withholds.
+    expect(res.body.logRef).toBe("logs/operation-1.ndjson");
+  });
+
+  it("discloses workspace-operation log content to a reader holding workspace_runtime:read", async () => {
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl).get("/api/workspace-operations/operation-1/log?offset=7&limitBytes=64"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.content).toBe(WORKSPACE_OPERATION_LOG_SENTINEL);
+    expect(mockWorkspaceOperationService.readLog).toHaveBeenCalledWith("operation-1", {
+      offset: 7,
+      limitBytes: 64,
+    });
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      companyId: "company-1",
+      actorType: "user",
+      actorId: "local-board",
+      action: "workspace_operation.log_accessed",
+      entityType: "workspace_operation",
+      entityId: "operation-1",
+      // The operation's own run, so an audit reader can join back to the run that produced it.
+      runId: "run-1",
+      details: expect.objectContaining({
+        result: "allowed",
+        actorSource: "local_implicit",
+        offset: 7,
+        limitBytes: 64,
+        logStore: "local_file",
+      }),
+    }));
+    expect(mockLogActivity.mock.calls[0]?.[1]?.details).not.toHaveProperty("content");
+  });
+
+  it("audits denied workspace-operation log access without reading content", async () => {
+    const res = await requestApp(
+      await createApp({}, {
+        type: "agent",
+        agentId: routeAgentId,
+        companyId: "company-2",
+        companyIds: ["company-2"],
+        source: "agent_key",
+        runId: "actor-run-1",
+      }),
+      (baseUrl) => request(baseUrl).get("/api/workspace-operations/operation-1/log?offset=4&limitBytes=32"),
+    );
+
+    // Cross-tenant stays a 404 so the route is not an existence oracle, but the attempt is recorded.
+    expect(res.status).toBe(404);
+    expect(mockWorkspaceOperationService.readLog).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      companyId: "company-1",
+      actorType: "agent",
+      actorId: routeAgentId,
+      agentId: routeAgentId,
+      action: "workspace_operation.log_accessed",
+      entityType: "workspace_operation",
+      entityId: "operation-1",
+      details: expect.objectContaining({
+        result: "denied",
+        actorSource: "agent_key",
+        actorRunId: "actor-run-1",
+        offset: 4,
+        limitBytes: 32,
+      }),
+    }));
+  });
+
+  /**
+   * AC 1. Write-time username censoring is not retroactive, so a chunk stored before it landed is
+   * in the store uncensored and crossed verbatim on this route only. Paired with the off-case
+   * below: the setting is the sole discriminator, so neither passes if the read-time censor is
+   * dropped, and neither passes if it is replaced by blanket blanking.
+   *
+   * `os.homedir()` rather than a literal, because that is the value `defaultHomeDirs` derives its
+   * module-cached candidate list from.
+   */
+  it("censors the current user's home directory in stored log content when the setting is on", async () => {
+    const { default: os } = await vi.importActual<typeof import("node:os")>("node:os");
+    const homeDir = os.homedir();
+    mockInstanceSettingsService.getGeneral.mockResolvedValue({
+      censorUsernameInLogs: true,
+      feedbackDataSharingPreference: "prompt",
+    });
+    mockWorkspaceOperationService.readLog.mockResolvedValue({
+      operationId: "operation-1",
+      store: "local_file",
+      logRef: "logs/operation-1.ndjson",
+      content: `cloned into ${homeDir}/checkout`,
+      nextOffset: 9,
+    });
+
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl).get("/api/workspace-operations/operation-1/log"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.content).not.toContain(homeDir);
+    // Censored, not blanked: the surrounding line survives so the log stays readable.
+    expect(res.body.content).toContain("cloned into ");
+    expect(res.body.content).toContain("/checkout");
+  });
+
+  it("leaves stored log content alone when the censor setting is off", async () => {
+    const { default: os } = await vi.importActual<typeof import("node:os")>("node:os");
+    const homeDir = os.homedir();
+    mockWorkspaceOperationService.readLog.mockResolvedValue({
+      operationId: "operation-1",
+      store: "local_file",
+      logRef: "logs/operation-1.ndjson",
+      content: `cloned into ${homeDir}/checkout`,
+      nextOffset: 9,
+    });
+
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl).get("/api/workspace-operations/operation-1/log"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.content).toBe(`cloned into ${homeDir}/checkout`);
   });
 
   it("caps company live run polling by default", async () => {
