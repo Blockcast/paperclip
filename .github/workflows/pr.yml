@@ -1228,6 +1228,106 @@ jobs:
             exit 1
           fi
 
+      # PEN-3223: the vendored version is recorded in two hand-maintained
+      # places — package.json `version` and PROVENANCE.md's Origin table
+      # `Current version` — and the hash above cannot see them disagree, since
+      # PROVENANCE.md is excluded from the manifest by design. That pair drifted
+      # on PR#1862 and survived three heads. The failure is quiet and lands
+      # later: the next vendored change reads the stale table field, bumps from
+      # there, and reuses a `-blockcast.N` already published against different
+      # bytes.
+      - name: Verify vendored version is recorded consistently
+        run: |
+          set -euo pipefail
+          pkg=$(node -p 'require("./package.json").version')
+          recorded=$(sed -n 's/^| Current version | `\([^`]*\)`.*/\1/p' PROVENANCE.md | head -1)
+          echo "package.json:   $pkg"
+          echo "PROVENANCE.md:  $recorded"
+          if [ -z "$recorded" ]; then
+            echo "::error::No 'Current version' row found in PROVENANCE.md's Origin table."
+            exit 1
+          fi
+          if [ "$pkg" != "$recorded" ]; then
+            echo "::error::PROVENANCE.md records version '$recorded' but package.json is '$pkg'."
+            echo "Update the 'Current version' row in vendor/paperclip-adapter-claude-k8s/PROVENANCE.md to: $pkg"
+            exit 1
+          fi
+
+      # PEN-3223 follow-up. The two checks above are both WITHIN-TREE: the hash
+      # compares PROVENANCE.md against the source beside it, and the version
+      # check compares two fields of this one checkout. Neither can see the axis
+      # this actually failed on — the same `-blockcast.N` claimed by two
+      # different byte-sets on diverged histories.
+      #
+      # Worked instance: this branch took `0.2.6-blockcast.10`, and 1h54m later
+      # master independently took `.10` for BLO-32908 (91b1c8cca) against
+      # different bytes. Merging master produced NO conflict in package.json —
+      # both sides already read `.10` — so the version check passed green while
+      # the reuse stood, and the hash check only forced a recompute of the
+      # *hash*, never the *version*. It took a human-authored review to catch.
+      #
+      # Deliberately narrow: this fires only when the base and this tree name
+      # the SAME version while their recorded manifest hashes DIFFER. Equal
+      # hashes mean identical bytes, where a shared version is correct and must
+      # stay green — that is what keeps this from reddening every PR that merely
+      # touches vendor/ after an unrelated trunk bump. When it does fire, the
+      # bytes genuinely differ and PROVENANCE.md's own Versioning rules already
+      # require a bump; the check is reporting that requirement, not adding one.
+      - name: Verify vendored version does not collide with the base branch
+        run: |
+          set -euo pipefail
+          base="${BASE_REF:-}"
+          if [ -z "$base" ]; then
+            echo "No base ref (not a pull request) — nothing to compare against."
+            exit 0
+          fi
+          if ! git fetch --no-tags --depth=1 origin "$base" 2>/dev/null; then
+            echo "::warning::Could not fetch base ref '$base'; skipping collision check."
+            exit 0
+          fi
+
+          pkg_path=vendor/paperclip-adapter-claude-k8s/package.json
+          prov_path=vendor/paperclip-adapter-claude-k8s/PROVENANCE.md
+
+          # A base without the vendored package at all (or without a recorded
+          # hash) leaves nothing to collide with.
+          if ! git show "FETCH_HEAD:$pkg_path" >/dev/null 2>&1; then
+            echo "Base '$base' has no vendored package — nothing to compare."
+            exit 0
+          fi
+
+          base_version=$(git show "FETCH_HEAD:$pkg_path" | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8")).version')
+          base_hash=$(git show "FETCH_HEAD:$prov_path" 2>/dev/null | grep -oE '^[0-9a-f]{64}$' | head -1 || true)
+          head_version=$(node -p 'require("./package.json").version')
+          head_hash=$(grep -oE '^[0-9a-f]{64}$' PROVENANCE.md | head -1)
+
+          echo "base ($base): version=$base_version hash=${base_hash:-<none>}"
+          echo "head:          version=$head_version hash=$head_hash"
+
+          if [ -z "$base_hash" ]; then
+            echo "Base records no integrity hash — cannot compare bytes; skipping."
+            exit 0
+          fi
+          if [ "$head_version" != "$base_version" ]; then
+            echo "Version differs from base — no collision."
+            exit 0
+          fi
+          if [ "$head_hash" = "$base_hash" ]; then
+            echo "Version matches base and bytes are identical — vendored package unchanged."
+            exit 0
+          fi
+
+          echo "::error::Vendored version '$head_version' is already used on '$base' against different bytes (base hash ${base_hash}, this tree ${head_hash})."
+          echo "Two byte-sets would claim one version. Bump the -blockcast.N suffix in:"
+          echo "  vendor/paperclip-adapter-claude-k8s/package.json      (version)"
+          echo "  vendor/paperclip-adapter-claude-k8s/package-lock.json (both self-version entries)"
+          echo "  vendor/paperclip-adapter-claude-k8s/PROVENANCE.md     ('Current version' row)"
+          echo "then recompute the integrity hash as the LAST step."
+          echo "Re-read the base and any in-flight PR touching vendor/ before picking N — the next integer is not necessarily free."
+          exit 1
+        env:
+          BASE_REF: ${{ github.base_ref }}
+
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     # Serialized server suites run inside the four general-server matrix jobs,
