@@ -97,6 +97,7 @@ export interface CostByAgent {
   apiRunCount: number;
   subscriptionRunCount: number;
   subscriptionCachedInputTokens: number;
+  /** BLO-29842: cache WRITE on subscription-billed runs. Not part of `subscriptionInputTokens`. */
   subscriptionCacheCreationInputTokens: number;
   subscriptionInputTokens: number;
   subscriptionOutputTokens: number;
@@ -116,6 +117,7 @@ export interface CostByProviderModel {
   apiRunCount: number;
   subscriptionRunCount: number;
   subscriptionCachedInputTokens: number;
+  /** BLO-29842: cache WRITE on subscription-billed runs. Not part of `subscriptionInputTokens`. */
   subscriptionCacheCreationInputTokens: number;
   subscriptionInputTokens: number;
   subscriptionOutputTokens: number;
@@ -132,6 +134,7 @@ export interface CostByBiller {
   apiRunCount: number;
   subscriptionRunCount: number;
   subscriptionCachedInputTokens: number;
+  /** BLO-29842: cache WRITE on subscription-billed runs. Not part of `subscriptionInputTokens`. */
   subscriptionCacheCreationInputTokens: number;
   subscriptionInputTokens: number;
   subscriptionOutputTokens: number;
