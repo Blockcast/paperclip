@@ -646,6 +646,16 @@ jobs:
         run: node --test ./.github/scripts/tests/post-lockfile-drift-alert.test.mjs
         timeout-minutes: 1
 
+      # BLO-26675. Same shape as the drift alert above: the only thing this
+      # reporter does is speak up after a merge-group run has already failed,
+      # so its failure mode is silence on a path that by definition only runs
+      # when something else broke. The PR-number extraction is the load-bearing
+      # part -- it decides WHICH pull request gets commented on.
+      - name: Test merge-queue ejection reporter (BLO-26675)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/report-merge-queue-ejection.test.mjs
+        timeout-minutes: 1
+
       - name: Validate dependency resolution when manifests change
         id: regen_lockfile
         if: ${{ !cancelled() }}
