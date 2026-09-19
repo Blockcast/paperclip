@@ -6943,6 +6943,22 @@ export function issueRoutes(
    *
    * `loadActorRunContext` returns null for non-agent actors, so this
    * self-limits to agents and cannot affect board or user callers.
+   *
+   * BLO-34683: run class alone is NOT the condition. The harm above needs a
+   * live recovery action to escape from — but `isStatusOnlyCheapRecoveryContext`
+   * reads only `contextSnapshot`, and the monitor-CLEAR path stamps its own
+   * repair wake status-only too (`heartbeat.ts`, `reason: issue_monitor_recovery`,
+   * unconditional). So the one run dispatched to fix a cleared monitor was the
+   * one run forbidden to re-arm it: the platform removed the wake path and then
+   * refused the repair, which on an `in_review`/`blocked` row whose only path
+   * was that monitor is the BLO-27553 permanent strand. Observed live on
+   * BLO-19124, an issue that has never held a recovery action at all.
+   *
+   * So test the containment, not the provenance. This cannot be self-lifted:
+   * clearing the action requires a recorded disposition, which is the intended
+   * exit. Deliberately NOT keyed on `wakeReason === "issue_monitor_recovery"` —
+   * that is a string standing in for the condition, and it would exempt the
+   * wake class forever rather than only while nothing is containing it.
    */
   async function assertMonitorArmingAllowedByRunContext(
     req: Request,
@@ -6951,6 +6967,13 @@ export function issueRoutes(
   ) {
     const run = await loadActorRunContext(req, companyId);
     if (!run || !isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return;
+
+    // A null `issue.id` FAILS CLOSED and must keep doing so. The creation
+    // routes mint the id after this gate, so there is no issue to query — and
+    // that is precisely the escape a contained run would use: create a fresh
+    // issue naming itself assignee, arm a monitor on it, collect an unguarded
+    // normal-model wake. An unresolvable scope is not evidence of no containment.
+    if (issue.id && !(await recoveryActionsSvc.getActiveForIssue(companyId, issue.id))) return;
 
     // Same shape as `assertCheapRecoveryIssueAssigneeProfileAllowed`: the
     // refusal is unconditional and single-point, the audit row is best-effort

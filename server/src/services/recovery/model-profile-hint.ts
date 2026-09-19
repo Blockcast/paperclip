@@ -50,14 +50,21 @@ export const PLANNING_ONLY_RECOVERY_GUARD_CONTEXT = {
 // a normal-model run, because only a recorded disposition clears the action. The narrower phrasing
 // is deliberate in both directions — it must not go stale again, and it must not read to a refused
 // agent as an instruction to go arm itself an unguarded run (that residual is BLO-32774).
+// BLO-34683: the exit list is now CONDITIONAL, because the state it used to assert is not
+// universal. `issue_monitor_recovery` wakes are stamped status-only while holding no recovery
+// action at all, so "record a valid issue disposition to clear the recovery action" named an
+// object that does not exist and left the refused run with no reachable exit but a branchless
+// external ask. Both arms must stay true in both states; do not collapse this back to one.
 export const STATUS_ONLY_RECOVERY_RESUME_GUIDANCE = {
   normalModelResumeIsAutomatic: false,
   resumeGuidance:
     "No normal-model run is dispatched for this issue on its own: every wake the recovery action " +
     "itself raises is status-only, and only a recorded disposition clears that action — so waiting " +
-    "for a normal-model run never ends. Reachable exits from this run: record a valid issue " +
-    "disposition to clear the recovery action, or file a `request_board_approval` linked to the " +
-    "run context's source issue.",
+    "for a normal-model run never ends. Reachable exits from this run: if a recovery action is " +
+    "active on this issue, record a valid issue disposition to clear it; if none is (a monitor-" +
+    "recovery wake holds no recovery action), record your conclusion on the issue and re-arm the " +
+    "wake path yourself. Either way you may file a `request_board_approval` linked to the run " +
+    "context's source issue.",
 } as const;
 
 // Does a run's `contextSnapshot` carry the full status-only guard tuple?
