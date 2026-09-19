@@ -24,12 +24,14 @@ import {
   type AllyPriorFindingDisposition,
 } from "./ally-review-detection.js";
 import {
+  githubFetchPrAuthorLogin,
   githubFetchPrHeadSha,
   githubListIssueCommentsWithTimestamps,
   githubListPrReviewsWithTimestamps,
   githubPostCheckRun,
   githubPostCommitStatusDetailed,
   githubReviewerIdentityMatches,
+  githubSharesReviewerIdentity,
   type GitHubCheckRunConclusion,
   type GitHubCommitStatusPostResult,
 } from "./github-app-auth.js";
@@ -72,12 +74,27 @@ export type CommentReviewGateOutcome =
   | "blocking_finding"
   /** No comment attests this head, but a finding from an earlier head stands undispositioned. */
   | "carried_finding"
-  /** Nothing established a comment-shaped review of this head. Not evidence of review. */
+  /**
+   * Nothing established an *independent* comment-shaped review of this head.
+   * Not evidence of review. Covers both "no comment attests it" and "the only
+   * one that does is the PR author's own" (BLO-34316).
+   */
   | "not_evaluated";
 
 export type CommentReviewGateVerdict =
   | { state: "success"; outcome: "clean"; reason: string }
-  | { state: "success"; outcome: "not_evaluated"; reason: string }
+  | {
+      state: "success";
+      outcome: "not_evaluated";
+      reason: string;
+      /**
+       * Set only on the branch that would have been `clean` had the author been
+       * known. It is what lets the caller fetch the author on the one path that
+       * reads it, instead of making that fetch a precondition for publishing
+       * anything — see executeCommentReviewGateCheck.
+       */
+      authorUnknown?: true;
+    }
   | { state: "failure"; outcome: "blocking_finding"; reason: string; commentCreatedAt: string }
   | {
       state: "failure";
@@ -85,6 +102,15 @@ export type CommentReviewGateVerdict =
       reason: string;
       commentCreatedAt: string;
       carriedFromHeadSha: string;
+      /**
+       * Same meaning as on `not_evaluated`, and it has to exist here too: a
+       * carried finding CONSUMES the withheld positive rather than returning
+       * it, so without this flag the author-blind first pass pins the verdict
+       * and the caller never fetches the author — making `clean` unreachable
+       * for a distinct author whose at-head attestation should have cleared
+       * the carry, and leaving the self-attested tail below unrenderable.
+       */
+      authorUnknown?: true;
     };
 
 function toEpochMs(value: string | Date): number {
@@ -306,6 +332,19 @@ export function evaluateCommentReviewGate(input: {
   comments: CommentReviewGateComment[];
   headSha: string;
   reviewerBotLogin?: string | null;
+  /**
+   * The login that opened the PR. Required to reach `clean` (BLO-34316).
+   *
+   * Every attesting comment has already been established to come from the
+   * reviewer identity, so "this attestation is the author's own" reduces to
+   * "the PR author IS that identity" — which is the case on every agent PR
+   * here, where both sides are `allyblockcast[bot]`. Null is treated the same
+   * as self-attested: the positive claim is that someone other than the author
+   * examined this head, and an absent author cannot establish it. Required and
+   * explicitly nullable rather than optional, so a new call site has to state
+   * which it means instead of silently downgrading every `clean` to `neutral`.
+   */
+  prAuthorLogin: string | null;
 }): CommentReviewGateVerdict {
   const reviewerBotLogin = input.reviewerBotLogin?.trim() || DEFAULT_PR_REVIEWER_BOT_LOGIN;
   const headSha = input.headSha?.trim();
@@ -321,6 +360,28 @@ export function evaluateCommentReviewGate(input: {
   const normalizedHead = headSha.toLowerCase();
   const forHead = latestAttestingAllyComment(comments, reviewerBotLogin, normalizedHead);
 
+  // Set when an attestation for this head exists but its positive claim is
+  // withheld. HELD rather than returned: withholding a positive is not an
+  // all-clear, so the carried-finding check below still has to run. Returning
+  // here made the author better off posting a self-attestation that carries NO
+  // disposition ledger than posting nothing — either withheld positive silently
+  // converted a red carried from an earlier head into `neutral`, because
+  // `headsWithUndispositionedFinding` is only reached when NOTHING attests the
+  // current head. The `clean` return below is deliberately not held: an
+  // independent attestation of the current head does disposition an earlier
+  // head's finding, which is the pre-existing BLO-29711 behaviour.
+  //
+  // The LEDGER route is deliberately still author-blind and is not closed here:
+  // `headsWithUndispositionedFinding` credits a `prior:<A> critical 1 — fixed`
+  // entry from any comment passing `isAllyConsolidatedReviewComment`, so on an
+  // agent PR — where the reviewer identity IS the author — a self-authored
+  // ledger still retires a carried finding. Requiring independence there would
+  // make an agent PR permanently red once any finding is raised, because only
+  // the reviewer ever writes ledgers: the BLO-29711 deadlock this module exists
+  // to avoid. What this branch closes is the malformed-ledger shape, where the
+  // section parses as absent and the bare attestation was the whole claim.
+  let withheldPositive: Extract<CommentReviewGateVerdict, { outcome: "not_evaluated" }> | null = null;
+
   if (forHead) {
     if (hasActionablePrReviewFeedback(forHead.comment.body)) {
       return {
@@ -331,22 +392,49 @@ export function evaluateCommentReviewGate(input: {
         commentCreatedAt: new Date(toEpochMs(forHead.comment.createdAt)).toISOString(),
       };
     }
-    return {
-      state: "success",
-      outcome: "clean",
-      reason:
-        "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
-    };
+    // Only the POSITIVE claim is withheld for a self-attestation. The blocking
+    // branch above stays author-blind on purpose: a finding is a finding
+    // whoever wrote it, and failing closed there is the direction this module
+    // must not get wrong.
+    const prAuthorLogin = input.prAuthorLogin?.trim();
+    if (!prAuthorLogin) {
+      withheldPositive = {
+        state: "success",
+        outcome: "not_evaluated",
+        authorUnknown: true,
+        reason: "The PR author is unknown, so this head's attestation cannot be shown to be independent.",
+      };
+      // `githubSharesReviewerIdentity`, not `githubReviewerIdentityMatches`: the
+      // strict predicate exists to keep the bare `<slug>` user seat from being
+      // CREDITED as the reviewer, and that fail direction is inverted here. The
+      // seat and the App are one agent wearing two hats, so a PR opened by the
+      // seat and attested by the App is still a self-attestation.
+    } else if (githubSharesReviewerIdentity(prAuthorLogin, reviewerBotLogin)) {
+      withheldPositive = {
+        state: "success",
+        outcome: "not_evaluated",
+        reason: "The only comment attesting this head is the PR author's own; nothing independent reviewed it.",
+      };
+    } else {
+      return {
+        state: "success",
+        outcome: "clean",
+        reason:
+          "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
+      };
+    }
   }
 
-  // Nothing attests this head. A finding raised against an earlier head is not
-  // dispositioned by replacing that head, so it carries forward rather than
-  // going green (BLO-29711). It is disposed by a later clean review of that
-  // same earlier head, or by a later review that names it as resolved in its
-  // prior-findings ledger — see headsWithUndispositionedFinding. It also clears
-  // the moment Ally attests the current head. Note that none of those routes
-  // exists while the reviewer itself is failing to run, which is the state that
-  // strands a PR here.
+  // Nothing attests this head, or what does cannot make the positive claim. A
+  // finding raised against an earlier head is not dispositioned by replacing
+  // that head, so it carries forward rather than going green (BLO-29711). It is
+  // disposed by a later clean review of that same earlier head, or by a later
+  // review that names it as resolved in its prior-findings ledger — see
+  // headsWithUndispositionedFinding. It also clears the moment an INDEPENDENT
+  // review attests the current head; the author's own attestation does not,
+  // which is why `withheldPositive` falls through to here rather than returning.
+  // Note that none of those routes exists while the reviewer itself is failing
+  // to run, which is the state that strands a PR here.
   const [carried] = headsWithUndispositionedFinding(comments, reviewerBotLogin);
   if (carried) {
     const shortHead = carried.attestedHeadSha.slice(0, 7);
@@ -376,25 +464,48 @@ export function evaluateCommentReviewGate(input: {
       .map((verb) => `"${verb}"`)
       .join(", ")
       .slice(0, UNRECOGNIZED_VERB_BUDGET);
+    // The tail is conditional because `withheldPositive` is exactly the state
+    // in which a comment DOES attest the current head. Saying "no comment
+    // attests the current head" there invites the author to post one — which
+    // they just did, and which cannot clear a carried finding. Naming why the
+    // attestation did not count is the difference between a red that routes
+    // the author to the reviewer and a red that routes them into a loop.
+    // Longest rendering is 131 characters, inside the 140 cap.
+    const carriedTail = !withheldPositive
+      ? "; no comment attests the current head."
+      : withheldPositive.authorUnknown
+        ? "; its only attestation is not known to be independent."
+        : "; the only comment attesting it is the PR author's own.";
     const reason = carried.unrecognizedVerbs.length
       ? `A finding from Ally's review of ${shortHead} is undispositioned: unrecognized ledger ` +
         `${carried.unrecognizedVerbs.length === 1 ? "verb" : "verbs"} ${verbList}.`
-      : `An unresolved finding from Ally's review of ${shortHead} ` +
-        "is still undispositioned; no comment attests the current head.";
+      : `An unresolved finding from Ally's review of ${shortHead} is still undispositioned` +
+        carriedTail;
     return {
       state: "failure",
       outcome: "carried_finding",
       reason,
       commentCreatedAt: new Date(toEpochMs(carried.comment.createdAt)).toISOString(),
       carriedFromHeadSha: carried.attestedHeadSha,
+      // Carried forward so the caller still fetches the author on this route.
+      // A distinct author's at-head attestation clears the carry outright (the
+      // `clean` return above), so pinning this red on the author-blind pass
+      // would publish a red the evidence does not support.
+      ...(withheldPositive?.authorUnknown ? { authorUnknown: true as const } : {}),
     };
   }
 
-  return {
-    state: "success",
-    outcome: "not_evaluated",
-    reason: "No Ally consolidated-review comment attests to reviewing this head.",
-  };
+  // The withheld positive is the accurate verdict only once no red carries: a
+  // comment DOES attest this head, so the generic "no comment attests" reason
+  // below would be false, and `authorUnknown` has to survive for the caller to
+  // know this is the one outcome worth a PR-author fetch.
+  return (
+    withheldPositive ?? {
+      state: "success",
+      outcome: "not_evaluated",
+      reason: "No Ally consolidated-review comment attests to reviewing this head.",
+    }
+  );
 }
 
 /**
@@ -431,7 +542,12 @@ export function commentReviewGateCheckTitle(
     case "carried_finding":
       return "Unresolved finding carried from an earlier head";
     case "not_evaluated":
-      return "Not evaluated — no comment-shaped review attests this head";
+      // "independent" carries the self-attested case (BLO-34316), where a
+      // comment DOES attest this head — the author's own. Saying "no
+      // comment-shaped review attests this head" there would be false, which is
+      // the same laundering one level down from the green it replaces. The
+      // summary (`verdict.reason`) names which of the two it was.
+      return "Not evaluated — no independent comment-shaped review attests this head";
   }
 }
 
@@ -687,15 +803,41 @@ async function executeCommentReviewGateCheck(
     ]);
     if (issueComments == null || prReviews == null) return { posted: false, reason: "fetch_failed" };
 
-    const verdict = evaluateCommentReviewGate({
-      comments: [...issueComments, ...prReviews].map((comment) => ({
-        authorLogin: comment.login,
-        body: comment.body,
-        createdAt: comment.createdAt,
-      })),
-      headSha,
-      reviewerBotLogin,
-    });
+    const comments = [...issueComments, ...prReviews].map((comment) => ({
+      authorLogin: comment.login,
+      body: comment.body,
+      createdAt: comment.createdAt,
+    }));
+
+    // Evaluate author-blind FIRST. Only `clean` reads the author, and both red
+    // outcomes stand on the comment surfaces alone — so fetching the author up
+    // front made an unreadable `GET /pulls/{n}` suppress a `blocking_finding`
+    // or `carried_finding` that was already fully justified, leaving the merge
+    // surface showing that finding as absent rather than red. A red going
+    // silent is the direction this module must not get wrong.
+    let verdict = evaluateCommentReviewGate({ comments, headSha, reviewerBotLogin, prAuthorLogin: null });
+
+    // `authorUnknown` marks every outcome the author could still change, which
+    // is both the withheld positive and the carried finding that consumed it —
+    // gating on the OUTCOME instead would never fetch on the carried route, and
+    // `clean` is unreachable on the author-blind pass by construction.
+    if ("authorUnknown" in verdict && verdict.authorUnknown) {
+      const prAuthorLogin = await withBoundedRetry(
+        () => githubFetchPrAuthorLogin({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
+        (login) => login == null,
+      );
+      if (prAuthorLogin) {
+        verdict = evaluateCommentReviewGate({ comments, headSha, reviewerBotLogin, prAuthorLogin });
+      } else if (verdict.state === "success") {
+        // Publishing `neutral` on incomplete evidence would overwrite a correct
+        // earlier verdict with a weaker one on a transient 5xx. Not publishing
+        // leaves it standing, and the next webhook re-evaluates.
+        return { posted: false, reason: "fetch_failed" };
+      }
+      // A `failure` stands on the comment surfaces alone — the author can only
+      // ever soften it — so it publishes even with the author unread. Going
+      // silent there is the direction this module must not get wrong.
+    }
 
     warnOnceIfMisreadableContext(verdict, context);
     const posted = await withBoundedRetry<GitHubCommitStatusPostResult>(
