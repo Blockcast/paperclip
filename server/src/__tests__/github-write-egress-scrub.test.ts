@@ -359,27 +359,41 @@ describe("the scrub is reachable from server/ at all", () => {
   it("leaves no server-side GitHub writer outside the scrub", () => {
     // Derived from source at file granularity, the same way PEN-3152's outbound
     // coverage table derives its writer set: a `ghFetch(` call plus a mutating
-    // method. A NEW service file that starts writing to GitHub fails here until
-    // it either routes through the shared helpers or calls the scrub itself.
+    // method. A NEW file that starts writing to GitHub fails here until it
+    // either routes through the shared helpers or calls the scrub itself.
     //
     // Enumerate-then-filter rather than grepping for an expected name: a
     // pathspec that matches nothing returns the same empty set as "everything
     // is covered", and that failure mode is silent.
-    const servicesDir = path.join(repoRoot, "server/src/services");
-    const writers: string[] = [];
-    for (const entry of readdirSync(servicesDir)) {
-      if (!entry.endsWith(".ts") || entry.endsWith(".test.ts")) continue;
-      const source = readFileSync(path.join(servicesDir, entry), "utf8");
-      if (!source.includes("ghFetch(")) continue;
-      if (!/method:\s*"(?:POST|PATCH|PUT|DELETE)"/.test(source)) continue;
-      writers.push(entry);
-    }
+    //
+    // The walk is RECURSIVE over `server/src`, not one level of
+    // `server/src/services`. Ally caught the narrower scope on #1754:
+    // `server/src/routes/` (63 files, including `github-webhook.ts`) and
+    // `server/src/services/recovery/` (a real subdirectory today) were both
+    // outside it, so a new `ghFetch`-based write in either would ship
+    // unscrubbed with this test green. Widening it finds the same two writers
+    // today — the gap was in what the guard could see, not in what it covered.
+    const serverSrc = path.join(repoRoot, "server/src");
+    const scanned = readdirSync(serverSrc, { recursive: true, encoding: "utf8" })
+      .map((entry) => entry.split(path.sep).join("/"))
+      .filter((entry) => entry.endsWith(".ts") && !entry.endsWith(".test.ts"));
+
+    // Scope control. A non-recursive regression still finds both writers below
+    // (they sit directly in `services/`), so the only thing that catches it is
+    // asserting the walk reaches a file it could not otherwise see.
+    expect(scanned).toContain("routes/github-webhook.ts");
+
+    const writers = scanned.filter((entry) => {
+      const source = readFileSync(path.join(serverSrc, entry), "utf8");
+      if (!source.includes("ghFetch(")) return false;
+      return /method:\s*"(?:POST|PATCH|PUT|DELETE)"/.test(source);
+    });
     // Positive control: the derivation must actually find the file we know
     // writes, or an empty `writers` would make the assertion below vacuous.
-    expect(writers).toContain("github-app-auth.ts");
+    expect(writers).toContain("services/github-app-auth.ts");
 
     for (const writer of writers) {
-      const source = readFileSync(path.join(servicesDir, writer), "utf8");
+      const source = readFileSync(path.join(serverSrc, writer), "utf8");
       expect(source, `${writer} writes to GitHub without reaching the egress scrub`).toContain(
         "scrubOutboundGitHubText",
       );
