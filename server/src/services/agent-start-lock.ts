@@ -117,6 +117,15 @@ const LOCK_HELD_ERROR_MS = 5 * 60_000;
  * anyone looked. Retaining the record is what makes the event answerable after
  * it has self-healed — the failure mode this whole line of work exists to fix
  * was precisely that a dead agent looked identical to an idle one.
+ *
+ * Expiry is observation-driven, not wall-clock: `forgetExpiredAborts` runs only
+ * from `describeAgentStartLockDispatchHealth` and from the first error tick of a
+ * NEW abort, so on an agent nobody reads again the record outlives this window
+ * indefinitely. Read it as "expired at the first observation after an hour",
+ * not "gone after an hour". Harmless in itself — the map is bounded by agent
+ * count and a stale record is still a true statement about the past — but it
+ * means the ABSENCE of a record is not proof that no abort happened within the
+ * window, so do not use it that way.
  */
 const DISPATCH_ABORT_RETENTION_MS = 60 * 60_000;
 

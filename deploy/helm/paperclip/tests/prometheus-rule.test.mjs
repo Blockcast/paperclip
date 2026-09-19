@@ -1299,10 +1299,21 @@ test("PaperclipAgentStartLockAborted reports the self-healed wedge the held gaug
     /alert: PaperclipAgentStartLockAborted[\s\S]*?\n\s+severity: warning\n/,
     "a self-healed dispatch wedge must warn rather than page",
   );
+  // The anchor is load-bearing, not cosmetic. The wedged section runs "do NOT
+  // clear the agent as healthy" and ends in pod replacement; the aborted
+  // section opens "Dispatch has already resumed and no queued runs were lost".
+  // Linking the wedged anchor here would send a responder to replace a pod that
+  // already recovered -- the exact work this alert's description calls
+  // unnecessary. Pinned per-alert so the two cannot silently converge again.
   assert.match(
     rendered,
-    /alert: PaperclipAgentStartLockAborted[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#agent-start-lock-wedged-pen-3305"/,
-    "aborted-start-lock alert must link the runbook section from its annotation",
+    /alert: PaperclipAgentStartLockAborted[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#agent-start-lock-aborted-pen-3328"/,
+    "aborted-start-lock alert must link its OWN runbook section, not the wedged one",
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipAgentStartLockWedged[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#agent-start-lock-wedged-pen-3305"/,
+    "wedged-start-lock alert must keep linking the wedged runbook section",
   );
 });
 

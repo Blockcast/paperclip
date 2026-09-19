@@ -857,7 +857,7 @@ spec:
           annotations:
             summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} had a queued-run dispatch section cancelled after overrunning its budget"
             description: "Agent {{`{{ $labels.agent_id }}`}} held its per-agent start lock past {{ .Values.prometheusRule.agentStartLockHeldSeconds }}s and the section was cancelled (PEN-3328), so the lock released and dispatch has RESUMED -- queued runs were not lost and this is not an outage. Treat it as evidence of the underlying hang, not of the recovery: something in the dispatch section blocked on the database for five minutes, which a healthy sub-second pass never does. Correlate with the `agent start lock held far past its budget` error log for the same agentId, and check `dispatchHealth` on the agent row (worker tier only) for the post-mortem. If this repeats for one agent_id, the cancellation is masking a persistent condition -- most likely pool exhaustion or a circular advisory-lock wait in lockIssueOwnership -- and that is what to fix. See the runbook."
-            runbook_url: {{ .Values.prometheusRule.agentStartLockWedgedRunbookUrl | quote }}
+            runbook_url: {{ .Values.prometheusRule.agentStartLockAbortedRunbookUrl | quote }}
     - name: paperclip-pr-review-queue
       rules:
         - alert: PaperclipPrReviewQueueWaitSaturated

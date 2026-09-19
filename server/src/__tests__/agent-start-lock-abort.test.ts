@@ -6,6 +6,7 @@ import {
   currentAgentStartLockSignal,
   describeAgentStartLockDispatchHealth,
   describeHeldAgentStartLocks,
+  registerAgentStartLockCancelRetry,
   withAgentStartLock,
 } from "../services/agent-start-lock.js";
 import { logger } from "../middleware/logger.js";
@@ -35,6 +36,9 @@ const coalesced = { onCoalesced: () => "coalesced" as const };
 
 /** The abort threshold in `agent-start-lock.ts`. */
 const LOCK_HELD_ERROR_MS = 5 * 60_000;
+
+/** The `warnTimer` tick interval in `agent-start-lock.ts`. */
+const LOCK_HELD_WARN_MS = 30_000;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -74,6 +78,13 @@ describe("agent start lock cancellation (PEN-3328)", () => {
     vi.useRealTimers();
     vi.restoreAllMocks();
     _resetAgentStartLocksForTesting();
+    // `cancelRetryHook` is module-global and has no unregister. The real
+    // registration comes from importing `agent-start-lock-db.ts`, which this
+    // file deliberately does not do, so the neutral state here is a hook that
+    // reports zero retries — behaviourally identical to the unset `?? 0` path.
+    // Without this, the cadence test's spy would stay installed for every test
+    // after it.
+    registerAgentStartLockCancelRetry(() => 0);
   });
 
   it("rejects a wedged section at the budget and releases the lock through the existing finally", async () => {
@@ -157,8 +168,57 @@ describe("agent start lock cancellation (PEN-3328)", () => {
     },
   );
 
-  it("never runs two sections concurrently for the same agent, including across a cancellation", async () => {
+  it("retries the cancel on every tick, not once per log line (PEN-3328 review)", async () => {
     vi.useFakeTimers();
+    vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    vi.spyOn(logger, "error").mockImplementation(() => logger);
+    const agentId = randomUUID();
+
+    // `Query#cancel()` on an EXECUTING statement dials a fresh connection, and
+    // that dial can fail. The abort listener is `once: true`, so nothing in the
+    // signal path retries: if the first cancel is the only attempt, a section
+    // whose cancel failed stays wedged with its abort already spent — the
+    // `status: "stalled"` outcome this PR exists to avoid. The retry is what
+    // makes a failed cancel recoverable, so what needs pinning is its CADENCE.
+    const ticksSeen: number[] = [];
+    registerAgentStartLockCancelRetry((signal) => {
+      expect(signal.aborted).toBe(true);
+      ticksSeen.push(Date.now());
+      return 1;
+    });
+
+    // Wedged on purpose: the section must still be held while the ticks run.
+    // An abortable section would settle at the budget and clear the timer.
+    const held = withAgentStartLock(agentId, unabortableAwait, coalesced);
+    void held.catch(() => {});
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Through the first error tick: this is where the abort is raised. The hook
+    // is NOT called on that tick — it is gated on `loggedStopped`, which that
+    // same tick sets only after the check.
+    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS + 1_000);
+    expect(describeAgentStartLockDispatchHealth(agentId)).toMatchObject({ status: "stalled" });
+    const afterFirstErrorTick = ticksSeen.length;
+
+    // Four more 30s ticks — deliberately well inside ONE LOCK_HELD_ERROR_MS log
+    // window, so the log backoff suppresses every line across this span.
+    await vi.advanceTimersByTimeAsync(4 * LOCK_HELD_WARN_MS);
+
+    // The load-bearing assertion. `cancelRetryHook` is invoked ABOVE the log
+    // backoff's early return, so it fires once per 30s tick even while no line
+    // is emitted. Moving that call back below the early return — which is the
+    // one-line regression this test exists to catch, and which no other
+    // assertion in the suite notices — drops the cadence to one attempt per
+    // LOCK_HELD_ERROR_MS and makes this 4 collapse to 0.
+    const retriesInOneLogWindow = ticksSeen.length - afterFirstErrorTick;
+    expect(retriesInOneLogWindow).toBe(4);
+
+    // And they are distinct ticks 30s apart, not four calls on one tick.
+    const spacings = ticksSeen.slice(1).map((t, i) => t - ticksSeen[i]!);
+    expect(new Set(spacings)).toEqual(new Set([LOCK_HELD_WARN_MS]));
+  });
+
+  it("never runs two sections concurrently for the same agent, including across a cancellation", async () => {    vi.useFakeTimers();
     vi.spyOn(logger, "warn").mockImplementation(() => logger);
     vi.spyOn(logger, "error").mockImplementation(() => logger);
     const agentId = randomUUID();
