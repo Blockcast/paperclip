@@ -111,16 +111,43 @@ commits behind ([BLO-25414](https://paperclip.blockcast.net/BLO/issues/BLO-25414
 
 ## Verifying it actually landed
 
+Every step below is executable and answers a *different* question. Step 1 can
+pass while 2 and 3 fail — that is the whole point of running all three.
+
 ```bash
-# 1. The ConfigMap exists and carries the label the sidecar keys on
+CM=paperclip-grafana-dashboard-runtime-run-queue-health   # ConfigMap name
+KEY=runtime-run-queue-health.json                 # key inside .data
+SRC=deploy/helm/paperclip/dashboards/$KEY         # the file in this repo
+
+# 1. EXISTS + LABELLED: the sidecar only adopts ConfigMaps carrying this label.
 kubectl -n paperclip get cm -l grafana_dashboard=1
 
-# 2. The dashboard JSON inside it is the revision you expect
-kubectl -n paperclip get cm <name> -o jsonpath='{.data}' | jq -r 'keys'
+# 2. CURRENT: is the live copy the revision you just merged?
+#    Diff the live JSON against the tree. `jq -r 'keys'` does NOT answer this --
+#    it returns the filename, which is identical in every revision, so a
+#    ConfigMap hundreds of commits stale looks exactly like a fresh one.
+diff <(kubectl -n paperclip get cm "$CM" -o jsonpath="{.data.$KEY}" | jq -S .) \
+     <(jq -S . "$SRC") && echo "LIVE == TREE" || echo "STALE -- deploy has not run"
 
-# 3. The series the panel queries actually resolve
-#    (use the `cluster` Prometheus, not thanos)
+# 3. RESOLVES: the panel can render only if its series exist. Query the
+#    `cluster` Prometheus directly -- thanos is the Grafana default and will
+#    not see these.
+kubectl -n monitoring port-forward svc/prometheus 9090:9090 >/dev/null 2>&1 &
+sleep 2
+for m in paperclip_queued_run_oldest_age_seconds \
+         paperclip_overdue_scheduled_retry_oldest_age_seconds \
+         paperclip_overdue_scheduled_retry_age_metrics_refresh_success; do
+  printf '%s -> %s series\n' "$m" \
+    "$(curl -sG http://localhost:9090/api/v1/query --data-urlencode "query=$m" \
+        | jq '.data.result | length')"
+done
+kill %1
 ```
+
+Step 3 returning `0 series` for a metric is a **fault, not an empty result** —
+the panel will render "NO DATA" on red by design (see the `-1` sentinel on
+*Worst queued-run age*), because a dead exporter and an idle queue are
+indistinguishable to Grafana and only one of them is healthy.
 
 "The ConfigMap exists" is **not** sufficient — confirm the panel renders and
 resolves non-empty series. A gauge whose healthy steady state is `0` (such as

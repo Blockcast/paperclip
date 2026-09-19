@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import path from "node:path";
@@ -226,6 +227,90 @@ test("the refresher-health panel is present so a frozen gauge cannot read as hea
   );
 });
 
+test("an absent queued-age series renders NO DATA on red, never a green zero", () => {
+  // The sibling refresher panel gets absence right because its BASE threshold
+  // is red, so a bare `or vector(0)` lands on red. This panel's base is green
+  // and its unit is seconds, so the same treatment would render a dead emit
+  // path as "0 s" on green -- an affirmatively healthy tile, which is worse
+  // than the "No data" it replaced. An empty queue and a dead exporter are
+  // both "no series" to Grafana and only one of them is healthy, so absence
+  // needs a value that is out of band for the metric: a negative age.
+  //
+  // All three assertions are one fact. `or vector(-1)` with a green base is a
+  // green tile; a red base without the sentinel reddens a legitimately empty
+  // queue. They are only correct together, so they fail together.
+  const { dashboard } = renderDashboard();
+
+  const panel = dashboard.panels.find((p) => p.title === "Worst queued-run age");
+  assert.ok(panel, "dashboard must chart the worst queued-run age");
+
+  assert.match(
+    panel.targets[0].expr,
+    /or vector\(-1\)/,
+    "absent queued-age series must fall back to an out-of-band sentinel, not render No data",
+  );
+
+  const steps = panel.fieldConfig.defaults.thresholds.steps;
+  assert.equal(
+    steps[0].color,
+    "red",
+    "base threshold must be red so the -1 sentinel colours the tile red",
+  );
+  assert.equal(
+    steps[1].value,
+    0,
+    "green must start at 0 so a legitimately empty queue is not reported as absent",
+  );
+
+  const mapped = panel.fieldConfig.defaults.mappings?.flatMap((m) =>
+    Object.keys(m.options ?? {}),
+  );
+  assert.ok(
+    mapped?.includes("-1"),
+    "the -1 sentinel must be mapped to readable text; a bare '-1 s' age reads as a bug in the panel, not as absence",
+  );
+});
+
+test("the runbook's verification commands name objects that actually render", () => {
+  // The runbook's whole job is telling an operator whether a merged dashboard
+  // is live. A wrong ConfigMap name or data key there fails in the worst
+  // direction: `kubectl get cm` says NotFound, the operator concludes the
+  // deploy is stale, and goes chasing a pipeline that is fine. (Caught for
+  // real -- the first draft of that block guessed the name and was wrong.)
+  const runbook = readFileSync(
+    path.join(repoRoot, "runbooks/grafana-dashboard-as-code.md"),
+    "utf8",
+  );
+  const rendered = renderChart();
+
+  const cm = runbook.match(/^CM=(\S+)/m);
+  const key = runbook.match(/^KEY=(\S+)/m);
+  const src = runbook.match(/^SRC=(\S+)/m);
+  assert.ok(cm && key && src, "runbook must define CM=, KEY= and SRC=");
+
+  // Anchor to end-of-line, NOT \b. Every one of these names is a prefix of a
+  // longer sibling (`...-runtime` vs `...-runtime-run-queue-health`) and the
+  // next char is `-`, which IS a word boundary -- so a \b-anchored match
+  // accepts the truncated name and the guard silently passes. Found by
+  // mutation-testing this very assertion: it did not fail when the runbook's
+  // CM= was replaced with the wrong, shorter name.
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  assert.match(
+    rendered,
+    new RegExp(`^\\s+name: ${esc(cm[1])}\\s*$`, "m"),
+    `runbook names ConfigMap '${cm[1]}' but the chart renders no such ConfigMap`,
+  );
+  assert.ok(
+    rendered.includes(`${key[1]}: |`),
+    `runbook names data key '${key[1]}' but the rendered ConfigMap has no such key`,
+  );
+  assert.equal(
+    src[1],
+    `deploy/helm/paperclip/dashboards/$KEY`,
+    "SRC must be derived from $KEY so the diff cannot compare two different dashboards",
+  );
+});
+
 test("grafanaDashboard.enabled=false renders no runtime ConfigMap", () => {
   const rendered = renderChart(["--set", "grafanaDashboard.enabled=false"]);
 
@@ -299,10 +384,24 @@ test("no two rendered dashboards claim the same uid", () => {
     byUid.set(parsed.uid, key);
   }
 
-  // Guard the guard: if the scan matched nothing the assertion above is
-  // vacuous and would pass on any collision at all.
-  assert.ok(
-    byUid.size >= 2,
-    `expected to find at least the two shipped dashboards, found ${byUid.size}`,
+  // Guard the guard: a scan that matched nothing makes the assertion above
+  // vacuous and it would pass on any collision at all.
+  //
+  // Count against the source dir, NOT a literal. The scanner drops a block it
+  // cannot parse (`catch { continue }`) and only recognises a filename matching
+  // `[\w.-]+\.json` indented by exactly four spaces -- so a dashboard rendered
+  // at a different nindent is skipped SILENTLY. Against a `>= 2` floor, a third
+  // dashboard skipped that way leaves the count at 2, the floor still passes,
+  // and a uid collision involving it goes unnoticed -- which is exactly the
+  // "third dashboard is safe rather than the second one lucky" case this test
+  // was added for. Equality turns that silent skip into a failure.
+  const shipped = readdirSync(
+    path.join(repoRoot, "deploy/helm/paperclip/dashboards"),
+  ).filter((f) => f.endsWith(".json"));
+
+  assert.equal(
+    byUid.size,
+    shipped.length,
+    `scanned ${byUid.size} dashboard(s) out of the rendered chart but ${shipped.length} exist on disk (${shipped.join(", ")}); an unscanned dashboard is not checked for uid collisions`,
   );
 });
