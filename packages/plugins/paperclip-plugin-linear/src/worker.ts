@@ -3589,6 +3589,12 @@ async function handleWebhookEvent(
     if (!link) return;
 
     const commentBody = data.body as string;
+    // An edit that *clears* the body exits here, leaving the mirror on its
+    // pre-edit text. Deliberate: a bridged comment whose body is empty renders
+    // as a bare `**Author** (from Linear):` header, and there is no delete verb
+    // on the comment path to reach for instead. Before BLO-31634 every edit was
+    // dropped so this was invisible; it is now the one edit shape that does not
+    // propagate.
     if (!commentBody || commentBody.includes("[synced from Paperclip]")) return;
 
     // BLO-31657: dedup by Linear comment UUID, in the database.
@@ -3691,37 +3697,56 @@ async function handleWebhookEvent(
       // inserts nothing, so a redelivered or concurrent edit writes the same
       // body twice and still leaves exactly one comment — the guarantee
       // BLO-31657 bought for `create`, at no extra cost here.
+      //
+      // `null` and a throw are different findings and must not share a branch.
+      // `null` is an answer — no keyed mirror exists — and the legacy scan below
+      // is the right next step. A throw is the *absence* of an answer, and the
+      // scan cannot stand in for one: every keyed mirror carries the sentinel
+      // too (written above, at `sentinelPrefix`), so on a throw the scan matches
+      // this comment's own sentinel and reports a keyless legacy row that is not
+      // one. Hence `updated` is hoisted and the catch returns.
+      let updated: Awaited<ReturnType<typeof ctx.issues.updateComment>>;
       try {
-        const updated = await ctx.issues.updateComment(
+        updated = await ctx.issues.updateComment(
           link.paperclipIssueId,
           `linear-comment:${linearCommentId}`,
           mirrorBody,
           link.paperclipCompanyId,
         );
-        if (updated) {
-          // An in-place body rewrite leaves no trace in the thread the way a new
-          // comment does, so log it: an edit that silently replaces text is
-          // exactly the mutation that wants an audit trail.
-          await ctx.activity.log({
-            companyId: link.paperclipCompanyId,
-            message: `issue.comment.synced_from_linear`,
-            entityType: "issue",
-            entityId: link.paperclipIssueId,
-            metadata: { source: "linear", identifier: link.linearIdentifier, author: userName, bodySnippet: commentBody.slice(0, 120), action: "comment.edit_synced", linearCommentId },
-          });
-          ctx.logger.info(`Webhook propagated comment edit ${linearCommentId} to ${link.linearIdentifier} as comment ${updated.id}`);
-          return;
-        }
       } catch (err) {
-        // Falling through is safe for a keyed mirror even though it reaches
-        // `createComment`: the same key dedups there and returns the existing
-        // row, so the worst case is a wasted round-trip, never a second copy.
-        ctx.logger.warn(`Failed to propagate comment edit ${linearCommentId}: ${err}; falling through to the legacy guard`);
+        // Nothing here can recover the edit, and that is deliberate rather than
+        // unfinished. `onWebhook` catches everything this function throws (see
+        // the handler's own try/catch) and returns normally, so there is no
+        // retry layer to rethrow into — and falling through to `createComment`
+        // would only have the key dedup against the mirror we just failed to
+        // rewrite, spending a round-trip to log "already mirrored" about an edit
+        // that did not land. The mirror keeps its pre-edit body until Linear
+        // delivers another edit of the same comment.
+        //
+        // So the one thing that matters is that the log names the real cause:
+        // an operator reading it is debugging exactly this failure.
+        ctx.logger.warn(`Failed to propagate comment edit ${linearCommentId} to ${link.linearIdentifier}: ${err}; mirror left with its pre-edit body`);
+        return;
       }
 
-      // No keyed mirror. Either this comment predates BLO-31657 (sentinel, no
-      // key) or it was never bridged at all — the scan below separates those,
-      // because only the first must not be re-created.
+      if (updated) {
+        // An in-place body rewrite leaves no trace in the thread the way a new
+        // comment does, so log it: an edit that silently replaces text is
+        // exactly the mutation that wants an audit trail.
+        await ctx.activity.log({
+          companyId: link.paperclipCompanyId,
+          message: `issue.comment.synced_from_linear`,
+          entityType: "issue",
+          entityId: link.paperclipIssueId,
+          metadata: { source: "linear", identifier: link.linearIdentifier, author: userName, bodySnippet: commentBody.slice(0, 120), action: "comment.edit_synced", linearCommentId },
+        });
+        ctx.logger.info(`Webhook propagated comment edit ${linearCommentId} to ${link.linearIdentifier} as comment ${updated.id}`);
+        return;
+      }
+
+      // `updated === null`: no keyed mirror. Either this comment predates
+      // BLO-31657 (sentinel, no key) or it was never bridged at all — the scan
+      // below separates those, because only the first must not be re-created.
       try {
         const existing = await ctx.issues.listComments(link.paperclipIssueId, link.paperclipCompanyId);
         const sentinel = `<!-- linear-comment-id: ${linearCommentId} -->`;
@@ -3754,11 +3779,14 @@ async function handleWebhookEvent(
       // key is bought to remove.
       //
       // In practice this is a `create`-only branch. An `update` of a keyed
-      // mirror is rewritten above and returns there; an `update` of a legacy
-      // mirror stops at the sentinel guard. One residual reaches here: an
-      // `update` whose `updateComment` threw *and* whose `listComments` threw
-      // too — both catches proceed, and a keyed mirror then dedups here, which
-      // is why falling through is safe rather than duplicating.
+      // mirror is rewritten above and returns there; an `update` whose rewrite
+      // *threw* also returns there, rather than arriving here to dedup against
+      // the row it failed to rewrite; an `update` of a legacy mirror stops at
+      // the sentinel guard. One residual reaches here: an `update` that found no
+      // keyed mirror (`null`) and whose `listComments` then threw, so neither
+      // mechanism could rule out a legacy mirror. That one may double-post, and
+      // the warn above names it — an extra comment with the correct body, which
+      // is the safe direction and the same exposure `create` already carries.
       //
       // An `update` of a mirror that was since soft-deleted reaches here and
       // *should*: `updateComment` filters `deleted_at IS NULL`, the scan cannot

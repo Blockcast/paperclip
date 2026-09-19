@@ -12880,7 +12880,7 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
     ) => {
       const currentUserRedactionOptions = {
-        enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+        enabled: (await instanceSettingsOn(dbOrTx)).general.censorUsernameInLogs,
       };
       const now = new Date();
       const [comment] = await dbOrTx
