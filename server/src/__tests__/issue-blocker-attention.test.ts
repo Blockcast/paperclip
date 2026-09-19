@@ -1055,6 +1055,60 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
+  // BLO-22660: the blocked-inbox map is the OPERATOR-FACING producer of the same classifier
+  // the recovery sweep drives, and it selected `createdAt` and then dropped it building the
+  // input, so a 32-day card read as a live waiting path here forever while the sweep aged the
+  // identical card out. Tests are not typechecked in this package (see tsconfig.typecheck.json),
+  // so the required-key guard on `IssueLivenessPendingInteractionInput` binds the production
+  // producers but cannot bind this file -- which is exactly why the behavioural pin lives here.
+  // Both arms are asserted: without the fresh arm the stale arm passes vacuously on a producer
+  // that never suppressed anything.
+  it("ages a stale pending interaction out of blocked-inbox attention (BLO-22660)", async () => {
+    const { companyId, agentId } = await createCompany("BIS");
+
+    const cardAge = async (createdAt: Date) => {
+      const reviewId = await insertIssue({
+        companyId,
+        identifier: `BIS-${createdAt.getTime()}`,
+        title: "Review behind a card",
+        status: "in_review",
+        assigneeAgentId: agentId,
+        executionState: null,
+      });
+      await db.insert(issueThreadInteractions).values({
+        id: randomUUID(),
+        companyId,
+        issueId: reviewId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdAt,
+        payload: { version: 1, prompt: "Accept?" },
+      });
+      const rows = await svc.list(companyId, { attention: "blocked" });
+      return rows.find((row) => row.id === reviewId)?.blockedInboxAttention ?? null;
+    };
+
+    const fresh = await cardAge(new Date(Date.now() - 60_000));
+    const stale = await cardAge(new Date(Date.now() - 25 * 60 * 60 * 1000));
+
+    // A fresh card genuinely does own the next action, and the board is genuinely the owner.
+    expect(fresh).toMatchObject({
+      state: "awaiting_decision",
+      reason: "pending_board_decision",
+      severity: "medium",
+      owner: { type: "board" },
+    });
+    // A card nobody has answered in 25h does not. The row must stop naming the board as the
+    // owner of a next action it has not taken.
+    expect(stale).toMatchObject({
+      state: "needs_attention",
+      reason: "in_review_without_action_path",
+      severity: "high",
+    });
+    expect(stale?.owner.type).not.toBe("board");
+  });
+
   it("classifies recovery issues and missing successful-run dispositions", async () => {
     const { companyId, agentId } = await createCompany("BID");
     const sourceId = await insertIssue({ companyId, identifier: "BID-1", title: "Stopped source", status: "blocked" });

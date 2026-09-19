@@ -13,6 +13,7 @@ import {
   issueComments,
   issueRecoveryActions,
   issueRelations,
+  issueThreadInteractions,
   issueWorkProducts,
   issues,
   routines,
@@ -2268,6 +2269,54 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       );
     },
   );
+
+  // BLO-22660: the remediation half of "a pending card is a live wake path". The classifier
+  // ages such a card out after 24h and mints a finding; this sweep has to age it out on the
+  // same threshold, or it declines to act on exactly the rows the finding names.
+  it.each([
+    { name: "fresh", ageMs: 60 * 60 * 1000, providerQuotaMonitored: 0, skipped: 1 },
+    { name: "older than 24h", ageMs: 25 * 60 * 60 * 1000, providerQuotaMonitored: 1, skipped: 0 },
+  ])("$name pending wake interaction: providerQuotaMonitored=$providerQuotaMonitored (BLO-22660)", async ({
+    ageMs,
+    providerQuotaMonitored,
+    skipped,
+  }) => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      error: "You've hit your usage limit for GPT-5. Try again at 12:00 AM (UTC).",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId: sourceIssueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      payload: { version: 1, prompt: "Proceed?" },
+      createdAt: new Date(Date.now() - ageMs),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ providerQuotaMonitored, skipped });
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    // The card itself is never touched -- the sweep resumes the row, it does not resolve
+    // or withdraw the interaction (BLO-22660 acceptance criterion).
+    const [card] = await db.select().from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.issueId, sourceIssueId));
+    expect(card?.status).toBe("pending");
+    expect(updatedIssue?.monitorNextCheckAt === null).toBe(providerQuotaMonitored === 0);
+  });
 
   it("schedules a provider-quota monitor for the original assignee without creating recovery work", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
