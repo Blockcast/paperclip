@@ -855,7 +855,15 @@ export function maskWorkspaceRuntimeForRead(value: unknown): unknown {
     if (Array.isArray(entry)) return entry.map((item) => maskEntry(item, depth + 1, false));
     if (!isPlainObject(entry)) return REDACTED_EVENT_VALUE;
 
-    const out: Record<string, unknown> = {};
+    // Null-prototype: every key written below comes from operator-authored JSON, and on an
+    // ordinary `{}` the assignment `out["__proto__"] = …` hits `Object.prototype`'s inherited
+    // `__proto__` SETTER — it re-parents `out` instead of adding a key, so the key vanishes from
+    // the masked output entirely. `JSON.parse` makes `__proto__` a real own key, so a jsonb
+    // runtime record can carry one at any depth. Dropping it discloses strictly less than masking,
+    // so this never leaked; what it broke is ask 1 — names survive, values elide — which is the
+    // one property this walk exists to provide. Seeding with a null prototype removes the
+    // inherited setter, so the key lands as ordinary data and is masked like any other.
+    const out: Record<string, unknown> = Object.create(null);
     for (const [key, child] of Object.entries(entry)) {
       // Identity keys are honoured only on an entry sitting directly inside a
       // `commands`/`services`/`jobs` array — the one position the parser reads them
@@ -878,7 +886,10 @@ export function maskWorkspaceRuntimeForRead(value: unknown): unknown {
 
   if (!isPlainObject(value)) return REDACTED_EVENT_VALUE;
 
-  const out: Record<string, unknown> = {};
+  // Null-prototype for the same reason as `maskEntry`'s accumulator above — this is the OTHER half
+  // of the same walk (the record's top level; `maskEntry` handles every level below it), and both
+  // have to be seeded this way or a `__proto__` key is dropped at whichever level is missed.
+  const out: Record<string, unknown> = Object.create(null);
   for (const [key, child] of Object.entries(value)) {
     if (WORKSPACE_RUNTIME_COMMAND_LIST_KEYS.has(key) && Array.isArray(child)) {
       out[key] = child.map((item) => maskEntry(item, 1, isPlainObject(item)));

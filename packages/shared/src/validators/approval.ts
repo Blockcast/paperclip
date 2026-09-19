@@ -67,16 +67,29 @@ const approvalPayloadSchema = z.object({
   }).refine((title) => title.trim().length > 0, approvalTitleMessage),
   gate: approvalGateSchema.optional(),
 }).catchall(z.unknown()).describe(
+  // This ships in every agent's tool list on every run, so it carries the rule,
+  // the shape and the error code only. Mechanics the caller needs *after* a
+  // refusal (resubmit semantics, the watcher's own exemption) live in that
+  // refusal's `details.remediation`, where they are read at the moment they
+  // matter and cost nothing to the agents that never file a budget card.
   "Free-form beyond `title`. When the decision can be stated as a concrete target value on a " +
     "specific object, ALSO include a machine-checkable `enforcement_assertions` array so the " +
     "approval-enforcement reconciler (BLO-24631) can verify the decision actually reached the " +
-    "object that enforces it. Approved decisions have silently never been applied — three " +
-    "confirmed instances, one of which left every one of 8 budget changes unapplied for 5 days " +
-    "while the affected agent approached an auto-pause. Prose alone cannot be checked. Shape: " +
+    "object that enforces it — approved decisions have silently never been applied, one instance " +
+    "leaving all 8 of a card's budget changes unapplied for 5 days while the affected agent " +
+    "approached an auto-pause. Prose alone cannot be checked. Shape: " +
     '`enforcement_assertions: [{ kind: "budget_policy_amount", policyId: "<uuid>", ' +
-    'expected_usd: 32000, label: "CTO" }]` (or `expected_amount_cents`). Today only ' +
-    "`budget_policy_amount` is checked; unknown kinds are ignored, so declaring one is never " +
-    "harmful and becomes useful when its resolver lands.",
+    'expected_usd: 32000, label: "<the agent or scope this policy caps>" }]` ' +
+    "(`expected_amount_cents` also accepted). `policyId` is a `budget_policies.id`, NOT an agent " +
+    "id. `label` is printed into the drift report this assertion raises, so name the scope this " +
+    "policy actually caps — never leave an example's. REQUIRED, not advisory, for " +
+    "`budget_override_required`: such a card carrying no parseable assertion is refused with " +
+    "`budget_approval_missing_enforcement_assertion` (BLO-34008), whose `details.remediation` " +
+    "gives the full shape — approving one writes nothing to `budget_policies`, so an undeclared " +
+    "figure is unverifiable forever. Optionally add the figure the change starts from as " +
+    "`from_usd` / `from_amount_cents` when you already know it; nothing reads it yet, so never " +
+    "invent one. For every other type it stays optional; today only `budget_policy_amount` is " +
+    "checked, and unknown kinds are ignored.",
 );
 
 export const createApprovalSchema = z.object({

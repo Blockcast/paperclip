@@ -1318,27 +1318,17 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       }
     }
 
-    // Fixed here: the escalation body's own `getCompanyIssuePrefix` and
-    // `getAgent` reads now run on `tx`. Still pooled under the lock, tracked on
-    // BLO-34207: owner resolution (`resolveStrandedIssueRecoveryOwnerAgentId`
-    // -> `getAgent` / `isAgentInvokable` / `budgets.getInvocationBlock` /
-    // instance settings). This ratchet fails on any new pooled call site and on
-    // a regression of the two fixed ones.
-    const knownPooledUnderLock = [
-      "resolveStrandedIssueRecoveryOwnerAgentId",
-      "isAgentInvokable",
-      "evaluateAgentInvokabilityFromDb",
-      "getInvocationBlock",
-      "getOrCreateRow",
-      // Deliberately pooled, NOT an unconverted call site. This read wants the
-      // freshest COMMITTED `heartbeat_runs` stamp: the stamp writer
-      // (`routes/issues.ts`, the statusOnly document-write refusal path) writes on
-      // the pooled connection and takes no advisory lock, so it does not serialize
-      // against `lockIssueOwnership`. Moving this onto the caller tx would bind it
-      // to the transaction snapshot and WIDEN the stale-read window the call site's
-      // own comment exists to narrow. See recovery/service.ts:7362-7371.
-      "getLatestIssueRun",
-    ];
+    // Fixed here: the escalation body's own `getCompanyIssuePrefix`, `getAgent`
+    // and `getLatestIssueRun` reads now run on `tx`, and so does owner
+    // resolution (BLO-34207: `resolveStrandedIssueRecoveryOwnerAgentId` ->
+    // `getAgent` / `isAgentInvokable` / `budgets.getInvocationBlock` /
+    // instance settings). This ratchet fails on any new pooled call site and
+    // on a regression of any of them.
+    // Empty on purpose: nothing may run pooled under the lock any more. Master
+    // dropped `getLatestIssueRun` (29cdd6ab3) and this PR moved the last one,
+    // `getOrCreateRow`, onto the caller tx (`readInstanceSettingsOn`); it is
+    // asserted forbidden by name below, so it must not be allowlisted here.
+    const knownPooledUnderLock: string[] = [];
     const unexpected = pooledInsideTransaction.filter(
       (entry) => !knownPooledUnderLock.some((name) => entry.includes(name)),
     );
@@ -1347,6 +1337,25 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(
       pooledInsideTransaction.filter((entry) => entry.includes("getAgent <- escalateStrandedAssignedIssue")),
     ).toEqual([]);
+    // Substring match, so this also covers `getLatestIssueRunForAgentStage` and
+    // `getLatestIssueRunSince` — none of the three may run pooled under the lock.
+    expect(pooledInsideTransaction.filter((entry) => entry.includes("getLatestIssueRun"))).toEqual([]);
+    // BLO-34207. Named individually rather than relying on the `unexpected`
+    // filter above: an allowlist entry is a substring match, so a future entry
+    // that happens to contain one of these names would silently re-admit it.
+    for (const name of [
+      // BLO-34207: `issuesSvc.update` / `addComment` read instance settings on
+      // the caller handle now (`instanceSettingsOn`), so the singleton read no
+      // longer takes a second pool connection under the graph lock.
+      "getOrCreateRow",
+      "resolveStrandedIssueRecoveryOwnerAgentId",
+      "resolveInvokableRecoveryAgentId",
+      "isAgentInvokable",
+      "evaluateAgentInvokabilityFromDb",
+      "getInvocationBlock",
+    ]) {
+      expect(pooledInsideTransaction.filter((entry) => entry.includes(name))).toEqual([]);
+    }
     const actionRows = await db
       .select()
       .from(issueRecoveryActions)
@@ -2532,12 +2541,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     }
 
     // The same row, except its continuation retry died on infrastructure instead of
-    // exiting 0. This is the population the exemption does NOT currently reach, because
-    // it is consulted only under `latestRun?.status === "succeeded"` -- see the
-    // "Deliberately consulted ONLY on the succeeded-run gate" note on
-    // `hasOpenPullRequestWakePath`. Seeded here so that scoping is pinned by a test
-    // rather than resting on the comment alone; BLO-32679 carries the pending ruling on
-    // whether it should stay.
+    // exiting 0. Under the BLO-32679 ruling this population IS reached: the exemption is
+    // consulted whenever the latest run never executed a model turn
+    // (`isInfraFailureRun`), not only on the succeeded arm. The run below is seeded to
+    // that never-executed shape, so the tests using this helper measure the exemption
+    // itself rather than a row the predicate declines to look at. The one test that
+    // varies it -- by giving the run real token usage -- is asserting the boundary, where
+    // an interrupted turn stays seizable.
     //
     // `job_failed` specifically, because that is the sweep's own retry giving up:
     // `reconcileStrandedAssignedIssues` issues the `issue_continuation_needed`
@@ -2546,13 +2556,29 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // NOT in `isInfraClassStrandedFailure`, so `infraClassCause` reads false on it.
     async function seedSeizableFailedContinuationRow() {
       const seeded = await seedCompany();
+      // Returned so callers that mutate this run address it by id. Scoping the update
+      // by `agentId` instead would be correct only while this helper inserts exactly
+      // one run for that agent -- an invariant of a shared helper two call sites away.
+      const failedRunId = randomUUID();
       await db.insert(heartbeatRuns).values({
-        id: randomUUID(),
+        id: failedRunId,
         companyId: seeded.companyId,
         agentId: seeded.coderId,
         invocationSource: "assignment",
         triggerDetail: "system",
         status: "failed",
+        // BLO-32679: `livenessState` and the usage/log pair are what
+        // `isInfraFailureRun` reads, so they are the difference between a run that never
+        // reached a model call and one interrupted mid-turn. Seeded to the measured
+        // production shape: of 71 live `stranded_assigned_issue` actions on company
+        // `aaced805` (2026-09-16), 71/71 carried `livenessState: "failed"`, and 49
+        // carried null usage with logs at most 4,738 bytes against a 200,000 ceiling.
+        // Leaving `livenessState` unset would make this row never-executed=false and
+        // quietly turn the exemption test below into a test of a row the predicate never
+        // looks at.
+        livenessState: "failed",
+        usageJson: null,
+        logBytes: null,
         error: "BackoffLimitExceeded: Job has reached the specified backoff limit",
         errorCode: "job_failed",
         startedAt: new Date(Date.now() - 45 * 60_000),
@@ -2563,7 +2589,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           source: "issue.productive_terminal_continuation_recovery",
         },
       });
-      return seeded;
+      return { ...seeded, failedRunId };
     }
 
     // Built through the real producer, not hand-written literals: the predicate filters
@@ -2701,8 +2727,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(updated?.status).toBe("blocked");
     });
 
-    // BLO-32679. These two pin the boundary of the exemption on the OTHER axis: not
-    // "which PRs count" but "which runs let the question be asked at all".
+    // BLO-32679. These three pin the boundary of the exemption on the OTHER axis: not
+    // "which PRs count" but "which runs let the question be asked at all". The control
+    // establishes the shape is seizable; the second shows a never-executed run does not
+    // void a fresh PR; the third shows an executed-then-died run still does.
     it("escalates the failed-continuation shape when no pull request is recorded (control)", async () => {
       const { sourceIssueId } = await seedSeizableFailedContinuationRow();
 
@@ -2715,7 +2743,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(updated?.status).toBe("blocked");
     });
 
-    it("still escalates a fresh webhook-written open pull request when the latest run failed", async () => {
+    it("skips a fresh webhook-written open pull request when the latest run never executed", async () => {
       const { companyId, sourceIssueId } = await seedSeizableFailedContinuationRow();
       const fields = await insertPullRequestWorkProduct({
         companyId,
@@ -2728,17 +2756,54 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
       const result = await sweep();
 
-      // CURRENT, DELIBERATE behaviour, not an aspiration: the work product satisfies
-      // every clause of `hasOpenPullRequestWakePath`, but the predicate is never
-      // consulted because the gate above it requires a succeeded run. Measured
-      // 2026-09-08 on company `aaced805`: 38 of 70 live `stranded_assigned_issue`
-      // actions were on rows matching this exact shape -- fresh webhook-written open
-      // PR, `latestRunStatus: failed` (22 `job_failed`, 12 `adapter_failed`, 4
-      // `k8s_pod_schedule_failed`), 70/70 of the population failed so 0 were eligible.
+      // BLO-32679, honoured. The seeded run failed before reaching a model call, so it
+      // interrupted no turn and says nothing about whether anyone will come back to the
+      // issue -- only that a runtime broke. The webhook-written open PR does answer that
+      // question, and is bounded by its own freshness grace (asserted above).
       //
-      // Flip these two assertions to `0` / `"in_progress"` if the BLO-32679 ruling
-      // honours the PR path independently of run status; that is the whole diff on the
-      // test side.
+      // Measured 2026-09-08 on company `aaced805`: 38 of 70 live
+      // `stranded_assigned_issue` actions were on rows matching this exact shape and
+      // were seized anyway, because the predicate was never consulted on the failed arm.
+      expect(result.escalated).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("in_progress");
+    });
+
+    it("still escalates a fresh webhook-written open pull request when the failed run had executed", async () => {
+      const { companyId, sourceIssueId, failedRunId } = await seedSeizableFailedContinuationRow();
+      // The boundary the BLO-32679 ruling draws, and the reason the exemption is keyed on
+      // `isInfraFailureRun` rather than on the error code. This run burned tokens before
+      // dying, so a turn WAS interrupted and its intent is unknown -- and if that
+      // interrupted work was what would have moved the PR, the webhook wake never comes.
+      //
+      // Not hypothetical: this is the one row out of 71 live actions (company
+      // `aaced805`, 2026-09-16) that had executed -- 6,531 input + 3,983 output tokens,
+      // 158,380 log bytes, under an `adapter_failed` code. Every error code in that
+      // population, including that one, is in `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES`, so
+      // a code-keyed exemption would have suppressed recovery on a genuinely interrupted
+      // turn.
+      //
+      // Only the usage/log pair is varied off the shared seed, NOT the error code:
+      // `adapter_failed` is in `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES`, so copying
+      // the live row's code verbatim would route this to the bounded-retry arm and the
+      // test would read `escalated: 0` for a reason that has nothing to do with the
+      // predicate under test. Holding the code at the control's `job_failed` keeps
+      // execution the single variable between this test and the one above.
+      await db.update(heartbeatRuns)
+        .set({
+          usageJson: { inputTokens: 6531, outputTokens: 3983 },
+          logBytes: 158380,
+        })
+        .where(eq(heartbeatRuns.id, failedRunId));
+      const fields = await insertPullRequestWorkProduct({
+        companyId,
+        issueId: sourceIssueId,
+        prNumber: 2434,
+      });
+      expect(fields.status).toBe("ready_for_review");
+
+      const result = await sweep();
+
       expect(result.escalated).toBe(1);
       const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
       expect(updated?.status).toBe("blocked");

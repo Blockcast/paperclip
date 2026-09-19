@@ -1642,6 +1642,63 @@ export async function awaitRuntimePrepareWithProgress<T>(
 }
 
 /**
+ * Await the post-handshake, pre-turn window while emitting periodic progress.
+ *
+ * The two siblings above bracket everything up to and including the handshake,
+ * but `acpx.session` is not emitted when the handshake returns -- two more
+ * unbounded awaits sit between them, and neither reported anything:
+ *
+ * - `applySessionConfigOptions` issues mode/model RPCs to the agent process.
+ *   The handshake only proves that process answered `session/new`; a process
+ *   that has since stopped answering leaves this call pending with no timer on
+ *   it, because `adapterConfig.timeoutSec` arms around the turn and the turn
+ *   has not started.
+ * - `buildPrompt` reads `instructionsFilePath` with `fs.readFile`. That path is
+ *   on the same network mount whose blocked syscalls motivated the prepare
+ *   bracket; a blocked call there does not return on its own either.
+ *
+ * A run parked in this window is silent at `lastOutputSeq` unchanged since the
+ * handshake, having emitted no `acpx.session` -- which is precisely the state
+ * the staleness detector cannot tell apart from a dead process, and which it
+ * has been measured to misread: healthy pre-turn waits have outlasted both the
+ * 1h suspicion and 4h critical thresholds (PEN-2555, PEN-2533).
+ *
+ * Bracketing it is what makes the silence mean something. Ticks arrive at most
+ * `ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS` (5 min) apart and the server
+ * flushes output progress at most every 60 s, so a bracketed stall keeps
+ * `lastOutputAt` advancing an order of magnitude inside the 1h threshold; an
+ * unbracketed one sits still and accrues silence it is not responsible for.
+ *
+ * Same non-terminating contract as its siblings -- this reports, it does not
+ * bound. Deciding a kill threshold needs the distribution this collects, and
+ * handshakes in this family have been observed recovering as late as 43.20h.
+ * Payload carries only stage/phase/elapsed metadata: never prompts, the
+ * instructions file's contents or path, credentials, environment values, or
+ * model output.
+ */
+export async function awaitPreTurnWithProgress<T>(
+  ctx: AdapterExecutionContext,
+  meta: { phase: "configure_session" | "build_prompt" },
+  start: () => Promise<T>,
+  delays: { firstDelayMs?: number; maxDelayMs?: number } = {},
+): Promise<T> {
+  const startedAtMs = Date.now();
+  return awaitPhaseWithProgress(
+    start,
+    async (stage) => {
+      await emitAcpxLog(ctx, {
+        type: "acpx.pre_turn",
+        stage: stage === "settled" ? "completed" : stage,
+        phase: meta.phase,
+        elapsedMs: Math.max(0, Date.now() - startedAtMs),
+        observedAt: new Date().toISOString(),
+      });
+    },
+    delays,
+  );
+}
+
+/**
  * Run `start()` while emitting `started`, backing-off `waiting`, and one
  * terminal `settled`/`failed` progress tick.
  *
@@ -2255,12 +2312,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     }
     const sessionHandle = handle;
     try {
-      await applySessionConfigOptions({
-        runtime,
-        handle: sessionHandle,
-        prepared,
-        onLog: ctx.onLog,
-      });
+      await awaitPreTurnWithProgress(ctx, { phase: "configure_session" }, () =>
+        applySessionConfigOptions({
+          runtime,
+          handle: sessionHandle,
+          prepared,
+          onLog: ctx.onLog,
+        }),
+      );
     } catch (err) {
       const { classified, message } = await emitAcpxFailure({
         ctx,
@@ -2298,7 +2357,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         summary: message,
       };
     }
-    const { prompt, promptMetrics, commandNotes } = await buildPrompt(ctx, resumedSession, prepared.env);
+    const { prompt, promptMetrics, commandNotes } = await awaitPreTurnWithProgress(
+      ctx,
+      { phase: "build_prompt" },
+      () => buildPrompt(ctx, resumedSession, prepared.env),
+    );
     const runPrompt = joinPromptSections([prepared.skillPromptInstructions, prompt]);
     await emitAcpxLog(ctx, {
       type: "acpx.session",

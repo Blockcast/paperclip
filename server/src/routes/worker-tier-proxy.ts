@@ -233,9 +233,18 @@ function createWorkerProxyHandler(
     // Non-streaming requests get a hard timeout. Streaming (SSE) requests get
     // only a bounded startup retry budget; after the worker responds, the
     // stream itself stays open until the client disconnects.
+    //
+    // `timedOut` records WHY the abort fired. Without it every abort surfaces
+    // as "Worker tier unreachable", which is false whenever the connection
+    // succeeded and the worker was merely slow — and it sends the responder
+    // hunting for a missing Service endpoint that was there the whole time.
+    let timedOut = false;
     const timeout = streaming
       ? undefined
-      : setTimeout(() => controller.abort(), requestTimeoutMs);
+      : setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, requestTimeoutMs);
 
     try {
       const headers = forwardRequestHeaders(req.headers);
@@ -318,13 +327,19 @@ function createWorkerProxyHandler(
       // Client left before we finished — expected, nothing to report.
       if (clientDisconnected) return;
       logger.error(
-        { err, targetUrl, method: req.method },
-        "worker-tier proxy: failed to relay request to worker tier",
+        { err, targetUrl, method: req.method, reason: timedOut ? "timeout" : "unreachable", requestTimeoutMs },
+        timedOut
+          ? "worker-tier proxy: worker tier did not respond before the proxy timeout"
+          : "worker-tier proxy: failed to relay request to worker tier",
       );
       if (!res.headersSent) {
         res
-          .status(502)
-          .json({ error: "Worker tier unreachable — plugin operation could not be completed." });
+          .status(timedOut ? 504 : 502)
+          .json({
+            error: timedOut
+              ? `Worker tier did not respond within ${requestTimeoutMs}ms — plugin operation could not be completed.`
+              : "Worker tier unreachable — plugin operation could not be completed.",
+          });
       } else {
         // Headers already flushed: the response is now a truncated stream.
         // Destroy the socket so the client sees a broken connection rather

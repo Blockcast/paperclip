@@ -138,6 +138,7 @@ import {
   setBackstopDeferredCandidates,
 } from "../metrics.js";
 import {
+  isInfraFailureRun,
   isLegacySessionUnavailableAdapterMismatch,
   isZeroTokenStartupFailureRun,
   isZeroTokenSessionResetRetryRun,
@@ -465,6 +466,37 @@ const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
 const STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
 
 export type BackstopSweepCompletionPath = "page_drained" | "cursor_wrap";
+
+/**
+ * Serializes overlapping invocations of a sweep that carries a mutable cursor across an
+ * `await` (BLO-29763).
+ *
+ * Each backstop cursor is a single closure variable read before the candidate query and
+ * written after it. Two overlapping invocations -- the periodic driver overlapping itself
+ * when a tick runs long, or an on-demand sweep from `routes/instance-settings.ts` landing
+ * mid-tick -- would both read the same cursor value, rescan the same page, and advance the
+ * cursor only one page, leaving the next page unvisited for that cycle. That defers rather
+ * than starves (the next wrap re-covers it) but it makes sweep coverage non-deterministic
+ * and is indistinguishable from a logging gap in the logs.
+ *
+ * A promise tail makes concurrent entry a queued no-op instead of a racer: call N+1 starts
+ * only after call N has settled, so the read-modify-write is never interleaved. Rejections
+ * are swallowed on the tail only -- the caller still receives them -- so one failing sweep
+ * cannot wedge every later invocation.
+ */
+export function serializeSweepInvocations<Args extends unknown[], Result>(
+  impl: (...args: Args) => Promise<Result>,
+): (...args: Args) => Promise<Result> {
+  let tail: Promise<void> = Promise.resolve();
+  return (...args: Args) => {
+    const run = tail.then(() => impl(...args));
+    tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+}
 
 export function backstopSweepCompletionPath(input: {
   useCursor: boolean;
@@ -806,6 +838,11 @@ type LatestIssueRun = Pick<
   | "livenessState"
   | "resultJson"
   | "usageJson"
+  // BLO-32679: read with `usageJson` by `isInfraFailureRun` to tell a run that
+  // never reached a model call from one that was interrupted mid-turn. Null
+  // usage alone is unknown, not zero, so omitting this column would silently
+  // widen the never-executed arm to every failed run with missing telemetry.
+  | "logBytes"
   | "sessionIdBefore"
   | "scheduledRetryAttempt"
   // BLO-32566: read by the stranded-lane wake sites to escalate off `status_only`
@@ -2248,9 +2285,6 @@ export function recoveryService(
   const runLogStore = getRunLogStore();
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
   let strandedRecoveryWakeBackstopCandidateCursor: string | null = null;
-  let resolvedDependencyWakeBackstopTail = Promise.resolve();
-  let strandedRecoveryWakeBackstopTail = Promise.resolve();
-  let strandedRecoveryHandBackTail = Promise.resolve();
 
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -2262,8 +2296,20 @@ export function recoveryService(
     return dbOrTx.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
   }
 
-  async function isAgentInvokable(agent: typeof agents.$inferSelect | null | undefined) {
-    return (await evaluateAgentInvokabilityFromDb(db, agent)).invokable;
+  // Same rule as `getAgent` above: under `lockIssueParentMutationCompany` this
+  // must read on the caller's transaction.
+  async function isAgentInvokable(
+    agent: typeof agents.$inferSelect | null | undefined,
+    dbOrTx: Db | DbTransaction = db,
+  ) {
+    return (await evaluateAgentInvokabilityFromDb(dbOrTx, agent)).invokable;
+  }
+
+  // Budget reads are pure reads, so the tx-scoped service is only ever used to
+  // keep them off a second pool connection while a lock is held. Same idiom as
+  // `issueRecoveryActionService(dbOrTx)` below.
+  function budgetsOn(dbOrTx: Db | DbTransaction) {
+    return dbOrTx === db ? budgets : budgetService(dbOrTx as Db);
   }
 
   // Column set behind `LatestIssueRun`. Shared by every helper that produces
@@ -2286,6 +2332,7 @@ export function recoveryService(
     livenessState: heartbeatRuns.livenessState,
     resultJson: heartbeatRuns.resultJson,
     usageJson: heartbeatRuns.usageJson,
+    logBytes: heartbeatRuns.logBytes,
     sessionIdBefore: heartbeatRuns.sessionIdBefore,
     scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
     statusOnlyDocumentWriteRefusedAt: heartbeatRuns.statusOnlyDocumentWriteRefusedAt,
@@ -2826,24 +2873,37 @@ export function recoveryService(
    * unique index explicitly allows) says someone typed a URL, which predicts no wake at
    * all.
    *
-   * Deliberately consulted ONLY on the succeeded-run gate, where the sweep is reasoning
-   * from absence of evidence. The failed/nonretryable arms escalate on positive evidence
-   * that something broke, and an open PR does not refute that -- widening this to them
-   * would suppress recovery from real faults.
+   * Consulted on the succeeded-run gate, where the sweep is reasoning from absence of
+   * evidence, and -- since BLO-32679 -- on one narrow slice of the failed arm. The
+   * general rule still holds: the failed/nonretryable arms escalate on positive evidence
+   * that something broke, and an open PR does not refute that, so widening this to the
+   * whole failed arm would suppress recovery from real faults.
    *
-   * BLO-32679 measured the cost of that scoping and it is larger than "an edge case", so
-   * the numbers are recorded here rather than left to be re-derived. Company `aaced805`,
-   * 2026-09-08, 70 live `stranded_assigned_issue` actions on one assignee: `latestRun`
-   * had failed on **70 of 70**, so nothing in the live population could reach this
-   * predicate, and **38 of those 70** were on rows carrying a fresh webhook-written open
-   * PR -- i.e. rows this predicate would have exempted had it been asked. Error codes on
-   * the 38: `job_failed` 22, `adapter_failed` 12, `k8s_pod_schedule_failed` 4. None of
-   * the three is an assertion about attendance, and `job_failed`
+   * The slice that is exempt is runs that never reached a model call (`isInfraFailureRun`).
+   * The gate's real premise is not "a run failed" but "a turn was interrupted, so intent
+   * is unknown" -- and the danger case is that the interrupted work was precisely what
+   * would have moved the PR, leaving a wake that never arrives. A run that never started
+   * interrupted nothing: the last real state is whatever the previous run left, and if
+   * that was a fresh open PR it is still evidence. So the premise is false for that
+   * subset and true everywhere else.
+   *
+   * BLO-32679 measured the cost of the original scoping, and the numbers are recorded
+   * here rather than left to be re-derived. Company `aaced805`, 2026-09-08, 70 live
+   * `stranded_assigned_issue` actions on one assignee: `latestRun` had failed on **70 of
+   * 70**, so nothing in the live population could reach this predicate, and **38 of those
+   * 70** were on rows carrying a fresh webhook-written open PR -- i.e. rows this
+   * predicate would have exempted had it been asked. `job_failed`
    * (`BackoffLimitExceeded`) is frequently the sweep's OWN `issue_continuation_needed`
-   * retry giving up -- so the sweep can supply the disqualifier that voids the
-   * exemption. Two tests in the PEN-2791 block pin this behaviour on the failed arm;
-   * the ruling on whether to keep it is on BLO-32679, and if it lands the honoured way
-   * this paragraph and those two assertions move together.
+   * retry giving up, so the sweep can supply the disqualifier that voids the exemption.
+   *
+   * Re-measured 2026-09-16 on the predicate that actually gates the exemption rather than
+   * on error codes: of 71 live actions, **70 never executed** (21 with an explicit
+   * zero-token usage blob, 49 inferred from null usage with logs at most 4,738 bytes
+   * against a 200,000 ceiling) and exactly **1 had executed** -- 6,531 input + 3,983
+   * output tokens under an `adapter_failed` code. That one row is why this is keyed on
+   * `isInfraFailureRun` and not on the error code: every code in the population appears
+   * in `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES`, so a code test would have exempted a
+   * genuinely interrupted turn.
    *
    * Bounded on `updatedAt` because an open PR proves a wake arrives when the PR next
    * MOVES, not that one arrives on a schedule -- see `openPullRequestAttendanceGraceMs`
@@ -5229,20 +5289,21 @@ export function recoveryService(
   async function resolveStrandedIssueRecoveryOwnerAgentId(
     issue: typeof issues.$inferSelect,
     preferredOwnerAgentId?: string | null,
+    dbOrTx: Db | DbTransaction = db,
   ) {
     const candidateIds: string[] = [];
     if (preferredOwnerAgentId) candidateIds.push(preferredOwnerAgentId);
     if (issue.assigneeAgentId) {
-      const assignee = await getAgent(issue.assigneeAgentId);
+      const assignee = await getAgent(issue.assigneeAgentId, dbOrTx);
       if (assignee?.reportsTo) candidateIds.push(assignee.reportsTo);
     }
     if (issue.createdByAgentId) {
-      const creator = await getAgent(issue.createdByAgentId);
+      const creator = await getAgent(issue.createdByAgentId, dbOrTx);
       if (creator?.reportsTo) candidateIds.push(creator.reportsTo);
       candidateIds.push(issue.createdByAgentId);
     }
 
-    const roleCandidates = await db
+    const roleCandidates = await dbOrTx
       .select()
       .from(agents)
       .where(and(eq(agents.companyId, issue.companyId), inArray(agents.role, ["cto", "ceo"])))
@@ -5254,13 +5315,13 @@ export function recoveryService(
     for (const agentId of candidateIds) {
       if (seen.has(agentId)) continue;
       seen.add(agentId);
-      const candidate = await getAgent(agentId);
+      const candidate = await getAgent(agentId, dbOrTx);
       if (!candidate || candidate.companyId !== issue.companyId) continue;
-      const budgetBlock = await budgets.getInvocationBlock(issue.companyId, candidate.id, {
+      const budgetBlock = await budgetsOn(dbOrTx).getInvocationBlock(issue.companyId, candidate.id, {
         issueId: issue.id,
         projectId: issue.projectId,
       });
-      if ((await isAgentInvokable(candidate)) && !budgetBlock) return candidate.id;
+      if ((await isAgentInvokable(candidate, dbOrTx)) && !budgetBlock) return candidate.id;
     }
 
     return null;
@@ -5269,15 +5330,16 @@ export function recoveryService(
   async function resolveInvokableRecoveryAgentId(
     issue: typeof issues.$inferSelect,
     agentId: string | null | undefined,
+    dbOrTx: Db | DbTransaction = db,
   ) {
     if (!agentId) return null;
-    const candidate = await getAgent(agentId);
+    const candidate = await getAgent(agentId, dbOrTx);
     if (!candidate || candidate.companyId !== issue.companyId) return null;
-    const budgetBlock = await budgets.getInvocationBlock(issue.companyId, candidate.id, {
+    const budgetBlock = await budgetsOn(dbOrTx).getInvocationBlock(issue.companyId, candidate.id, {
       issueId: issue.id,
       projectId: issue.projectId,
     });
-    return (await isAgentInvokable(candidate)) && !budgetBlock ? candidate.id : null;
+    return (await isAgentInvokable(candidate, dbOrTx)) && !budgetBlock ? candidate.id : null;
   }
 
   async function resolveStrandedRecoveryRouting(input: {
@@ -5287,7 +5349,7 @@ export function recoveryService(
     preferredOwnerAgentId?: string | null;
     existingReturnOwnerAgentId?: string | null;
     existingOwnerAgentId?: string | null;
-  }) {
+  }, dbOrTx: Db | DbTransaction = db) {
     // `originalAgentId` intentionally keeps `latestRun.agentId` as the first candidate:
     // `provider_quota` retries need the agent who actually hit the quota, which can
     // diverge from `issue.assigneeAgentId` once THIS function has already escalated
@@ -5350,10 +5412,10 @@ export function recoveryService(
         (ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has(input.latestRun?.errorCode ?? "") ||
           isInfraClassStrandedFailure(input.latestRun)));
     if (input.recoveryCause === "provider_quota") {
-      const retryAgentId = await resolveInvokableRecoveryAgentId(input.issue, originalAgentId);
+      const retryAgentId = await resolveInvokableRecoveryAgentId(input.issue, originalAgentId, dbOrTx);
       if (!retryAgentId) {
         return {
-          ownerAgentId: await resolveStrandedIssueRecoveryOwnerAgentId(input.issue),
+          ownerAgentId: await resolveStrandedIssueRecoveryOwnerAgentId(input.issue, null, dbOrTx),
           returnOwnerAgentId: originalAgentId,
           routingFallbackReason: "The original assignee is not invokable; quota recovery fell through to the manager ladder.",
         };
@@ -5365,12 +5427,12 @@ export function recoveryService(
       };
     }
     if (routeToOriginal) {
-      const ownerAgentId = await resolveInvokableRecoveryAgentId(input.issue, returnOwnerAgentId);
+      const ownerAgentId = await resolveInvokableRecoveryAgentId(input.issue, returnOwnerAgentId, dbOrTx);
       if (ownerAgentId) {
         return { ownerAgentId, returnOwnerAgentId, routingFallbackReason: null };
       }
       return {
-        ownerAgentId: await resolveStrandedIssueRecoveryOwnerAgentId(input.issue),
+        ownerAgentId: await resolveStrandedIssueRecoveryOwnerAgentId(input.issue, null, dbOrTx),
         returnOwnerAgentId,
         routingFallbackReason: "The original assignee is not invokable; recovery fell through to the manager ladder.",
       };
@@ -5379,6 +5441,7 @@ export function recoveryService(
       ownerAgentId: await resolveStrandedIssueRecoveryOwnerAgentId(
         input.issue,
         input.preferredOwnerAgentId,
+        dbOrTx,
       ),
       returnOwnerAgentId,
       routingFallbackReason: null,
@@ -5767,7 +5830,7 @@ export function recoveryService(
       preferredOwnerAgentId: input.recoveryOwnerAgentId,
       existingReturnOwnerAgentId: existingAction?.returnOwnerAgentId,
       existingOwnerAgentId: existingAction?.ownerAgentId,
-    });
+    }, dbOrTx);
     const ownerAgentId = routing.ownerAgentId;
     // BLO-18996: the single predicate for "will any sweep wake an owner for this action".
     // The wake budget and the wake path have to agree, and previously they were written as
@@ -8666,6 +8729,34 @@ export function recoveryService(
           lapsedMonitorGraceMs,
           openPullRequestAttendanceGraceMs,
         )
+      ) {
+        result.skipped += 1;
+        return;
+      }
+      // BLO-32679: a run that never reached a model call interrupted no turn, so it is
+      // not evidence about attendance — only about the runtime. The gate above rests on
+      // a real asymmetry and is kept: a run that executed and then died leaves unknown
+      // intent, and if the interrupted work was precisely what would have moved the PR,
+      // the webhook wake never arrives and the exemption converts a recoverable fault
+      // into a silent stall. A run that never started has no such in-flight work — the
+      // agent's last real state is whatever the previous run left, and if that was
+      // "parked with a fresh open PR", it still holds.
+      //
+      // Only the PR disjunct is admitted here, NOT the whole of
+      // `hasPersistedDurableWaitPath`: a lapsed monitor or a blocker edge is a claim the
+      // sweep makes from absence, whereas a webhook-written open PR is positive external
+      // evidence bounded by its own freshness grace. Widening further would reintroduce
+      // the unbounded belief this scoping exists to prevent.
+      //
+      // Keyed on `isInfraFailureRun`, not on error code. Measured 2026-09-16 over the 71
+      // live `stranded_assigned_issue` actions on company `aaced805`: 70 never executed,
+      // and the single exception is exactly the row an error-code test would have gotten
+      // wrong — `adapter_failed` (in `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES`) that had
+      // burned 6,531 input + 3,983 output tokens before dying. That is an interrupted
+      // turn wearing an infra error code, and it stays seizable.
+      if (
+        latestRun && isInfraFailureRun(latestRun) &&
+        await hasOpenPullRequestWakePath(issue, openPullRequestAttendanceGraceMs)
       ) {
         result.skipped += 1;
         return;
@@ -13346,27 +13437,21 @@ export function recoveryService(
     return result;
   }
 
-  function reconcileResolvedDependencyWakeBackstop(opts?: ResolvedDependencyWakeBackstopOptions) {
-    const run = resolvedDependencyWakeBackstopTail.then(() => reconcileResolvedDependencyWakeBackstopImpl(opts));
-    resolvedDependencyWakeBackstopTail = run.then(() => undefined, () => undefined);
-    return run;
-  }
+  const reconcileResolvedDependencyWakeBackstop = serializeSweepInvocations(
+    reconcileResolvedDependencyWakeBackstopImpl,
+  );
 
-  function reconcileStrandedRecoveryWakeBackstop(opts?: Parameters<typeof reconcileStrandedRecoveryWakeBackstopImpl>[0]) {
-    const run = strandedRecoveryWakeBackstopTail.then(() => reconcileStrandedRecoveryWakeBackstopImpl(opts));
-    strandedRecoveryWakeBackstopTail = run.then(() => undefined, () => undefined);
-    return run;
-  }
+  const reconcileStrandedRecoveryWakeBackstop = serializeSweepInvocations(
+    reconcileStrandedRecoveryWakeBackstopImpl,
+  );
 
   /**
    * Serialized like its sibling backstops: two overlapping passes would both read the same
    * pre-hand-back budget count and could spend the per-issue budget twice on one row.
    */
-  function reconcileStrandedRecoveryHandBacks(opts?: Parameters<typeof reconcileStrandedRecoveryHandBacksImpl>[0]) {
-    const run = strandedRecoveryHandBackTail.then(() => reconcileStrandedRecoveryHandBacksImpl(opts));
-    strandedRecoveryHandBackTail = run.then(() => undefined, () => undefined);
-    return run;
-  }
+  const reconcileStrandedRecoveryHandBacks = serializeSweepInvocations(
+    reconcileStrandedRecoveryHandBacksImpl,
+  );
 
   async function reconcileIssueGraphLiveness(opts?: {
     runId?: string | null;
