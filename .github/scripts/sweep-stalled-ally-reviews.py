@@ -71,11 +71,39 @@ def parse_list(value, fallback):
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+# Every pattern in this file carries re.ASCII, and that is a parity rule rather
+# than a style one. Python's `\b`, `\w` and IGNORECASE folding are all
+# Unicode-aware; the gate's regexes are built with "gm"/"gim"/"gi" and never the
+# `u` flag, so JavaScript's are ASCII-only. Measured over the whole Unicode
+# range at this head: 138495 code points are word characters to Python's `\b`
+# and not to JavaScript's, and exactly three -- U+0130, U+0131, U+017F -- fold
+# into the ASCII letters these patterns spell. re.ASCII closes both at once and
+# cannot be reasoned wrong per site, which an explicit character class can.
+# TestPatternCharacterClassesAreAsciiOnly pins the rule for patterns added
+# later, including ones using a construct nobody has hit yet.
+ASCII_RE = re.ASCII
+
+# Mirrors MARKDOWN_EMPHASIS_RUN / ATTESTATION_WRAPPER_RUN in the gate. Without
+# them this reader is *narrower* than the gate on the prose path: of the 25
+# attesting bodies on #1721, 3 wrap the SHA in backticks, which the gate reads
+# and a bare pattern does not. The indent bound is the gate's NOT_INDENTED_CODE
+# for the same reason in the other direction -- an attestation inside an
+# indented code block is prose to a bare `[ \t]*` and code to the gate.
+MARKDOWN_EMPHASIS_RUN = r"[*_`]{0,3}"
+ATTESTATION_WRAPPER_RUN = r"[*_`\t ]{0,6}"
+
 # The immutable head attestation Ally writes into every consolidated body:
 # a standalone "Reviewed head: <40 lowercase hex>" line. This is what binds a
 # signal to a revision -- NOT review.commit_id, and NOT a substring scan.
 REVIEWED_HEAD_PATTERN = re.compile(
-    r"^[ \t]*Reviewed head:[ \t]*([0-9a-f]{40})[ \t]*$", re.IGNORECASE | re.MULTILINE
+    r"^(?! *\t)(?! {4}) {0,3}"
+    + MARKDOWN_EMPHASIS_RUN
+    + r"[ \t]{0,3}Reviewed head:[ \t]*"
+    + ATTESTATION_WRAPPER_RUN
+    + r"([0-9a-f]{40})"
+    + ATTESTATION_WRAPPER_RUN
+    + r"[ \t]*$",
+    re.IGNORECASE | re.MULTILINE | ASCII_RE,
 )
 
 
@@ -91,16 +119,16 @@ VERDICT_BLOCK_PATTERN = re.compile(
     # as reviewed -- verbatim the divergence `parse_verdict_block_head` below
     # exists to prevent. Same rule at EMITTED_BUCKET_PATTERN, where it inverts.
     r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)<!--[ \t]*ally-verdict:[ \t]*([0-9]+)(.*?)-->",
-    re.MULTILINE | re.DOTALL,
+    re.MULTILINE | re.DOTALL | ASCII_RE,
 )
 VERDICT_OPENER_PATTERN = re.compile(
-    r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)<!--[ \t]*ally-verdict\b", re.MULTILINE
+    r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)<!--[ \t]*ally-verdict\b", re.MULTILINE | ASCII_RE
 )
 SUPPORTED_VERDICT_VERSION = 1
-FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE | ASCII_RE)
 # Ledger entries name the head they were raised at as Ally wrote it, which is
 # abbreviated. Mirrors the bound in `asDispositions` / `stillPresentIn`.
-ABBREV_SHA_PATTERN = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
+ABBREV_SHA_PATTERN = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE | ASCII_RE)
 
 # Mirrors BLOCKING_SEVERITIES / VERDICT_SEVERITIES / MAX_VERDICT_FINDING_COUNT
 # in ally-review-detection.ts. A block whose counts that reader rejects must be
@@ -123,10 +151,10 @@ EMITTED_BUCKET_PATTERN = re.compile(
     # while Unicode `\d` would make it a contradiction here, sending the sweep
     # to re-request review on a head Ally already reviewed.
     r"(Critical|Important)[ \t]+Issues[ \t]*[*_]{0,3}[ \t]*\(([0-9]+)\)[*_]{0,3}[ \t]*$",
-    re.IGNORECASE | re.MULTILINE,
+    re.IGNORECASE | re.MULTILINE | ASCII_RE,
 )
-FENCE_OPEN_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-FENCE_CLOSE_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
+FENCE_OPEN_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$", ASCII_RE)
+FENCE_CLOSE_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$", ASCII_RE)
 
 
 def without_fenced_spans(text):
@@ -312,7 +340,8 @@ def prose_count_contradicts(text, counts):
 # Same latitude the previous `startswith("## Ally") and "Consolidated PR Review"
 # in body` pair allowed, minus the first-byte anchor.
 CONSOLIDATED_HEADING_PATTERN = re.compile(
-    r"^[ \t]*##[ \t]*Ally\b.*Consolidated PR Review", re.MULTILINE | re.IGNORECASE
+    r"^[ \t]*##[ \t]*Ally\b.*Consolidated PR Review",
+    re.MULTILINE | re.IGNORECASE | ASCII_RE,
 )
 
 

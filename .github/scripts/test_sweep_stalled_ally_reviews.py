@@ -1465,5 +1465,107 @@ class TestVerdictBlockMirrorsJsCharacterSemantics(unittest.TestCase):
         )
 
 
+class TestPatternCharacterClassesAreAsciiOnly(unittest.TestCase):
+    """Peer review of #1721 at d05a49f3 -- `\\b` and IGNORECASE, the two members
+    of the class above that the `[0-9]` fix did not reach.
+
+    The gate builds its regexes with "gm"/"gim"/"gi" and never the `u` flag, so
+    every character class in them is ASCII-only. Python's are not. Measured
+    exhaustively over U+0000..U+10FFFF at this head: 138495 code points are word
+    characters to Python's `\\b` and not to JavaScript's, and exactly three --
+    U+0130, U+0131, U+017F -- fold into the ASCII letters these patterns spell.
+
+    Both harms run in the *silent* direction, which is why they are pinned
+    rather than documented: the sweep records the head as reviewed, so the one
+    automatic route back from a red gate never fires.
+    """
+
+    HEAD = "c" * 40
+
+    def test_a_non_ascii_word_char_after_the_prefix_still_counts_an_opener(self):
+        # `<!-- ally-verdict١` -- Python's `\b` finds no boundary between
+        # `t` and an Arabic-Indic digit, so an opener-counting rule built on it
+        # sees `absent` and falls through to the prose line, which on real data
+        # is usually readable. Both JS readers count the opener, find no block,
+        # and go `unreadable_verdict`. Gate red, sweep silent.
+        for drift in ("١", "１", "é"):
+            body = "<!-- ally-verdict%s1\n{}\n-->\n\nReviewed head: %s" % (drift, self.HEAD)
+            self.assertEqual(
+                len(sweep.VERDICT_OPENER_PATTERN.findall(body)), 1, repr(drift)
+            )
+            self.assertIsNone(sweep.parse_reviewed_head(body), repr(drift))
+
+    def test_control_an_ascii_non_word_char_after_the_prefix_is_unchanged(self):
+        # Without this the test above passes for a pattern that dropped `\b`
+        # and matched the bare prefix unconditionally -- which would also count
+        # an opener for a marker that never drifted at all.
+        ok = (
+            '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0}}\n-->'
+            % self.HEAD
+        )
+        self.assertEqual(sweep.parse_reviewed_head(ok), self.HEAD)
+        for control in ("<!-- ally-verdict:v1", "<!-- ally-verdict {"):
+            body = "%s\n{}\n-->\n\nReviewed head: %s" % (control, self.HEAD)
+            self.assertEqual(
+                len(sweep.VERDICT_OPENER_PATTERN.findall(body)), 1, control
+            )
+            self.assertIsNone(sweep.parse_reviewed_head(body), control)
+
+    def test_a_folded_bucket_heading_is_no_bucket_here_either(self):
+        # Python folds U+017F into `s`, so `### Critical Iſſues (1)` over a
+        # block stating 0 reads as a contradiction here and as no bucket at all
+        # to the gate -- gate green, sweep re-requesting a head Ally reviewed.
+        # The mirror image of the row above, so neither masks the other.
+        block = '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0}}\n-->' % self.HEAD
+        body = "%s\n\n### Critical Iſſues (1)" % block
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_control_an_ascii_bucket_heading_still_contradicts(self):
+        block = '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0}}\n-->' % self.HEAD
+        self.assertIsNone(sweep.parse_reviewed_head("%s\n\n### Critical Issues (1)" % block))
+
+    def test_a_folded_attestation_label_is_not_an_attestation(self):
+        # Not in the reported finding, and reachable by the same flag: the
+        # prose pattern's IGNORECASE folds U+0131 into `i`, so `Revıewed head:`
+        # attests here and not at the gate. Silent direction again, and it is
+        # the fallback the two rows above route *to*.
+        self.assertIsNone(sweep.parse_reviewed_head("Revıewed head: %s" % self.HEAD))
+        self.assertEqual(sweep.parse_reviewed_head("REVIEWED HEAD: %s" % self.HEAD), self.HEAD)
+
+    def test_the_prose_fallback_reads_the_wrapped_forms_the_gate_reads(self):
+        # 3 of the 25 attesting bodies on #1721 wrap the SHA in backticks. The
+        # gate carries ATTESTATION_WRAPPER_RUN / MARKDOWN_EMPHASIS_RUN for
+        # exactly these; without them this reader is narrower than the gate and
+        # re-requests a review that already attests.
+        for form in (
+            "Reviewed head: `%s`",
+            "**Reviewed head:** `%s`",
+            "_Reviewed head:_ %s",
+        ):
+            self.assertEqual(
+                sweep.parse_reviewed_head(form % self.HEAD), self.HEAD, form
+            )
+
+    def test_control_an_indented_code_attestation_is_not_read(self):
+        # The wrapper runs widen the pattern; the gate's NOT_INDENTED_CODE bound
+        # comes with them. A four-space-indented line is code to the gate, so
+        # reading it here would be a new divergence introduced by the fix.
+        self.assertIsNone(sweep.parse_reviewed_head("    Reviewed head: %s" % self.HEAD))
+
+    def test_every_compiled_pattern_in_the_module_is_ascii_only(self):
+        # The rule, not the four instances of it. `\b` was missed by the `[0-9]`
+        # fix because that fix enumerated the constructs it had seen; this
+        # fails for any pattern added later, including one using a construct
+        # nobody has hit yet.
+        import re as _re
+
+        offenders = [
+            name
+            for name, value in vars(sweep).items()
+            if isinstance(value, _re.Pattern) and not value.flags & _re.ASCII
+        ]
+        self.assertEqual(offenders, [])
+
+
 if __name__ == "__main__":
     unittest.main()
