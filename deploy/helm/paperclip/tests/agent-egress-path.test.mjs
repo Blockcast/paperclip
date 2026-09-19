@@ -104,6 +104,32 @@ function extractPathPublishFragment(rendered) {
   throw new Error("did not find the gh symlink line in the publish step");
 }
 
+/**
+ * PEN-3156: the same publish step, but captured through the `git` symlink
+ * rather than stopping at the `gh` one.
+ *
+ * A separate walker rather than a parameter on the one above, so that the `gh`
+ * assertion keeps testing exactly the region it always did and cannot start
+ * passing because of a line added for `git`.
+ */
+function extractPathPublishFragmentThroughGit(rendered) {
+  const lines = rendered.split("\n");
+  const startIdx = lines.findIndex((line) =>
+    /^\s*PATH_BIN="\$\{BASE\}\/bin"$/.test(line),
+  );
+  assert.notEqual(startIdx, -1, "seed script no longer publishes onto the default PATH");
+  const indent = lines[startIdx].match(/^(\s*)/)[1];
+  const body = [];
+  for (let i = startIdx; i < lines.length; i += 1) {
+    const line = lines[i].slice(indent.length);
+    body.push(line);
+    if (/^ln -sf "\$\{LOCAL_BIN\}\/git"/.test(line)) return body.join("\n");
+  }
+  throw new Error(
+    "the seed does not publish git onto the PATH-visible bin; the push guard would be off the traffic path (PEN-3156)",
+  );
+}
+
 function writeExecutable(dir, name, body) {
   const file = path.join(dir, name);
   fs.writeFileSync(file, body, { mode: 0o755 });
@@ -214,6 +240,90 @@ test("a non-login shell resolves gh to the scrubbing wrapper under the default-v
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), "scrubbing-wrapper");
+});
+
+// --- The publish guard on the `git` door (PEN-3156) -------------------------
+
+test("a non-login shell resolves git to the publish-guarding wrapper", () => {
+  // The regression this pins, measured in a live agent Job pod on 2026-09-10:
+  // ${LOCAL_BIN}/git existed and was byte-identical to the chart, but the pod's
+  // PATH carried /paperclip/bin without /paperclip/.local/bin and nothing
+  // published git into the former — so `command -v git` gave /usr/bin/git and
+  // any guard in the wrapper was a choke point nothing traversed. `gh` had the
+  // same defect and PEN-2527 fixed it with a symlink; git never got one.
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "git-path-reach-"));
+  const localBin = path.join(base, ".local", "bin");
+  const imageBin = path.join(base, "usr-bin");
+  for (const dir of [localBin, imageBin]) fs.mkdirSync(dir, { recursive: true });
+
+  const rendered = render("templates/statefulset.yaml", {
+    set: [`persistence.mountPath=${base}`],
+  });
+
+  writeExecutable(localBin, "git", "#!/bin/sh\necho guarding-wrapper\n");
+  writeExecutable(imageBin, "git", "#!/bin/sh\necho image-git\n");
+
+  // Run the seed's own publish step, so this fails if the seed stops publishing
+  // git rather than merely if a symlink is missing.
+  const seeded = spawnSync(
+    "sh",
+    [
+      "-c",
+      [
+        "set -eu",
+        `BASE=${JSON.stringify(base)}`,
+        `LOCAL_BIN=${JSON.stringify(localBin)}`,
+        extractPathPublishFragmentThroughGit(rendered),
+      ].join("\n"),
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(seeded.status, 0, seeded.stderr);
+
+  const containerPathValue = containerPath(rendered);
+  const testPath = containerPathValue
+    .split(":")
+    .map((entry) => (entry === "/usr/bin" ? imageBin : entry))
+    .join(":");
+
+  const result = spawnSync("/bin/sh", ["-c", "git"], {
+    encoding: "utf8",
+    env: { PATH: testPath },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "guarding-wrapper");
+});
+
+test("the seeded git wrapper routes through the egress runtime, inside the token wrapper", () => {
+  const rendered = render("templates/statefulset.yaml", {});
+  const match = /cat > "\$\{LOCAL_BIN\}\/git" <<'EOF'\n([\s\S]*?)\n[ \t]*EOF/.exec(rendered);
+  assert.notEqual(match, null, "the seed no longer writes a git wrapper");
+  const body = match[1];
+
+  assert.match(
+    body,
+    /github-git-egress-runtime\.js/,
+    "the git wrapper does not reach the publish guard (PEN-3156)",
+  );
+
+  // Ordering is load-bearing in one direction: the token wrapper must stay
+  // outermost or git runs without its credentials.
+  const tokenAt = body.indexOf("paperclip-github-token-env");
+  const runtimeAt = body.indexOf("github-git-egress-runtime.js");
+  assert.ok(tokenAt >= 0 && runtimeAt > tokenAt, "the scrub runtime must sit inside the token wrapper");
+});
+
+test("the seed installs a pre-push hook for the guard to run", () => {
+  const rendered = render("templates/statefulset.yaml", {});
+  // Without the hook the wrapper injects core.hooksPath at a directory holding
+  // nothing, and every push is allowed while looking guarded.
+  assert.match(rendered, /paperclip-git-hooks/, "no hooks directory is seeded");
+  assert.match(
+    rendered,
+    /cat > "\$\{GIT_HOOKS_DIR\}\/pre-push" <<'EOF'/,
+    "the seed does not write a pre-push hook",
+  );
+  assert.match(rendered, /--pre-push-hook/, "the seeded hook does not invoke the guard");
 });
 
 // --- Fail closed on overrides that would take the scrubber off the path ----
