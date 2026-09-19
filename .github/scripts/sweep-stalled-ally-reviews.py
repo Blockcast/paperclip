@@ -157,10 +157,128 @@ ALLY_REVIEWER_LOGINS = parse_list(os.environ.get("ALLY_REVIEWER_LOGINS"), DEFAUL
 ALLY_REQUEST_REVIEWER_LOGIN = os.environ.get("ALLY_REQUEST_REVIEWER_LOGIN") or "allyblockcast"
 
 # How long a head must have been awaiting review before we consider it
-# stranded rather than "just waiting its turn". Ally's own documented
-# response times in BLO-22892 were 6m35s and 30m when the wake landed; 90m
-# gives generous headroom above that before treating silence as loss.
-STALL_THRESHOLD_SECONDS = int(os.environ.get("STALL_THRESHOLD_SECONDS") or 90 * 60)
+# stranded rather than "just waiting its turn".
+#
+# THIS NUMBER IS CALIBRATION AND IT ROTS. Re-derive it, do not inherit it.
+# The threshold measures `unreviewed_since()` -> review: WEBHOOK LAG + QUEUE
+# WAIT + SERVICE + REVIEW-WRITING. Measure that, not any one term of it.
+# It was originally set to 90m from BLO-22892's figures of 6m35s and 30m --
+# but those are SERVICE time (`startedAt` -> review), measured when the wake
+# landed promptly. Queue wait was negligible then and dominates now by an
+# order of magnitude, so the old number had become a constant-true predicate:
+# "stranded" meant "dispatched normally", and every re-fire woke a PR author
+# for nothing.
+#
+# Measured 2026-09-18 (BLO-34521), window 2026-09-16T22:37Z -> 2026-09-18T05:50Z,
+# n=706 started Ally `pr_review:` runs, wait = `startedAt - createdAt`:
+#
+#     p50 268m (4h28m) | p90 338m | max 405m | min 45m
+#     > 90m: 697/706 = 99%
+#
+# plus 107 `pr_review` runs still QUEUED at observation: median age 201m,
+# max age 408m. Report that tail, because it is what censors the sample.
+# A queued run's eventual wait is unknown but strictly GREATER than its
+# current age, and long waits are disproportionately the ones still queued
+# when you look -- so `max 405m` over the started cohort is a biased-LOW
+# estimate of the population max, over a sample ~13% censored (107/813).
+#
+# Reproduce with:
+#
+#     GET /companies/{companyId}/heartbeat-runs?agentId=<ally>&limit=1000
+#     keep runs whose `contextSnapshot.taskKey` starts with "pr_review:"
+#     wait = startedAt - createdAt   (queued runs: now - createdAt; report
+#     those separately -- they are a lower bound, not an observation)
+#
+# RE-MEASURED 2026-09-19 (BLO-34521), window 2026-09-17T19:19Z ->
+# 2026-09-18T21:54Z, n=725 started, same query:
+#
+#     p50 187m | p90 355m | max 462m | min 6m
+#     > 90m: 698/725 = 96%   |   > 8h: 0/725 = 0%
+#
+# and the censored tail had largely drained: 114 still queued, median age
+# 94m, max age 185m (was max 408m). So 462m is a far less biased estimate of
+# the population max than the first window's 405m -- and it is HIGHER, which
+# is the direction that matters. Two independent windows now agree that 8h
+# sits outside the distribution: 0% breach on both.
+#
+# *** BOTH WINDOWS ABOVE MEASURE THE WRONG QUANTITY. They are kept because
+# they are a valid LOWER BOUND, and because the gap between them and the
+# right quantity is the whole lesson here. ***
+#
+# Dispatch wait is `startedAt - createdAt`. This threshold is compared
+# against `unreviewed_since()` -- max(PR opened, head commit landed) -- so
+# the interval it actually clocks is head-landed -> review posted, which is
+# webhook lag + queue wait + service + the time Ally spends writing the
+# review. Dispatch wait is one term of four. An 8h value derived from it was
+# never calibrated against the predicate it gates; the paragraph this
+# replaced conceded the gap ("does NOT also claim a separate service-time
+# buffer on top") and then treated it as a rounding margin. It is not one.
+#
+# MEASURED DIRECTLY 2026-09-19 (BLO-34521), `Blockcast/paperclip`, the last
+# 100 PRs, n=232 first-Ally-review-per-head pairs, window 2026-09-13T17:37Z
+# -> 2026-09-19T05:25Z, wait = review_submitted - unreviewed_since:
+#
+#     p50 4.09h | p90 12.70h | p95 17.20h | max 30.81h | min 0.05h
+#     > 90m: 178/232 = 77%   |   > 8h: 45/232 = 19.4%
+#     > 18h:  11/232 = 4.7%  |   > 22h (ALARM): ~3%
+#
+# So 8h breached on 19.4% of HEALTHY reviews -- against an acceptance
+# criterion of under ~10%. Measured against dispatch wait the same value
+# breached 0%. The instrument, not the number, was the defect.
+#
+# Reproduce with (no Paperclip credential needed, unlike the query above --
+# this one reads only GitHub, which is what makes it the reproducible one):
+#
+#     for each recent PR: reviews + `^## Ally` comments authored by the Ally
+#     App identity, keep those carrying a head SHA (`commit_id`, or the
+#     `Reviewed head: <40-hex>` line); take the EARLIEST review per
+#     (pr, head) -- the predicate is satisfied by the first one;
+#     wait = review_time - max(pr.created_at, commit.committer.date)
+#
+# Corroborated independently on `Blockcast/Network-Operator-Portal` the same
+# day (BLO-34617, TrafficOpsEngineer): marker -> review over n=50 served
+# pairs gave p50 4.26h against p50 4.09h here -- a near-exact match on two
+# repos by two different methods, which is what promotes this from one
+# sample to a property of the fleet rather than of this repo.
+#
+# 18h is picked off p90, not off the max: 1080m is 1.417x the 762m p90, and
+# the dispatch-wait derivation used 1.420x (480/338) -- the same multiplier to
+# the precision either sample supports. Quote it to 3dp, not 2: rounding this
+# UP to "1.42x" states a margin 18h does not actually clear, and the guard
+# below asserts the stated figure. Chasing the max instead would mean 32h --
+# a day and a half to detect a lost review, bought against
+# a tail of 3 PRs. The failure direction is benign (understating the ceiling
+# costs a false re-fire, never a missed loss), so the MULTIPLIER is the thing
+# to re-derive, not the max. The floor this must clear is asserted in
+# TestStallThresholdCalibration; update that table in the same commit that
+# changes this constant, and add the quantity you measured -- a row labelled
+# `dispatch-wait` alone is what let 8h pass its own guard.
+#
+# The upward drift is not noise: its root cause is BLO-19881 (fleet-wide
+# heartbeat queue starvation concentrated on Ally). If that lands, this
+# number should come back DOWN -- a threshold this far above a recovered
+# queue is slow loss detection. Re-derive after it, not just before.
+#
+# KNOWN CEILING -- elapsed time is structurally the wrong instrument. It
+# cannot distinguish a LOST wake from a merely QUEUED one, which is the only
+# distinction that matters here: no elapsed-time value separates them, so any
+# value is a trade between false author-wakes and slow loss detection. The
+# sound discriminator is the `heartbeat_run` row for this request's
+# `pr_review:<repo>:<n>` taskKey, and it is a THREE-state read, not two:
+#
+#     no row at all          -> the wake never landed: genuinely lost
+#     queued or running row  -> dispatch is healthy SO FAR
+#     terminal row, no review -> lost, and the alarm must still fire
+#
+# The third state is not hypothetical: `process_lost` and
+# `external_lifecycle_stale_killed` are live wake reasons on this fleet, so a
+# run can be created, start, and die mid-flight without posting a review.
+# Reading row-exists as health would call that healthy forever -- a false
+# negative in the same direction as the bug this script backstops.
+# review-gate-sweep.yml carries only `GITHUB_TOKEN` and no Paperclip
+# credential, so that check is unreachable from CI today; granting the sweep
+# API access is a strictly larger blast radius and belongs in its own row.
+STALL_THRESHOLD_SECONDS = int(os.environ.get("STALL_THRESHOLD_SECONDS") or 18 * 60 * 60)
 
 # Don't re-fire more than once per cooldown window even if still stalled --
 # the sweep itself must not become the burst that re-triggers whatever
@@ -201,11 +319,19 @@ MAX_REFIRES_PER_RUN = int(os.environ.get("MAX_REFIRES_PER_RUN") or 5)
 # +1h, because this repo's sweep runs HOURLY rather than every 30 minutes
 # (see review-gate-sweep.yml for the rate-limit arithmetic behind that). The
 # extra hour is the polling granularity: worst case a head goes stale just
-# after a run, so its first re-fire lands at 90m+60m=150m and its cooldown
-# expires at 270m, making the next re-fire opportunity 300m. Alarming at
-# 270m would fire in the same window as that second re-fire; 330m (5.5h)
-# keeps "at least one full re-fire and its cooldown have come and gone"
-# true at the coarser cadence.
+# after a run, so with STALL at 18h its first re-fire lands at 1080m+60m=1140m.
+# Its cooldown then expires at 1260m, and the boundary is INCLUSIVE --
+# `should_refire` blocks only on `since_last < REFIRE_COOLDOWN_SECONDS`, so
+# the hourly run at exactly 1260m is already eligible. The formula gives 1320m
+# (22h), clearing that second re-fire opportunity by a full hour rather than
+# landing on it. Either way the property the margin buys holds: "at least one
+# full re-fire AND its cooldown have come and gone", and at 1320m both (1140m,
+# 1260m) are strictly in the past. Kept as a formula so it tracks STALL
+# automatically; the 22h it yields breaches ~3% of the healthy head-landed ->
+# review distribution recorded above STALL_THRESHOLD_SECONDS (p90 12.70h, max
+# 30.81h), so a normally-queued PR no longer alarms. Before BLO-34521 it was
+# 330m, INSIDE the normal distribution -- and the 12h an earlier revision of
+# this same fix yielded was still inside it, at ~11%.
 ALARM_THRESHOLD_SECONDS = int(
     os.environ.get("ALARM_THRESHOLD_SECONDS") or (STALL_THRESHOLD_SECONDS + REFIRE_COOLDOWN_SECONDS + 2 * 60 * 60)
 )
@@ -693,11 +819,15 @@ def too_young_to_be_stranded(pr_payload, now):
 
     Call volume is the binding constraint on this job, not correctness: in
     `status-free` mode every non-draft PR costs at least three requests (head
-    commit + comments page + reviews page). Measured on this repo, 108
-    non-draft open PRs is ~346 requests per run, and at `9,39 * * * *` that is
-    ~700 requests/hour from this job alone against `github.token`'s documented
-    budget of 1,000/hour/repository -- shared with every other workflow here.
-    Exhaustion would not be an edge case, it would be the steady state.
+    commit + comments page + reviews page). Re-measured 2026-09-18T22:55Z on
+    this repo (BLO-34521): 110 non-draft unlocked open PRs of 116 open is
+    ~330 requests per run. The half-hourly `9,39 * * * *` cadence this
+    paragraph was written against would have made that ~660 requests/hour
+    from this job alone, against `github.token`'s documented budget of
+    1,000/hour/repository -- shared with every other workflow here, so
+    exhaustion would have been the steady state rather than an edge case.
+    That is why review-gate-sweep.yml now runs hourly; see the rate-limit
+    arithmetic there, which also records what this cut is currently worth.
 
     The cheap proof: `unreviewed_since` returns `max(created_at,
     committer_date)` (each clamped to `now`), so `pending_since >=
