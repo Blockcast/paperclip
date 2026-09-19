@@ -27,7 +27,7 @@ overrides:
   '@tootallnate/once': ^2.0.1
   form-data: '>=4.0.6'
   '@babel/core': '>=7.29.7 <8'
-  js-yaml: '>=4.3.1 <5'
+  js-yaml: '>=4.3.2 <5'
   esbuild: '>=0.28.1 <0.29'
   '@connectrpc/connect-node>undici': '>=6.27.0 <7'
   jsdom>undici: '>=7.29.0 <8'
@@ -6544,8 +6544,8 @@ packages:
   js-tokens@9.0.1:
     resolution: {integrity: sha512-mxa9E9ITFOt0ban3j6L5MpjwegGz6lBQmM1IJkWeBZGcMxto50+eWdjC/52xDbS2vy0k7vIMK0Fe2wfL9OQSpQ==}
 
-  js-yaml@4.3.1:
-    resolution: {integrity: sha512-CY6crGq313MX8GkwvB7tzgp99vjQxY1++5y10/BKN/GUfHqWaOGQMNZkBvqSzsZKWk/ijwHlWzzkLulsGHhjWQ==}
+  js-yaml@4.3.2:
+    resolution: {integrity: sha512-SFNOvSJ+Dgf/9An904Yx+CgSlIPCkIpao4qo51lpee25TIRejdH3rhR4EZMGoNx3/TP3O+wzWuiTFl4sqbltzA==}
     hasBin: true
 
   jsdom@28.1.0:
@@ -10021,7 +10021,7 @@ snapshots:
       form-data: 4.0.6
       hpagent: 1.2.0
       isomorphic-ws: 5.0.0(ws@8.21.0)
-      js-yaml: 4.3.1
+      js-yaml: 4.3.2
       jsonpath-plus: 10.4.0
       node-fetch: 2.7.0(encoding@0.1.13)
       openid-client: 6.8.4
@@ -10393,7 +10393,7 @@ snapshots:
       cm6-theme-basic-light: 0.2.0(@codemirror/language@6.12.3)(@codemirror/state@6.7.0)(@codemirror/view@6.43.3)(@lezer/highlight@1.2.3)
       codemirror: 6.0.2
       downshift: 7.6.2(react@19.2.7)
-      js-yaml: 4.3.1
+      js-yaml: 4.3.2
       lexical: 0.46.0(typescript@5.9.3)
       mdast-util-directive: 3.1.0
       mdast-util-from-markdown: 2.0.2
@@ -14316,7 +14316,7 @@ snapshots:
 
   js-tokens@9.0.1: {}
 
-  js-yaml@4.3.1:
+  js-yaml@4.3.2:
     dependencies:
       argparse: 2.0.1
 

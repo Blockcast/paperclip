@@ -27,6 +27,8 @@ import {
 } from "../services/approval-enforcement-reconciler.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
+import { applyApprovalEnforcement } from "../services/approval-enforcement-executor.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
 import {
   buildIssueGraphLivenessBoardEscalationKey,
@@ -202,6 +204,12 @@ export function approvalRoutes(
   const access = accessService(db);
   const issueApprovalsSvc = issueApprovalService(db);
   const secretsSvc = secretService(db);
+  // Built once, like `costRoutes` does for the sibling budget-writing route
+  // (`costs.ts`), rather than rebuilding the whole heartbeat closure graph on
+  // every apply just to reach one method.
+  const heartbeat = heartbeatService(db, {
+    pluginWorkerManager: options.pluginWorkerManager,
+  });
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
 
   async function requireApprovalAccess(req: Request, id: string) {
@@ -820,6 +828,38 @@ export function approvalRoutes(
     });
 
     res.json(redactApprovalPayload(approval, await approvalReadOptions(req, approval.companyId)));
+  });
+
+  /**
+   * Apply the values an approved card recorded to the objects that enforce
+   * them (BLO-32796).
+   *
+   * Requester-scoped rather than `assertBoard`-gated, and that is the whole
+   * point: it executes a decision a board actor already made. Approval
+   * authority is untouched — `approve`/`reject`/`requestRevision` above remain
+   * board-only, and this route cannot express any figure that is not already in
+   * the approved payload, because it takes no figures at all.
+   */
+  router.post("/approvals/:id/apply", async (req, res) => {
+    const id = req.params.id as string;
+    const approval = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
+    if (!approval) return;
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, approval.companyId)).allowed) return;
+
+    const actor = getActorInfo(req);
+    const result = await applyApprovalEnforcement(
+      db,
+      id,
+      {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId ?? null,
+        isBoard: req.actor.type === "board",
+      },
+      { cancelWorkForScope: heartbeat.cancelBudgetScopeWork },
+    );
+
+    res.json(result);
   });
 
   router.get("/approvals/:id/comments", async (req, res) => {

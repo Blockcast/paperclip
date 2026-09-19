@@ -1,5 +1,6 @@
 import { Router } from "express";
-import type { Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import { budgetPolicies, type Db } from "@paperclipai/db";
 import {
   createCostEventSchema,
   createFinanceEventSchema,
@@ -373,6 +374,21 @@ export function costRoutes(
     const deferredCancellations: BudgetEnforcementScope[] = [];
     const updated = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
+      // Lock the policy rows before anything touches `agents` — the one lock
+      // order for this pair, stated in full on `upsertPolicy` in `budgets.ts`.
+      // This route used to be the lone inversion: `txAgents.update` first, then
+      // the policy lock inside `upsertPolicy`'s UPDATE. Against a concurrent
+      // apply on the same agent that is a textbook ABBA deadlock — Postgres
+      // aborts one side with 40P01, which is not an `HttpError`, so the caller
+      // gets an unhandled 500 with no retry and a board cap change is the losing
+      // side as often as the apply is (BLO-32796).
+      await txDb
+        .select({ id: budgetPolicies.id })
+        .from(budgetPolicies)
+        .where(
+          and(eq(budgetPolicies.scopeType, "agent"), eq(budgetPolicies.scopeId, agentId)),
+        )
+        .for("update");
       const txAgents = agentService(txDb);
       // Process termination is irreversible and uses the outer DB connection.
       // Defer it until the transaction has committed so a failed policy write

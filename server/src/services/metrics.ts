@@ -135,6 +135,36 @@ export const PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC = "paperclip_plugin_webhook
 export const RECOVERY_HORIZON_EXPIRED_METRIC = "paperclip_recovery_horizon_expired_total";
 export const RECOVERY_HORIZON_DELIVERY_STATES = ["never_delivered", "delivered"] as const;
 export type RecoveryHorizonDeliveryState = (typeof RECOVERY_HORIZON_DELIVERY_STATES)[number];
+/**
+ * Relay failures in the worker-tier proxy, labeled by the reason the request
+ * never produced a worker response (BLO-31945).
+ *
+ * Exists because the only record of this failure was a log line, and the api
+ * pod's log is not an instrument: `paperclip-0` is recreated often enough that
+ * `--since=24h` silently resolves to whatever survived the last recreation
+ * (measured 2026-09-16: ~36 minutes, and `--previous` returns nothing at all).
+ * An acceptance criterion asserting "zero relay failures over a rolling 24h"
+ * was therefore unevaluable in either direction against that surface. The
+ * counter has normal retention, so the same question is a range query.
+ *
+ * Cardinality is three series by construction —
+ * {@link KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS} is a closed set, not caller
+ * input. `timeout` means the connection succeeded and the worker was still
+ * silent when the proxy's own deadline fired; `mid_stream` means the worker
+ * answered and the response then broke after headers were already flushed;
+ * `unreachable` means the request never got that far. They are separated
+ * because they route differently: `timeout` is worker latency, `mid_stream` is
+ * a worker that died or was restarted mid-response, and only `unreachable`
+ * points at a missing Service endpoint.
+ */
+export const WORKER_TIER_PROXY_FAILURES_METRIC = "paperclip_worker_tier_proxy_failures_total";
+export const KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS = [
+  "timeout",
+  "mid_stream",
+  "unreachable",
+] as const;
+export type WorkerTierProxyFailureReason =
+  (typeof KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS)[number];
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
 /**
@@ -2132,6 +2162,7 @@ let pluginWebhookDeliveryRejected:
   | Counter<"plugin_key" | "response_class" | "plugin_status">
   | null = null;
 let recoveryHorizonExpired: Counter<"delivery"> | null = null;
+let workerTierProxyFailures: Counter<"reason"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -2196,6 +2227,7 @@ function ensureRegistry(): {
   backstopCandidatesSkippedCounter: Counter<"source" | "reason">;
   pluginWebhookDeliveryRejectedCounter: Counter<"plugin_key" | "response_class" | "plugin_status">;
   recoveryHorizonExpiredCounter: Counter<"delivery">;
+  workerTierProxyFailuresCounter: Counter<"reason">;
 } {
   if (
     !registry
@@ -2258,6 +2290,7 @@ function ensureRegistry(): {
     || !backstopCandidatesSkipped
     || !pluginWebhookDeliveryRejected
     || !recoveryHorizonExpired
+    || !workerTierProxyFailures
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -3081,6 +3114,24 @@ function ensureRegistry(): {
     for (const delivery of RECOVERY_HORIZON_DELIVERY_STATES) {
       recoveryHorizonExpired.inc({ delivery }, 0);
     }
+    workerTierProxyFailures = new Counter({
+      name: WORKER_TIER_PROXY_FAILURES_METRIC,
+      help:
+        "Count of worker-tier proxy relay failures, labeled by reason: 'timeout' "
+        + "(connection succeeded, the worker was still silent at the proxy deadline), "
+        + "'mid_stream' (the worker answered and the response broke after headers "
+        + "were flushed) or 'unreachable' (the request never reached a worker). "
+        + "Replaces a log grep that could not answer a 24h question, because the api "
+        + "pod's log does not survive its own recreation (BLO-31945).",
+      labelNames: ["reason"],
+      registers: [registry],
+    });
+    // Zero-init every series. An un-incremented counter is absent from the
+    // scrape, and an absent series is indistinguishable from a healthy one on
+    // every dashboard — rate() over it returns nothing rather than 0.
+    for (const reason of KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS) {
+      workerTierProxyFailures.inc({ reason }, 0);
+    }
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -3147,6 +3198,7 @@ function ensureRegistry(): {
     backstopCandidatesSkippedCounter: backstopCandidatesSkipped,
     pluginWebhookDeliveryRejectedCounter: pluginWebhookDeliveryRejected,
     recoveryHorizonExpiredCounter: recoveryHorizonExpired,
+    workerTierProxyFailuresCounter: workerTierProxyFailures,
   };
 }
 
@@ -4388,6 +4440,26 @@ export function recordBackstopCandidateSkipped(source: BackstopSource, reason: B
 }
 
 /**
+ * Record a worker-tier proxy relay failure (BLO-31945).
+ *
+ * Paired with the existing log line, same division of labour as the webhook
+ * rejection counter: the counter answers "how many, of which kind, over what
+ * window" from a surface with normal retention, the log keeps the per-request
+ * detail (target URL, method, the error itself) that must never be a label.
+ *
+ * Must not throw — it sits on the error path of a request that is already
+ * failing, and a metrics fault has no business turning a considered 502/504
+ * into a 500.
+ */
+export function recordWorkerTierProxyFailure(reason: WorkerTierProxyFailureReason): void {
+  try {
+    ensureRegistry().workerTierProxyFailuresCounter.inc({ reason });
+  } catch (error) {
+    logger.error({ err: error, reason }, "failed to record worker-tier proxy failure metric");
+  }
+}
+
+/**
  * Record a webhook delivery turned away at the ingestion readiness guard
  * (BLO-28803).
  *
@@ -4531,6 +4603,7 @@ export function __resetMetricsForTest(): void {
   recoveryHorizonExpired = null;
   gbrainRecallTotal = null;
   pluginWebhookDeliveryRejected = null;
+  workerTierProxyFailures = null;
   trackedWebhookRejectionPluginKeys.clear();
   webhookRejectionLogState.clear();
   resetDepBlockedMetrics();
