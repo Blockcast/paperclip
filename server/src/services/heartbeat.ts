@@ -444,6 +444,7 @@ import {
   setReleasePendingExternalRuntimeReservationMetrics,
   setOrphanedEnvironmentLeaseMetrics,
   setOrphanedRuntimeResourceMetricsRefreshSuccess,
+  setCrashRecoveryCandidateIndexPresent,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
@@ -18455,6 +18456,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         limit 1
       `);
       const present = Array.from(rows as unknown as Iterable<unknown>).length > 0;
+      // Published on every tick, in BOTH directions (BLO-21526). The warn
+      // below is latched to the absent transition and says nothing at all
+      // while the index is healthy, which is the same silent-on-healthy shape
+      // as the migration's swallowed RAISE NOTICE; the gauge is what lets an
+      // operator or a later deploy check confirm presence rather than merely
+      // observe quiet.
+      setCrashRecoveryCandidateIndexPresent(present);
       if (present) {
         // Re-arm the warning so a later disappearance is reported again rather
         // than being silenced by a warning issued before the index existed.
@@ -18477,6 +18485,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Never let a catalog probe failure take out the caller, and never cache
       // it: "we could not tell" is not evidence either way. Skips this periodic
       // tick only; startup recovery is ungated.
+      //
+      // The gauge is cleared rather than set to 0 for the same reason: an
+      // unreadable catalog must not publish "the index is gone", and a stale 1
+      // left behind would publish "healthy" on no information (BLO-21526).
+      setCrashRecoveryCandidateIndexPresent(null);
       logger.warn({ err }, "failed to probe worker-crash candidate index; skipping periodic reconciliation this tick");
       return false;
     }

@@ -932,6 +932,52 @@ export const AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC =
   "paperclip_agent_wakeup_terminal_failed_oldest_age_seconds";
 
 /**
+ * Runtime presence of the worker-crash recovery candidate index (BLO-21526).
+ * 1 while `heartbeat_runs_crash_recovery_pending_idx` is present, valid and
+ * ready; 0 while it is absent or invalid, which is exactly when the periodic
+ * crash reconciliation gates itself off (`skippedReason:
+ * "candidate_index_missing"`) and the recovery path stops running.
+ *
+ * This exists because migration 0226 records complete on a populated database
+ * WITHOUT building its deferred `CREATE INDEX CONCURRENTLY`, and the only
+ * signal it left behind was a `RAISE NOTICE` the production client swallows
+ * (`onnotice: () => {}`). Every other channel that could have surfaced the gap
+ * is also silent-on-healthy: the deploy guard logs only when it *changes*
+ * something, and the probe's own `logger.warn` is latched to the absent
+ * transition. A gauge is the first signal that says "present" out loud, and
+ * the only one that survives -- `paperclip-0`'s log buffer retains ~4 minutes
+ * on a pod that has been up for hours, so a once-at-startup log line is
+ * unreadable by the time anyone asks.
+ *
+ * Re-derived from `pg_class`/`pg_index` on every periodic scheduler tick, so a
+ * pod restart republishes current state and an index dropped underneath a
+ * running process is picked up within a tick rather than latching forever.
+ *
+ * Deliberately CLEARED (series goes absent) rather than set to 0 when the
+ * catalog probe itself fails: "we could not tell" is not "the index is gone",
+ * and leaving a stale 1 behind would reproduce the exact silent-healthy
+ * failure this metric exists to end. Alert on `== 0` for a real absence and
+ * `absent()` for an unobservable one.
+ *
+ * Labeled by the index name even though only one index is ever published, for
+ * the same reason {@link PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} carries
+ * a constant `role` label: prom-client auto-publishes a bare (zero-label)
+ * Gauge at 0 the moment it is constructed, and `ensureRegistry` runs on every
+ * tier including the API tier, which never runs this probe. A bare Gauge would
+ * therefore publish a frozen `0` -- "the index is missing" -- on every API pod
+ * forever, and production scrapes both Services, so an `== 0` rule would page
+ * permanently regardless of the truth. A labeled Gauge renders no series until
+ * something calls `.set()`, so it appears only on the tier that can actually
+ * observe the catalog, and `.reset()` genuinely removes the series instead of
+ * zeroing it.
+ */
+export const CRASH_RECOVERY_CANDIDATE_INDEX_PRESENT_METRIC =
+  "paperclip_crash_recovery_candidate_index_present";
+
+/** The single index {@link CRASH_RECOVERY_CANDIDATE_INDEX_PRESENT_METRIC} tracks. */
+export const CRASH_RECOVERY_CANDIDATE_INDEX_NAME = "heartbeat_runs_crash_recovery_pending_idx";
+
+/**
  * Restart-safe gauge: 1 while an installed plugin sits in `status = 'error'`,
  * 0 otherwise (BLO-21092/BLO-20410). One sample per installed plugin, not per
  * status — the label set is only the plugin's stable identity (`plugin_id`,
@@ -2087,6 +2133,7 @@ let scheduledRetryParkHorizonRefreshSuccess: Gauge | null = null;
 let dbPoolConnections: Gauge<"state"> | null = null;
 let dbPoolWaitingQueries: Gauge | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
+let crashRecoveryCandidateIndexPresent: Gauge<"index"> | null = null;
 let pluginMetric: Counter<
   "plugin_id" | "plugin_key" | "metric" | PluginMetricPromotableTagKey
 > | null = null;
@@ -2206,6 +2253,7 @@ function ensureRegistry(): {
   dbPoolConnectionsGauge: Gauge<"state">;
   dbPoolWaitingQueriesGauge: Gauge;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
+  crashRecoveryCandidateIndexPresentGauge: Gauge<"index">;
   pluginMetricCounter: Counter<
     "plugin_id" | "plugin_key" | "metric" | PluginMetricPromotableTagKey
   >;
@@ -2273,6 +2321,7 @@ function ensureRegistry(): {
     || !dbPoolConnections
     || !dbPoolWaitingQueries
     || !pluginError
+    || !crashRecoveryCandidateIndexPresent
     || !pluginMetric
     || !pluginMetricDropped
     || !pluginStatusCollectorLastSuccess
@@ -2840,6 +2889,22 @@ function ensureRegistry(): {
       registers: [registry],
     });
     overdueScheduledRetryAgeMetricsRefreshSuccess.set(0);
+    crashRecoveryCandidateIndexPresent = new Gauge({
+      name: CRASH_RECOVERY_CANDIDATE_INDEX_PRESENT_METRIC,
+      help:
+        "1 while heartbeat_runs_crash_recovery_pending_idx is present, valid and "
+        + "ready; 0 while it is absent or invalid and the periodic worker-crash "
+        + "reconciliation is therefore gating itself off (BLO-21526). Migration "
+        + "0226 records complete on a populated database without building this "
+        + "deferred CONCURRENTLY index, and its RAISE NOTICE is swallowed by the "
+        + "production client, so this gauge is the only channel that states the "
+        + "index is present rather than merely staying quiet about it. Re-derived "
+        + "from pg_class/pg_index every periodic scheduler tick. The series is "
+        + "CLEARED, not zeroed, when the catalog probe itself fails: alert on == 0 "
+        + "for a real absence and absent() for an unobservable one.",
+      labelNames: ["index"],
+      registers: [registry],
+    });
     pluginError = new Gauge({
       name: PLUGIN_ERROR_METRIC,
       help:
@@ -3181,6 +3246,7 @@ function ensureRegistry(): {
     dbPoolConnectionsGauge: dbPoolConnections,
     dbPoolWaitingQueriesGauge: dbPoolWaitingQueries,
     pluginErrorGauge: pluginError,
+    crashRecoveryCandidateIndexPresentGauge: crashRecoveryCandidateIndexPresent,
     pluginMetricCounter: pluginMetric,
     pluginMetricDroppedCounter: pluginMetricDropped,
     pluginStatusCollectorLastSuccessGauge: pluginStatusCollectorLastSuccess,
@@ -4047,6 +4113,25 @@ export function setPluginErrorStatus(entries: ReadonlyArray<PluginErrorStatusEnt
   }
 }
 
+/**
+ * Publish whether the worker-crash recovery candidate index is usable right
+ * now (BLO-21526). Called from the periodic probe that already gates the
+ * reconciliation scan, so the gauge tracks the same fact the gate acts on
+ * instead of a second, independently-drifting catalog read.
+ *
+ * `present === null` means the probe itself failed, which is not evidence in
+ * either direction: the series is cleared so it reads as absent/unknown rather
+ * than leaving a stale 1 that would say "healthy" on no information at all.
+ */
+export function setCrashRecoveryCandidateIndexPresent(present: boolean | null): void {
+  const gauge = ensureRegistry().crashRecoveryCandidateIndexPresentGauge;
+  if (present === null) {
+    gauge.reset();
+    return;
+  }
+  gauge.set({ index: CRASH_RECOVERY_CANDIDATE_INDEX_NAME }, present ? 1 : 0);
+}
+
 export interface RecordPluginMetricInput {
   /** `plugins.id` (uuid). */
   pluginId: string;
@@ -4584,6 +4669,7 @@ export function __resetMetricsForTest(): void {
   scheduledRetryParkHorizon = null;
   scheduledRetryParkHorizonRefreshSuccess = null;
   pluginError = null;
+  crashRecoveryCandidateIndexPresent = null;
   pluginMetric = null;
   pluginMetricDropped = null;
   pluginMetricCombinations.clear();
