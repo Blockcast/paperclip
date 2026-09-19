@@ -1069,7 +1069,21 @@ describe("startServer feedback export wiring", () => {
     let releaseTail: (() => void) | null = null;
     try {
       await startServer();
-      // Both also run once from the startup recovery sequence.
+      // Both also run once from the startup recovery sequence, which
+      // `startServer()` does NOT await — it is a fire-and-forget IIFE
+      // (index.ts:1173) only handed to `trackHeartbeatSchedulerWork` at :1351.
+      // So wait for its `reconcileStrandedAssignedIssues` pass (:1273) rather
+      // than relying on `startServer()` having more `await`s after :1173 than
+      // the chain has before it. One wait orders BOTH clears: `resumeQueuedRuns`
+      // (:1272) is awaited immediately before it in the same chain.
+      //
+      // Ordering matters because a tick returns early at :1435 while
+      // `heartbeatStartupRecoveryPending` is true, so neither pass runs from a
+      // tick until the chain finishes. A clear that lands early therefore makes
+      // the first `vi.waitFor` below TIME OUT rather than fail on the latch — a
+      // timeout here is a lost race, not a latch bug.
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
       heartbeatServiceMock.reconcileStrandedAssignedIssues.mockClear();
       heartbeatServiceMock.resumeQueuedRuns.mockClear();
 
