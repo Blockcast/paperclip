@@ -2964,8 +2964,10 @@ describe("tool-child memory cap (BLO-34477)", () => {
       expect(cmd).toContain(`mkdir -p '${TOOL_RLIMIT_ZDOTDIR}'`);
       expect(cmd).toContain(`'ulimit -d 4194304 2>/dev/null || true' > '${TOOL_RLIMIT_FILE}'`);
       // zsh entry point: apply the cap, then defer to the user's own file.
+      // The inner single quotes are escaped the POSIX way ('\'') by the same
+      // quoter the rest of the init command uses.
       expect(cmd).toContain(
-        `printf '%s\\n' '. '"'"'${TOOL_RLIMIT_FILE}'"'"'' 'if [ -r "$HOME/.zshenv" ]; then . "$HOME/.zshenv"; fi' > '${TOOL_RLIMIT_ZDOTDIR}/.zshenv'`,
+        `printf '%s\\n' '. '\\''${TOOL_RLIMIT_FILE}'\\''' 'if [ -r "$HOME/.zshenv" ]; then . "$HOME/.zshenv"; fi' > '${TOOL_RLIMIT_ZDOTDIR}/.zshenv'`,
       );
       // Every other zsh dotfile is a pure chaining stub, so ZDOTDIR loses nothing.
       for (const name of ZSH_DOTFILES.filter((n) => n !== ".zshenv")) {
@@ -3005,21 +3007,16 @@ describe("tool-child memory cap (BLO-34477)", () => {
     });
 
     it("keeps BASH_ENV/ZDOTDIR on the emptyDir even when HOME is a per-run isolated root", () => {
-      ctx.runtime = {
-        ...ctx.runtime,
-        isolation: {
-          mode: "run",
-          key: "run-abc12345",
-          root: "/runtime-cache/paperclip-runs/run-abc12345",
-          workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
-          homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
-          sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
-          cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
-          tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
-          promptCacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/prompt-cache",
-          storage: { workspace: "ephemeral", home: "ephemeral", session: "ephemeral", cache: "ephemeral" },
-        },
-      } as AdapterExecutionContext["runtime"];
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
+        storage: isolatedStorage("ephemeral"),
+      });
       const env = claudeEnv();
       expect(env.get("HOME")).toBe("/runtime-cache/paperclip-runs/run-abc12345/home");
       expect(env.get("BASH_ENV")).toBe(TOOL_RLIMIT_FILE);
@@ -3047,6 +3044,14 @@ describe("tool-child memory cap (BLO-34477)", () => {
     // limit a CI runner has, so lowering to it always succeeds.
     const CAP_KB = 1048576;
     const which = (bin: string): boolean => spawnSync("sh", ["-c", `command -v ${bin}`], { encoding: "utf8" }).status === 0;
+    // Darwin's setrlimit(RLIMIT_DATA) returns EINVAL for any lowering, so the
+    // "cap applied" assertions can only be made where the kernel honours the
+    // knob (Linux — the adapter's only deployment target, and CI). The probe
+    // asks the host, not the platform string, so a Linux box with an odd hard
+    // limit is skipped honestly rather than failing on an unrelated cause.
+    const hostCanLowerRlimitData =
+      spawnSync("/bin/sh", ["-c", `ulimit -d ${CAP_KB} 2>/dev/null && ulimit -d`], { encoding: "utf8" }).stdout.trim() === String(CAP_KB);
+    const itOnCapableHost = hostCanLowerRlimitData ? it : it.skip;
     const install = (limitKb: number): { dir: string; home: string } => {
       const base = mkdtempSync(join(tmpdir(), "blo34477-"));
       tempDirs.push(base);
@@ -3062,7 +3067,7 @@ describe("tool-child memory cap (BLO-34477)", () => {
     const ulimitD = (argv: string[], env: Record<string, string>): string =>
       spawnSync(argv[0], argv.slice(1), { encoding: "utf8", env: { PATH: process.env.PATH ?? "", ...env } }).stdout.trim();
 
-    it("bash under BASH_ENV, and POSIX sh sourcing the file, report the cap", () => {
+    itOnCapableHost("bash under BASH_ENV, and POSIX sh sourcing the file, report the cap", () => {
       const { dir, home } = install(CAP_KB);
       expect(ulimitD(["/bin/sh", "-c", `. '${dir}/rlimit.sh'; ulimit -d`], { HOME: home })).toBe(String(CAP_KB));
       if (which("bash")) {
@@ -3079,8 +3084,7 @@ describe("tool-child memory cap (BLO-34477)", () => {
       expect(ulimitD(["/bin/sh", "-c", "ulimit -d"], { HOME: home, BASH_ENV: `${dir}/rlimit.sh` })).toBe(baseline);
     });
 
-    it("zsh under ZDOTDIR applies the cap and still sources the user's own $HOME dotfiles", () => {
-      if (!which("zsh")) return;
+    (which("zsh") ? itOnCapableHost : it.skip)("zsh under ZDOTDIR applies the cap and still sources the user's own $HOME dotfiles", () => {
       const { dir, home } = install(CAP_KB);
       writeFileSync(join(home, ".zshenv"), "export BLO34477_CHAIN=reached\n");
       const env = { HOME: home, ZDOTDIR: `${dir}/zdotdir` };
