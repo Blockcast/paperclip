@@ -63,11 +63,63 @@ describe("merge-gate reader", () => {
         ["policy", "cancelled", "2026-09-16T13:15Z", "35100490811"],
         ["verify", "failure", "2026-09-16T13:20Z", "35100490811"],
         ["Typecheck", "skipped", "2026-09-16T13:20Z", "35100490811"],
-        ["security-review", "neutral", "2026-09-16T13:14Z", "app"],
+        ["security-review", "neutral", "2026-09-16T13:14Z", "app:allyblockcast"],
       ],
       "35100490811",
     );
     assert.ok(stops(lines).length >= 1, `expected >=1 STOP, got ${JSON.stringify(lines)}`);
+    assert.match(lines.join("\n"), /ABSENT/);
+  });
+
+  // Reviewer finding at 5532b1ab: the survivor count excluded legacy-status rows
+  // but not App-published ones, and an App row is not a workflow verdict either.
+  // So the fixture above passed only because its App row is `neutral`, which
+  // $2!="neutral" removes before the App question is reached — one green App row
+  // suppresses the guard and the reader prints nothing. Reachable, not
+  // theoretical: pr.yml sets a PR-scoped concurrency group, and every head in
+  // this repo carries `security-review` plus `gate/ally-comment-findings`, the
+  // latter `success` whenever there are no unresolved findings.
+  it("reports ABSENT when the only survivor is a green App-published row", () => {
+    const lines = read(
+      [
+        ["Build", "failure", "2026-09-16T13:20Z", "111"],
+        ["gate/ally-comment-findings", "success", "2026-09-16T13:14Z", "app:allyblockcast"],
+      ],
+      "111",
+    );
+    assert.match(lines.join("\n"), /ABSENT/);
+  });
+
+  // ...but an App-only head with nothing dropped is NOT absent. This is the
+  // false-RED control on the arm above; without `dead=="__none__"` it fires.
+  it("stays silent on an App-only head when nothing was dropped", () => {
+    assert.deepEqual(
+      read([["gate/ally-comment-findings", "success", "2026-09-16T13:14Z", "app:allyblockcast"]]),
+      [],
+    );
+  });
+
+  // The mandated procedure's one carve-out: a name containing `${{` is an
+  // un-expanded workflow template, a malformed registration that can never
+  // report. Labelled MALFORMED rather than STOP, and it must not count as a
+  // surviving verdict either — otherwise it suppresses the ABSENT guard.
+  it("labels an un-expanded workflow template as MALFORMED, not STOP", () => {
+    const lines = read([
+      ["verify", "success", "2026-09-16T13:20Z", "999"],
+      ["build-${{ matrix.os }}", "failure", "2026-09-16T13:21Z", "999"],
+    ]);
+    assert.deepEqual(lines, ["MALFORMED\tbuild-${{ matrix.os }}\tfailure\trun=999"]);
+    assert.equal(stops(lines).length, 0);
+  });
+
+  it("does not count a malformed check-run as a surviving verdict", () => {
+    const lines = read(
+      [
+        ["verify", "failure", "2026-09-16T13:20Z", "111"],
+        ["build-${{ matrix.os }}", "success", "2026-09-16T13:21Z", "222"],
+      ],
+      "111",
+    );
     assert.match(lines.join("\n"), /ABSENT/);
   });
 
@@ -118,7 +170,7 @@ describe("merge-gate reader", () => {
     const lines = read(
       [
         ["verify", "failure", "2026-09-16T13:20Z", "111"],
-        ["gate/ally-comment-findings", "neutral", "2026-09-16T13:14Z", "app"],
+        ["gate/ally-comment-findings", "neutral", "2026-09-16T13:14Z", "app:allyblockcast"],
       ],
       "111",
     );
@@ -144,9 +196,9 @@ describe("merge-gate reader", () => {
   it("labels neutral as NOT-EVALUATED rather than dropping it", () => {
     const lines = read([
       ["verify", "success", "2026-09-16T13:20Z", "999"],
-      ["gate/ally-comment-findings", "neutral", "2026-09-16T13:14Z", "app"],
+      ["gate/ally-comment-findings", "neutral", "2026-09-16T13:14Z", "app:allyblockcast"],
     ]);
-    assert.deepEqual(lines, ["NOT-EVALUATED\tgate/ally-comment-findings\tneutral\trun=app"]);
+    assert.deepEqual(lines, ["NOT-EVALUATED\tgate/ally-comment-findings\tneutral\trun=app:allyblockcast"]);
     assert.equal(stops(lines).length, 0);
   });
 
@@ -246,6 +298,53 @@ describe("merge-gate reader", () => {
 
     it("is silent when no run was cancelled at all", () => {
       assert.equal(dead([["10", "100", "success"]]), "");
+    });
+
+    // DO NOT WIDEN THIS FILTER TO "newest run id per workflow wins". It is the
+    // obvious fix for a reported false RED (a workflow that re-runs at an
+    // UNCHANGED head on a later event leaves a stale `failure` behind —
+    // pim-multicast-gateway#3215 @ a8934c8e, review-gate on pull_request_target
+    // 16:34:36Z failure, then on pull_request_review 16:43:36Z success). It was
+    // implemented, measured, and REVERTED: it is BLO-34114's masking moved from
+    // the name dimension to the run dimension, and it cost 15 STOPs on 34114's
+    // own control including secret-scan and redaction-tests.
+    //
+    // The premise that killed it: `pull_request` and `pull_request_target` are
+    // NOT different workflow files. penstock-llm-proxy-core/.github/workflows/
+    // security.yml declares BOTH triggers, so one workflow_id fans out to two
+    // CONCURRENT lanes with identical check-run names and opposite verdicts —
+    // and the failing one is the secrets-bearing lane, because the pull_request
+    // lane cannot reach secrets and passes vacuously. Higher run id does not
+    // mean later: both are dispatched from one push and the ordering between
+    // them is arbitrary.
+    //
+    // Those two shapes are indistinguishable in this function's input: both are
+    // one workflow_id, two events, pull_request_target failed, something else
+    // succeeded. No predicate over (workflow_id, run id, conclusion) separates
+    // them, so the false RED is ACCEPTED — it costs a wait, the widening costs a
+    // merge-authorizing false GREEN on security checks.
+    it("keeps BOTH lanes when one workflow file fans out to two events", () => {
+      // penstock-llm-proxy-core#1992 @ fbdb3477 — BLO-34114's control.
+      assert.equal(
+        dead([
+          ["286504429", "34868322890", "failure"], // security, pull_request_target
+          ["286504429", "34868326080", "success"], // security, pull_request
+          ["286504427", "34868322979", "failure"], // ci, pull_request_target
+          ["286504427", "34868326159", "success"], // ci, pull_request
+        ]),
+        "",
+      );
+    });
+
+    it("keeps a stale failure its own workflow later re-ran and passed", () => {
+      // The accepted false RED. Deliberate, not an oversight: see above.
+      assert.equal(
+        dead([
+          ["315978042", "35369288224", "failure"],
+          ["315978042", "35370168113", "success"],
+        ]),
+        "",
+      );
     });
   });
 

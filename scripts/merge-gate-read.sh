@@ -9,6 +9,11 @@
 # the pipeline without adding a fixture to merge-gate-read.test.mjs; every guard
 # in here exists because a filter shipped a merge-authorizing false GREEN.
 #
+# The VERDICT IS THE LINES, never $?. Live mode propagates grep's status through
+# pipefail, so it exits 1 exactly when the ABSENT line fires and 0 when real STOP
+# lines print — the inverse of what a caller would guess. Never write
+# `merge-gate-read.sh … && merge`.
+#
 #   merge-gate-read.sh <owner/repo> <sha|pr-head>     # live
 #   merge-gate-read.sh --rows <DEAD-alternation>      # fixture mode, rows on stdin
 #   merge-gate-read.sh --dead                         # fixture mode, runs on stdin
@@ -77,8 +82,22 @@ verdicts() { # $1 = DEAD alternation ('__none__' when nothing is stale)
         # single-surface false RED. Control: run the same read against 3-8
         # commits that demonstrably shipped; empty there too means that surface
         # carries no verdict and the other one is the whole gate.
-        $4!="status"&&$2!="neutral"{n++}
-        $2!="success"&&$2!="skipped"{print ($2=="neutral"?"NOT-EVALUATED":"STOP")"\t"$1"\t"$2"\trun="$4}
+        # App-published rows are excluded on the SAME grounds as status rows,
+        # but only when something was dropped: they are not workflow verdicts,
+        # so one green App row otherwise suppresses the guard after DEAD ate
+        # every real check-run, and the reader prints nothing. Every head in
+        # this repo carries two such rows, and `gate/ally-comment-findings` is
+        # `success` whenever there are no unresolved findings. The
+        # `dead=="__none__"` arm keeps an App-only head from a false RED.
+        # A name containing `${{` is an un-expanded workflow template, i.e. a
+        # malformed registration that can never report. It is the ONE carve-out
+        # from the stop rule in the mandated procedure, and the only part of that
+        # procedure this script did not implement — so an affected repo
+        # got a permanent false RED and every consumer re-derived the exception
+        # by hand. Labelled, not dropped, exactly like `neutral`; and it is not a
+        # verdict, so it does not count toward the survivor total either.
+        $4!="status"&&$2!="neutral"&&$1!~/\$\{\{/&&(dead=="__none__"||$4!~/^app:/){n++}
+        $2!="success"&&$2!="skipped"{print ($1~/\$\{\{/?"MALFORMED":($2=="neutral"?"NOT-EVALUATED":"STOP"))"\t"$1"\t"$2"\trun="$4}
         END{if(!n) print "STOP\t<" (dead!="__none__" \
               ? "every check-run at this head dropped as superseded-run" \
               : "no check-run verdict at this head") ">\tABSENT\trun=-"}'
