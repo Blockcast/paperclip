@@ -2540,10 +2540,10 @@ function wakeIdempotencySuffix(
       scope: scopeFor(identity),
     };
   }
-  // PEN-2865: scope the push-driven reviewer wakes to the HEAD, not to the
+  // PEN-2865: scope the push-driven reviewer wake to the HEAD, not to the
   // delivery. Two deliveries of one PR event on an UNCHANGED head used to earn
   // two different keys, clear the idempotency precheck, and become two wakes.
-  // Nothing downstream collapses them: both reasons sit in
+  // Nothing downstream collapses them: the reason sits in
   // EXPLICIT_PR_REVIEW_REQUEST_WAKE_REASONS, which forces `includeRunning:
   // false` in enqueueWakeup, so a RUNNING same-PR review is never a coalesce
   // target and the second wake becomes a second queued run. Ally then posted a
@@ -2557,6 +2557,26 @@ function wakeIdempotencySuffix(
   // the same head. A GitHub redelivery dedups here too, as it did before.
   //
   // This is the BLO-32381 escalation precedent applied to the review itself.
+  //
+  // WHY ONLY `synchronize` IS HEAD-SCOPED, AND WHY WIDENING THIS SET IS NOT
+  // SAFE BY DEFAULT. Head-scoping cannot tell a duplicate DELIVERY of one event
+  // apart from a SECOND DISTINCT EVENT that happens to report the same head --
+  // head is the only identity left. `synchronize` is immune to that ambiguity
+  // because a genuine push always carries a new head, so a second `synchronize`
+  // at one head can only be a duplicate delivery. No other reason has that
+  // property, and `ready_for_review` actively lacks it: mark ready at head X ->
+  // convert back to draft (cancelPendingRunsForTask sets that very wake row to
+  // `cancelled`) -> mark ready again without pushing. The third step rebuilds
+  // the byte-identical head-scoped key, and `cancelled` is in
+  // TERMINAL_REQUEST_SCOPED_IDEMPOTENT_STATUSES, so the precheck would drop it
+  // and the PR would never be reviewed at that head -- the BLO-18953 /
+  // Blockcast/paperclip#822 self-poisoning class, narrowed to the unchanged-head
+  // toggle. That `cancelled` entry is only sound while the key cannot recur
+  // except as a redelivery, which is a property of DELIVERY scoping; it does not
+  // survive head scoping. Keep `ready_for_review` delivery-scoped. The
+  // duplicate-review evidence is on the push lane anyway: #1594 has no
+  // draft/ready toggle in its timeline at all, and #1304's lone
+  // `ready_for_review` predates its duplicate pair by three weeks.
   //
   // Falling back to the delivery-scoped branch below (rather than emitting
   // `head:unknown`) is load-bearing: an `unknown` identity scores `stable`,
@@ -2583,11 +2603,15 @@ const REVIEWER_DELIVERY_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set([
   "github_pr_synchronized",
 ]);
 
-// PEN-2865. Same two reasons as the delivery-scoped set above, and deliberately
-// NOT a replacement for it: head-scoping is attempted first, and the delivery
+// PEN-2865. A STRICT SUBSET of the delivery-scoped set above, and deliberately
+// not a replacement for it: head-scoping is attempted first, and the delivery
 // set remains the fallback for an event that somehow carries no head sha.
+//
+// `github_pr_ready_for_review` is deliberately ABSENT -- see the long comment in
+// wakeIdempotencySuffix. Adding a reason here is a behaviour change, not a
+// registration: it is only sound for a reason whose second occurrence at ONE
+// head can only be a duplicate delivery. Verify that before extending this set.
 const REVIEWER_HEAD_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set([
-  "github_pr_ready_for_review",
   "github_pr_synchronized",
 ]);
 
@@ -2630,13 +2654,17 @@ function buildPrReviewerWakeIdempotencyKey(
   // @ally comment requests are scoped to the GitHub comment id so a later
   // explicit re-review comment can wake Ally again.
   //
-  // github_pr_ready_for_review and github_pr_synchronized are scoped to the
-  // HEAD SHA (PEN-2865), falling back to the delivery id when a head is somehow
-  // absent. Each draft->ready toggle and each push is a fresh request for the
-  // current head, and a genuine one always carries a NEW head -- so head keeps
-  // the "fresh request" property that BLO-18953 needed, while collapsing the
-  // duplicate deliveries of ONE head that were producing two reviewer wakes and
-  // two byte-identical Ally reviews on an unchanged head.
+  // github_pr_synchronized is scoped to the HEAD SHA (PEN-2865), falling back
+  // to the delivery id when a head is somehow absent. Each push is a fresh
+  // request for the current head, and a genuine one always carries a NEW head
+  // -- so head keeps the "fresh request" property that BLO-18953 needed, while
+  // collapsing the duplicate deliveries of ONE head that were producing two
+  // reviewer wakes and two byte-identical Ally reviews on an unchanged head.
+  //
+  // github_pr_ready_for_review stays DELIVERY-scoped: unlike a push, a second
+  // ready_for_review can legitimately occur on an unchanged head (ready ->
+  // draft -> ready), and head-scoping would collide it with the `cancelled`
+  // row the draft toggle left behind. See wakeIdempotencySuffix.
   //
   // Keying either on repo+pr+reason alone made it self-poisoning: `coalesced`
   // is an
