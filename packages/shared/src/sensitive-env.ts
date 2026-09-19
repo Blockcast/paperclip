@@ -5,6 +5,15 @@
  * "withheld" from "absent" — but that contract only holds if the UI recognises the same string the
  * server writes. Both sides had their own literal, and nothing pinned them together: change one and
  * the viewer silently falls back to rendering a withheld log as an empty one.
+ *
+ * BLO-34738: it lives in this module for import-graph reasons, not because it is env-specific.
+ * Every other export here classifies env-var NAMES and VALUES; this one does not. Its consumers are
+ * product-wide and mostly non-env: `server/src/redaction.ts` re-exports it as
+ * `REDACTED_EVENT_VALUE`, which `maskWorkspaceRuntimeTextForRead` writes over workspace-operation
+ * `command`/`cwd`, run and operation LOG CONTENT, promoted runtime scalars and approval payloads;
+ * `ui/src/pages/AgentDetail.tsx` re-aliases it as `REDACTED_ENV_VALUE` to recognise a withheld
+ * value on read. Grep the alias names, not just this one — the two re-exports are where it is
+ * actually used.
  */
 export const REDACTED_VALUE_SENTINEL = "***REDACTED***";
 
