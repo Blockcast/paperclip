@@ -975,7 +975,7 @@ export function scanCommit(commit: string, runGit: GitReader): GitPushFinding[] 
  * The peel loop handles a tag pointing at a tag, which git permits. It is
  * bounded rather than `while (true)`: a malformed or cyclic chain must not spin
  * a push forever. Exhausting that bound REFUSES rather than returning what it
- * has, for the same reason the alias hop limit does. `git push refs/tags/<tag>`
+ * has, for the same reason the alias hop limit does. Pushing `refs/tags/<tag>`
  * sends every object in the chain, not just the first, so a chain longer than
  * the budget would publish objects — messages included — that nothing read.
  * Returning the findings so far would be a clean verdict on an unscanned tail,
