@@ -32,25 +32,27 @@ Look at the `labels` array. The label name(s) tell you which evidence shapes the
 
 | Label | Required shapes |
 |---|---|
-| `frontend`, `ui`, `cms-published` | `screenshot:1440x900` + `screenshot:390x844` + `checklist:done-when` + `landing-artifact` + `review:ally-clean` + `deploy:landed` |
-| `backend` | `test-output` + `checklist:done-when` + `landing-artifact` + `review:ally-clean` + `deploy:landed` |
+| `frontend`, `ui`, `cms-published` | `screenshot:1440x900` + `screenshot:390x844` + `checklist:done-when` + `landing-artifact` + `review:ally-clean` |
+| `backend` | `test-output` + `checklist:done-when` + `landing-artifact` + `review:ally-clean` |
 | `infra` | `kubectl-state` + `probe-output` |
 | `cms-data-op` | `url-probe` |
-| `db-migration`, `migration` | `migration-output` + `landing-artifact` + `review:ally-clean` + `deploy:landed` |
+| `db-migration`, `migration` | `migration-output` + `landing-artifact` + `review:ally-clean` |
 | `pr` | `pr-link` |
-| (no label or unrecognized) | `checklist:done-when` + `review:ally-clean` + `deploy:landed` (weak default — see the note below on when `review:ally-clean` can block) |
+| (no label or unrecognized) | `checklist:done-when` + `review:ally-clean` (weak default — see the note below on when `review:ally-clean` can block) |
 
-Multiple labels union their required sets. A `frontend + pr` issue needs all of `screenshot:1440x900`, `screenshot:390x844`, `checklist:done-when`, `landing-artifact`, `pr-link`.
+`deploy:landed` appears in no row on purpose: it is **detected but required nowhere** (CTO ruling 2026-09-17). See its section below.
 
-`infra` and `cms-data-op` intentionally do NOT require `landing-artifact`: their existing shapes already demand live, hard-to-fake state (a real `kubectl get`, a real HTTP probe), and some ops changes are legitimately applied ahead of a PR landing. They are excluded from the two truth shapes for the same reason, as is `pr` — that label exists to deliver an OPEN PR for a human decision.
+Multiple labels union their required sets. A `frontend + pr` issue needs all of `screenshot:1440x900`, `screenshot:390x844`, `checklist:done-when`, `landing-artifact`, `review:ally-clean`, `pr-link`.
+
+`infra` and `cms-data-op` intentionally do NOT require `landing-artifact`: their existing shapes already demand live, hard-to-fake state (a real `kubectl get`, a real HTTP probe), and some ops changes are legitimately applied ahead of a PR landing. They are excluded from `review:ally-clean` for the same reason, as is `pr` — that label exists to deliver an OPEN PR for a human decision.
 
 **The two truth shapes are computed by the server, and whether a gap made only of them blocks depends on one operator flag.** With `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK` off — the default — such a gap records `warn` with the `truth-gap-warn-only` diagnostic. With it on, a gap that *contains* `review:ally-clean` escalates to `block` with `unlabeled-truth-block`. A *mixed* gap is unchanged at either setting — a `frontend` issue missing its screenshots still blocks on the screenshots.
 
 Three things are never blocking, at any value of that flag:
 
-- **`deploy:landed`.** The gate blocks only on the transition INTO `in_review`, and `deploy:landed` means merged, so it is unsatisfiable at the one moment it is evaluated.
+- **`deploy:landed`.** The gate blocks only on the transition INTO `in_review`, and `deploy:landed` means merged, so it is unsatisfiable at the one moment it is evaluated. That is also why it is **not a required shape on any path** (CTO ruling 2026-09-17) — it appears in no row of the table above.
 - **A failed GitHub probe** (`unlabeled-truth-block-suppressed:probe-failed`). "We could not ask GitHub" is not "GitHub says this was never reviewed".
-- **An issue with no linked pull request** (`unlabeled-truth-block-suppressed:no-linked-pull-request`). `review:ally-clean` needs a head to review; with no PR there is no head, so you could never satisfy it. Doc-only and refactor issues are exactly why the unlabeled path is the weak one (CTO ruling 2026-09-16).
+- **An issue with no linked pull request.** `review:ally-clean` needs a head to review; with no PR there is no head, so you could never satisfy it (CTO ruling 2026-09-16). Two diagnostics, because the populations differ: an **unlabeled** issue drops the shape from `required` outright and reaches `pass` with `truth-shapes-not-required:no-linked-pull-request` — doc-only and refactor work is exactly why the unlabeled path is the weak one. A **labeled** issue keeps it required, because its assignee can open a PR, and only has the escalation suppressed: `unlabeled-truth-block-suppressed:no-linked-pull-request`.
 
 If you are reading this because a transition was refused, the verdict's `diagnostics` names which case you are in. The flip is governed by `docs/runbooks/evidence-gate-unlabeled-block.md`.
 
@@ -99,9 +101,9 @@ Fails after you think you are done when:
 
 #### `deploy:landed`
 
-Also server-computed: the linked PR is **merged**. Open, draft, or closed-unmerged does not satisfy it.
+Also server-computed: **every** linked PR is merged — the server aggregates with `every`, exactly as `review:ally-clean` does, and withholds both shapes entirely past the same five-PR cap. Open, draft, or closed-unmerged does not satisfy it.
 
-This shape is **never blocking at the `in_review` transition** — see the note under the table. Do not read it as "merge before you move to `in_review`"; `in_review` is the state work waits *for* review in. It is recorded so the scorecards and the rollout measurement can see which issues reached review with their code already landed.
+This shape is **not required on any path** (CTO ruling 2026-09-17) and is never blocking at the `in_review` transition — see the note under the table. Do not read it as "merge before you move to `in_review`"; `in_review` is the state work waits *for* review in. It is detected and reported through `allDetected` so the scorecards and the rollout measurement can see which issues reached review with their code already landed.
 
 "Landed" means merged, not running in production. Use the `infra` shapes for that.
 
