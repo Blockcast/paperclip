@@ -1,5 +1,9 @@
 import type { Db } from "@paperclipai/db";
 import { companies, instanceSettings } from "@paperclipai/db";
+
+// Same shape as `agent-invokability.ts` / `recovery/service.ts`: a caller's
+// open transaction handle, which the db package does not export as a name.
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 import {
   DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
   DEFAULT_BACKUP_RETENTION,
@@ -308,7 +312,7 @@ function toInstanceSettings(row: typeof instanceSettings.$inferSelect): Instance
  * equivalent to bootstrapping — minus the write. Writers still go through
  * `instanceSettingsService`, which keeps creating the row.
  */
-export async function readInstanceSettingsOn(dbOrTx: Db) {
+export async function readInstanceSettingsOn(dbOrTx: Db | DbTransaction) {
   const row = await dbOrTx
     .select()
     .from(instanceSettings)

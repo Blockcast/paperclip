@@ -1015,6 +1015,100 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
+  // BLO-34207 / BLO-34471: `heartbeatRecoveryChainInFlight` single-flights the
+  // lock-taking recovery tail across ticks. That latch is the whole mechanism
+  // bounding the convoy — a tail pass walks 147 stranded candidates
+  // sequentially, each taking the company-wide issue-graph advisory lock,
+  // against a 30 s tick, so two overlapping passes contend with EACH OTHER and
+  // starve `POSTGRES_POOL_MAX=10`. It had no regression guard, which is the
+  // "test passes while missing the real failure mode" shape: every other test
+  // in this file is satisfied by an unlatched implementation.
+  //
+  // Also pins the deliberate SPLIT. The dispatch chain above the tail is
+  // unlatched on purpose (see the rationale at index.ts:1675), so a guard that
+  // only proved "the tail is single-flighted" would be equally satisfied by
+  // latching the whole tick — which reproduces the symptom the latch is
+  // deployed against.
+  it("single-flights the recovery tail across ticks while leaving dispatch unlatched", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    const idleReconcile = {
+      assignmentDispatched: 0,
+      dispatchRequeued: 0,
+      continuationRequeued: 0,
+      successfulRunHandoffEscalated: 0,
+      escalated: 0,
+      skipped: 0,
+      issueIds: [],
+    };
+    // The tail's release is observable only by a LATER tick running it again,
+    // and the chain's trailing pass is a real (unmocked) import, so there is no
+    // mock to await for "the `.finally` has run". Tick until it does; a latch
+    // that never releases simply never satisfies this and times out.
+    const tickUntilTailRuns = async (times: number) =>
+      vi.waitFor(() => {
+        intervalCallback?.();
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(times);
+      });
+
+    let releaseTail: (() => void) | null = null;
+    try {
+      await startServer();
+      // Both also run once from the startup recovery sequence.
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockClear();
+      heartbeatServiceMock.resumeQueuedRuns.mockClear();
+
+      // Park the tail so it is still in flight when the next tick fires.
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          releaseTail = () => resolve(idleReconcile);
+        }),
+      );
+
+      intervalCallback?.();
+      await vi.waitFor(() => expect(releaseTail).not.toBeNull());
+      await vi.waitFor(() => expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1));
+
+      // (a) Second tick with the tail still parked must NOT start a second
+      // pass. This is the assertion the latch exists to make true, and the one
+      // that fails when the `if (!heartbeatRecoveryChainInFlight)` guard is
+      // reverted.
+      intervalCallback?.();
+      // (c) ...while the unlatched dispatch chain DOES run again. Awaiting it
+      // also gives a would-be second tail pass more than enough turns to start,
+      // so (a) below is not just observing an unresolved microtask.
+      await vi.waitFor(() => expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(2));
+      expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1);
+
+      // (b1) `.finally` releases the latch when the tail RESOLVES.
+      releaseTail?.();
+      releaseTail = null;
+      await tickUntilTailRuns(2);
+
+      // (b2) ...and when it REJECTS. The chain's terminal `.catch` swallows the
+      // error, so a latch released on the happy path only would leave recovery
+      // wedged estate-wide until restart, with no output at all.
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockRejectedValueOnce(
+        new Error("recovery pass blew up"),
+      );
+      await tickUntilTailRuns(3);
+      await tickUntilTailRuns(4);
+    } finally {
+      releaseTail?.();
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   it("refuses authenticated public startup without an external database URL", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       deploymentExposure: "public",

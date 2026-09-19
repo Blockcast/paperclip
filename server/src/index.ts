@@ -1674,9 +1674,31 @@ export async function startServer(): Promise<StartedServer> {
           //
           // Deliberately NOT under `heartbeatRecoveryChainInFlight`. These four
           // passes are the dispatch path — `resumeQueuedRuns` is what actually
-          // starts a queued run — and they do not take
-          // `lockIssueParentMutationCompany`, which is the contention the latch
-          // exists to remove. Gating them on the latched tail would couple
+          // starts a queued run — and they do not iterate the stranded
+          // candidate set under `lockIssueParentMutationCompany`, which is the
+          // contention the latch exists to remove.
+          //
+          // They are NOT lock-free, and an earlier wording of this comment
+          // claimed they were (BLO-34471). `reapOrphanedRuns` ->
+          // `releaseIssueExecutionAndPromote` takes that lock whenever a
+          // promotion comes back `blocked`, via
+          // `recovery.escalateStrandedAssignedIssue` /
+          // `escalateStrandedRecoveryIssueInPlace`; `startNextQueuedRunForAgent`
+          // reaches the same helper on the cancel paths. What makes them safe
+          // to leave unlatched is the BOUND, not the absence: that exposure is
+          // one escalation per reaped or cancelled run, against the 147
+          // candidates a single tail pass walks sequentially (measured
+          // 2026-09-16). It cannot build the convoy the latch removes.
+          //
+          // The split does admit one race: `reapOrphanedRuns` can finalize a
+          // run after an in-flight tail pass has already sampled its candidate
+          // set, so a newly-eligible issue waits for the next tick. That is
+          // bounded latency, not a correctness defect — every pass in the tail
+          // is idempotent and repeating — and the pre-latch code already let
+          // tick N's tail overlap tick N+1's dispatch, so it is not a new
+          // concurrency class.
+          //
+          // Gating them on the latched tail would couple
           // dispatch to that tail's slowest pass: it ends in
           // `reconcileContendedPrReviewerWakes`, which crosses the
           // plugin-worker RPC bridge that logged ~976 x 30 s timeouts in the
