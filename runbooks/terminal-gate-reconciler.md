@@ -12,6 +12,11 @@ It dispatches nothing, closes nothing, and clears no monitor.
 - Wiring: `server/src/index.ts` (worker tier only, `paperclipNodeRole !== "api"`)
 - Config: `PAPERCLIP_TERMINAL_GATE_RECONCILER_ENABLED` (default on),
   `PAPERCLIP_TERMINAL_GATE_RECONCILER_INTERVAL_MINUTES` (default 10)
+- Requires GitHub App credentials. Without them every gate read fails closed as
+  `gate_read_failed` and nothing can ever resolve, so the sweep does not start at
+  all — it logs `Terminal-gate reconciler disabled: GitHub App credentials are not
+  configured (BLO-27515)` once at boot. If the sweep is silent, check that line
+  before assuming there are no candidates.
 - Consumer: `productivity-review.ts` suppresses a `long_active_duration` review
   whose source carries a recorded resolution (`terminalGateResolvedSuppressed`)
 
