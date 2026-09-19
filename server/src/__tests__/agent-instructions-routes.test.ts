@@ -586,7 +586,11 @@ describe("agent instructions bundle routes", () => {
   // are pinned here: a 200-only test would also pass on a deleted guard.
   describe("agent-authenticated adapterConfig writes", () => {
     const bundleManagedConfig = {
-      instructionsBundleMode: "managed",
+      // `external`, and root/entry exactly dirname/basename of the file path,
+      // so the real sync below is a no-op on this fixture. A `managed` mode on
+      // a /tmp path would be internally inconsistent and the sync would rewrite
+      // it, which is a fixture artifact rather than anything under test.
+      instructionsBundleMode: "external",
       instructionsRootPath: "/tmp/agent-1",
       instructionsEntryFile: "AGENTS.md",
       instructionsFilePath: "/tmp/agent-1/AGENTS.md",
@@ -602,7 +606,14 @@ describe("agent instructions bundle routes", () => {
       };
     }
 
-    beforeEach(() => {
+    beforeEach(async () => {
+      // The rest of this file stubs the sync to identity, which would make the
+      // preservation assertions below a claim about the mock: in production the
+      // persisted value is the sync's *output*, and the sync is the step that
+      // re-derives these keys from `instructionsFilePath` + `cwd`. Run the real
+      // one here so the claim is load-bearing (it is pure, `(agent, config)`).
+      const { syncInstructionsBundleConfigFromFilePath } = await import("../services/agent-instructions.js");
+      mockSyncInstructionsBundleConfigFromFilePath.mockImplementation(syncInstructionsBundleConfigFromFilePath);
       mockAgentService.getById.mockResolvedValue({
         ...makeAgent(),
         adapterType: "codex_local",
@@ -621,7 +632,7 @@ describe("agent instructions bundle routes", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       const persisted = mockAgentService.update.mock.calls.at(-1)?.[1].adapterConfig as Record<string, unknown>;
-      expect(persisted.instructionsBundleMode).toBe("managed");
+      expect(persisted.instructionsBundleMode).toBe("external");
       expect(persisted.instructionsRootPath).toBe("/tmp/agent-1");
       expect(persisted.instructionsEntryFile).toBe("AGENTS.md");
       expect(persisted.instructionsFilePath).toBe("/tmp/agent-1/AGENTS.md");
@@ -655,6 +666,51 @@ describe("agent instructions bundle routes", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.error).toContain("adapterConfig.instructionsRootPath");
       expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    // `cwd` is not an instructions key and has no agent-actor guard of its own,
+    // but the sync resolves a legacy relative `instructionsFilePath` against
+    // it — so naming only `cwd` relocates the whole bundle while every
+    // instructions value is still byte-identical to stored at the pre-sync
+    // check. Only a check on the post-sync result catches this.
+    describe("with a legacy relative instructionsFilePath", () => {
+      const relativeConfig = {
+        instructionsBundleMode: "external",
+        instructionsRootPath: "/tmp/agent-1",
+        instructionsEntryFile: "AGENTS.md",
+        instructionsFilePath: "AGENTS.md",
+        cwd: "/tmp/agent-1",
+        model: "gpt-5.4",
+      };
+
+      beforeEach(() => {
+        mockAgentService.getById.mockResolvedValue({
+          ...makeAgent(),
+          adapterType: "codex_local",
+          adapterConfig: relativeConfig,
+        });
+      });
+
+      it("refuses a cwd-only write that would relocate the bundle", async () => {
+        const res = await requestApp(await createApp(agentActor()), (baseUrl) => request(baseUrl)
+          .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+          .send({ adapterConfig: { cwd: "/tmp/attacker" } }));
+
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(res.body.error).toContain("adapterConfig.instructionsRootPath");
+        expect(mockAgentService.update).not.toHaveBeenCalled();
+      });
+
+      it("still allows an unrelated write that leaves cwd alone", async () => {
+        const res = await requestApp(await createApp(agentActor()), (baseUrl) => request(baseUrl)
+          .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+          .send({ adapterConfig: { model: "gpt-5.5" } }));
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        const persisted = mockAgentService.update.mock.calls.at(-1)?.[1].adapterConfig as Record<string, unknown>;
+        expect(persisted.instructionsRootPath).toBe("/tmp/agent-1");
+        expect(persisted.instructionsEntryFile).toBe("AGENTS.md");
+      });
     });
   });
 });
