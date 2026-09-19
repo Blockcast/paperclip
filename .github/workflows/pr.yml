@@ -310,6 +310,11 @@ jobs:
         run: node --test ./scripts/__tests__/policy-step-kill-classifier.test.mjs
         timeout-minutes: 1
 
+      - name: Test PR work-product backfill link rule
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/backfill-pr-work-products.test.mjs
+        timeout-minutes: 1
+
       - name: Test @penstock publish-drift comparison
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/penstock-publish-drift.test.mjs

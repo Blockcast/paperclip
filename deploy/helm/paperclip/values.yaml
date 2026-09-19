@@ -269,6 +269,36 @@ githubApp:
   # that still requires the old name satisfied. Comma-separated.
   prCommentReviewGateRetiredStatusContexts: ""
 
+# -- Evidence-gate rollout flags. See docs/runbooks/evidence-gate-unlabeled-block.md.
+evidenceGate:
+  # -- Must be the string "0" or "1" — an unquoted YAML bool renders "true",
+  # which the server reads as OFF. The chart fails the render rather than let
+  # that pass silently.
+  #
+  # "1" escalates `warn` to `block` at the `in_review` transition when the gap
+  # is made ENTIRELY of truth shapes and CONTAINS `review:ally-clean`. Note the
+  # second half is `.some()`, not an exact match, so the predicate survives a
+  # future registry that re-requires a second truth shape. Today that is a
+  # no-op: `deploy:landed` is required nowhere (CTO ruling 2026-09-17), so it
+  # can never enter `missing` and a truth-only gap is always exactly
+  # `["review:ally-clean"]`.
+  #
+  # Reads "0" until PR #1857 is deployed — that is what registers the truth
+  # shapes and teaches loadConfig this variable. Setting "1" before then
+  # changes nothing, and every number in the runbook's measurement reads a
+  # structural zero.
+  #
+  # Two populations are always suppressed, at every value: a failed GitHub probe
+  # (an outage must not freeze `in_review` estate-wide) and an issue with no
+  # linked pull request (no head to review means the shape is unsatisfiable by
+  # the assignee forever).
+  #
+  # `deploy:landed` is never blocking at any value of this flag: the gate runs
+  # only on the transition INTO `in_review` and `deploy:landed` means merged, so
+  # it is unsatisfiable at the one moment it is evaluated. Keep "0" until the
+  # runbook's baseline, seven-day measurement and flip criteria pass.
+  unlabeledTruthBlock: "0"
+
 # -- Pod spec knobs.
 pod:
   # -- Share the process namespace so tini (pid 1) reaps orphaned child processes spawned by Claude agents.

@@ -571,6 +571,12 @@ githubApp:
   # a pre-existing external writer as on onprem-k8s.
   prReviewGateStatusContext: review/ally-complete
 
+# The live value of the unlabeled truth block. Flip it here, not in values.yaml.
+# Procedure, baseline, flip and abort criteria:
+# docs/runbooks/evidence-gate-unlabeled-block.md
+evidenceGate:
+  unlabeledTruthBlock: "0"
+
 # paperclip-plugin-gbrain reads per-agent OAuth client credentials through
 # Penstock/Authbot. The mounted Secret below contains only the managed service
 # key used to read gbrain-plugin-oauth-clients; the clients JSON itself lives in

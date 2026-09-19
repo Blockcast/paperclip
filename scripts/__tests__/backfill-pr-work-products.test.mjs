@@ -1,0 +1,131 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { createServer } from "node:http";
+import { execFile as execFileCb } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const execFile = promisify(execFileCb);
+
+import { namesIssue, prStatus } from "../ops/backfill-pr-work-products.mjs";
+
+test("a PR must name the issue to count as its delivery artifact", () => {
+  const id = "BLO-32239";
+  assert.equal(namesIssue({ title: "feat(evidence): BLO-32239 truth shapes" }, id), true);
+  assert.equal(namesIssue({ body: "Closes BLO-32239." }, id), true);
+  assert.equal(namesIssue({ headRefName: "blo-32239-b8-b10" }, id), true);
+
+  // The live dry run proposed both of these off a bare URL in prose. Linking
+  // them would point the truth probe at somebody else's pull request.
+  assert.equal(namesIssue({ title: "Bump controller-runtime", body: "upstream" }, id), false);
+  assert.equal(namesIssue({}, id), false);
+
+  // Bounded: a longer identifier sharing this prefix is a different issue.
+  assert.equal(namesIssue({ title: "BLO-322391 unrelated" }, id), false);
+});
+
+test("the body arm accepts only a labeled owning reference, never bare prose", () => {
+  const id = "BLO-32239";
+
+  // The hazard this narrowing closes (BLO-20886). A sibling PR that merely
+  // MENTIONS this issue is not this issue's delivery artifact — and because the
+  // probe aggregates with `every` over what is typically the only linked row,
+  // one wrong link either denies evidence the issue earned or grants both truth
+  // shapes vacuously off somebody else's merged PR.
+  assert.equal(namesIssue({ body: "Related: BLO-32239 — sibling under the same epic" }, id), false);
+  assert.equal(namesIssue({ body: "Stacked on BLO-32239, do not merge first." }, id), false);
+  assert.equal(namesIssue({ body: "See BLO-32239 for the plan." }, id), false);
+
+  // The owning forms the webhook honours.
+  for (const label of ["Fixes", "Closes", "Resolves", "Refs", "Issue", "Paperclip task"]) {
+    assert.equal(namesIssue({ body: `${label}: ${id}` }, id), true, label);
+  }
+  assert.equal(namesIssue({ body: `- Refs: ${id}` }, id), true);
+  assert.equal(namesIssue({ body: `intro\n\nCloses ${id}\n\noutro` }, id), true);
+
+  // Title and branch stay unconditional — they carry no prose to confuse.
+  assert.equal(namesIssue({ title: `wip ${id}`, body: "Related: BLO-1" }, id), true);
+});
+
+test("the body arm inherits the three defenses a merged-pattern copy dropped", () => {
+  const id = "BLO-32239";
+
+  // 1. The house labels require a colon; the closing verbs do not. An earlier
+  // revision folded both alternations under one optional-colon pattern, which
+  // linked off ordinary English — `Issue` is a noun as well as a label.
+  assert.equal(namesIssue({ body: `Issue filed a related bug, see ${id}` }, id), false);
+  assert.equal(namesIssue({ body: `Issue description for ${id} is attached.` }, id), false);
+
+  // 2. Fenced code declares nothing a reader can see. Both forms matter: a
+  // root-level fence and one nested in a list item — this repo's own issue
+  // bodies quote example PR bodies in exactly the second shape.
+  assert.equal(namesIssue({ body: "```\nRefs: " + id + "\n```" }, id), false);
+  assert.equal(namesIssue({ body: "- Example body:\n  ```md\n  Refs: " + id + "\n  ```" }, id), false);
+
+  // 3. A trailing non-owning label on the same line owns nothing: the owning
+  // reference is BLO-1, and this issue is explicitly marked `Related`.
+  assert.equal(namesIssue({ body: `Refs: BLO-1; Related: ${id}` }, id), false);
+  assert.equal(namesIssue({ body: `Closes BLO-1, see also: ${id}` }, id), false);
+
+  // Controls: the narrowing above must not cost recall on the real forms.
+  assert.equal(namesIssue({ body: `Fixes: ${id}` }, id), true);
+  assert.equal(namesIssue({ body: `Closes ${id}` }, id), true);
+  assert.equal(namesIssue({ body: `Issue: ${id}` }, id), true);
+  assert.equal(namesIssue({ body: `- Refs: ${id}` }, id), true);
+});
+
+test("PR state maps onto the work-product status enum", () => {
+  assert.equal(prStatus({ state: "MERGED" }), "merged");
+  assert.equal(prStatus({ state: "CLOSED" }), "closed");
+  assert.equal(prStatus({ state: "OPEN", isDraft: true }), "draft");
+  assert.equal(prStatus({ state: "OPEN", isDraft: false }), "ready_for_review");
+  // CLOSED wins over draft: a closed draft is abandoned work, and reporting it
+  // as `draft` puts a permanently-stale live-looking row in front of a human.
+  assert.equal(prStatus({ state: "CLOSED", isDraft: true }), "closed");
+  // MERGED still wins over both — GitHub reports isDraft on merged PRs too.
+  assert.equal(prStatus({ state: "MERGED", isDraft: true }), "merged");
+});
+
+// The module tail has now been the subject of two review findings — first a
+// silent-green module guard, then an unbraced `if` that re-parented that
+// guard's `else` and printed "no backfill performed" under every clean run,
+// directly beneath the counts the runbook tells the operator to read. Both
+// shipped under a green CI because nothing executed the script end to end.
+// A stub API with no issues is enough: it reaches the tail on the RUN=true
+// path, which is the only path either finding was ever on.
+test("a real invocation prints the summary and NOT the module-guard message", async () => {
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("[]");
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const script = fileURLToPath(new URL("../ops/backfill-pr-work-products.mjs", import.meta.url));
+    const { stdout, stderr } = await execFile(process.execPath, [script], {
+      env: {
+        ...process.env,
+        PAPERCLIP_API_URL: `http://127.0.0.1:${server.address().port}`,
+        PAPERCLIP_API_KEY: "test",
+        PAPERCLIP_COMPANY_ID: "test",
+      },
+    });
+    assert.match(stdout, /^done: created=0 would-create=0 /m);
+    assert.doesNotMatch(stderr, /no backfill performed/);
+  } finally {
+    server.close();
+  }
+});
+
+// The control for the case above: imported rather than invoked, the guard
+// message is the correct output. Without this, deleting the `else` entirely
+// would pass the assertion above.
+test("imported rather than invoked, the module guard reports it did nothing", async () => {
+  const entry = fileURLToPath(new URL("../ops/backfill-pr-work-products.mjs", import.meta.url));
+  const { stdout, stderr } = await execFile(process.execPath, [
+    "--input-type=module",
+    "-e",
+    `await import(${JSON.stringify(pathToFileURL(entry).href)});`,
+  ]);
+  assert.match(stderr, /no backfill performed/);
+  assert.doesNotMatch(stdout, /^done:/m);
+});
