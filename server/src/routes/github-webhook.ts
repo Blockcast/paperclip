@@ -572,13 +572,89 @@ function isClaudeCodeReviewServiceNotice(
   return !hasActionablePrReviewFeedback(rawBody, state);
 }
 
+// PEN-3383: a genuine comment-shaped review carries review STRUCTURE. This is
+// the second admission signal beside the consolidated header, so a template
+// change to one cannot silently suppress every comment-shaped review at once.
+//
+// Deliberately NOT anchored to the start of the body, and that is measured, not
+// stylistic: of the two genuine Ally reviews in the corpus below, one
+// (paperclip#1877 comment 5686789134) opens "_Supplementary pass — a concurrent
+// Ally run already submitted the operative verdict_" and carries its header
+// mid-body. Anchoring the way PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN does
+// would drop it. The cost of staying un-anchored is that a reply QUOTING a
+// review header still qualifies; that is accepted here because the conjunct
+// with hasActionablePrReviewFeedback already bounds it, and because the
+// fail-open direction is the safe one for a review-delivery path.
+function isReviewShapedPrComment(body: string | null | undefined): boolean {
+  if (hasAllyConsolidatedReviewHeader(body)) return true;
+  return typeof body === "string" && /^[ \t>]*(?:\*\*)?Reviewed\s+head(?:\s+SHA)?(?:\*\*)?[ \t]*:/im.test(body);
+}
+
+type PrReviewCommentVerdict =
+  | "actionable"
+  // Findings-shaped text from the reviewer identity, but no review structure —
+  // the PEN-3383 shape. Reported so the closure is visible, never silent.
+  | "suppressed_unstructured"
+  | "not_feedback";
+
+// PEN-3383: identity alone MUST NOT admit a comment-shaped review.
+//
+// Agents post PR comments through the same GitHub App as the reviewer, so
+// `commentAuthorLogin` is `allyblockcast[bot]` for BOTH Ally's review output and
+// an agent's own reply to that review (the shared-seat fact already documented
+// at PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN, which is why the REQUEST path
+// needs a marker). This predicate used to accept
+// `isConfiguredPrReviewerAuthor(...) || hasAllyConsolidatedReviewHeader(body)`,
+// so for the App seat the identity clause short-circuited and the verdict
+// reduced to hasActionablePrReviewFeedback on the raw body alone.
+//
+// That predicate deliberately reads the RAW body as well as the fence-stripped
+// one and blocks if either matches, because for a REVIEW a quoted finding is a
+// cheap false red (see its own comment). For an agent REPLY the same property is
+// not cheap: an agent discussing review tooling pastes the literal
+// `changes requested` inside a fenced block, `carriesBlockingFeedback` matches
+// it, and the agent is woken as `github_pr_review_feedback` against itself —
+// with its own prose rendered back as "## Changes Requested / Reviewer:
+// allyblockcast[bot]", and a directive to push a follow-up commit. On a PR whose
+// head was deliberately frozen awaiting a scarce human approval, following that
+// directive dismisses the approval (`dismiss_stale_reviews_on_push: true`).
+//
+// Verified, not reasoned: onprem-k8s#3672 comment 5740414507 is actionable
+// solely because of a fenced ```python block quoting `changes requested`;
+// deleting that one fence flips it to false. The negation guard is NOT at fault
+// here — the same body's "no blocking changes requested" is correctly ignored.
+//
+// Measured over 1,389 App-seat PR comments on Blockcast/paperclip +
+// Blockcast/onprem-k8s (~200 PRs each): 13 classified actionable today, 2 after
+// requiring structure. All 11 newly suppressed are agent replies or
+// `paperclip:review-request` markers — including both instances PEN-3383
+// confirmed (5740414507, 5714317633) — and neither surviving genuine Ally review
+// is affected. The review-request markers keep routing as REQUESTS: this
+// predicate only feeds `reviewFeedback`, and `reviewerRequest` wins the ternary.
+//
+// Formal reviews are untouched. They arrive as `pull_request_review` and carry a
+// real `state`, so they never reach this function.
+function classifyPrReviewComment(
+  body: string | null | undefined,
+  authorLogin: string | null | undefined,
+  configuredReviewerLogin: string | null | undefined,
+): PrReviewCommentVerdict {
+  if (!hasActionablePrReviewFeedback(body)) return "not_feedback";
+  if (isReviewShapedPrComment(body)) return "actionable";
+  // Structure is missing. Only the reviewer identity could have admitted this
+  // before, so only that case is a behaviour CHANGE worth reporting; a
+  // structureless body from any other author was already dropped here.
+  return isConfiguredPrReviewerAuthor(authorLogin, configuredReviewerLogin)
+    ? "suppressed_unstructured"
+    : "not_feedback";
+}
+
 function isActionablePrReviewComment(
   body: string | null | undefined,
   authorLogin: string | null | undefined,
   configuredReviewerLogin: string | null | undefined,
 ): boolean {
-  if (!hasActionablePrReviewFeedback(body)) return false;
-  return isConfiguredPrReviewerAuthor(authorLogin, configuredReviewerLogin) || hasAllyConsolidatedReviewHeader(body);
+  return classifyPrReviewComment(body, authorLogin, configuredReviewerLogin) === "actionable";
 }
 
 /**
@@ -1153,6 +1229,21 @@ function resolveEventContextRaw(
       commentAuthorLogin: string | null;
       commentAuthorType: string | null;
     }) => void;
+    // PEN-3383: invoked when a reviewer-identity comment carried findings-shaped
+    // text but no review structure, so it is no longer routed as review
+    // feedback. Its own callback for the same reason as its siblings: this file
+    // treats an invisible drop as a defect in itself (BLO-18273, BLO-32381), and
+    // this one has a specific failure mode worth watching. If Ally's review
+    // template ever stops emitting both the consolidated header and the
+    // `Reviewed head:` attestation, a REAL comment-shaped review lands here
+    // instead, and this is the only trace that would say so.
+    onSuppressedReviewFeedback?: (info: {
+      repoFullName: string | null;
+      prNumber: number | null;
+      commentId: number | null;
+      commentAuthorLogin: string | null;
+      commentUrl: string | null;
+    }) => void;
   } = {},
 ): ResolvedEventContext | null {
   const repository = payload.repository as Record<string, unknown> | undefined;
@@ -1317,11 +1408,12 @@ function resolveEventContextRaw(
       const reviewerRequest =
         (!commentAuthorIsReviewerBot || agentReviewRequest) &&
         hasPrReviewerRequestMention(commentBody);
-      const reviewFeedback = isActionablePrReviewComment(
+      const reviewFeedbackVerdict = classifyPrReviewComment(
         commentBody,
         commentAuthorLogin,
         options.prReviewerBotLogin,
       );
+      const reviewFeedback = reviewFeedbackVerdict === "actionable";
       // BLO-32381: the review gate's terminal "I have given up" state. See
       // readReviewGateEscalationHeadSha for the marker contract and why the
       // retry marker is deliberately excluded.
@@ -1485,6 +1577,25 @@ function resolveEventContextRaw(
             reason: "missing_mention",
           });
         }
+      }
+      // PEN-3383: report the structureless-feedback drop only when it actually
+      // changes the outcome — i.e. when nothing else claims this delivery. A
+      // body that is also a review REQUEST or an ESCALATION still produces a
+      // context on those paths and loses nothing, and reporting it there would
+      // make this signal noise instead of the template-drift alarm it exists to
+      // be.
+      if (
+        reviewFeedbackVerdict === "suppressed_unstructured" &&
+        !reviewerRequest &&
+        !reviewGateEscalation
+      ) {
+        options.onSuppressedReviewFeedback?.({
+          repoFullName,
+          prNumber: (issue.number as number | undefined) ?? null,
+          commentId: (comment?.id as number | undefined) ?? null,
+          commentAuthorLogin,
+          commentUrl: readStringField(comment, "html_url"),
+        });
       }
       if (!reviewerRequest && !reviewFeedback && !reviewGateEscalation) return null;
       // BLO-9293: on a PR's issue_comment payload, `issue.user.login` is the PR
@@ -3919,12 +4030,15 @@ function prFeedbackAuthorLogin(context: ResolvedEventContext): string | null {
 //
 // `github_pr_review_feedback` has exactly ONE producer (the issue_comment case
 // of resolveEventContext), and that producer reaches the wakeReason ternary only
-// when `reviewFeedback` is true — i.e. only when isActionablePrReviewComment,
-// and therefore hasActionablePrReviewFeedback, has ALREADY passed on the RAW
-// comment body. A non-actionable comment does not become a non-actionable
-// feedback context; it becomes no context at all (`return null`). So the
-// classification for this branch happened at resolve time, on better input, and
-// repeating it here is at best redundant.
+// when `reviewFeedback` is true — i.e. only when classifyPrReviewComment
+// returned "actionable" (PEN-3383 renamed the call site; isActionablePrReviewComment
+// is the equivalent boolean wrapper), and therefore hasActionablePrReviewFeedback
+// has ALREADY passed on the RAW comment body. PEN-3383 additionally requires
+// review STRUCTURE there, which only ever makes this branch narrower — so the
+// argument below is unaffected. A non-actionable comment does not become a
+// non-actionable feedback context; it becomes no context at all (`return null`).
+// So the classification for this branch happened at resolve time, on better
+// input, and repeating it here is at best redundant.
 //
 // At worst it is a fleet-wide outage. The comment path populates `commentBody`
 // and leaves `reviewBody` UNDEFINED (prFeedbackBody exists precisely to coalesce
@@ -4784,6 +4898,34 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             "neither the reviewer counter-review wake nor the PR-author wake was enqueued",
         );
       },
+      // PEN-3383: `warn`, for the same reason as the escalation drop below —
+      // the interesting case is not the one this fires on today. Today every
+      // hit is an agent's own PR reply being correctly kept out of the feedback
+      // path. But if Ally's review template ever stops emitting BOTH the
+      // consolidated header and the `Reviewed head:` attestation, a genuine
+      // comment-shaped review lands here and is dropped, and this line is the
+      // only thing that would say so. A sustained run of these on bodies that
+      // read like real reviews means the structure predicate needs widening,
+      // not that the reviewer went quiet.
+      onSuppressedReviewFeedback: (info) => {
+        logger.warn(
+          {
+            event: eventName,
+            deliveryId,
+            repoFullName: info.repoFullName,
+            prNumber: info.prNumber,
+            commentId: info.commentId,
+            commentAuthorLogin: info.commentAuthorLogin,
+            commentUrl: info.commentUrl,
+            suppressionReason: "review_feedback_comment_not_review_shaped",
+          },
+          "github webhook review-feedback wake skipped: a reviewer-identity comment carried " +
+            "findings-shaped text but no review structure (no consolidated header, no " +
+            "`Reviewed head:` attestation), so it is an agent's own PR reply rather than a " +
+            "review (PEN-3383). Identity cannot separate the two -- agents post through the " +
+            "reviewer's own GitHub App seat",
+        );
+      },
       // BLO-32381: `warn`, not `info`, and deliberately so. Unlike the
       // Code-Review notice above there IS something to fix in one of the two
       // situations this fires on, and the two are indistinguishable from the
@@ -4793,8 +4935,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       // REAL escalation is now being dropped. The second is precisely the
       // silence this row was opened about, so it cannot be logged at a level
       // anyone filters out.
-      onSuppressedEscalationAuthor: (info) => {
-        logger.warn(
+      onSuppressedEscalationAuthor: (info) => {        logger.warn(
           {
             event: eventName,
             deliveryId,
@@ -6563,6 +6704,8 @@ export const __test_isSelfReviewedPr = isSelfReviewedPr;
 export const __test_resolvePrCommentReviewGateWebhookTrigger = resolvePrCommentReviewGateWebhookTrigger;
 export const __test_readReviewGateEscalationHeadSha = readReviewGateEscalationHeadSha;
 export const __test_isActionablePrReviewComment = isActionablePrReviewComment;
+export const __test_classifyPrReviewComment = classifyPrReviewComment;
+export const __test_isReviewShapedPrComment = isReviewShapedPrComment;
 export const __test_isReviewGateEscalationProducer = isReviewGateEscalationProducer;
 export const __test_buildReviewGateEscalationExternalKey = buildReviewGateEscalationExternalKey;
 export const __test_buildReviewGateEscalationComment = buildReviewGateEscalationComment;
