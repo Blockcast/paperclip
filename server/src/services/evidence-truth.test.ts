@@ -170,6 +170,24 @@ describe("buildGithubTruthProbe", () => {
     expect((await probe({ workProducts: [wp()] })).detections["review:ally-clean"]).toBeUndefined();
   });
 
+  // GitHub REWRITES `commit_id` when the branch is updated, so this shape is
+  // not hypothetical: it is what every review of a superseded tree looks like
+  // after a push. The body attestation is immutable and is the only field that
+  // says which tree was actually read.
+  it("a review whose commit_id was rewritten onto this head, but whose body attests another, is not clean", async () => {
+    const probe = buildGithubTruthProbe(
+      deps({
+        listReviewerSurfaces: async () => ({
+          reviews: [
+            { login: ALLY, body: clean.replace(HEAD, "d".repeat(40)), state: "COMMENTED", commitId: HEAD, submittedAt: null },
+          ],
+          comments: [],
+        }),
+      }),
+    );
+    expect((await probe({ workProducts: [wp()] })).detections["review:ally-clean"]).toBeUndefined();
+  });
+
   // Dismissal is an authorized actor withdrawing a verdict from operation, so
   // it is dropped in BOTH directions — the same ruling
   // `githubListPrReviewsWithTimestamps` already makes for the merge gate.

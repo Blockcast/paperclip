@@ -35,7 +35,7 @@
  */
 import type { EvidenceShape } from "./evidence-shapes.js";
 import { evaluateCommentReviewGate } from "./pr-comment-review-gate.js";
-import { hasActionablePrReviewFeedback } from "./ally-review-detection.js";
+import { extractAllyReviewedHeadSha, hasActionablePrReviewFeedback } from "./ally-review-detection.js";
 import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID } from "./pull-request-work-products.js";
 import type { ReviewerSurfaces } from "./github-app-auth.js";
 
@@ -210,7 +210,26 @@ async function probeOne(
       .sort((a, b) => (b.submittedAt ?? "").localeCompare(a.submittedAt ?? ""));
     const newest = atHead[0];
     const formalBlocking = newest !== undefined && hasActionablePrReviewFeedback(newest.body, newest.state);
-    const formalClean = newest !== undefined && !formalBlocking;
+    // CLEAN is keyed on the body attestation, NEVER on `commit_id` alone.
+    // GitHub rewrites `commit_id` when the branch is updated, so a review of a
+    // tree that no longer exists can start reporting the current head. This
+    // repo already made that ruling for the other head-keyed read
+    // (`pr-review-head-attestation.ts:39-44`), and it bites hardest here: a
+    // false CLEAN is not a missed block, it flips the verdict to `pass` at the
+    // shipped default, which is the fabrication the header at :20-24 makes this
+    // module's premise. `Reviewed head:` is immutable and is emitted for
+    // exactly this; `extractAllyReviewedHeadSha` fails closed on zero or
+    // multiple attestations, so an unattested body can never vouch.
+    //
+    // Only CLEAN is narrowed, deliberately. The BLOCKING veto above still keys
+    // on `commit_id`, because a `CHANGES_REQUESTED` review is blocking on its
+    // STATE and may carry no body at all to attest with. Narrowing both would
+    // drop it from `atHead`, clear `formalBlocking`, and let the other
+    // surface's clean win — a false pass arriving through the veto instead of
+    // through the detection. `evidence-truth.test.ts` pins that direction with
+    // a bodyless CHANGES_REQUESTED against a clean comment.
+    const formalClean =
+      newest !== undefined && !formalBlocking && extractAllyReviewedHeadSha(newest.body) === normalizedHead;
 
     // Each surface is individually blind to the other — Ally files a formal
     // review on some PRs and only a comment on others — so SILENCE on one is
