@@ -502,16 +502,15 @@ export function probeApprovalGate(input: GateEvidenceInput): ProbeResult | null 
   );
 
   if (undecided.length > 0 || unrecognised.length > 0) {
-    const plural = cards;
     const clauses: string[] = [];
     if (undecided.length > 0) {
       clauses.push(
-        `${undecided.length} of ${total} linked approval${plural} still undecided: ${undecided.map(describeApproval).join(", ")}`,
+        `${undecided.length} of ${total} linked approval${cards} still undecided: ${undecided.map(describeApproval).join(", ")}`,
       );
     }
     if (unrecognised.length > 0) {
       clauses.push(
-        `${unrecognised.length} of ${total} linked approval${plural} carr${unrecognised.length === 1 ? "ies" : "y"} a status this module does not recognise, so the gate is read as live rather than resolved: ${unrecognised.map(describeApproval).join(", ")}`,
+        `${unrecognised.length} of ${total} linked approval${cards} carr${unrecognised.length === 1 ? "ies" : "y"} a status this module does not recognise, so the gate is read as live rather than resolved: ${unrecognised.map(describeApproval).join(", ")}`,
       );
     }
     return {

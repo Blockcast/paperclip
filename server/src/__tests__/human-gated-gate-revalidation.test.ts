@@ -919,4 +919,47 @@ describe("formatGateRevalidationSections", () => {
     const markdown = formatGateRevalidationSections(revalidateGates(inputs), { maxListed: 2 });
     expect(markdown).toContain("3 further resolved-but-open rows omitted");
   });
+
+  it("tallies a capped heading over the whole kind, not the rows that fit", () => {
+    // The cap is checked before the heading, so a block that is cut mid-way
+    // still heads with a tally over every row of its kind. That is deliberate
+    // — the "... N further omitted" line accounts for the difference — but
+    // nothing exercised `maxListed` against a *mixed* block, where the
+    // disposition split is what a reader would otherwise mis-scan as covering
+    // only the printed rows. Four rows elect `blocker-done-row-not-moved`; the
+    // two carrying a granted card stay escalated, and the cap prints two.
+    const report = revalidateGates([
+      evidence({
+        issueId: "esc-1",
+        identifier: "PEN-4000",
+        blockers: [{ blockerIssueId: "b", blockerStatus: "done" }],
+        approvals: [{ approvalId: "a1", approvalStatus: "approved" }],
+      }),
+      evidence({
+        issueId: "esc-2",
+        identifier: "PEN-4001",
+        blockers: [{ blockerIssueId: "c", blockerStatus: "done" }],
+        approvals: [{ approvalId: "a2", approvalStatus: "approved" }],
+      }),
+      evidence({
+        issueId: "wit-1",
+        identifier: "PEN-4002",
+        blockers: [{ blockerIssueId: "d", blockerStatus: "done" }],
+      }),
+      evidence({
+        issueId: "wit-2",
+        identifier: "PEN-4003",
+        blockers: [{ blockerIssueId: "e", blockerStatus: "done" }],
+      }),
+    ]);
+    const markdown = formatGateRevalidationSections(report, { maxListed: 2 });
+
+    // Tally spans all four, including the two rows below the cut.
+    expect(markdown).toContain("never moved — 4** (⛔ 2 action owed · 2 withheld");
+    // ...and only two rows actually print, with the remainder accounted for.
+    expect(markdown).toContain("- ⛔ PEN-4000");
+    expect(markdown).toContain("- ⛔ PEN-4001");
+    expect(markdown).not.toContain("PEN-4002");
+    expect(markdown).toContain("2 further resolved-but-open rows omitted");
+  });
 });
