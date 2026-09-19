@@ -1,3 +1,13 @@
+/**
+ * The single spelling of a withheld value across the whole product.
+ *
+ * BLO-34631 review: the server masks rather than empties a withheld value, so a reader can tell
+ * "withheld" from "absent" — but that contract only holds if the UI recognises the same string the
+ * server writes. Both sides had their own literal, and nothing pinned them together: change one and
+ * the viewer silently falls back to rendering a withheld log as an empty one.
+ */
+export const REDACTED_VALUE_SENTINEL = "***REDACTED***";
+
 /** Env-var names that conventionally hold credentials. */
 export const SENSITIVE_ENV_KEY_RE =
   /token(?:$|[-_])|api[-_]?key|access[-_]?token|auth(?:entication|_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring/i;
