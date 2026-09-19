@@ -15,7 +15,7 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 
 /**
  * `first_output_at` exists to answer one question `last_output_at` cannot:
- * how long did a run take to emit its FIRST byte. See migration 0244 — the
+ * how long did a run take to emit its FIRST byte. See migration 0245 — the
  * reaper's 15m silence floor is applied uniformly to started
  * external-lifecycle runs, and splitting it safely (so a run that never spoke
  * is not held for the full floor a streaming run needs) requires the
