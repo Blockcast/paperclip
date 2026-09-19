@@ -1,10 +1,9 @@
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import { agents } from "@paperclipai/db";
 import { getAgentWorkEligibility, type AgentEligibilityAgent, type AgentOrgChainHealth } from "@paperclipai/shared";
 import { eq } from "drizzle-orm";
 
 type AgentStatus = (typeof agents.$inferSelect)["status"];
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 export type AgentOrgRow = Pick<
   typeof agents.$inferSelect,

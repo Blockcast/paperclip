@@ -29,6 +29,7 @@ import { Router } from "express";
 import crypto from "node:crypto";
 import {
   type Db,
+  type DbTransaction,
   POSTGRES_POOL_MAX,
   agents,
   agentWakeupRequests,
@@ -114,7 +115,6 @@ import {
   type GithubReviewGateAuthorityConfig,
 } from "../services/github-review-gate-authority.js";
 
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
 
 // Keep lock contention well below GitHub's webhook timeout. If this bounded

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
   activityLog,
@@ -2067,7 +2067,7 @@ function dominantErrorCode(
  * the BLO-3737 refresh-throttle critical section accept this so the read and the
  * write land on the same connection (and therefore inside the same advisory lock).
  */
-type DbOrTx = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+type DbOrTx = Db | DbTransaction;
 
 export function productivityReviewService(db: Db, deps?: ProductivityReviewServiceDeps) {
   const issuesSvc = issueService(db);
