@@ -785,8 +785,9 @@ jobs:
         # refs, not `with:` inputs, so nothing moves this line automatically.
         # BLO-31516.
         #
-        # Drift, stated so it stays measurable rather than merely disclosed.
-        # Checked against helm/helm releases on 2026-09-04: v3.16.3 was
+        # Drift checked 2026-09-04 — the load-bearing token here, because every
+        # figure below decays from it. Stated so it stays measurable rather than
+        # merely disclosed. Against helm/helm releases on that date: v3.16.3 was
         # published 2024-11-14, so this pin is ~22 months behind. The newest
         # release is v3.21.4 (2026-08-14) — NOT a 4.x, because helm maintains
         # both lines in parallel (v4.0.0 shipped 2025-11-12, newest 4.x is

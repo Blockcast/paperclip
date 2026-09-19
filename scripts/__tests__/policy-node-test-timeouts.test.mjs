@@ -503,11 +503,43 @@ test("only helm_chart runs the chart suite from inside the chart directory (BLO-
 // for that reason; `--test-isolation` takes `process`/`none` and so only ever
 // costs a missed row, and is listed for consistency -- under BOTH spellings,
 // since node 24 prints it as `--experimental-test-isolation, --test-isolation`
-// and listing only the short one leaves the alias unmatched. Worth re-checking
-// against `node --help` whenever the pinned major moves -- and weighing any new
-// value-taking flag by whether its value can hold a glob.
+// and listing only the short one leaves the alias unmatched.
+// `--allow-fs-read`/`--allow-fs-write` are the strongest case of all: a glob is
+// the DOCUMENTED syntax of the permission model, not a convention, so their
+// values false-red by specification. `--cpu-prof-dir`/`--heap-prof-dir` take
+// directories, where a glob is unusual rather than idiomatic -- listed anyway
+// because listing a genuinely value-taking flag has no cost (its value is one
+// node consumes, so eating it is always right), while omitting one is the false
+// red above. That asymmetry, not glob-likelihood, is the rule for the next
+// flag: if `node --help` shows it taking a value, list it. Re-check that help
+// output whenever the pinned major moves.
 const VALUE_FLAGS =
-  /^(?:--(?:experimental-test-isolation|test-(?:reporter|reporter-destination|name-pattern|skip-pattern|timeout|concurrency|shard|isolation|coverage-exclude|coverage-include)|import|require|loader|conditions)|-[rC])$/;
+  /^(?:--(?:experimental-test-isolation|test-(?:reporter|reporter-destination|name-pattern|skip-pattern|timeout|concurrency|shard|isolation|coverage-exclude|coverage-include)|allow-fs-(?:read|write)|(?:cpu|heap)-prof-dir|import|require|loader|conditions)|-[rC])$/;
+// This regex has now been widened twice (coverage pair, then the permission and
+// profiler families) and every widening was found by review, not by this file
+// going red -- because the real pr.yml uses none of these flags, so narrowing it
+// back leaves all ten assertions green while restoring the false red. Same
+// silent-revert shape as `jobOwning` above, so pin it the same way: by name, on
+// synthetic tokens. The boolean row is the other direction -- widening
+// `coverage-(?:exclude|include)` to `coverage-.*` would swallow the path after
+// `--experimental-test-coverage` and turn a false red into a false green.
+test("VALUE_FLAGS covers the glob-valued flags, and only value-taking ones (BLO-31516)", () => {
+  for (const flag of [
+    "--allow-fs-read",
+    "--allow-fs-write",
+    "--cpu-prof-dir",
+    "--heap-prof-dir",
+    "--test-coverage-exclude",
+    "--test-reporter-destination",
+  ]) {
+    assert.ok(VALUE_FLAGS.test(flag), `${flag} takes a space-separated value and must be consumed`);
+    assert.ok(!VALUE_FLAGS.test(`${flag}=./x/*/y`), `${flag}=... is one token and must not match`);
+  }
+  for (const flag of ["--experimental-test-coverage", "--experimental-permission", "--test", "--watch"]) {
+    assert.ok(!VALUE_FLAGS.test(flag), `${flag} takes no value; listing it would eat the path argument`);
+  }
+});
+
 test("every node --test names explicit paths, so the text match above is sound (BLO-31516)", () => {
   const marker = "\n      - name: ";
   const offenders = [];
