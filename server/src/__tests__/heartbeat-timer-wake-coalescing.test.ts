@@ -14,6 +14,10 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import {
+  STALLED_COALESCE_BYPASS_SNAPSHOT_KEY,
+  STALLED_COALESCE_MIN_BUDGET_MS,
+} from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -276,6 +280,29 @@ describeEmbeddedPostgres("heartbeat timer wake coalescing", () => {
     // finish and deliver. This fix only removes it as a coalesce target.
     const stalled = runs.find((candidate) => candidate.id === runningRunId);
     expect(stalled?.status).toBe("running");
+
+    // PEN-1990: the activation is recorded on the run it minted. Without this
+    // the rule decides silently, and "has it ever fired in production?" can
+    // only be answered by inferring it from overlapping run pairs — which
+    // cannot tell a filter activation from any other overlap.
+    const minted = runs.find((candidate) => candidate.id !== runningRunId);
+    expect(minted?.contextSnapshot).toMatchObject({
+      [STALLED_COALESCE_BYPASS_SNAPSHOT_KEY]: {
+        targetRunId: runningRunId,
+        budgetMs: STALLED_COALESCE_MIN_BUDGET_MS,
+        intervalSec: 3600,
+      },
+    });
+    const bypass = (minted?.contextSnapshot as Record<string, any>)[
+      STALLED_COALESCE_BYPASS_SNAPSHOT_KEY
+    ];
+    // The age is the one the filter judged, so it must be past the budget it
+    // reports — an age below the budget would mean the record and the decision
+    // were taken off different clocks.
+    expect(bypass.targetAgeMs).toBeGreaterThan(bypass.budgetMs);
+    expect(Date.parse(bypass.targetStartedAt)).toBeGreaterThan(0);
+    // The marker must not leak onto the run that was filtered out.
+    expect(stalled?.contextSnapshot).not.toHaveProperty(STALLED_COALESCE_BYPASS_SNAPSHOT_KEY);
   });
 
   it("still coalesces into a tracked running run that is within its interval budget", async () => {
@@ -302,9 +329,13 @@ describeEmbeddedPostgres("heartbeat timer wake coalescing", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(1);
+    // PEN-1990: no activation, so no marker. A marker that also appeared on
+    // the coalesce path would make every run look like a filter activation.
+    expect(runs[0]?.contextSnapshot).not.toHaveProperty(STALLED_COALESCE_BYPASS_SNAPSHOT_KEY);
   });
 
   it("holds a fast-cadence agent to the 90 min floor rather than 1.5x its interval", async () => {
+
     // 30s interval * 1.5 = 45s, which is below the measured p50 run duration.
     // Without the floor this run (20 min old) would be filtered and the agent
     // would mint a fresh run on nearly every wake.
@@ -369,6 +400,9 @@ describeEmbeddedPostgres("heartbeat timer wake coalescing", () => {
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.agentId, agentId));
       expect(runs).toHaveLength(1);
+      // PEN-1990: and nothing recorded an activation for a wake the rule is
+      // not allowed to act on.
+      expect(runs[0]?.contextSnapshot).not.toHaveProperty(STALLED_COALESCE_BYPASS_SNAPSHOT_KEY);
     });
   }
 });
