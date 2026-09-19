@@ -109,8 +109,10 @@ rules:
   # in-tree Blockcast code under packages/, not vendored upstream, so it is a
   # design choice open to revisiting, not an external constraint.) It does NOT
   # cost the optimistic-concurrency guard: a merge patch carries
-  # `resourceVersion` in the body just as a PUT does (the adapter's does, at
-  # execute.ts:726). Granting `update` beside the `create`+`delete` already held
+  # `resourceVersion` in the body just as a PUT does (the adapter's does — see
+  # the patchNamespacedSecret body in createOrAdoptRunSecret, execute.ts; cited
+  # by symbol because a line number here drifts every time that file is edited).
+  # Granting `update` beside the `create`+`delete` already held
   # is not a privilege increase — the same end state is reachable by
   # delete-then-create.
   - apiGroups: [""]
