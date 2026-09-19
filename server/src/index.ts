@@ -1963,18 +1963,31 @@ export async function startServer(): Promise<StartedServer> {
   // have — is observed board-side instead of waiting for an assignee run that
   // may never be dispatched. Records the outcome as a comment; deliberately
   // dispatches nothing and closes nothing.
+  //
+  // Gated on GitHub App credentials for the same reason as the two reconcilers
+  // above: without them every gate read fails closed as `gate_read_failed` and
+  // nothing can ever resolve, while the candidate scan still runs every pass —
+  // and unlike the siblings it logs nothing on the unresolved path, so an inert
+  // sweep would be silent.
   if (config.terminalGateReconcilerEnabled && config.paperclipNodeRole !== "api") {
-    const { startTerminalGateReconciler } = await import(
-      "./services/terminal-gate-reconciler.js"
-    );
-    logger.info(
-      { intervalMinutes: config.terminalGateReconcilerIntervalMinutes },
-      "Terminal-gate reconciler enabled (BLO-27515)",
-    );
-    startTerminalGateReconciler(
-      db,
-      config.terminalGateReconcilerIntervalMinutes * 60 * 1000,
-    );
+    const { githubAppCredentialsConfigured } = await import("./services/github-app-auth.js");
+    if (!githubAppCredentialsConfigured()) {
+      logger.warn(
+        "Terminal-gate reconciler disabled: GitHub App credentials are not configured (BLO-27515)",
+      );
+    } else {
+      const { startTerminalGateReconciler } = await import(
+        "./services/terminal-gate-reconciler.js"
+      );
+      logger.info(
+        { intervalMinutes: config.terminalGateReconcilerIntervalMinutes },
+        "Terminal-gate reconciler enabled (BLO-27515)",
+      );
+      startTerminalGateReconciler(
+        db,
+        config.terminalGateReconcilerIntervalMinutes * 60 * 1000,
+      );
+    }
   }
 
   // Wait for external adapters to finish loading before accepting requests.
