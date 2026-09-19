@@ -736,9 +736,10 @@ export async function createOrAdoptRunSecret(
         // went stale under a concurrent writer — go re-read.  Both route back
         // through the loop's existing bound rather than adding a third code
         // path, so the retry budget is unchanged.  Note `continue` re-enters at
-        // the create (`:654`), not at the read: on the 409 path that create
-        // 409s again and *that* is what reaches the re-read.  One doomed create
-        // per stale-version retry is the price of not adding a third path.
+        // this loop's `createNamespacedSecret`, not at the read: on the 409
+        // path that create 409s again and *that* is what reaches the re-read.
+        // One doomed create per stale-version retry is the price of not adding
+        // a third path.
         if (!isK8s404(writeErr) && !isK8s409(writeErr)) throw writeErr;
         if (attempt === 0) continue;
         // Twice in a row means something is actively churning this name.
