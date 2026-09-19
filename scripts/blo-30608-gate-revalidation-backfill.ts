@@ -383,7 +383,13 @@ export function renderReport(
     "resolved-but-open by who can clear it:",
     `  blocker edge cancelled (never self-clears) : ${report.countsByResolutionKind["blocker-cancelled-edge-stuck"]}`,
     `  every question card withdrawn/expired      : ${report.countsByResolutionKind["interaction-abandoned"]}`,
-    `  every board card withdrawn/cancelled       : ${report.countsByResolutionKind["approval-abandoned"]}`,
+    // "a", not "every": `approval-abandoned` is assigned ahead of the refusal
+    // branch, on *at least one* abandoned card, so a mixed row is counted here
+    // with refused cards still on it. Deliberately asymmetric with the line
+    // above — `interaction-abandoned` is its probe's fall-through and so is
+    // genuinely terminal. See RESOLUTION_KIND_HEADINGS in
+    // human-gated-gate-revalidation.ts, which carries the full argument.
+    `  a board card withdrawn/cancelled           : ${report.countsByResolutionKind["approval-abandoned"]}`,
     `  all blockers done, row never moved         : ${report.countsByResolutionKind["blocker-done-row-not-moved"]}`,
     `  board granted the ask, row unperformed     : ${report.countsByResolutionKind["approval-granted"]}`,
     `  board refused the ask                      : ${report.countsByResolutionKind["approval-refused"]}`,
