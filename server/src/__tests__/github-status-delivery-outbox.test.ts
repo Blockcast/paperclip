@@ -293,6 +293,52 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     expect((persisted?.description ?? "").length).toBeLessThanOrEqual(140);
   });
 
+  it("scrubs the description on the ON CONFLICT arm too, not only on insert", async () => {
+    // The insert arm and the update arm used to derive `description`
+    // independently: `values` scrubbed-then-trimmed, while the
+    // onConflictDoUpdate `set` did a bare `input.description.slice(0, 140)`.
+    // So the guarantee the test above pins held only for a key never seen
+    // before — and the conflict target is (repoFullName, sha, context), which
+    // means every RE-evaluation of the same gate context on the same head takes
+    // the update arm. The bypass was on the common path, not an edge case.
+    //
+    // Same sizing as above so trim-then-scrub cannot pass by accident, and the
+    // marker rather than the token's absence is the discriminator.
+    setCreds();
+    const { companyId, runId } = await seedRun();
+    const token = ["gh", "p_", "Z9y8X7w6V5u4T3s2R1q0P9o8"].join("");
+    const filler = `${"x".repeat(116)} `;
+    const key = {
+      companyId,
+      sourceRunId: runId,
+      repoFullName: "Blockcast/hang",
+      sha: "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+      context: "review/conflict-arm",
+      prNumber: 9,
+      prUrl: "https://github.com/Blockcast/hang/pull/9",
+      targetUrl: null,
+    };
+
+    // First enqueue creates the row (insert arm) with innocuous text.
+    const first = await enqueueGithubCommitStatusDelivery(db, {
+      ...key,
+      state: "pending",
+      description: "queued",
+    });
+    // Second enqueue on the identical key takes the ON CONFLICT arm.
+    const second = await enqueueGithubCommitStatusDelivery(db, {
+      ...key,
+      state: "failure",
+      description: `${filler}${token}`,
+    });
+    expect(second.id, "expected the same row, i.e. the conflict arm").toBe(first.id);
+
+    const persisted = await readDelivery(second.id);
+    expect(persisted?.description).not.toContain(token);
+    expect(persisted?.description).toContain("[paperclip-egress-scrub");
+    expect((persisted?.description ?? "").length).toBeLessThanOrEqual(140);
+  });
+
   it("does not double-process one delivery when pollers race", async () => {
     setCreds();
     const { delivery } = await seedRun();
