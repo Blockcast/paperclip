@@ -456,3 +456,35 @@ test('every outcome the close step fires on is classified by the resolver', () =
     ['dispatched', 'up-to-date'],
   );
 });
+
+// ---------------------------------------------------------------------------
+// The stall clock is derived from run history (deploy-stall-chain.mjs), which
+// needs the waiting run's head to test whether a cancelled predecessor is a
+// strict ancestor of it. That head arrives only through the pending-runs JSON
+// this workflow writes, and dropping the field would make the derivation
+// silently fall back to run-only ageing — which is the exact 2026-09-18
+// under-report (a 46h stall reported as 3.0h on a green run) that it fixes.
+// Unobservable until a deploy is already stuck for hours.
+// ---------------------------------------------------------------------------
+
+test('the pending-runs JSON carries headSha for the stall-clock derivation', () => {
+  const jsonFields = workflow.match(/--json\s+([A-Za-z,]+)\s*\\/g) ?? [];
+  const pendingQuery = jsonFields.find((line) => line.includes('status'));
+  assert.ok(pendingQuery, 'expected a --json query selecting the pending dispatch fields');
+  for (const field of ['databaseId', 'status', 'createdAt', 'url', 'headSha']) {
+    assert.match(
+      pendingQuery,
+      new RegExp(`\\b${field}\\b`),
+      `pending-runs JSON must select ${field}`,
+    );
+  }
+});
+
+test('the escalation step can read run history for the supersede chain', () => {
+  // The derivation calls GET /actions/workflows/docker.yml/runs and GET
+  // /compare. Both are `actions: read` / `contents: read`, which the workflow
+  // already holds — assert it has not been narrowed below what the chain needs.
+  assert.match(workflow, /permissions:/);
+  assert.match(workflow, /actions:\s*write/, 'cancel+dispatch still needs actions: write');
+  assert.match(workflow, /contents:\s*read/, 'compare needs contents: read');
+});
