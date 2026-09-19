@@ -218,8 +218,12 @@ class TestStallThresholdCalibration(unittest.TestCase):
     # Picked off p90, never off the max -- the end-to-end tail is heavy
     # (p90 12.70h against max 30.81h), and chasing the max would mean a 32h
     # threshold: a day and a half to notice a lost review, bought against 3
-    # PRs. This is the multiplier the derivation actually claims.
-    P90_MULTIPLIER = 1.35
+    # PRs. This is the multiplier the derivation actually claims, floored to
+    # 2dp: 1080/762 = 1.417. It was 1.35, which is not a claim anything makes
+    # -- a floor ~5% under the asserted margin, i.e. the guard relaxed until
+    # it admitted the chosen value. At 1.41 the slack is 0.5%, so the guard
+    # now refuses any constant that does not clear the margin in the prose.
+    P90_MULTIPLIER = 1.41
 
     # (window label, quantity, p90 minutes)
     OBSERVED_WINDOWS = [
