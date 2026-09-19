@@ -5070,11 +5070,15 @@ export function agentRoutes(
       throw error;
     }
 
-    await logRunLogAccessAudit(req, run, "allowed", { offset: normalizedOffset, limitBytes });
+    // BLO-34738: audit AFTER `readLog` returns. It throws `notFound("Run log not found")` when the
+    // run stored no log (`services/heartbeat.ts`), and a 404 that disclosed nothing is not a read —
+    // auditing first booked `result: "allowed"` against it, so "who read this log" over-reported.
+    // Denied-path audits stay before the response: those record an attempt, which did happen.
     const result = await heartbeat.readLog(run, {
       offset: normalizedOffset,
       limitBytes,
     });
+    await logRunLogAccessAudit(req, run, "allowed", { offset: normalizedOffset, limitBytes });
 
     res.set("Cache-Control", "no-cache, no-store");
     res.json(result);
@@ -5138,11 +5142,18 @@ export function agentRoutes(
     // only the entitlement knows that. Resolved after the two denial paths, so a caller who never
     // clears company access costs no entitlement lookup.
     const viewer = await resolveWorkspaceRuntimeViewer(access, req, operation.companyId);
-    await audit("allowed", !viewer.revealRuntimeConfig);
+    // BLO-34738: then `readLog`, and only then the audit. It throws
+    // `notFound("Workspace operation log not found")` when the operation stored no log
+    // (`services/workspace-operations.ts`), so auditing first booked `result: "allowed",
+    // withheld: true` against a 404 that disclosed nothing — inaccurate on exactly the flag
+    // BLO-34631 added for audit accuracy. Same ordering as `/heartbeat-runs/:runId/log`
+    // deliberately: the two are one URL apart, and a split audit semantic across them is the
+    // failure mode this series exists to close.
     const result = await workspaceOperations.readLog(operationId, {
       offset: normalizedOffset,
       limitBytes,
     });
+    await audit("allowed", !viewer.revealRuntimeConfig);
 
     res.set("Cache-Control", "no-cache, no-store");
     // BLO-34631. `content` is the stored chunk verbatim — the write-time sanitizer is a heuristic
