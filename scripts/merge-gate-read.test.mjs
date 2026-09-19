@@ -177,6 +177,23 @@ describe("merge-gate reader", () => {
     assert.match(lines.join("\n"), /ABSENT/);
   });
 
+  // ...and the neutral row must carry a REAL run id in at least one fixture.
+  // The App-published one above passes on broken code: an `app:` row is already
+  // excluded from the survivor count by the BLO-34263 arm, so it masks the
+  // neutral arm entirely and removing `$2!="neutral"` changes nothing. Found by
+  // a mutation run — the guard survived, and it is genuinely load-bearing for a
+  // workflow-published neutral check-run.
+  it("does not count a workflow-published neutral row as a surviving verdict", () => {
+    const lines = read(
+      [
+        ["verify", "failure", "2026-09-16T13:20Z", "111"],
+        ["gate/ally-comment-findings", "neutral", "2026-09-16T13:14Z", "222"],
+      ],
+      "111",
+    );
+    assert.match(lines.join("\n"), /ABSENT/);
+  });
+
   // ...and excludes legacy `status` rows: a surviving commit status says nothing
   // about whether the check-run surface survived.
   it("does not count a legacy status row as a surviving check-run", () => {
@@ -251,86 +268,122 @@ describe("merge-gate reader", () => {
     it("keeps a cancelled run that nothing superseded", () => {
       assert.equal(
         dead([
-          ["276438379", "35249848781", "cancelled"], // sole run of its workflow
-          ["294511598", "35249846479", "success"],
-          ["315805904", "35249848741", "skipped"],
+          ["276438379", "pull_request", "35249848781", "cancelled"], // sole run of its workflow
+          ["294511598", "pull_request_target", "35249846479", "success"],
+          ["315805904", "pull_request", "35249848741", "skipped"],
         ]),
         "",
       );
     });
 
-    it("drops a cancelled run that a newer run of the same workflow replaced", () => {
+    it("drops a cancelled run whose sibling concluded success", () => {
       // penstock-llm-proxy-core#1948 @ 157589a6 — BLO-34114's own control.
       assert.equal(
         dead([
-          ["286504427", "34542908750", "cancelled"],
-          ["286504427", "34542929394", "success"], // 16s later, same workflow
+          ["286504427", "pull_request", "34542908750", "cancelled"],
+          ["286504427", "pull_request", "34542929394", "success"], // 16s later, same lane
         ]),
         "34542908750",
       );
     });
 
-    it("keeps the newest run of a workflow even when it is itself cancelled", () => {
-      // A chain of cancel-in-progress: only the last one still speaks for the head.
+    // BLO-34619. Supersession used to be proxied through `max run id == the
+    // survivor`. When a workflow fires several runs at one head in the same
+    // second the arbiter's survivor is not reliably the highest id — measured on
+    // trafficcontrol#1870 @ 39e233c3, where it is the THIRD of four. Max-id was
+    // spared as "newest", so its cancelled row printed STOP while the real
+    // `success` row was dropped as stale.
+    //
+    // The success MUST carry a lower id than at least one cancelled run, or the
+    // fixture passes on the old code. All three cancelled ids are asserted: with
+    // only the two below max, the old implementation agrees and proves nothing.
+    it("drops a cancelled run that outranks its successful sibling by id", () => {
       assert.equal(
         dead([
-          ["10", "100", "cancelled"],
-          ["10", "200", "cancelled"],
+          ["323092531", "pull_request_target", "35408038943", "cancelled"],
+          ["323092531", "pull_request_target", "35408039732", "cancelled"],
+          ["323092531", "pull_request_target", "35408039808", "success"],
+          ["323092531", "pull_request_target", "35408039945", "cancelled"], // max id
+          ["297263658", "pull_request", "35408038865", "success"],
         ]),
-        "100",
+        "35408038943|35408039732|35408039945",
       );
     });
 
-    // "Newest" is per workflow, not per head. The cancelled run must carry the
-    // LOWER run id: "newest" is max id, so a global (ungrouped) newest-check
-    // spares whichever run id is highest at the head and would mark this one
-    // stale. With the ids the other way round both implementations agree and the
-    // fixture passes on broken code — it did, until a mutation run caught it.
-    it("scopes the newest-run check to one workflow", () => {
+    // ...and the sibling test is keyed on workflow AND EVENT. Dropping `event`
+    // is the tempting simplification of the rule above and it is BLO-34114's
+    // masking in the run dimension: one workflow file declaring both triggers
+    // fans out to two concurrent lanes with identical check-run names, and the
+    // `pull_request` lane cannot reach secrets, so it passes vacuously. Without
+    // `event` that vacuous success deletes a terminally-cancelled secrets lane
+    // and `secret-scan` reads green.
+    it("does not let a vacuous pull_request pass delete a cancelled secrets lane", () => {
       assert.equal(
         dead([
-          ["20", "200", "success"], // unrelated workflow, higher id
-          ["10", "100", "cancelled"], // sole run of workflow 10 — not superseded
+          ["286504429", "pull_request_target", "34868322890", "cancelled"], // secrets lane, timed out
+          ["286504429", "pull_request", "34868326080", "success"], // vacuous lane
+        ]),
+        "",
+      );
+    });
+
+    it("keeps every run of a workflow whose lane never passed", () => {
+      // A chain of cancel-in-progress that never produced a verdict. Nothing in
+      // the lane succeeded, so nothing is provably stale and both still STOP.
+      assert.equal(
+        dead([
+          ["10", "push", "100", "cancelled"],
+          ["10", "push", "200", "cancelled"],
+        ]),
+        "",
+      );
+    });
+
+    // The sibling check is per workflow, not per head: an unrelated workflow's
+    // success must not retire this cancel. Its run id is deliberately HIGHER, so
+    // a max-id implementation would also spare this row and the fixture would
+    // pass on broken code.
+    it("scopes the sibling check to one workflow", () => {
+      assert.equal(
+        dead([
+          ["20", "push", "200", "success"], // unrelated workflow, higher id
+          ["10", "push", "100", "cancelled"], // sole run of workflow 10
         ]),
         "",
       );
     });
 
     it("is silent when no run was cancelled at all", () => {
-      assert.equal(dead([["10", "100", "success"]]), "");
+      assert.equal(dead([["10", "push", "100", "success"]]), "");
     });
 
-    // DO NOT WIDEN THIS FILTER TO "newest run id per workflow wins". It is the
-    // obvious fix for a reported false RED (a workflow that re-runs at an
-    // UNCHANGED head on a later event leaves a stale `failure` behind —
-    // pim-multicast-gateway#3215 @ a8934c8e, review-gate on pull_request_target
-    // 16:34:36Z failure, then on pull_request_review 16:43:36Z success). It was
-    // implemented, measured, and REVERTED: it is BLO-34114's masking moved from
-    // the name dimension to the run dimension, and it cost 15 STOPs on 34114's
-    // own control including secret-scan and redaction-tests.
+    // DO NOT WIDEN THIS FILTER TO DROP A STALE `failure`. Only `cancelled` rows
+    // are ever candidates. Dropping a failure that a later run of the same
+    // workflow re-ran and passed is the obvious fix for a reported false RED (a
+    // workflow re-running at an UNCHANGED head on a later event leaves a stale
+    // failure behind — pim-multicast-gateway#3215 @ a8934c8e, review-gate on
+    // pull_request_target 16:34:36Z failure, then on pull_request_review
+    // 16:43:36Z success). It was implemented, measured, and REVERTED: it is
+    // BLO-34114's masking moved from the name dimension to the run dimension,
+    // and it cost 15 STOPs on 34114's own control including secret-scan and
+    // redaction-tests.
     //
     // The premise that killed it: `pull_request` and `pull_request_target` are
     // NOT different workflow files. penstock-llm-proxy-core/.github/workflows/
     // security.yml declares BOTH triggers, so one workflow_id fans out to two
     // CONCURRENT lanes with identical check-run names and opposite verdicts —
-    // and the failing one is the secrets-bearing lane, because the pull_request
-    // lane cannot reach secrets and passes vacuously. Higher run id does not
+    // and the failing one is the secrets-bearing lane. Higher run id does not
     // mean later: both are dispatched from one push and the ordering between
-    // them is arbitrary.
-    //
-    // Those two shapes are indistinguishable in this function's input: both are
-    // one workflow_id, two events, pull_request_target failed, something else
-    // succeeded. No predicate over (workflow_id, run id, conclusion) separates
-    // them, so the false RED is ACCEPTED — it costs a wait, the widening costs a
-    // merge-authorizing false GREEN on security checks.
+    // them is arbitrary. So the false RED is ACCEPTED — it costs a wait, the
+    // widening costs a merge-authorizing false GREEN on security checks.
     it("keeps BOTH lanes when one workflow file fans out to two events", () => {
       // penstock-llm-proxy-core#1992 @ fbdb3477 — BLO-34114's control.
       assert.equal(
         dead([
-          ["286504429", "34868322890", "failure"], // security, pull_request_target
-          ["286504429", "34868326080", "success"], // security, pull_request
-          ["286504427", "34868322979", "failure"], // ci, pull_request_target
-          ["286504427", "34868326159", "success"], // ci, pull_request
+          ["286504429", "pull_request_target", "34868322890", "failure"],
+          ["286504429", "pull_request", "34868326080", "success"],
+          ["286504427", "pull_request_target", "34868322979", "failure"],
+          ["286504427", "pull_request", "34868326159", "success"],
         ]),
         "",
       );
@@ -340,8 +393,8 @@ describe("merge-gate reader", () => {
       // The accepted false RED. Deliberate, not an oversight: see above.
       assert.equal(
         dead([
-          ["315978042", "35369288224", "failure"],
-          ["315978042", "35370168113", "success"],
+          ["315978042", "pull_request_target", "35369288224", "failure"],
+          ["315978042", "pull_request_review", "35370168113", "success"],
         ]),
         "",
       );
@@ -354,8 +407,8 @@ describe("merge-gate reader", () => {
   // this a distinct defect rather than a repeat.
   it("prints the STOPs of a terminally-cancelled run that nothing superseded", () => {
     const runs = [
-      ["276438379", "35249848781", "cancelled"],
-      ["294511598", "35249846479", "success"],
+      ["276438379", "pull_request", "35249848781", "cancelled"],
+      ["294511598", "pull_request_target", "35249846479", "success"],
     ];
     const rows = [
       ["verify", "failure", "2026-09-17T17:13:29Z", "35249848781"],
@@ -370,6 +423,29 @@ describe("merge-gate reader", () => {
     ]);
     // The ABSENT guard is NOT what saved us here — prove it stayed quiet.
     assert.doesNotMatch(lines.join("\n"), /ABSENT/);
+  });
+
+  // BLO-34619 end to end, on the measured shape. Blockcast/trafficcontrol#1870 @
+  // 39e233c3: `review-gate` fired four pull_request_target runs inside one
+  // second, and the ONE that survived is the third of four. The old max-id proxy
+  // got this exactly backwards in both directions at once — it spared the
+  // cancelled max-id row (false STOP) AND put the real `success` row in DEAD, so
+  // the genuine verdict was discarded. Rows and ids are live API values.
+  it("keeps the surviving verdict when a workflow bursts several runs at one head", () => {
+    const runs = [
+      ["323092531", "pull_request_target", "35408038943", "cancelled"],
+      ["323092531", "pull_request_target", "35408039732", "cancelled"],
+      ["323092531", "pull_request_target", "35408039808", "success"],
+      ["323092531", "pull_request_target", "35408039945", "cancelled"],
+      ["297263658", "pull_request", "35408038865", "success"],
+    ];
+    const rows = [
+      ["Ally review gate", "cancelled", "2026-09-19T00:04:04Z", "35408038943"],
+      ["Ally review gate", "success", "2026-09-19T00:05:35Z", "35408039808"],
+      ["Ally review gate", "cancelled", "2026-09-19T00:04:05Z", "35408039945"],
+      ["Migration Timestamp Lint", "success", "2026-09-19T00:07:00Z", "35408038865"],
+    ];
+    assert.deepEqual(read(rows, dead(runs) || "__none__"), []);
   });
 
   // Reviewer finding on the BLO-34263 guard: it was gated on `dead != __none__`,
@@ -534,6 +610,20 @@ describe("merge-gate reader", () => {
         assert.doesNotMatch(out, /ABSENT/);
       });
     }
+
+    // The cases above exercise the FUNCTION; none of them exercises the CALL.
+    // Deleting `require_sha "$H" || exit 1` from the live path left every one of
+    // them green — found by a mutation run. The live path cannot be driven
+    // without mocking `gh`, so assert the invocation on the source, in the same
+    // style as the pagination check, and require it to precede the fetches that
+    // interpolate $H.
+    it("invokes the guard on the resolved head before any fetch uses it", () => {
+      const lines = SOURCE.split("\n");
+      const guarded = lines.findIndex((l) => /^require_sha "\$H" \|\| exit 1$/.test(l));
+      const firstUse = lines.findIndex((l) => l.includes('gh api "repos/$R/') && l.includes("$H"));
+      assert.ok(guarded > 0, "live path does not call require_sha on $H");
+      assert.ok(firstUse > guarded, `a fetch at line ${firstUse} uses $H before the guard`);
+    });
   });
 });
 

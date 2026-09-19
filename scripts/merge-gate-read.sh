@@ -22,7 +22,7 @@
 #   merge-gate-read.sh --sha-guard <sha>              # fixture mode, validates one sha
 #
 # Row shape  (TSV): name <TAB> conclusion <TAB> timestamp <TAB> run-id|app:<slug>|status
-# Run shape  (TSV): workflow-id <TAB> run-id <TAB> conclusion
+# Run shape  (TSV): workflow-id <TAB> event <TAB> run-id <TAB> conclusion
 set -uo pipefail
 
 extract() { # stdin: check-runs API body (one object per page) -> stdout: rows
@@ -63,12 +63,47 @@ dead_runs() { # stdin: run rows -> stdout: alternation of stale run ids
   #   TERMINAL    — a job hit timeout-minutes, or someone cancelled the run, and
   #                 nothing replaced it. That job produced NO VERDICT, which is a
   #                 STOP. Dropping it is a merge-authorizing false GREEN.
-  # Supersession is the property this filter always wanted, so test for it
-  # directly: a cancelled run is stale only when a NEWER run of the same workflow
-  # exists at this head. Run ids are monotonic, so `newest` == `max id`.
-  sort -t$'\t' -k1,1 -k2,2nr \
-    | awk -F'\t' '!newest[$1]++{next} $3=="cancelled"{print $2}' \
-    | paste -sd'|' -
+  #
+  # BLO-34619: supersession was proxied through `max run id == the survivor`.
+  # Run ids are monotonic, so that reads as sound, but when a workflow fires
+  # SEVERAL runs at one head in the same second the concurrency arbiter's
+  # survivor is NOT reliably the highest id. Measured on trafficcontrol#1870 @
+  # 39e233c3: four `review-gate` runs at 00:04:03-04Z, and the survivor is the
+  # THIRD of four (35408039808, success) while max id 35408039945 is a 0-second
+  # casualty. Max-id was spared as "newest", so its cancelled row printed STOP —
+  # and the real `success` row was dropped as stale. False RED, and the genuine
+  # verdict discarded with it. The BLO-34263 survivor guard cannot catch it:
+  # eight other workflows survived, so `n` is non-zero. That guard fires on
+  # "kept nothing"; this is "kept the wrong one".
+  #
+  # So ask the API the question instead of proxying it through id ordering: a
+  # cancelled run is stale iff a SIBLING run concluded `success`. A success at
+  # this head is positive proof that lane produced a verdict, which is the only
+  # thing that makes discarding the cancelled rows safe.
+  #
+  # A sibling is same workflow AND SAME EVENT. Dropping `event` from the key is
+  # the tempting simplification and it re-opens BLO-34114 in the run dimension:
+  # `pull_request` and `pull_request_target` are frequently ONE workflow file,
+  # hence one workflow_id, fanning out to two concurrent lanes with identical
+  # check-run names and opposite verdicts — and the failing lane is the
+  # SECRETS-BEARING one, because the `pull_request` lane cannot reach secrets and
+  # passes vacuously. Without `event`, a terminally-cancelled secrets lane is
+  # deleted by the vacuous lane's success and `secret-scan` reads green.
+  # Cost of keeping `event`: a run genuinely cancelled by a different-event run
+  # of the same workflow stays a STOP. That false RED is ACCEPTED, on the same
+  # grounds as the one pinned in the test file — it costs a wait, the widening
+  # costs a merge-authorizing false GREEN.
+  # `n=0` in BEGIN is load-bearing: an uninitialised awk variable is the empty
+  # STRING, and array subscripts are strings, so the first cancelled row would
+  # land at id[""] while the END loop reads id[0] — silently dropping one run
+  # from DEAD. Direction: RED, but it is the same class of defect as the rest of
+  # this file and a fixture caught it.
+  awk -F'\t' 'BEGIN { n = 0 }
+              { key = $1 FS $2
+                if ($4 == "success") sibling_passed[key] = 1
+                if ($4 == "cancelled") { id[n] = $3; grp[n] = key; n++ } }
+              END { for (i = 0; i < n; i++) if (sibling_passed[grp[i]]) print id[i] }' \
+    | sort -n | paste -sd'|' -
 }
 
 verdicts() { # $1 = DEAD alternation ('__none__' when nothing is stale)
@@ -116,7 +151,7 @@ H=$(gh api "repos/$R/commits/$2" --jq .sha 2>/dev/null)
 require_sha "$H" || exit 1
 
 DEAD=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate \
-        --jq '.workflow_runs[]|[.workflow_id,.id,.conclusion]|@tsv' | dead_runs)
+        --jq '.workflow_runs[]|[.workflow_id,.event,.id,.conclusion]|@tsv' | dead_runs)
 [ -z "$DEAD" ] && DEAD='__none__'
 
 # BOTH surfaces paginate. GitHub's default page size is 30, so an unpaginated
