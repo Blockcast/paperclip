@@ -148,7 +148,14 @@ import {
 import { runEvidenceGate, type EvidenceFetchResult } from "./evidence-gate-wiring.js";
 import { countDoneWhenBullets } from "./evidence-gate.js";
 import { shouldBlockNarratedDone } from "./done-gate.js";
-import { githubHasCommitEvidence } from "./github-app-auth.js";
+import {
+  githubFetchPrHeadSha,
+  githubGetPullRequestGate,
+  githubHasCommitEvidence,
+  githubListReviewerSurfacesAtPr,
+} from "./github-app-auth.js";
+import { buildGithubTruthProbe, type TruthProbe } from "./evidence-truth.js";
+import { loadConfig } from "../config.js";
 import {
   parseIssueGraphLivenessIncidentKey,
   RECOVERY_ORIGIN_KINDS,
@@ -2267,7 +2274,26 @@ async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWith
  * Shapes that record a DURABLE fact ("a PR/commit was attached to this issue"),
  * as opposed to a fact about the current comment window.
  */
-const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact"] as const;
+// `deploy:landed` joins these because a merge cannot be undone by a later
+// push: once true it stays true, so carrying it forward is honest.
+// `review:ally-clean` deliberately does NOT — the head can move, and a review
+// that was clean at an older head says nothing about what would ship now.
+// That is the whole defect BLO-19118 / BLO-21489 are about, and caching the
+// shape would reintroduce it inside the gate meant to catch it.
+const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact", "deploy:landed"] as const;
+
+/**
+ * The live GitHub truth probe. Built once: it is stateless, and `loadConfig`
+ * is read per call inside the deps so a config reload is picked up.
+ */
+const githubTruthProbe: TruthProbe = buildGithubTruthProbe({
+  fetchHeadSha: (ref) => githubFetchPrHeadSha(ref),
+  listReviewerSurfaces: (ref) => githubListReviewerSurfacesAtPr(ref),
+  getPullRequestGate: (ref) => githubGetPullRequestGate(ref),
+  get reviewerBotLogin() {
+    return loadConfig().prReviewerBotLogin;
+  },
+});
 
 /**
  * Carry forward durable landing evidence when re-evaluating an already-in_review
@@ -2573,6 +2599,11 @@ async function fetchEvidenceForIssue(
         type: issueWorkProducts.type,
         metadata: issueWorkProducts.metadata,
         status: issueWorkProducts.status,
+        // Required by the truth probe, which trusts a `merged` claim only from
+        // a webhook-stamped row. `dbOrTx` is `any` and the result is cast, so
+        // the compiler cannot catch a drop here — losing this column silently
+        // downgrades every PR to a confirm-with-GitHub round trip.
+        sourceTrust: issueWorkProducts.sourceTrust,
       })
       .from(issueWorkProducts)
       .where(eq(issueWorkProducts.issueId, issueId)),
@@ -10752,6 +10783,9 @@ export function issueService(db: Db) {
               effectiveLabelNames,
             ),
             id,
+            new Date(),
+            githubTruthProbe,
+            { unlabeledTruthBlock: loadConfig().evidenceGateUnlabeledTruthBlock },
           );
           doneGateEvidenceVerdict = doneTransitionEvidenceVerdict;
           const commitEvidence = doneTransitionEvidenceVerdict.commitEvidence ?? [];
@@ -10897,6 +10931,9 @@ export function issueService(db: Db) {
               effectiveLabelNames,
             ),
             id,
+            new Date(),
+            githubTruthProbe,
+            { unlabeledTruthBlock: loadConfig().evidenceGateUnlabeledTruthBlock },
           );
           inReviewVerdict = verdict;
           patch.lastEvidenceVerdict = isInReviewTransition

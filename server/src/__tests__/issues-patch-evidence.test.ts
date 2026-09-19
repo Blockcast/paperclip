@@ -235,9 +235,14 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
         .send({ status: "in_review" });
 
       expect(response.status, JSON.stringify(response.body)).toBe(200);
+      // BLO-32239: a `frontend` issue now also requires the two GitHub truth
+      // shapes, and this one has no linked PR. `missing` being EXACTLY those
+      // two is what proves every text shape was still detected. A truth-only
+      // gap warns rather than blocks while the flag is off — blocking would
+      // make the in_review transition unreachable before merge.
       expect(response.body.lastEvidenceVerdict).toMatchObject({
-        verdict: "pass",
-        missing: [],
+        verdict: "warn",
+        missing: ["review:ally-clean"],
       });
       // The frozen 11:48:19Z evaluation must have been superseded.
       expect(
@@ -398,10 +403,21 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
         .patch(`/api/issues/${issueId}`)
         .send({ status: "in_review" });
       expect(inReview.status, JSON.stringify(inReview.body)).toBe(200);
+      // BLO-32239: `pass`. This issue has no linked PR, so on the UNLABELED
+      // path `review:ally-clean` is unsatisfiable and is therefore not
+      // required at all — see `prLessUnlabeledTruthDrop` in evidence-gate.ts.
+      // It warned while the shape was still counted in `missing`; that was the
+      // permanent-`warn` metric hazard the drop removes. The subject of this
+      // case is the unlabeled fallback and the re-evaluation below, both
+      // unchanged — the `block` after labeling is what it actually pins.
       expect(inReview.body.lastEvidenceVerdict).toMatchObject({
         verdict: "pass",
         unlabeledFallback: true,
+        missing: [],
       });
+      expect(inReview.body.lastEvidenceVerdict.diagnostics).toEqual(
+        expect.arrayContaining(["truth-shapes-not-required:no-linked-pull-request"]),
+      );
 
       const labeled = await request(createApp())
         .patch(`/api/issues/${issueId}`)

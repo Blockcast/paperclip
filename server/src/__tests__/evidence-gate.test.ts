@@ -7,7 +7,7 @@ import {
   type EvidenceCommentLite,
   type EvidenceWorkProductLite,
 } from "../services/evidence-gate.js";
-import { DEFAULT_EVIDENCE_REGISTRY } from "../services/evidence-shapes.js";
+import { DEFAULT_EVIDENCE_REGISTRY, DEFAULT_UNLABELED_REQUIRED } from "../services/evidence-shapes.js";
 
 function agentComment(body: string, createdAt = "2026-05-11T20:00:00.000Z"): EvidenceCommentLite {
   return { body, authorAgentId: "a1", authorUserId: null, createdAt };
@@ -19,6 +19,16 @@ function operatorComment(body: string, createdAt = "2026-05-11T20:00:00.000Z"): 
 
 const FRONTEND_DONE_WHEN = `## Goal\nShip the blog.\n\n## Done when\n- entry page renders\n- listing page renders\n- footer at bottom\n`;
 const LANDING_ARTIFACT = "https://github.com/Blockcast/paperclip/pull/775";
+
+/**
+ * A clean GitHub truth probe (BLO-32239). `review:ally-clean` and
+ * `deploy:landed` are the two shapes no comment text can produce, so a case
+ * about a text-detected shape supplies them explicitly — otherwise every
+ * assertion below would silently become an assertion about the probe instead
+ * of about its own subject. Cases that ARE about the truth shapes live in
+ * "evaluateEvidence — truth shapes" and pass their own value.
+ */
+const TRUTH_OK = { "review:ally-clean": true, "deploy:landed": true } as const;
 
 describe("resolveRequiredShapes", () => {
   it("unions required shapes across multiple matching labels", () => {
@@ -63,7 +73,7 @@ describe("resolveRequiredShapes", () => {
       DEFAULT_EVIDENCE_REGISTRY,
     );
     expect(unlabeledFallback).toBe(true);
-    expect(required).toEqual(["checklist:done-when"]);
+    expect(required).toEqual(["checklist:done-when", "review:ally-clean"]);
   });
 
   it("falls back to weak default when no labels at all", () => {
@@ -72,7 +82,7 @@ describe("resolveRequiredShapes", () => {
       DEFAULT_EVIDENCE_REGISTRY,
     );
     expect(unlabeledFallback).toBe(true);
-    expect(required).toEqual(["checklist:done-when"]);
+    expect(required).toEqual(["checklist:done-when", "review:ally-clean"]);
   });
 });
 
@@ -120,6 +130,7 @@ describe("evaluateEvidence — frontend label", () => {
       comments: [agentComment(body)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("pass");
     expect(result.missing).toEqual([]);
@@ -156,6 +167,7 @@ describe("evaluateEvidence — frontend label", () => {
         { kind: "screenshot", metadata: { viewport: "390x844" } },
       ] as EvidenceWorkProductLite[],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("pass");
   });
@@ -170,6 +182,7 @@ describe("evaluateEvidence — frontend label", () => {
       comments: [agentComment(body)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("block");
     expect(result.missing).toEqual(["screenshot:390x844"]);
@@ -222,6 +235,7 @@ describe("evaluateEvidence — backend label", () => {
       comments: [agentComment(body)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("pass");
   });
@@ -254,6 +268,7 @@ describe("evaluateEvidence — unlabeled issue", () => {
       comments: [agentComment("done")],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("warn");
     expect(result.unlabeledFallback).toBe(true);
@@ -269,6 +284,7 @@ describe("evaluateEvidence — unlabeled issue", () => {
       comments: [agentComment("done")],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("warn");
     expect(result.unlabeledFallback).toBe(true);
@@ -282,6 +298,7 @@ describe("evaluateEvidence — unlabeled issue", () => {
       comments: [agentComment("Shipped: https://github.com/Blockcast/paperclip/pull/123")],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("warn");
     expect(result.missing).toEqual(["checklist:done-when"]);
@@ -294,6 +311,7 @@ describe("evaluateEvidence — unlabeled issue", () => {
       comments: [agentComment("done")],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("warn");
     expect(result.missing).toEqual(["checklist:done-when"]);
@@ -305,6 +323,7 @@ describe("evaluateEvidence — unlabeled issue", () => {
       comments: [agentComment(`Test Files  3 passed (3)\n${LANDING_ARTIFACT}`)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("block");
     expect(result.missing).toEqual(["checklist:done-when"]);
@@ -479,6 +498,7 @@ describe("evaluateEvidence — comment recency window", () => {
       comments: [old, recent],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
       recentCommentLimit: 1,
     });
     expect(result.verdict).toBe("pass");
@@ -623,6 +643,7 @@ describe("evaluateEvidence — additional shape coverage (review-driven)", () =>
       comments: [agentComment(body)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("block");
     expect(result.missing).toEqual(["test-output"]);
@@ -653,6 +674,7 @@ describe("evaluateEvidence — additional shape coverage (review-driven)", () =>
       comments: [bogus, evidence, stale],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
       recentCommentLimit: 2,
     });
     // The two most-recent valid comments survive: `evidence` (2026) and
@@ -727,11 +749,13 @@ describe("evaluateEvidence — shapeDetections shape", () => {
       comments: [agentComment("done")],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(Object.keys(result.shapeDetections).sort()).toEqual(
       [
         "checklist:done-when",
         "ci-green",
+        "deploy:landed",
         "e2e-run",
         "e2e-script",
         "kubectl-state",
@@ -739,6 +763,7 @@ describe("evaluateEvidence — shapeDetections shape", () => {
         "migration-output",
         "pr-link",
         "probe-output",
+        "review:ally-clean",
         "screenshot:1440x900",
         "screenshot:390x844",
         "test-output",
@@ -773,6 +798,7 @@ describe("evaluateEvidence — db-migration label", () => {
       comments: [agentComment(body)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("pass");
     expect(result.missing).toEqual([]);
@@ -789,6 +815,7 @@ describe("evaluateEvidence — db-migration label", () => {
       comments: [agentComment(body)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("pass");
   });
@@ -810,6 +837,7 @@ describe("evaluateEvidence — db-migration label", () => {
       comments: [agentComment(body)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("pass");
   });
@@ -836,6 +864,7 @@ describe("evaluateEvidence — db-migration label", () => {
       comments: [agentComment(body)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("pass");
   });
@@ -853,6 +882,7 @@ describe("evaluateEvidence — db-migration label", () => {
       ],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("block");
     expect(result.missing).toEqual(["migration-output"]);
@@ -875,6 +905,7 @@ describe("evaluateEvidence — db-migration label", () => {
       comments: [agentComment(body)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("block");
     expect(result.missing).toEqual(["migration-output"]);
@@ -889,6 +920,7 @@ describe("evaluateEvidence — db-migration label", () => {
       comments: [agentComment(`Migration ran successfully — trust me.\n${LANDING_ARTIFACT}`)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("block");
     expect(result.missing).toEqual(["migration-output"]);
@@ -904,6 +936,7 @@ describe("evaluateEvidence — db-migration label", () => {
       comments: [operatorComment(body)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("block");
   });
@@ -914,7 +947,7 @@ describe("evaluateEvidence — db-migration label", () => {
       DEFAULT_EVIDENCE_REGISTRY,
     );
     expect(unlabeledFallback).toBe(false);
-    expect(required).toEqual(["migration-output", "landing-artifact"]);
+    expect(required).toEqual(["migration-output", "landing-artifact", "review:ally-clean"]);
   });
 });
 
@@ -986,6 +1019,7 @@ describe("evaluateEvidence — criteria heading synonyms (BLO-19047)", () => {
       comments: [agentComment(MARKER_TABLE)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     // `checklist:done-when` is the whole unlabeled required set, so detecting
     // it clears the verdict outright. This is the BLO-18833 case: previously a
@@ -1007,6 +1041,7 @@ describe("evaluateEvidence — criteria heading synonyms (BLO-19047)", () => {
       ],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("pass");
     expect(result.missing).toEqual([]);
@@ -1024,6 +1059,7 @@ describe("evaluateEvidence — criteria heading synonyms (BLO-19047)", () => {
       comments: [agentComment(shortTable)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.missing).toEqual(["checklist:done-when"]);
   });
@@ -1036,6 +1072,7 @@ describe("evaluateEvidence — no-done-when-heading diagnostic (BLO-19047)", () 
       comments: [agentComment("done")],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.missing).toEqual(["checklist:done-when"]);
     expect(result.diagnostics).toContain("no-done-when-heading");
@@ -1077,6 +1114,7 @@ describe("evaluateEvidence — no-done-when-heading diagnostic (BLO-19047)", () 
       ],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("block");
     expect(result.missing).toEqual(["checklist:done-when"]);
@@ -1381,5 +1419,353 @@ describe("countDoneWhenBullets — Ally review regressions (BLO-19047)", () => {
       registry: DEFAULT_EVIDENCE_REGISTRY,
     });
     expect(full.missing).not.toContain("checklist:done-when");
+  });
+});
+
+// --- BLO-32239 Track B: the two truth shapes -------------------------------
+
+describe("registry policy (D13)", () => {
+  it("requires `review:ally-clean` on unlabeled and code-completion labels only", () => {
+    for (const label of ["frontend", "ui", "cms-published", "backend", "db-migration", "migration"]) {
+      expect(DEFAULT_EVIDENCE_REGISTRY[label]!.required).toContain("review:ally-clean");
+    }
+    // `pr` delivers an OPEN pull request for a human decision, so requiring
+    // "merged" would make the label unsatisfiable. `infra` and `cms-data-op`
+    // deliver live state with no PR at all.
+    for (const label of ["pr", "infra", "cms-data-op"]) {
+      expect(DEFAULT_EVIDENCE_REGISTRY[label]!.required).not.toContain("review:ally-clean");
+    }
+    expect(DEFAULT_UNLABELED_REQUIRED).toContain("review:ally-clean");
+  });
+
+  it("requires `deploy:landed` NOWHERE — it is registered and detected, never required", () => {
+    // CTO ruling 2026-09-17. A required shape must be satisfiable by correct
+    // behaviour at the moment it is evaluated; the gate fires only on the
+    // transition INTO `in_review`, where merged-ness is not. Requiring it made
+    // `pass` unreachable for labeled code work, so the only route to `pass`
+    // was to merge before requesting review — an inverted incentive, not a
+    // merely degraded metric. It stays detectable and reaches the scorecards
+    // through `allDetected` (see the truth-shapes suite below).
+    for (const entry of Object.values(DEFAULT_EVIDENCE_REGISTRY)) {
+      expect(entry.required).not.toContain("deploy:landed");
+    }
+    expect(DEFAULT_UNLABELED_REQUIRED).not.toContain("deploy:landed");
+  });
+});
+
+describe("evaluateEvidence — truth shapes", () => {
+  const DONE_WHEN = "## Done when\n- some criterion\n- another criterion";
+  const CHECKLIST = "| Criterion | Status | Evidence |\n|---|---|---|\n| some criterion | ✅ | x |\n| another criterion | ✅ | y |";
+  const base = () => ({
+    issue: { description: DONE_WHEN, labels: [] as Array<{ name: string }> },
+    comments: [agentComment(`Done.\n\n${CHECKLIST}`)],
+    workProducts: [] as EvidenceWorkProductLite[],
+    registry: DEFAULT_EVIDENCE_REGISTRY,
+  });
+
+  it("no probe ran: unlabeled with only a checklist warns, `review:ally-clean` missing", () => {
+    const result = evaluateEvidence(base());
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(expect.arrayContaining(["review:ally-clean"]));
+    // Registered but never required, so it is never a gap. See "registry policy (D13)".
+    expect(result.missing).not.toContain("deploy:landed");
+  });
+
+  it("external true detections satisfy the shapes and pass", () => {
+    const result = evaluateEvidence({ ...base(), externalDetections: { ...TRUTH_OK } });
+    expect(result.verdict).toBe("pass");
+    expect(result.allDetected).toEqual(expect.arrayContaining(["review:ally-clean", "deploy:landed"]));
+  });
+
+  it("external false never removes a shape the text detector found", () => {
+    // `landing-artifact` is detected from the comment; the probe saying false
+    // must not subtract it, or a probe outage would manufacture a block on
+    // evidence that is genuinely present.
+    const result = evaluateEvidence({
+      ...base(),
+      issue: { description: DONE_WHEN, labels: [{ name: "backend" }] },
+      comments: [
+        agentComment(
+          `Done: ${LANDING_ARTIFACT}\n\nTests:\n\`\`\`\n Test Files  1 passed (1)\n      Tests  35 passed (35)\n\`\`\`\n\n${CHECKLIST}`,
+        ),
+      ],
+      externalDetections: { "landing-artifact": false, "deploy:landed": true, "review:ally-clean": false },
+    });
+    expect(result.shapeDetections["landing-artifact"]).toBe(true);
+    // Truth-only gap, so warn rather than block — see the "never hard-blocks"
+    // describe below. The subject here is that `landing-artifact` survived a
+    // `false` from the probe.
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(["review:ally-clean"]);
+  });
+
+  it("flag escalates warn→block only when the probe actually established truth", () => {
+    expect(
+      evaluateEvidence({ ...base(), unlabeledTruthBlock: true, probeFailed: false }).verdict,
+    ).toBe("block");
+
+    const failed = evaluateEvidence({ ...base(), unlabeledTruthBlock: true, probeFailed: true });
+    expect(failed.verdict).toBe("warn");
+    expect(failed.diagnostics).toContain("unlabeled-truth-block-suppressed:probe-failed");
+
+    // A gap that is not purely the truth shapes is the ordinary unlabeled
+    // warn, and the flag must not convert it: the agent can fix a missing
+    // checklist itself, and blocking on it is the chore the fallback avoids.
+    const alsoChecklist = evaluateEvidence({
+      ...base(),
+      comments: [agentComment("Done.")],
+      unlabeledTruthBlock: true,
+      probeFailed: false,
+    });
+    expect(alsoChecklist.verdict).toBe("warn");
+    expect(alsoChecklist.diagnostics).not.toContain("unlabeled-truth-block");
+  });
+
+  it("the flag cannot downgrade a labeled block, nor upgrade a pass", () => {
+    const passing = evaluateEvidence({
+      ...base(),
+      externalDetections: { ...TRUTH_OK },
+      unlabeledTruthBlock: true,
+      probeFailed: false,
+    });
+    expect(passing.verdict).toBe("pass");
+    expect(passing.diagnostics).not.toContain("unlabeled-truth-block");
+  });
+});
+
+describe("evaluateEvidence — no linked PR: unsatisfiable, so not required (BLO-32239)", () => {
+  const DONE_WHEN = "## Done when\n- a\n- b\n- c\n";
+  const CHECKLIST = "| Criterion | Status |\n|---|---|\n| a | ✅ |\n| b | ✅ |\n| c | ✅ |";
+  const labeledComplete = () =>
+    agentComment(
+      [
+        "![desktop](./shot_1440x900.png)",
+        "![mobile](./shot_390x844.png)",
+        LANDING_ARTIFACT,
+        CHECKLIST,
+      ].join("\n"),
+    );
+
+  // The split is SATISFIABILITY, not blast radius. Suppressing the escalation
+  // (`unlabeled-truth-block-suppressed:no-linked-pull-request`) fixed the block
+  // hazard and left the metric one: the shape stayed in `missing`, so the
+  // verdict was a permanent `warn`, and `reviewPassRate` in agent-scorecards.ts
+  // counts warn and block identically as not-pass. Nothing an assignee of a
+  // doc-only issue could ever do would clear it.
+  it("unlabeled + no linked PR → PASS, the shape is not required at all", () => {
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [] },
+      comments: [agentComment(CHECKLIST)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      noLinkedPullRequest: true,
+    });
+    expect(result.verdict).toBe("pass");
+    expect(result.missing).toEqual([]);
+    expect(result.diagnostics).toContain("truth-shapes-not-required:no-linked-pull-request");
+  });
+
+  it("...at every flag value — the drop is upstream of the escalation, not a suppression", () => {
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [] },
+      comments: [agentComment(CHECKLIST)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      noLinkedPullRequest: true,
+      unlabeledTruthBlock: true,
+      probeFailed: false,
+    });
+    expect(result.verdict).toBe("pass");
+    expect(result.diagnostics).not.toContain("unlabeled-truth-block");
+    expect(result.diagnostics).not.toContain(
+      "unlabeled-truth-block-suppressed:no-linked-pull-request",
+    );
+  });
+
+  // The other side of the line, and the reason the drop is scoped to the
+  // unlabeled fallback: a LABELED assignee CAN satisfy the shape by opening a
+  // PR, so the gap is real and stays visible. Dropping it here too would let
+  // `landing-artifact`-via-commit-link reach `pass` with no review at all —
+  // exactly the fabrication hole the truth shapes were added to close.
+  it("LABELED + no linked PR → still required, still a warn, escalation suppressed", () => {
+    const input = {
+      issue: { description: DONE_WHEN, labels: [{ name: "frontend" }] },
+      comments: [labeledComplete()],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      noLinkedPullRequest: true,
+    };
+    const off = evaluateEvidence(input);
+    expect(off.verdict).toBe("warn");
+    expect(off.missing).toEqual(["review:ally-clean"]);
+    expect(off.diagnostics).not.toContain("truth-shapes-not-required:no-linked-pull-request");
+
+    // This is the case that keeps the escalation's `noLinkedPullRequest` arm
+    // reachable rather than dead code: flag on, and it suppresses rather than
+    // blocks.
+    const on = evaluateEvidence({ ...input, unlabeledTruthBlock: true, probeFailed: false });
+    expect(on.verdict).toBe("warn");
+    expect(on.diagnostics).toContain("unlabeled-truth-block-suppressed:no-linked-pull-request");
+    expect(on.diagnostics).not.toContain("unlabeled-truth-block");
+  });
+
+  // `probeFailed` must NOT get the drop. A probe that could not reach GitHub has
+  // not established that there is no PR, so laundering an outage into a `pass`
+  // would let a real gap through — the one direction the suppression logic is
+  // careful never to allow.
+  it("a FAILED probe keeps the shape required (no drop) and only suppresses", () => {
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [] },
+      comments: [agentComment(CHECKLIST)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      probeFailed: true,
+      unlabeledTruthBlock: true,
+    });
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(["review:ally-clean"]);
+    expect(result.diagnostics).toContain("unlabeled-truth-block-suppressed:probe-failed");
+    expect(result.diagnostics).not.toContain("truth-shapes-not-required:no-linked-pull-request");
+  });
+
+  // A mixed gap is untouched — the drop shrinks `required`, so it can only ever
+  // move a verdict warn -> pass, never reach down and clear a shape the agent
+  // does own.
+  it("a MIXED gap on a PR-less unlabeled issue still warns on the shape the agent owns", () => {
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [] },
+      comments: [agentComment("Done, no checklist.")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      noLinkedPullRequest: true,
+    });
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(["checklist:done-when"]);
+  });
+});
+
+describe("evaluateEvidence — a truth-only gap never hard-blocks (BLO-32239)", () => {
+  const DONE_WHEN = "## Done when\n- a\n- b\n- c\n";
+  const complete = () =>
+    agentComment(
+      [
+        "![desktop](./shot_1440x900.png)",
+        "![mobile](./shot_390x844.png)",
+        LANDING_ARTIFACT,
+        "| Criterion | Status |",
+        "|---|---|",
+        "| a | ✅ |",
+        "| b | ✅ |",
+        "| c | ✅ |",
+      ].join("\n"),
+    );
+
+  it("a labeled issue with every text shape but no Ally review warns, it does not block", () => {
+    // `review:ally-clean` is satisfiable while a PR is open, but it is not
+    // something the agent can type — so a gap of only truth shapes warns
+    // rather than blocking, unless the operator flag is on.
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [{ name: "frontend" }] },
+      comments: [complete()],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(["review:ally-clean"]);
+    expect(result.diagnostics).toContain("truth-gap-warn-only");
+  });
+
+  it("a MIXED gap on a labeled issue still blocks on the shape the agent owns", () => {
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [{ name: "frontend" }] },
+      comments: [agentComment(`![desktop](./shot_1440x900.png)\n${LANDING_ARTIFACT}`)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("block");
+    expect(result.missing).toContain("screenshot:390x844");
+    expect(result.diagnostics).not.toContain("truth-gap-warn-only");
+  });
+
+  it("the flag makes a labeled truth-only gap binding, and a failed probe still suppresses it", () => {
+    const input = {
+      issue: { description: DONE_WHEN, labels: [{ name: "frontend" }] },
+      comments: [complete()],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      unlabeledTruthBlock: true,
+    };
+    expect(evaluateEvidence({ ...input, probeFailed: false }).verdict).toBe("block");
+    const failed = evaluateEvidence({ ...input, probeFailed: true });
+    expect(failed.verdict).toBe("warn");
+    expect(failed.diagnostics).toContain("unlabeled-truth-block-suppressed:probe-failed");
+  });
+
+  // The gap the test above leaves open: there `review:ally-clean` is missing,
+  // so blocking is right — it is genuinely absent and genuinely satisfiable
+  // while a PR is open. These two pin the case where the only thing missing is
+  // the one shape no flag can make satisfiable at this transition.
+  //
+  // Since the CTO ruling of 2026-09-17 there are TWO independent defenses, and
+  // each is pinned separately on purpose:
+  //   1. the registry never requires `deploy:landed` — "registry policy (D13)";
+  //   2. the evaluator would refuse to escalate it even if a registry did —
+  //      `BLOCKABLE_TRUTH_SHAPES`, pinned here against a local registry that
+  //      deliberately requires it. Revert that constant and this test fails,
+  //      which is the only reason it is worth keeping after defense 1 landed.
+  it("the flag never makes `deploy:landed` binding alone — even from a registry that requires it", () => {
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [{ name: "frontend" }] },
+      comments: [complete()],
+      workProducts: [],
+      registry: {
+        frontend: {
+          required: [
+            "screenshot:1440x900",
+            "screenshot:390x844",
+            "checklist:done-when",
+            "landing-artifact",
+            "review:ally-clean",
+            "deploy:landed",
+          ],
+        },
+      },
+      unlabeledTruthBlock: true,
+      probeFailed: false,
+      externalDetections: { "review:ally-clean": true },
+    });
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(["deploy:landed"]);
+    expect(result.diagnostics).toContain("truth-gap-warn-only");
+    expect(result.diagnostics).not.toContain("unlabeled-truth-block");
+  });
+
+  it("the flag never makes `deploy:landed` binding alone — unlabeled, unmerged PR, still passes", () => {
+    // The shipped registry's half of the same guarantee: an unlabeled issue
+    // whose PR is reviewed-clean but NOT merged has no gap at all, at any flag
+    // value. The unmerged shape is still reported through `allDetected` once
+    // the probe sees it — which is how it reaches the scorecards and the
+    // rollout measurement without ever gating the transition.
+    const result = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [] },
+      comments: [complete()],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      unlabeledTruthBlock: true,
+      probeFailed: false,
+      externalDetections: { "review:ally-clean": true },
+    });
+    expect(result.verdict).toBe("pass");
+    expect(result.missing).toEqual([]);
+    expect(result.diagnostics).not.toContain("unlabeled-truth-block");
+
+    const merged = evaluateEvidence({
+      issue: { description: DONE_WHEN, labels: [] },
+      comments: [complete()],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { "review:ally-clean": true, "deploy:landed": true },
+    });
+    expect(merged.allDetected).toContain("deploy:landed");
   });
 });
