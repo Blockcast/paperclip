@@ -888,3 +888,6 @@ export async function resetPostgresDatabase(
 }
 
 export type Db = ReturnType<typeof createDb>;
+
+/** A caller's open transaction handle — the `tx` argument drizzle hands to `db.transaction(cb)`. */
+export type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];

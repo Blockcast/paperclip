@@ -4,7 +4,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, exists, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 
 /**
  * Either the pool or an open transaction. BLO-19722 needs a handful of writes
@@ -12,8 +12,7 @@ import type { Db } from "@paperclipai/db";
  * helpers they go through accept an executor rather than always closing over
  * the pool.
  */
-type HeartbeatTx = Parameters<Parameters<Db["transaction"]>[0]>[0];
-type HeartbeatDbExecutor = Db | HeartbeatTx;
+type HeartbeatDbExecutor = Db | DbTransaction;
 
 /**
  * Outcome of `enqueueProcessLossRetry` (BLO-19722).
@@ -584,7 +583,6 @@ import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { createServerGbrainClient } from "./gbrain-client-factory.js";
 import { runSweepWakePreflight } from "./sweep-wake-preflight.js";
 
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type WakeCoalescingDb = Pick<Db | DbTransaction, "select" | "update" | "insert">;
 
 // Run statuses considered terminal. Used to gate the agent-image-bump

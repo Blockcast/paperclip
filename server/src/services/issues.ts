@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { and, asc, desc, eq, exists, gt, gte, inArray, isNotNull, isNull, like, lt, lte, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   activityLog,
   agentWakeupRequests,
@@ -1007,7 +1007,6 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 /**
  * Serialize mutations to the issue parent/blocker graph for one company.
@@ -5735,7 +5734,7 @@ export function issueService(db: Db) {
     agentId: string,
     now: Date,
     operation: (
-      tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+      tx: DbTransaction,
       checkoutExecutionPatch: NonNullable<Awaited<ReturnType<typeof runningCheckoutExecutionPatch>>>["patch"],
     ) => Promise<T>,
   ) {

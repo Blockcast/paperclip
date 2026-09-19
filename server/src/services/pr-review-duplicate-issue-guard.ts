@@ -63,13 +63,12 @@
  * — one duplicate that slips through while the webhook's wake is still
  * uncommitted — remains tracked as BLO-21790.
  */
-import { type Db, heartbeatRuns } from "@paperclipai/db";
+import { type DbTransaction, heartbeatRuns } from "@paperclipai/db";
 import { type Column, type SQL, and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import { readGithubPrReviewerAgentIds } from "../config.js";
 import { conflict } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type DuplicatePrReviewIssueGuardDb = Pick<DbTransaction, "select" | "transaction">;
 
 /**
