@@ -1585,6 +1585,41 @@ class TestPreWriteAllyReviewedGuard(unittest.TestCase):
         self.assertFalse(reason.startswith(sweep.REVIEWED_SKIP_REASON_PREFIX), reason)
         self.assertEqual(self.review_fetches, 1, "the scan's read only")
 
+    def test_a_compound_skip_reports_answered_not_contended(self):
+        """THE ordering control: when BOTH free checks fire, answered wins.
+
+        Nothing else pins the order the two free checks run in. Both withhold
+        the write, so every write-suppression test above passes under either
+        order -- which is exactly how this shipped wrong: the cooldown ran
+        first, returned REREAD_SKIP_REASON_PREFIX, and _consider_pr took the
+        contended branch. That branch deliberately KEEPS pending_since, so a PR
+        Ally had answered at this exact head still alarmed and was filed in the
+        step summary as concurrency evidence -- pointing an operator at a
+        contention problem on a PR that was simply answered.
+
+        The two facts are not equally good. "Someone re-asked 60s ago" is true
+        and says nothing about whether the PR is stranded; "Ally reported on
+        THIS head" says it is not. Serve the re-read a page carrying both.
+        """
+        self._install(reread_comments=[
+            {"body": sweep.MARKER + "\nre-ask", "created_at": "2026-09-01T09:59:00Z"},
+            issue_comment(body=consolidated_body(self.PR_HEAD)),
+        ])
+
+        _pr_payload, _head, pending_since, refire, reason = self._consider()
+
+        self.assertFalse(refire, "the write is withheld under either order")
+        self.assertTrue(
+            reason.startswith(sweep.REVIEWED_SKIP_REASON_PREFIX),
+            "answered must win over contended, got: %s" % reason,
+        )
+        self.assertIsNone(
+            pending_since,
+            "an answered PR is not stranded, so it must not carry pending_since and alarm",
+        )
+        self.assertEqual(self._writes(), [])
+        self.assertEqual(self.review_fetches, 1, "still short-circuits the paid read")
+
     def test_the_two_skip_reasons_are_distinguishable(self):
         """AC3: an operator must be able to tell "Ally answered mid-run" from
         "re-asked too recently" off the log line, without reading the diff.
