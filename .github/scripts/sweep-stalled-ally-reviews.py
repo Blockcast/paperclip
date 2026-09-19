@@ -241,9 +241,12 @@ ALLY_REQUEST_REVIEWER_LOGIN = os.environ.get("ALLY_REQUEST_REVIEWER_LOGIN") or "
 # repos by two different methods, which is what promotes this from one
 # sample to a property of the fleet rather than of this repo.
 #
-# 18h is picked off p90, not off the max: 1080m is 1.42x the 762m p90, the
-# same multiplier the dispatch-wait derivation used. Chasing the max instead
-# would mean 32h -- a day and a half to detect a lost review, bought against
+# 18h is picked off p90, not off the max: 1080m is 1.417x the 762m p90, and
+# the dispatch-wait derivation used 1.420x (480/338) -- the same multiplier to
+# the precision either sample supports. Quote it to 3dp, not 2: rounding this
+# UP to "1.42x" states a margin 18h does not actually clear, and the guard
+# below asserts the stated figure. Chasing the max instead would mean 32h --
+# a day and a half to detect a lost review, bought against
 # a tail of 3 PRs. The failure direction is benign (understating the ceiling
 # costs a false re-fire, never a missed loss), so the MULTIPLIER is the thing
 # to re-derive, not the max. The floor this must clear is asserted in
