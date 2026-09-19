@@ -13,19 +13,42 @@
 #   merge-gate-read.sh --rows <DEAD-alternation>      # fixture mode, rows on stdin
 #   merge-gate-read.sh --dead                         # fixture mode, runs on stdin
 #   merge-gate-read.sh --extract                      # fixture mode, check-run JSON on stdin
+#   merge-gate-read.sh --status-extract               # fixture mode, status JSON on stdin
+#   merge-gate-read.sh --sha-guard <sha>              # fixture mode, validates one sha
 #
-# Row shape  (TSV): name <TAB> conclusion <TAB> timestamp <TAB> run-id|app|status
+# Row shape  (TSV): name <TAB> conclusion <TAB> timestamp <TAB> run-id|app:<slug>|status
 # Run shape  (TSV): workflow-id <TAB> run-id <TAB> conclusion
 set -uo pipefail
 
 extract() { # stdin: check-runs API body (one object per page) -> stdout: rows
   # `.details_url // ""` guards capture(), which RAISES on null rather than
-  # returning no match — `// "app"` never sees it. jq aborts mid-stream on the
-  # raise, so one nullable details_url silently truncates every check-run after
-  # it. details_url is nullable in the REST schema and is set by whichever App
-  # published the run, not by this repo. Failure direction is toward GREEN.
+  # returning no match. jq aborts mid-stream on the raise, so one nullable
+  # details_url silently truncates every check-run after it. details_url is
+  # nullable in the REST schema and is set by whichever App published the run,
+  # not by this repo. Failure direction is toward GREEN.
+  # The fallback carries `.app.slug`, not a constant: a constant collapses the
+  # `:50` dedup key to name-only for every App-published row, which is exactly
+  # the masking BLO-34114 fixed for the workflow lanes.
   jq -r '.check_runs[]|[.name,(.conclusion // .status),(.completed_at // .started_at // "-"),
-                        (.details_url // "" | capture("runs/(?<r>[0-9]+)").r // "app")]|@tsv'
+                        ((.details_url // "" | capture("runs/(?<r>[0-9]+)").r)
+                         // ("app:" + (.app.slug // "?")))]|@tsv'
+}
+
+status_extract() { # stdin: commit-status API body (one object per page) -> rows
+  jq -r '.statuses[]|[.context,.state,.updated_at,"status"]|@tsv'
+}
+
+require_sha() { # $1 = candidate -> stdout: a STOP line + rc 1 when not 40-hex
+  # `gh api` prints its error body to STDOUT, so a failed lookup makes H a JSON
+  # blob rather than empty. Without this the malformed URL fails both later
+  # calls and the reader reports ABSENT — misattributing a LOOKUP failure to an
+  # absent surface, the one distinction the ABSENT wording exists to preserve.
+  case "$1" in
+    *[!0-9a-f]* | "") ;;
+    ????????????????????????????????????????) return 0 ;;
+  esac
+  printf 'STOP\t<could not resolve a 40-hex commit sha>\tLOOKUP-FAILED\trun=-\n'
+  return 1
 }
 
 dead_runs() { # stdin: run rows -> stdout: alternation of stale run ids
@@ -49,6 +72,11 @@ verdicts() { # $1 = DEAD alternation ('__none__' when nothing is stale)
     | sort -t$'\t' -k1,1 -k4,4 -k3,3r \
     | awk -F'\t' '!seen[$1 FS $4]++' \
     | awk -F'\t' -v dead="$dead" 'NF==0{next}
+        # Survivors are check-run verdicts only. On a repo that publishes ONLY
+        # legacy statuses this fires ABSENT on every head — the documented
+        # single-surface false RED. Control: run the same read against 3-8
+        # commits that demonstrably shipped; empty there too means that surface
+        # carries no verdict and the other one is the whole gate.
         $4!="status"&&$2!="neutral"{n++}
         $2!="success"&&$2!="skipped"{print ($2=="neutral"?"NOT-EVALUATED":"STOP")"\t"$1"\t"$2"\trun="$4}
         END{if(!n) print "STOP\t<" (dead!="__none__" \
@@ -59,17 +87,23 @@ verdicts() { # $1 = DEAD alternation ('__none__' when nothing is stale)
 if [ "${1:-}" = "--rows" ]; then verdicts "${2:-__none__}"; exit 0; fi
 if [ "${1:-}" = "--dead" ]; then dead_runs; exit 0; fi
 if [ "${1:-}" = "--extract" ]; then extract; exit 0; fi
+if [ "${1:-}" = "--status-extract" ]; then status_extract; exit 0; fi
+if [ "${1:-}" = "--sha-guard" ]; then require_sha "${2:-}"; exit $?; fi
 
 R="$1"
 # MANDATORY full 40-hex: actions/runs?head_sha= returns zero rows for an
 # abbreviation, with no error, which silently empties DEAD (BLO-34114).
-H=$(gh api "repos/$R/commits/$2" --jq .sha)
+H=$(gh api "repos/$R/commits/$2" --jq .sha 2>/dev/null)
+require_sha "$H" || exit 1
 
 DEAD=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate \
         --jq '.workflow_runs[]|[.workflow_id,.id,.conclusion]|@tsv' | dead_runs)
 [ -z "$DEAD" ] && DEAD='__none__'
 
-{ gh api "repos/$R/commits/$H/status" \
-    --jq '.statuses[]|[.context,.state,.updated_at,"status"]|@tsv'
+# BOTH surfaces paginate. GitHub's default page size is 30, so an unpaginated
+# status fetch silently drops the 31st context onward — and a dropped `failure`
+# prints no STOP. The ABSENT guard cannot catch it: `:52` excludes status rows
+# from the survivor count, so one surviving check-run keeps the guard quiet.
+{ gh api "repos/$R/commits/$H/status?per_page=100" --paginate | status_extract
   gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate | extract
 } | verdicts "$DEAD"
