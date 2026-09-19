@@ -272,6 +272,17 @@ export function buildTerminalGateResolvedComment(input: {
  * door. No fixture can discriminate this on a `C`-collation test database,
  * which is exactly why it has to be pinned here rather than asserted.
  *
+ * The pin does not make the two orders identical, and this enumeration would
+ * read as exhaustive if that were left unsaid: `collate "C"` is code-point
+ * order while JS `.sort()` is UTF-16 code-unit order, and those diverge above
+ * the BMP — a U+10000+ character leads with a high surrogate (0xD800..0xDBFF),
+ * so it sorts before U+E000..U+FFFF in JS and after in PostgreSQL.
+ * `normalizeGateToken` does not constrain the charset, so an emoji or a
+ * supplementary-plane CJK character in a gate token reaches both sorts.
+ * Deliberately not closed: the consequence is the same wasted window slot
+ * described above, not a missed announcement, and a real gate token is
+ * `pr:owner/repo#123:merged`.
+ *
  * `normalizeIssueMonitorGateSignals` already
  * lowercases, trims and sorts on write (issue-execution-policy.ts), so the
  * stored array is in that form and no normalization is restated here. If a
