@@ -191,6 +191,45 @@ class TestIsAlarming(unittest.TestCase):
         )
 
 
+class TestStallThresholdCalibration(unittest.TestCase):
+    """The threshold must sit ABOVE the measured dispatch-wait distribution.
+
+    This is the defect BLO-34521 fixed. At 90m the predicate was effectively
+    constant-true -- 96-99% of *healthy* dispatches breached it -- so
+    "stranded" meant "dispatched normally", and every re-fire woke a PR
+    author for nothing.
+
+    These are the observed Ally `pr_review:` dispatch waits the current value
+    was derived from. If you change STALL_THRESHOLD_SECONDS, re-run the query
+    recorded in the comment block above it and update this table in the same
+    commit -- a constant whose derivation is not re-measured is how this rotted
+    the first time.
+    """
+
+    # (window label, p90 minutes, max minutes over STARTED runs)
+    OBSERVED_WINDOWS = [
+        ("2026-09-16T22:37Z->2026-09-18T05:50Z n=706", 338, 405),
+        ("2026-09-17T19:19Z->2026-09-18T21:54Z n=725", 355, 462),
+    ]
+
+    def test_threshold_is_above_every_observed_p90(self):
+        for label, p90_minutes, _ in self.OBSERVED_WINDOWS:
+            self.assertGreater(sweep.STALL_THRESHOLD_SECONDS, p90_minutes * 60, label)
+
+    def test_threshold_is_above_every_observed_max(self):
+        # A value inside the observed range re-fires on healthy dispatches,
+        # which is precisely the 90m behaviour this replaced.
+        for label, _, max_minutes in self.OBSERVED_WINDOWS:
+            self.assertGreater(sweep.STALL_THRESHOLD_SECONDS, max_minutes * 60, label)
+
+    def test_old_ninety_minute_value_would_fail_this_calibration(self):
+        # Guard the guard: if this assertion ever passes at 90m, the table
+        # above has been emptied or the comparison inverted, and the test is
+        # no longer capable of catching a regression to the rotted value.
+        worst_p90 = max(p90 for _, p90, _ in self.OBSERVED_WINDOWS)
+        self.assertLess(90 * 60, worst_p90 * 60)
+
+
 HEAD_SHA = "a" * 40
 OTHER_SHA = "b" * 40
 ALLY_LOGIN = "allyblockcast[bot]"

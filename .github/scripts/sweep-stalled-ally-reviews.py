@@ -188,14 +188,34 @@ ALLY_REQUEST_REVIEWER_LOGIN = os.environ.get("ALLY_REQUEST_REVIEWER_LOGIN") or "
 #     wait = startedAt - createdAt   (queued runs: now - createdAt; report
 #     those separately -- they are a lower bound, not an observation)
 #
-# 8h is therefore picked off p90, not off the max: 480m is 1.42x p90 (338m),
-# and 72m above the largest wait-so-far seen anywhere in the sample (408m,
-# a queued run). It does NOT also claim a separate service-time buffer on
-# top; BLO-22892's 6m35s/30m service figures fit inside that 72m only while
-# the censored tail stays where it is. The failure direction is benign --
-# understating the ceiling costs a false re-fire, never a missed loss -- so
-# the multiplier, not the max, is the thing to re-derive. Re-run the query
-# before trusting it; if p90 has moved, move this with it.
+# RE-MEASURED 2026-09-19 (BLO-34521), window 2026-09-17T19:19Z ->
+# 2026-09-18T21:54Z, n=725 started, same query:
+#
+#     p50 187m | p90 355m | max 462m | min 6m
+#     > 90m: 698/725 = 96%   |   > 8h: 0/725 = 0%
+#
+# and the censored tail had largely drained: 114 still queued, median age
+# 94m, max age 185m (was max 408m). So 462m is a far less biased estimate of
+# the population max than the first window's 405m -- and it is HIGHER, which
+# is the direction that matters. Two independent windows now agree that 8h
+# sits outside the distribution: 0% breach on both.
+#
+# 8h is picked off p90, not off the max: 480m is 1.35x-1.42x p90 across the
+# two windows (355m, 338m), and above the largest wait observed in either
+# (462m). It does NOT also claim a separate service-time buffer on top;
+# BLO-22892's 6m35s/30m service figures fit in the remaining margin only
+# while the tail stays where it is, and between these two windows p90 moved
+# +5% and max moved +14%, eating most of it. The failure direction is benign
+# -- understating the ceiling costs a false re-fire, never a missed loss --
+# so the multiplier, not the max, is the thing to re-derive. Re-run the query
+# before trusting it; if p90 has moved, move this with it. The floor this
+# must clear is asserted in TestStallThresholdCalibration; update that table
+# in the same commit that changes this constant.
+#
+# The upward drift is not noise: its root cause is BLO-19881 (fleet-wide
+# heartbeat queue starvation concentrated on Ally). If that lands, this
+# number should come back DOWN -- a threshold this far above a recovered
+# queue is slow loss detection. Re-derive after it, not just before.
 #
 # KNOWN CEILING -- elapsed time is structurally the wrong instrument. It
 # cannot distinguish a LOST wake from a merely QUEUED one, which is the only
