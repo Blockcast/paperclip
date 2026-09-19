@@ -1195,6 +1195,12 @@ async function buildAgentContext(
           model: asString(usage.model),
           inputTokens: asNumber(usage.inputTokens) ?? asNumber(usage.rawInputTokens),
           cachedInputTokens: asNumber(usage.cachedInputTokens) ?? asNumber(usage.rawCachedInputTokens),
+          // BLO-29842: cache WRITE, split out of inputTokens. This snapshot is
+          // sanitized and persisted into the bundle, so omitting it bakes in a
+          // shortfall of the whole cache-write volume rather than under-reporting
+          // on read. Kept separate here (unlike costSummary.inputTokens below,
+          // which sums) because this mirrors the raw usage blob field-for-field.
+          cacheCreationInputTokens: asNumber(usage.cacheCreationInputTokens) ?? asNumber(usage.rawCacheCreationInputTokens),
           outputTokens: asNumber(usage.outputTokens) ?? asNumber(usage.rawOutputTokens),
           costUsd: asNumber(usage.costUsd),
           usageSource: asString(usage.usageSource),

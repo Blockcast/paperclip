@@ -227,6 +227,8 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
         provider: "openai",
         model: "gpt-5.4",
         inputTokens: 123,
+        cachedInputTokens: 7,
+        cacheCreationInputTokens: 24_000,
         outputTokens: 45,
         costUsd: 0.12,
       },
@@ -644,6 +646,7 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     const agentContext = bundle?.agentContext as Record<string, unknown> | null;
     const runtime = agentContext?.runtime as Record<string, unknown> | null;
     const sourceRun = runtime?.sourceRun as Record<string, unknown> | null;
+    const sourceRunUsage = sourceRun?.usage as Record<string, unknown> | null;
     const skills = agentContext?.skills as Record<string, unknown> | null;
     const skillItems = skills?.items as Array<Record<string, unknown>> | undefined;
     const instructions = agentContext?.instructions as Record<string, unknown> | null;
@@ -661,6 +664,15 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     expect(JSON.stringify(issueContextItems)).toContain("[REDACTED_PHONE]");
     expect(sourceRun?.id).toBe(runId);
     expect(JSON.stringify(sourceRun)).toContain("gpt-5.4");
+    // BLO-29842: this snapshot reads usage_json as an untyped Record, so a
+    // dropped cache-write field is invisible to the type checker AND to the
+    // required-field gate on BilledTokenCounts — the same hole that hid two UI
+    // sites. The bundle is persisted, so a miss here is baked in, not
+    // recomputed on read. Pinned separate from inputTokens because this object
+    // mirrors the raw usage blob field-for-field (costSummary below sums).
+    expect(sourceRunUsage?.cacheCreationInputTokens).toBe(24_000);
+    expect(sourceRunUsage?.inputTokens).toBe(123);
+    expect(sourceRunUsage?.cachedInputTokens).toBe(7);
     expect(skillItems?.[1]?.sourceLocator).toBe("https://github.com/octo/research/tree/main/skills/public-skill");
     expect(String(instructions?.entryBody)).toContain("[REDACTED]");
     expect(String(instructions?.entryBody)).not.toContain("secret-value");

@@ -105,6 +105,7 @@ import {
   envBindingSchema,
   isSensitiveEnv,
   isEnvironmentDriverSupportedForAdapter,
+  promptTokens,
   type BillingType,
   type CostStatus,
   type EnvironmentLeaseStatus,
@@ -4635,10 +4636,11 @@ type UsageTotals = {
  * was split out of it, so every consumer that cared about "context size, not
  * cache reads" (session rotation above all) must go through this rather than
  * reading `inputTokens` directly, or its threshold silently loosens.
+ *
+ * Deliberately the shared `promptTokens` rather than a heartbeat-local twin:
+ * two names for one concept is how a third spelling arrives. `UsageTotals`
+ * structurally satisfies the shared `Pick<BilledTokenCounts, ...>` parameter.
  */
-function nonCachedInputTokens(usage: Pick<UsageTotals, "inputTokens" | "cacheCreationInputTokens">) {
-  return usage.inputTokens + usage.cacheCreationInputTokens;
-}
 
 type SessionCompactionDecision = {
   rotate: boolean;
@@ -15149,7 +15151,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // into inputTokens upstream, so reading inputTokens alone here would quietly
       // shrink the rotation trigger's input by the whole cache-write volume and
       // rotate far later than the policy asks for. The threshold is unchanged.
-      latestRawInputTokens: latestRawUsage ? nonCachedInputTokens(latestRawUsage) : null,
+      latestRawInputTokens: latestRawUsage ? promptTokens(latestRawUsage) : null,
       sessionAgeHours,
       consecutiveFailedOrZeroTokenResumes,
     });
