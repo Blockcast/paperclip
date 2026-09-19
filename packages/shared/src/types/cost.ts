@@ -1,5 +1,41 @@
 import type { BillingType, CostStatus } from "../constants.js";
 
+/**
+ * BLO-29842: the four billed token classes carried by every cost row.
+ *
+ * Fields are REQUIRED on purpose. Cache writes used to be folded into
+ * `inputTokens`, so every volume total in the app silently shrinks if a row is
+ * summed without them. Requiring the field makes that a compile error at the
+ * next call site instead of a quiet under-report.
+ */
+export interface BilledTokenCounts {
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheCreationInputTokens: number;
+  outputTokens: number;
+}
+
+/**
+ * Prompt tokens billed at or above the fresh-input rate: fresh input + cache
+ * writes. This is what `inputTokens` alone meant before BLO-29842 split cache
+ * writes into their own column, so any total that used to read `inputTokens`
+ * must read this to keep measuring the same thing.
+ *
+ * Excludes cache READS, which bill at ~0.1x and stay separate — callers that
+ * want every prompt class add `cachedInputTokens` themselves, or use
+ * `totalTokens`.
+ */
+export function promptTokens(
+  row: Pick<BilledTokenCounts, "inputTokens" | "cacheCreationInputTokens">,
+): number {
+  return row.inputTokens + row.cacheCreationInputTokens;
+}
+
+/** Every billed token class for a row: fresh input + cache write + cache read + output. */
+export function totalTokens(row: BilledTokenCounts): number {
+  return promptTokens(row) + row.cachedInputTokens + row.outputTokens;
+}
+
 export interface CostEvent {
   id: string;
   companyId: string;
@@ -16,6 +52,8 @@ export interface CostEvent {
   model: string;
   inputTokens: number;
   cachedInputTokens: number;
+  /** BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed 1.25x-2x input. Not part of `inputTokens`. */
+  cacheCreationInputTokens: number;
   outputTokens: number;
   costCents: number;
   occurredAt: Date;
@@ -36,6 +74,8 @@ export interface IssueCostSummary {
   costCents: number;
   inputTokens: number;
   cachedInputTokens: number;
+  /** BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed 1.25x-2x input. Not part of `inputTokens`. */
+  cacheCreationInputTokens: number;
   outputTokens: number;
   /** number of distinct heartbeat runs aggregated across the issue tree */
   runCount: number;
@@ -51,10 +91,13 @@ export interface CostByAgent {
   costCents: number;
   inputTokens: number;
   cachedInputTokens: number;
+  /** BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed 1.25x-2x input. Not part of `inputTokens`. */
+  cacheCreationInputTokens: number;
   outputTokens: number;
   apiRunCount: number;
   subscriptionRunCount: number;
   subscriptionCachedInputTokens: number;
+  subscriptionCacheCreationInputTokens: number;
   subscriptionInputTokens: number;
   subscriptionOutputTokens: number;
 }
@@ -67,10 +110,13 @@ export interface CostByProviderModel {
   costCents: number;
   inputTokens: number;
   cachedInputTokens: number;
+  /** BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed 1.25x-2x input. Not part of `inputTokens`. */
+  cacheCreationInputTokens: number;
   outputTokens: number;
   apiRunCount: number;
   subscriptionRunCount: number;
   subscriptionCachedInputTokens: number;
+  subscriptionCacheCreationInputTokens: number;
   subscriptionInputTokens: number;
   subscriptionOutputTokens: number;
 }
@@ -80,10 +126,13 @@ export interface CostByBiller {
   costCents: number;
   inputTokens: number;
   cachedInputTokens: number;
+  /** BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed 1.25x-2x input. Not part of `inputTokens`. */
+  cacheCreationInputTokens: number;
   outputTokens: number;
   apiRunCount: number;
   subscriptionRunCount: number;
   subscriptionCachedInputTokens: number;
+  subscriptionCacheCreationInputTokens: number;
   subscriptionInputTokens: number;
   subscriptionOutputTokens: number;
   providerCount: number;
@@ -101,6 +150,8 @@ export interface CostByAgentModel {
   costCents: number;
   inputTokens: number;
   cachedInputTokens: number;
+  /** BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed 1.25x-2x input. Not part of `inputTokens`. */
+  cacheCreationInputTokens: number;
   outputTokens: number;
 }
 
@@ -115,6 +166,8 @@ export interface CostWindowSpendRow {
   costCents: number;
   inputTokens: number;
   cachedInputTokens: number;
+  /** BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed 1.25x-2x input. Not part of `inputTokens`. */
+  cacheCreationInputTokens: number;
   outputTokens: number;
 }
 
@@ -125,5 +178,7 @@ export interface CostByProject {
   costCents: number;
   inputTokens: number;
   cachedInputTokens: number;
+  /** BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed 1.25x-2x input. Not part of `inputTokens`. */
+  cacheCreationInputTokens: number;
   outputTokens: number;
 }

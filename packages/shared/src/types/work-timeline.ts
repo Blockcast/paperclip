@@ -36,6 +36,8 @@ export interface WorkTimelineSpan {
   usage?: {
     inputTokens: number;
     cachedInputTokens: number;
+    /** BLO-29842: cache WRITE tokens, billed 1.25x-2x input. Not part of `inputTokens`. */
+    cacheCreationInputTokens: number;
     outputTokens: number;
     totalTokens: number;
   } | null;

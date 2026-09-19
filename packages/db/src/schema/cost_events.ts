@@ -24,6 +24,18 @@ export const costEvents = pgTable(
     model: text("model").notNull(),
     inputTokens: integer("input_tokens").notNull().default(0),
     cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
+    // BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed at
+    // 1.25x/2x input vs 0.1x for cachedInputTokens (cache read). Previously folded
+    // into inputTokens, which made the 3-price rate card unidentifiable from 2
+    // columns. Rows written before migration 0245 carry 0 and cannot be backfilled —
+    // the information was never captured. Any rate-card fit must start AFTER that
+    // migration deployed, or it reads the zero-default as real cache-write volume.
+    // ponytail: one column, not one per TTL. Claude's `modelUsage` ledger reports
+    // cacheCreationInputTokens as a single aggregate and does not split
+    // ephemeral_5m/_1h, so a second column would have nothing to read. Cost of the
+    // choice: the fit recovers a blended write price over the fleet's TTL mix, not
+    // the 1.25x and 2x legs separately. Split when an adapter reports the breakdown.
+    cacheCreationInputTokens: integer("cache_creation_input_tokens").notNull().default(0),
     outputTokens: integer("output_tokens").notNull().default(0),
     costCents: integer("cost_cents").notNull(),
     occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
