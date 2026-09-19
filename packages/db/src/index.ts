@@ -14,6 +14,7 @@ export {
   migratePostgresIfEmpty,
   type MigrationBootstrapResult,
   type Db,
+  type DbTransaction,
 } from "./client.js";
 export {
   checkPendingMigrationPreflight,

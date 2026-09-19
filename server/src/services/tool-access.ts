@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { and, asc, desc, eq, gte, inArray, isNull, lt, max, ne, sql } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   activityLog,
   agents,
@@ -153,7 +153,6 @@ type ToolAccessServiceOptions = {
   now?: () => Date;
 };
 
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type ToolAccessMutationDb = Pick<Db | DbTransaction, "select" | "insert" | "update" | "delete">;
 
 export type McpToolDescriptor = {
