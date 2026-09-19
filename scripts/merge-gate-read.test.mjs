@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -27,6 +28,26 @@ function extract(checkRuns) {
   });
   return out.split("\n").filter(Boolean);
 }
+
+/** Turn one or more commit-status API pages into reader rows. */
+function statusExtract(pages) {
+  const out = execFileSync("bash", [READER, "--status-extract"], {
+    input: pages.map((p) => JSON.stringify(p)).join("\n"),
+    encoding: "utf8",
+  });
+  return out.split("\n").filter(Boolean);
+}
+
+/** Validate a candidate head sha. Returns { rc, out }. */
+function shaGuard(sha) {
+  try {
+    return { rc: 0, out: execFileSync("bash", [READER, "--sha-guard", sha], { encoding: "utf8" }) };
+  } catch (e) {
+    return { rc: e.status, out: e.stdout };
+  }
+}
+
+const SOURCE = readFileSync(READER, "utf8");
 
 const stops = (lines) => lines.filter((l) => l.startsWith("STOP\t"));
 
@@ -293,13 +314,13 @@ describe("merge-gate reader", () => {
           run({ name: "b", conclusion: "failure", details_url: null }),
           run({ name: "c", conclusion: "failure", details_url: "https://x/runs/456/job/1" }),
         ]),
-        ["a\tsuccess\tt\t123", "b\tfailure\tt\tapp", "c\tfailure\tt\t456"],
+        ["a\tsuccess\tt\t123", "b\tfailure\tt\tapp:?", "c\tfailure\tt\t456"],
       );
     });
 
     it("falls back to `app` for a details_url with no run id", () => {
       assert.deepEqual(extract([run({ name: "gate", details_url: "https://x/apps/ally" })]), [
-        "gate\tsuccess\tt\tapp",
+        "gate\tsuccess\tt\tapp:?",
       ]);
     });
 
@@ -318,5 +339,102 @@ describe("merge-gate reader", () => {
         ["e2e\tin_progress\tt0\t9"],
       );
     });
+
+    // Reviewer finding: a CONSTANT app fallback collapses the dedup key to
+    // name-only for every App-published row — BLO-34114's masking, one surface
+    // over. Two Apps publishing the same check-run name at one head would hide
+    // each other, and the survivor is whichever sorts later. The red row must
+    // survive from EITHER app slug, so neither ordering passes on broken code.
+    for (const [redSlug, greenSlug] of [
+      ["zz-scanner", "aa-linter"],
+      ["aa-scanner", "zz-linter"],
+    ]) {
+      it(`keys the app fallback on .app.slug (red=${redSlug})`, () => {
+        const rows = extract([
+          run({ name: "secret-scan", conclusion: "failure", app: { slug: redSlug } }),
+          run({ name: "secret-scan", app: { slug: greenSlug } }),
+        ]);
+        assert.deepEqual(read(rows.map((r) => r.split("\t"))), [
+          `STOP\tsecret-scan\tfailure\trun=app:${redSlug}`,
+        ]);
+      });
+    }
+  });
+
+  // Reviewer finding: the legacy-status surface was fetched with neither
+  // per_page nor --paginate while the check-run surface one line below had
+  // both. GitHub's default page size is 30, so a head with >30 contexts
+  // silently loses the remainder, and a dropped `failure` prints no STOP.
+  // The ABSENT guard cannot catch it — `:52` excludes status rows from the
+  // survivor count, so one surviving check-run keeps it quiet. Direction: GREEN.
+  describe("legacy status surface", () => {
+    // Asserted over EVERY list fetch, not just the status one: the check-run and
+    // actions/runs calls carry the same silent-truncation risk, and neither had a
+    // guard until this finding. The single-object commit lookup is the only
+    // exemption.
+    it("paginates every list fetch", () => {
+      const fetches = SOURCE.split("\n").filter(
+        (l) => l.includes('gh api "repos/') && !l.includes("/commits/$2"),
+      );
+      assert.equal(fetches.length, 3, `unguarded fetch added? got ${JSON.stringify(fetches)}`);
+      for (const call of fetches) {
+        assert.match(call, /per_page=100/, call);
+        assert.match(call, /--paginate/, call);
+      }
+    });
+
+    // --paginate emits one object per page, so the extraction must stream every
+    // status of every page. Two per page deliberately: with one, a truncating
+    // extractor still emits one row per page and the fixture passes on broken code.
+    it("extracts every row of every page", () => {
+      assert.deepEqual(
+        statusExtract([
+          {
+            statuses: [
+              { context: "ci-gate", state: "success", updated_at: "t1" },
+              { context: "build", state: "success", updated_at: "t2" },
+            ],
+          },
+          {
+            statuses: [
+              { context: "review/ally", state: "failure", updated_at: "t3" },
+              { context: "sign", state: "pending", updated_at: "t4" },
+            ],
+          },
+        ]),
+        [
+          "ci-gate\tsuccess\tt1\tstatus",
+          "build\tsuccess\tt2\tstatus",
+          "review/ally\tfailure\tt3\tstatus",
+          "sign\tpending\tt4\tstatus",
+        ],
+      );
+    });
+  });
+
+  // Reviewer finding: `gh api` prints its error body to STDOUT, so a failed
+  // commit lookup leaves H as a JSON blob rather than empty. It failed closed
+  // by accident — the malformed URL broke both later calls and the reader said
+  // ABSENT — but that misattributes a LOOKUP failure to an absent surface,
+  // which is the one distinction the ABSENT wording was split to preserve.
+  describe("head sha guard", () => {
+    it("accepts a full 40-hex sha", () => {
+      assert.equal(shaGuard("4e62193a169ece35ff5c7076362ecb1aaa53c1ee").rc, 0);
+    });
+
+    for (const [label, bad] of [
+      ["a gh error body on stdout", '{"message":"No commit found for SHA: zzz"}'],
+      ["an abbreviation", "4e62193"],
+      ["an empty string", ""],
+      ["41 hex chars", "4e62193a169ece35ff5c7076362ecb1aaa53c1eef"],
+    ]) {
+      it(`stops with LOOKUP-FAILED on ${label}`, () => {
+        const { rc, out } = shaGuard(bad);
+        assert.equal(rc, 1);
+        assert.match(out, /^STOP\t.*\tLOOKUP-FAILED\trun=-$/m);
+        assert.doesNotMatch(out, /ABSENT/);
+      });
+    }
   });
 });
+
