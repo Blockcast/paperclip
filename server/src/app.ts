@@ -71,6 +71,7 @@ import { metricsIngestRoutes } from "./routes/metrics-ingest.js";
 import { renderMetrics } from "./services/metrics.js";
 import {
   expireStaleRefreshFreshness,
+  refreshAgentStartLockMetrics,
   refreshDbPoolMetrics,
   startScrapeMetricsCollector,
 } from "./services/scrape-metrics-collector.js";
@@ -319,12 +320,16 @@ export async function createApp(
   // that would have explained the stall. Two of three control-plane pods were
   // losing ~1 scrape in 8 that way. The refreshes now run on a background
   // interval (services/scrape-metrics-collector.ts); this handler renders the
-  // registry and nothing else. `expireStaleRefreshFreshness` and
-  // `refreshDbPoolMetrics` are synchronous in-memory reads, not queries.
+  // registry and nothing else. `expireStaleRefreshFreshness`,
+  // `refreshDbPoolMetrics` and `refreshAgentStartLockMetrics` are synchronous
+  // in-memory reads, not queries — which is load-bearing for the last one
+  // (PEN-3305): it reports dispatch sections wedged on the database, so it must
+  // not itself need the database to be reachable.
   app.get("/metrics", async (_req, res, next) => {
     try {
       expireStaleRefreshFreshness();
       refreshDbPoolMetrics(db);
+      refreshAgentStartLockMetrics();
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);
     } catch (err) {
