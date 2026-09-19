@@ -495,7 +495,11 @@ jobs:
         # through an un-ordered sibling test). All four are pinned here, and every
         # guard in the reader is mutation-checked: reverting any ONE of them alone
         # fails this suite. A guard with no failing mutation is a comment — add
-        # the mutation before you trust the fixture.
+        # the mutation before you trust the fixture. Last swept 2026-09-19:
+        # 28/28 guards killed. Two had survived and were caught by sweeping
+        # rather than by reading — an inert `newest_pass != ""` (deleted) and an
+        # unpinned max-tracking term (fixture added). Re-run the sweep when you
+        # add a guard; do not extend this claim on inspection alone.
         run: node --test ./scripts/merge-gate-read.test.mjs
         timeout-minutes: 1
 

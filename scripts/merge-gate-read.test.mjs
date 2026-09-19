@@ -6,11 +6,29 @@ import { fileURLToPath } from "node:url";
 
 const READER = fileURLToPath(new URL("./merge-gate-read.sh", import.meta.url));
 
-/** Run the canonical reader's verdict pipeline over fixture rows. */
-function read(rows, dead = "__none__") {
+/**
+ * Run the canonical reader's verdict pipeline over fixture rows.
+ * Returns { rc, lines }. `--rows` propagates the pipeline status, so a nonzero
+ * exit is an expected outcome here and must not be read as a harness failure —
+ * the VERDICT IS THE LINES. Use `read()` unless you are asserting on rc itself.
+ */
+function readRc(rows, dead = "__none__") {
   const stdin = rows.length ? rows.map((r) => r.join("\t")).join("\n") + "\n" : "";
-  const out = execFileSync("bash", [READER, "--rows", dead], { input: stdin, encoding: "utf8" });
-  return out.split("\n").filter(Boolean);
+  const opts = { input: stdin, encoding: "utf8" };
+  let rc = 0;
+  let out;
+  try {
+    out = execFileSync("bash", [READER, "--rows", dead], opts);
+  } catch (e) {
+    rc = e.status;
+    out = e.stdout;
+  }
+  return { rc, lines: out.split("\n").filter(Boolean) };
+}
+
+/** Run the verdict pipeline and return only its lines. */
+function read(rows, dead = "__none__") {
+  return readRc(rows, dead).lines;
 }
 
 /** Classify workflow runs at a head into the stale-run alternation. */
@@ -345,12 +363,35 @@ describe("merge-gate reader", () => {
     it("keeps every run of a workflow whose lane never passed", () => {
       // A chain of cancel-in-progress that never produced a verdict. Nothing in
       // the lane succeeded, so nothing is provably stale and both still STOP.
+      // This is also the lane-with-no-success shape that lets the END clause
+      // carry no `newest_pass[...] != ""` term: an unset newest_pass loses `>=`
+      // against an ISO timestamp as strings ("" < "2026-…") AND numerically
+      // (0 < 2026), so it fails closed under either compare mode.
       assert.equal(
         dead([
           ["10", "push", "100", "cancelled", "2026-09-19T01:00:00Z"],
           ["10", "push", "200", "cancelled", "2026-09-19T01:05:00Z"],
         ]),
         "",
+      );
+    });
+
+    // Pins `$5 > newest_pass[key]`: newest_pass must be the MAX start among a
+    // lane's successes, not merely the last one seen. actions/runs returns
+    // NEWEST-FIRST, so an older success trailing a newer one is the default
+    // ordering rather than an exotic one — and without the max, newest_pass ends
+    // up holding the OLDEST success, which fails `>=` and resurrects a genuinely
+    // superseded run as a STOP. Direction is RED, and it partially reverts
+    // BLO-34114's suppression. Found by mutation sweep: replacing the comparison
+    // with `1` left all 55 other tests green.
+    it("takes the newest sibling success, not the last one in input order", () => {
+      assert.equal(
+        dead([
+          ["10", "push", "300", "success", "2026-09-19T02:00:00Z"], // newest, first (API order)
+          ["10", "push", "200", "cancelled", "2026-09-19T01:30:00Z"], // superseded by 300
+          ["10", "push", "100", "success", "2026-09-19T01:00:00Z"], // older, trails it
+        ]),
+        "200",
       );
     });
 
@@ -576,6 +617,40 @@ describe("merge-gate reader", () => {
         /dropped as superseded-run/,
       );
       assert.match(read([]).join("\n"), /no check-run verdict/);
+    });
+  });
+
+  // The header used to claim the reader "exits 1 exactly when the ABSENT line
+  // fires and 0 when real STOP lines print". The `exactly` half is FALSE in the
+  // GREEN direction, and no fixture could catch it while every fixture entry
+  // point hardcoded `exit 0` — the unobservability WAS the defect. rc is a
+  // one-way signal: rc 1 implies ABSENT, never the converse.
+  describe("exit status is one-way: rc 1 implies ABSENT, not the converse", () => {
+    it("fires ABSENT at rc 0 when an excluded App row survives the drop", () => {
+      // The falsifying case. `grep -v` sees a survivor so the pipeline succeeds,
+      // while the survivor count excludes App rows once anything was dropped —
+      // so ABSENT prints at rc 0. Every head in this repo carries two App rows.
+      const { rc, lines } = readRc(
+        [
+          ["gate/x", "success", "t1", "app:ally"],
+          ["verify", "success", "t1", "111"],
+        ],
+        "111",
+      );
+      assert.match(lines.join("\n"), /ABSENT/);
+      assert.equal(rc, 0);
+    });
+
+    it("fires ABSENT at rc 1 when the drop leaves no row at all", () => {
+      const { rc, lines } = readRc([["verify", "failure", "t1", "111"]], "111");
+      assert.match(lines.join("\n"), /ABSENT/);
+      assert.equal(rc, 1);
+    });
+
+    it("exits 0 while printing a real STOP, so rc 0 is not a merge signal", () => {
+      const { rc, lines } = readRc([["verify", "failure", "t1", "111"]]);
+      assert.equal(stops(lines).length, 1);
+      assert.equal(rc, 0);
     });
   });
 

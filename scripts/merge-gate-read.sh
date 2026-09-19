@@ -10,17 +10,22 @@
 # in here exists because a filter shipped a merge-authorizing false GREEN.
 #
 # NOT every line is a stop, and the mandated "any line out is a stop" reading
-# gets a permanent false RED without this. Label column:
-#   STOP, LOOKUP-FAILED  — blocking.
+# gets a permanent false RED without this. Label column ($1):
+#   STOP                 — blocking.
 #   NOT-EVALUATED        — a `neutral` check: nothing attested this head. NOT
 #                          blocking (BLO-34035), and not evidence of a review.
 #   MALFORMED            — an un-expanded `${{` workflow template, i.e. a
 #                          registration that can never report. NOT blocking.
+# LOOKUP-FAILED is blocking but is NOT a label: `:71` emits it in the CONCLUSION
+# column ($3) under a $1 of STOP. A consumer filtering $1 for blocking labels
+# must match STOP and will never see it; listing it here as a label was wrong.
 #
-# The VERDICT IS THE LINES, never $?. Live mode propagates grep's status through
-# pipefail, so it exits 1 exactly when the ABSENT line fires and 0 when real STOP
-# lines print — the inverse of what a caller would guess. Never write
-# `merge-gate-read.sh … && merge`.
+# The VERDICT IS THE LINES, never $?. rc 1 IMPLIES the ABSENT line, but NOT the
+# converse: `grep -v` returns 0 whenever any row survives, while the survivor
+# count separately excludes App rows once anything was dropped — so an App-only
+# survivor prints ABSENT at rc 0. Every head in this repo carries two App rows,
+# so that is the common shape here, not a constructed one. rc is therefore a
+# one-way signal at best. Never write `merge-gate-read.sh … && merge`.
 #
 #   merge-gate-read.sh <owner/repo> <sha|pr-head>     # live
 #   merge-gate-read.sh --rows <DEAD-alternation>      # fixture mode, rows on stdin
@@ -133,10 +138,21 @@ dead_runs() { # stdin: run rows -> stdout: alternation of stale run ids
   # lets a `failure` sibling — or a vacuously-`skipped` lane — delete a terminal
   # cancellation, which is this file's whole failure mode. A missing timestamp on
   # either side fails CLOSED (the run is kept, i.e. STOP): an absent field must
-  # never be read as evidence that a verdict exists. The END check is the WHOLE
-  # fence for that — the entry side needs no `$5 != ""` because "" can never win
-  # a max, so such a guard is unkillable by any fixture and would be a comment
-  # wearing the costume of code.
+  # never be read as evidence that a verdict exists. `started[i] != ""` is the
+  # WHOLE fence for that, and it is killable. NEITHER side takes a second
+  # `!= ""`: on the entry side "" can never win a max, and on the END side an
+  # unset newest_pass already loses `>=` against any ISO timestamp, so it fails
+  # closed on its own. A `newest_pass[grp[i]] != ""` term shipped here
+  # through BLO-34619 and was deleted on review — all 52 tests stayed green with
+  # it removed, i.e. it was a comment wearing the costume of code, the same
+  # shape this paragraph rejects on the entry side.
+  # That deletion does NOT rest on the string/numeric compare mode, which was the
+  # reviewer's stated reason and is the weaker argument: an unset newest_pass
+  # loses `>=` against an ISO timestamp under BOTH readings — as strings
+  # "" < "2026-…", and numerically 0 < ("2026-…"+0) == 2026. It fails closed
+  # either way, so a CONVFMT or awk-implementation change cannot flip it. The
+  # outcome is asserted behaviourally by "keeps every run of a workflow whose
+  # lane never passed", which is the lane-with-no-success shape.
   # `n=0` in BEGIN is load-bearing: an uninitialised awk variable is the empty
   # STRING, and array subscripts are strings, so the first cancelled row would
   # land at id[""] while the END loop reads id[0] — silently dropping one run
@@ -148,7 +164,7 @@ dead_runs() { # stdin: run rows -> stdout: alternation of stale run ids
                 if ($4 == "cancelled") {
                   id[n] = $3; grp[n] = key; started[n] = $5; n++ } }
               END { for (i = 0; i < n; i++)
-                      if (started[i] != "" && newest_pass[grp[i]] != "" \
+                      if (started[i] != "" \
                           && newest_pass[grp[i]] >= started[i]) print id[i] }' \
     | sort -n | paste -sd'|' -
 }
@@ -193,7 +209,10 @@ verdicts() { # $1 = DEAD alternation (empty or '__none__' when nothing is stale)
               : "no check-run verdict at this head") ">\tABSENT\trun=-"}'
 }
 
-if [ "${1:-}" = "--rows" ]; then verdicts "${2:-}"; exit 0; fi
+# `--rows` propagates the pipeline status rather than swallowing it. Hardcoding
+# `exit 0` here made the exit contract unobservable by construction, so no
+# fixture could catch the header claiming an exactness it did not have.
+if [ "${1:-}" = "--rows" ]; then verdicts "${2:-}"; exit $?; fi
 if [ "${1:-}" = "--dead" ]; then dead_runs; exit 0; fi
 if [ "${1:-}" = "--extract" ]; then extract; exit 0; fi
 if [ "${1:-}" = "--status-extract" ]; then status_extract; exit 0; fi
