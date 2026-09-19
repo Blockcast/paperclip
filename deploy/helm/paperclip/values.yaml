@@ -627,6 +627,10 @@ prometheusRule:
   recoveryHorizonNoWakeToCurrentOwnerPagePerDay: 5
   # -- How long the high no-wake-to-current-owner count must be sustained before paging.
   recoveryHorizonNoWakeToCurrentOwnerPageFor: 1h
+  # -- How long heartbeat_runs_crash_recovery_pending_idx must read absent/invalid before warning (BLO-21526). Short: the gauge is re-derived from pg_class every periodic scheduler tick and only ever reads 0 on a tier that actually probed the catalog, so a 0 is already a settled reading rather than a transient.
+  crashRecoveryCandidateIndexMissingFor: 15m
+  # -- absent_over_time window for the crash-recovery index gauge: warn when NO pod has published it for this long (BLO-21526). Deliberately much wider than Prometheus's 5m lookback delta, because a rolling deploy publishes nothing until the first periodic tick on the new pod and paging on ordinary rollouts would train the fleet to ignore the alert. Catches sustained blindness (probe throwing, tier down, scrape broken), not a restart. Used as a range window, not a `for:` — see the rule comment.
+  crashRecoveryCandidateIndexUnobservableFor: 1h
   # -- Warn when more than this many ac-* agent pods are Unschedulable for unschedulableFor (node-pool scheduling starvation, BLO-16224). Reuses agentJobNameRegex to match agent pods.
   unschedulablePodThreshold: 0
   # -- How long agent pods must stay Unschedulable before warning (transient blips self-resolve; this catches sustained starvation).
