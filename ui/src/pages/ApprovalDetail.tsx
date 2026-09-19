@@ -13,8 +13,54 @@ import { PageSkeleton } from "../components/PageSkeleton";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { CheckCircle2, ChevronRight, Sparkles } from "lucide-react";
-import type { ApprovalComment } from "@paperclipai/shared";
+import type { Approval, ApprovalComment } from "@paperclipai/shared";
 import { MarkdownBody } from "../components/MarkdownBody";
+import { ApiError } from "../api/client";
+
+/**
+ * Some refusals carry a `details.remediation` naming the shape that would satisfy
+ * them — `budget_approval_missing_enforcement_assertion` (BLO-34008) is the one
+ * reachable from this page. The bare `error` says the payload is unverifiable but
+ * not what would make it verifiable, and the operator reading it is the one person
+ * who has to decide what happens to the card next, so fold the remediation in.
+ */
+export function errorWithRemediation(err: unknown, fallback: string): string {
+  const base = err instanceof Error ? err.message : fallback;
+  if (!(err instanceof ApiError)) return base;
+  const details = (err.body as { details?: { remediation?: unknown } } | null)?.details;
+  const remediation = typeof details?.remediation === "string" ? details.remediation.trim() : "";
+  return remediation ? `${base} — ${remediation}` : base;
+}
+
+/**
+ * Can this page's "Mark resubmitted" reach anything but a refusal?
+ *
+ * `routes/approvals.ts` guards a budget card's resubmit against the payload that
+ * would end up `pending`, and this page sends none — so for a caller-filed card
+ * whose stored payload carries no parseable assertion the button can only 422,
+ * with a remediation ("send the corrected assertions in the resubmit body")
+ * naming the one thing no surface here can do. Rendering a button whose own
+ * error says the fix must happen elsewhere is the dead end this closes.
+ *
+ * Gated on the requester columns rather than re-deriving the assertion check:
+ * `extractEnforcementAssertions` is server-side, and a second copy of a
+ * money-path parser in the UI is how the two silently diverge. Both columns null
+ * means the budget watcher filed it through `insertApproval()`, which the server
+ * exempts for the same reason it exempts them at creation — a threshold card
+ * records that a cap was *crossed*, so it has no target to declare. Those
+ * resubmit fine and keep the button.
+ *
+ * Wider than the refusal by exactly one case: a caller-filed budget card that
+ * *does* carry assertions would resubmit successfully. Deliberate — that card is
+ * the filing agent's to correct, not the board's to silently re-pend from a page
+ * that already declines to approve or reject budget cards at all.
+ */
+export function canResubmitFromBoard(
+  approval: Pick<Approval, "type" | "requestedByAgentId" | "requestedByUserId">,
+): boolean {
+  if (approval.type !== "budget_override_required") return true;
+  return !approval.requestedByAgentId && !approval.requestedByUserId;
+}
 
 export function ApprovalDetail() {
   const { approvalId } = useParams<{ approvalId: string }>();
@@ -118,7 +164,7 @@ export function ApprovalDetail() {
       setError(null);
       refresh();
     },
-    onError: (err) => setError(err instanceof Error ? err.message : "Resubmit failed"),
+    onError: (err) => setError(errorWithRemediation(err, "Resubmit failed")),
   });
 
   const addCommentMutation = useMutation({
@@ -148,6 +194,7 @@ export function ApprovalDetail() {
   const linkedAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
   const isActionable = approval.status === "pending" || approval.status === "revision_requested";
   const isBudgetApproval = approval.type === "budget_override_required";
+  const canDriveResubmit = canResubmitFromBoard(approval);
   const TypeIcon = typeIcon[approval.type] ?? defaultTypeIcon;
   const showApprovedBanner = searchParams.get("resolved") === "approved" && approval.status === "approved";
   const primaryLinkedIssue = linkedIssues?.[0] ?? null;
@@ -286,6 +333,15 @@ export function ApprovalDetail() {
               Resolve this budget stop from the budget controls on <Link to="/costs" className="underline underline-offset-2">/costs</Link>.
             </p>
           )}
+          {isBudgetApproval && approval.status === "revision_requested" && !canDriveResubmit && (
+            <p className="text-sm text-muted-foreground">
+              Sent back for revision. This page can only resubmit a card unchanged, and a budget card
+              a caller filed has to go back with its{" "}
+              <code className="font-mono text-xs">enforcement_assertions</code> reviewed — so resubmit
+              it through the API it was filed from. Budget figures are set from the budget controls
+              on <Link to="/costs" className="underline underline-offset-2">/costs</Link>.
+            </p>
+          )}
           {approval.status === "pending" && (
             <Button
               size="sm"
@@ -296,7 +352,7 @@ export function ApprovalDetail() {
               Request revision
             </Button>
           )}
-          {approval.status === "revision_requested" && (
+          {approval.status === "revision_requested" && canDriveResubmit && (
             <Button
               size="sm"
               variant="outline"

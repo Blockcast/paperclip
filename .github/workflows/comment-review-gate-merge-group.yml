@@ -1,0 +1,98 @@
+name: Comment-review gate (merge queue)
+
+# Writes the comment-shaped Ally review gate's verdict onto the merge-queue
+# candidate commit. See scripts/mirror-comment-review-gate-to-merge-group.mjs
+# for the full rationale and BLO-26602 for the issue.
+#
+# The short version: the gate posts its verdict on the PULL REQUEST head, driven
+# by `pull_request`, `pull_request_review` and Ally's `issue_comment`. A
+# `gh-readonly-queue/*` ref generates none of those, and `merge_group` appears
+# zero times in the server -- so nothing has ever written this context on a
+# queue head. Until something does, marking the context required would make
+# every queue entry wait the full 6h `checkResponseTimeout` and eject, since the
+# queue runs ALLGREEN and a merge_group run cannot be re-run. This workflow is
+# that missing writer, and it is the prerequisite for the required-check step,
+# not a replacement for it.
+#
+# DELIBERATELY NOT MARKED REQUIRED BY THIS CHANGE. The status this writes gates
+# nothing until a human marks the context required in branch protection, which
+# is a separate action that should happen only once this has been seen writing
+# real verdicts on real queue refs.
+#
+# That is NOT the same as "changes no merge behaviour", and the distinction
+# matters: this is itself a merge_group check, so if the JOB fails the entry is
+# ejected under ALLGREEN whatever the status says. Adding a job to the queue is
+# adding a way for a queue entry to die. That is precisely why the script fails
+# OPEN on everything it can (see its FAILURE POSTURE header) and exits non-zero
+# only where no status could be written at all -- the cases where exiting 0
+# would just buy the same ejection six hours later.
+
+on:
+  merge_group:
+    types:
+      - checks_requested
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  mirror:
+    # NOT arc-merge-queue. That pool is admission-gated to exactly ONE workflow:
+    # the runner's `merge_queue_job_gate` hook asserts GITHUB_WORKFLOW_REF equals
+    # `mergeQueueJobGate.expectedWorkflowRef`, pinned in onprem-k8s at
+    # `arc/arc-merge-queue-values.yaml` to `.github/workflows/pr.yml@refs/heads/master`.
+    # Any other workflow is refused BEFORE checkout, so no in-repo guard can save
+    # it. Measured on this PR's own first queue entry (run 34228985576, queue ref
+    # pr-1719-1efd24d1): "Set up runner" failed with `FATAL: merge-queue runner
+    # admission refused: workflow ref ... is not the protected queue workflow`,
+    # and under ALLGREEN that ejected the entry 2m40s after it was staged.
+    #
+    # arc-light is where the repo's other merge_group workflow already runs
+    # (commitperclip-review.yml), and it succeeded on that same queue ref -- so
+    # this is the precedented pool for a merge_group job that is not pr.yml,
+    # and it leaves the dedicated queue pool's exclusivity intact rather than
+    # asking a runner admin to widen it.
+    runs-on: arc-light
+    # The job itself is three API calls, but ARC runners start cold and the
+    # checkout dominates. 10 matches the floor the rest of this repo settled on
+    # rather than inventing a tighter budget for one job.
+    timeout-minutes: 10
+    steps:
+      # Checks out master, NOT the queue candidate, and that is deliberate: this
+      # job holds `statuses: write`, so running the candidate's copy of the
+      # script would let a diff under review rewrite the thing that reports on
+      # it. Same posture as commitperclip-review.yml. The values file read for
+      # the context name comes from master for the same reason.
+      - name: Checkout base branch (never queue-candidate code)
+        uses: actions/checkout@v6
+        with:
+          ref: master
+
+      - name: Mirror the gate verdict onto the queue head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        # The checkout above is master, so on the very queue entry that lands
+        # this change master does not have the script yet: the workflow file
+        # comes from the queue ref (which carries the diff) while the code
+        # comes from master (which does not). Without this guard the job would
+        # exit non-zero, and under `mergingStrategy: ALLGREEN` that ejects the
+        # entry -- so this change could never merge itself. The guard is not
+        # only a bootstrap shim: it is the right steady-state behaviour too,
+        # because deliberately running master's copy means "master has no
+        # copy" must be a no-op rather than a failure (a revert of the script
+        # would otherwise wedge the queue). Consequence to expect: the first
+        # real verdict lands on the NEXT entry queued after this merges, not
+        # on this one.
+        run: |
+          set -euo pipefail
+          script=./scripts/mirror-comment-review-gate-to-merge-group.mjs
+          if [ ! -f "$script" ]; then
+            echo "::notice::$script is not on master yet; nothing to mirror."
+            exit 0
+          fi
+          node "$script"

@@ -10,9 +10,16 @@
   So a rule added ONLY here is dead code on the cluster it is meant to protect.
   The live alerting surface is Blockcast/onprem-k8s, and it is itself a pair:
 
-    1. monitoring/prometheus-configmap.yaml, key `paperclip-runtime-alerts.rules.yml`
+    1. monitoring/prometheus-rules-2-configmap.yaml, key `paperclip-runtime-alerts.rules.yml`
        — AUTHORITATIVE. The cluster runs a vanilla Prometheus StatefulSet that
        loads rules from this static ConfigMap. This is the copy that fires.
+       The rules used to live in monitoring/prometheus-configmap.yaml; they were
+       sharded out into monitoring/prometheus-rules-{1..5}-configmap.yaml, and
+       prometheus-configmap.yaml now carries zero `alert:` rules (it keeps
+       scrape config + `rule_files: /etc/prometheus/rules/*.rules.yml`). Shard
+       membership is arbitrary and can change — find a rule with
+       `grep -rl <AlertName> monitoring/prometheus-rules-*-configmap.yaml`
+       rather than assuming shard 2 (BLO-33598).
     2. paperclip/paperclip-runtime-alerts-prometheusrule.yaml
        — a documentation copy of the same rules as a PrometheusRule CRD. No
        prometheus-operator runs on this cluster, so the CRD is an orphaned
@@ -32,7 +39,7 @@
     - Landed on both authoritative onprem-k8s files by Blockcast/onprem-k8s#1784,
       merged 2026-07-30T13:01:18Z as 423e32bc76c1bcdfa88c02bfce722a2ee71c22ef.
       Verify:
-        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-rules-2-configmap.yaml \
           --jq '.content' | base64 -d | grep PaperclipGithubReviewRequestDeadLettered
 
     - LIVE as of 2026-07-31T01:10Z after manually syncing the monitoring-rules
@@ -53,26 +60,45 @@
 
     - Added to both authoritative onprem-k8s files by Blockcast/onprem-k8s#1946
       (branch cto/blo-20255-terminal-failed-wake-alert). Verify:
-        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-rules-2-configmap.yaml \
           --jq '.content' | base64 -d | grep PaperclipPrReviewWakeTerminalFailed
 
     - NOT yet merged and NOT yet live as of 2026-08-02. It reads a metric this
       PR adds, so it is inert until both land. Same manual `monitoring-rules`
-      Argo sync gate as above applies afterwards.
+      Argo sync gate as above applies afterwards. Re-checked 2026-09-12: still
+      absent from all of monitoring/prometheus-rules-{1..5}-configmap.yaml.
 
   STATUS of the BLO-21092 plugin-error alert, same auditability rule:
 
-    - Not yet landed on the onprem-k8s authoritative files as of the PR that
-      introduces this comment. It reads paperclip_plugin_error, a new gauge
-      this same PR adds to server/src/services/metrics.ts -- both the metric
-      and the rule are inert until the server image ships AND the onprem-k8s
-      lockstep pair (monitoring/prometheus-configmap.yaml,
-      paperclip/paperclip-runtime-alerts-prometheusrule.yaml) is merged. Verify
-      before treating it as live:
-        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
+    - LANDED. Was "not yet landed" when this comment was written; re-checked
+      2026-09-12, PaperclipPluginErrored is present in
+      monitoring/prometheus-rules-2-configmap.yaml and in
+      paperclip/paperclip-runtime-alerts-prometheusrule.yaml. It reads
+      paperclip_plugin_error from server/src/services/metrics.ts, so it is
+      still inert unless the server image shipping that gauge is deployed.
+      Verify before treating it as live:
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-rules-2-configmap.yaml \
           --jq '.content' | base64 -d | grep PaperclipPluginErrored
     - Same manual `monitoring-rules` Argo sync gate as above (BLO-19095)
       applies after merge -- a merged rule is not a deployed one.
+
+  STATUS of the BLO-21460 runtime-resource-reconciliation-stuck alert, same
+  auditability rule:
+
+    - Proposed in Blockcast/onprem-k8s#2119 (branch
+      platformsre/blo-21460-runtime-resource-reconciliation-alert), currently
+      OPEN as of 2026-08-27 at head `ed177e5a8b7b`; it is not merged or live.
+      Verify the proposed rule before merge:
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
+          --jq '.content' | base64 -d | grep PaperclipRuntimeResourceReconciliationStuck
+
+    - It reads two metrics this PR adds
+      (paperclip_external_runtime_reservations_release_pending,
+      paperclip_environment_leases_orphaned_active). The worker scrape
+      backstop is independently live-capable once the onprem rule merges, but
+      the backlog metrics remain absent until this paperclip PR ships. The
+      onprem PR must merge and the manual `monitoring-rules` Argo app must sync
+      before treating the alert as live; the chart rule below is only a mirror.
 */}}
 {{- if .Values.prometheusRule.enabled }}
 apiVersion: monitoring.coreos.com/v1
@@ -126,10 +152,11 @@ spec:
           #    definitely exists, so the 400 is the shape, not a missing series.
           #
           # 2. DUPLICATE MATCH. Simply moving the parens is NOT sufficient here.
-          #    These gauges are published from the reconcileFailedWakeDispatches
-          #    pass, and every control-plane pod that runs it exports its own
+          #    These gauges are published on every heartbeat scheduler tick
+          #    (BLO-31335; they used to ride the reconcileFailedWakeDispatches
+          #    pass), and every control-plane pod that runs it exports its own
           #    copy: paperclip_agent_wakeup_terminal_failed_unresolved (same
-          #    pass, same registry) is live on 3 pods x 16 agents = 48 series.
+          #    tick, same registry) is live on 3 pods x 16 agents = 48 series.
           #    With 3 series per agent_id on both sides, `on (agent_id)` is a
           #    many-to-many match and errors at RUNTIME:
           #      wakeup_terminal_failed_unresolved
@@ -190,6 +217,32 @@ spec:
           annotations:
             summary: "Paperclip reaper is blind to kube Job liveness"
             description: "The reaper hit more than {{ .Values.prometheusRule.processLostLivenessNullWindowCount }} null kube Job-status lists in 15m, so it is falling back to the staleness heuristic while blind (BLO-16184 denominator guard). Any concurrent LOW process_lost count is UNRELIABLE — a 0 means 'could not see', not 'healthy'; a spike may be kube-outage-driven. Check the K8s API and the paperclip ServiceAccount RBAC."
+    - name: paperclip-recovery-horizon
+      rules:
+        # PEN-3000: keys on the never_delivered series of a counter that is zero-initialised at
+        # process start, so an absent series is a broken scrape and a 0 is a real 0. The label
+        # is scoped to the action's CURRENT owner (owner churn restarts attemptCount), so a
+        # firing here says the wake channel refused every sweep for that owner, not that the
+        # row never woke anyone in its life. The alert names and summaries say "current owner"
+        # rather than inheriting the bare series name, because a pager shows them with no
+        # metric HELP text attached and an unqualified "never delivered" would hand the
+        # operator a lifetime claim the data does not support.
+        - alert: PaperclipRecoveryHorizonNoWakeToCurrentOwnerElevated
+          expr: sum(increase(paperclip_recovery_horizon_expired_total{delivery="never_delivered"}[1d])) > {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerWarnPerDay }}
+          for: {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerElevatedFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip recovery actions expiring with no wake delivered to their current owner (>{{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerWarnPerDay }}/day)"
+            description: "More than {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerWarnPerDay }} recovery action(s) in the last 24h reached their auto-recovery wake horizon at attemptCount 0 (PEN-3000). attemptCount counts wakes that reached the queue for the current owner — every sweep reserves an attempt and refunds it when enqueueWakeup delivers nothing — so 0 means the wake channel (provider-capacity deferral, tree pause hold, wake disabled, cooldown) refused every sweep for that owner and the stranding was never worked. Owner churn restarts attemptCount, so an earlier owner may well have been woken; this does not claim the row never woke anyone in its life. This is a scheduler-side fault; compare against delivery=\"delivered\", which is the genuine unresolvable-stranding background rate. Action ids are on the paired 'recovery action passed its wake horizon' log line."
+        - alert: PaperclipRecoveryHorizonNoWakeToCurrentOwnerSustained
+          expr: sum(increase(paperclip_recovery_horizon_expired_total{delivery="never_delivered"}[1d])) > {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPagePerDay }}
+          for: {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPageFor }}
+          labels:
+            severity: critical
+          annotations:
+            summary: "Paperclip recovery wake channel refusing at scale (>{{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPagePerDay }} horizon expiries with no wake to the current owner/day for {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPageFor }})"
+            description: "Recovery horizon expiries with no wake delivered to the action's current owner exceeded {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPagePerDay }}/day sustained for {{ .Values.prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPageFor }} (PEN-3000). Whole 6h recovery windows are burning without a single wake reaching the current owner's queue, so the recovery layer itself is stranded. Owner churn restarts attemptCount, so this is a claim about the current owner's tenure, not the row's whole life. Check provider-capacity deferral, tree pause holds, disabled wake and cooldown on the owning agents before treating any of these as owner non-convergence."
     - name: paperclip-github-delivery
       rules:
         - alert: PaperclipGithubReviewRequestDeadLettered
@@ -213,15 +266,27 @@ spec:
           #      nothing, and the replacement starts at 0 — so a dead letter can
           #      vanish from the range before this rule's `for` has elapsed.
           # The gauge arm closes both: it is recomputed from committed
-          # agent_wakeup_requests rows on every wake-dispatch reconcile pass, so
+          # agent_wakeup_requests rows on every heartbeat scheduler tick, so
           # it is republished by whatever process is alive and does not depend on
           # a delta between two samples. It is an OR rather than a replacement
           # because the gauge cannot see the one dead-letter path that leaves no
           # row at all (the durable safety-net insert itself failing) — that path
           # is counter-only, and it is the more alarming of the two.
+          #
+          # `sum(max by (reason) (...))` on the gauge arm, NOT a bare sum
+          # (BLO-31335). Since that issue every replica publishes this gauge on
+          # its own tick, and it is a full rewrite of GLOBAL, DB-derived state,
+          # so all replicas publish the SAME number — a bare sum multiplies by
+          # the replica count. `max by (reason)` collapses the pod dimension
+          # first; the outer sum then adds the 8 `reason` buckets, which is the
+          # real total. A bare `max(...)` would instead return only the largest
+          # single reason bucket and undercount whenever more than one reason is
+          # populated. Harmless at this `> 0` threshold either way, but written
+          # so it is right for the reason it looks right rather than by accident
+          # of the threshold being zero.
           expr: >-
             (sum(increase(paperclip_github_review_request_delivery_total{state="dead_lettered"}[{{ .Values.prometheusRule.githubDeliveryDeadLetterWindow }}])) > 0)
-            or (sum(paperclip_github_review_request_dead_letter_unresolved) > 0)
+            or (sum(max by (reason) (paperclip_github_review_request_dead_letter_unresolved)) > 0)
           for: {{ .Values.prometheusRule.githubDeliveryDeadLetterFor }}
           labels:
             severity: warning
@@ -254,7 +319,7 @@ spec:
             summary: "Paperclip GitHub review-request wakes suppressed by an outage-like cause (reviews are being dropped)"
             description: "At least one GitHub review-request reviewer wake was terminally suppressed in the last {{ .Values.prometheusRule.githubDeliverySuppressionWindow }} with an outage-like cause ({{ .Values.prometheusRule.githubDeliverySuppressionOutageCauses }}) (BLO-18859). Suppressed means the wake was declined rather than dispatched: no run exists and nothing will re-arm it, so the PR has a posted trigger and no review — the same user-visible outcome as a dead-letter. Check the `cause` label first. `heartbeat.scheduling_suppressed` means the fleet-wide scheduling-suppression flag is on: if that is not a deliberate maintenance window, clear it (this is the mode that silently strands every review). `dispatch_rejected` means the dispatch path threw a business-rule HttpError with no durable skipped row — an unresolvable agent or responsible user; waiting will not fix it. `other` means the server emitted a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES in services/metrics.ts: find it with `select reason, count(*) from agent_wakeup_requests where status = 'skipped' and created_at > now() - interval '1 hour' group by 1 order by 2 desc`, then either add it to the allow-list as an expected decline or fix the cause. Expected declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded from this selector by default and are visible on the same counter for context."
         # BLO-21078: mirrors the authoritative copy in
-        # Blockcast/onprem-k8s monitoring/prometheus-configmap.yaml (key
+        # Blockcast/onprem-k8s monitoring/prometheus-rules-2-configmap.yaml (key
         # paperclip-runtime-alerts.rules.yml) and its CRD copy
         # paperclip/paperclip-runtime-alerts-prometheusrule.yaml — see those
         # files for the full incident writeup and threshold-tuning caveat.
@@ -294,8 +359,8 @@ spec:
           # Gauge-only (no counter arm). Unlike the dead-letter case there is no
           # process-local counter to OR against — every path that reaches this
           # state leaves a durable row, so the re-derived gauge is complete on
-          # its own. It is recomputed from committed rows on every
-          # wake-dispatch reconcile pass, so it survives a restart and a pod
+          # its own. It is recomputed from committed rows on every heartbeat
+          # scheduler tick, so it survives a restart and a pod
           # replacement mid-`for`.
           #
           # Scoped to pr_review because that is the user-visible loss: the PR
@@ -350,8 +415,57 @@ spec:
             severity: warning
           annotations:
             summary: "Paperclip PR-review wake is terminally failed and will never be retried"
-            description: "A pr_review-scoped agent_wakeup_requests row has been sitting at status='failed' for more than {{ .Values.prometheusRule.wakeTerminalFailedAgeSeconds }}s with no successor wake for the same taskKey (BLO-20255). The age is the server-computed age of the oldest such row, published as paperclip_agent_wakeup_terminal_failed_oldest_age_seconds; the companion count series paperclip_agent_wakeup_terminal_failed_unresolved{scope=\"pr_review\"} breaks the population down by error_code. This state is TERMINAL: reconcileFailedWakeDispatches only selects dispatch_failed, so nothing re-drives it, and the BLO-18030 bounded retry deliberately declines three cases so it can never double-post a review (the GitHub probe found an existing review, the probe threw or there was no PR context, or the run was not a pr_review context). The PR has a posted review trigger and no review. Break down by the `error_code` label on the count series to decide: it is joined from heartbeat_runs.error_code via agent_wakeup_requests.run_id, because the wake table has no error_code column of its own. `external_lifecycle_stale_killed` means the reviewer Job went silent past the 45m hard-stale window and was force-terminated. `job_failed` means the Job itself exited non-zero. `none` means there was no run row or no code recorded. `other` means a code missing from KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES in services/metrics.ts — triage it into that list. Query the rows with `select w.id, w.agent_id, w.reason, w.error, w.payload ->> 'taskKey' as task_key, r.error_code from agent_wakeup_requests w left join heartbeat_runs r on r.id = w.run_id where w.status = 'failed' and w.finished_at > now() - interval '24 hours' order by w.finished_at desc`. See the runbook for the re-review-vs-accept decision."
+            description: "A pr_review-scoped agent_wakeup_requests row has been sitting at status='failed' for more than {{ .Values.prometheusRule.wakeTerminalFailedAgeSeconds }}s with no successor wake for the same taskKey (BLO-20255). The age is the server-computed age of the oldest such row, published as paperclip_agent_wakeup_terminal_failed_oldest_age_seconds; the companion count series paperclip_agent_wakeup_terminal_failed_unresolved{scope=\"pr_review\"} breaks the population down by error_code. This state is TERMINAL: reconcileFailedWakeDispatches only selects dispatch_failed, so nothing re-drives it, and the BLO-18030 bounded retry deliberately declines three cases so it can never double-post a review (the GitHub probe found an existing review, the probe threw or there was no PR context, or the run was not a pr_review context). The PR has a posted review trigger and no review. Break down with `max by (error_code, scope) (paperclip_agent_wakeup_terminal_failed_unresolved{scope=\"pr_review\"})` to decide — NOT a bare `sum by (error_code)`: since BLO-31335 every replica publishes this gauge on its own scheduler tick and it is a full rewrite of global DB-derived state, so all replicas carry the SAME number and summing multiplies by the replica count. The ranking between codes survives either way, so this only matters when you read an absolute count. `error_code` is joined from heartbeat_runs.error_code via agent_wakeup_requests.run_id, because the wake table has no error_code column of its own. `external_lifecycle_stale_killed` means the reviewer Job went silent past the 45m hard-stale window and was force-terminated. `job_failed` means the Job itself exited non-zero. `none` means there was no run row or no code recorded. `other` means a code missing from KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES in services/metrics.ts — triage it into that list. Query the rows with `select w.id, w.agent_id, w.reason, w.error, w.payload ->> 'taskKey' as task_key, r.error_code from agent_wakeup_requests w left join heartbeat_runs r on r.id = w.run_id where w.status = 'failed' and w.finished_at > now() - interval '24 hours' order by w.finished_at desc`. See the runbook for the re-review-vs-accept decision."
             runbook_url: {{ .Values.prometheusRule.wakeTerminalFailedRunbookUrl | quote }}
+        - alert: PaperclipRuntimeResourceReconciliationStuck
+          # BLO-21460 (2026-08-03 incident follow-up). Both series are
+          # measured AFTER each reconciliation pass (reapOrphanedRuns ->
+          # reconcileReleasePendingExternalRuntimeReservations /
+          # reconcileOrphanedEnvironmentLeases, every
+          # heartbeatSchedulerIntervalMs), not the pre-pass candidate count —
+          # so 0 is the only healthy steady-state reading on either series.
+          # Unlike paperclip_external_runtime_reservations_active (expected
+          # to be non-zero whenever anything is genuinely running), a
+          # non-zero reading here means reconciliation itself is failing to
+          # keep up: the scheduler is down (e.g. crash-looping applying a
+          # migration, the incident this ticket follows up), or the kube API
+          # is unreachable so a reservation's Job status cannot be confirmed.
+          # Left unaddressed, held slots/leases exhaust executor capacity.
+          # A bare `max(metric) > 0` is silent for the scheduler-down case
+          # itself: the scrape stops, both series go absent (not zero), and
+          # max() over an empty vector never fires. The authoritative proposed
+          # onprem-k8s#2119 expression therefore adds an up=0 backstop scoped
+          # to the worker service, which is the process that runs this sweep;
+          # do not add absent(metric) branches before the companion metrics are
+          # deployed, because they would fire on a healthy pre-deployment
+          # cluster.
+          # The refresh_success arm closes the remaining blind spot (Ally
+          # review on #1304): reapOrphanedRuns' sweep reaches the kube API, and
+          # if it throws, the four backlog gauges retain their last prom-client
+          # value — normally the healthy 0 — while the process stays up, so
+          # neither up-based arm compensates and the count arms read clean
+          # during exactly the kube-API outage this alert tells the operator to
+          # check for. `max()` rather than a bare `== 0` on purpose: every
+          # control-plane pod exports its own copy of the gauge but only the
+          # worker runs the sweep, so a bare comparison would fire forever on
+          # the api pods' untouched initial 0 (the same duplicate-series defect
+          # documented on PaperclipAgentHeartbeatStale above). max() fires only
+          # when NO pod has completed a sweep. Like the arms above it is inert
+          # pre-deployment: max() over an absent series yields an empty vector,
+          # which never matches.
+          # See runbooks/cancellation-reservation-lease-leak-and-migration-0209-rollout.md.
+          expr: >
+            max(paperclip_external_runtime_reservations_release_pending) > 0
+            or max(paperclip_environment_leases_orphaned_active) > 0
+            or max(paperclip_orphaned_runtime_resource_metrics_refresh_success) == 0
+            or (max(up{job="paperclip-control-plane", service="paperclip-workers"}) == 0)
+            or absent(up{job="paperclip-control-plane", service="paperclip-workers"})
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip cancellation cleanup is not keeping up"
+            description: "A confirmed-releasable external-runtime reservation (paperclip_external_runtime_reservations_release_pending) or ephemeral environment lease (paperclip_environment_leases_orphaned_active) has not been released for 10+ minutes, OR the reconciliation sweep that publishes those gauges has been failing for 10+ minutes (paperclip_orphaned_runtime_resource_metrics_refresh_success == 0, meaning the backlog numbers are stale and a 0 must NOT be read as healthy), OR that telemetry / the paperclip-control-plane scrape target has gone missing for 10+ minutes (BLO-21460). A missing-telemetry firing usually means the scheduler itself is down (e.g. crash-looping on a migration) — check up{job=\"paperclip-control-plane\"} and control-plane pod status first. Otherwise check whether the kube API is reachable so a reservation's Job status can be confirmed. See the runbook for manual recovery steps if the automated reconciler itself is down."
     - name: paperclip-queued-run-stranded
       rules:
         - alert: PaperclipQueuedRunStranded

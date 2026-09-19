@@ -1611,6 +1611,55 @@
       "when": 1788480000000,
       "tag": "0237_heartbeat_runs_agent_queued_dispatch_index",
       "breakpoints": true
+    },
+    {
+      "idx": 238,
+      "version": "7",
+      "when": 1788560000000,
+      "tag": "0238_heartbeat_runs_status_only_document_write_refused",
+      "breakpoints": true
+    },
+    {
+      "idx": 239,
+      "version": "7",
+      "when": 1788560060000,
+      "tag": "0239_github_status_webhook_outbox_provenance",
+      "breakpoints": true
+    },
+    {
+      "idx": 240,
+      "version": "7",
+      "when": 1788560120000,
+      "tag": "0240_approval_enforcement_drift_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 241,
+      "version": "7",
+      "when": 1788560180000,
+      "tag": "0241_issue_recovery_action_delivery_bounds",
+      "breakpoints": true
+    },
+    {
+      "idx": 242,
+      "version": "7",
+      "when": 1788560240000,
+      "tag": "0242_issue_productivity_scanned_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 243,
+      "version": "7",
+      "when": 1789300000000,
+      "tag": "0243_heartbeat_runs_company_agent_created_at_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 244,
+      "version": "7",
+      "when": 1789541000000,
+      "tag": "0244_budget_policies_amount_updated_at",
+      "breakpoints": true
     }
   ]
 }

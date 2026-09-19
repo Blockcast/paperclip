@@ -105,6 +105,21 @@ export interface Config {
   strandedRecoveryHandBackMaxPerPass: number;
   strandedRecoveryHandBackIntervalMinutes: number;
   strandedBlockedIssueReconcilerIntervalMinutes: number;
+  // Approval-enforcement reconciler (BLO-24631): re-reads the object that
+  // enforces an approved decision and raises when it disagrees with what was
+  // decided. Worker-tier only, same rationale as the reconcilers above.
+  approvalEnforcementReconcilerEnabled: boolean;
+  approvalEnforcementReconcilerIntervalMinutes: number;
+  approvalEnforcementReconcilerGraceHours: number;
+  // Isolation-workspace reaper (BLO-31222): removes aged per-execution-workspace
+  // scratch under `data/k8s-isolation/workspaces`, which had no retention path of
+  // any kind and reached 406.7 GiB on a CephFS volume that ran out of headroom.
+  // Worker-tier only. Opt-IN — it deletes irreversibly.
+  isolationWorkspaceReaperEnabled: boolean;
+  isolationWorkspaceReaperIntervalMinutes: number;
+  isolationWorkspaceReaperMaxAgeDays: number;
+  isolationWorkspaceReaperMaxDeletesPerTick: number;
+  isolationWorkspaceReaperDryRun: boolean;
   // Human-gated ageing digest (BLO-29420): delivers the BLO-19130 ageing report
   // to a durable, human-assigned issue refreshed in place each period. Worker-tier
   // only, same rationale as the reconcilers above.
@@ -156,6 +171,12 @@ export interface Config {
   // are independently choosable and collapsing them would make raising either
   // one silently move the other.
   lapsedMonitorGraceMs: number;
+  // PEN-2791. Ceiling on how long an open GitHub PR recorded against an issue counts as
+  // that issue's external event-wake path in the stranded-assigned sweep. See the bounds
+  // entry for why this is a separate knob from `lapsedMonitorGraceMs` rather than a
+  // reuse of it: one bounds belief in an anomaly, this one bounds belief in a normal
+  // multi-day wait, so a shared value would be wrong for whichever it was not tuned for.
+  openPullRequestAttendanceGraceMs: number;
   // Process role for HA topology. When set to "api", the process serves
   // HTTP traffic only — no in-process plugin workers, no heartbeat
   // scheduler. When set to "worker", the process owns the heartbeat
@@ -226,6 +247,13 @@ export interface Config {
   // Commit-status context for comment-shaped Ally findings. Empty by default:
   // operators must opt in and make the context required in branch protection.
   prCommentReviewGateStatusContext: string;
+  // Contexts this gate used to publish to and has since moved off. GitHub
+  // commit statuses have no delete, so a context left behind by a rename keeps
+  // showing its final write forever. After posting the live status the gate
+  // also writes each of these a retirement pointer, which supersedes the stale
+  // row in place and keeps any repo that still requires the old context
+  // satisfied (BLO-29711).
+  prCommentReviewGateRetiredStatusContexts: string[];
   telemetryEnabled: boolean;
 }
 
@@ -246,6 +274,20 @@ function detectTailnetBindHost(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Numeric env var where `0` is a meaningful value. `Number(x) || fallback`
+ * cannot express this: it folds an explicit `0` into the fallback, so an
+ * operator who configures zero silently gets the default instead. Only an
+ * unset, blank, or non-finite value falls back here.
+ */
+function numericEnv(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) return fallback;
+  const trimmed = raw.trim();
+  if (trimmed === "") return fallback;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 /**
@@ -322,6 +364,16 @@ export const NUMERIC_SETTING_BOUNDS = {
     min: 1,
     max: TIMER_PERIOD_MINUTES_MAX,
   },
+  // BLO-31222. Daily is the right cadence: the cohort is defined in days, so a
+  // tighter interval re-scans the same tree for nothing. The age floor is 7 —
+  // below that a between-runs workspace looks reapable.
+  isolationWorkspaceReaperIntervalMinutes: {
+    fallback: 1440,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
+  isolationWorkspaceReaperMaxAgeDays: { fallback: 30, min: 7, max: 3650 },
+  isolationWorkspaceReaperMaxDeletesPerTick: { fallback: 200, min: 1, max: 10_000 },
   // BLO-19123. Per-tick ceiling on how many *distinct* rows the hand-back drain returns.
   //
   // The pass already had two per-issue guards — max 2 hand-backs per source issue and a 6h
@@ -390,6 +442,18 @@ export const NUMERIC_SETTING_BOUNDS = {
     min: 1,
     max: TIMER_PERIOD_MINUTES_MAX,
   },
+  // BLO-24631. Hourly by default: enforced state (budget policies, permission
+  // grants, repo settings) changes rarely, and each pass is a couple of indexed
+  // reads plus one read per approved card carrying a machine-checkable
+  // assertion. The ceiling matters more than the cadence here — this reconciler
+  // is the thing that notices an approved decision never reached its enforcing
+  // object, so an unbounded period turns the detector itself into the silent
+  // failure it was built to catch.
+  approvalEnforcementReconcilerIntervalMinutes: {
+    fallback: 60,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
   heartbeatSchedulerIntervalMs: { fallback: 30_000, min: 10_000, max: 24 * 60 * 60_000 },
   recoveryActionMaxAttempts: { fallback: 5, min: 1, max: 1_000 },
   recoveryActionTimeoutMs: {
@@ -409,6 +473,38 @@ export const NUMERIC_SETTING_BOUNDS = {
     min: 15 * 60_000,
     max: 7 * 24 * 60 * 60_000,
   },
+  // PEN-2791. How long an open GitHub PR recorded against an issue is believed to be a
+  // live external event-wake path.
+  //
+  // Deliberately NOT `lapsedMonitorGraceMs`, despite bounding a superficially similar
+  // "how long do we keep believing this watch" question, because the two bound opposite
+  // kinds of state. A monitor left `triggered` and never re-armed is an ANOMALY — the
+  // wake that should have re-armed it did not arrive — so believing it for long is
+  // believing a fault, and 6h is generous. An open PR awaiting human merge is the NORMAL
+  // resting state of correct work: the measured review queue routinely holds PRs across
+  // a weekend, and `review/ally-complete` plus a human merge press is a multi-day path
+  // on the repositories this fleet actually ships to. A 6h bound here would re-seize
+  // exactly the rows this setting exists to protect, on the second morning.
+  //
+  // The bound is nonetheless required, and it is the honest limit of the evidence: an
+  // open PR row proves a wake will arrive when the PR next MOVES, not that one arrives
+  // on a schedule. An abandoned PR emits nothing forever, so without a ceiling this
+  // disjunct would hold its issue `in_progress` and unattended indefinitely — the same
+  // silent-darkness failure PEN-2791 was filed about, entered from the other side.
+  //
+  // Recency is read from `issue_work_products.updatedAt`, which `upsertByExternalId`
+  // advances only when it ACCEPTS a strictly-newer PR event. Redeliveries and
+  // out-of-order webhooks are rejected without touching it, so this cannot be refreshed
+  // by webhook noise on a PR that is not really moving.
+  //
+  // Floor is 1h rather than 15m: below about an hour a PR that is merely waiting on a CI
+  // run reads as abandoned. Ceiling is 30d, past which "waiting on a human" is not a
+  // description of the PR but of a problem nobody is holding.
+  openPullRequestAttendanceGraceMs: {
+    fallback: 7 * 24 * 60 * 60_000,
+    min: 60 * 60_000,
+    max: 30 * 24 * 60 * 60_000,
+  },
 } as const satisfies Record<string, NumericSettingBounds>;
 
 /**
@@ -421,6 +517,7 @@ export const TIMER_SETTING_MS_FACTOR = {
   databaseBackupIntervalMinutes: 60_000,
   prReconcilerIntervalMinutes: 60_000,
   strandedBlockedIssueReconcilerIntervalMinutes: 60_000,
+  isolationWorkspaceReaperIntervalMinutes: 60_000,
   // Minute-denominated like its neighbours, though it gates an elapsed-time comparison rather
   // than a `setInterval` delay. Registered anyway: the guard that requires this entry keys off
   // the name, and an unregistered minute setting is exactly the omission that guard exists to
@@ -429,6 +526,7 @@ export const TIMER_SETTING_MS_FACTOR = {
   humanGatedDigestIntervalMinutes: 60_000,
   prReviewStateReconcilerIntervalMinutes: 60_000,
   approvalGateReconcilerIntervalMinutes: 60_000,
+  approvalEnforcementReconcilerIntervalMinutes: 60_000,
   heartbeatSchedulerIntervalMs: 1,
 } as const satisfies Partial<Record<keyof typeof NUMERIC_SETTING_BOUNDS, number>>;
 
@@ -733,6 +831,31 @@ export function loadConfig(): Config {
     NUMERIC_SETTING_BOUNDS.strandedBlockedIssueReconcilerIntervalMinutes,
     "strandedBlockedIssueReconcilerIntervalMinutes",
   );
+
+  // BLO-31222. Opt-IN, like `strandedRecoveryHandBack` and unlike the
+  // reconcilers above: this removes directory trees irreversibly. Shipping it
+  // dark keeps "deploy the code" and "delete a month of workspaces" as two
+  // separate decisions, with a run in between to inspect what the predicate
+  // matched. `..._DRY_RUN=true` performs that inspection without deleting.
+  const isolationWorkspaceReaperEnabled =
+    process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_ENABLED === "true";
+  const isolationWorkspaceReaperDryRun =
+    process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_DRY_RUN === "true";
+  const isolationWorkspaceReaperIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.isolationWorkspaceReaperIntervalMinutes,
+    "isolationWorkspaceReaperIntervalMinutes",
+  );
+  const isolationWorkspaceReaperMaxAgeDays = resolveNumericSetting(
+    [process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_AGE_DAYS],
+    NUMERIC_SETTING_BOUNDS.isolationWorkspaceReaperMaxAgeDays,
+    "isolationWorkspaceReaperMaxAgeDays",
+  );
+  const isolationWorkspaceReaperMaxDeletesPerTick = resolveNumericSetting(
+    [process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_DELETES_PER_TICK],
+    NUMERIC_SETTING_BOUNDS.isolationWorkspaceReaperMaxDeletesPerTick,
+    "isolationWorkspaceReaperMaxDeletesPerTick",
+  );
   // BLO-19123. Opt-IN, unlike its sibling reconcilers above, and deliberately so: this pass
   // reassigns real in-flight work in bulk (~360 rows at the time of writing). Defaulting it
   // on would make "deploy the code" and "perform the data move" the same irreversible act,
@@ -805,6 +928,40 @@ export function loadConfig(): Config {
     [process.env.PAPERCLIP_APPROVAL_GATE_RECONCILER_INTERVAL_MINUTES],
     NUMERIC_SETTING_BOUNDS.approvalGateReconcilerIntervalMinutes,
     "approvalGateReconcilerIntervalMinutes",
+  );
+  // Approval-enforcement reconciler (BLO-24631). Enabled by default: an
+  // approved decision that never reaches its enforcing object is invisible to
+  // everyone involved — the board reads it as approved, the requester reads it
+  // as resolved — so detection has to be on by default to be worth anything.
+  // 60m interval: enforced state changes rarely and each pass is a couple of
+  // indexed reads. 6h grace after `decidedAt` so a freshly-approved decision
+  // that simply has not been applied *yet* is not reported as drift.
+  const approvalEnforcementReconcilerEnabled =
+    process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_ENABLED !== undefined
+      ? process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_ENABLED === "true"
+      : true;
+  const approvalEnforcementReconcilerIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.approvalEnforcementReconcilerIntervalMinutes,
+    "approvalEnforcementReconcilerIntervalMinutes",
+  );
+  // `0` is a valid, documented grace: report drift on the first pass after the
+  // decision. It therefore has to survive parsing rather than be folded into
+  // the 6h default the way `|| 6` would fold it.
+  //
+  // Deliberately NOT migrated to `resolveNumericSetting` alongside the interval
+  // above, though the review suggested it: that helper rejects any override
+  // `<= 0` as "not a finite positive number" (see its candidate loop) and falls
+  // through to the fallback, so the documented `0` would silently resolve to 6.
+  // The bound it would buy is real but smaller than it looks — `numericEnv`
+  // already rejects non-finite input, so `Infinity`/`1e999` cannot get through
+  // here, and this value is an elapsed-hours comparison rather than a timer
+  // delay, so it cannot overflow `setInterval`. A valid-zero bounded setting
+  // needs a resolver that separates "absent" from "zero"; until one exists,
+  // converting this trades a documented behaviour for a smaller guarantee.
+  const approvalEnforcementReconcilerGraceHours = Math.max(
+    0,
+    numericEnv(process.env.PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_GRACE_HOURS, 6),
   );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
@@ -909,6 +1066,14 @@ export function loadConfig(): Config {
     strandedRecoveryHandBackMaxPerPass,
     strandedRecoveryHandBackIntervalMinutes,
     strandedBlockedIssueReconcilerIntervalMinutes,
+    approvalEnforcementReconcilerEnabled,
+    approvalEnforcementReconcilerIntervalMinutes,
+    approvalEnforcementReconcilerGraceHours,
+    isolationWorkspaceReaperEnabled,
+    isolationWorkspaceReaperIntervalMinutes,
+    isolationWorkspaceReaperMaxAgeDays,
+    isolationWorkspaceReaperMaxDeletesPerTick,
+    isolationWorkspaceReaperDryRun,
     humanGatedDigestEnabled,
     humanGatedDigestIntervalMinutes,
     humanGatedDigestPeriodDays,
@@ -969,6 +1134,11 @@ export function loadConfig(): Config {
       NUMERIC_SETTING_BOUNDS.lapsedMonitorGraceMs,
       "lapsedMonitorGraceMs",
     ),
+    openPullRequestAttendanceGraceMs: resolveNumericSetting(
+      [process.env.OPEN_PULL_REQUEST_ATTENDANCE_GRACE_MS],
+      NUMERIC_SETTING_BOUNDS.openPullRequestAttendanceGraceMs,
+      "openPullRequestAttendanceGraceMs",
+    ),
     paperclipNodeRole,
     paperclipWorkersInternalUrl:
       process.env.PAPERCLIP_WORKERS_INTERNAL_URL?.trim().replace(/\/+$/, "") || null,
@@ -1004,6 +1174,14 @@ export function loadConfig(): Config {
     githubReviewGateExpectedAppId,
     githubReviewGateExpectedInstallationId,
     prReviewGateStatusContext,
+    prCommentReviewGateRetiredStatusContexts: [
+      ...new Set(
+        (process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_RETIRED_STATUS_CONTEXTS ?? "")
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean),
+      ),
+    ],
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };
 }

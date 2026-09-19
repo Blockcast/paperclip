@@ -58,6 +58,7 @@ const KEEP_SET = [
   "OPENAI_API_BASE",
   "OPENAI_API_BASE_URL",
   "OPENAI_API_KEY",
+  "PENSTOCK_API_KEY",
   // Toolchain caches.
   "GOCACHE",
   "GOMODCACHE",
@@ -133,6 +134,12 @@ describe("inherit allowlist — keep set", () => {
     expect(isAgentInheritableEnvName("ANTHROPIC_MODEL")).toBe(true);
     expect(isAgentInheritableEnvName("GOOGLE_APPLICATION_CREDENTIALS")).toBe(true);
     expect(isAgentInheritableEnvName("CLAUDE_CODE_USE_BEDROCK")).toBe(true);
+  });
+
+  it("admits only the exact Penstock launcher key", () => {
+    expect(isAgentInheritableEnvName("PENSTOCK_API_KEY")).toBe(true);
+    expect(isAgentInheritableEnvName("PENSTOCK_RUNTIME_TOKEN")).toBe(false);
+    expect(isAgentInheritableEnvName("PENSTOCK_ADMIN_KEY")).toBe(false);
   });
 });
 

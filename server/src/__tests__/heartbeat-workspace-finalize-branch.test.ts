@@ -37,6 +37,7 @@ import {
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import { waitForRunToFinish } from "./helpers/wait-for-run-to-finish.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -94,17 +95,16 @@ async function createGitRepo() {
   return repoRoot;
 }
 
-async function waitForRunToFinish(heartbeat: Heartbeat, runId: string, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const run = await heartbeat.getRun(runId);
-    if (run && run.status !== "queued" && run.status !== "running") return run;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return heartbeat.getRun(runId);
-}
-
-async function waitForHeartbeatIdle(db: Db, timeoutMs = 5_000) {
+// CI-load margin (BLO-22985): these budgets bound how long a run may take to reach a
+// terminal status, not the behaviour under test — a run that never terminates still
+// fails, just later. Across six passing merge_group runs this file's wall time spanned
+// 11_236ms..28_668ms (2.55x), so the previous 10_000ms sat at ~1.05x margin against its
+// own observed p100 and tripped under normal queue load. Widened to 3x the old budget
+// (30_000 at each `waitForRunToFinish` call site, 15_000 for the idle / runtime-state
+// waits below), above the observed spread. The shared helper throws on expiry
+// (BLO-33449), so an overrun now surfaces as a timeout rather than a
+// `status: 'succeeded'` mismatch.
+async function waitForHeartbeatIdle(db: Db, timeoutMs = 15_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
@@ -113,7 +113,7 @@ async function waitForHeartbeatIdle(db: Db, timeoutMs = 5_000) {
   }
 }
 
-async function waitForRuntimeStateLastRun(db: Db, agentId: string, runId: string, timeoutMs = 5_000) {
+async function waitForRuntimeStateLastRun(db: Db, agentId: string, runId: string, timeoutMs = 15_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const state = await db
@@ -344,7 +344,7 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
     const run = await wakeIssue(heartbeat, agentId, issueId);
     expect(run).not.toBeNull();
 
-    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id, 30_000);
     expect(finishedRun).toMatchObject({
       status: "succeeded",
       errorCode: null,
@@ -399,7 +399,7 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
         }),
       },
     });
-  }, 20_000);
+  }, 90_000);
 
   it("adopts unrecorded forward branch drift for finalization without persisting it", async () => {
     const repoRoot = await createGitRepo();
@@ -433,7 +433,7 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
     const run = await wakeIssue(heartbeat, agentId, issueId);
     expect(run).not.toBeNull();
 
-    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id, 30_000);
     expect(finishedRun).toMatchObject({
       status: "succeeded",
       errorCode: null,
@@ -469,7 +469,7 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
       }),
     });
     expect(recordedBranch).not.toBe(publishBranch);
-  }, 20_000);
+  }, 90_000);
 
   it("allows a successful adapter run when the branch transition is recorded before finalization", async () => {
     const repoRoot = await createGitRepo();
@@ -505,7 +505,7 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
     const run = await wakeIssue(heartbeat, agentId, issueId);
     expect(run).not.toBeNull();
 
-    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id, 30_000);
     expect(finishedRun).toMatchObject({
       status: "succeeded",
       errorCode: null,
@@ -536,5 +536,5 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
         actualBranchName: publishBranch,
       },
     });
-  }, 20_000);
+  }, 90_000);
 });

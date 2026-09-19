@@ -42,7 +42,9 @@ vi.mock("node:child_process", async (importOriginal) => {
 });
 
 const { createDb, plugins } = await import("@paperclipai/db");
-const { pluginLoader, TORN_STORE_ERROR_MARKER } = await import("../services/plugin-loader.js");
+const { pluginLoader, TORN_STORE_ERROR_MARKER, SDK_NOT_INSTALLED_ERROR_MARKER } = await import(
+  "../services/plugin-loader.js"
+);
 const { ISOLATED_SDK_PLUGIN_PACKAGES, resolveDefaultInstallDir } = await import(
   "../bootstrap/isolated-sdk-plugins.js"
 );
@@ -313,5 +315,69 @@ describeEmbeddedPostgres("BLO-20961 — pre-isolation rows migrate into an isola
 
     const [after] = await db.select().from(plugins);
     expect(after?.installDir).toBe(alreadyIsolated);
+  }, 60_000);
+
+  // BLO-31857 — the nothing-installed latch needs its own un-latch rule.
+  //
+  // The torn-store marker above is cleared by a *relocation*, which is what
+  // repoints a row away from the torn shared store. An empty tree is repaired
+  // by an actual install, which never moves the dir — so a relocation test
+  // would strand such a row in `error` forever and require an operator. These
+  // two pin the re-probe rule that replaces it: revive iff the SDK is genuinely
+  // there now, whether or not the dir moved.
+  it("revives a row latched by the nothing-installed guard once the SDK install has landed, even though the dir never moved", async () => {
+    const sharedDir = await tornSharedStore();
+    // A row that ALREADY carries an installDir, so the relocation pass returns
+    // it unchanged — the case the torn-store rule cannot help.
+    const isolatedDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-notinstalled-"));
+    cleanupPaths.add(isolatedDir);
+
+    const pluginKey = `paperclip.notinstalled_${randomUUID().slice(0, 8)}`;
+    const manifest = await seedIsolatedPackage(isolatedDir, pluginKey);
+    // The slow boot `npm install` that outran the activation recheck window has
+    // since completed: the SDK is now present and congruent.
+    await writeLockfileVersion(isolatedDir, SDK_PACKAGE, "2026.513.0");
+    await writeInstalledPackageVersion(isolatedDir, SDK_PACKAGE, "2026.513.0");
+
+    await insertLegacyRow(pluginKey, manifest, {
+      installDir: isolatedDir,
+      status: "error",
+      lastError: `${SDK_NOT_INSTALLED_ERROR_MARKER}: ${isolatedDir}/package-lock.json records no ${SDK_PACKAGE} entry ...`,
+    });
+
+    const { runtimeServices } = createRuntimeServices();
+    const loader = pluginLoader(db, { localPluginDir: sharedDir }, runtimeServices);
+    await loader.loadAll();
+
+    const [after] = await db.select().from(plugins);
+    expect(after?.status).toBe("ready");
+    expect(after?.lastError).toBeNull();
+    expect(after?.installDir).toBe(isolatedDir);
+  }, 60_000);
+
+  it("leaves a row latched by the nothing-installed guard errored while its tree is still empty", async () => {
+    const sharedDir = await tornSharedStore();
+    const isolatedDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-stillempty-"));
+    cleanupPaths.add(isolatedDir);
+
+    const pluginKey = `paperclip.stillempty_${randomUUID().slice(0, 8)}`;
+    // The plugin package is there, but no SDK and no lockfile — the tree is
+    // still (absent)/(absent), so the re-probe must NOT revive it into the
+    // same failure.
+    const manifest = await seedIsolatedPackage(isolatedDir, pluginKey);
+
+    await insertLegacyRow(pluginKey, manifest, {
+      installDir: isolatedDir,
+      status: "error",
+      lastError: `${SDK_NOT_INSTALLED_ERROR_MARKER}: ${isolatedDir}/package-lock.json records no ${SDK_PACKAGE} entry ...`,
+    });
+
+    const { runtimeServices } = createRuntimeServices();
+    const loader = pluginLoader(db, { localPluginDir: sharedDir }, runtimeServices);
+    await loader.loadAll();
+
+    const [after] = await db.select().from(plugins);
+    expect(after?.status).toBe("error");
+    expect(after?.lastError).toContain(SDK_NOT_INSTALLED_ERROR_MARKER);
   }, 60_000);
 });

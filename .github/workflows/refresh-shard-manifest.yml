@@ -22,6 +22,32 @@ on:
     - cron: "23 5 * * 1" # Monday 05:23 UTC -- clear of the hourly/half-hourly pile-up
   workflow_dispatch:
 
+# Assessed under BLO-31818 (the concurrency-eviction defect that removed the
+# equivalent block from review-gate-sweep.yml) and deliberately KEPT as-is.
+#
+# That defect is real here in principle -- GitHub holds one pending run per
+# group and a new arrival evicts the run occupying the slot, so
+# `cancel-in-progress: false` does not mean "never cancelled" -- but this
+# workflow is not meaningfully exposed, for two independent reasons:
+#
+#   1. Cadence. Eviction needs a second run to arrive while the first is still
+#      pending. The schedule is WEEKLY, so a scheduled run would have to be
+#      starved a full 7 days to be evicted by its successor. review-gate-sweep
+#      is hourly, which is what made a few hours of runner starvation enough to
+#      lose three consecutive runs there. The only realistic path here is a
+#      manual `workflow_dispatch` landing on top of a starved scheduled run --
+#      at which point superseding the stale one is the behaviour you want.
+#
+#   2. `cancel-in-progress: true` would be the WRONG repair regardless. This is
+#      a 4-shard matrix of 90-minute measurement jobs feeding a merge step; a
+#      newer run does not supersede an older one for free the way a stateless
+#      reconciler does, and cancelling mid-measurement discards up to six hours
+#      of runner time and leaves the manifest un-refreshed for the week.
+#
+# Losing a run here is also self-announcing rather than silent: the manifest
+# stops being refreshed and the drift it exists to catch reappears in the PR it
+# would have opened. That is the opposite of review-gate-sweep, whose whole
+# failure mode was that a lost run took the alarm-on-the-lost-run with it.
 concurrency:
   group: refresh-shard-manifest-master
   cancel-in-progress: false

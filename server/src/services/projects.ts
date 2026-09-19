@@ -160,6 +160,8 @@ function toWorkspace(
   row: ProjectWorkspaceRow,
   runtimeServices: WorkspaceRuntimeService[] = [],
 ): ProjectWorkspace {
+  const metadata = (row.metadata as Record<string, unknown> | null) ?? null;
+  const runtimeConfig = readProjectWorkspaceRuntimeConfig(metadata);
   return {
     id: row.id,
     companyId: row.companyId,
@@ -176,8 +178,9 @@ function toWorkspace(
     remoteProvider: row.remoteProvider ?? null,
     remoteWorkspaceRef: row.remoteWorkspaceRef ?? null,
     sharedWorkspaceKey: row.sharedWorkspaceKey ?? null,
-    metadata: (row.metadata as Record<string, unknown> | null) ?? null,
-    runtimeConfig: readProjectWorkspaceRuntimeConfig((row.metadata as Record<string, unknown> | null) ?? null),
+    metadata,
+    runtimeConfig,
+    hasWorkspaceRuntimeConfig: Boolean(runtimeConfig?.workspaceRuntime),
     isPrimary: row.isPrimary,
     runtimeServices,
     createdAt: row.createdAt,

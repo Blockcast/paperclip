@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, approvalComments, approvals, issueApprovals } from "@paperclipai/db";
+import { agents, approvalComments, approvals, budgetPolicies, issueApprovals } from "@paperclipai/db";
 import { APPROVAL_UNDECIDED_STATUSES } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
@@ -419,6 +419,27 @@ export function approvalService(db: Db) {
           const boundPendingAgent = await findBoundPendingAgent(updated, txDb);
           const explicitAgentId = updated.linkedAgentId ?? payloadAgentId(updated);
           if (boundPendingAgent) {
+            // Policies before `agents` — the one lock order every in-transaction
+            // writer of this pair takes (see the note on `upsertPolicy` in
+            // `budgets.ts`). `activatePendingApproval` opens with an explicit
+            // `select … from agents … for update`, and this transaction ends at
+            // `txBudgets.upsertPolicy` below, so without this the hire decision
+            // is agents→policies while `PATCH /agents/:agentId/budgets` is
+            // policies→agents. A pending agent that already carries an
+            // agent-scoped policy row, activated while a board cap change holds
+            // that row, is then an ABBA deadlock: Postgres aborts one side with
+            // 40P01, which is not an `HttpError`, so the loser gets an
+            // unhandled 500 with no retry (BLO-34422).
+            await txDb
+              .select({ id: budgetPolicies.id })
+              .from(budgetPolicies)
+              .where(
+                and(
+                  eq(budgetPolicies.scopeType, "agent"),
+                  eq(budgetPolicies.scopeId, boundPendingAgent.id),
+                ),
+              )
+              .for("update");
             const activation = await txAgentsSvc.activatePendingApproval(boundPendingAgent.id, payload);
             if (!activation?.activated) {
               throw conflict("Pending agent could not be activated", {

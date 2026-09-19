@@ -21,6 +21,7 @@ import {
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { countRunsOccupyingSlots, resolveEffectiveMaxConcurrentRuns } from "./agent-concurrency.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { budgetService } from "./budgets.js";
 import {
@@ -40,7 +41,12 @@ import {
   PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
   PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
 } from "./pull-request-work-products.js";
-import { runUsageTokenCounts } from "./recovery/zero-token-startup-failure.js";
+import { resolveOwningPaperclipIdentifiers } from "./paperclip-identifiers.js";
+import {
+  isDependencyBlockedRun,
+  isInfraFailureRun,
+  runUsageTokenCounts,
+} from "./recovery/zero-token-startup-failure.js";
 import { extractNextActionFromText } from "./run-liveness.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
@@ -77,6 +83,30 @@ const PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS = 5 * 60 * 1000;
  * block below (BLO-19566 AC4).
  */
 export const PRODUCTIVITY_REVIEW_PR_FRESH_MS = 24 * 60 * 60 * 1000;
+/**
+ * BLO-27698 A3: window in which an assignee `Next action:` comment counts as a
+ * live progress signal, matching the "in the last 6h" wording in the Manager
+ * Decision block below.
+ *
+ * Deliberately its own constant rather than `thresholds.longActiveMs`. Those two
+ * numbers happen to share the 6h default, but they answer different questions —
+ * one is the bar an episode must cross to be *reviewed*, the other is how far
+ * back evidence stays *relevant*. Keying the evidence lookback off the trigger
+ * bar meant raising the bar silently widened the search, so an operator tuning
+ * `longActiveMs` up to 12h would also, invisibly, have started accepting 12h-old
+ * comments as current. Not overridable: it tracks the rubric text a human
+ * reviewer is asked to apply, so drifting it out of step with that wording would
+ * make the printed criterion and the evaluated one disagree.
+ */
+export const PRODUCTIVITY_REVIEW_NEXT_ACTION_COMMENT_FRESH_MS = 6 * 60 * 60 * 1000;
+/**
+ * BLO-27698 A2: window in which an issue the assignee filed against this one
+ * counts as a progress signal. Shared with `PRODUCTIVITY_REVIEW_PR_FRESH_MS` by
+ * intent, not coincidence — A2 suppresses "on the same terms as A1", so the two
+ * deliverable-shaped progress signals must age out together. A reader comparing
+ * the two gates should not have to check whether 24h means the same 24h.
+ */
+const PRODUCTIVITY_REVIEW_LINKED_ISSUE_FRESH_MS = PRODUCTIVITY_REVIEW_PR_FRESH_MS;
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 // BLO-25410: NOT a lock predicate — this only counts recent runs for the review
 // narrative (`activeRunCount`), and never decides whether an issue is
@@ -230,6 +260,25 @@ type NoExecutableTurnGating = {
   currentBlockOpen: boolean;
 };
 
+// BLO-22887 AC2. Deliberately a STATE record, not a duration: the readiness
+// map carries blocker ids and counts, never the edge's own age, so there is no
+// honest "blocked for N hours" figure to compute from it — and inventing one
+// by scanning `issueRelations` or `latestRuns` was the defect that sank the
+// first attempt at this (PR #1361: an unbounded `latestRuns.find` against a
+// 100-run cap, so an older park silently read as absent). The line's job is to
+// tell a reviewer that the control plane independently classified this issue
+// as dependency-blocked while the elapsed split was calling the same wall-clock
+// "unattended". That disagreement is the whole finding; the arithmetic is not.
+type DependencyGating = {
+  unresolvedBlockerCount: number;
+  /** Subset that are `done` but whose execution workspace has not finalized. */
+  pendingFinalizeBlockerCount: number;
+  // The fired triggers an unresolved blocker does NOT excuse — i.e. the reason
+  // this review survived the suppression gate. Never empty on a rendered line:
+  // an all-closable set is suppressed before the body is built.
+  nonClosableTriggers: ProductivityReviewTrigger[];
+};
+
 type PullRequestEvidence = {
   title: string;
   url: string | null;
@@ -239,6 +288,20 @@ type PullRequestEvidence = {
   updatedAt: Date;
   /** Age of the newest PR event at evidence-collection time. */
   ageMs: number;
+  /**
+   * Whether this PR names the source issue as an OWNER, rather than merely
+   * mentioning it (PEN-3219).
+   *
+   * A `pull_request` work product is written for every issue a PR references
+   * anywhere, so holding one is not evidence that the PR is work on the issue
+   * holding it. A long-lived registry/invariant row accumulates every PR that
+   * name-drops it: PEN-2370 carried 44 such rows, none of them its own work.
+   * Without this flag the most recently *touched* member of that pile became
+   * the row's progress signal, and the review then told its reviewer that
+   * "the second signal is already present" — licensing a "close as productive"
+   * verdict on a `critical` row that had been dark for seven days.
+   */
+  ownsSourceIssue: boolean;
 };
 
 const PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUS_VALUES = ["ready_for_review", "draft", "merged"] as const;
@@ -267,6 +330,14 @@ type PullRequestEvidenceRow = {
   externalId: string | null;
   updatedAt: Date;
   sourceEventTimestampMs: string | number | null;
+  /** PR head branch, from metadata — an ownership tier for legacy rows. */
+  branch: string | null;
+  /**
+   * Owning identifiers recorded by the webhook at write time, or null on rows
+   * written before that field existed. Null means "not recorded", NOT "owns
+   * nothing" — see `pullRequestOwnsIssue`.
+   */
+  owningIdentifiers: unknown;
 };
 
 type ProductivityReviewEvidence = {
@@ -345,6 +416,10 @@ type ProductivityReviewEvidence = {
   nonLiveHoldMs: number;
   monitorGating: {
     gatedMs: number;
+    // BLO-27698 B1: episode time a run was demonstrably executing, taken out of
+    // `unattendedMs` (never out of `gatedMs`). The three buckets partition the
+    // episode: `gatedMs + executingMs + unattendedMs === elapsedMs`.
+    executingMs: number;
     unattendedMs: number;
     lapsedAt: Date | null;
     priorLapseAt: Date | null;
@@ -357,6 +432,12 @@ type ProductivityReviewEvidence = {
     // monitor so `formatMonitorGating` doesn't blame the wrong thing.
     firedAt: Date | null;
     successorRunId: string | null;
+    // BLO-27698 A4: set (to the same instant as `lapsedAt`) when the monitor's
+    // scheduled check has passed but is still inside `monitorLapseServiceGraceMs`
+    // — the same window `deliberatePendingMonitor` treats as pending. Reporting
+    // only; see `monitorGatingBreakdown` for why it is deliberately not folded
+    // into `gatedIsUpperBound`.
+    awaitingServiceSince: Date | null;
   } | null;
   // BLO-23248/BLO-23624: elapsed time attributable to a no-executable-turn
   // run — the union of capacity park, dispatch backlog, and zero-token
@@ -364,6 +445,43 @@ type ProductivityReviewEvidence = {
   // monitor-gated and unattended time. null when no run in the episode
   // classifies as one of those three mechanisms.
   noExecutableTurnGating: NoExecutableTurnGating | null;
+  // BLO-22887 AC2: the dependency-blocked bucket, reported alongside — never
+  // folded into — the monitor-gated/unattended split. Populated only on the
+  // generation path (`reconcileProductivityReviews`), from the readiness map
+  // that path already computes for BLO-22436's suppression gate;
+  // `collectEvidence` deliberately does not fetch it (see the note at the top
+  // of that function — its other caller must not see dependency state at all,
+  // and re-querying would put a second readiness round-trip on the
+  // continuation-hold path for a field that path never renders).
+  //
+  // Null whenever the source has no unresolved blocker, so the line's presence
+  // is itself a signal. Every blocked source that reaches the body builder is
+  // by construction one whose fired-trigger set is NOT dependency-closable —
+  // the closable case is suppressed outright at generation — i.e. exactly
+  // AC2's "still warranted on other grounds".
+  dependencyGating: DependencyGating | null;
+  // BLO-27698 C1: the assignee's live slot occupancy at evidence time —
+  // `running` runs against the ceiling the dispatcher actually enforces. The
+  // four fallback verdicts on a `long_active_duration` review all presuppose an
+  // agent that had a turn and used it poorly; a saturated agent had no turn to
+  // use, and until now a reviewer had to reconstruct that from Kubernetes. Null
+  // only when the effective ceiling cannot be resolved from the agent row.
+  //
+  // `runningRunCount` counts the agent's `running` rows that still occupy a
+  // slot, company-wide and NOT just this issue — saturation is an agent-level
+  // property and the whole point is that the other slots are held by *other*
+  // issues. Stale/silent rows are excluded by the same predicate the
+  // dispatcher's slot gate applies (`isRunOccupyingSlot`), so this cannot
+  // report saturation while dispatch would still admit a turn. It is the DB's
+  // view of live runs, deliberately not a Kubernetes read, and the rendered
+  // line says so rather than implying a cluster probe.
+  assigneeConcurrency: {
+    runningRunCount: number;
+    maxConcurrentRuns: number;
+    effectiveMaxConcurrentRuns: number;
+    concurrencyEnabled: boolean;
+    externalLifecycle: boolean;
+  } | null;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -988,10 +1106,45 @@ function monitorGatingBreakdown(
   elapsedMs: number | null,
   now: Date,
   latestRuns: HeartbeatRunRow[],
+  thresholds: ProductivityReviewThresholds,
 ) {
   if (elapsedMs === null || !activeStartedAt) return null;
   const armedUntil = coerceDate(issue.monitorNextCheckAt);
   const lastTriggeredAt = coerceDate(issue.monitorLastTriggeredAt);
+
+  // BLO-27698 B1: time a run was demonstrably executing is neither a deliberate
+  // monitor-gated wait nor an unattended stall — the assignee had its turn and
+  // was taking it. Reported as a third bucket so a manager reading the split
+  // does not have to reconstruct it from run rows.
+  //
+  // Scoped to the *unwatched* window: the monitor-gated prefix keeps its overlap,
+  // and only the suffix nobody was accounting for is split into executing vs
+  // unattended. That is the question the split exists to answer — "nobody was
+  // watching; was anything still happening?" — and executing time inside the
+  // gated prefix is unremarkable, because the monitor was accounting for it.
+  // Since `activeStartedAt` is the most recent dispatch, the current run's live
+  // span starts at the episode boundary, so this is the tail of that span.
+  //
+  // Leaving the gated prefix whole also keeps `unattendedMs + executingMs`
+  // exactly equal to the pre-B1 `unattendedMs`, which is what lets the BLO-22331
+  // AC2 suppression gate below stay bit-identical while this lands. Reporting
+  // only: B3 is the separate change that makes the trigger fire on the narrowed
+  // bucket, and folding it in here is the compute-without-consult failure
+  // BLO-27225 documents.
+  const episodeStartMs = activeStartedAt.getTime();
+  const episodeEndMs = episodeStartMs + elapsedMs;
+  const liveSpans = latestRuns
+    .map((run) => runLiveInterval(run, now))
+    .filter((span): span is { start: number; end: number } => span !== null);
+  /** Splits an episode whose monitor-gated prefix is `gatedMs` into the three buckets. */
+  const splitExecuting = (gatedMs: number) => {
+    const boundaryMs = Math.min(episodeEndMs, episodeStartMs + gatedMs);
+    const executingMs =
+      episodeEndMs > boundaryMs
+        ? episodeEndMs - boundaryMs - msOutsideLiveSpans(boundaryMs, episodeEndMs, liveSpans)
+        : 0;
+    return { gatedMs, executingMs, unattendedMs: Math.max(0, elapsedMs - gatedMs) - executingMs };
+  };
 
   // Still armed for a future check. There is no arm-time column, so a monitor
   // armed seconds ago is indistinguishable from one armed at `activeStartedAt`
@@ -1000,14 +1153,14 @@ function monitorGatingBreakdown(
   // accounted for when only the last 90s provably was.
   if (armedUntil && armedUntil.getTime() > now.getTime()) {
     return {
-      gatedMs: elapsedMs,
-      unattendedMs: 0,
+      ...splitExecuting(elapsedMs),
       lapsedAt: null,
       priorLapseAt: null,
       armedUntil,
       gatedIsUpperBound: true,
       firedAt: null,
       successorRunId: null,
+      awaitingServiceSince: null,
     };
   }
 
@@ -1016,14 +1169,14 @@ function monitorGatingBreakdown(
   const lapseCandidates = [lastTriggeredAt, armedUntil].filter((d): d is Date => Boolean(d));
   if (lapseCandidates.length === 0) {
     return {
-      gatedMs: 0,
-      unattendedMs: elapsedMs,
+      ...splitExecuting(0),
       lapsedAt: null,
       priorLapseAt: null,
       armedUntil: null,
       gatedIsUpperBound: false,
       firedAt: null,
       successorRunId: null,
+      awaitingServiceSince: null,
     };
   }
   const lapsedAt = new Date(Math.max(...lapseCandidates.map((d) => d.getTime())));
@@ -1033,14 +1186,14 @@ function monitorGatingBreakdown(
   // print a timestamp from before `activeStartedAt`.
   if (lapsedAt.getTime() <= activeStartedAt.getTime()) {
     return {
-      gatedMs: 0,
-      unattendedMs: elapsedMs,
+      ...splitExecuting(0),
       lapsedAt: null,
       priorLapseAt: lapsedAt,
       armedUntil: null,
       gatedIsUpperBound: false,
       firedAt: null,
       successorRunId: null,
+      awaitingServiceSince: null,
     };
   }
 
@@ -1059,15 +1212,34 @@ function monitorGatingBreakdown(
     : null;
 
   const gatedMs = Math.min(elapsedMs, lapsedAt.getTime() - activeStartedAt.getTime());
+  // BLO-27698 A4: a monitor whose scheduled check has only just passed has not
+  // "lapsed" — it is waiting on the dispatcher, inside the same
+  // `monitorLapseServiceGraceMs` window `deliberatePendingMonitor` already
+  // honours for suppression. Reporting that as "never re-armed" tells a manager
+  // nobody is watching when dispatch is merely still due, so suppression and
+  // reporting disagree about what lapsed means.
+  //
+  // Deliberately a separate display-only field rather than routing this case
+  // into the still-armed branch above, which is what a literal reading of the AC
+  // would do: that branch reports `gatedIsUpperBound: true`, and the BLO-22331
+  // AC2 guard below only subtracts the *measured* unattended component
+  // (`!gatedIsUpperBound`). Flipping this case into it would skip that guard
+  // entirely and fire the very `long_active_duration` review the current code
+  // correctly suppresses. Bucket math and `gatedIsUpperBound` are untouched here
+  // on purpose.
+  const awaitingServiceSince =
+    armedUntil !== null && now.getTime() - lapsedAt.getTime() <= thresholds.monitorLapseServiceGraceMs
+      ? lapsedAt
+      : null;
   return {
-    gatedMs,
-    unattendedMs: Math.max(0, elapsedMs - gatedMs),
+    ...splitExecuting(gatedMs),
     lapsedAt,
     priorLapseAt: null,
     armedUntil: null,
     gatedIsUpperBound: false,
     firedAt: armedUntil === null ? lapsedAt : null,
     successorRunId,
+    awaitingServiceSince,
   };
 }
 
@@ -1076,7 +1248,11 @@ function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["mon
   // carry a qualifier so neither half of the split reads as measured.
   const gated = `${gating.gatedIsUpperBound ? "≤" : ""}${msToHumanFine(gating.gatedMs)} monitor-gated`;
   const unattended = `${gating.gatedIsUpperBound ? "≥" : ""}${msToHumanFine(gating.unattendedMs)} unattended`;
-  const split = `${gated}, ${unattended}`;
+  // BLO-27698 B1: executing time is measured from run spans, so it carries no
+  // qualifier even when the gated half is an upper bound. Omitted entirely at
+  // zero so the common no-overlap case reads exactly as it did before.
+  const executing = gating.executingMs > 0 ? `${msToHumanFine(gating.executingMs)} executing, ` : "";
+  const split = `${gated}, ${executing}${unattended}`;
   if (gating.armedUntil) {
     return `${split} (monitor armed until ${gating.armedUntil.toISOString()}; arm time is not recorded, so monitor-gated time is an upper bound)`;
   }
@@ -1087,6 +1263,9 @@ function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["mon
     const successor = gating.successorRunId ? ` (run \`${gating.successorRunId}\`)` : "";
     return `${split} (monitor fired on schedule at ${gating.firedAt.toISOString()} and enqueued a successor run${successor}; nothing has re-armed it since)`;
   }
+  if (gating.awaitingServiceSince) {
+    return `${split} (monitor came due at ${gating.awaitingServiceSince.toISOString()} and is still inside the dispatch service grace, so its wake has not been missed yet)`;
+  }
   if (gating.lapsedAt) return `${split} (monitor lapsed at ${gating.lapsedAt.toISOString()}, never re-armed)`;
   if (gating.priorLapseAt) {
     return `${split} (no monitor armed during this episode; previous monitor lapsed at ${gating.priorLapseAt.toISOString()}, before it began)`;
@@ -1094,15 +1273,104 @@ function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["mon
   return `${split} (no monitor armed during this episode)`;
 }
 
+// BLO-22887 AC2: the dependency-blocked bucket, rendered next to the elapsed
+// split rather than subtracted from it. Reports blocker state and says so —
+// see `DependencyGating` for why there is no honest span to report here, and
+// why claiming one would be worse than the bug this replaces.
+function formatDependencyGating(
+  gating: NonNullable<ProductivityReviewEvidence["dependencyGating"]>,
+  // Whether the `Elapsed accounting` split is rendered above this line. It is
+  // conditional on `monitorGating`, which is null whenever `elapsedMs` is —
+  // i.e. for every `todo` candidate, the most ordinary dependency-blocked
+  // shape there is — so the caveat below must not point at a figure that is
+  // not on the page (Ally review, PR #1722).
+  elapsedSplitRendered: boolean,
+) {
+  const blockers = `${gating.unresolvedBlockerCount} unresolved \`blockedBy\` ${
+    gating.unresolvedBlockerCount === 1 ? "blocker" : "blockers"
+  } at this evidence pass`;
+  const finalize = gating.pendingFinalizeBlockerCount > 0
+    ? ` (${gating.pendingFinalizeBlockerCount} \`done\` but awaiting workspace finalize)`
+    : "";
+  // Explains the line's own presence. Without it the line reads as a
+  // contradiction of BLO-22436's suppression — "blocked, so why am I looking
+  // at this?" — which is the question that makes a reviewer close a real
+  // high-churn or runtime-failure review as a false positive.
+  const survived = gating.nonClosableTriggers.length > 0
+    ? `; reviewed anyway because ${gating.nonClosableTriggers.map((trigger) => `\`${trigger}\``).join(", ")} fired, which an unresolved blocker does not excuse`
+    : "";
+  // Names NO individual bucket of the elapsed split, deliberately. This read
+  // "read their unattended portion as covering dependency-blocked time", which
+  // was written when the split had exactly two buckets and dependency-blocked
+  // time could only land in `unattended`. B1 (BLO-27698) adds an `executing`
+  // bucket that absorbs some of it, so on a 30m episode with a blocker
+  // unresolved throughout, the split can render `0m unattended` and a manager
+  // applying the old wording literally concludes there was no
+  // dependency-blocked time — the opposite of the truth, reached by following
+  // the caveat correctly. Point at the figures collectively so a bucket added
+  // later cannot empty the one this names. Do not re-add a bucket name.
+  const caveat = elapsedSplitRendered
+    ? "the elapsed figures above are wall-clock and are NOT reduced by this, so dependency-blocked time of unrecorded length is already inside them"
+    : "no elapsed split was computed for this episode, so there is no wall-clock figure this reduces";
+  return `${blockers}${finalize}${survived} — blocker state at this pass, not a measured span: ${caveat}`;
+}
+
 function isFreshPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEvidence {
   return pr !== null && pr.ageMs <= PRODUCTIVITY_REVIEW_PR_FRESH_MS;
 }
 
-function isProgressPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEvidence {
-  return isFreshPullRequest(pr) && PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES.has(pr.status);
+// Deliberately NOT a type predicate: a false result means "not progress", not
+// "null", so narrowing `pr` to null on the false branch (as `pr is
+// PullRequestEvidence` would) makes the unattributed fall-through in
+// `pullRequestProgressNote` read as `never` and fails the build.
+function isProgressPullRequest(pr: PullRequestEvidence | null): boolean {
+  return (
+    isFreshPullRequest(pr) &&
+    PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES.has(pr.status) &&
+    // PEN-3219: attribution, not just movement. The webhook proves the PR
+    // moved; it says nothing about whether THIS row moved. Every consumer of
+    // this predicate treats a true result as concrete progress on the source
+    // issue — the "second signal is already present" note in the Manager
+    // Decision block, and any suppression gate that declines to file a review
+    // at all — so an unattributed PR here is a counterfeit progress signal
+    // that defeats the exact failure mode a productivity review exists to
+    // catch. Checked in the predicate rather than at each call site so a
+    // consumer added later inherits it.
+    pr.ownsSourceIssue
+  );
 }
 
-function toPullRequestEvidence(row: PullRequestEvidenceRow | null, now: Date): PullRequestEvidence | null {
+/**
+ * Does this PR work product belong to the issue holding it?
+ *
+ * Prefers the owning set the webhook recorded at write time. Rows written
+ * before that field existed fall back to re-deriving ownership from the two
+ * tiers the row still carries — the PR title and its head branch. The PR body
+ * is never persisted on the row, so a legacy PR that claims its issue ONLY in
+ * a labeled body line (`Fixes: PEN-1234`) cannot be recognised here and loses
+ * the progress signal until its next `pull_request` event rewrites the row.
+ * That direction is the safe one: it withholds a progress signal rather than
+ * manufacturing one.
+ */
+function pullRequestOwnsIssue(row: PullRequestEvidenceRow, sourceIdentifier: string | null): boolean {
+  if (!sourceIdentifier) return false;
+  const recorded = row.owningIdentifiers;
+  // An empty recorded array IS authoritative — the PR named no owner anywhere,
+  // so it is attributable to nothing. Only null/absent means "not recorded".
+  if (Array.isArray(recorded)) {
+    return recorded.some((value) => typeof value === "string" && value === sourceIdentifier);
+  }
+  return resolveOwningPaperclipIdentifiers({
+    title: row.title,
+    branch: row.branch,
+  }).owning.includes(sourceIdentifier);
+}
+
+function toPullRequestEvidence(
+  row: PullRequestEvidenceRow | null,
+  now: Date,
+  sourceIdentifier: string | null,
+): PullRequestEvidence | null {
   if (!row) return null;
   // Prefer the GitHub event time; `updatedAt` is only a fallback for rows
   // written before the source timestamp was recorded.
@@ -1117,6 +1385,7 @@ function toPullRequestEvidence(row: PullRequestEvidenceRow | null, now: Date): P
     externalId: row.externalId ?? null,
     updatedAt: eventAt,
     ageMs: Math.max(0, now.getTime() - eventAt.getTime()),
+    ownsSourceIssue: pullRequestOwnsIssue(row, sourceIdentifier),
   };
 }
 
@@ -1124,6 +1393,11 @@ function toPullRequestEvidence(row: PullRequestEvidenceRow | null, now: Date): P
  * Render the linked PR for the evidence pack (BLO-19566 AC4). Reads "none
  * recorded" only when the issue genuinely has no PR work product -- which is
  * now a real signal rather than, as before, the only possible output.
+ *
+ * PEN-3219: reports attribution alongside freshness and status. The PR is
+ * still shown when it belongs to another issue — suppressing it would hide
+ * real information from the reviewer — but it is labelled, so the line cannot
+ * be read as progress on this row.
  */
 function formatPullRequestEvidence(pr: PullRequestEvidence | null) {
   if (!pr) return "none recorded";
@@ -1132,7 +1406,46 @@ function formatPullRequestEvidence(pr: PullRequestEvidence | null) {
   const progress = PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES.has(pr.status)
     ? "progress-eligible"
     : "not progress-eligible";
-  return `${ref} \`${pr.status}\`, last activity ${pr.updatedAt.toISOString()} (${msToHuman(pr.ageMs)} ago, ${freshness}, ${progress})`;
+  const attribution = pr.ownsSourceIssue
+    ? "attributed to this issue"
+    : "NOT attributed to this issue";
+  return `${ref} \`${pr.status}\`, last activity ${pr.updatedAt.toISOString()} (${msToHuman(pr.ageMs)} ago, ${freshness}, ${progress}, ${attribution})`;
+}
+
+/**
+ * The Manager Decision note about the linked PR.
+ *
+ * Three outcomes, not two (PEN-3219). The affirmation is unchanged for a PR
+ * that owns this row. A PR that moved recently but belongs to another issue
+ * now gets an explicit warning rather than silence: staying quiet would leave
+ * the reviewer reading a `Linked pull request:` line that looks like progress
+ * with nothing telling them it is not theirs, which is how PEN-3216 reached a
+ * reviewer recommending "close as productive" on a `critical` row that had
+ * been dark for seven days.
+ */
+function pullRequestProgressNote(pr: PullRequestEvidence | null): string[] {
+  if (isProgressPullRequest(pr)) {
+    return [
+      "",
+      `> The second signal is already present: ${formatPullRequestEvidence(pr)}.`,
+      "> PR activity is recorded from the GitHub webhook, so this is deliverable progress even",
+      "> when the run/comment counters above read zero.",
+    ];
+  }
+  const movedButUnattributed =
+    pr !== null &&
+    isFreshPullRequest(pr) &&
+    PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUSES.has(pr.status) &&
+    !pr.ownsSourceIssue;
+  if (!movedButUnattributed) return [];
+  return [
+    "",
+    `> A linked PR moved recently, but it is NOT attributed to this issue: ${formatPullRequestEvidence(pr)}.`,
+    "> A PR work product is recorded against every issue the PR mentions anywhere, so this row",
+    "> holding it is not evidence that anyone worked on THIS issue. The webhook proves the PR",
+    "> moved; it says nothing about whether this row moved.",
+    "> This does NOT satisfy the second signal. Do not treat it as grounds for \"Close as productive\".",
+  ];
 }
 
 const NO_EXECUTABLE_TURN_MECHANISM_LABELS: Record<NoExecutableTurnMechanism, string> = {
@@ -1166,6 +1479,106 @@ function formatNoExecutableTurnGating(gating: NonNullable<ProductivityReviewEvid
     currentClause = `; current run \`${gating.currentRunId}\` failed with zero tokens executed`;
   }
   return `${msToHumanFine(gating.noExecutableTurnMs)} no-executable-turn time (${mix})${currentClause}`;
+}
+
+// BLO-27698 C2: whether the evidence pack itself shows the assignee was denied
+// an executable turn, from the two signals this service already measures — live
+// slot saturation (C1) and no-executable-turn time (BLO-23624). Deliberately
+// NOT a new measurement and NOT a heuristic: the capacity verdict is offered
+// only when one of those two already-computed facts is present, so it cannot
+// become a blanket excuse for every slow episode.
+//
+// The `noExecutableTurn` arm does not require dominance. The dominance test
+// gates *suppression* — withholding the review entirely — and must stay strict.
+// This gates whether a human reviewer is *shown the option*, where a
+// non-dominant but real capacity block is still the thing they need to know.
+// What the cell then SAYS is graded by `hasEpisodeScopedCapacityBlock` — being
+// shown the option and being told not to record under-performance are two
+// different claims, and only the second needs episode-scoped evidence.
+function isCapacityConstrainedEvidence(evidence: ProductivityReviewEvidence) {
+  return (
+    (evidence.assigneeConcurrency !== null
+      && evidence.assigneeConcurrency.runningRunCount
+        >= evidence.assigneeConcurrency.effectiveMaxConcurrentRuns)
+    || (evidence.noExecutableTurnGating !== null
+      && evidence.noExecutableTurnGating.noExecutableTurnMs > 0)
+  );
+}
+
+// BLO-27698 C2 (Ally review on #1856): whether the evidence can carry the
+// CATEGORICAL claim — "had no turn, none of the four verdicts applies" — across
+// the whole episode. Only one of the two signals can:
+//
+//   - `noExecutableTurnGating` is episode-scoped by construction (clamped to
+//     `[attributableStartAt, attributableEndAt)`), so a DOMINANT share of it
+//     does describe the episode. Same predicate and same constant the
+//     suppression gate uses, deliberately — one bar, two consumers.
+//   - `assigneeConcurrency` is a single sample at `now` (see its field note).
+//     Saturation at evidence time says nothing about the preceding hours.
+//   - a NON-dominant no-executable-turn share is real but does not exonerate
+//     the episode: ~30s of queue inside a 7h stall would otherwise emit a
+//     blanket "do not record this as assignee under-performance".
+//
+// Neither weak case is dropped — `isCapacityConstrainedEvidence` still offers
+// the cell — but they render as an unconfirmed partial block the reviewer must
+// check, not as an exoneration.
+function hasEpisodeScopedCapacityBlock(evidence: ProductivityReviewEvidence) {
+  const { noExecutableTurnGating: gating, elapsedMs } = evidence;
+  return Boolean(
+    gating
+      && elapsedMs !== null
+      && elapsedMs > 0
+      && gating.noExecutableTurnMs / elapsedMs > NO_EXECUTABLE_TURN_DOMINANT_SHARE,
+  );
+}
+
+function describeCapacityConstraint(evidence: ProductivityReviewEvidence) {
+  const parts: string[] = [];
+  if (
+    evidence.assigneeConcurrency
+    && evidence.assigneeConcurrency.runningRunCount
+      >= evidence.assigneeConcurrency.effectiveMaxConcurrentRuns
+  ) {
+    // "as of this evidence snapshot" is load-bearing, not hedging: this count
+    // is read once at `now`, so stating it unqualified inside an episode-wide
+    // verdict is an instant-to-episode leap. The C1 line scopes itself the
+    // same way ("live", "while this held").
+    parts.push(
+      `all ${evidence.assigneeConcurrency.effectiveMaxConcurrentRuns} of the assignee's run slots occupied as of this evidence snapshot`,
+    );
+  }
+  if (evidence.noExecutableTurnGating && evidence.noExecutableTurnGating.noExecutableTurnMs > 0) {
+    parts.push(
+      `${msToHuman(evidence.noExecutableTurnGating.noExecutableTurnMs)} of no-executable-turn time`,
+    );
+  }
+  return parts.join("; ");
+}
+
+// BLO-27698 C1: the assignee's live slot occupancy, stated so a reviewer does
+// not have to reconstruct it from Kubernetes. Says "running runs" rather than
+// "pods" because it is a DB count, not a cluster probe — naming it "pods"
+// would claim a measurement this service never takes. The count excludes
+// stale/silent rows on the dispatcher's own predicate, so "saturated" here
+// means dispatch would genuinely have refused a turn.
+function formatAssigneeConcurrency(
+  concurrency: NonNullable<ProductivityReviewEvidence["assigneeConcurrency"]>,
+) {
+  const { runningRunCount, effectiveMaxConcurrentRuns, maxConcurrentRuns } = concurrency;
+  const saturated = runningRunCount >= effectiveMaxConcurrentRuns;
+  // Only worth explaining the ceiling when the enforced value differs from the
+  // configured one — otherwise the parenthetical is noise on every review.
+  const ceilingClause =
+    effectiveMaxConcurrentRuns === maxConcurrentRuns
+      ? ""
+      : concurrency.externalLifecycle && !concurrency.concurrencyEnabled
+        ? ` (configured \`maxConcurrentRuns\` ${maxConcurrentRuns}, held to 1 because external-lifecycle \`concurrencyEnabled\` is off — BLO-15959)`
+        : ` (configured \`maxConcurrentRuns\` ${maxConcurrentRuns}, bounded by the external-lifecycle slot ceiling)`;
+  return `${runningRunCount}/${effectiveMaxConcurrentRuns} running runs against the dispatcher's enforced ceiling${ceilingClause}${
+    saturated
+      ? " — **saturated**: the assignee could not have been dispatched a turn on this issue while this held"
+      : ""
+  }`;
 }
 
 // BLO-23624: the `longActive` trigger-reason qualifier — only rendered when
@@ -1366,23 +1779,6 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
   return "Long active duration";
 }
 
-// BLO-22097: `usageJson: null` means usage was never *recorded*, not that
-// zero tokens were consumed — a post-model failure whose result event never
-// arrives leaves usage null even though the model produced output. Treating
-// null the same as an explicit `{inputTokens: 0, outputTokens: 0}` (which
-// `runUsageTokenCounts` does, since it exists to parse the blob once it
-// exists) misclassifies that run as never-executed. `logBytes` corroborates
-// the unknown case: every run log opens with ~15-20KB of session boilerplate
-// before any model turn, and explicit-zero-usage runs sampled across
-// BLO-19924/BLO-21091/BLO-21025 topped out at 111,337 bytes (still no model
-// turn — likely a slow upstream timeout inflating the pre-failure log). A
-// run that genuinely executed but lost its usage accounting (BLO-19924's
-// `claude_truncated` case) logged 844,801 bytes, two orders of magnitude
-// above that ceiling. The floor below is set with wide margin above the
-// observed boilerplate ceiling and well below the observed executed-run
-// floor — see BLO-22097 for the full sample tables.
-const NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING = 200_000;
-
 const PRODUCTIVITY_REVIEW_TRIGGERS: readonly ProductivityReviewTrigger[] = [
   "no_comment_streak",
   "long_active_duration",
@@ -1400,53 +1796,6 @@ function extractReviewTriggerFromDescription(description: string | null): Produc
   const match = description.match(/^- Primary trigger: `([a-z_]+)`/m);
   const candidate = match?.[1];
   return PRODUCTIVITY_REVIEW_TRIGGERS.find((trigger) => trigger === candidate) ?? null;
-}
-
-// True when the dependency gate cancelled a queued run before dispatch (see
-// `cancelQueuedRunForBlockedDependencies` in heartbeat.ts). The run never
-// reached the adapter, so it is disjoint from `isInfraFailureRun` below even
-// though both are zero-token: this one is a graph-state fact about the issue
-// (an unresolved `blockedBy` edge), not an infrastructure fault, and it must
-// not be reported as one (BLO-22436).
-function isDependencyBlockedRun(run: Pick<HeartbeatRunRow, "errorCode">): boolean {
-  return run.errorCode === "issue_dependencies_blocked";
-}
-
-// True when a run's most recent classification is `failed` liveness AND it
-// burned zero input+output tokens. That combination means the agent never
-// got a model turn — the runtime crashed, the process was killed, or every
-// model call errored before producing output. Observed causes include a K8s
-// crashloop (`BackoffLimitExceeded`), an inference-gateway 503 storm, a
-// provider capacity 429 kill, and retry-budget exhaustion with no error code
-// at all (`error: "unknown"`, `error_status: null`). Keying on token usage
-// rather than error code/status/dispatch-state is deliberate: it is the one
-// signature all four causes share (BLO-21769). Excludes dependency-gate
-// cancellations (BLO-22436) — those never reached the adapter at all, so they
-// are a graph-state fact rather than an infrastructure fault, and are counted
-// separately.
-//
-// `usageJson: null` is unknown, not a measured zero (BLO-22097): it is only
-// read as never-executed when `logBytes` also stays at or under the
-// boilerplate-only ceiling. An *explicit* zero-usage blob is never
-// second-guessed by `logBytes` — a large log with confirmed zero tokens
-// (observed up to 111,337 bytes) is still never-executed, since the
-// corroboration only fills in for missing telemetry, not disputed telemetry.
-//
-// The two narrowings compose without collapsing: BLO-22097 narrows *within*
-// this predicate (which failed runs count as infra), while BLO-22436 widens
-// the *union* below (which populations count as never-executed). Keep them
-// disjoint — folding the dependency gate into the usage test would let a
-// blocker edge masquerade as an infrastructure fault.
-function isInfraFailureRun(
-  run: Pick<HeartbeatRunRow, "livenessState" | "usageJson" | "logBytes" | "errorCode">,
-): boolean {
-  if (isDependencyBlockedRun(run)) return false;
-  if (run.livenessState !== "failed") return false;
-  if (run.usageJson == null) {
-    return (run.logBytes ?? 0) <= NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING;
-  }
-  const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
-  return inputTokens === 0 && outputTokens === 0;
 }
 
 // BLO-22097: manager-facing evidence text must not claim a measured "0
@@ -2708,8 +3057,58 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           notInArray(issues.status, ["done", "cancelled"]),
         ),
       )
-      .orderBy(asc(issues.updatedAt), asc(issues.id))
+      // BLO-33477: rotate on the same least-recently-scanned watermark the
+      // source candidate scan uses (BLO-30303), for the same reason. This loop
+      // writes only to a review it *retires*; a review that is scanned and
+      // correctly declined — its alarm still stands — has nothing written back,
+      // so its `updatedAt` never advances. Under `asc(updatedAt)` the same
+      // oldest-MAX_CANDIDATE_ISSUES declined rows therefore re-occupied the
+      // window on every pass forever, and once the open-review population
+      // passed the cap no review sorting behind them could ever be evaluated
+      // for retirement. Those are exactly the reviews whose sources have since
+      // gone `done` — dead alarms, each costing a manager run to triage by hand.
+      //
+      // Sharing `productivityScannedAt` with the source scan is safe: that scan
+      // filters `originKind <> PRODUCTIVITY_REVIEW_ORIGIN_KIND` and this one
+      // requires equality, so the two stamp strictly disjoint row sets and
+      // neither can perturb the other's ordering.
+      // `recoverStaleReservedProductivityReviews` reads a subset of these rows
+      // but orders on `updatedAt` and never reads this column, so it is
+      // unaffected either way (see the note on its own query).
+      //
+      // Coalesce to `createdAt` rather than sorting NULLS FIRST, for the reason
+      // given at the source scan: NULLS FIRST is an absolute priority class, so
+      // a sustained influx of new reviews would permanently preempt an
+      // already-scanned one — the same starvation with a different victim.
+      // Treating "created" as the implicit first touch makes the key a strict
+      // FIFO, so every open review is reached within
+      // ceil(N / MAX_CANDIDATE_ISSUES) passes at any population and arrival
+      // rate. `updatedAt`/`id` only break ties within one watermark value; a
+      // whole batch shares one `now`, so ties are common and must be stable.
+      .orderBy(
+        sql`coalesce(${issues.productivityScannedAt}, ${issues.createdAt}) asc`,
+        asc(issues.updatedAt),
+        asc(issues.id),
+      )
       .limit(MAX_CANDIDATE_ISSUES);
+
+    // Stamp before evaluating, not after: a review that throws mid-loop has
+    // already rotated out, so one poison row cannot wedge the window forever.
+    // A bare column write — it leaves `updatedAt` alone, so the
+    // `issues_sync_last_activity_at` BEFORE UPDATE trigger (which fires only
+    // when `updated_at` is distinct from OLD) stays quiet and the watermark
+    // cannot masquerade as activity on the review.
+    if (reviewRows.length > 0) {
+      await db
+        .update(issues)
+        .set({ productivityScannedAt: now })
+        .where(
+          inArray(
+            issues.id,
+            reviewRows.map((review) => review.id),
+          ),
+        );
+    }
 
     const sourceIssueIds = [
       ...new Set(reviewRows.map((review) => review.originId).filter((id): id is string => Boolean(id))),
@@ -2904,10 +3303,21 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       else if (suppressedBy === "dependency_blocked") closedDependencyBlocked += 1;
       else closedMonitorScheduled += 1;
     }
+    const retiredCount = closedMonitorScheduled + closedTerminalSource + closedDependencyBlocked;
     return {
       monitorScheduled: closedMonitorScheduled,
       terminalSource: closedTerminalSource,
       dependencyBlocked: closedDependencyBlocked,
+      // BLO-33477 AC4: funnel counters for the retirement pass. A sweep that
+      // scans a full window and retires nothing is exactly what starvation
+      // looks like, and without `scanned` it is indistinguishable from a
+      // healthy sweep with nothing to do — the same blind spot that let
+      // BLO-30303 read as normal for 23 days. `declined` is "scanned but not
+      // retired", which folds in the early `continue`s (no origin, missing or
+      // cross-company source, lost close race) as well as a standing alarm.
+      scanned: reviewRows.length,
+      retired: retiredCount,
+      declined: reviewRows.length - retiredCount,
     };
   }
 
@@ -3058,31 +3468,189 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => rows[0]?.count ?? 0);
   }
 
+  /**
+   * Newest assignee comment carrying a `Next action:` line, within
+   * `PRODUCTIVITY_REVIEW_NEXT_ACTION_COMMENT_FRESH_MS`.
+   *
+   * Returns the row rather than a bare string because BLO-27698 A3 gives this
+   * signal a caller in the generation path, and that caller needs one fact the
+   * string cannot carry: whether the comment is **run-linked**. The Manager
+   * Decision rubric asks for "an assignee run-linked comment in the last 6h",
+   * and suppression must apply the criterion as written — see the gate in
+   * `collectEvidence` for why the unlinked case is reported but not acted on.
+   *
+   * `runLinked` is a property of the **window**, not of the newest comment:
+   * the rubric asks whether *a* run-linked comment exists in the last 6h. Read
+   * off the newest row alone, any later unlinked comment carrying a next-action
+   * line — an out-of-band note, a human-triggered edit — would mask a run-linked
+   * one behind it and flip the gate off. The reported `line` stays the newest,
+   * since that is the one a reviewer wants to read; the two facts are decoupled.
+   *
+   * They are decoupled in their *window* too, and the asymmetry is deliberate:
+   * `line` is drawn from the full freshness window, while `runLinked` is
+   * additionally intersected with the episode. Reporting a next action is useful
+   * to a reviewer at a lower bar than suppressing the review outright — see the
+   * two cutoffs below.
+   */
   async function findCommentNextAction(
     sourceIssue: IssueRow,
     sourceAgent: AgentRow,
-    thresholds: ProductivityReviewThresholds,
+    episodeStartAt: Date | null,
     now: Date,
-  ) {
-    const lookbackStart = new Date(now.getTime() - thresholds.longActiveMs);
+  ): Promise<{ line: string; runLinked: boolean } | null> {
+    // The QUERY keeps the full freshness window, because the reporting fallback
+    // (BLO-19604) is a deliberately lower bar than suppression: recovering a
+    // `Next action:` line for a reviewer to read is useful even when the comment
+    // predates the current episode. Narrowing the query instead would regress it
+    // to "none recorded" — which reads as "the assignee left no next step" and is
+    // exactly what that fallback exists to prevent.
+    const freshCutoff = new Date(now.getTime() - PRODUCTIVITY_REVIEW_NEXT_ACTION_COMMENT_FRESH_MS);
+    // SUPPRESSION, by contrast, is intersected with the episode, exactly as A2's
+    // `findFreshLinkedProgressIssue` is. The freshness bar alone is NOT a subset
+    // of the episode: `longActiveMs` is freely overridable with no lower clamp
+    // (`buildThresholds`), so a lowered bar makes this fixed 6h window wider than
+    // the episode itself, and a `Next action:` from a *previous* episode on the
+    // same issue would suppress indefinitely many reviews of the current one.
+    // Before the lookback was decoupled from `longActiveMs` the subset property
+    // held by construction (`longActive` requires `elapsedMs >= longActiveMs`);
+    // decoupling it is right, but only its upper bound was argued — this restores
+    // the lower one. The failure direction is the unsafe one (review silently
+    // withheld), which is the indefinite-suppression hazard BLO-22331 AC2 forbids.
+    const suppressionStart = episodeStartAt && episodeStartAt.getTime() > freshCutoff.getTime()
+      ? episodeStartAt
+      : freshCutoff;
     const rows = await db
-      .select({ body: issueComments.body })
+      .select({
+        body: issueComments.body,
+        createdByRunId: issueComments.createdByRunId,
+        createdAt: issueComments.createdAt,
+      })
       .from(issueComments)
       .where(
         and(
           eq(issueComments.companyId, sourceIssue.companyId),
           eq(issueComments.issueId, sourceIssue.id),
           eq(issueComments.authorAgentId, sourceAgent.id),
-          sql`${issueComments.createdAt} >= ${lookbackStart.toISOString()}::timestamptz`,
+          sql`${issueComments.createdAt} >= ${freshCutoff.toISOString()}::timestamptz`,
           sql`${issueComments.body} ~* ${NEXT_ACTION_COMMENT_CANDIDATE_PATTERN}`,
         ),
       )
       .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
       .limit(MAX_NEXT_ACTION_COMMENT_CANDIDATES);
 
-    return rows
-      .map((comment) => extractNextActionFromText(comment.body))
-      .find((line): line is string => Boolean(line)) ?? null;
+    let newestLine: string | null = null;
+    let runLinked = false;
+    for (const comment of rows) {
+      const line = extractNextActionFromText(comment.body);
+      // The regex above is a cheap *candidate* filter; `extractNextActionFromText`
+      // is what actually decides a comment states a next action. Only the latter
+      // may be treated as the signal — otherwise a comment merely containing the
+      // words would suppress a review.
+      if (!line) continue;
+      // Rows are newest-first, so the first line seen is the one to report.
+      newestLine ??= line;
+      if (comment.createdByRunId !== null && comment.createdAt.getTime() >= suppressionStart.getTime()) {
+        runLinked = true;
+        break;
+      }
+    }
+    return newestLine === null ? null : { line: newestLine, runLinked };
+  }
+
+  /**
+   * BLO-27698 A2: an issue the assignee filed against this one during the
+   * episode, as a progress signal.
+   *
+   * Decomposing a too-large issue, or filing the human row that a blocker needs,
+   * is deliverable work — but it leaves no trace in any signal this detector
+   * reads. The work-product query is hard-scoped `type = "pull_request"`, so an
+   * assignee who decomposes on contact with a blocker scored exactly zero and
+   * looked identical to one doing nothing.
+   *
+   * "References the source issue" is read **structurally** — a parent link or an
+   * `issue_relations` edge in either direction — never by matching the source
+   * identifier in free text. An identifier is quoted in ordinary prose all the
+   * time (this very comment does it), so a text match would let an assignee
+   * suppress its own review by mentioning the issue it is already working on.
+   * Both structural forms are load-bearing and neither subsumes the other:
+   * decomposition writes `parentId`, while follow-up work the source blocks
+   * writes a relation edge and no parent.
+   *
+   * The relation arm deliberately matches an edge of **any** `type`, in either
+   * direction, whoever created it. `blocks` is the only type the codebase writes
+   * today, so constraining to it would be a no-op that silently excludes any type
+   * added later — and it would not close the residual anyway: a third party can
+   * write a `blocks` edge as easily as any other, so the edge's *creator*, not its
+   * type, is what a tightening would have to key on, and `issue_relations` records
+   * no creator. The residual is therefore accepted and bounded rather than
+   * half-closed: a third party linking an unrelated assignee-filed issue to the
+   * source can manufacture one suppression, but the freshness bar below ages it
+   * out, so it cannot suppress indefinitely.
+   *
+   * Restricted to `originKind = 'manual'`, which is the single most important
+   * line in this function. The productivity review row is ITSELF written as a
+   * child of the source issue with `createdByAgentId` set to the assignee, so
+   * without this filter a generated review would satisfy A2 and suppress the
+   * next one — the detector would switch itself off 24h after firing once, which
+   * is precisely the indefinite-suppression hazard BLO-22331 AC2 forbids. Three
+   * existing `assignment wake` replay tests caught exactly this.
+   *
+   * An allowlist rather than a denylist of known platform origins, so that a
+   * recovery/routine/plugin origin kind added later is excluded by default: the
+   * failure direction is then "a review still generates", not "the detector went
+   * quiet for a reason nobody can see".
+   */
+  async function findFreshLinkedProgressIssue(
+    sourceIssue: IssueRow,
+    sourceAgent: AgentRow,
+    episodeStartAt: Date | null,
+    now: Date,
+  ) {
+    // Bounded by construction, per BLO-22331 AC2. The episode bound alone would
+    // NOT be bounded: an episode grows without limit, so one sub-issue filed in
+    // its first hour would suppress every review for the rest of the episode,
+    // however long. Intersecting it with the same 24h freshness bar A1 uses is
+    // what makes the signal age out.
+    const freshCutoff = new Date(now.getTime() - PRODUCTIVITY_REVIEW_LINKED_ISSUE_FRESH_MS);
+    const createdSince = episodeStartAt && episodeStartAt.getTime() > freshCutoff.getTime()
+      ? episodeStartAt
+      : freshCutoff;
+    const rows = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, sourceIssue.companyId),
+          eq(issues.createdByAgentId, sourceAgent.id),
+          eq(issues.originKind, "manual"),
+          // A soft-deleted row is not a deliverable, and a `harnessKind` row is
+          // test scaffolding. Reuses the shared predicate rather than restating
+          // `hidden_at is null`, so this ages with the visibility rule.
+          visibleIssueCondition(),
+          // Progress-*eligibility*, mirroring `isProgressPullRequest`: A1 keys on
+          // status rather than mere freshness, so that a PR the assignee closed
+          // without merging is not progress however recently it moved. A sub-issue
+          // filed and then cancelled is the same shape. `done` is deliberately
+          // still eligible — completed work is the strongest progress there is.
+          sql`${issues.status} <> 'cancelled'`,
+          sql`${issues.id} <> ${sourceIssue.id}`,
+          sql`${issues.createdAt} >= ${createdSince.toISOString()}::timestamptz`,
+          or(
+            eq(issues.parentId, sourceIssue.id),
+            sql`exists (
+              select 1 from ${issueRelations} r
+              where r.company_id = ${sourceIssue.companyId}
+                and (
+                  (r.issue_id = ${issues.id} and r.related_issue_id = ${sourceIssue.id})
+                  or (r.issue_id = ${sourceIssue.id} and r.related_issue_id = ${issues.id})
+                )
+            )`,
+          ),
+        ),
+      )
+      .orderBy(desc(issues.createdAt), desc(issues.id))
+      .limit(1);
+    return rows[0] ?? null;
   }
 
   async function collectEvidence(
@@ -3238,6 +3806,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           then (${issueWorkProducts.metadata}->>'sourceEventTimestampMs')::bigint
         else null
       end`,
+      branch: sql<string | null>`${issueWorkProducts.metadata}->>'branch'`,
+      owningIdentifiers: sql<unknown>`${issueWorkProducts.metadata}->'owningIdentifiers'`,
     };
     const trustedPullRequestEvidenceWhere = and(
       eq(issueWorkProducts.companyId, sourceIssue.companyId),
@@ -3262,6 +3832,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       costRow,
       latestPullRequestRow,
       progressPullRequestRow,
+      assigneeRunningRunRows,
     ] = await Promise.all([
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, oneHourAgo),
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, sixHoursAgo),
@@ -3324,6 +3895,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // The verdict criterion is satisfied by any fresh progress-eligible PR,
       // not necessarily the newest PR overall. A newer closed-unmerged PR must
       // not hide an older open/draft/merged PR that is still fresh.
+      //
+      // PEN-3219: and it must be a PR that OWNS this row. Attribution cannot be
+      // decided in SQL — `resolveOwningPaperclipIdentifiers` is a ranked
+      // tier-walk over title/body/branch, and legacy rows carry no recorded
+      // owning set — so every candidate is read newest-first and the first
+      // attributed one is picked in TS below. There is deliberately NO row cap:
+      // a cap applied before the ownership filter would let N newer
+      // unattributed PRs (a registry issue name-dropped by many PRs at once)
+      // push this row's own PR off the page and withhold a real progress
+      // signal. The WHERE already bounds the read to this issue's trusted PR
+      // rows that moved inside the 24h freshness window AND sit in a
+      // progress-eligible state, which is small in practice (PEN-2370 held 44
+      // rows in TOTAL, not 44 moving inside one day).
       db
         .select(pullRequestEvidenceSelect)
         .from(issueWorkProducts)
@@ -3335,13 +3919,50 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           ),
         )
         .orderBy(desc(pullRequestEffectiveEventAtSql))
-        .limit(1)
-        .then((rows) => rows[0] ?? null),
+        .then((rows) => rows.find((row) => pullRequestOwnsIssue(row, sourceIssue.identifier)) ?? null),
+      // BLO-27698 C1: the assignee's live slot occupancy. Company-wide for the
+      // agent, NOT scoped to this issue — the slots that starve this issue are
+      // held by other issues, so an issue-scoped count would always read 1 and
+      // say nothing. `running` only: a `queued` or `scheduled_retry` run holds
+      // no pod and no slot.
+      //
+      // Selects the liveness stamps rather than `count(*)` because the
+      // dispatcher's slot gate counts only NON-STALE running rows
+      // (`isRunOccupyingSlot`). Counting every `running` row here would let a
+      // stale/silent row report `N/N … saturated` — and offer the C2 capacity
+      // verdict — while dispatch would still admit a turn. That is a false
+      // capacity explanation, which is worse than none: it reads as
+      // measurement. The row set is bounded by the agent's live runs, so
+      // filtering in JS against the shared predicate is cheaper than keeping a
+      // second copy of the staleness rule in SQL.
+      db
+        .select({
+          startedAt: heartbeatRuns.startedAt,
+          lastOutputAt: heartbeatRuns.lastOutputAt,
+          lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, sourceIssue.companyId),
+            eq(heartbeatRuns.agentId, sourceAgent.id),
+            eq(heartbeatRuns.status, "running"),
+          ),
+        ),
     ]);
 
     const activeRunCount = latestRuns.filter((run) =>
       ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number]),
     ).length;
+    // BLO-27698 C1: both halves resolved through the same leaf module the
+    // dispatcher's slot gate uses — the ceiling via
+    // `resolveEffectiveMaxConcurrentRuns`, the occupancy via
+    // `countRunsOccupyingSlots` — so neither a reported ceiling nor a reported
+    // occupancy can disagree with the enforced one.
+    const assigneeConcurrency = {
+      runningRunCount: countRunsOccupyingSlots(assigneeRunningRunRows, now.getTime()),
+      ...resolveEffectiveMaxConcurrentRuns(sourceAgent),
+    };
     // BLO-19604: a run stuck in `queued` never reaches `startedAt`, so it must not anchor
     // the episode. `mostRecentDispatchAt` is a direct `max(startedAt)` over every run
     // touching this issue (queried above, not derived from the createdAt-ordered
@@ -3422,7 +4043,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ? trailingHoldMs
       : Math.min(episodeMs, leadingParkMs + trailingHoldMs);
 
-    const latestPullRequest = toPullRequestEvidence(progressPullRequestRow ?? latestPullRequestRow, now);
+    const latestPullRequest = toPullRequestEvidence(
+      progressPullRequestRow ?? latestPullRequestRow,
+      now,
+      sourceIssue.identifier,
+    );
     // BLO-23248/BLO-23624: the portion of elapsedMs attributable to a
     // no-executable-turn run anywhere in the episode (not just the current
     // one), reported as its own evidence bucket distinct from
@@ -3586,10 +4211,71 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       };
     }
 
+    // BLO-27698 A1: a fresh, progress-eligible linked PR is a concrete progress
+    // signal, so `long_active_duration` must not fire over it. A GitHub-side push
+    // is invisible to every Paperclip-side recency measure this detector reads
+    // (issue comments, run cadence), so an assignee actively pushing commits
+    // produced an evidence pack indistinguishable from an idle issue — BLO-27207
+    // fired with the PR 6h13m old and the last comment only 7m outside the
+    // window. `isProgressPullRequest` already gated the render-side "second
+    // signal is already present" line; this is the caller it never had in the
+    // generation path, so the suppression and the report now agree on what
+    // counts as progress.
+    //
+    // Bounded by construction, per BLO-22331 AC2: progress-eligibility requires
+    // `ageMs <= PRODUCTIVITY_REVIEW_PR_FRESH_MS` (24h), so a PR that stops moving
+    // ages out and the trigger fires again — this cannot suppress indefinitely.
+    // Returns null rather than a recorded suppression for the same reason the
+    // gated-elapsed check below does: `long_active_duration` is last in
+    // `choosePrimaryTrigger`'s ladder, so no other fired trigger is discarded.
+    if (trigger === "long_active_duration" && isProgressPullRequest(latestPullRequest)) {
+      return null;
+    }
+
+    // BLO-19604: `run.nextAction` is only populated when that specific run's own
+    // liveness classification saw the text. Computed here — above the two gates
+    // below rather than at its point of use further down — because it is a pure
+    // scan of already-loaded rows, and hoisting it lets the comment query below
+    // stay lazy for the callers that never needed it.
+    const structuredNextAction = latestRuns.find((run) => run.nextAction)?.nextAction ?? null;
+
+    // BLO-27698 A3: the comment progress signal, evaluated rather than only
+    // printed. The Manager Decision rubric has told reviewers for three releases
+    // that a run-linked `Next action:` comment in the last 6h means "close as
+    // productive", while no code read it — so an assignee that posted exactly the
+    // artifact the rubric asks for still had the review generated against it.
+    //
+    // Queried here (not at the `nextAction` fallback below) because the gate needs
+    // it whether or not the structured field is populated: `run.nextAction` has no
+    // freshness bound of its own, so a stale structured value must not stand in
+    // for a fresh comment. Kept lazy for every other trigger, which is the access
+    // pattern the fallback below was written for.
+    const nextActionComment = trigger === "long_active_duration" || !structuredNextAction
+      ? await findCommentNextAction(sourceIssue, sourceAgent, attributableStartAt, now)
+      : null;
+    // Run-linked only, exactly as the rubric words it. An assignee comment with no
+    // `createdByRunId` is still *reported* (the fallback below prints it), but it
+    // is not evidence that a turn happened — and this gate's whole claim is that
+    // the assignee attended the issue. Bounded per BLO-22331 AC2 by the 6h window:
+    // stop commenting and the trigger fires, so this cannot suppress indefinitely.
+    if (trigger === "long_active_duration" && nextActionComment?.runLinked) {
+      return null;
+    }
+
+    // BLO-27698 A2: an issue filed against this one during the episode is
+    // deliverable progress on the same terms as a fresh PR. Structural edges only
+    // — see `findFreshLinkedProgressIssue`.
+    const linkedProgressIssue = trigger === "long_active_duration"
+      ? await findFreshLinkedProgressIssue(sourceIssue, sourceAgent, attributableStartAt, now)
+      : null;
+    if (linkedProgressIssue) {
+      return null;
+    }
+
     // BLO-25877: computed once here — after both suppression gates above have had
     // their chance to hold this review back — and reused as-is for the report-text
     // field further down, rather than recomputed there.
-    const monitorGating = monitorGatingBreakdown(sourceIssue, attributableStartAt, elapsedMs, now, latestRuns);
+    const monitorGating = monitorGatingBreakdown(sourceIssue, attributableStartAt, elapsedMs, now, latestRuns, thresholds);
     // Neither suppression gate above catches every "monitor accounted for most of
     // this episode" case: `currentPendingMonitorForReviewSuppression` only covers a
     // monitor that is still armed or within its lapse grace, not one that lapsed a
@@ -3609,28 +4295,27 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       trigger === "long_active_duration" &&
       monitorGating &&
       !monitorGating.gatedIsUpperBound &&
-      monitorGating.unattendedMs < thresholds.longActiveMs
+      // BLO-27698 B1: `unattendedMs` no longer includes executing time, so it is
+      // re-added here to keep this gate bit-identical to its pre-B1 behaviour.
+      // B3 is the deliberate, separately-reviewed change that drops the addend
+      // and lets the trigger fire on the narrowed bucket; do not drop it here.
+      monitorGating.unattendedMs + monitorGating.executingMs < thresholds.longActiveMs
     ) {
       return null;
     }
 
-    // BLO-19604: `run.nextAction` is only populated when that specific run's own
-    // liveness classification saw the text (e.g. a comment posted after that run had
-    // already been classified is invisible to it). Before reporting "none recorded" —
-    // which reads as "the assignee left no next step" — fall back to scanning the
-    // assignee's own recent comments directly, the same way run-liveness classification
-    // would have. This is a genuine fallback, not just a relabelled null: it recovers a
-    // `Next action:`/`Next:` line the structured field missed. Sourced from
-    // `findCommentNextAction` (queried directly against `issueComments`, no join on
-    // `heartbeatRuns`) rather than `latestComments`, since a plain assignee comment with no
-    // `createdByRunId` is exactly the kind of comment this fallback exists to recover, and
-    // `latestComments`'s inner join excludes it. Keep that fallback lazy and projected: the
-    // common structured path should not transfer or parse the assignee's full comment window.
-    const structuredNextAction = latestRuns.find((run) => run.nextAction)?.nextAction ?? null;
-    const commentNextAction = structuredNextAction
-      ? null
-      : await findCommentNextAction(sourceIssue, sourceAgent, thresholds, now);
-    const nextAction = structuredNextAction ?? commentNextAction;
+    // BLO-19604: before reporting "none recorded" — which reads as "the assignee
+    // left no next step" — fall back to the assignee's own recent comments, the
+    // same way run-liveness classification would have. This is a genuine fallback,
+    // not a relabelled null: it recovers a `Next action:`/`Next:` line the
+    // structured field missed. Sourced from `findCommentNextAction` (queried
+    // directly against `issueComments`, no join on `heartbeatRuns`) rather than
+    // `latestComments`, since a plain assignee comment with no `createdByRunId` is
+    // exactly the kind this fallback exists to recover, and `latestComments`'s
+    // inner join excludes it. That unlinked case is why the A3 gate above checks
+    // `runLinked` while this line does not: reporting a next action is useful to a
+    // reviewer at a lower bar than suppressing the review outright.
+    const nextAction = structuredNextAction ?? nextActionComment?.line ?? null;
 
     // Queued-but-never-dispatched runs are excluded from the elapsed-time figure but
     // reported explicitly, so a reviewer has an explanation for why the episode looks
@@ -3668,6 +4353,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       nonLiveHoldMs,
       monitorGating,
       noExecutableTurnGating,
+      // BLO-22887 AC2: always null here. Dependency readiness is not fetched on
+      // this path (see the header note); `reconcileProductivityReviews` fills
+      // this in from the map it already holds, and the continuation-hold
+      // caller leaves it null because it renders no body.
+      dependencyGating: null,
+      assigneeConcurrency,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -3779,6 +4470,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Total sampled issue-linked runs: ${evidence.totalRunCount}`,
       `- Terminal sampled runs: ${evidence.terminalRunCount}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
+      ...(evidence.assigneeConcurrency
+        ? [`- Assignee live concurrency: ${formatAssigneeConcurrency(evidence.assigneeConcurrency)}`]
+        : []),
       `- No-comment streak (terminal, turn-executing runs): ${evidence.noCommentStreak}`,
       `- Runtime-failure streak (terminal, never-executed runs): ${evidence.runtimeFailureStreak}`,
       `- Never-invoked runs excluded (terminal, no adapter ever created — \`usageJson\`/\`logStore\`/\`logRef\` null, \`logBytes\` null or 0, BLO-26165): ${evidence.neverInvokedRunCount}`,
@@ -3831,6 +4525,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ...(evidence.noExecutableTurnGating
         ? [`- No-executable-turn accounting: ${formatNoExecutableTurnGating(evidence.noExecutableTurnGating)}`]
         : []),
+      ...(evidence.dependencyGating
+        ? [`- Dependency accounting: ${formatDependencyGating(evidence.dependencyGating, evidence.monitorGating !== null)}`]
+        : []),
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
@@ -3875,18 +4572,30 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         : [
           "A \"Close as productive\" verdict requires at least ONE of the following concrete progress signals:",
           "- An assignee run-linked comment in the last 6h that contains a `Next action:` line",
-          "- A non-stale PR/MR link in the source issue's evidence (created or updated in the last 24h)",
+          "- A non-stale PR/MR link in the source issue's evidence, attributed to THIS issue (created or updated in the last 24h)",
           "- A recent test result, artifact commit, or workspace deliverable in the last 6h",
-          ...(isProgressPullRequest(evidence.latestPullRequest)
-            ? [
-              "",
-              `> The second signal is already present: ${formatPullRequestEvidence(evidence.latestPullRequest)}.`,
-              "> PR activity is recorded from the GitHub webhook, so this is deliverable progress even",
-              "> when the run/comment counters above read zero.",
-            ]
-            : []),
+          ...pullRequestProgressNote(evidence.latestPullRequest),
           "",
           "If none of these signals is present, the correct verdict is one of:",
+          // BLO-27698 C2: the four verdicts below all presuppose an agent that
+          // was given a turn and used it poorly — decompose, block, stop,
+          // snooze are all instructions to the *assignee*. An assignee that was
+          // saturated or fleet-starved had no turn to use, and with no cell for
+          // that case a reviewer had to force one of the four, which is how a
+          // platform-capacity episode gets recorded as assignee
+          // under-performance. Mirrors the "Route to platform/SRE" block the
+          // `runtime_failure_streak` branch already carries.
+          //
+          // Listed FIRST, and gated on measured evidence rather than always
+          // offered: an always-present capacity excuse would become the default
+          // verdict for every slow episode, which is the opposite failure.
+          ...(isCapacityConstrainedEvidence(evidence)
+            ? [
+              hasEpisodeScopedCapacityBlock(evidence)
+                ? `- Route to platform/SRE as a capacity/dispatch constraint — the evidence above shows the assignee was not given an executable turn (${describeCapacityConstraint(evidence)}). None of the four verdicts below applies to an agent that had no turn; do not record this as assignee under-performance.`
+                : `- Route to platform/SRE as a capacity/dispatch constraint — the evidence above shows a PARTIAL capacity block (${describeCapacityConstraint(evidence)}), not established across the whole episode. Confirm it held for the period in question before routing; if it did not, one of the four verdicts below still applies.`,
+            ]
+            : []),
           "- Request decomposition (the work is too large for a single heartbeat issue and needs to be split)",
           "- Block with an unblock owner (the work needs human direction; name the gate)",
           "- Stop/cancel (the work is not delivering value and should be wound down)",
@@ -3935,6 +4644,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         : []),
       ...(evidence.noExecutableTurnGating
         ? [`- No-executable-turn accounting: ${formatNoExecutableTurnGating(evidence.noExecutableTurnGating)}`]
+        : []),
+      ...(evidence.dependencyGating
+        ? [`- Dependency accounting: ${formatDependencyGating(evidence.dependencyGating, evidence.monitorGating !== null)}`]
         : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
       `- Linked pull request: ${formatPullRequestEvidence(evidence.latestPullRequest)}`,
@@ -4361,6 +5073,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     now: Date;
     companyId?: string;
   }) {
+    // BLO-33477 AC3: this scan orders by `asc(updatedAt)` rather than the
+    // `productivityScannedAt` watermark the source scan (BLO-30303) and the
+    // retirement scan above use — it cannot share that column, because
+    // `closeOpenSuppressedReviews` stamps a superset of these rows and would
+    // drive the ordering. It is starvation-free anyway: every path out of the
+    // loop below takes the row *out* of this window, including the failure
+    // path, which backs the row off for a full stale interval (see the catch).
+    //
+    //   - retired        -> status `done`, drops out of `notInArray(status, ...)`
+    //   - finalized      -> gains identifier/issueNumber, drops out of `isNull(...)`
+    //   - retire raced   -> `existing`; transient, the row changed under us
+    //   - finalize threw -> `failed`, and the catch sets `updatedAt = now`, so
+    //                       the row fails `updatedAt < staleCutoff` on the next
+    //                       pass and cannot hold a slot at all
     const staleCutoff = new Date(input.now.getTime() - PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS);
     const reservedReviews = await db
       .select()
@@ -4518,6 +5244,34 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       } catch (err) {
         result.failed += 1;
         result.failedIssueIds.push(sourceIssue.id);
+        // BLO-33477 AC3: back the row off for a full stale interval so a
+        // deterministically-failing finalize cannot re-select on the next pass
+        // and starve the reservations behind it. `input.now`, not `staleCutoff`
+        // — clamping to the cutoff also bounds starvation (the cohort's key
+        // tracks the eligibility frontier, so any fixed-key row overtakes it
+        // within two eligible passes) but keeps 250 poison rows re-filling the
+        // window forever; `now` drops them out of `updatedAt < staleCutoff`
+        // entirely until stale again, which is the property worth asserting.
+        // Costs a failed finalize one stale interval before retry, which this
+        // janitor path (rows are already >= 5min stale) can afford.
+        //
+        // Guarded to rows still reserved: if finalize threw *after* assigning
+        // identifier/issueNumber the row has already left this window. This
+        // advances `lastActivityAt` too, via the migration-0076 BEFORE UPDATE
+        // trigger — intended, the row was genuinely touched.
+        await db
+          .update(issues)
+          .set({ updatedAt: input.now })
+          .where(
+            and(
+              eq(issues.companyId, review.companyId),
+              eq(issues.id, review.id),
+              eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+              isNull(issues.issueNumber),
+              isNull(issues.identifier),
+              notInArray(issues.status, ["done", "cancelled"]),
+            ),
+          );
         logger.warn(
           {
             err,
@@ -4667,6 +5421,14 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       closedSuppressedMonitorReviews: 0,
       closedTerminalSourceReviews: 0,
       closedDependencyBlockedReviews: 0,
+      // BLO-33477 AC4: the retirement pass's own funnel. Kept separate from the
+      // `closed*` counters above because those are outcome tallies and one of
+      // them (`closedTerminalSourceReviews`) is also credited by the stale
+      // reservation recovery below — so neither it nor their sum isolates what
+      // this sweep actually did.
+      retirementScanned: 0,
+      retirementRetired: 0,
+      retirementDeclined: 0,
       creationCapped: 0,
       noActionSuppressed: 0,
       skipped: 0,
@@ -4680,6 +5442,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     result.closedSuppressedMonitorReviews = closedSuppressed.monitorScheduled;
     result.closedTerminalSourceReviews = closedSuppressed.terminalSource;
     result.closedDependencyBlockedReviews = closedSuppressed.dependencyBlocked;
+    result.retirementScanned = closedSuppressed.scanned;
+    result.retirementRetired = closedSuppressed.retired;
+    result.retirementDeclined = closedSuppressed.declined;
 
     const recoveredReservations = await recoverStaleReservedProductivityReviews({
       now,
@@ -4706,9 +5471,57 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
       )
-      .orderBy(asc(issues.updatedAt), asc(issues.id))
+      // BLO-30303: rotate on a least-recently-*scanned* watermark, not on
+      // `updatedAt`. Nothing in this file writes back to a scanned *source*
+      // row, so under the old `asc(updatedAt)` ordering the same oldest-250
+      // rows were re-selected on every pass forever and `created` was
+      // permanently 0 once the eligible population passed the cap. `desc` is
+      // not the fix either — a stalled issue's `updatedAt` stops advancing by
+      // definition, so it would sink out of the window exactly as it became
+      // interesting. Any static ordering on a field uncorrelated with
+      // eligibility starves at some cap; rotation makes that impossible by
+      // construction.
+      //
+      // Coalesce to `createdAt` rather than sorting NULLS FIRST (Ally review).
+      // NULLS FIRST is an *absolute* priority class: never-scanned rows always
+      // outrank every scanned row, so a sustained influx of >= MAX_CANDIDATE_ISSUES
+      // new eligible rows per pass would consume the whole window forever and
+      // an already-scanned row could never be revisited. That is the same
+      // starvation this fix exists to remove, just with a different victim —
+      // and the victim is the one that matters, since a row is scanned while it
+      // is still healthy and only becomes interesting once it later goes quiet.
+      // Treating "created" as the implicit first touch makes the key a strict
+      // FIFO: it advances only when a row is scanned, so the scan always takes
+      // the globally longest-waiting rows and new arrivals cannot jump the
+      // queue. Every eligible row is then evaluated within ceil(N/250) passes
+      // at any population and any arrival rate.
+      // `updatedAt`/`id` only break ties within one watermark value — a whole
+      // scan batch shares one `now`, so ties are common and must be stable.
+      .orderBy(
+        sql`coalesce(${issues.productivityScannedAt}, ${issues.createdAt}) asc`,
+        asc(issues.updatedAt),
+        asc(issues.id),
+      )
       .limit(MAX_CANDIDATE_ISSUES);
     result.scanned = candidates.length;
+
+    // Stamp before evaluating, not after: a candidate that throws mid-loop has
+    // already rotated out, so one poison row cannot wedge the window forever
+    // (the failure shape of BLO-30320). A bare column write — it does not
+    // touch `updatedAt`, so the `issues_sync_last_activity_at` trigger stays
+    // quiet and the watermark is invisible to the evidence signals this
+    // detector reads.
+    if (candidates.length > 0) {
+      await db
+        .update(issues)
+        .set({ productivityScannedAt: now })
+        .where(
+          inArray(
+            issues.id,
+            candidates.map((candidate) => candidate.id),
+          ),
+        );
+    }
 
     // BLO-22436: an issue with an unresolved blocker has its queued *routine*
     // runs cancelled by the dependency gate before dispatch (see
@@ -4741,7 +5554,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // (below) rather than filtering the candidate up front, since the trigger
     // is what determines whether the blocker is dispositive and evidence is
     // already collected for every other candidate that reaches this point.
-    const dependencyBlockedSourceIssueIds = new Set<string>();
+    const dependencyBlockedSourceIssueIds = new Map<
+      string,
+      { unresolvedBlockerCount: number; pendingFinalizeBlockerCount: number }
+    >();
     const candidateIdsByCompany = new Map<string, string[]>();
     for (const candidate of candidates) {
       const forCompany = candidateIdsByCompany.get(candidate.companyId) ?? [];
@@ -4751,8 +5567,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     for (const [candidateCompanyId, candidateIds] of candidateIdsByCompany) {
       const readiness = await issuesSvc.listDependencyReadiness(candidateCompanyId, candidateIds, db);
       for (const candidateId of candidateIds) {
-        if ((readiness.get(candidateId)?.unresolvedBlockerCount ?? 0) > 0) {
-          dependencyBlockedSourceIssueIds.add(candidateId);
+        const candidateReadiness = readiness.get(candidateId);
+        const unresolvedBlockerCount = candidateReadiness?.unresolvedBlockerCount ?? 0;
+        if (unresolvedBlockerCount > 0) {
+          // BLO-22887 AC2: the membership test below is unchanged (`.has`), but
+          // the counts ride along so the reported bucket costs no second
+          // readiness round-trip. Deliberately NOT the blocker ids: rendering
+          // raw uuids in a review body is noise, and the source issue's own
+          // `blockedBy` is one click away for a reviewer who needs them.
+          dependencyBlockedSourceIssueIds.set(candidateId, {
+            unresolvedBlockerCount,
+            pendingFinalizeBlockerCount: candidateReadiness?.pendingFinalizeBlockerIssueIds.length ?? 0,
+          });
         }
       }
     }
@@ -4801,6 +5627,21 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         await recordMonitorScheduledSuppression(evidence);
         result.monitorScheduledSuppressed += 1;
         continue;
+      }
+      // BLO-22887 AC2: attach the dependency bucket for the survivors of the
+      // gate above. Placed here rather than beside that gate only because this
+      // is where the union has narrowed to `ProductivityReviewEvidence` — the
+      // two suppression branches carry no body to render. Reaching this line
+      // while blocked means the fired set was NOT all-closable, so
+      // `nonClosableTriggers` is non-empty by construction.
+      const dependencyBlockers = dependencyBlockedSourceIssueIds.get(candidate.id);
+      if (dependencyBlockers) {
+        evidence.dependencyGating = {
+          ...dependencyBlockers,
+          nonClosableTriggers: evidence.firedTriggers.filter(
+            (trigger) => !isDependencyBlockedClosableTrigger(trigger),
+          ),
+        };
       }
       if (await findRecentResolvedProductivityReview(candidate.companyId, candidate.id, thresholds, now)) {
         result.snoozed += 1;

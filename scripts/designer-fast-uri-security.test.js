@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-import { FAST_URI_ADVISORY, isVulnerableFastUri } from "./fast-uri-advisory.js";
+import {
+  fastUriAdvisoriesFor,
+  isVulnerableFastUri,
+} from "./fast-uri-advisory.js";
 
 const designerRoot = new URL("../packages/services/designer/", import.meta.url);
 
@@ -21,7 +24,7 @@ assert.ok(
 for (const [path, fastUri] of fastUriResolutions) {
   assert.ok(
     !isVulnerableFastUri(fastUri.version),
-    `designer lockfile ${path} resolved fast-uri ${fastUri.version}, vulnerable per ${FAST_URI_ADVISORY}`,
+    `designer lockfile ${path} resolved fast-uri ${fastUri.version}, vulnerable per ${fastUriAdvisoriesFor(fastUri.version).join(", ")}`,
   );
 }
 

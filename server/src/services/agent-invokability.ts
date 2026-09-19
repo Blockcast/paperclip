@@ -4,6 +4,7 @@ import { getAgentWorkEligibility, type AgentEligibilityAgent, type AgentOrgChain
 import { eq } from "drizzle-orm";
 
 type AgentStatus = (typeof agents.$inferSelect)["status"];
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 export type AgentOrgRow = Pick<
   typeof agents.$inferSelect,
@@ -116,7 +117,9 @@ export function evaluateAgentInvokability(
 }
 
 export async function evaluateAgentInvokabilityFromDb(
-  db: Db,
+  // Callers holding an advisory lock MUST pass their own transaction — a second
+  // pool connection here is what convoyed on BLO-34207.
+  db: Db | DbTransaction,
   agent: AgentOrgRow | null | undefined,
 ): Promise<AgentInvokability> {
   if (!agent) return evaluateAgentInvokability(agent, []);

@@ -31,6 +31,16 @@ import {
   collectProjectWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import { assertCanManageProjectWorkspaceRuntimeServices } from "./workspace-runtime-service-authz.js";
+import {
+  publicProject,
+  publicProjectExecutionWorkspacePolicy,
+  publicProjects,
+  publicProjectWorkspace,
+  publicProjectWorkspaces,
+  publicWorkspaceOperation,
+  resolveWorkspaceRuntimeViewer,
+} from "./workspace-response.js";
+import { parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { appendWithCap } from "../adapters/utils.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
@@ -130,7 +140,8 @@ export function projectRoutes(db: Db) {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const result = await svc.list(companyId);
-    res.json(await filterProjectsForActor(req, result));
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, companyId);
+    res.json(publicProjects(await filterProjectsForActor(req, result), viewer));
   });
 
   router.get("/projects/:id", async (req, res) => {
@@ -138,7 +149,7 @@ export function projectRoutes(db: Db) {
     const project = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
     if (!project) return;
     if (!(await assertProjectReadAllowed(req, res, project))) return;
-    res.json(project);
+    res.json(publicProject(project, await resolveWorkspaceRuntimeViewer(access, req, project.companyId)));
   });
 
   router.get("/projects/:id/external-object-summary", async (req, res) => {
@@ -214,7 +225,12 @@ export function projectRoutes(db: Db) {
     if (telemetryClient) {
       trackProjectCreated(telemetryClient);
     }
-    res.status(201).json(hydratedProject ?? project);
+    res.status(201).json(
+      publicProject(
+        hydratedProject ?? project,
+        await resolveWorkspaceRuntimeViewer(access, req, companyId),
+      ),
+    );
   });
 
   router.patch("/projects/:id", validate(updateProjectSchema), async (req, res) => {
@@ -270,7 +286,7 @@ export function projectRoutes(db: Db) {
       },
     });
 
-    res.json(project);
+    res.json(publicProject(project, await resolveWorkspaceRuntimeViewer(access, req, project.companyId)));
   });
 
   router.get("/projects/:id/workspaces", async (req, res) => {
@@ -278,7 +294,8 @@ export function projectRoutes(db: Db) {
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
     if (!existing) return;
     const workspaces = await svc.listWorkspaces(id);
-    res.json(workspaces);
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, existing.companyId);
+    res.json(publicProjectWorkspaces(workspaces, viewer));
   });
 
   router.post("/projects/:id/workspaces", validate(createProjectWorkspaceSchema), async (req, res) => {
@@ -312,7 +329,9 @@ export function projectRoutes(db: Db) {
       },
     });
 
-    res.status(201).json(workspace);
+    res.status(201).json(
+      publicProjectWorkspace(workspace, await resolveWorkspaceRuntimeViewer(access, req, existing.companyId)),
+    );
   });
 
   router.patch(
@@ -353,7 +372,9 @@ export function projectRoutes(db: Db) {
         },
       });
 
-      res.json(workspace);
+      res.json(
+        publicProjectWorkspace(workspace, await resolveWorkspaceRuntimeViewer(access, req, existing.companyId)),
+      );
     },
   );
 
@@ -622,9 +643,11 @@ export function projectRoutes(db: Db) {
       },
     });
 
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, project.companyId);
+
     res.json({
-      workspace: updatedWorkspace,
-      operation,
+      workspace: publicProjectWorkspace(updatedWorkspace, viewer),
+      operation: publicWorkspaceOperation(operation, viewer),
     });
   }
 
@@ -657,31 +680,45 @@ export function projectRoutes(db: Db) {
       },
     });
 
-    res.json(workspace);
+    res.json(
+      publicProjectWorkspace(workspace, await resolveWorkspaceRuntimeViewer(access, req, existing.companyId)),
+    );
   });
 
   router.delete("/projects/:id", async (req, res) => {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
     if (!existing) return;
-    const project = await svc.remove(id);
-    if (!project) {
+    // `svc.remove` returns the bare deleted row — no `workspaces` / `primaryWorkspace`. That used to
+    // mean "no withheld material on this response"; PEN-3073 falsified it. `executionWorkspacePolicy`
+    // is a COLUMN on the project row, so it survives the absence of the embedded workspaces and
+    // carries both the open `workspaceRuntime` record and the strategy's command strings. Named
+    // `deletedProjectRow` rather than `project` so the narrowing is legible at the response site
+    // instead of being an unexplained exemption in the CI guard.
+    const deletedProjectRow = await svc.remove(id);
+    if (!deletedProjectRow) {
       res.status(404).json({ error: "Project not found" });
       return;
     }
 
     const actor = getActorInfo(req);
     await logActivity(db, {
-      companyId: project.companyId,
+      companyId: deletedProjectRow.companyId,
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
       action: "project.deleted",
       entityType: "project",
-      entityId: project.id,
+      entityId: deletedProjectRow.id,
     });
 
-    res.json(project);
+    res.json({
+      ...deletedProjectRow,
+      executionWorkspacePolicy: publicProjectExecutionWorkspacePolicy(
+        parseProjectExecutionWorkspacePolicy(deletedProjectRow.executionWorkspacePolicy),
+        await resolveWorkspaceRuntimeViewer(access, req, deletedProjectRow.companyId),
+      ),
+    });
   });
 
   return router;

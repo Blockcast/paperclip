@@ -1081,7 +1081,8 @@ export function attentionService(db: Db) {
           .select({
             agentId: heartbeatRuns.agentId,
             createdAt: heartbeatRuns.createdAt,
-            contextSnapshot: heartbeatRuns.contextSnapshot,
+            contextIssueId: heartbeatRuns.contextIssueId,
+            contextTaskId: heartbeatRuns.contextTaskId,
           })
           .from(heartbeatRuns)
           .where(and(
@@ -1090,7 +1091,7 @@ export function attentionService(db: Db) {
             gt(heartbeatRuns.createdAt, oldestFailedRunCreatedAt),
           ));
         for (const newerRun of newerRuns) {
-          const newerRunKey = `${newerRun.agentId}:${readRunIssueId(newerRun.contextSnapshot) ?? ""}`;
+          const newerRunKey = `${newerRun.agentId}:${newerRun.contextIssueId ?? newerRun.contextTaskId ?? ""}`;
           const latestCreatedAt = latestRunCreatedAtByKey.get(newerRunKey);
           if (!latestCreatedAt || newerRun.createdAt > latestCreatedAt) {
             latestRunCreatedAtByKey.set(newerRunKey, newerRun.createdAt);

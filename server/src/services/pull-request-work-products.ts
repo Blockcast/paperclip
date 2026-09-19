@@ -22,6 +22,25 @@ export interface PullRequestWorkProductInput {
   prUpdatedAt?: string | null;
   /** GitHub `action` from the pull_request event. */
   action: string;
+  /**
+   * Identifiers this PR *owns*, as resolved by the ranked tiers in
+   * `resolveOwningPaperclipIdentifiers` — NOT every identifier it mentions
+   * (BLO-20886).
+   *
+   * A PR work product is written for every issue the PR references anywhere,
+   * deliberately: the row is evidence about the PR, not a wake. That makes the
+   * row's mere existence useless for deciding whether the PR represents
+   * progress on the issue holding it, because a long-lived registry issue
+   * accumulates every PR that name-drops it. Recording the owning set here lets
+   * a consumer ask "does this PR belong to the row I am reviewing?" without
+   * re-deriving ownership from fields the row does not carry (the PR body is
+   * never persisted).
+   *
+   * `undefined`/`null` means "not recorded" — for rows written before this
+   * field existed — and must not be read as "owns nothing". An empty array IS
+   * authoritative: the PR named no owner in its title, branch, or labeled body.
+   */
+  owningIdentifiers?: readonly string[] | null;
 }
 
 export interface PullRequestWorkProductFields {
@@ -51,6 +70,38 @@ export function pullRequestExternalId(repoFullName: string, prNumber: number): s
 }
 
 /**
+ * The statuses a PR work product takes while GitHub can still send another
+ * `pull_request` event for it.
+ *
+ * PEN-2791: the stranded-assigned sweep reads this to decide whether an issue still has
+ * an external event-wake path, which makes the split load-bearing in a way it was not
+ * when it only drove display. `merged` and `closed` are exactly the states after which
+ * no further webhook arrives, so a row in either is not evidence of attendance; a row in
+ * `draft` or `ready_for_review` will produce a wake the next time the PR moves.
+ *
+ * Kept beside the producer rather than restated at the consumer, because the consumer is
+ * a SQL `inArray` several files away and a second hand-written status list there would
+ * drift silently the first time this mapping gains a state.
+ */
+export const OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES = ["draft", "ready_for_review"] as const;
+
+/** Terminal counterpart. Together with the above this must cover the producer exactly. */
+export const TERMINAL_PULL_REQUEST_WORK_PRODUCT_STATUSES = ["merged", "closed"] as const;
+
+/**
+ * Exactly the statuses `pullRequestWorkProductStatus` can return.
+ *
+ * Deliberately NOT `IssueWorkProduct["status"]`, which is far wider (`active`,
+ * `approved`, `failed`, `archived`, ... and `| string`) and which PR rows never take
+ * from the webhook. Annotating the producer with this narrow union is what makes the
+ * open/terminal split above a checked partition instead of a comment: adding a fifth PR
+ * state without classifying it here stops the producer compiling.
+ */
+export type PullRequestWorkProductStatus =
+  | (typeof OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES)[number]
+  | (typeof TERMINAL_PULL_REQUEST_WORK_PRODUCT_STATUSES)[number];
+
+/**
  * Map a PR's current state onto the work-product status enum.
  *
  * Reads the PR's *state* (merged/draft) in preference to the triggering action,
@@ -59,7 +110,7 @@ export function pullRequestExternalId(repoFullName: string, prNumber: number): s
  */
 export function pullRequestWorkProductStatus(
   input: Pick<PullRequestWorkProductInput, "action" | "prDraft" | "prMerged">,
-): IssueWorkProduct["status"] {
+): PullRequestWorkProductStatus {
   if (input.prMerged === true) return "merged";
   if (input.action === "closed") return "closed";
   if (input.prDraft === true) return "draft";
@@ -124,6 +175,12 @@ export function buildPullRequestWorkProductFields(
       merged: input.prMerged === true,
       mergedAt: input.prMergedAt ?? null,
       lastEventAction: input.action,
+      // Null (not `[]`) when the caller did not resolve ownership, so a
+      // consumer can tell "not recorded" from "owns nothing" — see the field
+      // docblock on PullRequestWorkProductInput.
+      owningIdentifiers: Array.isArray(input.owningIdentifiers)
+        ? [...input.owningIdentifiers]
+        : null,
     },
     sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
   };

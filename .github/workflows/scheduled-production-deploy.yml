@@ -22,33 +22,78 @@
 # Auto-approval was considered and rejected on 2026-08-28: three green guards prove the
 # code builds, not that a human intends to ship it. That reasoning is unchanged.
 #
-# THE THREE EXITS ARE DISTINGUISHABLE (PEN-2848)
-# ----------------------------------------------
-# This workflow can end three ways, and originally all three were an identical
+# THE FOUR EXITS ARE DISTINGUISHABLE (PEN-2848, BLO-33400)
+# --------------------------------------------------------
+# This workflow can end four ways, and originally all of them were an identical
 # green `exit 0`. On 2026-09-01 the first-ever real slot skipped because a deploy
 # had been waiting on a human since 00:52Z, reported `conclusion: success`, and
 # nothing escalated — production reached 45 commits behind. Guard (1) is correct;
 # what was missing was any way to tell "declined to dispatch" from "dispatched".
 #
-#   dispatched       -> ::notice:: + step summary, green
-#   up-to-date       -> ::notice:: + step summary, green (nothing to do, nobody to chase)
-#   skipped-pending  -> ::warning:: + step summary; and if the pending approval is
-#                       older than PENDING_DEPLOY_ALERT_HOURS, a severity=critical
-#                       ProductionDeployApprovalStuck alert to Alertmanager plus a
-#                       RED run, so `conclusion` itself carries the signal.
+#   dispatched         -> ::notice:: + step summary, green
+#   up-to-date         -> ::notice:: + step summary, green (nothing to do, nobody to chase)
+#   checked-no-pending -> ::notice:: + step summary, green. An hourly approval-age
+#                         slot with nothing pending; never dispatches (guard 1b).
+#   skipped-pending    -> ::warning:: + step summary; and if the pending approval is
+#                         older than PENDING_DEPLOY_ALERT_HOURS, a severity=critical
+#                         ProductionDeployApprovalStuck alert to Alertmanager plus a
+#                         RED run, so `conclusion` itself carries the signal.
+#
+# GUARD (1) NOW HAS A BOUNDED EXIT (PEN-3315)
+# -------------------------------------------
+# Guard (1) is correct and stays. What it never had was a way to END a wait: the
+# only exit was a human cancelling or approving. On 2026-09-14 a dispatch at head
+# c316ff73 sat `waiting` for 41.2h, production shipped nothing for 53h, and
+# paperclip_api_deploy_commits_behind reached 164 — while every dispatcher run
+# correctly refused to dispatch anything newer. The staleness is in the PENDING
+# RUN, which is pinned to the sha it was dispatched with; the dispatcher itself
+# has always computed each dispatch against origin/master at dispatch time.
+#
+# So on the `skipped-pending` path, past the SAME threshold that arms the
+# escalation, a `waiting` dispatch whose head is a strict ancestor of
+# origin/master is cancelled and re-dispatched at master. It APPROVES NOTHING —
+# the 2026-08-28 rejection of auto-approval is untouched. A human still presses
+# the button; they press it on a current head, so the click that eventually lands
+# ships everything instead of a partial. See .github/scripts/supersede-stale-deploy.mjs.
+#
+# The escalation also writes a durable GitHub issue now, because an Alertmanager
+# alert is gone from /api/v2/alerts three hours after the last push and PEN-3289
+# could not audit the incident afterwards. That record doubles as the stall clock,
+# so superseding a run cannot reset the reported age.
 name: Scheduled production deploy dispatch
 
 on:
   schedule:
-    # 07:23 UTC daily. Deliberately not :00 — every scheduler on the planet fires there.
-    # Daily is chosen to sit inside the 24h drift threshold: a same-day approval keeps
-    # the metric under its alert line without a second cadence to maintain.
+    # 07:23 UTC daily — the ONLY cron that dispatches. Deliberately not :00, every
+    # scheduler on the planet fires there. Daily sits inside the 24h drift
+    # threshold: a same-day approval keeps the metric under its alert line.
     - cron: "23 7 * * *"
+    # Hourly, every hour EXCEPT 07. Sampling only: this slot can reach
+    # `skipped-pending` and therefore the escalation, but guard (1b) stops it
+    # before the dispatch.
+    #
+    # Why it exists (BLO-33400): PENDING_DEPLOY_ALERT_HOURS is 6h, and the
+    # escalation below was reachable only from the daily slot — so a 6h condition
+    # was sampled once per 24h. Both failure modes were measured live here:
+    #   * late   — docker.yml dispatch 34324444180 sat 27.8h on the reviewer gate;
+    #              the alert fired at 24.0h, 4x its own threshold.
+    #   * silent — dispatch 34561898524 sat 15h28m (2026-09-11 04:21Z -> 19:50Z)
+    #              and was cancelled between samples. The single 07:23 sample
+    #              caught it at 3h10m, so nothing escalated at any duration.
+    #
+    # Disjoint hours rather than "23 * * * *" so the two entries never match the
+    # same minute: GitHub fires one run per matching cron entry, so an overlap
+    # would queue a redundant second run every day at 07:23.
+    - cron: "23 0-6,8-23 * * *"
   workflow_dispatch: # manual kick, e.g. after a hotfix merge
 
 permissions:
   contents: read
-  actions: write # required to dispatch docker.yml
+  actions: write # required to dispatch docker.yml, and to cancel a stale dispatch
+  # PEN-3315: the escalation writes a durable GitHub issue alongside the
+  # Alertmanager push. This is the ONLY new permission the change needs — no new
+  # credential — which is why a GitHub issue was chosen over any external store.
+  issues: write
 
 concurrency:
   group: scheduled-production-deploy
@@ -70,10 +115,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PENDING_JSON_PATH: ${{ runner.temp }}/pending-dispatches.json
+          # True only for the daily cron and a manual kick. Keyed on WHICH cron
+          # entry fired, not on the wall clock: GitHub delays scheduled runs under
+          # load (5-17min late on this repo's own history), and an hour check would
+          # silently drop the day's dispatch whenever a 07:23 slot slipped to 08:xx.
+          IS_DISPATCH_SLOT: ${{ github.event_name != 'schedule' || github.event.schedule == '23 7 * * *' }}
         run: |
           set -euo pipefail
           MASTER_SHA="$(git rev-parse origin/master)"
           echo "master head: $MASTER_SHA"
+          # Published for the supersede step (PEN-3315), which needs the same
+          # master head this guard judged against. Written BEFORE guard (1)'s
+          # early exit, because the supersede only ever runs on that exit.
+          echo "master_sha=$MASTER_SHA" >> "$GITHUB_OUTPUT"
 
           # (1) Never stack approval requests. If a dispatch is already waiting on a
           # human or still building, a second one just splits the reviewer's attention
@@ -101,6 +155,25 @@ jobs:
               echo "**Production stays at its current commit until the pending approval is approved or rejected.**"
             } >> "$GITHUB_STEP_SUMMARY"
             echo "outcome=skipped-pending" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # (1b) Sampling slots stop here. They exist ONLY to age a pending approval,
+          # which is why this sits BELOW guard (1) rather than above it: guard (1) is
+          # what emits `skipped-pending`, and `skipped-pending` is what arms the
+          # escalation step. Hoisting this block would restore the exact BLO-33400
+          # defect — a 6h threshold evaluated once per 24h — while looking like a
+          # tidy-up. .github/scripts/tests/scheduled-production-deploy-schedule.test.mjs
+          # pins the order for that reason.
+          if [ "$IS_DISPATCH_SLOT" != "true" ]; then
+            echo "::notice::Approval-age check only: nothing pending, and this is not the daily dispatch slot."
+            {
+              echo "### Approval-age check only — not a dispatch slot"
+              echo
+              echo "No non-terminal \`docker.yml\` dispatch is pending, so there is no approval age to judge."
+              echo "This slot never dispatches; the dispatch stays exactly once daily at \`23 7 * * *\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "outcome=checked-no-pending" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -154,15 +227,19 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "outcome=dispatched" >> "$GITHUB_OUTPUT"
 
-      # Only on the skip path, so the common dispatch run pays nothing for it.
       # `node` is not guaranteed on the arc-deploy image (it carries helm,
       # kubectl, jq and ruby; actions/checkout runs on the runner's own bundled
       # node, which is not on PATH for `run:` steps). setup-node explicitly, for
       # the same reason pr.yml pins setup-python rather than trusting a bare
       # `python3`: an unproven `command not found` on the escalation path would
       # be worse than the gap it closes.
-      - name: Set up Node for the escalation step
-        if: steps.dispatch.outputs.outcome == 'skipped-pending'
+      #
+      # Unconditional since PEN-3315: the non-pending outcomes now close the
+      # durable stall record, so every outcome needs node. That costs a few
+      # seconds on the common path and buys a record lifecycle that ends, rather
+      # than one open issue inheriting the next stall's clock.
+      - name: Set up Node
+        if: ${{ !cancelled() }}
         uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -181,6 +258,12 @@ jobs:
       # nothing. Delivery here is proven live — the sibling
       # production-environment-protection-guard has been pushing to this same
       # endpoint from the same arc-runners network namespace.
+      #
+      # PEN-3315 adds a durable GitHub issue alongside that push. The alert's
+      # own TTL is 3h, so PEN-3289 could not audit the 41.2h stall afterwards —
+      # the same query that returned 5 hits for a live alert returned 0 for this
+      # one. The issue is deduplicated on a label and also carries the stall
+      # start, so a supersede below cannot reset the reported age.
       - name: Escalate a production approval that is stuck past its threshold
         id: escalate
         if: steps.dispatch.outputs.outcome == 'skipped-pending'
@@ -193,16 +276,71 @@ jobs:
           # first skipped slot rather than after a second silent day. Tune via
           # the repo variable without a code change.
           ALERT_AFTER_HOURS: ${{ vars.PENDING_DEPLOY_ALERT_HOURS || '6' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           ENVIRONMENT_NAME: ${{ vars.PRODUCTION_ENVIRONMENT_NAME || 'paperclip-production' }}
         run: node .github/scripts/post-pending-deploy-alert.mjs
+
+      # PEN-3315. Guard (1)'s bounded exit: cancel a dispatch that has been on the
+      # reviewer gate past the SAME threshold and whose head is a strict ancestor
+      # of master, then dispatch fresh at master. Deliberately reuses
+      # PENDING_DEPLOY_ALERT_HOURS rather than adding a tunable, so the condition
+      # that supersedes is the condition that already escalates.
+      #
+      # `!cancelled()` rather than `success()`: the escalation above is fatal on a
+      # failed Alertmanager push, and an Alertmanager outage must not also freeze
+      # the deploy lane. This step is independently correct — it re-reads the run's
+      # live status before touching anything.
+      #
+      # AFTER the escalation, so the durable record exists to be annotated and so
+      # the alert reports the pre-supersede run.
+      - name: Supersede a stale pending deploy so the approvable head is current
+        id: supersede
+        if: ${{ !cancelled() && steps.dispatch.outputs.outcome == 'skipped-pending' }}
+        env:
+          PENDING_JSON_PATH: ${{ runner.temp }}/pending-dispatches.json
+          ALERT_AFTER_HOURS: ${{ vars.PENDING_DEPLOY_ALERT_HOURS || '6' }}
+          MASTER_SHA: ${{ steps.dispatch.outputs.master_sha }}
+          STALL_ISSUE_NUMBER: ${{ steps.escalate.outputs.stall_issue_number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ENVIRONMENT_NAME: ${{ vars.PRODUCTION_ENVIRONMENT_NAME || 'paperclip-production' }}
+        run: node .github/scripts/supersede-stale-deploy.mjs
+
+      # The other three outcomes all mean the same thing: nothing is sitting on
+      # the reviewer gate, so any stall is over. Closing here is what stops one
+      # open record from carrying its clock into an unrelated later stall, and it
+      # runs hourly, so a failed close self-heals on the next slot. Non-fatal by
+      # design — the dispatcher's `conclusion` is load-bearing (PEN-2848) and must
+      # not start meaning "housekeeping failed".
+      #
+      # ONE EXCEPTION, and the script owns it rather than this `if:`. The supersede
+      # above has two failure paths that cancel the stale run and then fail to
+      # dispatch, which empties the gate with nothing shipped — and that reads as
+      # `checked-no-pending`, identical to a human clearing it. Those paths label
+      # the record, and --resolve refuses to close a labelled record on an outcome
+      # that did not refill the lane. The condition stays here so a labelled record
+      # still closes on `dispatched` / `up-to-date`.
+      - name: Close the durable deploy-stall record once nothing is pending
+        if: ${{ !cancelled() && steps.dispatch.outputs.outcome != '' && steps.dispatch.outputs.outcome != 'skipped-pending' }}
+        env:
+          DISPATCH_OUTCOME: ${{ steps.dispatch.outputs.outcome }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: node .github/scripts/deploy-stall-record.mjs --resolve
 
       # Backstop, not the alerting path: a red run only emails the last
       # committer, which for a `schedule` trigger is nobody useful. The alert
       # above is what reaches a human. This makes `conclusion` itself carry the
       # signal, so a stuck approval is visible in `gh run list` and any
       # dashboard without opening the log.
+      #
+      # Still gated on the ESCALATION, not on the supersede: refreshing the head
+      # does not mean a human has acted, so the run must stay red for as long as
+      # the approval is outstanding.
       - name: Fail the run when a production approval is stuck
         if: steps.escalate.outputs.escalated == 'true'
         run: |

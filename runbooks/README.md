@@ -17,7 +17,21 @@ platform cannot resolve automatically. Each runbook should be:
   PR-review wake left terminal at `agent_wakeup_requests.status='failed'`,
   which nothing re-drives: decide re-review vs accept without double-posting a
   review. Trigger: alert `PaperclipPrReviewWakeTerminalFailed`, or
-  `paperclip_agent_wakeup_terminal_failed_unresolved{scope="pr_review"} > 0`.
+  `max by (error_code, scope) (paperclip_agent_wakeup_terminal_failed_unresolved{scope="pr_review"}) > 0`.
+- [`agent-review-submission-refused.md`](agent-review-submission-refused.md) —
+  an agent's PR review was refused by the `gh` egress guard and never posted,
+  because its `Reviewed head:` attestation is malformed or names a commit that
+  does not exist in the target repository. Covers how to tell cross-repository
+  contamination from a benign force-push, and why there is deliberately no
+  bypass. Trigger: agent stderr or run log carrying
+  `paperclip-github-egress: refusing to submit PR review:` with exit 65.
+- [`cancellation-reservation-lease-leak-and-migration-0209-rollout.md`](cancellation-reservation-lease-leak-and-migration-0209-rollout.md) —
+  cancelled runs leaving external-runtime reservations/environment leases
+  unreleased, and the online-index prerequisites for migrations 0205, 0208,
+  0209, 0217, 0224, 0226, and 0230.
+  Trigger: `paperclip_external_runtime_reservations_release_pending > 0`,
+  `paperclip_environment_leases_orphaned_active > 0`, or a scheduler crash-loop
+  on a database migration at startup.
 - [`clear-polluted-ssh-workspace.md`](clear-polluted-ssh-workspace.md) —
   recover a stranded SSH-driven run whose workspace import is failing on a
   sibling task's leftover scratch state. Trigger: blocked issue auto-comment

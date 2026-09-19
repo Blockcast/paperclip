@@ -544,6 +544,55 @@ export function exhaustedMonitorClearReason(input: {
   return null;
 }
 
+/**
+ * Single source of truth for "is this monitor's next check still a live wake path?"
+ * — shared by the stranded-assigned sweep and the `in_review` disposition validator
+ * (PEN-2853).
+ *
+ * The two were written independently and disagreed about the same column. The sweep
+ * (`hasActiveMonitorPath`, recovery/service.ts) required a genuinely future instant;
+ * the validator (`hasScheduledMonitor`, routes/issues.ts) accepted any non-null one.
+ * So an issue could pass the write-side gate on a monitor the read-side had already
+ * stopped counting — admitted to `in_review` and seizable as stranded at the same
+ * moment, off the same `monitorNextCheckAt`. A week-old lapsed monitor, or a patch
+ * arming one in the past, cleared the 422 (`nextCheckAt` has no future constraint in
+ * the validator, unlike `timeoutAt`, which `exhaustedMonitorClearReason` rejects).
+ *
+ * That compounded badly. Of the five review paths the validator accepts, the monitor
+ * is the only one an agent can satisfy unilaterally — the other four need a human, a
+ * board decision, a counterparty to ask, or a configured execution policy. So the one
+ * remedy always in reach was also the one verified least.
+ *
+ * This is the BLO-24782 divergence again, one predicate over, and it takes that
+ * remedy: delegate rather than restate. A restated rule is only ever as good as the
+ * test that notices it drifting; delegation makes the drift unrepresentable. Hence
+ * `>` at millisecond resolution, no grace, in one place.
+ *
+ * Two asymmetries are deliberate, not oversights:
+ *
+ * - The sweep ORs a bounded lapsed-trigger window on top of this (BLO-18643 /
+ *   BLO-24782) and the validator does not, so the validator is strictly the tighter
+ *   reading. That is safe in exactly one direction and this is it: everything the
+ *   validator accepts, the sweep counts. The leniency exists to avoid *seizing* a row
+ *   whose owner has not had a chance to re-arm; it is not a licence to *assert* a
+ *   review path. On a write the agent supplies the instant, so it can always name a
+ *   real one.
+ * - `hasScheduledMonitor` in recovery/issue-graph-liveness.ts is a third copy of this
+ *   rule and is deliberately left alone. It is already future-bounded — on the safe
+ *   side of the invariant, no defect — and that module is pure by construction
+ *   (`@paperclipai/shared` and one sibling only, its own structural row type and date
+ *   readers), so importing this file into it would cost more than the duplication.
+ */
+export function isMonitorNextCheckAtLive(
+  nextCheckAt: Date | string | null | undefined,
+  nowMs: number,
+): boolean {
+  const parsed = nextCheckAt instanceof Date
+    ? (Number.isNaN(nextCheckAt.getTime()) ? null : nextCheckAt)
+    : parseMonitorDate(nextCheckAt ?? null);
+  return parsed !== null && parsed.getTime() > nowMs;
+}
+
 function nextAssigneeIds(input: {
   issue: IssueLike;
   requestedAssigneePatch: RequestedAssigneePatch;
@@ -921,6 +970,31 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     requestedStatus !== "cancelled"
   ) {
     patch.executionState = null;
+    return { patch };
+  }
+
+  // BLO-33728: cancelling while the stage sits in `changes_requested` (the work
+  // is back with the return assignee, so there is no active stage) reaches none
+  // of the branches below — `shouldStartWorkflow` covers only done/in_review —
+  // and so used to return an empty patch, leaving a live `currentStageId` on a
+  // terminal issue. Drop only the live pointers: `lastDecisionOutcome` and
+  // `completedStageIds` are real history, and a genuine `changes_requested`
+  // must still read back as `changes_requested`. Reopening still nulls the
+  // whole state via the terminal -> active branch above, so the review path is
+  // rebuilt from scratch rather than resumed against a discharged stage.
+  if (
+    requestedStatus === "cancelled" &&
+    existingState?.status === CHANGES_REQUESTED_STATUS &&
+    existingState.currentStageId
+  ) {
+    patch.executionState = {
+      ...existingState,
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      reviewRequest: null,
+    };
     return { patch };
   }
 

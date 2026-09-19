@@ -52,6 +52,10 @@ import {
   restoreCheckoutPromotedStatus,
 } from "../services/issue-checkout-status.ts";
 import {
+  ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES,
+  TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
+} from "../services/issue-execution-lock.ts";
+import {
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
 } from "../services/issue-execution-policy.ts";
@@ -6754,6 +6758,280 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  // PEN-3304: "the owing run is over" has exactly one definition in this
+  // codebase -- `TERMINAL_HEARTBEAT_RUN_STATUSES`, the set that decides a run
+  // has released the issue execution lock -- and the release above must agree
+  // with it. The first cut of this fix reached for `agent-scorecards.ts`'s
+  // 4-element `TERMINAL_RUN_STATUSES` instead. That list answers a different
+  // question ("did the agent fail?", for a failure-rate denominator) and omits
+  // `interrupted`, `error` and `adapter_failed`, so the barrier stayed
+  // permanently shut on three of the seven ways a run can die -- precisely the
+  // run-death paths that record no finalize row. It shipped green because this
+  // suite only ever drove `running -> failed`.
+  //
+  // So the table is DERIVED from the constant, not transcribed from it: an
+  // eighth terminal status extends this test automatically rather than
+  // silently reopening the gap. `issue-execution-lock.ts` exists because this
+  // same notion had already been open-coded as three literal arrays that drifted
+  // apart; a fourth definition site is the defect, not the fix.
+  const seedFinalizeBarrierFixture = async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const owingRunId = randomUUID();
+    const blockerId = randomUUID();
+    const dependentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "QA",
+      role: "qa",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Shared workspace project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Shared workspace",
+      sourceType: "local_path",
+      visibility: "default",
+      isPrimary: true,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Shared exec workspace",
+      status: "active",
+      providerType: "local_fs",
+    });
+    await db.insert(issues).values([
+      {
+        id: blockerId,
+        companyId,
+        projectId,
+        title: "Predecessor",
+        status: "done",
+        priority: "medium",
+        executionWorkspaceId,
+      },
+      {
+        id: dependentId,
+        companyId,
+        projectId,
+        title: "Dependent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+    await svc.update(dependentId, { blockedByIssueIds: [blockerId] });
+
+    // The shape measured on PEN-2969: the finalize was attempted and FAILED
+    // ("External runtime reservation no longer owns execution for run ..."),
+    // so the barrier's own retry story -- "a subsequent finalize wake will
+    // re-evaluate readiness" -- had nothing left to fire it.
+    await db.insert(heartbeatRuns).values({
+      id: owingRunId,
+      companyId,
+      agentId: assigneeAgentId,
+      status: "running",
+      invocationSource: "automation",
+    });
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      heartbeatRunId: owingRunId,
+      issueId: blockerId,
+      phase: "workspace_finalize",
+      status: "failed",
+      startedAt: new Date("2026-09-06T02:27:34.412Z"),
+    });
+
+    return { assigneeAgentId, blockerId, dependentId, owingRunId };
+  };
+
+  it.each(TERMINAL_HEARTBEAT_RUN_STATUS_VALUES)(
+    "releases the workspace-finalize barrier once the run that owed the finalize is `%s` (PEN-3255, PEN-3304)",
+    async (terminalStatus) => {
+      const { assigneeAgentId, blockerId, dependentId, owingRunId } = await seedFinalizeBarrierFixture();
+
+      // While that run is still alive the gate must stay closed -- it may yet
+      // record a succeeded finalize. This is the positive control for the
+      // release below: without it, a test that only asserts the release could
+      // pass against a gate that had been removed outright.
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: false,
+        pendingFinalizeBlockerIssueIds: [blockerId],
+        unresolvedBlockerIssueIds: [blockerId],
+      });
+      expect(await svc.listWakeableBlockedDependents(blockerId)).toEqual([]);
+
+      // Once the owing run reaches a terminal status no finalize can ever
+      // arrive. Before PEN-3255 the dependent stayed gated forever here, which
+      // refused both checkout and every `status=in_progress` write on three
+      // issues for nine days after their blocker closed.
+      //
+      // Note `error` and `adapter_failed` are absent from the `HeartbeatRunStatus`
+      // union but are observed in the column, which is text -- that gap is the
+      // whole reason the canonical set is a superset of it.
+      await db
+        .update(heartbeatRuns)
+        .set({ status: terminalStatus, finishedAt: new Date("2026-09-06T02:25:58.824Z") })
+        .where(eq(heartbeatRuns.id, owingRunId));
+
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: true,
+        pendingFinalizeBlockerIssueIds: [],
+        unresolvedBlockerIssueIds: [],
+      });
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+        expect.objectContaining({ id: dependentId, assigneeAgentId, blockerIssueIds: [blockerId] }),
+      ]);
+    },
+  );
+
+  // The complement, so the release cannot widen into "always release": a run
+  // that still holds the issue execution lock may yet deliver the finalize, and
+  // `scheduled_retry` is the one that reads most like a dead run while being
+  // resumable -- the retry ladder parks a run there with the issue's lock
+  // columns still pointed at it.
+  it.each(ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES)(
+    "keeps the workspace-finalize barrier closed while the owing run is `%s` (PEN-3304)",
+    async (holdingStatus) => {
+      const { blockerId, dependentId, owingRunId } = await seedFinalizeBarrierFixture();
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: holdingStatus })
+        .where(eq(heartbeatRuns.id, owingRunId));
+
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: false,
+        pendingFinalizeBlockerIssueIds: [blockerId],
+        unresolvedBlockerIssueIds: [blockerId],
+      });
+      expect(await svc.listWakeableBlockedDependents(blockerId)).toEqual([]);
+    },
+  );
+
+  it("keeps the workspace-finalize barrier closed when the unfinalized operation names no run (PEN-3255)", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "QA",
+      role: "qa",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Shared workspace project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Shared workspace",
+      sourceType: "local_path",
+      visibility: "default",
+      isPrimary: true,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Shared exec workspace",
+      status: "active",
+      providerType: "git_worktree",
+    });
+
+    const blockerId = randomUUID();
+    const dependentId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: blockerId,
+        companyId,
+        projectId,
+        title: "Predecessor",
+        status: "done",
+        priority: "medium",
+        executionWorkspaceId,
+      },
+      {
+        id: dependentId,
+        companyId,
+        projectId,
+        title: "Dependent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+    await svc.update(dependentId, { blockedByIssueIds: [blockerId] });
+
+    // An operation with no `heartbeat_run_id` carries no evidence either way,
+    // so the release must NOT fire: absence of a run row is not proof the work
+    // finished. Pinning this keeps the PEN-3255 release narrow -- it is the one
+    // case where "nothing can deliver the finalize" and "we cannot tell" look
+    // alike, and defaulting it open would drop the barrier for every legacy row.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      phase: "worktree_prepare",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:00:00.000Z"),
+    });
+
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: false,
+      pendingFinalizeBlockerIssueIds: [blockerId],
+      unresolvedBlockerIssueIds: [blockerId],
+    });
+  });
+
   it("does NOT count/log fast_path_finalize_gated when a dependent also has a wholly-unresolved blocker (Ally review, BLO-13250)", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
@@ -8616,6 +8894,38 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       status: 422,
       message: "Parent issue would create a cycle",
     });
+  });
+
+  // BLO-34207: issue mutations read instance settings on the caller's handle so
+  // they do not take a second pool connection while holding the company graph
+  // lock. That read must stay a pure read: bootstrapping the singleton row from
+  // inside the caller's tx takes an instance-wide row lock BEFORE
+  // `lockIssueParentMutationCompany` and holds it to commit, so two callers can
+  // take the two locks in opposite orders. Assert the write never happens.
+  it("does not write the instance settings singleton from an update running on a caller transaction", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Settings read must not write",
+      status: "todo",
+      priority: "medium",
+    });
+    await db.delete(instanceSettings);
+
+    await db.transaction(async (tx) => {
+      await svc.update(issueId, { title: "Renamed under a caller tx" }, tx);
+    });
+
+    expect(await db.select().from(instanceSettings)).toHaveLength(0);
   });
 
   it("returns cycle validation instead of deadlocking intersecting multi-level reparent updates", async () => {

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -9,6 +9,7 @@ import {
   companies,
   createDb,
   detachedQueuedRunRecoveries,
+  externalRuntimeReservations,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -65,6 +66,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     await db.delete(activityLog);
     await db.delete(issueTreeHolds);
     await db.delete(issues);
+    await db.delete(externalRuntimeReservations);
     // Must precede heartbeatRuns: the promotion tests drive
     // promoteDueScheduledRetries, which writes heartbeat_run_events, and the FK
     // heartbeat_run_events_run_id_heartbeat_runs_id_fk otherwise blocks the
@@ -78,6 +80,11 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     // BLO-30087: back to "no positive busy evidence" so a busy-pod case cannot
     // leak into the pre-existing cases, which all assume silence == dead.
     mockProbeAgentPodActivity.mockImplementation(async () => "unknown");
+    // BLO-30245: reset the CALL HISTORY too, not just the implementation.
+    // Without this the count accumulates across cases, so any probe-count
+    // assertion silently measures every earlier test as well and its verdict
+    // depends on execution order.
+    mockProbeAgentPodActivity.mockClear();
   });
 
   afterAll(async () => {
@@ -210,6 +217,161 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row).toEqual({ checkoutRunId: runningRunId, executionRunId: runningRunId });
+  });
+
+  it("does not clear a terminal run lock while its external runtime reservation is active", async () => {
+    const { companyId, agentId, failedRunId } = await seed();
+    const issueId = randomUUID();
+    const now = new Date();
+    await db.insert(externalRuntimeReservations).values({
+      companyId,
+      agentId,
+      runId: failedRunId,
+      slotId: 0,
+      state: "release_pending",
+      expectedJobName: `agent-job-${failedRunId.slice(0, 8)}`,
+      jobName: `agent-job-${failedRunId.slice(0, 8)}`,
+      jobUid: `uid-${failedRunId}`,
+      isolationMode: "shared",
+      isolationKey: `agent-shared:${agentId}`,
+      isolationBoundAt: now,
+      reservedAt: now,
+      launchingAt: now,
+      launchedAt: now,
+      releaseRequestedAt: now,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Terminal run with external cleanup pending",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: failedRunId,
+      executionRunId: failedRunId,
+      executionLockedAt: now,
+    });
+
+    const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: failedRunId, executionRunId: failedRunId });
+  });
+
+  it("rechecks external runtime reservations inside the stale-lock transaction", async () => {
+    const { companyId, agentId, failedRunId } = await seed();
+    const issueId = randomUUID();
+    const now = new Date();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Terminal run whose cleanup starts during the sweep",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: failedRunId,
+      executionRunId: failedRunId,
+      executionLockedAt: now,
+    });
+
+    const heartbeat = heartbeatService(db, {
+      beforeStaleIssueLockSweepClearForTest: async (issue) => {
+        if (issue.id !== issueId) return;
+        await db.insert(externalRuntimeReservations).values({
+          companyId,
+          agentId,
+          runId: failedRunId,
+          slotId: 0,
+          state: "release_pending",
+          expectedJobName: `agent-job-${failedRunId.slice(0, 8)}`,
+          jobName: `agent-job-${failedRunId.slice(0, 8)}`,
+          jobUid: `uid-${failedRunId}`,
+          isolationMode: "shared",
+          isolationKey: `agent-shared:${agentId}`,
+          isolationBoundAt: now,
+          reservedAt: now,
+          launchingAt: now,
+          launchedAt: now,
+          releaseRequestedAt: now,
+        });
+      },
+    });
+
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: failedRunId, executionRunId: failedRunId });
+  });
+
+  it("does not promote an ordinary deferred wake while an external monitor owns resumption", async () => {
+    const { companyId, agentId, failedRunId } = await seed();
+    const issueId = randomUUID();
+    const monitorNextCheckAt = new Date("2099-12-01T12:00:00.000Z");
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "External wait with a deferred comment",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: failedRunId,
+      executionRunId: failedRunId,
+      executionLockedAt: new Date(),
+      executionPolicy: {
+        monitor: {
+          nextCheckAt: monitorNextCheckAt.toISOString(),
+          scheduledBy: "assignee",
+          kind: "external_service",
+          serviceName: "github-actions",
+        },
+      },
+      monitorNextCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    const deferredWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        _paperclipWakeContext: { issueId, wakeReason: "issue_comment_added" },
+      },
+      status: "deferred_issue_execution",
+    });
+
+    const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    const [wake, promotedRuns] = await Promise.all([
+      db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, deferredWakeId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`${heartbeatRuns.id} <> ${failedRunId}`,
+        )),
+    ]);
+    expect(wake?.status).toBe("cancelled");
+    expect(promotedRuns).toHaveLength(0);
   });
 
   it("does not clear when checkoutRunId is terminal but executionRunId is still running", async () => {
@@ -1550,28 +1712,33 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       expect(result.issueIds).toEqual([issueId]);
     });
 
-    // Why the in-transaction revalidation does NOT need to re-check the busy
-    // ceiling — reviewed and asserted rather than left to inference.
+    // Why the in-transaction revalidation's `=== true` arm is still a no-op —
+    // reviewed and asserted rather than left to inference.
     //
-    // `currentRunningLockSilent` reads the memoized busy verdict without
-    // re-deriving the ceiling, which reads like a hole: a holder probed at 2h30m
-    // could be past the 3h ceiling by the time the transaction revalidates, and
-    // a memoized "spared" would then preserve a zombie's lock. It cannot,
-    // because being spared and reaching the transaction are mutually exclusive:
+    // `currentRunningLockSilent` reads the memoized busy verdict rather than
+    // probing, which reads like a hole: a holder probed at 2h30m could be past
+    // the 3h ceiling by the time the transaction revalidates, and a memoized
+    // "busy" would then preserve a zombie's lock. Two independent guards stop
+    // it, and it is worth being precise about which does what, because
+    // BLO-30245 turned on exactly this distinction.
     //
-    //   executionLockExpired = isPreClaimLockExpired(...) || runningLockSilent
-    //   runningLockSilent    = isRunningLockSilent(...) && !isBusySparedRunningHolder(...)
+    // 1. A holder spared inside the band never gets here at all:
     //
-    // and a non-cleanable `running` holder that is not expired hits `continue`
-    // before `db.transaction` is ever opened. So a `running` holder only reaches
-    // the transaction when the busy spare returned FALSE, which means the memo
-    // for that run is `false` or absent exactly when the branch is evaluated.
-    // The `=== true` arm is defensive, not load-bearing.
+    //      executionLockExpired = isPreClaimLockExpired(...) || runningLockSilent
+    //      runningLockSilent    = isRunningLockSilent(...) && !isBusySparedRunningHolder(...)
     //
-    // That guarantee lives in the ordering of two guards ~150 lines apart, and
-    // nothing enforced it. This case does: let a spared holder into the
-    // transaction and the branch stops being a no-op and becomes the bug it is
-    // mistaken for.
+    //    and a non-cleanable `running` holder that is not expired hits
+    //    `continue` before `db.transaction` is ever opened.
+    // 2. A holder PAST the ceiling does now reach this transaction — the
+    //    BLO-30245 hoist returns false early so the lock can be reclaimed — so
+    //    guard 1 no longer covers it. What covers it is that the revalidation
+    //    re-derives the ceiling itself before consulting the memo.
+    //
+    // Guard 1 alone was the original argument, and it was load-bearing: the
+    // moment the hoist let a past-ceiling holder through, the `=== true` arm
+    // stopped being a no-op and became the very bug it is mistaken for, one
+    // layer below where the hoist could see it. Hence guard 2. This case pins
+    // guard 1; the BLO-30245 mid-invocation case below pins guard 2.
     it("never lets a spared busy holder reach the sweep transaction", async () => {
       const { companyId, agentId } = await seed();
       // Spared: busy pod, inside the band.
@@ -1623,6 +1790,237 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       expect(row).toEqual({
         checkoutRunId: busy.wedgedRunId,
         executionRunId: busy.wedgedRunId,
+      });
+    });
+
+    // BLO-30245: one run can hold execution locks on SEVERAL candidates, and the
+    // loop derives `silentMs` per candidate from a live clock while `runById` is
+    // a pre-loop snapshot. The busy verdict is memoized per run to hold the
+    // probe to one k8s round-trip per invocation — so the memo is necessarily
+    // read at points where the holder's silence has moved on from where it was
+    // probed. These cases pin the ceiling as the authority at every read site,
+    // rather than something baked once into the memoized value.
+    describe("multi-issue holders crossing the ceiling (BLO-30245)", () => {
+      // One `running` holder, N issues, all locked by it. Distinct from
+      // seedWedgedRunningIssue, which mints a fresh holder per issue and so can
+      // never exercise a shared memo.
+      async function seedOneHolderManyIssues(input: {
+        companyId: string;
+        agentId: string;
+        silentFor: number;
+        issueCount: number;
+      }) {
+        const wedgedRunId = randomUUID();
+        const silentSince = new Date(Date.now() - input.silentFor);
+        await db.insert(heartbeatRuns).values({
+          id: wedgedRunId,
+          companyId: input.companyId,
+          agentId: input.agentId,
+          status: "running",
+          invocationSource: "assignment",
+          startedAt: silentSince,
+          lastOutputAt: silentSince,
+          lastUsefulActionAt: silentSince,
+        });
+        const issueIds: string[] = [];
+        for (let index = 0; index < input.issueCount; index += 1) {
+          const issueId = randomUUID();
+          issueIds.push(issueId);
+          await db.insert(issues).values({
+            id: issueId,
+            companyId: input.companyId,
+            title: `Lock ${index} held by one multi-issue holder`,
+            status: "in_progress",
+            priority: "high",
+            assigneeAgentId: input.agentId,
+            checkoutRunId: wedgedRunId,
+            executionRunId: wedgedRunId,
+            executionLockedAt: new Date(Date.now() - 8 * 60 * 60 * 1000),
+          });
+        }
+        return { wedgedRunId, issueIds };
+      }
+
+      async function stillLockedIssueIds(issueIds: string[]) {
+        const rows = await db
+          .select({ id: issues.id, executionRunId: issues.executionRunId })
+          .from(issues)
+          .where(inArray(issues.id, issueIds));
+        return rows
+          .filter((row) => row.executionRunId !== null)
+          .map((row) => row.id)
+          .sort();
+      }
+
+      it("clears every lock of a holder already past the busy ceiling, without probing", async () => {
+        // The unconditional half of the acceptance criterion: a holder that was
+        // already past the ceiling when the sweep opened loses EVERY lock, with
+        // no dependence on which candidate is visited first.
+        const { companyId, agentId } = await seed();
+        const { issueIds } = await seedOneHolderManyIssues({
+          companyId,
+          agentId,
+          silentFor: AGENT_POD_BUSY_MAX_STALE_MS + 10 * 60 * 1000,
+          issueCount: 2,
+        });
+        mockProbeAgentPodActivity.mockImplementation(async () => "busy");
+
+        const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+        expect(result.cleared).toBe(2);
+        expect([...result.issueIds].sort()).toEqual([...issueIds].sort());
+        expect(await stillLockedIssueIds(issueIds)).toEqual([]);
+        // The ceiling settles this outright, so it must not cost a k8s call:
+        // past the bound no pod state can spare the lock.
+        expect(mockProbeAgentPodActivity).not.toHaveBeenCalled();
+      });
+
+      it("spares every lock of an in-band busy holder, probing exactly once", async () => {
+        // The other half: memoization is preserved, not removed. Hoisting the
+        // ceiling must not turn the spare into a per-issue k8s round-trip.
+        const { companyId, agentId } = await seed();
+        const { wedgedRunId, issueIds } = await seedOneHolderManyIssues({
+          companyId,
+          agentId,
+          silentFor: SILENT_INSIDE_WINDOW_MS,
+          issueCount: 2,
+        });
+        mockProbeAgentPodActivity.mockImplementation(async () => "busy");
+
+        const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+        expect(result.cleared).toBe(0);
+        expect(await stillLockedIssueIds(issueIds)).toEqual([...issueIds].sort());
+        expect(mockProbeAgentPodActivity).toHaveBeenCalledTimes(1);
+        expect(mockProbeAgentPodActivity).toHaveBeenCalledWith(wedgedRunId);
+      });
+
+      it("clears the lock of a holder that crosses the busy ceiling mid-invocation", async () => {
+        // The bug. Pre-fix the memo was read BEFORE the ceiling was evaluated,
+        // so a run probed `busy` at 2h58m answered a later candidate at 3h03m
+        // straight from the memo and kept that lock for the rest of the
+        // invocation — past the bound the sweeper advertises.
+        //
+        // Only the clock moves between the two candidates: they share one
+        // holder, and `runById` is a pre-loop snapshot. So advancing it from
+        // inside the probe mock lands the crossing precisely between them. The
+        // probe fires exactly once (the sole memo miss) and the first
+        // candidate's `silentMs` is already computed when it fires, so that
+        // candidate is legitimately in-band and keeps its lock. `silentMs` is
+        // re-derived per candidate, which is what makes the second one differ.
+        //
+        // Note this asserts the PRECISE criterion, not the loose reading of it:
+        // for a mid-loop crossing only the post-crossing candidates can clear.
+        // "every candidate" holds unconditionally in the already-past-ceiling
+        // case above, which is why both cases are needed.
+        const { companyId, agentId } = await seed();
+        const realNow = Date.now.bind(Date);
+        let clockOffsetMs = 0;
+        // vi.spyOn over Date.now, not fake timers: this suite drives real
+        // Postgres I/O, and `new Date()` does not route through Date.now in V8,
+        // so the service's own `clearedAt` stamps stay truthful.
+        const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow() + clockOffsetMs);
+        try {
+          const { issueIds } = await seedOneHolderManyIssues({
+            companyId,
+            agentId,
+            silentFor: AGENT_POD_BUSY_MAX_STALE_MS - 2 * 60 * 1000,
+            issueCount: 2,
+          });
+          mockProbeAgentPodActivity.mockImplementation(async () => {
+            // Crossing the ceiling between candidate one and candidate two.
+            clockOffsetMs = 5 * 60 * 1000;
+            return "busy";
+          });
+
+          const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+          // Caught by re-deriving the ceiling, not by spending a second probe.
+          expect(mockProbeAgentPodActivity).toHaveBeenCalledTimes(1);
+          // Pre-fix this is 0: the memo spared both candidates.
+          expect(result.cleared).toBe(1);
+          // The candidates query has no ORDER BY (see the pre-transaction scan),
+          // so which issue is visited first is unspecified. Assert the
+          // partition, never the identity: one keeps its lock, the other loses
+          // it, and they are not the same issue.
+          const stillLocked = await stillLockedIssueIds(issueIds);
+          expect(stillLocked).toHaveLength(1);
+          expect(issueIds).toContain(stillLocked[0]);
+          expect(result.issueIds).toHaveLength(1);
+          expect(stillLocked).not.toContain(result.issueIds[0]);
+        } finally {
+          // This suite has no restoreAllMocks in afterEach; leaking a shifted
+          // clock would corrupt every later case.
+          nowSpy.mockRestore();
+        }
+      });
+
+      it("still spares an in-band candidate of a holder whose other candidate is past the ceiling", async () => {
+        // Two candidates of ONE holder on opposite sides of the ceiling inside a
+        // single invocation. Reachable because `runningLockStaleBasis` falls back
+        // to the PER-ISSUE lock timestamp when a `running` holder has stamped no
+        // activity at all — the mid-claim shape — so `silentMs` stops being a
+        // property of the run alone.
+        //
+        // This pins the decision NOT to memoize the past-ceiling early return.
+        // Recording "not busy" there would poison the memo for the in-band
+        // candidate and clear a lock the ceiling never authorised clearing: the
+        // reported bug with its sign flipped, losing a live holder's workspace
+        // instead of over-holding a dead one. Order-independent by construction
+        // — whichever candidate the (unordered) query yields first, the
+        // past-ceiling one clears, the in-band one is spared, and the probe
+        // fires exactly once.
+        const { companyId, agentId } = await seed();
+        const wedgedRunId = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id: wedgedRunId,
+          companyId,
+          agentId,
+          status: "running",
+          invocationSource: "assignment",
+          // No activity signal of any kind, forcing the per-issue fallback.
+          startedAt: null,
+          lastOutputAt: null,
+          lastUsefulActionAt: null,
+        });
+        const pastCeilingIssueId = randomUUID();
+        const inBandIssueId = randomUUID();
+        await db.insert(issues).values([
+          {
+            id: pastCeilingIssueId,
+            companyId,
+            title: "Lock held past the busy ceiling",
+            status: "in_progress",
+            priority: "high",
+            assigneeAgentId: agentId,
+            checkoutRunId: wedgedRunId,
+            executionRunId: wedgedRunId,
+            executionLockedAt: new Date(
+              Date.now() - (AGENT_POD_BUSY_MAX_STALE_MS + 10 * 60 * 1000),
+            ),
+          },
+          {
+            id: inBandIssueId,
+            companyId,
+            title: "Lock held inside the busy band",
+            status: "in_progress",
+            priority: "high",
+            assigneeAgentId: agentId,
+            checkoutRunId: wedgedRunId,
+            executionRunId: wedgedRunId,
+            executionLockedAt: new Date(Date.now() - SILENT_INSIDE_WINDOW_MS),
+          },
+        ]);
+        mockProbeAgentPodActivity.mockImplementation(async () => "busy");
+
+        const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+        expect(result.cleared).toBe(1);
+        expect(result.issueIds).toEqual([pastCeilingIssueId]);
+        expect(
+          await stillLockedIssueIds([pastCeilingIssueId, inBandIssueId]),
+        ).toEqual([inBandIssueId]);
+        expect(mockProbeAgentPodActivity).toHaveBeenCalledTimes(1);
       });
     });
 
@@ -2453,5 +2851,461 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row?.checkoutRunId).toBe(runningRunId);
+  });
+
+  // BLO-29913: the sweep is the last writer that can restore a checkout
+  // promotion, because clearing the lock columns is exactly what makes every
+  // other (run-context-scoped) restore call site unable to reach the row again.
+  describe("checkout promotion restore (BLO-29913)", () => {
+    async function seedStrandedPromotion(input: {
+      companyId: string;
+      agentId: string;
+      lockRunId: string;
+      startedAt: Date;
+      checkoutRestoreStatus?: string | null;
+      monitorNextCheckAt?: Date | null;
+    }) {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: input.companyId,
+        title: "Stranded checkout promotion",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: input.agentId,
+        checkoutRunId: input.lockRunId,
+        executionRunId: null,
+        checkoutRestoreStatus:
+          "checkoutRestoreStatus" in input ? input.checkoutRestoreStatus : "todo",
+        startedAt: input.startedAt,
+        monitorNextCheckAt: input.monitorNextCheckAt ?? null,
+      });
+      return issueId;
+    }
+
+    function readRow(issueId: string) {
+      return db
+        .select({
+          status: issues.status,
+          startedAt: issues.startedAt,
+          checkoutRestoreStatus: issues.checkoutRestoreStatus,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+    }
+
+    it("restores the queue-tier status, clears startedAt, and preserves the assignee", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt: new Date(Date.now() - 40 * 60 * 60 * 1000),
+      });
+
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.sweepStaleIssueLocks();
+
+      expect(result.cleared).toBe(1);
+      const row = await readRow(issueId);
+      // Demoted back to the tier checkout promoted it from...
+      expect(row?.status).toBe("todo");
+      // ...with the long_active_duration clock stopped...
+      expect(row?.startedAt).toBeNull();
+      expect(row?.checkoutRestoreStatus).toBeNull();
+      // ...and still in its owner's queue rather than released to the pool.
+      expect(row?.assigneeAgentId).toBe(agentId);
+      expect(row?.checkoutRunId).toBeNull();
+    });
+
+    // BLO-33144: a `blocked` marker is only restored verbatim when an edge can
+    // actually wake the row again. `checkout` accepts `blocked` in
+    // `expectedStatuses` and the recovery path writes `blocked` on stranded
+    // rows, so the marker is minted far more often than real dependency
+    // blocking — measured on the 2026-09-10 cohort, 141 of 141 rows carrying a
+    // `blocked` marker had zero blocker edges. Restoring those verbatim turns a
+    // loud row into a silent permanent one, because the heartbeat skips
+    // `blocked` (BLO-27553).
+    async function seedBlocker(input: {
+      companyId: string;
+      blockedIssueId: string;
+      blockerStatus: string;
+    }) {
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId: input.companyId,
+        title: "Blocker",
+        status: input.blockerStatus,
+        priority: "high",
+      });
+      await db.insert(issueRelations).values({
+        companyId: input.companyId,
+        issueId: blockerId,
+        relatedIssueId: input.blockedIssueId,
+        type: "blocks",
+      });
+      return blockerId;
+    }
+
+    it("restores a promotion whose pre-checkout status was blocked, when a live blocker edge still exists", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+        checkoutRestoreStatus: "blocked",
+      });
+      // The edge is what makes `blocked` a real waiting state: when this
+      // blocker reaches `done`, issue_blockers_resolved_sweep wakes the row.
+      await seedBlocker({ companyId, blockedIssueId: issueId, blockerStatus: "todo" });
+
+      await heartbeatService(db).sweepStaleIssueLocks();
+
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("blocked");
+      expect(row?.startedAt).toBeNull();
+    });
+
+    it("lands a blocked marker with no blocker edge in todo rather than stranding it", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+        checkoutRestoreStatus: "blocked",
+      });
+
+      await heartbeatService(db).sweepStaleIssueLocks();
+
+      const row = await readRow(issueId);
+      // `blocked` here would have no wake path of any kind: the heartbeat skips
+      // it and there is no edge for the resolved sweep to fire on. `todo` keeps
+      // it in inbox-lite and re-dispatchable.
+      expect(row?.status).toBe("todo");
+      expect(row?.startedAt).toBeNull();
+      expect(row?.assigneeAgentId).toBe(agentId);
+    });
+
+    it("lands a blocked marker whose only blocker is cancelled in todo", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+        checkoutRestoreStatus: "blocked",
+      });
+      // A cancelled blocker never reaches `done`, so "every blocker done" is
+      // unreachable and the resolved sweep can never fire. Worse than no edge:
+      // it reads as a live dependency on every triage surface.
+      await seedBlocker({ companyId, blockedIssueId: issueId, blockerStatus: "cancelled" });
+
+      await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect((await readRow(issueId))?.status).toBe("todo");
+    });
+
+    it("lands a blocked marker whose blockers are all done in todo", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+        checkoutRestoreStatus: "blocked",
+      });
+      // The resolved sweep fires on the TRANSITION to all-done, which already
+      // happened while this row was `in_progress`. Restoring `blocked` now
+      // would wait for an event that has been and gone.
+      await seedBlocker({ companyId, blockedIssueId: issueId, blockerStatus: "done" });
+
+      await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect((await readRow(issueId))?.status).toBe("todo");
+    });
+
+    it("does not demote a row holding a dispatchable monitor with a future check", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const startedAt = new Date(Date.now() - 40 * 60 * 60 * 1000);
+      const monitorNextCheckAt = new Date(Date.now() + 60 * 60 * 1000);
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt,
+        monitorNextCheckAt,
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      // The stale lock is still released — only the promotion is retained, so
+      // the monitor keeps the `in_progress` status it needs in order to fire.
+      expect(result.cleared).toBe(1);
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("in_progress");
+      expect(row?.startedAt?.getTime()).toBe(startedAt.getTime());
+      expect(row?.checkoutRestoreStatus).toBe("todo");
+      expect(row?.checkoutRunId).toBeNull();
+    });
+
+    it("leaves a deliberate in_progress write alone when no promotion marker is present", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const startedAt = new Date(Date.now() - 40 * 60 * 60 * 1000);
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt,
+        // Any explicit status write clears the marker, so its absence means the
+        // `in_progress` is owned by a writer other than checkout.
+        checkoutRestoreStatus: null,
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect(result.cleared).toBe(1);
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("in_progress");
+      expect(row?.startedAt?.getTime()).toBe(startedAt.getTime());
+    });
+  });
+
+  // BLO-33144: the reconciliation half. BLO-29913 stops NEW strands but is
+  // forward-only — the candidate scan requires a non-null lock column, and on
+  // an already-stranded row an earlier pass nulled both without restoring. So
+  // the fixed sweep can never select the accumulated cohort (measured
+  // 2026-09-10: 225 of 225 drainable rows had both lock columns NULL).
+  describe("stranded promotion drain (BLO-33144)", () => {
+    async function seedLockFreeStrand(input: {
+      companyId: string;
+      agentId: string | null;
+      assigneeUserId?: string | null;
+      startedAt?: Date;
+      checkoutRestoreStatus?: string | null;
+      monitorNextCheckAt?: Date | null;
+      status?: string;
+    }) {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: input.companyId,
+        title: "Lock-free stranded promotion",
+        status: input.status ?? "in_progress",
+        priority: "high",
+        assigneeAgentId: input.agentId,
+        assigneeUserId: input.assigneeUserId ?? null,
+        // The defining shape: no lock left for the sweep's scan to find.
+        checkoutRunId: null,
+        executionRunId: null,
+        checkoutRestoreStatus:
+          "checkoutRestoreStatus" in input ? input.checkoutRestoreStatus : "todo",
+        startedAt: input.startedAt ?? new Date(Date.now() - 40 * 60 * 60 * 1000),
+        monitorNextCheckAt: input.monitorNextCheckAt ?? null,
+      });
+      return issueId;
+    }
+
+    function readRow(issueId: string) {
+      return db
+        .select({
+          status: issues.status,
+          startedAt: issues.startedAt,
+          checkoutRestoreStatus: issues.checkoutRestoreStatus,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+    }
+
+    it("drains a row whose lock columns an earlier pass already cleared", async () => {
+      const { companyId, agentId } = await seed();
+      const issueId = await seedLockFreeStrand({ companyId, agentId });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      // Nothing to clear — this row is invisible to the lock scan entirely,
+      // which is the whole reason it needed its own pass.
+      expect(result.cleared).toBe(0);
+      expect(result.restoredStrandedPromotions).toBe(1);
+      expect(result.restoredStrandedPromotionIssueIds).toContain(issueId);
+
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("todo");
+      // The load-bearing half: long_active_duration measures from startedAt.
+      expect(row?.startedAt).toBeNull();
+      expect(row?.checkoutRestoreStatus).toBeNull();
+      expect(row?.assigneeAgentId).toBe(agentId);
+    });
+
+    it("is idempotent — a second pass restores nothing", async () => {
+      const { companyId, agentId } = await seed();
+      await seedLockFreeStrand({ companyId, agentId });
+
+      const first = await heartbeatService(db).sweepStaleIssueLocks();
+      expect(first.restoredStrandedPromotions).toBe(1);
+
+      // The restore clears the marker, so the shared guard no longer matches.
+      const second = await heartbeatService(db).sweepStaleIssueLocks();
+      expect(second.restoredStrandedPromotions).toBe(0);
+      expect(second.restoredStrandedPromotionIssueIds).toEqual([]);
+    });
+
+    it("skips a lock-free row holding a dispatchable monitor with a future check", async () => {
+      const { companyId, agentId } = await seed();
+      const startedAt = new Date(Date.now() - 40 * 60 * 60 * 1000);
+      const monitorNextCheckAt = new Date(Date.now() + 60 * 60 * 1000);
+      const issueId = await seedLockFreeStrand({
+        companyId,
+        agentId,
+        startedAt,
+        monitorNextCheckAt,
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      // Attended: `in_progress` is the state the monitor needs to fire, so the
+      // promotion is deferred rather than cancelled (BLO-29554).
+      expect(result.restoredStrandedPromotions).toBe(0);
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("in_progress");
+      expect(row?.startedAt?.getTime()).toBe(startedAt.getTime());
+      expect(row?.checkoutRestoreStatus).toBe("todo");
+      expect(row?.monitorNextCheckAt?.getTime()).toBe(monitorNextCheckAt.getTime());
+    });
+
+    it("skips a lock-free row carrying no promotion marker", async () => {
+      const { companyId, agentId } = await seed();
+      const startedAt = new Date(Date.now() - 40 * 60 * 60 * 1000);
+      const issueId = await seedLockFreeStrand({
+        companyId,
+        agentId,
+        startedAt,
+        checkoutRestoreStatus: null,
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect(result.restoredStrandedPromotions).toBe(0);
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("in_progress");
+      expect(row?.startedAt?.getTime()).toBe(startedAt.getTime());
+    });
+
+    it("leaves an ownerless row loud rather than laundering it into a silent strand", async () => {
+      const { companyId } = await seed();
+      const startedAt = new Date(Date.now() - 40 * 60 * 60 * 1000);
+      const issueId = await seedLockFreeStrand({
+        companyId,
+        agentId: null,
+        assigneeUserId: null,
+        startedAt,
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      // Heartbeat selection is by assignee, so restoring this to `todo` would
+      // put it in no inbox at all — the mirror of the blocked-with-no-edge
+      // strand, and quieter, because it would read as a healthy actionable row
+      // (BLO-30095). `in_progress` with a live `startedAt` at least stays
+      // anomalous, and the marker is preserved so a later restore is possible
+      // once the row has an owner.
+      expect(result.restoredStrandedPromotions).toBe(0);
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("in_progress");
+      expect(row?.startedAt?.getTime()).toBe(startedAt.getTime());
+      expect(row?.checkoutRestoreStatus).toBe("todo");
+    });
+
+    it("drains a row whose only owner is a user, since their inbox is a real wake path", async () => {
+      const { companyId } = await seed();
+      const issueId = await seedLockFreeStrand({
+        companyId,
+        agentId: null,
+        assigneeUserId: "user_wake_path",
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect(result.restoredStrandedPromotions).toBe(1);
+      expect(result.restoredStrandedPromotionIssueIds).toContain(issueId);
+
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("todo");
+      expect(row?.startedAt).toBeNull();
+      expect(row?.checkoutRestoreStatus).toBeNull();
+      expect(row?.assigneeUserId).toBe("user_wake_path");
+    });
+
+    it("leaves a row held by a live run to the lock sweep", async () => {
+      const { companyId, agentId, runningRunId } = await seed();
+      const issueId = randomUUID();
+      const startedAt = new Date(Date.now() - 40 * 60 * 60 * 1000);
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Live run holds this",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        executionRunId: runningRunId,
+        executionLockedAt: new Date(),
+        checkoutRestoreStatus: "todo",
+        startedAt,
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      // The drain only ever selects both-columns-NULL rows, so the two passes
+      // are disjoint and neither can demote a row out from under a live run.
+      expect(result.restoredStrandedPromotionIssueIds).not.toContain(issueId);
+      const row = await readRow(issueId);
+      expect(row?.status).toBe("in_progress");
+      expect(row?.startedAt?.getTime()).toBe(startedAt.getTime());
+    });
+
+    it("drains a blocked marker with no edge to todo, and keeps one with a live edge blocked", async () => {
+      const { companyId, agentId } = await seed();
+      const strandedId = await seedLockFreeStrand({
+        companyId,
+        agentId,
+        checkoutRestoreStatus: "blocked",
+      });
+      const genuinelyBlockedId = await seedLockFreeStrand({
+        companyId,
+        agentId,
+        checkoutRestoreStatus: "blocked",
+      });
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId,
+        title: "Blocker",
+        status: "todo",
+        priority: "high",
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: genuinelyBlockedId,
+        type: "blocks",
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect(result.restoredStrandedPromotions).toBe(2);
+      // This is the case that makes the drain safe to run at all: without it,
+      // the drain would mint a row with no wake path of any kind.
+      expect((await readRow(strandedId))?.status).toBe("todo");
+      expect((await readRow(genuinelyBlockedId))?.status).toBe("blocked");
+    });
   });
 });

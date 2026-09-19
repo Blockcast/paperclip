@@ -110,6 +110,30 @@ const listIssuesSchema = z.object({
       "Hydrate `blockedBy` on every row. Default false, in which case the key is ABSENT (not `[]`) — do not read a missing key as 'no blockers'. `blocks` is never hydrated on list at any setting; use paperclipGetIssue for that.",
     ),
   q: z.string().optional().describe(ISSUE_SEARCH_Q_DESCRIPTION),
+  // BLO-33741: without these an MCP caller could neither raise the 500 default
+  // nor page past it, so learning a page was truncated left nothing to do
+  // about it. They pass straight through as query params.
+  //
+  // Deliberately NO `.max()`: the REST endpoint clamps an oversized `limit` to
+  // ISSUE_LIST_MAX_LIMIT (`clampIssueListLimit`) and 400s only on a
+  // non-positive / non-integer value. A schema bound here would reject the
+  // oversized request this very description tells callers is clamped, so they
+  // could never observe `appliedLimit: 1000`. Keep the client permissive and
+  // let the server's clamp be the single source of truth.
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(
+      "Rows to return. Defaults to 500; the server hard-caps it at 1000 and a larger value is silently clamped to 1000, NOT rejected. When the cap bites, the response is an object `{truncated: true, appliedLimit, returnedCount, note, issues: [...]}` instead of the usual bare array — so a plain array back is itself the proof that you have every matching row. Page the remainder with `offset`.",
+    ),
+  offset: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe("Rows to skip. Use with `limit` to page past a truncated result."),
 });
 
 const searchIssuesSchema = listIssuesSchema.omit({ q: true }).extend({
@@ -308,6 +332,31 @@ async function getIssueWorkspaceRuntime(client: PaperclipApiClient, issueId: str
 
 type ListIssuesInput = z.infer<typeof listIssuesSchema>;
 
+/**
+ * BLO-33741: fold the server's truncation headers into the tool result.
+ *
+ * Exported for test. The asymmetry is deliberate and is the whole point: an
+ * UNtruncated response passes through as the bare array callers already parse,
+ * so nothing that works today changes shape. Only the case that is currently
+ * silently wrong — a capped page indistinguishable from a complete one — gets
+ * the envelope, and it gets one loud enough that a caller cannot read past it.
+ */
+export function applyIssueListTruncationEnvelope(data: unknown, headers: Headers): unknown {
+  if (headers.get("x-result-truncated") !== "true") return data;
+  const appliedLimit = Number(headers.get("x-applied-limit"));
+  const rows = Array.isArray(data) ? data : [];
+  return {
+    truncated: true,
+    appliedLimit: Number.isFinite(appliedLimit) ? appliedLimit : null,
+    returnedCount: rows.length,
+    note:
+      `TRUNCATED: this response holds ${rows.length} rows and MORE MATCH beyond it. ` +
+      "This is a prefix, not the population — do not report a count from it. " +
+      "Page with limit/offset (offset += appliedLimit), or narrow the filters.",
+    issues: rows,
+  };
+}
+
 async function listIssues(client: PaperclipApiClient, input: ListIssuesInput) {
   const companyId = await client.resolveCompany({ override: input.companyId });
   const params = new URLSearchParams();
@@ -316,9 +365,12 @@ async function listIssues(client: PaperclipApiClient, input: ListIssuesInput) {
     params.set(key, String(value));
   }
   const qs = params.toString();
-  return client.requestJson("GET", `/companies/${companyId}/issues${qs ? `?${qs}` : ""}`, {
-    companyId,
-  });
+  const { data, headers } = await client.requestJsonWithHeaders(
+    "GET",
+    `/companies/${companyId}/issues${qs ? `?${qs}` : ""}`,
+    { companyId },
+  );
+  return applyIssueListTruncationEnvelope(data, headers);
 }
 
 export function createToolDefinitions(client: PaperclipApiClient): ToolDefinition[] {
@@ -373,13 +425,13 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipListIssues",
-      "List issues for a company with optional filters (status, projectId, assigneeAgentId, labelId, q, ...). Omitting a filter does not scope it — pass status explicitly if you only want open work; unfiltered can return the full company backlog.\n\nRELATIONAL FIELDS ARE NOT HYDRATED HERE. `blockedBy` is absent unless you pass includeBlockedBy=true; `blocks` and `children` are NEVER present at any setting. An absent key is not an empty relation — never conclude 'this issue has no blockers' or 'this epic has no children' from a list row. To enumerate children pass parentId (direct) or descendantOf (subtree); to read `blocks`, call paperclipGetIssue.\n\nLIVENESS IS THREE PATHS, AND EVERY ROW CARRIES ALL THREE. An issue is *attended* by a live run (`activeRun`), an armed monitor (`monitorNextCheckAt` + peers), or a scheduled retry (`scheduledRetryAt`, `scheduledRetryReason`, `scheduledRetryAttempt`). The retry scalars are always **present**, explicitly `null` when the issue has no parked run — so `scheduledRetryAt === null` genuinely means 'no retry', and a row is unattended only when all three paths are empty. Auditing on `activeRun` alone systematically over-reports unattended, because a run parked on a concrete `scheduledRetryAt` is not abandoned; that is the defect BLO-28843 fixed, after it produced a >20× lane-capacity error. The scalars mirror `paperclipGetIssue`'s `scheduledRetry` object and agree with `paperclipListParkedAgents` for the same run.\n\n`blockerAttention` is a coarse triage signal, NOT a summary of `blockedBy`, and reading it as one is wrong in three ways: (1) it is computed for non-terminal rows whose status is `blocked` or whose dependency readiness has unresolved explicit blockers; all-zeros means the row is not an attention root, but open child issues do NOT make a row a root, so all-zeros still tells you nothing about children — enumerate them with parentId; (2) `unresolvedBlockerCount` counts explicit blockers UNION open child issues, so it legitimately exceeds `blockedBy.length`; (3) `sampleBlockerIdentifier` is drawn from the transitive closure and often names an issue absent from `blockedBy`. Use it to rank attention, never to decide a specific issue is unblocked.",
+      "List issues for a company with optional filters (status, projectId, assigneeAgentId, labelId, q, ...). Omitting a filter does not scope it — pass status explicitly if you only want open work; unfiltered can return the full company backlog.\n\nTHIS CALL IS CAPPED AT 500 ROWS BY DEFAULT AND 1000 MAXIMUM. Pass `limit` to raise it up to 1000; a larger value is clamped to 1000, not rejected. When the cap bites you get an OBJECT — `{truncated: true, appliedLimit, returnedCount, note, issues: [...]}` — instead of the usual bare array, so a bare array back is positive proof you have every matching row and an object means you are holding a PREFIX. Never report a population count off a truncated page; page the rest with `limit`/`offset` or narrow the filters.\n\nRELATIONAL FIELDS ARE NOT HYDRATED HERE. `blockedBy` is absent unless you pass includeBlockedBy=true; `blocks` and `children` are NEVER present at any setting. An absent key is not an empty relation — never conclude 'this issue has no blockers' or 'this epic has no children' from a list row. To enumerate children pass parentId (direct) or descendantOf (subtree); to read `blocks`, call paperclipGetIssue.\n\nLIVENESS IS THREE PATHS, AND EVERY ROW CARRIES ALL THREE. An issue is *attended* by a live run (`activeRun`), an armed monitor (`monitorNextCheckAt` + peers), or a scheduled retry (`scheduledRetryAt`, `scheduledRetryReason`, `scheduledRetryAttempt`). The retry scalars are always **present**, explicitly `null` when the issue has no parked run — so `scheduledRetryAt === null` genuinely means 'no retry', and a row is unattended only when all three paths are empty. Auditing on `activeRun` alone systematically over-reports unattended, because a run parked on a concrete `scheduledRetryAt` is not abandoned; that is the defect BLO-28843 fixed, after it produced a >20× lane-capacity error. The scalars mirror `paperclipGetIssue`'s `scheduledRetry` object and agree with `paperclipListParkedAgents` for the same run.\n\n`blockerAttention` is a coarse triage signal, NOT a summary of `blockedBy`, and reading it as one is wrong in three ways: (1) it is computed for non-terminal rows whose status is `blocked` or whose dependency readiness has unresolved explicit blockers; all-zeros means the row is not an attention root, but open child issues do NOT make a row a root, so all-zeros still tells you nothing about children — enumerate them with parentId; (2) `unresolvedBlockerCount` counts explicit blockers UNION open child issues, so it legitimately exceeds `blockedBy.length`; (3) `sampleBlockerIdentifier` is drawn from the transitive closure and often names an issue absent from `blockedBy`. Use it to rank attention, never to decide a specific issue is unblocked.",
       listIssuesSchema,
       async (input) => listIssues(client, input),
     ),
     makeTool(
       "paperclip_search_issues",
-      "Find Paperclip issues whose title, identifier, description, or comments CONTAIN a literal substring. Compatibility alias for clients that ask for paperclip_search_issues; prefer paperclipListIssues with q when choosing tools directly.\n\nDespite the name this is substring matching, not search: the query is not tokenized, so a multi-word phrase must appear verbatim and contiguously. Pass a single distinctive token — see the `query` parameter description before using this as a duplicate check.",
+      "Find Paperclip issues whose title, identifier, description, or comments CONTAIN a literal substring. Compatibility alias for clients that ask for paperclip_search_issues; prefer paperclipListIssues with q when choosing tools directly.\n\nDespite the name this is substring matching, not search: the query is not tokenized, so a multi-word phrase must appear verbatim and contiguously. Pass a single distinctive token — see the `query` parameter description before using this as a duplicate check.\n\nSame 500-default / 1000-maximum row cap as paperclipListIssues, and the same signal: a bare array means you have every match, an object with `truncated: true` means you are holding a prefix.",
       searchIssuesSchema,
       async ({ query, ...input }) => listIssues(client, { ...input, q: query }),
     ),
@@ -859,11 +911,21 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipApiRequest",
-      "Escape hatch: make a raw JSON request to any /api endpoint not covered by a named tool above. Prefer the named tools when one exists — they validate inputs and shape errors consistently; this one does neither.",
+      "Escape hatch: make a raw JSON request to any Paperclip API endpoint not covered by a named tool above. Prefer the named tools when one exists — they validate inputs and shape errors consistently; this one does neither. path is relative to /api — pass '/agents/me', not '/api/agents/me'.",
       apiRequestSchema,
       async ({ method, path, jsonBody }) => {
         if (!path.startsWith("/") || path.includes("..")) {
           throw new Error("path must start with / and be relative to /api, and must not contain '..'");
+        }
+        // The client's base URL already ends in /api, so an /api-prefixed path would
+        // request /api/api/... and come back 404 "API route not found" — byte-identical
+        // to an absent route. Reject it, so a usage error can never read as a measurement.
+        if (/^\/api([/?#]|$)/i.test(path)) {
+          const relative = path.slice(4);
+          throw new Error(
+            `path is relative to /api — pass '${relative.startsWith("/") ? relative : "/agents/me"}', not '${path}'. ` +
+              "This is a usage error in the caller, not a missing route on the server.",
+          );
         }
         return client.requestJson(method, path, {
           body: parseOptionalJson(jsonBody),

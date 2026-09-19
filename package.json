@@ -26,6 +26,7 @@
     "test:k8s-concurrency-chaos:json": "mkdir -p artifacts && pnpm run preflight:workspace-links && vitest run --no-file-parallelism --maxWorkers=1 server/src/services/external-runtime-reservations.test.ts server/src/__tests__/heartbeat-external-lifecycle-concurrency-flag.test.ts server/src/__tests__/heartbeat-workspace-session.test.ts server/src/__tests__/k8s-job-liveness.test.ts --reporter=json --outputFile=artifacts/k8s-concurrency-chaos-core.json && vitest run server/src/__tests__/github-webhook.test.ts -t 'dedupes replayed @ally PR comment reviewer wakes|dedupes a duplicate GitHub delivery' --reporter=json --outputFile=artifacts/k8s-concurrency-chaos-webhook.json",
     "db:generate": "pnpm --filter @paperclipai/db generate",
     "db:migrate": "pnpm --filter @paperclipai/db migrate",
+    "db:precreate-online-indexes": "pnpm --filter @paperclipai/db precreate-online-indexes",
     "issue-references:backfill": "pnpm run preflight:workspace-links && tsx scripts/backfill-issue-reference-mentions.ts",
     "secrets:migrate-inline-env": "tsx scripts/migrate-inline-env-secrets.ts",
     "db:backup": "./scripts/backup-db.sh",
@@ -44,9 +45,12 @@
     "check:no-git-push": "node scripts/check-no-git-push.mjs",
     "test:check-no-git-push": "node --test scripts/check-no-git-push.test.mjs",
     "test:agent-health-preflight": "node --test scripts/agent-health-preflight.test.mjs",
+    "test:fast-uri-advisory": "node --test scripts/fast-uri-advisory.test.js",
     "test:security-audit-overrides": "node scripts/security-audit-overrides.test.js",
     "test:ip-address-security-override": "node --test scripts/ip-address-security-override.test.js",
     "test:browserslist-security-override": "node --test scripts/browserslist-security-override.test.js",
+    "test:multer-security-override": "node --test scripts/multer-security-override.test.js",
+    "test:js-yaml-security-override": "node --test scripts/js-yaml-security-override.test.js",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
     "docs:dev": "cd docs && npx mintlify dev",
     "smoke:hermes-gateway-join": "./scripts/smoke/hermes-gateway-join.sh",
@@ -110,10 +114,11 @@
         ]
       },
       "multer": {
-        "patchedRange": ">=2.2.0 <3",
+        "patchedRange": ">=2.3.0 <3",
         "advisories": [
           "GHSA-72gw-mp4g-v24j",
-          "GHSA-3p4h-7m6x-2hcm"
+          "GHSA-3p4h-7m6x-2hcm",
+          "GHSA-535w-7cp7-47q4"
         ]
       },
       "@babel/core": {
@@ -123,10 +128,11 @@
         ]
       },
       "js-yaml": {
-        "patchedRange": ">=4.3.1 <5",
+        "patchedRange": ">=4.3.2 <5",
         "advisories": [
           "GHSA-h67p-54hq-rp68",
-          "GHSA-5p4m-2wfm-xmqj"
+          "GHSA-5p4m-2wfm-xmqj",
+          "GHSA-2883-xcg3-v3hh"
         ]
       },
       "esbuild": {
@@ -167,11 +173,11 @@
       "@tootallnate/once": "^2.0.1",
       "form-data": ">=4.0.6",
       "@babel/core": ">=7.29.7 <8",
-      "js-yaml": ">=4.3.1 <5",
+      "js-yaml": ">=4.3.2 <5",
       "esbuild": ">=0.28.1 <0.29",
       "@connectrpc/connect-node>undici": ">=6.27.0 <7",
       "jsdom>undici": ">=7.29.0 <8",
-      "multer": ">=2.2.0 <3",
+      "multer": ">=2.3.0 <3",
       "browserslist": ">=4.28.7 <5",
       "react": "^19.2.7",
       "react-dom": "^19.2.7",

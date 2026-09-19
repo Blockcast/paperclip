@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
+import { ApiException } from "@kubernetes/client-node";
 import type { Writable } from "node:stream";
 import { readFile } from "node:fs/promises";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
@@ -25,6 +26,8 @@ const mockBatchPatchJob = vi.fn();
 const mockCoreListPods = vi.fn();
 const mockCoreReadPodLog = vi.fn();
 const mockCoreCreateSecret = vi.fn();
+const mockCoreReadSecret = vi.fn();
+const mockCoreReplaceSecret = vi.fn();
 const mockCorePatchSecret = vi.fn();
 const mockCoreDeleteSecret = vi.fn();
 // vi.hoisted ensures a single vi.fn() instance shared between the mock factory
@@ -49,6 +52,8 @@ vi.mock("./k8s-client.js", () => ({
     listNamespacedPod: mockCoreListPods,
     readNamespacedPodLog: mockCoreReadPodLog,
     createNamespacedSecret: mockCoreCreateSecret,
+    readNamespacedSecret: mockCoreReadSecret,
+    replaceNamespacedSecret: mockCoreReplaceSecret,
     patchNamespacedSecret: mockCorePatchSecret,
     deleteNamespacedSecret: mockCoreDeleteSecret,
   }),
@@ -58,9 +63,16 @@ vi.mock("./k8s-client.js", () => ({
 }));
 
 const mockPrepareBundle = vi.fn();
-vi.mock("./prompt-cache.js", () => ({
-  prepareClaudePromptBundle: mockPrepareBundle,
-}));
+// Partial mock via importOriginal, matching the server-utils mock below: only
+// prepareClaudePromptBundle needs replacing, and a whole-module replacement
+// silently drops every other export the module gains later (BLO-32055 added
+// readCatalogBackedSkillKeys and broke 23 tests here that way).
+vi.mock("./prompt-cache.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./prompt-cache.js")>();
+  return Object.assign(Object.create(null), original, {
+    prepareClaudePromptBundle: mockPrepareBundle,
+  });
+});
 
 vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
   const original = await importOriginal<typeof import("@paperclipai/adapter-utils/server-utils")>();
@@ -82,6 +94,11 @@ const {
   shouldAbortForCancellation,
   execute,
 } = await import("./execute.js");
+
+// Real class, not a stub: the prompt-cache mock above is a partial that passes
+// `original` through, so this is the exact constructor execute.ts imports and
+// the `instanceof` guard under test compares against.
+const { ClaudeSkillSourceUnavailableError } = await import("./prompt-cache.js");
 
 function makeJob(opts: {
   runId?: string;
@@ -1044,6 +1061,66 @@ describe("execute: concurrency guard", () => {
   });
 });
 
+// ─── execute: skill-source classification (BLO-32055) ────────────────────────
+
+// The seam this PR exists to produce. Both halves were already covered and the
+// JOIN was not: prompt-cache.test.ts proves the error carries the right
+// `catalogBacked` flag, recovery-classifiers.test.ts proves the classifier
+// treats `skill_materialization_pending` as transient — but nothing asserted
+// that execute() maps one to the other. Invert the ternary or drop the
+// `instanceof` guard and every other test in this PR still passes while the
+// stated acceptance criterion silently regresses to `adapter_failed`.
+describe("execute: skill source unavailable", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockReadSkillEntries.mockResolvedValue([]);
+    mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+  });
+
+  function makeSkillError(catalogBacked: boolean) {
+    return new ClaudeSkillSourceUnavailableError({
+      skillKey: "garrytan/gstack/investigate",
+      skillSource: "/paperclip/instances/default/skills/co/__runtime__/investigate--9debdeaf08",
+      missingPath:
+        "/paperclip/instances/default/skills/co/__runtime__/investigate--9debdeaf08/SKILL.md",
+      catalogBacked,
+      cause: Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" }),
+    });
+  }
+
+  it("classifies a catalog-backed skill as retryable skill_materialization_pending", async () => {
+    // A catalog row exists => the sweep is mid-refresh and the tree completes on
+    // its own. Measured live at 43m36s to self-heal, so this MUST stay retryable.
+    mockPrepareBundle.mockRejectedValueOnce(makeSkillError(true));
+    const result = await execute(makeCtx());
+    expect(result.errorCode).toBe("skill_materialization_pending");
+    expect(result.errorCode).not.toBe("adapter_failed");
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
+  });
+
+  it("classifies a non-catalog-backed skill as non-retryable skill_not_found", async () => {
+    // No catalog row => the path is a bundled skill in a read-only image path,
+    // i.e. a packaging fault no retry can fix. Keeps the existing permanent code.
+    mockPrepareBundle.mockRejectedValueOnce(makeSkillError(false));
+    const result = await execute(makeCtx());
+    expect(result.errorCode).toBe("skill_not_found");
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
+  });
+
+  it("rethrows a non-skill bundle failure rather than laundering it", async () => {
+    // Pins the `instanceof` guard. Without it, any prepareClaudePromptBundle
+    // failure would be reported as a skill fault. The rethrow propagates out of
+    // execute() entirely — it does NOT become a typed result — so the caller
+    // keeps classifying it as the anonymous adapter fault it has always been.
+    // That is the pre-existing behaviour for every non-skill bundle failure and
+    // this change must not alter it.
+    mockPrepareBundle.mockRejectedValueOnce(new Error("disk full"));
+    await expect(execute(makeCtx())).rejects.toThrow("disk full");
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
+  });
+});
+
 // ─── execute: job creation paths ─────────────────────────────────────────────
 
 describe("execute: job creation", () => {
@@ -1060,6 +1137,12 @@ describe("execute: job creation", () => {
     // cleanup throws a TypeError instead of doing what it says (BLO-21858).
     mockCoreCreateSecret.mockResolvedValue({});
     mockCoreDeleteSecret.mockResolvedValue({});
+    // Same reasoning as the two above, for the 409 adopt path (BLO-31665).
+    // Left unstubbed, a future test that trips a 409 gets `existing ===
+    // undefined` from the read and a TypeError masked into a secret-create
+    // failure — the exact trap the comment above was written about.
+    mockCoreReadSecret.mockResolvedValue({ metadata: { resourceVersion: "1" } });
+    mockCoreReplaceSecret.mockResolvedValue({});
   });
 
   it("returns k8s_job_create_failed when createNamespacedJob throws", async () => {
@@ -1067,6 +1150,256 @@ describe("execute: job creation", () => {
     const result = await execute(makeCtx());
     expect(result.errorCode).toBe("k8s_job_create_failed");
     expect(result.errorMessage).toContain("quota exceeded");
+  });
+
+  // ── BLO-31665: an AlreadyExists 409 must not kill the run ────────────────
+  //
+  // Secret names are `${jobName}-{prompt,env,mcp}` where jobName embeds
+  // shortHash(agentId:runId), so a name collision is a collision with this
+  // same run — a leftover from an earlier attempt. Before this guard every
+  // throw from the create was fatal, and three agents sat in `status: error`
+  // holding a stale k8s_*_secret_create_failed for a Secret that no longer
+  // existed. These drive the real execute() path, not the helper directly.
+  //
+  // The 409 is the genuine `ApiException` the client throws (it sets `code`
+  // and leaves `statusCode`/`response` undefined), so these fixtures match the
+  // production shape and the unit-test ones. An earlier revision built a plain
+  // Error and described it as "status only in the message" — that account of
+  // the incident was retracted; see the isK8s409 comment in execute.ts.
+  const alreadyExists409 = () =>
+    new ApiException(
+      409,
+      "Conflict",
+      { kind: "Status", status: "Failure", reason: "AlreadyExists", code: 409 },
+      {},
+    ) as unknown as Error;
+
+  // A prompt over the 256 KiB threshold forces the prompt Secret path.
+  const largePromptCtx = () =>
+    makeCtx({ context: { paperclipTaskMarkdown: "x".repeat(300 * 1024) } } as Partial<AdapterExecutionContext>);
+
+  // A sensitive-named adapterConfig env var forces the *env* Secret path
+  // (isSensitiveEnvName routes it to a secretKeyRef — BLO-17980).
+  const envSecretCtx = () =>
+    makeCtx({
+      agent: {
+        id: "agent-abc",
+        companyId: "co1",
+        name: "Test Agent",
+        adapterType: "claude_k8s",
+        adapterConfig: { env: { MY_API_TOKEN: "s3cret" } },
+      },
+    } as unknown as Partial<AdapterExecutionContext>);
+
+  it("adopts a same-run leftover Secret and still creates the Job", async () => {
+    mockCoreCreateSecret.mockRejectedValueOnce(alreadyExists409());
+    mockCoreReadSecret.mockResolvedValue({
+      metadata: {
+        resourceVersion: "42",
+        labels: { "app.kubernetes.io/managed-by": "paperclip", "paperclip.io/run-id": "run-test-001" },
+      },
+    });
+    mockCoreReplaceSecret.mockResolvedValue({});
+
+    const result = await execute(largePromptCtx());
+
+    expect(result.errorCode).not.toBe("k8s_prompt_secret_create_failed");
+    expect(mockCoreReplaceSecret).toHaveBeenCalledTimes(1);
+    expect(mockBatchCreateJob).toHaveBeenCalled();
+  });
+
+  it("re-creates when the leftover Secret is deleted between create and read", async () => {
+    mockCoreCreateSecret.mockRejectedValueOnce(alreadyExists409()).mockResolvedValue({});
+    mockCoreReadSecret.mockRejectedValue(
+      new ApiException(404, "Not Found", { kind: "Status", reason: "NotFound", code: 404 }, {}),
+    );
+
+    const result = await execute(largePromptCtx());
+
+    expect(result.errorCode).not.toBe("k8s_prompt_secret_create_failed");
+    expect(mockCoreReplaceSecret).not.toHaveBeenCalled();
+    expect(mockBatchCreateJob).toHaveBeenCalled();
+  });
+
+  it("still fails the run when the colliding Secret belongs to another run", async () => {
+    // Fail-closed half: adopting must never mean overwriting someone else's
+    // credentials just because a name collided.
+    mockCoreCreateSecret.mockRejectedValueOnce(alreadyExists409());
+    mockCoreReadSecret.mockResolvedValue({
+      metadata: { resourceVersion: "42", labels: { "paperclip.io/run-id": "some-other-run" } },
+    });
+
+    const result = await execute(largePromptCtx());
+
+    expect(result.errorCode).toBe("k8s_prompt_secret_create_failed");
+    expect(result.errorMessage).toContain("belongs to run some-other-run");
+    expect(mockCoreReplaceSecret).not.toHaveBeenCalled();
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
+  });
+
+  it("adopts a same-run leftover on the ENV Secret, the path that actually broke", async () => {
+    // The other three e2e cases drive the prompt Secret. The reported incident
+    // was k8s_env_secret_create_failed, so prove that exact path end to end
+    // rather than inferring it from the shared helper.
+    mockCoreCreateSecret.mockRejectedValueOnce(alreadyExists409());
+    mockCoreReadSecret.mockResolvedValue({
+      metadata: {
+        resourceVersion: "42",
+        labels: { "app.kubernetes.io/managed-by": "paperclip", "paperclip.io/run-id": "run-test-001" },
+      },
+    });
+    mockCoreReplaceSecret.mockResolvedValue({});
+
+    const result = await execute(envSecretCtx());
+
+    expect(result.errorCode).not.toBe("k8s_env_secret_create_failed");
+    // The Secret that 409'd must be the env one, or this test is silently
+    // re-testing the prompt path with different scaffolding.
+    expect(mockCoreCreateSecret.mock.calls[0][0].body.metadata.name).toMatch(/-env$/);
+    expect(mockCoreReplaceSecret).toHaveBeenCalledTimes(1);
+    expect(mockCoreReplaceSecret.mock.calls[0][0].name).toMatch(/-env$/);
+    expect(mockBatchCreateJob).toHaveBeenCalled();
+  });
+
+  // ── BLO-27155: a worker restart must reattach, not recreate ──────────────
+  //
+  // `resumeRunningExternalRuntimeRuns()` re-executes an in-flight run from its
+  // persisted reservation after the worker process restarts.  The Job name is
+  // deterministic per (agentId, runId), so that re-execution's create always
+  // collides with the run's OWN still-live Job — the concurrency guard above
+  // deliberately `continue`s past it ("Ignoring current lifecycle Job … during
+  // concurrency admission"), so admission proceeds *while that Job is live*.
+  //
+  // The 409 used to be fatal, and worse, its catch block deleted all three run
+  // Secrets — which are mounted into the live pod.  So a restart did not merely
+  // fail the run, it dismantled a still-running Job's inputs.  These cases drive
+  // the real execute() path rather than the `jobAdoptionVerdict` helper, which
+  // is unit-tested separately in job-adopt.test.ts.
+
+  // Re-applies this block's beforeEach defaults.  Needed because these cases
+  // call execute() twice — once to learn the deterministic Job name, then again
+  // to drive the collision — and the first call must not leak call history or a
+  // spent one-shot rejection into the second.
+  function armJobCreationDefaults() {
+    vi.resetAllMocks();
+    mockReadSkillEntries.mockResolvedValue([]);
+    mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+    mockBatchCreateJob.mockResolvedValue({ metadata: { uid: "job-uid-1" } });
+    mockBatchDeleteJob.mockResolvedValue({});
+    mockCoreCreateSecret.mockResolvedValue({});
+    mockCoreDeleteSecret.mockResolvedValue({});
+    mockCoreReadSecret.mockResolvedValue({ metadata: { resourceVersion: "1" } });
+    mockCoreReplaceSecret.mockResolvedValue({});
+  }
+
+  /**
+   * The Job name is deterministic per (agentId, runId) but is built inside
+   * `buildJobManifest`, which does not export it.  Rather than reproduce the
+   * `ac-<agentSlug>-<runSlug>-<shortHash>` formula here — where it would
+   * silently drift from job-manifest.ts and make these tests pass against a
+   * name the adapter no longer builds — read it back from the adapter's own
+   * create call, then re-arm for the real assertion.
+   */
+  async function deterministicJobName(ctx: AdapterExecutionContext = makeCtx()): Promise<string> {
+    await execute(ctx);
+    const name = mockBatchCreateJob.mock.calls[0]?.[0]?.body?.metadata?.name as string | undefined;
+    expect(name, "probe execute() should have reached createNamespacedJob").toBeTruthy();
+    armJobCreationDefaults();
+    return name as string;
+  }
+
+  /** A prompt over the 256 KiB threshold, so all three Secrets are staged. */
+  const restartCtx = (over: Record<string, unknown>) =>
+    makeCtx({
+      context: { paperclipTaskMarkdown: "x".repeat(300 * 1024) },
+      ...over,
+    } as unknown as Partial<AdapterExecutionContext>);
+
+  it("adopts this run's own live Job on 409 and reattaches to the SAME uid", async () => {
+    const jobName = await deterministicJobName();
+    // Deliberately not "job-uid-1": the assertion below is that the run keeps
+    // the uid it was launched with, rather than acquiring a freshly created one.
+    const liveUid = "live-uid-from-before-the-restart";
+    mockBatchCreateJob.mockRejectedValueOnce(alreadyExists409());
+    mockBatchReadJob.mockResolvedValue(
+      makeJob({ name: jobName, uid: liveUid, runId: "run-test-001", agentId: "agent-abc" }),
+    );
+    const onExternalRuntimeLaunched = vi.fn().mockResolvedValue(undefined);
+
+    const result = await execute(
+      restartCtx({
+        externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName, jobUid: liveUid },
+        onExternalRuntimeLaunched,
+      }),
+    );
+
+    expect(result.errorCode).not.toBe("k8s_job_create_failed");
+    // Reattach means the same object: no second create, no duplicate Job.
+    expect(mockBatchCreateJob).toHaveBeenCalledTimes(1);
+    expect(onExternalRuntimeLaunched).toHaveBeenCalledWith({ jobName, jobUid: liveUid });
+    // Deliberately NOT asserting that no Secret is ever deleted in this case.
+    // Once the run reattaches it owns that Job's lifecycle again — it waits for
+    // it, streams its logs, and the terminal `finally` then deletes the Job and
+    // its Secrets exactly as it would for a Job this execution had created.
+    // Gating that terminal cleanup on adoption would leak a Job and three
+    // Secrets on every successful reattach. What must never delete an adopted
+    // object is the two *abort* paths, which the next case isolates.
+  });
+
+  it("still fails closed when the colliding Job is not the one this run launched", async () => {
+    // BLO-17291 AC-3: a same-name object that is not this exact object is never
+    // adopted. Adopting here would attach the run to work it does not own.
+    const jobName = await deterministicJobName();
+    mockBatchCreateJob.mockRejectedValueOnce(alreadyExists409());
+    mockBatchReadJob.mockResolvedValue(
+      makeJob({ name: jobName, uid: "a-different-objects-uid", runId: "run-test-001", agentId: "agent-abc" }),
+    );
+
+    const result = await execute(
+      restartCtx({
+        externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName, jobUid: "the-uid-we-launched" },
+      }),
+    );
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+  });
+
+  it("does NOT tear down an ADOPTED Job's Secrets when the launch ack throws", async () => {
+    // The dangerous edge. Those Secrets are mounted into a running pod, so
+    // deleting them converts a recoverable stall into lost work. Leaking a Job
+    // is recoverable by the existing reapers; deleting a live one is not.
+    const jobName = await deterministicJobName();
+    const liveUid = "live-uid-from-before-the-restart";
+    mockBatchCreateJob.mockRejectedValueOnce(alreadyExists409());
+    mockBatchReadJob.mockResolvedValue(
+      makeJob({ name: jobName, uid: liveUid, runId: "run-test-001", agentId: "agent-abc" }),
+    );
+
+    await execute(
+      restartCtx({
+        externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName, jobUid: liveUid },
+        onExternalRuntimeLaunched: vi.fn().mockRejectedValue(new Error("reservation ack failed")),
+      }),
+    );
+
+    expect(mockCoreDeleteSecret).not.toHaveBeenCalled();
+    expect(mockBatchDeleteJob).not.toHaveBeenCalled();
+  });
+
+  it("DOES tear down a Job it created itself when the launch ack throws", async () => {
+    // Negative control for the case above: without it, that assertion passes
+    // just as well if cleanup had been deleted outright rather than made
+    // conditional on adoption.
+    await execute(
+      restartCtx({
+        onExternalRuntimeLaunched: vi.fn().mockRejectedValue(new Error("reservation ack failed")),
+      }),
+    );
+
+    expect(mockBatchDeleteJob).toHaveBeenCalled();
+    expect(mockCoreDeleteSecret).toHaveBeenCalled();
   });
 
   it("acknowledges the created Job identity before continuing", async () => {

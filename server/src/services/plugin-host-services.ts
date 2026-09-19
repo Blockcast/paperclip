@@ -33,8 +33,9 @@ import type {
   PluginExecutionWorkspaceMetadata,
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import { isClosedExecutionWorkspace, pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import { companyService } from "./companies.js";
+import { recordPluginMetric } from "./metrics.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
@@ -724,12 +725,19 @@ export function buildHostServices(
     companyId: workspace.companyId,
     projectId: workspace.projectId,
     projectWorkspaceId: workspace.projectWorkspaceId,
+    name: workspace.name,
     path: workspace.cwd ?? workspace.providerRef,
     cwd: workspace.cwd,
     repoUrl: workspace.repoUrl,
     baseRef: workspace.baseRef,
     branchName: workspace.branchName,
     providerType: workspace.providerType,
+    mode: workspace.mode,
+    // BLO-31349: expose the host's own closed-ness verdict rather than the raw
+    // `status`/`closedAt` columns, so plugins (and the SDK test double) branch
+    // on the same predicate `getWorkspaceForIssue` uses to reject a torn-down
+    // workspace, instead of each re-deriving it and missing `cleanup_failed`.
+    closed: isClosedExecutionWorkspace(workspace),
     providerMetadata: readProviderMetadata(workspace.metadata),
   });
 
@@ -1332,6 +1340,7 @@ export function buildHostServices(
             value: params.value,
           },
           await resolveCallerFencingPrecondition(params.fencing),
+          params.ifMatch,
         );
       },
       async delete(params) {
@@ -1613,6 +1622,26 @@ export function buildHostServices(
         const safeName = truncStr(String(params.name ?? ""), MAX_METRIC_NAME_LENGTH);
         logger.debug({ pluginId, name: safeName, value: params.value, tags: params.tags }, "Plugin metric write");
 
+        // Publish to Prometheus FIRST (PEN-2799). Ordered before the
+        // plugin_logs buffer push deliberately: the buffer write can fail or be
+        // lost on a flush error, and the exposition path is the one an alert
+        // rule depends on. `recordPluginMetric` never throws, so this cannot
+        // turn a mis-shaped metric into a failed plugin call.
+        //
+        // Note this passes the *untruncated* name: recordPluginMetric applies
+        // its own length bound and counts an over-long name as an explicit
+        // `bad_name` drop. Handing it the pre-truncated string would let a
+        // too-long name silently masquerade as a valid shorter one and occupy a
+        // real series.
+        recordPluginMetric({
+          pluginId,
+          pluginKey,
+          name: String(params.name ?? ""),
+          value: typeof params.value === "number" ? params.value : Number(params.value),
+          tags: (params.tags ?? null) as Readonly<Record<string, unknown>> | null,
+          declaredLabels: options.manifest?.metricLabels ?? null,
+        });
+
         // Persist metrics to plugin_logs via the batch buffer (same path as
         // logger.log) so they benefit from batched writes and are flushed
         // reliably on shutdown. Using level "metric" makes them queryable
@@ -1801,6 +1830,74 @@ export function buildHostServices(
         if (!projectId) return null;
         const project = await projects.getById(projectId);
         if (!inCompany(project, companyId)) return null;
+
+        // BLO-31349: prefer the issue's OWN execution workspace. This method
+        // takes an issueId and promises issue scope; previously it used the
+        // issueId only to find the project and then returned the project base
+        // checkout, so every issue in a project got the same path — and under
+        // an `isolated_workspace` policy that path is the one directory the
+        // policy exists to keep agents out of.
+        const executionWorkspaceId = (issue as Record<string, unknown>)
+          .executionWorkspaceId as string | null | undefined;
+        if (executionWorkspaceId) {
+          const workspace = await executionWorkspaces.getById(executionWorkspaceId);
+          // A closed/archived workspace may already have had its directory torn
+          // down, so treat it as absent rather than handing back a path that no
+          // longer exists. Deliberately the mode-INDEPENDENT guard: the reason
+          // ("the directory may be gone") is true of an archived cloud_sandbox
+          // or shared_workspace exactly as much as of an isolated worktree, and
+          // the isolated-only variant reports false for four of the five modes.
+          if (inCompany(workspace, companyId) && !isClosedExecutionWorkspace(workspace)) {
+            // `cwd`, NOT `agentCwd`: agentCwd is documented as the path to
+            // prefer for filesystem ops *inside the adapter session*, and for
+            // an ssh-transport realization it is a path on the REMOTE host. The
+            // plugin host runs in the server process, so that path may not
+            // exist here — and PLUGIN_SPEC tells plugins to hand `path`
+            // straight to Node and git. `cwd` is the canonical local
+            // realization and equals `agentCwd` whenever the realization is
+            // local, so nothing is lost in the common case; a null `cwd`
+            // correctly drops to the honest project-scoped fallback below.
+            const path = sanitizeWorkspacePath(workspace.cwd);
+            // An unrealized workspace (no cwd yet) has no directory to offer.
+            // Returning `path: ""` with `isIssueScoped: true` would be worse
+            // than the honest project-scoped fallback below.
+            if (path) {
+              // Deliberate: `name` becomes the execution workspace's own label
+              // (e.g. the branch slug) rather than the project name, so a
+              // caller rendering it sees which working copy it actually got.
+              // A project-name label on a per-issue worktree would be the same
+              // conflation this method is being fixed for.
+              const name = sanitizeWorkspaceName(workspace.name, path);
+              return {
+                id: workspace.id,
+                projectId: workspace.projectId,
+                name,
+                path,
+                repoUrl: workspace.repoUrl ?? project.codebase.repoUrl,
+                // For a worktree the checked-out ref *is* the branch, and the
+                // base ref is what tooling should diff against.
+                repoRef: workspace.branchName ?? project.codebase.repoRef,
+                defaultRef: workspace.baseRef ?? project.codebase.defaultRef,
+                branchName: workspace.branchName ?? null,
+                // An execution workspace is never the project primary.
+                isPrimary: false,
+                isIssueScoped: true,
+                // Provenance alone does not tell a caller whether the path is
+                // private to this issue — `shared_workspace` and
+                // `operator_branch` are issue-bound but NOT isolated. Surface
+                // the mode so the isolation question is answerable.
+                mode: workspace.mode,
+                createdAt: workspace.createdAt.toISOString(),
+                updatedAt: workspace.updatedAt.toISOString(),
+              };
+            }
+          }
+        }
+
+        // Fallback: no live execution workspace bound to this issue. Return the
+        // project primary rather than null, so callers do not each invent their
+        // own fallback and re-derive `effectiveLocalFolder` — the very defect
+        // this method had. `isIssueScoped: false` tells them what they got.
         const row = project.primaryWorkspace;
         const path = sanitizeWorkspacePath(project.codebase.effectiveLocalFolder);
         const name = sanitizeWorkspaceName(row?.name ?? project.name, path);
@@ -1812,9 +1909,13 @@ export function buildHostServices(
           repoUrl: row?.repoUrl ?? project.codebase.repoUrl,
           repoRef: row?.repoRef ?? project.codebase.repoRef,
           defaultRef: row?.defaultRef ?? project.codebase.defaultRef,
+          branchName: null,
           // BLO-26184: see getPrimaryWorkspace above — do not claim explicit
           // choice for a fallback guess.
           isPrimary: project.primaryWorkspaceSource === "explicit",
+          isIssueScoped: false,
+          // Project-scoped: no execution workspace, so no mode to report.
+          mode: null,
           createdAt: (row?.createdAt ?? project.createdAt).toISOString(),
           updatedAt: (row?.updatedAt ?? project.updatedAt).toISOString(),
         };

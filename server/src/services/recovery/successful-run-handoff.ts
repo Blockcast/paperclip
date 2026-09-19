@@ -348,13 +348,25 @@ function isProductiveSuccessfulRun(input: {
   return Boolean(input.detectedProgressSummary);
 }
 
+/**
+ * Which recovery lane the corrective wake is dispatched on.
+ *
+ * Resolved once in `decideSuccessfulRunHandoff` and threaded into both the guard
+ * context and the instruction text, so the wake can never tell the agent
+ * "document or plan updates are not allowed" while dispatching it on a lane
+ * where they are. Before BLO-23197 the instruction re-derived that sentence from
+ * `issue.workMode` independently, so any escalation not keyed on `workMode`
+ * would have contradicted its own payload.
+ */
+export type SuccessfulRunHandoffWorkClass = "planning_only" | "status_only";
+
 export function buildSuccessfulRunHandoffInstruction(input: {
   issueIdentifier: string | null;
   sourceRunId: string;
-  workMode: IssueRow["workMode"];
+  workClass: SuccessfulRunHandoffWorkClass;
 }) {
   const issueLabel = input.issueIdentifier ?? "this issue";
-  const isPlanningContinuation = input.workMode === "planning";
+  const isPlanningContinuation = input.workClass === "planning_only";
   return [
     `Your previous run on ${issueLabel} succeeded, but the issue is still in \`in_progress\` and Paperclip cannot identify a valid issue disposition.`,
     "",
@@ -384,6 +396,17 @@ export function buildSuccessfulRunHandoffInstruction(input: {
   ].join("\n");
 }
 
+/**
+ * `input.run` must be a row re-read AFTER the source run body executed, not the
+ * claim-time snapshot. `statusOnlyDocumentWriteRefusedAt` is stamped mid-run by
+ * `assertDeliverableMutationAllowedByRunContext`, so a claim-time row would
+ * carry `null` and the BLO-23197 escalation below would never fire. Both
+ * dispatch paths satisfy this today — `classifyAndPersistRunLiveness` returns
+ * the row from an `UPDATE ... RETURNING()`, and the finalize path re-reads via
+ * `getRun` — but that is an invariant of `heartbeat.ts` rather than of this
+ * function, and no test here can observe it: pass a stale row and every case
+ * below still passes while the escalation silently stops firing.
+ */
 export function decideSuccessfulRunHandoff(input: {
   run: HeartbeatRunRow;
   issue: IssueRow | null;
@@ -450,12 +473,40 @@ export function decideSuccessfulRunHandoff(input: {
     return { kind: "skip", reason: "corrective handoff wake already exists for this source run" };
   }
 
+  // A status-only wake cannot write an issue document. So when the source run
+  // was refused exactly that write, dispatching another status-only wake
+  // guarantees the identical 403 and the issue can never self-heal — the
+  // BLO-23197 deadlock, measured live on BLO-23032 and five times since.
+  //
+  // `issue.workMode` alone is the wrong signal for it: it is a proxy for "is the
+  // remaining deliverable a document", and it reads `standard` in precisely the
+  // reported case, so the escalation that already existed here only ever fired
+  // for `planning` issues. The refusal itself is the direct signal, stamped on
+  // the run row by `assertDeliverableMutationAllowedByRunContext`.
+  //
+  // `planning_only` is the minimum escalation that clears it: the normal-model
+  // lane with `allowDocumentUpdates: true`, while deliverable and annotation
+  // writes stay barred. A run refused a *deliverable* or *annotation* write is
+  // deliberately not escalated — that needs a full normal-model run, a wider
+  // grant than this detector should make on its own — which is why the stamp is
+  // scoped to documents at the point of refusal.
+  //
+  // `Boolean(...)` guards a narrowed column projection, not `undefined`: the row
+  // type is `Date | null` and never `undefined`, so the only way this field goes
+  // absent is a `select()` that omits it. `getRun` is projected, but both
+  // `heartbeatRunSafeColumns` and `heartbeatRunSqlAsciiSafeColumns` spread
+  // `...getTableColumns(heartbeatRuns)` — that spread is what keeps this field
+  // present, and a future hand-enumerated projection there would disable the
+  // escalation in production while every test in this file still passed.
+  const workClass: SuccessfulRunHandoffWorkClass =
+    issue.workMode === "planning" || Boolean(run.statusOnlyDocumentWriteRefusedAt)
+      ? "planning_only"
+      : "status_only";
   const instruction = buildSuccessfulRunHandoffInstruction({
     issueIdentifier: issue.identifier,
     sourceRunId: run.id,
-    workMode: issue.workMode,
+    workClass,
   });
-  const workClass = issue.workMode === "planning" ? "planning_only" : "status_only";
   const payloadInput = {
     issueId: issue.id,
     taskId: issue.id,
